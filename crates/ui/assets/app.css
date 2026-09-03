@@ -43,8 +43,23 @@
 }
 
 @layer pages {
-/* CapabilityStatement-only presentation: keep the backend note subordinate to
-   its interaction tags, and let the resource filter fit a phone-width card. */
+/* CapabilityStatement-only presentation: all card headers stay edge-to-edge,
+   while their bodies own the content rhythm appropriate to fields, tags, or
+   tables. The generic table-card keeps its padded treatment elsewhere. */
+.cap-operations-card,
+.cap-resource-card {
+  padding: 0;
+}
+
+.cap-interaction-tags {
+  margin: 0;
+}
+
+.cap-interaction-tags > .tag {
+  margin-left: 0;
+}
+
+/* Keep the backend note subordinate to its interaction tags. */
 .cap-transaction-note {
   margin: 8px 0 0 16px;
   padding-left: 10px;
@@ -64,6 +79,25 @@
   min-width: 0;
 }
 
+.capability-raw-card > .card-head {
+  justify-content: flex-start;
+  flex-wrap: wrap;
+}
+
+.capability-json-actions {
+  align-items: center;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+
+.capability-json-actions__status:empty {
+  display: none;
+}
+
+.capability-json-fallback {
+  margin: 0 0 10px;
+}
+
 @media (max-width: 520px) {
   .cap-resource-card > .card-head {
     flex-direction: column;
@@ -73,6 +107,18 @@
   .cap-resource-filter {
     flex-basis: auto;
     width: 100%;
+  }
+
+  .capability-raw-card > .card-head {
+    align-items: stretch;
+  }
+
+  .capability-json-actions {
+    width: 100%;
+  }
+
+  .capability-json-actions__status {
+    flex-basis: 100%;
   }
 }
 }
@@ -173,8 +219,8 @@
   --warn: #8a5a00;
   --warn-soft: #fdf2dd;
   --danger-soft: #f0dfde;
-  /* Neutral pair for the cancelled state (#833 gate-fix, FALLA 3): the same
-     shape as the ok/warn/danger soft pairs above, but genuinely gray so
+  /* Neutral pair for the cancelled state (#833): the same shape as the
+     ok/warn/danger soft pairs above, but genuinely gray so
      "Cancelled" never reads as an accent-tinted (blue) or danger (red)
      status. */
   --muted-soft: #e9e9e9;
@@ -1333,6 +1379,33 @@ button.pill {
   border: 0;
 }
 
+/* Progressive-enhancement utility (#843): hides an element that only works
+   once JavaScript has actually run. `theme.js` marks `<html class="js">`
+   from `<head>`, without `defer`, before first paint — so "js" here means
+   "the earliest script ran", not "JavaScript is enabled" the way `[hidden]`
+   above means "the server or a script says so".
+
+   Generic on purpose — no page or container it needs to sit inside: the
+   reveal rule below is `html.js .needs-js`, nothing narrower, so any page
+   that renders a `.needs-js` element can rely on it regardless of what
+   wraps that element. `display: flex` is this crate's one real use so far
+   (View Definitions' guided-form card, a flex column) — a future consumer
+   needing a different shown-state display overrides it with a selector at
+   least as specific as this one (or later in the same layer), the same way
+   `.editor__grid--stretch`'s own layout rules add flex-item properties
+   (`flex`, `min-height`, ...) on top of this pair without touching
+   `display` themselves. Not `!important` like `[hidden]` above: two
+   declarations of ordinary weight, `display: none` and `display: flex`,
+   let a more specific override win normally instead of requiring every
+   future consumer to out-`!important` this utility too. */
+.needs-js {
+  display: none;
+}
+
+html.js .needs-js {
+  display: flex;
+}
+
 
 .stat-grid--5 {
   grid-template-columns: repeat(5, 1fr);
@@ -1601,28 +1674,18 @@ select.field__input {
   color: var(--muted);
 }
 
-/* The CapabilityStatement raw view is a real link without JavaScript. Keep its
-   htmx-only progress message out of that fallback, then reveal it only while
-   htmx marks this explicit indicator as the active request indicator.
-   #capability-json-loading is the CapabilityStatement fold (E2E selectors);
-   .json-fold-loading is the generalized class for multiple folds (#898). */
-#capability-json-loading,
-.json-fold-loading {
-  display: none;
-}
-
-#capability-json-loading.htmx-request,
-.json-fold-loading.htmx-request {
-  display: inline-flex;
-}
-
-/* Large JSON trees use an incremental, bounded rendering strategy. Only the
-   currently expanded fragments exist in the DOM. Class-based for multiple
-   folds per page (#898). */
-.json-fold-body {
+/* The Raw CapabilityStatement has one keyboard-focusable scroll owner. Every
+   nested outline and shared JSON fragment remains overflow-visible inside it. */
+#capability-json-body {
   max-height: 70vh;
   overflow: auto;
-  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+  outline: none;
+}
+
+#capability-json-body:focus-visible {
+  border-radius: 8px;
+  box-shadow: 0 0 0 3px var(--accent-soft);
 }
 
 .capability-json-outline {
@@ -1632,7 +1695,7 @@ select.field__input {
   line-height: 1.6;
 }
 
-.json-fold-body .capability-json-outline {
+#capability-json-body .capability-json-outline {
   max-height: none;
   overflow: visible;
 }
@@ -1659,11 +1722,14 @@ select.field__input {
 .capability-json-node > summary::-webkit-details-marker { display: none; }
 .capability-json-row__fold { flex: 0 0 18px; color: var(--muted); }
 .capability-json-node[open] > summary .capability-json-row__fold { transform: rotate(90deg); }
-.capability-json-node__body { padding-left: 18px; }
+.capability-json-node__body {
+  padding-left: 18px;
+  overflow: visible;
+}
 
 .capability-json-truncated {
   color: var(--muted);
-  font-family: var(--font-sans);
+  font-family: Figtree, ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
   font-size: 11px;
 }
 
@@ -1673,7 +1739,7 @@ select.field__input {
   justify-content: center;
   gap: 10px;
   padding: 10px;
-  font-family: var(--font-sans);
+  font-family: Figtree, ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
 }
 
 /* Centered-popup variant of the addbox (the Bulk Import dialogs, #527): the
@@ -1744,6 +1810,12 @@ select.field__input {
 .data-table .col-actions {
   text-align: right;
   width: 64px;
+}
+
+/* A leading checkbox column (SQL Export's subjects table, #834): just wide
+   enough for the control, never stretching to carry column weight. */
+.data-table .col-check {
+  width: 32px;
 }
 
 .col-tenant {
@@ -2034,10 +2106,49 @@ select.field__input {
   min-width: 0;
 }
 
+/* Vertical-rhythm variant for detail-page headers with eyebrow + title +
+   optional lede + chips + kv-grid (HTS CodeSystem / ValueSet / ConceptMap).
+   HFS pages with simpler title+lede keep the base `.page-head__copy`. */
+.page-head__copy--spaced {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.page-head__copy--spaced > .page-head__title {
+  margin-bottom: 0; /* gap handles spacing */
+}
+.page-head__copy--spaced > .facets--bare {
+  padding-bottom: 6px; /* reduce from 12px; gap adds rest */
+}
+.page-head__copy--spaced > .kv-grid {
+  margin-bottom: 0; /* final child; no trailing margin needed */
+}
+
 .page-head--back-link > .page-head__action {
   grid-area: action;
   min-width: 0;
   align-self: start;
+}
+
+/* #835: the job detail header's status row (status chip, contextual
+   action, overflow) — a peer of .job-card__actions, right-aligned like it. */
+.page-head__action {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 10px;
+}
+
+/* #835: the job detail's own vertical rhythm for the notice/progress/cards
+   region. That content lives inside #job-detail, a descendant of .content
+   rather than a direct child of it, so the site-wide
+   .content > .card ~ .card spacing rule ("Stacked section cards keep the
+   page's vertical rhythm", further down this file) never reaches it. */
+.job-detail-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 24px;
 }
 
 .page-head__title {
@@ -2760,6 +2871,12 @@ select.field__input {
   margin-top: 12px;
 }
 
+/* The "nothing to export yet" card's actions (SQL Export, #834): left-aligned
+   like the rest of that card's body copy, not trailing off to the right. */
+.form-actions--start {
+  justify-content: flex-start;
+}
+
 /* Shared labelled-value compositions. The flush modifier sets the value that
    the existing key/value grid consumes in the later page layer, so component
    ownership does not depend on !important or layer-breaking specificity. */
@@ -2785,10 +2902,6 @@ select.field__input {
   --kv-grid-margin-bottom: 0;
 }
 
-.json-editor--short {
-  min-height: 120px;
-}
-
 .json-editor:focus {
   outline: none;
   border-color: var(--accent);
@@ -2796,7 +2909,11 @@ select.field__input {
 }
 
 /* The collapsible JSON fold's summary rides .card-head; the chevron flips
-   when the fold opens, like the app's other disclosures. */
+   when the fold opens, like the app's other disclosures. #839 retired
+   `sql-library.html`'s own `.json-fold` (the SQL pane's JSON pane), but the
+   class is still load-bearing for the CapabilityStatement raw-JSON card
+   (`crates/ui-chrome/templates/partials/capability-raw-card.html`), so the
+   rule stays. */
 details.json-fold > summary {
   cursor: pointer;
   list-style: none;
@@ -3252,6 +3369,19 @@ details.json-fold[open] > summary .icon {
 }
 
 @layer pages {
+/* SQL Queries / SQL Views title row (#839): the selected Library's type
+   icon and its two chips (type, status) sit inline with its name inside
+   `.page-head__title` — no other page nests an icon or a chip in this
+   heading class, so the flex/gap treatment `.card-head h3` already gives
+   its own inline icon is scoped here as a modifier instead of changing the
+   shared rule every other page's title also uses. */
+.page-head__title--kind {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
 /* Bulk Import detail: consistent rhythm between its non-empty cards. */
 .bulk-import-section {
   margin-bottom: 16px;
@@ -3626,6 +3756,17 @@ details.json-fold[open] > summary .icon {
   display: flex;
   flex-wrap: wrap;
   gap: 5px;
+}
+
+/* #835: the job detail's Job card Subjects field — a `.tag--type` pill per
+   subject holding only the kind, its display name running on as plain text
+   right after (not inside the pill, unlike .detail__tags' own single-node
+   pills), so the two flow and wrap together like ordinary inline content. */
+.job-detail__subjects {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
 }
 
 .detail__code {
@@ -4355,6 +4496,91 @@ details.json-fold[open] > summary .icon {
   overflow: hidden;
 }
 
+/* View Definitions' editor + guided-form pairing (#843): the two cards grow
+   together, stretching to whichever is taller, capped at 70vh — beyond that,
+   each scrolls inside its own content area instead of growing the row.
+   `.editor__grid` alone (the Resource Editor's layout, above) does not do
+   this: each of its panes caps itself independently at 70vh (`.editor-tree`,
+   `.json-view`, below) with nothing requiring the two to match. A flex row
+   rather than a second grid template: hiding the guided-form card without
+   JavaScript (`needs-js`) then leaves the editor card alone to fill the
+   whole row, with no empty second track to collapse by hand. */
+.editor__grid--stretch {
+  display: flex;
+  align-items: stretch;
+  gap: 16px;
+  max-height: 70vh;
+}
+
+/* `display` lives in its own rule, scoped `:not(.needs-js)`: layer order
+   beats specificity in the cascade, so a `display` declared anywhere in
+   this `pages` layer would otherwise always win over `.needs-js`'s
+   `display: none` in the earlier `components` layer, `html.js` or not, if
+   this selector also matched the guided-form card — undoing the whole
+   point of that utility. `html.js .needs-js` (also `components`, specific
+   enough to win there) already resolves the guided-form card's own
+   `display: flex` generically; every other box-model property below is
+   identical for both cards and safe to share, since they do nothing to an
+   element `display: none` has already taken out of layout. */
+.editor__grid--stretch > .card:not(.needs-js) {
+  display: flex;
+}
+
+.editor__grid--stretch > .card,
+.editor__grid--stretch > .needs-js {
+  flex: 1 1 0;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 320px;
+  overflow: hidden;
+}
+
+/* The editor card's own scrolling area is whichever of the two the browser
+   actually mounted: CodeMirror's wrapper (`.code-editor`) normally, or the
+   plain `<textarea>` it replaces when the bundle never mounted.
+   Only `flex` lives here for the CodeMirror wrapper: the matching
+   `min-height`/`max-height` override that actually lets it grow past its
+   own 320px/70vh clamp to fill the stretch row lives beside the unlayered
+   rule it overrides, further down this file — a layered override of an
+   unlayered declaration always loses regardless of specificity (see that
+   section's own header comment), so `max-height: none` written here would
+   silently do nothing. The textarea fallback's own `flex: 1` moved down to
+   sit there too (`design-system.spec.ts`'s "no selector twice" guard does
+   not treat `@layer` as licensing a second definition of the same selector,
+   deliberately — a repeat is a repeat regardless of which cascade layer it
+   lives in) — with nothing here it would otherwise need to beat, `flex`
+   loses nothing by living unlayered alongside `max-height: none` instead of
+   splitting the one selector across two blocks. */
+.editor__grid--stretch #vd-editor-form {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.editor__grid--stretch .code-editor {
+  flex: 1;
+  min-height: 0;
+}
+
+/* The guided-form card: header, legend, and validity chip stay put; the row
+   tree (or, mid-edit, the invalid-JSON notice) becomes the scrolling area. */
+.editor__grid--stretch .editor-form .editor-tree,
+.editor__grid--stretch .editor-form .alert {
+  flex: 1;
+  min-height: 0;
+  max-height: none;
+  overflow-y: auto;
+}
+
+/* `#editor-form` (`editor-hidden-form.html`) carries only hidden `<input>`s
+   — nothing to show — but as a bare `<form>` it is still a block box; inside
+   a stretch row it would otherwise get `align-items: stretch`'s full row
+   height as empty, gap-widening space between the two cards. */
+#editor-form {
+  display: none;
+}
+
 .card-head {
   display: flex;
   align-items: center;
@@ -4415,9 +4641,9 @@ details.json-fold[open] > summary .icon {
   line-height: 1.6;
 }
 
-/* The fold owns the only scroll container for its incremental tree. Keep
-   bounded scalar fragments from creating nested 70vh scrollers (#898). */
-.json-fold-body .json-view {
+/* The CapabilityStatement owns the only scroll container for its incremental
+   tree. Keep bounded scalar fragments from creating nested 70vh scrollers. */
+#capability-json-body .json-view {
   max-height: none;
   overflow: visible;
 }
@@ -5707,6 +5933,21 @@ details.json-fold[open] > summary .icon {
   margin-right: auto;
 }
 
+/* The subjects table's toolbar (SQL Export builder, #834): the type switch
+   and filter box beside "Subjects". Rendered `hidden` until the filter/
+   switch/select-all enhancement reveals it — a no-JavaScript client never
+   sees this row at all. `flex-wrap` keeps the switch and the filter box from
+   forcing horizontal overflow once revealed on a narrow viewport. */
+.card-head__tools--subjects {
+  flex-wrap: wrap;
+  gap: 10px;
+  align-items: center;
+}
+
+.card-head__tools--subjects .field__input {
+  width: 220px;
+}
+
 }
 @layer components {
 /* Shared HTMX-backed multi-select combobox (#655). Domain-specific search and
@@ -6051,6 +6292,16 @@ details.json-fold[open] > summary .icon {
   overflow-wrap: anywhere;
 }
 
+/* #835: the card title links to the job's own detail page. */
+.job-card__name a {
+  color: inherit;
+  text-decoration: none;
+}
+
+.job-card__name a:hover {
+  text-decoration: underline;
+}
+
 .job-card__actions {
   display: flex;
   align-items: center;
@@ -6145,6 +6396,13 @@ details.json-fold[open] > summary .icon {
 .job-card__files a:hover {
   border-color: var(--accent);
   background: var(--accent-soft);
+}
+
+/* #835: the Output files table's Files column reuses .job-card__files for
+   its download pills, but as a table cell's sole content — the top margin
+   above assumes trailing a .job-card__meta paragraph, which isn't there. */
+.data-table .job-card__files {
+  margin-top: 0;
 }
 }
 
@@ -6305,6 +6563,16 @@ body.app-shell .pane {
   background: var(--accent-soft);
 }
 
+/* Row -> editor cross-highlight (#843, vd-editor.js): a CodeMirror line
+   decoration (its own `cm-line` wrapper gains this class alongside), the
+   same `--accent-soft` wash `.json-line--hit`/`.editor-row--hit` below use
+   for the Resource Editor's own JSON<->form link — View Definitions' JSON
+   pane is CodeMirror, with no server-rendered `.json-line[data-jpath]` to
+   paint instead. */
+.code-editor .cm-line--hit {
+  background: var(--accent-soft);
+}
+
 /* drawSelection()'s caret defaults to a fixed black border-left (CM6's
    unthemed base — its `&dark` variant never applies here, see the tooltip
    comment below), invisible over a dark `--input-bg`. Tying it to the
@@ -6338,7 +6606,7 @@ body.app-shell .pane {
   background-color: transparent;
 }
 
-/* Lint hover tooltip chrome (#753 gate-fixes): @codemirror/lint's own
+/* Lint hover tooltip chrome (#753): @codemirror/lint's own
    `.cm-tooltip` styling only exists under an internal `&light`/`&dark`
    state — set once, globally, from whether any loaded theme extension
    opted into `EditorView.darkTheme`, which no mount in this crate ever
@@ -6467,17 +6735,43 @@ body.app-shell .pane {
   max-height: 70vh;
 }
 
-/* RF8 (#752 ticket 02): the plain `<textarea>` fallback's own height — the
-   same "min 320px, max ~70vh, scroll internally" cotas `.cm-editor` gets
-   above, so nojs and the pre-mount flash match the mounted editor's
-   footprint instead of the old fixed `rows="18"`. Scoped to this page's
-   form rather than `.json-editor` itself, which `sql-library.html` still
-   uses with its original sizing (#839 will give that page the same
-   treatment separately). */
+/* Inside the guided-form pairing (#843, `.editor__grid--stretch` further up
+   this file, in the layered `pages` section): the row itself already caps
+   total height at 70vh and stretches both cards to match, so `.cm-editor`
+   becomes its wrapper's `flex: 1` scrolling area — `height: 100%` of
+   whatever the stretch pairing gives it — instead of clamping itself
+   independently. The 320px floor above is untouched — that minimum applies
+   either way. Written here, unlayered, beside the rule it overrides: a `pages`-
+   layer override of an unlayered declaration always loses regardless of
+   specificity (see this section's own header comment) — `max-height: none`
+   in `@layer pages` would silently do nothing against the `max-height: 70vh`
+   two lines up. */
+.editor__grid--stretch .code-editor .cm-editor {
+  height: 100%;
+  max-height: none;
+}
+
+/* #752: the plain `<textarea>` fallback's own height — the same
+   "min 320px, max ~70vh, scroll internally" shape `.cm-editor` gets above,
+   so nojs and the pre-mount flash match the mounted editor's footprint
+   instead of a fixed `rows` count. Scoped to this page's form rather than
+   `.json-editor` itself, which every other page keeps its own sizing for —
+   the Library-backed SQL pane below gets the identical treatment, scoped to
+   its own smaller editor's dimensions (#839). */
 #vd-editor-form textarea.json-editor {
   min-height: 320px;
   max-height: 70vh;
   overflow-y: auto;
+}
+
+/* Same reasoning as `.cm-editor` above for `max-height`: inside the stretch
+   pairing the row supplies the 70vh cap, so this fallback's own copy of it
+   yields — its 320px floor does not. `flex: 1` rides along here too (moved
+   down from beside `.code-editor`'s own copy, further up this file) so the
+   selector is not declared a second time. */
+.editor__grid--stretch #vd-editor-form textarea.json-editor {
+  flex: 1;
+  max-height: none;
 }
 
 /* JSON token colors — the same variables the Resource Editor's raw JSON
@@ -6513,6 +6807,18 @@ body.app-shell .pane {
   max-height: 60vh;
 }
 
+/* #839: the SQL pane's plain `<textarea>` fallback matches the mounted
+   CodeMirror editor's own min-height/max-height above — the same
+   "nojs footprint equals the mounted one" contract `#vd-editor-form
+   textarea.json-editor` gives the ViewDefinition editor, scoped here to
+   `#lib-editor-form` instead since `.json-editor` itself keeps its generic
+   sizing for every other page. */
+#lib-editor-form textarea.json-editor {
+  min-height: 180px;
+  max-height: 60vh;
+  overflow-y: auto;
+}
+
 /* SQL token colors — one class per @codemirror/lang-sql tag group this
    editor assigns (sql-editor.js has the full tag -> class mapping and why
    Identifier/Builtin are left uncolored). Keywords and boolean/null
@@ -6527,3 +6833,13 @@ body.app-shell .pane {
 .sql-editor .cmt-sql-comment { color: var(--sql-comment); font-style: italic; }
 .sql-editor .cmt-sql-punct { color: var(--sql-punct); }
 .sql-editor .cmt-sql-literal { color: var(--sql-literal); font-weight: 600; }
+
+/* Failed-line tint (#839, sql-editor.js): the class its `errorLineField`
+   `StateField` decoration applies to the `.cm-line` of the 1-based line a
+   `$sql-run` parse error names (`data-error-line` on `#run-notice`'s
+   notice — SQLite execution errors carry no line and get no tint). Three
+   classes deep beats `.code-editor .cm-activeLine`'s two above, so the tint
+   still shows through when the cursor sits on the failed line. */
+.sql-editor .cm-line.sql-editor__error-line {
+  background: var(--danger-soft);
+}

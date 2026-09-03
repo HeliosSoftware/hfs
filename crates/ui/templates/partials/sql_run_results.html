@@ -1,65 +1,74 @@
 {#
-  The `$sql-run` preview (#752 tickets 01–02): the results card and its
-  failure notice, written once here and rendered by two callers —
-  `SqlViewDefinitionsPage`'s own initial render, nested as a template field
-  (`fragment: false` — `{{ run_results.render()?|safe }}` in
-  `sql-view-definitions.html`), and `POST /ui/sql/view-definitions/run`
-  (`fragment: true`, RF4–RF6), which renders this file directly as its
-  whole response. `fragment` only toggles the `hx-swap-oob` attributes below
-  and whether the `Empty` arm's own load trigger applies (it never fires
-  from the fragment endpoint, which always ends in `Success` or `Failure`);
-  the table markup itself (the `Success` arm) lives in exactly one place.
+  The `$sql-run` preview (#752, generalized across the three SQL on FHIR
+  playgrounds in #839): the results card and its failure notice, written
+  once here and shared by View Definitions, SQL Queries, and SQL Views.
+  Each caller supplies its own "surface" — `run_href` (its `POST …/run`
+  fragment endpoint), `form_id` (the id of the `<form>` its editable fields
+  live in), `heading_key`/`failed_key` (its i18n keys), and an optional
+  `export_href` — rather than this partial hardcoding one page's ids, URLs,
+  or catalog keys. Rendered nested as a template field for each page's own
+  initial render (`fragment: false` — `{{ run_results.render()?|safe }}`),
+  and directly as the whole response of that page's own `/run` fragment
+  endpoint (`fragment: true`). `fragment` only toggles the `hx-swap-oob`
+  attributes below and whether the `Empty` arm's own load trigger applies
+  (it never fires from a fragment endpoint, which always ends in `Success`
+  or `Failure`); the table markup itself (the `Success` arm) lives in
+  exactly one place.
 
-  `#vd-run-notice` is always present, in both modes (RF3) — it is the
-  textarea's own `hx-post` target (ticket 02's `input changed delay:500ms`
-  wiring lives on the textarea in `sql-view-definitions.html`, not here):
+  `#run-notice` is always present, in both modes:
   - Empty on success, so a fragment response clears a previous failure.
-  - Carrying the `vd-run-failed` message on a run or parse failure
-    (RF5/RF6).
-  - On its own, page-mode-only `Empty` arm (RF4): no results have reached
-    the server yet, so this element also carries the *initial* load
-    request — `hx-trigger="load"`, `hx-include` reaching into the editor
-    form since this element sits outside it — run once against whatever the
-    textarea currently holds, including the `?vd=new` starter document.
+  - Carrying the surface's own `failed_key` message on a run or parse
+    failure. When the message names the 1-based line of a `$sql-run` parse
+    error (`sql_views::extract_error_line`), the notice also carries
+    `data-error-line` for the editor to tint.
+  - On its own, page-mode-only `Empty` arm: no results have reached the
+    server yet, so this element also carries the *initial* load request —
+    `hx-trigger="load"`, `hx-include` reaching into the surface's own form
+    (`#{form_id}`) since this element sits outside it — run once against
+    whatever the editor currently holds, including a "Create New" starter
+    document.
 
-  In fragment mode, `#vd-run-notice` is the `hx-post`'s own swap target, so
-  it never carries `hx-swap-oob` — the response's non-OOB content already
-  lands there. Two more elements do ride their own `hx-swap-oob="outerHTML"`
+  In fragment mode, `#run-notice` is the `hx-post`'s own swap target, so it
+  never carries `hx-swap-oob` — the response's non-OOB content already lands
+  there. Two more elements do ride their own `hx-swap-oob="outerHTML"`
   there:
-  - `#vd-results` (the results card) on success, and is entirely absent on
+  - `#run-results` (the results card) on success, and is entirely absent on
     failure — the client's previous table is left untouched.
-  - `#vd-results-meta` on failure only, relabelling the untouched table's
+  - `#run-results-meta` on failure only, relabelling the untouched table's
     meta to "last successful run" (`vd-results-stale`). On success the meta
-    travels inside the `#vd-results` card instead, so the two never target
+    travels inside the `#run-results` card instead, so the two never target
     the same swap.
 
-  Page mode renders `#vd-results` with the identical id and no OOB
+  Page mode renders `#run-results` with the identical id and no OOB
   attribute — there is nothing to swap into on a hard navigation — so a
   later fragment response's OOB target already exists in the DOM.
 
   htmx only swaps an out-of-band element into an id that already exists on
-  the page — an OOB response with no matching target is silently dropped
-  (decision #7's "si no hay tabla anterior, htmx ignora el OOB a un id
-  inexistente", by design for the failure/meta case). For `#vd-results`
-  itself that is a problem exactly once: the very first live run of a
-  session that has never rendered a table (`Empty`, and page-mode
-  `Failure` — both mean nothing real has appeared yet). The `Empty` and
-  page-mode `Failure` arms below render an empty, classless placeholder
-  `<div id="vd-results">` for that reason alone — RF3's "no hay card" still
-  holds (nothing with `.card`/`.table-card` renders, nothing is visible) —
-  so a first successful fragment always has a real element to replace via
-  its own OOB `outerHTML` swap into a genuine `<section class="card
+  the page — an OOB response with no matching target is silently dropped, by
+  design for the failure/meta case. For `#run-results` itself that is a
+  problem exactly once: the very first live run of a session that has never
+  rendered a table (`Empty`, and page-mode `Failure` — both mean nothing
+  real has appeared yet). The `Empty` and page-mode `Failure` arms below
+  render an empty, classless placeholder `<div id="run-results">` for that
+  reason alone — no `.card`/`.table-card` renders, nothing is visible — so a
+  first successful fragment always has a real element to replace via its
+  own OOB `outerHTML` swap into a genuine `<section class="card
   table-card">`. Once that happens, every later run — success or failure —
   targets the real card, no placeholder involved.
 #}
 {% match state %}
 
 {% when RunResultsState::Success(table, ms) %}
-<div id="vd-run-notice"></div>
-<section class="card table-card" id="vd-results"{% if fragment %} hx-swap-oob="outerHTML"{% endif %}>
+<div id="run-notice"></div>
+<section class="card table-card" id="run-results"{% if fragment %} hx-swap-oob="outerHTML"{% endif %}>
   <div class="card-head">
-    <h3>{{ i18n.t("vd-results-heading") }}</h3>
-    <span id="vd-results-meta" class="card-head__meta">{{ i18n.t_arg2("vd-results-meta", "rows", table.rows.len().to_string(), "ms", ms.to_string()) }}</span>
+    <h3>{{ i18n.t(heading_key) }}</h3>
+    <div class="card-head__tools">
+      <span id="run-results-meta" class="card-head__meta">{{ i18n.t_arg2("vd-results-meta", "rows", table.rows.len().to_string(), "ms", ms.to_string()) }}</span>
+      {% if let Some(href) = export_href %}
+      <a class="btn" href="{{ href }}"><span class="icon">{% include "icons/export.svg" %}</span> {{ i18n.t("sql-run-export") }}</a>
+      {% endif %}
+    </div>
   </div>
   <div class="table-wrap">
     <table class="data-table">
@@ -78,24 +87,24 @@
   </div>
 </section>
 
-{% when RunResultsState::Failure(message) %}
-<div id="vd-run-notice"><p class="notice notice--warn">{{ i18n.t("vd-run-failed") }} {{ message }}</p></div>
+{% when RunResultsState::Failure(message, line) %}
+<div id="run-notice"><p class="notice notice--warn"{% if let Some(line) = line %} data-error-line="{{ line }}"{% endif %}>{{ i18n.t(failed_key) }} {{ message }}</p></div>
 {% if fragment %}
-<span id="vd-results-meta" class="card-head__meta" hx-swap-oob="outerHTML">{{ i18n.t("vd-results-stale") }}</span>
+<span id="run-results-meta" class="card-head__meta" hx-swap-oob="outerHTML">{{ i18n.t("vd-results-stale") }}</span>
 {% else %}
-<div id="vd-results"></div>
+<div id="run-results"></div>
 {% endif %}
 
 {% when RunResultsState::Empty %}
-{#- RF4/RF7: nothing has run on the server yet — the current selection has
-    no `?saved=1` result. The empty shell below is what fires the one
+{#- Nothing has run on the server yet — the current selection has no
+    `?…saved=1` result. The empty shell below is what fires the one
     initial-load request; a later fragment response (Success or Failure)
     replaces it with a plain notice that carries no load trigger, so the
-    live preview never re-fires itself. Never produced by the `/run`
-    fragment endpoint. -#}
-<div id="vd-run-notice" hx-post="/ui/sql/view-definitions/run"
-     hx-trigger="load" hx-target="#vd-run-notice" hx-swap="outerHTML"
-     hx-include="#vd-editor-form"></div>
-<div id="vd-results"></div>
+    live preview never re-fires itself. Never produced by a `/run` fragment
+    endpoint. -#}
+<div id="run-notice" hx-post="{{ run_href }}"
+     hx-trigger="load" hx-target="#run-notice" hx-swap="outerHTML"
+     hx-include="#{{ form_id }}"></div>
+<div id="run-results"></div>
 
 {% endmatch %}

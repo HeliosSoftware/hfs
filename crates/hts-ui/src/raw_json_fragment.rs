@@ -230,9 +230,8 @@ pub fn workbench_fragment_routes() -> Router<Arc<HtsUiState>> {
 
 // ── Fragment URL builders ───────────────────────────────────────────────
 
-/// Base URL for concept identity JSON fragments.
+// Concept Explorer fragment URL constants
 const IDENTITY_FRAGMENT_URL: &str = "/ui/hts/concepts/identity/json-fragment";
-/// Base URL for concept mappings JSON fragments.
 const MAPPINGS_FRAGMENT_URL: &str = "/ui/hts/concepts/mappings/json-fragment";
 
 // Workbench fragment URL constants (#898)
@@ -240,52 +239,8 @@ const CS_LOOKUP_FRAGMENT_URL: &str = "/ui/hts/code-systems/workbench/lookup/json
 const CS_VALIDATE_FRAGMENT_URL: &str = "/ui/hts/code-systems/workbench/validate/json-fragment";
 const CS_SUBSUMES_FRAGMENT_URL: &str = "/ui/hts/code-systems/workbench/subsumes/json-fragment";
 const VS_EXPAND_FRAGMENT_URL: &str = "/ui/hts/value-sets/workbench/expand/json-fragment";
+const VS_VALIDATE_FRAGMENT_URL: &str = "/ui/hts/value-sets/workbench/validate/json-fragment";
 const CM_TRANSLATE_FRAGMENT_URL: &str = "/ui/hts/concept-maps/workbench/translate/json-fragment";
-
-/// Build a fragment URL for concept identity that includes the concept reference.
-pub fn identity_fragment_url(reference: &ConceptRef, fhir_version: &str) -> String {
-    let endpoint = FragmentEndpoint {
-        base_path: IDENTITY_FRAGMENT_URL,
-        version: fhir_version,
-    };
-    let root_url = capability_json::root_fragment_url(endpoint);
-    // Append the concept reference parameters using form_urlencoded for correct escaping
-    let mut ser = form_urlencoded::Serializer::new(String::new());
-    ser.append_pair("system", &reference.system);
-    ser.append_pair("code", &reference.code);
-    if let Some(version) = &reference.version {
-        ser.append_pair("version", version);
-    }
-    if let Some(display_language) = &reference.display_language {
-        ser.append_pair("displayLanguage", display_language);
-    }
-    format!("{}&{}", root_url, ser.finish())
-}
-
-/// Build a fragment URL for concept mappings that includes the concept reference and direction.
-pub fn mappings_fragment_url(
-    reference: &ConceptRef,
-    direction: MappingDirection,
-    fhir_version: &str,
-) -> String {
-    let endpoint = FragmentEndpoint {
-        base_path: MAPPINGS_FRAGMENT_URL,
-        version: fhir_version,
-    };
-    let root_url = capability_json::root_fragment_url(endpoint);
-    // Append the concept reference and direction parameters using form_urlencoded
-    let mut ser = form_urlencoded::Serializer::new(String::new());
-    ser.append_pair("system", &reference.system);
-    ser.append_pair("code", &reference.code);
-    if let Some(version) = &reference.version {
-        ser.append_pair("version", version);
-    }
-    if let Some(display_language) = &reference.display_language {
-        ser.append_pair("displayLanguage", display_language);
-    }
-    ser.append_pair("direction", direction.as_str());
-    format!("{}&{}", root_url, ser.finish())
-}
 
 // ── Workbench fragment URL builders (#898) ──────────────────────────────
 

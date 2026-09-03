@@ -846,9 +846,9 @@ fn extract_bundle_resources(bundle: &Value) -> Vec<Value> {
 /// One `$sql-export` operation as [`StaticConformanceSource`] received it —
 /// which method, the [`Caller`] it was called with (#833), and — for
 /// `"start"` only — the `(output name, reference)` subjects submitted, so a
-/// test can assert on the output names a kick-off actually sent (#833
-/// gate-fix, FALLA 1) without standing up a real server. Empty for every
-/// other operation, which does not carry subjects.
+/// test can assert on the output names a kick-off actually sent (#833)
+/// without standing up a real server. Empty for every other operation,
+/// which does not carry subjects.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecordedExportCall {
     /// `"start"`, `"status"`, `"cancel"`, or `"manifest"`.
@@ -868,6 +868,7 @@ pub struct RecordedExportCall {
 #[derive(Clone)]
 pub struct StaticConformanceSource {
     map: HashMap<(String, FhirVersion), Vec<Value>>,
+    fetch_errors: HashMap<(String, FhirVersion), String>,
     metadata: Option<Value>,
     sql_rows: Option<Result<Vec<Value>, String>>,
     export_status: SqlExportStatus,
@@ -880,6 +881,7 @@ impl StaticConformanceSource {
     pub fn empty() -> Self {
         Self {
             map: HashMap::new(),
+            fetch_errors: HashMap::new(),
             metadata: None,
             sql_rows: None,
             export_status: SqlExportStatus::Unknown,
@@ -953,6 +955,22 @@ impl StaticConformanceSource {
         self
     }
 
+    /// Makes `fetch()` fail for one `(resource_type, version)` slot instead
+    /// of returning its (possibly empty) resource list — exercising a
+    /// degraded fetch (#834), the kind the SQL Export builder reports as
+    /// "the library list could not be loaded" rather than as an actually
+    /// empty store.
+    pub fn with_fetch_error(
+        mut self,
+        resource_type: &str,
+        version: FhirVersion,
+        message: impl Into<String>,
+    ) -> Self {
+        self.fetch_errors
+            .insert((resource_type.to_string(), version), message.into());
+        self
+    }
+
     /// Loads the shipped `data/` spec bundles for every enabled version, so a
     /// test exercises the real handlers and view models against real data
     /// without a running server. `data_dir` is the repo `data/` directory.
@@ -983,6 +1001,9 @@ impl ConformanceSource for StaticConformanceSource {
         version: FhirVersion,
         _tenant: &str,
     ) -> Result<Vec<Value>, String> {
+        if let Some(message) = self.fetch_errors.get(&(resource_type.to_string(), version)) {
+            return Err(message.clone());
+        }
         Ok(self
             .map
             .get(&(resource_type.to_string(), version))

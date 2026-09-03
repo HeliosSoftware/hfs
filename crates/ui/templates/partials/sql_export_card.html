@@ -3,13 +3,12 @@
    chip, and the overflow menu up top, the full-width progress track, one
    meta line. In-progress cards poll their own fragment every 5s.
 
-   The overflow (#833 ticket 03, RF7) always lists Copy job id — a
-   progressive enhancement (RF8) hidden by default and revealed only when
-   JavaScript and the Clipboard API are both available (sql-export.js) — plus
-   whichever plain-form actions the status allows. An in-progress card's
-   overflow would otherwise hold nothing but that hidden Copy button, so its
-   whole `<details>` starts hidden too (RNF1: no empty menu behind "…"
-   without JavaScript). #}
+   The overflow (#833) always lists Copy job id — a progressive enhancement
+   hidden by default and revealed only when JavaScript and the Clipboard API
+   are both available (sql-export.js) — plus whichever plain-form actions
+   the status allows. An in-progress card's overflow would otherwise hold
+   nothing but that hidden Copy button, so its whole `<details>` starts
+   hidden too (no empty menu behind "…" without JavaScript). #}
 {% if card.status == "in-progress" %}
 <div id="job-{{ card.id }}" class="card job-card"
      hx-get="/ui/sql/export/{{ card.id }}/card"
@@ -19,7 +18,7 @@
 <div id="job-{{ card.id }}" class="card job-card">
 {% endif %}
   <div class="job-card__head">
-    <h2 class="job-card__name">{{ card.name }}</h2>
+    <h2 class="job-card__name"><a href="/ui/sql/export/{{ card.id }}">{{ card.name }}</a></h2>
     <div class="job-card__actions">
       {% if card.status == "in-progress" %}
       <form method="post" action="/ui/sql/export/{{ card.id }}/cancel">
@@ -32,7 +31,10 @@
       </form>
       {% endif %}
       {% if card.status == "complete" %}
-      <a class="btn btn--primary" href="/ui/sql/files?job={{ card.job_id }}">{{ i18n.t("sql-export-view-files") }}</a>
+      <!-- #835: the job's own detail page, not the retired Files lookup —
+           the record's persisted outputs are what this button always meant
+           to reach. -->
+      <a class="btn btn--primary" href="/ui/sql/export/{{ card.id }}">{{ i18n.t("sql-export-view-files") }}</a>
       {% endif %}
       <span class="tag tag--{{ card.status }}">{{ card.status_label }}</span>
       {% if card.status == "in-progress" %}

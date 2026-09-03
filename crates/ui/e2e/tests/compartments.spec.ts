@@ -11,13 +11,12 @@ test("the compartment rail and tabs render", async ({ compartments }) => {
   await expect(compartments.tab(/test/i)).toBeVisible();
 });
 
-// "Tests esperados" #5 (#754/#755 ticket 04): the server remembers the
-// selected definition (RF1/RF2) — no client script involved, since
-// Compartments navigates via real (`hx-boost`) GETs and has no "Recently
-// used" group to render — so picking one and returning through the nav with
-// no `?def=` at all restores it: not just the current-request-only history
-// entry a back button would exercise, but the actual stored
-// `rails.compartments.last`.
+// #754/#755: the server remembers the selected definition — no client
+// script involved, since Compartments navigates via real (`hx-boost`) GETs
+// and has no "Recently used" group to render — so picking one and returning
+// through the nav with no `?def=` at all restores it: not just the
+// current-request-only history entry a back button would exercise, but the
+// actual stored `rails.compartments.last`.
 test("picking a definition and returning through the nav (no ?def=) restores it", async ({
   compartments,
   chrome,

@@ -97,8 +97,8 @@ where
     // Optional HTS administrative UI (crates/hts-ui) mounted at `/ui` so
     // routes resolve as `/ui/hts`, `/ui/hts/assets/*`, etc. The crate owns
     // the `/hts` prefix internally so this mount point stays `/ui`, the same
-    // place HFS mounts its own UI. Off by default; opt in with
-    // `HTS_UI_ENABLED=1`.
+    // place HFS mounts its own UI. On by default; opt out with
+    // `HTS_UI_ENABLED=false`.
     //
     // Upstream URL policy (design doc §7 degraded state contract):
     //   1. `HTS_UI_UPSTREAM_URL` when set — lets a developer point the UI at

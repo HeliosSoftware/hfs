@@ -614,6 +614,11 @@ pub struct BulkSubmitConfig {
     pub output_ttl_secs: u64,
     /// Maximum manifests this pod ingests concurrently.
     pub worker_concurrency: u32,
+    /// Bulk fast-load (#903): ingest without search-index/FTS writes and
+    /// rebuild them with an automatic per-type reindex when each manifest
+    /// finishes. Reads and history are complete throughout; search sees a
+    /// manifest's resources once its reindex lands.
+    pub defer_indexing: bool,
     /// When `true`, this pod does not run in-process submit workers.
     pub disable_local_worker: bool,
     /// Cap on simultaneous in-flight submissions per tenant.
@@ -669,6 +674,7 @@ impl Default for BulkSubmitConfig {
             output_ttl_secs: 86400,
             worker_concurrency: 2,
             disable_local_worker: false,
+            defer_indexing: false,
             max_concurrent_per_tenant: 4,
             batch_size: 1000,
             lease_duration_secs: 60,
@@ -726,6 +732,7 @@ impl BulkSubmitConfig {
             file_url_ttl_secs: env_u64("HFS_BULK_SUBMIT_FILE_URL_TTL", d.file_url_ttl_secs),
             output_ttl_secs: env_u64("HFS_BULK_SUBMIT_OUTPUT_TTL", d.output_ttl_secs),
             worker_concurrency: env_u32("HFS_BULK_SUBMIT_WORKER_CONCURRENCY", d.worker_concurrency),
+            defer_indexing: env_bool("HFS_BULK_SUBMIT_DEFER_INDEXING", d.defer_indexing),
             disable_local_worker: env_bool(
                 "HFS_BULK_SUBMIT_DISABLE_LOCAL_WORKER",
                 d.disable_local_worker,

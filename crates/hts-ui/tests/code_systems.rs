@@ -684,7 +684,7 @@ fn cs_detail_page_uses_the_v3_compact_header_shape() {
     for hook in [
         r#"<header class="page-head page-head--back-link">"#,
         r#"class="back-link""#,
-        r#"class="page-head__copy""#,
+        r#"class="page-head__copy "#, // may carry modifiers like --spaced
         r#"class="page-head__title""#,
         r#"class="stat__label""#,
         r#"class="facets facets--bare""#,

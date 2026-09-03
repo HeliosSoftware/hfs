@@ -88,6 +88,12 @@ error-not-found = The requested resource was not found.
 error-unauthorized = You are not authorized to perform this action.
 error-generic = Something went wrong. Try again.
 
+## Generic "not found" page (#835): a full-page 404 inside the shell, distinct
+## from error-not-found above (OperationOutcome text for API responses).
+
+not-found-title = Not found
+not-found-text = This page doesn't exist, or isn't available to you.
+
 ## Dashboard shell (Figma "Dashboard V1.1")
 
 nav-section-work = Work
@@ -108,7 +114,6 @@ nav-sql-view-definitions = View Definitions
 nav-sql-queries = SQL Queries
 nav-sql-views = SQL Views
 nav-sql-export = SQL Export
-nav-sql-files = Files
 nav-capability-conformance = Capability & Conformance
 nav-search-parameters = Search Parameters
 nav-subscriptions = Subscriptions
@@ -485,6 +490,17 @@ editor-must-support-badge = MS
 editor-binding-hint = Bound to a value set — codes come from it; strength shown
 editor-legend-live = Checked as you type: structure, cardinality, required bindings
 editor-legend-save = Checked on save: constraints and terminology
+# ViewDefinition's own single-line legend (#843): Save stays permissive
+# there, so promising a "checked on save" pass would be misleading — this
+# names everything the guided form's per-keystroke pass actually covers,
+# folding in the SQL-on-FHIR-specific checks the generic validator above
+# does not run.
+vd-form-legend-live = Checked as you type: structure, cardinality, required bindings, and FHIRPath syntax / SQL-on-FHIR rules
+# The guided form's validity chip (#843), client-side only, while the JSON
+# editor's text does not parse at all — short like the chip's other two
+# states ("No issues.", "3 issues"), never the longer editor-invalid-json
+# sentence.
+vd-form-invalid-chip = Invalid JSON
 editor-deferred-badge = on save
 editor-deferred-hint = Codes are verified against the value set when you save (and live in the picker where a terminology server is configured)
 editor-must-support-hint = Must-support: consumers of this profile are expected to handle this element
@@ -720,6 +736,10 @@ bulk-export-since-month = Last 4 weeks
 bulk-export-since-custom = Custom
 bulk-export-field-since-custom = Custom instant
 bulk-export-since-invalid = Enter a valid FHIR instant, such as 2026-08-01T00:00:00Z.
+bulk-export-field-until = Until
+bulk-export-field-until-hint = Optional upper bound. RFC 3339, e.g. 2026-08-01T00:00:00Z.
+bulk-export-window-since = Since
+bulk-export-window-until = Until
 bulk-export-start = Start Export
 bulk-export-running = running
 bulk-export-clear = Clear
@@ -781,6 +801,13 @@ cap-json-path-too-deep = maximum expansion depth reached
 cap-json-pagination-label = JSON items
 cap-json-page-prev = Previous
 cap-json-page-next = Next
+cap-json-collapse-all = Collapse all
+cap-json-expand-all = Expand all
+cap-json-expanding = Expanding visible JSON…
+cap-json-expand-complete = All JSON is expanded.
+cap-json-expand-partial = Expanded the current pages up to the safe limit. Remaining nodes stay collapsed.
+cap-json-limit-reached = The JSON display limit was reached. Collapse another branch before loading more.
+cap-json-expand-error = The JSON tree could not be expanded. The current view was kept; try again.
 cap-unavailable = The CapabilityStatement could not be fetched from the server — the self-call may need an outbound token when authentication is enabled.
 
 ## Generic JSON fold labels (#898) — used by raw response folds in HTS-UI.
@@ -797,17 +824,14 @@ sql-vd-title = View Definitions
 sql-vd-lede = Author and manage the ViewDefinitions that SQL on FHIR runs flatten resources with.
 
 sql-queries-title = SQL Queries
-sql-queries-lede = Run SQL on FHIR queries against this server.
+sql-queries-lede = Ad-hoc SQL over the flat tables your view definitions produce. Results refresh as you type.
 
 sql-views-title = SQL Views
-sql-views-lede = Reusable SQL views layered over ViewDefinitions.
+sql-views-lede = Named views other queries and exports select from. Define the SQL once; the columns it produces become a table everyone else can use.
 
 sql-export-title = SQL Export
-sql-export-lede = Long-running SQL on FHIR export jobs.
+sql-export-lede = Run stored view definitions, SQL queries and SQL views as a long-running $sql-export job and download the output files.
 sql-export-active-title = SQL Exports
-
-sql-files-title = Files
-sql-files-lede = Manifests and output files produced by SQL exports.
 
 ## View Definitions workspace (#649)
 
@@ -821,7 +845,6 @@ vd-none = No view definitions yet.
 vd-empty-lede = Create your first ViewDefinition with Create New.
 vd-degraded = The view definition list could not be loaded.
 vd-saved = Saved.
-vd-run = Run
 vd-run-failed = Could not run the view.
 vd-save = Save
 vd-duplicate = Duplicate
@@ -832,38 +855,83 @@ vd-json-heading = Definition (JSON)
 vd-run-hint = Runs as you type — results follow the current definition, saved or not
 vd-results-heading = Results
 vd-results-empty = The view produced no rows.
-# #752 ticket 01: the $sql-run preview's row/duration meta, shared by the
-# page's own render and the `/run` fragment endpoint.
+# #752: the $sql-run preview's row/duration meta, shared by the page's own
+# render and the `/run` fragment endpoint.
 vd-results-meta = { $rows } rows · { $ms } ms
-# #752 ticket 01: the results meta after a failed run — the previous table
-# stays on screen, relabelled.
+# #752: the results meta after a failed run — the previous table stays on
+# screen, relabelled.
 vd-results-stale = last successful run
 vd-pagination-label = View definition pages
 vd-page-prev = Previous
 vd-page-next = Next
 
-## SQL Queries / SQL Views workspaces (#649)
+## $sql-run results partial (#752): shared by the View Definitions, SQL
+## Queries, and SQL Views playgrounds (#839).
+
+sql-run-export = Export as files
+
+## SQL Queries / SQL Views workspaces (#649, editor-first layout #839)
 
 sql-queries-new-title = New SQL Query
 sql-views-new-title = New SQL View
 sql-queries-rail-all-heading = All SQL Queries
 sql-views-rail-all-heading = All SQL Views
-lib-filter = Filter libraries
-lib-none = No libraries yet.
-lib-empty-lede = Create your first library with Create New.
+# The title row's `.tag--type` chip (#839) — one document's type, singular,
+# distinct from the *-title keys above (the collection's own plural name).
+sql-queries-chip = SQL Query
+sql-views-chip = SQL View
+sql-queries-filter = Filter queries
+sql-views-filter = Filter views
+sql-queries-rail-empty = No queries yet.
+sql-views-rail-empty = No views yet.
+sql-queries-empty-title = No SQL queries yet
+sql-views-empty-title = No SQL views yet
+sql-queries-empty-lede = Write your first query with Create New. It runs against the flat tables of every active view definition.
+sql-views-empty-lede = Define your first view with Create New. Its columns become a table other queries and exports can select from.
+sql-queries-editor-heading = SQL
+sql-views-editor-heading = View definition (SQL)
+sql-queries-results-heading = Results
+sql-views-results-heading = Preview
+sql-queries-run-failed = Could not run the query.
+sql-views-run-failed = Could not run the view.
 lib-degraded = The library list could not be loaded.
-lib-sql-heading = SQL
+# The SQL card's "runs as you type" legend (#839) — shared verbatim by SQL
+# Queries and SQL Views, unlike the headings/failure prefix above.
+lib-run-hint = Runs as you type — results follow the current SQL, saved or not
+# The title row's secondary link to the full resource (#839; #840 replaces
+# this with a Details card).
+lib-edit-json = Edit as JSON
 lib-delete-confirm = Delete "{ $name }"? This cannot be undone.
 lib-delete-failed = Could not delete the library.
 
-## SQL Export and Files pages (#649, #833)
+## SQL Export pages (#649, #833)
 
 export-start-failed = Could not start the export.
-export-job-id = Job id
-export-new-heading = New Export
-export-no-subjects = Nothing to export yet — create a ViewDefinition first.
 export-format = Output format
 export-start = Start Export
+
+## SQL Export builder — create form (#834)
+
+sql-export-name-placeholder = Monthly patient flat files
+sql-export-subjects-legend = What are you exporting?
+sql-export-subjects-heading = Subjects
+sql-export-filter-all = All
+sql-export-filter-view-definitions = View Definitions
+sql-export-filter-queries = Queries
+sql-export-filter-views = Views
+sql-export-filter-subjects = Filter subjects
+sql-export-select-all = Select all
+sql-export-col-subject = Subject
+sql-export-col-kind = Kind
+sql-export-col-status = Status
+sql-export-selected-count = { $selected } of { $total } selected
+sql-export-format-ndjson-hint = One JSON object per row. Streams well into pipelines.
+sql-export-format-csv-hint = Header row plus one line per row. Opens in any spreadsheet.
+sql-export-format-json-hint = A single JSON array per output. Easiest to inspect by hand.
+sql-export-format-parquet-hint = Columnar and typed. Best for analytics engines.
+sql-export-empty-heading = Nothing to export yet
+sql-export-empty-body = Every stored view definition, SQL query and SQL view shows up here as an export subject. Create one first.
+sql-export-filter-empty = No subjects match
 
 ## Active SQL Exports list and job cards (#833)
 
@@ -917,14 +985,28 @@ sql-export-files-count = { $count ->
     [one] { $count } file
    *[other] { $count } files
 }
-files-job-heading = Export Job
-files-load = Load Manifest
-files-error = Could not load the manifest.
-files-outputs-heading = Outputs
-files-col-output = Output
-files-col-downloads = Downloads
-files-shard = File { $n }
-files-empty = The job produced no output files.
+
+## Job detail page (#835)
+
+sql-export-detail-finished = Finished
+sql-export-detail-failed = Failed
+sql-export-detail-cancelled = Cancelled
+sql-export-detail-started = Started
+sql-export-detail-after = after
+sql-export-failure-subject = The export stopped on subject
+sql-export-failure-generic = The export failed:
+sql-export-detail-job-heading = Job
+sql-export-detail-field-job-id = Job id
+sql-export-detail-field-format = Format
+sql-export-detail-field-started = Started
+sql-export-detail-field-duration = Duration
+sql-export-detail-field-subjects = Subjects
+sql-export-detail-outputs-heading = Output files
+sql-export-detail-col-output = Output
+sql-export-detail-col-subject = Subject
+sql-export-detail-col-files = Files
+sql-export-detail-outputs-empty = The job produced no output files.
+sql-export-file-fallback = File { $n }
 
 ## HTS administrative UI (crates/hts-ui) — Phase 1 scaffold stubs
 ##
@@ -1363,8 +1445,8 @@ hts-vs-expand-total = total { $n }
 ## live under `hts-import-*`; `hts-nav-import` above is the sidebar
 ## label reused from the Phase 1 stub set.
 
-hts-import-title = Import terminology
-hts-import-heading = Import terminology
+hts-import-title = Import Terminology
+hts-import-heading = Import Terminology
 hts-import-help = Submit a FHIR JSON Bundle. HTS accepts CodeSystem, ValueSet, and ConceptMap resources in one POST.
 hts-import-source-legend = Source
 hts-import-source-paste = Paste JSON
@@ -1399,6 +1481,12 @@ hts-import-step-source = Choose source
 hts-import-step-review = Review
 hts-import-step-result = Result
 hts-import-file-hint = JSON only. The file is read in your browser and copied into the Bundle field below; nothing is sent until you submit.
+hts-import-drop-hint = Drop a bundle JSON file here
+hts-import-drop-browse = or click to browse
+hts-import-reading = Reading file…
+hts-import-read-failed = The file could not be read.
+hts-import-file-too-large = File exceeds the ~7.5 MiB limit for urlencoded submission.
+hts-import-file-loaded = File loaded: {"{name}"}
 hts-import-bundle-hint = The Bundle is posted to POST /import on the terminology server. Existing resources are matched on url + version.
 hts-import-review-target = Target server
 hts-import-review-request = Request

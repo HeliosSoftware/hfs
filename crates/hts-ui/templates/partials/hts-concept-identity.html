@@ -9,8 +9,10 @@
   single direct `<span>` child (`.detail__field > span` uppercases it to 10px)
   and the value is a `<div>` or a `<code>` — never a second span.
 
-  #898: Raw JSON fold uses the incremental JSON renderer (capability-json.js)
-  with card-shaped disclosure matching the CapabilityStatement raw fold.
+  The disclosure is a bare `<details>` + `<summary>` + `<pre class="detail__code">`
+  inside the card, the same shape HFS's `capability-statement.html` uses.
+  Deliberately not `.addbox`: that is the Add-tenant dropdown and its
+  `.addbox__panel` is `position: absolute`.
 -#}
 <section id="hts-concept-identity" class="card">
   <div class="card-head">
@@ -120,28 +122,9 @@
     </div>
     {% endif %}
 
-    {#- Raw JSON fold with incremental loading (#898) -#}
-    <details class="card json-fold" id="identity-json-fold" data-json-fold-root{% if view.raw_requested() %} open{% else %} data-capability-json-node{% endif %}>
-      <summary class="card-head">
-        <h3>{{ chrome.i18n.t("hts-concept-raw-response") }}</h3>
-        <span class="icon">{% include "icons/chevron-down.svg" %}</span>
-      </summary>
-      <div class="card__body json-fold-body"{% if !view.raw_requested() %}
-           data-capability-json-body
-           data-loading-text="{{ chrome.i18n.t("json-fold-loading") }}"
-           data-error-text="{{ chrome.i18n.t("json-fold-load-error") }}"
-           data-fragment-url="{{ view.identity_json_fragment_url() }}"{% endif %}>
-        {% if view.raw_requested() %}
-        <p class="notice">{{ chrome.i18n.t("json-fold-plain") }}</p>
-        <pre class="detail__code" tabindex="0">{{ identity.raw_body }}</pre>
-        {% else %}
-        <a class="btn" href="{{ view.identity_raw_url() }}#identity-json-fold">{{ chrome.i18n.t("json-fold-open-plain") }}</a>
-        <p class="busy-status htmx-indicator json-fold-loading" role="status">
-          <span class="spinner" aria-hidden="true"></span>
-          {{ chrome.i18n.t("json-fold-loading") }}
-        </p>
-        {% endif %}
-      </div>
+    <details>
+      <summary>{{ chrome.i18n.t("hts-concept-raw-response") }}</summary>
+      {% if !identity.raw_body_json.is_empty() %}{{ identity.raw_body_json|safe }}{% else %}<pre class="detail__code" tabindex="0">{{ identity.raw_body }}</pre>{% endif %}
     </details>
   </div>
   {% endif %}

@@ -41,12 +41,28 @@ export class CapabilityStatementPage {
       .locator(":scope > div");
   }
 
-  get rawDisclosure(): Locator {
+  get rawCard(): Locator {
     return this.page.locator("#capability-json-fold");
   }
 
-  get rawSummary(): Locator {
-    return this.rawDisclosure.locator(":scope > summary");
+  get rawHeader(): Locator {
+    return this.rawCard.locator(":scope > .card-head");
+  }
+
+  get rawActions(): Locator {
+    return this.rawHeader.locator("[data-capability-json-actions]");
+  }
+
+  get collapseAll(): Locator {
+    return this.rawActions.locator("[data-capability-json-collapse-all]");
+  }
+
+  get expandAll(): Locator {
+    return this.rawActions.locator("[data-capability-json-expand-all]");
+  }
+
+  get rawStatus(): Locator {
+    return this.rawActions.locator("[data-capability-json-status]");
   }
 
   get rawBody(): Locator {
@@ -54,19 +70,15 @@ export class CapabilityStatementPage {
   }
 
   get rawLoadLink(): Locator {
-    return this.rawBody.getByRole("link", { name: "Open plain JSON" });
+    return this.rawCard.getByRole("link", { name: "Open plain JSON" });
   }
 
-  get rawLoading(): Locator {
-    return this.rawBody.locator("#capability-json-loading");
-  }
-
-  get jsonView(): Locator {
-    return this.rawBody.locator("#capability-json");
+  get jsonTree(): Locator {
+    return this.rawBody.locator(":scope > [data-capability-json-tree]");
   }
 
   get jsonOutline(): Locator {
-    return this.rawBody.locator(":scope > .capability-json-outline");
+    return this.jsonTree.locator(":scope > [data-capability-json-page]");
   }
 
   jsonNode(scope: Locator, key: string): Locator {

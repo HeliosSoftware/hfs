@@ -65,17 +65,9 @@
     </div>
   {% endif %}
   {% if !view.raw_body.is_empty() %}
-    {#- Raw JSON fold with card-shaped disclosure (#898). Unlike Concept Explorer,
-        import results cannot be re-fetched, so inline rendering is kept. -#}
-    <details class="card json-fold" id="import-rejected-json-fold" data-json-fold-root open>
-      <summary class="card-head">
-        <h3>{{ chrome.i18n.t("hts-import-raw-toggle") }}</h3>
-        <span class="icon">{% include "icons/chevron-down.svg" %}</span>
-      </summary>
-      <div class="card__body json-fold-body">
-        <p class="detail__hint-inline" style="margin-bottom:8px"><code>{{ view.request_url }}</code></p>
-        <pre class="detail__code" tabindex="0">{{ view.raw_body }}</pre>
-      </div>
+    <details>
+      <summary><span class="detail__hint-inline">{{ chrome.i18n.t("hts-import-raw-toggle") }}</span> <code>{{ view.request_url }}</code></summary>
+      {% if !view.raw_body_json.is_empty() %}{{ view.raw_body_json|safe }}{% else %}<pre class="detail__code" tabindex="0">{{ view.raw_body }}</pre>{% endif %}
     </details>
   {% endif %}
 {% else if view.is_success || view.is_partial %}
@@ -132,17 +124,9 @@
     </div>
   {% endif %}
   {% if !view.raw_body.is_empty() %}
-    {#- Raw JSON fold with card-shaped disclosure (#898). Unlike Concept Explorer,
-        import results cannot be re-fetched, so inline rendering is kept. -#}
-    <details class="card json-fold" id="import-success-json-fold" data-json-fold-root open>
-      <summary class="card-head">
-        <h3>{{ chrome.i18n.t("hts-import-raw-toggle") }}</h3>
-        <span class="icon">{% include "icons/chevron-down.svg" %}</span>
-      </summary>
-      <div class="card__body json-fold-body">
-        <p class="detail__hint-inline" style="margin-bottom:8px"><code>{{ view.request_url }}</code></p>
-        <pre class="detail__code" tabindex="0">{{ view.raw_body }}</pre>
-      </div>
+    <details>
+      <summary><span class="detail__hint-inline">{{ chrome.i18n.t("hts-import-raw-toggle") }}</span> <code>{{ view.request_url }}</code></summary>
+      {% if !view.raw_body_json.is_empty() %}{{ view.raw_body_json|safe }}{% else %}<pre class="detail__code" tabindex="0">{{ view.raw_body }}</pre>{% endif %}
     </details>
   {% endif %}
 {% endif %}

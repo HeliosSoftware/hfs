@@ -75,7 +75,7 @@ test.describe("HTS Import page shell (§7.7)", () => {
     expect(response?.status(), "import route must respond 200").toBe(200);
     await expect(
       page.getByRole("heading", {
-        name: /Import terminology/i,
+        name: /Import Terminology/i,
         level: 1,
       }),
     ).toBeVisible();

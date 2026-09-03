@@ -28,8 +28,8 @@ export class SqlExportPage {
     return this.page.locator(".page-head__lede");
   }
 
-  /** One job card on the list, matched by its name (RF19: the subjects'
-   * names when the job has none of its own — the only kind the form offers
+  /** One job card on the list, matched by its name (the subjects' names
+   * when the job has none of its own — the only kind the form offers
    * today). Several cards can share a name (e.g. after Run again); narrow
    * further with `.first()`/`.nth()`, which the list's most-recent-first
    * order makes deterministic. */
@@ -43,8 +43,41 @@ export class SqlExportPage {
     return this.page.locator(`input[name="subject"][value="${reference}"]`);
   }
 
-  get formatSelect(): Locator {
-    return this.page.locator("#export-format");
+  /** A subject row, by its `data-name` (#834's filterable subjects table). */
+  subjectRow(name: string): Locator {
+    return this.page.locator(`.table-card tbody tr[data-name="${name}"]`);
+  }
+
+  /** One of the four output-format choice cards' radio inputs (#834). */
+  formatOption(format: "ndjson" | "csv" | "json" | "parquet"): Locator {
+    return this.page.locator(`input[name="format"][value="${format}"]`);
+  }
+
+  // --- The subjects table's filter/switch/select-all tools (#834), a
+  // JavaScript-only enhancement (sql-export-form.js) over the plain table. ---
+
+  get subjectTypeSwitch(): Locator {
+    return this.page.locator(".card-head__tools--subjects .seg");
+  }
+
+  subjectTypeButton(kind: "all" | "view-definition" | "sql-query" | "sql-view"): Locator {
+    return this.page.locator(`[data-subject-filter="${kind}"]`);
+  }
+
+  get subjectFilterInput(): Locator {
+    return this.page.locator(".card-head__tools--subjects input[type='search']");
+  }
+
+  get subjectSelectAll(): Locator {
+    return this.page.locator(".table-card thead .col-check input[type='checkbox']");
+  }
+
+  get subjectsEmptyRow(): Locator {
+    return this.page.locator(".table-card tbody tr.data-table__empty");
+  }
+
+  get selectedCount(): Locator {
+    return this.page.locator("#sql-export-subjects-count");
   }
 
   get startButton(): Locator {

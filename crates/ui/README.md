@@ -119,28 +119,103 @@ asset in this crate (above), nothing bundler-specific about how it ships. It
 backs the ViewDefinition JSON editor on `/ui/sql/view-definitions` and the SQL
 pane editors on `/ui/sql/queries` and `/ui/sql/views`; see
 [`docs/viewdefinition-editor-evaluation.md`](../../docs/viewdefinition-editor-evaluation.md)
-for the full evaluation this amendment is drawn from. The editor talks to two
-JSON-in-HTML-fragment-out endpoints on that page: `POST …/lint` (#753 ticket
-03), the CodeMirror linter's structural + FHIRPath-syntax check, and `POST
-…/run` (#752 ticket 01), which runs the editor's own posted text — saved or
-not — through `$sql-run` and answers with `partials/sql_run_results.html`,
-the same results-card partial the page's own initial render nests as a
-template field. `/run` always answers `200` (htmx does not swap `4xx`/`5xx`
-by default) except for a malformed request body.
+for the full evaluation this amendment is drawn from. The ViewDefinition
+editor also talks to `POST …/lint` (#753), the CodeMirror linter's
+structural + FHIRPath-syntax check — a JSON-in-HTML-fragment-out endpoint of
+its own, unrelated to the run preview below.
 
-That page is a playground, not a Run button (#752 ticket 02): the editor card
-is always open (no fold, no separate "Run" action), and the results region
-below it wires straight to `/run` with plain `hx-*` attributes — no JavaScript
-beyond what already ships. The results region's own empty shell fires one
-`hx-trigger="load"` request when the page opens with nothing to show yet
-(a fresh selection, or `?vd=new`'s starter document), and the editor's
-`textarea` reposts on `hx-trigger="input changed delay:500ms"` as it changes —
-CodeMirror's mount already dispatches `input` on every edit, so this needs no
-mount-specific wiring. A failed run leaves the editor's text untouched and the
-last successful table on screen, relabelled "last successful run" via an
-out-of-band swap of just its meta. With JavaScript disabled there is no live
-preview at all: Save's own redirect (`?vd=<id>&saved=1`) is what renders the
-just-stored definition's results, server-side, once.
+All three SQL on FHIR playgrounds — `/ui/sql/view-definitions`,
+`/ui/sql/queries`, and `/ui/sql/views` — share one results-card partial,
+`partials/sql_run_results.html`, and one `$sql-run` preview contract (#752,
+generalized in #839): each page's own render nests the partial as a template
+field, and each has its own `POST …/run` fragment endpoint
+(`/ui/sql/view-definitions/run`, `/ui/sql/queries/run`, `/ui/sql/views/run`)
+that runs the editor's *posted* text — saved or not — through `$sql-run` and
+renders that same partial as its whole response, with `hx-swap-oob`
+attributes so only the results card and its meta move. `/run` always answers
+`200` (htmx does not swap `4xx`/`5xx` by default) except for a malformed
+request body. Each caller supplies its own surface — the fragment URL, the
+id of the form to `hx-include`, the results heading and failure-prefix i18n
+keys, and an optional "Export as files" action (SQL Queries only, once the
+Library has a saved id) — so the partial itself never branches on which page
+is rendering it.
+
+None of the three pages has a Run button: the editor card is always open,
+and the results region below it wires straight to `/run` with plain `hx-*`
+attributes — no JavaScript beyond what already ships. The results region's
+own empty shell fires one `hx-trigger="load"` request when the page opens
+with nothing to show yet (a fresh selection, or the `new` starter document),
+and the editor's `json`/`sql` textarea reposts on `hx-trigger="input changed
+delay:500ms"` as it changes — CodeMirror's mount already dispatches `input`
+on every edit, so this needs no mount-specific wiring. A failed run leaves
+the editor's text untouched and the last successful table on screen,
+relabelled "last successful run" via an out-of-band swap of just its meta;
+when the server's message names a parse error's line (sqlparser's own
+`… at Line: N, Column: M`), the notice also carries `data-error-line="N"`
+(SQLite execution errors carry no line — those notices go out without the
+attribute). On `/ui/sql/queries` and `/ui/sql/views`, `sql-editor.js` reacts
+to that same `#run-notice` swap and tints the named line in the mounted
+CodeMirror editor (`.sql-editor__error-line`, #839) — a decoration only, it
+never edits the document or touches the textarea. With JavaScript disabled
+there is no live preview at all: Save's own redirect (`?vd=<id>&saved=1` /
+`?lib=<id>&saved=1`) is what renders the just-stored resource's results,
+server-side, once.
+
+Beside the editor sits a guided-form card (#843, `.editor__grid--stretch` in
+`assets/app.css`): the two cards stretch to match each other's height, capped
+at 70vh, each scrolling inside its own content area past that. Both are one
+document — the editor's — with two views onto it: the card is built inline,
+server-side, on the page's own first paint from the same document the
+textarea shows (`editor::build_form_pane`, the `pane=form` engine `POST
+/ui/editor/render` also serves, called directly rather than fetched, so
+there is no post-`load` layout shift); a guided-form edit posts back through
+`assets/editor-form.js` (`pane=form`) and lands in the editor as one minimal
+transaction (`assets/vd-editor.js`'s `minimalChange`, a common-prefix/
+common-suffix diff) — undoable, and without moving the caret or the scroll;
+an editor change that transaction did not itself just cause is parsed
+600ms after the last keystroke and, if its canonical JSON actually moved,
+re-requests the panel alone. `editor::EditorFormPane`'s `is_view_definition`
+flag also selects this page's own single-line legend
+(`vd-form-legend-live`) in place of the Resource Editor's two-line one — Save
+here stays permissive (#752, above), so "checked on save" would be
+misleading. The per-keystroke pass that builds the card's rows is the same
+schema-driven validator the Resource Editor runs (`Validator::validate_sync`
+over the embedded core packs) — `ViewDefinition` is a resource type in every
+enabled version's pack, `select`/`column`/`where`/`constant` and their
+bindings included (`crates/fhir-validator/tests/pack_smoke.rs` exercises this
+per version, R4 through R6) — folded together with
+`helios_sof::lint::lint_view_definition`'s own SQL-on-FHIR-specific
+diagnostics a structural check alone cannot see (FHIRPath syntax, undeclared
+constants, duplicate column names, a `select` with no output, more than one
+iteration directive); see `SOF_ONLY_LINT_CODES` in `editor.rs` for exactly
+which lint codes fold in and why the rest are excluded (double-reporting what
+the validator already covers).
+
+The two cards also stay linked while you point at them: hovering or focusing
+a row paints the lines its node occupies in the editor, and moving the cursor
+in the editor (click, selection, or typing) lights the row for whichever node
+it now sits in — the same idea as the Resource Editor's own `editor-sync.js`,
+reimplemented in `vd-editor.js` because this page's JSON pane is a
+CodeMirror `EditorView`, not the server-rendered `.json-line[data-jpath]`
+markup that link is built on. Both directions resolve a node by walking the
+browser's own CodeMirror syntax tree — a row's dotted path
+(`select.0.column.0.path`) down to its node, or a cursor position up through
+its ancestors back to a dotted path — never by re-parsing the text by hand;
+a CodeMirror `StateField` of line decorations (`cm-line--hit` in `app.css`)
+carries the editor-side paint, reset the moment the document itself changes.
+Reveal stays inside each pane's own scroll container (`EditorView.
+scrollIntoView` for the editor, the same container-only scroll `editor-sync.
+js` uses for `.editor-tree`) — never the page's.
+
+**`needs-js`** (`assets/app.css`, `@layer components`): hides an element
+until `<html class="js">` — a class `theme.js` sets synchronously, before
+first paint (below) — so a page that renders a JavaScript-driven card inline,
+server-side, on its own first response (the guided-form card here) does not
+show it with no client-side loop wired to it yet. A consumer that needs a
+shown-state `display` other than the browser default supplies its own
+`html.js …` override next to its own layout rules (`.editor__grid--stretch`'s
+own `display: flex` override is the example). Reusable by any future page
+that renders `pane=form` inline the same way.
 
 ### Client-side scripts
 
@@ -155,7 +230,7 @@ not just a closed IIFE.
 
 | Asset | Owns |
 |---|---|
-| `theme.js` | Light/dark preference: stored choice → OS preference, plus the top-bar toggle |
+| `theme.js` | Light/dark preference: stored choice → OS preference, plus the top-bar toggle. Also marks `<html class="js">` (#843), synchronously, before first paint — the signal `.needs-js` (above) hides against |
 | `busy.js` | The shared busy states (#679): `during(buttons, work)` and `region(el, label)` |
 | `saved-queries.js` | Saved queries, the visual search builder, the `/_user/settings` read/modify/write cycle, and — on Resources/Search/Saved Queries — writing `rails.<page>` back on an in-page rail click (#754/#755) |
 | `editor.js` | The schema-driven editor loop — posts the document to `/ui/editor/render` and swaps in the server's HTML |
@@ -170,8 +245,9 @@ not just a closed IIFE.
 | `resource-filter.js` | Shared truncated-name tooltips (type rails and the resource grid) and each rail's scroll-to-selection on arrival — the "Recently used" group itself is server-rendered (#754/#755) |
 | `conformance-crud.js` | The conformance viewers' write half (create/edit/delete against the FHIR API) |
 | `code-editor.js` | Shared CodeMirror 6 mount helper (#838): textarea-as-source-of-truth sync, aria-label, Tab-not-captured, silent degradation — `window.HfsCodeEditor.mount(textarea, options)`, exported for `vd-editor.js` and `sql-editor.js` to build their own language/highlight/lint on top of |
-| `vd-editor.js` | The ViewDefinition editor on `/ui/sql/view-definitions`: JSON + injected FHIRPath language and highlighting, fold, and the async server lint (#753, generalized onto `code-editor.js` in #838) |
-| `sql-editor.js` | The SQL pane editor on `/ui/sql/queries` and `/ui/sql/views`: SQLite-dialect SQL language and highlighting, no fold or lint yet (#838) |
+| `editor-form.js` | The guided-form loop (#843), extracted from `editor.js`'s original: `[data-add]`/`[data-remove]`/`[data-extension]`/`[data-choose]`/`[data-set]`, the add-picker's typeahead, live `$expand` — driven against a caller-supplied `root` and `host` (`{ getDoc, setDoc, renderUrl? }`) instead of page ids, so it works over any document a host owns. `window.HfsEditorForm.attach(root, host)`; loaded only on `/ui/sql/view-definitions` so far — `editor.js` and the Resources modal's own copy of this loop are a follow-up migration |
+| `vd-editor.js` | The ViewDefinition editor on `/ui/sql/view-definitions`: JSON + injected FHIRPath language and highlighting, fold, and the async server lint (#753, generalized onto `code-editor.js` in #838). Also builds `editor-form.js`'s host over the mounted `EditorView` (#843): a form-driven change lands as one minimal (common-prefix/common-suffix) transaction, tagged so the sync listener skips its own echo; an editor change 600ms after the last keystroke re-requests the guided-form panel alone when its canonical JSON actually moved. Falls back to the plain `<textarea>` as the host when CodeMirror never mounted. Also drives the row↔editor cross-highlight (#843): a `StateField` of line decorations for a hovered/focused row, and a debounced cursor listener that marks the row for whichever node the caret sits in |
+| `sql-editor.js` | The SQL pane editor on `/ui/sql/queries` and `/ui/sql/views`: SQLite-dialect SQL language and highlighting, and — after each `#run-notice` swap — tinting the line a parse failure names via `data-error-line` (#839); no fold or lint yet (#838) |
 
 `editor.js` is deliberately thin, and that is the architectural point: it does
 not model the resource, know what a choice type is, or understand cardinality.
@@ -431,6 +507,15 @@ in `e2e/tests/a11y.spec.ts`.
 - `AutoVaryLayer` emits `Vary: HX-Request` on handlers that read the header, so
   a cache never serves a fragment for a hard navigation. Being on this router
   gets you this for free; don't hand-roll the header.
+- **`needs-js`** (`assets/app.css`'s `.needs-js` utility, `@layer components`):
+  for a fragment rendered inline, server-side, on a page's own first paint
+  that needs a client-side loop wired to it before it should show — the
+  alternative to fetching it after `load`, which costs a visible layout
+  shift. Hidden until `<html class="js">`, a class `theme.js` sets
+  synchronously, before first paint, so a page whose script never runs (or
+  hasn't run yet) never shows a dead card. See "The one exception: a
+  vendored, prebuilt bundle" above (View Definitions' guided-form card) for
+  the concrete case this backs.
 
 Relevant htmx request/response headers we rely on: `HX-Request` (present on
 htmx-issued requests). See the
@@ -455,7 +540,7 @@ cargo run -p helios-hfs   # then open http://127.0.0.1:8080/ui
 | `/ui` | GET | Dashboard — stat cards and the "FHIR resources over time" chart |
 | `/ui/resources` | GET | Resources workspace: type rail with live counts, search, edit modal |
 | `/ui/editor` | GET | Standalone schema-driven resource editor |
-| `/ui/editor/render` | POST | Applies every structural mutation and re-renders; the document rides with the request |
+| `/ui/editor/render` | POST | Applies every structural mutation and re-renders; the document rides with the request. `pane=form` (#843) renders only the guided-form panel — hidden state plus the card, no JSON view — for a host that keeps its own JSON editor (the View Definitions page's CodeMirror pane) |
 | `/ui/json-view/render` | POST | Renders raw `application/json` as a highlighted, foldable HTML fragment; applies no FHIR semantics and retains no payload |
 | `/ui/editor/expand` | GET | ValueSet expansion, proxied to `HFS_TERMINOLOGY_SERVER` |
 | `/ui/queries` | GET | Saved FHIR queries per resource type (#234) and the visual search builder |
@@ -470,11 +555,13 @@ cargo run -p helios-hfs   # then open http://127.0.0.1:8080/ui
 | `/ui/status` | GET | System-status read path; the fragment-vs-full-page reference |
 | `/ui/version` | POST | Persists the sidebar FHIR-version choice (#343) and redirects back |
 | `/ui/tenant`, `/ui/tenant/options` | POST/GET | Tenant selector (#344), options loaded lazily |
-| `/ui/sql/export` | GET/POST | Active SQL Exports — the user's `$sql-export` jobs as cards, most recent first (#833); POST resolves the checked subjects and kicks off the job |
-| `/ui/sql/export/new` | GET | SQL Export builder — pick stored ViewDefinitions/Libraries and an output format |
+| `/ui/sql/export` | GET/POST | Active SQL Exports — the user's `$sql-export` jobs as cards, most recent first (#833); POST resolves the checked subjects and kicks off the job, optionally naming it |
+| `/ui/sql/export/new` | GET | SQL Export builder (#834) — an optional name, a single filterable table of stored ViewDefinitions/Libraries with their status, and an output format; `?subject=` (repeatable) pre-checks matching rows |
+| `/ui/sql/export/{id}` | GET | A job's own permalink (#835): header with the contextual action/status/overflow, a failure notice when `failed`, the Job card, and the Output files table — reading the notebook's own persisted record, not the server |
+| `/ui/sql/export/{id}/detail` | GET | htmx fragment of the page above (`#job-detail`), polled every 5s while the job is `in-progress`; `404` with no body for an id this user/tenant does not own |
 | `/ui/sql/export/{id}/card` | GET | htmx fragment: one job's card, polling `$sql-export` status while the job is in progress |
 | `/ui/sql/export/{id}/cancel`, `/retry`, `/rerun`, `/remove` | POST | Per-job actions: cancel an in-progress job, resubmit a failed or terminal job as a new record, or drop a terminal job's record from the list |
-| `/ui/sql/files` | GET | Completion-manifest lookup by job id — *legacy job-id form, superseded by a card's own "View files" link until #835 folds it into the list* |
+| `/ui/sql/files` | GET | `301` → `/ui/sql/export` (the job-id form was replaced by the job page, #835) |
 | `/ui/assets/*` | GET | Embedded htmx, CSS, JS, fonts, logo |
 
 The router's `fallback_service` is the FHIR app, so anything not under `/ui`
@@ -506,7 +593,10 @@ falls through to the normal REST surface.
   `byTenant.<tenant>.bulkExport.jobs` and `byTenant.<tenant>.sqlExport.jobs` —
   one member per job, keyed by a locally-generated id, written with the same
   optimistic-locking (`If-Match`) read-modify-write every other settings write
-  uses.
+  uses. A SQL Export job optionally carries the builder's trimmed `name`
+  (#834); empty is omitted, and the card falls back to the subjects' own
+  names. `name` is a label for this notebook only — it is never sent to
+  `$sql-export` itself.
 - **SQL Export's self-calls carry the caller's own identity.** `$sql-export`
   kick-off, status polling, cancel, and the completion manifest all go through
   `ConformanceSource`'s four `$sql-export` methods with a `Caller`: the
@@ -519,6 +609,18 @@ falls through to the normal REST surface.
   this UI — never appear on the list**, and a job the server has since reaped
   or restarted away from shows as `cancelled` with an explanatory reason
   rather than as an error.
+- **A job's detail page (`/ui/sql/export/{id}`, #835) reads the notebook's own
+  `outputs`, never the server.** The completion manifest is copied into the
+  record the moment a poll sees the job go `Done` (module docs of
+  `sql_export.rs`), so the detail page's Output files table survives the
+  reaper and a server restart the same way the list does — the one exception
+  being the download links themselves, which expire with whatever the storage
+  backend's presigned-URL TTL is. Only a job still `in-progress` triggers a
+  poll: one when the page (or its htmx fragment) renders, exactly like the
+  list. An id belonging to another user or tenant is a `404` rendered by the
+  shared `pages/not-found.html`/`render_not_found` helper (`crates/ui/src/
+  lib.rs`), indistinguishable from an unknown id — reusable by any future
+  route that needs the same "not found, and not why" shape.
 
 ### Internationalization
 

@@ -97,10 +97,10 @@
 </section>
 
 {#-
-  6. Raw CapabilityStatement — the same htmx-lazy, paginated fold HFS renders
-  (#798, shared in #808's follow-up). Its own fragment endpoint
-  (`/ui/hts/capability-statement/json-fragment`) re-fetches `/metadata`
-  against this server's own upstream, so a statement that grows with the
+  6. Raw CapabilityStatement — the same bounded, paginated tree HFS renders
+  (#798/#808/#902). The page's existing `/metadata` result renders its first
+  level; its fragment endpoint (`/ui/hts/capability-statement/json-fragment`)
+  re-fetches only for deeper manual expansion, so a statement that grows with the
   loaded code systems — one `capabilitystatement-supported-system` extension
   per system, ~422 KB against the bundled seeds — pages through the same
   bounded engine rather than needing its own byte cap.
@@ -109,13 +109,11 @@
 {{ raw_card|safe }}
 {% endif %}
 {#-
-  The fold's auto-loader, exactly as HFS wires it on its own copy of this
-  page (`crates/ui/templates/pages/capability-statement.html`): it listens
-  for the native `toggle` event on `details[data-capability-json-node]` and
-  fires the htmx GET against `data-fragment-url`, so opening the fold shows
-  the tree instead of the server-rendered "Load JSON" fallback. Without this
-  include the shared card still renders — it just degrades silently, with no
-  compile-time signal; see the regression tests in `tests/chrome_parity.rs`.
+  The tree enhancer, exactly as HFS wires it on its own page: it reveals the
+  aggregate controls, sends one HTML POST for Expand all, and keeps native
+  `details[data-capability-json-node]` incremental. Without it the first level
+  and plain-JSON link still work, while deeper controls remain inert; see the
+  regression tests in `tests/chrome_parity.rs`.
 
   Kept outside the `{% if %}` above to mirror HFS, whose tag likewise sits
   after its own conditional. The per-node arrow toggles come from

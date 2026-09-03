@@ -50,6 +50,9 @@ pub struct PostgresTransaction {
     search_extractor: Arc<SearchParameterExtractor>,
     /// When true, search indexing is offloaded to a secondary backend.
     search_offloaded: bool,
+    /// Bulk fast-load (#903): skip search-index writes; stale rows of updated
+    /// resources are still deleted so a deferred index never lies.
+    defer_search_indexing: bool,
     /// The `search_index` layout, so writes in this transaction take the same
     /// composite shape the read path will look for.
     index_layout: super::schema::IndexLayout,
@@ -128,6 +131,7 @@ impl PostgresTransaction {
         tenant: TenantContext,
         search_extractor: Arc<SearchParameterExtractor>,
         search_offloaded: bool,
+        defer_search_indexing: bool,
         fhir_version: FhirVersion,
         index_layout: super::schema::IndexLayout,
     ) -> StorageResult<Self> {
@@ -154,6 +158,7 @@ impl PostgresTransaction {
             tenant,
             search_extractor,
             search_offloaded,
+            defer_search_indexing,
             fhir_version,
             index_layout,
             pending: Vec::new(),
@@ -249,6 +254,12 @@ impl PostgresTransaction {
         }
 
         // Extract values using the registry-driven extractor
+        // Fast-load (#903): stale rows are gone (Replace delete above); the
+        // rebuild is deferred to the post-ingest reindex.
+        if self.defer_search_indexing {
+            return Ok(());
+        }
+
         let values = self
             .search_extractor
             .extract(resource, resource_type)
@@ -521,7 +532,7 @@ impl Transaction for PostgresTransaction {
         // extraction failure is still raised by the `create` call that caused
         // it — it is the one per-entry error on this path that is not a
         // conflict, and it must keep naming its own entry.
-        let index_rows = if self.search_offloaded {
+        let index_rows = if self.search_offloaded || self.defer_search_indexing {
             Vec::new()
         } else {
             let values = self
@@ -950,6 +961,7 @@ impl TransactionProvider for PostgresBackend {
             tenant.clone(),
             std::sync::Arc::new(self.tenant_extractor(tenant.tenant_id().as_str())),
             self.is_search_offloaded(),
+            options.defer_search_indexing,
             options.fhir_version.unwrap_or(self.config().fhir_version),
             self.index_layout(),
         )
