@@ -204,12 +204,38 @@ fn parse_prepared(expr: &str) -> Result<Arc<FhirPathExpression>, String> {
 /// Extracts searchable values from FHIR resources using FHIRPath.
 pub struct SearchParameterExtractor {
     registry: Arc<RwLock<SearchParameterRegistry>>,
+    /// When set, only these parameter codes are indexed; every other active
+    /// parameter is skipped. `None` indexes all active parameters (the
+    /// default). Evaluating each parameter's FHIRPath against the resource is
+    /// the dominant per-resource cost of ingestion and reindex, so restricting
+    /// indexing to the parameters a deployment actually queries trades search
+    /// coverage for a proportional speed-up. `_id` and `_lastUpdated` are
+    /// always retained — pagination and `_sort` depend on them.
+    index_only: Option<Arc<HashSet<String>>>,
 }
 
 impl SearchParameterExtractor {
     /// Creates a new extractor with the given registry.
     pub fn new(registry: Arc<RwLock<SearchParameterRegistry>>) -> Self {
-        Self { registry }
+        Self {
+            registry,
+            index_only: None,
+        }
+    }
+
+    /// Restricts indexing to a set of parameter codes (see [`Self::index_only`]).
+    /// `None` keeps the default of indexing every active parameter.
+    pub fn with_index_only(mut self, index_only: Option<Arc<HashSet<String>>>) -> Self {
+        self.index_only = index_only;
+        self
+    }
+
+    /// Whether a parameter code is indexed under the current allowlist.
+    fn indexes(&self, code: &str) -> bool {
+        match &self.index_only {
+            None => true,
+            Some(set) => code == "_id" || code == "_lastUpdated" || set.contains(code),
+        }
     }
 
     /// Extracts all searchable values from a resource.
@@ -276,6 +302,9 @@ impl SearchParameterExtractor {
         };
 
         for param in &params {
+            if !self.indexes(&param.code) {
+                continue;
+            }
             match self.extract_for_param_in(resource, &context, &mut composite_bases, param) {
                 Ok(values) => results.extend(values),
                 Err(e) => {
@@ -303,6 +332,9 @@ impl SearchParameterExtractor {
 
             for param in &common_params {
                 if !seen.insert(param.code.clone()) {
+                    continue;
+                }
+                if !self.indexes(&param.code) {
                     continue;
                 }
                 match self.extract_for_param_in(resource, &context, &mut composite_bases, param) {
@@ -1410,6 +1442,37 @@ mod tests {
     }
 
     #[test]
+    fn index_only_restricts_to_the_allowlist() {
+        let patient = json!({
+            "resourceType": "Patient",
+            "id": "123",
+            "name": [{ "family": "Smith", "given": ["John"] }],
+            "gender": "male",
+            "identifier": [{ "system": "http://hospital.org/mrn", "value": "12345" }]
+        });
+
+        // Baseline: every active parameter is indexed.
+        let full = create_test_extractor();
+        let all = full.extract(&patient, "Patient").unwrap();
+        assert!(all.iter().any(|v| v.param_name == "name"));
+        assert!(all.iter().any(|v| v.param_name == "gender"));
+        assert!(all.iter().any(|v| v.param_name == "identifier"));
+
+        // Allowlist of {gender}: only gender survives, and it is strictly
+        // fewer values than the full extraction.
+        let allow: HashSet<String> = ["gender".to_string()].into_iter().collect();
+        let restricted = create_test_extractor().with_index_only(Some(Arc::new(allow)));
+        let some = restricted.extract(&patient, "Patient").unwrap();
+        assert!(some.iter().any(|v| v.param_name == "gender"));
+        assert!(
+            !some.iter().any(|v| v.param_name == "name"),
+            "name must be skipped when not in the allowlist"
+        );
+        assert!(!some.iter().any(|v| v.param_name == "identifier"));
+        assert!(some.len() < all.len());
+    }
+
+    #[test]
     fn test_extract_observation_values() {
         let extractor = create_test_extractor();
 
@@ -1470,6 +1533,111 @@ mod tests {
 
         let result = extractor.extract(&patient, "Observation");
         assert!(result.is_err());
+    }
+
+    /// Per-resource indexing profile: splits the cost into the JSON→FHIRPath
+    /// tree conversion, the search-parameter evaluation, and the full-text
+    /// tokenization. Run explicitly:
+    ///   cargo test -p helios-persistence --features sqlite --lib \
+    ///     profile_indexing_cost_breakdown -- --ignored --nocapture
+    /// Samples live in `benches/samples/<Type>.json` (real resources).
+    #[test]
+    #[ignore = "profiling harness; run explicitly with --ignored --nocapture"]
+    fn profile_indexing_cost_breakdown() {
+        use std::time::Instant;
+        let extractor = create_test_extractor_for(FhirVersion::R4);
+        let base = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("benches/samples");
+        let iters = 3000u32;
+
+        println!(
+            "\n{:<14} {:>7} {:>10} {:>10} {:>10} {:>10}",
+            "resource", "bytes", "extract", "tree-conv", "fp-eval", "fts"
+        );
+        for name in ["Patient", "Claim", "Observation", "Condition"] {
+            let path = base.join(format!("{name}.json"));
+            let Ok(bytes) = std::fs::read(&path) else {
+                println!("{name}: sample missing at {}", path.display());
+                continue;
+            };
+            let json: Value = serde_json::from_slice(&bytes).unwrap();
+            let rt = json["resourceType"].as_str().unwrap().to_string();
+
+            // Warm the prepared-expression cache and FTS paths.
+            let _ = extractor.extract(&json, &rt);
+            let _ = crate::backends::sqlite::search::fts::extract_searchable_content(&json);
+
+            let per = |t: Instant| t.elapsed().as_nanos() as f64 / iters as f64 / 1000.0; // µs
+
+            let t = Instant::now();
+            for _ in 0..iters {
+                let _ = extractor.extract(&json, &rt).unwrap();
+            }
+            let extract_us = per(t);
+
+            let t = Instant::now();
+            for _ in 0..iters {
+                let _ = SearchParameterExtractor::evaluation_context(&json).unwrap();
+            }
+            let tree_us = per(t);
+
+            let t = Instant::now();
+            for _ in 0..iters {
+                let _ = crate::backends::sqlite::search::fts::extract_searchable_content(&json);
+            }
+            let fts_us = per(t);
+
+            // extract() includes one tree conversion; the rest is FHIRPath eval.
+            let fp_us = (extract_us - tree_us).max(0.0);
+            println!(
+                "{:<14} {:>7} {:>9.1}µs {:>9.1}µs {:>9.1}µs {:>9.1}µs",
+                rt,
+                bytes.len(),
+                extract_us,
+                tree_us,
+                fp_us,
+                fts_us
+            );
+        }
+        println!(
+            "\nPer-resource indexing ≈ extract + fts. tree-conv is the JSON→FHIRPath\n\
+             tree deep-copy (shared by all params); fp-eval is the parameter\n\
+             expressions; fts is the full-text tokenization of the whole resource.\n"
+        );
+
+        // Per-parameter breakdown for the worst type: which expressions dominate.
+        for name in ["Patient", "Observation"] {
+            let Ok(bytes) = std::fs::read(base.join(format!("{name}.json"))) else {
+                continue;
+            };
+            let json: Value = serde_json::from_slice(&bytes).unwrap();
+            let rt = json["resourceType"].as_str().unwrap();
+            let context = SearchParameterExtractor::evaluation_context(&json).unwrap();
+            let params = {
+                let reg = extractor.registry.read();
+                reg.get_active_params(rt)
+            };
+            let mut rows: Vec<(String, f64)> = Vec::new();
+            for param in &params {
+                let mut bases = HashMap::new();
+                let _ = extractor.extract_for_param_in(&json, &context, &mut bases, param);
+                let t = Instant::now();
+                for _ in 0..iters {
+                    let mut bases = HashMap::new();
+                    let _ = extractor.extract_for_param_in(&json, &context, &mut bases, param);
+                }
+                rows.push((
+                    param.code.clone(),
+                    t.elapsed().as_nanos() as f64 / iters as f64 / 1000.0,
+                ));
+            }
+            rows.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+            let total: f64 = rows.iter().map(|r| r.1).sum();
+            println!("--- {rt}: {} params, {:.0}µs total, top 8 ---", rows.len(), total);
+            for (code, us) in rows.iter().take(8) {
+                println!("    {:<24} {:>8.1}µs  ({:>4.1}%)", code, us, us / total * 100.0);
+            }
+            println!();
+        }
     }
 
     #[test]

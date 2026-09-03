@@ -1306,8 +1306,10 @@ impl PostgresBackend {
         );
 
         // Index FTS content for _text and _content searches
-        self.index_fts_content(client, tenant_id, resource_type, resource_id, resource)
-            .await?;
+        if self.should_index_fts() {
+            self.index_fts_content(client, tenant_id, resource_type, resource_id, resource)
+                .await?;
+        }
 
         Ok(())
     }
@@ -3681,8 +3683,10 @@ impl ReindexTarget for PostgresBackend {
         // Not counted in `count`, which reports `search_index` entries only.
         // The write is an upsert, so it is idempotent regardless of what ran
         // before it — a reindex can find a row present.
-        self.index_fts_content(&client, tenant_id, resource_type, resource_id, content)
-            .await?;
+        if self.should_index_fts() {
+            self.index_fts_content(&client, tenant_id, resource_type, resource_id, content)
+                .await?;
+        }
 
         Ok(count)
     }
