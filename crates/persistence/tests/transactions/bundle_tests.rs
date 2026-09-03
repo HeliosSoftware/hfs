@@ -883,3 +883,130 @@ sqlite_if_match_test!(multi_valued_if_match_fails_when_no_member_matches);
 sqlite_if_match_test!(strong_form_if_match_matches_weak_etag);
 sqlite_if_match_test!(transaction_delete_honors_stale_if_match);
 sqlite_if_match_test!(transaction_delete_accepts_matching_if_match);
+
+// ============================================================================
+// Issue #859 — `PUT/DELETE [type]?[criteria]` inside a transaction
+//
+// The scenarios live in `super::conditional_url_suite` so PostgreSQL and
+// MongoDB run the same assertions. Each wrapper gets its own in-memory backend
+// with the spec search parameters loaded (`identifier` is not in the embedded
+// minimal set).
+// ============================================================================
+
+macro_rules! sqlite_conditional_url_test {
+    ($name:ident) => {
+        #[cfg(feature = "sqlite")]
+        #[tokio::test]
+        async fn $name() {
+            let backend = create_sqlite_backend_with_spec_params();
+            super::conditional_url_suite::$name(&backend, &create_tenant()).await;
+        }
+    };
+}
+
+sqlite_conditional_url_test!(conditional_put_updates_the_single_match);
+sqlite_conditional_url_test!(conditional_put_creates_when_nothing_matches);
+sqlite_conditional_url_test!(conditional_put_with_several_matches_rolls_back);
+sqlite_conditional_url_test!(conditional_delete_removes_the_single_match);
+sqlite_conditional_url_test!(conditional_delete_with_no_match_is_204);
+sqlite_conditional_url_test!(conditional_delete_with_several_matches_rolls_back);
+sqlite_conditional_url_test!(overlap_with_an_instance_entry_fails_the_bundle);
+sqlite_conditional_url_test!(two_conditional_entries_resolving_to_one_resource_fail);
+sqlite_conditional_url_test!(matched_conditional_put_resolves_urn_references);
+
+/// With search offloaded the local index is empty, so a URL-borne conditional
+/// entry is refused with the same 501 `ifNoneExist` gets, before any write.
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn test_bundle_conditional_url_is_refused_when_search_is_offloaded() {
+    let mut backend = create_sqlite_backend_with_spec_params();
+    backend.set_search_offloaded(true);
+    assert!(!backend.supports_conditional_in_transaction());
+    let tenant = create_tenant();
+
+    let err = backend
+        .process_transaction(
+            &tenant,
+            vec![super::conditional_url_suite::conditional_put(
+                "Sibling", None,
+            )],
+            FhirVersion::default(),
+        )
+        .await
+        .expect_err("must be refused");
+    match err {
+        helios_persistence::error::TransactionError::BundleError { index, message } => {
+            assert_eq!(index, 0);
+            assert!(message.contains("501"), "{message}");
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+    assert_eq!(backend.count(&tenant, Some("Patient")).await.unwrap(), 0);
+}
+
+/// The `ConditionalTransaction` defaults on top of `find_matching`: upsert
+/// semantics for `update_conditional`, single-match delete, and the shared
+/// outcome enums (#28, #859).
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn test_conditional_transaction_defaults() {
+    use helios_persistence::core::{
+        ConditionalDeleteResult, ConditionalTransaction, ConditionalUpdateResult, Transaction,
+        TransactionOptions, TransactionProvider,
+    };
+
+    let backend = create_sqlite_backend_with_spec_params();
+    let tenant = create_tenant();
+    let criteria = super::conditional_url_suite::identifier_criteria();
+    let resource = json!({
+        "resourceType": "Patient",
+        "identifier": [{"system": "http://example.org", "value": "12345"}],
+        "name": [{"family": "First"}]
+    });
+
+    let mut tx = backend
+        .begin_transaction(&tenant, TransactionOptions::new())
+        .await
+        .unwrap();
+
+    let created = tx
+        .update_conditional("Patient", resource.clone(), &criteria)
+        .await
+        .unwrap();
+    let ConditionalUpdateResult::Created(created) = created else {
+        panic!("no match creates: {created:?}");
+    };
+
+    let matches = tx.find_matching("Patient", &criteria).await.unwrap();
+    assert_eq!(matches.len(), 1, "the transaction sees its own create");
+    assert_eq!(matches[0].id(), created.id());
+
+    let mut second = resource.clone();
+    second["name"][0]["family"] = json!("Second");
+    let updated = tx
+        .update_conditional("Patient", second, &criteria)
+        .await
+        .unwrap();
+    let ConditionalUpdateResult::Updated(updated) = updated else {
+        panic!("one match updates: {updated:?}");
+    };
+    assert_eq!(updated.id(), created.id());
+    assert_eq!(updated.content()["name"][0]["family"], "Second");
+
+    let deleted = tx.delete_conditional("Patient", &criteria).await.unwrap();
+    let ConditionalDeleteResult::Deleted(deleted) = deleted else {
+        panic!("one match deletes: {deleted:?}");
+    };
+    assert_eq!(deleted.id(), created.id());
+    assert!(matches!(
+        tx.delete_conditional("Patient", &criteria).await.unwrap(),
+        ConditionalDeleteResult::NoMatch
+    ));
+    assert!(
+        tx.find_matching("Patient", &[]).await.unwrap().is_empty(),
+        "empty criteria match nothing"
+    );
+
+    Box::new(tx).commit().await.unwrap();
+    assert_eq!(backend.count(&tenant, Some("Patient")).await.unwrap(), 0);
+}

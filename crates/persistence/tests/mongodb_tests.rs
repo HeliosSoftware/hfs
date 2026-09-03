@@ -301,6 +301,11 @@ mod shared_mongo {
 #[path = "multitenancy/tenant_id_fidelity_suite.rs"]
 mod tenant_id_fidelity_suite;
 
+/// Backend-agnostic `PUT/DELETE [type]?[criteria]` transaction scenarios
+/// (#859), shared with the SQLite and PostgreSQL suites.
+#[path = "transactions/conditional_url_suite.rs"]
+mod conditional_url_suite;
+
 /// The backend-agnostic day-precision date-boundary suite (issue #519) — the
 /// #456 table that #463 pinned for SQLite only. Same `#[path]` arrangement.
 #[path = "search/date_boundary_suite.rs"]
@@ -4527,4 +4532,116 @@ async fn mongodb_integration_export_until_is_inclusive() {
         1,
         "a resource exactly on the bound is included"
     );
+}
+
+// ============================================================================
+// Issue #859 — `PUT/DELETE [type]?[criteria]` inside a transaction
+// ============================================================================
+
+/// Runs one shared #859 scenario on its own database and tenant, skipping when
+/// Docker is unavailable or the topology cannot run transactions (probed with an
+/// empty bundle, the way `mongodb_integration_transaction_bundle_topology_behavior`
+/// does, since the scenarios call `process_transaction` directly).
+macro_rules! mongodb_conditional_url_test {
+    ($test_name:ident, $scenario:ident) => {
+        #[tokio::test]
+        async fn $test_name() {
+            let Some(backend) = create_backend(stringify!($scenario)).await else {
+                eprintln!(
+                    "Skipping {} (requires Docker or HFS_TEST_MONGODB_URL)",
+                    stringify!($test_name)
+                );
+                return;
+            };
+            let tenant = create_tenant(concat!("tenant-cond-url-", stringify!($scenario)));
+            if process_transaction_or_skip(&backend, &tenant, vec![], stringify!($test_name))
+                .await
+                .is_none()
+            {
+                return;
+            }
+            conditional_url_suite::$scenario(&backend, &tenant).await;
+        }
+    };
+}
+
+mongodb_conditional_url_test!(
+    mongodb_integration_conditional_put_updates_the_single_match,
+    conditional_put_updates_the_single_match
+);
+mongodb_conditional_url_test!(
+    mongodb_integration_conditional_put_creates_when_nothing_matches,
+    conditional_put_creates_when_nothing_matches
+);
+mongodb_conditional_url_test!(
+    mongodb_integration_conditional_put_with_several_matches_rolls_back,
+    conditional_put_with_several_matches_rolls_back
+);
+mongodb_conditional_url_test!(
+    mongodb_integration_conditional_delete_removes_the_single_match,
+    conditional_delete_removes_the_single_match
+);
+mongodb_conditional_url_test!(
+    mongodb_integration_conditional_delete_with_no_match_is_204,
+    conditional_delete_with_no_match_is_204
+);
+mongodb_conditional_url_test!(
+    mongodb_integration_conditional_delete_with_several_matches_rolls_back,
+    conditional_delete_with_several_matches_rolls_back
+);
+mongodb_conditional_url_test!(
+    mongodb_integration_overlap_with_an_instance_entry_fails_the_bundle,
+    overlap_with_an_instance_entry_fails_the_bundle
+);
+mongodb_conditional_url_test!(
+    mongodb_integration_two_conditional_entries_resolving_to_one_resource_fail,
+    two_conditional_entries_resolving_to_one_resource_fail
+);
+mongodb_conditional_url_test!(
+    mongodb_integration_matched_conditional_put_resolves_urn_references,
+    matched_conditional_put_resolves_urn_references
+);
+
+/// The session-scoped matcher evaluates plain `name=value` only; a modifier
+/// refuses the entry with the 501 the offloaded-search case answers elsewhere,
+/// rather than silently matching nothing and creating a duplicate (#865, #709).
+#[tokio::test]
+async fn mongodb_integration_conditional_url_with_a_modifier_is_refused() {
+    let Some(backend) = create_backend("conditional_url_modifier").await else {
+        eprintln!(
+            "Skipping mongodb_integration_conditional_url_with_a_modifier_is_refused (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = create_tenant("tenant-cond-url-modifier");
+    if process_transaction_or_skip(
+        &backend,
+        &tenant,
+        vec![],
+        "mongodb_integration_conditional_url_with_a_modifier_is_refused",
+    )
+    .await
+    .is_none()
+    {
+        return;
+    }
+
+    let mut entry = conditional_url_suite::conditional_put("Modifier", None);
+    let criteria = entry.criteria.as_mut().expect("criteria");
+    criteria[0].modifier = Some(helios_persistence::types::SearchModifier::Exact);
+    entry.url = "Patient?identifier:exact=http://example.org|12345".to_string();
+
+    let err = backend
+        .process_transaction(&tenant, vec![entry], FhirVersion::default())
+        .await
+        .expect_err("a modifier cannot be evaluated in memory");
+    match err {
+        TransactionError::BundleError { index, message } => {
+            assert_eq!(index, 0);
+            assert!(message.contains("501"), "{message}");
+            assert!(message.contains("identifier:exact"), "{message}");
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+    assert_eq!(backend.count(&tenant, Some("Patient")).await.unwrap(), 0);
 }
