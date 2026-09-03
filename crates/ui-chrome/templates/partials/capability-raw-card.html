@@ -29,17 +29,22 @@
     <h3>{{ i18n.t("cap-raw-toggle") }}</h3>
     <span class="icon">{% include "icons/chevron-down.svg" %}</span>
   </summary>
-  <div class="card__body json-fold-body"{% if !raw_requested %}
+  {#- The body keeps id="capability-json-body" for E2E selectors and backward
+      compat; the class `.json-fold-body` is the generalized hook for CSS.
+      hx-indicator tells htmx which element to show during requests. -#}
+  <div id="capability-json-body" class="card__body json-fold-body"{% if !raw_requested %}
        data-capability-json-body
        data-loading-text="{{ i18n.t("cap-raw-loading") }}"
        data-error-text="{{ i18n.t("cap-json-load-error") }}"
-       data-fragment-url="{{ fragment_url }}"{% endif %}>
+       data-fragment-url="{{ fragment_url }}"
+       hx-indicator="#capability-json-loading"{% endif %}>
     {% if raw_requested %}
     <p class="notice">{{ i18n.t("cap-raw-plain") }}</p>
     <pre class="detail__code">{{ raw }}</pre>
     {% else %}
     <a class="btn" href="{{ raw_url }}#capability-json-fold">{{ i18n.t("cap-raw-load") }}</a>
-    <p class="busy-status htmx-indicator json-fold-loading" role="status">
+    {#- Same pattern: id for E2E, class for generalized CSS -#}
+    <p id="capability-json-loading" class="busy-status htmx-indicator json-fold-loading" role="status">
       <span class="spinner" aria-hidden="true"></span>
       {{ i18n.t("cap-raw-loading") }}
     </p>

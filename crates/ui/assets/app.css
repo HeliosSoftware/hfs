@@ -1604,11 +1604,14 @@ select.field__input {
 /* The CapabilityStatement raw view is a real link without JavaScript. Keep its
    htmx-only progress message out of that fallback, then reveal it only while
    htmx marks this explicit indicator as the active request indicator.
-   Class-based selectors support multiple folds per page (#898). */
+   #capability-json-loading is the CapabilityStatement fold (E2E selectors);
+   .json-fold-loading is the generalized class for multiple folds (#898). */
+#capability-json-loading,
 .json-fold-loading {
   display: none;
 }
 
+#capability-json-loading.htmx-request,
 .json-fold-loading.htmx-request {
   display: inline-flex;
 }

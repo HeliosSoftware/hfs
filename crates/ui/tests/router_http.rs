@@ -543,8 +543,10 @@ async fn capability_statement_page_renders_summary_and_degrades() {
     // The ordinary page carries only a lazy shell. It neither renders nor
     // pretty-prints the large CapabilityStatement before the fold is opened.
     // #898: The fold now uses class-based selectors (`.json-fold-body`) plus
-    // `data-json-fold-root` to support multiple folds per page.
+    // `data-json-fold-root` to support multiple folds per page. The body
+    // keeps `id="capability-json-body"` for E2E selector compatibility.
     assert!(html.contains(r#"id="capability-json-fold""#));
+    assert!(html.contains(r#"id="capability-json-body""#));
     assert!(html.contains(r#"class="card__body json-fold-body""#));
     assert!(html.contains(r#"data-json-fold-root"#));
     assert!(html.contains(r#"data-fragment-url="/ui/capability-statement/json-fragment?"#));
