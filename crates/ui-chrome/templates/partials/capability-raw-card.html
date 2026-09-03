@@ -1,0 +1,47 @@
+{#
+  SHARED CAPABILITY CARD -- Raw CapabilityStatement (#902).
+
+  The ordinary page already owns the metadata document, so it includes the
+  bounded root outline immediately. Nested levels remain incremental.
+  JavaScript reveals the aggregate controls; the plain-JSON link is the no-JS
+  path and `raw=1` remains an unbounded, explicit fallback.
+#}
+<section class="card capability-raw-card" id="capability-json-fold"{% if !raw_requested %}
+         data-capability-json-root
+         data-expand-url="{{ expand_url }}"
+         data-expanding-text="{{ i18n.t("cap-json-expanding") }}"
+         data-complete-text="{{ i18n.t("cap-json-expand-complete") }}"
+         data-partial-text="{{ i18n.t("cap-json-expand-partial") }}"
+         data-limit-text="{{ i18n.t("cap-json-limit-reached") }}"
+         data-error-text="{{ i18n.t("cap-json-expand-error") }}"{% endif %}>
+  <div class="card-head">
+    <h3 id="capability-json-heading">{{ i18n.t("cap-raw-toggle") }}</h3>
+    {% if !raw_requested %}
+    <div class="card-head__tools capability-json-actions" data-capability-json-actions hidden>
+      <button type="button" class="btn" data-capability-json-collapse-all disabled>{{ i18n.t("cap-json-collapse-all") }}</button>
+      <button type="button" class="btn" data-capability-json-expand-all>{{ i18n.t("cap-json-expand-all") }}</button>
+      <span class="busy-status capability-json-actions__status" role="status" aria-live="polite" data-capability-json-status></span>
+    </div>
+    {% endif %}
+  </div>
+  <div class="card__body">
+    {% if raw_requested %}
+    <p class="notice">{{ i18n.t("cap-raw-plain") }}</p>
+    <pre class="detail__code">{{ raw }}</pre>
+    {% else %}
+    <p class="capability-json-fallback" data-capability-json-fallback><a class="btn" href="{{ raw_url }}#capability-json-fold">{{ i18n.t("cap-raw-load") }}</a></p>
+    <div id="capability-json-body"
+         role="region"
+         aria-labelledby="capability-json-heading"
+         tabindex="0"
+         data-capability-json-body{% if let Some(outline) = initial_outline %}
+         data-fragment-url="{{ outline.previous_url }}"{% endif %}>
+      <div data-capability-json-tree>
+        {% if let Some(outline) = initial_outline %}
+        {% include "partials/capability-json-outline.html" %}
+        {% endif %}
+      </div>
+    </div>
+    {% endif %}
+  </div>
+</section>

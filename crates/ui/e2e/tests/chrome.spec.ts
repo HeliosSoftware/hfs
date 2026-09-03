@@ -1,4 +1,9 @@
 import { test, expect } from "../pages/fixtures";
+import {
+  assertLanguageRoundTrip,
+  assertMenuShape,
+  type MenuContext,
+} from "../pages/user-menu";
 
 // The persistent chrome: the sidebar rail (#438). There is no toggle and no
 // persisted state anymore — the sidebar rests as an icon rail and expands as
@@ -46,12 +51,14 @@ test("the Batch & Data section lists Import and Export", async ({ page, chrome }
   await expect(chrome.navLink("/ui/bulk-export")).toBeVisible();
 });
 
-test("SQL on FHIR is its own section with five navigable children", async ({
+test("SQL on FHIR is its own section with four navigable children", async ({
   page,
   chrome,
 }) => {
   // #649: the former coming-soon placeholder inside Batch & Data became a
-  // top-level section whose every child is a real route.
+  // top-level section whose every child is a real route. The job-id lookup
+  // form that used to round the section out to five is retired (#835): its
+  // nav entry is gone and `/ui/sql/files` now just redirects to the list.
   await page.goto("/ui", { waitUntil: "networkidle" });
   await chrome.sidebar.hover();
   for (const href of [
@@ -59,9 +66,33 @@ test("SQL on FHIR is its own section with five navigable children", async ({
     "/ui/sql/queries",
     "/ui/sql/views",
     "/ui/sql/export",
-    "/ui/sql/files",
   ]) {
     await expect(chrome.navLink(href)).toBeVisible();
   }
   await expect(page.locator(".nav-item--soon")).toHaveCount(0);
+  await expect(chrome.navLink("/ui/sql/files")).toHaveCount(0);
+});
+
+// The account menu (#725). Until #799 it had NO coverage in this project at
+// all — only the `nojs` ring touched it — so a JS-enabled regression (a stray
+// script closing the disclosure, a panel that never paints) went unnoticed.
+// The assertions live in `pages/user-menu.ts` and are shared byte-for-byte
+// with the HTS suite, because both products render one shared template.
+const HFS_MENU: MenuContext = {
+  langCookie: "hfs_lang",
+  home: "/ui",
+  favicon: "/ui/assets/logo.png",
+};
+
+test("the topbar account menu carries the identity card and the language segment", async ({
+  page,
+}) => {
+  await page.goto("/ui", { waitUntil: "networkidle" });
+  await assertMenuShape(page, expect, HFS_MENU);
+});
+
+test("the account menu switches language and persists it in the hfs_lang cookie", async ({
+  page,
+}) => {
+  await assertLanguageRoundTrip(page, expect, HFS_MENU);
 });

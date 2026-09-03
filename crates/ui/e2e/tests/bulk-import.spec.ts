@@ -1,10 +1,4 @@
 import { test, expect } from "../pages/fixtures";
-import type { Locator } from "@playwright/test";
-import { seedBulkImportDetail } from "../pages/routes";
-import {
-  CANONICAL_BUTTON_GEOMETRY,
-  readButtonGeometries,
-} from "../pages/button-geometry";
 
 function contrastRatio(foreground: string, background: string): number {
   const luminance = (cssColor: string): number => {
@@ -45,6 +39,8 @@ for (const viewport of VIEWPORTS) {
         overflowY: style.overflowY,
         scrolls: element.scrollHeight > element.clientHeight,
         columns: getComputedStyle(grid).gridTemplateColumns.split(/\s+/).filter(Boolean).length,
+        rowGap: getComputedStyle(grid).rowGap,
+        marginBottom: getComputedStyle(grid).marginBottom,
       };
     });
     expect(summaryLayout).toEqual({
@@ -53,19 +49,16 @@ for (const viewport of VIEWPORTS) {
       overflowY: "visible",
       scrolls: false,
       columns: viewport.columns,
+      rowGap: "14px",
+      marginBottom: "0px",
     });
 
     const boxes = await Promise.all(
-      [bulkImport.summary, bulkImport.manifestsCard, bulkImport.logCard].map((card) =>
-        card.boundingBox(),
-      ),
+      [bulkImport.summary, bulkImport.logCard].map((card) => card.boundingBox()),
     );
     expect(boxes.every(Boolean)).toBe(true);
-    const gaps = [
-      boxes[1]!.y - (boxes[0]!.y + boxes[0]!.height),
-      boxes[2]!.y - (boxes[1]!.y + boxes[1]!.height),
-    ];
-    for (const gap of gaps) expect(gap).toBeGreaterThanOrEqual(15);
+    const gap = boxes[1]!.y - (boxes[0]!.y + boxes[0]!.height);
+    expect(gap).toBeGreaterThanOrEqual(15);
   });
 }
 
@@ -198,33 +191,13 @@ for (const theme of ["light", "dark"] as const) {
       4.5,
     );
 
-    const emptySignature = async (locator: Locator) =>
-      locator.evaluate((element) => {
-        const style = getComputedStyle(element);
-        return {
-          color: style.color,
-          textAlign: style.textAlign,
-          paddingTop: style.paddingTop,
-          paddingRight: style.paddingRight,
-          paddingBottom: style.paddingBottom,
-          paddingLeft: style.paddingLeft,
-          backgroundColor: style.backgroundColor,
-        };
-      });
-    const manifestEmpty = await emptySignature(bulkImport.manifestEmptyState);
-    const logEmpty = await emptySignature(bulkImport.logEmptyState);
-    expect(manifestEmpty).toEqual(logEmpty);
-
-    await bulkImport.manifestEmptyState.hover();
-    expect((await emptySignature(bulkImport.manifestEmptyState)).backgroundColor).toBe(
-      manifestEmpty.backgroundColor,
-    );
   });
 }
 
-// Bulk Import dialogs: dismissal clears the form (#682), the Add Manifest
-// field is labeled Format (#684), and its headers textarea matches the other
-// fields instead of overflowing the panel (#685).
+// Bulk Import create dialog: dismissal clears the form (#682), the Advanced
+// fold hides the pre-coordinated options until opened, the Format label reads
+// Format (#684), and the headers textarea matches the other fields instead of
+// overflowing the panel (#685).
 test("dismissing the New Submission dialog clears the typed form", async ({ page }) => {
   await page.goto("/ui/bulk-import");
   const toggle = page.locator("summary.btn", { hasText: "New Submission" });
@@ -236,15 +209,18 @@ test("dismissing the New Submission dialog clears the typed form", async ({ page
   await expect(name).toHaveValue("");
 });
 
-test("the Add Manifest dialog labels Format and sizes its textarea", async ({
-  page,
-  request,
-}) => {
-  const detail = await seedBulkImportDetail(request);
-  await page.goto(detail);
-  await page.locator("summary.btn", { hasText: "Add Manifest" }).click();
-  // #684: the field reads Format, not Output format.
-  await expect(page.locator(".field__label", { hasText: /^Format$/ })).toBeVisible();
+test("the Advanced fold reveals Format and the headers textarea", async ({ page }) => {
+  await page.goto("/ui/bulk-import");
+  await page.locator("summary.btn", { hasText: "New Submission" }).click();
+
+  // Collapsed by default; the essential fields stay visible.
+  await expect(page.locator("input[name='manifest_url']")).toBeVisible();
+  const formatLabel = page.locator(".field__label", { hasText: /^Format$/ });
+  await expect(formatLabel).not.toBeVisible();
+
+  await page.locator(".disclosure__summary", { hasText: "Advanced options" }).click();
+  await expect(formatLabel).toBeVisible();
+
   // #685: the textarea inherits the page font, sizes within the panel, and
   // only resizes vertically.
   const styles = await page
@@ -257,83 +233,6 @@ test("the Add Manifest dialog labels Format and sizes its textarea", async ({
   expect(styles.boxSizing).toBe("border-box");
   expect(styles.fontFamily.toLowerCase()).not.toContain("monospace");
 });
-
-test("manifest-row actions use the canonical scale across emphasis variants", async ({
-  page,
-  request,
-  bulkImport,
-}) => {
-  await page.setViewportSize({ width: 390, height: 844 });
-  const detail = await bulkImport.seedAndGoto(request, `button-scale-${Date.now()}`);
-  const response = await request.post(`${detail}/manifests`, {
-    form: {
-      manifest_url: "https://example.test/manifest.json",
-      fhir_base_url: "https://example.test/fhir",
-      output_format: "application/fhir+ndjson",
-    },
-    maxRedirects: 0,
-  });
-  expect(response.status()).toBeGreaterThanOrEqual(300);
-  expect(response.status()).toBeLessThan(400);
-  await page.goto(detail, { waitUntil: "networkidle" });
-
-  const metrics = await readButtonGeometries(
-    bulkImport.manifestsCard.locator(".bulk-import-manifest-row .btn"),
-  );
-  expect(metrics).toHaveLength(1);
-  for (const geometry of metrics) expect(geometry).toEqual(CANONICAL_BUTTON_GEOMETRY);
-
-  const menuTrigger = bulkImport.manifestsCard.locator(".bulk-import-manifest-menu__trigger");
-  await expect(menuTrigger).toHaveCSS("width", "30px");
-  await expect(menuTrigger).toHaveCSS("height", "30px");
-  await expect(menuTrigger).toHaveCSS("border-radius", "9px");
-  await expect(menuTrigger).toHaveCSS("border-top-width", "0px");
-});
-
-for (const viewport of [
-  { width: 1440, height: 1024 },
-  { width: 390, height: 844 },
-] as const) {
-  test(`long manifest URLs ellipsize without clipping the row menu — ${viewport.width}px`, async ({
-    page,
-    request,
-    bulkImport,
-  }) => {
-    await page.setViewportSize(viewport);
-    const detail = await bulkImport.seedAndGoto(request, `long-url-${viewport.width}`);
-    const manifestUrl = `https://example.test/${"deeply-nested-segment/".repeat(16)}manifest.json?${"filter=Patient%2F".repeat(8)}`;
-    const response = await request.post(`${detail}/manifests`, {
-      form: { manifest_url: manifestUrl },
-      maxRedirects: 0,
-    });
-    expect(response.status()).toBeGreaterThanOrEqual(300);
-    expect(response.status()).toBeLessThan(400);
-    await page.goto(detail, { waitUntil: "networkidle" });
-
-    const url = page.locator(".bulk-import-manifest-row__url");
-    await expect(url).toHaveText(manifestUrl);
-    expect(
-      await url.evaluate((element) => element.scrollWidth > element.clientWidth),
-    ).toBe(true);
-    expect(
-      await page.evaluate(
-        () => document.documentElement.scrollWidth <= document.documentElement.clientWidth,
-      ),
-    ).toBe(true);
-
-    const trigger = page.locator(".bulk-import-manifest-menu__trigger");
-    await trigger.focus();
-    await page.keyboard.press("Enter");
-    const panel = page.locator(".bulk-import-manifest-menu__panel");
-    await expect(panel).toBeVisible();
-    const bounds = await panel.boundingBox();
-    expect(bounds!.x).toBeGreaterThanOrEqual(0);
-    expect(bounds!.x + bounds!.width).toBeLessThanOrEqual(viewport.width);
-    await page.keyboard.press("Escape");
-    await expect(panel).not.toBeVisible();
-    await expect(trigger).toBeFocused();
-  });
-}
 
 // #721: the New Submission summary doubles as the modal backdrop; the
 // button's fixed height used to beat the inset stretch and shrink it to a

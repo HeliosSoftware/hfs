@@ -11,6 +11,34 @@ test("the compartment rail and tabs render", async ({ compartments }) => {
   await expect(compartments.tab(/test/i)).toBeVisible();
 });
 
+// #754/#755: the server remembers the selected definition — no client
+// script involved, since Compartments navigates via real (`hx-boost`) GETs
+// and has no "Recently used" group to render — so picking one and returning
+// through the nav with no `?def=` at all restores it: not just the
+// current-request-only history entry a back button would exercise, but the
+// actual stored `rails.compartments.last`.
+test("picking a definition and returning through the nav (no ?def=) restores it", async ({
+  compartments,
+  chrome,
+  page,
+}) => {
+  await compartments.goto();
+  await expect(compartments.railItem("Patient")).toHaveAttribute("aria-current", "true");
+
+  await compartments.railItem("Encounter").click();
+  await page.waitForLoadState("networkidle");
+  await expect(compartments.railItem("Encounter")).toHaveAttribute("aria-current", "true");
+
+  await chrome.navLink("/ui/resources").click();
+  await page.waitForLoadState("networkidle");
+  await chrome.navLink("/ui/compartments").click();
+  await page.waitForLoadState("networkidle");
+
+  expect(new URL(page.url()).searchParams.has("def")).toBe(false);
+  await expect(compartments.railItem("Encounter")).toHaveAttribute("aria-current", "true");
+  await expect(compartments.railItem("Patient")).not.toHaveAttribute("aria-current", "true");
+});
+
 test("tester: a linked type is a member", async ({ compartments }) => {
   await compartments.gotoTester();
   await compartments.runTester("p1", "Observation");

@@ -19,9 +19,13 @@ partial page updates. Handlers return **full pages** on hard navigations and
 thin.
 
 **There is no React, Vue, Svelte, Alpine, or jQuery here — and no bundler, no
-npm dependency, and no build step for the browser code.** The only vendored
-third-party script is htmx itself; everything else under `assets/` is
-hand-written vanilla JS in an IIFE. Do not introduce a framework.
+npm dependency, and no build step for the browser code, with one narrow,
+documented exception** (see "Assets: vendored & embedded" below). Two
+third-party scripts are vendored: htmx, and — as a prebuilt, never-built-here
+bundle — CodeMirror 6, mounted over the ViewDefinition JSON editor (#753) and
+the SQL Queries/SQL Views editor panes (#838). Everything else under
+`assets/` is hand-written vanilla JS in an IIFE. Do not introduce a
+framework.
 
 Why, over a SPA + JSON API:
 
@@ -93,6 +97,126 @@ stale.
 To update htmx, replace `assets/htmx.min.js` with the new pinned release and
 note the version bump in the commit.
 
+### The one exception: a vendored, prebuilt bundle
+
+"No bundler" (above) is the default, not an absolute: a third-party script that
+is a real parser or grammar — not a widget — cannot reasonably be hand-written
+in the style every other asset in this crate uses. For that narrow case:
+
+> Third-party browser code may be vendored as a prebuilt single-file bundle produced by a
+> documented, checked-in, one-off script under `crates/ui/vendor/`; pinned versions and a
+> lockfile are committed alongside it; the script is never executed at build time or in CI;
+> the resulting bundle is never loaded from a CDN; and the bundle ships with its license
+> banner intact.
+
+CodeMirror 6 is the first, and so far only, case this applies to (#753,
+extended by #838): [`crates/ui/vendor/codemirror/`](vendor/codemirror/README.md)
+is the vendoring ritual (pinned npm dependencies, a committed lockfile, a
+rollup + terser recipe run by hand, never by `cargo build` or CI); its one
+output, [`assets/vendor/codemirror.bundle.js`](assets/vendor/codemirror.bundle.js),
+is the vendored bundle itself — embedded and served exactly like every other
+asset in this crate (above), nothing bundler-specific about how it ships. It
+backs the ViewDefinition JSON editor on `/ui/sql/view-definitions` and the SQL
+pane editors on `/ui/sql/queries` and `/ui/sql/views`; see
+[`docs/viewdefinition-editor-evaluation.md`](../../docs/viewdefinition-editor-evaluation.md)
+for the full evaluation this amendment is drawn from. The ViewDefinition
+editor also talks to `POST …/lint` (#753), the CodeMirror linter's
+structural + FHIRPath-syntax check — a JSON-in-HTML-fragment-out endpoint of
+its own, unrelated to the run preview below.
+
+All three SQL on FHIR playgrounds — `/ui/sql/view-definitions`,
+`/ui/sql/queries`, and `/ui/sql/views` — share one results-card partial,
+`partials/sql_run_results.html`, and one `$sql-run` preview contract (#752,
+generalized in #839): each page's own render nests the partial as a template
+field, and each has its own `POST …/run` fragment endpoint
+(`/ui/sql/view-definitions/run`, `/ui/sql/queries/run`, `/ui/sql/views/run`)
+that runs the editor's *posted* text — saved or not — through `$sql-run` and
+renders that same partial as its whole response, with `hx-swap-oob`
+attributes so only the results card and its meta move. `/run` always answers
+`200` (htmx does not swap `4xx`/`5xx` by default) except for a malformed
+request body. Each caller supplies its own surface — the fragment URL, the
+id of the form to `hx-include`, the results heading and failure-prefix i18n
+keys, and an optional "Export as files" action (SQL Queries only, once the
+Library has a saved id) — so the partial itself never branches on which page
+is rendering it.
+
+None of the three pages has a Run button: the editor card is always open,
+and the results region below it wires straight to `/run` with plain `hx-*`
+attributes — no JavaScript beyond what already ships. The results region's
+own empty shell fires one `hx-trigger="load"` request when the page opens
+with nothing to show yet (a fresh selection, or the `new` starter document),
+and the editor's `json`/`sql` textarea reposts on `hx-trigger="input changed
+delay:500ms"` as it changes — CodeMirror's mount already dispatches `input`
+on every edit, so this needs no mount-specific wiring. A failed run leaves
+the editor's text untouched and the last successful table on screen,
+relabelled "last successful run" via an out-of-band swap of just its meta;
+when the server's message names a parse error's line (sqlparser's own
+`… at Line: N, Column: M`), the notice also carries `data-error-line="N"`
+(SQLite execution errors carry no line — those notices go out without the
+attribute). On `/ui/sql/queries` and `/ui/sql/views`, `sql-editor.js` reacts
+to that same `#run-notice` swap and tints the named line in the mounted
+CodeMirror editor (`.sql-editor__error-line`, #839) — a decoration only, it
+never edits the document or touches the textarea. With JavaScript disabled
+there is no live preview at all: Save's own redirect (`?vd=<id>&saved=1` /
+`?lib=<id>&saved=1`) is what renders the just-stored resource's results,
+server-side, once.
+
+Beside the editor sits a guided-form card (#843, `.editor__grid--stretch` in
+`assets/app.css`): the two cards stretch to match each other's height, capped
+at 70vh, each scrolling inside its own content area past that. Both are one
+document — the editor's — with two views onto it: the card is built inline,
+server-side, on the page's own first paint from the same document the
+textarea shows (`editor::build_form_pane`, the `pane=form` engine `POST
+/ui/editor/render` also serves, called directly rather than fetched, so
+there is no post-`load` layout shift); a guided-form edit posts back through
+`assets/editor-form.js` (`pane=form`) and lands in the editor as one minimal
+transaction (`assets/vd-editor.js`'s `minimalChange`, a common-prefix/
+common-suffix diff) — undoable, and without moving the caret or the scroll;
+an editor change that transaction did not itself just cause is parsed
+600ms after the last keystroke and, if its canonical JSON actually moved,
+re-requests the panel alone. `editor::EditorFormPane`'s `is_view_definition`
+flag also selects this page's own single-line legend
+(`vd-form-legend-live`) in place of the Resource Editor's two-line one — Save
+here stays permissive (#752, above), so "checked on save" would be
+misleading. The per-keystroke pass that builds the card's rows is the same
+schema-driven validator the Resource Editor runs (`Validator::validate_sync`
+over the embedded core packs) — `ViewDefinition` is a resource type in every
+enabled version's pack, `select`/`column`/`where`/`constant` and their
+bindings included (`crates/fhir-validator/tests/pack_smoke.rs` exercises this
+per version, R4 through R6) — folded together with
+`helios_sof::lint::lint_view_definition`'s own SQL-on-FHIR-specific
+diagnostics a structural check alone cannot see (FHIRPath syntax, undeclared
+constants, duplicate column names, a `select` with no output, more than one
+iteration directive); see `SOF_ONLY_LINT_CODES` in `editor.rs` for exactly
+which lint codes fold in and why the rest are excluded (double-reporting what
+the validator already covers).
+
+The two cards also stay linked while you point at them: hovering or focusing
+a row paints the lines its node occupies in the editor, and moving the cursor
+in the editor (click, selection, or typing) lights the row for whichever node
+it now sits in — the same idea as the Resource Editor's own `editor-sync.js`,
+reimplemented in `vd-editor.js` because this page's JSON pane is a
+CodeMirror `EditorView`, not the server-rendered `.json-line[data-jpath]`
+markup that link is built on. Both directions resolve a node by walking the
+browser's own CodeMirror syntax tree — a row's dotted path
+(`select.0.column.0.path`) down to its node, or a cursor position up through
+its ancestors back to a dotted path — never by re-parsing the text by hand;
+a CodeMirror `StateField` of line decorations (`cm-line--hit` in `app.css`)
+carries the editor-side paint, reset the moment the document itself changes.
+Reveal stays inside each pane's own scroll container (`EditorView.
+scrollIntoView` for the editor, the same container-only scroll `editor-sync.
+js` uses for `.editor-tree`) — never the page's.
+
+**`needs-js`** (`assets/app.css`, `@layer components`): hides an element
+until `<html class="js">` — a class `theme.js` sets synchronously, before
+first paint (below) — so a page that renders a JavaScript-driven card inline,
+server-side, on its own first response (the guided-form card here) does not
+show it with no client-side loop wired to it yet. A consumer that needs a
+shown-state `display` other than the browser default supplies its own
+`html.js …` override next to its own layout rules (`.editor__grid--stretch`'s
+own `display: flex` override is the example). Reusable by any future page
+that renders `pane=form` inline the same way.
+
 ### Client-side scripts
 
 Each is a small, self-contained IIFE. Page-specific scripts load with `defer`;
@@ -100,21 +224,30 @@ Each is a small, self-contained IIFE. Page-specific scripts load with `defer`;
 is used across workspaces — `busy.js` ahead of every page script (defer runs in
 document order) because page scripts call into it. `theme.js` loads **without
 `defer`**, before first paint, to avoid a flash of the wrong theme. `busy.js`
-is the crate's one exported global (`window.hfsBusy`): unlike the closed IIFEs
-it exists to be called by the others.
+exports `window.hfsBusy`; the CodeMirror stack (below) exports two more
+globals for the same reason — code that exists to be called by other scripts,
+not just a closed IIFE.
 
 | Asset | Owns |
 |---|---|
-| `theme.js` | Light/dark preference: stored choice → OS preference, plus the top-bar toggle |
+| `theme.js` | Light/dark preference: stored choice → OS preference, plus the top-bar toggle. Also marks `<html class="js">` (#843), synchronously, before first paint — the signal `.needs-js` (above) hides against |
 | `busy.js` | The shared busy states (#679): `during(buttons, work)` and `region(el, label)` |
-| `saved-queries.js` | Saved queries, the visual search builder, and the `/_user/settings` read/modify/write cycle |
+| `saved-queries.js` | Saved queries, the visual search builder, the `/_user/settings` read/modify/write cycle, and — on Resources/Search/Saved Queries — writing `rails.<page>` back on an in-page rail click (#754/#755) |
 | `editor.js` | The schema-driven editor loop — posts the document to `/ui/editor/render` and swaps in the server's HTML |
 | `json-view.js` | Delegated folding and accessibility state for every server-rendered JSON view |
+| `combobox.js` | Shared multi-select state, chips, keyboard/ARIA behavior, and progressive fallback upgrade; htmx owns transport and callers own result semantics |
 | `resources.js` | The Resources workspace edit modal and "Create new" |
 | `batch.js` | Bundle pick → lazy highlighted previews → execution plan → per-entry outcomes |
+| `bulk-export.js` | All Resources, individual resource types, and Since/Custom instant state on the Bulk Export builder |
+| `sql-export.js` | "Copy job id" on Active SQL Exports job cards — reveals the button only when the Clipboard API is available, writes the id, shows "Copied" |
 | `history.js` | Version selection and diff requests |
 | `nl-search.js` | Natural-language search mode (only loaded when configured) |
-| `resource-filter.js`, `conformance-crud.js` | The conformance viewers' rail filter and write half |
+| `resource-filter.js` | Shared truncated-name tooltips (type rails and the resource grid) and each rail's scroll-to-selection on arrival — the "Recently used" group itself is server-rendered (#754/#755) |
+| `conformance-crud.js` | The conformance viewers' write half (create/edit/delete against the FHIR API) |
+| `code-editor.js` | Shared CodeMirror 6 mount helper (#838): textarea-as-source-of-truth sync, aria-label, Tab-not-captured, silent degradation — `window.HfsCodeEditor.mount(textarea, options)`, exported for `vd-editor.js` and `sql-editor.js` to build their own language/highlight/lint on top of |
+| `editor-form.js` | The guided-form loop (#843), extracted from `editor.js`'s original: `[data-add]`/`[data-remove]`/`[data-extension]`/`[data-choose]`/`[data-set]`, the add-picker's typeahead, live `$expand` — driven against a caller-supplied `root` and `host` (`{ getDoc, setDoc, renderUrl? }`) instead of page ids, so it works over any document a host owns. `window.HfsEditorForm.attach(root, host)`; loaded only on `/ui/sql/view-definitions` so far — `editor.js` and the Resources modal's own copy of this loop are a follow-up migration |
+| `vd-editor.js` | The ViewDefinition editor on `/ui/sql/view-definitions`: JSON + injected FHIRPath language and highlighting, fold, and the async server lint (#753, generalized onto `code-editor.js` in #838). Also builds `editor-form.js`'s host over the mounted `EditorView` (#843): a form-driven change lands as one minimal (common-prefix/common-suffix) transaction, tagged so the sync listener skips its own echo; an editor change 600ms after the last keystroke re-requests the guided-form panel alone when its canonical JSON actually moved. Falls back to the plain `<textarea>` as the host when CodeMirror never mounted. Also drives the row↔editor cross-highlight (#843): a `StateField` of line decorations for a hovered/focused row, and a debounced cursor listener that marks the row for whichever node the caret sits in |
+| `sql-editor.js` | The SQL pane editor on `/ui/sql/queries` and `/ui/sql/views`: SQLite-dialect SQL language and highlighting, and — after each `#run-notice` swap — tinting the line a parse failure names via `data-error-line` (#839); no fold or lint yet (#838) |
 
 `editor.js` is deliberately thin, and that is the architectural point: it does
 not model the resource, know what a choice type is, or understand cardinality.
@@ -203,8 +336,10 @@ Errors follow one convention across the Fluent catalogs
   persistence or terminology logic here.
 - **No new browser-facing JSON API** to feed the UI. htmx consumes HTML
   fragments, not JSON.
-- **No SPA framework, no bundler, no npm dependency** for browser code. (The
-  `e2e/` directory has a `package.json`, but that is test-only and never ships.)
+- **No SPA framework, no bundler, no npm dependency** for browser code, with
+  one documented exception — see "Assets: vendored & embedded" above. (The
+  `e2e/` directory also has a `package.json`, but that is test-only and never
+  ships.)
 - **No inline `<script>` blobs or scattered JS.** Prefer `hx-*` attributes
   (Locality of Behaviour); where JS is truly needed, use small pinned assets.
   Inert `type="application/json"` data carriers are the one allowed exception,
@@ -239,12 +374,15 @@ These are the shared primitives. Before styling anything, reach for one; add to
 | `.btn`, `.btn--primary`, `.btn--danger`, `.btn--current`, `.btn--icon` | The action button: 30px high, 12px horizontal padding, 12px type, and a 9px radius. Primary, danger, and current change emphasis only; `--icon` makes the control a 30px square with no horizontal padding. |
 | `.card`, `.card-head`, `.table-card` | Raised surface; its header row; the padding variant that hosts a table. |
 | `.panel` | Padding for a full-width card that hosts detail fields without rail behavior. |
-| `.kv-grid` | Responsive two-column key/value layout; collapses to one column on compact viewports. |
+| `.detail__field`, `.detail__field--wide` | One labelled value. The field owns the 5px label/value gap; `--wide` spans all columns when the field is inside a key/value grid. |
+| `.detail-stack` | Padding-free vertical composition for detail fields and form actions, with a 12px gap. Direct `.form-actions` children rely on that gap instead of adding their usual top margin. |
+| `.kv-grid`, `.kv-grid--flush` | Responsive two-column key/value layout with 14px row and 18px column gaps; it collapses to one column at 1250px. `--flush` removes the grid's trailing margin when its container already provides the bottom inset. |
 | `.page-head`, `.page-head__title`, `.page-head__lede`, `.page-head--row` | Page heading block; the only `<h1>` treatment; `--row` puts an action on the right. |
 | `.back-link` | In-page return link with theme-safe normal, visited, hover, and focus states. |
-| `.table-wrap` > `.data-table`, `.data-table__empty`, `.table-foot` | The table, always in its scroll wrapper; empty-state row; footer with pagination. |
+| `.table-wrap` > `.data-table`, `.col-num`, `.col-actions`, `.data-table__empty`, `.table-foot` | The table, always in its scroll wrapper: ordinary headers and data align left; `.col-num` uses tabular figures without changing alignment; `.col-actions` aligns right; empty-state rows stay centered; the footer hosts pagination. |
 | `.empty-state` | The same centered, muted empty treatment for non-table content. |
 | `.field`, `.field__label`, `.field__input`, `.field__hint`, `.field__hint--error` | A labelled form field. |
+| `.combobox`, `.combobox__*` | Shared progressively enhanced multi-select. Render it through `partials/combobox.html`; callers provide localized domain copy and an HTML-fragment endpoint, while `combobox.js` owns selection/keyboard state and repeated hidden inputs. Keep a named textarea fallback usable without JavaScript. |
 | `.addbox`, `.addbox--modal`, `.addbox__panel`, `.addbox__head`, `.addbox__x`, `.addbox__actions` | The `<details>` disclosure for create/add flows; `--modal` centers it as a dialog. |
 | `.choice-grid`, `.choice-card`, `.choice-card__title`, `.choice-card__hint` | The radio-group treatment: one selectable card per choice, `:has(:checked)` accent (#735). |
 | `.progress`, `.progress__bar`, `.progress--complete`, `.progress--failed`, `.progress--cancelled` | Full-width job progress track; terminal states recolor the fill. |
@@ -260,6 +398,43 @@ These are the shared primitives. Before styling anything, reach for one; add to
 | `.filter-rail`, `.nav-panel` | Left rails: the filter list inside a page; the type panel flush against the sidebar. |
 | `.icon-button`, `.icon-button--danger` | Bare 30px-square icon action (table rows), with the action-button 9px radius. |
 | `.busy-status` > `.spinner` | Inline working state: the ring plus a short label, `role="status"` in the markup so it announces. |
+
+Labeled values follow one spacing contract: `.detail__field` owns only its 5px
+internal label/value gap, while its direct parent owns the larger external
+rhythm. Use `.detail-stack`, `.kv-grid`, `.detail`, or `.tester` as that parent;
+do not add outer margins to individual fields or place them directly in a
+generic `.card__body`.
+
+```text
+Parent owns external rhythm (> 5px)
+
+  Wide metadata (> 1250px)                 Compact metadata (<= 1250px)
+  ┌──────────────────────────────────┐      ┌─────────────────────────┐
+  │ DESCRIPTION — full width         │      │ DESCRIPTION — full width│
+  │   ↕ 5px  value                   │      │   ↕ 5px  value          │
+  │              ↕ 14px              │      │          ↕ 14px         │
+  │ BASE URL — full width            │      │ BASE URL — full width   │
+  │   ↕ 5px  value                   │      │   ↕ 5px  value          │
+  │              ↕ 14px              │      │          ↕ 14px         │
+  │ FHIR VERSION       ← 18px → STATUS│      │ FHIR VERSION            │
+  │   ↕ 5px value          ↕ 5px value│      │   ↕ 5px  value          │
+  │              ↕ 14px              │      │          ↕ 14px         │
+  │ KIND               ← 18px → DATE │      │ STATUS                  │
+  │   ↕ 5px value          ↕ 5px value│      │   ↕ 5px  value          │
+  │              ↕ 14px              │      │          ↕ 14px         │
+  │ FORMATS             │              │      │ KIND                    │
+  │   ↕ 5px value       │              │      │   ↕ 5px  value          │
+  └──────────────────────────────────┘      │          ↕ 14px         │
+                                            │ DATE                    │
+                                            │   ↕ 5px  value          │
+                                            │          ↕ 14px         │
+                                            │ FORMATS                 │
+                                            │   ↕ 5px  value          │
+                                            └─────────────────────────┘
+
+  `.detail-stack` uses the same contract vertically: 12px between fields,
+  while each field keeps exactly 5px between its label and value.
+```
 
 Starting a new page: copy `templates/pages/_scaffold.html` (or crib
 `tenants.html`, the smallest real page). Both compose only this vocabulary.
@@ -332,6 +507,15 @@ in `e2e/tests/a11y.spec.ts`.
 - `AutoVaryLayer` emits `Vary: HX-Request` on handlers that read the header, so
   a cache never serves a fragment for a hard navigation. Being on this router
   gets you this for free; don't hand-roll the header.
+- **`needs-js`** (`assets/app.css`'s `.needs-js` utility, `@layer components`):
+  for a fragment rendered inline, server-side, on a page's own first paint
+  that needs a client-side loop wired to it before it should show — the
+  alternative to fetching it after `load`, which costs a visible layout
+  shift. Hidden until `<html class="js">`, a class `theme.js` sets
+  synchronously, before first paint, so a page whose script never runs (or
+  hasn't run yet) never shows a dead card. See "The one exception: a
+  vendored, prebuilt bundle" above (View Definitions' guided-form card) for
+  the concrete case this backs.
 
 Relevant htmx request/response headers we rely on: `HX-Request` (present on
 htmx-issued requests). See the
@@ -356,7 +540,7 @@ cargo run -p helios-hfs   # then open http://127.0.0.1:8080/ui
 | `/ui` | GET | Dashboard — stat cards and the "FHIR resources over time" chart |
 | `/ui/resources` | GET | Resources workspace: type rail with live counts, search, edit modal |
 | `/ui/editor` | GET | Standalone schema-driven resource editor |
-| `/ui/editor/render` | POST | Applies every structural mutation and re-renders; the document rides with the request |
+| `/ui/editor/render` | POST | Applies every structural mutation and re-renders; the document rides with the request. `pane=form` (#843) renders only the guided-form panel — hidden state plus the card, no JSON view — for a host that keeps its own JSON editor (the View Definitions page's CodeMirror pane) |
 | `/ui/json-view/render` | POST | Renders raw `application/json` as a highlighted, foldable HTML fragment; applies no FHIR semantics and retains no payload |
 | `/ui/editor/expand` | GET | ValueSet expansion, proxied to `HFS_TERMINOLOGY_SERVER` |
 | `/ui/queries` | GET | Saved FHIR queries per resource type (#234) and the visual search builder |
@@ -371,6 +555,13 @@ cargo run -p helios-hfs   # then open http://127.0.0.1:8080/ui
 | `/ui/status` | GET | System-status read path; the fragment-vs-full-page reference |
 | `/ui/version` | POST | Persists the sidebar FHIR-version choice (#343) and redirects back |
 | `/ui/tenant`, `/ui/tenant/options` | POST/GET | Tenant selector (#344), options loaded lazily |
+| `/ui/sql/export` | GET/POST | Active SQL Exports — the user's `$sql-export` jobs as cards, most recent first (#833); POST resolves the checked subjects and kicks off the job, optionally naming it |
+| `/ui/sql/export/new` | GET | SQL Export builder (#834) — an optional name, a single filterable table of stored ViewDefinitions/Libraries with their status, and an output format; `?subject=` (repeatable) pre-checks matching rows |
+| `/ui/sql/export/{id}` | GET | A job's own permalink (#835): header with the contextual action/status/overflow, a failure notice when `failed`, the Job card, and the Output files table — reading the notebook's own persisted record, not the server |
+| `/ui/sql/export/{id}/detail` | GET | htmx fragment of the page above (`#job-detail`), polled every 5s while the job is `in-progress`; `404` with no body for an id this user/tenant does not own |
+| `/ui/sql/export/{id}/card` | GET | htmx fragment: one job's card, polling `$sql-export` status while the job is in progress |
+| `/ui/sql/export/{id}/cancel`, `/retry`, `/rerun`, `/remove` | POST | Per-job actions: cancel an in-progress job, resubmit a failed or terminal job as a new record, or drop a terminal job's record from the list |
+| `/ui/sql/files` | GET | `301` → `/ui/sql/export` (the job-id form was replaced by the job page, #835) |
 | `/ui/assets/*` | GET | Embedded htmx, CSS, JS, fonts, logo |
 
 The router's `fallback_service` is the FHIR app, so anything not under `/ui`
@@ -390,9 +581,46 @@ falls through to the normal REST surface.
   the same rendering path. Counts reflect the **default tenant** only — an
   operator view, never exported to the public Prometheus `/metrics` endpoint.
 - **Per-user preferences** (theme, nav state, FHIR version, tenant, saved and
-  recent queries) roam in the `/_user/settings` document: weak `ETag`, JSON merge
-  patch, `If-Match` on write. Tenant-derived keys live under a reserved
-  `byTenant` map so a tenant purge can reach them.
+  recent queries, and — since #754/#755 — every sidebar rail's `rails.<page>`
+  record of `last`/`recent`, tenant-scoped, see `rail_state`) roam in the
+  `/_user/settings` document: weak `ETag`, JSON merge patch, `If-Match` on
+  write. Tenant-derived keys live under a reserved `byTenant` map so a tenant
+  purge can reach them. The server renders the "Recently used" group from
+  `recent` on every rail but Compartments — its 4-5 definitions make a group
+  noise, so it remembers only `last`; with no settings store configured, there
+  is nothing to render and every rail opens on its page default instead. The
+  async export workspaces' job lists live there too —
+  `byTenant.<tenant>.bulkExport.jobs` and `byTenant.<tenant>.sqlExport.jobs` —
+  one member per job, keyed by a locally-generated id, written with the same
+  optimistic-locking (`If-Match`) read-modify-write every other settings write
+  uses. A SQL Export job optionally carries the builder's trimmed `name`
+  (#834); empty is omitted, and the card falls back to the subjects' own
+  names. `name` is a label for this notebook only — it is never sent to
+  `$sql-export` itself.
+- **SQL Export's self-calls carry the caller's own identity.** `$sql-export`
+  kick-off, status polling, cancel, and the completion manifest all go through
+  `ConformanceSource`'s four `$sql-export` methods with a `Caller`: the
+  browser's own `Authorization` bearer when the request carried one, the
+  configured outbound credential (`HFS_OUTBOUND_BEARER_TOKEN`) otherwise — so
+  an async export is attributable to the person who started it, not a service
+  account. Because the Active SQL Exports list is the browser's own notebook
+  rather than server state (the one `$sql-export` job controller is in-memory,
+  ownerless, and reaped after 24h), **jobs started through the API — outside
+  this UI — never appear on the list**, and a job the server has since reaped
+  or restarted away from shows as `cancelled` with an explanatory reason
+  rather than as an error.
+- **A job's detail page (`/ui/sql/export/{id}`, #835) reads the notebook's own
+  `outputs`, never the server.** The completion manifest is copied into the
+  record the moment a poll sees the job go `Done` (module docs of
+  `sql_export.rs`), so the detail page's Output files table survives the
+  reaper and a server restart the same way the list does — the one exception
+  being the download links themselves, which expire with whatever the storage
+  backend's presigned-URL TTL is. Only a job still `in-progress` triggers a
+  poll: one when the page (or its htmx fragment) renders, exactly like the
+  list. An id belonging to another user or tenant is a `404` rendered by the
+  shared `pages/not-found.html`/`render_not_found` helper (`crates/ui/src/
+  lib.rs`), indistinguishable from an unknown id — reusable by any future
+  route that needs the same "not found, and not why" shape.
 
 ### Internationalization
 

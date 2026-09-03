@@ -1,5 +1,6 @@
-// Bulk Import submission detail (/ui/bulk-import/{id}): the summary metadata,
-// status fragment, manifest list, and submission log.
+// Bulk Import submission detail (/ui/bulk-import/{id}): the summary metadata
+// (manifest URL included — one-shot submissions carry exactly one), the
+// status fragment, and the submission log.
 import type { APIRequestContext, Locator, Page } from "@playwright/test";
 
 export class BulkImportPage {
@@ -9,7 +10,7 @@ export class BulkImportPage {
     const response = await request.post("/ui/bulk-import", {
       form: {
         name,
-        recipient_base_url: "http://127.0.0.1:9/fhir",
+        manifest_url: "https://example.test/manifest.json",
         auth: "none",
       },
       maxRedirects: 0,
@@ -40,18 +41,10 @@ export class BulkImportPage {
     return this.summary.locator("form[action$='/delete'] > button");
   }
 
-  get manifestsCard(): Locator {
-    return this.page.locator("section.bulk-import-manifests-card");
-  }
-
   get logCard(): Locator {
     return this.page
       .locator("section.table-card")
       .filter({ has: this.page.getByRole("heading", { name: "Submission Log" }) });
-  }
-
-  get manifestEmptyState(): Locator {
-    return this.manifestsCard.locator("[data-bulk-import-manifest-empty]");
   }
 
   get logEmptyState(): Locator {

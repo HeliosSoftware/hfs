@@ -1,0 +1,42 @@
+<div class="capability-json-outline" data-capability-json-page data-path="{{ outline.pointer }}" data-offset="{{ outline.offset }}" data-limit="{{ outline.limit }}" data-item-count="{{ outline.rows.len() }}">
+  <div class="capability-json-bracket"><span class="jt--punct">{{ outline.opening }}</span></div>
+  <div class="capability-json-rows">
+    {% for row in outline.rows %}
+    {% if row.is_container %}
+    <details class="capability-json-node" data-capability-json-node>
+      <summary class="capability-json-row">
+        <span class="capability-json-row__fold" aria-hidden="true">▸</span>
+        <code><span class="jt--key">{{ row.prefix }}</span><span class="jt--punct">{{ row.summary }}{% if row.comma %},{% endif %}</span></code>
+        {% if row.truncated %}<span class="capability-json-truncated">{{ i18n.t("cap-json-truncated") }}</span>{% endif %}
+        {% if !row.expandable %}<span class="capability-json-truncated">{{ i18n.t("cap-json-path-too-deep") }}</span>{% endif %}
+      </summary>
+      {% if row.expandable %}
+      <div class="capability-json-node__body"
+           data-capability-json-body
+           data-loading-text="{{ i18n.t("cap-raw-loading") }}"
+           data-error-text="{{ i18n.t("cap-json-load-error") }}"
+           data-fragment-url="{{ row.fragment_url }}">
+        <p class="busy-status" role="status"><span class="spinner" aria-hidden="true"></span>{{ i18n.t("cap-raw-loading") }}</p>
+      </div>
+      {% endif %}
+    </details>
+    {% else %}
+    <div class="capability-json-row">
+      <span class="capability-json-row__fold" aria-hidden="true"></span>
+      <code><span class="jt--key">{{ row.prefix }}</span>{% for token in row.tokens %}<span class="jt--{{ token.kind }}">{{ token.text }}</span>{% endfor %}<span class="jt--punct">{% if row.comma %},{% endif %}</span></code>
+      {% if row.truncated %}<span class="capability-json-truncated">{{ i18n.t("cap-json-truncated") }}</span>{% endif %}
+    </div>
+    {% endif %}
+    {% endfor %}
+  </div>
+  <div class="capability-json-bracket"><span class="jt--punct">{{ outline.closing }}</span></div>
+  {% if outline.has_previous || outline.has_next %}
+  <nav class="capability-json-pagination" aria-label="{{ i18n.t("cap-json-pagination-label") }}">
+    <button type="button" class="btn" data-capability-json-page-direction="previous"{% if outline.has_previous %}
+            hx-get="{{ outline.previous_url }}" hx-target="closest [data-capability-json-body]" hx-swap="innerHTML"{% else %} disabled{% endif %}>{{ i18n.t("cap-json-page-prev") }}</button>
+    <span>{{ outline.first_item }}–{{ outline.last_item }} / {{ outline.total_items }}</span>
+    <button type="button" class="btn" data-capability-json-page-direction="next"{% if outline.has_next %}
+            hx-get="{{ outline.next_url }}" hx-target="closest [data-capability-json-body]" hx-swap="innerHTML"{% else %} disabled{% endif %}>{{ i18n.t("cap-json-page-next") }}</button>
+  </nav>
+  {% endif %}
+</div>

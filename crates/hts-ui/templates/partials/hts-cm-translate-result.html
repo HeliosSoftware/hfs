@@ -1,0 +1,143 @@
+{#-
+  ConceptMap `$translate` result panel (design doc §7.5 wireframe).
+
+  Per-op partial (mirrors Slice C's `hts-vs-expand-result.html`, per
+  §7.4.1 F3). The abstract concept renderer stays aspirational until a
+  second operation demands it.
+
+  Inputs (context-provided):
+    view : TranslateResultView { request_url, raw_body, result, outcome,
+                                 degraded_reason, direction }
+
+  Renders (in order):
+    - Degraded notice (Connect / Timeout / ClientBuild)
+    - Inline validation OperationOutcome (pre-flight, forward missing
+      code/system or reverse missing targetCode — §7.5 states matrix)
+    - HTS error OperationOutcome (4xx / 5xx via `hts-outcome.html`)
+    - `result=false` neutral no-matches label (§7.5 F11 realized: 200
+      + `result=false` is NOT an error)
+    - Match table with columns code / system / display /
+      equivalence|relationship / origin — the mapping column heading reads
+      whichever field name HTS actually returned in the response
+    - Reverse-mode Origin footnote (see below)
+    - Raw request + response echo (§7.5 wireframe)
+
+  ORIGIN COLUMN, REVERSE MODE: HTS suppresses `originMap` on a reverse
+  translate, so every Origin cell is an em-dash by design. The footnote
+  below the table says so explicitly — the value is NOT invented, and the
+  em-dash is not a decode failure.
+-#}
+<div id="hts-workbench-result" aria-live="polite">
+  {% if let Some(reason) = view.degraded_reason %}
+  <aside class="notice notice--warn" role="alert" aria-live="assertive">
+    <strong>{{ chrome.i18n.t("hts-degraded-title") }}</strong>
+    {{ chrome.i18n.t(format!("hts-degraded-reason-{}", reason).as_str()) }}
+    {{ chrome.i18n.t("hts-degraded-body") }}
+  </aside>
+  {% endif %}
+
+  {% if let Some(outcome) = view.outcome.as_ref() %}
+    {% let outcome = outcome.clone() %}
+    {% include "partials/hts-outcome.html" %}
+  {% endif %}
+
+  {% if let Some(result) = view.result.as_ref() %}
+    <article class="card" style="margin-bottom:16px">
+      <div class="card-head">
+        <h3>
+          {% if result.result %}
+            {{ chrome.i18n.t_arg("hts-cm-translate-matches-count", "count", result.matches.len().to_string()) }}
+          {% else %}
+            {{ chrome.i18n.t("hts-cm-translate-no-matches") }}
+          {% endif %}
+        </h3>
+        <div class="card-head__tools">
+          <span class="tag tag--embedded">
+            {%- if view.direction == TranslateDirection::Reverse -%}
+              {{ chrome.i18n.t("hts-cm-translate-direction-reverse") }}
+            {%- else -%}
+              {{ chrome.i18n.t("hts-cm-translate-direction-forward") }}
+            {%- endif -%}
+          </span>
+        </div>
+      </div>
+
+      {% if result.result && !result.matches.is_empty() %}
+      {#-
+        Column heading for the mapping-kind column derives from the field
+        name HTS returned, not from a compile-time cfg. `result.mapping_kind`
+        is `Equivalence` when the response used the R4/R4B `equivalence`
+        field, `Relationship` for R5/R6. The Fluent catalog picks a label
+        off the `$kind` selector so a Rust build compiled for R5 pointed
+        at an R4 HTS still renders "Equivalence" if that's what came back.
+      -#}
+      {% let kind = result.mapping_kind %}
+      <div class="table-wrap">
+        <table id="translate-matches" class="data-table">
+          <caption class="visually-hidden">{{ chrome.i18n.t("hts-cm-translate-table-caption") }}</caption>
+          <thead>
+            <tr>
+              <th scope="col">{{ chrome.i18n.t("hts-cm-translate-column-code") }}</th>
+              <th scope="col">{{ chrome.i18n.t("hts-cm-translate-column-system") }}</th>
+              <th scope="col">{{ chrome.i18n.t("hts-cm-translate-column-display") }}</th>
+              {#- §7.5 a11y contract: the mapping column carries an explicit
+                  `aria-label` naming the field HTS actually returned, so the
+                  heading is unambiguous when the table is read column-wise. -#}
+              <th scope="col"
+                  aria-label="{{ chrome.i18n.t_arg("hts-cm-translate-column-mapping", "kind", kind.as_str().to_string()) }}">
+                {{ chrome.i18n.t_arg("hts-cm-translate-column-mapping", "kind", kind.as_str().to_string()) }}
+              </th>
+              <th scope="col">{{ chrome.i18n.t("hts-cm-translate-column-origin") }}</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for m in result.matches %}
+            <tr>
+              <td>{% if m.code.is_empty() %}&mdash;{% else %}<code class="code">{{ m.code }}</code>{% endif %}</td>
+              <td>{% if m.system.is_empty() %}&mdash;{% else %}<code class="url">{{ m.system }}</code>{% endif %}</td>
+              <td>
+                {%- match m.display -%}
+                  {%- when Some(d) -%}{{ d }}
+                  {%- when None -%}&mdash;
+                {%- endmatch -%}
+              </td>
+              <td>
+                {%- match m.mapping_value -%}
+                  {%- when Some(v) -%}<span class="tag tag--matched">{{ v }}</span>
+                  {%- when None -%}&mdash;
+                {%- endmatch -%}
+              </td>
+              <td>
+                {%- match m.origin -%}
+                  {%- when Some(o) -%}<code class="url">{{ o }}</code>
+                  {%- when None -%}&mdash;
+                {%- endmatch -%}
+              </td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+
+      {% if view.direction == TranslateDirection::Reverse %}
+      <div class="panel">
+        <p class="notice notice--warn" style="margin-bottom:0">
+          {{ chrome.i18n.t("hts-cm-translate-origin-reverse-note") }}
+        </p>
+      </div>
+      {% endif %}
+      {% else %}
+      <div class="panel">
+        <p id="translate-no-matches" class="query-empty" style="margin:0">
+          {{ chrome.i18n.t("hts-cm-translate-no-matches") }}
+        </p>
+        {% if !result.message.is_empty() %}
+        <p class="query-empty" style="margin:6px 0 0"><small>{{ result.message }}</small></p>
+        {% endif %}
+      </div>
+      {% endif %}
+    </article>
+  {% endif %}
+
+  {% include "partials/hts-raw-fold.html" %}
+</div>

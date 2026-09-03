@@ -10,6 +10,7 @@
 //! [`BulkSubmitProvider`]: crate::core::bulk_submit::BulkSubmitProvider
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -21,7 +22,7 @@ use crate::core::bulk_export_output::{ExportOutputStore, ExportPartKey};
 use crate::core::bulk_export_worker::{LeaseError, WorkerId};
 use crate::core::bulk_submit::{
     BulkEntryOutcome, BulkProcessingOptions, BulkSubmitProvider, BulkSubmitRollbackProvider,
-    ImportMode, StreamingBulkSubmitProvider, SubmissionId,
+    ByteProgress, ImportMode, StreamingBulkSubmitProvider, SubmissionId,
 };
 use crate::core::bulk_submit_input::{SubmitInputFetcher, submission_output_job_id};
 use crate::error::StorageResult;
@@ -222,6 +223,17 @@ pub trait SubmitWorkerStorage: Send + Sync {
         last_processed_line: u64,
     ) -> Result<(), LeaseError>;
 
+    /// Idempotent update of the manifest's byte progress — bytes consumed so
+    /// far across its files, and the summed advertised size of the files
+    /// opened so far (both monotonic within a run). What the status
+    /// endpoint's percentage is computed from. Fenced.
+    async fn update_manifest_bytes(
+        &self,
+        lease: &ManifestLease,
+        bytes_processed: u64,
+        bytes_total: u64,
+    ) -> Result<(), LeaseError>;
+
     /// Idempotent upsert of a finalized status-manifest artifact row. Fenced.
     async fn record_submit_file(
         &self,
@@ -312,7 +324,17 @@ pub trait SubmitWorkerStorage: Send + Sync {
         id: &SubmissionId,
     ) -> StorageResult<()>;
 
-    /// Counts non-terminal submissions for a tenant (per-tenant concurrency cap).
+    /// Counts submissions with work in flight for a tenant (per-tenant
+    /// concurrency cap).
+    ///
+    /// A submission counts while it is `in-progress` **and** still has work
+    /// pending: either no manifests yet (opened, awaiting its first kick-off)
+    /// or at least one non-terminal manifest. A drained submission — open per
+    /// the spec so `replacesManifestUrl` can still land, but with every
+    /// manifest terminal — holds no slot: the cap bounds concurrent
+    /// ingestion, and a submitter that never sends the closing
+    /// `submissionStatus=completed` must not leak its tenant's slots forever
+    /// (#850). A new manifest on a drained submission makes it count again.
     async fn count_active_submissions(&self, tenant: &TenantContext) -> StorageResult<u64>;
 
     /// Lists submissions whose `updated_at` is older than `now - ttl`, across all
@@ -357,6 +379,15 @@ impl<T> BulkSubmitJobStore for T where
 {
 }
 
+/// Rebuilds deferred search indexes once a manifest finishes ingesting
+/// (bulk fast-load, #903). Implemented over the reindex machinery by the
+/// server wiring; fire-and-forget from the worker's perspective.
+#[async_trait]
+pub trait DeferredReindexHook: Send + Sync {
+    /// Kicks a reindex of the given resource types for the tenant.
+    async fn reindex_types(&self, tenant: &TenantContext, resource_types: Vec<String>);
+}
+
 /// The default in-process submit worker.
 ///
 /// Binds a [`BulkSubmitJobStore`] (job state + claim + worker storage + ingestion
@@ -370,11 +401,138 @@ pub struct DefaultSubmitWorker<Js: ?Sized, Fetcher: ?Sized, Os: ?Sized> {
     output: Arc<Os>,
     #[allow(dead_code)]
     worker_id: WorkerId,
+    /// Bulk fast-load (#903): ingest without search indexing, then reindex.
+    defer_indexing: bool,
+    /// Rebuilds the deferred indexes after each finished manifest. Without a
+    /// hook, deferred mode still ingests and logs that $reindex is owed.
+    reindex_hook: Option<Arc<dyn DeferredReindexHook>>,
+}
+
+/// A pass-through [`AsyncBufRead`] that adds every consumed byte to a shared
+/// counter — the live half of the status endpoint's percentage.
+struct CountingReader {
+    inner: Box<dyn tokio::io::AsyncBufRead + Send + Unpin>,
+    consumed: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl tokio::io::AsyncRead for CountingReader {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let before = buf.filled().len();
+        let poll = std::pin::Pin::new(&mut self.inner).poll_read(cx, buf);
+        if let std::task::Poll::Ready(Ok(())) = &poll {
+            let read = buf.filled().len() - before;
+            self.consumed.fetch_add(read as u64, Ordering::Relaxed);
+        }
+        poll
+    }
+}
+
+impl tokio::io::AsyncBufRead for CountingReader {
+    fn poll_fill_buf(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<&[u8]>> {
+        std::pin::Pin::new(&mut self.get_mut().inner).poll_fill_buf(cx)
+    }
+
+    fn consume(mut self: std::pin::Pin<&mut Self>, amt: usize) {
+        self.consumed.fetch_add(amt as u64, Ordering::Relaxed);
+        std::pin::Pin::new(&mut self.inner).consume(amt);
+    }
+}
+
+/// Renews a [`ManifestLease`] from a dedicated task for as long as it is alive.
+///
+/// The renewal must not share a future with the ingestion: a fast local stream
+/// keeps the ingest future Ready-heavy enough that a sibling `select!` timer arm
+/// is polled too rarely to ever fire, the lease silently expires mid-file, and
+/// the manifest is reclaimed and restarted from its first file — an unbounded
+/// loop, invisible in the counts because re-ingested entries upsert
+/// idempotently. A separately spawned task renews on schedule no matter how the
+/// ingest future behaves.
+///
+/// The keeper's task also flushes the shared byte progress every few seconds,
+/// best-effort. On backends whose batch bookkeeping persists the counters
+/// itself (SQLite) this is only a fallback — a standalone write can starve
+/// for tens of seconds behind back-to-back batch transactions there, and the
+/// value it finally lands is as old as the wait. All byte writes are
+/// monotonic (`MAX`), so a stale flush can never walk progress backwards.
+/// The heartbeat alone decides lease health.
+///
+/// Dropping the keeper stops the renewal task.
+struct LeaseKeeper {
+    lost: Arc<AtomicBool>,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl LeaseKeeper {
+    fn spawn<Js>(jobs: Arc<Js>, lease: ManifestLease, progress: ByteProgress) -> Self
+    where
+        Js: BulkSubmitJobStore + ?Sized + 'static,
+    {
+        const FLUSH_EVERY: Duration = Duration::from_secs(3);
+        let lost = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&lost);
+        let handle = tokio::spawn(async move {
+            let mut expiry = lease.lease_expiry;
+            let mut last_flushed: u64 = 0;
+            loop {
+                let remaining = (expiry - Utc::now())
+                    .to_std()
+                    .unwrap_or(Duration::from_secs(1));
+                let wait = (remaining / 3).clamp(Duration::from_secs(1), Duration::from_secs(60));
+                let heartbeat_at = tokio::time::Instant::now() + wait;
+                loop {
+                    let now = tokio::time::Instant::now();
+                    if now >= heartbeat_at {
+                        break;
+                    }
+                    tokio::time::sleep(FLUSH_EVERY.min(heartbeat_at - now)).await;
+                    let total = progress.total.load(Ordering::Relaxed);
+                    let consumed = progress.consumed.load(Ordering::Relaxed);
+                    if total > 0 && consumed != last_flushed {
+                        last_flushed = consumed;
+                        let _ = jobs.update_manifest_bytes(&lease, consumed, total).await;
+                    }
+                }
+                match jobs.heartbeat(&lease).await {
+                    Ok(new_expiry) => expiry = new_expiry,
+                    Err(LeaseError::LeaseLost { .. }) => {
+                        flag.store(true, Ordering::SeqCst);
+                        return;
+                    }
+                    Err(LeaseError::Storage(e)) => {
+                        tracing::debug!(
+                            submission = %lease.submission_id,
+                            manifest = %lease.manifest_id,
+                            error = %e,
+                            "bulk-submit lease heartbeat failed; retrying"
+                        );
+                    }
+                }
+            }
+        });
+        Self { lost, handle }
+    }
+
+    fn lease_lost(&self) -> bool {
+        self.lost.load(Ordering::SeqCst)
+    }
+}
+
+impl Drop for LeaseKeeper {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
 }
 
 impl<Js, Fetcher, Os> DefaultSubmitWorker<Js, Fetcher, Os>
 where
-    Js: BulkSubmitJobStore + ?Sized,
+    Js: BulkSubmitJobStore + ?Sized + 'static,
     Fetcher: SubmitInputFetcher + ?Sized,
     Os: ExportOutputStore + ?Sized,
 {
@@ -385,7 +543,21 @@ where
             fetcher,
             output,
             worker_id,
+            defer_indexing: false,
+            reindex_hook: None,
         }
+    }
+
+    /// Enables bulk fast-load: entries ingest without search-index/FTS
+    /// writes, and the hook (when set) rebuilds them per finished manifest.
+    pub fn with_deferred_indexing(
+        mut self,
+        defer: bool,
+        hook: Option<Arc<dyn DeferredReindexHook>>,
+    ) -> Self {
+        self.defer_indexing = defer;
+        self.reindex_hook = hook;
+        self
     }
 
     /// Drives a single claimed manifest to a terminal state.
@@ -445,23 +617,67 @@ where
                 "ingesting manifest with submission metadata"
             );
         }
-        let opts = BulkProcessingOptions::new().with_import_mode(import_mode);
+        let progress = ByteProgress::default();
+        let opts = BulkProcessingOptions::new()
+            .with_import_mode(import_mode)
+            .with_defer_indexing(self.defer_indexing)
+            .with_byte_progress(progress.clone());
         let mut processed: u64 = 0;
         let mut failed: u64 = 0;
-        let mut lease_expiry = lease.lease_expiry;
+        // Pre-size the byte denominator: every output file's advertised size
+        // up front, so the percentage never recomputes against a partial
+        // total — learned lazily per file, each newly opened file yanked the
+        // bar backwards on multi-file manifests (#874). Encrypted files are
+        // skipped (wire length ≠ decrypted length); any unknown size falls
+        // back to lazy accumulation below.
+        let mut presized = false;
+        if view.file_encryption_key.is_none() && !manifest.output.is_empty() {
+            let mut sum: u64 = 0;
+            let mut all_known = true;
+            for file in &manifest.output {
+                match self
+                    .fetcher
+                    .file_size(
+                        &file.url,
+                        &view.file_request_headers,
+                        manifest.requires_access_token,
+                        &view.oauth_metadata_urls,
+                    )
+                    .await
+                {
+                    Ok(Some(len)) => sum += len,
+                    _ => {
+                        all_known = false;
+                        break;
+                    }
+                }
+            }
+            // A zero sum (every file empty, or a source misreporting sizes)
+            // presizes nothing — the lazy path below stays the authority.
+            if all_known && sum > 0 {
+                progress.total.store(sum, Ordering::Relaxed);
+                presized = true;
+            }
+        }
+        // The lease must stay heartbeated *through* a file, not only between
+        // files, and independently of how often the ingest future yields; the
+        // keeper renews from its own task until dropped.
+        // Percentages need every file's size; one sizeless file (e.g. a
+        // gzip-decompressed stream) poisons the total for the whole manifest
+        // and the status endpoint falls back to manifest-count progress.
+        let mut totals_known = true;
+        let keeper = LeaseKeeper::spawn(Arc::clone(&self.jobs), lease.clone(), progress.clone());
 
         // 2. Ingest each output file via the existing streaming engine.
         for file in &manifest.output {
-            match self.jobs.heartbeat(&lease).await {
-                Ok(expiry) => lease_expiry = expiry,
-                Err(LeaseError::LeaseLost { .. }) => return Ok(()),
-                Err(LeaseError::Storage(_)) => {}
+            if keeper.lease_lost() {
+                return Ok(());
             }
             let resource_type = file
                 .resource_type
                 .clone()
                 .unwrap_or_else(|| "Resource".into());
-            let stream = match self
+            let (stream, file_bytes_total) = match self
                 .fetcher
                 .open_file_stream(
                     &file.url,
@@ -484,41 +700,37 @@ where
                     continue;
                 }
             };
+            match file_bytes_total {
+                _ if presized => {}
+                Some(len) if totals_known => {
+                    progress.total.fetch_add(len, Ordering::Relaxed);
+                }
+                Some(_) => {}
+                None => {
+                    totals_known = false;
+                    progress.total.store(0, Ordering::Relaxed);
+                }
+            }
+            let stream: Box<dyn tokio::io::AsyncBufRead + Send + Unpin> =
+                Box::new(CountingReader {
+                    inner: stream,
+                    consumed: Arc::clone(&progress.consumed),
+                });
 
             // Per-file options: the file url is part of every entry result's
             // identity, since line numbers restart in each file (#457).
             let file_opts = opts.clone().with_file_url(&file.url);
-            // The lease must stay heartbeated *through* a file, not only
-            // between files: a single file whose ingest outlives the lease
-            // would otherwise expire mid-stream, get reclaimed, and restart
-            // the manifest from its first file — an unbounded silent loop,
-            // since the re-ingested entries upsert idempotently and no error
-            // is ever recorded.
-            let ingest = self.jobs.process_ndjson_stream(
-                &lease.tenant,
-                &lease.submission_id,
-                &lease.manifest_id,
-                &resource_type,
-                stream,
-                &file_opts,
-            );
-            tokio::pin!(ingest);
-            let outcome = loop {
-                let remaining = (lease_expiry - Utc::now())
-                    .to_std()
-                    .unwrap_or(Duration::from_secs(1));
-                let wait = (remaining / 3).clamp(Duration::from_secs(1), Duration::from_secs(60));
-                tokio::select! {
-                    r = &mut ingest => break r,
-                    _ = tokio::time::sleep(wait) => {
-                        match self.jobs.heartbeat(&lease).await {
-                            Ok(expiry) => lease_expiry = expiry,
-                            Err(LeaseError::LeaseLost { .. }) => return Ok(()),
-                            Err(LeaseError::Storage(_)) => {}
-                        }
-                    }
-                }
-            };
+            let outcome = self
+                .jobs
+                .process_ndjson_stream(
+                    &lease.tenant,
+                    &lease.submission_id,
+                    &lease.manifest_id,
+                    &resource_type,
+                    stream,
+                    &file_opts,
+                )
+                .await;
             match outcome {
                 Ok(result) => {
                     processed += result.counts.success + result.counts.skipped;
@@ -542,12 +754,19 @@ where
             {
                 return Err(e);
             }
+            let total = progress.total.load(Ordering::Relaxed);
+            if total > 0 {
+                let _ = self
+                    .jobs
+                    .update_manifest_bytes(&lease, progress.consumed.load(Ordering::Relaxed), total)
+                    .await;
+            }
         }
 
         // 2b. Process `deleted` files — transaction Bundles / resource refs to remove.
         let mut deleted_refs: Vec<String> = Vec::new();
         for file in &manifest.deleted {
-            if let Err(LeaseError::LeaseLost { .. }) = self.jobs.heartbeat(&lease).await {
+            if keeper.lease_lost() {
                 return Ok(());
             }
             match self
@@ -561,7 +780,7 @@ where
                 )
                 .await
             {
-                Ok(reader) => {
+                Ok((reader, _)) => {
                     self.process_deleted_stream(&lease, reader, &mut deleted_refs)
                         .await;
                 }
@@ -581,12 +800,47 @@ where
         }
 
         // 3. Emit per-type `output` receipts and an aggregated `error` artifact.
+        if keeper.lease_lost() {
+            return Ok(());
+        }
         self.write_result_artifacts(&lease, &manifest_url, view.fhir_version, failed)
             .await?;
 
         // 4. Mark the manifest complete.
         if let Err(LeaseError::Storage(e)) = self.jobs.finish_manifest(&lease).await {
             return Err(e);
+        }
+
+        // 5. Fast-load (#903): the manifest ingested without search indexing —
+        // rebuild the indexes for its resource types now. Fire-and-forget:
+        // the manifest is already terminal, and the hook drives the same
+        // machinery $reindex does.
+        if self.defer_indexing {
+            let mut types: Vec<String> = manifest
+                .output
+                .iter()
+                .filter_map(|f| f.resource_type.clone())
+                .collect();
+            types.sort();
+            types.dedup();
+            match (&self.reindex_hook, types.is_empty()) {
+                (Some(hook), false) => {
+                    tracing::info!(
+                        submission = %lease.submission_id,
+                        manifest = %lease.manifest_id,
+                        types = ?types,
+                        "bulk fast-load: rebuilding deferred search indexes"
+                    );
+                    hook.reindex_types(&lease.tenant, types).await;
+                }
+                _ => {
+                    tracing::warn!(
+                        submission = %lease.submission_id,
+                        manifest = %lease.manifest_id,
+                        "bulk fast-load ingested without indexing and no reindex \n                         hook is wired — run $reindex to make the data searchable"
+                    );
+                }
+            }
         }
         Ok(())
     }
@@ -949,6 +1203,18 @@ mod tests {
     use crate::tenant::{TenantContext, TenantId, TenantPermissions};
     use std::time::Duration as StdDuration;
 
+    /// Captures the deferred-reindex callbacks the worker fires.
+    struct MockReindexHook {
+        calls: std::sync::Mutex<Vec<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl DeferredReindexHook for MockReindexHook {
+        async fn reindex_types(&self, _tenant: &TenantContext, resource_types: Vec<String>) {
+            self.calls.lock().unwrap().push(resource_types);
+        }
+    }
+
     /// A fetcher that returns a fixed manifest and serves NDJSON from memory.
     struct MockFetcher {
         files: std::collections::HashMap<String, Vec<u8>>,
@@ -974,11 +1240,23 @@ mod tests {
             _requires_access_token: bool,
             _oauth: &[String],
             _encryption_key: Option<&Value>,
-        ) -> StorageResult<Box<dyn tokio::io::AsyncBufRead + Send + Unpin>> {
+        ) -> StorageResult<(Box<dyn tokio::io::AsyncBufRead + Send + Unpin>, Option<u64>)> {
             let data = self.files.get(url).cloned().unwrap_or_default();
-            Ok(Box::new(tokio::io::BufReader::new(std::io::Cursor::new(
-                data,
-            ))))
+            let len = data.len() as u64;
+            Ok((
+                Box::new(tokio::io::BufReader::new(std::io::Cursor::new(data))),
+                Some(len),
+            ))
+        }
+
+        async fn file_size(
+            &self,
+            url: &str,
+            _headers: &[(String, String)],
+            _requires_access_token: bool,
+            _oauth: &[String],
+        ) -> StorageResult<Option<u64>> {
+            Ok(self.files.get(url).map(|d| d.len() as u64))
         }
     }
 
@@ -1064,6 +1342,236 @@ mod tests {
             crate::core::bulk_submit::ManifestStatus::Completed
         );
 
+        // Byte progress reached the file's full advertised size.
+        assert_eq!(manifests[0].bytes_total, ndjson.len() as u64);
+        assert_eq!(manifests[0].bytes_processed, ndjson.len() as u64);
+    }
+
+    /// #903 fast-load: deferred ingestion stores readable resources that are
+    /// invisible to search, fires the reindex hook with the manifest's types,
+    /// and the real reindex machinery then makes them searchable.
+    #[tokio::test]
+    async fn test_deferred_indexing_defers_search_and_fires_the_hook() {
+        use crate::search::{ReindexOnFinish, ReindexOperation};
+        use crate::types::{SearchParamType, SearchParameter, SearchQuery, SearchValue};
+
+        // A data dir gives the tenant a real SearchParameter registry — the
+        // reindex half of this test extracts through it.
+        let data_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .map(|p| p.join("data"))
+            .unwrap();
+        let backend = Arc::new(
+            SqliteBackend::with_config(
+                ":memory:",
+                crate::backends::sqlite::SqliteBackendConfig {
+                    data_dir: Some(data_dir),
+                    ..Default::default()
+                },
+            )
+            .unwrap(),
+        );
+        backend.init_schema().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let output = Arc::new(LocalFsOutputStore::new(
+            tmp.path().to_path_buf(),
+            "http://localhost:8080",
+        ));
+
+        let tenant = tenant();
+        let sub_id = SubmissionId::generate("mock-system");
+        backend
+            .create_submission(&tenant, &sub_id, None)
+            .await
+            .unwrap();
+        backend
+            .add_manifest(
+                &tenant,
+                &sub_id,
+                Some("http://provider/manifest.json"),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let ndjson = "{\"resourceType\":\"Patient\",\"id\":\"defer-1\",\"name\":[{\"family\":\"Deferred\"}]}\n";
+        let mut files = std::collections::HashMap::new();
+        files.insert(
+            "http://provider/patient.ndjson".to_string(),
+            ndjson.as_bytes().to_vec(),
+        );
+        let fetcher = Arc::new(MockFetcher {
+            files,
+            manifest: RemoteManifest {
+                requires_access_token: false,
+                output: vec![RemoteFile {
+                    resource_type: Some("Patient".to_string()),
+                    url: "http://provider/patient.ndjson".to_string(),
+                    count: Some(1),
+                }],
+                deleted: vec![],
+            },
+        });
+
+        let hook = Arc::new(MockReindexHook {
+            calls: std::sync::Mutex::new(Vec::new()),
+        });
+        let worker = DefaultSubmitWorker::new(
+            backend.clone(),
+            fetcher,
+            output,
+            WorkerId::new("defer-worker"),
+        )
+        .with_deferred_indexing(true, Some(hook.clone()));
+
+        let lease = backend
+            .claim_next_manifest(&WorkerId::new("defer-worker"), StdDuration::from_secs(60))
+            .await
+            .unwrap()
+            .expect("claimable manifest");
+        worker.run_job(lease).await.unwrap();
+
+        // Readable immediately…
+        assert!(
+            backend
+                .read(&tenant, "Patient", "defer-1")
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        // …but invisible to search: the index writes were deferred.
+        let by_name = SearchQuery::new("Patient").with_parameter(SearchParameter {
+            name: "family".to_string(),
+            param_type: SearchParamType::String,
+            modifier: None,
+            values: vec![SearchValue::eq("Deferred")],
+            chain: vec![],
+            components: vec![],
+        });
+        use crate::core::search::SearchProvider;
+        let found = backend.search(&tenant, &by_name).await.unwrap();
+        assert_eq!(
+            found.resources.items.len(),
+            0,
+            "deferred ingest must not index"
+        );
+
+        // The hook received the manifest's resource types.
+        assert_eq!(
+            hook.calls.lock().unwrap().clone(),
+            vec![vec!["Patient".to_string()]]
+        );
+
+        // The real hook + reindex machinery restores searchability.
+        let op = Arc::new(ReindexOperation::new(
+            backend.clone(),
+            backend.tenant_registries().clone(),
+        ));
+        let real_hook = ReindexOnFinish::new(op);
+        DeferredReindexHook::reindex_types(&real_hook, &tenant, vec!["Patient".to_string()]).await;
+        // The reindex runs as a spawned background job — poll briefly.
+        let mut visible = false;
+        for _ in 0..50 {
+            tokio::time::sleep(StdDuration::from_millis(100)).await;
+            if backend
+                .search(&tenant, &by_name)
+                .await
+                .unwrap()
+                .resources
+                .items
+                .len()
+                == 1
+            {
+                visible = true;
+                break;
+            }
+        }
+        assert!(
+            visible,
+            "reindex must make the deferred resources searchable"
+        );
+    }
+
+    /// #874: with every file's size known up front, the byte denominator is
+    /// the full manifest total from the start — the percentage never
+    /// recomputes against a partial sum as later files open.
+    #[tokio::test]
+    async fn test_multi_file_manifest_presizes_the_byte_total() {
+        let backend = Arc::new(SqliteBackend::in_memory().unwrap());
+        backend.init_schema().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let output = Arc::new(LocalFsOutputStore::new(
+            tmp.path().to_path_buf(),
+            "http://localhost:8080",
+        ));
+
+        let tenant = tenant();
+        let sub_id = SubmissionId::generate("mock-system");
+        backend
+            .create_submission(&tenant, &sub_id, None)
+            .await
+            .unwrap();
+        backend
+            .add_manifest(
+                &tenant,
+                &sub_id,
+                Some("http://provider/manifest.json"),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let f1 = "{\"resourceType\":\"Patient\",\"id\":\"m1\"}\n";
+        let f2 = "{\"resourceType\":\"Patient\",\"id\":\"m2\"}\n{\"resourceType\":\"Patient\",\"id\":\"m3\"}\n";
+        let mut files = std::collections::HashMap::new();
+        files.insert(
+            "http://provider/a.ndjson".to_string(),
+            f1.as_bytes().to_vec(),
+        );
+        files.insert(
+            "http://provider/b.ndjson".to_string(),
+            f2.as_bytes().to_vec(),
+        );
+        let fetcher = Arc::new(MockFetcher {
+            files,
+            manifest: RemoteManifest {
+                requires_access_token: false,
+                output: vec![
+                    RemoteFile {
+                        resource_type: Some("Patient".to_string()),
+                        url: "http://provider/a.ndjson".to_string(),
+                        count: None,
+                    },
+                    RemoteFile {
+                        resource_type: Some("Patient".to_string()),
+                        url: "http://provider/b.ndjson".to_string(),
+                        count: None,
+                    },
+                ],
+                deleted: vec![],
+            },
+        });
+
+        let worker = DefaultSubmitWorker::new(
+            backend.clone(),
+            fetcher,
+            output,
+            WorkerId::new("presize-worker"),
+        );
+        let lease = backend
+            .claim_next_manifest(&WorkerId::new("presize-worker"), StdDuration::from_secs(60))
+            .await
+            .unwrap()
+            .expect("claimable manifest");
+        worker.run_job(lease).await.unwrap();
+
+        let manifests = backend.list_manifests(&tenant, &sub_id).await.unwrap();
+        let expected = (f1.len() + f2.len()) as u64;
+        assert_eq!(manifests[0].bytes_total, expected);
+        assert_eq!(manifests[0].bytes_processed, expected);
+
         // An `output` artifact for Patient was recorded.
         let files = backend.list_submit_files(&tenant, &sub_id).await.unwrap();
         assert!(
@@ -1099,10 +1607,11 @@ mod tests {
             _r: bool,
             _o: &[String],
             _k: Option<&Value>,
-        ) -> StorageResult<Box<dyn tokio::io::AsyncBufRead + Send + Unpin>> {
-            Ok(Box::new(tokio::io::BufReader::new(std::io::Cursor::new(
-                Vec::new(),
-            ))))
+        ) -> StorageResult<(Box<dyn tokio::io::AsyncBufRead + Send + Unpin>, Option<u64>)> {
+            Ok((
+                Box::new(tokio::io::BufReader::new(std::io::Cursor::new(Vec::new()))),
+                Some(0),
+            ))
         }
     }
 

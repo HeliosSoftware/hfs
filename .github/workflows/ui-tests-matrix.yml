@@ -329,8 +329,9 @@ jobs:
           # The suite creates and immediately searches; on the ES composites
           # the default asynchronous sync races the specs (nightly reds since
           # the SearchParameter CRUD spec landed). Synchronous puts the write
-          # in ES before the API responds; the specs' waitSearchable covers
-          # the index-refresh window that remains. Only the S3 composite stays
+          # in ES before the API responds, and wait_for blocks the write until
+          # the index refresh so the document is searchable on return (the
+          # specs' waitSearchable remains as a backstop). Only the S3 composite stays
           # asynchronous: against real S3 the extra per-write latency tipped
           # the seed-heavy dashboard specs over their budgets (run 62), so
           # that leg stays asynchronous and leans on the polls alone.
@@ -338,6 +339,7 @@ jobs:
              [ "${{ matrix.backend }}" = "postgres-elasticsearch" ] || \
              [ "${{ matrix.backend }}" = "mongodb-elasticsearch" ]; then
             export HFS_COMPOSITE_SYNC_MODE=synchronous
+            export HFS_ELASTICSEARCH_WRITE_REFRESH=wait_for
           fi
 
           if [ "${{ matrix.backend }}" = "sqlite-elasticsearch" ]; then

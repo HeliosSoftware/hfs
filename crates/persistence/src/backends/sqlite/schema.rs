@@ -5,7 +5,7 @@ use rusqlite::Connection;
 use crate::error::StorageResult;
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 16;
+pub const SCHEMA_VERSION: i32 = 19;
 
 /// Initialize the database schema.
 pub fn initialize_schema(conn: &Connection) -> StorageResult<()> {
@@ -201,6 +201,7 @@ fn create_indexes(conn: &Connection) -> StorageResult<()> {
         // Resources table indexes
         "CREATE INDEX IF NOT EXISTS idx_resources_type ON resources(tenant_id, resource_type)",
         "CREATE INDEX IF NOT EXISTS idx_resources_updated ON resources(tenant_id, last_updated)",
+        "CREATE INDEX IF NOT EXISTS idx_resources_reindex ON resources(tenant_id, resource_type, last_updated, id)",
         // History table indexes
         "CREATE INDEX IF NOT EXISTS idx_history_resource ON resource_history(tenant_id, resource_type, id)",
         "CREATE INDEX IF NOT EXISTS idx_history_updated ON resource_history(tenant_id, last_updated)",
@@ -297,6 +298,9 @@ fn migrate_schema(conn: &Connection, from_version: i32) -> StorageResult<()> {
             13 => migrate_v13_to_v14(conn)?,
             14 => migrate_v14_to_v15(conn)?,
             15 => migrate_v15_to_v16(conn)?,
+            16 => migrate_v16_to_v17(conn)?,
+            17 => migrate_v17_to_v18(conn)?,
+            18 => migrate_v18_to_v19(conn)?,
             _ => {
                 return Err(crate::error::StorageError::Backend(
                     crate::error::BackendError::Internal {
@@ -1364,6 +1368,80 @@ fn migration_err(message: String) -> crate::error::StorageError {
     })
 }
 
+/// Migrate from schema version 16 to version 17.
+///
+/// Adds the `bulk_provider_submissions` table backing the provider-side Bulk
+/// Submit store (#772): the submissions the Bulk Import workspace sends,
+/// previously misfiled in the per-user `user_settings` document. One opaque
+/// JSON document per (tenant, submission), whole-document writes under a
+/// monotonic `version` for optimistic locking.
+fn migrate_v16_to_v17(conn: &Connection) -> StorageResult<()> {
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS bulk_provider_submissions (
+            tenant_id  TEXT NOT NULL,
+            id         TEXT NOT NULL,
+            data       BLOB NOT NULL,
+            version    INTEGER NOT NULL DEFAULT 1,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (tenant_id, id)
+        )",
+        [],
+    )
+    .map_err(|e| migration_err(format!("create bulk_provider_submissions table: {e}")))?;
+    Ok(())
+}
+
+/// Migrate from schema version 17 to version 18: byte-level ingest
+/// progress on manifests, so the status endpoint can report a real
+/// percentage while a file streams in.
+fn migrate_v17_to_v18(conn: &Connection) -> StorageResult<()> {
+    // The columns already exist when the table was created fresh at v18 — guard
+    // with PRAGMA table_info since SQLite has no `ADD COLUMN IF NOT EXISTS`.
+    let manifest_columns: Vec<String> = {
+        let mut stmt = conn
+            .prepare("PRAGMA table_info(bulk_manifests)")
+            .map_err(|e| migration_err(format!("pragma bulk_manifests: {e}")))?;
+        let cols: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .map_err(|e| migration_err(format!("pragma rows: {e}")))?
+            .filter_map(|r| r.ok())
+            .collect();
+        cols
+    };
+    let adds = [
+        (
+            "bytes_processed",
+            "ALTER TABLE bulk_manifests ADD COLUMN bytes_processed INTEGER NOT NULL DEFAULT 0",
+        ),
+        (
+            "bytes_total",
+            "ALTER TABLE bulk_manifests ADD COLUMN bytes_total INTEGER NOT NULL DEFAULT 0",
+        ),
+    ];
+    for (col, sql) in &adds {
+        if !manifest_columns.iter().any(|c| c == col) {
+            conn.execute(sql, [])
+                .map_err(|e| migration_err(format!("add manifest byte columns: {e}")))?;
+        }
+    }
+    Ok(())
+}
+
+/// v19: keyset-pagination index for reindex page fetches.
+///
+/// fetch_resources_page orders by (last_updated, id) within a
+/// (tenant_id, resource_type) — with no covering index every page pays a
+/// sort of the whole type, which turns a 5.7M-row Observation reindex
+/// quadratic (#903).
+fn migrate_v18_to_v19(conn: &Connection) -> StorageResult<()> {
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_resources_reindex          ON resources(tenant_id, resource_type, last_updated, id)",
+        [],
+    )
+    .map_err(|e| migration_err(format!("create idx_resources_reindex: {e}")))?;
+    Ok(())
+}
+
 /// Drop all tables (for testing).
 #[cfg(test)]
 #[allow(dead_code)]
@@ -1532,6 +1610,23 @@ mod tests {
 
         let version = get_schema_version(&conn).unwrap();
         assert_eq!(version, SCHEMA_VERSION);
+    }
+
+    /// Migrations must be re-runnable: a database already carrying the latest
+    /// columns can be replayed from any earlier recorded version (tests do this,
+    /// and so does a build that stamped a version before finishing its work).
+    /// SQLite has no `ADD COLUMN IF NOT EXISTS`, so every `ALTER TABLE ... ADD
+    /// COLUMN` step has to guard against the column already being there.
+    #[test]
+    fn test_migration_ladder_replays_on_a_current_database() {
+        for from in 1..SCHEMA_VERSION {
+            let conn = Connection::open_in_memory().unwrap();
+            initialize_schema(&conn).unwrap();
+            set_schema_version(&conn, from).unwrap();
+            initialize_schema(&conn)
+                .unwrap_or_else(|e| panic!("replay from v{from} failed: {e:?}"));
+            assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
+        }
     }
 
     #[test]

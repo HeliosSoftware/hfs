@@ -219,6 +219,50 @@ impl I18n {
             .try_lookup_with_args(self.locale, key, &args)
             .unwrap_or_else(|| key.to_owned())
     }
+
+    /// Look up a message with two named placeables, e.g. the View
+    /// Definitions "run" meta (#752):
+    /// `t_arg2("vd-results-meta", "rows", rows.to_string(), "ms", ms.to_string())`.
+    /// `crates/hts-ui/src/i18n.rs` carries the identical method for its own
+    /// catalog lookups.
+    pub fn t_arg2(
+        &self,
+        key: &str,
+        name1: &str,
+        value1: impl Into<FluentValue<'static>>,
+        name2: &str,
+        value2: impl Into<FluentValue<'static>>,
+    ) -> String {
+        let args: HashMap<Cow<'static, str>, FluentValue<'static>> = HashMap::from([
+            (Cow::Owned(name1.to_owned()), value1.into()),
+            (Cow::Owned(name2.to_owned()), value2.into()),
+        ]);
+        LOCALES
+            .try_lookup_with_args(self.locale, key, &args)
+            .unwrap_or_else(|| key.to_owned())
+    }
+}
+
+/// Lets the shared chrome partials resolve catalog keys against this request's
+/// locale (#799).
+///
+/// A forwarding shim, not an adapter: the shared markup needs only the
+/// *intersection* of the two products' `I18n` surfaces — a locale tag and a
+/// message lookup — and both this type and `helios_hts_ui::I18n` already spell
+/// those exactly that way. Nothing is translated, renamed or defaulted here, so
+/// the trait cannot become a place where the two implementations quietly
+/// diverge. HFS-only methods (`t_arg`, `t_arg2`) deliberately stay off the trait: they
+/// are page-level vocabulary, and widening the shared contract to fit them
+/// would force HTS to grow methods its own templates never call.
+/// `crates/hts-ui/src/i18n.rs` carries the identical shim.
+impl helios_ui_chrome::ChromeLabels for I18n {
+    fn lang(&self) -> String {
+        I18n::lang(self)
+    }
+
+    fn t(&self, key: &str) -> String {
+        I18n::t(self, key)
+    }
 }
 
 #[cfg(test)]
@@ -306,6 +350,20 @@ mod tests {
         assert_eq!(
             de.t_arg("health-uptime", "duration", "3d"),
             "Betriebszeit: 3d"
+        );
+    }
+
+    #[test]
+    fn two_placeables_interpolate_per_locale() {
+        let en = I18n { locale: &EN };
+        assert_eq!(
+            en.t_arg2("vd-results-meta", "rows", "3", "ms", "12"),
+            "3 rows · 12 ms"
+        );
+        let de = I18n { locale: &DE };
+        assert_eq!(
+            de.t_arg2("vd-results-meta", "rows", "0", "ms", "5"),
+            "0 Zeilen · 5 ms"
         );
     }
 

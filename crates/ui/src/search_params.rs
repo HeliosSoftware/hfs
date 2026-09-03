@@ -18,6 +18,7 @@ use helios_fhir::search::{
 use serde_json::Value;
 
 use crate::conformance::ConformanceSource;
+use crate::rail_state;
 
 /// Rows per page. The issue calls for pagination rather than a render cap.
 pub(crate) const PAGE_SIZE: usize = 50;
@@ -152,6 +153,12 @@ impl SpQuery {
 
     /// Serializes the state to an href, with `page` and `sel` reset unless
     /// explicitly carried over.
+    ///
+    /// `base` always renders as a `base=` marker, empty when `None` — never
+    /// simply omitted. A link this page generates for "All types" must
+    /// keep that state reachable in one click even when a real type is
+    /// remembered (`rails.searchParameters.last`): an omitted `base` would
+    /// resolve through that stored `last` instead of staying on "All types".
     fn href_with(
         &self,
         base: Option<&str>,
@@ -164,9 +171,7 @@ impl SpQuery {
         if let Some(v) = &self.version {
             parts.push(format!("version={}", urlencode(v)));
         }
-        if let Some(b) = base {
-            parts.push(format!("base={}", urlencode(b)));
-        }
+        parts.push(format!("base={}", base.map(urlencode).unwrap_or_default()));
         if let Some(t) = ptype {
             parts.push(format!("type={}", urlencode(t)));
         }
@@ -360,11 +365,25 @@ pub(crate) struct SpView {
     pub pages: Vec<PageLink>,
     pub detail: Option<SpDetail>,
     pub spec_loaded: bool,
-    /// Hidden inputs so the rail's search form round-trips the other filters.
+    /// Hidden inputs so the rail's search form round-trips the other filters
+    /// (`base` is always present, empty for "All types" — see
+    /// `SpQuery::href_with`'s doc).
     pub hidden_fields: Vec<(String, String)>,
+    /// The "Recently used" group's rows, server-rendered by
+    /// `partials/rail_recent.html`.
+    pub recent: Vec<rail_state::ResolvedRailEntry>,
+    /// `rails.searchParameters`, carried to the template so
+    /// `partials/rail_recent.html` never redeclares the page key.
+    pub rail_page: &'static str,
+    /// `rail_state::MAX_RECENT`, carried the same way.
+    pub max_recent: usize,
 }
 
-pub(crate) fn build_view(snapshot: &VersionSnapshot, query: &SpQuery) -> SpView {
+pub(crate) fn build_view(
+    snapshot: &VersionSnapshot,
+    query: &SpQuery,
+    stored_rail: &rail_state::RailState,
+) -> SpView {
     let params = &snapshot.params;
     let version = query.fhir_version();
 
@@ -443,6 +462,47 @@ pub(crate) fn build_view(snapshot: &VersionSnapshot, query: &SpQuery) -> SpView 
         ),
         current: query.base.is_none(),
     };
+
+    // The "Recently used" group, resolved against every base with at least
+    // one parameter — unfiltered by the search box's `needle`, since a
+    // recent must stay visible even while the box hides it from the
+    // scrollable list. Every surviving base is also a valid live entry, so
+    // `resolve_recents`'s snapshot fallback never triggers here: type rails
+    // never store one (only the SQL rails do).
+    let recent_live: HashMap<String, rail_state::LiveRailItem> = base_counts
+        .iter()
+        .map(|(name, count)| {
+            let name = (*name).to_string();
+            let item = rail_state::LiveRailItem {
+                label: name.clone(),
+                meta: None,
+                count: Some(count.to_string()),
+                href: query.href_with(
+                    Some(&name),
+                    query.ptype.as_deref(),
+                    query.source.as_deref(),
+                    1,
+                    None,
+                ),
+                current: query.base.as_deref() == Some(name.as_str()),
+            };
+            (name, item)
+        })
+        .collect();
+    let recent_is_valid: &dyn Fn(&str) -> bool = &|id| recent_live.contains_key(id);
+    let recent = stored_rail.resolve_recents(
+        &recent_live,
+        |id| {
+            query.href_with(
+                Some(id),
+                query.ptype.as_deref(),
+                query.source.as_deref(),
+                1,
+                None,
+            )
+        },
+        Some(recent_is_valid),
+    );
 
     // Facets are scoped to the current base type and show live counts.
     let in_base: Vec<&Arc<SearchParameterDefinition>> = params
@@ -650,9 +710,8 @@ pub(crate) fn build_view(snapshot: &VersionSnapshot, query: &SpQuery) -> SpView 
     if let Some(v) = &query.version {
         hidden_fields.push(("version".into(), v.clone()));
     }
-    if let Some(b) = &query.base {
-        hidden_fields.push(("base".into(), b.clone()));
-    }
+    // Always present, empty for "All types" — see `href_with`'s doc.
+    hidden_fields.push(("base".into(), query.base.clone().unwrap_or_default()));
     if let Some(t) = &query.ptype {
         hidden_fields.push(("type".into(), t.clone()));
     }
@@ -676,6 +735,9 @@ pub(crate) fn build_view(snapshot: &VersionSnapshot, query: &SpQuery) -> SpView 
         detail,
         spec_loaded: snapshot.spec_loaded,
         hidden_fields,
+        recent,
+        rail_page: rail_state::RailPage::SearchParameters.key(),
+        max_recent: rail_state::MAX_RECENT,
     }
 }
 
@@ -719,6 +781,13 @@ fn page_links(page: usize, page_count: usize) -> Vec<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The never-selected rail state: what every test not exercising the
+    /// rail resolution itself passes to `build_view` (empty "Recently used"
+    /// group, no stored `base`).
+    fn no_rail() -> rail_state::RailState {
+        rail_state::RailState::default()
+    }
 
     /// A source whose first fetch is empty and later fetches carry data, the
     /// way a composite backend behaves while its search index still syncs.
@@ -839,7 +908,7 @@ mod tests {
             sel: Some("http://example.org/SearchParameter/color".into()),
             ..SpQuery::default()
         };
-        let view = build_view(&snapshot, &query);
+        let view = build_view(&snapshot, &query, &no_rail());
         assert_eq!(
             view.detail.expect("selected").resource_id.as_deref(),
             Some("sp-1")
@@ -864,7 +933,7 @@ mod tests {
             base: Some("Patient".into()),
             ..SpQuery::default()
         };
-        let view = build_view(&snapshot, &query);
+        let view = build_view(&snapshot, &query, &no_rail());
 
         assert!(view.total < snapshot.params.len());
         assert!(view.total > 10, "Patient supports dozens of parameters");
@@ -887,6 +956,7 @@ mod tests {
                     page,
                     ..SpQuery::default()
                 },
+                &no_rail(),
             );
             for row in &view.rows {
                 assert!(seen.insert(row.url.clone()), "row repeated: {}", row.url);
@@ -909,6 +979,7 @@ mod tests {
                 sel: Some(first.clone()),
                 ..SpQuery::default()
             },
+            &no_rail(),
         );
         let detail = view.detail.expect("selected parameter resolves");
         assert_eq!(detail.url, first);
@@ -933,7 +1004,7 @@ mod tests {
             spec_loaded: true,
             resource_ids: Default::default(),
         };
-        let view = build_view(&snapshot, &SpQuery::default());
+        let view = build_view(&snapshot, &SpQuery::default(), &no_rail());
 
         let spec_row = view
             .rows
@@ -964,7 +1035,7 @@ mod tests {
             spec_loaded: true,
             resource_ids: Default::default(),
         };
-        let view = build_view(&snapshot, &SpQuery::default());
+        let view = build_view(&snapshot, &SpQuery::default(), &no_rail());
         assert!(view.rows.iter().all(|r| r.chips[0].kind == "conflict"));
     }
 

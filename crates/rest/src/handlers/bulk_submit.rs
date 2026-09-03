@@ -760,7 +760,26 @@ where
     let stopped = summary.status == SubmissionStatus::Aborted;
 
     if !all_terminal && !stopped {
-        let pct = if manifests.is_empty() {
+        // Byte-level progress when the workers know every file's size: the
+        // percentage then moves *while* a file streams in, instead of jumping
+        // 0 → 100 on a single-manifest submission. A manifest with an unknown
+        // total (sizeless stream) contributes nothing to either sum, and when
+        // no totals are known at all the manifest-count fraction remains the
+        // fallback. Capped at 99 — 100 is reserved for the terminal manifest.
+        let bytes_total: u64 = manifests.iter().map(|m| m.bytes_total).sum();
+        let bytes_done: u64 = manifests
+            .iter()
+            .map(|m| {
+                if m.status.is_terminal() {
+                    m.bytes_total
+                } else {
+                    m.bytes_processed.min(m.bytes_total)
+                }
+            })
+            .sum();
+        let pct = if bytes_total > 0 {
+            (((bytes_done as u128 * 100) / bytes_total as u128) as u64).min(99) as usize
+        } else if manifests.is_empty() {
             0
         } else {
             (manifests.iter().filter(|m| m.status.is_terminal()).count() * 100) / manifests.len()
@@ -777,6 +796,9 @@ where
             m.status == helios_persistence::core::ManifestStatus::Processing
                 && m.lease_expiry.is_some_and(|e| now - e > stall_after)
         });
+        // The entry counter complements the percentage with absolute volume,
+        // and carries the progress alone when no byte totals are known (#790).
+        let entries: u64 = manifests.iter().map(|m| m.processed_entries).sum();
         let progress = if stalled {
             tracing::warn!(
                 submission = %sub_id,
@@ -784,6 +806,8 @@ where
                  worker lease expired without renewal or reclaim"
             );
             format!("stalled at {pct}% - a worker stopped without handoff; see server logs")
+        } else if entries > 0 {
+            format!("processing {pct}% complete ({entries} entries ingested)")
         } else {
             format!("processing {pct}% complete")
         };

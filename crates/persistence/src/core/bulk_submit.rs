@@ -289,6 +289,14 @@ pub struct SubmissionManifest {
     /// stall signal the status poll surfaces (#646).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lease_expiry: Option<DateTime<Utc>>,
+    /// Bytes consumed so far across the manifest's files — the status
+    /// endpoint's real percentage while a file streams in.
+    #[serde(default)]
+    pub bytes_processed: u64,
+    /// Summed advertised size of the files opened so far; `0` when no file
+    /// carried a length, which degrades the status to count-only progress.
+    #[serde(default)]
+    pub bytes_total: u64,
 }
 
 impl SubmissionManifest {
@@ -304,6 +312,8 @@ impl SubmissionManifest {
             processed_entries: 0,
             failed_entries: 0,
             lease_expiry: None,
+            bytes_processed: 0,
+            bytes_total: 0,
         }
     }
 
@@ -663,6 +673,19 @@ fn merge_patch(target: &Value, patch: &Value) -> Value {
     Value::Object(out)
 }
 
+/// Live byte counters for a manifest ingest in flight, shared between the
+/// reader that counts consumption and the writers that persist it.
+///
+/// `total` stays `0` until every opened file has advertised a size, so a
+/// partial total never inflates a percentage.
+#[derive(Debug, Clone, Default)]
+pub struct ByteProgress {
+    /// Bytes the ingestion engine has consumed across the manifest's files.
+    pub consumed: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// Summed advertised size of the files opened so far.
+    pub total: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
 /// Options for bulk processing.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BulkProcessingOptions {
@@ -686,6 +709,19 @@ pub struct BulkProcessingOptions {
     /// file every file after the first collides on the stored key (#457).
     #[serde(default)]
     pub file_url: Option<String>,
+    /// Bulk fast-load (#903): defer search-index and FTS writes to a
+    /// post-ingest reindex. The stored resources, history, receipts, and
+    /// rollback records are identical either way — only the derived search
+    /// structures are rebuilt later instead of inline.
+    #[serde(default)]
+    pub defer_indexing: bool,
+    /// Live byte counters for the manifest ingest, when the caller tracks
+    /// them. Batch bookkeeping persists these alongside the entry counters —
+    /// that write already wins the database's write lock between batches,
+    /// where a standalone flush starves against back-to-back batch
+    /// transactions on SQLite.
+    #[serde(skip)]
+    pub byte_progress: Option<ByteProgress>,
 }
 
 fn default_submit_batch_size() -> u32 {
@@ -716,12 +752,26 @@ impl BulkProcessingOptions {
             allow_updates: default_allow_updates(),
             import_mode: ImportMode::default(),
             file_url: None,
+            defer_indexing: false,
+            byte_progress: None,
         }
     }
 
     /// Names the manifest output file the entries come from (#457).
     pub fn with_file_url(mut self, file_url: impl Into<String>) -> Self {
         self.file_url = Some(file_url.into());
+        self
+    }
+
+    /// Defers search indexing to a post-ingest reindex (#903).
+    pub fn with_defer_indexing(mut self, defer: bool) -> Self {
+        self.defer_indexing = defer;
+        self
+    }
+
+    /// Attaches live byte counters for batch bookkeeping to persist.
+    pub fn with_byte_progress(mut self, byte_progress: ByteProgress) -> Self {
+        self.byte_progress = Some(byte_progress);
         self
     }
 

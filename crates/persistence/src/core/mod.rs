@@ -93,6 +93,7 @@ pub mod backend;
 pub mod bulk_export;
 pub mod bulk_export_output;
 pub mod bulk_export_worker;
+pub mod bulk_provider;
 pub mod bulk_submit;
 pub mod bulk_submit_input;
 pub mod bulk_submit_worker;
@@ -121,6 +122,7 @@ pub use bulk_export_worker::{
     BulkExportJobStore, DefaultExportWorker, ExportClaimStrategy, ExportJobLease,
     ExportResourceProvider, ExportWorkerStorage, LeaseError, WorkerId, WorkerJobView,
 };
+pub use bulk_provider::{BulkProviderStore, StoredProviderSubmission};
 pub use bulk_submit::{
     BulkEntryOutcome, BulkEntryResult, BulkProcessingOptions, BulkSubmitProvider,
     BulkSubmitRollbackProvider, ChangeType, EntryCountSummary, IMPORT_MODE_PARAMETER_URL,
@@ -132,9 +134,9 @@ pub use bulk_submit_input::{
     FileTokenProvider, RemoteFile, RemoteManifest, SubmitInputFetcher, submission_output_job_id,
 };
 pub use bulk_submit_worker::{
-    BulkSubmitJobStore, DefaultSubmitWorker, ManifestFetchParams, ManifestLease,
-    ManifestWorkerView, PollTokenTarget, SubmitClaimStrategy, SubmitFileRecord, SubmitFileRow,
-    SubmitWorkerStorage,
+    BulkSubmitJobStore, DefaultSubmitWorker, DeferredReindexHook, ManifestFetchParams,
+    ManifestLease, ManifestWorkerView, PollTokenTarget, SubmitClaimStrategy, SubmitFileRecord,
+    SubmitFileRow, SubmitWorkerStorage,
 };
 pub use capabilities::{
     CapabilityProvider, GlobalSearchCapabilities, Interaction, ResourceCapabilities,
@@ -147,7 +149,8 @@ pub use history::{
 };
 pub use preconditions::{
     EntityTag, EntityTagPrecondition, MalformedPrecondition, bundle_if_match_gate,
-    if_match_field_satisfied, precondition_failed_entry,
+    bundle_if_none_exist_gate, if_match_field_satisfied, multiple_matches_entry,
+    not_supported_entry, precondition_failed_entry,
 };
 pub use search::{
     ChainedSearchProvider, FullSearchProvider, IncludeProvider, MultiTypeSearchProvider,

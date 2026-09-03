@@ -268,37 +268,38 @@ impl<'a> EsQueryBuilder<'a> {
         }
     }
 
-    /// Builds a clause for the _lastUpdated special parameter.
+    /// Builds a clause for the `_lastUpdated` special parameter.
+    ///
+    /// Reuses the precision-aware date logic that indexed date parameters
+    /// get, against the top-level `last_updated` field: `eq` at day
+    /// precision means `[day, day+1)`, `ne` its complement, `sa`/`eb` mirror
+    /// `gt`/`lt` on the whole period, and comma-separated values OR together
+    /// (#892). Previously every value was folded into one `range` map, so
+    /// `ne`/`sa`/`eb`/`ap` degraded to `eq` and a second value overwrote the
+    /// first.
     fn build_last_updated_clause(&self, param: &SearchParameter) -> Option<Value> {
-        let mut range = serde_json::Map::new();
-        for value in &param.values {
-            match value.prefix {
-                SearchPrefix::Eq => {
-                    range.insert("gte".to_string(), json!(value.value));
-                    range.insert("lte".to_string(), json!(value.value));
+        let mut clauses: Vec<Value> = param
+            .values
+            .iter()
+            .map(
+                |value| match date::field_range("last_updated", &value.value, value.prefix) {
+                    date::DateRange::Within(range) => range,
+                    date::DateRange::Outside(range) => {
+                        json!({ "bool": { "must_not": [range] } })
+                    }
+                },
+            )
+            .collect();
+
+        match clauses.len() {
+            0 => None,
+            1 => clauses.pop(),
+            _ => Some(json!({
+                "bool": {
+                    "should": clauses,
+                    "minimum_should_match": 1
                 }
-                SearchPrefix::Gt => {
-                    range.insert("gt".to_string(), json!(value.value));
-                }
-                SearchPrefix::Lt => {
-                    range.insert("lt".to_string(), json!(value.value));
-                }
-                SearchPrefix::Ge => {
-                    range.insert("gte".to_string(), json!(value.value));
-                }
-                SearchPrefix::Le => {
-                    range.insert("lte".to_string(), json!(value.value));
-                }
-                _ => {
-                    range.insert("gte".to_string(), json!(value.value));
-                    range.insert("lte".to_string(), json!(value.value));
-                }
-            }
-        }
-        if range.is_empty() {
-            None
-        } else {
-            Some(json!({ "range": { "last_updated": Value::Object(range) } }))
+            })),
         }
     }
 
@@ -331,16 +332,41 @@ impl<'a> EsQueryBuilder<'a> {
                 "_score" => {
                     sort_clauses.push(json!({ "_score": { "order": order } }));
                 }
-                // For other parameters, sort on the nested search_params field
+                // For other parameters, sort on the nested search_params
+                // group that actually holds the parameter's values. The sort
+                // used to assume every parameter was a string — a date sort
+                // like `_sort=birthdate` filtered `search_params.string` for
+                // a name that only exists under `search_params.date`, matched
+                // nothing, and returned the whole page in arbitrary order
+                // with a 200 (#883).
                 name => {
-                    // Use nested sort on the most likely field type (string)
+                    let (group, field) = match directive.param_type {
+                        Some(SearchParamType::Date) => ("date", "search_params.date.value"),
+                        Some(SearchParamType::Number) => ("number", "search_params.number.value"),
+                        Some(SearchParamType::Quantity) => {
+                            ("quantity", "search_params.quantity.value")
+                        }
+                        Some(SearchParamType::Token) => ("token", "search_params.token.code"),
+                        Some(SearchParamType::Reference) => {
+                            ("reference", "search_params.reference.reference")
+                        }
+                        Some(SearchParamType::Uri) => ("uri", "search_params.uri.value"),
+                        // Strings, composites, and unresolved types sort on
+                        // the string group, the pre-existing behavior.
+                        _ => ("string", "search_params.string.value.keyword"),
+                    };
+                    // FHIR multi-value sort semantics: the smallest value
+                    // orders an ascending sort, the largest a descending one
+                    // (the SQL backends' MIN/MAX).
+                    let mode = if order == "asc" { "min" } else { "max" };
                     sort_clauses.push(json!({
-                        "search_params.string.value.keyword": {
+                        field: {
                             "order": order,
+                            "mode": mode,
                             "nested": {
-                                "path": "search_params.string",
+                                "path": format!("search_params.{group}"),
                                 "filter": {
-                                    "term": { "search_params.string.name": name }
+                                    "term": { format!("search_params.{group}.name"): name }
                                 }
                             },
                             "missing": if order == "asc" { "_last" } else { "_first" }
@@ -451,6 +477,63 @@ mod tests {
         }
     }
 
+    fn last_updated_query(values: Vec<SearchValue>) -> Value {
+        let query = SearchQuery::new("Patient").with_parameter(SearchParameter {
+            name: "_lastUpdated".to_string(),
+            param_type: SearchParamType::Date,
+            modifier: None,
+            values,
+            chain: vec![],
+            components: vec![],
+        });
+        let builder = EsQueryBuilder::new("acme", "Patient", "hfs_acme_patient".to_string());
+        builder.build(&query).body["query"]["bool"]["must"][0].clone()
+    }
+
+    #[test]
+    fn last_updated_eq_is_a_day_range() {
+        let clause = last_updated_query(vec![SearchValue::eq("2026-09-01")]);
+        assert_eq!(
+            clause["range"]["last_updated"],
+            json!({ "gte": "2026-09-01", "lt": "2026-09-02" })
+        );
+    }
+
+    #[test]
+    fn last_updated_ne_is_negated_not_eq() {
+        // #892: `ne` fell into the default arm and matched exactly the day.
+        let clause = last_updated_query(vec![SearchValue::new(SearchPrefix::Ne, "2026-09-01")]);
+        assert_eq!(
+            clause["bool"]["must_not"][0]["range"]["last_updated"],
+            json!({ "gte": "2026-09-01", "lt": "2026-09-02" })
+        );
+    }
+
+    #[test]
+    fn last_updated_sa_and_eb_exclude_the_named_period() {
+        let sa = last_updated_query(vec![SearchValue::new(SearchPrefix::Sa, "2026-09-01")]);
+        assert_eq!(sa["range"]["last_updated"], json!({ "gte": "2026-09-02" }));
+
+        let eb = last_updated_query(vec![SearchValue::new(SearchPrefix::Eb, "2026-09-01")]);
+        assert_eq!(eb["range"]["last_updated"], json!({ "lt": "2026-09-01" }));
+    }
+
+    #[test]
+    fn last_updated_or_list_keeps_every_value() {
+        // #892: a second value overwrote the first in the single range map.
+        let clause = last_updated_query(vec![
+            SearchValue::eq("2026-09-01"),
+            SearchValue::eq("2026-09-03"),
+        ]);
+        let should = clause["bool"]["should"]
+            .as_array()
+            .expect("OR list -> bool.should");
+        assert_eq!(should.len(), 2);
+        assert_eq!(clause["bool"]["minimum_should_match"], 1);
+        assert_eq!(should[0]["range"]["last_updated"]["gte"], "2026-09-01");
+        assert_eq!(should[1]["range"]["last_updated"]["gte"], "2026-09-03");
+    }
+
     fn not_param(values: Vec<SearchValue>) -> SearchQuery {
         SearchQuery::new("Patient").with_parameter(SearchParameter {
             name: "language".to_string(),
@@ -526,5 +609,64 @@ mod tests {
 
         let sort = &es_query.body["sort"];
         assert!(sort[0]["resource_id"]["order"].as_str() == Some("asc"));
+    }
+
+    /// #883: a parameter sort must target the nested group that holds the
+    /// parameter's type — a date sort against the string group matched
+    /// nothing and returned arbitrary order with a 200.
+    #[test]
+    fn test_parameter_sort_targets_the_type_group() {
+        let query = SearchQuery::new("Patient").with_sort(SortDirective {
+            parameter: "birthdate".to_string(),
+            direction: SortDirection::Ascending,
+            param_type: Some(SearchParamType::Date),
+        });
+        let builder = EsQueryBuilder::new("acme", "Patient", "hfs_acme_patient".to_string());
+        let sort = &builder.build(&query).body["sort"][0];
+
+        let clause = &sort["search_params.date.value"];
+        assert!(
+            !clause.is_null(),
+            "date parameter must sort on the date group, got {sort}"
+        );
+        assert_eq!(clause["order"], "asc");
+        assert_eq!(clause["mode"], "min");
+        assert_eq!(clause["nested"]["path"], "search_params.date");
+        assert_eq!(
+            clause["nested"]["filter"]["term"]["search_params.date.name"],
+            "birthdate"
+        );
+    }
+
+    #[test]
+    fn test_token_sort_descending_uses_max_mode() {
+        let query = SearchQuery::new("Patient").with_sort(SortDirective {
+            parameter: "gender".to_string(),
+            direction: SortDirection::Descending,
+            param_type: Some(SearchParamType::Token),
+        });
+        let builder = EsQueryBuilder::new("acme", "Patient", "hfs_acme_patient".to_string());
+        let sort = &builder.build(&query).body["sort"][0];
+
+        let clause = &sort["search_params.token.code"];
+        assert!(!clause.is_null(), "token sorts on the code, got {sort}");
+        assert_eq!(clause["order"], "desc");
+        assert_eq!(clause["mode"], "max");
+        assert_eq!(clause["missing"], "_first");
+    }
+
+    #[test]
+    fn test_untyped_sort_falls_back_to_string_group() {
+        let query = SearchQuery::new("Patient").with_sort(SortDirective {
+            parameter: "name".to_string(),
+            direction: SortDirection::Ascending,
+            param_type: None,
+        });
+        let builder = EsQueryBuilder::new("acme", "Patient", "hfs_acme_patient".to_string());
+        let sort = &builder.build(&query).body["sort"][0];
+        assert!(
+            !sort["search_params.string.value.keyword"].is_null(),
+            "untyped parameters keep the string-group sort, got {sort}"
+        );
     }
 }

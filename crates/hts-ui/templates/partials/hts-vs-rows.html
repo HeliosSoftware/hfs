@@ -1,0 +1,105 @@
+{#-
+  ValueSet browser rows partial (design doc §7.4 mirror of §7.2, Phase 5
+  columns).
+
+  Rendered inline by `pages/vs-browser.html` on the first hard nav, and
+  swapped in by every subsequent filter change or Load-more click. The
+  same partial covers every state: empty page, HTS-side OperationOutcome,
+  connection-level degrade. The pre-flight `_count > MAX` branch renders
+  the invalid-input OperationOutcome above an empty table so the operator
+  can still see the filter form's other values echoed back.
+
+  Phase 5 columns: Name · Title · URL · Version · Status — parallel with
+  the CS browser.
+-#}
+<div id="hts-vs-rows">
+  {#- `.notice.notice--warn`: see hts-cs-rows.html — the old
+      `.hts-degraded*` hooks had no rule in app.css. -#}
+  {% if let Some(reason) = view.degraded_reason() %}
+  <aside class="notice notice--warn" role="alert" aria-live="assertive">
+    <p><strong>{{ chrome.i18n.t("hts-degraded-title") }}</strong></p>
+    <p>{{ chrome.i18n.t(format!("hts-degraded-reason-{}", reason).as_str()) }}</p>
+    <p>{{ chrome.i18n.t("hts-degraded-body") }}</p>
+  </aside>
+  {% endif %}
+
+  {% if let Some(outcome) = view.outcome() %}
+    {% include "partials/hts-outcome.html" %}
+  {% endif %}
+
+  <section class="card">
+    <div class="table-wrap">
+      <table class="data-table" aria-describedby="hts-vs-browser-heading">
+        <caption class="visually-hidden">{{ chrome.i18n.t("hts-vs-browser-table-caption") }}</caption>
+        <thead>
+          <tr>
+            <th scope="col" class="col-name">{{ chrome.i18n.t("hts-vs-browser-column-name") }}</th>
+            <th scope="col">{{ chrome.i18n.t("hts-vs-browser-column-title") }}</th>
+            <th scope="col">{{ chrome.i18n.t("hts-vs-browser-column-url") }}</th>
+            <th scope="col">{{ chrome.i18n.t("hts-vs-browser-column-version") }}</th>
+            <th scope="col">{{ chrome.i18n.t("hts-vs-browser-column-status") }}</th>
+          </tr>
+        </thead>
+        <tbody aria-live="polite">
+          {% if let Some(page) = view.page() %}
+            {% if page.rows.is_empty() %}
+              {% if !view.count_over_max %}
+              <tr class="data-table__empty">
+                <td colspan="5">{{ chrome.i18n.t("hts-vs-browser-empty") }}</td>
+              </tr>
+              {% endif %}
+            {% else %}
+              {% for row in page.rows %}
+              <tr>
+                <td class="col-name">
+                  {#- ValueSet ids have no version pipe, but the segment is
+                      encoded anyway so any future id shape stays safe. -#}
+                  <a href="/ui/hts/value-sets/{{ row.id|urlencode_strict }}">
+                    {% if !row.name.is_empty() %}{{ row.name }}
+                    {%- else %}{{ row.id }}
+                    {%- endif %}
+                  </a>
+                </td>
+                <td>{% if row.title.is_empty() %}&mdash;{% else %}{{ row.title }}{% endif %}</td>
+                <td>{% if row.url.is_empty() %}&mdash;{% else %}<span class="url">{{ row.url }}</span>{% endif %}</td>
+                <td>{% if row.version.is_empty() %}&mdash;{% else %}{{ row.version }}{% endif %}</td>
+                <td>
+                  {% if row.status.is_empty() %}
+                    &mdash;
+                  {% else %}
+                    <span class="tag tag--{{ row.status }}">{{ chrome.i18n.t(format!("hts-vs-status-{}", row.status).as_str()) }}</span>
+                  {% endif %}
+                </td>
+              </tr>
+              {% endfor %}
+            {% endif %}
+          {% endif %}
+        </tbody>
+      </table>
+    </div>
+
+    {% if let Some(page) = view.page() %}
+      {% if !page.rows.is_empty() %}
+      {#-
+        Stable foot id + hx-select-oob: see hts-cs-rows.html. Same stale-
+        button duplication bug otherwise.
+      -#}
+      <div class="table-foot" id="hts-vs-rows-foot">
+        <span>
+          {{ chrome.i18n.t_arg("hts-vs-browser-showing-count", "count", page.showing_count().to_string()) }}
+        </span>
+        {% if let Some(next) = page.next_offset() %}
+          <button type="button" class="btn"
+                  hx-get="{{ view.filters.load_more_url(next) }}"
+                  hx-target="#hts-vs-rows tbody"
+                  hx-swap="beforeend"
+                  hx-select="#hts-vs-rows tbody > tr"
+                  hx-select-oob="#hts-vs-rows-foot">
+            {{ chrome.i18n.t("hts-vs-browser-load-more") }}
+          </button>
+        {% endif %}
+      </div>
+      {% endif %}
+    {% endif %}
+  </section>
+</div>

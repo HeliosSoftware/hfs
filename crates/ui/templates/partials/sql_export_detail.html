@@ -1,0 +1,178 @@
+{#
+  One $sql-export job's status-dependent region (#835): the header (back
+  link, name, lede, status chip, contextual action, overflow), the failure
+  notice, the progress bar, and the Job/Output files cards — the whole
+  `#job-detail` element `pages/sql-export-detail.html` wraps in the shell,
+  and the exact body `GET /ui/sql/export/{id}/detail` returns on its own.
+
+  An in-progress job polls itself every 5s via this element's own
+  `hx-get`/`hx-trigger`; a terminal job carries neither attribute, so the
+  swap that lands the terminal state also stops the polling — there is
+  nothing left to re-arm it.
+
+  The header's `.page-head__action` row is, in order: the status chip, the
+  one contextual action the status allows, then the overflow — following
+  `partials/sql_export_card.html`'s own status-per-action rule: in-progress
+  → Cancel; failed → Retry (primary); complete/cancelled → Run again. The
+  overflow itself only ever holds Copy job id (progressive enhancement,
+  revealed by sql-export.js — hidden by default, and the whole `<details>`
+  starts hidden while in-progress since it would otherwise hold nothing
+  usable without JavaScript) and Remove from list (terminal states only).
+
+  The notice, progress bar, and both cards share `.job-detail-stack`'s own
+  vertical rhythm: they live inside `#job-detail`, a descendant of
+  `.content` rather than a direct child of it, so the site-wide
+  `.content > .card ~ .card` spacing rule never reaches them.
+#}
+{% if detail.status == "in-progress" %}
+<div id="job-detail"
+     hx-get="/ui/sql/export/{{ detail.id }}/detail"
+     hx-trigger="every 5s"
+     hx-swap="outerHTML">
+{% else %}
+<div id="job-detail">
+{% endif %}
+  <header class="page-head page-head--back-link">
+    <a class="back-link" href="/ui/sql/export">
+      <span aria-hidden="true">{% include "icons/chevron-left.svg" %}</span>
+      <span>{{ i18n.t("sql-export-active-title") }}</span>
+    </a>
+    <div class="page-head__copy">
+      <h1 class="page-head__title">{{ detail.name }}</h1>
+      <p class="page-head__lede">{{ detail.lede }}</p>
+    </div>
+    <div class="page-head__action">
+      <span class="tag tag--{{ detail.status }}">{{ detail.status_label }}</span>
+      {% if detail.status == "in-progress" %}
+      <form method="post" action="/ui/sql/export/{{ detail.id }}/cancel">
+        <button type="submit" class="btn">{{ i18n.t("sql-export-cancel") }}</button>
+      </form>
+      {% endif %}
+      {% if detail.status == "failed" %}
+      <form method="post" action="/ui/sql/export/{{ detail.id }}/retry">
+        <button type="submit" class="btn btn--primary">
+          <span class="icon">{% include "icons/sync.svg" %}</span>{{ i18n.t("sql-export-retry") }}
+        </button>
+      </form>
+      {% endif %}
+      {% if detail.status == "complete" || detail.status == "cancelled" %}
+      <form method="post" action="/ui/sql/export/{{ detail.id }}/rerun">
+        <button type="submit" class="btn">
+          <span class="icon">{% include "icons/sync.svg" %}</span>{{ i18n.t("sql-export-run-again") }}
+        </button>
+      </form>
+      {% endif %}
+      {% if detail.status == "in-progress" %}
+      {% if !detail.job_id.is_empty() %}
+      <details class="menu" hidden>
+        <summary class="btn btn--icon" aria-label="{{ i18n.t("sql-export-more-actions") }}">{% include "icons/dots-vertical.svg" %}</summary>
+        <div class="menu__panel menu__panel--right menu__panel--compact">
+          <button type="button" class="menu__option" hidden
+                  data-copy-job-id="{{ detail.job_id }}"
+                  data-copy-label="{{ i18n.t("sql-export-copy-job-id") }}"
+                  data-copied-label="{{ i18n.t("sql-export-copied") }}">{{ i18n.t("sql-export-copy-job-id") }}</button>
+        </div>
+      </details>
+      {% endif %}
+      {% else %}
+      <details class="menu">
+        <summary class="btn btn--icon" aria-label="{{ i18n.t("sql-export-more-actions") }}">{% include "icons/dots-vertical.svg" %}</summary>
+        <div class="menu__panel menu__panel--right menu__panel--compact">
+          {% if !detail.job_id.is_empty() %}
+          <button type="button" class="menu__option" hidden
+                  data-copy-job-id="{{ detail.job_id }}"
+                  data-copy-label="{{ i18n.t("sql-export-copy-job-id") }}"
+                  data-copied-label="{{ i18n.t("sql-export-copied") }}">{{ i18n.t("sql-export-copy-job-id") }}</button>
+          {% endif %}
+          <form method="post" action="/ui/sql/export/{{ detail.id }}/remove">
+            <button type="submit" class="menu__option">{{ i18n.t("sql-export-remove") }}</button>
+          </form>
+        </div>
+      </details>
+      {% endif %}
+    </div>
+  </header>
+
+  <div class="job-detail-stack">
+    {% if let Some(notice) = detail.warning %}
+    <p class="notice notice--warn">
+      {% match notice %}
+      {% when FailureNotice::Subject(name, rest) %}
+      {{ i18n.t("sql-export-failure-subject") }} <strong>{{ name }}</strong>: {{ rest }}.
+      {% when FailureNotice::Generic(message) %}
+      {{ i18n.t("sql-export-failure-generic") }} {{ message }}
+      {% endmatch %}
+    </p>
+    {% endif %}
+
+    {% if detail.status == "in-progress" %}
+    <div class="progress progress--in-progress" role="progressbar"
+         aria-valuemin="0" aria-valuemax="100" aria-valuenow="{{ detail.progress_pct }}"
+         aria-label="{{ detail.status_label }}">
+      <div class="progress__bar" style="width: {{ detail.progress_pct }}%"></div>
+    </div>
+    {% endif %}
+
+    <section class="card">
+      <div class="card-head">
+        <h3><span class="icon">{% include "icons/layers.svg" %}</span> {{ i18n.t("sql-export-detail-job-heading") }}</h3>
+      </div>
+      <div class="card__body kv-grid kv-grid--flush">
+        <div class="detail__field">
+          <span>{{ i18n.t("sql-export-detail-field-job-id") }}</span>
+          <div>{% if detail.job_id.is_empty() %}—{% else %}<code>{{ detail.job_id }}</code>{% endif %}</div>
+        </div>
+        <div class="detail__field"><span>{{ i18n.t("sql-export-detail-field-format") }}</span><div>{{ detail.format_label }}</div></div>
+        <div class="detail__field"><span>{{ i18n.t("sql-export-detail-field-started") }}</span><div>{{ detail.started_label }}</div></div>
+        <div class="detail__field"><span>{{ i18n.t("sql-export-detail-field-duration") }}</span><div>{{ detail.duration_label }}</div></div>
+        <div class="detail__field detail__field--wide">
+          <span>{{ i18n.t("sql-export-detail-field-subjects") }}</span>
+          <div class="job-detail__subjects">
+            {% for tag in detail.subjects %}<span class="tag tag--type">{{ tag.kind_label }}</span> {{ tag.name }} {% endfor %}
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="card table-card">
+      <div class="card-head">
+        <h3>
+          <span class="icon">{% include "icons/import.svg" %}</span>
+          {{ i18n.t("sql-export-detail-outputs-heading") }}
+          <span class="toolbar__count">{{ detail.output_count }}</span>
+        </h3>
+      </div>
+      <div class="table-wrap">
+        <table class="data-table">
+          <thead>
+            <tr>
+              <th>{{ i18n.t("sql-export-detail-col-output") }}</th>
+              <th>{{ i18n.t("sql-export-detail-col-subject") }}</th>
+              <th>{{ i18n.t("sql-export-detail-col-files") }}</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for row in detail.outputs %}
+            <tr>
+              <td>{{ row.name }}</td>
+              <td>{% if let Some(tag) = row.subject %}<span class="tag tag--type">{{ tag.kind_label }}</span> {{ tag.name }}{% else %}—{% endif %}</td>
+              <td>
+                <div class="job-card__files">
+                  {% for file in row.files %}
+                  <a href="{{ file.href }}" download>
+                    <span class="icon">{% include "icons/import.svg" %}</span>{{ file.label }}
+                  </a>
+                  {% endfor %}
+                </div>
+              </td>
+            </tr>
+            {% endfor %}
+            {% if detail.outputs.is_empty() %}
+            <tr class="data-table__empty"><td colspan="3">{{ i18n.t("sql-export-detail-outputs-empty") }}</td></tr>
+            {% endif %}
+          </tbody>
+        </table>
+      </div>
+    </section>
+  </div>
+</div>

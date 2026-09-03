@@ -24,7 +24,7 @@
   font-style: normal;
   font-weight: 300 900;
   font-display: swap;
-  src: url("/ui/assets/fonts/figtree-latin.woff2") format("woff2");
+  src: url("fonts/figtree-latin.woff2") format("woff2");
   unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA,
     U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193,
     U+2212, U+2215, U+FEFF, U+FFFD;
@@ -35,10 +35,91 @@
   font-style: normal;
   font-weight: 300 900;
   font-display: swap;
-  src: url("/ui/assets/fonts/figtree-latin-ext.woff2") format("woff2");
+  src: url("fonts/figtree-latin-ext.woff2") format("woff2");
   unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF,
     U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020,
     U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF;
+}
+}
+
+@layer pages {
+/* CapabilityStatement-only presentation: all card headers stay edge-to-edge,
+   while their bodies own the content rhythm appropriate to fields, tags, or
+   tables. The generic table-card keeps its padded treatment elsewhere. */
+.cap-operations-card,
+.cap-resource-card {
+  padding: 0;
+}
+
+.cap-interaction-tags {
+  margin: 0;
+}
+
+.cap-interaction-tags > .tag {
+  margin-left: 0;
+}
+
+/* Keep the backend note subordinate to its interaction tags. */
+.cap-transaction-note {
+  margin: 8px 0 0 16px;
+  padding-left: 10px;
+  border-left: 2px solid var(--surface-border);
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.cap-resource-filter {
+  flex: 0 1 280px;
+  min-width: 0;
+}
+
+.cap-resource-filter input {
+  width: 100%;
+  min-width: 0;
+}
+
+.capability-raw-card > .card-head {
+  justify-content: flex-start;
+  flex-wrap: wrap;
+}
+
+.capability-json-actions {
+  align-items: center;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+
+.capability-json-actions__status:empty {
+  display: none;
+}
+
+.capability-json-fallback {
+  margin: 0 0 10px;
+}
+
+@media (max-width: 520px) {
+  .cap-resource-card > .card-head {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .cap-resource-filter {
+    flex-basis: auto;
+    width: 100%;
+  }
+
+  .capability-raw-card > .card-head {
+    align-items: stretch;
+  }
+
+  .capability-json-actions {
+    width: 100%;
+  }
+
+  .capability-json-actions__status {
+    flex-basis: 100%;
+  }
 }
 }
 
@@ -99,16 +180,69 @@
   --json-string: #137333;
   --json-number: #b4232d;
   --json-literal: #6f42c1;
+  /* FHIRPath token palette (#753 evaluation POC, vd-editor.js): the
+     injected grammar's tags mapped to distinct hues, each clearing 4.5:1 on
+     --input-bg below. Kept apart from --json-* above so a FHIRPath path
+     inside a JSON string never reads as "just another JSON string". */
+  --fp-path: #0f6f66;
+  --fp-function: #8a5a00;
+  --fp-keyword: #9a3aa0;
+  --fp-operator: #4b5563;
+  --fp-literal: #0b6e99;
+  --fp-constant: #b1460a;
+  --fp-comment: #5b6472;
+  /* SQL token palette (#838, sql-editor.js): declared with its own
+     names rather than reusing --json-* / --fp-* directly, so the SQL editor
+     never depends on another editor's palette even where the hex values
+     happen to match today. Each clears 4.5:1 on --input-bg below; keyword
+     (purple) and variable (teal) are deliberately different hues from each
+     other and from --text, so a `:ward`-style bind parameter never reads as
+     "just another keyword". */
+  --sql-keyword: #9a3aa0;
+  --sql-type: #0a5f96;
+  --sql-string: #137333;
+  --sql-number: #b4232d;
+  --sql-operator: #4b5563;
+  --sql-variable: #0f6f66;
+  --sql-comment: #5b6472;
+  --sql-punct: #6a6a6a;
+  --sql-literal: #8a5a00;
   /* Destructive text clears 7:1 on the light card surface; the soft hover
      fill keeps 5.8:1 contrast with the same foreground. */
   --danger: #a61b12;
+  /* Positive / caution pairs, mirroring the danger pair: referenced by the
+     stored/member and warn tag variants and the progress track since the
+     SearchParameter viewer landed, but never defined - they rendered
+     transparent. */
+  --ok: #1e7d46;
+  --ok-soft: #e4f6ec;
+  --warn: #8a5a00;
+  --warn-soft: #fdf2dd;
   --danger-soft: #f0dfde;
+  /* Neutral pair for the cancelled state (#833): the same shape as the
+     ok/warn/danger soft pairs above, but genuinely gray so
+     "Cancelled" never reads as an accent-tinted (blue) or danger (red)
+     status. */
+  --muted-soft: #e9e9e9;
+  /* Text on --muted-soft (PR #887 CI a11y fix): --muted itself only clears
+     4.455:1 against --muted-soft, just under the 4.5:1 axe requires. Same
+     move as --accent-text above — a dedicated, darker-on-light /
+     lighter-on-dark shade for text sitting on the soft tint, not a change to
+     --muted (which stays as every other muted body-text use already relies
+     on it). Clears 6.4:1 here. */
+  --muted-text: #525252;
   /* Menu panel input */
   --input-bg: #f5f5f5;
   /* Pill scrollbars: thin bar, fully-rounded track and thumb. */
   --scroll-track: #ececec;
   --scroll-thumb: #bdbdbd;
   --scroll-thumb-hover: #a0a0a0;
+  /* The semantic status pairs `.tag--*`, `.lint__item--*`, `.notice--warn` and
+     `.batch-badge--*` reference are declared once, above. This branch used to
+     redeclare all six here; every one of them now has a canonical definition
+     earlier in the same rule, so a second declaration only shadowed it — which
+     is what `design-system.spec.ts` and the contrast guard in
+     `bulk-import.spec.ts` exist to catch. */
 
   font-family: Figtree, ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
   background: var(--bg);
@@ -132,9 +266,37 @@
   --json-string: #7ee787;
   --json-number: #ff7b72;
   --json-literal: #d2a8ff;
+  /* FHIRPath token palette, dark cast — see the light block for why these
+     are distinct from --json-*. */
+  --fp-path: #5eead4;
+  --fp-function: #e3b341;
+  --fp-keyword: #e2a8ff;
+  --fp-operator: #9aa7b5;
+  --fp-literal: #79c0ff;
+  --fp-constant: #ffa657;
+  --fp-comment: #9198a1;
+  /* SQL token palette, dark cast — see the light block for why these are
+     distinct from --json-* / --fp-*. */
+  --sql-keyword: #e2a8ff;
+  --sql-type: #7cc9ff;
+  --sql-string: #7ee787;
+  --sql-number: #ff7b72;
+  --sql-operator: #9aa7b5;
+  --sql-variable: #5eead4;
+  --sql-comment: #9198a1;
+  --sql-punct: #a0a0a0;
+  --sql-literal: #e3b341;
   /* Theme-specific destructive pair: 7.6:1 on the card and 5.6:1 on soft. */
   --danger: #ff9a90;
+  --ok: #7fd8a5;
+  --ok-soft: #14301f;
+  --warn: #e8c07a;
+  --warn-soft: #2f2410;
   --danger-soft: #453534;
+  --muted-soft: #333333;
+  /* Opposite move from the light theme (lighter, not darker) — see the
+     light block. Clears 5.8:1 against --muted-soft here. */
+  --muted-text: #b0b0b0;
   /* Same value as light for now (#681) — the point to adjust from if flat
      black at 45% is later found to read too heavy/light over the dark bg. */
   --scrim: rgb(0 0 0 / 45%);
@@ -146,6 +308,7 @@
   --scroll-track: rgb(255 255 255 / 7%);
   --scroll-thumb: rgb(255 255 255 / 25%);
   --scroll-thumb-hover: rgb(255 255 255 / 38%);
+  /* Dark-theme status pairs are declared once, above — see the light block. */
 }
 }
 
@@ -800,6 +963,19 @@ button.menu__option {
   color: var(--text);
 }
 
+/* The single accent moment on a stat tile — used sparingly (currently only
+   the "up" state of the HTS dashboard Status tile). Reuses the accent token
+   already tuned for AA contrast per theme, so no new palette values enter. */
+.stat__value--ok {
+  color: var(--accent-text);
+}
+
+.stat__unit {
+  font-size: 17px;
+  letter-spacing: -0.3px;
+  vertical-align: 12px;
+}
+
 .stat__sub {
   display: block;
   margin-top: 6px;
@@ -1186,6 +1362,51 @@ button.pill {
   max-width: 620px;
 }
 
+/* Accessible sr-only helper — hides the element visually while keeping it
+   in the accessibility tree. Referenced by row headings in the HTS
+   dashboard partial and by outcome/import announcements. Without this rule
+   those `<h2>`s would render at browser default size and break the
+   visual hierarchy. */
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* Progressive-enhancement utility (#843): hides an element that only works
+   once JavaScript has actually run. `theme.js` marks `<html class="js">`
+   from `<head>`, without `defer`, before first paint — so "js" here means
+   "the earliest script ran", not "JavaScript is enabled" the way `[hidden]`
+   above means "the server or a script says so".
+
+   Generic on purpose — no page or container it needs to sit inside: the
+   reveal rule below is `html.js .needs-js`, nothing narrower, so any page
+   that renders a `.needs-js` element can rely on it regardless of what
+   wraps that element. `display: flex` is this crate's one real use so far
+   (View Definitions' guided-form card, a flex column) — a future consumer
+   needing a different shown-state display overrides it with a selector at
+   least as specific as this one (or later in the same layer), the same way
+   `.editor__grid--stretch`'s own layout rules add flex-item properties
+   (`flex`, `min-height`, ...) on top of this pair without touching
+   `display` themselves. Not `!important` like `[hidden]` above: two
+   declarations of ordinary weight, `display: none` and `display: flex`,
+   let a more specific override win normally instead of requiring every
+   future consumer to out-`!important` this utility too. */
+.needs-js {
+  display: none;
+}
+
+html.js .needs-js {
+  display: flex;
+}
+
+
 .stat-grid--5 {
   grid-template-columns: repeat(5, 1fr);
 }
@@ -1349,6 +1570,15 @@ textarea.field__input {
   box-shadow: 0 0 0 3px var(--accent-soft);
 }
 
+.field__input[aria-invalid="true"] {
+  border-color: var(--danger);
+}
+
+.field__input[aria-invalid="true"]:focus {
+  border-color: var(--danger);
+  box-shadow: 0 0 0 3px var(--danger-soft);
+}
+
 /* The native dropdown arrow hugs the border regardless of padding, so draw
    our own chevron with the same inset the text gets. The muted gray reads on
    both themes. */
@@ -1388,6 +1618,10 @@ select.field__input {
 
 .spinner,
 .btn[aria-busy="true"]::after {
+  /* Explicit border-box (#786): the `*` reset does not match pseudo-elements,
+     and content-box would render the ::after ring at 18px — off center against
+     the -7px offsets below. */
+  box-sizing: border-box;
   width: 14px;
   height: 14px;
   border-radius: 50%;
@@ -1438,6 +1672,74 @@ select.field__input {
   margin: 0;
   font-size: 13px;
   color: var(--muted);
+}
+
+/* The Raw CapabilityStatement has one keyboard-focusable scroll owner. Every
+   nested outline and shared JSON fragment remains overflow-visible inside it. */
+#capability-json-body {
+  max-height: 70vh;
+  overflow: auto;
+  scrollbar-gutter: stable;
+  outline: none;
+}
+
+#capability-json-body:focus-visible {
+  border-radius: 8px;
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+
+.capability-json-outline {
+  padding: 10px 0;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+#capability-json-body .capability-json-outline {
+  max-height: none;
+  overflow: visible;
+}
+
+.capability-json-bracket,
+.capability-json-row {
+  min-height: 24px;
+  padding-right: 10px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.capability-json-bracket { padding-left: 12px; }
+.capability-json-rows { padding-left: 18px; }
+.capability-json-row { display: flex; align-items: baseline; gap: 6px; }
+.capability-json-row:hover { background: var(--input-bg); }
+.capability-json-row code { font: inherit; min-width: 0; }
+
+.capability-json-node > summary {
+  cursor: pointer;
+  list-style: none;
+}
+
+.capability-json-node > summary::-webkit-details-marker { display: none; }
+.capability-json-row__fold { flex: 0 0 18px; color: var(--muted); }
+.capability-json-node[open] > summary .capability-json-row__fold { transform: rotate(90deg); }
+.capability-json-node__body {
+  padding-left: 18px;
+  overflow: visible;
+}
+
+.capability-json-truncated {
+  color: var(--muted);
+  font-family: Figtree, ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  font-size: 11px;
+}
+
+.capability-json-pagination {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  padding: 10px;
+  font-family: Figtree, ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
 }
 
 /* Centered-popup variant of the addbox (the Bulk Import dialogs, #527): the
@@ -1502,13 +1804,18 @@ select.field__input {
 }
 
 .col-num {
-  text-align: right;
   font-variant-numeric: tabular-nums;
 }
 
-.col-actions {
+.data-table .col-actions {
   text-align: right;
   width: 64px;
+}
+
+/* A leading checkbox column (SQL Export's subjects table, #834): just wide
+   enough for the control, never stretching to carry column weight. */
+.data-table .col-check {
+  width: 32px;
 }
 
 .col-tenant {
@@ -1637,6 +1944,7 @@ select.field__input {
    defined twice and render their cascade-merge, which this preserves. */
 .tabs {
   display: flex;
+  flex-wrap: wrap;
   gap: 4px;
   margin-bottom: 16px;
   border-bottom: 1px solid var(--surface-border);
@@ -1778,6 +2086,71 @@ select.field__input {
   margin-bottom: 20px;
 }
 
+.page-head--back-link {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-areas:
+    "back-link ."
+    "copy action";
+  column-gap: 16px;
+  align-items: start;
+}
+
+.page-head--back-link > .back-link {
+  grid-area: back-link;
+  justify-self: start;
+}
+
+.page-head--back-link > .page-head__copy {
+  grid-area: copy;
+  min-width: 0;
+}
+
+/* Vertical-rhythm variant for detail-page headers with eyebrow + title +
+   optional lede + chips + kv-grid (HTS CodeSystem / ValueSet / ConceptMap).
+   HFS pages with simpler title+lede keep the base `.page-head__copy`. */
+.page-head__copy--spaced {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.page-head__copy--spaced > .page-head__title {
+  margin-bottom: 0; /* gap handles spacing */
+}
+.page-head__copy--spaced > .facets--bare {
+  padding-bottom: 6px; /* reduce from 12px; gap adds rest */
+}
+.page-head__copy--spaced > .kv-grid {
+  margin-bottom: 0; /* final child; no trailing margin needed */
+}
+
+.page-head--back-link > .page-head__action {
+  grid-area: action;
+  min-width: 0;
+  align-self: start;
+}
+
+/* #835: the job detail header's status row (status chip, contextual
+   action, overflow) — a peer of .job-card__actions, right-aligned like it. */
+.page-head__action {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 10px;
+}
+
+/* #835: the job detail's own vertical rhythm for the notice/progress/cards
+   region. That content lives inside #job-detail, a descendant of .content
+   rather than a direct child of it, so the site-wide
+   .content > .card ~ .card spacing rule ("Stacked section cards keep the
+   page's vertical rhythm", further down this file) never reaches it. */
+.job-detail-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 24px;
+}
+
 .page-head__title {
   margin: 0 0 4px;
   font-size: 24px;
@@ -1793,6 +2166,11 @@ select.field__input {
 
 .back-link,
 .back-link:visited {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  margin-bottom: 24px;
+  font-size: 13px;
   color: var(--accent-text);
   text-decoration: none;
 }
@@ -2246,6 +2624,45 @@ select.field__input {
   border: 1px solid var(--warn);
 }
 
+/* The HTS OperationOutcome box (`crates/hts-ui/templates/partials/
+   hts-outcome.html`, #805). It is a `.notice` whose body is a stack of
+   `<p>` rows, which the primitive alone cannot spell: HFS's own notices
+   put bare text in the box, so `.notice` carries no paragraph reset and
+   the UA's `margin: 1em 0` pushed the first line ~13px below a box padded
+   for 10px. Scope the rhythm here rather than touching `.notice`, which is
+   shared with every HFS warning surface. */
+.hts-outcome > * {
+  margin: 0;
+}
+
+.hts-outcome > * + * {
+  margin-top: 6px;
+}
+
+/* The box follows result content — the `$validate-code` field grid is
+   pinned flush on the assumption it is the panel's last child. The margin
+   collapses against a preceding notice's 16px, so stacked warnings stay
+   16px apart rather than 30. */
+.hts-outcome:not(:first-child) {
+  margin-top: 14px;
+}
+
+/* Last child of a `.panel` / `.card`: the container's 18px padding is the
+   gap, and the primitive's 16px on top of it reads as a doubled band. */
+.hts-outcome:last-child {
+  margin-bottom: 0;
+}
+
+/* FHIRPath locations. Previously borrowed `.filter-rail__list`, the
+   scrolling type-rail container, which indented them 40px (its rules never
+   touch the UA list padding) inside a needless scroll region. */
+.hts-outcome__locations {
+  display: grid;
+  gap: 2px;
+  padding-left: 0;
+  list-style: none;
+}
+
 /* 280px matches .nav-panel and .queries-layout's rail column (#603 follow-up):
    one rail width across Resources, Search, Saved Queries, and Search
    Parameters. */
@@ -2341,6 +2758,13 @@ select.field__input {
 .filter-rail__heading--group {
   color: var(--text);
   font-weight: 700;
+}
+
+/* The Recently used heading sits inside its group, so the group's 2px item
+   gap is all that separates it from the first entry; the All Types heading
+   is a rail child and gets the rail's 10px. Top up to the same 10px (#785). */
+.filter-rail__group > .filter-rail__heading--group {
+  margin-bottom: 8px;
 }
 
 /* Between the Recently used group and the general list. Hidden by default —
@@ -2447,8 +2871,35 @@ select.field__input {
   margin-top: 12px;
 }
 
-.json-editor--short {
-  min-height: 120px;
+/* The "nothing to export yet" card's actions (SQL Export, #834): left-aligned
+   like the rest of that card's body copy, not trailing off to the right. */
+.form-actions--start {
+  justify-content: flex-start;
+}
+
+/* Shared labelled-value compositions. The flush modifier sets the value that
+   the existing key/value grid consumes in the later page layer, so component
+   ownership does not depend on !important or layer-breaking specificity. */
+:where(.detail__field) {
+  min-width: 0;
+}
+
+:where(.detail__field) > div {
+  overflow-wrap: anywhere;
+}
+
+.detail-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.detail-stack > .form-actions {
+  margin-top: 0;
+}
+
+.kv-grid--flush {
+  --kv-grid-margin-bottom: 0;
 }
 
 .json-editor:focus {
@@ -2458,7 +2909,11 @@ select.field__input {
 }
 
 /* The collapsible JSON fold's summary rides .card-head; the chevron flips
-   when the fold opens, like the app's other disclosures. */
+   when the fold opens, like the app's other disclosures. #839 retired
+   `sql-library.html`'s own `.json-fold` (the SQL pane's JSON pane), but the
+   class is still load-bearing for the CapabilityStatement raw-JSON card
+   (`crates/ui-chrome/templates/partials/capability-raw-card.html`), so the
+   rule stays. */
 details.json-fold > summary {
   cursor: pointer;
   list-style: none;
@@ -2490,9 +2945,9 @@ details.json-fold[open] > summary .icon {
   font-variant-numeric: tabular-nums;
 }
 
-/* Appended to <body> and positioned from the focused/hovered rail item so the
-   full label is not clipped by the rail's scrolling overflow. One shared
-   tooltip serves both the main list and cloneNode()-based Recent items. */
+/* Appended to <body> and positioned from the focused/hovered truncated-name
+   item so the full label is not clipped by rail or grid overflow. One shared
+   tooltip serves rails, cloneNode()-based Recent items, and Bulk Export. */
 .filter-rail__tooltip {
   position: fixed;
   z-index: 1000;
@@ -2529,6 +2984,29 @@ details.json-fold[open] > summary .icon {
   gap: 14px;
   min-width: 0;
 }
+
+/* HTS Phase-5 filter-rail field group: label above a row of
+   mode-select + text-input. Input skin comes from
+   `.builder-row__value` / `.builder-row__modifier`; rules below
+   only handle the stacked layout and the sticky action row. */
+.filter-rail__field { display: flex; flex-direction: column; gap: 4px; padding: 0 4px; }
+.filter-rail__field-label { margin: 0 2px; font-size: 11px; font-weight: 600; color: var(--muted); }
+.filter-rail__field-row { display: flex; gap: 6px; align-items: center; }
+.filter-rail__field-row .builder-row__value { flex: 1; min-width: 0; }
+.filter-rail__actions {
+  display: flex; gap: 8px; padding: 10px 4px 0; margin-top: 4px;
+  border-top: 1px solid var(--surface-border);
+}
+/* HTS browsers: bound Name column so long computer-friendly names
+   (`hl7.terminology.r4.CodeSystem-*`) don't crowd Title. */
+.data-table .col-name { max-width: 240px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* HTS ConceptMap stacked source/target cell (Phase-5 §7.5 Gate 1):
+   two vertically-stacked lines with a monospace `S:` / `T:` prefix
+   so the mapping direction stays scannable in-row. */
+.cm-mapping { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.cm-mapping__line { display: flex; gap: 6px; align-items: baseline; min-width: 0; }
+.cm-mapping__prefix { font-size: 11px; font-weight: 600; color: var(--muted); flex: none; }
+.cm-mapping__line .url { min-width: 0; }
 
 /* Facet chip rows */
 
@@ -2583,6 +3061,18 @@ details.json-fold[open] > summary .icon {
   font-variant-numeric: tabular-nums;
 }
 
+/* A native radio/checkbox carries a UA margin that .chip's
+   align-items: center centers by margin box, not visible box — the
+   control lands a couple of px below the chip's vertical center (#804).
+   Same reset .choice-card already applies to its radios. */
+.chip input[type="radio"],
+.chip input[type="checkbox"] {
+  width: 16px;
+  height: 16px;
+  margin: 0;
+  accent-color: var(--accent);
+}
+
 /* Data table */
 
 .table-wrap {
@@ -2610,6 +3100,7 @@ details.json-fold[open] > summary .icon {
   padding: 9px 14px;
   border-bottom: 1px solid var(--surface-border);
   color: var(--text);
+  text-align: left;
   vertical-align: top;
 }
 
@@ -2617,7 +3108,7 @@ details.json-fold[open] > summary .icon {
   border-bottom: 0;
 }
 
-.data-table__empty td,
+.data-table .data-table__empty td,
 .empty-state {
   margin: 0;
   color: var(--muted);
@@ -2626,8 +3117,16 @@ details.json-fold[open] > summary .icon {
 }
 
 
+/* Merge of two independent intents, 2026-08-28:
+   - main excluded the empty-state row from hover highlighting, so "no
+     results" no longer lights up under the cursor;
+   - this branch added `aria-current`, the convention every other selected
+     element in this file already uses (.chip, .tab, .nav-item,
+     .filter-rail__item), so a selected row paints like everything else.
+   They touch different selectors in the same list; both are kept. */
 .data-table tbody tr:not(.data-table__empty):hover td,
-.data-table tbody tr[aria-selected="true"] td {
+.data-table tbody tr[aria-selected="true"] td,
+.data-table tbody tr[aria-current="true"] td {
   background: var(--accent-soft);
 }
 
@@ -2712,7 +3211,8 @@ details.json-fold[open] > summary .icon {
 }
 
 .tag--stored,
-.tag--member {
+.tag--member,
+.tag--matched {
   background: var(--ok-soft);
   color: var(--ok);
 }
@@ -2730,22 +3230,97 @@ details.json-fold[open] > summary .icon {
   color: var(--danger);
 }
 
-/* Subscription states (#580): the cards and the STATUS column share this
-   vocabulary — active delivers, idle has no listeners, error needs attention. */
+/* FHIR publication-status tags (HTS browsers + resource detail headers).
+   Distinct from the .tag--stored/config/conflict family: those describe
+   configuration/lint outcomes, these describe a resource's own status. */
 .tag--active {
   background: var(--ok-soft);
   color: var(--ok);
 }
 
-.tag--idle,
-.tag--requested {
+.tag--draft {
   background: var(--warn-soft);
   color: var(--warn);
 }
 
-.tag--error {
-  background: var(--danger-soft);
-  color: var(--danger);
+.tag--retired {
+  background: var(--input-bg);
+  border: 1px solid var(--surface-border);
+  color: var(--muted);
+}
+
+.tag--unknown {
+  background: var(--input-bg);
+  border: 1px solid var(--surface-border);
+  color: var(--muted);
+}
+
+/* Subscription states (#580, reshaped to the frame in #767): the cards and
+   the STATUS column share a dot vocabulary — green delivers, amber has no
+   listeners, red needs attention. */
+.status-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  margin-right: 7px;
+  border-radius: 50%;
+  vertical-align: baseline;
+}
+
+.status-dot--ok {
+  background: var(--ok);
+}
+
+.status-dot--danger {
+  background: var(--danger);
+}
+
+.status-dot--warn {
+  background: var(--warn);
+}
+
+.status-dot--muted {
+  background: var(--muted);
+}
+
+/* A failing row carries the frame's red left edge. */
+.data-table tr.row--alert > td:first-child {
+  box-shadow: inset 3px 0 0 var(--danger);
+}
+
+/* The Last 24 hrs sparkline (#782): the engine's half-hour delivery series,
+   scaled server-side; color follows the row's state — the frame's dotted
+   amber marks a listener-less websocket. */
+.spark {
+  display: block;
+  width: 120px;
+  height: 24px;
+}
+
+.spark__line {
+  fill: none;
+  stroke: var(--muted);
+  stroke-width: 1.5;
+  stroke-linejoin: round;
+  stroke-linecap: round;
+}
+
+.spark--active .spark__line {
+  stroke: var(--ok);
+}
+
+.spark--error .spark__line {
+  stroke: var(--danger);
+}
+
+.spark--idle .spark__line {
+  stroke: var(--warn);
+  stroke-dasharray: 2 3;
+}
+
+.spark--requested .spark__line,
+.spark--off .spark__line {
+  stroke: var(--muted);
 }
 
 /* Bulk Export job states (#537) — the same status-pill vocabulary. */
@@ -2765,8 +3340,8 @@ details.json-fold[open] > summary .icon {
 }
 
 .tag--cancelled {
-  background: var(--accent-soft);
-  color: var(--muted);
+  background: var(--muted-soft);
+  color: var(--muted-text);
 }
 
 .subs-sort summary.btn {
@@ -2776,12 +3351,90 @@ details.json-fold[open] > summary .icon {
 .subs-sort summary.btn::-webkit-details-marker {
   display: none;
 }
+
+.subs-sort__label {
+  color: var(--muted);
+  font-size: 9px;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+.subs-sort__chevron {
+  transition: transform 120ms ease;
+}
+
+.subs-sort[open] .subs-sort__chevron {
+  transform: rotate(180deg);
+}
 }
 
 @layer pages {
+/* SQL Queries / SQL Views title row (#839): the selected Library's type
+   icon and its two chips (type, status) sit inline with its name inside
+   `.page-head__title` — no other page nests an icon or a chip in this
+   heading class, so the flex/gap treatment `.card-head h3` already gives
+   its own inline icon is scoped here as a modifier instead of changing the
+   shared rule every other page's title also uses. */
+.page-head__title--kind {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
 /* Bulk Import detail: consistent rhythm between its non-empty cards. */
 .bulk-import-section {
   margin-bottom: 16px;
+}
+
+/* The processing card's Abort row: .detail__actions carries a 10px bottom
+   margin that doubled up with the card padding (#789). */
+#bulk-status .detail__actions {
+  margin-bottom: 0;
+}
+
+/* The processing card's progress bar. Determinate when the recipient
+   reports a percentage; indeterminate (sweeping) while only the entry
+   counter moves. */
+.progress-track {
+  overflow: hidden;
+  position: relative;
+  height: 6px;
+  margin: 8px 0 6px;
+  border-radius: 999px;
+  background: var(--accent-soft);
+}
+
+.progress-fill {
+  height: 100%;
+  border-radius: 999px;
+  background: var(--accent);
+  transition: width 400ms ease;
+}
+
+.progress-track--indeterminate .progress-fill {
+  position: absolute;
+  width: 30%;
+  animation: progress-sweep 1.6s ease-in-out infinite;
+}
+
+@keyframes progress-sweep {
+  0% {
+    left: -30%;
+  }
+
+  100% {
+    left: 100%;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .progress-track--indeterminate .progress-fill {
+    animation: none;
+    left: 0;
+    width: 100%;
+    opacity: 0.5;
+  }
 }
 
 .bulk-import-summary-card {
@@ -2789,10 +3442,6 @@ details.json-fold[open] > summary .icon {
   grid-template-columns: minmax(0, 1fr) auto;
   gap: 18px 24px;
   align-items: start;
-}
-
-.bulk-import-summary-card > .kv-grid {
-  margin-bottom: 0;
 }
 
 .bulk-import-summary__actions {
@@ -2805,142 +3454,57 @@ details.json-fold[open] > summary .icon {
 }
 
 .bulk-import-summary__actions > form,
-.bulk-import-summary__actions > details,
-.bulk-import-manifest-row > form,
-.bulk-import-manifest-menu__panel form {
+.bulk-import-summary__actions > details {
   margin: 0;
 }
 
-.bulk-import-manifests-card {
-  padding-top: 20px;
-  overflow: visible;
-  border-top: 1px solid var(--surface-border);
+/* Advanced-options fold in the create dialog: a native disclosure whose
+   chevron flips while open, matching the sort menus' affordance. */
+.disclosure {
+  margin: 14px 0;
 }
 
-.bulk-import-manifests-card .toolbar {
-  justify-content: space-between;
-}
-
-.bulk-import-sort__label {
-  color: var(--muted);
-  font-size: 9px;
-  letter-spacing: 0.05em;
-  text-transform: uppercase;
-}
-
-.bulk-import-sort__chevron {
-  transition: transform 120ms ease;
-}
-
-.bulk-import-sort[open] .bulk-import-sort__chevron {
-  transform: rotate(180deg);
-}
-
-.bulk-import-manifest-list {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
+/* #806: the HTS folds adopting this pattern sit directly in a `.panel`,
+   usually as the card's only child. `.panel`'s own 18px padding already
+   spaces them, and a panel is a plain block — so the margin above cannot
+   collapse into anything and would simply make every collapsed card 28px
+   taller. The dialog folds this pattern was written for are not in a
+   `.panel`, so they keep the default. */
+.panel > .disclosure {
   margin: 0;
-  padding: 0;
-  list-style: none;
 }
 
-.bulk-import-manifest-row {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto 30px;
+.disclosure__summary {
+  display: inline-flex;
   align-items: center;
-  gap: 10px;
-  min-width: 0;
-  padding: 10px 12px;
-  border: 1px solid var(--surface-border);
-  border-radius: 12px;
-  background: var(--surface);
-}
-
-.bulk-import-manifest-row__url {
-  min-width: 0;
-  overflow: hidden;
-  color: var(--text);
-  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  gap: 6px;
+  color: var(--muted);
   font-size: 13px;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.bulk-import-manifest-menu {
-  position: relative;
-}
-
-.bulk-import-manifest-menu > summary {
+  cursor: pointer;
   list-style: none;
 }
 
-.bulk-import-manifest-menu > summary::-webkit-details-marker {
+.disclosure__summary::-webkit-details-marker {
   display: none;
 }
 
-.bulk-import-manifest-menu__trigger {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 30px;
-  height: 30px;
-  padding: 0;
-  border: 0;
-  border-radius: 9px;
-  background: transparent;
-  color: var(--muted);
-  cursor: pointer;
-}
-
-.bulk-import-manifest-menu__trigger:hover,
-.bulk-import-manifest-menu__trigger:focus-visible {
-  background: var(--accent-soft);
+.disclosure__summary:hover {
   color: var(--text);
 }
 
-.bulk-import-manifest-menu__trigger:focus-visible {
-  outline: 2px solid var(--accent);
-  outline-offset: 2px;
+.disclosure__chevron {
+  transition: transform 120ms ease;
 }
 
-.bulk-import-manifest-menu__panel {
-  position: absolute;
-  z-index: 30;
-  top: calc(100% + 6px);
-  right: 0;
-  width: 150px;
-  padding: 6px;
-  border: 1px solid var(--surface-border);
-  border-radius: 10px;
-  background: var(--surface);
-  box-shadow: var(--surface-shadow);
+.disclosure[open] .disclosure__chevron {
+  transform: rotate(180deg);
 }
 
-.bulk-import-manifest-menu__item {
-  width: 100%;
-  padding: 8px 10px;
-  border: 0;
-  border-radius: 7px;
-  background: transparent;
-  color: var(--text);
-  font: inherit;
-  font-size: 13px;
-  text-align: left;
-  cursor: pointer;
+.disclosure__body {
+  padding-top: 8px;
 }
 
-.bulk-import-manifest-menu__item:hover:not(:disabled) {
-  background: var(--accent-soft);
-}
-
-.bulk-import-manifest-menu__item--danger {
-  color: var(--danger);
-}
-
-.bulk-import-section button:disabled,
-.page-head [data-bulk-import-add-manifest]:disabled,
-.bulk-import-manifest-menu__item:disabled {
+.bulk-import-section button:disabled {
   cursor: not-allowed;
   opacity: 0.45;
 }
@@ -2964,11 +3528,6 @@ details.json-fold[open] > summary .icon {
     gap: 7px;
     padding: 8px;
   }
-}
-
-/* Status cards have no actions or content after their sole grid. */
-#bulk-status.bulk-import-section > .kv-grid:only-child {
-  margin-bottom: 0;
 }
 
 /* Detail panel (right rail on the SearchParameter viewer) */
@@ -3008,6 +3567,22 @@ details.json-fold[open] > summary .icon {
 }
 
 .bulk-export-form:has(input[name="scope"][value="group"]:checked) .field--group-id {
+  display: block;
+}
+
+/* HTS CodeSystem $validate-code: show only the fields for the selected
+   input mode (#804), same CSS-only reveal idiom as the Bulk Export scope
+   field above. Browsers without :has() keep both halves visible — today's
+   (buggy) fallback behavior. */
+#hts-workbench-input .validate-mode-panel--coding {
+  display: none;
+}
+
+#hts-workbench-input:has(input[name="mode"][value="coding"]:checked) .validate-mode-panel--code {
+  display: none;
+}
+
+#hts-workbench-input:has(input[name="mode"][value="coding"]:checked) .validate-mode-panel--coding {
   display: block;
 }
 
@@ -3183,6 +3758,17 @@ details.json-fold[open] > summary .icon {
   gap: 5px;
 }
 
+/* #835: the job detail's Job card Subjects field — a `.tag--type` pill per
+   subject holding only the kind, its display name running on as plain text
+   right after (not inside the pill, unlike .detail__tags' own single-node
+   pills), so the two flow and wrap together like ordinary inline content. */
+.job-detail__subjects {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
 .detail__code {
   margin: 0;
   padding: 10px 12px;
@@ -3253,7 +3839,8 @@ details.json-fold[open] > summary .icon {
 /* Compartment viewer: tabs, members, tester. The .tabs / .tab primitives are
    defined once, with the history feed switcher. */
 
-.tab[aria-current="true"] {
+.tab[aria-current="true"],
+.tab[aria-current="page"] {
   background: var(--accent-soft);
   color: var(--text-strong);
 }
@@ -3266,7 +3853,7 @@ details.json-fold[open] > summary .icon {
   display: grid;
   grid-template-columns: 1fr 1fr;
   gap: 14px 18px;
-  margin-bottom: 14px;
+  margin-bottom: var(--kv-grid-margin-bottom, 14px);
 }
 
 .detail__field--wide {
@@ -3909,6 +4496,91 @@ details.json-fold[open] > summary .icon {
   overflow: hidden;
 }
 
+/* View Definitions' editor + guided-form pairing (#843): the two cards grow
+   together, stretching to whichever is taller, capped at 70vh — beyond that,
+   each scrolls inside its own content area instead of growing the row.
+   `.editor__grid` alone (the Resource Editor's layout, above) does not do
+   this: each of its panes caps itself independently at 70vh (`.editor-tree`,
+   `.json-view`, below) with nothing requiring the two to match. A flex row
+   rather than a second grid template: hiding the guided-form card without
+   JavaScript (`needs-js`) then leaves the editor card alone to fill the
+   whole row, with no empty second track to collapse by hand. */
+.editor__grid--stretch {
+  display: flex;
+  align-items: stretch;
+  gap: 16px;
+  max-height: 70vh;
+}
+
+/* `display` lives in its own rule, scoped `:not(.needs-js)`: layer order
+   beats specificity in the cascade, so a `display` declared anywhere in
+   this `pages` layer would otherwise always win over `.needs-js`'s
+   `display: none` in the earlier `components` layer, `html.js` or not, if
+   this selector also matched the guided-form card — undoing the whole
+   point of that utility. `html.js .needs-js` (also `components`, specific
+   enough to win there) already resolves the guided-form card's own
+   `display: flex` generically; every other box-model property below is
+   identical for both cards and safe to share, since they do nothing to an
+   element `display: none` has already taken out of layout. */
+.editor__grid--stretch > .card:not(.needs-js) {
+  display: flex;
+}
+
+.editor__grid--stretch > .card,
+.editor__grid--stretch > .needs-js {
+  flex: 1 1 0;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 320px;
+  overflow: hidden;
+}
+
+/* The editor card's own scrolling area is whichever of the two the browser
+   actually mounted: CodeMirror's wrapper (`.code-editor`) normally, or the
+   plain `<textarea>` it replaces when the bundle never mounted.
+   Only `flex` lives here for the CodeMirror wrapper: the matching
+   `min-height`/`max-height` override that actually lets it grow past its
+   own 320px/70vh clamp to fill the stretch row lives beside the unlayered
+   rule it overrides, further down this file — a layered override of an
+   unlayered declaration always loses regardless of specificity (see that
+   section's own header comment), so `max-height: none` written here would
+   silently do nothing. The textarea fallback's own `flex: 1` moved down to
+   sit there too (`design-system.spec.ts`'s "no selector twice" guard does
+   not treat `@layer` as licensing a second definition of the same selector,
+   deliberately — a repeat is a repeat regardless of which cascade layer it
+   lives in) — with nothing here it would otherwise need to beat, `flex`
+   loses nothing by living unlayered alongside `max-height: none` instead of
+   splitting the one selector across two blocks. */
+.editor__grid--stretch #vd-editor-form {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.editor__grid--stretch .code-editor {
+  flex: 1;
+  min-height: 0;
+}
+
+/* The guided-form card: header, legend, and validity chip stay put; the row
+   tree (or, mid-edit, the invalid-JSON notice) becomes the scrolling area. */
+.editor__grid--stretch .editor-form .editor-tree,
+.editor__grid--stretch .editor-form .alert {
+  flex: 1;
+  min-height: 0;
+  max-height: none;
+  overflow-y: auto;
+}
+
+/* `#editor-form` (`editor-hidden-form.html`) carries only hidden `<input>`s
+   — nothing to show — but as a bare `<form>` it is still a block box; inside
+   a stretch row it would otherwise get `align-items: stretch`'s full row
+   height as empty, gap-widening space between the two cards. */
+#editor-form {
+  display: none;
+}
+
 .card-head {
   display: flex;
   align-items: center;
@@ -3967,6 +4639,13 @@ details.json-fold[open] > summary .icon {
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   font-size: 12px;
   line-height: 1.6;
+}
+
+/* The CapabilityStatement owns the only scroll container for its incremental
+   tree. Keep bounded scalar fragments from creating nested 70vh scrollers. */
+#capability-json-body .json-view {
+  max-height: none;
+  overflow: visible;
 }
 
 /* Form ↔ JSON cross-highlight (editor-sync.js): hovering or focusing a form
@@ -5254,8 +5933,146 @@ details.json-fold[open] > summary .icon {
   margin-right: auto;
 }
 
+/* The subjects table's toolbar (SQL Export builder, #834): the type switch
+   and filter box beside "Subjects". Rendered `hidden` until the filter/
+   switch/select-all enhancement reveals it — a no-JavaScript client never
+   sees this row at all. `flex-wrap` keeps the switch and the filter box from
+   forcing horizontal overflow once revealed on a narrow viewport. */
+.card-head__tools--subjects {
+  flex-wrap: wrap;
+  gap: 10px;
+  align-items: center;
+}
+
+.card-head__tools--subjects .field__input {
+  width: 220px;
+}
+
 }
 @layer components {
+/* Shared HTMX-backed multi-select combobox (#655). Domain-specific search and
+   result rendering stay in each caller; this block owns the reusable control. */
+.combobox {
+  position: relative;
+  min-inline-size: 0;
+  padding: 0;
+  border: 0;
+}
+
+.combobox__enhancement {
+  position: relative;
+}
+
+.combobox__selections {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+
+.combobox__control {
+  position: relative;
+}
+
+.combobox__search-icon {
+  position: absolute;
+  z-index: 1;
+  top: 50%;
+  left: 12px;
+  width: 16px;
+  height: 16px;
+  color: var(--muted);
+  pointer-events: none;
+  transform: translateY(-50%);
+}
+
+.combobox__search-icon svg {
+  width: 100%;
+  height: 100%;
+}
+
+.combobox__input {
+  padding-left: 38px;
+}
+
+.combobox__listbox {
+  position: absolute;
+  z-index: 10;
+  top: calc(100% + 4px);
+  right: 0;
+  left: 0;
+  max-height: 280px;
+  padding: 5px;
+  overflow-y: auto;
+  border: 1px solid var(--surface-border);
+  border-radius: 10px;
+  background: var(--surface);
+  box-shadow: 0 12px 30px rgb(0 0 0 / 12%);
+}
+
+.combobox__message:not([hidden]) {
+  display: block;
+}
+
+.combobox__option {
+  display: block;
+  width: 100%;
+  padding: 9px 10px;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.combobox__option:hover,
+.combobox__option--active {
+  background: var(--accent-soft);
+  color: var(--text-strong);
+}
+
+.combobox__option[aria-selected="true"] {
+  color: var(--muted);
+}
+
+.combobox__chip {
+  gap: 4px;
+  max-width: 100%;
+  padding-right: 2px;
+}
+
+.combobox__chip-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.combobox__remove {
+  display: inline-grid;
+  flex: none;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  font-size: 18px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.combobox__remove:hover,
+.combobox__remove:focus-visible {
+  background: var(--accent-soft);
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
 /* Addbox close affordances (#545). */
 .addbox__head {
   display: flex;
@@ -5333,10 +6150,19 @@ details.json-fold[open] > summary .icon {
 @layer pages {
 /* Bulk Export (#537): the resource-type checkbox grid. Its job-status chips
    are .tag variants — one status-pill vocabulary, not a second chip family. */
+.bulk-export-form .combobox--scope-patient {
+  display: none;
+}
+
+.bulk-export-form:has(input[name="scope"][value="patient"]:checked) .combobox--scope-patient {
+  display: block;
+}
+
 .typegrid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
   gap: 6px 18px;
+  margin-top: 8px;
   padding: 6px 0;
 }
 
@@ -5345,6 +6171,22 @@ details.json-fold[open] > summary .icon {
   display: flex;
   gap: 8px;
   align-items: center;
+  min-width: 0;
+}
+
+.typegrid__item > input {
+  flex: none;
+}
+
+/* Resource names share the rail's clipped-name tooltip. Keep their text
+   inside its grid track instead of allowing a long flex item to overlap the
+   next column (#793). */
+.typegrid__label {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 /* ---- Bulk Export against the Figma frame (#735) ---------------------- */
@@ -5424,7 +6266,11 @@ details.json-fold[open] > summary .icon {
   color: var(--muted);
 }
 
-/* ---- Active Exports job cards (#735) --------------------------------- */
+/* ---- Exports builder and job cards (#735, #795, #832) ---------------- */
+
+[data-bulk-export-name-heading] {
+  overflow-wrap: anywhere;
+}
 
 .job-card {
   padding: 14px;
@@ -5438,16 +6284,62 @@ details.json-fold[open] > summary .icon {
 }
 
 .job-card__name {
+  min-width: 0;
   margin: 0;
   font-size: 15px;
   font-weight: 600;
   color: var(--text-strong);
+  overflow-wrap: anywhere;
+}
+
+/* #835: the card title links to the job's own detail page. */
+.job-card__name a {
+  color: inherit;
+  text-decoration: none;
+}
+
+.job-card__name a:hover {
+  text-decoration: underline;
 }
 
 .job-card__actions {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
+  justify-content: flex-end;
   gap: 10px;
+}
+
+.job-card__delete {
+  position: relative;
+}
+
+.job-card__delete > summary {
+  list-style: none;
+}
+
+.job-card__delete > summary::-webkit-details-marker {
+  display: none;
+}
+
+.job-card__delete-confirm {
+  position: absolute;
+  z-index: var(--z-dialog-panel);
+  top: calc(100% + 8px);
+  right: 0;
+  width: min(320px, calc(100vw - 32px));
+  padding: 12px;
+  color: var(--text);
+}
+
+.job-card__delete-confirm p {
+  margin: 0 0 10px;
+}
+
+.job-card__delete-confirm form {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
 }
 
 .progress {
@@ -5468,9 +6360,12 @@ details.json-fold[open] > summary .icon {
   background: var(--ok);
 }
 
-.progress--failed .progress__bar,
-.progress--cancelled .progress__bar {
+.progress--failed .progress__bar {
   background: var(--danger);
+}
+
+.progress--cancelled .progress__bar {
+  background: var(--muted);
 }
 
 .job-card__meta {
@@ -5501,6 +6396,13 @@ details.json-fold[open] > summary .icon {
 .job-card__files a:hover {
   border-color: var(--accent);
   background: var(--accent-soft);
+}
+
+/* #835: the Output files table's Files column reuses .job-card__files for
+   its download pills, but as a table cell's sole content — the top margin
+   above assumes trailing a .job-card__meta paragraph, which isn't there. */
+.data-table .job-card__files {
+  margin-top: 0;
 }
 }
 
@@ -5587,4 +6489,357 @@ body.app-shell .pane {
     overflow: visible;
   }
 }
+}
+
+/* ---------------------------------------------------------------------------
+   Shared CodeMirror 6 chrome (#838, generalized out of #753's
+   original ViewDefinition-only rules): the wrapper layout, focus treatment,
+   and the async server lint's underline/gutter/tooltip colors
+   that every CodeMirror mount in this crate shares, for the `.code-editor`
+   wrapper `code-editor.js`'s `HfsCodeEditor.mount` inserts before the
+   source textarea it replaces. Deliberately OUTSIDE the `tokens, base,
+   components, pages` layer system above: CodeMirror mounts its own
+   `<style>` via `StyleModule.mount` at runtime, and that stylesheet is
+   unlayered. Per the CSS Cascade Layers spec, *any* unlayered declaration
+   always beats *every* layered one, regardless of selector specificity — so
+   a `.cm-editor` override written inside `@layer components` would silently
+   lose to CodeMirror's own defaults no matter how many classes it stacked.
+   Living here, unlayered, is what lets these rules actually override the
+   library's baseTheme (the focus outline in particular) without
+   `!important`, which the rest of this file deliberately avoids (see the
+   `.kv-grid--flush` comment above). Only the CodeMirror-facing rules need
+   this; everything about `.code-editor__source--mounted` (the hidden
+   textarea) is ordinary layout, but it lives in this same unlayered block
+   for one clear read.
+
+   What is deliberately NOT here: sizing (min/max-height) and token colors.
+   Those are per editor — `.vd-editor` below sets its own heights and
+   `.cmt-json-*`/`.cmt-fp-*` colors; `.sql-editor` does the
+   same for its own tokens — because different editors in this crate need
+   different heights and color palettes even though they share every other
+   rule below. */
+
+.code-editor {
+  width: 100%;
+}
+
+.code-editor .cm-editor {
+  border: 1px solid var(--surface-border);
+  border-radius: 10px;
+  background: var(--input-bg, var(--surface));
+}
+
+.code-editor .cm-editor.cm-focused {
+  /* Same focus treatment as .json-editor:focus, the textarea this replaces. */
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+
+.code-editor .cm-scroller {
+  overflow: auto;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.code-editor .cm-content {
+  color: var(--text);
+  padding: 12px 0;
+}
+
+.code-editor .cm-gutters {
+  background: transparent;
+  color: var(--muted);
+  border-right: 1px solid var(--surface-border);
+}
+
+.code-editor .cm-activeLine,
+.code-editor .cm-activeLineGutter {
+  background: var(--accent-soft);
+}
+
+.code-editor .cm-selectionBackground {
+  background: var(--accent-soft);
+}
+
+/* Row -> editor cross-highlight (#843, vd-editor.js): a CodeMirror line
+   decoration (its own `cm-line` wrapper gains this class alongside), the
+   same `--accent-soft` wash `.json-line--hit`/`.editor-row--hit` below use
+   for the Resource Editor's own JSON<->form link — View Definitions' JSON
+   pane is CodeMirror, with no server-rendered `.json-line[data-jpath]` to
+   paint instead. */
+.code-editor .cm-line--hit {
+  background: var(--accent-soft);
+}
+
+/* drawSelection()'s caret defaults to a fixed black border-left (CM6's
+   unthemed base — its `&dark` variant never applies here, see the tooltip
+   comment below), invisible over a dark `--input-bg`. Tying it to the
+   theme's own text color keeps it visible, and exactly matching, in both
+   themes without depending on CodeMirror's internal light/dark state. */
+.code-editor .cm-cursor {
+  border-left-color: var(--text);
+}
+
+.code-editor .cm-matchingBracket {
+  background: var(--accent-soft);
+  outline: 1px solid var(--accent);
+  border-radius: 2px;
+}
+
+/* bracketMatching()'s unmatched-bracket indicator (gate feedback: the
+   muddy, hardcoded box sitting right on top of an unclosed `(` in a
+   FHIRPath expression, exactly where the async lint's own squiggly
+   underline already marks the same error). CM6's only rule for it is
+   `&.cm-focused .cm-nonmatchingBracket{backgroundColor:"#bb555544"}` —
+   unthemed (fires regardless of light/dark), ignoring this app's palette
+   entirely, and redundant once a lint diagnostic already covers the same
+   span with its own (themed) underline. Cleared rather than recolored: the
+   squiggle alone (pure text-decoration) already reads as the single,
+   clean "VSCode-like" error indicator. Selector matches CM6's own
+   `.cm-editor.cm-focused .cm-nonmatchingBracket` compound one extra class
+   over - a plain `.code-editor .cm-nonmatchingBracket` ties CM6's
+   specificity and loses, since its <style> mounts (and so cascades) after
+   this sheet. */
+.code-editor .cm-editor.cm-focused .cm-nonmatchingBracket {
+  background-color: transparent;
+}
+
+/* Lint hover tooltip chrome (#753): @codemirror/lint's own
+   `.cm-tooltip` styling only exists under an internal `&light`/`&dark`
+   state — set once, globally, from whether any loaded theme extension
+   opted into `EditorView.darkTheme`, which no mount in this crate ever
+   does (the browser only knows syntax, not which app theme is active).
+   CodeMirror therefore always renders its `&light` variant, a hardcoded
+   `#f5f5f5`/`#bbb` box, while the tooltip's *text* still inherits this
+   page's real `--text` — white-on-`#f5f5f5` in dark, and a box that
+   matches neither surface in light. Recolored here as an ordinary app
+   popover instead: the same surface/border/radius/shadow recipe
+   `.menu__panel` already uses, so it reads as this UI's own chrome, not a
+   library default. (The bottom `cm-panel-lint` diagnostics panel is left
+   alone: nothing in the ViewDefinition editor's keymap can open it — no
+   `lintKeymap` is wired in `vd-editor.js` — so it is unreachable, not just
+   unstyled.) */
+.code-editor .cm-tooltip {
+  background: var(--surface);
+  color: var(--text);
+  border: 1px solid var(--surface-border);
+  border-radius: 10px;
+  box-shadow: var(--surface-shadow);
+  overflow: hidden;
+}
+
+.code-editor .cm-tooltip-lint {
+  max-width: 360px;
+  /* Vertical breathing room so a single-row diagnostic (the common case)
+     does not span the tooltip's full height and collide with its rounded
+     top/bottom-left corners - see the .cm-diagnostic-error comment below
+     for what that collision looked like. */
+  padding: 4px 0;
+}
+
+/* CM6's own `.cm-diagnostic` base sets `marginLeft: -1px` so a diagnostic's
+   severity bar sits flush against the tooltip's 1px border - fine against
+   CM6's original square-cornered box, but combined with the rounded,
+   clipped popover above it pushed the bar's square corners past the curve,
+   rendering as an oddly clipped (and, at the anti-aliased edge, washed-out)
+   pill instead of a clean accent bar (gate feedback). Zeroing the margin
+   keeps the bar fully inside the rounded box instead of flush with its edge. */
+.code-editor .cm-diagnostic {
+  margin-left: 0;
+}
+
+/* Server lint presentation (#753): the underline, gutter
+   marker, and tooltip/panel border CM6's own @codemirror/lint baseTheme
+   bakes fixed reds/oranges into (an inline SVG data URI for the underline
+   and the gutter dot, which cannot reference a CSS variable) are redrawn
+   here with --danger/--warn so both severities theme correctly in light and
+   dark. Nothing here blocks Save — diagnostics stay purely informational. */
+.code-editor .cm-lintRange-error {
+  background-image: none;
+  text-decoration: underline wavy var(--danger);
+}
+
+.code-editor .cm-lintRange-warning {
+  background-image: none;
+  text-decoration: underline wavy var(--warn);
+}
+
+.code-editor .cm-gutter-lint .cm-lint-marker {
+  width: 8px;
+  height: 8px;
+  margin: 0.5em auto 0;
+  border-radius: 50%;
+}
+
+.code-editor .cm-lint-marker-error {
+  background: var(--danger);
+}
+
+.code-editor .cm-lint-marker-warning {
+  background: var(--warn);
+}
+
+.code-editor .cm-diagnostic-error,
+.code-editor .cm-diagnostic-warning {
+  /* CM6's own base is a 5px bar - thinned to a subtle accent stripe
+     (VSCode's own hover card uses a similarly thin severity rule), not a
+     block. */
+  border-left-width: 3px;
+}
+
+.code-editor .cm-diagnostic-error {
+  border-left-color: var(--danger);
+}
+
+.code-editor .cm-diagnostic-warning {
+  border-left-color: var(--warn);
+}
+
+/* jsonParseLinter()'s local syntax pass reports a single point, not a range,
+   so CM6 renders it as a small triangle (.cm-lintPoint) rather than an
+   underline — same --danger/--warn recoloring, different selector. */
+.code-editor .cm-lintPoint::after {
+  border-bottom-color: var(--danger);
+}
+
+.code-editor .cm-lintPoint-warning::after {
+  border-bottom-color: var(--warn);
+}
+
+/* The textarea code-editor.js mounts over: present for the form (its
+   `name` attribute still submits), hidden from sight and the accessibility
+   tree so it does not shadow the editor's own role="textbox" (CM6's
+   default) landmark. */
+.code-editor__source--mounted {
+  display: none;
+}
+
+/* ---------------------------------------------------------------------------
+   ViewDefinition editor (#753, generalized in #838): only what is specific to
+   this editor now lives here — its heights and its two token palettes
+   (JSON, FHIRPath). Everything CodeMirror-generic moved to `.code-editor`
+   above.
+
+   Sizing is on `.cm-editor` itself, not the `.vd-editor` wrapper: CodeMirror
+   already makes it a flex column with no explicit height, so a plain
+   min-height/max-height there is enough for `.cm-scroller`'s `height: 100%`
+   to resolve once content forces the max-height clamp, giving the
+   "min 320px, max ~70vh, scrolls internally" shape (#753) without
+   measuring anything in JS.
+   --------------------------------------------------------------------------- */
+
+.vd-editor .cm-editor {
+  min-height: 320px;
+  max-height: 70vh;
+}
+
+/* Inside the guided-form pairing (#843, `.editor__grid--stretch` further up
+   this file, in the layered `pages` section): the row itself already caps
+   total height at 70vh and stretches both cards to match, so `.cm-editor`
+   becomes its wrapper's `flex: 1` scrolling area — `height: 100%` of
+   whatever the stretch pairing gives it — instead of clamping itself
+   independently. The 320px floor above is untouched — that minimum applies
+   either way. Written here, unlayered, beside the rule it overrides: a `pages`-
+   layer override of an unlayered declaration always loses regardless of
+   specificity (see this section's own header comment) — `max-height: none`
+   in `@layer pages` would silently do nothing against the `max-height: 70vh`
+   two lines up. */
+.editor__grid--stretch .code-editor .cm-editor {
+  height: 100%;
+  max-height: none;
+}
+
+/* #752: the plain `<textarea>` fallback's own height — the same
+   "min 320px, max ~70vh, scroll internally" shape `.cm-editor` gets above,
+   so nojs and the pre-mount flash match the mounted editor's footprint
+   instead of a fixed `rows` count. Scoped to this page's form rather than
+   `.json-editor` itself, which every other page keeps its own sizing for —
+   the Library-backed SQL pane below gets the identical treatment, scoped to
+   its own smaller editor's dimensions (#839). */
+#vd-editor-form textarea.json-editor {
+  min-height: 320px;
+  max-height: 70vh;
+  overflow-y: auto;
+}
+
+/* Same reasoning as `.cm-editor` above for `max-height`: inside the stretch
+   pairing the row supplies the 70vh cap, so this fallback's own copy of it
+   yields — its 320px floor does not. `flex: 1` rides along here too (moved
+   down from beside `.code-editor`'s own copy, further up this file) so the
+   selector is not declared a second time. */
+.editor__grid--stretch #vd-editor-form textarea.json-editor {
+  flex: 1;
+  max-height: none;
+}
+
+/* JSON token colors — the same variables the Resource Editor's raw JSON
+   view (.jt--key et al.) already uses, so a ViewDefinition's outer shape
+   reads identically wherever it appears in the UI. */
+.vd-editor .cmt-json-key { color: var(--json-key); }
+.vd-editor .cmt-json-string { color: var(--json-string); }
+.vd-editor .cmt-json-number { color: var(--json-number); }
+.vd-editor .cmt-json-literal { color: var(--json-literal); font-weight: 600; }
+.vd-editor .cmt-json-punct { color: var(--muted); }
+
+/* FHIRPath token colors — the injected grammar, scoped separately in
+   vd-editor.js so these never bleed onto the outer JSON's own tokens even
+   though several tags (string, number, ...) are literally the same Tag
+   objects on both sides of the injection. */
+.vd-editor .cmt-fp-path { color: var(--fp-path); }
+.vd-editor .cmt-fp-function { color: var(--fp-function); }
+.vd-editor .cmt-fp-keyword { color: var(--fp-keyword); font-weight: 600; }
+.vd-editor .cmt-fp-operator { color: var(--fp-operator); }
+.vd-editor .cmt-fp-literal { color: var(--fp-literal); }
+.vd-editor .cmt-fp-constant { color: var(--fp-constant); font-weight: 600; }
+.vd-editor .cmt-fp-comment { color: var(--fp-comment); font-style: italic; }
+
+/* ---------------------------------------------------------------------------
+   SQL editor (#838, sql-editor.js): mounted over the SQL pane's
+   `<textarea name="sql">` on /ui/sql/queries and /ui/sql/views. Same
+   min-height-grows / max-height-scrolls shape as .vd-editor above, just
+   shorter — the SQL pane is a single query, not a full ViewDefinition
+   document — and one token palette instead of two (no injected language). */
+
+.sql-editor .cm-editor {
+  min-height: 180px;
+  max-height: 60vh;
+}
+
+/* #839: the SQL pane's plain `<textarea>` fallback matches the mounted
+   CodeMirror editor's own min-height/max-height above — the same
+   "nojs footprint equals the mounted one" contract `#vd-editor-form
+   textarea.json-editor` gives the ViewDefinition editor, scoped here to
+   `#lib-editor-form` instead since `.json-editor` itself keeps its generic
+   sizing for every other page. */
+#lib-editor-form textarea.json-editor {
+  min-height: 180px;
+  max-height: 60vh;
+  overflow-y: auto;
+}
+
+/* SQL token colors — one class per @codemirror/lang-sql tag group this
+   editor assigns (sql-editor.js has the full tag -> class mapping and why
+   Identifier/Builtin are left uncolored). Keywords and boolean/null
+   literals read as bold, matching the JSON/FHIRPath editor's own weight
+   convention for "reserved word" tokens; comments read as italic. */
+.sql-editor .cmt-sql-keyword { color: var(--sql-keyword); font-weight: 600; }
+.sql-editor .cmt-sql-type { color: var(--sql-type); }
+.sql-editor .cmt-sql-string { color: var(--sql-string); }
+.sql-editor .cmt-sql-number { color: var(--sql-number); }
+.sql-editor .cmt-sql-operator { color: var(--sql-operator); }
+.sql-editor .cmt-sql-variable { color: var(--sql-variable); }
+.sql-editor .cmt-sql-comment { color: var(--sql-comment); font-style: italic; }
+.sql-editor .cmt-sql-punct { color: var(--sql-punct); }
+.sql-editor .cmt-sql-literal { color: var(--sql-literal); font-weight: 600; }
+
+/* Failed-line tint (#839, sql-editor.js): the class its `errorLineField`
+   `StateField` decoration applies to the `.cm-line` of the 1-based line a
+   `$sql-run` parse error names (`data-error-line` on `#run-notice`'s
+   notice — SQLite execution errors carry no line and get no tint). Three
+   classes deep beats `.code-editor .cm-activeLine`'s two above, so the tint
+   still shows through when the cursor sits on the failed line. */
+.sql-editor .cm-line.sql-editor__error-line {
+  background: var(--danger-soft);
 }

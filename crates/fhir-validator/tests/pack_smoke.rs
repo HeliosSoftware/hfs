@@ -19,7 +19,9 @@
 
 use helios_fhir::FhirVersion;
 use helios_fhir_validator::packs::core_registry;
-use helios_fhir_validator::{SchemaResolver, ValidationOptions, Validator};
+use helios_fhir_validator::{
+    ErrorKind, SchemaResolver, Severity, ValidationOptions, Validator, core_terminology,
+};
 use serde_json::json;
 
 /// Every enabled version's pack loads and validates a minimal Patient.
@@ -66,6 +68,113 @@ fn all_enabled_packs_load_and_validate() {
         assert!(
             !outcome.errors.is_empty(),
             "{version:?}: unknown element must be caught"
+        );
+    }
+}
+
+/// `ViewDefinition` (SQL-on-FHIR) resolves and validates against every
+/// enabled version's embedded pack — the guided form in `helios-ui`
+/// (`crates/ui/src/editor.rs`) relies on this to check ViewDefinition
+/// documents the same way it checks any other resource (#843).
+#[test]
+fn view_definition_validates_across_enabled_packs() {
+    let versions = [
+        FhirVersion::R4,
+        #[cfg(feature = "R4B")]
+        FhirVersion::R4B,
+        #[cfg(feature = "R5")]
+        FhirVersion::R5,
+        #[cfg(feature = "R6")]
+        FhirVersion::R6,
+    ];
+    let opts = ValidationOptions::default();
+    for version in versions {
+        let registry = core_registry(version);
+        assert!(
+            registry.resolve("ViewDefinition").is_some(),
+            "{version:?}: ViewDefinition must resolve"
+        );
+        let validator = Validator::new(registry);
+
+        // The guided form's own starter document (mirrors
+        // `helios-ui`'s `sql_views::starter_view_definition`): a minimal but
+        // complete ViewDefinition must validate with no errors.
+        let starter = json!({
+            "resourceType": "ViewDefinition",
+            "name": "new_view",
+            "status": "draft",
+            "resource": "Patient",
+            "select": [
+                { "column": [ { "name": "id", "path": "getResourceKey()" } ] }
+            ]
+        });
+        let outcome = validator.validate_sync(&starter, &opts);
+        let mut errors = outcome.errors.clone();
+        errors.retain(|e| e.severity == Severity::Error);
+        errors.extend(core_terminology(version).required_binding_errors(&outcome.deferred));
+        assert_eq!(
+            errors,
+            vec![],
+            "{version:?}: starter ViewDefinition must validate clean, got: {}",
+            serde_json::to_string_pretty(&errors).unwrap()
+        );
+
+        // Backbone elements (`select`, `column`, `where`, `constant`) carry
+        // `id`/`extension`/`modifierExtension` per the base FHIR `Element`/
+        // `BackboneElement` shape even though the ViewDefinition schema's own
+        // model does not list them explicitly on every node — a valid
+        // extension on `select[0]` and an `id` on both `select[0]` and
+        // `select[0].column[0]` must not be reported as unknown elements.
+        let with_backbone_extensions = json!({
+            "resourceType": "ViewDefinition",
+            "name": "new_view",
+            "status": "draft",
+            "resource": "Patient",
+            "select": [
+                {
+                    "id": "s1",
+                    "extension": [
+                        { "url": "http://example.org/x", "valueString": "y" }
+                    ],
+                    "column": [
+                        { "id": "c1", "name": "id", "path": "getResourceKey()" }
+                    ]
+                }
+            ]
+        });
+        let outcome = validator.validate_sync(&with_backbone_extensions, &opts);
+        let mut errors = outcome.errors.clone();
+        errors.retain(|e| e.severity == Severity::Error);
+        errors.extend(core_terminology(version).required_binding_errors(&outcome.deferred));
+        assert_eq!(
+            errors,
+            vec![],
+            "{version:?}: id/extension on select and column must validate clean, got: {}",
+            serde_json::to_string_pretty(&errors).unwrap()
+        );
+
+        // No `select` (required), and a `status` outside the bound
+        // `publication-status` value set: at least one required-element
+        // error and one binding error.
+        let bad = json!({
+            "resourceType": "ViewDefinition",
+            "name": "broken_view",
+            "status": "bogus",
+            "resource": "Patient"
+        });
+        let outcome = validator.validate_sync(&bad, &opts);
+        let mut errors = outcome.errors;
+        errors.retain(|e| e.severity == Severity::Error);
+        assert!(
+            errors.iter().any(|e| e.kind == ErrorKind::Required),
+            "{version:?}: missing `select` must be reported, got: {}",
+            serde_json::to_string_pretty(&errors).unwrap()
+        );
+        let binding_errors = core_terminology(version).required_binding_errors(&outcome.deferred);
+        assert!(
+            !binding_errors.is_empty(),
+            "{version:?}: status \"bogus\" must fail its required binding, got: {}",
+            serde_json::to_string_pretty(&binding_errors).unwrap()
         );
     }
 }

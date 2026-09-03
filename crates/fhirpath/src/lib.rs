@@ -383,3 +383,81 @@ pub fn parse_expression(expression: &str) -> Result<parser::Expression, String> 
             )
         })
 }
+
+/// A single parse error from [`parse_expression_diagnostics`], with its span
+/// expressed in **Unicode scalar value (`char`) offsets** into the original
+/// `expression` string — never UTF-8 byte offsets.
+///
+/// chumsky's own `Rich` errors (which the FHIRPath parser produces) report
+/// spans as byte offsets, since that is what its `&str` `Input` impl tracks
+/// internally. Callers that index into the expression by character (e.g. a
+/// browser editor counting Unicode code points, or anything that turns the
+/// span into a substring via `.chars()`) would silently miscount on any
+/// expression containing a multi-byte character, so the conversion happens
+/// once here rather than being every caller's problem.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParseDiagnostic {
+    /// `(start, end)` char offsets of the erroring span within `expression`.
+    /// `start == end` for a zero-width error (e.g. unexpected end of input).
+    pub span: (usize, usize),
+    /// A human-readable description of the problem, taken from chumsky's own
+    /// [`Display`](std::fmt::Display) rendering of the error — not a `Debug`
+    /// dump of its internal structure, and never the expression text itself.
+    pub message: String,
+}
+
+/// Parses `expression` and, on failure, returns every diagnostic chumsky's
+/// [`Rich`](chumsky::error::Rich) error reporting produced, spans converted
+/// to Unicode char offsets (see [`ParseDiagnostic`]).
+///
+/// Purely additive: [`parse_expression`] keeps its existing signature and
+/// behavior unchanged. This is a second, richer entry point for callers that
+/// need error *positions* rather than one flattened message — e.g. a lint
+/// pass that must underline the offending span inside a larger document.
+///
+/// Never evaluates the expression and never touches a FHIR resource or a
+/// terminology server: like [`parse_expression`], this is parsing alone.
+///
+/// # Examples
+///
+/// ```
+/// use helios_fhirpath::parse_expression_diagnostics;
+///
+/// assert!(parse_expression_diagnostics("Patient.name.family").is_ok());
+///
+/// let errors = parse_expression_diagnostics("Patient.name.").unwrap_err();
+/// assert!(!errors.is_empty());
+/// assert!(!errors[0].message.is_empty());
+/// ```
+pub fn parse_expression_diagnostics(
+    expression: &str,
+) -> Result<parser::Expression, Vec<ParseDiagnostic>> {
+    use chumsky::Parser;
+
+    parser::parser()
+        .parse(expression)
+        .into_result()
+        .map_err(|errors| {
+            errors
+                .iter()
+                .map(|error| {
+                    let span = error.span();
+                    ParseDiagnostic {
+                        span: (
+                            byte_to_char_offset(expression, span.start),
+                            byte_to_char_offset(expression, span.end),
+                        ),
+                        message: error.to_string(),
+                    }
+                })
+                .collect()
+        })
+}
+
+/// Converts a UTF-8 byte offset into `s` (assumed to already fall on a
+/// `char` boundary, which every span chumsky's `&str` parser produces does)
+/// into a count of Unicode scalar values before that offset.
+fn byte_to_char_offset(s: &str, byte_offset: usize) -> usize {
+    s.get(..byte_offset)
+        .map_or_else(|| s.chars().count(), |prefix| prefix.chars().count())
+}

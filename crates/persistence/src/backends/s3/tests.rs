@@ -481,6 +481,87 @@ async fn crud_happy_path_and_count() {
     assert_eq!(count_after_delete, 0);
 }
 
+/// Regression test for #787 on the S3 backend specifically: creating a
+/// SearchParameter must make it immediately visible in that tenant's
+/// registry — S3's `create()`/`update()`/`delete()` never invalidated any
+/// overlay at all before this fix (S3 had no real per-tenant registry to
+/// invalidate; the composite handed Elasticsearch a `base_only()` container
+/// whose loader unconditionally returned an empty overlay for every tenant).
+#[tokio::test]
+async fn search_parameter_write_updates_the_tenant_registry_immediately() {
+    use crate::core::search::SearchProvider;
+
+    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+    let backend = make_prefix_backend(mock);
+    let tenant = tenant("tenant-a");
+
+    // Not yet registered: creating a Patient under a code the registry
+    // doesn't know about must not resolve.
+    assert!(
+        backend
+            .search_param_registry(&tenant)
+            .read()
+            .get_param("Patient", "nickname-s3")
+            .is_none()
+    );
+
+    let sp = backend
+        .create(
+            &tenant,
+            "SearchParameter",
+            json!({
+                "resourceType": "SearchParameter",
+                "id": "patient-nickname-s3",
+                "url": "http://acme.health/fhir/SearchParameter/patient-nickname-s3",
+                "name": "nickname-s3",
+                "status": "active",
+                "code": "nickname-s3",
+                "base": ["Patient"],
+                "type": "string",
+                "expression": "Patient.name.where(use = 'nickname').given"
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+
+    // Immediately visible — no separate refresh call, no TTL wait.
+    let registered = backend
+        .search_param_registry(&tenant)
+        .read()
+        .get_param("Patient", "nickname-s3")
+        .expect("SearchParameter should be registered immediately after create");
+    assert_eq!(
+        registered.url,
+        "http://acme.health/fhir/SearchParameter/patient-nickname-s3"
+    );
+
+    // Another tenant never sees it (per-tenant overlay, not a global cache).
+    let other_tenant =
+        TenantContext::new(TenantId::new("tenant-b"), TenantPermissions::full_access());
+    assert!(
+        backend
+            .search_param_registry(&other_tenant)
+            .read()
+            .get_param("Patient", "nickname-s3")
+            .is_none()
+    );
+
+    // Deleting it removes it from the registry immediately too.
+    backend
+        .delete(&tenant, "SearchParameter", sp.id())
+        .await
+        .unwrap();
+    assert!(
+        backend
+            .search_param_registry(&tenant)
+            .read()
+            .get_param("Patient", "nickname-s3")
+            .is_none(),
+        "a deleted SearchParameter must drop out of the registry immediately"
+    );
+}
+
 #[tokio::test]
 async fn crud_duplicate_create_and_missing_read() {
     let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
@@ -3528,9 +3609,10 @@ mod bulk_submit_worker {
                 _requires_access_token: bool,
                 _oauth: &[String],
                 _key: Option<&serde_json::Value>,
-            ) -> StorageResult<Box<dyn tokio::io::AsyncBufRead + Send + Unpin>> {
+            ) -> StorageResult<(Box<dyn tokio::io::AsyncBufRead + Send + Unpin>, Option<u64>)>
+            {
                 let data = self.files.get(url).cloned().unwrap_or_default();
-                Ok(Box::new(BufReader::new(Cursor::new(data))))
+                Ok((Box::new(BufReader::new(Cursor::new(data))), None))
             }
         }
 

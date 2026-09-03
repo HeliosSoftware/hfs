@@ -36,7 +36,12 @@ helios-observability = { path = "../observability", version = "0.2.1" }
 helios-fhirpath = { path = "../fhirpath", version = "0.2.1", default-features = false }
 helios-fhirpath-support = { path = "../fhirpath-support", version = "0.2.1" }
 serde = { workspace = true }
-serde_json = { workspace = true }
+# `preserve_order` is load-bearing: `lint::lint_view_definition` (#753 ticket
+# 03) returns diagnostics ordered by JSON pointer in document order, which
+# requires iterating a `serde_json::Map` in the order its keys were parsed
+# rather than serde_json's default alphabetical BTreeMap order. Same
+# rationale as helios-fhir-validator's own override of this dependency.
+serde_json = { workspace = true, features = ["preserve_order"] }
 csv = "1.3"
 thiserror = "1.0"
 anyhow = "1.0"

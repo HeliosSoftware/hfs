@@ -1,6 +1,10 @@
 //! End-to-end tests for the Bulk Import workspace (`/ui/bulk-import`, #527),
 //! driving the mounted router against a real in-memory SQLite settings store
 //! and, for submission, a loopback stand-in for the Data Recipient.
+//!
+//! One-shot model: a submission carries exactly one manifest, and creating it
+//! fires the `$bulk-submit` kick-off immediately — there is no separate
+//! add-manifest or submit step.
 
 use std::sync::Arc;
 
@@ -13,16 +17,19 @@ use helios_fhir::FhirVersion;
 use helios_persistence::{
     StorageResult,
     backends::sqlite::SqliteBackend,
-    core::{SettingsStore, StoredUserSettings},
+    core::{BulkProviderStore, SettingsStore},
     error::BackendError,
 };
 use http_body_util::BodyExt;
 use tower::ServiceExt;
 
-fn settings_store() -> Arc<dyn SettingsStore> {
-    let backend = SqliteBackend::in_memory().expect("in-memory sqlite");
-    backend.init_schema().expect("init schema");
-    Arc::new(backend)
+fn backing_stores() -> (Arc<dyn SettingsStore>, Arc<dyn BulkProviderStore>) {
+    let backend = Arc::new({
+        let backend = SqliteBackend::in_memory().expect("in-memory sqlite");
+        backend.init_schema().expect("init schema");
+        backend
+    });
+    (backend.clone(), backend)
 }
 
 /// One test's world: the settings store and the recipient base the router is
@@ -30,62 +37,66 @@ fn settings_store() -> Arc<dyn SettingsStore> {
 /// that need the kickoff to reach their mock recipient mount with its URL.
 struct Ctx {
     settings: Arc<dyn SettingsStore>,
+    bulk_provider: Arc<dyn BulkProviderStore>,
     recipient: String,
 }
 
 fn ctx(recipient: &str) -> Ctx {
+    let (settings, bulk_provider) = backing_stores();
     Ctx {
-        settings: settings_store(),
+        settings,
+        bulk_provider,
         recipient: recipient.to_string(),
     }
 }
 
-struct FailNextPatchStore {
-    inner: Arc<dyn SettingsStore>,
+struct FailNextPutStore {
+    inner: Arc<dyn BulkProviderStore>,
     fail: std::sync::atomic::AtomicBool,
 }
 
 #[async_trait::async_trait]
-impl SettingsStore for FailNextPatchStore {
-    async fn get_settings(&self, user_key: &str) -> StorageResult<Option<StoredUserSettings>> {
-        self.inner.get_settings(user_key).await
+impl BulkProviderStore for FailNextPutStore {
+    async fn list_provider_submissions(
+        &self,
+        tenant: &helios_persistence::tenant::TenantContext,
+    ) -> StorageResult<Vec<helios_persistence::core::StoredProviderSubmission>> {
+        self.inner.list_provider_submissions(tenant).await
     }
 
-    async fn put_settings(
+    async fn get_provider_submission(
         &self,
-        user_key: &str,
+        tenant: &helios_persistence::tenant::TenantContext,
+        id: &str,
+    ) -> StorageResult<Option<helios_persistence::core::StoredProviderSubmission>> {
+        self.inner.get_provider_submission(tenant, id).await
+    }
+
+    async fn put_provider_submission(
+        &self,
+        tenant: &helios_persistence::tenant::TenantContext,
+        id: &str,
         document: serde_json::Value,
         if_match_version: Option<i64>,
-    ) -> StorageResult<StoredUserSettings> {
-        self.inner
-            .put_settings(user_key, document, if_match_version)
-            .await
-    }
-
-    async fn patch_settings(
-        &self,
-        user_key: &str,
-        merge_patch: serde_json::Value,
-        if_match_version: Option<i64>,
-    ) -> StorageResult<StoredUserSettings> {
+    ) -> StorageResult<helios_persistence::core::StoredProviderSubmission> {
         if self.fail.swap(false, std::sync::atomic::Ordering::SeqCst) {
             return Err(BackendError::Unavailable {
-                backend_name: "test-settings".to_string(),
+                backend_name: "test-provider".to_string(),
                 message: "forced edit failure".to_string(),
             }
             .into());
         }
         self.inner
-            .patch_settings(user_key, merge_patch, if_match_version)
+            .put_provider_submission(tenant, id, document, if_match_version)
             .await
     }
 
-    async fn delete_settings(&self, user_key: &str) -> StorageResult<bool> {
-        self.inner.delete_settings(user_key).await
-    }
-
-    async fn purge_tenant_settings(&self, tenant_id: &str) -> StorageResult<u64> {
-        self.inner.purge_tenant_settings(tenant_id).await
+    async fn delete_provider_submission(
+        &self,
+        tenant: &helios_persistence::tenant::TenantContext,
+        id: &str,
+    ) -> StorageResult<bool> {
+        self.inner.delete_provider_submission(tenant, id).await
     }
 }
 
@@ -103,6 +114,7 @@ fn app(ctx: &Ctx) -> Router {
         FhirVersion::R4,
         None,
         ctx.recipient.clone(),
+        Some(Arc::clone(&ctx.bulk_provider)),
     )
 }
 
@@ -121,6 +133,7 @@ fn app_with_path_tenant(ctx: &Ctx, tenant: &str) -> Router {
         ctx.recipient.clone(),
         10 * 1024 * 1024,
         true,
+        Some(Arc::clone(&ctx.bulk_provider)),
     )
 }
 
@@ -159,9 +172,15 @@ async fn post_form(ctx: &Ctx, uri: &str, form: &str) -> (StatusCode, String, Str
     (status, location, body_text(res).await)
 }
 
-/// Creates a submission and returns its detail path (`/ui/bulk-import/{id}`).
+/// Creates a one-shot submission and returns its detail path
+/// (`/ui/bulk-import/{id}`). The kick-off goes to the ctx's recipient.
 async fn create_submission(ctx: &Ctx) -> String {
-    let (status, location, _) = post_form(ctx, "/ui/bulk-import", "name=BrettTest&auth=none").await;
+    let (status, location, _) = post_form(
+        ctx,
+        "/ui/bulk-import",
+        "name=BrettTest&manifest_url=http%3A%2F%2Fone.example%2Fm.json&auth=none",
+    )
+    .await;
     assert_eq!(status, StatusCode::SEE_OTHER);
     assert!(location.starts_with("/ui/bulk-import/"), "{location}");
     location
@@ -169,16 +188,20 @@ async fn create_submission(ctx: &Ctx) -> String {
 
 async fn set_submission_status(ctx: &Ctx, detail_path: &str, status: &str) {
     let id = detail_path.rsplit('/').next().expect("submission id");
-    ctx.settings
-        .patch_settings(
-            "l2:",
-            serde_json::json!({
-                "byTenant": { "default": { "bulkImport": { "submissions": {
-                    id: { "status": status }
-                } } } }
-            }),
-            None,
-        )
+    let tenant = helios_persistence::tenant::TenantContext::new(
+        helios_persistence::tenant::TenantId::new("default"),
+        helios_persistence::tenant::TenantPermissions::full_access(),
+    );
+    let stored = ctx
+        .bulk_provider
+        .get_provider_submission(&tenant, id)
+        .await
+        .expect("read submission")
+        .expect("submission exists");
+    let mut document = stored.document;
+    document["status"] = serde_json::json!(status);
+    ctx.bulk_provider
+        .put_provider_submission(&tenant, id, document, Some(stored.version))
         .await
         .expect("seed submission state");
 }
@@ -191,6 +214,17 @@ async fn the_list_page_renders_and_offers_creation() {
     assert!(html.contains("Bulk Import"));
     assert!(html.contains("New Submission"));
     assert!(html.contains("No submissions yet"));
+    // The create dialog carries the one-shot fields: manifest URL up front,
+    // the pre-coordinated options behind the Advanced fold.
+    assert!(html.contains(r#"name="manifest_url""#));
+    assert!(html.contains("Advanced options"));
+    assert!(html.contains(r#"class="disclosure""#));
+    assert!(html.contains(r#"name="output_format""#));
+    assert!(html.contains(r#"name="file_request_headers""#));
+    // Retired inputs stay retired: the id is generated, the FHIR base derives
+    // from the manifest URL.
+    assert!(!html.contains(r#"name="submission_id""#));
+    assert!(!html.contains(r#"name="fhir_base_url""#));
 }
 
 #[tokio::test]
@@ -206,7 +240,9 @@ async fn recipient_includes_public_prefix_and_selected_path_tenant() {
             Request::post("/ui/bulk-import")
                 .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
                 .header("host", "spoofed.example")
-                .body(Body::from("name=BrettTest&auth=none"))
+                .body(Body::from(
+                    "name=BrettTest&manifest_url=http%3A%2F%2Fone.example%2Fm.json&auth=none",
+                ))
                 .unwrap(),
         )
         .await
@@ -242,12 +278,15 @@ async fn creating_a_submission_lands_on_its_detail_page() {
     let (status, html) = get(&ctx, &detail_path).await;
     assert_eq!(status, StatusCode::OK);
     assert!(html.contains("BrettTest"));
-    assert!(html.contains("Not Started"));
+    assert!(html.contains("http://one.example/m.json"), "{html}");
     assert!(
         html.contains("http://localhost:9"),
         "trailing slash trimmed"
     );
-    assert!(html.contains("Add Manifest"));
+    // The kick-off fired at create time; this recipient is unreachable, so
+    // the submission lands Failed with the attempt in the log.
+    assert!(html.contains("Failed"));
+    assert!(html.contains("Submitting manifest"));
 
     // And the list now shows it.
     let (_, list) = get(&ctx, "/ui/bulk-import").await;
@@ -268,36 +307,76 @@ async fn the_detail_page_uses_the_shared_full_width_components() {
             r#"<section class="card panel bulk-import-section bulk-import-summary-card">"#
         )
     );
-    assert!(html.contains(r#"<section class="bulk-import-section bulk-import-manifests-card">"#));
-    assert!(
-        !html.contains(r#"<section class="card bulk-import-section bulk-import-manifests-card">"#)
-    );
-    assert_eq!(html.matches("bulk-import-section").count(), 2);
-    assert!(html.contains(r#"<div class="kv-grid">"#));
+    assert_eq!(html.matches("bulk-import-section").count(), 1);
+    assert!(html.contains(r#"<div class="kv-grid kv-grid--flush">"#));
     assert!(!html.contains(r#"class="card detail""#));
 
     // Machine-readable values stay mono while human-readable labels remain
-    // ordinary proportional text.
+    // ordinary proportional text. The manifest joined the summary card.
+    assert!(html.contains(r#"<span>Manifest URL</span><code>http://one.example/m.json</code>"#));
     assert!(html.contains(r#"<span>Data Recipient</span><code>http://localhost:9</code>"#));
     assert!(html.contains(&format!(
         r#"<span>Submission ID</span><code>{submission_id}</code>"#
     )));
     assert!(html.contains(r#"<span>Submitter</span><code>"#));
     assert!(html.contains(r#"<span>Created</span><code>"#));
-    assert!(html.contains(r#"<span>Status</span><div>Not Started</div>"#));
+    assert!(html.contains(r#"<span>Status</span><div id="submission-status">"#));
     assert!(html.contains(r#"<span>Authentication</span><div>"#));
 
-    assert!(html.contains(r#"<a class="back-link" href="/ui/bulk-import">"#));
+    let assert_back_link =
+        |localized_html: &str, label: &str| {
+            let marker = r#"<a class="back-link" href="/ui/bulk-import">"#;
+            let start = localized_html.find(marker).expect("shared back link");
+            let end = start
+                + localized_html[start..]
+                    .find("</a>")
+                    .expect("back link closing tag")
+                + "</a>".len();
+            let back_link = &localized_html[start..end];
+
+            assert!(back_link.contains(
+                r#"<span aria-hidden="true"><svg width="5" height="8" viewBox="0 0 5 8""#
+            ));
+            assert!(back_link.contains(&format!("<span>{label}</span>")));
+            assert_eq!(back_link.matches("<span").count(), 2);
+            assert!(
+                !back_link.contains('‹'),
+                "spacing must come from CSS, not the former literal chevron and space"
+            );
+        };
+    assert_back_link(&html, "All Submissions");
+    let header_start = html
+        .find(r#"<header class="page-head page-head--back-link">"#)
+        .expect("shared back-link header");
+    let header_end = header_start
+        + html[header_start..]
+            .find("</header>")
+            .expect("page header closing tag");
+    let header = &html[header_start..header_end];
+    let back_link_position = header.find(r#"class="back-link""#).unwrap();
+    let copy_position = header.find(r#"class="page-head__copy""#).unwrap();
+    assert!(back_link_position < copy_position);
+    // One-shot: the header carries no action slot — Add Manifest is gone.
+    assert!(!header.contains(r#"class="page-head__action""#));
+    for (lang, label) in [("es", "Todas las submissions"), ("de", "Alle Submissions")] {
+        let (status, localized_html) = get(&ctx, &format!("{detail_path}?lang={lang}")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_back_link(&localized_html, label);
+    }
     assert!(html.contains("bulk-import-summary__actions"));
-    let actions = ["Edit", "Delete", "Abort", "Complete"];
+    // One-shot summary actions: Edit and Delete only — Submit/Add Manifest
+    // are gone, Abort lives on the progress card, Complete belongs to the
+    // server.
+    let actions = ["Edit", "Delete"];
     let mut cursor = 0;
     for action in actions {
         let offset = html[cursor..].find(action).expect("summary action");
         cursor += offset + action.len();
     }
+    assert!(!html.contains("Add Manifest"));
+    assert!(!html.contains("Complete</button>"));
+    assert!(!html.contains(r#"/submit""#));
     assert!(!html.contains(r#"<th scope="col">"#));
-    assert!(html.contains("data-bulk-import-manifest-empty"));
-    assert!(html.contains(r#"class="empty-state""#));
 
     // The initial HTMX load is owned directly by the fragment host, so its
     // outerHTML replacement does not leave a redundant wrapper behind.
@@ -307,87 +386,19 @@ async fn the_detail_page_uses_the_shared_full_width_components() {
 }
 
 #[tokio::test]
-async fn manifests_can_be_added_and_removed() {
-    let ctx = ctx("http://localhost:9/");
-    let detail_path = create_submission(&ctx).await;
-
-    let (status, location, _) = post_form(
-        &ctx,
-        &format!("{detail_path}/manifests"),
-        "manifest_url=http%3A%2F%2F10.2.1.890%2Fmanifest.local",
-    )
-    .await;
-    assert_eq!(status, StatusCode::SEE_OTHER);
-    assert_eq!(location, detail_path);
-
-    let (_, html) = get(&ctx, &detail_path).await;
-    assert!(html.contains("http://10.2.1.890/manifest.local"));
-    assert!(!html.contains("Submit All"));
-    assert!(html.contains("Most recent"));
-    assert!(html.contains(&format!(r#"href="{detail_path}?sort=oldest""#)));
-    assert!(html.contains(r#"class="btn""#));
-    assert!(html.contains("menu__panel--compact"));
-    assert!(html.contains(r#"class="bulk-import-manifest-row""#));
-    assert!(html.contains("Manifest actions"));
-
-    // Pull the manifest id out of the rendered submit form action.
-    let marker = format!("{detail_path}/manifests/");
-    let mid = html
-        .split(&marker)
-        .nth(1)
-        .and_then(|rest| rest.split('/').next())
-        .expect("manifest id in form action")
-        .to_string();
-
-    let (status, _, _) =
-        post_form(&ctx, &format!("{detail_path}/manifests/{mid}/delete"), "").await;
-    assert_eq!(status, StatusCode::SEE_OTHER);
-    let (_, html) = get(&ctx, &detail_path).await;
-    assert!(html.contains("No manifests yet"));
-}
-
-#[tokio::test]
-async fn manifests_follow_the_selected_created_time_order() {
-    let ctx = ctx("http://localhost:9/");
-    let detail_path = create_submission(&ctx).await;
-    let first = "https%3A%2F%2Fexample.test%2Ffirst.json";
-    let second = "https%3A%2F%2Fexample.test%2Fsecond.json";
-
-    post_form(
-        &ctx,
-        &format!("{detail_path}/manifests"),
-        &format!("manifest_url={first}"),
-    )
-    .await;
-    tokio::time::sleep(std::time::Duration::from_millis(2)).await;
-    post_form(
-        &ctx,
-        &format!("{detail_path}/manifests"),
-        &format!("manifest_url={second}"),
-    )
-    .await;
-
-    let (_, recent) = get(&ctx, &format!("{detail_path}?sort=recent")).await;
-    assert!(recent.find("second.json").unwrap() < recent.find("first.json").unwrap());
-
-    let (_, oldest) = get(&ctx, &format!("{detail_path}?sort=oldest")).await;
-    assert!(oldest.find("first.json").unwrap() < oldest.find("second.json").unwrap());
-}
-
-#[tokio::test]
 async fn editing_a_submission_changes_only_local_display_and_auth_fields() {
     let ctx = ctx("http://localhost:9/");
     let (_, detail_path, _) = post_form(
         &ctx,
         "/ui/bulk-import",
-        "name=Before&auth=backend-services&client_id=old-client&token_url=https%3A%2F%2Fold.example%2Ftoken&submitter_system=https%3A%2F%2Fsubmitter.example&submitter_value=provider-a&submission_id=stable-id",
+        "name=Before&manifest_url=http%3A%2F%2Fone.example%2Fm.json&auth=backend-services&client_id=old-client&token_url=https%3A%2F%2Fold.example%2Ftoken&submitter_system=https%3A%2F%2Fsubmitter.example&submitter_value=provider-a",
     )
     .await;
 
     let (status, location, _) = post_form(
         &ctx,
         &format!("{detail_path}/edit"),
-        "name=After&auth=none&client_id=ignored&token_url=https%3A%2F%2Fignored.example%2Ftoken&submitter_system=https%3A%2F%2Fevil.example&submitter_value=evil&submission_id=changed&recipient_base_url=https%3A%2F%2Fevil.example",
+        "name=After&auth=none&client_id=ignored&token_url=https%3A%2F%2Fignored.example%2Ftoken&submitter_system=https%3A%2F%2Fevil.example&submitter_value=evil&manifest_url=https%3A%2F%2Fevil.example%2Fm.json&recipient_base_url=https%3A%2F%2Fevil.example",
     )
     .await;
     assert_eq!(status, StatusCode::SEE_OTHER);
@@ -397,24 +408,28 @@ async fn editing_a_submission_changes_only_local_display_and_auth_fields() {
     assert!(html.contains("After"));
     assert!(html.contains("https://submitter.example | provider-a"));
     assert!(html.contains("http://localhost:9"));
-    assert!(html.contains("stable-id"));
+    assert!(html.contains("http://one.example/m.json"), "{html}");
     assert!(!html.contains("evil.example"));
     assert!(html.contains(r#"value="After""#));
     assert!(html.contains(r#"value="none" checked"#));
-    assert!(html.contains(r#"name="client_id" autocomplete="off" value="""#));
-    assert!(html.contains(r#"name="token_url" autocomplete="off" value="""#));
+    // A cleared credential renders with no value attribute at all - the
+    // shared fieldset omits it when empty rather than emitting value="".
+    assert!(html.contains(r#"name="client_id" autocomplete="off">"#));
+    assert!(html.contains(r#"name="token_url" autocomplete="off">"#));
 }
 
 #[tokio::test]
 async fn a_failed_edit_reopens_the_dialog_with_attempted_values_and_preserves_storage() {
-    let backing = settings_store();
+    let (settings, backing) = backing_stores();
     let setup = Ctx {
-        settings: Arc::clone(&backing),
+        settings: Arc::clone(&settings),
+        bulk_provider: Arc::clone(&backing),
         recipient: "http://localhost:9/".to_string(),
     };
     let detail_path = create_submission(&setup).await;
     let ctx = Ctx {
-        settings: Arc::new(FailNextPatchStore {
+        settings,
+        bulk_provider: Arc::new(FailNextPutStore {
             inner: backing,
             fail: std::sync::atomic::AtomicBool::new(true),
         }),
@@ -485,20 +500,16 @@ async fn mock_recipient(
 }
 
 #[tokio::test]
-async fn submitting_a_manifest_posts_the_kickoff_and_logs_the_outcome() {
+async fn creating_posts_the_kickoff_and_logs_the_outcome() {
     let (recipient_url, received) = mock_recipient(StatusCode::OK).await;
     let ctx = ctx(&recipient_url);
 
-    let (_, detail_path, _) = post_form(&ctx, "/ui/bulk-import", "name=Alice&auth=none").await;
-    post_form(
+    let (_, detail_path, _) = post_form(
         &ctx,
-        &format!("{detail_path}/manifests"),
-        "manifest_url=http%3A%2F%2Fexample.org%2Fexports%2Fmanifest.json&output_format=application%2Ffhir%2Bndjson",
+        "/ui/bulk-import",
+        "name=Alice&manifest_url=http%3A%2F%2Fexample.org%2Fexports%2Fmanifest.json&auth=none&output_format=application%2Ffhir%2Bndjson",
     )
     .await;
-
-    let (status, _, _) = post_form(&ctx, &format!("{detail_path}/submit-all"), "").await;
-    assert_eq!(status, StatusCode::SEE_OTHER);
 
     // The recipient saw a spec-shaped kick-off.
     let bodies = received.lock().unwrap().clone();
@@ -542,27 +553,21 @@ async fn a_rejected_kickoff_is_logged_as_a_failure() {
     let (recipient_url, received) = mock_recipient(StatusCode::NOT_FOUND).await;
     let ctx = ctx(&recipient_url);
 
-    let (_, detail_path, _) = post_form(&ctx, "/ui/bulk-import", "name=Alice&auth=none").await;
-    post_form(
+    let (_, detail_path, _) = post_form(
         &ctx,
-        &format!("{detail_path}/manifests"),
-        "manifest_url=http%3A%2F%2Ftest.com",
+        "/ui/bulk-import",
+        "name=Alice&manifest_url=http%3A%2F%2Ftest.com&auth=none",
     )
     .await;
-    post_form(&ctx, &format!("{detail_path}/submit-all"), "").await;
 
     let (_, html) = get(&ctx, &detail_path).await;
-    // The log names the request that failed — the kick-off POST, with the
-    // manifest as context — and the submission reads Failed (#686).
+    // The log names the request that actually failed — the kick-off POST,
+    // with the manifest as context — and the submission reads Failed (#686).
     assert!(html.contains("$bulk-submit → 404"));
     assert!(html.contains("(manifest http://test.com)"));
     assert!(html.contains("Failed"), "status shows the failure");
     assert!(!html.contains("Not Started"));
-
-    // A failed attempt does not consume the manifest; it remains retryable.
-    let (status, _, _) = post_form(&ctx, &format!("{detail_path}/submit-all"), "").await;
-    assert_eq!(status, StatusCode::SEE_OTHER);
-    assert_eq!(received.lock().unwrap().len(), 2);
+    assert_eq!(received.lock().unwrap().len(), 1);
 }
 
 fn urlencode(s: &str) -> String {
@@ -570,97 +575,52 @@ fn urlencode(s: &str) -> String {
 }
 
 #[tokio::test]
-async fn a_single_manifest_can_be_submitted_from_its_row() {
+async fn abort_sends_a_status_only_kickoff() {
     let (recipient_url, received) = mock_recipient(StatusCode::OK).await;
     let ctx = ctx(&recipient_url);
 
-    let (_, detail_path, _) = post_form(&ctx, "/ui/bulk-import", "name=Solo&auth=none").await;
-    for url in [
-        "http%3A%2F%2Fone.example%2Fm.json",
-        "http%3A%2F%2Ftwo.example%2Fm.json",
-    ] {
-        post_form(
-            &ctx,
-            &format!("{detail_path}/manifests"),
-            &format!("manifest_url={url}"),
-        )
-        .await;
-    }
-    let (_, html) = get(&ctx, &detail_path).await;
-    let marker = format!("{detail_path}/manifests/");
-    let mid = html
-        .split(&marker)
-        .nth(1)
-        .and_then(|rest| rest.split('/').next())
-        .expect("manifest id")
-        .to_string();
-
-    let (status, _, _) =
-        post_form(&ctx, &format!("{detail_path}/manifests/{mid}/submit"), "").await;
-    assert_eq!(status, StatusCode::SEE_OTHER);
-
-    // Only the one manifest went out.
-    assert_eq!(received.lock().unwrap().len(), 1);
-
-    // Submit All skips that accepted row and sends only the remaining one.
-    let (status, _, _) = post_form(&ctx, &format!("{detail_path}/submit-all"), "").await;
-    assert_eq!(status, StatusCode::SEE_OTHER);
-    assert_eq!(received.lock().unwrap().len(), 2);
-}
-
-#[tokio::test]
-async fn abort_and_complete_send_status_only_kickoffs() {
-    let (recipient_url, received) = mock_recipient(StatusCode::OK).await;
-    let ctx = ctx(&recipient_url);
-
-    let (_, abort_path, _) = post_form(&ctx, "/ui/bulk-import", "name=Abort&auth=none").await;
-    post_form(
-        &ctx,
-        &format!("{abort_path}/manifests"),
-        "manifest_url=http%3A%2F%2Fone.example%2Fm.json",
-    )
-    .await;
-    post_form(&ctx, &format!("{abort_path}/submit-all"), "").await;
+    let abort_path = create_submission(&ctx).await;
     post_form(&ctx, &format!("{abort_path}/abort"), "").await;
     let (_, html) = get(&ctx, &abort_path).await;
     assert!(html.contains("Stopped"));
     assert!(html.contains("Recipient acknowledged (200)"));
 
-    let (_, complete_path, _) = post_form(&ctx, "/ui/bulk-import", "name=Complete&auth=none").await;
-    post_form(
-        &ctx,
-        &format!("{complete_path}/manifests"),
-        "manifest_url=http%3A%2F%2Ftwo.example%2Fm.json",
-    )
-    .await;
-    post_form(&ctx, &format!("{complete_path}/submit-all"), "").await;
-    post_form(&ctx, &format!("{complete_path}/complete"), "").await;
-    let (_, html) = get(&ctx, &complete_path).await;
-    assert!(html.contains("Completed"));
-
-    // Status-only kick-offs carry no manifestUrl.
+    // The abort kick-off is status-only: no manifestUrl rides along.
     let bodies = received.lock().unwrap().clone();
-    assert_eq!(bodies.len(), 4);
-    let statuses: Vec<&str> = bodies
+    assert_eq!(bodies.len(), 2, "create kick-off plus abort");
+    let params = bodies[1]["parameter"].as_array().unwrap();
+    assert!(params.iter().all(|p| p["name"] != "manifestUrl"));
+    let status_code = params
         .iter()
-        .filter(|b| {
-            b["parameter"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .all(|p| p["name"] != "manifestUrl")
-        })
-        .map(|b| {
-            b["parameter"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .find(|p| p["name"] == "submissionStatus")
-                .and_then(|p| p["valueCoding"]["code"].as_str())
-                .unwrap()
-        })
-        .collect();
-    assert_eq!(statuses, vec!["stopped", "completed"]);
+        .find(|p| p["name"] == "submissionStatus")
+        .and_then(|p| p["valueCoding"]["code"].as_str())
+        .unwrap();
+    assert_eq!(status_code, "stopped");
+}
+
+/// #850: "Mark completed" is the Data Provider's closing signal — without it
+/// the recipient keeps the submission open and its concurrency slot held.
+#[tokio::test]
+async fn complete_sends_a_status_only_kickoff() {
+    let (recipient_url, received) = mock_recipient(StatusCode::OK).await;
+    let ctx = ctx(&recipient_url);
+
+    let detail_path = create_submission(&ctx).await;
+    set_submission_status(&ctx, &detail_path, "in-progress").await;
+    post_form(&ctx, &format!("{detail_path}/complete"), "").await;
+    let (_, html) = get(&ctx, &detail_path).await;
+    assert!(html.contains("Completed"), "{html}");
+    assert!(html.contains("Recipient acknowledged (200)"), "{html}");
+
+    let bodies = received.lock().unwrap().clone();
+    let params = bodies.last().unwrap()["parameter"].as_array().unwrap();
+    assert!(params.iter().all(|p| p["name"] != "manifestUrl"));
+    let status_code = params
+        .iter()
+        .find(|p| p["name"] == "submissionStatus")
+        .and_then(|p| p["valueCoding"]["code"].as_str())
+        .unwrap();
+    assert_eq!(status_code, "completed");
 }
 
 #[tokio::test]
@@ -668,7 +628,7 @@ async fn a_rejected_status_change_keeps_the_status_and_logs_it() {
     let (recipient_url, _) = mock_recipient(StatusCode::CONFLICT).await;
     let ctx = ctx(&recipient_url);
 
-    let (_, detail_path, _) = post_form(&ctx, "/ui/bulk-import", "name=Reject&auth=none").await;
+    let detail_path = create_submission(&ctx).await;
     set_submission_status(&ctx, &detail_path, "in-progress").await;
     post_form(&ctx, &format!("{detail_path}/abort"), "").await;
 
@@ -678,84 +638,46 @@ async fn a_rejected_status_change_keeps_the_status_and_logs_it() {
 }
 
 #[tokio::test]
-async fn terminal_and_row_state_guards_reject_direct_posts_without_side_effects() {
+async fn terminal_submissions_reject_status_changes_without_side_effects() {
     let (recipient_url, received) = mock_recipient(StatusCode::OK).await;
     let ctx = ctx(&recipient_url);
-    let (_, detail_path, _) = post_form(&ctx, "/ui/bulk-import", "name=Guarded&auth=none").await;
-    post_form(
-        &ctx,
-        &format!("{detail_path}/manifests"),
-        "manifest_url=http%3A%2F%2Fold.example%2Fm.json",
-    )
-    .await;
-    let (_, html) = get(&ctx, &detail_path).await;
-    let marker = format!("{detail_path}/manifests/");
-    let mid = html
-        .split(&marker)
-        .nth(1)
-        .and_then(|rest| rest.split('/').next())
-        .expect("manifest id")
-        .to_string();
+    let detail_path = create_submission(&ctx).await;
+    set_submission_status(&ctx, &detail_path, "completed").await;
 
-    let before_unsent_abort = received.lock().unwrap().len();
-    let (status, _, _) = post_form(&ctx, &format!("{detail_path}/manifests/{mid}/abort"), "").await;
-    assert_eq!(status, StatusCode::CONFLICT);
-    assert_eq!(received.lock().unwrap().len(), before_unsent_abort);
-
-    post_form(&ctx, &format!("{detail_path}/manifests/{mid}/submit"), "").await;
-    let before_repeat = received.lock().unwrap().len();
-    let (status, _, _) =
-        post_form(&ctx, &format!("{detail_path}/manifests/{mid}/submit"), "").await;
-    assert_eq!(status, StatusCode::CONFLICT);
-    assert_eq!(received.lock().unwrap().len(), before_repeat);
-
-    post_form(&ctx, &format!("{detail_path}/complete"), "").await;
-    let before_terminal = received.lock().unwrap().len();
-    let settings_before = ctx
-        .settings
-        .get_settings("l2:")
+    let tenant = helios_persistence::tenant::TenantContext::new(
+        helios_persistence::tenant::TenantId::new("default"),
+        helios_persistence::tenant::TenantPermissions::full_access(),
+    );
+    let submission_id = detail_path.rsplit('/').next().unwrap();
+    let stored_before = ctx
+        .bulk_provider
+        .get_provider_submission(&tenant, submission_id)
         .await
         .unwrap()
         .unwrap()
         .document;
-    for (uri, form) in [
-        (
-            format!("{detail_path}/manifests"),
-            "manifest_url=http%3A%2F%2Fnew.example%2Fm.json",
-        ),
-        (format!("{detail_path}/manifests/{mid}/submit"), ""),
-        (format!("{detail_path}/manifests/{mid}/abort"), ""),
-        (
-            format!("{detail_path}/manifests/{mid}/replace"),
-            "manifest_url=http%3A%2F%2Freplacement.example%2Fm.json",
-        ),
-        (format!("{detail_path}/submit-all"), ""),
-        (format!("{detail_path}/abort"), ""),
-        (format!("{detail_path}/complete"), ""),
-    ] {
-        let (status, _, _) = post_form(&ctx, &uri, form).await;
-        assert_eq!(status, StatusCode::CONFLICT, "{uri}");
-    }
-    assert_eq!(received.lock().unwrap().len(), before_terminal);
-    let settings_after = ctx
-        .settings
-        .get_settings("l2:")
+    let before = received.lock().unwrap().len();
+
+    let (status, _, _) = post_form(&ctx, &format!("{detail_path}/abort"), "").await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(received.lock().unwrap().len(), before);
+    let stored_after = ctx
+        .bulk_provider
+        .get_provider_submission(&tenant, submission_id)
         .await
         .unwrap()
         .unwrap()
         .document;
-    assert_eq!(settings_after, settings_before);
+    assert_eq!(stored_after, stored_before);
 
     let (_, html) = get(&ctx, &detail_path).await;
     assert!(html.contains("Completed"));
-    assert!(html.contains(r#"data-bulk-import-add-manifest disabled"#));
-    assert!(html.contains("Remove"));
 }
 
 #[tokio::test]
 async fn an_unreachable_recipient_fails_the_status_change() {
     let ctx = ctx("http://localhost:9/");
-    let (_, detail_path, _) = post_form(&ctx, "/ui/bulk-import", "name=Gone&auth=none").await;
+    let detail_path = create_submission(&ctx).await;
     set_submission_status(&ctx, &detail_path, "in-progress").await;
     post_form(&ctx, &format!("{detail_path}/abort"), "").await;
 
@@ -765,21 +687,18 @@ async fn an_unreachable_recipient_fails_the_status_change() {
 }
 
 #[tokio::test]
-async fn manifest_options_ride_the_kickoff() {
+async fn advanced_options_ride_the_kickoff() {
     let (recipient_url, received) = mock_recipient(StatusCode::OK).await;
     let ctx = ctx(&recipient_url);
 
-    let (_, detail_path, _) = post_form(&ctx, "/ui/bulk-import", "name=Options&auth=none").await;
     post_form(
         &ctx,
-        &format!("{detail_path}/manifests"),
-        "manifest_url=http%3A%2F%2Fone.example%2Fm.json\
-         &fhir_base_url=http%3A%2F%2Fbase.example%2Ffhir\
+        "/ui/bulk-import",
+        "name=Options&manifest_url=http%3A%2F%2Fone.example%2Fm.json&auth=none\
          &output_format=application%2Ffhir%2Bndjson\
          &file_request_headers=Authorization%3A%20Bearer%20abc%0AX-Trace%3A%201",
     )
     .await;
-    post_form(&ctx, &format!("{detail_path}/submit-all"), "").await;
 
     let bodies = received.lock().unwrap().clone();
     assert_eq!(bodies.len(), 1);
@@ -791,11 +710,8 @@ async fn manifest_options_ride_the_kickoff() {
             .cloned()
             .unwrap_or_default()
     };
-    // The explicit FHIR base wins over the manifest-derived fallback.
-    assert_eq!(
-        value_of("fhirBaseUrl")["valueUrl"],
-        "http://base.example/fhir"
-    );
+    // The FHIR base always derives from the manifest URL's origin.
+    assert_eq!(value_of("fhirBaseUrl")["valueUrl"], "http://one.example");
     assert_eq!(
         value_of("outputFormat")["valueString"],
         "application/fhir+ndjson"
@@ -833,7 +749,8 @@ async fn the_page_degrades_without_a_settings_store() {
         Arc::new(helios_ui::StaticConformanceSource::empty()),
         FhirVersion::R4,
         None,
-        "http://localhost:8080".to_string(),
+        "http://localhost:9".to_string(),
+        None,
     );
     let res = app
         .clone()
@@ -849,7 +766,9 @@ async fn the_page_degrades_without_a_settings_store() {
         .oneshot(
             Request::post("/ui/bulk-import")
                 .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
-                .body(Body::from("name=X"))
+                .body(Body::from(
+                    "name=X&manifest_url=http%3A%2F%2Fone.example%2Fm.json",
+                ))
                 .unwrap(),
         )
         .await
@@ -877,6 +796,113 @@ async fn mock_token_endpoint(status: StatusCode, body: &'static str) -> String {
     );
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     format!("http://{addr}/token")
+}
+
+/// A recipient whose poll URL always answers with the given status and a
+/// `Retry-After`, counting how many polls actually arrive (#790).
+async fn mock_recipient_counting_polls(
+    poll_status: StatusCode,
+    retry_after: &'static str,
+) -> (String, Arc<std::sync::Mutex<u32>>) {
+    use axum::extract::State as AxState;
+    #[derive(Clone)]
+    struct S {
+        polls: Arc<std::sync::Mutex<u32>>,
+        base: Arc<std::sync::Mutex<String>>,
+    }
+    let state = S {
+        polls: Arc::new(std::sync::Mutex::new(0)),
+        base: Arc::new(std::sync::Mutex::new(String::new())),
+    };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    *state.base.lock().unwrap() = format!("http://{addr}");
+    let polls = Arc::clone(&state.polls);
+    let app = Router::new()
+        .route(
+            "/$bulk-submit",
+            axum::routing::post(|| async {
+                axum::Json(serde_json::json!({"resourceType": "OperationOutcome"}))
+            }),
+        )
+        .route(
+            "/$bulk-submit-status",
+            axum::routing::post(|AxState(s): AxState<S>| async move {
+                let base = s.base.lock().unwrap().clone();
+                (
+                    StatusCode::ACCEPTED,
+                    [("content-location", format!("{base}/poll"))],
+                    "",
+                )
+            }),
+        )
+        .route(
+            "/poll",
+            axum::routing::get(move |AxState(s): AxState<S>| async move {
+                *s.polls.lock().unwrap() += 1;
+                (
+                    poll_status,
+                    [
+                        ("retry-after", retry_after.to_string()),
+                        ("x-progress", "processing 10% complete".to_string()),
+                    ],
+                    String::new(),
+                )
+            }),
+        )
+        .with_state(state);
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (format!("http://{addr}"), polls)
+}
+
+/// #790: a `202` carrying `Retry-After` holds the next recipient poll — the
+/// card keeps refreshing from stored state, but the recipient is not asked
+/// again until the window passes.
+#[tokio::test]
+async fn a_retry_after_holds_the_next_poll() {
+    let (recipient_url, polls) = mock_recipient_counting_polls(StatusCode::ACCEPTED, "120").await;
+    let ctx = ctx(&recipient_url);
+    let detail_path = create_submission(&ctx).await;
+
+    let (_, html) = get(&ctx, &format!("{detail_path}/status")).await;
+    assert_eq!(*polls.lock().unwrap(), 1);
+    assert!(html.contains("processing 10% complete"), "{html}");
+    assert!(html.contains("every 5s"), "the card keeps refreshing");
+    // A reported percentage renders the determinate bar, and the summary's
+    // STATUS cell rides along out-of-band so it can never go stale.
+    assert!(html.contains(r#"aria-valuenow="10""#), "{html}");
+    assert!(
+        html.contains(r#"<div id="submission-status" hx-swap-oob="true">In Progress</div>"#),
+        "{html}"
+    );
+
+    // The htmx cadence fires again immediately — the recipient must not.
+    let (_, html) = get(&ctx, &format!("{detail_path}/status")).await;
+    assert_eq!(*polls.lock().unwrap(), 1, "poll held by Retry-After");
+    assert!(html.contains("processing 10% complete"), "cached: {html}");
+    assert!(html.contains("every 5s"));
+}
+
+/// #790: a throttled poll is backoff bookkeeping — no run-log line, and the
+/// next fetch inside the `Retry-After` window sends nothing.
+#[tokio::test]
+async fn a_throttled_poll_backs_off_and_stays_out_of_the_log() {
+    let (recipient_url, polls) =
+        mock_recipient_counting_polls(StatusCode::TOO_MANY_REQUESTS, "60").await;
+    let ctx = ctx(&recipient_url);
+    let detail_path = create_submission(&ctx).await;
+
+    let _ = get(&ctx, &format!("{detail_path}/status")).await;
+    assert_eq!(*polls.lock().unwrap(), 1);
+    let _ = get(&ctx, &format!("{detail_path}/status")).await;
+    assert_eq!(*polls.lock().unwrap(), 1, "429's Retry-After held the poll");
+
+    let (_, detail) = get(&ctx, &detail_path).await;
+    assert!(
+        !detail.contains("throttled"),
+        "backoff is not a run event: {detail}"
+    );
+    assert!(detail.contains("In Progress"), "{detail}");
 }
 
 /// One sequential test for everything that reads the process-wide signing-key
@@ -940,30 +966,24 @@ async fn backend_services_auth_mints_and_attaches_tokens() {
     assert!(html.contains("no access_token"));
 
     // Phase 6 — a backend-services submission attaches the Bearer token to
-    // the kick-off it POSTs at the recipient.
+    // the kick-off its creation POSTs at the recipient.
     let (recipient_url, seen_auth) = mock_recipient_capturing_auth().await;
     // Same settings (the registered signing key lives there), phase-local
     // recipient: the kick-off must reach this phase's capturing mock.
     let ctx = Ctx {
         settings: Arc::clone(&ctx.settings),
+        bulk_provider: Arc::clone(&ctx.bulk_provider),
         recipient: recipient_url.clone(),
     };
     let (_, detail_path, _) = post_form(
         &ctx,
         "/ui/bulk-import",
         &format!(
-            "name=Authy&auth=backend-services&client_id=alice&token_url={}",
+            "name=Authy&manifest_url=http%3A%2F%2Fone.example%2Fm.json&auth=backend-services&client_id=alice&token_url={}",
             urlencode(&token_url)
         ),
     )
     .await;
-    post_form(
-        &ctx,
-        &format!("{detail_path}/manifests"),
-        "manifest_url=http%3A%2F%2Fone.example%2Fm.json",
-    )
-    .await;
-    post_form(&ctx, &format!("{detail_path}/submit-all"), "").await;
 
     assert_eq!(
         seen_auth.lock().unwrap().as_deref(),
@@ -1050,43 +1070,20 @@ async fn unknown_ids_redirect_instead_of_crashing() {
     let ctx = ctx("http://localhost:9/");
     let ghost = "/ui/bulk-import/00000000-0000-4000-8000-000000000000";
 
-    for uri in [
-        format!("{ghost}/manifests"),
-        format!("{ghost}/manifests/also-missing/delete"),
-        format!("{ghost}/manifests/also-missing/submit"),
-        format!("{ghost}/submit-all"),
-        format!("{ghost}/abort"),
+    for (uri, form) in [
+        (format!("{ghost}/abort"), ""),
+        (format!("{ghost}/edit"), "name=X"),
+        (format!("{ghost}/delete"), ""),
     ] {
-        let (status, _, _) = post_form(&ctx, &uri, "manifest_url=http%3A%2F%2Fx").await;
+        let (status, _, _) = post_form(&ctx, &uri, form).await;
         assert_eq!(status, StatusCode::SEE_OTHER, "{uri}");
     }
 }
 
 #[tokio::test]
-async fn a_missing_manifest_id_submits_nothing() {
-    let (recipient_url, received) = mock_recipient(StatusCode::OK).await;
-    let ctx = ctx(&recipient_url);
-    let (_, detail_path, _) = post_form(&ctx, "/ui/bulk-import", "name=Ghost&auth=none").await;
-    post_form(
-        &ctx,
-        &format!("{detail_path}/manifests/no-such-manifest/submit"),
-        "",
-    )
-    .await;
-    assert_eq!(received.lock().unwrap().len(), 0);
-}
-
-#[tokio::test]
-async fn an_unreachable_recipient_fails_the_manifest_submit() {
+async fn an_unreachable_recipient_fails_the_create_submit() {
     let ctx = ctx("http://localhost:9/");
-    let (_, detail_path, _) = post_form(&ctx, "/ui/bulk-import", "name=Down&auth=none").await;
-    post_form(
-        &ctx,
-        &format!("{detail_path}/manifests"),
-        "manifest_url=http%3A%2F%2Fone.example%2Fm.json",
-    )
-    .await;
-    post_form(&ctx, &format!("{detail_path}/submit-all"), "").await;
+    let detail_path = create_submission(&ctx).await;
 
     let (_, html) = get(&ctx, &detail_path).await;
     assert!(html.contains("Bulk Submit request failed:"));
@@ -1146,6 +1143,9 @@ async fn mock_recipient_with_status() -> (String, Arc<std::sync::Mutex<Vec<serde
                         [
                             ("x-progress", "processing 0% complete".to_string()),
                             ("content-type", "text/plain".to_string()),
+                            // An expired window: the next fetch may poll again
+                            // immediately, so the flip to 200 stays reachable.
+                            ("retry-after", "0".to_string()),
                         ],
                         String::new(),
                     )
@@ -1174,21 +1174,12 @@ async fn status_polling_tracks_progress_and_lands_the_result() {
     let (_, detail_path, _) = post_form(
         &ctx,
         "/ui/bulk-import",
-        "name=Polling&auth=none&submitter_system=http%3A%2F%2Fexample.org%2Fsubmitters&submitter_value=acme&submission_id=pinned-42",
+        "name=Polling&manifest_url=http%3A%2F%2Fone.example%2Fm.json&auth=none&submitter_system=http%3A%2F%2Fexample.org%2Fsubmitters&submitter_value=acme",
     )
     .await;
-    assert!(detail_path.ends_with("/pinned-42"), "{detail_path}");
 
-    post_form(
-        &ctx,
-        &format!("{detail_path}/manifests"),
-        "manifest_url=http%3A%2F%2Fone.example%2Fm.json",
-    )
-    .await;
-    post_form(&ctx, &format!("{detail_path}/submit-all"), "").await;
-
-    // The submit kick-off carried the pinned id and the custom submitter,
-    // and the status kick-off went out with the same identity.
+    // The create kick-off carried the custom submitter, and the status
+    // kick-off went out with the same identity.
     let bodies = kickoffs.lock().unwrap().clone();
     assert_eq!(bodies.len(), 1, "one manifest kick-off");
     let submitter = bodies[0]["parameter"]
@@ -1201,23 +1192,43 @@ async fn status_polling_tracks_progress_and_lands_the_result() {
     assert_eq!(submitter["system"], "http://example.org/submitters");
     assert_eq!(submitter["value"], "acme");
 
-    // First status fetch: one poll happens -> 202 progress recorded, and the
-    // fragment keeps polling.
+    // First status fetch: one poll happens -> 202 progress recorded, the
+    // fragment keeps polling, and the in-progress card offers Abort. A 0%
+    // report renders a determinate bar at zero — the recipient's percentage
+    // is byte-based now, so an early zero fills within seconds instead of
+    // sweeping indeterminately for the whole run.
     let (status, html) = get(&ctx, &format!("{detail_path}/status")).await;
     assert_eq!(status, StatusCode::OK);
     assert!(html.contains("processing 0% complete"), "{html}");
+    assert!(html.contains(r#"aria-valuenow="0""#), "{html}");
+    assert!(!html.contains("progress-track--indeterminate"), "{html}");
     assert!(html.contains("every 5s"), "keeps polling: {html}");
     assert!(html.contains(r#"id="bulk-status" class="card panel bulk-import-section""#));
-    assert!(html.contains(r#"class="kv-grid""#));
+    assert!(html.contains(r#"class="kv-grid kv-grid--flush""#));
+    assert!(
+        html.contains(&format!(r#"action="{detail_path}/abort""#)),
+        "abort on the progress card: {html}"
+    );
+    assert!(
+        html.contains(&format!(r#"action="{detail_path}/complete""#)),
+        "mark-completed on the progress card: {html}"
+    );
     assert!(!html.contains(r#"class="card detail""#));
 
-    // Second fetch: the mock flips to 200 -> result summary, polling stops.
+    // Second fetch: the mock flips to 200 -> result summary, polling stops,
+    // the finished card carries no abort, and the out-of-band STATUS cell
+    // flips to Completed with it — no page reload required.
     let (_, html) = get(&ctx, &format!("{detail_path}/status")).await;
     assert!(!html.contains("every 5s"), "polling stopped: {html}");
     assert!(html.contains("Output files"), "{html}");
+    assert!(
+        html.contains(r#"<div id="submission-status" hx-swap-oob="true">Completed</div>"#),
+        "{html}"
+    );
     assert!(html.contains(r#"id="bulk-status" class="card panel bulk-import-section""#));
-    assert!(html.contains(r#"class="kv-grid""#));
+    assert!(html.contains(r#"class="kv-grid kv-grid--flush""#));
     assert!(html.contains("Processing finished at <code>"), "{html}");
+    assert!(!html.contains(&format!(r#"action="{detail_path}/abort""#)));
     assert!(!html.contains(r#"class="card detail""#));
 
     // The log recorded the whole journey and the detail shows the summary.
@@ -1259,175 +1270,6 @@ async fn the_empty_manifest_is_served() {
     assert_eq!(m["requiresAccessToken"], false);
 }
 
-#[tokio::test]
-async fn replacing_a_manifest_sends_replaces_manifest_url() {
-    let (recipient_url, received) = mock_recipient(StatusCode::OK).await;
-    let ctx = ctx(&recipient_url);
-    let (_, detail_path, _) = post_form(&ctx, "/ui/bulk-import", "name=R&auth=none").await;
-    post_form(
-        &ctx,
-        &format!("{detail_path}/manifests"),
-        "manifest_url=http%3A%2F%2Fold.example%2Fm.json",
-    )
-    .await;
-    let (_, html) = get(&ctx, &detail_path).await;
-    let marker = format!("{detail_path}/manifests/");
-    let mid = html
-        .split(&marker)
-        .nth(1)
-        .and_then(|r| r.split('/').next())
-        .unwrap()
-        .to_string();
-
-    post_form(&ctx, &format!("{detail_path}/manifests/{mid}/submit"), "").await;
-
-    post_form(
-        &ctx,
-        &format!("{detail_path}/manifests/{mid}/replace"),
-        "manifest_url=http%3A%2F%2Fnew.example%2Fm.json",
-    )
-    .await;
-
-    let bodies = received.lock().unwrap().clone();
-    assert_eq!(bodies.len(), 2);
-    let params = bodies[1]["parameter"].as_array().unwrap();
-    let get_p = |n: &str| {
-        params
-            .iter()
-            .find(|p| p["name"] == n)
-            .cloned()
-            .unwrap_or_default()
-    };
-    assert_eq!(
-        get_p("manifestUrl")["valueUrl"],
-        "http://new.example/m.json"
-    );
-    assert_eq!(
-        get_p("replacesManifestUrl")["valueUrl"],
-        "http://old.example/m.json"
-    );
-
-    let (_, html) = get(&ctx, &detail_path).await;
-    assert!(html.contains("http://new.example/m.json"));
-    assert!(html.contains("Replacement accepted (200)"));
-}
-
-#[tokio::test]
-async fn aborting_one_manifest_sends_a_replace_only_kickoff() {
-    let (recipient_url, received) = mock_recipient(StatusCode::OK).await;
-    let ctx = ctx(&recipient_url);
-    let (_, detail_path, _) = post_form(&ctx, "/ui/bulk-import", "name=A&auth=none").await;
-    post_form(
-        &ctx,
-        &format!("{detail_path}/manifests"),
-        "manifest_url=http%3A%2F%2Fold.example%2Fm.json",
-    )
-    .await;
-    post_form(&ctx, &format!("{detail_path}/submit-all"), "").await;
-    let (_, html) = get(&ctx, &detail_path).await;
-    let marker = format!("{detail_path}/manifests/");
-    let mid = html
-        .split(&marker)
-        .nth(1)
-        .and_then(|r| r.split('/').next())
-        .unwrap()
-        .to_string();
-
-    post_form(&ctx, &format!("{detail_path}/manifests/{mid}/abort"), "").await;
-
-    let bodies = received.lock().unwrap().clone();
-    assert_eq!(bodies.len(), 2);
-    let params = bodies[1]["parameter"].as_array().unwrap();
-    let get_p = |n: &str| {
-        params
-            .iter()
-            .find(|p| p["name"] == n)
-            .cloned()
-            .unwrap_or_default()
-    };
-    assert!(params.iter().all(|p| p["name"] != "manifestUrl"));
-    assert!(params.iter().all(|p| p["name"] != "fhirBaseUrl"));
-    assert_eq!(
-        get_p("submissionStatus")["valueCoding"]["code"],
-        "in-progress"
-    );
-    assert_eq!(
-        get_p("replacesManifestUrl")["valueUrl"],
-        "http://old.example/m.json"
-    );
-
-    let (_, html) = get(&ctx, &detail_path).await;
-    assert!(html.contains("Abort accepted (200)"));
-    let submit_form = format!(r#"action="{detail_path}/manifests/{mid}/submit""#);
-    let submit_markup = html
-        .split(&submit_form)
-        .nth(1)
-        .expect("submitted row remains visible");
-    assert!(submit_markup[..submit_markup.len().min(400)].contains("disabled"));
-
-    let after_abort = received.lock().unwrap().len();
-    for action in ["abort", "submit"] {
-        let (status, _, _) =
-            post_form(&ctx, &format!("{detail_path}/manifests/{mid}/{action}"), "").await;
-        assert_eq!(status, StatusCode::CONFLICT);
-    }
-    assert_eq!(received.lock().unwrap().len(), after_abort);
-}
-
-#[tokio::test]
-async fn two_submitted_manifests_can_be_aborted_by_their_distinct_urls() {
-    let (recipient_url, received) = mock_recipient(StatusCode::OK).await;
-    let ctx = ctx(&recipient_url);
-    let (_, detail_path, _) = post_form(&ctx, "/ui/bulk-import", "name=Pair&auth=none").await;
-    for url in [
-        "http%3A%2F%2Fone.example%2Fm.json",
-        "http%3A%2F%2Ftwo.example%2Fm.json",
-    ] {
-        post_form(
-            &ctx,
-            &format!("{detail_path}/manifests"),
-            &format!("manifest_url={url}"),
-        )
-        .await;
-    }
-
-    post_form(&ctx, &format!("{detail_path}/submit-all"), "").await;
-    let (_, html) = get(&ctx, &detail_path).await;
-    let marker = format!("{detail_path}/manifests/");
-    let mids: std::collections::BTreeSet<String> = html
-        .split(&marker)
-        .skip(1)
-        .filter_map(|rest| rest.split('/').next())
-        .map(String::from)
-        .collect();
-    assert_eq!(mids.len(), 2);
-    for mid in mids {
-        let (status, _, _) =
-            post_form(&ctx, &format!("{detail_path}/manifests/{mid}/abort"), "").await;
-        assert_eq!(status, StatusCode::SEE_OTHER);
-    }
-
-    let bodies = received.lock().unwrap().clone();
-    assert_eq!(bodies.len(), 4);
-    let replaced: std::collections::BTreeSet<&str> = bodies[2..]
-        .iter()
-        .filter_map(|body| {
-            body["parameter"]
-                .as_array()?
-                .iter()
-                .find(|parameter| parameter["name"] == "replacesManifestUrl")?["valueUrl"]
-                .as_str()
-        })
-        .collect();
-    assert_eq!(
-        replaced,
-        std::collections::BTreeSet::from([
-            "http://one.example/m.json",
-            "http://two.example/m.json",
-        ])
-    );
-}
-
 /// #686's repro: a recipient that is a plain static file server answers 501
 /// with an HTML error page. The log explains instead of pasting markup.
 #[tokio::test]
@@ -1444,14 +1286,7 @@ async fn a_non_fhir_recipient_error_is_summarized_not_pasted() {
     tokio::spawn(async move { axum::serve(listener, recipient).await.unwrap() });
     let ctx = ctx(&format!("http://{addr}"));
 
-    let (_, detail_path, _) = post_form(&ctx, "/ui/bulk-import", "name=Static&auth=none").await;
-    post_form(
-        &ctx,
-        &format!("{detail_path}/manifests"),
-        "manifest_url=http%3A%2F%2Fone.example%2Fm.json",
-    )
-    .await;
-    post_form(&ctx, &format!("{detail_path}/submit-all"), "").await;
+    let detail_path = create_submission(&ctx).await;
 
     let (_, html) = get(&ctx, &detail_path).await;
     assert!(html.contains("$bulk-submit → 501"));
@@ -1461,4 +1296,140 @@ async fn a_non_fhir_recipient_error_is_summarized_not_pasted() {
     );
     assert!(!html.contains("Error code: 501"), "markup is not pasted");
     assert!(html.contains("Failed"));
+}
+
+/// A recipient whose poll URL answers `200` with the given status manifest
+/// body on the first poll (no 202 phase), or `500` when `body` is `None`.
+async fn mock_recipient_finishing_with(body: Option<serde_json::Value>) -> String {
+    use axum::extract::State as AxState;
+    #[derive(Clone)]
+    struct S {
+        base: Arc<std::sync::Mutex<String>>,
+        body: Arc<Option<serde_json::Value>>,
+    }
+    let state = S {
+        base: Arc::new(std::sync::Mutex::new(String::new())),
+        body: Arc::new(body),
+    };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    *state.base.lock().unwrap() = format!("http://{addr}");
+    let app = Router::new()
+        .route(
+            "/$bulk-submit",
+            axum::routing::post(|| async {
+                axum::Json(serde_json::json!({"resourceType": "OperationOutcome"}))
+            }),
+        )
+        .route(
+            "/$bulk-submit-status",
+            axum::routing::post(|AxState(s): AxState<S>| async move {
+                let base = s.base.lock().unwrap().clone();
+                (
+                    StatusCode::ACCEPTED,
+                    [("content-location", format!("{base}/poll"))],
+                    "",
+                )
+            }),
+        )
+        .route(
+            "/poll",
+            axum::routing::get(|AxState(s): AxState<S>| async move {
+                match s.body.as_ref() {
+                    Some(manifest) => axum::Json(manifest.clone()).into_response(),
+                    None => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+                }
+            }),
+        )
+        .with_state(state);
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    format!("http://{addr}")
+}
+
+/// Drives a one-shot create, then one status fetch; returns the detail page
+/// HTML afterwards.
+async fn run_one_manifest_to_poll(recipient_url: &str) -> (Ctx, String, String) {
+    let ctx = ctx(recipient_url);
+    let (_, detail_path, _) = post_form(
+        &ctx,
+        "/ui/bulk-import",
+        "name=Outcome&manifest_url=http%3A%2F%2Fone.example%2Fm.json&auth=none",
+    )
+    .await;
+    let _ = get(&ctx, &format!("{detail_path}/status")).await;
+    let (_, detail) = get(&ctx, &detail_path).await;
+    (ctx, detail_path, detail)
+}
+
+/// #765: a clean `200` status manifest completes the submission by itself —
+/// no manual Complete press required. An `outcome` file whose countSeverity
+/// records no errors does not spoil the completion.
+#[tokio::test]
+async fn a_clean_completion_manifest_completes_the_submission() {
+    let recipient = mock_recipient_finishing_with(Some(serde_json::json!({
+        "output": [{"type": "Patient", "url": "http://x/1.ndjson"}],
+        "outcome": [{
+            "type": "OperationOutcome",
+            "url": "http://x/oo.ndjson",
+            "countSeverity": {"error": 0, "fatal": 0, "warning": 2}
+        }],
+        "error": []
+    })))
+    .await;
+    let (_ctx, _path, detail) = run_one_manifest_to_poll(&recipient).await;
+    assert!(detail.contains("Completed"), "{detail}");
+    assert!(!detail.contains("In Progress"), "{detail}");
+    assert!(detail.contains("submission completed"), "{detail}");
+}
+
+/// #764: a completion manifest carrying error files fails the submission.
+/// The STU4 status manifest lists them under `outcome` (with a countSeverity
+/// tally); reading only the export-style `error` key made a truncated ingest
+/// read "finished cleanly".
+#[tokio::test]
+async fn a_completion_manifest_with_errors_fails_the_submission() {
+    let recipient = mock_recipient_finishing_with(Some(serde_json::json!({
+        "output": [{"type": "Patient", "url": "http://x/1.ndjson"}],
+        "outcome": [{
+            "type": "OperationOutcome",
+            "url": "http://x/e.ndjson",
+            "countSeverity": {"error": 1}
+        }]
+    })))
+    .await;
+    let (_ctx, _path, detail) = run_one_manifest_to_poll(&recipient).await;
+    assert!(detail.contains("Failed"), "{detail}");
+    assert!(!detail.contains("In Progress"), "{detail}");
+    assert!(detail.contains("marked failed"), "{detail}");
+}
+
+/// The export-manifest vocabulary (`error[]`) still counts for recipients
+/// that answer with it.
+#[tokio::test]
+async fn an_export_style_error_array_also_fails_the_submission() {
+    let recipient = mock_recipient_finishing_with(Some(serde_json::json!({
+        "output": [{"type": "Patient", "url": "http://x/1.ndjson"}],
+        "error": [{"type": "OperationOutcome", "url": "http://x/e.ndjson"}]
+    })))
+    .await;
+    let (_ctx, _path, detail) = run_one_manifest_to_poll(&recipient).await;
+    assert!(detail.contains("Failed"), "{detail}");
+    assert!(detail.contains("marked failed"), "{detail}");
+}
+
+/// #764: a poll answering `5xx` stops polling, fails the submission, and the
+/// status card stays on screen instead of vanishing.
+#[tokio::test]
+async fn a_poll_server_error_fails_the_submission_and_keeps_the_card() {
+    let recipient = mock_recipient_finishing_with(None).await;
+    let (ctx, detail_path, detail) = run_one_manifest_to_poll(&recipient).await;
+    assert!(detail.contains("Failed"), "{detail}");
+    assert!(detail.contains("polling stopped"), "{detail}");
+    // The status fragment still renders the result card, and no longer polls.
+    let (_, fragment) = get(&ctx, &format!("{detail_path}/status")).await;
+    assert!(
+        fragment.contains("Processing finished at <code>"),
+        "{fragment}"
+    );
+    assert!(!fragment.contains("every 5s"), "{fragment}");
 }

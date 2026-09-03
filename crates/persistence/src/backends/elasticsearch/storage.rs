@@ -441,10 +441,14 @@ impl ElasticsearchBackend {
                 &contained.contained_type,
                 &contained_resource_id(container_id, &contained.local_id),
             );
-            let response = self
+            let mut request = self
                 .client()
                 .index(IndexParts::IndexId(&index, &doc_id))
-                .body(doc)
+                .body(doc);
+            if let Some(refresh) = self.write_refresh_param() {
+                request = request.refresh(refresh);
+            }
+            let response = request
                 .send()
                 .await
                 .map_err(|e| internal_error(format!("Failed to index contained doc: {}", e)))?;
@@ -490,7 +494,7 @@ impl ResourceStorage for ElasticsearchBackend {
             .get("id")
             .and_then(|v| v.as_str())
             .map(String::from)
-            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+            .unwrap_or_else(crate::types::new_resource_id);
 
         let version_id = "1";
 
@@ -528,10 +532,14 @@ impl ResourceStorage for ElasticsearchBackend {
         let index = self.index_name(tenant_id, resource_type);
         let doc_id = Self::document_id(resource_type, &id);
 
-        let response = self
+        let mut request = self
             .client()
             .index(IndexParts::IndexId(&index, &doc_id))
-            .body(doc)
+            .body(doc);
+        if let Some(refresh) = self.write_refresh_param() {
+            request = request.refresh(refresh);
+        }
+        let response = request
             .send()
             .await
             .map_err(|e| internal_error(format!("Failed to index document: {}", e)))?;
@@ -694,10 +702,14 @@ impl ResourceStorage for ElasticsearchBackend {
         // Ensure index exists
         schema::ensure_index(self, tenant_id, resource_type).await?;
 
-        let response = self
+        let mut request = self
             .client()
             .index(IndexParts::IndexId(&index, &doc_id))
-            .body(doc)
+            .body(doc);
+        if let Some(refresh) = self.write_refresh_param() {
+            request = request.refresh(refresh);
+        }
+        let response = request
             .send()
             .await
             .map_err(|e| internal_error(format!("Failed to index document: {}", e)))?;
@@ -859,10 +871,14 @@ impl ResourceStorage for ElasticsearchBackend {
         let index = self.index_name(tenant_id, resource_type);
         let doc_id = Self::document_id(resource_type, id);
 
-        let response = self
+        let mut request = self
             .client()
             .index(IndexParts::IndexId(&index, &doc_id))
-            .body(doc)
+            .body(doc);
+        if let Some(refresh) = self.write_refresh_param() {
+            request = request.refresh(refresh);
+        }
+        let response = request
             .send()
             .await
             .map_err(|e| internal_error(format!("Failed to update document: {}", e)))?;
@@ -902,9 +918,11 @@ impl ResourceStorage for ElasticsearchBackend {
         let index = self.index_name(tenant_id, resource_type);
         let doc_id = Self::document_id(resource_type, id);
 
-        let response = self
-            .client()
-            .delete(DeleteParts::IndexId(&index, &doc_id))
+        let mut request = self.client().delete(DeleteParts::IndexId(&index, &doc_id));
+        if let Some(refresh) = self.write_refresh_param() {
+            request = request.refresh(refresh);
+        }
+        let response = request
             .send()
             .await
             .map_err(|e| internal_error(format!("Failed to delete document: {}", e)))?;
@@ -1193,10 +1211,14 @@ impl ReindexTarget for ElasticsearchBackend {
         let index = self.index_name(tenant_id, resource_type);
         let doc_id = Self::document_id(resource_type, resource_id);
 
-        let response = self
+        let mut request = self
             .client()
             .index(IndexParts::IndexId(&index, &doc_id))
-            .body(doc)
+            .body(doc);
+        if let Some(refresh) = self.write_refresh_param() {
+            request = request.refresh(refresh);
+        }
+        let response = request
             .send()
             .await
             .map_err(|e| internal_error(format!("Failed to index document: {e}")))?;

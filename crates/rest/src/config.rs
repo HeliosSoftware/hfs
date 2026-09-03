@@ -614,6 +614,11 @@ pub struct BulkSubmitConfig {
     pub output_ttl_secs: u64,
     /// Maximum manifests this pod ingests concurrently.
     pub worker_concurrency: u32,
+    /// Bulk fast-load (#903): ingest without search-index/FTS writes and
+    /// rebuild them with an automatic per-type reindex when each manifest
+    /// finishes. Reads and history are complete throughout; search sees a
+    /// manifest's resources once its reindex lands.
+    pub defer_indexing: bool,
     /// When `true`, this pod does not run in-process submit workers.
     pub disable_local_worker: bool,
     /// Cap on simultaneous in-flight submissions per tenant.
@@ -669,6 +674,7 @@ impl Default for BulkSubmitConfig {
             output_ttl_secs: 86400,
             worker_concurrency: 2,
             disable_local_worker: false,
+            defer_indexing: false,
             max_concurrent_per_tenant: 4,
             batch_size: 1000,
             lease_duration_secs: 60,
@@ -726,6 +732,7 @@ impl BulkSubmitConfig {
             file_url_ttl_secs: env_u64("HFS_BULK_SUBMIT_FILE_URL_TTL", d.file_url_ttl_secs),
             output_ttl_secs: env_u64("HFS_BULK_SUBMIT_OUTPUT_TTL", d.output_ttl_secs),
             worker_concurrency: env_u32("HFS_BULK_SUBMIT_WORKER_CONCURRENCY", d.worker_concurrency),
+            defer_indexing: env_bool("HFS_BULK_SUBMIT_DEFER_INDEXING", d.defer_indexing),
             disable_local_worker: env_bool(
                 "HFS_BULK_SUBMIT_DISABLE_LOCAL_WORKER",
                 d.disable_local_worker,
@@ -1006,6 +1013,19 @@ pub struct ServerConfig {
     #[arg(long, env = "HFS_ELASTICSEARCH_PASSWORD")]
     pub elasticsearch_password: Option<String>,
 
+    /// Elasticsearch index refresh interval (e.g. "1s", "200ms", "-1" to disable
+    /// periodic refresh). Controls how quickly indexed documents become
+    /// searchable when no per-write refresh is requested.
+    #[arg(long, env = "HFS_ELASTICSEARCH_REFRESH_INTERVAL", default_value = "1s")]
+    pub elasticsearch_refresh_interval: String,
+
+    /// Refresh behavior applied to Elasticsearch index/delete operations:
+    /// "false" (no per-write refresh), "wait_for" (block each write until the
+    /// affected shards refresh, giving read-after-write search visibility), or
+    /// "true" (force a refresh per write).
+    #[arg(long, env = "HFS_ELASTICSEARCH_WRITE_REFRESH", default_value = "false")]
+    pub elasticsearch_write_refresh: String,
+
     /// Enable SQL-on-FHIR operations ($sql-run, $sql-export).
     /// When enabled, the configured storage backend MUST provide an in-DB
     /// SOF runner (sqlite or postgres) — there is no in-process fallback.
@@ -1224,6 +1244,8 @@ impl Default for ServerConfig {
             elasticsearch_index_prefix: "hfs".to_string(),
             elasticsearch_username: None,
             elasticsearch_password: None,
+            elasticsearch_refresh_interval: "1s".to_string(),
+            elasticsearch_write_refresh: "false".to_string(),
             sof_enabled: true,
             nl_search_enabled: true,
             nl_search_api_key: None,
@@ -1444,6 +1466,8 @@ impl ServerConfig {
             elasticsearch_index_prefix: "hfs".to_string(),
             elasticsearch_username: None,
             elasticsearch_password: None,
+            elasticsearch_refresh_interval: "1s".to_string(),
+            elasticsearch_write_refresh: "false".to_string(),
             sof_enabled: true,
             nl_search_enabled: true,
             nl_search_api_key: None,

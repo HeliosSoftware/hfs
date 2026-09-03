@@ -1,0 +1,83 @@
+{# One $sql-export job card on the Active SQL Exports list (#833). Structure
+   mirrors partials/bulk_export_card.html: contextual action, the status
+   chip, and the overflow menu up top, the full-width progress track, one
+   meta line. In-progress cards poll their own fragment every 5s.
+
+   The overflow (#833) always lists Copy job id — a progressive enhancement
+   hidden by default and revealed only when JavaScript and the Clipboard API
+   are both available (sql-export.js) — plus whichever plain-form actions
+   the status allows. An in-progress card's overflow would otherwise hold
+   nothing but that hidden Copy button, so its whole `<details>` starts
+   hidden too (no empty menu behind "…" without JavaScript). #}
+{% if card.status == "in-progress" %}
+<div id="job-{{ card.id }}" class="card job-card"
+     hx-get="/ui/sql/export/{{ card.id }}/card"
+     hx-trigger="every 5s"
+     hx-swap="outerHTML">
+{% else %}
+<div id="job-{{ card.id }}" class="card job-card">
+{% endif %}
+  <div class="job-card__head">
+    <h2 class="job-card__name"><a href="/ui/sql/export/{{ card.id }}">{{ card.name }}</a></h2>
+    <div class="job-card__actions">
+      {% if card.status == "in-progress" %}
+      <form method="post" action="/ui/sql/export/{{ card.id }}/cancel">
+        <button type="submit" class="btn">{{ i18n.t("sql-export-cancel") }}</button>
+      </form>
+      {% endif %}
+      {% if card.status == "failed" %}
+      <form method="post" action="/ui/sql/export/{{ card.id }}/retry">
+        <button type="submit" class="btn">{{ i18n.t("sql-export-retry") }}</button>
+      </form>
+      {% endif %}
+      {% if card.status == "complete" %}
+      <!-- #835: the job's own detail page, not the retired Files lookup —
+           the record's persisted outputs are what this button always meant
+           to reach. -->
+      <a class="btn btn--primary" href="/ui/sql/export/{{ card.id }}">{{ i18n.t("sql-export-view-files") }}</a>
+      {% endif %}
+      <span class="tag tag--{{ card.status }}">{{ card.status_label }}</span>
+      {% if card.status == "in-progress" %}
+      {% if !card.job_id.is_empty() %}
+      <details class="menu" hidden>
+        <summary class="btn btn--icon" aria-label="{{ i18n.t("sql-export-more-actions") }}">{% include "icons/dots-vertical.svg" %}</summary>
+        <div class="menu__panel menu__panel--right menu__panel--compact">
+          <button type="button" class="menu__option" hidden
+                  data-copy-job-id="{{ card.job_id }}"
+                  data-copy-label="{{ i18n.t("sql-export-copy-job-id") }}"
+                  data-copied-label="{{ i18n.t("sql-export-copied") }}">{{ i18n.t("sql-export-copy-job-id") }}</button>
+        </div>
+      </details>
+      {% endif %}
+      {% else %}
+      <details class="menu">
+        <summary class="btn btn--icon" aria-label="{{ i18n.t("sql-export-more-actions") }}">{% include "icons/dots-vertical.svg" %}</summary>
+        <div class="menu__panel menu__panel--right menu__panel--compact">
+          {% if card.status == "complete" || card.status == "cancelled" %}
+          <form method="post" action="/ui/sql/export/{{ card.id }}/rerun">
+            <button type="submit" class="menu__option">{{ i18n.t("sql-export-run-again") }}</button>
+          </form>
+          {% endif %}
+          {% if !card.job_id.is_empty() %}
+          <button type="button" class="menu__option" hidden
+                  data-copy-job-id="{{ card.job_id }}"
+                  data-copy-label="{{ i18n.t("sql-export-copy-job-id") }}"
+                  data-copied-label="{{ i18n.t("sql-export-copied") }}">{{ i18n.t("sql-export-copy-job-id") }}</button>
+          {% endif %}
+          <form method="post" action="/ui/sql/export/{{ card.id }}/remove">
+            <button type="submit" class="menu__option">{{ i18n.t("sql-export-remove") }}</button>
+          </form>
+        </div>
+      </details>
+      {% endif %}
+    </div>
+  </div>
+
+  <div class="progress progress--{{ card.status }}" role="progressbar"
+       aria-valuemin="0" aria-valuemax="100" aria-valuenow="{{ card.progress_pct }}"
+       aria-label="{{ card.status_label }}">
+    <div class="progress__bar" style="width: {{ card.progress_pct }}%"></div>
+  </div>
+
+  <p class="job-card__meta">{{ card.meta }}</p>
+</div>

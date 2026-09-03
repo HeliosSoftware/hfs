@@ -9,26 +9,27 @@
 </section>
 
 {% if !available %}
-<div class="card notice">{{ i18n.t("subs-unavailable") }}</div>
+<div class="card notice">
+  <p>{{ i18n.t("subs-unavailable") }}</p>
+  <p>{{ i18n.t("subs-unavailable-how") }} <code>HFS_SUBSCRIPTIONS_ENABLED=true</code> · <code>--features subscriptions</code></p>
+</div>
 {% else %}
 
-<!-- The four headline cards from Brett's design. The delivery-window card
-     waits for engine instrumentation (#580): figures here are real or absent. -->
 <section class="stat-grid">
   <article class="card stat">
-    <span class="stat__label">{{ i18n.t("subs-card-failing") }}</span>
+    <span class="stat__label"><span class="status-dot status-dot--ok" aria-hidden="true"></span>{{ i18n.t("subs-card-active") }}</span>
+    <span class="stat__value">{{ cards.active }}</span>
+    <span class="stat__sub">{{ i18n.t("subs-card-active-sub") }}</span>
+  </article>
+  <article class="card stat">
+    <span class="stat__label"><span class="status-dot status-dot--danger" aria-hidden="true"></span>{{ i18n.t("subs-card-failing") }}</span>
     <span class="stat__value">{{ cards.failing }}</span>
     <span class="stat__sub">{{ i18n.t("subs-card-failing-sub") }}</span>
   </article>
   <article class="card stat">
-    <span class="stat__label">{{ i18n.t("subs-card-idle") }}</span>
+    <span class="stat__label"><span class="status-dot status-dot--warn" aria-hidden="true"></span>{{ i18n.t("subs-card-idle") }}</span>
     <span class="stat__value">{{ cards.idle }}</span>
     <span class="stat__sub">{{ i18n.t("subs-card-idle-sub") }}</span>
-  </article>
-  <article class="card stat">
-    <span class="stat__label">{{ i18n.t("subs-card-active") }}</span>
-    <span class="stat__value">{{ cards.active }}</span>
-    <span class="stat__sub">{{ i18n.t("subs-card-active-sub") }}</span>
   </article>
   <article class="card stat">
     <span class="stat__label">{{ i18n.t("subs-card-delivered") }}</span>
@@ -46,10 +47,11 @@
     <!-- Sort is a plain-links menu, so it works without JavaScript. -->
     <details class="menu subs-sort">
       <summary class="btn">
-        {{ i18n.t("subs-sort") }}:
-        {% if sort == "sent" %}{{ i18n.t("subs-sort-sent") }}{% else if sort == "fails" %}{{ i18n.t("subs-sort-fails") }}{% else %}{{ i18n.t("subs-sort-status") }}{% endif %}
+        <span class="subs-sort__label">{{ i18n.t("subs-sort") }}</span>
+        <span>{% if sort == "sent" %}{{ i18n.t("subs-sort-sent") }}{% else if sort == "fails" %}{{ i18n.t("subs-sort-fails") }}{% else %}{{ i18n.t("subs-sort-status") }}{% endif %}</span>
+        <span class="icon subs-sort__chevron" aria-hidden="true">{% include "icons/chevron-down.svg" %}</span>
       </summary>
-      <div class="menu__panel menu__panel--right">
+      <div class="menu__panel menu__panel--right menu__panel--compact">
         <a class="menu__option" href="/ui/subscriptions?sort=status"{% if sort == "status" %} aria-current="true"{% endif %}>{{ i18n.t("subs-sort-status") }}</a>
         <a class="menu__option" href="/ui/subscriptions?sort=sent"{% if sort == "sent" %} aria-current="true"{% endif %}>{{ i18n.t("subs-sort-sent") }}</a>
         <a class="menu__option" href="/ui/subscriptions?sort=fails"{% if sort == "fails" %} aria-current="true"{% endif %}>{{ i18n.t("subs-sort-fails") }}</a>
@@ -71,7 +73,7 @@
       </thead>
       <tbody>
         {% for row in rows %}
-        <tr>
+        <tr{% if row.state == "error" %} class="row--alert"{% endif %}>
           <td>
             <span class="code">{{ row.id }}</span>
             <span class="url" title="{{ row.topic_url }}">{{ row.topic }}</span>
@@ -84,18 +86,27 @@
           </td>
           <td>
             {% if row.state == "active" %}
-            <span class="tag tag--active">{{ i18n.t("subs-state-active") }}</span>
+            <span class="status-dot status-dot--ok" aria-hidden="true"></span>{{ i18n.t("subs-state-active") }}
             {% else if row.state == "error" %}
-            <span class="tag tag--error">{{ i18n.t("subs-state-error") }}</span>
+            <span class="status-dot status-dot--danger" aria-hidden="true"></span>{{ i18n.t("subs-state-error") }}
             {% else if row.state == "idle" %}
-            <span class="tag tag--idle">{{ i18n.t("subs-state-idle") }}</span>
+            <span class="status-dot status-dot--warn" aria-hidden="true"></span>{{ i18n.t("subs-state-idle") }}
             {% else if row.state == "requested" %}
-            <span class="tag tag--requested">{{ i18n.t("subs-state-requested") }}</span>
+            <span class="status-dot status-dot--muted" aria-hidden="true"></span>{{ i18n.t("subs-state-requested") }}
             {% else %}
-            <span class="tag tag--muted">{{ i18n.t("subs-state-off") }}</span>
+            <span class="status-dot status-dot--muted" aria-hidden="true"></span>{{ i18n.t("subs-state-off") }}
             {% endif %}
           </td>
-          <td class="col-num">{{ row.last24 }}</td>
+          <td class="col-num">
+            {% if !row.spark_points.is_empty() %}
+            <svg class="spark spark--{{ row.state }}" viewBox="0 0 120 24" role="img" aria-label="{{ row.last24 }}">
+              <title>{{ row.last24 }}</title>
+              <polyline class="spark__line" points="{{ row.spark_points }}"></polyline>
+            </svg>
+            {% else %}
+            {{ row.last24 }}
+            {% endif %}
+          </td>
           <td class="col-num">{{ row.sent }}</td>
           <td class="col-num">{{ row.streak }}</td>
         </tr>

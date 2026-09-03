@@ -112,6 +112,16 @@ pub struct HtsConfig {
     /// Changing this re-triggers bootstrap imports of affected files.
     #[arg(long, env = "HTS_IMPORT_LANGUAGES", default_value = "")]
     pub import_languages: String,
+
+    /// Mount the optional HTS administrative UI (crates/hts-ui) at `/ui`.
+    ///
+    /// On by default, matching HFS's always-on UI, so local dev gets the
+    /// same experience out of the box. Operators who deploy behind an API
+    /// gateway and don't want an HTML surface listening at all can opt out
+    /// with `HTS_UI_ENABLED=false`; the HTML surface is an operator
+    /// convenience, not part of the FHIR contract.
+    #[arg(long, env = "HTS_UI_ENABLED", default_value = "true")]
+    pub ui_enabled: bool,
 }
 
 impl HtsConfig {
@@ -136,6 +146,7 @@ impl Default for HtsConfig {
             bootstrap_dir: String::new(),
             bootstrap_batch_size: 5000,
             import_languages: String::new(),
+            ui_enabled: true,
         }
     }
 }

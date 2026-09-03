@@ -17,7 +17,8 @@ use crate::core::{
     BundleEntry, BundleEntryResult, BundleMethod, BundleProvider, BundleResult, BundleType,
     HistoryEntry, HistoryMethod, HistoryPage, HistoryParams, InstanceHistoryProvider,
     PurgableStorage, ResourceStorage, SettingsStore, SystemHistoryProvider, TypeHistoryProvider,
-    VersionedStorage, bundle_if_match_gate, if_match_field_satisfied, normalize_etag,
+    VersionedStorage, bundle_if_match_gate, bundle_if_none_exist_gate, if_match_field_satisfied,
+    normalize_etag,
 };
 use crate::error::{
     BackendError, ConcurrencyError, QueryErrorExt, ResourceError, StorageError, StorageResult,
@@ -568,7 +569,7 @@ impl ResourceStorage for MongoBackend {
             .get("id")
             .and_then(|v| v.as_str())
             .map(String::from)
-            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+            .unwrap_or_else(crate::types::new_resource_id);
 
         // Check if resource already exists (including deleted resources).
         let identity_filter = doc! {
@@ -1570,6 +1571,13 @@ impl ResourceStorage for MongoBackend {
                 .await
                 .or_query_error(&format!("purge delete ({collection})"))?;
         }
+        // Provider-side Bulk Submit submissions are tenant-keyed documents (#772).
+        db.collection::<Document>(
+            crate::backends::mongodb::bulk_provider::BULK_PROVIDER_COLLECTION,
+        )
+        .delete_many(doc! { "tenant_id": id })
+        .await
+        .or_query_error("purge delete (bulk_provider_submissions)")?;
         // Per-user settings are keyed by user, not tenant, so the deletes above
         // do not reach them — but a client stores PHI-derived query strings in
         // them, which belong to this tenant (issue #313).
@@ -2688,29 +2696,11 @@ impl MongoBackend {
                         )
                         .await?;
 
-                    match matches.len() {
-                        0 => {}
-                        1 => {
-                            return Ok(BundleEntryResult::ok(
-                                matches.into_iter().next().expect("single match must exist"),
-                            ));
-                        }
-                        n => {
-                            return Ok(BundleEntryResult::error(
-                                412,
-                                serde_json::json!({
-                                    "resourceType": "OperationOutcome",
-                                    "issue": [{
-                                        "severity": "error",
-                                        "code": "multiple-matches",
-                                        "diagnostics": format!(
-                                            "Conditional create matched {} resources",
-                                            n
-                                        )
-                                    }]
-                                }),
-                            ));
-                        }
+                    // Shared with the SQLite and PostgreSQL executors so all
+                    // three answer 200-with-location / 412 identically, and so
+                    // the matched id reaches the fullUrl reference map.
+                    if let Some(gated) = bundle_if_none_exist_gate(matches) {
+                        return Ok(gated);
                     }
                 }
 
@@ -2868,7 +2858,7 @@ impl MongoBackend {
             .get("id")
             .and_then(|v| v.as_str())
             .map(str::to_string)
-            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+            .unwrap_or_else(crate::types::new_resource_id);
 
         let existing = resources
             .find_one(doc! {

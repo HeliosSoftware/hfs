@@ -87,6 +87,27 @@ impl DeliveryStats {
         out
     }
 
+    /// The last 24 hours of deliveries as a chronological series — one count
+    /// per half-hour bucket, oldest first, zeros where nothing was recorded.
+    /// This is the operator page's sparkline (#782): the same ring the
+    /// [`window`](Self::window) totals read, just not summed.
+    pub fn series(&self, tenant: &str, id: &str, now_epoch: i64) -> [u64; BUCKET_COUNT] {
+        let mut out = [0u64; BUCKET_COUNT];
+        let Some(ring) = self.rings.get(&(tenant.to_string(), id.to_string())) else {
+            return out;
+        };
+        let newest = bucket_start(now_epoch);
+        let horizon = newest - BUCKET_SECONDS * (BUCKET_COUNT as i64 - 1);
+        let ring = ring.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        for bucket in ring.iter() {
+            if bucket.start >= horizon && bucket.start <= now_epoch {
+                let offset = ((bucket.start - horizon) / BUCKET_SECONDS) as usize;
+                out[offset] = bucket.delivered;
+            }
+        }
+        out
+    }
+
     /// Drops a subscription's counters (deregistration).
     pub fn remove(&self, tenant: &str, id: &str) {
         self.rings.remove(&(tenant.to_string(), id.to_string()));
@@ -174,6 +195,25 @@ mod tests {
                 failed: 1
             }
         );
+    }
+
+    #[test]
+    fn the_series_is_chronological_with_zeros_between() {
+        let stats = DeliveryStats::new();
+        // Three buckets ago, one delivery; latest bucket, two.
+        stats.record_success("t", "s", true, T0);
+        stats.record_success("t", "s", true, T0 + BUCKET_SECONDS * 3);
+        stats.record_success("t", "s", false, T0 + BUCKET_SECONDS * 3 + 5);
+
+        let series = stats.series("t", "s", T0 + BUCKET_SECONDS * 3 + 10);
+        assert_eq!(series[BUCKET_COUNT - 4], 1, "oldest recorded bucket");
+        assert_eq!(series[BUCKET_COUNT - 3], 0);
+        assert_eq!(series[BUCKET_COUNT - 2], 0);
+        assert_eq!(series[BUCKET_COUNT - 1], 2, "newest bucket");
+        assert_eq!(series.iter().sum::<u64>(), 3);
+
+        // Unknown subscription: all zeros.
+        assert_eq!(stats.series("t", "other", T0).iter().sum::<u64>(), 0);
     }
 
     #[test]

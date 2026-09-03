@@ -452,7 +452,7 @@ impl CompositeStorage {
     }
 
     /// Synchronizes a resource change to secondary backends.
-    async fn sync_to_secondaries(&self, event: SyncEvent) -> StorageResult<()> {
+    pub(crate) async fn sync_to_secondaries(&self, event: SyncEvent) -> StorageResult<()> {
         if let Some(ref sync_manager) = self.sync_manager {
             sync_manager.sync(&event, &self.secondaries).await?;
         }
@@ -1401,7 +1401,7 @@ impl ConditionalStorage for CompositeStorage {
                         warn!(error = %e, "Failed to sync conditional_delete to secondaries");
                     }
 
-                    Ok(ConditionalDeleteResult::Deleted)
+                    Ok(ConditionalDeleteResult::Deleted(current))
                 }
                 n => Ok(ConditionalDeleteResult::MultipleMatches(n)),
             };
@@ -1418,8 +1418,19 @@ impl ConditionalStorage for CompositeStorage {
             .conditional_delete(tenant, resource_type, search_params)
             .await?;
 
-        // Note: We don't have the resource ID for sync here — the primary already
-        // performed the delete. The sync_manager will handle it if configured.
+        // The primary resolved the criteria and performed the delete; its
+        // result names the row it removed, so the secondaries can drop it too.
+        if let ConditionalDeleteResult::Deleted(deleted) = &result
+            && let Err(e) = self
+                .sync_to_secondaries(SyncEvent::Delete {
+                    resource_type: resource_type.to_string(),
+                    resource_id: deleted.id().to_string(),
+                    tenant_id: tenant.tenant_id().clone(),
+                })
+                .await
+        {
+            warn!(error = %e, "Failed to sync conditional_delete to secondaries");
+        }
 
         Ok(result)
     }

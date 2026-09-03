@@ -81,9 +81,14 @@ The `CompositeStorage` pattern combines backends (e.g., SQLite for CRUD + Elasti
 ## Project Skills
 
 Detailed operational guidance lives in project skills under `.claude/skills/`.
-Use those skills instead of expanding this always-loaded file:
+Use those skills instead of expanding this always-loaded file.
 
+HFS / Claude Code skills:
+
+- `/fhir-developer` - Anthropic FHIR R4 developer skill (resources, cardinality, coding systems, REST/SMART, OperationOutcome). Use for generic FHIR/HL7 API modeling; compose with the HFS-specific skills below for runtime behavior.
 - `/run-hfs-server` - HFS server runtime, storage backends, multi-tenancy, compression, and API endpoints.
+- `/run-hts-server` - HTS terminology server runtime, env vars, and terminology-seed bootstrap.
+- `/run-hfs-and-hts` - Start HFS and HTS together for local dev, wired via HFS_TERMINOLOGY_SERVER/FHIRPATH_TERMINOLOGY_SERVER.
 - `/work-with-fhirpath` - FHIRPath CLI, server, expressions, terminology integration, and tests.
 - `/work-with-sof` - SQL-on-FHIR, ViewDefinition processing, `sof-cli`, `sof-server`, and parquet output.
 - `/work-with-pysof` - Python bindings under `crates/pysof`, maturin setup, API usage, and pysof tests.

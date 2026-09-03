@@ -1,0 +1,15 @@
+{% for option in options %}
+<button type="button" class="combobox__option" data-combobox-option
+        data-value="{{ option.value }}" data-label="{{ option.label }}">
+  {{ option.label }}
+</button>
+{% endfor %}
+<div id="bulk-export-patients-message" hx-swap-oob="innerHTML">
+  {% if id_only %}
+  <span data-combobox-use-alternate hidden></span>
+  {% endif %}
+  {% if !message.is_empty() %}
+  <span class="field__hint{% if error %} field__hint--error{% endif %}"
+        data-combobox-message-content>{{ message }}</span>
+  {% endif %}
+</div>

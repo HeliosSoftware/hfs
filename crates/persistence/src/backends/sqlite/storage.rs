@@ -148,7 +148,7 @@ impl ResourceStorage for SqliteBackend {
             .get("id")
             .and_then(|v| v.as_str())
             .map(String::from)
-            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+            .unwrap_or_else(crate::types::new_resource_id);
 
         // Check if resource already exists
         let exists: bool = conn
@@ -1006,6 +1006,12 @@ impl ResourceStorage for SqliteBackend {
         // them, which belong to this tenant (issue #313). Same transaction: this
         // connection already holds the write lock, and a second one would
         // deadlock against it.
+        // Provider-side Bulk Submit submissions are tenant-keyed rows (#772).
+        tx.execute(
+            "DELETE FROM bulk_provider_submissions WHERE tenant_id = ?1",
+            params![id],
+        )
+        .or_query_error("purge provider submissions")?;
         let settings = SqliteBackend::purge_tenant_settings_in_txn(&tx, id)?;
         tx.commit().or_query_error("purge commit")?;
         if settings > 0 {
@@ -2807,7 +2813,7 @@ impl ConditionalStorage for SqliteBackend {
                 // Exactly one match - delete it
                 let existing = matches.into_iter().next().unwrap();
                 self.delete(tenant, resource_type, existing.id()).await?;
-                Ok(ConditionalDeleteResult::Deleted)
+                Ok(ConditionalDeleteResult::Deleted(existing))
             }
             n => {
                 // Multiple matches - error condition
@@ -2879,31 +2885,61 @@ impl SqliteBackend {
         resource_type: &str,
         search_params_str: &str,
     ) -> StorageResult<Vec<StoredResource>> {
-        // Parse search parameters into (name, value) pairs
-        let parsed_params = parse_simple_search_params(search_params_str);
-
-        if parsed_params.is_empty() {
-            // No search params means match all - but for conditional ops this is unusual
-            // Return empty to avoid unintended matches
+        let Some(query) = self.conditional_query(tenant, resource_type, search_params_str)? else {
             return Ok(Vec::new());
-        }
-
-        // Build SearchParameter objects by looking up types from the registry
-        let search_params = self.build_search_parameters(tenant, resource_type, &parsed_params)?;
-
-        // Build a SearchQuery
-        let query = SearchQuery {
-            resource_type: resource_type.to_string(),
-            parameters: search_params,
-            // No pagination limit for conditional operations - we need all matches
-            count: Some(1000), // Reasonable upper limit for conditional matching
-            ..Default::default()
         };
 
         // Use the SearchProvider implementation which uses the search index
         let result = <Self as SearchProvider>::search(self, tenant, &query).await?;
 
         Ok(result.resources.items)
+    }
+
+    /// Resolves conditional criteria on the transaction's own connection, so
+    /// the match set includes what earlier entries of the same bundle wrote
+    /// (#511). The pooled-connection twin above cannot see those rows under
+    /// `BEGIN IMMEDIATE`.
+    fn find_matching_resources_in_tx(
+        &self,
+        tenant: &TenantContext,
+        tx: &crate::backends::sqlite::transaction::SqliteTransaction,
+        resource_type: &str,
+        search_params_str: &str,
+    ) -> StorageResult<Vec<StoredResource>> {
+        let Some(query) = self.conditional_query(tenant, resource_type, search_params_str)? else {
+            return Ok(Vec::new());
+        };
+
+        tx.with_connection(|conn| self.search_with_connection(conn, tenant, &query, None))
+            .map(|result| result.resources.items)
+    }
+
+    /// Builds the search a conditional interaction's criteria describe, or
+    /// `None` when the criteria are empty — matching everything would be the
+    /// literal reading, but no conditional interaction means that.
+    fn conditional_query(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        search_params_str: &str,
+    ) -> StorageResult<Option<SearchQuery>> {
+        // Parse search parameters into (name, value) pairs
+        let parsed_params = parse_simple_search_params(search_params_str);
+
+        if parsed_params.is_empty() {
+            return Ok(None);
+        }
+
+        // Build SearchParameter objects by looking up types from the registry
+        let search_params = self.build_search_parameters(tenant, resource_type, &parsed_params)?;
+
+        Ok(Some(SearchQuery {
+            resource_type: resource_type.to_string(),
+            parameters: search_params,
+            // No pagination limit for conditional operations - we need all matches
+            count: Some(1000), // Reasonable upper limit for conditional matching
+            ..Default::default()
+        }))
     }
 
     /// Builds SearchParameter objects from parsed (name, value) pairs.
@@ -3189,6 +3225,15 @@ impl BundleProvider for SqliteBackend {
         // This maps urn:uuid:xxx to ResourceType/assigned-id after creates
         let mut reference_map: HashMap<String, String> = HashMap::new();
 
+        // Whether any entry in this transaction writes a SearchParameter that
+        // affects this tenant's cached overlay (#787: transaction-bundle writes
+        // never invalidated the registry, so a SearchParameter POSTed inside a
+        // Bundle — e.g. by Inferno's US Core setup — never took effect until
+        // the TTL cache refresh). Mirrors the non-transactional create/update/
+        // delete checks below (create is conditional via `create_affects_overlay`;
+        // update/delete are unconditional).
+        let mut search_param_overlay_changed = false;
+
         // Make entries mutable for reference resolution
         let mut entries = entries;
 
@@ -3199,7 +3244,7 @@ impl BundleProvider for SqliteBackend {
                 resolve_bundle_references(resource, &reference_map);
             }
 
-            let result = self.process_bundle_entry_tx(&mut tx, entry).await;
+            let result = self.process_bundle_entry_tx(tenant, &mut tx, entry).await;
 
             match result {
                 Ok(entry_result) => {
@@ -3210,6 +3255,38 @@ impl BundleProvider for SqliteBackend {
                             format!("Entry failed with status {}", entry_result.status),
                         ));
                         break;
+                    }
+
+                    if !search_param_overlay_changed {
+                        search_param_overlay_changed =
+                            match entry_result.status {
+                                // Created (POST, or PUT-as-create): only overlay-affecting
+                                // creates need to invalidate (see `create_affects_overlay`).
+                                201 => entry_result
+                                    .resource
+                                    .as_ref()
+                                    .filter(|r| {
+                                        r.get("resourceType").and_then(|v| v.as_str())
+                                            == Some("SearchParameter")
+                                    })
+                                    .is_some_and(|r| {
+                                        self.tenant_registries().create_affects_overlay(r)
+                                    }),
+                                // Updated (PUT/PATCH): unconditional, like the
+                                // non-transactional update path.
+                                200 => {
+                                    entry_result.resource.as_ref().and_then(|r| {
+                                        r.get("resourceType").and_then(|v| v.as_str())
+                                    }) == Some("SearchParameter")
+                                }
+                                // Deleted: the emptied result carries no resource, so
+                                // parse the type from the entry's URL instead.
+                                204 => self
+                                    .parse_url(&entry.url)
+                                    .map(|(resource_type, _)| resource_type == "SearchParameter")
+                                    .unwrap_or(false),
+                                _ => false,
+                            };
                     }
 
                     // If this was a create (POST) and we have a fullUrl, record the mapping
@@ -3251,6 +3328,14 @@ impl BundleProvider for SqliteBackend {
                 reason: format!("Commit failed: {}", e),
             })?;
 
+        // A committed SearchParameter write in this transaction changes this
+        // tenant's cached overlay — drop it so the next access rebuilds from
+        // storage (#787).
+        if search_param_overlay_changed {
+            self.tenant_registries()
+                .invalidate(tenant.tenant_id().as_str());
+        }
+
         Ok(BundleResult {
             bundle_type: BundleType::Transaction,
             entries: results,
@@ -3262,6 +3347,7 @@ impl SqliteBackend {
     /// Process a single bundle entry within a transaction.
     async fn process_bundle_entry_tx(
         &self,
+        tenant: &TenantContext,
         tx: &mut crate::backends::sqlite::transaction::SqliteTransaction,
         entry: &BundleEntry,
     ) -> StorageResult<BundleEntryResult> {
@@ -3301,6 +3387,26 @@ impl SqliteBackend {
                             },
                         )
                     })?;
+
+                if let Some(criteria) = entry.if_none_exist.as_deref() {
+                    // With search offloaded to a secondary backend the local
+                    // index is empty for every row, so an in-transaction
+                    // search would always find nothing and this arm would
+                    // create the duplicate `ifNoneExist` exists to prevent.
+                    // Refuse the entry instead; the bundle rolls back (#511).
+                    if self.is_search_offloaded() {
+                        return Ok(crate::core::not_supported_entry(
+                            "ifNoneExist cannot be resolved inside a transaction when search \
+                             is offloaded to a secondary backend; submit the entry in a batch \
+                             Bundle instead",
+                        ));
+                    }
+                    let matches =
+                        self.find_matching_resources_in_tx(tenant, tx, &resource_type, criteria)?;
+                    if let Some(gated) = crate::core::bundle_if_none_exist_gate(matches) {
+                        return Ok(gated);
+                    }
+                }
 
                 let created = tx.create(&resource_type, resource).await?;
                 Ok(BundleEntryResult::created(created))
@@ -3585,6 +3691,75 @@ impl ReindexSource for SqliteBackend {
 
 // ReindexTarget: SQLite keeps search entries in its own `search_index`
 // table, so it is also a writer and can reindex itself standalone.
+impl SqliteBackend {
+    /// Writes one resource's search entries — dynamic extraction, contained
+    /// resources, and the FTS row — on the caller's connection, so a batched
+    /// reindex can put a whole page inside one transaction.
+    fn write_search_entries_on(
+        &self,
+        conn: &rusqlite::Connection,
+        tenant: &TenantContext,
+        resource: &StoredResource,
+    ) -> StorageResult<usize> {
+        let resource_type = resource.resource_type();
+        let resource_id = resource.id();
+        let content = resource.content();
+
+        // Use the dynamic extraction over the tenant's registry
+        let values = self
+            .tenant_extractor(tenant.tenant_id().as_str())
+            .extract(content, resource_type)
+            .map_err(|e| internal_error(format!("Search parameter extraction failed: {}", e)))?;
+
+        let mut count = 0;
+        for value in values {
+            self.write_index_entry(
+                conn,
+                tenant.tenant_id().as_str(),
+                resource_type,
+                resource_id,
+                &value,
+            )?;
+            count += 1;
+        }
+
+        // Re-index contained resources too, so `$reindex` rebuilds `_contained`
+        // search entries.
+        count += self.index_contained_resources(
+            conn,
+            tenant.tenant_id().as_str(),
+            resource_type,
+            resource_id,
+            content,
+        )?;
+
+        // Rebuild the full-text row as well. Without this, `$reindex` was a
+        // *destructive* operation for `_text`/`_content`: `run_reindex` deletes
+        // each resource's search entries via `delete_search_entries` ->
+        // `delete_search_index`, which does drop the FTS row, and nothing here
+        // put it back. That happened on every reindex, with or without
+        // `clear_existing`, so the documented recovery operation silently
+        // disabled full-text search until each resource was next written.
+        //
+        // Not counted in `count`: that value is the number of `search_index`
+        // entries, which `$reindex-status` reports, and an FTS row is not one.
+        //
+        // Safe against duplicates because every caller deletes the resource's
+        // search entries (FTS row included) immediately before this, and
+        // SQLite's `index_fts_content` is a bare INSERT with no delete-first.
+        // If that ordering ever changes, this must become delete-then-insert.
+        self.index_fts_content(
+            conn,
+            tenant.tenant_id().as_str(),
+            resource_type,
+            resource_id,
+            content,
+        )?;
+
+        Ok(count)
+    }
+}
+
 #[async_trait]
 impl ReindexTarget for SqliteBackend {
     async fn delete_search_entries(
@@ -3610,62 +3785,52 @@ impl ReindexTarget for SqliteBackend {
         resource: &StoredResource,
     ) -> StorageResult<usize> {
         let conn = self.get_connection()?;
-        let resource_type = resource.resource_type();
-        let resource_id = resource.id();
-        let content = resource.content();
+        self.write_search_entries_on(&conn, tenant, resource)
+    }
 
-        // Use the dynamic extraction over the tenant's registry
-        let values = self
-            .tenant_extractor(tenant.tenant_id().as_str())
-            .extract(content, resource_type)
-            .map_err(|e| internal_error(format!("Search parameter extraction failed: {}", e)))?;
-
-        let mut count = 0;
-        for value in values {
-            self.write_index_entry(
-                &conn,
-                tenant.tenant_id().as_str(),
-                resource_type,
-                resource_id,
-                &value,
-            )?;
-            count += 1;
+    /// Rebuilds a page of resources inside one IMMEDIATE transaction — the
+    /// reindex-side counterpart of the #815 batch ingest. Per-resource
+    /// autocommit made the fast-load rebuild (#903) run at ~50-100
+    /// resources/s, giving back most of what the deferred ingest won.
+    async fn write_search_entries_page(
+        &self,
+        tenant: &TenantContext,
+        resources: &[StoredResource],
+    ) -> Vec<StorageResult<usize>> {
+        let conn = match self.get_connection() {
+            Ok(conn) => conn,
+            Err(e) => {
+                let msg = e.to_string();
+                return resources
+                    .iter()
+                    .map(|_| Err(internal_error(msg.clone())))
+                    .collect();
+            }
+        };
+        if let Err(e) = conn.execute("BEGIN IMMEDIATE", []) {
+            let msg = format!("Failed to begin reindex batch: {e}");
+            return resources
+                .iter()
+                .map(|_| Err(internal_error(msg.clone())))
+                .collect();
         }
-
-        // Re-index contained resources too, so `$reindex` rebuilds `_contained`
-        // search entries.
-        count += self.index_contained_resources(
-            &conn,
-            tenant.tenant_id().as_str(),
-            resource_type,
-            resource_id,
-            content,
-        )?;
-
-        // Rebuild the full-text row as well. Without this, `$reindex` was a
-        // *destructive* operation for `_text`/`_content`: `run_reindex` deletes
-        // each resource's search entries via `delete_search_entries` ->
-        // `delete_search_index`, which does drop the FTS row, and nothing here
-        // put it back. That happened on every reindex, with or without
-        // `clear_existing`, so the documented recovery operation silently
-        // disabled full-text search until each resource was next written.
-        //
-        // Not counted in `count`: that value is the number of `search_index`
-        // entries, which `$reindex-status` reports, and an FTS row is not one.
-        //
-        // Safe against duplicates because `run_reindex` always calls
-        // `delete_search_entries` for the resource immediately before this, and
-        // SQLite's `index_fts_content` is a bare INSERT with no delete-first.
-        // If that ordering ever changes, this must become delete-then-insert.
-        self.index_fts_content(
-            &conn,
-            tenant.tenant_id().as_str(),
-            resource_type,
-            resource_id,
-            content,
-        )?;
-
-        Ok(count)
+        let tenant_id = tenant.tenant_id().as_str();
+        let mut results: Vec<StorageResult<usize>> = Vec::with_capacity(resources.len());
+        for resource in resources {
+            let outcome = self
+                .delete_search_index(&conn, tenant_id, resource.resource_type(), resource.id())
+                .and_then(|_| self.write_search_entries_on(&conn, tenant, resource));
+            results.push(outcome);
+        }
+        if let Err(e) = conn.execute("COMMIT", []) {
+            let _ = conn.execute("ROLLBACK", []);
+            let msg = format!("Failed to commit reindex batch: {e}");
+            return resources
+                .iter()
+                .map(|_| Err(internal_error(msg.clone())))
+                .collect();
+        }
+        results
     }
 
     async fn clear_search_index(&self, tenant: &TenantContext) -> StorageResult<u64> {
@@ -5988,7 +6153,7 @@ mod tests {
             .unwrap();
 
         match result {
-            ConditionalDeleteResult::Deleted => {
+            ConditionalDeleteResult::Deleted(_) => {
                 // Verify resource is deleted (read returns Gone error or None)
                 let read_result = backend.read(&tenant, "Patient", "p1").await;
                 match read_result {

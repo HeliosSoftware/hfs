@@ -31,7 +31,7 @@ language-en = English
 language-es = Spanish
 language-de = German
 user-menu-label = Account menu
-user-local = Local user
+user-anonymous = Anonymous user
 user-local-hint = Authentication is disabled
 user-logout = Sign out
 
@@ -88,6 +88,12 @@ error-not-found = The requested resource was not found.
 error-unauthorized = You are not authorized to perform this action.
 error-generic = Something went wrong. Try again.
 
+## Generic "not found" page (#835): a full-page 404 inside the shell, distinct
+## from error-not-found above (OperationOutcome text for API responses).
+
+not-found-title = Not found
+not-found-text = This page doesn't exist, or isn't available to you.
+
 ## Dashboard shell (Figma "Dashboard V1.1")
 
 nav-section-work = Work
@@ -108,7 +114,6 @@ nav-sql-view-definitions = View Definitions
 nav-sql-queries = SQL Queries
 nav-sql-views = SQL Views
 nav-sql-export = SQL Export
-nav-sql-files = Files
 nav-capability-conformance = Capability & Conformance
 nav-search-parameters = Search Parameters
 nav-subscriptions = Subscriptions
@@ -117,6 +122,7 @@ nav-tenants = Tenants
 ## Tenant maintenance (/ui/tenants)
 
 tenants-title = Tenant Maintenance
+tenants-lede = Provision, inspect, and delete the tenants this server isolates data between.
 tenants-unavailable = The tenant registry is not available on this storage backend.
 tenants-stat-total = Total tenants
 tenants-stat-total-sub = { $count ->
@@ -197,7 +203,6 @@ history-tab-instance = Instance
 history-tab-type = Type Feed
 history-tab-system = System Feed
 history-versions-label = Versions
-history-pick-instance = Pick an instance
 history-current = current
 history-from = From
 history-to = To
@@ -485,6 +490,17 @@ editor-must-support-badge = MS
 editor-binding-hint = Bound to a value set — codes come from it; strength shown
 editor-legend-live = Checked as you type: structure, cardinality, required bindings
 editor-legend-save = Checked on save: constraints and terminology
+# ViewDefinition's own single-line legend (#843): Save stays permissive
+# there, so promising a "checked on save" pass would be misleading — this
+# names everything the guided form's per-keystroke pass actually covers,
+# folding in the SQL-on-FHIR-specific checks the generic validator above
+# does not run.
+vd-form-legend-live = Checked as you type: structure, cardinality, required bindings, and FHIRPath syntax / SQL-on-FHIR rules
+# The guided form's validity chip (#843), client-side only, while the JSON
+# editor's text does not parse at all — short like the chip's other two
+# states ("No issues.", "3 issues"), never the longer editor-invalid-json
+# sentence.
+vd-form-invalid-chip = Invalid JSON
 editor-deferred-badge = on save
 editor-deferred-hint = Codes are verified against the value set when you save (and live in the picker where a terminology server is configured)
 editor-must-support-hint = Must-support: consumers of this profile are expected to handle this element
@@ -569,6 +585,8 @@ batch-read-failed = The file could not be read.
 ## Bulk Import workspace (#527)
 
 bulk-import-title = Bulk Import
+bulk-import-lede = Send precoordinated FHIR data sets to a Data Recipient with the Bulk Data $bulk-submit operation.
+bulk-import-detail-lede = The manifests, status, and run log of this submission.
 bulk-import-new = New Submission
 bulk-import-create-title = Create Bulk Submission
 bulk-import-field-name = Submission name
@@ -585,14 +603,14 @@ bulk-import-field-token-url-hint = Authorization server's token endpoint URL.
 bulk-import-jwks-hint = Register this server's public key with the recipient using the JWKS URL:
 bulk-import-test-auth = Test authentication
 bulk-import-test-auth-ok = Authentication succeeded.
-bulk-import-create-submit = Create Submission
+bulk-import-create-submit = Submit
+bulk-import-advanced = Advanced options
 bulk-import-unavailable = The storage backend does not host the settings store, so submissions cannot be saved.
 bulk-import-submissions = Submissions
 bulk-import-records = records
 bulk-import-col-name = Name
 bulk-import-col-status = Status
 bulk-import-col-created = Created
-bulk-import-col-manifests = Manifests
 bulk-import-col-destination = Destination
 bulk-import-empty = No submissions yet. Create one to get started.
 bulk-import-all = All Submissions
@@ -608,47 +626,37 @@ bulk-import-detail-created = Created
 bulk-import-detail-status = Status
 bulk-import-detail-auth = Authentication
 bulk-import-abort = Abort
-bulk-import-complete = Complete
+bulk-import-mark-completed = Mark completed
 bulk-import-delete = Delete
 bulk-import-edit = Edit
 bulk-import-edit-title = Edit Submission
 bulk-import-edit-submit = Save Changes
-bulk-import-add-manifest = Add Manifest
-bulk-import-add-manifest-title = Add Manifest
-bulk-import-add-manifest-submit = Add
 bulk-import-field-manifest-url = Manifest URL
 bulk-import-field-manifest-url-hint = URL pointing to a Bulk Export Manifest with a precoordinated FHIR data set.
-bulk-import-field-fhir-base = FHIR base URL
-bulk-import-field-fhir-base-hint = Base URL used by the Data Recipient when resolving relative references. Leave empty to use the base URL of the manifest.
 bulk-import-field-output-format = Format
 bulk-import-field-output-format-hint = The format for the Bulk Data files in the manifest.
 bulk-import-field-headers = File request headers
 bulk-import-field-headers-hint = HTTP headers the Data Recipient should use when requesting a data file, one "Name: value" per line.
-bulk-import-manifests = Manifests
-bulk-import-manifest-actions = Manifest actions
-bulk-import-no-manifests = No manifests yet. Add one to submit data.
-bulk-import-submit = Submit
-bulk-import-submit-all = Submit All
-bulk-import-sort = Sort
-bulk-import-sort-recent = Most recent
-bulk-import-sort-oldest = Oldest
-bulk-import-remove = Remove
 bulk-import-log = Submission Log
 bulk-import-log-empty = Nothing submitted yet.
 bulk-import-field-submitter-system = Submitter system
 bulk-import-field-submitter-value = Submitter value
 bulk-import-field-submitter-hint = Must match an identifier registered with the Data Recipient (coordinated out-of-band). Leave empty to use the generated defaults.
-bulk-import-field-submission-id = Submission ID
-bulk-import-field-submission-id-hint = Unique per submitter. Leave empty to generate a UUID.
 bulk-import-processing = Processing
 bulk-import-processing-waiting = Waiting for the recipient's first status report…
 bulk-import-result = Result
 bulk-import-result-finished = Processing finished at
 bulk-import-result-outputs = Output files
 bulk-import-result-errors = Error files
-bulk-import-abort-manifest = Abort
 ui-cancel = Cancel
 ui-close = Close
+ui-combobox-selected-label = Selected items
+ui-combobox-remove = Remove
+ui-combobox-added = Added
+ui-combobox-removed = Removed
+ui-combobox-loading = Loading suggestions…
+ui-combobox-results-updated = Suggestions available:
+ui-combobox-error = Suggestions could not be loaded. Try again.
 editor-orphans-title = These issues have no field yet — add the elements to fix them
 editor-hint-date = FHIR date: YYYY, YYYY-MM, or YYYY-MM-DD
 editor-hint-datetime = FHIR dateTime: YYYY, YYYY-MM, YYYY-MM-DD, or a full timestamp with timezone (2024-05-17T14:30:00+02:00)
@@ -660,11 +668,12 @@ editor-hint-instant = FHIR instant: full timestamp with timezone, e.g. 2024-05-1
 subs-title = Subscriptions
 subs-lede = Read-only view of the subscriptions engine: every registered subscription, its channel, live status, and delivery counters.
 subs-unavailable = The subscriptions engine is not enabled on this server.
+subs-unavailable-how = Turn it on by starting HFS with:
 subs-empty = No subscriptions are registered for this tenant.
 subs-card-failing = Failing
-subs-card-failing-sub = needs attention
+subs-card-failing-sub = Needs attention
 subs-card-idle = Idle
-subs-card-idle-sub = no clients
+subs-card-idle-sub = No clients
 subs-card-active = Active
 subs-card-active-sub = delivering
 subs-card-delivered = Delivered in 24 h
@@ -681,17 +690,17 @@ subs-col-status = Status
 subs-col-last24 = Last 24 hrs
 subs-col-sent = Sent
 subs-col-fails = Fail streak
-subs-state-active = active
-subs-state-error = error
+subs-state-active = Active
+subs-state-error = Error
 subs-state-idle = 0 clients
-subs-state-requested = requested
-subs-state-off = off
+subs-state-requested = Requested
+subs-state-off = Off
 
 ## Bulk Export workspace (#537)
 
 bulk-export-title = Bulk Export
-bulk-export-active-title = Active Exports
-bulk-export-active-link = Active exports
+bulk-export-lede = Pull data out of this server as NDJSON files with the FHIR Bulk Data $export operation.
+bulk-export-active-title = Exports
 bulk-export-new = New Export
 bulk-export-unavailable = The storage backend does not host the settings store, so export jobs cannot be tracked.
 bulk-export-scope = What are you exporting?
@@ -703,10 +712,19 @@ bulk-export-scope-group = Group
 bulk-export-scope-group-hint = Just the members of a cohort you've already defined.
 bulk-export-field-group-id = Group ID
 bulk-export-field-group-id-hint = Required for the Group scope: the id of the FHIR Group to export.
+bulk-export-field-patients = Patients
+bulk-export-field-patients-placeholder = Search patients
+bulk-export-field-patients-hint = Search by name, surname or exact identifier. Leave empty to export every patient.
+bulk-export-field-patients-fallback-placeholder = Patient FHIR IDs
+bulk-export-field-patients-fallback-hint = Enter exact logical FHIR IDs separated by commas or new lines. Leave empty to export every patient.
+bulk-export-field-patients-id-only-hint = Search by exact FHIR ID. Leave empty to export every patient.
+bulk-export-patient-options-empty = No matching patients found.
+bulk-export-patient-invalid = Enter only valid logical Patient IDs, separated by commas or new lines.
 bulk-export-field-name = Name
 bulk-export-field-name-placeholder = Diabetes registry 2024
+bulk-export-name-required = Enter a name for this export.
 bulk-export-types = Resource types
-bulk-export-types-hint = Leave everything unchecked to export every type.
+bulk-export-all-resources = All Resources
 bulk-export-narrow = Narrow it down
 bulk-export-field-elements = FHIR elements
 bulk-export-field-type-filter = Type filter
@@ -717,13 +735,17 @@ bulk-export-since-week = Last 7 days
 bulk-export-since-month = Last 4 weeks
 bulk-export-since-custom = Custom
 bulk-export-field-since-custom = Custom instant
-bulk-export-field-since-custom-hint = Used when Since is Custom. RFC 3339, e.g. 2026-08-01T00:00:00Z.
+bulk-export-since-invalid = Enter a valid FHIR instant, such as 2026-08-01T00:00:00Z.
+bulk-export-field-until = Until
+bulk-export-field-until-hint = Optional upper bound. RFC 3339, e.g. 2026-08-01T00:00:00Z.
+bulk-export-window-since = Since
+bulk-export-window-until = Until
 bulk-export-start = Start Export
 bulk-export-running = running
 bulk-export-clear = Clear
 bulk-export-files-word = files
 bulk-export-exports-word = exports
-bulk-export-none = No exports yet. Start one from the Bulk Export page.
+bulk-export-none = No exports yet. Use New Export to start one.
 bulk-export-status-in-progress = In progress
 bulk-export-status-complete = Complete
 bulk-export-status-failed = Failed
@@ -735,6 +757,14 @@ bulk-export-finished-in = finished in
 bulk-export-error = Error
 bulk-export-cancel = Cancel
 bulk-export-retry = Retry
+bulk-export-download-all = Download All Resources
+bulk-export-download-all-aria = Download all resources from { $name }
+bulk-export-delete = Delete
+bulk-export-delete-aria = Delete export { $name }
+bulk-export-delete-warning = Delete { $name } and its output files from the server? This cannot be undone.
+bulk-export-delete-confirm = Delete export
+bulk-export-delete-cancel = Keep export
+bulk-export-delete-error = The export could not be deleted safely. Its card was kept so you can try again.
 
 # CapabilityStatement page (#653)
 cap-title = Capability Statement
@@ -749,6 +779,7 @@ cap-summary-date = Date
 cap-summary-formats = Formats
 cap-interactions-heading = System Interactions
 cap-transaction-note = transaction is advertised because the active backend supports atomic transactions; batch is always available.
+cap-role-matrix = View the backend role matrix.
 cap-operations-heading = Operations
 cap-col-operation = Operation
 cap-col-definition = Definition
@@ -761,6 +792,22 @@ cap-col-includes = Includes
 cap-col-revincludes = Revincludes
 cap-resources-empty = No resource types match the filter.
 cap-raw-toggle = Raw CapabilityStatement (JSON)
+cap-raw-load = Open plain JSON
+cap-raw-loading = Loading highlighted JSON…
+cap-raw-plain = Plain JSON fallback. Highlighting is loaded incrementally when JavaScript is available.
+cap-json-load-error = This JSON section could not be loaded. Collapse and reopen it to retry.
+cap-json-truncated = display truncated
+cap-json-path-too-deep = maximum expansion depth reached
+cap-json-pagination-label = JSON items
+cap-json-page-prev = Previous
+cap-json-page-next = Next
+cap-json-collapse-all = Collapse all
+cap-json-expand-all = Expand all
+cap-json-expanding = Expanding visible JSON…
+cap-json-expand-complete = All JSON is expanded.
+cap-json-expand-partial = Expanded the current pages up to the safe limit. Remaining nodes stay collapsed.
+cap-json-limit-reached = The JSON display limit was reached. Collapse another branch before loading more.
+cap-json-expand-error = The JSON tree could not be expanded. The current view was kept; try again.
 cap-unavailable = The CapabilityStatement could not be fetched from the server — the self-call may need an outbound token when authentication is enabled.
 
 ## SQL on FHIR section stubs (#649)
@@ -770,16 +817,14 @@ sql-vd-title = View Definitions
 sql-vd-lede = Author and manage the ViewDefinitions that SQL on FHIR runs flatten resources with.
 
 sql-queries-title = SQL Queries
-sql-queries-lede = Run SQL on FHIR queries against this server.
+sql-queries-lede = Ad-hoc SQL over the flat tables your view definitions produce. Results refresh as you type.
 
 sql-views-title = SQL Views
-sql-views-lede = Reusable SQL views layered over ViewDefinitions.
+sql-views-lede = Named views other queries and exports select from. Define the SQL once; the columns it produces become a table everyone else can use.
 
 sql-export-title = SQL Export
-sql-export-lede = Long-running SQL on FHIR export jobs.
-
-sql-files-title = Files
-sql-files-lede = Manifests and output files produced by SQL exports.
+sql-export-lede = Run stored view definitions, SQL queries and SQL views as a long-running $sql-export job and download the output files.
+sql-export-active-title = SQL Exports
 
 ## View Definitions workspace (#649)
 
@@ -787,12 +832,12 @@ vd-new = Create New
 vd-new-title = New View Definition
 vd-rail-label = View definitions
 vd-rail-heading = View Definitions
+vd-rail-all-heading = All View Definitions
 vd-filter = Filter views
 vd-none = No view definitions yet.
 vd-empty-lede = Create your first ViewDefinition with Create New.
 vd-degraded = The view definition list could not be loaded.
 vd-saved = Saved.
-vd-run = Run
 vd-run-failed = Could not run the view.
 vd-save = Save
 vd-duplicate = Duplicate
@@ -800,44 +845,793 @@ vd-delete = Delete
 vd-delete-confirm = Delete view definition "{ $name }"? This cannot be undone.
 vd-delete-failed = Could not delete the view definition.
 vd-json-heading = Definition (JSON)
+vd-run-hint = Runs as you type — results follow the current definition, saved or not
 vd-results-heading = Results
 vd-results-empty = The view produced no rows.
+# #752: the $sql-run preview's row/duration meta, shared by the page's own
+# render and the `/run` fragment endpoint.
+vd-results-meta = { $rows } rows · { $ms } ms
+# #752: the results meta after a failed run — the previous table stays on
+# screen, relabelled.
+vd-results-stale = last successful run
+vd-pagination-label = View definition pages
+vd-page-prev = Previous
+vd-page-next = Next
 
-## SQL Queries / SQL Views workspaces (#649)
+## $sql-run results partial (#752): shared by the View Definitions, SQL
+## Queries, and SQL Views playgrounds (#839).
+
+sql-run-export = Export as files
+
+## SQL Queries / SQL Views workspaces (#649, editor-first layout #839)
 
 sql-queries-new-title = New SQL Query
 sql-views-new-title = New SQL View
-lib-filter = Filter libraries
-lib-none = No libraries yet.
-lib-empty-lede = Create your first library with Create New.
+sql-queries-rail-all-heading = All SQL Queries
+sql-views-rail-all-heading = All SQL Views
+# The title row's `.tag--type` chip (#839) — one document's type, singular,
+# distinct from the *-title keys above (the collection's own plural name).
+sql-queries-chip = SQL Query
+sql-views-chip = SQL View
+sql-queries-filter = Filter queries
+sql-views-filter = Filter views
+sql-queries-rail-empty = No queries yet.
+sql-views-rail-empty = No views yet.
+sql-queries-empty-title = No SQL queries yet
+sql-views-empty-title = No SQL views yet
+sql-queries-empty-lede = Write your first query with Create New. It runs against the flat tables of every active view definition.
+sql-views-empty-lede = Define your first view with Create New. Its columns become a table other queries and exports can select from.
+sql-queries-editor-heading = SQL
+sql-views-editor-heading = View definition (SQL)
+sql-queries-results-heading = Results
+sql-views-results-heading = Preview
+sql-queries-run-failed = Could not run the query.
+sql-views-run-failed = Could not run the view.
 lib-degraded = The library list could not be loaded.
-lib-sql-heading = SQL
+# The SQL card's "runs as you type" legend (#839) — shared verbatim by SQL
+# Queries and SQL Views, unlike the headings/failure prefix above.
+lib-run-hint = Runs as you type — results follow the current SQL, saved or not
+# The title row's secondary link to the full resource (#839; #840 replaces
+# this with a Details card).
+lib-edit-json = Edit as JSON
 lib-delete-confirm = Delete "{ $name }"? This cannot be undone.
 lib-delete-failed = Could not delete the library.
 
-## SQL Export and Files pages (#649)
+## SQL Export pages (#649, #833)
 
 export-start-failed = Could not start the export.
-export-started = Export started.
-export-cancelled = Cancellation requested.
-export-job-heading = Export Job
-export-job-id = Job id
-export-job-state = State
-export-state-running = Running
-export-state-done = Finished
-export-state-unknown = This job is unknown — it may have been cancelled or reclaimed.
-export-refresh = Refresh
-export-cancel = Cancel Job
-export-view-files = View Files
-export-new-heading = New Export
-export-no-subjects = Nothing to export yet — create a ViewDefinition first.
 export-format = Output format
 export-start = Start Export
-files-job-heading = Export Job
-files-load = Load Manifest
-files-error = Could not load the manifest.
-files-outputs-heading = Outputs
-files-col-output = Output
-files-col-downloads = Downloads
-files-shard = File { $n }
-files-empty = The job produced no output files.
+
+## SQL Export builder — create form (#834)
+
+sql-export-name-placeholder = Monthly patient flat files
+sql-export-subjects-legend = What are you exporting?
+sql-export-subjects-heading = Subjects
+sql-export-filter-all = All
+sql-export-filter-view-definitions = View Definitions
+sql-export-filter-queries = Queries
+sql-export-filter-views = Views
+sql-export-filter-subjects = Filter subjects
+sql-export-select-all = Select all
+sql-export-col-subject = Subject
+sql-export-col-kind = Kind
+sql-export-col-status = Status
+sql-export-selected-count = { $selected } of { $total } selected
+sql-export-format-ndjson-hint = One JSON object per row. Streams well into pipelines.
+sql-export-format-csv-hint = Header row plus one line per row. Opens in any spreadsheet.
+sql-export-format-json-hint = A single JSON array per output. Easiest to inspect by hand.
+sql-export-format-parquet-hint = Columnar and typed. Best for analytics engines.
+sql-export-empty-heading = Nothing to export yet
+sql-export-empty-body = Every stored view definition, SQL query and SQL view shows up here as an export subject. Create one first.
+sql-export-filter-empty = No subjects match
+
+## Active SQL Exports list and job cards (#833)
+
+sql-export-new = New SQL Export
+sql-export-unavailable = The storage backend does not host the settings store, so SQL export jobs cannot be tracked.
+sql-export-none = No SQL exports yet. Use New SQL Export to start one.
+sql-export-store-error = The export started, but could not be added to this list. Job id:
+sql-export-exports-word = exports
+sql-export-running = running
+sql-export-select-subject = Select at least one subject.
+sql-export-unknown-subject = One or more selected subjects are no longer available. Refresh the page and try again.
+sql-export-cancelled-reason = the server no longer knows this job
+sql-export-status-in-progress = In progress
+sql-export-status-complete = Complete
+sql-export-status-failed = Failed
+sql-export-status-cancelled = Cancelled
+sql-export-view-files = View files
+sql-export-cancel = Cancel
+sql-export-retry = Retry
+sql-export-run-again = Run again
+sql-export-remove = Remove from list
+sql-export-more-actions = More actions
+sql-export-copy-job-id = Copy job id
+sql-export-copied = Copied
+sql-export-progress-waiting = Waiting for the first status report…
+sql-export-started = started
+sql-export-finished-in = finished in
+sql-export-cancelled-at = cancelled at
+sql-export-status-unavailable = status unavailable
+sql-export-format-ndjson = NDJSON
+sql-export-format-csv = CSV
+sql-export-format-json = JSON
+sql-export-format-parquet = Parquet
+sql-export-subjects-count = { $count ->
+    [one] { $count } subject
+   *[other] { $count } subjects
+}
+sql-export-kind-view-definition = { $count ->
+    [one] { $count } ViewDefinition
+   *[other] { $count } ViewDefinitions
+}
+sql-export-kind-sql-query = { $count ->
+    [one] { $count } SQL Query
+   *[other] { $count } SQL Queries
+}
+sql-export-kind-sql-view = { $count ->
+    [one] { $count } SQL View
+   *[other] { $count } SQL Views
+}
+sql-export-files-count = { $count ->
+    [one] { $count } file
+   *[other] { $count } files
+}
+
+## Job detail page (#835)
+
+sql-export-detail-finished = Finished
+sql-export-detail-failed = Failed
+sql-export-detail-cancelled = Cancelled
+sql-export-detail-started = Started
+sql-export-detail-after = after
+sql-export-failure-subject = The export stopped on subject
+sql-export-failure-generic = The export failed:
+sql-export-detail-job-heading = Job
+sql-export-detail-field-job-id = Job id
+sql-export-detail-field-format = Format
+sql-export-detail-field-started = Started
+sql-export-detail-field-duration = Duration
+sql-export-detail-field-subjects = Subjects
+sql-export-detail-outputs-heading = Output files
+sql-export-detail-col-output = Output
+sql-export-detail-col-subject = Subject
+sql-export-detail-col-files = Files
+sql-export-detail-outputs-empty = The job produced no output files.
+sql-export-file-fallback = File { $n }
+
+## HTS administrative UI (crates/hts-ui) — Phase 1 scaffold stubs
+##
+## Keys for the HTS UI follow the convention hts-<page>-<role>-<control>. These stubs cover the base layout, sidebar
+## nav, and the dashboard scaffold placeholder rendered by the Phase 1 blocker
+## slice. They must be kept in parity with es/de/main.ftl.
+
+-hts-app-name = Helios Terminology Server
+hts-app-title = { -hts-app-name }
+
+hts-nav-section-work = Terminology
+hts-nav-section-tools = Tools
+hts-nav-section-server = Server
+hts-nav-home = Home
+hts-nav-code-systems = Code Systems
+hts-nav-value-sets = Value Sets
+hts-nav-concept-maps = Concept Maps
+hts-nav-operations = Operations
+hts-nav-import = Import
+
+hts-fhir-version-heading = FHIR version
+hts-fhir-version = FHIR { $version }
+
+hts-home-title = Home
+hts-home-subtitle = Terminology server health, catalog inventory, and quick actions.
+
+## Dashboard rows (row headings are visually hidden — they're for screen readers).
+
+hts-home-row-status = Server status
+
+## Dashboard tiles.
+
+hts-home-tile-status = Status
+hts-home-tile-uptime = Uptime
+hts-home-tile-loaded-systems = Loaded code systems
+hts-home-tile-loaded-systems-hint = From TerminologyCapabilities.codeSystem[]
+hts-home-tile-requests = Requests
+hts-home-tile-metrics-hint = Since server start
+
+## Home request-rate chart (design doc §7.1). Plots a rate differenced from
+## the cumulative `/metrics` counters, sampled only while this page is open,
+## so several honest "nothing to draw" states need their own copy.
+
+hts-home-chart-title = Requests per minute
+hts-home-chart-window = Chart time window
+hts-home-chart-series = Status class
+hts-home-chart-window-15m = 15m
+hts-home-chart-window-1h = 1h
+hts-home-chart-window-6h = 6h
+hts-home-chart-series-all = All
+hts-home-chart-series-2xx = 2xx
+hts-home-chart-series-4xx = 4xx
+hts-home-chart-series-5xx = 5xx
+hts-home-chart-empty-unreachable = /metrics is unreachable — no new samples are arriving.
+hts-home-chart-empty-none = No samples collected yet.
+hts-home-chart-empty-first = Collecting the first interval — a rate needs two samples.
+hts-home-chart-empty-window = No samples in this window. Sampling only runs while this page is open.
+hts-home-chart-axis-now = now
+hts-home-chart-axis-minutes = -{ $n }m
+hts-home-chart-axis-hours = -{ $n }h
+
+## /health `status` values, keyed for translation.
+
+hts-home-status-ok = OK
+
+## Degraded banner (design doc §7 header contract).
+
+hts-degraded-title = Terminology backend not fully available
+hts-degraded-body = Some tiles are hidden until HTS becomes reachable again. Interactive controls are disabled on affected pages.
+hts-degraded-reason-client-build = Failed to build the upstream HTTP client.
+hts-degraded-reason-upstream-down = Could not reach the terminology server.
+hts-degraded-reason-upstream-timeout = The terminology server did not respond in time.
+hts-degraded-reason-upstream-error = The terminology server returned an error status.
+hts-degraded-reason-upstream-shape = The terminology server returned an unexpected response shape.
+hts-degraded-reason-bootstrapping = The terminology server is still loading its bootstrap data.
+hts-degraded-reason-unknown = The terminology server is temporarily unavailable.
+
+## Dialect chip (topbar, session-wide displayLanguage / Accept-Language per §7.1).
+
+
+## OperationOutcome partial (shared, design doc §7 / §11).
+
+hts-outcome-severity = Severity: { $severity }
+hts-outcome-request-id = Request id: { $id }
+hts-outcome-code-not-found = The requested resource was not found.
+hts-outcome-code-invalid = The request was rejected as invalid.
+hts-outcome-code-too-costly = The requested operation was rejected as too expensive.
+hts-outcome-code-unknown = The server returned an issue the UI does not recognise.
+hts-degraded-since = Since { $timestamp }
+
+## HTS Slice B — CodeSystem browser + detail with embedded workbench
+## (design doc §7.2 + §7.3). Every key here has a peer in es/de/main.ftl.
+
+## CodeSystem status pills (used by browser rows and detail header).
+
+hts-cs-status-draft = draft
+hts-cs-status-active = active
+hts-cs-status-retired = retired
+hts-cs-status-unknown = unknown
+
+## CS browser page.
+
+hts-cs-browser-title = CodeSystems
+hts-cs-browser-subtitle = Browse the terminology server's catalog of CodeSystems and open any row to inspect its metadata and workbench.
+hts-cs-browser-filter-legend = Filter CodeSystems
+hts-cs-browser-filter-url = Canonical URL
+hts-cs-browser-filter-version = Version
+hts-cs-browser-filter-name = Name
+hts-cs-browser-filter-title = Title
+hts-cs-browser-filter-status = Status
+hts-cs-browser-filter-reset = Reset
+hts-cs-browser-empty = No CodeSystems match these filters.
+hts-cs-browser-load-more = Load more
+hts-cs-browser-showing-count = Showing { $count ->
+    [one] { $count } CodeSystem
+   *[other] { $count } CodeSystems
+}
+hts-cs-browser-table-caption = CodeSystems matching the active filters.
+hts-cs-browser-column-url = URL
+hts-cs-browser-column-version = Version
+hts-cs-browser-column-title = Title
+hts-cs-browser-column-status = Status
+hts-cs-browser-column-name = Name
+
+## Phase 5 — HTS search-form shared strings (used by CS / VS / CM browsers).
+
+hts-search-rail-label = Search filters
+hts-search-rail-heading = Filters
+hts-facet-status-any = Any status
+
+## CS detail page.
+
+hts-cs-detail-title = { $name } · CodeSystem
+hts-cs-detail-title-fallback = CodeSystem
+hts-cs-detail-eyebrow = CodeSystem
+hts-cs-detail-section-identity = Identity
+hts-cs-detail-section-content = Content
+hts-cs-detail-content-mode = Content mode
+hts-cs-detail-count = Concept count
+hts-cs-detail-publisher = Publisher
+hts-cs-detail-jurisdiction = Jurisdiction
+hts-cs-detail-supersedes = Supersedes
+hts-cs-detail-superseded-by = Superseded by
+hts-cs-detail-tabs-label = CodeSystem workbench sections
+hts-cs-detail-tab-lookup = Lookup
+hts-cs-detail-tab-validate = Validate
+hts-cs-detail-tab-subsumes = Subsumes
+hts-cs-detail-result-empty = Run the operation to see its result here.
+
+## CS $lookup form + result labels.
+
+hts-cs-lookup-heading = Look up a concept
+hts-cs-lookup-code = Code
+hts-cs-lookup-version = Version
+hts-cs-lookup-display-language = Display language
+hts-cs-lookup-display-language-placeholder = e.g. en-GB
+hts-cs-lookup-properties-legend = Properties
+hts-cs-lookup-designations = Designations
+hts-cs-lookup-properties = Properties
+hts-cs-lookup-no-match = HTS returned no matching concept.
+
+## CS $validate-code form + result labels.
+
+hts-cs-validate-heading = Validate a code
+hts-cs-validate-mode-legend = Input mode
+hts-cs-validate-mode-code = Bare code
+hts-cs-validate-mode-coding = Coding
+hts-cs-validate-code-legend = Bare code
+hts-cs-validate-code = Code
+hts-cs-validate-display = Display
+hts-cs-validate-coding-legend = Coding
+hts-cs-validate-coding-system = system
+hts-cs-validate-coding-code = code
+hts-cs-validate-coding-display = display
+hts-cs-validate-badge-true = valid
+hts-cs-validate-badge-false = invalid
+hts-cs-validate-message = Message
+
+## CS $subsumes form + result labels.
+
+hts-cs-subsumes-heading = Test subsumption
+hts-cs-subsumes-scoped-system = System (fixed)
+hts-cs-subsumes-code-a = Code A
+hts-cs-subsumes-code-b = Code B
+hts-cs-subsumes-outcome-equivalent = Codes are equivalent.
+hts-cs-subsumes-outcome-subsumes = Code A subsumes code B.
+hts-cs-subsumes-outcome-subsumed-by = Code A is subsumed by code B.
+hts-cs-subsumes-outcome-not-subsumed = Neither code subsumes the other.
+
+## Shared workbench chrome (reused by Slice C/D/E workbenches).
+
+hts-workbench-run = Run
+hts-workbench-raw-response = Raw request and response
+hts-workbench-copy-url = Request URL
+hts-workbench-request-body = Request body
+hts-workbench-response-body = Response body
+
+## Additional degraded reason for CS-read 404s (design doc §7.3 states matrix).
+
+hts-degraded-reason-upstream-not-found = The terminology server did not find that resource.
+
+## HTS Slice C — ValueSet browser + detail with embedded $expand workbench
+## (design doc §7.4 + §7.4.1). Every key here has a peer in es/de/main.ftl.
+
+## ValueSet status pills.
+
+hts-vs-status-draft = draft
+hts-vs-status-active = active
+hts-vs-status-retired = retired
+hts-vs-status-unknown = unknown
+
+## VS browser page.
+
+hts-vs-browser-title = ValueSets
+hts-vs-browser-subtitle = Browse the terminology server's catalog of ValueSets and open any row to inspect its metadata or run an expansion.
+hts-vs-browser-filter-legend = Filter ValueSets
+hts-vs-browser-filter-url = Canonical URL
+hts-vs-browser-filter-version = Version
+hts-vs-browser-filter-name = Name
+hts-vs-browser-filter-title = Title
+hts-vs-browser-filter-status = Status
+hts-vs-browser-filter-reset = Reset
+hts-vs-browser-empty = No ValueSets match these filters.
+hts-vs-browser-load-more = Load more
+hts-vs-browser-showing-count = Showing { $count ->
+    [one] { $count } ValueSet
+   *[other] { $count } ValueSets
+}
+hts-vs-browser-table-caption = ValueSets matching the active filters.
+hts-vs-browser-column-url = URL
+hts-vs-browser-column-version = Version
+hts-vs-browser-column-title = Title
+hts-vs-browser-column-status = Status
+hts-vs-browser-column-name = Name
+
+## VS detail page.
+
+hts-vs-detail-title = { $name } · ValueSet
+hts-vs-detail-title-fallback = ValueSet
+hts-vs-detail-eyebrow = ValueSet
+hts-vs-detail-section-identity = Identity
+hts-vs-detail-section-governance = Governance
+hts-vs-detail-publisher = Publisher
+hts-vs-detail-jurisdiction = Jurisdiction
+hts-vs-detail-immutable = Immutable
+hts-vs-detail-immutable-yes = yes
+hts-vs-detail-immutable-no = no
+hts-vs-detail-purpose = Purpose
+hts-vs-detail-copyright = Copyright
+hts-vs-detail-tabs-label = ValueSet workbench sections
+hts-vs-detail-tab-expand = Expand
+hts-vs-detail-result-empty = Run the operation to see its result here.
+
+## VS $expand form + result labels.
+
+hts-vs-expand-heading = Expand this ValueSet
+hts-vs-expand-scoped-valueset = ValueSet (fixed)
+hts-vs-expand-filter = Filter
+hts-vs-expand-filter-placeholder = code or display text
+hts-vs-expand-count = count
+hts-vs-expand-offset = offset
+hts-vs-expand-display-language = Display language
+hts-vs-expand-display-language-placeholder = e.g. en-GB
+hts-vs-expand-flags-legend = Flags
+hts-vs-expand-active-only = Active concepts only
+hts-vs-expand-include-designations = Include designations
+hts-vs-expand-mode-legend = Result mode
+hts-vs-expand-mode-flat = Flat
+hts-vs-expand-mode-tree = Tree
+hts-vs-expand-use-supplement-legend = Use supplements
+hts-vs-expand-use-supplement-placeholder = canonical URL
+hts-vs-expand-advanced-summary = Advanced
+hts-vs-expand-date = Date
+hts-vs-expand-date-placeholder = ISO 8601 (e.g. 2025-06-01)
+hts-vs-expand-property-legend = Properties
+hts-vs-expand-property-placeholder = property code
+hts-vs-expand-tx-resource-legend = tx-resource
+hts-vs-expand-tx-resource-placeholder = canonical URL or reference
+hts-vs-expand-system-version-legend = system-version
+hts-vs-expand-system-version-placeholder = system|version
+hts-vs-expand-check-system-version-legend = check-system-version
+hts-vs-expand-force-system-version-legend = force-system-version
+hts-vs-expand-default-valueset-version = default-valueset-version
+hts-vs-expand-threshold = Too-costly threshold
+hts-vs-expand-ceiling-tooltip = UI ceiling: { $ceiling } (values above are dropped)
+hts-vs-expand-ceiling-note = ceiling: { $ceiling }
+hts-vs-expand-ceiling-warning-title = Threshold above the UI ceiling
+hts-vs-expand-ceiling-warning-body = You requested threshold { $requested }, which is above the UI ceiling — the header was not attached.
+hts-vs-expand-ceiling-value = ceiling: { $ceiling }
+hts-vs-expand-too-costly-title = Expansion rejected as too costly
+hts-vs-expand-too-costly-body = HTS refused the expansion above the current threshold. Raise it below and re-run, or narrow the filter.
+hts-vs-expand-raise-threshold = Raise threshold to
+hts-vs-expand-raise-submit = Retry
+hts-vs-expand-tree-label = showing full tree { $count ->
+    [one] { $count } leaf
+   *[other] { $count } leaves
+}
+hts-vs-expand-total-label = total { $total }
+hts-vs-expand-total-unknown = total (unknown)
+hts-vs-expand-offset-label = offset { $offset }
+hts-vs-expand-filter-no-match = No members match the filter "{ $filter }".
+hts-vs-expand-no-members = This expansion contains no members.
+hts-vs-expand-column-code = Code
+hts-vs-expand-column-display = Display
+hts-vs-expand-column-system = System
+hts-vs-expand-load-more = Load more
+hts-vs-expand-echoed-parameters = Echoed parameters
+
+## HTS Slice D — ConceptMap browser + detail with embedded $translate
+## workbench (design doc §7.5). Every key here has a peer in
+## es/de/main.ftl.
+
+## ConceptMap status pills.
+
+hts-cm-status-draft = draft
+hts-cm-status-active = active
+hts-cm-status-retired = retired
+hts-cm-status-unknown = unknown
+
+## CM browser page.
+
+hts-cm-browser-title = ConceptMaps
+hts-cm-browser-subtitle = Browse the terminology server's catalog of ConceptMaps and open any row to inspect its metadata or run a translation.
+hts-cm-browser-filter-legend = Filter ConceptMaps
+hts-cm-browser-filter-url = Canonical URL
+hts-cm-browser-filter-name = Name
+hts-cm-browser-filter-title = Title
+hts-cm-browser-filter-status = Status
+hts-cm-browser-filter-hint = Source and target canonicals are not offered as filters: HTS accepts only url, version, name, title and status when searching ConceptMaps, and ignores anything else. Filter by URL or name, then read the Mapping column.
+hts-cm-browser-filter-reset = Reset
+hts-cm-browser-empty = No ConceptMaps match these filters.
+hts-cm-browser-load-more = Load more
+hts-cm-browser-showing-count = Showing { $count ->
+    [one] { $count } ConceptMap
+   *[other] { $count } ConceptMaps
+}
+hts-cm-browser-table-caption = ConceptMaps matching the active filters.
+hts-cm-browser-column-url = URL
+hts-cm-browser-column-title = Title
+hts-cm-browser-column-status = Status
+hts-cm-browser-column-name = Name
+hts-cm-browser-column-source = Source system
+hts-cm-browser-column-target = Target system
+hts-cm-browser-column-mapping = Mapping
+hts-cm-browser-mapping-source-prefix = S:
+hts-cm-browser-mapping-target-prefix = T:
+
+## CM detail page.
+
+hts-cm-detail-title = { $name } · ConceptMap
+hts-cm-detail-title-fallback = ConceptMap
+hts-cm-detail-eyebrow = ConceptMap
+hts-cm-detail-section-identity = Identity
+hts-cm-detail-section-mapping = Mapping
+hts-cm-detail-publisher = Publisher
+hts-cm-detail-jurisdiction = Jurisdiction
+hts-cm-detail-purpose = Purpose
+hts-cm-detail-source-uri = Source
+hts-cm-detail-target-uri = Target
+hts-cm-detail-group-count = Groups
+hts-cm-detail-tabs-label = ConceptMap workbench sections
+hts-cm-detail-tab-translate = Translate
+hts-cm-detail-result-empty = Run the operation to see its result here.
+
+## CM $translate form + result labels.
+
+hts-cm-translate-heading = Translate a code
+hts-cm-translate-scoped-map = ConceptMap (fixed)
+hts-cm-translate-direction-legend = Direction
+hts-cm-translate-direction-forward = Forward
+hts-cm-translate-direction-reverse = Reverse
+hts-cm-translate-source-legend = Source coding
+hts-cm-translate-source-system = System
+hts-cm-translate-source-system-placeholder = canonical URL
+hts-cm-translate-source-code = Code
+hts-cm-translate-source-display = Display
+hts-cm-translate-source-display-placeholder = optional
+hts-cm-translate-reverse-legend = Reverse source
+hts-cm-translate-target-code = Target code
+hts-cm-translate-target-code-hint = Required in reverse mode.
+hts-cm-translate-target-legend = Target constraints
+hts-cm-translate-target-system = Target system
+hts-cm-translate-target-system-placeholder = canonical URL
+hts-cm-translate-source-url = Source ValueSet
+hts-cm-translate-source-url-placeholder = canonical URL (optional)
+hts-cm-translate-target-url = Target ValueSet
+hts-cm-translate-target-url-placeholder = canonical URL (optional)
+hts-cm-translate-date = Date
+hts-cm-translate-date-placeholder = ISO 8601 (e.g. 2025-06-01)
+hts-cm-translate-submit = Translate
+hts-cm-translate-matches-count = { $count ->
+    [one] { $count } match
+   *[other] { $count } matches
+}
+hts-cm-translate-no-matches = No matches for this source.
+hts-cm-translate-column-code = Code
+hts-cm-translate-column-system = System
+hts-cm-translate-column-display = Display
+hts-cm-translate-column-mapping = { $kind ->
+    [equivalence] Equivalence
+    [relationship] Relationship
+   *[other] Mapping
+}
+hts-cm-translate-column-origin = Origin
+
+## HTS Slice E -- standalone Operations workbench (design doc s7.6).
+## Every user-visible string on `/ui/hts/operations` resolves to a key
+## in this section. Keys have peers in es/de/main.ftl (parity gated by
+## the fluent-key inventory test).
+
+## Shell.
+
+## Op selector labels -- one per OperationKind slug.
+
+## CS $lookup widening (Slice E adds useSupplement to the Slice B set).
+
+## CS $validate-code widening.
+
+## CS $subsumes standalone (heading + outcomes already live in Slice B).
+
+## VS $expand widening (adds designation chip).
+hts-vs-expand-advanced = Advanced parameters
+hts-vs-expand-total = total { $n }
+
+## VS $validate-code (new op in Slice E).
+
+## CM $translate standalone (base keys already live in Slice D).
+
+## $closure workbench (new op in Slice E).
+
+## batch-validate workbench (new UI-fabricated op in Slice E).
+
+## Slice F — standalone Import page (design doc §7.7).
+##
+## Shell + upload form + status region for POST /import. All strings
+## live under `hts-import-*`; `hts-nav-import` above is the sidebar
+## label reused from the Phase 1 stub set.
+
+hts-import-title = Import Terminology
+hts-import-heading = Import Terminology
+hts-import-help = Submit a FHIR JSON Bundle. HTS accepts CodeSystem, ValueSet, and ConceptMap resources in one POST.
+hts-import-source-legend = Source
+hts-import-source-paste = Paste JSON
+hts-import-source-file = Upload file
+hts-import-bundle-textarea-label = FHIR Bundle (JSON)
+hts-import-bundle-file-label = Bundle file (JSON)
+hts-import-submit = Import
+hts-import-status-empty = No import has been submitted yet.
+hts-import-status-success = Import complete
+hts-import-status-partial = Import partially succeeded
+hts-import-status-rejected = Import rejected
+hts-import-status-too-large = Bundle too large
+hts-import-counts-heading = Counts by resource
+hts-import-counts-created = Created / updated
+hts-import-resource-code-system = CodeSystem
+hts-import-resource-value-set = ValueSet
+hts-import-resource-concept-map = ConceptMap
+hts-import-resource-concept = Concepts inserted
+hts-import-issues-heading = { $n ->
+    [one] { $n } issue
+   *[other] { $n } issues
+}
+hts-import-too-large-hint = The request exceeded the server's payload limit. Split the Bundle into smaller batches and retry.
+hts-import-empty-bundle-error = Paste a JSON Bundle before submitting.
+hts-import-invalid-json-error = The submitted body is not valid JSON.
+
+# V3 "stepped" Import layout (#551): three numbered steps — choose source,
+# review, result. Step 2 deliberately carries no entry counts: HTS reports
+# counts only in the `POST /import` response, so a pre-flight number would
+# be invented rather than measured.
+hts-import-step-source = Choose source
+hts-import-step-review = Review
+hts-import-step-result = Result
+hts-import-file-hint = JSON only. The file is read in your browser and copied into the Bundle field below; nothing is sent until you submit.
+hts-import-drop-hint = Drop a bundle JSON file here
+hts-import-drop-browse = or click to browse
+hts-import-reading = Reading file…
+hts-import-read-failed = The file could not be read.
+hts-import-file-too-large = File exceeds the ~7.5 MiB limit for urlencoded submission.
+hts-import-file-loaded = File loaded: {"{name}"}
+hts-import-bundle-hint = The Bundle is posted to POST /import on the terminology server. Existing resources are matched on url + version.
+hts-import-review-target = Target server
+hts-import-review-request = Request
+hts-import-review-accepted = Accepted resources
+hts-import-review-accepted-value = CodeSystem, ValueSet, ConceptMap
+hts-import-review-existing = Existing resources
+hts-import-review-existing-value = Updated in place when url and version match.
+hts-import-review-note = Nothing is written until you submit. How many resources were actually created is reported by the server in the result below.
+hts-import-counts-resource = Resource
+hts-import-raw-toggle = Raw response
+hts-import-rejected-note = Nothing was written to the terminology store.
+hts-import-tag-success = Success
+hts-import-tag-partial = Partial
+hts-import-tag-error = Error
+
+## Slice G — standalone Diagnostics page (design doc §7.9).
+##
+## Stacked-card view over CapabilityStatement, TerminologyCapabilities,
+## /health, and /metrics — mirrors HFS's Capability Statement page.
+## A failing source renders an `hts-degraded-reason-*` warning notice
+## inside its own card; the other cards stay readable.
+
+
+# Concept information plane (Direction B, "concept-first").
+# The concept is a top-level object with its own permalink at
+# /ui/hts/concepts?system=...&code=..., rendered as three panels:
+# Identity, Mappings (across every stored ConceptMap), and Subsumption.
+hts-concept-title = Concept
+hts-concept-lede = One code, seen from every angle the terminology server can answer for: what it is, what it maps to, and where it sits in the hierarchy.
+hts-concept-open = Open concept
+hts-concept-panel-loading = Loading
+hts-concept-panel-open = Open this panel
+
+hts-concept-identity-heading = Identity
+hts-concept-status-active = Active
+hts-concept-status-inactive = Inactive
+hts-concept-status-unreported = Activity not reported
+hts-concept-field-system = System
+hts-concept-field-code = Code
+hts-concept-field-display = Display
+hts-concept-field-code-system-name = CodeSystem name
+hts-concept-field-version = Version
+hts-concept-field-selectability = Selectability
+hts-concept-selectability-abstract = Abstract (not selectable)
+hts-concept-selectability-selectable = Selectable
+hts-concept-field-definition = Definition
+hts-concept-field-neighbours = Hierarchy neighbours
+hts-concept-field-used-supplements = Supplements applied
+hts-concept-designations-heading = Designations
+hts-concept-designations-value = Designation
+hts-concept-designations-language = Language
+hts-concept-designations-use = Use
+hts-concept-properties-heading = Properties
+hts-concept-properties-code = Property
+hts-concept-properties-value = Value
+hts-concept-raw-response = Raw response
+
+hts-concept-mappings-heading = Mappings
+hts-concept-mappings-direction-forward = Mappings where this concept is the source, across every stored ConceptMap.
+hts-concept-mappings-direction-reverse = Mappings where this concept is the target, across every stored ConceptMap.
+hts-concept-mappings-switch-forward = Show mappings from this concept
+hts-concept-mappings-switch-reverse = Show mappings to this concept
+hts-concept-mappings-empty = No ConceptMap maps this concept.
+hts-concept-mappings-vocabulary = Mapping vocabulary
+hts-concept-mappings-vocabulary-equivalence = equivalence (R4 / R4B)
+hts-concept-mappings-vocabulary-relationship = relationship (R5 / R6)
+hts-concept-mappings-vocabulary-unknown = Not reported
+hts-concept-mappings-unattributable = The server does not attribute reverse-mode matches to a source map, so the origin cannot be shown. Switch to the forward direction to see which ConceptMap each mapping came from.
+hts-concept-mappings-origin = Origin map
+hts-concept-mappings-column-code = Code
+hts-concept-mappings-column-system = System
+hts-concept-mappings-column-display = Display
+hts-concept-mappings-column-mapping = Relationship
+
+hts-concept-relations-heading = Subsumption
+hts-concept-relations-lede = Each row is one subsumption check. The ancestor candidate is always sent as code A, so a hierarchy that agrees with itself answers "subsumes" every time.
+hts-concept-relation-parent = Parent
+hts-concept-relation-child = Child
+hts-concept-relation-manual = Compared
+hts-concept-relations-column-relation = Relation
+hts-concept-relations-column-question = Question asked
+hts-concept-relations-column-outcome = Outcome
+hts-concept-relations-subsumes-verb = subsumes
+hts-concept-subsumes-outcome-equivalent = Equivalent
+hts-concept-subsumes-outcome-subsumes = Subsumes
+hts-concept-subsumes-outcome-subsumed-by = Subsumed by
+hts-concept-subsumes-outcome-not-subsumed = Not subsumed
+hts-concept-relations-conflict-caveat = The concept lookup reports this hierarchy link but the subsumption check does not confirm it. That usually means the subsumption closure was not rebuilt after the CodeSystem was re-imported; the hierarchy itself survived.
+hts-concept-relations-empty = This concept has no parents or children to compare.
+hts-concept-relations-dropped = { $n } further comparators were not checked; this panel runs at most 20 subsumption calls per render.
+hts-concept-relations-compare-label = Compare with code
+hts-concept-relations-compare-placeholder = Another code in this system
+hts-concept-relations-compare-hint = The system is pinned to this concept's, so enter the bare code. The check asks whether that code subsumes this one.
+hts-concept-relations-compare-submit = Compare
+
+## HTS detail pages -- V3 compact header (#551 Slice B/C/D layout pass).
+## Shared chip-row and disclosure labels for the CodeSystem / ValueSet /
+## ConceptMap detail pages, plus the result-panel headings and the two
+## honesty footnotes (tree pager, reverse-mode originMap).
+
+hts-detail-facts-label = Facts
+hts-detail-canonical-url = Canonical URL
+hts-detail-version-label = Version
+hts-detail-status-label = Status
+hts-cs-detail-facts-summary = All CodeSystem facts
+hts-vs-detail-facts-summary = All ValueSet facts
+hts-cm-detail-facts-summary = All ConceptMap facts
+hts-cs-lookup-definition = Definition
+hts-cs-validate-result-heading = Validation result
+hts-cs-subsumes-result-heading = Subsumption result
+hts-vs-expand-result-heading = Expansion
+hts-vs-expand-table-caption = Expansion members returned by the terminology server.
+hts-vs-expand-tree-note = Tree mode returns the whole hierarchy; the pager is flat-mode only.
+hts-cm-translate-table-caption = Translate matches returned by the terminology server.
+hts-cm-translate-origin-reverse-note = In reverse mode HTS omits originMap, so a match cannot be attributed to a specific concept map. Every Origin cell stays an em-dash by design — it is not a missing value.
+
+
+# Capability & Conformance page (HTS mirror of HFS's page). The shared
+# `cap-*` and `nav-capability-conformance` keys carry everything both
+# pages say identically; only what is specific to a terminology server
+# lives here.
+hts-capability-lede = What this terminology server advertises right now — composed live from /metadata.
+hts-capability-operations-empty = No operations advertised.
+hts-capability-rest-empty = No REST resources advertised.
+hts-capability-terminology-heading = Terminology Capabilities
+hts-capability-expansion-hierarchical = Hierarchical expansion
+hts-capability-expansion-paging = Expansion paging
+hts-capability-expansion-incomplete = Incomplete expansions
+hts-capability-expansion-parameters = $expand parameters
+hts-capability-validate-code-translations = Validate-code translations
+hts-capability-translation-needs-map = Translation needs a map
+hts-capability-closure = Closure maintenance
+hts-capability-code-systems-declared = Code systems declared
+hts-capability-flag-true = Yes
+hts-capability-flag-false = No
+
+# Home V3 tile sub-lines. The mockup folds Backend, FHIR version,
+# Bundled data and Avg latency into the sub-line of the tile each
+# qualifies, instead of giving them tiles of their own.
+hts-home-tile-status-sub = backend { $backend } · FHIR { $version }
+hts-home-tile-uptime-sub = hts v{ $version } · no restarts since { $since } UTC
+hts-home-tile-uptime-sub-noclock = hts v{ $version }
+hts-home-tile-loaded-systems-sub = { $mib } MiB bundled on disk
+hts-home-tile-requests-sub = { $ms } ms average · from /metrics
+
+# Chart caption, composed from the SELECTED window and status class.
+# Each locale owns its own word order through the two placeables.
+hts-home-chart-hint = { $window }, { $classes }. Sampled while this page is open. Excludes this page's own 15 s refresh and /metrics scrapes.
+hts-home-chart-hint-window-15m = Last 15 minutes
+hts-home-chart-hint-window-1h = Last hour
+hts-home-chart-hint-window-6h = Last 6 hours
+hts-home-chart-hint-series-all = all status classes
+hts-home-chart-hint-series-2xx = 2xx responses only
+hts-home-chart-hint-series-4xx = 4xx responses only
+hts-home-chart-hint-series-5xx = 5xx responses only

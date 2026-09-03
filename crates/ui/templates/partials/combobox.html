@@ -1,0 +1,51 @@
+<!--
+  Shared, progressively enhanced multi-select combobox. The caller supplies
+  domain copy and the HTML-fragment endpoint; combobox.js owns only generic
+  selection and keyboard behavior. The fallback textarea remains the usable
+  control until JavaScript completes initialization.
+-->
+{% macro multi_select(id, name, label, placeholder, hint, fallback_placeholder, fallback_hint, endpoint, extra_class="", alternate_hint="", alternate_placeholder="", query_name="q", initial_value="") %}
+<fieldset id="{{ id }}" class="field combobox{% if !extra_class.is_empty() %} {{ extra_class }}{% endif %}"
+          data-combobox data-combobox-name="{{ name }}" data-combobox-query-name="{{ query_name }}"
+          {% if !alternate_hint.is_empty() %}data-combobox-alternate-hint="{{ alternate_hint }}"{% endif %}
+          {% if !alternate_placeholder.is_empty() %}data-combobox-alternate-placeholder="{{ alternate_placeholder }}"{% endif %}
+          data-combobox-added-message="{{ i18n.t("ui-combobox-added") }}"
+          data-combobox-removed-message="{{ i18n.t("ui-combobox-removed") }}"
+          data-combobox-loading-message="{{ i18n.t("ui-combobox-loading") }}"
+          data-combobox-results-message="{{ i18n.t("ui-combobox-results-updated") }}"
+          data-combobox-error-message="{{ i18n.t("ui-combobox-error") }}"
+          data-combobox-remove-label="{{ i18n.t("ui-combobox-remove") }}">
+  <legend id="{{ id }}-label" class="field__label">{{ label }}</legend>
+
+  <div data-combobox-fallback>
+    <textarea class="field__input" name="{{ name }}" rows="2"
+              placeholder="{{ fallback_placeholder }}"
+              aria-labelledby="{{ id }}-label"
+              aria-describedby="{{ id }}-fallback-hint">{{ initial_value }}</textarea>
+    <span id="{{ id }}-fallback-hint" class="field__hint">{{ fallback_hint }}</span>
+  </div>
+
+  <div class="combobox__enhancement" data-combobox-enhancement hidden>
+    <div class="combobox__selections" data-combobox-selections role="list"
+         aria-label="{{ i18n.t("ui-combobox-selected-label") }}" hidden></div>
+    <div class="combobox__control">
+      <span class="combobox__search-icon" aria-hidden="true">{% include "icons/search.svg" %}</span>
+      <input class="field__input combobox__input" type="search"
+             placeholder="{{ placeholder }}" autocomplete="off" disabled
+             role="combobox" aria-autocomplete="list" aria-expanded="false"
+             aria-labelledby="{{ id }}-label"
+             aria-controls="{{ id }}-listbox" aria-describedby="{{ id }}-hint {{ id }}-message"
+             hx-post="{{ endpoint }}"
+             hx-trigger="input changed delay:300ms, search"
+             hx-target="#{{ id }}-listbox" hx-swap="innerHTML"
+             hx-sync="this:replace">
+      <div id="{{ id }}-listbox" class="combobox__listbox" data-combobox-listbox
+           role="listbox" aria-multiselectable="true" hidden></div>
+    </div>
+    <div id="{{ id }}-message" class="combobox__message" data-combobox-message hidden></div>
+    <span id="{{ id }}-hint" class="field__hint" data-combobox-hint>{{ hint }}</span>
+    <p class="visually-hidden" data-combobox-status role="status"
+       aria-live="polite" aria-atomic="true"></p>
+  </div>
+</fieldset>
+{% endmacro %}

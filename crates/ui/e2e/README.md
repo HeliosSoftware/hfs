@@ -16,6 +16,24 @@ import `{ test, expect }` from `../pages/fixtures` and receive page objects as
 fixtures (`async ({ resources, history }) => …`); `pages/api.ts` seeds resources
 over the REST API for state-dependent tests.
 
+Most projects share one server and one user (`l2:`, the default when auth is
+disabled) across every test. The server-side rail state introduced by
+#754/#755 — "recently used" + "last selected" per page, stored in `rails`
+under `/_user/settings` — is therefore per-*user*, not per-test: without a
+reset, a selection recorded by one test would still be there for the next one
+to restore from. `pages/fixtures.ts`'s `page` fixture resets `rails` (a merge
+patch of `{"rails": null}`) before every test runs. Nothing else under
+`/_user/settings` is touched by the reset.
+
+The reset is **100% best-effort** and never fails a test over its own result:
+the whole request is wrapped in `try`/`catch`, and no response status is
+checked at all. This matters beyond the plain SQLite leg — the `auth` and
+`auth-degraded` projects run against `HFS_AUTH`-enabled servers and this
+fixture carries no bearer token, so the reset there always comes back
+401/403; other legs can 501 (no settings store configured) or fail to connect
+outright. All of that is silently swallowed; only navigation failures a test
+actually depends on should ever fail it.
+
 | Path | What it covers |
 |------|----------------|
 | `tests/a11y.spec.ts` | axe-core WCAG 2.2 AA over every full page, light × dark |
@@ -27,12 +45,20 @@ over the REST API for state-dependent tests.
 | `tests/resources-editor.spec.ts` | edit flows: Create targets the picked type, inline binding validation, Save blocked on invalid, raw-edit round-trips |
 | `tests/editor-controls.spec.ts` | fold/expand, add-node (+filter), remove, `value[x]` choice, ad-hoc extension, standalone `/ui/editor` |
 | `tests/history.spec.ts` | version rail, from/to selects, the **show-metadata diff checkbox**, deep-link, not-found |
-| `tests/compartments.spec.ts` | rail + tabs, and the membership tester's four outcomes (member/self/not-member/fan-out) |
+| `tests/compartments.spec.ts` | rail + tabs, the membership tester's four outcomes (member/self/not-member/fan-out), and the stored `last` restore through the nav |
 | `tests/queries.spec.ts` | query builder: run → results, pagination, add-condition, per-type param datalist, Recent |
 | `tests/nl-search.spec.ts` | NL mode toggle; translation lands a query and never runs it; refusal; example chips (stubbed `/$nl-search`) |
 | `tests/search-parameters.spec.ts` | registry table, htmx rail filter, facet narrowing, row → detail |
 | `tests/tenants.spec.ts` | add-tenant slide-over, htmx search filter, delete (skips if no tenant store) |
-| `tests/nojs/*.spec.ts` | the README promise: the UI works with JavaScript disabled (`nojs` project) |
+| `tests/sql-view-definitions.spec.ts` | View Definitions playground: rail, live `$sql-run` preview (#752); the guided-form card beside the editor (#843) — add a column from the form, edit `resource` in CodeMirror and see the row (and an invalid value's error) sync back, Ctrl+Z after a form edit, the two cards' shared internally-scrolling height, and the row↔editor cross-highlight in both directions (hover a row, click a JSON line, reveal stays inside each pane's own scroll) |
+| `tests/nojs/*.spec.ts` | the README promise: the UI works with JavaScript disabled (`nojs` project) — includes `sql-view-definitions.spec.ts`'s own case: the guided-form card (#843) stays hidden and the editor works alone |
+
+Pure-function browser modules (`assets/combobox.js`, `assets/vd-editor.js`'s
+`minimalChange`) get a third, faster ring: plain Node tests under `unit/`,
+run with `npm run test:unit` — no browser, no server. `vd-editor.js` is wired
+UMD-style (`module.exports` under Node, auto-mounts under a real
+`document`) specifically so this stays possible without a second copy of the
+diff algorithm.
 
 ## Run it
 

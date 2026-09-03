@@ -30,9 +30,15 @@ use parking_lot::RwLock;
 use crate::search::{SearchParameterDefinition, SearchParameterRegistry};
 
 /// Loads a tenant's stored (POSTed) active SearchParameter definitions from
-/// storage. Returns an empty vec when the tenant has none (or the backend has
-/// no store, e.g. S3).
-pub type StoredParamLoader = Arc<dyn Fn(&str) -> Vec<SearchParameterDefinition> + Send + Sync>;
+/// storage. `Some(vec)` — possibly empty — means the load itself succeeded
+/// (a tenant legitimately has no stored overlay is `Some(vec![])`, not
+/// `None`; likewise a backend with no store at all, e.g. S3, always returns
+/// `Some(vec![])`). `None` means the load could not be attempted or failed
+/// (e.g. a transient connection/query error) — [`TenantSearchRegistries::for_tenant`]
+/// must not cache that outcome, or a single transient failure permanently
+/// poisons the tenant with an empty overlay (#787).
+pub type StoredParamLoader =
+    Arc<dyn Fn(&str) -> Option<Vec<SearchParameterDefinition>> + Send + Sync>;
 
 /// A shared base registry plus lazily-built, cached per-tenant registries.
 ///
@@ -65,7 +71,7 @@ impl TenantSearchRegistries {
     /// Creates a container whose tenants never have stored overlays — every
     /// tenant sees exactly the base. Used by backends without a store (S3).
     pub fn base_only() -> Self {
-        Self::new(Arc::new(|_tenant: &str| Vec::new()))
+        Self::new(Arc::new(|_tenant: &str| Some(Vec::new())))
     }
 
     /// The shared base registry. Construction-time loading (embedded/spec/custom)
@@ -77,14 +83,44 @@ impl TenantSearchRegistries {
 
     /// Returns the registry for `tenant_id`, building and caching it on first
     /// use: a clone of the base with the tenant's stored active params overlaid.
+    ///
+    /// If the loader fails (returns `None` — e.g. a transient connection/query
+    /// error), this returns a base-only registry for this call *without*
+    /// caching it, so the next access retries the load instead of being
+    /// permanently stuck with an incomplete overlay (#787).
     pub fn for_tenant(&self, tenant_id: &str) -> Arc<RwLock<SearchParameterRegistry>> {
-        if let Some(reg) = self.per_tenant.read().get(tenant_id) {
-            return reg.clone();
+        if let Some(reg) = self.cached(tenant_id) {
+            return reg;
         }
         // Build outside the map lock. A concurrent builder for the same tenant
         // is harmless — the last writer wins and both hold equivalent content.
+        let Some(stored) = (self.loader)(tenant_id) else {
+            return Arc::new(RwLock::new(self.base.read().clone()));
+        };
+        self.build_and_cache(tenant_id, stored)
+    }
+
+    /// Returns `tenant_id`'s registry only if already cached — never consults
+    /// the loader. For a caller that can itself load the tenant's stored
+    /// overlay on a cache miss (e.g. a SQLite transaction reusing its own
+    /// held connection instead of asking the pool for a second one, avoiding
+    /// the two-simultaneous-connections hazard behind #787) and wants to
+    /// check the fast path first via [`build_and_cache`](Self::build_and_cache).
+    pub fn cached(&self, tenant_id: &str) -> Option<Arc<RwLock<SearchParameterRegistry>>> {
+        self.per_tenant.read().get(tenant_id).cloned()
+    }
+
+    /// Builds and caches `tenant_id`'s registry from an already-loaded set of
+    /// stored definitions — the base clone + overlay step `for_tenant` would
+    /// otherwise do itself, exposed for callers that source `stored` some
+    /// other way (see [`cached`](Self::cached)).
+    pub fn build_and_cache(
+        &self,
+        tenant_id: &str,
+        stored: Vec<SearchParameterDefinition>,
+    ) -> Arc<RwLock<SearchParameterRegistry>> {
         let mut reg = self.base.read().clone();
-        for def in (self.loader)(tenant_id) {
+        for def in stored {
             // A stored param may legitimately shadow a base spec param; ignore
             // duplicate-url rejections (already-registered canonical URLs).
             let _ = reg.register(def);
@@ -157,7 +193,7 @@ mod tests {
     ) -> TenantSearchRegistries {
         let stored = Arc::new(stored);
         let regs = TenantSearchRegistries::new(Arc::new(move |t: &str| {
-            stored.get(t).cloned().unwrap_or_default()
+            Some(stored.get(t).cloned().unwrap_or_default())
         }));
         // Base: one standard param present for all tenants.
         regs.base()
@@ -262,7 +298,7 @@ mod tests {
             Arc::new(RwLock::new(HashMap::new()));
         let store2 = store.clone();
         let regs = TenantSearchRegistries::new(Arc::new(move |t: &str| {
-            store2.read().get(t).cloned().unwrap_or_default()
+            Some(store2.read().get(t).cloned().unwrap_or_default())
         }));
         regs.base()
             .write()
@@ -305,5 +341,58 @@ mod tests {
                 .is_some(),
             "rebuilt"
         );
+    }
+
+    /// Regression test for #787: a transient loader failure (e.g. a pooled
+    /// connection hitting a genuinely empty/uninitialized database — see
+    /// `crates/persistence/src/backends/sqlite/backend.rs`'s
+    /// `load_tenant_stored_params`) must not permanently poison the tenant
+    /// with an empty overlay. Before this fix, `for_tenant` could not tell
+    /// "the tenant has no stored params" (`Some(vec![])`) apart from "the load
+    /// itself failed" (previously silently treated the same as empty) and
+    /// cached the empty result either way — so a single bad read locked the
+    /// tenant out of ever seeing its stored SearchParameters again.
+    #[test]
+    fn a_failed_load_is_not_cached_and_the_next_access_retries() {
+        let attempt = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let attempt2 = attempt.clone();
+        let regs = TenantSearchRegistries::new(Arc::new(move |_t: &str| {
+            if attempt2.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                // First call: simulate a transient load failure.
+                None
+            } else {
+                Some(vec![def(
+                    "http://acme.health/fhir/SearchParameter/patient-nickname",
+                    "Patient",
+                    "nickname",
+                    SearchParameterSource::Stored,
+                )])
+            }
+        }));
+
+        // First access hits the failing load: no param, and (crucially) not cached.
+        assert!(
+            regs.for_tenant("acme1")
+                .read()
+                .get_param("Patient", "nickname")
+                .is_none(),
+            "failed load should not surface the param"
+        );
+        assert_eq!(
+            regs.cached_tenant_count(),
+            0,
+            "a failed load must not be cached"
+        );
+
+        // Second access retries the loader (no explicit invalidate needed,
+        // since nothing was cached) and succeeds.
+        assert!(
+            regs.for_tenant("acme1")
+                .read()
+                .get_param("Patient", "nickname")
+                .is_some(),
+            "the next access should retry and see the param"
+        );
+        assert_eq!(attempt.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 }

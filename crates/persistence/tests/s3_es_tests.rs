@@ -122,17 +122,55 @@ async fn shared_minio() -> &'static SharedMinio {
         .await
 }
 
+/// Startup budget for one Elasticsearch container start attempt.
+///
+/// ES on the shared CI Docker host boots alongside MinIO and a
+/// coverage-instrumented test binary; under that load the JVM has been
+/// observed to blow through a 120s budget and then come up fine on the retry
+/// a minute later (run 33636603224). 300s gives one attempt room to succeed
+/// on its own.
+const ES_STARTUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// How many times to try starting the ES container before giving up.
+const ES_START_ATTEMPTS: usize = 2;
+
+/// Starts the shared Elasticsearch container, retrying once on a startup
+/// failure so a slow host does not fail the whole suite.
+///
+/// Retrying here is explicit rather than a side effect of the initializer
+/// panicking inside `OnceCell::get_or_init` (which lets the next waiter re-run
+/// it): the test that observes the panic fails regardless, so the retry has to
+/// happen before anything is reported.
+async fn start_es_container() -> testcontainers::ContainerAsync<ElasticSearch> {
+    let run_id = std::env::var("GITHUB_RUN_ID").unwrap_or_default();
+    let mut last_err = None;
+    for attempt in 1..=ES_START_ATTEMPTS {
+        match ElasticSearch::default()
+            .with_env_var("ES_JAVA_OPTS", "-Xms256m -Xmx256m")
+            .with_label("github.run_id", &run_id)
+            .with_startup_timeout(ES_STARTUP_TIMEOUT)
+            .start()
+            .await
+        {
+            Ok(container) => return container,
+            Err(err) => {
+                eprintln!(
+                    "Elasticsearch container start attempt {attempt}/{ES_START_ATTEMPTS} failed: {err}"
+                );
+                last_err = Some(err);
+            }
+        }
+    }
+    panic!(
+        "failed to start Elasticsearch container after {ES_START_ATTEMPTS} attempts: {:?}",
+        last_err.expect("at least one attempt ran")
+    );
+}
+
 async fn shared_es() -> &'static SharedEs {
     SHARED_ES
         .get_or_init(|| async {
-            let run_id = std::env::var("GITHUB_RUN_ID").unwrap_or_default();
-            let container = ElasticSearch::default()
-                .with_env_var("ES_JAVA_OPTS", "-Xms256m -Xmx256m")
-                .with_label("github.run_id", &run_id)
-                .with_startup_timeout(std::time::Duration::from_secs(120))
-                .start()
-                .await
-                .expect("failed to start Elasticsearch container");
+            let container = start_es_container().await;
 
             let port = container
                 .get_host_port_ipv4(9200)

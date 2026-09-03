@@ -1,92 +1,59 @@
 {% extends "layouts/base.html" %}
 
 {#
-  SQL Export (#649): pick stored subjects, submit one $sql-export job, follow
-  it by ?job= — running / finished / unknown per the async pattern's status
-  poll. Submission and cancel are plain forms, refresh is a plain link, so
-  the page works without JavaScript. Job state lives on the server; the URL
-  is the only state here.
+  Active SQL Exports (#833): the list-first entry page for $sql-export jobs,
+  mirroring /ui/bulk-export's shape. Job state lives in the per-user settings
+  document (see crate::sql_export's module docs); every in-progress job is
+  polled once before rendering, so a plain reload without JavaScript stays
+  current, and each in-progress card also polls its own fragment every 5s
+  over htmx. The builder lives at /ui/sql/export/new.
 #}
 
-{% block title %}{{ i18n.t("sql-export-title") }} — {{ i18n.t("app-title") }}{% endblock %}
+{% block title %}{{ i18n.t("sql-export-active-title") }} — {{ i18n.t("app-title") }}{% endblock %}
+
+{% block breadcrumb %}{% endblock %}
 
 {% block content %}
-<section class="page-head">
-  <h1 class="page-head__title">{{ i18n.t("sql-export-title") }}</h1>
-  <p class="page-head__lede">{{ i18n.t("sql-export-lede") }}</p>
-</section>
-
-{% if let Some(message) = degraded %}
-<p class="notice notice--warn">{{ i18n.t("lib-degraded") }} {{ message }}</p>
-{% endif %}
-{% if let Some(error) = start_error %}
-<p class="notice notice--warn">{{ i18n.t("export-start-failed") }} {{ error }}</p>
-{% endif %}
-{% if started %}
-<p class="notice">{{ i18n.t("export-started") }}</p>
-{% endif %}
-{% if cancelled %}
-<p class="notice">{{ i18n.t("export-cancelled") }}</p>
-{% endif %}
-
-{% if let Some(job_id) = job %}
-<section class="card">
-  <div class="card-head">
-    <h3>{{ i18n.t("export-job-heading") }}</h3>
+<header class="page-head page-head--row">
+  <div>
+    <h1 class="page-head__title">{{ i18n.t("sql-export-active-title") }}</h1>
+    {% if available %}
+    <p class="page-head__lede">{{ total }} {{ i18n.t("sql-export-exports-word") }} · {{ running }} {{ i18n.t("sql-export-running") }}</p>
+    {% endif %}
   </div>
-  <div class="detail__field"><span>{{ i18n.t("export-job-id") }}</span><div><code>{{ job_id }}</code></div></div>
-  {% if let Some(state) = job_status %}
-  {% match state %}
-  {% when SqlExportStatus::Running(progress) %}
-  <div class="detail__field"><span>{{ i18n.t("export-job-state") }}</span><div>{{ i18n.t("export-state-running") }}{% if let Some(p) = progress %} — {{ p }}{% endif %}</div></div>
-  <div class="card-head">
-    <a class="btn" href="/ui/sql/export?job={{ job_id }}">{{ i18n.t("export-refresh") }}</a>
-    <form method="post" action="/ui/sql/export/cancel">
-      <input type="hidden" name="job" value="{{ job_id }}">
-      <button type="submit" class="btn btn--danger">{{ i18n.t("export-cancel") }}</button>
-    </form>
-  </div>
-  {% when SqlExportStatus::Done %}
-  <div class="detail__field"><span>{{ i18n.t("export-job-state") }}</span><div>{{ i18n.t("export-state-done") }}</div></div>
-  <div class="card-head">
-    <a class="btn btn--primary" href="/ui/sql/files?job={{ job_id }}">{{ i18n.t("export-view-files") }}</a>
-  </div>
-  {% when SqlExportStatus::Unknown %}
-  <p class="notice notice--warn">{{ i18n.t("export-state-unknown") }}</p>
-  {% endmatch %}
+  {% if available %}
+  <a class="btn btn--primary" href="/ui/sql/export/new">
+    <span class="icon">{% include "icons/plus.svg" %}</span> {{ i18n.t("sql-export-new") }}
+  </a>
   {% endif %}
-</section>
+</header>
+
+{% if let Some(job_id) = store_error %}
+<div class="card notice notice--warn" role="alert">
+  {{ i18n.t("sql-export-store-error") }} <code>{{ job_id }}</code>
+  <!-- #835: the job started but this UI's own record of it never got
+       written, so there is no notebook entry to link a detail page to
+       (module docs of sql_export.rs) — Copy job id is all this notice can
+       offer. Server-rendered hidden, like the same button on every card,
+       and revealed only once JavaScript and the Clipboard API are both
+       available (sql-export.js). -->
+  <button type="button" class="btn" hidden
+          data-copy-job-id="{{ job_id }}"
+          data-copy-label="{{ i18n.t("sql-export-copy-job-id") }}"
+          data-copied-label="{{ i18n.t("sql-export-copied") }}">{{ i18n.t("sql-export-copy-job-id") }}</button>
+</div>
 {% endif %}
 
-<section class="card">
-  <div class="card-head">
-    <h3>{{ i18n.t("export-new-heading") }}</h3>
-  </div>
-  {% if subjects.is_empty() %}
-  <div class="card__body"><p class="page-head__lede">{{ i18n.t("export-no-subjects") }}</p></div>
-  {% else %}
-  <form method="post" action="/ui/sql/export" class="card__body">
-    {% for s in subjects %}
-    <div class="detail__field">
-      <span><label><input type="checkbox" name="subject" value="{{ s.reference }}"> {{ s.name }}</label></span>
-      <div><span class="tag">{{ s.kind }}</span></div>
-    </div>
-    {% endfor %}
-    <div class="detail__field">
-      <span><label for="export-format">{{ i18n.t("export-format") }}</label></span>
-      <div>
-        <select id="export-format" name="format" class="field__input">
-          <option value="ndjson">ndjson</option>
-          <option value="csv">csv</option>
-          <option value="json">json</option>
-          <option value="parquet">parquet</option>
-        </select>
-      </div>
-    </div>
-    <div class="form-actions">
-      <button type="submit" class="btn btn--primary">{{ i18n.t("export-start") }}</button>
-    </div>
-  </form>
-  {% endif %}
-</section>
+{% if !available %}
+<div class="card notice">{{ i18n.t("sql-export-unavailable") }}</div>
+{% else %}
+{% if cards.is_empty() %}
+<div class="card notice">{{ i18n.t("sql-export-none") }}</div>
+{% endif %}
+
+{% for card in cards %}
+{% include "partials/sql_export_card.html" %}
+{% endfor %}
+{% endif %}
+<script src="/ui/assets/sql-export.js" defer></script>
 {% endblock %}

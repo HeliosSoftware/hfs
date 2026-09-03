@@ -26,6 +26,102 @@ export async function createResource(
   return (await res.json()).id as string;
 }
 
+/** One resource to create via [`createResources`]. */
+export type BatchEntry = { type: string; body: Record<string, unknown> };
+
+/**
+ * Create several resources in a single batch Bundle round trip, returning
+ * their server-assigned ids in submission order. For tests that need many
+ * resources (e.g. enough `$sql-export` subjects to keep a job genuinely
+ * `in-progress` for a moment — a single tiny job finishes before the page
+ * even finishes rendering), calling `createResource` in a loop is one HTTP
+ * round trip per resource; this is one round trip total.
+ */
+export async function createResources(
+  request: APIRequestContext,
+  entries: BatchEntry[],
+  tenant?: string,
+): Promise<string[]> {
+  const bundle = {
+    resourceType: "Bundle",
+    type: "batch",
+    entry: entries.map(({ type, body }) => ({
+      resource: { resourceType: type, ...body },
+      request: { method: "POST", url: type },
+    })),
+  };
+  const res = await request.post("/", {
+    headers: {
+      "Content-Type": FHIR_JSON,
+      Accept: FHIR_JSON,
+      ...(tenant ? { "X-Tenant-ID": tenant } : {}),
+    },
+    data: bundle,
+  });
+  if (!res.ok()) throw new Error(`batch create -> ${res.status()}: ${await res.text()}`);
+  type BatchResponseEntry = { response?: { status?: string; location?: string } };
+  const responseEntries = ((await res.json()).entry ?? []) as BatchResponseEntry[];
+  return responseEntries.map((entry, index) => {
+    const status = entry.response?.status ?? "";
+    if (!status.startsWith("201")) {
+      throw new Error(`batch entry ${index} (${entries[index]?.type}) failed: ${status}`);
+    }
+    // `Location: {Type}/{id}/_history/{version}`.
+    const location = entry.response?.location ?? "";
+    const id = location.split("/")[1];
+    if (!id) {
+      throw new Error(`batch entry ${index} had no usable Location: ${location}`);
+    }
+    return id;
+  });
+}
+
+/**
+ * Delete several resources of the same type in one batch Bundle round trip.
+ * For specs that seed many resources as `$sql-export`/`$sql-run` padding
+ * (e.g. enough `ViewDefinition`s to keep a job observably `in-progress` —
+ * see [`createResources`]): those resources are real, tenant-visible FHIR
+ * data, and the suite shares one server/database across every spec file
+ * (`playwright.config.ts`: `fullyParallel: false`, `workers: 1`). Left
+ * behind, they leak into any other page that lists that resource type
+ * without a filter — e.g. `/ui/sql/view-definitions`, whose rail defaults
+ * to the first `ViewDefinition` it finds and renders it, CodeMirror and
+ * all. A spec that seeds resources it doesn't otherwise clean up through
+ * the UI must delete them here once it's done. Missing ids (already
+ * removed by the spec itself) are tolerated: a `404` batch entry is not an
+ * error, only a genuine delete failure is.
+ */
+export async function deleteResources(
+  request: APIRequestContext,
+  type: string,
+  ids: string[],
+  tenant?: string,
+): Promise<void> {
+  if (ids.length === 0) return;
+  const bundle = {
+    resourceType: "Bundle",
+    type: "batch",
+    entry: ids.map((id) => ({ request: { method: "DELETE", url: `${type}/${id}` } })),
+  };
+  const res = await request.post("/", {
+    headers: {
+      "Content-Type": FHIR_JSON,
+      Accept: FHIR_JSON,
+      ...(tenant ? { "X-Tenant-ID": tenant } : {}),
+    },
+    data: bundle,
+  });
+  if (!res.ok()) throw new Error(`batch delete ${type} -> ${res.status()}: ${await res.text()}`);
+  type BatchResponseEntry = { response?: { status?: string } };
+  const responseEntries = ((await res.json()).entry ?? []) as BatchResponseEntry[];
+  responseEntries.forEach((entry, index) => {
+    const status = entry.response?.status ?? "";
+    if (!status.startsWith("200") && !status.startsWith("204") && !status.startsWith("404")) {
+      throw new Error(`batch delete entry ${index} (${type}/${ids[index]}) failed: ${status}`);
+    }
+  });
+}
+
 /** PUT a resource, minting a new version. */
 export async function updateResource(
   request: APIRequestContext,
@@ -93,4 +189,34 @@ export async function waitSearchable(
     }
     await new Promise((r) => setTimeout(r, 250));
   }
+}
+
+/**
+ * Seeds a `Library` sql-query subject depending on `canonical` (an
+ * already-created ViewDefinition's own `url`), aliased "v" in its SQL — the
+ * same shape `sql-libraries.spec.ts` uses for a genuinely runnable SQLQuery
+ * Library. `sql` defaults to a query that always succeeds; the chromium and
+ * `nojs` SQL Export job-detail specs both pass a deliberately broken one to
+ * seed a `failed` job.
+ */
+export async function createSqlQueryLibrary(
+  request: APIRequestContext,
+  name: string,
+  canonical: string,
+  sql = "SELECT COUNT(*) AS n FROM v",
+): Promise<string> {
+  return createResource(request, "Library", {
+    name,
+    status: "active",
+    type: {
+      coding: [
+        {
+          system: "http://hl7.org/fhir/uv/sql-on-fhir/CodeSystem/LibraryTypesCodes",
+          code: "sql-query",
+        },
+      ],
+    },
+    relatedArtifact: [{ type: "depends-on", resource: canonical, label: "v" }],
+    content: [{ contentType: "application/sql", data: Buffer.from(sql).toString("base64") }],
+  });
 }

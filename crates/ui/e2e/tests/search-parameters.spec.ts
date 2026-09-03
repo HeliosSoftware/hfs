@@ -39,6 +39,64 @@ test("selecting a row opens its detail", async ({ page, searchParameters }) => {
   await expect(searchParameters.detailTitle).toBeVisible();
 });
 
+// #754/#755: the server remembers a chosen base type, and "All types" is
+// its own explicit, remembered state — never masked by a real
+// type recorded earlier — reachable in one click no matter what.
+test("a chosen type and All types both survive leaving the page and coming back", async ({
+  page,
+  chrome,
+  searchParameters,
+}) => {
+  const base = () => new URL(page.url()).searchParams.get("base");
+
+  await searchParameters.goto();
+  await searchParameters.railItem("Encounter").click();
+  // hx-boost swaps in place and pushes the URL itself; wait on that
+  // deterministically rather than the "networkidle" heuristic.
+  await page.waitForURL((url) => url.searchParams.get("base") === "Encounter");
+  expect(base()).toBe("Encounter");
+
+  await chrome.navLink("/ui/resources").click();
+  await page.waitForURL(/\/ui\/resources/);
+  await chrome.navLink("/ui/search-parameters").click();
+  await page.waitForURL(/\/ui\/search-parameters/);
+  expect(base()).toBeNull(); // no explicit ?base= on this deep link
+  await expect(searchParameters.railItem("Encounter")).toHaveAttribute("aria-current", "true");
+
+  await searchParameters.allTypesLink.click();
+  await page.waitForURL((url) => url.searchParams.get("base") === "");
+  expect(base()).toBe(""); // explicit "All types" marker, not omitted
+  await expect(searchParameters.allTypesLink).toHaveAttribute("aria-current", "true");
+
+  await chrome.navLink("/ui/resources").click();
+  await page.waitForURL(/\/ui\/resources/);
+  await chrome.navLink("/ui/search-parameters").click();
+  await page.waitForURL(/\/ui\/search-parameters/);
+  // Still "All types" — a stored Encounter from earlier in this test must not
+  // resurface now that "All types" is itself the remembered state.
+  await expect(searchParameters.allTypesLink).toHaveAttribute("aria-current", "true");
+  await expect(searchParameters.railItem("Encounter")).not.toHaveAttribute(
+    "aria-current",
+    "true",
+  );
+});
+
+// The group is present-but-hidden until a base is picked, then shows it
+// with a live, current-marked entry — all server-rendered, no reload needed
+// since the base link is itself a real navigation (hx-boost).
+test("the recently-used group appears after a pick and marks it current", async ({
+  page,
+  searchParameters,
+}) => {
+  await searchParameters.goto();
+  await expect(searchParameters.railRecent).toBeHidden();
+
+  await searchParameters.railItem("Patient").click();
+  await page.waitForLoadState("networkidle");
+  await expect(searchParameters.railRecent).toBeVisible();
+  await expect(searchParameters.recentItem("Patient")).toHaveAttribute("aria-current", "true");
+});
+
 // CRUD (#238): New deep-links the schema-driven editor, and a stored
 // parameter's detail offers Edit (editor deep-link) and Delete (FHIR API).
 test("a stored parameter can be created, offers Edit, and deletes", async ({

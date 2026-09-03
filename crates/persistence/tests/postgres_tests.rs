@@ -187,23 +187,35 @@ mod query_builder_tests {
         let result = PostgresQueryBuilder::build_search_query(&query, 2);
         assert!(result.is_some());
         let fragment = result.unwrap();
-        // Default string search is starts-with. `LIKE`, not `ILIKE`: both the stored
-        // column and the bound pattern are already case-folded by `fold_text`, and
-        // `ILIKE` cannot use a btree index (#224). The raw-column fallback is wrapped
-        // in `lower()` so un-backfilled rows keep matching case-insensitively.
+        // Default string search is starts-with, emitted since schema v34 as an
+        // explicit bytewise range on the folded expression rather than a `LIKE`:
+        // a `LIKE` whose pattern is a bind parameter cannot be turned into an
+        // index range by the planner, so the bounds are derived in Rust. Never
+        // `ILIKE`, which cannot use a btree at all (#224); both the stored column
+        // and the bound values are already case-folded by `fold_text`, and the
+        // raw-column fallback is wrapped in `lower()` so un-backfilled rows keep
+        // matching case-insensitively.
         assert!(
             fragment
                 .sql
-                .contains("COALESCE(value_string_folded, lower(value_string)) LIKE"),
+                .contains("COALESCE(value_string_folded, lower(value_string)) ~>=~ $3")
+                && fragment
+                    .sql
+                    .contains("COALESCE(value_string_folded, lower(value_string)) ~<~ $4"),
             "string search must target the indexed folded expression: {}",
             fragment.sql
         );
         assert!(!fragment.sql.contains("ILIKE"));
         assert!(fragment.sql.contains("param_name = 'name'"));
-        // Parameter should be "Smith%"
-        match &fragment.params[0] {
-            SqlParam::Text(s) => assert!(s.ends_with('%')),
-            _ => panic!("Expected Text param"),
+        // Two bounds, both folded: the prefix itself and the exclusive successor
+        // of its last character.
+        assert_eq!(fragment.params.len(), 2);
+        match (&fragment.params[0], &fragment.params[1]) {
+            (SqlParam::Text(lo), SqlParam::Text(hi)) => {
+                assert_eq!(lo, "smith");
+                assert_eq!(hi, "smiti");
+            }
+            other => panic!("Expected two Text params, got {:?}", other),
         }
     }
 
@@ -380,10 +392,18 @@ mod query_builder_tests {
         });
 
         let fragment = PostgresQueryBuilder::build_search_query(&query, 2).unwrap();
-        // Correlated subquery against the target's 'identifier' index rows.
+        // The identifier lookup drives and yields the target's `Type/id`; the
+        // reference index is seeked with it. The correlated-EXISTS form this
+        // replaced measured 285.6 ms against 1.4 ms on the same replica — see
+        // `build_reference_identifier_condition`.
         assert!(fragment.sql.contains("param_name = 'identifier'"));
         assert!(fragment.sql.contains("idx.value_token_system"));
         assert!(fragment.sql.contains("idx.value_token_code"));
+        assert!(
+            !fragment.sql.contains("EXISTS") && !fragment.sql.contains("SUBSTRING"),
+            "{}",
+            fragment.sql
+        );
     }
 
     #[test]
@@ -503,7 +523,15 @@ mod query_builder_tests {
         assert!(result.is_some());
         let fragment = result.unwrap();
         assert!(fragment.sql.contains("value_token_system"));
-        assert!(!fragment.sql.contains("value_token_code"));
+        // The `system|` form binds the system and nothing else — still exactly
+        // one parameter. It does carry `value_token_code IS NOT NULL` as of
+        // schema v31, which is not a second binding: it is the conjunct that
+        // makes the partial `idx_search_token_code_recent` reachable for this
+        // shape, and it excludes no row (`IndexValue::Token.code` is a
+        // non-optional `String`). What must stay true is that no code VALUE is
+        // compared, which is what would make the search wrong.
+        assert!(fragment.sql.contains("value_token_code IS NOT NULL"));
+        assert!(!fragment.sql.contains("value_token_code ="));
         assert_eq!(fragment.params.len(), 1);
     }
 
@@ -687,17 +715,27 @@ mod query_builder_tests {
 
     #[test]
     fn test_prefix_operators() {
-        // Test all prefix-to-operator mappings by using date search
-        let prefixes_and_ops = vec![
-            (SearchPrefix::Eq, "="),
-            (SearchPrefix::Ne, "!="),
-            (SearchPrefix::Gt, ">"),
-            (SearchPrefix::Lt, "<"),
-            (SearchPrefix::Ge, ">="),
-            (SearchPrefix::Le, "<="),
+        // Day-precision prefixes compare against the value's [day, day+1)
+        // range (#871), matching the date-parameter semantics from #463: eq
+        // must mean "inside the named day", gt must exclude it entirely.
+        let cases = vec![
+            (
+                SearchPrefix::Eq,
+                "last_updated >= $1 AND last_updated < $2",
+                2,
+            ),
+            (
+                SearchPrefix::Ne,
+                "(last_updated < $1 OR last_updated >= $2)",
+                2,
+            ),
+            (SearchPrefix::Gt, "last_updated >= $1", 1),
+            (SearchPrefix::Lt, "last_updated < $1", 1),
+            (SearchPrefix::Ge, "last_updated >= $1", 1),
+            (SearchPrefix::Le, "last_updated < $1", 1),
         ];
 
-        for (prefix, expected_op) in prefixes_and_ops {
+        for (prefix, expected_sql, expected_params) in cases {
             let query = SearchQuery::new("Patient").with_parameter(SearchParameter {
                 name: "_lastUpdated".to_string(),
                 param_type: SearchParamType::Date,
@@ -711,15 +749,37 @@ mod query_builder_tests {
             assert!(result.is_some(), "Failed for prefix {:?}", prefix);
             let fragment = result.unwrap();
             assert!(
-                fragment
-                    .sql
-                    .contains(&format!("last_updated {} $", expected_op)),
-                "Expected operator '{}' for prefix {:?}, got SQL: {}",
-                expected_op,
+                fragment.sql.contains(expected_sql),
+                "Expected '{}' for prefix {:?}, got SQL: {}",
+                expected_sql,
                 prefix,
                 fragment.sql
             );
+            assert_eq!(
+                fragment.params.len(),
+                expected_params,
+                "param count for prefix {:?}",
+                prefix
+            );
         }
+
+        // A full-precision instant is a degenerate range and falls back to
+        // scalar comparison.
+        let query = SearchQuery::new("Patient").with_parameter(SearchParameter {
+            name: "_lastUpdated".to_string(),
+            param_type: SearchParamType::Date,
+            modifier: None,
+            values: vec![SearchValue::new(SearchPrefix::Gt, "2024-01-01T10:00:00Z")],
+            chain: vec![],
+            components: vec![],
+        });
+        let fragment = PostgresQueryBuilder::build_search_query(&query, 0)
+            .expect("full-precision instant must build");
+        assert!(
+            fragment.sql.contains("last_updated > $1"),
+            "full-precision gt must stay scalar, got SQL: {}",
+            fragment.sql
+        );
     }
 }
 
@@ -769,12 +829,18 @@ mod postgres_integration {
 
     static SHARED_PG: OnceCell<SharedPg> = OnceCell::const_new();
     static BULK_EXPORT_TEST_LOCK: Mutex<()> = Mutex::const_new(());
+    static BULK_SUBMIT_TEST_LOCK: Mutex<()> = Mutex::const_new(());
 
     async fn shared_pg() -> &'static SharedPg {
         SHARED_PG
             .get_or_init(|| async {
                 let run_id = std::env::var("GITHUB_RUN_ID").unwrap_or_default();
+                // Pin the major version. testcontainers-modules defaults to
+                // postgres:11, which is EOL and predates `plan_cache_mode` — a GUC
+                // the backend sends as a startup option, so PG 11 rejects every
+                // connection FATAL. The rest of the repo runs 16.
                 let container = Postgres::default()
+                    .with_tag("16-alpine")
                     .with_label("github.run_id", &run_id)
                     .start()
                     .await
@@ -1414,6 +1480,142 @@ mod postgres_integration {
             other => {
                 panic!("Expected Gone error or None, got: {:?}", other);
             }
+        }
+    }
+
+    /// A tombstone's version comes from the row, not from an earlier read.
+    ///
+    /// `delete` used to `SELECT version_id`, add one in Rust, and
+    /// compare-and-swap. It now computes the increment inside the `UPDATE`'s
+    /// target list, so this pins the arithmetic that replaced the Rust: after
+    /// two updates the live row is v3 and the tombstone must be v4, with a
+    /// contiguous, duplicate-free version chain behind it.
+    #[tokio::test]
+    async fn postgres_integration_delete_tombstone_version_follows_the_row() {
+        use helios_persistence::core::VersionedStorage;
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("delete-tombstone-version");
+
+        let created = backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType": "Patient", "active": true}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(created.version_id(), "1");
+
+        let v2 = backend
+            .update(
+                &tenant,
+                &created,
+                json!({"resourceType": "Patient", "active": false}),
+            )
+            .await
+            .unwrap();
+        let v3 = backend
+            .update(
+                &tenant,
+                &v2,
+                json!({"resourceType": "Patient", "active": true}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(v3.version_id(), "3");
+
+        backend
+            .delete(&tenant, "Patient", created.id())
+            .await
+            .unwrap();
+
+        let mut versions = backend
+            .list_versions(&tenant, "Patient", created.id())
+            .await
+            .unwrap();
+        versions.sort_by_key(|v| v.parse::<u64>().unwrap());
+        assert_eq!(
+            versions,
+            vec!["1", "2", "3", "4"],
+            "the tombstone must continue the chain at current + 1"
+        );
+    }
+
+    /// Concurrent writers on one row must never produce an internal error.
+    ///
+    /// This is the failure the removed compare-and-swap existed to prevent: a
+    /// version computed from a stale read colliding with one another writer had
+    /// already inserted, tripping `resource_history`'s
+    /// `PRIMARY KEY (tenant_id, resource_type, id, version_id)`. Deriving the
+    /// version inside the statement makes that unreachable, because PostgreSQL
+    /// re-evaluates the target list against the committed new tuple when it
+    /// unblocks. Every outcome here must therefore be a success or an ordinary
+    /// `NotFound`/`VersionConflict` — never a `Backend` error — and the surviving
+    /// history must have no duplicate versions.
+    #[tokio::test]
+    async fn postgres_integration_concurrent_update_and_delete_never_collide() {
+        use helios_persistence::core::VersionedStorage;
+        use std::sync::Arc;
+
+        let backend = Arc::new(create_backend().await);
+        let tenant = create_tenant("concurrent-update-delete");
+
+        for _ in 0..12 {
+            let created = backend
+                .create(
+                    &tenant,
+                    "Patient",
+                    json!({"resourceType": "Patient", "active": true}),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+            let id = created.id().to_string();
+
+            let (b1, b2, t1, t2, id1, id2) = (
+                backend.clone(),
+                backend.clone(),
+                tenant.clone(),
+                tenant.clone(),
+                id.clone(),
+                id.clone(),
+            );
+            let updater = tokio::spawn(async move {
+                b1.update(
+                    &t1,
+                    &created,
+                    json!({"resourceType": "Patient", "active": false}),
+                )
+                .await
+                .map(|_| ())
+            });
+            let deleter = tokio::spawn(async move { b2.delete(&t2, "Patient", &id1).await });
+
+            for outcome in [updater.await.unwrap(), deleter.await.unwrap()] {
+                match outcome {
+                    Ok(())
+                    | Err(StorageError::Resource(ResourceError::NotFound { .. }))
+                    | Err(StorageError::Concurrency(ConcurrencyError::VersionConflict {
+                        ..
+                    })) => {}
+                    other => panic!("concurrent update/delete produced {:?}", other),
+                }
+            }
+
+            let versions = backend
+                .list_versions(&tenant, "Patient", &id2)
+                .await
+                .unwrap();
+            let mut unique = versions.clone();
+            unique.sort();
+            unique.dedup();
+            assert_eq!(
+                unique.len(),
+                versions.len(),
+                "duplicate history versions for {id2}: {versions:?}"
+            );
         }
     }
 
@@ -4398,6 +4600,186 @@ mod postgres_integration {
         }
     }
 
+    fn if_none_exist_entry(family: &str, full_url: &str) -> helios_persistence::core::BundleEntry {
+        use helios_persistence::core::{BundleEntry, BundleMethod};
+        BundleEntry {
+            method: BundleMethod::Post,
+            url: "Patient".to_string(),
+            resource: Some(json!({
+                "resourceType": "Patient",
+                "identifier": [{"system": "http://example.org/mrn", "value": "MRN-TX-COND-1"}],
+                "name": [{"family": family}]
+            })),
+            if_match: None,
+            if_none_match: None,
+            if_none_exist: Some("identifier=http://example.org/mrn|MRN-TX-COND-1".to_string()),
+            full_url: Some(full_url.to_string()),
+        }
+    }
+
+    /// `ifNoneExist` is resolved inside the transaction (#511): the same bundle
+    /// twice answers 201 then 200, the 200 names the match, and one row exists.
+    /// Two entries with the same criteria in one bundle see each other, since
+    /// buffered creates are flushed before the search.
+    #[tokio::test]
+    async fn postgres_integration_transaction_if_none_exist_is_idempotent() {
+        use helios_persistence::core::BundleProvider;
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("tx-if-none-exist");
+
+        let first = backend
+            .process_transaction(
+                &tenant,
+                vec![if_none_exist_entry("First", "urn:uuid:first")],
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.entries[0].status, 201);
+
+        let second = backend
+            .process_transaction(
+                &tenant,
+                vec![if_none_exist_entry("Second", "urn:uuid:second")],
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            second.entries[0].status, 200,
+            "the match is answered, not duplicated"
+        );
+        assert_eq!(second.entries[0].location, first.entries[0].location);
+        assert_eq!(backend.count(&tenant, Some("Patient")).await.unwrap(), 1);
+
+        let tenant = create_tenant("tx-if-none-exist-same-bundle");
+        let both = backend
+            .process_transaction(
+                &tenant,
+                vec![
+                    if_none_exist_entry("First", "urn:uuid:first"),
+                    if_none_exist_entry("Second", "urn:uuid:second"),
+                ],
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(both.entries[0].status, 201);
+        assert_eq!(both.entries[1].status, 200);
+        assert_eq!(both.entries[1].location, both.entries[0].location);
+        assert_eq!(backend.count(&tenant, Some("Patient")).await.unwrap(), 1);
+    }
+
+    /// A `urn:uuid` reference to a matched `ifNoneExist` entry resolves to the
+    /// match (R4 §3.1.0.11.2); several matches fail the entry with 412 and roll
+    /// the bundle back.
+    #[tokio::test]
+    async fn postgres_integration_transaction_if_none_exist_resolves_references_and_rejects_ambiguity()
+     {
+        use helios_persistence::core::{BundleEntry, BundleMethod, BundleProvider};
+        use helios_persistence::error::TransactionError;
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("tx-if-none-exist-urn");
+
+        let existing = backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({
+                    "resourceType": "Patient",
+                    "identifier": [{"system": "http://example.org/mrn", "value": "MRN-TX-COND-1"}],
+                    "name": [{"family": "AlreadyThere"}]
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+
+        let result = backend
+            .process_transaction(
+                &tenant,
+                vec![
+                    if_none_exist_entry("Duplicate", "urn:uuid:patient"),
+                    BundleEntry {
+                        method: BundleMethod::Post,
+                        url: "Observation".to_string(),
+                        resource: Some(json!({
+                            "resourceType": "Observation",
+                            "status": "final",
+                            "code": {"text": "test"},
+                            "subject": {"reference": "urn:uuid:patient"}
+                        })),
+                        if_match: None,
+                        if_none_match: None,
+                        if_none_exist: None,
+                        full_url: Some("urn:uuid:observation".to_string()),
+                    },
+                ],
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.entries[0].status, 200);
+        assert_eq!(result.entries[1].status, 201);
+        let observation = result.entries[1].resource.as_ref().expect("created");
+        assert_eq!(
+            observation["subject"]["reference"],
+            json!(format!("Patient/{}", existing.id()))
+        );
+
+        // A second identical patient makes the criteria ambiguous.
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({
+                    "resourceType": "Patient",
+                    "identifier": [{"system": "http://example.org/mrn", "value": "MRN-TX-COND-1"}],
+                    "name": [{"family": "Twin"}]
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        let before = backend.count(&tenant, Some("Patient")).await.unwrap();
+
+        let err = backend
+            .process_transaction(
+                &tenant,
+                vec![
+                    BundleEntry {
+                        method: BundleMethod::Post,
+                        url: "Patient".to_string(),
+                        resource: Some(
+                            json!({"resourceType": "Patient", "name": [{"family": "Plain"}]}),
+                        ),
+                        if_match: None,
+                        if_none_match: None,
+                        if_none_exist: None,
+                        full_url: None,
+                    },
+                    if_none_exist_entry("Ambiguous", "urn:uuid:ambiguous"),
+                ],
+                FhirVersion::default(),
+            )
+            .await
+            .expect_err("an ambiguous ifNoneExist must fail the bundle");
+        match err {
+            TransactionError::BundleError { index, message } => {
+                assert_eq!(index, 1);
+                assert!(message.contains("412"), "{message}");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+        assert_eq!(
+            backend.count(&tenant, Some("Patient")).await.unwrap(),
+            before,
+            "the plain create in entry 0 must have been rolled back"
+        );
+    }
+
     #[tokio::test]
     async fn postgres_integration_conditional_delete() {
         use helios_persistence::core::{
@@ -4433,7 +4815,7 @@ mod postgres_integration {
             .unwrap();
 
         assert!(
-            matches!(result, ConditionalDeleteResult::Deleted),
+            matches!(result, ConditionalDeleteResult::Deleted(_)),
             "Conditional delete should find and delete resource"
         );
 
@@ -4810,9 +5192,10 @@ mod postgres_integration {
     // Bulk Export — Phase 2 multi-instance job state on Postgres.
     // ========================================================================
 
-    use chrono::Utc;
+    use chrono::{DateTime, Utc};
     use helios_persistence::core::bulk_export::{
-        BulkExportStorage, ExportRequest, ExportStatus, StartExportInput, TypeExportProgress,
+        BulkExportStorage, ExportDataProvider, ExportRequest, ExportStatus, PatientExportProvider,
+        StartExportInput, TypeExportProgress,
     };
     use helios_persistence::core::bulk_export_worker::{
         ExportClaimStrategy, ExportWorkerStorage, LeaseError, WorkerId,
@@ -4900,6 +5283,228 @@ mod postgres_integration {
 
         let progress = backend.get_export_status(&tenant, &job_id).await.unwrap();
         assert_eq!(progress.status, ExportStatus::Complete);
+    }
+
+    /// Pins a stored resource's `last_updated` so a window test does not depend
+    /// on wall-clock timing.
+    async fn pin_last_updated(backend: &PostgresBackend, id: &str, at: DateTime<Utc>) {
+        let client = backend.get_client().await.unwrap();
+        client
+            .execute(
+                "UPDATE resources SET last_updated = $1 WHERE id = $2",
+                &[&at, &id],
+            )
+            .await
+            .unwrap();
+    }
+
+    async fn seed_patient_at(
+        backend: &PostgresBackend,
+        tenant: &TenantContext,
+        at: DateTime<Utc>,
+    ) -> String {
+        let stored = backend
+            .create(
+                tenant,
+                "Patient",
+                serde_json::json!({"resourceType": "Patient"}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        let id = stored.id().to_string();
+        pin_last_updated(backend, &id, at).await;
+        id
+    }
+
+    fn instant(s: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
+    }
+
+    /// The `Patient` branch of the compartment fetch applies `_since`, the way
+    /// the non-Patient branch below it always has.
+    #[tokio::test]
+    async fn postgres_integration_since_bounds_the_patient_compartment_branch() {
+        let _guard = BULK_EXPORT_TEST_LOCK.lock().await;
+        let backend = create_backend().await;
+        let tenant = create_tenant("since-patient-branch");
+
+        let stale = seed_patient_at(&backend, &tenant, instant("2026-01-01T00:00:00Z")).await;
+        let fresh = seed_patient_at(&backend, &tenant, instant("2026-07-01T00:00:00Z")).await;
+
+        // Both named explicitly, as a group export or an explicit `patient`
+        // parameter would: the id list reaching this method is NOT pre-filtered.
+        let ids = vec![stale.clone(), fresh.clone()];
+        let request = ExportRequest::patient().with_since(instant("2026-06-01T00:00:00Z"));
+
+        let batch = backend
+            .fetch_patient_compartment_batch(&tenant, &request, "Patient", &ids, None, 10)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            batch.lines.len(),
+            1,
+            "the stale patient must be filtered out"
+        );
+        assert!(batch.lines[0].contains(&fresh));
+    }
+
+    /// The new bound and the keyset cursor coexist: paging a filtered set
+    /// neither drops nor repeats a row, and the bound does not consume the
+    /// `$4`/`$5` the cursor clause needs.
+    #[tokio::test]
+    async fn postgres_integration_since_and_cursor_page_the_patient_branch() {
+        let _guard = BULK_EXPORT_TEST_LOCK.lock().await;
+        let backend = create_backend().await;
+        let tenant = create_tenant("since-patient-paging");
+
+        let stale = seed_patient_at(&backend, &tenant, instant("2026-01-01T00:00:00Z")).await;
+        let a = seed_patient_at(&backend, &tenant, instant("2026-07-01T00:00:00Z")).await;
+        let b = seed_patient_at(&backend, &tenant, instant("2026-07-02T00:00:00Z")).await;
+        let c = seed_patient_at(&backend, &tenant, instant("2026-07-03T00:00:00Z")).await;
+
+        let ids = vec![stale.clone(), a.clone(), b.clone(), c.clone()];
+        let request = ExportRequest::patient().with_since(instant("2026-06-01T00:00:00Z"));
+
+        let first = backend
+            .fetch_patient_compartment_batch(&tenant, &request, "Patient", &ids, None, 2)
+            .await
+            .unwrap();
+        assert_eq!(first.lines.len(), 2);
+        assert!(!first.is_last);
+
+        let second = backend
+            .fetch_patient_compartment_batch(
+                &tenant,
+                &request,
+                "Patient",
+                &ids,
+                first.next_cursor.as_deref(),
+                2,
+            )
+            .await
+            .unwrap();
+
+        let all: Vec<&String> = first.lines.iter().chain(second.lines.iter()).collect();
+        for id in [&a, &b, &c] {
+            let hits = all.iter().filter(|l| l.contains(id.as_str())).count();
+            assert_eq!(hits, 1, "each in-window patient appears exactly once");
+        }
+        assert!(
+            !all.iter().any(|l| l.contains(stale.as_str())),
+            "the stale patient never appears on any page"
+        );
+    }
+
+    /// `_until` excludes a resource modified after the bound, and the count
+    /// agrees with what the fetch emits.
+    #[tokio::test]
+    async fn postgres_integration_export_until_bounds_count_and_fetch() {
+        let _guard = BULK_EXPORT_TEST_LOCK.lock().await;
+        let backend = create_backend().await;
+        let tenant = create_tenant("export-until");
+
+        let early = seed_patient_at(&backend, &tenant, instant("2026-01-01T00:00:00Z")).await;
+        let _late = seed_patient_at(&backend, &tenant, instant("2026-03-01T00:00:00Z")).await;
+
+        let request = ExportRequest::system().with_until(instant("2026-02-01T00:00:00Z"));
+
+        let count = backend
+            .count_export_resources(&tenant, &request, "Patient")
+            .await
+            .unwrap();
+        let batch = backend
+            .fetch_export_batch(&tenant, &request, "Patient", None, 10)
+            .await
+            .unwrap();
+
+        assert_eq!(count, 1, "count must apply the upper bound");
+        assert_eq!(batch.lines.len(), 1, "fetch must apply the upper bound");
+        assert_eq!(
+            count as usize,
+            batch.lines.len(),
+            "count and fetch must agree about the window"
+        );
+        assert!(batch.lines[0].contains(&early));
+    }
+
+    /// The bound is inclusive, matching S3.
+    #[tokio::test]
+    async fn postgres_integration_export_until_is_inclusive() {
+        let _guard = BULK_EXPORT_TEST_LOCK.lock().await;
+        let backend = create_backend().await;
+        let tenant = create_tenant("export-until-incl");
+
+        seed_patient_at(&backend, &tenant, instant("2026-02-01T00:00:00Z")).await;
+
+        let request = ExportRequest::system().with_until(instant("2026-02-01T00:00:00Z"));
+        let batch = backend
+            .fetch_export_batch(&tenant, &request, "Patient", None, 10)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            batch.lines.len(),
+            1,
+            "a resource exactly on the bound is included"
+        );
+    }
+
+    /// `_since` and `_until` together bound the window at both ends.
+    #[tokio::test]
+    async fn postgres_integration_export_since_and_until_bound_the_window() {
+        let _guard = BULK_EXPORT_TEST_LOCK.lock().await;
+        let backend = create_backend().await;
+        let tenant = create_tenant("export-window");
+
+        let _before = seed_patient_at(&backend, &tenant, instant("2025-12-01T00:00:00Z")).await;
+        let inside = seed_patient_at(&backend, &tenant, instant("2026-01-15T00:00:00Z")).await;
+        let _after = seed_patient_at(&backend, &tenant, instant("2026-03-01T00:00:00Z")).await;
+
+        let request = ExportRequest::system()
+            .with_since(instant("2026-01-01T00:00:00Z"))
+            .with_until(instant("2026-02-01T00:00:00Z"));
+
+        let count = backend
+            .count_export_resources(&tenant, &request, "Patient")
+            .await
+            .unwrap();
+        let batch = backend
+            .fetch_export_batch(&tenant, &request, "Patient", None, 10)
+            .await
+            .unwrap();
+
+        assert_eq!(count, 1);
+        assert_eq!(batch.lines.len(), 1);
+        assert!(batch.lines[0].contains(&inside));
+    }
+
+    /// The patient-compartment path applies the bound too — it builds its own
+    /// query, separate from `fetch_export_batch`.
+    #[tokio::test]
+    async fn postgres_integration_export_until_bounds_patient_compartment() {
+        let _guard = BULK_EXPORT_TEST_LOCK.lock().await;
+        let backend = create_backend().await;
+        let tenant = create_tenant("export-compartment");
+
+        let early = seed_patient_at(&backend, &tenant, instant("2026-01-01T00:00:00Z")).await;
+        let late = seed_patient_at(&backend, &tenant, instant("2026-03-01T00:00:00Z")).await;
+
+        let request = ExportRequest::patient().with_until(instant("2026-02-01T00:00:00Z"));
+        let ids = vec![early.clone(), late.clone()];
+
+        let batch = backend
+            .fetch_patient_compartment_batch(&tenant, &request, "Patient", &ids, None, 10)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            batch.lines.len(),
+            1,
+            "the compartment fetch applies the upper bound"
+        );
+        assert!(batch.lines[0].contains(&early));
     }
 
     #[tokio::test]
@@ -5431,6 +6036,46 @@ mod postgres_integration {
             "expected a backend error from an unmigrated database, got {create:?}"
         );
     }
+    /// Claims manifests in a loop until the lease for `target` comes back,
+    /// holding any other lease it picks up along the way (so the loop cannot
+    /// re-claim the same foreign manifest) and returning those to the queue
+    /// once the target is held. Robust to concurrent tests sharing the
+    /// testcontainers PostgreSQL instance — the submit-side twin of
+    /// `claim_specific` for exports.
+    async fn claim_specific_manifest(
+        backend: &PostgresBackend,
+        worker_id: &helios_persistence::core::WorkerId,
+        submission_id: &helios_persistence::core::SubmissionId,
+        target_manifest_id: &str,
+        lease_duration: std::time::Duration,
+    ) -> helios_persistence::core::ManifestLease {
+        use helios_persistence::core::SubmitClaimStrategy;
+
+        let mut held = Vec::new();
+        let mut found = None;
+        for _ in 0..100 {
+            match backend
+                .claim_next_manifest(worker_id, lease_duration)
+                .await
+                .unwrap()
+            {
+                Some(lease)
+                    if lease.submission_id == *submission_id
+                        && lease.manifest_id == target_manifest_id =>
+                {
+                    found = Some(lease);
+                    break;
+                }
+                Some(other) => held.push(other),
+                None => tokio::time::sleep(std::time::Duration::from_millis(20)).await,
+            }
+        }
+        for other in held {
+            let _ = SubmitClaimStrategy::release(backend, other).await;
+        }
+        found.expect("never claimed the expected manifest")
+    }
+
     /// The `import` / `metadata` kickoff directives must survive the PostgreSQL
     /// round-trip and reach the worker, and `merge` must actually merge.
     ///
@@ -5442,10 +6087,12 @@ mod postgres_integration {
     async fn postgres_bulk_submit_import_directives_round_trip() {
         use helios_persistence::core::{
             BulkProcessingOptions, BulkSubmitProvider, IMPORT_MODE_PARAMETER_URL, ImportMode,
-            ManifestFetchParams, NdjsonEntry, SubmissionId, SubmitClaimStrategy,
-            SubmitWorkerStorage,
+            ManifestFetchParams, NdjsonEntry, SubmissionId, SubmitWorkerStorage,
         };
 
+        // The worker claim queue is intentionally cross-tenant, so keep this
+        // claim isolated from the synchronous bulk-submit test below.
+        let _guard = BULK_SUBMIT_TEST_LOCK.lock().await;
         let backend = create_backend().await;
         let tenant = create_tenant("bulk_submit_import");
         let sub_id = SubmissionId::generate("pg-import-test");
@@ -5475,15 +6122,25 @@ mod postgres_integration {
             .await
             .unwrap();
 
-        // Claim the manifest the way the worker does, then read its view back.
-        let lease = backend
-            .claim_next_manifest(
-                &helios_persistence::core::WorkerId::new("pg-import-worker"),
-                std::time::Duration::from_secs(60),
-            )
-            .await
-            .unwrap()
-            .expect("claimable manifest");
+        // Claim *this* manifest the way the worker does, then read its view
+        // back. The claim queue is cross-tenant and ordered by `added_at`, and
+        // the test binary shares one container database, so a plain
+        // `claim_next_manifest` can hand back another test's manifest — and
+        // an unleased `processing` manifest (the synchronous `process_entries`
+        // path leaves one behind) is reclaimable, so "move it out of pending"
+        // elsewhere is no defence. Loop until ours comes back, returning
+        // anything else to the queue.
+        let lease = claim_specific_manifest(
+            &backend,
+            &helios_persistence::core::WorkerId::new(format!(
+                "pg-import-worker-{}",
+                uuid::Uuid::new_v4()
+            )),
+            &sub_id,
+            &manifest.manifest_id,
+            std::time::Duration::from_secs(60),
+        )
+        .await;
         let view = backend.get_manifest_for_worker(&lease).await.unwrap();
         assert_eq!(view.import_directives, directives);
         assert_eq!(view.metadata, metadata);
@@ -5534,6 +6191,153 @@ mod postgres_integration {
             stored.content()["gender"],
             json!("female"),
             "merge must retain elements the submission omitted"
+        );
+    }
+
+    /// #872: the batched ingest commits entry writes, rollback records, and
+    /// per-line receipts together, and a failing entry is contained to its
+    /// savepoint — on Postgres a failed statement aborts the transaction, so
+    /// without the savepoint one bad entry would poison the whole batch.
+    #[tokio::test]
+    async fn postgres_bulk_submit_batch_commits_bookkeeping_and_contains_errors() {
+        use helios_persistence::core::{
+            BulkProcessingOptions, BulkSubmitProvider, BulkSubmitRollbackProvider, NdjsonEntry,
+            SubmissionId,
+        };
+
+        // A synchronous manifest has no worker lease. Serialize it with the
+        // worker claim test above so the cross-tenant queue cannot hand it to
+        // that test while this one is processing the batch.
+        let _guard = BULK_SUBMIT_TEST_LOCK.lock().await;
+        let backend = create_backend().await;
+        let tenant = create_tenant("bulk_submit_batch");
+        let sub_id = SubmissionId::generate("pg-batch-test");
+        backend
+            .create_submission(&tenant, &sub_id, None)
+            .await
+            .unwrap();
+        let manifest = backend
+            .add_manifest(&tenant, &sub_id, Some("https://provider/b.json"), None)
+            .await
+            .unwrap();
+        // Mark the manifest `processing` right away. Note this is not a
+        // defence against other tests' `claim_next_manifest` calls — an
+        // unleased `processing` manifest is reclaimable, so a claimant may
+        // still pick this one up transiently — which is why claiming tests use
+        // `claim_specific_manifest` and hand foreign manifests back.
+        backend
+            .process_entries(
+                &tenant,
+                &sub_id,
+                &manifest.manifest_id,
+                Vec::new(),
+                &BulkProcessingOptions::new(),
+            )
+            .await
+            .unwrap();
+
+        // An existing resource for the update path, and a soft-deleted id
+        // whose create fails with AlreadyExists inside the batch.
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType":"Patient","id":"pg-batch-upd","name":[{"family":"Old"}]}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType":"Patient","id":"pg-batch-gone"}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        backend
+            .delete(&tenant, "Patient", "pg-batch-gone")
+            .await
+            .unwrap();
+
+        let entries = vec![
+            NdjsonEntry::new(
+                1,
+                "Patient",
+                json!({"resourceType":"Patient","id":"pg-batch-new","name":[{"family":"BatchNew"}]}),
+            ),
+            NdjsonEntry::new(
+                2,
+                "Patient",
+                json!({"resourceType":"Patient","id":"pg-batch-gone"}),
+            ),
+            NdjsonEntry::new(
+                3,
+                "Patient",
+                json!({"resourceType":"Patient","id":"pg-batch-upd","name":[{"family":"BatchUpd"}]}),
+            ),
+        ];
+        let results = backend
+            .process_entries(
+                &tenant,
+                &sub_id,
+                &manifest.manifest_id,
+                entries,
+                &BulkProcessingOptions::new().with_file_url("https://provider/p.ndjson"),
+            )
+            .await
+            .unwrap();
+
+        // `process_entries` leaves synchronous manifests in `processing`
+        // without a worker lease. Such rows remain eligible for the worker
+        // claim queue, so terminate this test submission before releasing the
+        // lock shared with the claim round-trip test.
+        assert_eq!(
+            backend
+                .abort_submission(&tenant, &sub_id, "test cleanup")
+                .await
+                .unwrap(),
+            1
+        );
+
+        assert!(results[0].is_success() && results[0].created);
+        assert!(
+            results[1].is_error(),
+            "the soft-deleted id must fail its entry, got {:?}",
+            results[1]
+        );
+        assert!(results[2].is_success() && !results[2].created);
+
+        // The failed entry did not poison the batch: both writes committed,
+        // together with their receipts and rollback records.
+        assert!(
+            backend
+                .read(&tenant, "Patient", "pg-batch-new")
+                .await
+                .unwrap()
+                .is_some()
+        );
+        let updated = backend
+            .read(&tenant, "Patient", "pg-batch-upd")
+            .await
+            .unwrap()
+            .expect("updated patient");
+        assert_eq!(updated.content()["name"], json!([{"family":"BatchUpd"}]));
+
+        let counts = backend
+            .get_entry_counts(&tenant, &sub_id, &manifest.manifest_id)
+            .await
+            .unwrap();
+        assert_eq!(counts.total, 3);
+        assert_eq!(counts.success, 2);
+        assert_eq!(counts.processing_error, 1);
+
+        let changes = backend.list_changes(&tenant, &sub_id, 10, 0).await.unwrap();
+        assert_eq!(
+            changes.len(),
+            2,
+            "one rollback record per successful write, none for the failed entry"
         );
     }
 

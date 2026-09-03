@@ -35,6 +35,17 @@ pub struct PostgresBackend {
     registries: Arc<TenantSearchRegistries>,
     /// Sync cache of each tenant's stored params, read by the registry loader.
     stored_by_tenant: StoredByTenant,
+    /// `search_index` layout, read from the marker once the schema is initialized.
+    /// Unset until then, which reads as [`IndexLayout::Legacy`] — the form that
+    /// is correct against either layout.
+    index_layout: Arc<std::sync::OnceLock<super::schema::IndexLayout>>,
+    /// Whether the `resource_fts` table exists, resolved once.
+    ///
+    /// The FTS write path used to ask `information_schema.tables` on every
+    /// single resource write — 254,970 catalog queries in one 5-minute crud
+    /// run. The answer only changes when the schema is created or migrated,
+    /// both of which happen before the instance serves traffic.
+    pub(super) fts_table_exists: Arc<std::sync::OnceLock<bool>>,
 }
 
 impl Debug for PostgresBackend {
@@ -93,6 +104,15 @@ pub struct PostgresConfig {
     #[serde(default = "default_statement_timeout_ms")]
     pub statement_timeout_ms: u64,
 
+    /// `plan_cache_mode` shipped to every pooled connection.
+    ///
+    /// Defaults to [`PostgresPlanCacheMode::ForceCustomPlan`]. Settable as
+    /// `HFS_PG_PLAN_CACHE_MODE` (`force_custom_plan` | `auto` |
+    /// `force_generic_plan`). See the type's documentation for why the default
+    /// is not PostgreSQL's.
+    #[serde(default)]
+    pub plan_cache_mode: PostgresPlanCacheMode,
+
     /// How long to wait for a free pooled connection before returning
     /// `BackendError::Unavailable`.
     #[serde(default = "default_pool_wait_timeout_secs")]
@@ -122,6 +142,81 @@ pub enum PostgresSslMode {
     Prefer,
     /// Require SSL.
     Require,
+}
+
+/// `plan_cache_mode` for pooled connections.
+///
+/// PostgreSQL promotes a persistent prepared statement to a **generic plan**
+/// after five executions, and a generic plan is one built without the parameter
+/// values. For most of this backend that is free money — a primary-key lookup
+/// plans the same way either way — which is why the write path's statements were
+/// cached with the default `auto` and left there.
+///
+/// The search path is not most of this backend. Two of its predicate shapes are
+/// only sargable when the planner can see the value, and both are hot:
+///
+/// - `value_reference = $3 OR value_reference LIKE $4 ESCAPE '\'` — the prefix
+///   bounds `idx_search_reference_pattern` needs exist only while the pattern is
+///   a `Const`. Measured against a 21.8M-row `search_index`:
+///   **1,499 buffers under a custom plan, 6,005,788 under a generic one.**
+/// - `value_token_code = $3 OR value_token_code = $4` (an OR-list such as
+///   `?category=laboratory,vital-signs`) — neither plan can make the `OR` an
+///   index condition, but only the custom plan estimates it well enough to pick
+///   the `last_updated`-ordered index that lets the `LIMIT` stop early.
+///   **464 buffers versus 2,453,618.**
+///
+/// End to end on those two shapes: 6,349 qps today, 7,626 qps cached with
+/// `ForceCustomPlan`, **56.8 qps** cached with `Auto`.
+///
+/// So the default is `ForceCustomPlan`: it keeps every plan byte-identical to
+/// the one this backend produces today (a throwaway statement is planned with
+/// its values in hand, which *is* a custom plan) while the statement cache still
+/// removes the parse, the parse analysis, the Describe and a round trip. It also
+/// retires a hazard the write path already carries — a cached point read that
+/// has gone generic can pick a prefix-redundant index and filter, which a
+/// sibling seat measured at 1,575 buffers for a three-buffer primary-key lookup.
+///
+/// `Auto` is PostgreSQL's own default and is the larger win — it is what makes
+/// the safe shapes 1.7x rather than 1.2x — but it is not safe to switch on until
+/// the reference predicate is rewritten as an explicit range, the way schema v34
+/// rewrote the string predicate. The knob exists so that can be A/B'd on the
+/// benchmark host without a code change, not because operators should tune it.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PostgresPlanCacheMode {
+    /// Plan every execution with the parameter values in hand. The default.
+    #[default]
+    ForceCustomPlan,
+    /// PostgreSQL's own policy: custom for five executions, then generic if the
+    /// generic plan does not cost more.
+    Auto,
+    /// Always use a generic plan. Present for symmetry and A/B measurement;
+    /// see the type documentation for what it does to reference search.
+    ForceGenericPlan,
+}
+
+impl PostgresPlanCacheMode {
+    /// The GUC value. A fixed set of literals — nothing derived from
+    /// configuration text is ever interpolated into the startup packet.
+    fn as_guc(self) -> &'static str {
+        match self {
+            Self::ForceCustomPlan => "force_custom_plan",
+            Self::Auto => "auto",
+            Self::ForceGenericPlan => "force_generic_plan",
+        }
+    }
+
+    /// Parses `HFS_PG_PLAN_CACHE_MODE`. An unrecognised value is ignored rather
+    /// than substituted, so a typo cannot silently ship a different plan policy
+    /// or a malformed startup packet.
+    fn from_env_value(v: &str) -> Option<Self> {
+        match v.trim().to_ascii_lowercase().as_str() {
+            "force_custom_plan" => Some(Self::ForceCustomPlan),
+            "auto" => Some(Self::Auto),
+            "force_generic_plan" => Some(Self::ForceGenericPlan),
+            _ => None,
+        }
+    }
 }
 
 fn default_host() -> String {
@@ -201,6 +296,7 @@ impl Default for PostgresConfig {
             max_connections: default_max_connections(),
             connect_timeout_secs: default_connect_timeout_secs(),
             statement_timeout_ms: default_statement_timeout_ms(),
+            plan_cache_mode: PostgresPlanCacheMode::default(),
             pool_wait_timeout_secs: default_pool_wait_timeout_secs(),
             fhir_version: FhirVersion::default_enabled(),
             data_dir: None,
@@ -236,7 +332,30 @@ impl PostgresConfig {
         {
             self.pool_wait_timeout_secs = v;
         }
+        if let Some(v) = std::env::var("HFS_PG_PLAN_CACHE_MODE")
+            .ok()
+            .and_then(|v| PostgresPlanCacheMode::from_env_value(&v))
+        {
+            self.plan_cache_mode = v;
+        }
     }
+}
+
+/// The `options` startup parameter every pooled connection is opened with.
+///
+/// Both settings must arrive in the startup packet rather than as a post-connect
+/// `SET`: a `SET` binds one borrowed session, which says nothing about the
+/// connections the pool adds as it grows or replaces after a recycle. For
+/// `plan_cache_mode` there is a second reason — the prepared-statement cache is
+/// per-connection and a statement first planned under one policy keeps it, so a
+/// policy that arrives after the first `prepare_cached` would apply to some
+/// statements and not others.
+fn startup_options(config: &PostgresConfig) -> String {
+    format!(
+        "-c statement_timeout={} -c plan_cache_mode={}",
+        config.statement_timeout_ms,
+        config.plan_cache_mode.as_guc()
+    )
 }
 
 impl PostgresBackend {
@@ -319,11 +438,16 @@ impl PostgresBackend {
         let loader_cache = stored_by_tenant.clone();
         let registries = Arc::new(TenantSearchRegistries::new(Arc::new(
             move |tenant_id: &str| {
-                loader_cache
-                    .read()
-                    .get(tenant_id)
-                    .cloned()
-                    .unwrap_or_default()
+                // A HashMap lookup cannot fail the way a live query can — a
+                // missing entry legitimately means "no stored params yet",
+                // not "load failed" — so this always reports success (#787).
+                Some(
+                    loader_cache
+                        .read()
+                        .get(tenant_id)
+                        .cloned()
+                        .unwrap_or_default(),
+                )
             },
         )));
         Self::initialize_search_registry(registries.base(), &config);
@@ -333,6 +457,8 @@ impl PostgresBackend {
             config,
             registries,
             stored_by_tenant,
+            index_layout: Arc::new(std::sync::OnceLock::new()),
+            fts_table_exists: Arc::new(std::sync::OnceLock::new()),
         })
     }
 
@@ -424,10 +550,13 @@ impl PostgresBackend {
         // and ones replaced after a recycle. A post-connect `SET` on a single
         // borrowed client cannot make that guarantee (it binds only that session),
         // and a per-connection hook would cost an extra round-trip.
-        cfg.options = Some(format!(
-            "-c statement_timeout={}",
-            config.statement_timeout_ms
-        ));
+        //
+        // `plan_cache_mode` rides along for the same reason, and because it must
+        // hold for the connection's whole life: the statement cache is
+        // per-connection and a statement prepared before a `SET` would keep
+        // whichever policy was in force when it was first planned. See
+        // [`PostgresPlanCacheMode`] for what the default protects.
+        cfg.options = Some(startup_options(config));
         // Makes HFS connections identifiable in pg_stat_activity.
         cfg.application_name = Some("hfs".to_string());
 
@@ -612,10 +741,21 @@ impl PostgresBackend {
     pub async fn init_schema(&self) -> StorageResult<()> {
         let client = self.get_client().await?;
         super::schema::initialize_schema(&client).await?;
+        let _ = self
+            .index_layout
+            .set(super::schema::read_index_layout(&client).await);
         // Populate the per-tenant stored-param cache so the registries can build
         // each tenant's overlay lazily.
         self.reload_stored_cache().await?;
         Ok(())
+    }
+
+    /// The `search_index` layout this database is in.
+    pub(crate) fn index_layout(&self) -> super::schema::IndexLayout {
+        self.index_layout
+            .get()
+            .copied()
+            .unwrap_or(super::schema::IndexLayout::Legacy)
     }
 
     /// Reloads every tenant's stored active SearchParameters into the sync
@@ -1153,6 +1293,73 @@ mod tests {
         // SAFETY: see above.
         unsafe {
             std::env::remove_var("HFS_PG_MAX_CONNECTIONS");
+        }
+    }
+
+    #[test]
+    fn the_default_plan_cache_mode_is_the_conservative_one() {
+        // Not PostgreSQL's default. `auto` promotes a cached statement to a
+        // generic plan after five executions, and the reference predicate
+        // (`= $3 OR LIKE $4 ESCAPE`) loses its index bounds when it does:
+        // 1,499 buffers becomes 6,005,788 on a 21.8M-row search_index.
+        assert_eq!(
+            PostgresConfig::default().plan_cache_mode,
+            PostgresPlanCacheMode::ForceCustomPlan
+        );
+    }
+
+    #[test]
+    fn both_settings_ride_in_the_startup_packet() {
+        let cfg = PostgresConfig::default();
+        let opts = startup_options(&cfg);
+        assert!(opts.contains("-c statement_timeout=30000"), "{opts}");
+        assert!(
+            opts.contains("-c plan_cache_mode=force_custom_plan"),
+            "{opts}"
+        );
+    }
+
+    #[test]
+    fn plan_cache_mode_parses_only_the_three_guc_values() {
+        assert_eq!(
+            PostgresPlanCacheMode::from_env_value("AUTO"),
+            Some(PostgresPlanCacheMode::Auto)
+        );
+        assert_eq!(
+            PostgresPlanCacheMode::from_env_value(" force_generic_plan "),
+            Some(PostgresPlanCacheMode::ForceGenericPlan)
+        );
+        // Anything else is ignored rather than substituted: a typo must not
+        // silently change the plan policy, and nothing operator-supplied may
+        // reach the startup packet verbatim.
+        assert_eq!(PostgresPlanCacheMode::from_env_value("generic"), None);
+        assert_eq!(
+            PostgresPlanCacheMode::from_env_value("auto -c work_mem=1GB"),
+            None
+        );
+    }
+
+    #[test]
+    fn an_unparseable_plan_cache_mode_leaves_the_default_alone() {
+        let _g = ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: serialized by ENV_GUARD, removed before releasing the lock.
+        unsafe {
+            std::env::set_var("HFS_PG_PLAN_CACHE_MODE", "force_fast_plan");
+        }
+        let mut cfg = PostgresConfig::default();
+        cfg.apply_env_overrides();
+        assert_eq!(cfg.plan_cache_mode, PostgresPlanCacheMode::ForceCustomPlan);
+
+        // SAFETY: see above.
+        unsafe {
+            std::env::set_var("HFS_PG_PLAN_CACHE_MODE", "auto");
+        }
+        cfg.apply_env_overrides();
+        assert_eq!(cfg.plan_cache_mode, PostgresPlanCacheMode::Auto);
+
+        // SAFETY: see above.
+        unsafe {
+            std::env::remove_var("HFS_PG_PLAN_CACHE_MODE");
         }
     }
 }

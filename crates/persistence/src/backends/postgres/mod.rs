@@ -74,7 +74,9 @@
 
 mod backend;
 mod bulk_export;
+mod bulk_provider;
 mod bulk_submit;
+pub(crate) mod cached;
 pub(crate) mod schema;
 pub mod search;
 mod search_impl;

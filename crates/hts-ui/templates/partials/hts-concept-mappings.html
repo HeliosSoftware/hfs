@@ -1,0 +1,134 @@
+{#-
+  Panel 2 — Mappings across ALL ConceptMaps.
+
+  `POST /ConceptMap/$translate` with the `url` parameter OMITTED, which makes
+  HTS scan `concept_map_elements` across every stored map rather than one.
+  Results are grouped by `originMap` so the operator can see which map each
+  mapping came from.
+
+  Two backend limits are rendered honestly here rather than papered over:
+
+    • `originMap` is suppressed in reverse mode
+      (`crates/hts/src/operations/translate.rs`, `if !is_reverse`), so a
+      cross-map reverse query cannot attribute its matches. The Origin cell is
+      an em-dash and a `.lint__item--warn` footnote says why. An origin is
+      never invented.
+    • `source` / `target` (ValueSet scoping) are parsed into `TranslateRequest`
+      but never bound by the SQL, so they are not exposed at all — a control
+      that does nothing is worse than an absent one.
+
+  "No match" is `result: false` at HTTP **200**. It renders as a neutral
+  `.query-empty`, never as an error.
+
+  Skeleton contract: the pending branch self-fetches with `hx-trigger="load"`
+  + `hx-swap="outerHTML"` on the element itself and no `hx-target`. The loaded
+  branch re-emits the same `id` but not the trigger, so the swap terminates.
+  The `<noscript>` link points at the same standalone route, which renders a
+  full page around this panel on hard navigation.
+-#}
+{% if view.mappings_pending() %}
+<section id="hts-concept-mappings"
+         class="card"
+         hx-get="{{ view.mappings_url() }}"
+         hx-trigger="load"
+         hx-swap="outerHTML">
+  <div class="card-head">
+    <h3>{{ chrome.i18n.t("hts-concept-mappings-heading") }}</h3>
+  </div>
+  <p class="query-empty" aria-live="polite">{{ chrome.i18n.t("hts-concept-panel-loading") }}</p>
+  <noscript>
+    <p class="query-empty"><a href="{{ view.mappings_url() }}">{{ chrome.i18n.t("hts-concept-panel-open") }}</a></p>
+  </noscript>
+</section>
+{% else %}
+<section id="hts-concept-mappings" class="card table-card">
+  <div class="card-head">
+    <h3>{{ chrome.i18n.t("hts-concept-mappings-heading") }}</h3>
+    {#- Askama rewrites template *fields* to `self.…`, but not inside a
+        `format!()` argument — only local bindings survive there. Bind the two
+        direction suffixes first so the Fluent keys can be composed. -#}
+    {% let toggle_suffix = view.toggle_suffix() %}
+    {% let direction_suffix = view.direction_suffix() %}
+    <a class="chip"
+       href="{{ view.mappings_toggle_url() }}"
+       hx-get="{{ view.mappings_toggle_url() }}"
+       hx-target="#hts-concept-mappings"
+       hx-swap="outerHTML">
+      {{ chrome.i18n.t(format!("hts-concept-mappings-switch-{}", toggle_suffix).as_str()) }}
+    </a>
+  </div>
+
+  <p class="query-empty">{{ chrome.i18n.t(format!("hts-concept-mappings-direction-{}", direction_suffix).as_str()) }}</p>
+
+  {% if let Some(reason) = view.mappings_degraded() %}
+  <p class="notice notice--warn">{{ chrome.i18n.t(format!("hts-degraded-reason-{}", reason).as_str()) }}</p>
+  {% else if let Some(outcome) = view.mappings_outcome() %}
+    {% include "partials/hts-outcome.html" %}
+  {% else if let Some(mappings) = view.mappings() %}
+
+    {% if mappings.is_empty() %}
+    {#- `result: false` arrives at HTTP 200. Neutral, not an error. -#}
+    <p class="query-empty">
+      {{ chrome.i18n.t("hts-concept-mappings-empty") }}
+      {%- if !mappings.message.is_empty() %} {{ mappings.message }}{% endif -%}
+    </p>
+    {% else %}
+
+    <div class="detail__field">
+      <span>{{ chrome.i18n.t("hts-concept-mappings-vocabulary") }}</span>
+      <div>{{ chrome.i18n.t(format!("hts-concept-mappings-vocabulary-{}", mappings.kind_str()).as_str()) }}</div>
+    </div>
+
+    {% if mappings.unattributable %}
+    <div class="lint">
+      <p class="lint__item lint__item--warn">
+        <span class="lint__sev">!</span>
+        {{ chrome.i18n.t("hts-concept-mappings-unattributable") }}
+      </p>
+    </div>
+    {% endif %}
+
+    {% for group in mappings.groups %}
+    <div class="detail__field detail__field--wide">
+      <span>{{ chrome.i18n.t("hts-concept-mappings-origin") }}</span>
+      {%- if group.is_attributed() -%}
+      <code>{{ group.origin }}</code>
+      {%- else -%}
+      <div>&mdash;</div>
+      {%- endif -%}
+    </div>
+    <div class="table-wrap">
+      <table class="data-table">
+        <thead>
+          <tr>
+            <th>{{ chrome.i18n.t("hts-concept-mappings-column-code") }}</th>
+            <th>{{ chrome.i18n.t("hts-concept-mappings-column-system") }}</th>
+            <th>{{ chrome.i18n.t("hts-concept-mappings-column-display") }}</th>
+            <th>{{ chrome.i18n.t("hts-concept-mappings-column-mapping") }}</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for row in group.rows %}
+          <tr>
+            <td><code>{{ row.code }}</code></td>
+            <td>{% if row.system.is_empty() %}&mdash;{% else %}<code>{{ row.system }}</code>{% endif %}</td>
+            <td>{% if row.display.is_empty() %}&mdash;{% else %}{{ row.display }}{% endif %}</td>
+            <td>{% if row.mapping_value.is_empty() %}&mdash;{% else %}<span class="tag tag--param">{{ row.mapping_value }}</span>{% endif %}</td>
+          </tr>
+          {% endfor %}
+          {% if group.rows.is_empty() %}
+          <tr class="data-table__empty"><td colspan="4">{{ chrome.i18n.t("hts-concept-mappings-empty") }}</td></tr>
+          {% endif %}
+        </tbody>
+      </table>
+    </div>
+    {% endfor %}
+    {% endif %}
+
+    <details>
+      <summary>{{ chrome.i18n.t("hts-concept-raw-response") }}</summary>
+      {% if !mappings.raw_body_json.is_empty() %}{{ mappings.raw_body_json|safe }}{% else %}<pre class="detail__code" tabindex="0">{{ mappings.raw_body }}</pre>{% endif %}
+    </details>
+  {% endif %}
+</section>
+{% endif %}

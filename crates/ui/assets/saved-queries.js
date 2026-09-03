@@ -1485,17 +1485,26 @@
     };
   }
 
-  /* Marks the picker rail's active type. */
+  /* Marks the picker rail's active type — in the scrollable list and in the
+   * server-rendered "Recently used" group alike, keeping `aria-current`
+   * consistent between the two, since a clone of the same item can sit in
+   * either. Also keeps the rail's own `data-selected-type` current, so a
+   * later `popstate` with no `?type=` in the URL restores from here rather
+   * than a hardcoded default (see `locationSearchValue`). */
   function markRailType(type) {
-    document
-      .querySelectorAll("#type-rail-list a.filter-rail__item")
-      .forEach(function (item) {
+    var railAside = document.querySelector(".filter-rail[data-selected-type]");
+    if (railAside) railAside.dataset.selectedType = type || "";
+    ["type-rail-list", "type-rail-recent"].forEach(function (id) {
+      var host = document.getElementById(id);
+      if (!host) return;
+      host.querySelectorAll("a.filter-rail__item").forEach(function (item) {
         if (item.dataset.type === type) {
           item.setAttribute("aria-current", "true");
         } else {
           item.removeAttribute("aria-current");
         }
       });
+    });
   }
 
   function csvHas(csv, value) {
@@ -1902,12 +1911,22 @@
   /* ---- Resource picker rail --------------------------------------------
    * The type list, its links (`/ui/<page>?type=<name>`), and its counts are
    * all server-rendered (#541) from the shared `partials/type_rail.html`
-   * macro. Without JavaScript the `<a>` navigates and the server marks the
-   * selection; with it, a click is intercepted so the action happens
-   * in-page and the URL still updates via `history.pushState`. */
+   * macro; the "Recently used" group above it is server-rendered too
+   * (`partials/rail_recent.html`, #754/#755). Without JavaScript the `<a>`
+   * navigates and the server records the selection; with it, a click is
+   * intercepted so the action happens in-page, the URL still updates via
+   * `history.pushState`, and this script itself records the selection — a
+   * click is recorded exactly once either way, never both. */
 
   var railList = document.getElementById("type-rail-list");
   var railFilter = document.getElementById("type-rail-filter");
+  var railRecentGroup = document.getElementById("type-rail-recent");
+  /* The page's `rails.<page>` key and its recent-list cap: read off the
+   * server-rendered group, never redeclared here. */
+  var railPage = railRecentGroup && railRecentGroup.getAttribute("data-rail-page");
+  var railMaxRecent = railRecentGroup
+    ? parseInt(railRecentGroup.getAttribute("data-max-recent"), 10) || 5
+    : 5;
 
   /* Selects a resource type: syncs the rail, the builder, and the results —
    * the one path both the rail click and the initial page load (#605) drive,
@@ -1925,23 +1944,121 @@
     runSearch("/" + encodeURIComponent(type), false);
   }
 
-  if (railList) {
-    railList.addEventListener("click", function (event) {
-      var item = event.target.closest("a.filter-rail__item");
-      if (!item || !urlInput) return;
-      event.preventDefault();
-      selectType(item.dataset.type);
-      window.history.pushState({}, "", item.getAttribute("href"));
+  /* Repaints the "Recently used" group locally — cloning the clicked item
+   * from the live list, the same technique `resource-filter.js` used to use
+   * for its localStorage-backed clones — so the group reflects the click
+   * immediately, without waiting on `recordRailSelection`'s network
+   * round-trip. Moves an existing clone to the front instead of duplicating
+   * it, and caps at `railMaxRecent`, mirroring `RailState::select`. */
+  function paintRecentClick(type) {
+    if (!railRecentGroup || !railList) return;
+    var source = railList.querySelector(
+      'a.filter-rail__item[data-type="' + CSS.escape(type) + '"]',
+    );
+    if (!source) return;
+    railRecentGroup.querySelectorAll("a.filter-rail__item").forEach(function (item) {
+      if (item.dataset.type === type) item.remove();
     });
+    var heading = railRecentGroup.querySelector(".filter-rail__heading--group");
+    railRecentGroup.insertBefore(source.cloneNode(true), heading ? heading.nextSibling : null);
+    railRecentGroup
+      .querySelectorAll("a.filter-rail__item")
+      .forEach(function (item, index) {
+        if (index >= railMaxRecent) item.remove();
+      });
+    railRecentGroup.hidden = false;
+  }
+
+  /* Serializes every `recordRailSelection` read-modify-write cycle behind
+   * the previous one: two rail clicks close enough together that the second
+   * fires before the first's PATCH has landed would otherwise both read the
+   * *same* pre-click document (racing on `fetchDocument`'s shared `etag`,
+   * exactly like `mutate`/`recordRecent`'s single retry-on-412 already can),
+   * each build its own `next` from that stale `recent`, and — since a JSON
+   * merge patch replaces the whole `recent` array — whichever PATCH lands
+   * last overwrites the other's write outright rather than merging with it.
+   * Chaining onto this promise instead of firing `fetchDocument` immediately
+   * guarantees the second cycle's read only starts once the first cycle's
+   * write (and any of its own 412 retries) has fully settled, so it always
+   * builds `next` from a document that already reflects the prior click. */
+  var railWriteChain = Promise.resolve();
+
+  /* Records `type` as this page's rail selection with the same semantics
+   * as `RailState::select` (front, no duplicates, capped,
+   * `last` = the id) — the settings document's existing ETag/merge-patch
+   * cycle, retried once on 412, exactly as `mutate`/`recordRecent` already do
+   * for saved and recent queries. A `501` (no settings store) or a network
+   * error is ignored in silence: the in-page selection already happened, it
+   * simply is not remembered. */
+  function recordRailSelection(type) {
+    if (!railPage || !type) return;
+    railWriteChain = railWriteChain
+      .then(function () {
+        return fetchDocument();
+      })
+      .then(function (doc) {
+        var stored = (doc && doc.rails && doc.rails[railPage]) || {};
+        var recent = Array.isArray(stored.recent) ? stored.recent : [];
+        var next = recent.filter(function (entry) {
+          return !entry || entry.id !== type;
+        });
+        next.unshift({ id: type });
+        var patch = { rails: {} };
+        patch.rails[railPage] = { last: type, recent: next.slice(0, railMaxRecent) };
+        return patchDocument(patch, 0);
+      })
+      .catch(function () {
+        /* Unavailable store or a network error: nothing to remember. The
+         * chain itself must stay resolved (not rejected) so the *next*
+         * click's cycle still runs instead of being skipped forever. */
+      });
+  }
+
+  /* Shared by the scrollable list and the "Recently used" group: whichever
+   * one the click landed in, the effect is identical. `selectType` already
+   * marks the rail (via `renderBuilder` → `syncTypeContext` →
+   * `markRailType`), so only the group repaint and the write-back are this
+   * handler's own job. */
+  function handleRailClick(event) {
+    var item = event.target.closest("a.filter-rail__item");
+    if (!item || !urlInput) return;
+    event.preventDefault();
+    var type = item.dataset.type;
+    selectType(type);
+    window.history.pushState({}, "", item.getAttribute("href"));
+    paintRecentClick(type);
+    recordRailSelection(type);
+  }
+
+  if (railList) railList.addEventListener("click", handleRailClick);
+  if (railRecentGroup) railRecentGroup.addEventListener("click", handleRailClick);
+
+  /* The type the current URL (or, absent an explicit `?type=`, this rail's
+   * own `data-selected-type`) names — never a hardcoded default. The server
+   * always resolves and renders one (explicit → stored `last` → the page's
+   * own fallback), so this only ever comes up empty when the rail's
+   * `<aside>` itself is absent. */
+  function resolvedSelectedType() {
+    var type = new URLSearchParams(window.location.search).get("type");
+    if (type) return type;
+    var railAside = document.querySelector(".filter-rail[data-selected-type]");
+    return (railAside && railAside.dataset.selectedType) || "";
   }
 
   function locationSearchValue() {
     var params = new URLSearchParams(window.location.search);
     if (params.has("url")) return params.get("url") || "";
-    var type = params.get("type");
-    return "/" + (type || "Patient");
+    return "/" + resolvedSelectedType();
   }
 
+  /* Resources opens on the resolved type (#605): the same path as a rail
+   * click, so the builder and results already match what the rail
+   * shows — without registering a "recently used" entry, since that only
+   * fires on an actual rail click. Search and Saved Queries keep their
+   * blank-canvas load/back-navigation (unchanged from `main`): the visual
+   * builder is opt-in there, so this never fires a search or a param-catalog
+   * fetch nobody asked for — see `restoreRailMarkOnly` for what they do
+   * instead. */
   function restoreLocationContext() {
     if (!urlInput || !document.getElementById("resources")) return;
     urlInput.value = "GET " + locationSearchValue().replace(/^GET\s+/i, "");
@@ -1950,7 +2067,21 @@
     if (parsed) runSearch(searchPath(parsed.type, parsed.query), false);
   }
 
-  window.addEventListener("popstate", restoreLocationContext);
+  /* The rail-mark half of type resolution for Search and Saved Queries:
+   * `renderBuilder`'s `syncTypeContext("")` (fired when `urlInput` is
+   * blank, its no-JS baseline on these two pages) would otherwise strip the
+   * SSR `aria-current`/`data-selected-type` these tests and the
+   * reveal-on-load script depend on. Marking after settles it without
+   * touching the builder, results, or the catalog cache `loadCatalog`
+   * populates per type. */
+  function restoreRailMarkOnly() {
+    if (railList) markRailType(resolvedSelectedType());
+  }
+
+  window.addEventListener("popstate", function () {
+    if (document.getElementById("resources")) restoreLocationContext();
+    else restoreRailMarkOnly();
+  });
   if (railFilter && railList) {
     railFilter.addEventListener("input", function () {
       var needle = railFilter.value.trim().toLowerCase();
@@ -2914,19 +3045,16 @@
     consumeWhenBuilderReady(deepRevision, function () {
       runCurrentBuilderSearch(true);
     });
+  } else if (document.getElementById("resources") && urlInput) {
+    // Resources opens on the type the server already resolved (#605) — the
+    // same path a rail click drives — without registering a "recently
+    // used" entry, since that only fires on an actual rail click.
+    restoreLocationContext();
   } else {
-    // Resources opens in Patient (or `?type=`) context (#605): the same
-    // path as a rail click, so the builder and results match the type the
-    // server already selected — without registering a "recently used" entry,
-    // since that only fires on an actual rail click (resource-filter.js).
-    var initialPanel = document.getElementById("resources");
-    if (initialPanel && urlInput) {
-      renderBuilder();
-      var parsedInitial = parseSearchUrl(urlInput.value);
-      if (parsedInitial)
-        runSearch(searchPath(parsedInitial.type, parsedInitial.query), false);
-    } else {
-      renderBuilder();
-    }
+    // Search and Saved Queries: unchanged blank-canvas load, plus the
+    // rail-mark fix (see `restoreRailMarkOnly`) so the mark this render
+    // resolved survives `renderBuilder`'s empty-`urlInput` sweep.
+    renderBuilder();
+    restoreRailMarkOnly();
   }
 })();
