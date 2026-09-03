@@ -247,9 +247,16 @@ fn assert_back_link(source: &str, page: &str, href: &str, key: &str) {
     let back_link_position = source
         .find("class=\"back-link\"")
         .expect("back link marker was located above");
-    let copy_position = source.find("class=\"page-head__copy\"").unwrap_or_else(|| {
-        panic!("{page}'s header children must live inside `<div class=\"page-head__copy\">` (#801)")
-    });
+    // Match `class="page-head__copy"` or `class="page-head__copy page-head__copy--*"`
+    // (the detail pages use the `--spaced` modifier for vertical rhythm #900).
+    let copy_position = source
+        .find("class=\"page-head__copy\"")
+        .or_else(|| source.find("class=\"page-head__copy "))
+        .unwrap_or_else(|| {
+            panic!(
+                "{page}'s header children must live inside `<div class=\"page-head__copy\">` (#801)"
+            )
+        });
     assert!(
         back_link_position < copy_position,
         "{page}'s back link must precede `.page-head__copy` inside the header",

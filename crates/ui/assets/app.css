@@ -2106,6 +2106,24 @@ select.field__input {
   min-width: 0;
 }
 
+/* Vertical-rhythm variant for detail-page headers with eyebrow + title +
+   optional lede + chips + kv-grid (HTS CodeSystem / ValueSet / ConceptMap).
+   HFS pages with simpler title+lede keep the base `.page-head__copy`. */
+.page-head__copy--spaced {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.page-head__copy--spaced > .page-head__title {
+  margin-bottom: 0; /* gap handles spacing */
+}
+.page-head__copy--spaced > .facets--bare {
+  padding-bottom: 6px; /* reduce from 12px; gap adds rest */
+}
+.page-head__copy--spaced > .kv-grid {
+  margin-bottom: 0; /* final child; no trailing margin needed */
+}
+
 .page-head--back-link > .page-head__action {
   grid-area: action;
   min-width: 0;
