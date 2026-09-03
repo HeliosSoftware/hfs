@@ -115,14 +115,12 @@ pub struct HtsConfig {
 
     /// Mount the optional HTS administrative UI (crates/hts-ui) at `/ui`.
     ///
-    /// Off by default: the terminology API surface is the primary product
-    /// contract, and operators who deploy behind an API gateway may not want
-    /// an HTML surface listening at all. `HTS_UI_ENABLED=1` opts in.
-    ///
-    /// Off by default because a terminology server is an API product first:
-    /// the HTML surface is an operator convenience, not part of the FHIR
-    /// contract.
-    #[arg(long, env = "HTS_UI_ENABLED", default_value = "false")]
+    /// On by default, matching HFS's always-on UI, so local dev gets the
+    /// same experience out of the box. Operators who deploy behind an API
+    /// gateway and don't want an HTML surface listening at all can opt out
+    /// with `HTS_UI_ENABLED=false`; the HTML surface is an operator
+    /// convenience, not part of the FHIR contract.
+    #[arg(long, env = "HTS_UI_ENABLED", default_value = "true")]
     pub ui_enabled: bool,
 }
 
@@ -148,7 +146,7 @@ impl Default for HtsConfig {
             bootstrap_dir: String::new(),
             bootstrap_batch_size: 5000,
             import_languages: String::new(),
-            ui_enabled: false,
+            ui_enabled: true,
         }
     }
 }
