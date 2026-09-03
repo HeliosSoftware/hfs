@@ -146,6 +146,16 @@
                  placeholder="2026-08-01T00:00:00Z">
           <span id="bulk-export-since-custom-error" class="field__hint field__hint--error" role="alert"{% if since_custom_error.is_none() %} hidden{% endif %}>{% match since_custom_error %}{% when Some(message) %}{{ message }}{% when None %}{{ i18n.t("bulk-export-since-invalid") }}{% endmatch %}</span>
         </label>
+        <!-- Until has no natural preset list the way Since does, so it is a
+             single instant input. Left empty it is simply not sent, which keeps
+             today's open-ended behaviour. -->
+        <label class="field">
+          <span class="field__label">{{ i18n.t("bulk-export-field-until") }}</span>
+          <input class="field__input" type="text" name="until" autocomplete="off"
+                 value="{{ form.until }}"
+                 placeholder="2026-08-01T00:00:00Z">
+          <span class="field__hint">{{ i18n.t("bulk-export-field-until-hint") }}</span>
+        </label>
       </div>
     </div>
   </section>
