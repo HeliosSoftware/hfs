@@ -106,6 +106,10 @@ struct StatusView {
     outcome: Option<OutcomeView>,
     request_url: String,
     raw_body: String,
+    /// The `raw_body` rendered into the shared highlighted JSON view, or empty
+    /// when the payload exceeded the budget and the partial should fall back to
+    /// a `<pre>`. Filled by [`StatusView::highlight`] at the response funnel.
+    raw_body_json: String,
     /// Reason key for the shared degraded partial when the upstream
     /// import round-trip failed at the transport layer (5xx / connect
     /// / timeout). `None` for the normal 200/207/400/413 arms.
@@ -137,6 +141,7 @@ impl StatusView {
             outcome: result.outcome,
             request_url: result.request_url,
             raw_body: result.raw_body,
+            raw_body_json: String::new(),
             degraded_reason: None,
         }
     }
@@ -155,6 +160,7 @@ impl StatusView {
             outcome: Some(outcome),
             request_url: String::new(),
             raw_body: String::new(),
+            raw_body_json: String::new(),
             degraded_reason: None,
         }
     }
@@ -173,8 +179,18 @@ impl StatusView {
             outcome: None,
             request_url,
             raw_body: String::new(),
+            raw_body_json: String::new(),
             degraded_reason: Some(err.degraded_reason()),
         }
+    }
+
+    /// Renders `raw_body` into the shared JSON view.
+    ///
+    /// Non-JSON or over-budget text leaves `raw_body_json` empty; the partial
+    /// then shows the raw string in a `<pre>`, which is what the fold did for
+    /// every payload before #897.
+    fn highlight(&mut self, i18n: &I18n) {
+        self.raw_body_json = crate::raw_fold::highlight_json(i18n, &self.raw_body);
     }
 
     fn issue_count(&self) -> usize {
@@ -303,11 +319,14 @@ async fn import_run(
 
     match state.upstream.import_bundle(bundle_trim).await {
         Ok(result) => {
-            let view = StatusView::from_result(result);
+            let mut view = StatusView::from_result(result);
+            // Highlight raw JSON payload for the "Raw response" disclosure (#897).
+            view.highlight(&chrome.i18n);
             respond(&chrome, view, is_htmx, target_url)
         }
         Err(err) => {
-            let view = StatusView::from_error(target_url.clone(), &err);
+            let mut view = StatusView::from_error(target_url.clone(), &err);
+            view.highlight(&chrome.i18n);
             respond(&chrome, view, is_htmx, target_url)
         }
     }

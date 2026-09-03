@@ -93,7 +93,16 @@ impl RawFold {
     }
 }
 
-fn highlight_one(i18n: &I18n, payload: &str) -> String {
+/// Renders a JSON payload into the shared highlighted JSON view.
+///
+/// Returns the highlighted HTML, or an empty string when the payload is empty,
+/// not valid JSON, or exceeds the render budget. The empty return signals that
+/// the caller's template should fall back to a bare `<pre>` block.
+///
+/// This is the shared entry point for all raw-payload highlighting in HTS-UI:
+/// the workbench fold (`RawFold::highlight`), the Concept Explorer panels, and
+/// the import status page.
+pub fn highlight_json(i18n: &I18n, payload: &str) -> String {
     if payload.is_empty() {
         return String::new();
     }
@@ -117,6 +126,10 @@ fn highlight_one(i18n: &I18n, payload: &str) -> String {
         tracing::error!(%error, "hts-ui raw fold json view render failed");
         String::new()
     })
+}
+
+fn highlight_one(i18n: &I18n, payload: &str) -> String {
+    highlight_json(i18n, payload)
 }
 
 #[cfg(test)]
