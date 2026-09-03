@@ -341,7 +341,7 @@ impl BundleEntryResult {
             location: Some(resource.versioned_url()),
             etag: Some(resource.etag().to_string()),
             last_modified: Some(resource.last_modified().to_rfc3339()),
-            resource: Some(resource.into_content()),
+            resource: Some(resource.content_with_meta()),
             outcome: None,
         }
     }
@@ -353,7 +353,7 @@ impl BundleEntryResult {
             location: None,
             etag: Some(resource.etag().to_string()),
             last_modified: Some(resource.last_modified().to_rfc3339()),
-            resource: Some(resource.into_content()),
+            resource: Some(resource.content_with_meta()),
             outcome: None,
         }
     }

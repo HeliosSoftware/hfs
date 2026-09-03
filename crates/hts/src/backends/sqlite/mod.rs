@@ -496,6 +496,12 @@ impl SqliteTerminologyBackend {
             schema::migrate_authority_rank(&conn).map_err(|e| {
                 HtsError::StorageError(format!("Failed to apply authority_rank migration: {e}"))
             })?;
+            // See crates/hts/src/backends/sqlite/schema.rs::migrate_icd9cm_reimport
+            // (issue #802): clears the ICD-9-CM ledger row exactly once so an
+            // already-bootstrapped database re-imports it with the fixed parser.
+            schema::migrate_icd9cm_reimport(&conn).map_err(|e| {
+                HtsError::StorageError(format!("Failed to apply icd9cm reimport migration: {e}"))
+            })?;
 
             // FTS prebuild + index pre-warm. Skipped when `prebuild_fts` is
             // false (server startup path): bootstrap re-imports run first and
@@ -666,6 +672,12 @@ impl SqliteTerminologyBackend {
             // See the on-disk path: must follow the drop_url_unique rebuilds.
             schema::migrate_authority_rank(&conn).map_err(|e| {
                 HtsError::StorageError(format!("Failed to apply authority_rank migration: {e}"))
+            })?;
+            // See crates/hts/src/backends/sqlite/schema.rs::migrate_icd9cm_reimport
+            // (issue #802): clears the ICD-9-CM ledger row exactly once so an
+            // already-bootstrapped database re-imports it with the fixed parser.
+            schema::migrate_icd9cm_reimport(&conn).map_err(|e| {
+                HtsError::StorageError(format!("Failed to apply icd9cm reimport migration: {e}"))
             })?;
         }
 

@@ -3016,3 +3016,93 @@ mod date_precision {
         );
     }
 }
+
+/// #873: response bodies must carry server-populated `meta.versionId` and
+/// `meta.lastUpdated` on every read path. The row's version and timestamp were
+/// header-only (ETag / Last-Modified), so search entries, reads, vreads, and
+/// history bundles all returned resources with no server metadata — visibly,
+/// the Resources workspace's UPDATED column rendered blank on every backend.
+mod server_meta {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_bodies_carry_version_and_last_updated_on_every_read_path() {
+        let (server, _backend) = create_test_server().await;
+        let tenant_header = HeaderValue::from_static("test-tenant");
+
+        // Create: the response body already carries v1 meta, with
+        // client-supplied meta members preserved.
+        let created = server
+            .post("/Patient")
+            .add_header(X_TENANT_ID, tenant_header.clone())
+            .json(&json!({
+                "resourceType": "Patient",
+                "meta": {"profile": ["http://example.org/StructureDefinition/p"]},
+                "name": [{"family": "Metadata"}]
+            }))
+            .await;
+        created.assert_status(StatusCode::CREATED);
+        let body: Value = created.json();
+        assert_eq!(body["meta"]["versionId"], "1");
+        assert!(body["meta"]["lastUpdated"].is_string());
+        assert_eq!(
+            body["meta"]["profile"][0], "http://example.org/StructureDefinition/p",
+            "client-supplied meta members must survive the injection"
+        );
+        let id = body["id"].as_str().expect("created id").to_string();
+
+        // Update to v2.
+        let mut updated_body = body.clone();
+        updated_body["name"][0]["family"] = json!("Metadata2");
+        server
+            .put(&format!("/Patient/{id}"))
+            .add_header(X_TENANT_ID, tenant_header.clone())
+            .json(&updated_body)
+            .await
+            .assert_status_ok();
+
+        // Read: current version's meta.
+        let read: Value = server
+            .get(&format!("/Patient/{id}"))
+            .add_header(X_TENANT_ID, tenant_header.clone())
+            .await
+            .json();
+        assert_eq!(read["meta"]["versionId"], "2");
+        assert!(read["meta"]["lastUpdated"].is_string());
+
+        // Vread: each version reports its own meta.
+        let v1: Value = server
+            .get(&format!("/Patient/{id}/_history/1"))
+            .add_header(X_TENANT_ID, tenant_header.clone())
+            .await
+            .json();
+        assert_eq!(v1["meta"]["versionId"], "1");
+
+        // History bundle entries carry their version's meta.
+        let history: Value = server
+            .get(&format!("/Patient/{id}/_history"))
+            .add_header(X_TENANT_ID, tenant_header.clone())
+            .await
+            .json();
+        let versions: Vec<&str> = history["entry"]
+            .as_array()
+            .expect("history entries")
+            .iter()
+            .map(|e| e["resource"]["meta"]["versionId"].as_str().unwrap_or(""))
+            .collect();
+        assert!(
+            versions.contains(&"1") && versions.contains(&"2"),
+            "history entries must carry per-version meta, got {versions:?}"
+        );
+
+        // Search: match entries carry meta.
+        let search: Value = server
+            .get("/Patient?family=Metadata2")
+            .add_header(X_TENANT_ID, tenant_header)
+            .await
+            .json();
+        let entry = &get_bundle_entries(&search)[0]["resource"];
+        assert_eq!(entry["meta"]["versionId"], "2");
+        assert!(entry["meta"]["lastUpdated"].is_string());
+    }
+}
