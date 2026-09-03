@@ -1434,7 +1434,21 @@ pub fn mount_with_conformance_source_and_runtime(
         // in request extensions next to the locale.
         .layer(middleware::from_fn_with_state(state.clone(), resolve_prefs))
         .with_state(state)
+        // Registered after the UI layers so neither arm of `/` picks them up:
+        // the redirect needs none, and `POST /` (FHIR batch) must reach the
+        // fallback with the same middleware stack as every other FHIR route.
+        .route("/", get(root_redirect).fallback_service(fhir_app.clone()))
         .fallback_service(fhir_app)
+}
+
+/// Redirects the bare root to the UI home (#896), mirroring HTS. Registered
+/// on the UI router, so it only exists when the UI is mounted (a headless
+/// build keeps its current behavior) and sits outside the FHIR router's auth
+/// layer — an unauthenticated browser lands on `/ui` instead of a 401.
+/// Temporary (307) rather than HTS's 308: `/` is also the FHIR batch
+/// endpoint, and a permanent redirect gets cached hard by browsers.
+async fn root_redirect() -> axum::response::Redirect {
+    axum::response::Redirect::temporary("/ui")
 }
 
 /// Form body for `POST /ui/version` â€” the sidebar selector's submit.
