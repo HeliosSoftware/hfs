@@ -19,6 +19,7 @@ use crate::tenant::{Operation, TenantContext};
 use crate::types::StoredResource;
 
 use super::SqliteBackend;
+use super::backend::load_tenant_stored_params_with_conn;
 
 fn internal_error(message: String) -> StorageError {
     StorageError::Backend(BackendError::Internal {
@@ -559,12 +560,33 @@ impl TransactionProvider for SqliteBackend {
         options: TransactionOptions,
     ) -> StorageResult<Self::Transaction> {
         let conn = self.get_connection()?;
-        SqliteTransaction::new(
-            conn,
-            tenant.clone(),
-            self.clone(),
-            options.fhir_version.unwrap_or(self.config().fhir_version),
-        )
+        let tenant_id = tenant.tenant_id().as_str();
+        let fhir_version = options.fhir_version.unwrap_or(self.config().fhir_version);
+
+        // Warm this tenant's search-parameter registry from THIS connection
+        // on a cache miss, rather than letting the backend's indexing path
+        // ask the pool for a second, simultaneous one (#787) — see
+        // `load_tenant_stored_params_with_conn`. Writes in this transaction
+        // index through `SqliteBackend::index_resource`, whose extractor
+        // reads the registry cache populated here; a cached registry skips
+        // the query entirely, same as the non-transactional path.
+        if self.tenant_registries().cached(tenant_id).is_none() {
+            let stored = load_tenant_stored_params_with_conn(&conn, fhir_version, tenant_id)
+                .map_err(|e| {
+                    StorageError::Backend(BackendError::Internal {
+                        backend_name: "sqlite".to_string(),
+                        message: format!(
+                            "Failed to load this tenant's SearchParameter overlay; \
+                             refusing to start a transaction that would index \
+                             resources against an incomplete registry: {e}"
+                        ),
+                        source: None,
+                    })
+                })?;
+            self.tenant_registries().build_and_cache(tenant_id, stored);
+        }
+
+        SqliteTransaction::new(conn, tenant.clone(), self.clone(), fhir_version)
     }
 }
 

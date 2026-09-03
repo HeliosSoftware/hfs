@@ -18,7 +18,7 @@ const ROUTES = [
   "/ui/hts/operations",
   "/ui/hts/import",
   "/ui/hts/capability-statement",
-  // Detail pages: seed.mjs provisions ex-cs-1, ex-vs-1, ex-cm-1, and the
+  // Detail pages: seed.ts provisions ex-cs-1, ex-vs-1, ex-cm-1, and the
   // §8.3 operation-first landing redirects /{id} to /{id}/{default-op}.
   // Hitting the effective landing URL directly avoids Playwright following
   // a 308 mid-request and dropping the network capture.

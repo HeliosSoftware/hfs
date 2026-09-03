@@ -19,6 +19,7 @@ use crate::core::{
 use crate::error::{
     BackendError, ConcurrencyError, ResourceError, SearchError, StorageError, StorageResult,
 };
+use crate::search::SearchParameterLoader;
 use crate::search::reindex::{ReindexSource, ResourcePage};
 use crate::tenant::{Operation, TenantContext, TenantId, TenantPermissions};
 use crate::types::{
@@ -324,23 +325,40 @@ impl S3Backend {
     ///
     /// Shares the `list_current_keys` + `get_json_object` walk used by bulk
     /// export ([`super::bulk_export`]); used by the in-process SQL-on-FHIR
-    /// runner to feed the `helios-sof` engine.
+    /// runner to feed the `helios-sof` engine, and by the SearchParameter
+    /// overlay reload (`reload_stored_cache_for_tenant`).
+    ///
+    /// Fetches concurrently (same `bulk_write_concurrency` fan-out the seeder
+    /// uses for writes, `search/seeder.rs`) — a resource type can hold
+    /// thousands of objects (every seeded spec `SearchParameter` is a real,
+    /// individually-keyed object here, indistinguishable from a stored one),
+    /// and one GET per object sequentially turned a same-tenant SearchParameter
+    /// write into a ~30s stall that Inferno's client then timed out on (#787).
     pub(crate) async fn scan_live_resources(
         &self,
         tenant: &TenantContext,
         resource_type: &str,
     ) -> StorageResult<Vec<Value>> {
+        use futures::stream::{self, StreamExt};
+
         let location = self.tenant_location(tenant)?;
         let keys = self
             .list_current_keys(&location, Some(resource_type))
             .await?;
 
+        let bucket = &location.bucket;
+        let fetched: Vec<StorageResult<Option<(StoredResource, ObjectMetadata)>>> =
+            stream::iter(keys)
+                .map(
+                    |key| async move { self.get_json_object::<StoredResource>(bucket, &key).await },
+                )
+                .buffer_unordered(self.bulk_write_concurrency())
+                .collect()
+                .await;
+
         let mut resources = Vec::new();
-        for key in keys {
-            let Some((resource, _)) = self
-                .get_json_object::<StoredResource>(&location.bucket, &key)
-                .await?
-            else {
+        for result in fetched {
+            let Some((resource, _)) = result? else {
                 continue;
             };
             if resource.is_deleted() {
@@ -349,6 +367,105 @@ impl S3Backend {
             resources.push(resource.content().clone());
         }
         Ok(resources)
+    }
+
+    /// Reloads one tenant's stored active SearchParameters into the sync
+    /// `stored_by_tenant` cache, then drops that tenant's cached registry so
+    /// it rebuilds against the fresh overlay on next access.
+    ///
+    /// Runs inside the same `create`/`update`/`delete`/`restore_deleted` call
+    /// that wrote the SearchParameter (see `maybe_reload_search_param_cache`),
+    /// so — unlike a database-backed backend that could just invalidate and
+    /// let a live query resolve it lazily — this scan (`scan_live_resources`,
+    /// backed by S3's strongly-consistent LIST+GET) completes and the overlay
+    /// is already correct before the write call returns to its caller (#787).
+    pub(crate) async fn reload_stored_cache_for_tenant(
+        &self,
+        tenant: &TenantContext,
+    ) -> StorageResult<usize> {
+        use crate::search::registry::{SearchParameterSource, SearchParameterStatus};
+
+        let loader = SearchParameterLoader::new(FhirVersion::default());
+        let resources = self.scan_live_resources(tenant, "SearchParameter").await?;
+
+        let mut defs = Vec::new();
+        for json in &resources {
+            if let Ok(mut def) = loader.parse_resource(json) {
+                if def.status == SearchParameterStatus::Active {
+                    def.source = SearchParameterSource::Stored;
+                    defs.push(def);
+                }
+            }
+        }
+        let count = defs.len();
+
+        let tenant_id = tenant.tenant_id().as_str();
+        self.stored_by_tenant
+            .write()
+            .insert(tenant_id.to_string(), defs);
+        self.registries.invalidate(tenant_id);
+        Ok(count)
+    }
+
+    /// Reloads every registered tenant's stored SearchParameters (startup and
+    /// the TTL refresh, #235 — S3 never had this at all before #787, since
+    /// there was nothing real to refresh). Unlike a database's single
+    /// unfiltered query, S3 has no tenant-independent listing, so this
+    /// enumerates tenants first (`list_tenants`) and reloads each in turn.
+    pub(crate) async fn reload_stored_cache(&self) -> StorageResult<usize> {
+        let tenant_ids: Vec<String> = match self.list_tenants().await {
+            Ok(records) => records.into_iter().map(|r| r.id).collect(),
+            Err(e) => {
+                tracing::warn!("Listing tenants for SearchParameter cache reload failed: {e}");
+                Vec::new()
+            }
+        };
+
+        let mut total = 0;
+        for tenant_id in tenant_ids {
+            let tenant =
+                TenantContext::new(TenantId::new(&tenant_id), TenantPermissions::full_access());
+            match self.reload_stored_cache_for_tenant(&tenant).await {
+                Ok(count) => total += count,
+                Err(e) => {
+                    tracing::warn!(tenant = %tenant_id, "SearchParameter cache reload failed: {e}")
+                }
+            }
+        }
+        Ok(total)
+    }
+
+    /// TTL-cache refresh (#235): reload the stored-param cache and drop the
+    /// cached per-tenant registries.
+    pub async fn refresh_stored_search_parameters(&self) -> StorageResult<usize> {
+        self.reload_stored_cache().await
+    }
+
+    /// Reloads `tenant`'s stored-param cache when `resource_type` is
+    /// `SearchParameter` and the write can affect that tenant's overlay.
+    /// `resource` is only consulted for creates — `create_affects_overlay`
+    /// gates out inert writes (e.g. re-seeding a spec copy); update, delete,
+    /// and restore always reload unconditionally, mirroring every other
+    /// backend's SearchParameter write hooks (#787).
+    async fn maybe_reload_search_param_cache(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        resource: Option<&Value>,
+    ) {
+        if resource_type != "SearchParameter" {
+            return;
+        }
+        let affects_overlay = match resource {
+            Some(r) => self.registries.create_affects_overlay(r),
+            None => true,
+        };
+        if !affects_overlay {
+            return;
+        }
+        if let Err(e) = self.reload_stored_cache_for_tenant(tenant).await {
+            tracing::warn!("SearchParameter cache reload failed: {e}");
+        }
     }
 
     /// Loads history entries by scanning all index event objects under `prefix`.
@@ -475,6 +592,12 @@ impl S3Backend {
             Ok(_) => {
                 self.put_history_and_indexes(&location, &restored, HistoryMethod::Put)
                     .await?;
+                self.maybe_reload_search_param_cache(
+                    tenant,
+                    resource_type,
+                    Some(restored.content()),
+                )
+                .await;
                 Ok(restored)
             }
             Err(StorageError::Backend(BackendError::QueryError { .. })) => {
@@ -633,6 +756,8 @@ impl ResourceStorage for S3Backend {
             Ok(_) => {
                 self.put_history_and_indexes(&location, &stored, HistoryMethod::Post)
                     .await?;
+                self.maybe_reload_search_param_cache(tenant, resource_type, Some(stored.content()))
+                    .await;
                 Ok(stored)
             }
             Err(StorageError::Backend(BackendError::QueryError { .. })) => {
@@ -766,6 +891,8 @@ impl ResourceStorage for S3Backend {
             Ok(_) => {
                 self.put_history_and_indexes(&location, &updated, HistoryMethod::Put)
                     .await?;
+                self.maybe_reload_search_param_cache(tenant, resource_type, None)
+                    .await;
                 Ok(updated)
             }
             Err(StorageError::Backend(BackendError::QueryError { .. })) => {
@@ -832,6 +959,8 @@ impl ResourceStorage for S3Backend {
             Ok(_) => {
                 self.put_history_and_indexes(&location, &deleted, HistoryMethod::Delete)
                     .await?;
+                self.maybe_reload_search_param_cache(tenant, resource_type, None)
+                    .await;
                 Ok(())
             }
             Err(StorageError::Backend(BackendError::QueryError { .. })) => Err(
@@ -1491,17 +1620,20 @@ impl SearchProvider for S3Backend {
 
     fn search_param_registry(
         &self,
-        _tenant: &crate::tenant::TenantContext,
+        tenant: &crate::tenant::TenantContext,
     ) -> std::sync::Arc<parking_lot::RwLock<crate::search::SearchParameterRegistry>> {
-        // S3 standalone does not implement search; an empty registry is
-        // required only to satisfy the trait. In real deployments S3 is
-        // composed with a search backend (e.g., Elasticsearch) and the
-        // composite forwards to that backend's registry.
-        use std::sync::OnceLock;
-        static EMPTY: OnceLock<crate::search::TenantSearchRegistries> = OnceLock::new();
-        EMPTY
-            .get_or_init(crate::search::TenantSearchRegistries::base_only)
-            .for_tenant("")
+        // S3 standalone does not implement search (`search`/`search_count`
+        // above return `UnsupportedCapability`), but the registry itself is
+        // real: `base()` is populated by a composite starter (e.g.
+        // `start_s3_elasticsearch`) and the per-tenant overlay reflects this
+        // tenant's stored SearchParameters (#787). In real deployments S3 is
+        // composed with a search backend (e.g. Elasticsearch), which is handed
+        // this same `TenantSearchRegistries` via `with_shared_registry` and so
+        // resolves through it directly — the composite's `search_param_registry`
+        // routing (`CompositeStorage::search_param_registry`) never reaches
+        // this method in that case; it exists for standalone S3 and for
+        // consistency with every other backend.
+        self.registries.for_tenant(tenant.tenant_id().as_str())
     }
 }
 

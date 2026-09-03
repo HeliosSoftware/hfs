@@ -268,37 +268,38 @@ impl<'a> EsQueryBuilder<'a> {
         }
     }
 
-    /// Builds a clause for the _lastUpdated special parameter.
+    /// Builds a clause for the `_lastUpdated` special parameter.
+    ///
+    /// Reuses the precision-aware date logic that indexed date parameters
+    /// get, against the top-level `last_updated` field: `eq` at day
+    /// precision means `[day, day+1)`, `ne` its complement, `sa`/`eb` mirror
+    /// `gt`/`lt` on the whole period, and comma-separated values OR together
+    /// (#892). Previously every value was folded into one `range` map, so
+    /// `ne`/`sa`/`eb`/`ap` degraded to `eq` and a second value overwrote the
+    /// first.
     fn build_last_updated_clause(&self, param: &SearchParameter) -> Option<Value> {
-        let mut range = serde_json::Map::new();
-        for value in &param.values {
-            match value.prefix {
-                SearchPrefix::Eq => {
-                    range.insert("gte".to_string(), json!(value.value));
-                    range.insert("lte".to_string(), json!(value.value));
+        let mut clauses: Vec<Value> = param
+            .values
+            .iter()
+            .map(
+                |value| match date::field_range("last_updated", &value.value, value.prefix) {
+                    date::DateRange::Within(range) => range,
+                    date::DateRange::Outside(range) => {
+                        json!({ "bool": { "must_not": [range] } })
+                    }
+                },
+            )
+            .collect();
+
+        match clauses.len() {
+            0 => None,
+            1 => clauses.pop(),
+            _ => Some(json!({
+                "bool": {
+                    "should": clauses,
+                    "minimum_should_match": 1
                 }
-                SearchPrefix::Gt => {
-                    range.insert("gt".to_string(), json!(value.value));
-                }
-                SearchPrefix::Lt => {
-                    range.insert("lt".to_string(), json!(value.value));
-                }
-                SearchPrefix::Ge => {
-                    range.insert("gte".to_string(), json!(value.value));
-                }
-                SearchPrefix::Le => {
-                    range.insert("lte".to_string(), json!(value.value));
-                }
-                _ => {
-                    range.insert("gte".to_string(), json!(value.value));
-                    range.insert("lte".to_string(), json!(value.value));
-                }
-            }
-        }
-        if range.is_empty() {
-            None
-        } else {
-            Some(json!({ "range": { "last_updated": Value::Object(range) } }))
+            })),
         }
     }
 
@@ -449,6 +450,63 @@ mod tests {
 
             assert_eq!(clause["exists"]["field"], field);
         }
+    }
+
+    fn last_updated_query(values: Vec<SearchValue>) -> Value {
+        let query = SearchQuery::new("Patient").with_parameter(SearchParameter {
+            name: "_lastUpdated".to_string(),
+            param_type: SearchParamType::Date,
+            modifier: None,
+            values,
+            chain: vec![],
+            components: vec![],
+        });
+        let builder = EsQueryBuilder::new("acme", "Patient", "hfs_acme_patient".to_string());
+        builder.build(&query).body["query"]["bool"]["must"][0].clone()
+    }
+
+    #[test]
+    fn last_updated_eq_is_a_day_range() {
+        let clause = last_updated_query(vec![SearchValue::eq("2026-09-01")]);
+        assert_eq!(
+            clause["range"]["last_updated"],
+            json!({ "gte": "2026-09-01", "lt": "2026-09-02" })
+        );
+    }
+
+    #[test]
+    fn last_updated_ne_is_negated_not_eq() {
+        // #892: `ne` fell into the default arm and matched exactly the day.
+        let clause = last_updated_query(vec![SearchValue::new(SearchPrefix::Ne, "2026-09-01")]);
+        assert_eq!(
+            clause["bool"]["must_not"][0]["range"]["last_updated"],
+            json!({ "gte": "2026-09-01", "lt": "2026-09-02" })
+        );
+    }
+
+    #[test]
+    fn last_updated_sa_and_eb_exclude_the_named_period() {
+        let sa = last_updated_query(vec![SearchValue::new(SearchPrefix::Sa, "2026-09-01")]);
+        assert_eq!(sa["range"]["last_updated"], json!({ "gte": "2026-09-02" }));
+
+        let eb = last_updated_query(vec![SearchValue::new(SearchPrefix::Eb, "2026-09-01")]);
+        assert_eq!(eb["range"]["last_updated"], json!({ "lt": "2026-09-01" }));
+    }
+
+    #[test]
+    fn last_updated_or_list_keeps_every_value() {
+        // #892: a second value overwrote the first in the single range map.
+        let clause = last_updated_query(vec![
+            SearchValue::eq("2026-09-01"),
+            SearchValue::eq("2026-09-03"),
+        ]);
+        let should = clause["bool"]["should"]
+            .as_array()
+            .expect("OR list -> bool.should");
+        assert_eq!(should.len(), 2);
+        assert_eq!(clause["bool"]["minimum_should_match"], 1);
+        assert_eq!(should[0]["range"]["last_updated"]["gte"], "2026-09-01");
+        assert_eq!(should[1]["range"]["last_updated"]["gte"], "2026-09-03");
     }
 
     fn not_param(values: Vec<SearchValue>) -> SearchQuery {
