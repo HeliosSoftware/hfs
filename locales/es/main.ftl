@@ -1375,6 +1375,7 @@ hts-import-drop-browse = o haz clic para explorar
 hts-import-reading = Leyendo archivo…
 hts-import-read-failed = No se pudo leer el archivo.
 hts-import-file-too-large = El archivo excede el limite de ~7,5 MiB para envio URL-codificado.
+hts-import-file-loaded = Archivo cargado: {"{name}"}
 hts-import-bundle-hint = El Bundle se envia a POST /import en el servidor de terminologia. Los recursos existentes se emparejan por url + version.
 hts-import-review-target = Servidor destino
 hts-import-review-request = Peticion

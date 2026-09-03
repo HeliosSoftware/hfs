@@ -74,7 +74,8 @@
          id="hts-import-file-field"
          data-msg-reading="{{ chrome.i18n.t("hts-import-reading") }}"
          data-msg-read-failed="{{ chrome.i18n.t("hts-import-read-failed") }}"
-         data-msg-too-large="{{ chrome.i18n.t("hts-import-file-too-large") }}">
+         data-msg-too-large="{{ chrome.i18n.t("hts-import-file-too-large") }}"
+         data-msg-loaded="{{ chrome.i18n.t("hts-import-file-loaded") }}">
       <span class="field__label">{{ chrome.i18n.t("hts-import-bundle-file-label") }}</span>
       <button type="button" class="batch-drop" id="hts-import-drop">
         <strong>{{ chrome.i18n.t("hts-import-drop-hint") }}</strong>
@@ -83,8 +84,9 @@
       <input id="hts-import-file"
              type="file"
              name="bundle_file"
-             accept="application/json,application/fhir+json,.json"
+             accept=".json,application/json,application/fhir+json"
              hidden>
+      <p class="notice" id="hts-import-file-success" role="status" style="background:var(--ok-soft);color:var(--ok);margin-top:8px" hidden></p>
       <p class="alert" id="hts-import-file-error" role="alert" hidden></p>
       <span class="field__hint">{{ chrome.i18n.t("hts-import-file-hint") }}</span>
     </div>

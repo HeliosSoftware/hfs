@@ -28,6 +28,7 @@
   var fileField = document.getElementById("hts-import-file-field") || fileInput.closest(".field");
   var drop = document.getElementById("hts-import-drop");
   var fileError = document.getElementById("hts-import-file-error");
+  var fileSuccess = document.getElementById("hts-import-file-success");
 
   // i18n messages from data attributes on the file field
   var messages = fileField ? fileField.dataset : {};
@@ -57,9 +58,10 @@
     radio.addEventListener("change", applyMode);
   });
 
-  // --- Error display ---
+  // --- Feedback display ---
 
   function showError(message) {
+    clearSuccess();
     if (fileError) {
       fileError.textContent = message;
       fileError.hidden = false;
@@ -73,10 +75,27 @@
     }
   }
 
+  function showSuccess(fileName) {
+    clearError();
+    if (fileSuccess) {
+      var msg = messages.msgLoaded || "File loaded: {name}";
+      fileSuccess.textContent = msg.replace("{name}", fileName);
+      fileSuccess.hidden = false;
+    }
+  }
+
+  function clearSuccess() {
+    if (fileSuccess) {
+      fileSuccess.hidden = true;
+      fileSuccess.textContent = "";
+    }
+  }
+
   // --- File reading with validation ---
 
   function readFile(file) {
     clearError();
+    clearSuccess();
 
     // Size check: urlencoding overhead ~33% means ~7.5 MiB effective cap
     if (file.size > MAX_FILE_SIZE) {
@@ -91,6 +110,7 @@
     }
 
     var reader = new FileReader();
+    var fileName = file.name;
 
     reader.onload = function () {
       if (drop) {
@@ -98,6 +118,7 @@
         drop.classList.remove("batch-drop--reading");
       }
       textarea.value = typeof reader.result === "string" ? reader.result : "";
+      showSuccess(fileName);
     };
 
     reader.onerror = reader.onabort = function () {

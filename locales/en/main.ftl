@@ -1397,6 +1397,7 @@ hts-import-drop-browse = or click to browse
 hts-import-reading = Reading file…
 hts-import-read-failed = The file could not be read.
 hts-import-file-too-large = File exceeds the ~7.5 MiB limit for urlencoded submission.
+hts-import-file-loaded = File loaded: {"{name}"}
 hts-import-bundle-hint = The Bundle is posted to POST /import on the terminology server. Existing resources are matched on url + version.
 hts-import-review-target = Target server
 hts-import-review-request = Request
