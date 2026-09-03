@@ -47,4 +47,6 @@ pub mod search;
 mod search_impl;
 mod storage;
 
-pub use backend::{ElasticsearchAuth, ElasticsearchBackend, ElasticsearchConfig};
+pub use backend::{
+    ElasticsearchAuth, ElasticsearchBackend, ElasticsearchConfig, WriteRefreshPolicy,
+};

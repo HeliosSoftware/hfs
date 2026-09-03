@@ -1006,6 +1006,19 @@ pub struct ServerConfig {
     #[arg(long, env = "HFS_ELASTICSEARCH_PASSWORD")]
     pub elasticsearch_password: Option<String>,
 
+    /// Elasticsearch index refresh interval (e.g. "1s", "200ms", "-1" to disable
+    /// periodic refresh). Controls how quickly indexed documents become
+    /// searchable when no per-write refresh is requested.
+    #[arg(long, env = "HFS_ELASTICSEARCH_REFRESH_INTERVAL", default_value = "1s")]
+    pub elasticsearch_refresh_interval: String,
+
+    /// Refresh behavior applied to Elasticsearch index/delete operations:
+    /// "false" (no per-write refresh), "wait_for" (block each write until the
+    /// affected shards refresh, giving read-after-write search visibility), or
+    /// "true" (force a refresh per write).
+    #[arg(long, env = "HFS_ELASTICSEARCH_WRITE_REFRESH", default_value = "false")]
+    pub elasticsearch_write_refresh: String,
+
     /// Enable SQL-on-FHIR operations ($sql-run, $sql-export).
     /// When enabled, the configured storage backend MUST provide an in-DB
     /// SOF runner (sqlite or postgres) — there is no in-process fallback.
@@ -1224,6 +1237,8 @@ impl Default for ServerConfig {
             elasticsearch_index_prefix: "hfs".to_string(),
             elasticsearch_username: None,
             elasticsearch_password: None,
+            elasticsearch_refresh_interval: "1s".to_string(),
+            elasticsearch_write_refresh: "false".to_string(),
             sof_enabled: true,
             nl_search_enabled: true,
             nl_search_api_key: None,
@@ -1444,6 +1459,8 @@ impl ServerConfig {
             elasticsearch_index_prefix: "hfs".to_string(),
             elasticsearch_username: None,
             elasticsearch_password: None,
+            elasticsearch_refresh_interval: "1s".to_string(),
+            elasticsearch_write_refresh: "false".to_string(),
             sof_enabled: true,
             nl_search_enabled: true,
             nl_search_api_key: None,

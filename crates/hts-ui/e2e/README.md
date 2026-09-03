@@ -69,7 +69,7 @@ the seed lands:
     F11 neutral no-matches state renders and is NOT the error partial.
 
 Until the seed loader ships, run the Playwright ring against a local
-`hts` populated by hand (`curl -XPUT` the fixtures `seed.mjs` creates) or
+`hts` populated by hand (`curl -XPUT` the fixtures `seed.ts` creates) or
 skip the specs that reference the ids above with `--grep-invert`.
 
 ## Prereqs
