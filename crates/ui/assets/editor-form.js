@@ -20,6 +20,11 @@
  *   host.setDoc(text)  -> `text` lands back in `host` (a CodeMirror doc, a
  *                         plain textarea, ...) however `host` sees fit.
  *   host.renderUrl     -> optional override of "/ui/editor/render".
+ *   host.fields        -> optional `{name: value}` pairs added to every
+ *                         request this loop sends (mutations and `refresh`
+ *                         alike) - e.g. `hidden`/`legend` for a document
+ *                         that hides some of its own paths from the panel
+ *                         (#840). Absent, behavior is unchanged.
  *
  * Returns `{ refresh(text) }`: re-renders `root` for `text` with no
  * mutation (`op=""`), for a caller driving JSON -> form sync from its own
@@ -52,6 +57,13 @@
       form.set("pane", "form");
       Object.keys(fields || {}).forEach(function (key) {
         form.set(key, fields[key]);
+      });
+      // #840: a host-level extra, constant across every request this loop
+      // sends for this pairing (e.g. `hidden`/`legend`) - distinct from
+      // `fields` above, this call's own per-operation fields (`path`,
+      // `value`, ...).
+      Object.keys(host.fields || {}).forEach(function (key) {
+        form.set(key, host.fields[key]);
       });
       return fetch(renderUrl, { method: "POST", body: form })
         .then(function (response) {

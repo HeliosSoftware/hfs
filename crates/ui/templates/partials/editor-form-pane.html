@@ -39,23 +39,36 @@
     Live-vs-save legibility (#366): the per-keystroke pass is structural
     plus the embedded required-binding check; FHIRPath constraints and the
     configured terminology run on save. A clean form here is not the whole
-    story, and the legend says so instead of surprising on save.
+    story, and the legend says so instead of surprising on save. Which of
+    the three legends below shows is the host's own choice (`legend`, #840),
+    not necessarily derived from the document's `resourceType` — see
+    `editor::Legend`.
 
-    ViewDefinition (#843) gets its own single-line legend instead: Save
-    stays permissive there, so "checked on save" would promise a pass this
-    page never runs. Its line names what the per-keystroke pass here
-    actually covers, including the SOF-only lint diagnostics `analyze`
-    folds into `rows`/`orphan_errors` below (an invalid FHIRPath
-    expression, an undeclared constant, duplicate column names, ...)
-    alongside the validator's own structural checks.
+    ViewDefinition (#843) gets its own single-line legend: Save stays
+    permissive there, so "checked on save" would promise a pass this page
+    never runs. Its line names what the per-keystroke pass here actually
+    covers, including the SOF-only lint diagnostics `analyze` folds into
+    `rows`/`orphan_errors` below (an invalid FHIRPath expression, an
+    undeclared constant, duplicate column names, ...) alongside the
+    validator's own structural checks.
+
+    SQL Query / SQL View (#840) get their own two-line legend: "checked on
+    save" there names the SQL on FHIR Library type and the SQL attachment —
+    what actually gates Save on those pages — rather than the generic
+    constraints/terminology promise below, which would be misleading with
+    `HFS_VALIDATION_MODE` off (the default).
   -->
   <p class="editor-legend">
-    {% if is_view_definition %}
+    {% match legend %}
+    {% when Legend::ViewDefinition %}
     <span class="editor-legend__live">{{ i18n.t("vd-form-legend-live") }}</span>
-    {% else %}
+    {% when Legend::SqlLibrary %}
+    <span class="editor-legend__live">{{ i18n.t("lib-form-legend-live") }}</span>
+    <span class="editor-legend__save">{{ i18n.t("lib-form-legend-save") }}</span>
+    {% when Legend::Resource %}
     <span class="editor-legend__live">{{ i18n.t("editor-legend-live") }}</span>
     <span class="editor-legend__save">{{ i18n.t("editor-legend-save") }}</span>
-    {% endif %}
+    {% endmatch %}
   </p>
 
   <div class="editor-tree">

@@ -874,6 +874,8 @@ pub struct StaticConformanceSource {
     export_status: SqlExportStatus,
     export_manifest: Option<Result<Value, String>>,
     export_calls: Arc<Mutex<Vec<RecordedExportCall>>>,
+    saved_resources: Arc<Mutex<Vec<Value>>>,
+    sql_run_calls: Arc<Mutex<Vec<Value>>>,
 }
 
 impl StaticConformanceSource {
@@ -887,7 +889,31 @@ impl StaticConformanceSource {
             export_status: SqlExportStatus::Unknown,
             export_manifest: None,
             export_calls: Arc::new(Mutex::new(Vec::new())),
+            saved_resources: Arc::new(Mutex::new(Vec::new())),
+            sql_run_calls: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    /// The resources `save_resource` has received so far, in call order —
+    /// for a test to assert on what a Save actually merged (with an id
+    /// already assigned), since this source does not persist them anywhere
+    /// `fetch()` would read back from.
+    pub fn saved_resources(&self) -> Vec<Value> {
+        self.saved_resources
+            .lock()
+            .expect("saved_resources mutex is never held across a panic")
+            .clone()
+    }
+
+    /// The documents `sql_run` has received so far, in call order — for a
+    /// test to assert on exactly what a `$sql-run` call carried (e.g. that
+    /// `embed_sql` reached it), since [`Self::with_sql_run`] only seeds the
+    /// *outcome*, blind to the input.
+    pub fn sql_run_calls(&self) -> Vec<Value> {
+        self.sql_run_calls
+            .lock()
+            .expect("sql_run_calls mutex is never held across a panic")
+            .clone()
     }
 
     /// The `$sql-export` calls this source has received so far, in call
@@ -1019,11 +1045,15 @@ impl ConformanceSource for StaticConformanceSource {
 
     async fn sql_run(
         &self,
-        _view_definition: &Value,
+        view_definition: &Value,
         limit: usize,
         _version: FhirVersion,
         _tenant: &str,
     ) -> Result<Vec<Value>, String> {
+        self.sql_run_calls
+            .lock()
+            .expect("sql_run_calls mutex is never held across a panic")
+            .push(view_definition.clone());
         match &self.sql_rows {
             Some(Ok(rows)) => Ok(rows.iter().take(limit).cloned().collect()),
             Some(Err(e)) => Err(e.clone()),
@@ -1137,6 +1167,11 @@ impl ConformanceSource for StaticConformanceSource {
 
     /// Echoes the resource back with an id, so the save handler's redirect
     /// (and a test's assertion on it) has something stable to point at.
+    /// Also records the exact resource that was posted (post-id) in
+    /// [`Self::saved_resources`], for a test that needs to assert on the
+    /// document a save actually merged and would have persisted — #840's
+    /// own Details/SQL fusion, say — without a real backend to read it back
+    /// from.
     async fn save_resource(
         &self,
         _resource_type: &str,
@@ -1149,6 +1184,10 @@ impl ConformanceSource for StaticConformanceSource {
         if let Some(map) = resource.as_object_mut() {
             map.insert("id".to_string(), Value::String(id));
         }
+        self.saved_resources
+            .lock()
+            .expect("saved_resources mutex is never held across a panic")
+            .push(resource.clone());
         Ok(resource)
     }
 }
