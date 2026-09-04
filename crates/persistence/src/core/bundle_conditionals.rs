@@ -426,4 +426,282 @@ mod tests {
         assert_eq!(result.location.as_deref(), Some("Patient/p1/_history/1"));
         assert!(result.resource.is_none());
     }
+
+    /// A transaction that answers `find_matching` from a fixed list, or
+    /// refuses it, so the pre-pass can be exercised without a backend.
+    struct FakeTransaction {
+        matches: Vec<StoredResource>,
+        fail: bool,
+        tenant: crate::tenant::TenantContext,
+    }
+
+    impl FakeTransaction {
+        fn returning(matches: Vec<StoredResource>) -> Self {
+            Self {
+                matches,
+                fail: false,
+                tenant: crate::tenant::TenantContext::new(
+                    TenantId::new("t"),
+                    crate::tenant::TenantPermissions::full_access(),
+                ),
+            }
+        }
+
+        fn failing() -> Self {
+            Self {
+                fail: true,
+                ..Self::returning(Vec::new())
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl super::super::transaction::Transaction for FakeTransaction {
+        async fn create(
+            &mut self,
+            resource_type: &str,
+            _resource: serde_json::Value,
+        ) -> crate::error::StorageResult<StoredResource> {
+            Ok(stored(resource_type, "created"))
+        }
+
+        async fn read(
+            &mut self,
+            _resource_type: &str,
+            _id: &str,
+        ) -> crate::error::StorageResult<Option<StoredResource>> {
+            Ok(None)
+        }
+
+        async fn update(
+            &mut self,
+            current: &StoredResource,
+            _resource: serde_json::Value,
+        ) -> crate::error::StorageResult<StoredResource> {
+            Ok(current.clone())
+        }
+
+        async fn delete(
+            &mut self,
+            _resource_type: &str,
+            _id: &str,
+        ) -> crate::error::StorageResult<()> {
+            Ok(())
+        }
+
+        async fn commit(self: Box<Self>) -> crate::error::StorageResult<()> {
+            Ok(())
+        }
+
+        async fn rollback(self: Box<Self>) -> crate::error::StorageResult<()> {
+            Ok(())
+        }
+
+        fn tenant(&self) -> &crate::tenant::TenantContext {
+            &self.tenant
+        }
+
+        fn is_active(&self) -> bool {
+            true
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ConditionalTransaction for FakeTransaction {
+        async fn find_matching(
+            &mut self,
+            _resource_type: &str,
+            _criteria: &[SearchParameter],
+        ) -> crate::error::StorageResult<Vec<StoredResource>> {
+            if self.fail {
+                return Err(crate::error::StorageError::Backend(
+                    crate::error::BackendError::Unavailable {
+                        backend_name: "fake".to_string(),
+                        message: "search is down".to_string(),
+                    },
+                ));
+            }
+            Ok(self.matches.clone())
+        }
+    }
+
+    /// The pre-pass pins one target per conditional entry, keyed by the
+    /// entry's own index, and leaves the instance entries alone.
+    #[tokio::test]
+    async fn the_pre_pass_pins_a_target_per_conditional_entry() {
+        let entries = vec![
+            entry(BundleMethod::Put, "Patient/p9", false),
+            entry(BundleMethod::Put, "Patient?identifier=x", true),
+        ];
+        let mut tx = FakeTransaction::returning(vec![stored("Patient", "p1")]);
+
+        let targets = resolve_conditional_targets(&mut tx, &entries, None)
+            .await
+            .expect("one match resolves");
+
+        assert_eq!(targets.len(), 1);
+        let target = targets.get(&1).expect("the conditional entry's index");
+        assert_eq!(target.resource_type, "Patient");
+        assert_eq!(target.identity().as_deref(), Some("Patient/p1"));
+    }
+
+    /// A URL with criteria but no type before them cannot be resolved; the
+    /// entry is named so the client can see which one.
+    #[tokio::test]
+    async fn a_url_naming_no_resource_type_fails_the_bundle() {
+        let entries = vec![entry(BundleMethod::Delete, "?identifier=x", true)];
+        let mut tx = FakeTransaction::returning(Vec::new());
+
+        let err = resolve_conditional_targets(&mut tx, &entries, None)
+            .await
+            .expect_err("no resource type");
+
+        let TransactionError::BundleError { index, message } = err else {
+            panic!("expected a bundle error");
+        };
+        assert_eq!(index, 0);
+        assert!(message.contains("names no resource type"), "{message}");
+    }
+
+    /// A search the backend cannot run fails the bundle rather than being
+    /// read as "nothing matched" — which on a conditional PUT is a duplicate.
+    #[tokio::test]
+    async fn a_failing_search_fails_the_bundle() {
+        let entries = vec![entry(BundleMethod::Put, "Patient?identifier=x", true)];
+        let mut tx = FakeTransaction::failing();
+
+        let err = resolve_conditional_targets(&mut tx, &entries, None)
+            .await
+            .expect_err("the search failed");
+
+        let TransactionError::BundleError { index, message } = err else {
+            panic!("expected a bundle error");
+        };
+        assert_eq!(index, 0);
+        assert!(message.starts_with("Entry processing failed"), "{message}");
+        assert!(message.contains("fake"), "{message}");
+    }
+
+    /// A backend that cannot resolve conditionals inside a transaction at all
+    /// refuses the first such entry with the 501 the REST gate mirrors.
+    #[tokio::test]
+    async fn an_unsupported_backend_refuses_the_first_conditional_entry() {
+        let entries = vec![entry(BundleMethod::Put, "Patient?identifier=x", true)];
+        let mut tx = FakeTransaction::returning(Vec::new());
+
+        let err = resolve_conditional_targets(&mut tx, &entries, Some("search is offloaded"))
+            .await
+            .expect_err("unsupported");
+
+        let TransactionError::BundleError { message, .. } = err else {
+            panic!("expected a bundle error");
+        };
+        assert!(message.contains("501"), "{message}");
+        assert!(message.contains("search is offloaded"), "{message}");
+    }
+
+    /// The three defaults are composed from `find_matching` alone, so the
+    /// outcome follows from the number of matches whatever the backend is.
+    #[tokio::test]
+    async fn the_conditional_defaults_read_their_outcome_from_find_matching() {
+        use super::super::storage::{
+            ConditionalCreateResult, ConditionalDeleteResult, ConditionalUpdateResult,
+        };
+        use super::super::transaction::Transaction;
+
+        let criteria = [SearchParameter {
+            name: "identifier".to_string(),
+            param_type: SearchParamType::Token,
+            ..Default::default()
+        }];
+        let resource = serde_json::json!({"resourceType": "Patient"});
+
+        let mut none = FakeTransaction::returning(Vec::new());
+        assert!(matches!(
+            none.create_if_none_exist("Patient", resource.clone(), &criteria)
+                .await
+                .unwrap(),
+            ConditionalCreateResult::Created(_)
+        ));
+        assert!(matches!(
+            none.update_conditional("Patient", resource.clone(), &criteria)
+                .await
+                .unwrap(),
+            ConditionalUpdateResult::Created(_)
+        ));
+        assert!(matches!(
+            none.delete_conditional("Patient", &criteria).await.unwrap(),
+            ConditionalDeleteResult::NoMatch
+        ));
+        assert!(none.is_active());
+        assert_eq!(none.tenant().tenant_id().as_str(), "t");
+
+        let mut one = FakeTransaction::returning(vec![stored("Patient", "p1")]);
+        assert!(matches!(
+            one.create_if_none_exist("Patient", resource.clone(), &criteria)
+                .await
+                .unwrap(),
+            ConditionalCreateResult::Exists(existing) if existing.id() == "p1"
+        ));
+        assert!(matches!(
+            one.update_conditional("Patient", resource.clone(), &criteria)
+                .await
+                .unwrap(),
+            ConditionalUpdateResult::Updated(updated) if updated.id() == "p1"
+        ));
+        assert!(matches!(
+            one.delete_conditional("Patient", &criteria).await.unwrap(),
+            ConditionalDeleteResult::Deleted(deleted) if deleted.id() == "p1"
+        ));
+
+        let mut several =
+            FakeTransaction::returning(vec![stored("Patient", "a"), stored("Patient", "b")]);
+        assert!(matches!(
+            several
+                .create_if_none_exist("Patient", resource.clone(), &criteria)
+                .await
+                .unwrap(),
+            ConditionalCreateResult::MultipleMatches(2)
+        ));
+        assert!(matches!(
+            several
+                .update_conditional("Patient", resource, &criteria)
+                .await
+                .unwrap(),
+            ConditionalUpdateResult::MultipleMatches(2)
+        ));
+        assert!(matches!(
+            several
+                .delete_conditional("Patient", &criteria)
+                .await
+                .unwrap(),
+            ConditionalDeleteResult::MultipleMatches(2)
+        ));
+
+        Box::new(one).commit().await.unwrap();
+        Box::new(several).rollback().await.unwrap();
+    }
+
+    /// The `412` names the interaction the entry's method describes.
+    #[test]
+    fn the_multiple_matches_error_names_each_interaction() {
+        let matches = || vec![stored("Patient", "a"), stored("Patient", "b")];
+        for (method, operation) in [
+            (BundleMethod::Put, "update"),
+            (BundleMethod::Patch, "update"),
+            (BundleMethod::Delete, "delete"),
+            (BundleMethod::Post, "create"),
+            (BundleMethod::Get, "read"),
+        ] {
+            let e = entry(method, "Patient?identifier=x", true);
+            let err = conditional_target(0, &e, "Patient", matches()).expect_err("two matches");
+            assert!(
+                matches!(
+                    &err,
+                    TransactionError::MultipleMatches { operation: op, count: 2 } if op == operation
+                ),
+                "{method:?}: {err:?}"
+            );
+        }
+    }
 }

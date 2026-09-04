@@ -386,10 +386,15 @@ fn bundle_criteria_pairs(
                 && param.values.len() == 1
                 && param.values[0].prefix == SearchPrefix::Eq;
             if !plain {
+                // `eq` is the implicit prefix: spelling it out would echo the
+                // criterion back in a form the client never sent.
                 let values = param
                     .values
                     .iter()
-                    .map(|v| format!("{}{}", v.prefix, v.value))
+                    .map(|v| match v.prefix {
+                        SearchPrefix::Eq => v.value.clone(),
+                        prefix => format!("{prefix}{}", v.value),
+                    })
                     .collect::<Vec<_>>()
                     .join(",");
                 let name = match &param.modifier {
@@ -4119,5 +4124,147 @@ fn resolve_bundle_references(value: &mut Value, reference_map: &HashMap<String, 
             }
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{
+        ChainedParameter, CompositeSearchComponent, SearchModifier, SearchParamType,
+        SearchParameter, SearchPrefix, SearchValue,
+    };
+
+    fn plain(name: &str, value: &str) -> SearchParameter {
+        SearchParameter {
+            name: name.to_string(),
+            param_type: SearchParamType::Token,
+            values: vec![SearchValue::eq(value)],
+            ..Default::default()
+        }
+    }
+
+    /// The shapes the session-scoped matcher does understand: one `eq` value
+    /// per criterion, flattened in order.
+    #[test]
+    fn plain_criteria_flatten_to_name_value_pairs() {
+        let pairs = bundle_criteria_pairs(&[
+            plain("identifier", "http://example.org|12345"),
+            plain("family", "Nguyen"),
+        ])
+        .expect("plain criteria are evaluable");
+
+        assert_eq!(
+            pairs,
+            vec![
+                (
+                    "identifier".to_string(),
+                    "http://example.org|12345".to_string()
+                ),
+                ("family".to_string(), "Nguyen".to_string()),
+            ]
+        );
+        assert_eq!(bundle_criteria_pairs(&[]).expect("no criteria"), vec![]);
+    }
+
+    /// A modifier the matcher cannot evaluate names itself in the refusal, so
+    /// the 501 says which criterion the entry has to lose (#709, #865).
+    #[test]
+    fn a_modifier_is_refused_and_named_with_its_modifier() {
+        let mut param = plain("family", "Nguyen");
+        param.modifier = Some(SearchModifier::Exact);
+
+        assert_eq!(
+            bundle_criteria_pairs(&[param]).expect_err("a modifier is not evaluable"),
+            "family:exact=Nguyen"
+        );
+    }
+
+    /// A chain resolves through another resource, which the in-memory matcher
+    /// never loads: refusing beats silently matching nothing.
+    #[test]
+    fn a_chain_is_refused() {
+        let mut param = plain("subject", "Nguyen");
+        param.chain = vec![ChainedParameter {
+            reference_param: "subject".to_string(),
+            target_type: Some("Patient".to_string()),
+            target_param: "family".to_string(),
+        }];
+
+        assert_eq!(
+            bundle_criteria_pairs(&[param]).expect_err("a chain is not evaluable"),
+            "subject=Nguyen"
+        );
+    }
+
+    /// A comparison prefix is kept in the refusal's value, so `gt2020` reads
+    /// back as it was sent rather than as a bare `2020`.
+    #[test]
+    fn a_comparison_prefix_is_refused_and_shown() {
+        let param = SearchParameter {
+            name: "birthdate".to_string(),
+            param_type: SearchParamType::Date,
+            values: vec![SearchValue::new(SearchPrefix::Gt, "2020-01-01")],
+            ..Default::default()
+        };
+
+        assert_eq!(
+            bundle_criteria_pairs(&[param]).expect_err("a prefix is not evaluable"),
+            "birthdate=gt2020-01-01"
+        );
+    }
+
+    /// An OR-list is one criterion with several values; the matcher tests a
+    /// single value, so the whole list is refused, comma-joined as sent.
+    #[test]
+    fn an_or_list_is_refused_whole() {
+        let mut param = plain("identifier", "12345");
+        param.values.push(SearchValue::eq("67890"));
+
+        assert_eq!(
+            bundle_criteria_pairs(&[param]).expect_err("an OR-list is not evaluable"),
+            "identifier=12345,67890"
+        );
+    }
+
+    /// A composite parameter carries components rather than a plain value.
+    #[test]
+    fn a_composite_is_refused() {
+        let mut param = plain("component-code-value-quantity", "loinc|8480-6$lt60");
+        param.components = vec![CompositeSearchComponent {
+            param_type: SearchParamType::Token,
+            param_name: "component-code".to_string(),
+        }];
+
+        assert!(bundle_criteria_pairs(&[param]).is_err());
+    }
+
+    /// The first criterion the matcher cannot evaluate decides the refusal,
+    /// even when a later one could have been flattened.
+    #[test]
+    fn the_first_unevaluable_criterion_refuses_the_entry() {
+        let mut param = plain("family", "Nguyen");
+        param.modifier = Some(SearchModifier::Contains);
+
+        assert_eq!(
+            bundle_criteria_pairs(&[param, plain("identifier", "12345")])
+                .expect_err("one unevaluable criterion refuses the entry"),
+            "family:contains=Nguyen"
+        );
+    }
+
+    /// A criterion with no value at all is not a plain `name=value` either.
+    #[test]
+    fn a_valueless_criterion_is_refused() {
+        let param = SearchParameter {
+            name: "identifier".to_string(),
+            param_type: SearchParamType::Token,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            bundle_criteria_pairs(&[param]).expect_err("no value is not evaluable"),
+            "identifier="
+        );
     }
 }

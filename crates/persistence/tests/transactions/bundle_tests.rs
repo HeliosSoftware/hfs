@@ -951,8 +951,8 @@ async fn test_bundle_conditional_url_is_refused_when_search_is_offloaded() {
 #[tokio::test]
 async fn test_conditional_transaction_defaults() {
     use helios_persistence::core::{
-        ConditionalDeleteResult, ConditionalTransaction, ConditionalUpdateResult, Transaction,
-        TransactionOptions, TransactionProvider,
+        ConditionalCreateResult, ConditionalDeleteResult, ConditionalTransaction,
+        ConditionalUpdateResult, Transaction, TransactionOptions, TransactionProvider,
     };
 
     let backend = create_sqlite_backend_with_spec_params();
@@ -1006,6 +1006,38 @@ async fn test_conditional_transaction_defaults() {
         tx.find_matching("Patient", &[]).await.unwrap().is_empty(),
         "empty criteria match nothing"
     );
+
+    // `create_if_none_exist`: the third default, and the one `ifNoneExist`
+    // rides on. No match creates; the same criteria then answer the existing
+    // resource rather than creating a second one.
+    let created = tx
+        .create_if_none_exist("Patient", resource.clone(), &criteria)
+        .await
+        .unwrap();
+    let ConditionalCreateResult::Created(created) = created else {
+        panic!("no match creates: {created:?}");
+    };
+    let existing = tx
+        .create_if_none_exist("Patient", resource.clone(), &criteria)
+        .await
+        .unwrap();
+    let ConditionalCreateResult::Exists(existing) = existing else {
+        panic!("one match is answered as it stands: {existing:?}");
+    };
+    assert_eq!(existing.id(), created.id());
+
+    // A second resource carrying the same identifier makes the criteria
+    // ambiguous, which is the `412` the bundle arm renders.
+    let duplicate = tx.create("Patient", resource.clone()).await.unwrap();
+    assert!(matches!(
+        tx.create_if_none_exist("Patient", resource, &criteria)
+            .await
+            .unwrap(),
+        ConditionalCreateResult::MultipleMatches(2)
+    ));
+
+    tx.delete("Patient", created.id()).await.unwrap();
+    tx.delete("Patient", duplicate.id()).await.unwrap();
 
     Box::new(tx).commit().await.unwrap();
     assert_eq!(backend.count(&tenant, Some("Patient")).await.unwrap(), 0);

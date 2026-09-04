@@ -2055,6 +2055,34 @@ mod conditional_entries {
         assert_eq!(patient_count(&backend).await, before);
     }
 
+    /// A modifier the parameter's type does not define is refused by the
+    /// search parser; dropping it would silently widen the criteria (#865).
+    #[tokio::test]
+    async fn an_invalid_modifier_in_transaction_criteria_is_400() {
+        let (server, backend) = create_test_server().await;
+        seed_patient_with_identifier(&backend, "p1", "Nguyen").await;
+        let before = patient_count(&backend).await;
+
+        let response = post_bundle(
+            &server,
+            transaction(vec![put_entry(
+                "Patient?birthdate:contains=1980",
+                "Invalid",
+            )]),
+        )
+        .await;
+
+        response.assert_status(StatusCode::BAD_REQUEST);
+        let body: Value = response.json();
+        assert!(
+            body["issue"][0]["details"]["text"]
+                .as_str()
+                .is_some_and(|t| t.contains("invalid criteria")),
+            "{body}"
+        );
+        assert_eq!(patient_count(&backend).await, before);
+    }
+
     #[tokio::test]
     async fn if_match_on_a_transaction_conditional_entry_is_400() {
         let (server, backend) = create_test_server().await;

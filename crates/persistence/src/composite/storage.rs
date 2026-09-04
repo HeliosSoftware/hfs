@@ -2526,7 +2526,9 @@ impl GroupExportProvider for CompositeStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::{BackendKind, CapabilityProvider};
+    use crate::core::{
+        BackendKind, BundleEntryResult, BundleResult, BundleType, CapabilityProvider,
+    };
     use crate::error::{BackendError, StorageError, StorageResult};
     use crate::tenant::{TenantContext, TenantId, TenantPermissions};
     use crate::types::{
@@ -4182,5 +4184,252 @@ mod tests {
                 crate::search::SearchParameterRegistry::new(),
             ))
         }
+    }
+
+    // ── sync_bundle_results: a conditional delete's 204 (#859) ─────
+
+    /// Records the writes a secondary is asked to make, so a bundle's
+    /// fan-out can be asserted without a live search backend.
+    struct SpySecondary {
+        calls: Arc<parking_lot::Mutex<Vec<String>>>,
+    }
+
+    impl SpySecondary {
+        fn new(calls: Arc<parking_lot::Mutex<Vec<String>>>) -> Arc<Self> {
+            Arc::new(Self { calls })
+        }
+    }
+
+    #[async_trait]
+    impl ResourceStorage for SpySecondary {
+        fn backend_name(&self) -> &'static str {
+            "spy-secondary"
+        }
+
+        async fn create(
+            &self,
+            tenant: &TenantContext,
+            resource_type: &str,
+            resource: Value,
+            fhir_version: FhirVersion,
+        ) -> StorageResult<StoredResource> {
+            let id = resource
+                .get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            self.calls
+                .lock()
+                .push(format!("create {resource_type}/{id}"));
+            MockStorage
+                .create(tenant, resource_type, resource, fhir_version)
+                .await
+        }
+
+        async fn create_or_update(
+            &self,
+            tenant: &TenantContext,
+            resource_type: &str,
+            id: &str,
+            resource: Value,
+            fhir_version: FhirVersion,
+        ) -> StorageResult<(StoredResource, bool)> {
+            self.calls
+                .lock()
+                .push(format!("upsert {resource_type}/{id}"));
+            MockStorage
+                .create_or_update(tenant, resource_type, id, resource, fhir_version)
+                .await
+        }
+
+        async fn read(
+            &self,
+            tenant: &TenantContext,
+            resource_type: &str,
+            id: &str,
+        ) -> StorageResult<Option<StoredResource>> {
+            MockStorage.read(tenant, resource_type, id).await
+        }
+
+        async fn update(
+            &self,
+            tenant: &TenantContext,
+            current: &StoredResource,
+            resource: Value,
+        ) -> StorageResult<StoredResource> {
+            MockStorage.update(tenant, current, resource).await
+        }
+
+        async fn delete(
+            &self,
+            _tenant: &TenantContext,
+            resource_type: &str,
+            id: &str,
+        ) -> StorageResult<()> {
+            self.calls
+                .lock()
+                .push(format!("delete {resource_type}/{id}"));
+            Ok(())
+        }
+
+        async fn count(
+            &self,
+            _tenant: &TenantContext,
+            _resource_type: Option<&str>,
+        ) -> StorageResult<u64> {
+            Ok(0)
+        }
+    }
+
+    /// A composite whose secondary is the spy, syncing synchronously so the
+    /// calls have landed by the time `sync_bundle_results` returns.
+    fn make_composite_with_spy(spy: Arc<SpySecondary>) -> CompositeStorage {
+        let config = CompositeConfig::builder()
+            .primary("primary", BackendKind::Sqlite)
+            .search_backend("es", BackendKind::Elasticsearch)
+            .sync_mode(SyncMode::Synchronous)
+            .build()
+            .unwrap();
+        let mut backends = HashMap::new();
+        backends.insert("primary".to_string(), Arc::new(MockStorage) as DynStorage);
+        backends.insert("es".to_string(), spy as DynStorage);
+        CompositeStorage::new(config, backends).unwrap()
+    }
+
+    /// The same pair, left on the default asynchronous sync mode with no
+    /// worker started, so every fan-out fails to queue.
+    fn make_composite_with_spy_async(spy: Arc<SpySecondary>) -> CompositeStorage {
+        let config = CompositeConfig::builder()
+            .primary("primary", BackendKind::Sqlite)
+            .search_backend("es", BackendKind::Elasticsearch)
+            .build()
+            .unwrap();
+        let mut backends = HashMap::new();
+        backends.insert("primary".to_string(), Arc::new(MockStorage) as DynStorage);
+        backends.insert("es".to_string(), spy as DynStorage);
+        CompositeStorage::new(config, backends).unwrap()
+    }
+
+    fn deleted_entry(location: Option<&str>) -> BundleEntryResult {
+        BundleEntryResult {
+            status: 204,
+            location: location.map(str::to_string),
+            etag: None,
+            last_modified: None,
+            resource: None,
+            outcome: None,
+        }
+    }
+
+    /// A transactional conditional delete answers `204` with no body; the
+    /// secondaries learn what to drop from `location` alone (#859, #921).
+    #[tokio::test]
+    async fn a_bundle_delete_syncs_the_resource_named_by_location() {
+        let calls = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let composite = make_composite_with_spy(SpySecondary::new(calls.clone()));
+
+        composite
+            .sync_bundle_results(
+                &make_tenant(),
+                &BundleResult {
+                    bundle_type: BundleType::Transaction,
+                    entries: vec![deleted_entry(Some("Patient/p1/_history/2"))],
+                },
+                FhirVersion::default(),
+            )
+            .await;
+
+        assert_eq!(*calls.lock(), vec!["delete Patient/p1".to_string()]);
+    }
+
+    /// A `204` with nothing to name — an unconditional delete, or a delete
+    /// that matched nothing — leaves the secondaries alone.
+    #[tokio::test]
+    async fn a_bundle_delete_without_a_location_syncs_nothing() {
+        let calls = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let composite = make_composite_with_spy(SpySecondary::new(calls.clone()));
+
+        composite
+            .sync_bundle_results(
+                &make_tenant(),
+                &BundleResult {
+                    bundle_type: BundleType::Transaction,
+                    entries: vec![deleted_entry(None), deleted_entry(Some("Patient"))],
+                },
+                FhirVersion::default(),
+            )
+            .await;
+
+        assert!(calls.lock().is_empty(), "{:?}", calls.lock());
+    }
+
+    /// The delete arm is additional to the existing body-carrying arm, not a
+    /// replacement: a create in the same bundle still fans out.
+    #[tokio::test]
+    async fn a_bundle_delete_does_not_displace_the_writes_beside_it() {
+        let calls = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let composite = make_composite_with_spy(SpySecondary::new(calls.clone()));
+
+        composite
+            .sync_bundle_results(
+                &make_tenant(),
+                &BundleResult {
+                    bundle_type: BundleType::Transaction,
+                    entries: vec![
+                        deleted_entry(Some("Patient/p1/_history/2")),
+                        BundleEntryResult {
+                            status: 201,
+                            location: Some("Patient/p2/_history/1".to_string()),
+                            etag: None,
+                            last_modified: None,
+                            resource: Some(json!({"resourceType": "Patient", "id": "p2"})),
+                            outcome: None,
+                        },
+                    ],
+                },
+                FhirVersion::default(),
+            )
+            .await;
+
+        assert_eq!(
+            *calls.lock(),
+            vec![
+                "delete Patient/p1".to_string(),
+                "create Patient/p2".to_string()
+            ]
+        );
+    }
+
+    /// A fan-out that cannot even be queued — async sync configured, worker
+    /// never started — is logged, not propagated: the primary has already
+    /// committed the transaction, so the bundle's own result stands.
+    #[tokio::test]
+    async fn a_fan_out_failure_does_not_fail_the_bundle() {
+        let calls = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let composite = make_composite_with_spy_async(SpySecondary::new(calls.clone()));
+
+        composite
+            .sync_bundle_results(
+                &make_tenant(),
+                &BundleResult {
+                    bundle_type: BundleType::Transaction,
+                    entries: vec![deleted_entry(Some("Patient/p1/_history/2"))],
+                },
+                FhirVersion::default(),
+            )
+            .await;
+
+        assert!(
+            calls.lock().is_empty(),
+            "the event never reached the secondary: {:?}",
+            calls.lock()
+        );
+    }
+
+    /// Without a primary that can process bundles at all, the composite
+    /// cannot promise conditional resolution inside one.
+    #[test]
+    fn conditional_in_transaction_follows_the_primary() {
+        use crate::core::BundleProvider;
+        assert!(!make_composite_with_secondary().supports_conditional_in_transaction());
     }
 }
