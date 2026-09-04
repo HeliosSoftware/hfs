@@ -138,8 +138,11 @@ pub enum RestError {
         message: String,
     },
 
-    /// Resource validation failed in enforce mode (HTTP 422). Carries the
-    /// full multi-issue OperationOutcome from the validator.
+    /// A full-document validation pass rejected the request (HTTP 422).
+    /// Carries the full multi-issue OperationOutcome from whichever pass
+    /// produced it — the FHIR resource validator in enforce mode
+    /// (`crates/rest/src/validation.rs`), or the SQL-on-FHIR ViewDefinition
+    /// lint on an inline `$sql-run` subject (`helios_sof::lint`, #821).
     ValidationFailed {
         /// The OperationOutcome to return as the response body.
         outcome: serde_json::Value,

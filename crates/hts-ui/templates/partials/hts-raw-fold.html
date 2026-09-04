@@ -7,46 +7,52 @@
   Kept last in every result partial so the readable summary above stays
   visually primary.
 
-  #803 changed three things here. It is the shared `.disclosure` idiom
-  (#806) — `<details class="disclosure">` with a `.disclosure__summary` and
-  an explicit chevron — because the previous `<summary class="field__label">`
-  suppressed the native disclosure marker (a `<summary>` only draws one at
-  `display: list-item`) and set no `cursor`, leaving a control that read as
-  a section label. The payloads render through the shared highlighted JSON
-  view, falling back to the old bare `.detail__code` block when the render
-  budget is exceeded or the body is not JSON. And the request body is shown
-  at all, which the heading had been promising since it was written.
-
-  The fold sits directly in a `.panel` as the card's only child, so
-  `.panel > .disclosure` zeroes the pattern's default margin.
+  #898: The fold is the container; inside it the request URL comes first,
+  then the incremental JSON viewer (partials/hts-json-pane.html — the same
+  component as the CapabilityStatement raw card) appears twice: once for
+  the POSTed `Parameters`, once for the response. Each pane carries its own
+  Expand all / Collapse all controls. A pane that could not be planned
+  (payload missing, not JSON, or over budget) falls back to the highlighted
+  view or a plain `<pre>`.
 -#}
 {% if !view.raw.is_empty() %}
-<section class="card panel">
-  <details class="disclosure">
-    <summary class="disclosure__summary">
-      <span class="icon disclosure__chevron" aria-hidden="true">{% include "icons/chevron-down.svg" %}</span>
-      {{ chrome.i18n.t("hts-workbench-raw-response") }}
-    </summary>
+<details class="card json-fold" id="workbench-json-fold" open>
+  <summary class="card-head">
+    <h3>{{ chrome.i18n.t("hts-workbench-raw-response") }}</h3>
+    <span class="icon">{% include "icons/chevron-down.svg" %}</span>
+  </summary>
+  <div class="card__body json-fold-body">
+    {#- 1. The request URL -#}
     {% if !view.raw.request_url.is_empty() %}
-    <div class="kv-grid" style="margin:14px 0">
+    <div class="kv-grid" style="margin-bottom:14px">
       <div class="detail__field detail__field--wide">
         <span>{{ chrome.i18n.t("hts-workbench-copy-url") }}</span>
         <code>{{ view.raw.request_url }}</code>
       </div>
     </div>
     {% endif %}
-    {% if !view.raw.request_body.is_empty() %}
+    {#- 2. The POSTed Parameters -#}
+    {% if !view.raw.request_pane.is_empty() %}
+    {% let pane = view.raw.request_pane.clone() %}
+    {% let pane_label = chrome.i18n.t("hts-workbench-request-body") %}
+    {% include "partials/hts-json-pane.html" %}
+    {% else if !view.raw.request_body.is_empty() %}
     <div class="detail__field detail__field--wide" style="margin-bottom:14px">
       <span>{{ chrome.i18n.t("hts-workbench-request-body") }}</span>
       {% if !view.raw.request_json.is_empty() %}{{ view.raw.request_json|safe }}{% else %}<pre class="detail__code" tabindex="0">{{ view.raw.request_body }}</pre>{% endif %}
     </div>
     {% endif %}
-    {% if !view.raw.response_body.is_empty() %}
+    {#- 3. The response body -#}
+    {% if !view.raw.response_pane.is_empty() %}
+    {% let pane = view.raw.response_pane.clone() %}
+    {% let pane_label = chrome.i18n.t("hts-workbench-response-body") %}
+    {% include "partials/hts-json-pane.html" %}
+    {% else if !view.raw.response_body.is_empty() %}
     <div class="detail__field detail__field--wide">
       <span>{{ chrome.i18n.t("hts-workbench-response-body") }}</span>
       {% if !view.raw.response_json.is_empty() %}{{ view.raw.response_json|safe }}{% else %}<pre class="detail__code" tabindex="0">{{ view.raw.response_body }}</pre>{% endif %}
     </div>
     {% endif %}
-  </details>
-</section>
+  </div>
+</details>
 {% endif %}

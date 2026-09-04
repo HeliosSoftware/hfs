@@ -47,11 +47,25 @@ const BUNDLED_PACKAGES = [
 
 const NOT_DECLARED = 'not declared in package metadata — to be confirmed before adoption';
 
+/**
+ * License string to use for a package whose own `package.json` has no
+ * `license` field, keyed by package name. `lezer-fhirpath` declares its MIT
+ * license only in its published README (see `../README.md` § "What's
+ * bundled" for the citation); reaching into a tarball's README at build time
+ * isn't worth the added parsing surface for one package, so the resolved
+ * license is recorded here instead and used only as a fallback — a package
+ * that later adds a proper `license` field keeps taking precedence over its
+ * entry here.
+ */
+const LICENSE_OVERRIDES = {
+  'lezer-fhirpath': 'MIT (declared in the package README, not in package.json)',
+};
+
 /** `{ package: version }`, read from each package's own `package.json`. */
 const packageInfo = Object.fromEntries(
   BUNDLED_PACKAGES.map((name) => {
     const pkg = readPackageJson(name);
-    return [name, { version: pkg.version, license: pkg.license ?? NOT_DECLARED }];
+    return [name, { version: pkg.version, license: pkg.license ?? LICENSE_OVERRIDES[name] ?? NOT_DECLARED }];
   }),
 );
 
@@ -133,8 +147,9 @@ const licenseBanner = [
   ' *   OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN',
   ' *   THE SOFTWARE.',
   ' *',
-  ` *   lezer-fhirpath's package.json declares no \`license\` field (${NOT_DECLARED}).`,
-  ' *   No LICENSE file ships in its published tarball either.',
+  ' *   lezer-fhirpath is MIT-licensed too, declared in its published README',
+  ' *   rather than a `license` field or a `LICENSE` file — see ../README.md,',
+  ' *   section "What’s bundled", for the exact citation.',
   ' */',
 ].join('\n');
 

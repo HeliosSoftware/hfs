@@ -1,22 +1,65 @@
 {% extends "layouts/base.html" %}
+{% import "partials/combobox.html" as combobox %}
+{% import "partials/sql_parameter_fields.html" as param_fields %}
 
 {#
-  SQL Export builder (#833, #649): pick stored subjects, submit one
-  $sql-export job. The kick-off redirects to the Active SQL Exports list
-  (/ui/sql/export), which is the feedback — this page holds no job state of
-  its own. Submission is a plain form, so it works without JavaScript. The
-  restyle of this form is #834.
+  SQL Export builder (#833, #834, #836, #837): pick stored subjects from a
+  single filterable table, narrow the job with the optional "Narrow it down"
+  card (patients/groups/since), pick an output format, and — under
+  "Advanced" — a tracking id and the CSV header switch, then submit. In Bulk
+  Export's own visual language (page-head--back-link, bulk-export-form,
+  form-legend, choice-grid, form-actions, card/card-head, field-row,
+  combobox).
+
+  Everything on this page works without JavaScript: every row and every
+  checkbox render plain, the Patients/Groups fields fall back to a plain
+  textarea, "Advanced" is a native `<details>` disclosure, and the kick-off
+  is a normal form post. The table's type switch, filter box, and header
+  select-all render `hidden` here — `sql-export-form.js` (#834) reveals them
+  once it loads, and stays inert otherwise. That script's one hard rule:
+  hiding a row must never uncheck it — a filtered-out selection still
+  submits, and the "n of m selected" hint below always counts every checked
+  box, regardless of what the filter currently shows. `combobox.js` is the
+  same generic enhancement Bulk Export loads; page-specific browser behavior
+  for #836's own fields (hiding the CSV header switch for non-CSV formats,
+  enabling the Since custom instant only for "custom") lands separately.
+
+  #837's values row: every SQL Query subject that declares
+  `Library.parameter[use=in]` entries carries an `n parameter(s)` chip next
+  to its name, checked or not, and — right under its own `<tr>` — a
+  `.row--params` row holding one field per declared parameter (the shared
+  `sql_parameter_fields.html` partial). This markup always renders every
+  values row open (no `hidden` here) — the no-JavaScript case this page must
+  guarantee — alongside a `.row-toggle` chevron and a `.param-summary` span
+  in the Subject cell, both server-rendered `hidden`: `sql-export-form.js`
+  reveals the chevron only for a checked query, hides an unchecked one's
+  values row, and folds a checked one into `.param-summary`'s `:name = value`
+  chips on demand. A row whose resubmission left a field in error carries
+  `data-open` (`SubjectRow::open`), the script's signal to keep it expanded
+  and focus that field regardless of whatever fold state it would otherwise
+  start in. The one thing this page enforces itself, with no script needed,
+  is that a field only renders `required` when its row's checkbox is
+  *checked in this render* (`SubjectRow::checked`, computed in
+  `subject_rows`) — an unmarked query's own fields never carry `required`,
+  so the browser's native validation can never block a submit on a query
+  nobody selected.
 #}
 
-{% block title %}{{ i18n.t("sql-export-title") }} — {{ i18n.t("app-title") }}{% endblock %}
+{% block title %}{{ i18n.t("sql-export-new") }} — {{ i18n.t("app-title") }}{% endblock %}
 
 {% block breadcrumb %}{% endblock %}
 
 {% block content %}
-<section class="page-head">
-  <h1 class="page-head__title">{{ i18n.t("sql-export-title") }}</h1>
-  <p class="page-head__lede">{{ i18n.t("sql-export-lede") }}</p>
-</section>
+<header class="page-head page-head--back-link">
+  <a class="back-link" href="/ui/sql/export">
+    <span aria-hidden="true">{% include "icons/chevron-left.svg" %}</span>
+    <span>{{ i18n.t("sql-export-active-title") }}</span>
+  </a>
+  <div class="page-head__copy">
+    <h1 class="page-head__title">{{ i18n.t("sql-export-new") }}</h1>
+    <p class="page-head__lede">{{ i18n.t("sql-export-lede") }}</p>
+  </div>
+</header>
 
 {% if let Some(message) = degraded %}
 <p class="notice notice--warn">{{ i18n.t("lib-degraded") }} {{ message }}</p>
@@ -25,35 +68,261 @@
 <p class="notice notice--warn">{{ i18n.t("export-start-failed") }} {{ error }}</p>
 {% endif %}
 
-<section class="card">
-  <div class="card-head">
-    <h3>{{ i18n.t("export-new-heading") }}</h3>
-  </div>
-  {% if subjects.is_empty() %}
-  <div class="card__body"><p class="page-head__lede">{{ i18n.t("export-no-subjects") }}</p></div>
-  {% else %}
-  <form method="post" action="/ui/sql/export" class="card__body detail-stack">
-    {% for s in subjects %}
-    <div class="detail__field">
-      <span><label><input type="checkbox" name="subject" value="{{ s.reference }}"> {{ s.name }}</label></span>
-      <div><span class="tag">{{ s.kind_label }}</span></div>
-    </div>
-    {% endfor %}
-    <div class="detail__field">
-      <span><label for="export-format">{{ i18n.t("export-format") }}</label></span>
-      <div>
-        <select id="export-format" name="format" class="field__input">
-          <option value="ndjson">ndjson</option>
-          <option value="csv">csv</option>
-          <option value="json">json</option>
-          <option value="parquet">parquet</option>
-        </select>
+{% if !subjects.is_empty() %}
+<form method="post" action="/ui/sql/export" class="bulk-export-form">
+  <label class="field bulk-export-form__name">
+    <span class="field__label">{{ i18n.t("bulk-export-field-name") }}</span>
+    <input class="field__input" type="text" name="name" autocomplete="off"
+           value="{{ name }}"
+           placeholder="{{ i18n.t("sql-export-name-placeholder") }}">
+  </label>
+
+  <h2 class="form-legend">{{ i18n.t("sql-export-subjects-legend") }}</h2>
+
+  <!-- The subjects table (#834): every stored subject in one list,
+       ViewDefinitions then SQL Queries then SQL Views, each group
+       name-sorted (export_subjects's own order). `data-kind`/`data-name`
+       are what sql-export-form.js filters and switches on, without ever
+       touching this markup itself.
+
+       Hiding a row must never uncheck it: the type switch and the text
+       filter are one view over the same selection, not a way to lose it.
+       A row hidden by either one keeps its checked state and still submits
+       with the form; the header select-all only acts on the rows currently
+       visible; the "n of m selected" count below always counts every
+       checked box, visible or not. -->
+  <section class="card table-card">
+    <div class="card-head">
+      <h3>
+        <span class="icon">{% include "icons/layers.svg" %}</span>
+        {{ i18n.t("sql-export-subjects-heading") }}
+        <span class="toolbar__count">{{ total }}</span>
+      </h3>
+      <div class="card-head__tools card-head__tools--subjects" hidden>
+        <div class="seg" role="group" aria-label="{{ i18n.t("sql-export-col-kind") }}">
+          <button type="button" class="seg__btn" data-subject-filter="all" aria-pressed="true">{{ i18n.t("sql-export-filter-all") }}</button>
+          <button type="button" class="seg__btn" data-subject-filter="view-definition" aria-pressed="false"><span class="icon">{% include "icons/grid.svg" %}</span> {{ i18n.t("sql-export-filter-view-definitions") }}</button>
+          <button type="button" class="seg__btn" data-subject-filter="sql-query" aria-pressed="false"><span class="icon">{% include "icons/code.svg" %}</span> {{ i18n.t("sql-export-filter-queries") }}</button>
+          <button type="button" class="seg__btn" data-subject-filter="sql-view" aria-pressed="false"><span class="icon">{% include "icons/layers-platforms.svg" %}</span> {{ i18n.t("sql-export-filter-views") }}</button>
+        </div>
+        <input class="field__input" type="search"
+               placeholder="{{ i18n.t("sql-export-filter-subjects") }}"
+               aria-label="{{ i18n.t("sql-export-filter-subjects") }}">
       </div>
     </div>
-    <div class="form-actions">
-      <button type="submit" class="btn btn--primary">{{ i18n.t("export-start") }}</button>
+    <div class="table-wrap">
+      <table class="data-table">
+        <thead>
+          <tr>
+            <th class="col-check"><input type="checkbox" aria-label="{{ i18n.t("sql-export-select-all") }}" hidden></th>
+            <th>{{ i18n.t("sql-export-col-subject") }}</th>
+            <th>{{ i18n.t("sql-export-col-kind") }}</th>
+            <th>{{ i18n.t("sql-export-col-status") }}</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for s in subjects %}
+          <tr data-kind="{{ s.kind_code }}" data-name="{{ s.name }}">
+            <td class="col-check">
+              <input type="checkbox" name="subject" value="{{ s.reference }}" aria-label="{{ s.name }}"{% if s.checked %} checked{% endif %}>
+            </td>
+            <td>
+              {{ s.name }}
+              {% if let Some(chip) = s.param_chip %}<span class="tag tag--param">{{ chip }}</span>{% endif %}
+              {% if !s.parameters.is_empty() %}
+              <!-- #837: revealed by sql-export-form.js only for a checked
+                   query — a plain HTML submit has no fold state to toggle,
+                   so the chevron would otherwise control nothing. -->
+              <button type="button" class="btn btn--icon row-toggle" aria-expanded="true" aria-controls="{{ s.param_row_id }}" aria-label="{{ i18n.t("sql-export-toggle-values") }}" hidden>
+                <span class="icon">{% include "icons/chevron-down.svg" %}</span>
+              </button>
+              <span class="param-summary" hidden></span>
+              {% endif %}
+            </td>
+            <td><span class="tag tag--type">{{ s.kind_label }}</span></td>
+            <td>{{ s.status }}</td>
+          </tr>
+          {% if !s.parameters.is_empty() %}
+          <!-- #837 values row: always rendered visible here (the
+               no-JavaScript case) — sql-export-form.js hides it for an
+               unchecked query and folds it for a checked-but-collapsed one
+               on its first tick. One field per declared parameter, named
+               `param:{reference}:{name}` by the shared partial's own
+               `prefix` argument. `data-open` (only when `s.open`) is the
+               script's cue to keep this exact row expanded and focus its
+               first invalid field after a resubmission. -->
+          <tr class="row--params" id="{{ s.param_row_id }}" data-subject="{{ s.reference }}"{% if s.open %} data-open{% endif %}>
+            <td></td>
+            <td colspan="3">{% call param_fields::fields(s.param_prefix, &s.parameters) %}{% endcall %}</td>
+          </tr>
+          {% endif %}
+          {% endfor %}
+          <!-- Shown only once the filter/switch enhancement hides every row
+               (never on a no-JavaScript load, where nothing can hide a
+               row); the JS toggles this instead of inserting it so the
+               message stays translated by the template, not duplicated in
+               the script. -->
+          <tr class="data-table__empty" hidden><td colspan="4">{{ i18n.t("sql-export-filter-empty") }}</td></tr>
+        </tbody>
+      </table>
     </div>
-  </form>
-  {% endif %}
+    <div class="card__body">
+      <p class="field__hint" id="sql-export-subjects-count"
+         data-msg-count="{{ i18n.t_arg2("sql-export-selected-count", "selected", "{selected}".to_string(), "total", "{total}".to_string()) }}"
+         data-msg-missing-one="{{ i18n.t_arg("sql-export-values-missing-one", "count", "{count}".to_string()) }}"
+         data-msg-missing-other="{{ i18n.t_arg("sql-export-values-missing-other", "count", "{count}".to_string()) }}"
+         data-msg-param-required="{{ i18n.t("sql-export-param-required") }}"
+         data-msg-param-required-chip="{{ i18n.t("sql-export-param-required-chip") }}">{{ i18n.t_arg2("sql-export-selected-count", "selected", selected_count.to_string(), "total", total.to_string()) }}</p>
+    </div>
+  </section>
+
+  <!-- "Narrow it down" (#836): the job-wide patient/group/since filters
+       $sql-export applies across every subject — global to the job, never
+       per-subject (see helios-rest's ExportTask::ViewFilters), so this is
+       one card, not a row per subject. Optional throughout: empty leaves
+       the export unbounded. -->
+  <section class="card">
+    <div class="card-head">
+      <h3><span class="icon">{% include "icons/sliders.svg" %}</span> {{ i18n.t("sql-export-narrow-title") }}</h3>
+      <span class="card-head__meta">{{ i18n.t("sql-export-narrow-meta") }}</span>
+    </div>
+    <div class="card__body">
+      <div class="field-row">
+        {% call combobox::multi_select(
+          "sql-export-patients",
+          "patient",
+          i18n.t("sql-export-field-patients"),
+          i18n.t("sql-export-field-patients-placeholder"),
+          patients_hint,
+          i18n.t("sql-export-field-patients-fallback-placeholder"),
+          i18n.t("sql-export-field-patients-fallback-hint"),
+          "/ui/lookup/patient-options?target=sql-export-patients",
+          "",
+          i18n.t("sql-export-field-patients-id-only-hint"),
+          "",
+          "q",
+          patients_value
+        ) %}{% endcall %}
+        {% call combobox::multi_select(
+          "sql-export-groups",
+          "group",
+          i18n.t("sql-export-field-groups"),
+          i18n.t("sql-export-field-groups-placeholder"),
+          groups_hint,
+          i18n.t("sql-export-field-groups-fallback-placeholder"),
+          i18n.t("sql-export-field-groups-fallback-hint"),
+          "/ui/lookup/group-options?target=sql-export-groups",
+          "",
+          "",
+          "",
+          "q",
+          groups_value
+        ) %}{% endcall %}
+      </div>
+      <div class="field-row">
+        <label class="field">
+          <span class="field__label">{{ i18n.t("sql-export-field-since") }}</span>
+          <select class="field__input" name="since_preset">
+            <option value=""{% if since_preset.is_empty() %} selected{% endif %}>{{ i18n.t("sql-export-since-all") }}</option>
+            <option value="day"{% if since_preset == "day" %} selected{% endif %}>{{ i18n.t("sql-export-since-day") }}</option>
+            <option value="week"{% if since_preset == "week" %} selected{% endif %}>{{ i18n.t("sql-export-since-week") }}</option>
+            <option value="month"{% if since_preset == "month" %} selected{% endif %}>{{ i18n.t("sql-export-since-month") }}</option>
+            <option value="custom"{% if since_preset == "custom" %} selected{% endif %}>{{ i18n.t("sql-export-since-custom") }}</option>
+          </select>
+        </label>
+        <label class="field">
+          <span class="field__label">{{ i18n.t("sql-export-field-since-custom") }}</span>
+          <input class="field__input" type="text" name="since_custom" autocomplete="off" value="{{ since_custom }}" data-pattern="([0-9]([0-9]([0-9][1-9]|[1-9]0)|[1-9]00)|[1-9]000)-(0[1-9]|1[0-2])-(0[1-9]|[1-2][0-9]|3[0-1])T([01][0-9]|2[0-3]):[0-5][0-9]:([0-5][0-9]|60)(\.[0-9]+)?(Z|[+\-]((0[0-9]|1[0-3]):[0-5][0-9]|14:00))" placeholder="2026-08-01T00:00:00Z"{% if since_custom_error.is_some() %} autofocus aria-invalid="true" aria-describedby="sql-export-since-custom-error"{% endif %}>
+          <span id="sql-export-since-custom-error" class="field__hint field__hint--error" role="alert"{% if since_custom_error.is_none() %} hidden{% endif %}>{% match since_custom_error %}{% when Some(message) %}{{ message }}{% when None %}{{ i18n.t("sql-export-since-invalid") }}{% endmatch %}</span>
+        </label>
+      </div>
+    </div>
+  </section>
+
+  <h2 class="form-legend">{{ i18n.t("export-format") }}</h2>
+  <div class="choice-grid">
+    <label class="choice-card">
+      <span class="choice-card__title">
+        <input type="radio" name="format" value="ndjson"{% if format == "ndjson" %} checked{% endif %}>
+        {{ i18n.t("sql-export-format-ndjson") }}
+      </span>
+      <span class="choice-card__hint">{{ i18n.t("sql-export-format-ndjson-hint") }}</span>
+    </label>
+    <label class="choice-card">
+      <span class="choice-card__title">
+        <input type="radio" name="format" value="csv"{% if format == "csv" %} checked{% endif %}>
+        {{ i18n.t("sql-export-format-csv") }}
+      </span>
+      <span class="choice-card__hint">{{ i18n.t("sql-export-format-csv-hint") }}</span>
+    </label>
+    <label class="choice-card">
+      <span class="choice-card__title">
+        <input type="radio" name="format" value="json"{% if format == "json" %} checked{% endif %}>
+        {{ i18n.t("sql-export-format-json") }}
+      </span>
+      <span class="choice-card__hint">{{ i18n.t("sql-export-format-json-hint") }}</span>
+    </label>
+    <label class="choice-card">
+      <span class="choice-card__title">
+        <input type="radio" name="format" value="parquet"{% if format == "parquet" %} checked{% endif %}>
+        {{ i18n.t("sql-export-format-parquet") }}
+      </span>
+      <span class="choice-card__hint">{{ i18n.t("sql-export-format-parquet-hint") }}</span>
+    </label>
+  </div>
+
+  <!-- "Advanced" (#836): how the file itself comes out, not what data goes
+       into it — a tracking id echoed back in the completion manifest, and
+       the CSV header switch. Closed by default; reopens on re-render only
+       when one of its own fields carries something to show
+       (render_new_page's advanced_open). -->
+  <details class="card"{% if advanced_open %} open{% endif %}>
+    <summary class="card-head">
+      <h3><span class="icon">{% include "icons/chevron-down.svg" %}</span> {{ i18n.t("sql-export-advanced") }}</h3>
+      <span class="card-head__meta">{{ i18n.t("sql-export-advanced-meta") }}</span>
+    </summary>
+    <div class="card__body">
+      <label class="field">
+        <span class="field__label">{{ i18n.t("sql-export-field-tracking-id") }}</span>
+        <input class="field__input" type="text" name="client_tracking_id" autocomplete="off" value="{{ client_tracking_id }}"{% if client_tracking_id_error.is_some() %} autofocus aria-invalid="true" aria-describedby="sql-export-tracking-id-error"{% endif %}>
+        <span class="field__hint">{{ i18n.t("sql-export-field-tracking-id-hint") }}</span>
+        <span id="sql-export-tracking-id-error" class="field__hint field__hint--error" role="alert"{% if client_tracking_id_error.is_none() %} hidden{% endif %}>{% match client_tracking_id_error %}{% when Some(message) %}{{ message }}{% when None %}{{ i18n.t("sql-export-tracking-id-too-long") }}{% endmatch %}</span>
+      </label>
+      <label class="typegrid__item">
+        <input type="checkbox" name="header"{% if header_checked %} checked{% endif %}>
+        {{ i18n.t("sql-export-field-header") }}
+      </label>
+      <span class="field__hint">{{ i18n.t("sql-export-field-header-hint") }}</span>
+    </div>
+  </details>
+
+  <div class="form-actions">
+    <button type="submit" class="btn btn--primary">
+      <span class="icon">{% include "icons/export.svg" %}</span>
+      {{ i18n.t("export-start") }}
+    </button>
+  </div>
+</form>
+<script src="/ui/assets/combobox.js" defer></script>
+<script src="/ui/assets/sql-export-form.js" defer></script>
+{% else if degraded.is_none() %}
+<!-- Nothing stored, and the fetch itself did not fail: a real empty store,
+     not a masked failure — offer the two places a subject gets created. -->
+<section class="card">
+  <div class="card-head">
+    <h3>{{ i18n.t("sql-export-empty-heading") }}</h3>
+  </div>
+  <div class="card__body">
+    <p class="page-head__lede">{{ i18n.t("sql-export-empty-body") }}</p>
+    <div class="form-actions form-actions--start">
+      <a class="btn btn--primary" href="/ui/sql/view-definitions?vd=new">
+        <span class="icon">{% include "icons/plus.svg" %}</span> {{ i18n.t("vd-new-title") }}
+      </a>
+      <a class="btn" href="/ui/sql/queries?lib=new">
+        <span class="icon">{% include "icons/plus.svg" %}</span> {{ i18n.t("sql-queries-new-title") }}
+      </a>
+    </div>
+  </div>
 </section>
+{% endif %}
 {% endblock %}

@@ -13,7 +13,16 @@
 // The toggle buttons in the top bar carry `data-set-theme="light|dark"`; a
 // single delegated listener keeps behavior in one pinned asset (see
 // README.md: no inline script blobs).
+//
+// `<html class="js">` (#843): also set here, synchronously and before first
+// paint for the same reason the theme attribute is - it is the earliest
+// point any script runs. `app.css`'s `.needs-js` utility hides an element
+// until this class lands, so a page that renders a JavaScript-driven card
+// inline on its own first response (View Definitions' guided-form card, so
+// far) never shows it with no client-side loop wired to it yet.
 (function () {
+  document.documentElement.classList.add("js");
+
   var KEY = "hfs-theme";
   var SETTINGS = "/_user/settings";
 

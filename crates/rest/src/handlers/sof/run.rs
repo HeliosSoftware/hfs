@@ -45,7 +45,15 @@
 //! - `200 OK` — stream of output rows in the requested format
 //! - `400 Bad Request` — unsupported `_format`, no subject or more than one, or a parameter the subject kind does not accept
 //! - `404 Not Found` — the subject could not be resolved
-//! - `422 Unprocessable Entity` — the subject could not be compiled or executed
+//! - `422 Unprocessable Entity` — the subject could not be compiled or executed. An
+//!   inline `subjectResource` ViewDefinition is linted structurally first (#821):
+//!   any structural error responds with an `OperationOutcome` carrying **one
+//!   `issue` per diagnostic** (`severity: "error"`; `code` one of `structure`,
+//!   `required`, `invalid`; `details.coding[0]` the diagnostic's own code under
+//!   `http://heliossoftware.com/fhir/CodeSystem/view-definition-lint`;
+//!   `expression[0]` a FHIRPath-style path to the offending node) — the same
+//!   shape `sof-server`'s `$sql-run` returns. A subject the lint accepts can
+//!   still fail later (compilation or evaluation) with a single-issue `422`.
 //! - `501 Not Implemented` — `source` parameter (storage-backed server)
 
 use axum::{
@@ -63,6 +71,7 @@ use helios_sof::fhir_format::{
 use helios_sof::{
     ContentType, ExtractedRunParams, RunOptions, create_bundle_from_resources_for_version,
     extract_run_params_from_json, filter_resources_by_patient_and_group, filter_resources_by_since,
+    lint::{Severity, lint_operation_outcome, lint_view_definition},
     parse_view_definition_for_version, process_view_definition, run_view_definition_with_options,
     split_csv_refs,
 };
@@ -175,6 +184,20 @@ where
 
     let subject_ref = build_subject_ref(&query_params, &body_params, body_value.as_ref());
     let subject = resolve_subject(&state, tenant.context(), &subject_ref, "$sql-run").await?;
+
+    // #821: an inline `subjectResource` ViewDefinition is linted structurally
+    // before it reaches either execution path below — the storage-backed
+    // runner's SQL compiler (`execute_view` -> `runner.run_view`) reports at
+    // most one `processing` issue with no position, and the in-process path
+    // (`execute_view_inline`) parses the JSON through a typed struct that
+    // silently drops keys it doesn't recognize either way. This mirrors
+    // sof-server's own `$sql-run` (`helios_sof::handlers::sql_run_handler`):
+    // same lint, same `OperationOutcome` shape. A subject resolved from
+    // storage via `subjectCanonical`/`subjectReference` is not re-linted here
+    // — only the inline shorthand is in scope.
+    if subject.kind == SubjectKind::ViewDefinition && subject_ref.resource.is_some() {
+        lint_inline_view_definition(&subject.resource)?;
+    }
 
     // `resource` carries inline FHIR resources to transform instead of using
     // server data, and requires a ViewDefinition subject: how inline resources
@@ -675,6 +698,26 @@ fn parse_content_type(format: &str, include_header: bool) -> Option<ContentType>
         | "application/vnd.apache.parquet" => Some(ContentType::Parquet),
         "arrow" | "application/vnd.apache.arrow.stream" => Some(ContentType::ArrowIpc),
         _ => None,
+    }
+}
+
+/// Runs `helios_sof::lint` (#821) against an inline ViewDefinition subject
+/// and, if it reports any error-severity diagnostic, rejects the request
+/// with `422 Unprocessable Entity` and one `OperationOutcome.issue` per
+/// diagnostic — identical in shape to sof-server's own `$sql-run` `422`
+/// (`helios_sof::lint::lint_operation_outcome`). Warnings never block the
+/// request.
+fn lint_inline_view_definition(view_json: &Value) -> Result<(), RestError> {
+    let diagnostics = lint_view_definition(view_json);
+    let has_errors = diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.severity == Severity::Error);
+    if has_errors {
+        Err(RestError::ValidationFailed {
+            outcome: lint_operation_outcome(&diagnostics),
+        })
+    } else {
+        Ok(())
     }
 }
 

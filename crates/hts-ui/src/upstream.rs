@@ -4786,10 +4786,24 @@ pub struct ConceptIdentity {
     pub designations: Vec<LookupDesignation>,
     pub used_supplements: Vec<String>,
     pub raw_body: String,
+    /// The `raw_body` rendered into the shared highlighted JSON view, or empty
+    /// when the payload exceeded the budget and the partial should fall back to
+    /// a `<pre>`. Filled by [`ConceptIdentity::highlight`] at the response
+    /// funnel, because the viewer's fold buttons carry a translated label and
+    /// the upstream layer has no business knowing the request locale.
+    pub raw_body_json: String,
     pub request_url: String,
 }
 
 impl ConceptIdentity {
+    /// Renders `raw_body` into the shared JSON view.
+    ///
+    /// Non-JSON or over-budget text leaves `raw_body_json` empty; the partial
+    /// then shows the raw string in a `<pre>`, which is what the fold did for
+    /// every payload before #897.
+    pub fn highlight(&mut self, i18n: &crate::i18n::I18n) {
+        self.raw_body_json = crate::raw_fold::highlight_json(i18n, &self.raw_body);
+    }
     /// Human label for the page heading: display falls back to name falls back
     /// to the code, so the operator always sees something legible.
     pub fn heading(&self) -> &str {
@@ -5048,10 +5062,24 @@ pub struct ConceptMappings {
     /// em-dash Origin cell and its footnote.
     pub unattributable: bool,
     pub raw_body: String,
+    /// The `raw_body` rendered into the shared highlighted JSON view, or empty
+    /// when the payload exceeded the budget and the partial should fall back to
+    /// a `<pre>`. Filled by [`ConceptMappings::highlight`] at the response
+    /// funnel.
+    pub raw_body_json: String,
     pub request_url: String,
 }
 
 impl ConceptMappings {
+    /// Renders `raw_body` into the shared JSON view.
+    ///
+    /// Non-JSON or over-budget text leaves `raw_body_json` empty; the partial
+    /// then shows the raw string in a `<pre>`, which is what the fold did for
+    /// every payload before #897.
+    pub fn highlight(&mut self, i18n: &crate::i18n::I18n) {
+        self.raw_body_json = crate::raw_fold::highlight_json(i18n, &self.raw_body);
+    }
+
     pub fn is_empty(&self) -> bool {
         self.match_count == 0
     }

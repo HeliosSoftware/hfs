@@ -2,20 +2,52 @@
 {% import "partials/rail_recent.html" as recent %}
 
 {#
-  SQL Queries / SQL Views workspace (#649): the View Definitions shape over
-  Library resources of the route's kind. The SQL pane edits the decoded
-  application/sql attachment; the JSON fold edits the rest of the Library.
-  Above the list, a server-rendered "Recently used" group (#754/#755)
-  restores the last-picked library on arrival and remembers up to
-  `max_recent` more, with a `{id, name, meta}` snapshot so a recent still
-  renders when the search box filters it out — the page key (`rail_page`) and
-  heading (`all_heading_key`) come from the route's `LibraryKind`, never
-  hardcoded here, so SQL Queries and SQL Views never share or contaminate
-  each other's record. Save/Duplicate are one plain form; Run is a plain
-  link; Delete rides conformance-crud.js. The SQL pane's textarea gets a
-  CodeMirror 6 editor with SQL highlighting (#838) when JS and the vendored
-  bundle are available; the JSON pane is a plain textarea (#840). Everything
-  works without JavaScript.
+  SQL Queries / SQL Views workspace (#649): the editor-first layout (#839)
+  over Library resources of the route's kind — a title row with the type's
+  icon and status/type chips, a Details section (#840), a SQL card with its
+  CodeMirror pane, and a Results/Preview card that runs the *current* text
+  (saved or not) through $sql-run. Everything that tells the two kinds
+  apart — the icon, the chips, the rail and empty-state copy, the
+  editor/results headings, the failure notice's prefix, and Export — comes
+  from the route's own `LibraryKind` table (lib.rs), never an `if`
+  comparing `code` against a string in this template (NF5). Above the
+  list, a server-rendered "Recently used" group (#754/#755) restores the
+  last-picked library on arrival and remembers up to `max_recent` more,
+  with a `{id, name, meta}` snapshot so a recent still renders when the
+  search box filters it out — the page key (`rail_page`) and heading
+  (`all_heading_key`) come from the route's `LibraryKind`, never hardcoded
+  here, so SQL Queries and SQL Views never share or contaminate each
+  other's record.
+
+  Details (#840): a JSON editor (CodeMirror 6, `sql-library-details.js`)
+  beside the guided form the Resource Editor and View Definitions already
+  share (`editor::build_form_pane`, `crate::render_lib_details_pane`) — the
+  Library minus its `application/sql` attachment, which the SQL card below
+  owns instead (`sql_libraries::strip_sql_attachment`). The two panes sync
+  in both directions through the shared host (`editor-pair.js`, #840); the
+  guided form's own "+ Add" and mutations never touch `content`
+  (`hidden=content`, #840's engine). One Save posts both cards and the
+  server fuses them (`sql_libraries::embed_sql`) — see the SQL card's own
+  comment below for the exact merge rule. The SQL pane's textarea gets its
+  own CodeMirror editor with SQL highlighting (#838) when JS and the
+  vendored bundle are available. Save/Duplicate are one plain form; Delete
+  rides conformance-crud.js. Everything works without JavaScript — both
+  JSON and SQL textareas post together, and the guided-form card
+  (`needs-js`) stays out of the way until it does.
+
+  There is no Run button and no JSON fold: the results region below the
+  form (`partials/sql_run_results.html`, shared with `POST {base_href}/run`
+  and the identical partial on `/ui/sql/view-definitions`) loads itself on
+  arrival and refreshes 500ms after the last keystroke, via the SQL and
+  Details textareas' own `hx-*` attributes and the notice region's own
+  empty shell. With JavaScript disabled the results region simply stays
+  empty until Save, whose redirect (`?lib=<id>&saved=1`) renders the saved
+  Library's results on the server instead.
+
+  Parameters (#841, SQL Query only) and Tables (#842) are still holes in
+  this layout — the comment markers below name where each one lands; #839
+  renders nothing for either, and Details (#840) shows `parameter[]` and
+  `relatedArtifact[]` as generic guided-form rows in the meantime.
 #}
 
 {% block title %}{{ i18n.t(title_key) }} — {{ i18n.t("app-title") }}{% endblock %}
@@ -45,7 +77,7 @@
       {% endif %}{% endif %}
       <span class="icon">{% include "icons/search.svg" %}</span>
       <input type="search" name="filter" value="{{ filter }}"
-             placeholder="{{ i18n.t("lib-filter") }}" aria-label="{{ i18n.t("lib-filter") }}">
+             placeholder="{{ i18n.t(filter_placeholder_key) }}" aria-label="{{ i18n.t(filter_placeholder_key) }}">
     </form>
     {% call recent::group("lib-rail-recent", "lib-rail-list", rail_page, max_recent, i18n.t("sp-rail-recent"), recent_entries) %}{% endcall %}
     <div class="filter-rail__divider" aria-hidden="true"></div>
@@ -60,18 +92,26 @@
       </a>
       {% endfor %}
       {% if rail.is_empty() %}
-      <p class="filter-rail__heading filter-rail__heading--group">{{ i18n.t("lib-none") }}</p>
+      <p class="filter-rail__heading filter-rail__heading--group">{{ i18n.t(rail_empty_key) }}</p>
       {% endif %}
     </div>
   </aside>
 
   <div class="filter-center">
     {% if let Some(sel) = selected %}
+    {#- The title row (#839): icon + name + type/status chips on the left,
+        actions on the right. Duplicate submits the form below with its own
+        intent, so it stays inside the form via the `form` attribute;
+        nothing here is a rename control. -#}
     <section class="page-head page-head--row">
-      <h2 class="page-head__title">{% if is_new %}{{ i18n.t(new_title_key) }}{% else %}{{ sel.name }}{% endif %}</h2>
+      <h2 class="page-head__title page-head__title--kind">
+        <span class="icon" aria-hidden="true">{{ icon_svg|safe }}</span>
+        {% if is_new %}{{ i18n.t(new_title_key) }}{% else %}{{ sel.name }}{% endif %}
+        <span class="tag tag--type">{{ i18n.t(chip_key) }}</span>
+        <span class="tag tag--{{ sel.status_class }}">{{ sel.status }}</span>
+      </h2>
       <div class="page-head__actions">
         {% if !is_new %}
-        <a class="btn" href="{{ base_href }}?lib={{ sel.id }}&run=1">{{ i18n.t("vd-run") }}</a>
         <button type="submit" class="btn" form="lib-editor-form" name="action" value="duplicate">
           <span class="icon">{% include "icons/copy.svg" %}</span> {{ i18n.t("vd-duplicate") }}
         </button>
@@ -93,68 +133,95 @@
     <p class="notice notice--warn">{{ error }}</p>
     {% endif %}
 
-    <!-- One form, two panes: the SQL (decoded from the attachment) and the
-         Library JSON behind a fold. -->
-    <form method="post" action="{{ base_href }}" id="lib-editor-form" class="filter-center">
-      <input type="hidden" name="id" value="{{ sel.id }}">
+    {#- Details (#840): the Library minus its SQL attachment, edited two
+        ways at once — a JSON editor (left) and the guided form the
+        Resource Editor and View Definitions already share (right,
+        `details`, built server-side by `crate::render_lib_details_pane`
+        with `hidden=content`). Both cards grow together up to a 70vh cap
+        (`.editor__grid--stretch`, same as View Definitions' own pairing);
+        `details` carries `needs-js` so the grid collapses to the JSON card
+        alone until `sql-library-details.js` wires the pairing up. The JSON
+        textarea's `form="lib-editor-form"` attribute is what makes it
+        submit (and, via `hx-include`, live-preview) alongside the SQL
+        card's own form below even though it lives outside it in the DOM
+        — see that card's own comment for the merge rule the two sides of
+        this document follow at Save/Run. -#}
+    <h2 class="form-legend">{{ i18n.t("lib-details-heading") }}</h2>
+    {% if is_new %}
+    <p class="page-head__lede">{{ i18n.t("lib-details-new-lede") }}</p>
+    {% endif %}
+    <div class="editor__grid editor__grid--stretch" id="lib-details-grid">
       <section class="card">
         <div class="card-head">
-          <h3>{{ i18n.t("lib-sql-heading") }}</h3>
+          <h3>{{ i18n.t("lib-details-json-heading") }}</h3>
         </div>
-        <div class="card__body">
-          <textarea class="json-editor json-editor--short" name="sql" rows="6" spellcheck="false"
-                    aria-label="{{ i18n.t("lib-sql-heading") }}">{{ sel.sql }}</textarea>
+        <div class="card__body editor__doc">
+          <textarea class="json-editor" name="json" form="lib-editor-form" spellcheck="false"
+                    hx-post="{{ run_href }}"
+                    hx-trigger="input changed delay:500ms"
+                    hx-include="#lib-editor-form"
+                    hx-target="#run-notice" hx-swap="outerHTML"
+                    aria-label="{{ i18n.t("lib-details-json-heading") }}">{{ sel.json }}</textarea>
+          <p class="editor__source-hint">{{ i18n.t("lib-details-json-note") }}</p>
         </div>
       </section>
 
-      <details class="card json-fold">
-        <summary class="card-head">
-          <h3>{{ i18n.t("vd-json-heading") }}</h3>
-          <span class="icon">{% include "icons/chevron-down.svg" %}</span>
-        </summary>
-        <div class="card__body">
-          <textarea class="json-editor" name="json" rows="14" spellcheck="false"
-                    aria-label="{{ i18n.t("vd-json-heading") }}">{{ sel.json }}</textarea>
-        </div>
-      </details>
+      {% if let Some(pane) = details %}
+      {{ pane.render()?|safe }}
+      {% endif %}
+    </div>
 
-      <div class="form-actions">
-        <button type="submit" class="btn btn--primary" name="action" value="save">{{ i18n.t("vd-save") }}</button>
-      </div>
-    </form>
-
-    {% if let Some(error) = run_error %}
-    <p class="notice notice--warn">{{ i18n.t("vd-run-failed") }} {{ error }}</p>
-    {% endif %}
-    {% if let Some(table) = results %}
-    <section class="card table-card">
+    {#- The SQL card (#839): the only other card in this layout, always
+        open. Save/Run fuse this pane into Details on the server
+        (`sql_libraries::embed_sql`, #840): it replaces the first
+        `content[]` attachment whose `contentType` is `application/sql`, or
+        appends one when Details carries none — so a SQL attachment typed
+        by hand into the Details JSON card is always overwritten by this
+        one, never the reverse. The textarea carries the same live-preview
+        wiring the View Definitions editor uses (#752): htmx reposts it
+        500ms after the last change, targeting the notice region below. -#}
+    <section class="card">
       <div class="card-head">
-        <h3>{{ i18n.t("vd-results-heading") }}</h3>
+        <h3>{{ i18n.t(editor_heading_key) }}</h3>
+        <div class="card-head__tools">
+          <p class="editor-legend">
+            <span class="editor-legend__live">{{ i18n.t("lib-run-hint") }}</span>
+          </p>
+        </div>
       </div>
-      <div class="table-wrap">
-        <table class="data-table">
-          <thead>
-            <tr>{% for c in table.columns %}<th>{{ c }}</th>{% endfor %}</tr>
-          </thead>
-          <tbody>
-            {% for row in table.rows %}
-            <tr>{% for cell in row %}<td>{{ cell }}</td>{% endfor %}</tr>
-            {% endfor %}
-            {% if table.rows.is_empty() %}
-            <tr class="data-table__empty"><td colspan="{{ table.columns.len() }}">{{ i18n.t("vd-results-empty") }}</td></tr>
-            {% endif %}
-          </tbody>
-        </table>
-      </div>
+      <form method="post" action="{{ base_href }}" id="lib-editor-form" class="card__body">
+        <input type="hidden" name="id" value="{{ sel.id }}">
+        <textarea class="json-editor" name="sql" spellcheck="false"
+                  hx-post="{{ run_href }}"
+                  hx-trigger="input changed delay:500ms"
+                  hx-target="#run-notice" hx-swap="outerHTML"
+                  aria-label="{{ i18n.t(editor_heading_key) }}">{{ sel.sql }}</textarea>
+        <div class="form-actions">
+          <button type="submit" class="btn btn--primary" name="action" value="save">{{ i18n.t("vd-save") }}</button>
+        </div>
+      </form>
     </section>
-    {% endif %}
+
+    {#- Parameters (#841, SQL Query only): #839 renders nothing here for
+        either kind — #841 decides how, and whether, this hueco shows on
+        SQL Query. -#}
+    {#- Tables (#842): the dependency/table lint surface lands here. -#}
+
+    {#- The $sql-run preview region (#752, generalized to Library-backed
+        pages in #839): always renders `#run-notice`, and `#run-results`
+        once the server has something to show — either `?…&saved=1`'s
+        server-side run, or, still empty here, the client-driven live
+        preview the notice's own load trigger kicks off. Rendered once in
+        partials/sql_run_results.html and shared, with View Definitions,
+        verbatim with this kind's own `/run` fragment endpoint. -#}
+    {{ run_results.render()?|safe }}
     {% else %}
     <section class="card">
       <div class="card-head">
-        <h3>{{ i18n.t("lib-none") }}</h3>
+        <h3>{{ i18n.t(empty_title_key) }}</h3>
       </div>
       <div class="card__body">
-        <p class="page-head__lede">{{ i18n.t("lib-empty-lede") }}</p>
+        <p class="page-head__lede">{{ i18n.t(empty_lede_key) }}</p>
         <a class="btn btn--primary" href="{{ base_href }}?lib=new">
           <span class="icon">{% include "icons/plus.svg" %}</span> {{ i18n.t("vd-new") }}
         </a>
@@ -166,13 +233,21 @@
 
 <script src="/ui/assets/resource-filter.js" defer></script>
 <script src="/ui/assets/conformance-crud.js" defer></script>
-<!-- The SQL pane editor (#838): the vendored CodeMirror 6 bundle must
-     load before the shared mount helper, which must load before this
-     page's own editor script - each reads globals (window.HfsCodeMirror,
-     window.HfsCodeEditor) at the top of its IIFE. Loaded on both
-     /ui/sql/queries and /ui/sql/views, since this one template serves both
-     routes; no other page mounts this editor. -->
+<!-- The two CodeMirror editors this page mounts — the Details JSON pane
+     (#840) and the SQL pane (#838) — and the Details guided-form pairing
+     (#840, shared with View Definitions) all read globals the previous
+     script in this list defines, so the order below is load-bearing: the
+     vendored CodeMirror 6 bundle before its shared mount helper, before
+     the guided form's shared loop, before the shared editor/form pairing,
+     before either page-specific editor script. editor-form.js and
+     editor-pair.js are loaded here, not from base.html, the same as on
+     View Definitions — nothing outside this page drives the Details
+     pairing through them yet. Loaded on both /ui/sql/queries and
+     /ui/sql/views, since this one template serves both routes. -->
 <script src="/ui/assets/vendor/codemirror.bundle.js" defer></script>
 <script src="/ui/assets/code-editor.js" defer></script>
+<script src="/ui/assets/editor-form.js" defer></script>
+<script src="/ui/assets/editor-pair.js" defer></script>
 <script src="/ui/assets/sql-editor.js" defer></script>
+<script src="/ui/assets/sql-library-details.js" defer></script>
 {% endblock %}

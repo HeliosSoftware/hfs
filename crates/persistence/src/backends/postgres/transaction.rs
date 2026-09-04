@@ -56,6 +56,9 @@ pub struct PostgresTransaction {
     search_extractor: Arc<SearchParameterExtractor>,
     /// When true, search indexing is offloaded to a secondary backend.
     search_offloaded: bool,
+    /// Bulk fast-load (#903): skip search-index writes; stale rows of updated
+    /// resources are still deleted so a deferred index never lies.
+    defer_search_indexing: bool,
     /// The `search_index` layout, so writes in this transaction take the same
     /// composite shape the read path will look for.
     index_layout: super::schema::IndexLayout,
@@ -129,15 +132,23 @@ impl std::fmt::Debug for PostgresTransaction {
 
 impl PostgresTransaction {
     /// Create a new transaction.
+    ///
+    /// The extractor, the offload flag and the index layout are read off
+    /// `backend` rather than passed alongside it: the transaction holds the
+    /// backend for its conditional-URL search (#859), so taking them as
+    /// separate arguments would let a caller hand over settings that disagree
+    /// with the backend the transaction actually writes through.
     async fn new(
         client: Client,
         tenant: TenantContext,
         backend: PostgresBackend,
-        search_extractor: Arc<SearchParameterExtractor>,
-        search_offloaded: bool,
+        defer_search_indexing: bool,
         fhir_version: FhirVersion,
-        index_layout: super::schema::IndexLayout,
     ) -> StorageResult<Self> {
+        let search_extractor = Arc::new(backend.tenant_extractor(tenant.tenant_id().as_str()));
+        let search_offloaded = backend.is_search_offloaded();
+        let index_layout = backend.index_layout();
+
         // Start the transaction.
         //
         // `batch_execute` and not `execute`: `execute("BEGIN", &[])` takes the
@@ -162,6 +173,7 @@ impl PostgresTransaction {
             backend,
             search_extractor,
             search_offloaded,
+            defer_search_indexing,
             fhir_version,
             index_layout,
             pending: Vec::new(),
@@ -257,6 +269,12 @@ impl PostgresTransaction {
         }
 
         // Extract values using the registry-driven extractor
+        // Fast-load (#903): stale rows are gone (Replace delete above); the
+        // rebuild is deferred to the post-ingest reindex.
+        if self.defer_search_indexing {
+            return Ok(());
+        }
+
         let values = self
             .search_extractor
             .extract(resource, resource_type)
@@ -529,7 +547,7 @@ impl Transaction for PostgresTransaction {
         // extraction failure is still raised by the `create` call that caused
         // it — it is the one per-entry error on this path that is not a
         // conflict, and it must keep naming its own entry.
-        let index_rows = if self.search_offloaded {
+        let index_rows = if self.search_offloaded || self.defer_search_indexing {
             Vec::new()
         } else {
             let values = self
@@ -985,10 +1003,8 @@ impl TransactionProvider for PostgresBackend {
             client,
             tenant.clone(),
             self.clone(),
-            std::sync::Arc::new(self.tenant_extractor(tenant.tenant_id().as_str())),
-            self.is_search_offloaded(),
+            options.defer_search_indexing,
             options.fhir_version.unwrap_or(self.config().fhir_version),
-            self.index_layout(),
         )
         .await
     }

@@ -659,6 +659,7 @@ impl BulkSubmitProvider for SqliteBackend {
             tenant,
             crate::core::TransactionOptions {
                 fhir_version: Some(FhirVersion::default_enabled()),
+                defer_search_indexing: options.defer_indexing,
                 ..Default::default()
             },
         )

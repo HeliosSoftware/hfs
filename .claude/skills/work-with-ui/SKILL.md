@@ -87,17 +87,57 @@ through to the normal REST surface.
 - `assets/` — `htmx.min.js` (pinned), `app.css`, `fonts/`, `logo.png`, the
   shared `busy.js` (#679, `window.hfsBusy`), the vendored CodeMirror 6 bundle
   (`vendor/codemirror.bundle.js`, `window.HfsCodeMirror`) with its shared
-  mount helper `code-editor.js` (`window.HfsCodeEditor`, #838), and the
-  per-page scripts: `theme.js`, `editor.js`, `resources.js`,
+  mount helper `code-editor.js` (`window.HfsCodeEditor`, #838, also the
+  shared JSON token-color preset `jsonHighlight()`, #840), the shared
+  guided-form loop `editor-form.js` (`window.HfsEditorForm.attach(root,
+  host)`, #843; `host.fields` for constant extra request fields, #840), the
+  shared editor/guided-form pairing `editor-pair.js`
+  (`window.HfsEditorPair.mount({ textarea, view?, grid, fields? })`, #840,
+  extracted out of `vd-editor.js`'s original #843 implementation: two-way
+  JSON↔form sync, the validity chip, and the row↔editor cross-highlight),
+  and the per-page scripts: `theme.js`, `editor.js`, `resources.js`,
   `saved-queries.js`, `batch.js`, `history.js`, `nl-search.js`,
   `resource-filter.js`, `conformance-crud.js`, `vd-editor.js` (ViewDefinition
-  editor, `/ui/sql/view-definitions`), `sql-editor.js` (SQL pane editor,
-  `/ui/sql/queries` and `/ui/sql/views`).
+  editor, `/ui/sql/view-definitions` — JSON + injected FHIRPath language,
+  highlighting, and lint; hands its mounted `EditorView` to
+  `editor-pair.js`), `sql-editor.js` (SQL pane editor, `/ui/sql/queries` and
+  `/ui/sql/views`), and `sql-library-details.js` (Details JSON editor on
+  those same two pages — plain JSON language and highlighting, no lint;
+  hands its mounted view, `hidden: "content"` and `legend: "sql-library"`,
+  to `editor-pair.js`, #840).
 
-`theme.js` loads **without `defer`**, before first paint, to avoid a FOUC; every
-other script is `defer`. Busy/working states go through `hfsBusy` for
-fetch-driven code and `hx-disabled-elt` for htmx controls — see
-`crates/ui/README.md` § Busy states.
+`/ui/sql/queries` and `/ui/sql/views` (`pages/sql-library.html`, one
+template keyed by the route's own `LibraryKind`) each edit `Library`
+resources of their own SQL on FHIR type code (`sql-query`/`sql-view`): a
+title row, a Details section — the Details JSON editor (`sql-library-
+details.js`) beside the same guided-form card View Definitions uses,
+`content` hidden from it since the SQL card below owns that attachment —,
+the SQL card itself (`sql-editor.js`), and a `$sql-run` preview that
+follows whichever text is current. Save fuses the two cards' documents
+server-side (`sql_libraries::embed_sql`); a document whose type code names
+the other kind is rejected with a warning.
+
+  `vd-editor.js` also drives completion and quick fixes (#821), server-
+  backed like the async lint above it — the browser only locates the cursor
+  in its own syntax tree, `POST /ui/sql/view-definitions/complete` (`kind:
+  "key"` for a structural JSON node, `kind: "fhirpath"` for a partial
+  expression) answers what fits there. Ctrl-Space opens the popup manually
+  (typing opens it too); Enter accepts. Each `/lint` diagnostic's `fixes`
+  becomes a button in the hover tooltip and the bottom lint panel — **Ctrl+.**
+  applies the one fix under the cursor, or opens the panel when several
+  apply (F8/Ctrl-Shift-M reach the panel too, `lintKeymap`); every fix is one
+  undoable transaction. Saving with at least one uncorrected error (Save,
+  not Duplicate) pops a plural-correct `window.confirm`. To regenerate the
+  vendored bundle after touching `entry.js`, see `crates/ui/vendor/
+  codemirror/README.md`'s own ritual — it is never run by `cargo build` or CI.
+
+`theme.js` loads **without `defer`**, before first paint, to avoid a FOUC —
+and, since #843, is what marks `<html class="js">` for `app.css`'s `.needs-js`
+utility (a card that renders inline, server-side, on a page's own first paint
+and needs a client-side loop wired to it before it shows — View Definitions'
+guided-form card, so far). Every other script is `defer`. Busy/working states
+go through `hfsBusy` for fetch-driven code and `hx-disabled-elt` for htmx
+controls — see `crates/ui/README.md` § Busy states.
 
 ## Rules of the road
 

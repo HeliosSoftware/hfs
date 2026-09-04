@@ -17,8 +17,8 @@ fixtures (`async ({ resources, history }) => …`); `pages/api.ts` seeds resourc
 over the REST API for state-dependent tests.
 
 Most projects share one server and one user (`l2:`, the default when auth is
-disabled) across every test. The server-side rail state introduced by the
-754/755 epic — "recently used" + "last selected" per page, stored in `rails`
+disabled) across every test. The server-side rail state introduced by
+#754/#755 — "recently used" + "last selected" per page, stored in `rails`
 under `/_user/settings` — is therefore per-*user*, not per-test: without a
 reset, a selection recorded by one test would still be there for the next one
 to restore from. `pages/fixtures.ts`'s `page` fixture resets `rails` (a merge
@@ -36,8 +36,8 @@ actually depends on should ever fail it.
 
 | Path | What it covers |
 |------|----------------|
-| `tests/a11y.spec.ts` | axe-core WCAG 2.2 AA over every full page, light × dark |
-| `tests/no-cdn.spec.ts` | no off-origin requests, no page errors, no inline `<script>` — every page |
+| `tests/a11y.spec.ts` | axe-core WCAG 2.2 AA over every full page, light × dark, plus three targeted states on the ViewDefinition editor (#821): the completion popup, the lint hover tooltip, and the lint panel, each open, in both themes |
+| `tests/no-cdn.spec.ts` | no off-origin requests, no page errors, no inline `<script>` — every page, plus a whole ViewDefinition editing session (#821: an edit that fires the lint's server round trip, then a completion popup) |
 | `tests/theme.spec.ts` | FOUC guard, OS-preference precedence, PATCH merge-patch, server-roam, graceful degradation |
 | `tests/chrome.spec.ts` | the collapsible nav: toggle, aria sync, localStorage cache, `/_user/settings` roam |
 | `tests/dashboard.spec.ts` | stat cards, chart, time-window + legend link controls |
@@ -50,7 +50,25 @@ actually depends on should ever fail it.
 | `tests/nl-search.spec.ts` | NL mode toggle; translation lands a query and never runs it; refusal; example chips (stubbed `/$nl-search`) |
 | `tests/search-parameters.spec.ts` | registry table, htmx rail filter, facet narrowing, row → detail |
 | `tests/tenants.spec.ts` | add-tenant slide-over, htmx search filter, delete (skips if no tenant store) |
-| `tests/nojs/*.spec.ts` | the README promise: the UI works with JavaScript disabled (`nojs` project) |
+| `tests/sql-view-definitions.spec.ts` | View Definitions playground: rail, live `$sql-run` preview (#752); the guided-form card beside the editor (#843) — add a column from the form, edit `resource` in CodeMirror and see the row (and an invalid value's error) sync back, Ctrl+Z after a form edit, the two cards' shared internally-scrolling height, and the row↔editor cross-highlight in both directions (hover a row, click a JSON line, reveal stays inside each pane's own scroll) |
+| `tests/vd-editor-lint.spec.ts` | the ViewDefinition editor's lint UI (#821): gutter marker + underline for an unknown key, the hover tooltip's message and fix buttons, applying a fix by click, Ctrl+. (one action applies directly, several open the lint panel), a duplicate column name's `_2` fix, an extra iteration directive's remove fix leaving valid JSON, an undeclared constant underlined at exactly its own `%name` token, Ctrl+Z undoing a fix in one step, the save-with-errors confirmation (cancel/accept, never for a valid document or for Duplicate), and `?lang=es` rendering |
+| `tests/vd-editor-completion.spec.ts` | the ViewDefinition editor's completion popup (#821): structural keys inside `column[]` (offered, excluded-if-present, required marker), skeleton insertion with valid surrounding commas and the cursor left inside the value, FHIRPath elements after a dot, the ancestor `select`'s own `forEach` context, `%` for constants/environment variables, a function candidate's call insertion, no popup/request outside a completion context, Ctrl+Space opening it with nothing typed, and the required marker's `?lang=es` translation |
+| `tests/sql-libraries.spec.ts` | SQL Queries/SQL Views playgrounds (#839): rail split by kind, SQL pane decode/highlight/roundtrip, the live `$sql-run` preview, recents, and a parse error's tinted line — plus, since #840, the Details section's own `describe`: a guided-form edit lands in the JSON pane and Save persists the merge, an invalid value errors on its row without saving, Save fuses an edited SQL pane with an edited Details title into one Library, Ctrl+Z after a form edit, the two Details cards' shared internally-scrolling height, and the type-code Save gate (`sql-view` saved from SQL Queries, and the reverse) on both routes |
+| `tests/editor-pair.spec.ts` | The shared editor/guided-form host (`assets/editor-pair.js`, #840) — coverage of the pairing's own contract that is not tied to one page: the invalid-JSON chip still switches after a guided-form round trip has replaced the `.editor-form` card underneath it |
+| `tests/nojs/*.spec.ts` | the README promise: the UI works with JavaScript disabled (`nojs` project) — includes `sql-view-definitions.spec.ts`'s and `sql-libraries.spec.ts`'s own cases: the guided-form card (#843/#840) stays hidden and both editors work alone; (#821) a ViewDefinition with lint errors still saves through Save with no dialog and no `.cm-editor` on the page at all; and — for `sql-libraries.spec.ts` — editing both the Details and SQL textareas by hand and saving persists the merged Library |
+
+Pure-function browser modules (`assets/combobox.js`; `assets/editor-pair.js`'s
+`minimalChange`; `assets/vd-editor.js`'s completion/diagnostic-fix helpers
+(#821) — `skeletonForDetail`, `classifyObjectGap`, `buildKeyInsertion`,
+`codePointOffset`/`utf16OffsetForCodePoints`, `stringContentRange`,
+`escapeJsonStringContent`, `removeKeyRange`; the vendored bundle's own export
+surface and size budget) get a third, faster ring: plain Node tests under
+`unit/` (`editor-pair.test.cjs`, `vd-editor.test.cjs`,
+`codemirror-bundle.test.cjs`), run with `npm run test:unit` — no browser, no
+server. `editor-pair.js` and `vd-editor.js` are wired UMD-style
+(`module.exports` under Node; `window.HfsEditorPair` / auto-mount under a
+real `document`) specifically so this stays possible without a second copy
+of the diff algorithm or the completion helpers.
 
 ## Run it
 

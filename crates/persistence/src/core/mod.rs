@@ -135,9 +135,9 @@ pub use bulk_submit_input::{
     FileTokenProvider, RemoteFile, RemoteManifest, SubmitInputFetcher, submission_output_job_id,
 };
 pub use bulk_submit_worker::{
-    BulkSubmitJobStore, DefaultSubmitWorker, ManifestFetchParams, ManifestLease,
-    ManifestWorkerView, PollTokenTarget, SubmitClaimStrategy, SubmitFileRecord, SubmitFileRow,
-    SubmitWorkerStorage,
+    BulkSubmitJobStore, DefaultSubmitWorker, DeferredReindexHook, ManifestFetchParams,
+    ManifestLease, ManifestWorkerView, PollTokenTarget, SubmitClaimStrategy, SubmitFileRecord,
+    SubmitFileRow, SubmitWorkerStorage,
 };
 pub use bundle_conditionals::{
     CONDITIONAL_MATCH_LIMIT, ConditionalTarget, check_identity_overlap, conditional_delete_entry,

@@ -84,6 +84,13 @@ error-not-found = No se encontró el recurso solicitado.
 error-unauthorized = No está autorizado para realizar esta acción.
 error-generic = Algo salió mal. Vuelva a intentarlo.
 
+## Página genérica de "no encontrado" (#835): un 404 de página completa dentro
+## del shell, distinta de error-not-found (texto de OperationOutcome para
+## respuestas de la API).
+
+not-found-title = No encontrado
+not-found-text = Esta página no existe, o no está disponible para usted.
+
 ## Estructura del panel (Figma «Dashboard V1.1»)
 
 nav-section-work = Trabajo
@@ -104,7 +111,6 @@ nav-sql-view-definitions = Definiciones de vistas
 nav-sql-queries = Consultas SQL
 nav-sql-views = Vistas SQL
 nav-sql-export = Exportación SQL
-nav-sql-files = Archivos
 nav-capability-conformance = Capacidad y conformidad
 nav-search-parameters = Parámetros de búsqueda
 nav-subscriptions = Suscripciones
@@ -481,6 +487,10 @@ editor-must-support-badge = MS
 editor-binding-hint = Ligado a un value set — los códigos salen de él; se muestra la fuerza
 editor-legend-live = Se comprueba al escribir: estructura, cardinalidad, bindings requeridos
 editor-legend-save = Se comprueba al guardar: constraints y terminología
+vd-form-legend-live = Se comprueba al escribir: estructura, cardinalidad, bindings requeridos y sintaxis FHIRPath / reglas SQL-on-FHIR
+vd-form-invalid-chip = JSON no válido
+lib-form-legend-live = Se comprueba al escribir: estructura, cardinalidad, bindings requeridos
+lib-form-legend-save = Se comprueba al guardar: tipo de Library de SQL on FHIR y el adjunto SQL
 editor-deferred-badge = al guardar
 editor-deferred-hint = Los códigos se verifican contra el value set al guardar (y en vivo en el picker si hay servidor de terminología configurado)
 editor-must-support-hint = Must-support: se espera que los consumidores de este perfil manejen este elemento
@@ -717,6 +727,10 @@ bulk-export-since-month = Últimas 4 semanas
 bulk-export-since-custom = Personalizado
 bulk-export-field-since-custom = Instante personalizado
 bulk-export-since-invalid = Ingresa un instante FHIR válido, como 2026-08-01T00:00:00Z.
+bulk-export-field-until = Hasta
+bulk-export-field-until-hint = Límite superior opcional. RFC 3339, p. ej. 2026-08-01T00:00:00Z.
+bulk-export-window-since = Desde
+bulk-export-window-until = Hasta
 bulk-export-start = Iniciar exportación
 bulk-export-running = en curso
 bulk-export-clear = Limpiar
@@ -778,7 +792,21 @@ cap-json-path-too-deep = se alcanzó la profundidad máxima de expansión
 cap-json-pagination-label = Elementos JSON
 cap-json-page-prev = Anterior
 cap-json-page-next = Siguiente
+cap-json-collapse-all = Colapsar todo
+cap-json-expand-all = Expandir todo
+cap-json-expanding = Expandiendo el JSON visible…
+cap-json-expand-complete = Todo el JSON está expandido.
+cap-json-expand-partial = Se expandieron las páginas actuales hasta el límite seguro. Los nodos restantes permanecen colapsados.
+cap-json-limit-reached = Se alcanzó el límite de visualización del JSON. Colapsa otra rama antes de cargar más.
+cap-json-expand-error = No se pudo expandir el árbol JSON. Se conservó la vista actual; inténtalo de nuevo.
 cap-unavailable = No se pudo obtener la CapabilityStatement del servidor — la autollamada puede necesitar un token saliente cuando la autenticación está activada.
+
+## Etiquetas genéricas de desplegable JSON (#898) — usadas por las respuestas raw en HTS-UI.
+## Las claves cap-* anteriores se mantienen específicamente para CapabilityStatement.
+json-fold-loading = Cargando JSON…
+json-fold-load-error = No se pudo cargar esta sección JSON. Colapse y vuelva a abrir para reintentar.
+json-fold-open-plain = Abrir JSON plano
+json-fold-plain = JSON plano de reserva. El resaltado se carga incrementalmente cuando JavaScript está disponible.
 
 ## Stubs de la sección SQL on FHIR (#649)
 
@@ -787,17 +815,14 @@ sql-vd-title = Definiciones de vistas
 sql-vd-lede = Crea y gestiona las ViewDefinitions con las que SQL on FHIR aplana recursos.
 
 sql-queries-title = Consultas SQL
-sql-queries-lede = Ejecuta consultas SQL on FHIR contra este servidor.
+sql-queries-lede = SQL ad hoc sobre las tablas planas que producen tus view definitions. Los resultados se actualizan mientras escribes.
 
 sql-views-title = Vistas SQL
-sql-views-lede = Vistas SQL reutilizables construidas sobre ViewDefinitions.
+sql-views-lede = Vistas con nombre que otras consultas y exportaciones pueden seleccionar. Define el SQL una vez; las columnas que produce se convierten en una tabla que cualquiera puede usar.
 
 sql-export-title = Exportación SQL
-sql-export-lede = Trabajos de exportación SQL on FHIR de larga duración.
+sql-export-lede = Ejecuta ViewDefinitions, consultas SQL y vistas SQL almacenadas como un trabajo $sql-export de larga duración y descarga los archivos de salida.
 sql-export-active-title = Exportaciones SQL
-
-sql-files-title = Archivos
-sql-files-lede = Manifiestos y archivos de salida producidos por las exportaciones SQL.
 
 ## Espacio de definiciones de vistas (#649)
 
@@ -811,7 +836,6 @@ vd-none = Aún no hay definiciones de vistas.
 vd-empty-lede = Crea tu primera ViewDefinition con «Crear nueva».
 vd-degraded = No se pudo cargar la lista de definiciones de vistas.
 vd-saved = Guardado.
-vd-run = Ejecutar
 vd-run-failed = No se pudo ejecutar la vista.
 vd-save = Guardar
 vd-duplicate = Duplicar
@@ -828,28 +852,150 @@ vd-pagination-label = Páginas de definiciones de vistas
 vd-page-prev = Anterior
 vd-page-next = Siguiente
 
-## Espacios de consultas y vistas SQL (#649)
+## Mensajes y arreglos del lint de ViewDefinition (#821): localización propia
+## del handler `/lint` para `helios_sof::lint::Diagnostic` — code + args,
+## nunca `Diagnostic.message` (siempre en inglés, sin localizar). Las claves
+## `vd-lint-*` llevan el nombre kebab-case de `DiagnosticCode`; el diagnóstico
+## `missing-required`/`wrong-type` de la elección value[x] de una constante
+## lleva `$variant` ("missing"/"multiple") en vez de los `$key`/`$expected`+
+## `$found` genéricos, seleccionado abajo. Cada clave `vd-fix-*` etiqueta un
+## `Fix`, mostrado junto al diagnóstico como una acción de un clic.
+vd-lint-not-a-view-definition = No es un ViewDefinition: se encontró { $found }
+vd-lint-unknown-key = Clave desconocida "{ $key }"
+vd-lint-missing-required = { $variant ->
+    [missing] Una constante debe establecer exactamente un valor
+   *[other] Falta la clave obligatoria "{ $key }"
+}
+vd-lint-wrong-type = { $variant ->
+    [multiple] Una constante solo puede establecer un valor
+   *[other] Se esperaba { $expected }, se encontró { $found }
+}
+vd-lint-empty-required = La clave obligatoria "{ $key }" no puede estar vacía
+vd-lint-duplicate-column-name = Nombre de columna duplicado "{ $name }"
+vd-lint-multiple-iteration-directives = Un select solo puede establecer una de forEach, forEachOrNull, repeat (se encontraron { $keys })
+vd-lint-select-without-output = Un select debe tener al menos uno de column, select o unionAll
+vd-lint-fhirpath-syntax = Sintaxis FHIRPath: { $detail }
+vd-lint-undeclared-constant = Constante no declarada "%{ $name }"
+vd-fix-rename-key = Renombrar a "{ $to }"
+vd-fix-remove-key = Quitar "{ $key }"
+vd-fix-set-string = Establecer en "{ $value }"
+
+## Completado de ViewDefinition (#821): `vd-editor.js` lo lee una vez desde
+## `data-msg-required` de `#vd-editor-grid` — el marcador que lleva el
+## elemento de completado de una clave estructural obligatoria, añadido a su
+## texto `detail` en el cliente (nunca lo envía `/complete`, que no traduce).
+vd-complete-required = obligatorio
+
+## Aviso de guardado con errores del editor de ViewDefinition (#821):
+## `vd-editor.js` elige cuál de estos renderiza `data-msg-save-errors-one`/
+## `-other` de `#vd-editor-grid` y sustituye el marcador literal `{count}`
+## (el valor que se le dio a `$count`) por el número real — el texto de
+## `window.confirm` no tiene traducción propia, así que esta es la única
+## forma de traducirlo. Se muestra solo al enviar como Save (no Duplicate)
+## mientras la última pasada de lint completada aún tenga algún error.
+vd-save-with-errors-one = Esta definición de vista aún tiene { $count } error. ¿Guardar de todas formas?
+vd-save-with-errors-other = Esta definición de vista aún tiene { $count } errores. ¿Guardar de todas formas?
+
+## Partial de resultados de $sql-run (#752): compartido por los playgrounds
+## de View Definitions, SQL Queries y SQL Views (#839).
+
+sql-run-export = Exportar como archivos
+
+## Espacios de consultas y vistas SQL (#649, layout editor-first #839)
 
 sql-queries-new-title = Nueva consulta SQL
 sql-views-new-title = Nueva vista SQL
 sql-queries-rail-all-heading = Todas las consultas SQL
 sql-views-rail-all-heading = Todas las vistas SQL
-lib-filter = Filtrar bibliotecas
-lib-none = Aún no hay bibliotecas.
-lib-empty-lede = Crea tu primera biblioteca con «Crear nueva».
+sql-queries-chip = Consulta SQL
+sql-views-chip = Vista SQL
+sql-queries-filter = Filtrar consultas
+sql-views-filter = Filtrar vistas
+sql-queries-rail-empty = Aún no hay consultas.
+sql-views-rail-empty = Aún no hay vistas.
+sql-queries-empty-title = Aún no hay consultas SQL
+sql-views-empty-title = Aún no hay vistas SQL
+sql-queries-empty-lede = Escribe tu primera consulta con «Crear nueva». Se ejecuta contra las tablas planas de cada view definition activa.
+sql-views-empty-lede = Define tu primera vista con «Crear nueva». Sus columnas se convierten en una tabla que otras consultas y exportaciones pueden seleccionar.
+sql-queries-editor-heading = SQL
+sql-views-editor-heading = Definición de vista (SQL)
+sql-queries-results-heading = Resultados
+sql-views-results-heading = Vista previa
+sql-queries-run-failed = No se pudo ejecutar la consulta.
+sql-views-run-failed = No se pudo ejecutar la vista.
 lib-degraded = No se pudo cargar la lista de bibliotecas.
-lib-sql-heading = SQL
+lib-run-hint = Se ejecuta mientras escribes: los resultados siguen el SQL actual, esté guardado o no
 lib-delete-confirm = ¿Eliminar «{ $name }»? Esta acción no se puede deshacer.
 lib-delete-failed = No se pudo eliminar la biblioteca.
+lib-details-heading = Detalles
+lib-details-json-heading = Library (JSON)
+lib-details-json-note = El adjunto SQL se edita en la tarjeta SQL de abajo y no forma parte de esta vista.
+lib-details-new-lede = Cámbiale el nombre y haz que relatedArtifact[0] apunte a una ViewDefinition que exista.
+lib-save-wrong-kind = El tipo de Library de SQL on FHIR debe ser «{ $code }» para guardarla aquí.
 
-## Páginas de exportación SQL y archivos (#649, #833)
+## Páginas de exportación SQL (#649, #833)
 
 export-start-failed = No se pudo iniciar la exportación.
-export-job-id = Id del trabajo
-export-new-heading = Nueva exportación
-export-no-subjects = Nada que exportar todavía: crea primero una ViewDefinition.
 export-format = Formato de salida
 export-start = Iniciar exportación
+
+## Formulario de creación del generador de exportaciones SQL (#834)
+
+sql-export-name-placeholder = Archivos planos mensuales de pacientes
+sql-export-subjects-legend = ¿Qué vas a exportar?
+sql-export-subjects-heading = Elementos
+sql-export-filter-all = Todos
+sql-export-filter-view-definitions = ViewDefinitions
+sql-export-filter-queries = Consultas
+sql-export-filter-views = Vistas
+sql-export-filter-subjects = Filtrar elementos
+sql-export-select-all = Seleccionar todo
+sql-export-col-subject = Elemento
+sql-export-col-kind = Tipo
+sql-export-col-status = Estado
+sql-export-selected-count = { $selected } de { $total } seleccionados
+sql-export-format-ndjson-hint = Un objeto JSON por fila. Se transmite bien hacia otras canalizaciones.
+sql-export-format-csv-hint = Fila de encabezado más una línea por fila. Se abre en cualquier hoja de cálculo.
+sql-export-format-json-hint = Un único arreglo JSON por salida. El más fácil de inspeccionar a mano.
+sql-export-format-parquet-hint = Columnar y tipado. El mejor para motores de análisis.
+sql-export-empty-heading = Aún no hay nada que exportar
+sql-export-empty-body = Cada ViewDefinition, consulta SQL y vista SQL almacenada aparece aquí como un elemento exportable. Crea uno primero.
+sql-export-filter-empty = Ningún elemento coincide
+
+## Generador de exportaciones SQL — "Acotar" y "Avanzado" (#836)
+
+sql-export-narrow-title = Acotar
+sql-export-narrow-meta = opcional — déjalo vacío para exportar todo
+sql-export-field-patients = Pacientes
+sql-export-field-patients-placeholder = Buscar pacientes
+sql-export-field-patients-hint = Busca por nombre, apellido o identificador exacto. Déjalo vacío para exportar todos los pacientes.
+sql-export-field-patients-fallback-placeholder = IDs FHIR de pacientes
+sql-export-field-patients-fallback-hint = Ingresa IDs lógicos FHIR exactos separados por comas o saltos de línea. Déjalo vacío para exportar todos los pacientes.
+sql-export-field-patients-id-only-hint = Busca por ID FHIR exacto. Déjalo vacío para exportar todos los pacientes.
+sql-export-field-groups = Grupos
+sql-export-field-groups-placeholder = Buscar grupos
+sql-export-field-groups-hint-r4 = Busca por ID FHIR exacto o identificador.
+sql-export-field-groups-hint-r5 = Busca por nombre, ID FHIR exacto o identificador.
+sql-export-field-groups-fallback-placeholder = IDs FHIR de grupos
+sql-export-field-groups-fallback-hint = Ingresa IDs FHIR o identificadores exactos separados por comas o saltos de línea.
+sql-export-group-options-empty = No se encontraron grupos coincidentes.
+sql-export-field-since = Desde
+sql-export-since-all = Todo el tiempo
+sql-export-since-day = Último día
+sql-export-since-week = Últimos 7 días
+sql-export-since-month = Últimas 4 semanas
+sql-export-since-custom = Personalizado
+sql-export-field-since-custom = Instante personalizado
+sql-export-since-invalid = Ingresa un instante FHIR válido, como 2026-08-01T00:00:00Z.
+sql-export-patient-invalid = Ingresa solo IDs lógicos de Patient válidos, separados por comas o saltos de línea.
+sql-export-group-invalid = Ingresa solo IDs lógicos de Group válidos, separados por comas o saltos de línea.
+sql-export-advanced = Avanzado
+sql-export-advanced-meta = id de seguimiento · encabezado CSV
+sql-export-field-tracking-id = Id de seguimiento
+sql-export-field-tracking-id-hint = Se repite en el manifiesto de finalización como clientTrackingId.
+sql-export-tracking-id-too-long = El id de seguimiento debe tener 200 caracteres o menos.
+sql-export-field-header = Incluir una fila de encabezado
+sql-export-field-header-hint = (solo CSV — se ignora para otros formatos)
 
 ## Lista de exportaciones SQL activas y tarjetas de trabajo (#833)
 
@@ -903,14 +1049,46 @@ sql-export-files-count = { $count ->
     [one] { $count } archivo
    *[other] { $count } archivos
 }
-files-job-heading = Trabajo de exportación
-files-load = Cargar manifiesto
-files-error = No se pudo cargar el manifiesto.
-files-outputs-heading = Salidas
-files-col-output = Salida
-files-col-downloads = Descargas
-files-shard = Archivo { $n }
-files-empty = El trabajo no produjo archivos de salida.
+
+## Página de detalle del trabajo (#835)
+
+sql-export-detail-finished = Finalizada
+sql-export-detail-failed = Fallida
+sql-export-detail-cancelled = Cancelada
+sql-export-detail-started = Iniciada
+sql-export-detail-after = luego de
+sql-export-failure-subject = La exportación se detuvo en el elemento
+sql-export-failure-generic = La exportación falló:
+sql-export-detail-job-heading = Trabajo
+sql-export-detail-field-job-id = Id del trabajo
+sql-export-detail-field-format = Formato
+sql-export-detail-field-started = Iniciado
+sql-export-detail-field-duration = Duración
+sql-export-detail-field-subjects = Elementos
+sql-export-detail-header-included = con fila de encabezado
+sql-export-detail-header-omitted = sin fila de encabezado
+sql-export-detail-outputs-heading = Archivos de salida
+sql-export-detail-col-output = Salida
+sql-export-detail-col-subject = Elemento
+sql-export-detail-col-files = Archivos
+sql-export-detail-outputs-empty = El trabajo no produjo archivos de salida.
+sql-export-file-fallback = Archivo { $n }
+
+## #837: valores de parámetros por SQL Query en el formulario de SQL Export
+sql-export-param-count = { $count ->
+    [one] { $count } parámetro
+   *[other] { $count } parámetros
+}
+sql-export-param-required = Este valor es obligatorio.
+sql-export-param-type-mismatch = Se esperaba un valor de tipo { $type }.
+sql-export-param-required-chip = obligatorio
+sql-export-toggle-values = Mostrar u ocultar valores
+sql-export-values-missing-one = falta { $count } valor
+sql-export-values-missing-other = faltan { $count } valores
+
+## partials/sql_parameter_fields.html (#837) — compartido con el formulario
+## de parámetros de la página de SQL Query
+sql-param-default = predeterminado
 
 ## UI administrativa de HTS (crates/hts-ui) — stubs de Phase 1
 ##
@@ -1370,6 +1548,12 @@ hts-import-step-source = Elegir origen
 hts-import-step-review = Revisar
 hts-import-step-result = Resultado
 hts-import-file-hint = Solo JSON. El archivo se lee en el navegador y se copia en el campo Bundle de abajo; no se envia nada hasta que confirmes.
+hts-import-drop-hint = Suelta aqui un archivo JSON de bundle
+hts-import-drop-browse = o haz clic para explorar
+hts-import-reading = Leyendo archivo…
+hts-import-read-failed = No se pudo leer el archivo.
+hts-import-file-too-large = El archivo excede el limite de ~7,5 MiB para envio URL-codificado.
+hts-import-file-loaded = Archivo cargado: {"{name}"}
 hts-import-bundle-hint = El Bundle se envia a POST /import en el servidor de terminologia. Los recursos existentes se emparejan por url + version.
 hts-import-review-target = Servidor destino
 hts-import-review-request = Peticion

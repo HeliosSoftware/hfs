@@ -5,6 +5,7 @@
 //! generation for error responses.
 
 use crate::SofError;
+use crate::lint::{Diagnostic, lint_operation_outcome};
 use axum::{
     Json,
     http::StatusCode,
@@ -40,6 +41,14 @@ pub enum ServerError {
     /// Internal processing error from SOF engine
     ProcessingError(SofError),
 
+    /// An inline ViewDefinition failed `helios_sof::lint` (#821): every
+    /// element is an error-severity [`Diagnostic`] `lint_view_definition`
+    /// reported against the document exactly as the client sent it, before
+    /// any typed parse. Surfaces as `422 Unprocessable Entity` with one
+    /// `OperationOutcome.issue` per diagnostic — see
+    /// [`invalid_view_definition_response`] for the exact shape.
+    InvalidViewDefinition(Vec<Diagnostic>),
+
     /// JSON parsing error
     JsonError(serde_json::Error),
 
@@ -61,6 +70,11 @@ impl fmt::Display for ServerError {
             ServerError::UnsupportedMediaType(msg) => write!(f, "Unsupported media type: {}", msg),
             ServerError::NotAcceptable(msg) => write!(f, "Not acceptable: {}", msg),
             ServerError::ProcessingError(err) => write!(f, "Processing error: {}", err),
+            ServerError::InvalidViewDefinition(diagnostics) => write!(
+                f,
+                "Invalid ViewDefinition: {} lint error(s)",
+                diagnostics.len()
+            ),
             ServerError::JsonError(err) => write!(f, "JSON error: {}", err),
             ServerError::InternalError(msg) => write!(f, "Internal server error: {}", msg),
             ServerError::NotImplemented(msg) => write!(f, "Not implemented: {}", msg),
@@ -100,6 +114,14 @@ impl From<serde_json::Error> for ServerError {
 
 impl IntoResponse for ServerError {
     fn into_response(self) -> Response {
+        // Multi-issue shape: every other variant below reduces to one
+        // `OperationOutcome.issue`, but a lint failure reports one issue per
+        // diagnostic, so it can't share `create_operation_outcome`'s single-issue
+        // builder.
+        if let ServerError::InvalidViewDefinition(diagnostics) = &self {
+            return invalid_view_definition_response(diagnostics);
+        }
+
         let (status, error_code, details) = match &self {
             ServerError::BadRequest(msg) => (StatusCode::BAD_REQUEST, "invalid", msg.clone()),
             ServerError::ReferencedResourceNotFound(msg) => {
@@ -130,6 +152,12 @@ impl IntoResponse for ServerError {
             ServerError::NotImplemented(msg) => {
                 (StatusCode::NOT_IMPLEMENTED, "not-supported", msg.clone())
             }
+            // Handled by the early return above; kept as an explicit arm
+            // (rather than `_`) so a future variant added to this enum
+            // fails to compile here instead of silently falling through.
+            ServerError::InvalidViewDefinition(_) => unreachable!(
+                "InvalidViewDefinition returns via invalid_view_definition_response above"
+            ),
         };
 
         // Create FHIR OperationOutcome
@@ -151,6 +179,19 @@ fn create_operation_outcome(code: &str, details: &str) -> serde_json::Value {
             }
         }]
     })
+}
+
+/// Builds the `422 Unprocessable Entity` response for
+/// [`ServerError::InvalidViewDefinition`] (#821): one `OperationOutcome.issue`
+/// per lint diagnostic, via [`lint_operation_outcome`] — the same builder
+/// HFS's own `$sql-run` handler uses, so both servers render an identical
+/// body for an identical set of diagnostics.
+fn invalid_view_definition_response(diagnostics: &[Diagnostic]) -> Response {
+    (
+        StatusCode::UNPROCESSABLE_ENTITY,
+        Json(lint_operation_outcome(diagnostics)),
+    )
+        .into_response()
 }
 
 /// Result type alias for server operations

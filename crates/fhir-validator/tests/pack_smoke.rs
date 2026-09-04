@@ -19,7 +19,9 @@
 
 use helios_fhir::FhirVersion;
 use helios_fhir_validator::packs::core_registry;
-use helios_fhir_validator::{SchemaResolver, ValidationOptions, Validator};
+use helios_fhir_validator::{
+    ErrorKind, SchemaResolver, Severity, ValidationOptions, Validator, core_terminology,
+};
 use serde_json::json;
 
 /// Every enabled version's pack loads and validates a minimal Patient.
@@ -66,6 +68,113 @@ fn all_enabled_packs_load_and_validate() {
         assert!(
             !outcome.errors.is_empty(),
             "{version:?}: unknown element must be caught"
+        );
+    }
+}
+
+/// `ViewDefinition` (SQL-on-FHIR) resolves and validates against every
+/// enabled version's embedded pack — the guided form in `helios-ui`
+/// (`crates/ui/src/editor.rs`) relies on this to check ViewDefinition
+/// documents the same way it checks any other resource (#843).
+#[test]
+fn view_definition_validates_across_enabled_packs() {
+    let versions = [
+        FhirVersion::R4,
+        #[cfg(feature = "R4B")]
+        FhirVersion::R4B,
+        #[cfg(feature = "R5")]
+        FhirVersion::R5,
+        #[cfg(feature = "R6")]
+        FhirVersion::R6,
+    ];
+    let opts = ValidationOptions::default();
+    for version in versions {
+        let registry = core_registry(version);
+        assert!(
+            registry.resolve("ViewDefinition").is_some(),
+            "{version:?}: ViewDefinition must resolve"
+        );
+        let validator = Validator::new(registry);
+
+        // The guided form's own starter document (mirrors
+        // `helios-ui`'s `sql_views::starter_view_definition`): a minimal but
+        // complete ViewDefinition must validate with no errors.
+        let starter = json!({
+            "resourceType": "ViewDefinition",
+            "name": "new_view",
+            "status": "draft",
+            "resource": "Patient",
+            "select": [
+                { "column": [ { "name": "id", "path": "getResourceKey()" } ] }
+            ]
+        });
+        let outcome = validator.validate_sync(&starter, &opts);
+        let mut errors = outcome.errors.clone();
+        errors.retain(|e| e.severity == Severity::Error);
+        errors.extend(core_terminology(version).required_binding_errors(&outcome.deferred));
+        assert_eq!(
+            errors,
+            vec![],
+            "{version:?}: starter ViewDefinition must validate clean, got: {}",
+            serde_json::to_string_pretty(&errors).unwrap()
+        );
+
+        // Backbone elements (`select`, `column`, `where`, `constant`) carry
+        // `id`/`extension`/`modifierExtension` per the base FHIR `Element`/
+        // `BackboneElement` shape even though the ViewDefinition schema's own
+        // model does not list them explicitly on every node — a valid
+        // extension on `select[0]` and an `id` on both `select[0]` and
+        // `select[0].column[0]` must not be reported as unknown elements.
+        let with_backbone_extensions = json!({
+            "resourceType": "ViewDefinition",
+            "name": "new_view",
+            "status": "draft",
+            "resource": "Patient",
+            "select": [
+                {
+                    "id": "s1",
+                    "extension": [
+                        { "url": "http://example.org/x", "valueString": "y" }
+                    ],
+                    "column": [
+                        { "id": "c1", "name": "id", "path": "getResourceKey()" }
+                    ]
+                }
+            ]
+        });
+        let outcome = validator.validate_sync(&with_backbone_extensions, &opts);
+        let mut errors = outcome.errors.clone();
+        errors.retain(|e| e.severity == Severity::Error);
+        errors.extend(core_terminology(version).required_binding_errors(&outcome.deferred));
+        assert_eq!(
+            errors,
+            vec![],
+            "{version:?}: id/extension on select and column must validate clean, got: {}",
+            serde_json::to_string_pretty(&errors).unwrap()
+        );
+
+        // No `select` (required), and a `status` outside the bound
+        // `publication-status` value set: at least one required-element
+        // error and one binding error.
+        let bad = json!({
+            "resourceType": "ViewDefinition",
+            "name": "broken_view",
+            "status": "bogus",
+            "resource": "Patient"
+        });
+        let outcome = validator.validate_sync(&bad, &opts);
+        let mut errors = outcome.errors;
+        errors.retain(|e| e.severity == Severity::Error);
+        assert!(
+            errors.iter().any(|e| e.kind == ErrorKind::Required),
+            "{version:?}: missing `select` must be reported, got: {}",
+            serde_json::to_string_pretty(&errors).unwrap()
+        );
+        let binding_errors = core_terminology(version).required_binding_errors(&outcome.deferred);
+        assert!(
+            !binding_errors.is_empty(),
+            "{version:?}: status \"bogus\" must fail its required binding, got: {}",
+            serde_json::to_string_pretty(&binding_errors).unwrap()
         );
     }
 }
@@ -247,6 +356,72 @@ fn r4_pack_validates_known_good_and_bad_resources() {
         "dynamic resolution must reach the nested Patient, got: {}",
         serde_json::to_string_pretty(&outcome.errors).unwrap()
     );
+}
+
+/// Regression for issue #424: a StructureDefinition whose `element.id`s carry a
+/// choice suffix (`[x]`) or a slice qualifier (`:`) must NOT trip a
+/// primitive-value error. Before the converter fix, R4B/R5 typed
+/// `ElementDefinition.id` as the constrained `id` primitive, whose regex
+/// `[A-Za-z0-9\-\.]{1,64}` rejects exactly these ids — so the spec's own
+/// profiles failed validation. R4 was always clean (typed `string`), so it
+/// serves as the control that the assertion is meaningful.
+///
+/// Version-gated behind R4B/R5 (that is where the bug lived), so it runs in
+/// CI's `cargo test --workspace --all-features` but not in the coverage job,
+/// which builds default features (R4 only).
+#[cfg(any(feature = "R4B", feature = "R5"))]
+#[test]
+fn structuredefinition_element_ids_with_choice_or_slice_are_not_rejected() {
+    // A trimmed but structurally-valid StructureDefinition whose element ids
+    // include a choice base (`Observation.value[x]`) and a named slice
+    // (`Observation.category:vital-signs`). These are the exact shapes the `id`
+    // regex rejected.
+    let sd = json!({
+        "resourceType": "StructureDefinition",
+        "url": "http://example.org/StructureDefinition/choice-and-slice",
+        "name": "ChoiceAndSlice",
+        "status": "active",
+        "kind": "resource",
+        "abstract": false,
+        "type": "Observation",
+        "baseDefinition": "http://hl7.org/fhir/StructureDefinition/Observation",
+        "derivation": "constraint",
+        "differential": { "element": [
+            { "id": "Observation.value[x]", "path": "Observation.value[x]", "min": 0, "max": "1" },
+            {
+                "id": "Observation.category:vital-signs",
+                "path": "Observation.category",
+                "sliceName": "vital-signs",
+                "min": 0, "max": "1"
+            }
+        ]}
+    });
+
+    let versions = [
+        #[cfg(feature = "R4B")]
+        FhirVersion::R4B,
+        #[cfg(feature = "R5")]
+        FhirVersion::R5,
+    ];
+    for version in versions {
+        let validator = Validator::new(core_registry(version));
+        let outcome = validator.validate_sync(&sd, &ValidationOptions::default());
+
+        // The precise #424 failure: a primitive-value error on an element id.
+        let id_value_errors: Vec<_> = outcome
+            .errors
+            .iter()
+            .filter(|e| {
+                e.kind == helios_fhir_validator::ErrorKind::PrimitiveValue
+                    && e.path.ends_with(".id")
+            })
+            .collect();
+        assert!(
+            id_value_errors.is_empty(),
+            "{version:?}: element ids with [x]/: must not fail primitive-value validation, got: {}",
+            serde_json::to_string_pretty(&id_value_errors).unwrap()
+        );
+    }
 }
 
 /// U+00A0 in a `string` or a `code` must survive validation against the real

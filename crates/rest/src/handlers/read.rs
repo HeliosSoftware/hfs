@@ -142,7 +142,7 @@ where
                 .get("_elements")
                 .map(|v| v.split(',').map(|s| s.trim()).collect());
 
-            let mut content = stored.content().clone();
+            let mut content = stored.content_with_meta();
             let mut subsetted = false;
 
             if let Some(mode) = summary_mode {

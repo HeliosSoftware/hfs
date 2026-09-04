@@ -1168,12 +1168,17 @@ fn vs_detail_templates_only_use_classes_that_exist_in_app_css() {
     );
 }
 
-/// #806 regression guard: no ValueSet detail template may fold content
+/// #806 / #898 regression guard: no ValueSet detail template may fold content
 /// behind a `<summary class="field__label">`. `.field__label` is
 /// `display:block`, and a `<summary>` only paints its native ::marker at
 /// `display:list-item` — so such a fold renders as an inert grey label with
-/// no triangle and no pointer cursor. Every fold must take the shared
-/// `.disclosure` / `.disclosure__summary` pattern from app.css instead.
+/// no triangle and no pointer cursor.
+///
+/// There are two fold patterns:
+/// - `.disclosure__summary` for fact-set folds (collapsing metadata)
+/// - `.card-head` for raw JSON folds (#898, card-shaped json-fold)
+///
+/// Both carry explicit chevrons, so either class is acceptable.
 #[test]
 fn vs_detail_templates_never_fold_behind_a_bare_field_label_summary() {
     let templates = [
@@ -1202,14 +1207,17 @@ fn vs_detail_templates_never_fold_behind_a_bare_field_label_summary() {
         assert!(
             !body.contains(r#"<summary class="field__label""#),
             "{name} still folds content behind `<summary class=\"field__label\"`; \
-             use the shared `.disclosure` pattern (app.css) so the fold keeps \
-             its marker and pointer cursor",
+             use a fold pattern with an explicit chevron",
         );
         for chunk in body.split("<summary").skip(1) {
             let open = chunk.split('>').next().unwrap_or_default();
+            // Accept either fold pattern: .disclosure__summary (fact-set) or
+            // .card-head (raw JSON fold, #898)
             assert!(
-                open.contains(r#"class="disclosure__summary""#),
-                "a <summary> in {name} must carry `disclosure__summary`, got `<summary{open}>`",
+                open.contains(r#"class="disclosure__summary""#)
+                    || open.contains(r#"class="card-head""#),
+                "a <summary> in {name} must carry `disclosure__summary` or `card-head`, \
+                 got `<summary{open}>`",
             );
             summaries += 1;
         }
@@ -1232,7 +1240,7 @@ fn vs_detail_page_uses_the_v3_compact_header_shape() {
     for hook in [
         r#"<header class="page-head page-head--back-link">"#,
         r#"class="back-link""#,
-        r#"class="page-head__copy""#,
+        r#"class="page-head__copy "#, // may carry modifiers like --spaced
         r#"class="page-head__title""#,
         r#"class="facets facets--bare""#,
         r#"class="detail__field detail__field--wide""#,

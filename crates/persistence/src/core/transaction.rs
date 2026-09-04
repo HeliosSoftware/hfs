@@ -68,6 +68,12 @@ pub struct TransactionOptions {
     /// version, so it rides on the transaction rather than on every write.
     /// `None` falls back to the backend's configured version.
     pub fhir_version: Option<helios_fhir::FhirVersion>,
+    /// Skip writing search-index and full-text rows for resources written in
+    /// this transaction (bulk fast-load, #903). Stale index rows for updated
+    /// resources are still deleted — a deferred index may miss a resource,
+    /// never mislead about one. The caller owns rebuilding the index
+    /// afterwards (`$reindex` / [`crate::search::ReindexOperation`]).
+    pub defer_search_indexing: bool,
 }
 
 impl TransactionOptions {
@@ -104,6 +110,12 @@ impl TransactionOptions {
     /// Sets the FHIR version writes in this transaction are stamped with.
     pub fn fhir_version(mut self, version: helios_fhir::FhirVersion) -> Self {
         self.fhir_version = Some(version);
+        self
+    }
+
+    /// Defers search-index and full-text writes to a later reindex (#903).
+    pub fn defer_search_indexing(mut self, defer: bool) -> Self {
+        self.defer_search_indexing = defer;
         self
     }
 }
@@ -443,7 +455,7 @@ impl BundleEntryResult {
             location: Some(resource.versioned_url()),
             etag: Some(resource.etag().to_string()),
             last_modified: Some(resource.last_modified().to_rfc3339()),
-            resource: Some(resource.into_content()),
+            resource: Some(resource.content_with_meta()),
             outcome: None,
         }
     }
@@ -455,7 +467,7 @@ impl BundleEntryResult {
             location: None,
             etag: Some(resource.etag().to_string()),
             last_modified: Some(resource.last_modified().to_rfc3339()),
-            resource: Some(resource.into_content()),
+            resource: Some(resource.content_with_meta()),
             outcome: None,
         }
     }

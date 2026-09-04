@@ -12,6 +12,7 @@ mod sof_run_tests {
     use helios_persistence::core::ResourceStorage;
     use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
     use helios_rest::ServerConfig;
+    use helios_sof::lint::{Severity, lint_view_definition, pointer_to_fhirpath};
     use serde_json::{Value, json};
     use std::sync::Arc;
 
@@ -897,6 +898,116 @@ mod sof_run_tests {
             body["resourceType"], "OperationOutcome",
             "422 body must be OperationOutcome: {body}"
         );
+    }
+
+    // =========================================================================
+    // Structural lint (#821): one issue per diagnostic, located by expression
+    // =========================================================================
+
+    /// An inline ViewDefinition subject with multiple independent structural
+    /// problems is linted *before* it reaches the storage-backed compiler
+    /// (`execute_view` -> `runner.run_view`), which otherwise reports at most
+    /// one `processing` issue with no position. All three problems here — an
+    /// unknown key, a duplicate column name, and an undeclared `%constant` —
+    /// come back as separate, located issues in the same request, identical
+    /// in shape to `sof-server`'s own `$sql-run` `422`.
+    #[tokio::test]
+    async fn test_run_inline_view_definition_lint_errors_return_one_issue_per_diagnostic() {
+        let (server, _backend) = create_test_server().await;
+
+        let bad_view = json!({
+            "resourceType": "ViewDefinition",
+            "resource": "Patient",
+            "status": "draft",
+            "select": [
+                {
+                    "column": [{ "name": "id", "path": "id" }],
+                    // Typo for "column" -> unknown-key.
+                    "columns": [{ "name": "x", "path": "id" }]
+                },
+                {
+                    "column": [
+                        { "name": "a", "path": "id" },
+                        // Same output name as above -> duplicate-column-name,
+                        // and %nope is never declared -> undeclared-constant.
+                        { "name": "a", "path": "%nope" }
+                    ]
+                }
+            ]
+        });
+
+        let expected: Vec<_> = lint_view_definition(&bad_view)
+            .into_iter()
+            .filter(|d| d.severity == Severity::Error)
+            .collect();
+        assert_eq!(
+            expected.len(),
+            3,
+            "fixture must exercise three lint errors, got {expected:?}"
+        );
+
+        let response = server
+            .post("/$sql-run?_format=ndjson")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .add_header(
+                CONTENT_TYPE,
+                HeaderValue::from_static("application/fhir+json"),
+            )
+            .json(&bad_view)
+            .await;
+
+        response.assert_status(StatusCode::UNPROCESSABLE_ENTITY);
+        let body: Value =
+            serde_json::from_str(&response.text()).expect("422 body must be valid JSON");
+        assert_eq!(body["resourceType"], "OperationOutcome");
+
+        let issues = body["issue"].as_array().expect("issue must be an array");
+        assert_eq!(
+            issues.len(),
+            expected.len(),
+            "one issue per lint error, got {issues:?}"
+        );
+
+        let codes: Vec<&str> = issues
+            .iter()
+            .map(|issue| issue["details"]["coding"][0]["code"].as_str().unwrap())
+            .collect();
+        assert!(codes.contains(&"unknown-key"), "{codes:?}");
+        assert!(codes.contains(&"duplicate-column-name"), "{codes:?}");
+        assert!(codes.contains(&"undeclared-constant"), "{codes:?}");
+
+        for (issue, diagnostic) in issues.iter().zip(&expected) {
+            assert_eq!(issue["severity"], "error");
+            assert_eq!(issue["diagnostics"], diagnostic.message);
+            assert_eq!(
+                issue["expression"][0],
+                pointer_to_fhirpath(&diagnostic.pointer)
+            );
+            assert_eq!(
+                issue["details"]["coding"][0]["system"],
+                "http://heliossoftware.com/fhir/CodeSystem/view-definition-lint"
+            );
+        }
+    }
+
+    /// A lint-clean inline ViewDefinition is unaffected by the new
+    /// pre-execution lint gate (#821) and still runs to completion.
+    #[tokio::test]
+    async fn test_run_lint_clean_view_definition_still_returns_200() {
+        let (server, backend) = create_test_server().await;
+        seed_patient(&backend, "pt-001", "Smith").await;
+
+        let response = server
+            .post("/$sql-run?_format=ndjson")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .add_header(
+                CONTENT_TYPE,
+                HeaderValue::from_static("application/fhir+json"),
+            )
+            .json(&patient_view_definition())
+            .await;
+
+        response.assert_status(StatusCode::OK);
     }
 
     // =========================================================================

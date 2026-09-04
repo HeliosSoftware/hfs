@@ -1,4 +1,4 @@
-//! Tests for `helios_sof::lint` (#753 ticket 03).
+//! Tests for `helios_sof::lint` (#753, #820, #821).
 
 use super::*;
 use serde_json::json;
@@ -533,6 +533,258 @@ fn fhirpath_syntax_empty_expression_gets_zero_width_span() {
 }
 
 // ---------------------------------------------------------------------------
+// UndeclaredConstant (#821)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn undeclared_constant_in_column_path() {
+    let mut doc = valid_doc();
+    doc["select"][0]["column"][0]["path"] = json!("%notDeclared");
+    let diagnostics = lint_view_definition(&doc);
+    let undeclared = diagnostics_of(&diagnostics, DiagnosticCode::UndeclaredConstant);
+    assert_eq!(undeclared.len(), 1, "{undeclared:?}");
+    assert_eq!(undeclared[0].pointer, "/select/0/column/0/path");
+    assert_eq!(undeclared[0].message, "undeclared constant `%notDeclared`");
+    assert_eq!(undeclared[0].severity, Severity::Error);
+    assert_eq!(
+        undeclared[0].span,
+        Some(Span {
+            start: 0,
+            end: "%notDeclared".chars().count()
+        })
+    );
+}
+
+#[test]
+fn undeclared_constant_in_foreach() {
+    let doc = json!({
+        "resourceType": "ViewDefinition",
+        "status": "active",
+        "resource": "Patient",
+        "select": [{
+            "forEach": "name.where(use = %notDeclared)",
+            "column": [{ "name": "id", "path": "getResourceKey()" }]
+        }]
+    });
+    let diagnostics = lint_view_definition(&doc);
+    let undeclared = diagnostics_of(&diagnostics, DiagnosticCode::UndeclaredConstant);
+    assert_eq!(undeclared.len(), 1, "{undeclared:?}");
+    assert_eq!(undeclared[0].pointer, "/select/0/forEach");
+}
+
+#[test]
+fn undeclared_constant_in_root_where_path() {
+    let doc = json!({
+        "resourceType": "ViewDefinition",
+        "status": "active",
+        "resource": "Patient",
+        "select": [{
+            "column": [{ "name": "id", "path": "getResourceKey()" }]
+        }],
+        "where": [{ "path": "active = %notDeclared" }]
+    });
+    let diagnostics = lint_view_definition(&doc);
+    let undeclared = diagnostics_of(&diagnostics, DiagnosticCode::UndeclaredConstant);
+    assert_eq!(undeclared.len(), 1, "{undeclared:?}");
+    assert_eq!(undeclared[0].pointer, "/where/0/path");
+}
+
+#[test]
+fn undeclared_constant_in_repeat_element() {
+    let mut doc = valid_doc();
+    doc["select"][0] = json!({
+        "repeat": ["contact", "link.where(active = %notDeclared)"],
+        "column": [{ "name": "id", "path": "getResourceKey()" }]
+    });
+    let diagnostics = lint_view_definition(&doc);
+    let undeclared = diagnostics_of(&diagnostics, DiagnosticCode::UndeclaredConstant);
+    assert_eq!(undeclared.len(), 1, "{undeclared:?}");
+    assert_eq!(undeclared[0].pointer, "/select/0/repeat/1");
+}
+
+#[test]
+fn undeclared_constant_in_nested_select_and_union_all() {
+    let doc = json!({
+        "resourceType": "ViewDefinition",
+        "status": "active",
+        "resource": "Patient",
+        "select": [{
+            "select": [{
+                "column": [{ "name": "n", "path": "%nestedUndeclared" }]
+            }],
+            "unionAll": [{
+                "column": [{ "name": "u", "path": "%unionUndeclared" }]
+            }]
+        }]
+    });
+    let diagnostics = lint_view_definition(&doc);
+    let pointers: Vec<&str> = diagnostics_of(&diagnostics, DiagnosticCode::UndeclaredConstant)
+        .iter()
+        .map(|d| d.pointer.as_str())
+        .collect();
+    assert!(
+        pointers.contains(&"/select/0/select/0/column/0/path"),
+        "{pointers:?}"
+    );
+    assert!(
+        pointers.contains(&"/select/0/unionAll/0/column/0/path"),
+        "{pointers:?}"
+    );
+}
+
+#[test]
+fn constant_declared_in_constant_array_is_not_undeclared() {
+    let mut doc = valid_doc();
+    doc["constant"] = json!([{ "name": "myConst", "valueString": "hello" }]);
+    doc["select"][0]["column"][0]["path"] = json!("%myConst");
+    let diagnostics = lint_view_definition(&doc);
+    assert!(
+        diagnostics_of(&diagnostics, DiagnosticCode::UndeclaredConstant).is_empty(),
+        "{diagnostics:?}"
+    );
+}
+
+#[test]
+fn declared_constant_check_is_case_sensitive() {
+    let mut doc = valid_doc();
+    doc["constant"] = json!([{ "name": "myConst", "valueString": "hello" }]);
+    doc["select"][0]["column"][0]["path"] = json!("%MyConst");
+    let diagnostics = lint_view_definition(&doc);
+    let undeclared = diagnostics_of(&diagnostics, DiagnosticCode::UndeclaredConstant);
+    assert_eq!(undeclared.len(), 1, "{undeclared:?}");
+}
+
+#[test]
+fn constant_declared_without_value_x_is_still_not_undeclared() {
+    // A `constant` entry missing its value[x] is its own MissingRequired
+    // diagnostic (see `constant_missing_value_x_is_missing_required`) — it
+    // must not *also* make every reference to its name UndeclaredConstant.
+    let mut doc = valid_doc();
+    doc["constant"] = json!([{ "name": "noValue" }]);
+    doc["select"][0]["column"][0]["path"] = json!("%noValue");
+    let diagnostics = lint_view_definition(&doc);
+    assert!(
+        diagnostics_of(&diagnostics, DiagnosticCode::UndeclaredConstant).is_empty(),
+        "{diagnostics:?}"
+    );
+    assert!(!diagnostics_of(&diagnostics, DiagnosticCode::MissingRequired).is_empty());
+}
+
+#[test]
+fn environment_variables_are_not_undeclared() {
+    let mut doc = valid_doc();
+    doc["select"][0]["column"][0]["path"] =
+        json!("%context.combine(%resource).combine(%rootResource) & %ucum & %sct & %loinc");
+    let diagnostics = lint_view_definition(&doc);
+    assert!(
+        diagnostics_of(&diagnostics, DiagnosticCode::UndeclaredConstant).is_empty(),
+        "{diagnostics:?}"
+    );
+}
+
+#[test]
+fn sql_on_fhir_row_index_is_not_undeclared() {
+    // `%rowIndex` is bound by `helios_sof` itself (see
+    // `extract_view_definition_constants`), not by the FHIRPath evaluator —
+    // this is the case that regressed `official_sql_on_fhir_fixtures_that_
+    // are_not_error_cases_lint_clean` (row_index.json) during development.
+    let mut doc = valid_doc();
+    doc["select"][0]["column"][0]["path"] = json!("%rowIndex");
+    let diagnostics = lint_view_definition(&doc);
+    assert!(
+        diagnostics_of(&diagnostics, DiagnosticCode::UndeclaredConstant).is_empty(),
+        "{diagnostics:?}"
+    );
+}
+
+#[test]
+fn two_occurrences_of_the_same_undeclared_constant_produce_two_diagnostics() {
+    let mut doc = valid_doc();
+    doc["select"][0]["column"][0]["path"] = json!("%dup = 1 or %dup = 2");
+    let diagnostics = lint_view_definition(&doc);
+    let undeclared = diagnostics_of(&diagnostics, DiagnosticCode::UndeclaredConstant);
+    assert_eq!(undeclared.len(), 2, "{undeclared:?}");
+    assert_ne!(undeclared[0].span, undeclared[1].span);
+}
+
+#[test]
+fn undeclared_constant_span_covers_exactly_the_percent_name_token() {
+    let mut doc = valid_doc();
+    doc["select"][0]["column"][0]["path"] = json!("true and %notDeclared");
+    let diagnostics = lint_view_definition(&doc);
+    let undeclared = diagnostics_of(&diagnostics, DiagnosticCode::UndeclaredConstant);
+    assert_eq!(undeclared.len(), 1, "{undeclared:?}");
+    let span = undeclared[0].span.expect("span set");
+    let expression = "true and %notDeclared";
+    let chars: Vec<char> = expression.chars().collect();
+    let underlined: String = chars[span.start..span.end].iter().collect();
+    assert_eq!(underlined, "%notDeclared");
+}
+
+#[test]
+fn non_parsing_expression_only_reports_fhirpath_syntax() {
+    let mut doc = valid_doc();
+    // A trailing dot before the constant reference means the expression
+    // never parses: only FhirPathSyntax should fire, never
+    // UndeclaredConstant for the `%notDeclared` reference inside it.
+    doc["select"][0]["column"][0]["path"] = json!("name.%notDeclared");
+    let diagnostics = lint_view_definition(&doc);
+    assert!(
+        diagnostics_of(&diagnostics, DiagnosticCode::UndeclaredConstant).is_empty(),
+        "{diagnostics:?}"
+    );
+    assert!(!diagnostics_of(&diagnostics, DiagnosticCode::FhirPathSyntax).is_empty());
+}
+
+#[test]
+fn undeclared_constant_sorts_by_true_document_position() {
+    let doc: Value = serde_json::from_str(
+        r#"{
+            "resourceType": "ViewDefinition",
+            "status": "active",
+            "resource": "Patient",
+            "select": [
+                { "column": [{ "name": "a", "path": "%firstUndeclared" }] },
+                { "unknownField": true, "column": [{ "name": "b", "path": "getResourceKey()" }] }
+            ]
+        }"#,
+    )
+    .expect("valid JSON literal");
+
+    let diagnostics = lint_view_definition(&doc);
+    let pointers: Vec<&str> = diagnostics.iter().map(|d| d.pointer.as_str()).collect();
+    let undeclared_index = pointers
+        .iter()
+        .position(|p| *p == "/select/0/column/0/path")
+        .expect("UndeclaredConstant on /select/0/column/0/path");
+    let unknown_key_index = pointers
+        .iter()
+        .position(|p| *p == "/select/1/unknownField")
+        .expect("UnknownKey on /select/1/unknownField");
+    assert!(
+        undeclared_index < unknown_key_index,
+        "undeclared-constant in /select/0 must sort before unknown-key in /select/1: {pointers:?}"
+    );
+}
+
+#[test]
+fn undeclared_constant_serializes_with_the_documented_code_and_a_span_object() {
+    let mut doc = valid_doc();
+    doc["select"][0]["column"][0]["path"] = json!("%notDeclared");
+    let diagnostics = lint_view_definition(&doc);
+    let value = serde_json::to_value(&diagnostics).unwrap();
+    let undeclared = value
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["code"] == "undeclared-constant")
+        .expect("an undeclared-constant diagnostic was serialized");
+    assert!(undeclared["span"].is_object());
+    assert!(undeclared["span"]["start"].is_u64());
+    assert!(undeclared["span"]["end"].is_u64());
+}
+
+// ---------------------------------------------------------------------------
 // Pointer escaping (RFC 6901) and ordering (RF1)
 // ---------------------------------------------------------------------------
 
@@ -973,10 +1225,586 @@ fn diagnostic_fields_are_camel_case() {
     let doc = json!({ "resourceType": "Patient" });
     let value = serde_json::to_value(lint_view_definition(&doc)).unwrap();
     let diagnostic = &value.as_array().unwrap()[0];
-    for key in ["pointer", "message", "severity", "code", "span"] {
+    for key in [
+        "pointer", "message", "severity", "code", "span", "args", "fixes",
+    ] {
         assert!(
             diagnostic.get(key).is_some(),
             "missing `{key}` in {diagnostic}"
         );
     }
+}
+
+#[test]
+fn args_and_fixes_serialize_as_empty_object_and_array_when_absent() {
+    // not-a-view-definition carries `args.found` but never a fix; a code with
+    // neither (select-without-output) proves the "nothing to report" shape.
+    let doc = json!({
+        "resourceType": "ViewDefinition",
+        "status": "active",
+        "resource": "Patient",
+        "select": [{}]
+    });
+    let diagnostics = lint_view_definition(&doc);
+    let value = serde_json::to_value(&diagnostics).unwrap();
+    let without_output = value
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["code"] == "select-without-output")
+        .expect("a select-without-output diagnostic");
+    assert_eq!(without_output["args"], json!({}));
+    assert_eq!(without_output["fixes"], json!([]));
+}
+
+// ---------------------------------------------------------------------------
+// pointer_to_fhirpath (#821)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn pointer_to_fhirpath_root_is_bare_view_definition() {
+    assert_eq!(pointer_to_fhirpath(""), "ViewDefinition");
+}
+
+#[test]
+fn pointer_to_fhirpath_renders_array_indices_and_keys() {
+    assert_eq!(
+        pointer_to_fhirpath("/select/0/column/1/path"),
+        "ViewDefinition.select[0].column[1].path"
+    );
+    assert_eq!(pointer_to_fhirpath("/resource"), "ViewDefinition.resource");
+    assert_eq!(
+        pointer_to_fhirpath("/select/12"),
+        "ViewDefinition.select[12]"
+    );
+}
+
+#[test]
+fn pointer_to_fhirpath_unescapes_rfc_6901_keys() {
+    // `~1` -> `/`, `~0` -> `~`, decoded in that order (the encoding escapes
+    // `~` before `/`, so decoding must undo `/` first or a literal `~1` in a
+    // key would be corrupted into `~/`).
+    assert_eq!(pointer_to_fhirpath("/a~1b"), "ViewDefinition.a/b");
+    assert_eq!(pointer_to_fhirpath("/a~0b"), "ViewDefinition.a~b");
+    // `~01` decodes to `~1` verbatim (not `/`): confirms `~1` -> `/` runs
+    // before `~0` -> `~`, so the `~0` this segment starts with can't create
+    // a spurious `~1` for the first pass to consume.
+    assert_eq!(pointer_to_fhirpath("/a~01"), "ViewDefinition.a~1");
+}
+
+// ---------------------------------------------------------------------------
+// Diagnostic args (#821)
+// ---------------------------------------------------------------------------
+
+/// The single diagnostic with `code` on `doc`, panicking with everything
+/// found if there isn't exactly one — most of the `args`/`fixes` tests below
+/// only care about one diagnostic and want a clean failure message if the
+/// document accidentally produces more (or fewer) than expected.
+fn only_diagnostic_of(doc: &Value, code: DiagnosticCode) -> Diagnostic {
+    let diagnostics = lint_view_definition(doc);
+    let mut matching = diagnostics_of(&diagnostics, code).into_iter();
+    let found = matching
+        .next()
+        .unwrap_or_else(|| panic!("expected one {code:?} diagnostic, found none"))
+        .clone();
+    assert!(
+        matching.next().is_none(),
+        "expected exactly one {code:?} diagnostic on {doc}"
+    );
+    found
+}
+
+#[test]
+fn args_not_a_view_definition_names_what_was_found() {
+    assert_eq!(
+        only_diagnostic_of(&json!([1, 2, 3]), DiagnosticCode::NotAViewDefinition).args["found"],
+        "a non-object document"
+    );
+    assert_eq!(
+        only_diagnostic_of(
+            &json!({ "resourceType": "Patient" }),
+            DiagnosticCode::NotAViewDefinition
+        )
+        .args["found"],
+        r#"resourceType "Patient""#
+    );
+    assert_eq!(
+        only_diagnostic_of(
+            &json!({ "resourceType": 5 }),
+            DiagnosticCode::NotAViewDefinition
+        )
+        .args["found"],
+        "a non-string resourceType (a number)"
+    );
+}
+
+#[test]
+fn args_missing_required_and_empty_required_carry_the_key() {
+    // `{"resourceType": "ViewDefinition"}` is missing both `resource` and
+    // `select` - both diagnostics land on the same (root) pointer, so only
+    // the missing `select` one is picked out by its own `args.key`.
+    let doc = json!({ "resourceType": "ViewDefinition" });
+    let diagnostics = lint_view_definition(&doc);
+    let missing = diagnostics_of(&diagnostics, DiagnosticCode::MissingRequired)
+        .into_iter()
+        .find(|d| d.args.get("key").map(String::as_str) == Some("select"))
+        .expect("a missing-required diagnostic for select");
+    assert_eq!(missing.args["key"], "select");
+
+    let mut doc = valid_doc();
+    doc["resource"] = json!("   ");
+    let diagnostics = lint_view_definition(&doc);
+    let empty = diagnostics_of(&diagnostics, DiagnosticCode::EmptyRequired)
+        .into_iter()
+        .find(|d| d.pointer == "/resource")
+        .expect("an empty-required diagnostic on /resource");
+    assert_eq!(empty.args["key"], "resource");
+}
+
+#[test]
+fn args_wrong_type_carries_expected_and_found() {
+    let mut doc = valid_doc();
+    doc["status"] = json!(42);
+    let wrong = only_diagnostic_of(&doc, DiagnosticCode::WrongType);
+    assert_eq!(wrong.args["expected"], "a string");
+    assert_eq!(wrong.args["found"], "a number");
+}
+
+#[test]
+fn args_duplicate_column_name_carries_the_name() {
+    let doc = json!({
+        "resourceType": "ViewDefinition",
+        "status": "active",
+        "resource": "Patient",
+        "select": [{
+            "column": [
+                { "name": "id", "path": "getResourceKey()" },
+                { "name": "id", "path": "id" }
+            ]
+        }]
+    });
+    let dup = only_diagnostic_of(&doc, DiagnosticCode::DuplicateColumnName);
+    assert_eq!(dup.args["name"], "id");
+}
+
+#[test]
+fn args_multiple_iteration_directives_lists_present_keys_in_struct_order() {
+    let mut doc = valid_doc();
+    doc["select"][0]["repeat"] = json!(["contact"]);
+    doc["select"][0]["forEach"] = json!("name");
+    doc["select"][0]["forEachOrNull"] = json!("telecom");
+    let multi = only_diagnostic_of(&doc, DiagnosticCode::MultipleIterationDirectives);
+    assert_eq!(multi.args["keys"], "forEach, forEachOrNull, repeat");
+}
+
+#[test]
+fn args_select_without_output_has_none() {
+    let doc = json!({
+        "resourceType": "ViewDefinition",
+        "status": "active",
+        "resource": "Patient",
+        "select": [{}]
+    });
+    let diag = only_diagnostic_of(&doc, DiagnosticCode::SelectWithoutOutput);
+    assert!(diag.args.is_empty(), "{:?}", diag.args);
+}
+
+#[test]
+fn args_fhirpath_syntax_carries_the_parser_detail_verbatim() {
+    let mut doc = valid_doc();
+    doc["select"][0]["column"][0]["path"] = json!("getResourceKey(");
+    let syntax = only_diagnostic_of(&doc, DiagnosticCode::FhirPathSyntax);
+    assert_eq!(syntax.args["detail"], syntax.message);
+
+    let mut doc = valid_doc();
+    doc["select"][0]["column"][0]["path"] = json!("   ");
+    let empty = only_diagnostic_of(&doc, DiagnosticCode::FhirPathSyntax);
+    assert_eq!(empty.args["detail"], "empty expression");
+}
+
+#[test]
+fn args_undeclared_constant_carries_the_bare_name() {
+    let mut doc = valid_doc();
+    doc["select"][0]["column"][0]["path"] = json!("%notDeclared");
+    let undeclared = only_diagnostic_of(&doc, DiagnosticCode::UndeclaredConstant);
+    assert_eq!(undeclared.args["name"], "notDeclared");
+}
+
+#[test]
+fn args_constant_value_x_missing_carries_variant_and_the_constants_name() {
+    let mut doc = valid_doc();
+    doc["constant"] = json!([{ "name": "myConst" }]);
+    let diagnostics = lint_view_definition(&doc);
+    let missing = diagnostics_of(&diagnostics, DiagnosticCode::MissingRequired)
+        .into_iter()
+        .find(|d| d.args.get("variant").map(String::as_str) == Some("missing"))
+        .expect("a missing-required diagnostic with variant \"missing\"");
+    assert_eq!(missing.args["name"], "myConst");
+}
+
+#[test]
+fn args_constant_value_x_multiple_carries_variant_multiple_and_omits_name_when_absent() {
+    let mut doc = valid_doc();
+    doc["constant"] = json!([{ "valueString": "a", "valueBoolean": true }]);
+    let diagnostics = lint_view_definition(&doc);
+    let multiple = diagnostics_of(&diagnostics, DiagnosticCode::WrongType)
+        .into_iter()
+        .find(|d| d.args.get("variant").map(String::as_str) == Some("multiple"))
+        .expect("a wrong-type diagnostic with variant \"multiple\"");
+    assert!(!multiple.args.contains_key("name"), "{:?}", multiple.args);
+}
+
+// ---------------------------------------------------------------------------
+// unknown-key typo suggestions and fixes (#821)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn unknown_key_suggests_the_singular_for_a_pluralized_typo() {
+    let doc = json!({
+        "resourceType": "ViewDefinition",
+        "status": "active",
+        "resource": "Patient",
+        "select": [{ "columns": [{ "name": "id", "path": "getResourceKey()" }] }]
+    });
+    let unknown = only_diagnostic_of(&doc, DiagnosticCode::UnknownKey);
+    assert_eq!(unknown.args["key"], "columns");
+    assert_eq!(unknown.args["suggestion"], "column");
+    assert_eq!(
+        unknown.fixes,
+        vec![
+            Fix::RenameKey {
+                pointer: "/select/0/columns".to_string(),
+                to: "column".to_string(),
+            },
+            Fix::RemoveKey {
+                pointer: "/select/0/columns".to_string(),
+            },
+        ]
+    );
+}
+
+#[test]
+fn unknown_key_suggestion_ignores_case() {
+    let mut doc = valid_doc();
+    doc["select"][0]["column"][0] = json!({ "Path": "getResourceKey()", "name": "id" });
+    let diagnostics = lint_view_definition(&doc);
+    let unknown = diagnostics_of(&diagnostics, DiagnosticCode::UnknownKey)
+        .into_iter()
+        .find(|d| d.pointer == "/select/0/column/0/Path")
+        .expect("an unknown-key diagnostic for Path");
+    assert_eq!(unknown.args["suggestion"], "path");
+}
+
+#[test]
+fn unknown_key_suggests_within_edit_distance_two() {
+    let mut doc = valid_doc();
+    doc["select"][0]["forEachh"] = json!("name");
+    let diagnostics = lint_view_definition(&doc);
+    let unknown = diagnostics_of(&diagnostics, DiagnosticCode::UnknownKey)
+        .into_iter()
+        .find(|d| d.pointer == "/select/0/forEachh")
+        .expect("an unknown-key diagnostic for forEachh");
+    assert_eq!(unknown.args["suggestion"], "forEach");
+}
+
+#[test]
+fn unknown_key_offers_no_suggestion_when_nothing_is_close() {
+    let mut doc = valid_doc();
+    doc["zzz"] = json!("oops");
+    let diagnostics = lint_view_definition(&doc);
+    let unknown = diagnostics_of(&diagnostics, DiagnosticCode::UnknownKey)
+        .into_iter()
+        .find(|d| d.pointer == "/zzz")
+        .expect("an unknown-key diagnostic for zzz");
+    assert!(
+        !unknown.args.contains_key("suggestion"),
+        "{:?}",
+        unknown.args
+    );
+    assert_eq!(
+        unknown.fixes,
+        vec![Fix::RemoveKey {
+            pointer: "/zzz".to_string()
+        }]
+    );
+}
+
+#[test]
+fn unknown_key_never_suggests_a_key_already_present() {
+    let mut doc = valid_doc();
+    // The select already has a valid `column`; `Column` is the typo.
+    // Renaming it to `column` would collide with the one already there, so
+    // the suggestion rule excludes it even though the edit distance
+    // qualifies.
+    doc["select"][0]["Column"] = doc["select"][0]["column"].clone();
+    let diagnostics = lint_view_definition(&doc);
+    let unknown = diagnostics_of(&diagnostics, DiagnosticCode::UnknownKey)
+        .into_iter()
+        .find(|d| d.pointer == "/select/0/Column")
+        .expect("an unknown-key diagnostic for Column");
+    assert!(
+        !unknown.args.contains_key("suggestion"),
+        "{:?}",
+        unknown.args
+    );
+    assert_eq!(
+        unknown.fixes,
+        vec![Fix::RemoveKey {
+            pointer: "/select/0/Column".to_string()
+        }]
+    );
+}
+
+// ---------------------------------------------------------------------------
+// duplicate-column-name and multiple-iteration-directives fixes (#821)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn duplicate_column_name_fix_increments_the_suffix_past_a_real_collision() {
+    let doc = json!({
+        "resourceType": "ViewDefinition",
+        "status": "active",
+        "resource": "Patient",
+        "select": [{
+            "column": [
+                { "name": "id", "path": "getResourceKey()" },
+                { "name": "id", "path": "id" },
+                { "name": "id_2", "path": "id" },
+                { "name": "id", "path": "id" }
+            ]
+        }]
+    });
+    let diagnostics = lint_view_definition(&doc);
+    let dups = diagnostics_of(&diagnostics, DiagnosticCode::DuplicateColumnName);
+    assert_eq!(dups.len(), 2, "{dups:?}");
+    // The `id_2` real column claims that suffix document-wide, so even the
+    // *first* duplicate (declared before it) must skip past it — not just
+    // duplicates declared after it in document order.
+    assert_eq!(
+        dups[0].fixes,
+        vec![Fix::SetString {
+            pointer: "/select/0/column/1/name".to_string(),
+            value: "id_3".to_string(),
+        }]
+    );
+    // The first duplicate's own fix just claimed `id_3`, so the second
+    // duplicate's fix skips to `id_4`.
+    assert_eq!(
+        dups[1].fixes,
+        vec![Fix::SetString {
+            pointer: "/select/0/column/3/name".to_string(),
+            value: "id_4".to_string(),
+        }]
+    );
+}
+
+/// Regression: the collision the suggested name must avoid is not limited to
+/// names the row-scoped duplicate walk has already passed — a column named
+/// `g_2` declared *later*, in a wholly different `select` entry, is just as
+/// real a collision as one declared earlier. Reported against the fix
+/// generation before it pre-collected every column name in the document.
+#[test]
+fn duplicate_column_name_fix_avoids_a_name_declared_later_in_a_different_select() {
+    let doc = json!({
+        "resourceType": "ViewDefinition",
+        "resource": "Patient",
+        "status": "draft",
+        "select": [
+            { "column": [{ "name": "id", "path": "id" }] },
+            {
+                "forEach": "name",
+                "column": [
+                    { "name": "g", "path": "given" },
+                    { "name": "g", "path": "family" },
+                    { "name": "g_2", "path": "id" }
+                ]
+            }
+        ]
+    });
+    let diagnostics = lint_view_definition(&doc);
+    let dups = diagnostics_of(&diagnostics, DiagnosticCode::DuplicateColumnName);
+    assert_eq!(dups.len(), 1, "{dups:?}");
+    assert_eq!(dups[0].pointer, "/select/1/column/1/name");
+    assert_eq!(
+        dups[0].fixes,
+        vec![Fix::SetString {
+            pointer: "/select/1/column/1/name".to_string(),
+            value: "g_3".to_string(),
+        }]
+    );
+}
+
+/// Three columns sharing one name in a row produce two duplicates, each
+/// picking a suffix the other's fix hasn't already claimed this same pass —
+/// `g_2` then `g_3`, never `g_2` twice.
+#[test]
+fn duplicate_column_name_fix_increments_across_two_consecutive_duplicates() {
+    let doc = json!({
+        "resourceType": "ViewDefinition",
+        "status": "active",
+        "resource": "Patient",
+        "select": [{
+            "column": [
+                { "name": "g", "path": "a" },
+                { "name": "g", "path": "b" },
+                { "name": "g", "path": "c" }
+            ]
+        }]
+    });
+    let diagnostics = lint_view_definition(&doc);
+    let dups = diagnostics_of(&diagnostics, DiagnosticCode::DuplicateColumnName);
+    assert_eq!(dups.len(), 2, "{dups:?}");
+    assert_eq!(
+        dups[0].fixes,
+        vec![Fix::SetString {
+            pointer: "/select/0/column/1/name".to_string(),
+            value: "g_2".to_string(),
+        }]
+    );
+    assert_eq!(
+        dups[1].fixes,
+        vec![Fix::SetString {
+            pointer: "/select/0/column/2/name".to_string(),
+            value: "g_3".to_string(),
+        }]
+    );
+}
+
+#[test]
+fn multiple_iteration_directives_fix_removes_every_directive_after_the_first() {
+    let mut doc = valid_doc();
+    doc["select"][0]["forEach"] = json!("name");
+    doc["select"][0]["forEachOrNull"] = json!("telecom");
+    doc["select"][0]["repeat"] = json!(["contact"]);
+    let multi = only_diagnostic_of(&doc, DiagnosticCode::MultipleIterationDirectives);
+    assert_eq!(
+        multi.fixes,
+        vec![
+            Fix::RemoveKey {
+                pointer: "/select/0/forEachOrNull".to_string(),
+            },
+            Fix::RemoveKey {
+                pointer: "/select/0/repeat".to_string(),
+            },
+        ]
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Fix serialization (#821)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn fix_serializes_with_a_kebab_case_kind_tag() {
+    assert_eq!(
+        serde_json::to_value(Fix::RenameKey {
+            pointer: "/select/0/columns".to_string(),
+            to: "column".to_string(),
+        })
+        .unwrap(),
+        json!({ "kind": "rename-key", "pointer": "/select/0/columns", "to": "column" })
+    );
+    assert_eq!(
+        serde_json::to_value(Fix::RemoveKey {
+            pointer: "/select/0/columns".to_string(),
+        })
+        .unwrap(),
+        json!({ "kind": "remove-key", "pointer": "/select/0/columns" })
+    );
+    assert_eq!(
+        serde_json::to_value(Fix::SetString {
+            pointer: "/select/0/column/1/name".to_string(),
+            value: "id_2".to_string(),
+        })
+        .unwrap(),
+        json!({ "kind": "set-string", "pointer": "/select/0/column/1/name", "value": "id_2" })
+    );
+}
+
+// ---------------------------------------------------------------------------
+// node_keys (#821)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn node_keys_root_lists_resource_type_and_select() {
+    let keys = node_keys("").expect("the root resolves to a node");
+    let names: Vec<&str> = keys.iter().map(|k| k.key).collect();
+    assert!(names.contains(&"resourceType"), "{names:?}");
+    assert!(names.contains(&"resource"), "{names:?}");
+    assert!(names.contains(&"select"), "{names:?}");
+    let resource_type = keys.iter().find(|k| k.key == "resourceType").unwrap();
+    assert!(resource_type.required);
+    assert_eq!(resource_type.kind, KeyKind::String);
+    let select = keys.iter().find(|k| k.key == "select").unwrap();
+    assert!(select.required);
+    assert_eq!(select.kind, KeyKind::ObjectArray);
+}
+
+#[test]
+fn node_keys_select_index_and_union_all_resolve_to_the_select_node() {
+    let expected: Vec<&str> = node_keys("/select/0")
+        .expect("/select/0 resolves")
+        .iter()
+        .map(|k| k.key)
+        .collect();
+    assert!(expected.contains(&"forEach"), "{expected:?}");
+    assert!(expected.contains(&"unionAll"), "{expected:?}");
+
+    // A `unionAll` branch is itself a `select` node — same keys.
+    let union_all: Vec<&str> = node_keys("/select/0/unionAll/1")
+        .expect("/select/0/unionAll/1 resolves")
+        .iter()
+        .map(|k| k.key)
+        .collect();
+    assert_eq!(expected, union_all);
+}
+
+#[test]
+fn node_keys_column_index_and_the_column_array_resolve_to_the_same_node() {
+    let indexed: Vec<&str> = node_keys("/select/0/column/0")
+        .expect("/select/0/column/0 resolves")
+        .iter()
+        .map(|k| k.key)
+        .collect();
+    let array: Vec<&str> = node_keys("/select/0/column")
+        .expect("/select/0/column resolves")
+        .iter()
+        .map(|k| k.key)
+        .collect();
+    assert_eq!(indexed, array);
+    assert!(indexed.contains(&"path"), "{indexed:?}");
+    assert!(indexed.contains(&"name"), "{indexed:?}");
+    assert!(indexed.contains(&"tag"), "{indexed:?}");
+}
+
+#[test]
+fn node_keys_resolves_tag_where_and_constant_nodes() {
+    let tag: Vec<&str> = node_keys("/select/0/column/0/tag/0")
+        .expect("tag resolves")
+        .iter()
+        .map(|k| k.key)
+        .collect();
+    assert_eq!(tag, vec!["name", "value"]);
+
+    let where_keys: Vec<&str> = node_keys("/where/2")
+        .expect("where resolves")
+        .iter()
+        .map(|k| k.key)
+        .collect();
+    assert_eq!(where_keys, vec!["path", "description"]);
+
+    let constant: Vec<&str> = node_keys("/constant/0")
+        .expect("constant resolves")
+        .iter()
+        .map(|k| k.key)
+        .collect();
+    assert!(constant.contains(&"name"), "{constant:?}");
+    assert!(constant.contains(&"valueString"), "{constant:?}");
+}
+
+#[test]
+fn node_keys_returns_none_for_a_scalar_or_unmodeled_pointer() {
+    assert_eq!(node_keys("/resource"), None);
+    assert_eq!(node_keys("/notAField"), None);
+    assert_eq!(node_keys("/select/0/column/0/notAField"), None);
 }

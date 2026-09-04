@@ -1,6 +1,7 @@
 import { test, expect } from "../pages/fixtures";
 import AxeBuilder from "@axe-core/playwright";
 import { ROUTES, seedBulkImportDetail } from "../pages/routes";
+import { VdEditor } from "../pages/vd-editor";
 
 // Tier 1 of the strategy (issue #249): WCAG 2.2 AA is the spec, axe-core the
 // harness. Contrast differs per theme, so every route is scanned in both light
@@ -72,6 +73,101 @@ for (const theme of THEMES) {
     await expect(create).toBeDisabled();
     await expect(create).toHaveAttribute("aria-describedby", "resource-create-reason");
     await expect(reason).toBeVisible();
+
+    const { violations } = await new AxeBuilder({ page }).withTags(WCAG).analyze();
+    expect(violations).toEqual([]);
+  });
+
+  test(`expanded CapabilityStatement JSON is accessible — ${theme}`, async ({ page, chrome }) => {
+    test.setTimeout(120_000);
+    await chrome.seedTheme(theme);
+    await page.goto("/ui/capability-statement", { waitUntil: "networkidle" });
+    const body = page.locator("#capability-json-body");
+    await page.locator("[data-capability-json-expand-all]").click();
+    await expect(body).not.toHaveAttribute("aria-busy", "true");
+    await expect(page.locator("[data-capability-json-tree] > [data-expansion-state]")).toBeVisible();
+    const { violations } = await new AxeBuilder({ page }).withTags(WCAG).analyze();
+    expect(violations).toEqual([]);
+  });
+
+  // #821: the ViewDefinition editor's own three floating UIs — none of them
+  // is on the page by default, so the general `ROUTES` sweep (`?vd=new`
+  // above) never opens any of them. `withTags(WCAG)` scans the whole page
+  // as it stands at that moment, popup/tooltip/panel included, exactly like
+  // every other targeted state test in this file.
+
+  test(`ViewDefinition editor completion popup is free of WCAG 2.2 AA violations — ${theme}`, async ({
+    page,
+    chrome,
+  }) => {
+    await chrome.seedTheme(theme);
+    await page.goto("/ui/sql/view-definitions?vd=new", { waitUntil: "networkidle" });
+    const ed = new VdEditor(page);
+    const doc = `{
+  "resourceType": "ViewDefinition",
+  "resource": "Patient",
+  "select": [{ "column": [{ "name": "id", "path": "getResourceKey()" }] }],
+  "status": "active"
+}`;
+    await ed.setDoc(doc);
+    await ed.setCursorAfter(doc, '"status": "active"');
+    await page.keyboard.press("Control+Space");
+    await expect(ed.completionPopup).toBeVisible();
+
+    const { violations } = await new AxeBuilder({ page }).withTags(WCAG).analyze();
+    expect(violations).toEqual([]);
+  });
+
+  test(`ViewDefinition editor lint tooltip is free of WCAG 2.2 AA violations — ${theme}`, async ({
+    page,
+    chrome,
+  }) => {
+    await chrome.seedTheme(theme);
+    await page.goto("/ui/sql/view-definitions?vd=new", { waitUntil: "networkidle" });
+    const ed = new VdEditor(page);
+    const doc = `{
+  "resourceType": "ViewDefinition",
+  "status": "active",
+  "resource": "Patient",
+  "select": [
+    {
+      "columns": [{ "name": "id", "path": "getResourceKey()" }]
+    }
+  ]
+}`;
+    await ed.setDoc(doc);
+    const errorRange = page.locator(".cm-lintRange-error", { hasText: '"columns"' });
+    await errorRange.hover();
+    await expect(ed.lintTooltip).toBeVisible();
+
+    const { violations } = await new AxeBuilder({ page }).withTags(WCAG).analyze();
+    expect(violations).toEqual([]);
+  });
+
+  test(`ViewDefinition editor lint panel is free of WCAG 2.2 AA violations — ${theme}`, async ({
+    page,
+    chrome,
+  }) => {
+    await chrome.seedTheme(theme);
+    await page.goto("/ui/sql/view-definitions?vd=new", { waitUntil: "networkidle" });
+    const ed = new VdEditor(page);
+    const doc = `{
+  "resourceType": "ViewDefinition",
+  "status": "active",
+  "resource": "Patient",
+  "select": [
+    {
+      "columns": [{ "name": "id", "path": "getResourceKey()" }]
+    }
+  ]
+}`;
+    await ed.setDoc(doc);
+    // "columns" carries two fixes (rename, remove) — Ctrl+. with more than
+    // one action under the cursor opens the panel (see
+    // vd-editor-lint.spec.ts's own test of this exact mechanism).
+    await ed.setCursorAt(doc, '"columns"');
+    await page.keyboard.press("ControlOrMeta+.");
+    await expect(ed.lintPanel).toBeVisible();
 
     const { violations } = await new AxeBuilder({ page }).withTags(WCAG).analyze();
     expect(violations).toEqual([]);
