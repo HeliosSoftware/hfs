@@ -1009,26 +1009,73 @@ fn is_ident(s: &str) -> bool {
 }
 
 /// Splits a plain dotted identifier chain into segments; `None` if any
-/// segment is not a bare identifier (a function call, an index, an operator)
-/// or is a FHIR choice-element base (`effective`, `onset`, `deceased`, …).
-///
-/// Choice bases resolve to typed JSON fields (`effective` →
-/// `effectiveDateTime`) through the engine's per-version metadata table; the
-/// walker reads literal fields only, so those expressions stay on the engine.
-/// The check uses the same default FHIR version the engine's evaluation
-/// context is built with.
+/// segment is not a bare identifier (a function call, an index, an operator).
 fn ident_chain(s: &str) -> Option<Vec<String>> {
     let segs: Vec<&str> = s.split('.').collect();
     segs.iter()
-        .all(|seg| {
-            is_ident(seg)
-                && !helios_fhirpath::is_choice_element_with_context(
-                    seg,
-                    None,
-                    helios_fhir::FhirVersion::default_enabled(),
-                )
-        })
+        .all(|seg| is_ident(seg))
         .then(|| segs.iter().map(|s| s.to_string()).collect())
+}
+
+/// The generated field table for the same default FHIR version the engine's
+/// evaluation context is built with — the authority the compiler type-walks.
+fn fast_field_table() -> Option<&'static [(&'static str, &'static str, &'static str, bool)]> {
+    helios_fhir::field_types(helios_fhir::FhirVersion::default_enabled())
+}
+
+/// The declared type of `parent.field`, from the sorted `FIELD_TYPES` table.
+fn field_entry(
+    table: &'static [(&'static str, &'static str, &'static str, bool)],
+    parent: &str,
+    field: &str,
+) -> Option<&'static str> {
+    let idx = table.partition_point(|&(p, f, _, _)| (p, f) < (parent, field));
+    match table.get(idx) {
+        Some(&(p, f, ty, _)) if p == parent && f == field => Some(ty),
+        _ => None,
+    }
+}
+
+/// Whether `parent` declares typed choice variants of `field`
+/// (`deceasedBoolean` for `deceased`) — the engine resolves those
+/// polymorphically, so the walker must not claim them.
+fn has_choice_variant(
+    table: &'static [(&'static str, &'static str, &'static str, bool)],
+    parent: &str,
+    field: &str,
+) -> bool {
+    let start = table.partition_point(|&(p, f, _, _)| (p, f) < (parent, field));
+    table[start..]
+        .iter()
+        .take_while(|&&(p, f, _, _)| p == parent && f.starts_with(field))
+        .any(|&(_, f, _, _)| {
+            f.len() > field.len()
+                && f[field.len()..]
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_ascii_uppercase())
+        })
+}
+
+/// Type-walks `segs` from `root_type`, returning the final segment's declared
+/// type. `None` — an unknown field, or a segment that is a choice base under
+/// its actual parent — sends the expression to the engine.
+fn type_walk(
+    table: &'static [(&'static str, &'static str, &'static str, bool)],
+    root_type: &str,
+    segs: &[String],
+) -> Option<&'static str> {
+    let mut parent: &str = root_type;
+    let mut last: Option<&'static str> = None;
+    for seg in segs {
+        if has_choice_variant(table, parent, seg) {
+            return None;
+        }
+        let ty = field_entry(table, parent, seg)?;
+        last = Some(ty);
+        parent = ty;
+    }
+    last
 }
 
 /// Compiles a filtered expression to direct-navigation members, or `None`
@@ -1045,6 +1092,18 @@ fn compile_fast_path(filtered: &str, resource_type: &str) -> Option<Vec<FastMemb
 }
 
 fn compile_fast_member(member: &str, resource_type: &str) -> Option<FastMember> {
+    let table = fast_field_table()?;
+
+    // A fully-parenthesized plain path — `(Patient.deceasedDateTime)`, the
+    // shape union filtering leaves behind — unwraps to its inner path. Only
+    // when the parens wrap the whole member and nothing else nests inside.
+    let member = member.trim();
+    let member = member
+        .strip_prefix('(')
+        .and_then(|m| m.strip_suffix(')'))
+        .filter(|inner| !inner.contains('(') && !inner.contains(')'))
+        .unwrap_or(member);
+
     // The root segment must name this resource type or an abstract base every
     // resource satisfies; anything else goes to the engine.
     let strip_root = |segs: Vec<String>| -> Option<Vec<String>> {
@@ -1058,12 +1117,13 @@ fn compile_fast_member(member: &str, resource_type: &str) -> Option<FastMember> 
         if pre.is_empty() {
             return None;
         }
+        let item_type = type_walk(table, resource_type, &pre)?;
         let rest = &member[idx + ".where(".len()..];
         let close = rest.find(')')?;
         // Only the exact shape `field = 'literal'` (no escapes, no operators).
         let (field, value) = rest[..close].split_once('=')?;
         let field = field.trim();
-        if !is_ident(field) {
+        if !is_ident(field) || type_walk(table, item_type, &[field.to_string()]).is_none() {
             return None;
         }
         let value = value.trim().strip_prefix('\'')?.strip_suffix('\'')?;
@@ -1074,7 +1134,9 @@ fn compile_fast_member(member: &str, resource_type: &str) -> Option<FastMember> 
         let post = if after.is_empty() {
             Vec::new()
         } else {
-            ident_chain(after.strip_prefix('.')?)?
+            let post = ident_chain(after.strip_prefix('.')?)?;
+            type_walk(table, item_type, &post)?;
+            post
         };
         return Some(FastMember::WhereEq {
             pre,
@@ -1085,7 +1147,11 @@ fn compile_fast_member(member: &str, resource_type: &str) -> Option<FastMember> 
     }
 
     let segs = strip_root(ident_chain(member)?)?;
-    (!segs.is_empty()).then_some(FastMember::Path(segs))
+    if segs.is_empty() {
+        return None;
+    }
+    type_walk(table, resource_type, &segs)?;
+    Some(FastMember::Path(segs))
 }
 
 /// Walks a dotted element path over raw JSON with FHIRPath collection
@@ -1767,13 +1833,14 @@ mod tests {
             }
         }
 
+        println!("fast-path compiled params across sample types: {compiled_total}");
         // The point of the fast path is coverage: a compiler regression that
-        // silently sends everything to the engine must fail loudly. 50 is the
+        // silently sends everything to the engine must fail loudly. 91 is the
         // measured coverage across these four types at the time of writing —
-        // choice-element bases (`effective`, `value`, `onset`, …) and anything
-        // the conservative compiler does not recognize stay on the engine.
+        // only expressions with functions, non-literal filters, or choice bases
+        // under their actual parent type stay on the engine.
         assert!(
-            compiled_total >= 45,
+            compiled_total >= 85,
             "expected most parameters to compile to the fast path, got {compiled_total}"
         );
     }

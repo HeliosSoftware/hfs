@@ -312,7 +312,6 @@ pub mod parser;
 // Public API exports - this is what users of the fhirpath crate should use
 pub use evaluator::EvaluationContext;
 pub use helios_fhirpath_support::EvaluationResult;
-pub use polymorphic_access::is_choice_element_with_context;
 
 /// Evaluates a FHIRPath expression against a given context.
 ///
