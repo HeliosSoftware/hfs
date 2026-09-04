@@ -163,18 +163,21 @@ server-side, once.
 
 Beside the editor sits a guided-form card (#843, `.editor__grid--stretch` in
 `assets/app.css`): the two cards stretch to match each other's height, capped
-at 70vh, each scrolling inside its own content area past that. Both are one
-document — the editor's — with two views onto it: the card is built inline,
-server-side, on the page's own first paint from the same document the
-textarea shows (`editor::build_form_pane`, the `pane=form` engine `POST
-/ui/editor/render` also serves, called directly rather than fetched, so
-there is no post-`load` layout shift); a guided-form edit posts back through
-`assets/editor-form.js` (`pane=form`) and lands in the editor as one minimal
-transaction (`assets/vd-editor.js`'s `minimalChange`, a common-prefix/
-common-suffix diff) — undoable, and without moving the caret or the scroll;
-an editor change that transaction did not itself just cause is parsed
-600ms after the last keystroke and, if its canonical JSON actually moved,
-re-requests the panel alone. `editor::EditorFormPane`'s `is_view_definition`
+at 70vh, each scrolling inside its own content area past that (the editor's
+own form carries the shared `editor__doc` class, #840, for that sizing — see
+"Client-side scripts" below). Both are one document — the editor's — with two
+views onto it: the card is built inline, server-side, on the page's own first
+paint from the same document the textarea shows (`editor::build_form_pane`,
+the `pane=form` engine `POST /ui/editor/render` also serves, called directly
+rather than fetched, so there is no post-`load` layout shift); a guided-form
+edit posts back through `assets/editor-form.js` (`pane=form`) and lands in
+the editor as one minimal transaction (`assets/editor-pair.js`'s
+`minimalChange`, a common-prefix/common-suffix diff, #840 — extracted from
+`vd-editor.js`'s own original #843 implementation) — undoable, and without
+moving the caret or the scroll; an editor change that transaction did not
+itself just cause is parsed 600ms after the last keystroke and, if its
+canonical JSON actually moved, re-requests the panel alone.
+`editor::EditorFormPane`'s `is_view_definition`
 flag also selects this page's own single-line legend
 (`vd-form-legend-live`) in place of the Resource Editor's two-line one — Save
 here stays permissive (#752, above), so "checked on save" would be
@@ -195,8 +198,10 @@ The two cards also stay linked while you point at them: hovering or focusing
 a row paints the lines its node occupies in the editor, and moving the cursor
 in the editor (click, selection, or typing) lights the row for whichever node
 it now sits in — the same idea as the Resource Editor's own `editor-sync.js`,
-reimplemented in `vd-editor.js` because this page's JSON pane is a
-CodeMirror `EditorView`, not the server-rendered `.json-line[data-jpath]`
+reimplemented in `assets/editor-pair.js` (#840, extracted from
+`vd-editor.js`'s own original #843 implementation) because this page's JSON
+pane is a CodeMirror `EditorView`, not the server-rendered
+`.json-line[data-jpath]`
 markup that link is built on. Both directions resolve a node by walking the
 browser's own CodeMirror syntax tree — a row's dotted path
 (`select.0.column.0.path`) down to its node, or a cursor position up through
@@ -214,8 +219,42 @@ server-side, on its own first response (the guided-form card here) does not
 show it with no client-side loop wired to it yet. A consumer that needs a
 shown-state `display` other than the browser default supplies its own
 `html.js …` override next to its own layout rules (`.editor__grid--stretch`'s
-own `display: flex` override is the example). Reusable by any future page
-that renders `pane=form` inline the same way.
+own `display: flex` override is the example). Not View Definitions' own: SQL
+Query and SQL View's Details section (below) renders its guided-form card
+the same inline, server-side way and carries the identical `needs-js`.
+
+### Details (#840): the SQL Query/SQL View Library minus its SQL attachment
+
+`/ui/sql/queries` and `/ui/sql/views` (`pages/sql-library.html`, one template
+keyed by the route's own `LibraryKind`) give each stored `Library` a Details
+section — the same JSON editor + guided-form pairing described above, over a
+different document: the `Library` with its `application/sql` `content[]`
+attachment stripped out (`sql_libraries::strip_sql_attachment`), since the
+SQL card beside it owns that attachment on its own. `crate::
+render_lib_details_pane` calls the shared engine with `hidden: &["content"]`
+(so the guided form neither shows nor offers to mutate it) and `legend:
+"sql-library"` (its own two-line legend — "checked on save" here names the
+Library type coding and the SQL attachment, not the generic constraints/
+terminology promise `Legend::Resource` makes, since `HFS_VALIDATION_MODE` is
+off by default). `assets/sql-library-details.js` mounts CodeMirror with the
+shared JSON language/highlight preset (no injected FHIRPath grammar, unlike
+`vd-editor.js`) and hands the mounted view to `editor-pair.js` with `fields:
+{ hidden: "content", legend: "sql-library" }` — the same host View
+Definitions uses, so the sync, the validity chip, and the row↔editor
+cross-highlight behave identically on both pages.
+
+One Save posts both cards; the server fuses them
+(`sql_libraries::embed_sql`, replacing the first `application/sql`
+attachment or appending one when Details carries none — a SQL attachment
+typed by hand into the Details JSON always loses to the SQL card) and
+rejects a document whose `type.coding` names the other kind — `sql-view`
+saved from SQL Queries, or the reverse — with a warning naming the route's
+own expected code, before anything is written. Without JavaScript both
+textareas — the Details JSON one carries `form="lib-editor-form"`, HTML5
+form-associated even though it lives outside that `<form>` in the DOM — post
+together in one plain submit; the guided-form card stays `needs-js`-hidden
+and the grid collapses to the JSON card alone, exactly like View
+Definitions' own card does.
 
 ### Client-side scripts
 
@@ -245,10 +284,12 @@ not just a closed IIFE.
 | `nl-search.js` | Natural-language search mode (only loaded when configured) |
 | `resource-filter.js` | Shared truncated-name tooltips (type rails and the resource grid) and each rail's scroll-to-selection on arrival — the "Recently used" group itself is server-rendered (#754/#755) |
 | `conformance-crud.js` | The conformance viewers' write half (create/edit/delete against the FHIR API) |
-| `code-editor.js` | Shared CodeMirror 6 mount helper (#838): textarea-as-source-of-truth sync, aria-label, Tab-not-captured, silent degradation — `window.HfsCodeEditor.mount(textarea, options)`, exported for `vd-editor.js` and `sql-editor.js` to build their own language/highlight/lint on top of |
-| `editor-form.js` | The guided-form loop (#843), extracted from `editor.js`'s original: `[data-add]`/`[data-remove]`/`[data-extension]`/`[data-choose]`/`[data-set]`, the add-picker's typeahead, live `$expand` — driven against a caller-supplied `root` and `host` (`{ getDoc, setDoc, renderUrl? }`) instead of page ids, so it works over any document a host owns. `window.HfsEditorForm.attach(root, host)`; loaded only on `/ui/sql/view-definitions` so far — `editor.js` and the Resources modal's own copy of this loop are a follow-up migration |
-| `vd-editor.js` | The ViewDefinition editor on `/ui/sql/view-definitions`: JSON + injected FHIRPath language and highlighting, fold, and the async server lint (#753, generalized onto `code-editor.js` in #838). Also builds `editor-form.js`'s host over the mounted `EditorView` (#843): a form-driven change lands as one minimal (common-prefix/common-suffix) transaction, tagged so the sync listener skips its own echo; an editor change 600ms after the last keystroke re-requests the guided-form panel alone when its canonical JSON actually moved. Falls back to the plain `<textarea>` as the host when CodeMirror never mounted. Also drives the row↔editor cross-highlight (#843): a `StateField` of line decorations for a hovered/focused row, and a debounced cursor listener that marks the row for whichever node the caret sits in |
+| `code-editor.js` | Shared CodeMirror 6 mount helper (#838): textarea-as-source-of-truth sync, aria-label, tabindex, Tab-not-captured, silent degradation — `window.HfsCodeEditor.mount(textarea, options)` — plus the shared JSON token-color preset every JSON-editing page reads (`jsonHighlight()`, #840), exported for `vd-editor.js` and `sql-editor.js` to build their own language/highlight/lint on top of |
+| `editor-form.js` | The guided-form loop (#843), extracted from `editor.js`'s original: `[data-add]`/`[data-remove]`/`[data-extension]`/`[data-choose]`/`[data-set]`, the add-picker's typeahead, live `$expand` — driven against a caller-supplied `root` and `host` (`{ getDoc, setDoc, renderUrl?, fields? }`) instead of page ids, so it works over any document a host owns; `host.fields` (#840) adds constant extra fields (e.g. `hidden`/`legend`) to every request. `window.HfsEditorForm.attach(root, host)` |
+| `editor-pair.js` | The shared host between a CodeMirror/textarea JSON editor and the guided-form card beside it (#840, extracted from `vd-editor.js`'s original #843 implementation): two-way JSON↔form sync (a form-driven change lands as one minimal common-prefix/common-suffix transaction, tagged so the sync listener skips its own echo; an editor change 600ms after the last keystroke re-requests the panel alone when its canonical JSON actually moved, or flips the `.editor-validity` chip to "Invalid JSON" when it does not parse), and the row↔editor cross-highlight (a `StateField` of line decorations for a hovered/focused row, a debounced cursor listener that marks the row for whichever node the caret sits in). Adds its own CodeMirror extensions onto an already-mounted `EditorView` via `StateEffect.appendConfig`, so callers pass nothing pair-specific into `HfsCodeEditor.mount`. Falls back to driving the plain `<textarea>` when no `EditorView` is given. `window.HfsEditorPair.mount({ textarea, view?, grid, fields? })`, consumed by `vd-editor.js` on `/ui/sql/view-definitions` and the Library Details editor (#840) |
+| `vd-editor.js` | The ViewDefinition editor on `/ui/sql/view-definitions`: JSON + injected FHIRPath language and highlighting, fold, and the async server lint (#753, generalized onto `code-editor.js` in #838); hands the mounted `EditorView` to `editor-pair.js` (#840) to drive the guided-form card beside it |
 | `sql-editor.js` | The SQL pane editor on `/ui/sql/queries` and `/ui/sql/views`: SQLite-dialect SQL language and highlighting, and — after each `#run-notice` swap — tinting the line a parse failure names via `data-error-line` (#839); no fold or lint yet (#838) |
+| `sql-library-details.js` | The Details JSON editor on `/ui/sql/queries` and `/ui/sql/views` (#840): plain JSON language and the shared highlight preset, no injected grammar or lint; hands the mounted `EditorView` to `editor-pair.js` with `fields: { hidden: "content", legend: "sql-library" }` to drive the guided-form card beside it |
 
 `editor.js` is deliberately thin, and that is the architectural point: it does
 not model the resource, know what a choice type is, or understand cardinality.
@@ -544,7 +585,7 @@ cargo run -p helios-hfs   # then open http://127.0.0.1:8080/ui
 | `/ui` | GET | Dashboard — stat cards and the "FHIR resources over time" chart |
 | `/ui/resources` | GET | Resources workspace: type rail with live counts, search, edit modal |
 | `/ui/editor` | GET | Standalone schema-driven resource editor |
-| `/ui/editor/render` | POST | Applies every structural mutation and re-renders; the document rides with the request. `pane=form` (#843) renders only the guided-form panel — hidden state plus the card, no JSON view — for a host that keeps its own JSON editor (the View Definitions page's CodeMirror pane) |
+| `/ui/editor/render` | POST | Applies every structural mutation and re-renders; the document rides with the request. `pane=form` (#843) renders only the guided-form panel — hidden state plus the card, no JSON view — for a host that keeps its own JSON editor (the View Definitions and SQL Query/SQL View Details pages' CodeMirror panes). `hidden` (#840) is a comma-separated list of first-level element names the host neither shows nor lets this endpoint mutate (`content`, for a Library edited as SQL Query/SQL View Details, whose SQL attachment lives in its own card); `legend` (#840) overrides which of the guided-form card's explanatory legends renders (`resource`/`view-definition`/`sql-library`) independently of the document's own `resourceType` — see `editor::Legend` |
 | `/ui/json-view/render` | POST | Renders raw `application/json` as a highlighted, foldable HTML fragment; applies no FHIR semantics and retains no payload |
 | `/ui/editor/expand` | GET | ValueSet expansion, proxied to `HFS_TERMINOLOGY_SERVER` |
 | `/ui/queries` | GET | Saved FHIR queries per resource type (#234) and the visual search builder |

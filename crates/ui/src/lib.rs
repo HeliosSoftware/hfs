@@ -2582,9 +2582,9 @@ fn shape_vd(vd: &serde_json::Value) -> (String, String, String) {
 /// `pane=form` branch performs over HTTP (`editor::build_form_pane`), called
 /// directly instead: the page's own render (and the Save-error re-render)
 /// need the panel in place on first paint, not fetched after the fact.
-/// `document`'s own `resourceType` decides
-/// [`editor::EditorFormPane::is_view_definition`] exactly as `render_body`
-/// would, falling back to `"ViewDefinition"` — every caller on this page
+/// `document`'s own `resourceType` decides [`editor::EditorFormPane::legend`]
+/// exactly as `render_body` would (an empty legend override derives it), and
+/// falls back to `"ViewDefinition"` — every caller on this page
 /// hands it a `ViewDefinition`, valid or not, except the one Save-error path
 /// where the submitted document parses but carries some other type; letting
 /// the schema registry decide what that renders as (or fails to) is exactly
@@ -2604,14 +2604,36 @@ fn render_vd_form_pane(
     // render, not the shared HTTP endpoint - the card needs `needs-js` so it
     // stays hidden until `theme.js` marks `<html class="js">` and
     // `vd-editor.js` wires it up.
-    editor::build_form_pane(i18n, registry, version, resource_type, document, None, true)
+    // #840: nothing hidden and the legend derived, exactly as before that
+    // parameter pair existed.
+    editor::build_form_pane(
+        i18n,
+        registry,
+        version,
+        resource_type,
+        document,
+        None,
+        true,
+        &[],
+        "",
+    )
 }
 
-/// The guided-form panel for text that failed to parse as JSON (#843) — the
+/// The guided-form panel for text that failed to parse as JSON (#843,
+/// generalized off its original View-Definitions-only copy in #840) — the
 /// Save-error path's counterpart to `editor::render_body`'s own malformed-
-/// document branch: the card still appears, with the invalid-JSON notice in
-/// place of rows, and the user's exact text untouched.
-fn invalid_vd_form_pane(i18n: I18n, text: String, parse_error: String) -> editor::EditorFormPane {
+/// document branch, shared by View Definitions and the SQL Query/SQL View
+/// Details panel: the card still appears, with the invalid-JSON notice in
+/// place of rows, and the user's exact text untouched. `legend` is the
+/// caller's own choice ([`editor::Legend`]) rather than derived — text that
+/// never parsed carries no `resourceType` for [`editor::Legend::resolve`] to
+/// read.
+fn invalid_form_pane(
+    i18n: I18n,
+    text: String,
+    parse_error: String,
+    legend: editor::Legend,
+) -> editor::EditorFormPane {
     editor::EditorFormPane {
         i18n,
         rows: Vec::new(),
@@ -2622,8 +2644,11 @@ fn invalid_vd_form_pane(i18n: I18n, text: String, parse_error: String) -> editor
         parse_error: Some(parse_error),
         focus_path: String::new(),
         auto_open_add: false,
-        is_view_definition: false,
-        needs_js: true, // #843: the page's own inline render, always needs-js
+        // Unread while `parse_error` is `Some` (the pane's own template
+        // renders the invalid-JSON notice instead of the legend), but kept
+        // faithful to the caller's own host nonetheless.
+        legend,
+        needs_js: true, // #843: every caller's own inline render, always needs-js
     }
 }
 
@@ -2964,9 +2989,12 @@ async fn sql_view_definitions_save(
         // own malformed-document branch renders.
         let form_pane = match serde_json::from_str::<serde_json::Value>(&json) {
             Ok(document) => render_vd_form_pane(I18n::new(locale), rv.0, document),
-            Err(parse_error) => {
-                invalid_vd_form_pane(I18n::new(locale), json.clone(), parse_error.to_string())
-            }
+            Err(parse_error) => invalid_form_pane(
+                I18n::new(locale),
+                json.clone(),
+                parse_error.to_string(),
+                editor::Legend::ViewDefinition,
+            ),
         };
         SqlViewDefinitionsPage {
             status: current_status(&state, rv.0, &rt),
@@ -3350,6 +3378,12 @@ struct SqlLibraryPage {
     degraded: Option<String>,
     selected: Option<SelectedLib>,
     is_new: bool,
+    /// The Details card's guided-form panel (#840), alongside its own JSON
+    /// editor — the same shape View Definitions' `form_pane` is, built
+    /// inline from the document `selected.json` already shows so the page's
+    /// first paint never flashes full-width before shrinking to make room
+    /// for it. `None` only alongside `selected: None`.
+    details: Option<editor::EditorFormPane>,
     /// The `$sql-run` preview card and its failure notice, nested as its own
     /// template (#839) so `partials/sql_run_results.html`'s markup — shared
     /// with View Definitions — stays in exactly one place. `fragment: false`
@@ -3392,7 +3426,11 @@ struct SqlLibQuery {
 }
 
 /// Shapes a stored `Library` resource into the editor's `(id, name, json,
-/// sql)` quadruple, decoding the SQL pane out of its base64 attachment.
+/// sql)` quadruple: `sql` decoded out of the base64 `application/sql`
+/// attachment for the SQL card, `json` the Details card's own document —
+/// `lib` with that same attachment stripped back out (#840,
+/// [`sql_libraries::strip_sql_attachment`]) — so the two cards never show
+/// the SQL text twice.
 fn shape_lib(lib: &serde_json::Value) -> (String, String, String, String) {
     let id = lib
         .get("id")
@@ -3405,8 +3443,73 @@ fn shape_lib(lib: &serde_json::Value) -> (String, String, String, String) {
         .unwrap_or(&id)
         .to_string();
     let sql = sql_libraries::extract_sql(lib);
-    let json = serde_json::to_string_pretty(lib).unwrap_or_default();
+    let json =
+        serde_json::to_string_pretty(&sql_libraries::strip_sql_attachment(lib)).unwrap_or_default();
     (id, name, json, sql)
+}
+
+/// Builds SQL Query/SQL View's Details guided-form panel (#840) against an
+/// already-parsed document — the same analysis `editor::render_body`'s
+/// `pane=form` branch performs over HTTP (`editor::build_form_pane`) with
+/// `hidden=["content"]` and `legend=sql-library`, called directly instead:
+/// the page's own render (and the Save-error re-render) need the panel in
+/// place on first paint, not fetched after the fact. Mirrors
+/// [`render_vd_form_pane`]; `document`'s own `resourceType` decides the
+/// fallback resource type when absent, falling back to `"Library"` — every
+/// caller on this page hands it a `Library` (its SQL attachment already
+/// stripped by the caller), except the one Save-error path where the
+/// submitted document parses but carries some other type.
+fn render_lib_details_pane(
+    i18n: I18n,
+    version: helios_fhir::FhirVersion,
+    document: serde_json::Value,
+) -> editor::EditorFormPane {
+    let registry = helios_fhir_validator::packs::core_registry(version);
+    let resource_type = document
+        .get("resourceType")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("Library")
+        .to_string();
+    // #840: the SQL attachment lives in its own card below, never in the
+    // Details form — hidden from both its rows and its own "+ Add" list —
+    // and the two-line legend names what Save actually gates on this page
+    // (the Library type coding and the SQL attachment), not the generic
+    // constraints/terminology promise `Legend::Resource` makes.
+    editor::build_form_pane(
+        i18n,
+        registry,
+        version,
+        resource_type,
+        document,
+        None,
+        true,
+        &[String::from("content")],
+        "sql-library",
+    )
+}
+
+/// The Details panel for whichever document this render selected (#840):
+/// the stored library — its SQL attachment stripped — or `?lib=new`'s
+/// starter document (which carries none to begin with), mirroring
+/// [`vd_form_pane_for_selection`]. `None` only alongside `selected: None`.
+fn lib_details_pane_for_selection(
+    i18n: I18n,
+    version: helios_fhir::FhirVersion,
+    kind: &LibraryKind,
+    is_new: bool,
+    selected_value: Option<&serde_json::Value>,
+) -> Option<editor::EditorFormPane> {
+    if is_new {
+        Some(render_lib_details_pane(
+            i18n,
+            version,
+            sql_libraries::starter_library_value(kind.code),
+        ))
+    } else {
+        selected_value.map(|lib| {
+            render_lib_details_pane(i18n, version, sql_libraries::strip_sql_attachment(lib))
+        })
+    }
 }
 
 /// Resolves one candidate Library id, requiring it to carry `code`: a stored
@@ -3612,6 +3715,10 @@ async fn sql_library_page(
         },
         _ => RunResultsState::Empty,
     };
+    // #840: the Details card's guided-form panel, built inline from the same
+    // document `selected.json` already shows — `selected_value` is still
+    // borrowed here, ahead of `selected` itself moving into the response.
+    let details = lib_details_pane_for_selection(i18n, rv.0, kind, is_new, selected_value.as_ref());
 
     render(SqlLibraryPage {
         status: current_status(&state, rv.0, &rt),
@@ -3635,6 +3742,7 @@ async fn sql_library_page(
         degraded,
         selected,
         is_new,
+        details,
         run_results: RunResultsPartial {
             i18n,
             fragment: false,
@@ -3683,6 +3791,23 @@ async fn sql_library_save(
         let export_href = export_href(kind, &id);
         let status_class = status_tag_class(&status);
         let i18n = I18n::new(locale);
+        // #840: Details reconstructed from exactly what was submitted — the
+        // guided-form panel built from it when it parses (with rows and
+        // errors of its own), the invalid-JSON notice in its place when it
+        // does not — the same shape View Definitions' own Save-error path
+        // gives `form_pane` (`invalid_form_pane`/`render_vd_form_pane`).
+        // `json` has never had a SQL attachment embedded into it at this
+        // point (`embed_sql` runs only after every gate below passes), so
+        // it is already the Details document as posted, unstripped further.
+        let details = match serde_json::from_str::<serde_json::Value>(&json) {
+            Ok(document) => render_lib_details_pane(i18n, rv.0, document),
+            Err(parse_error) => invalid_form_pane(
+                i18n,
+                json.clone(),
+                parse_error.to_string(),
+                editor::Legend::SqlLibrary,
+            ),
+        };
         SqlLibraryPage {
             status: current_status(&state, rv.0, &rt),
             i18n,
@@ -3712,6 +3837,7 @@ async fn sql_library_save(
                 status_class,
             }),
             is_new,
+            details: Some(details),
             // A form-validation error re-renders in place: nothing has run
             // server-side, so this render's own results are `Empty` — same
             // as any other render with no `?saved=1`. The submitted text is
@@ -3762,6 +3888,22 @@ async fn sql_library_save(
         let status = sql_libraries::extract_status(&resource);
         return render(error_page(
             "the document must have resourceType \"Library\"".to_string(),
+            form.json,
+            form.sql,
+            form.id.is_empty(),
+            form.id,
+            status,
+        ));
+    }
+    // #840: this page only ever shows and saves Libraries of its own kind —
+    // saving a `sql-view` from SQL Queries (or the reverse) would silently
+    // vanish it from the rail it was just edited on. Checked ahead of
+    // `embed_sql` below, against the resource exactly as submitted, so a
+    // rejected Save changes nothing about what the user typed.
+    if !sql_libraries::has_library_code(&resource, kind.code) {
+        let status = sql_libraries::extract_status(&resource);
+        return render(error_page(
+            I18n::new(locale).t_arg("lib-save-wrong-kind", "code", kind.code.to_string()),
             form.json,
             form.sql,
             form.id.is_empty(),

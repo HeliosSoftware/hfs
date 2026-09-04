@@ -1735,6 +1735,59 @@ async fn editor_pane_form_keeps_the_users_text_when_the_json_is_broken() {
     assert!(!html.contains(r#"class="editor__grid""#));
 }
 
+/* `hidden` and `legend` (#840): the engine two hosts (SQL Query and SQL
+ * View's own Details panel) will build on — a `hidden` first-level element
+ * neither renders nor mutates, and a host-chosen `legend` independent of
+ * `resourceType`. Same endpoint, same `apply()`/`analyze()` pass as every
+ * other `pane=form` test above. */
+
+/// `hidden=content` on a `Library` with two `content[]` attachments (#840)
+/// drops every row under `content` and its own "+ Add" option, while
+/// `#editor-doc` still carries both attachments untouched.
+#[tokio::test]
+async fn editor_pane_form_hidden_content_drops_its_rows_and_add_option_but_keeps_the_document() {
+    let doc = serde_json::json!({
+        "resourceType": "Library",
+        "status": "draft",
+        "content": [
+            { "contentType": "application/sql", "data": "U0VMRUNUIDE=" },
+            { "contentType": "text/plain", "data": "aGVsbG8=" }
+        ]
+    });
+    let html = edit(&form_pane_body(&doc, &[("hidden", "content")])).await;
+
+    assert!(!html.contains(r#"data-path="content""#));
+    assert!(!html.contains(r#"data-path="content.0""#));
+    assert!(!html.contains(r#"data-path="content.0.contentType""#));
+    assert!(!html.contains(r#"data-name="content""#));
+    // Other top-level elements are still offered.
+    assert!(html.contains(r#"data-name="name""#));
+
+    // #editor-doc carries the whole document, both attachments included,
+    // HTML-escaped by Askama.
+    let doc_start = html.find(r#"id="editor-doc""#).expect("#editor-doc");
+    let doc_field = &html[doc_start..];
+    assert!(doc_field.contains("application/sql"));
+    assert!(doc_field.contains("U0VMRUNUIDE="));
+    assert!(doc_field.contains("text/plain"));
+    assert!(doc_field.contains("aGVsbG8="));
+}
+
+/// `legend=sql-library` (#840) swaps in the SQL Query/SQL View pair of
+/// legend lines — neither the Resource Editor's generic "constraints and
+/// terminology" line nor View Definitions' single line.
+#[tokio::test]
+async fn editor_pane_form_sql_library_legend_shows_its_own_two_lines() {
+    let doc = serde_json::json!({ "resourceType": "Library", "status": "draft" });
+    let html = edit(&form_pane_body(&doc, &[("legend", "sql-library")])).await;
+
+    assert!(html.contains("editor-legend__live"));
+    assert!(html.contains("editor-legend__save"));
+    assert!(html.contains("SQL on FHIR Library type"));
+    assert!(!html.contains("constraints and terminology"));
+    assert!(!html.contains("FHIRPath syntax"));
+}
+
 /* History & Versions (#236). The diff is computed server-side; these post two
  * versions the way the browser does after fetching them from _history. */
 
@@ -2610,8 +2663,17 @@ async fn sql_library_workspaces_split_kinds_and_roundtrip_sql() {
     assert!(html.contains("flat_patients"));
     assert!(!html.contains("patient_counts"));
 
-    // Save re-embeds the SQL pane and redirects to the stored library.
-    let body = "id=&action=save&sql=SELECT%202&json=%7B%22resourceType%22%3A%22Library%22%2C%22name%22%3A%22x%22%7D";
+    // Save re-embeds the SQL pane and redirects to the stored library. The
+    // posted `json` carries this page's own `sql-query` coding — #840's
+    // gate rejects anything else (exercised separately below).
+    let new_query = serde_json::json!({"resourceType": "Library", "name": "x",
+        "type": {"coding": [{"system": system, "code": "sql-query"}]}});
+    let body = form_urlencoded::Serializer::new(String::new())
+        .append_pair("id", "")
+        .append_pair("action", "save")
+        .append_pair("sql", "SELECT 2")
+        .append_pair("json", &new_query.to_string())
+        .finish();
     let response = app
         .clone()
         .oneshot(
@@ -2664,11 +2726,11 @@ fn title_row_html(html: &str) -> String {
 /// head's own plural collection title) and `.tag--{status}` naming the
 /// resource's own FHIR `status` verbatim — render for both a saved
 /// selection and the `?lib=new` starter, whose chips read the starter's own
-/// fixed `draft` status. The secondary "Edit as JSON" link only appears for
-/// a saved Library, and its `href` names that Library's own `_id`. There is
-/// exactly one `<h1>` per page.
+/// fixed `draft` status. There is exactly one `<h1>` per page. #840 retires
+/// the title row's "Edit as JSON" link — the Details card below replaces it
+/// — so it never appears, saved or not.
 #[tokio::test]
-async fn sql_library_title_row_carries_kind_chips_and_the_edit_as_json_link() {
+async fn sql_library_title_row_carries_kind_chips_and_no_edit_as_json_link() {
     let system = "http://hl7.org/fhir/uv/sql-on-fhir/CodeSystem/LibraryTypesCodes";
     let libs = vec![
         serde_json::json!({"resourceType": "Library", "id": "q1", "name": "patient_counts",
@@ -2700,7 +2762,8 @@ async fn sql_library_title_row_carries_kind_chips_and_the_edit_as_json_link() {
     assert!(title_row.contains(r#"class="tag tag--type">SQL Query<"#));
     assert!(title_row.contains(r#"class="tag tag--active">active<"#));
     assert!(title_row.contains("patient_counts"));
-    assert!(html.contains(r#"href="/ui/resources?url=Library%3F_id%3Dq1""#));
+    assert!(!html.contains("Edit as JSON"));
+    assert!(!html.contains(r#"href="/ui/resources?url=Library%3F_id%3Dq1""#));
 
     let response = app
         .clone()
@@ -2715,10 +2778,11 @@ async fn sql_library_title_row_carries_kind_chips_and_the_edit_as_json_link() {
     let title_row = title_row_html(&html);
     assert!(title_row.contains(r#"class="tag tag--type">SQL View<"#));
     assert!(title_row.contains(r#"class="tag tag--retired">retired<"#));
-    assert!(html.contains(r#"href="/ui/resources?url=Library%3F_id%3Dv1""#));
+    assert!(!html.contains("Edit as JSON"));
+    assert!(!html.contains(r#"href="/ui/resources?url=Library%3F_id%3Dv1""#));
 
     // `?lib=new`: the starter's own fixed `draft` status: no stored id, so
-    // no "Edit as JSON" link and no CRUD actions at all.
+    // no CRUD actions at all.
     let response = app
         .oneshot(
             Request::get("/ui/sql/queries?lib=new")
@@ -2814,8 +2878,9 @@ async fn sql_library_editor_results_and_failure_copy_differ_by_kind() {
 /// `sql_queries_run_previews_posted_content_and_offers_export_with_an_id`),
 /// present only for SQL Queries and only once the Library is saved — never
 /// for `?lib=new`'s unsaved starter, and never for SQL Views at all. The
-/// JSON fold, its `<details>`, and `?run=1` are gone; the resource travels
-/// as a hidden `name="json"` field instead of a visible textarea.
+/// JSON fold, its `<details>`, and `?run=1` are gone; the resource — its
+/// own SQL attachment stripped out — travels as the Details card's own
+/// visible `name="json"` textarea (#840), not a hidden field.
 #[tokio::test]
 async fn sql_library_page_offers_export_only_for_a_saved_query_and_drops_the_json_fold() {
     let system = "http://hl7.org/fhir/uv/sql-on-fhir/CodeSystem/LibraryTypesCodes";
@@ -2844,9 +2909,12 @@ async fn sql_library_page_offers_export_only_for_a_saved_query_and_drops_the_jso
     // this checks the fold's own class rather than every `<details>`.
     assert!(!html.contains("json-fold"));
     assert!(!html.contains("run=1"));
-    assert!(!html.contains(r#"<textarea class="json-editor" name="json""#));
-    assert!(html.contains(r#"<input type="hidden" name="json" value="#));
+    assert!(html.contains(r#"<textarea class="json-editor" name="json" form="lib-editor-form""#));
+    assert!(!html.contains(r#"<input type="hidden" name="json""#));
     assert!(html_unescape(&html).contains(r#""resourceType": "Library""#));
+    // The SQL attachment is stripped out of the Details document — it lives
+    // only in the SQL card's own textarea, decoded (#840).
+    assert!(!html_unescape(&html).contains("application/sql"));
 
     // `?lib=new`: the starter is never saved, so Export never appears even
     // though the kind offers it.
@@ -2910,6 +2978,277 @@ async fn sql_library_empty_state_uses_the_routes_own_kind_copy() {
     assert!(html.contains("No views yet."));
     assert!(!html.contains("No SQL queries yet"));
     assert!(html.contains(r#"href="/ui/sql/views?lib=new""#));
+}
+
+/// The exact text between the Details JSON pane's `<textarea name="json"
+/// ...>` open tag and its `</textarea>` close tag, HTML-unescaped — the same
+/// shape as [`sql_textarea_value`] for the SQL pane below it. `name="json"`
+/// occurs exactly once on this page (the hidden guided-form state names its
+/// own fields `doc`/`op`/`path`/…, never `json`).
+fn lib_json_textarea_value(html: &str) -> String {
+    let open_tag_end = html
+        .find(r#"name="json""#)
+        .and_then(|from| html[from..].find('>').map(|to| from + to + 1))
+        .expect("a <textarea name=\"json\"> open tag");
+    let close = html[open_tag_end..]
+        .find("</textarea>")
+        .expect("a matching </textarea>");
+    html_unescape(&html[open_tag_end..open_tag_end + close])
+}
+
+/// #840: the Details JSON pane shows the Library minus its SQL attachment —
+/// a second, non-SQL attachment survives untouched — the guided form beside
+/// it never shows or offers to mutate `content`, its own legend names what
+/// Save actually gates, and the retired "Edit as JSON" link is gone.
+#[tokio::test]
+async fn sql_library_details_strips_the_sql_attachment_and_hides_content() {
+    let system = "http://hl7.org/fhir/uv/sql-on-fhir/CodeSystem/LibraryTypesCodes";
+    let lib = serde_json::json!({"resourceType": "Library", "id": "q1", "name": "patient_counts",
+    "status": "active",
+    "type": {"coding": [{"system": system, "code": "sql-query"}]},
+    "content": [
+        {"contentType": "application/sql", "data": BASE64.encode("SELECT 1")},
+        {"contentType": "text/plain", "data": BASE64.encode("a note")},
+    ]});
+    let source = helios_ui::StaticConformanceSource::empty().with(
+        "Library",
+        helios_fhir::FhirVersion::R4,
+        vec![lib],
+    );
+    let app = library_app(source);
+
+    let response = app
+        .oneshot(
+            Request::get("/ui/sql/queries?lib=q1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+
+    assert!(html.contains(r#"class="card editor-form needs-js""#));
+    assert!(html.contains(r#"id="lib-details-grid""#));
+    let json_field = lib_json_textarea_value(&html);
+    assert!(json_field.contains("text/plain"), "{json_field}");
+    assert!(!json_field.contains("application/sql"), "{json_field}");
+    assert!(!html.contains(r#"data-path="content""#));
+    assert!(html.contains("Checked on save: SQL on FHIR"));
+    assert!(!html.contains("Edit as JSON"));
+}
+
+/// #840: the Details lede only shows for `?lib=new` — the hint that closes
+/// the #839 follow-up about the starter's `change-me` placeholder — and is
+/// absent for a saved selection.
+#[tokio::test]
+async fn sql_library_details_new_lede_shows_only_for_the_starter() {
+    let system = "http://hl7.org/fhir/uv/sql-on-fhir/CodeSystem/LibraryTypesCodes";
+    let lib = serde_json::json!({"resourceType": "Library", "id": "q1", "name": "patient_counts",
+        "status": "active",
+        "type": {"coding": [{"system": system, "code": "sql-query"}]}});
+    let source = helios_ui::StaticConformanceSource::empty().with(
+        "Library",
+        helios_fhir::FhirVersion::R4,
+        vec![lib],
+    );
+    let app = library_app(source);
+
+    let html = body_text(
+        app.clone()
+            .oneshot(
+                Request::get("/ui/sql/queries?lib=new")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert!(html.contains("Rename it and point relatedArtifact[0]"));
+
+    let html = body_text(
+        app.oneshot(
+            Request::get("/ui/sql/queries?lib=q1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap(),
+    )
+    .await;
+    assert!(!html.contains("Rename it and point relatedArtifact[0]"));
+}
+
+/// #840: Save fuses the posted Details document (no SQL attachment, a
+/// non-SQL one kept) with the posted SQL pane into one Library —
+/// `sql_libraries::embed_sql` appends the `application/sql` attachment
+/// alongside the surviving `text/plain` one — and redirects to it.
+/// `StaticConformanceSource::save_resource` does not persist (see
+/// `sql_editor_save_roundtrips_special_characters_byte_for_byte`'s own doc
+/// comment), so the merged document is read back off
+/// [`helios_ui::StaticConformanceSource::saved_resources`] instead of a
+/// follow-up fetch.
+#[tokio::test]
+async fn sql_library_save_merges_details_and_sql_into_one_library() {
+    let system = "http://hl7.org/fhir/uv/sql-on-fhir/CodeSystem/LibraryTypesCodes";
+    let details = serde_json::json!({"resourceType": "Library", "id": "q1", "name": "new_title",
+        "status": "active",
+        "type": {"coding": [{"system": system, "code": "sql-query"}]},
+        "content": [{"contentType": "text/plain", "data": BASE64.encode("a note")}]});
+    let source = helios_ui::StaticConformanceSource::empty();
+    let app = library_app(source.clone());
+
+    let body = form_urlencoded::Serializer::new(String::new())
+        .append_pair("id", "q1")
+        .append_pair("action", "save")
+        .append_pair("json", &details.to_string())
+        .append_pair("sql", "SELECT 2")
+        .finish();
+    let response = app
+        .oneshot(
+            Request::post("/ui/sql/queries")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        response.headers()["location"],
+        "/ui/sql/queries?lib=q1&saved=1"
+    );
+
+    let saved = source.saved_resources();
+    assert_eq!(saved.len(), 1);
+    let saved = &saved[0];
+    assert_eq!(saved["name"], "new_title");
+    let content = saved["content"].as_array().expect("content array");
+    assert_eq!(content.len(), 2);
+    assert!(
+        content
+            .iter()
+            .any(|a| a["contentType"] == "text/plain" && a["data"] == BASE64.encode("a note"))
+    );
+    assert!(
+        content.iter().any(
+            |a| a["contentType"] == "application/sql" && a["data"] == BASE64.encode("SELECT 2")
+        )
+    );
+}
+
+/// #840: saving a `sql-view`-coded document from SQL Queries (and the
+/// reverse, from SQL Views) is rejected with the route's own expected code
+/// named in a warning notice — nothing is saved.
+#[tokio::test]
+async fn sql_library_save_rejects_the_other_kinds_coding() {
+    let system = "http://hl7.org/fhir/uv/sql-on-fhir/CodeSystem/LibraryTypesCodes";
+    let cases = [
+        ("/ui/sql/queries", "sql-view", "sql-query"),
+        ("/ui/sql/views", "sql-query", "sql-view"),
+    ];
+    for (route, wrong_code, expected_code) in cases {
+        let wrong_kind = serde_json::json!({"resourceType": "Library", "name": "x",
+            "status": "active",
+            "type": {"coding": [{"system": system, "code": wrong_code}]}});
+        let source = helios_ui::StaticConformanceSource::empty();
+        let app = library_app(source.clone());
+
+        let body = form_urlencoded::Serializer::new(String::new())
+            .append_pair("id", "")
+            .append_pair("action", "save")
+            .append_pair("json", &wrong_kind.to_string())
+            .append_pair("sql", "SELECT 1")
+            .finish();
+        let response = app
+            .oneshot(
+                Request::post(route)
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{route}");
+        let html = body_text(response).await;
+        assert!(html.contains("notice--warn"), "{route}: {html}");
+        assert!(html.contains(expected_code), "{route}: {html}");
+        assert!(source.saved_resources().is_empty(), "{route}");
+    }
+}
+
+/// #840: invalid Details JSON re-renders with the guided-form card showing
+/// the invalid-JSON notice in place of rows — the same shape View
+/// Definitions' own Save-error path already proves — and both textareas
+/// keep exactly what was submitted.
+#[tokio::test]
+async fn sql_library_save_invalid_json_shows_the_invalid_form_card() {
+    let source = helios_ui::StaticConformanceSource::empty();
+    let app = library_app(source);
+
+    let body = form_urlencoded::Serializer::new(String::new())
+        .append_pair("id", "")
+        .append_pair("action", "save")
+        .append_pair("json", "{nope")
+        .append_pair("sql", "SELECT 3")
+        .finish();
+    let response = app
+        .oneshot(
+            Request::post("/ui/sql/queries")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains("invalid JSON"));
+    // The guided-form card itself, in its own invalid-JSON state
+    // (`partials/editor-form-fragment.html`'s `parse_error` branch) —
+    // distinct from the page-level `.notice--warn` the "invalid JSON"
+    // assertion above already covers.
+    assert!(html.contains(r#"<div class="alert" role="alert">"#));
+    assert_eq!(lib_json_textarea_value(&html), "{nope");
+    assert_eq!(sql_textarea_value(&html), "SELECT 3");
+}
+
+/// #840: `POST …/run` embeds the posted SQL into the posted (content-less)
+/// Details document exactly as Save does, before handing it to `$sql-run` —
+/// the same `sql_libraries::embed_sql` merge, proven here against the live
+/// preview endpoint rather than Save's redirect.
+#[tokio::test]
+async fn sql_queries_run_embeds_the_sql_into_the_content_less_document() {
+    let source = helios_ui::StaticConformanceSource::empty()
+        .with_sql_run(Ok(vec![serde_json::json!({"n": 1})]));
+    let app = library_app(source.clone());
+    let details =
+        serde_json::json!({"resourceType": "Library", "name": "unsaved_query", "status": "draft"});
+
+    let response = app
+        .oneshot(post_run(
+            "/ui/sql/queries/run",
+            library_run_body("lib1", &details, "SELECT COUNT(*) AS n FROM v"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let calls = source.sql_run_calls();
+    assert_eq!(calls.len(), 1);
+    let content = calls[0]["content"].as_array().expect("content array");
+    let sql_attachment = content
+        .iter()
+        .find(|a| a["contentType"] == "application/sql")
+        .expect("an application/sql attachment");
+    let decoded = BASE64
+        .decode(sql_attachment["data"].as_str().unwrap())
+        .unwrap();
+    assert_eq!(
+        String::from_utf8(decoded).unwrap(),
+        "SELECT COUNT(*) AS n FROM v"
+    );
 }
 
 /// `application/x-www-form-urlencoded`-encodes `s`, byte by byte, so tests

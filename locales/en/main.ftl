@@ -501,6 +501,12 @@ vd-form-legend-live = Checked as you type: structure, cardinality, required bind
 # states ("No issues.", "3 issues"), never the longer editor-invalid-json
 # sentence.
 vd-form-invalid-chip = Invalid JSON
+# SQL Query / SQL View's own two-line legend (#840): Save there gates the
+# SQL on FHIR Library type and the SQL attachment, not the generic
+# constraints/terminology promise `editor-legend-save` makes — a promise
+# `HFS_VALIDATION_MODE` off (the default) would make false.
+lib-form-legend-live = Checked as you type: structure, cardinality, required bindings
+lib-form-legend-save = Checked on save: SQL on FHIR Library type and the SQL attachment
 editor-deferred-badge = on save
 editor-deferred-hint = Codes are verified against the value set when you save (and live in the picker where a terminology server is configured)
 editor-must-support-hint = Must-support: consumers of this profile are expected to handle this element
@@ -891,11 +897,21 @@ lib-degraded = The library list could not be loaded.
 # The SQL card's "runs as you type" legend (#839) — shared verbatim by SQL
 # Queries and SQL Views, unlike the headings/failure prefix above.
 lib-run-hint = Runs as you type — results follow the current SQL, saved or not
-# The title row's secondary link to the full resource (#839; #840 replaces
-# this with a Details card).
-lib-edit-json = Edit as JSON
 lib-delete-confirm = Delete "{ $name }"? This cannot be undone.
 lib-delete-failed = Could not delete the library.
+# Details section (#840): the Library minus its SQL attachment, edited as
+# JSON (left) and through the guided form (right).
+lib-details-heading = Details
+lib-details-json-heading = Library (JSON)
+lib-details-json-note = The SQL attachment is edited in the SQL card below and is not part of this view.
+# Shown only for `?lib=new`, under the Details heading — closes the #839
+# follow-up asking for a hint about the starter's `change-me` placeholder.
+lib-details-new-lede = Rename it and point relatedArtifact[0] at a ViewDefinition that exists.
+# The Save gate (#840): rejects a document whose `type.coding` names the
+# other kind's code (a sql-view saved from SQL Queries, or the reverse),
+# which would otherwise silently vanish it from the rail it was just edited
+# on. `$code` is the route's own expected code ("sql-query"/"sql-view").
+lib-save-wrong-kind = The Library's SQL on FHIR type must be "{ $code }" to save it here.
 
 ## SQL Export pages (#649, #833)
 

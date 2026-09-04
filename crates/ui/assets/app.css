@@ -4606,7 +4606,12 @@ details.json-fold[open] > summary .icon {
   overflow: hidden;
 }
 
-/* The editor card's own scrolling area is whichever of the two the browser
+/* `.editor__doc` (#840, generalized off View Definitions' own `#vd-editor-
+   form`): the flex-column container of a JSON editor pane inside a stretch
+   pairing — on View Definitions, the `<form id="vd-editor-form">` around
+   the editor itself carries this class; any future `.editor__grid--stretch`
+   consumer's own editor container does the same to get identical sizing.
+   The editor card's own scrolling area is whichever of the two the browser
    actually mounted: CodeMirror's wrapper (`.code-editor`) normally, or the
    plain `<textarea>` it replaces when the bundle never mounted.
    Only `flex` lives here for the CodeMirror wrapper: the matching
@@ -4622,7 +4627,7 @@ details.json-fold[open] > summary .icon {
    lives in) — with nothing here it would otherwise need to beat, `flex`
    loses nothing by living unlayered alongside `max-height: none` instead of
    splitting the one selector across two blocks. */
-.editor__grid--stretch #vd-editor-form {
+.editor__grid--stretch .editor__doc {
   display: flex;
   flex: 1;
   flex-direction: column;
@@ -6596,12 +6601,27 @@ body.app-shell .pane {
    textarea) is ordinary layout, but it lives in this same unlayered block
    for one clear read.
 
-   What is deliberately NOT here: sizing (min/max-height) and token colors.
-   Those are per editor — `.vd-editor` below sets its own heights and
-   `.cmt-json-*`/`.cmt-fp-*` colors; `.sql-editor` does the
-   same for its own tokens — because different editors in this crate need
-   different heights and color palettes even though they share every other
-   rule below. */
+   What is deliberately NOT here: sizing (min/max-height) and non-JSON token
+   colors. Sizing is per editor — `.editor__doc` (shared JSON editor panes)
+   and `.sql-editor` further down each set their own heights, because
+   different editors in this crate need different footprints even though
+   they share every other rule below. The JSON token palette (`.cmt-json-*`,
+   right below) IS here, generalized off View Definitions' own original
+   copy (#840): every editor in this crate that shows outer JSON — View
+   Definitions today, the Library Details editor next (#840) — reads the
+   same five classes, so one shared rule set beats a per-editor copy. A
+   language injected into JSON's own string values (`.cmt-fp-*`, FHIRPath)
+   is not shared the same way and stays scoped to the editor that injects
+   it (`.vd-editor`, further down). */
+
+/* JSON token colors — the same variables the Resource Editor's raw JSON
+   view (.jt--key et al.) already uses, so a JSON document's outer shape
+   reads identically wherever it appears in the UI. */
+.code-editor .cmt-json-key { color: var(--json-key); }
+.code-editor .cmt-json-string { color: var(--json-string); }
+.code-editor .cmt-json-number { color: var(--json-number); }
+.code-editor .cmt-json-literal { color: var(--json-literal); font-weight: 600; }
+.code-editor .cmt-json-punct { color: var(--muted); }
 
 .code-editor {
   width: 100%;
@@ -6801,27 +6821,28 @@ body.app-shell .pane {
 }
 
 /* ---------------------------------------------------------------------------
-   ViewDefinition editor (#753, generalized in #838): only what is specific to
-   this editor now lives here — its heights and its two token palettes
-   (JSON, FHIRPath). Everything CodeMirror-generic moved to `.code-editor`
-   above.
+   Shared JSON editor pane sizing (#753, generalized off View Definitions'
+   own original copy in #840): `.editor__doc` marks a JSON editor's
+   container inside a stretch pairing (`.editor__grid--stretch` further up
+   this file, in the layered `pages` section, #843) — on View Definitions
+   the `<form id="vd-editor-form">` around the editor carries it; any future
+   consumer's own container does the same to get the identical "min 320px,
+   max ~70vh, scrolls internally" footprint below.
 
-   Sizing is on `.cm-editor` itself, not the `.vd-editor` wrapper: CodeMirror
-   already makes it a flex column with no explicit height, so a plain
-   min-height/max-height there is enough for `.cm-scroller`'s `height: 100%`
-   to resolve once content forces the max-height clamp, giving the
-   "min 320px, max ~70vh, scrolls internally" shape (#753) without
-   measuring anything in JS.
+   Sizing is on `.cm-editor` itself, not the `.editor__doc` wrapper:
+   CodeMirror already makes it a flex column with no explicit height, so a
+   plain min-height/max-height there is enough for `.cm-scroller`'s
+   `height: 100%` to resolve once content forces the max-height clamp,
+   without measuring anything in JS.
    --------------------------------------------------------------------------- */
 
-.vd-editor .cm-editor {
+.editor__doc .cm-editor {
   min-height: 320px;
   max-height: 70vh;
 }
 
-/* Inside the guided-form pairing (#843, `.editor__grid--stretch` further up
-   this file, in the layered `pages` section): the row itself already caps
-   total height at 70vh and stretches both cards to match, so `.cm-editor`
+/* Inside the guided-form pairing (#843): the row itself already caps total
+   height at 70vh and stretches both cards to match, so `.cm-editor`
    becomes its wrapper's `flex: 1` scrolling area — `height: 100%` of
    whatever the stretch pairing gives it — instead of clamping itself
    independently. The 320px floor above is untouched — that minimum applies
@@ -6838,11 +6859,11 @@ body.app-shell .pane {
 /* #752: the plain `<textarea>` fallback's own height — the same
    "min 320px, max ~70vh, scroll internally" shape `.cm-editor` gets above,
    so nojs and the pre-mount flash match the mounted editor's footprint
-   instead of a fixed `rows` count. Scoped to this page's form rather than
+   instead of a fixed `rows` count. Scoped to `.editor__doc` rather than
    `.json-editor` itself, which every other page keeps its own sizing for —
    the Library-backed SQL pane below gets the identical treatment, scoped to
    its own smaller editor's dimensions (#839). */
-#vd-editor-form textarea.json-editor {
+.editor__doc textarea.json-editor {
   min-height: 320px;
   max-height: 70vh;
   overflow-y: auto;
@@ -6853,19 +6874,17 @@ body.app-shell .pane {
    yields — its 320px floor does not. `flex: 1` rides along here too (moved
    down from beside `.code-editor`'s own copy, further up this file) so the
    selector is not declared a second time. */
-.editor__grid--stretch #vd-editor-form textarea.json-editor {
+.editor__grid--stretch .editor__doc textarea.json-editor {
   flex: 1;
   max-height: none;
 }
 
-/* JSON token colors — the same variables the Resource Editor's raw JSON
-   view (.jt--key et al.) already uses, so a ViewDefinition's outer shape
-   reads identically wherever it appears in the UI. */
-.vd-editor .cmt-json-key { color: var(--json-key); }
-.vd-editor .cmt-json-string { color: var(--json-string); }
-.vd-editor .cmt-json-number { color: var(--json-number); }
-.vd-editor .cmt-json-literal { color: var(--json-literal); font-weight: 600; }
-.vd-editor .cmt-json-punct { color: var(--muted); }
+/* ---------------------------------------------------------------------------
+   ViewDefinition editor (#753, generalized in #838; its JSON sizing and
+   token colors generalized off this section in #840): only what is
+   specific to this editor now lives here — the FHIRPath palette for the
+   grammar its own script injects into the outer JSON.
+   --------------------------------------------------------------------------- */
 
 /* FHIRPath token colors — the injected grammar, scoped separately in
    vd-editor.js so these never bleed onto the outer JSON's own tokens even
@@ -6882,9 +6901,11 @@ body.app-shell .pane {
 /* ---------------------------------------------------------------------------
    SQL editor (#838, sql-editor.js): mounted over the SQL pane's
    `<textarea name="sql">` on /ui/sql/queries and /ui/sql/views. Same
-   min-height-grows / max-height-scrolls shape as .vd-editor above, just
-   shorter — the SQL pane is a single query, not a full ViewDefinition
-   document — and one token palette instead of two (no injected language). */
+   min-height-grows / max-height-scrolls shape as `.editor__doc .cm-editor`
+   above, just shorter — the SQL pane is a single query, not a full
+   ViewDefinition document — and one token palette instead of two (no
+   injected language). Not `.editor__doc` itself: the SQL pane is not part
+   of a `.editor__grid--stretch` pairing. */
 
 .sql-editor .cm-editor {
   min-height: 180px;
@@ -6893,8 +6914,8 @@ body.app-shell .pane {
 
 /* #839: the SQL pane's plain `<textarea>` fallback matches the mounted
    CodeMirror editor's own min-height/max-height above — the same
-   "nojs footprint equals the mounted one" contract `#vd-editor-form
-   textarea.json-editor` gives the ViewDefinition editor, scoped here to
+   "nojs footprint equals the mounted one" contract `.editor__doc
+   textarea.json-editor` gives a JSON editor pane, scoped here to
    `#lib-editor-form` instead since `.json-editor` itself keeps its generic
    sizing for every other page. */
 #lib-editor-form textarea.json-editor {
