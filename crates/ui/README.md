@@ -115,14 +115,129 @@ is the vendoring ritual (pinned npm dependencies, a committed lockfile, a
 rollup + terser recipe run by hand, never by `cargo build` or CI); its one
 output, [`assets/vendor/codemirror.bundle.js`](assets/vendor/codemirror.bundle.js),
 is the vendored bundle itself — embedded and served exactly like every other
-asset in this crate (above), nothing bundler-specific about how it ships. It
-backs the ViewDefinition JSON editor on `/ui/sql/view-definitions` and the SQL
-pane editors on `/ui/sql/queries` and `/ui/sql/views`; see
+asset in this crate (above), nothing bundler-specific about how it ships. The
+license of every bundled package, including `lezer-fhirpath` (MIT, declared
+in its published README rather than `package.json`), is documented with its
+citation in the vendor README's "What's bundled" table (#821) and carried in
+the bundle's own banner comment. It backs the ViewDefinition JSON editor on
+`/ui/sql/view-definitions` and the SQL pane editors on `/ui/sql/queries` and
+`/ui/sql/views`; see
 [`docs/viewdefinition-editor-evaluation.md`](../../docs/viewdefinition-editor-evaluation.md)
 for the full evaluation this amendment is drawn from. The ViewDefinition
-editor also talks to `POST …/lint` (#753), the CodeMirror linter's
-structural + FHIRPath-syntax check — a JSON-in-HTML-fragment-out endpoint of
-its own, unrelated to the run preview below.
+editor also talks to `POST /ui/sql/view-definitions/lint` (#753, #820, #821),
+the CodeMirror linter's structural + FHIRPath-syntax check — a plain
+JSON-in-JSON-out endpoint of its own (no htmx swap), unrelated to the run
+preview below. The request body is the raw ViewDefinition JSON; the response
+is `{"diagnostics": [...]}`, one element per
+`helios_sof::lint::Diagnostic` with two additions the handler itself builds:
+`message` is **not** `Diagnostic::message` (that field is always English —
+`$sql-run`, `sof-cli`, and `pysof` all use it verbatim) but the request's
+negotiated-locale rendering of `code` + `args` against the `vd-lint-*`
+catalog in `locales/*/main.ftl` — negotiated exactly like every page (`?lang=`
+override → `hfs_lang` cookie → `Accept-Language` → `en`, see
+[`i18n.rs`](src/i18n.rs)); and each element of `fixes` (one-click structural
+edits — rename/remove a key, set a string value, addressed by RFC 6901
+pointer, never a text position, since this handler never sees source text)
+carries an additional `label`, translated the same way from the matching
+`vd-fix-*` catalog key. `args`, `span`, and every other `Diagnostic`/`Fix`
+field pass through unchanged, so a client that wants the raw value behind a
+translated sentence still has it.
+
+`vd-editor.js` turns each diagnostic's `fixes` into a `Diagnostic.action`
+(#821) — a button in the hover tooltip and, with several diagnostics at once,
+the bottom lint panel — whose `name` is the fix's own `label` and whose
+`apply` edits the document by the fix's RFC 6901 `pointer`, resolved against
+the browser's *live* syntax tree at the moment it is actually clicked (never
+against the tree the diagnostic first arrived against): a `pointer` that no
+longer resolves to the shape its kind expects — the document changed in
+between — makes the fix a no-op rather than mangling unrelated text.
+`rename-key` replaces just the content of the named property's key string;
+`remove-key` deletes the property together with whichever neighboring comma
+would otherwise dangle, never leaving a stray blank line or disturbing any
+other property's indentation; `set-string` replaces just the content of the
+pointed-at value string, escaping `"`/`\`. Every edit is one transaction
+(`userEvent: "lint.fix"`, one `Ctrl+Z` undoes it) that relaunches the lint
+(`forceLinting`) once applied. **Ctrl+.** collects the actions of every
+diagnostic under the cursor (`@codemirror/lint`'s own `forEachDiagnostic`):
+exactly one applies it directly, more than one opens the lint panel
+(`openLintPanel`), none falls through to `.`'s normal self-insertion;
+`lintKeymap` rides along in the same keymap, adding F8 (next diagnostic) and
+Ctrl-Shift-M (open the panel). Submitting `#vd-editor-form` as Save (not
+Duplicate) while the most recently *completed* lint pass still has at least
+one `error`-severity diagnostic — local JSON syntax errors included — pops a
+native, plural-correct `window.confirm` (`data-msg-save-errors-one`/`-other`
+on `#vd-editor-grid`, Fluent `vd-save-with-errors-one`/`-other`); cancelling
+it keeps the page as it is with focus back on the editor, and warnings alone
+(or no lint result yet) never prompt at all. None of this requires anything
+beyond `window.HfsCodeMirror` — no JavaScript at all means Save always just
+submits, exactly as it does today.
+
+The editor also talks to `POST /ui/sql/view-definitions/complete` (#821),
+a sibling of `/lint` following the same "the browser knows syntax, the
+server knows FHIR" split: a CodeMirror completion source only has to say
+*where the cursor is*, and this endpoint answers *what fits there*. No
+tenant, no htmx swap, no locale — plain JSON in, JSON out, and the FHIR
+version comes from the request's negotiated `RequestVersion` (`?version=`/
+cookie), never the body. Two request shapes, tagged by `kind`:
+
+- `{"kind": "key", "pointer": "...", "present": [...]}` — completion at a
+  structural JSON node. The response's `items` is
+  `helios_sof::lint::node_keys(pointer)` (the same key model `/lint`'s
+  `unknown-key` check is built on) minus whatever `present` already has, each
+  one `{"label": <key>, "kind": "key", "detail": <"string"|"number"|
+  "boolean"|"string[]"|"object"|"object[]"|"other">, "required": <bool>}`;
+  `from` is always `0`. A pointer the key model doesn't recognize answers
+  `{"from": 0, "items": []}`, never an error.
+- `{"kind": "fhirpath", "pointer": "...", "document": {...}, "expression":
+  "...", "cursor": N}` — completion inside a partial FHIRPath expression.
+  `expression` is the field's current full text; `cursor` is a **char**
+  offset (not a UTF-8 byte offset) into it, and anything after the cursor is
+  ignored. `document` is capped at 1 MiB — larger bodies are rejected with
+  `400`, never evaluated. The response's `from` is the char offset where the
+  token being completed starts (so a client splices its choice in at
+  `[from, cursor)`), and `items` mixes up to four candidate kinds depending
+  on where the cursor sits:
+  - Right after a `.` ("member mode"): `element` candidates (the resolved
+    type's own children) plus every `function`.
+  - Right after `%` (or the token itself starts with `%`, "constant mode"):
+    only `constant` (the document's own `constant[]` entries) and `variable`
+    (the FHIRPath environment variables) — `from` backs up to point at the
+    `%`.
+  - Anywhere else — start of expression, after `(`/`,`/an operator/
+    whitespace ("root mode"): `element` (children of the current
+    `%context`) plus `function`, `constant`, and `variable` together.
+  - Inside an unterminated `'...'` string literal: `items: []` always.
+
+  `element` items carry `detail` as the FHIR type (`"HumanName"`, `"string"`,
+  or `"Quantity | CodeableConcept | ..."` for an un-narrowed choice element),
+  suffixed `[]` when the element repeats, and `doc` from the schema's `short`
+  text when the pack carries one. `function` items carry `detail` as the
+  catalog's call signature (`"where(criteria)"`). `constant` items are
+  `"%name"`, `detail` the type derived from whichever `value[x]` key is
+  present (`valueString` → `"string"`, `"unknown"` if none is). `variable`
+  items are `"%name"` with no `detail`. Filtering candidates by whatever
+  prefix the user has typed is the browser's job — every list here is
+  unfiltered.
+
+  The type a partial expression resolves against is a heuristic, not a
+  FHIRPath evaluation (nothing here ever evaluates one): the root type is
+  `document.resource` when the request's version registry resolves it,
+  narrowed by each ancestor `select`'s own `forEach`/`forEachOrNull`/(first
+  element of) `repeat` in order (a `select`'s own iteration expression is
+  resolved against the context *above* it, never itself); a member chain
+  (`a.b(c).d[0]`) is split into top-level, paren/bracket/string-respecting
+  `.`-segments and walked left to right — an identifier looks up that name's
+  child type; `ofType(T)`/`as(T)` resolves to `T` outright (narrowing an
+  otherwise-ambiguous choice element like `value[x]`); `extension(...)`
+  resolves to `Extension`; `%resource`/`%rootResource` resolves to the root
+  type and `%context` to the current context type; the type-preserving
+  functions `where`, `first`, `last`, `tail`, `skip`, `take`, `single`,
+  `exclude`, `distinct`, `union`, `intersect`, and `trace` pass the incoming
+  type through unchanged; a trailing `[...]` indexer never changes the type;
+  and anything else (`resolve()`, `select(...)`, a literal, an operator, an
+  undeclared `%const`) resolves to an unknown type — which drops `element`
+  from the response but never `function` (or, in root mode, `constant`/
+  `variable`).
 
 All three SQL on FHIR playgrounds — `/ui/sql/view-definitions`,
 `/ui/sql/queries`, and `/ui/sql/views` — share one results-card partial,
@@ -244,9 +359,9 @@ not just a closed IIFE.
 | `nl-search.js` | Natural-language search mode (only loaded when configured) |
 | `resource-filter.js` | Shared truncated-name tooltips (type rails and the resource grid) and each rail's scroll-to-selection on arrival — the "Recently used" group itself is server-rendered (#754/#755) |
 | `conformance-crud.js` | The conformance viewers' write half (create/edit/delete against the FHIR API) |
-| `code-editor.js` | Shared CodeMirror 6 mount helper (#838): textarea-as-source-of-truth sync, aria-label, Tab-not-captured, silent degradation — `window.HfsCodeEditor.mount(textarea, options)`, exported for `vd-editor.js` and `sql-editor.js` to build their own language/highlight/lint on top of |
+| `code-editor.js` | Shared CodeMirror 6 mount helper (#838): textarea-as-source-of-truth sync, aria-label, Tab-not-captured, silent degradation — `window.HfsCodeEditor.mount(textarea, options)`, exported for `vd-editor.js` and `sql-editor.js` to build their own language/highlight/lint on top of. An `options.completion` array of `CompletionSource` functions (#821) wires `autocompletion({ override, activateOnTyping: true, maxRenderedOptions: 300 })` — the library's own default of 100 silently cut off a real match past the fold (a FHIRPath member chain offers a type's own elements plus the entire function catalog) — plus `completionKeymap` (Ctrl-Space opens the popup manually; Enter/Escape/arrow keys are its own while it is open) ahead of `defaultKeymap` — only `vd-editor.js` passes one; `sql-editor.js` is unaffected, and Tab still never indents (no command in `completionKeymap` binds it) |
 | `editor-form.js` | The guided-form loop (#843), extracted from `editor.js`'s original: `[data-add]`/`[data-remove]`/`[data-extension]`/`[data-choose]`/`[data-set]`, the add-picker's typeahead, live `$expand` — driven against a caller-supplied `root` and `host` (`{ getDoc, setDoc, renderUrl? }`) instead of page ids, so it works over any document a host owns. `window.HfsEditorForm.attach(root, host)`; loaded only on `/ui/sql/view-definitions` so far — `editor.js` and the Resources modal's own copy of this loop are a follow-up migration |
-| `vd-editor.js` | The ViewDefinition editor on `/ui/sql/view-definitions`: JSON + injected FHIRPath language and highlighting, fold, and the async server lint (#753, generalized onto `code-editor.js` in #838). Also builds `editor-form.js`'s host over the mounted `EditorView` (#843): a form-driven change lands as one minimal (common-prefix/common-suffix) transaction, tagged so the sync listener skips its own echo; an editor change 600ms after the last keystroke re-requests the guided-form panel alone when its canonical JSON actually moved. Falls back to the plain `<textarea>` as the host when CodeMirror never mounted. Also drives the row↔editor cross-highlight (#843): a `StateField` of line decorations for a hovered/focused row, and a debounced cursor listener that marks the row for whichever node the caret sits in |
+| `vd-editor.js` | The ViewDefinition editor on `/ui/sql/view-definitions`: JSON + injected FHIRPath language and highlighting, fold, and the async server lint (#753, generalized onto `code-editor.js` in #838). Also builds `editor-form.js`'s host over the mounted `EditorView` (#843): a form-driven change lands as one minimal (common-prefix/common-suffix) transaction, tagged so the sync listener skips its own echo; an editor change 600ms after the last keystroke re-requests the guided-form panel alone when its canonical JSON actually moved. Falls back to the plain `<textarea>` as the host when CodeMirror never mounted. Also drives the row↔editor cross-highlight (#843): a `StateField` of line decorations for a hovered/focused row, and a debounced cursor listener that marks the row for whichever node the caret sits in. `vdCompletionSource` (#821, `code-editor.js`'s `completion` option) classifies the cursor against the browser's own syntax tree — inside a `PropertyName` string, or in an `Object` at a "new key" gap (right after `{`/`,`, or right after a `Property` with no comma of its own yet — a JSON-error-recovery state reached mid-edit as often as a genuinely new key) → `POST .../complete` with `kind: "key"`; inside the content of a `String` the same injection rule `nestFhirpath` already applies to (`path`/`forEach`/`forEachOrNull`/a `repeat` element, no `\` in the string) → `kind: "fhirpath"`, `document` the editor's own currently-parsed JSON (a document that does not parse never queries at all); anywhere else, no request. Every request is same-origin, `AbortController`-linked to CodeMirror's own completion `context`, and degrades to no popup (`console.debug`) on any failure. A key item's `apply` re-resolves the same classification fresh against the *live* tree at accept time rather than trusting what the source captured — inserting/renaming just the key's own text, and (only when it has no `:` yet) a `": " + skeleton` alongside it, comma-wrapped as the surrounding gap needs (`classifyObjectGap`/`buildKeyInsertion`, both pure and unit-tested); a `function` item inserts `name()` with the cursor between the parens, or after it for a no-argument signature like `first()`; `element`/`constant`/`variable` items take CodeMirror's own default replace. The required-key marker (`data-msg-required` on `#vd-editor-grid`, Fluent `vd-complete-required`) is the only translated string this file owns for completion — every label/detail/message otherwise comes from the server already localized or, for FHIRPath identifiers, untranslatable by nature. Each lint diagnostic's `fixes` (#821) becomes a `Diagnostic.action` that resolves its own RFC 6901 `pointer` against the live tree at apply time and dispatches one `userEvent: "lint.fix"` transaction (`renameKeyChange`/`removeKeyChange`/`setStringChange`, atop the pure, unit-tested `removeKeyRange`/`stringContentRange`/`escapeJsonStringContent`), then relaunches the lint; **Ctrl+.** applies the single fix under the cursor or opens the lint panel for several, `lintKeymap` adding F8/Ctrl-Shift-M alongside it. `#vd-editor-form`'s own `submit` listener pops a plural-correct `window.confirm` (`data-msg-save-errors-one`/`-other` on `#vd-editor-grid`) when submitting as Save while the most recently completed lint pass still has an error |
 | `sql-editor.js` | The SQL pane editor on `/ui/sql/queries` and `/ui/sql/views`: SQLite-dialect SQL language and highlighting, and — after each `#run-notice` swap — tinting the line a parse failure names via `data-error-line` (#839); no fold or lint yet (#838) |
 
 `editor.js` is deliberately thin, and that is the architectural point: it does
@@ -650,7 +765,13 @@ SQLite store, via the test-only `sqlite` feature), plus `mod tests` in most
 
 **Outer ring — Playwright + axe-core.** Behavior only a real browser can
 observe. Everything Node lives in `e2e/`; the cargo workspace is untouched. See
-[`e2e/README.md`](e2e/README.md) for the spec inventory.
+[`e2e/README.md`](e2e/README.md) for the full spec inventory — among them,
+the ViewDefinition editor's own two specs (#821): `vd-editor-lint.spec.ts`
+(gutter marker, hover tooltip, quick fixes by click and by Ctrl+., the lint
+panel, Ctrl+Z undo, the save-with-errors confirmation, `?lang=es`) and
+`vd-editor-completion.spec.ts` (structural keys, FHIRPath elements, the
+`forEach` context, constants, functions, and no popup/request outside a
+completion context).
 
 ```bash
 cargo build -p helios-hfs --features ui

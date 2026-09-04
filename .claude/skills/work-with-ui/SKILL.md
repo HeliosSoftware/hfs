@@ -97,6 +97,20 @@ through to the normal REST surface.
   cross-highlight between it and the guided-form card, #843), `sql-editor.js`
   (SQL pane editor, `/ui/sql/queries` and `/ui/sql/views`).
 
+  `vd-editor.js` also drives completion and quick fixes (#821), server-
+  backed like the async lint above it — the browser only locates the cursor
+  in its own syntax tree, `POST /ui/sql/view-definitions/complete` (`kind:
+  "key"` for a structural JSON node, `kind: "fhirpath"` for a partial
+  expression) answers what fits there. Ctrl-Space opens the popup manually
+  (typing opens it too); Enter accepts. Each `/lint` diagnostic's `fixes`
+  becomes a button in the hover tooltip and the bottom lint panel — **Ctrl+.**
+  applies the one fix under the cursor, or opens the panel when several
+  apply (F8/Ctrl-Shift-M reach the panel too, `lintKeymap`); every fix is one
+  undoable transaction. Saving with at least one uncorrected error (Save,
+  not Duplicate) pops a plural-correct `window.confirm`. To regenerate the
+  vendored bundle after touching `entry.js`, see `crates/ui/vendor/
+  codemirror/README.md`'s own ritual — it is never run by `cargo build` or CI.
+
 `theme.js` loads **without `defer`**, before first paint, to avoid a FOUC —
 and, since #843, is what marks `<html class="js">` for `app.css`'s `.needs-js`
 utility (a card that renders inline, server-side, on a page's own first paint
