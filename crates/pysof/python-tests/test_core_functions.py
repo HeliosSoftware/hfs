@@ -199,8 +199,14 @@ class TestErrorHandling:
         with pytest.raises(pysof.InvalidViewDefinitionError) as exc_info:
             pysof.run_view_definition(invalid_view, bundle, "json")
 
-        # Verify error message is propagated
-        assert "ViewDefinition" in str(exc_info.value)
+        # Verify error message is propagated. The exact wording comes from
+        # helios_sof's structural lint (#821) and lists each missing key
+        # separately ("missing required key `resource`; missing required
+        # key `select`"); assert on that stable shape rather than the
+        # message as a whole.
+        error_message = str(exc_info.value)
+        assert "required key" in error_message
+        assert "resource" in error_message
 
     def test_fhirpath_error(self) -> None:
         """Test FhirPathError is raised for invalid FHIRPath expressions."""

@@ -2628,6 +2628,19 @@ where
     })
 }
 
+/// Renders a lint diagnostic as `"<message> at <pointer>"` for
+/// [`validate_view_definition`]'s plain-text `SofError` messages — the
+/// document root's own pointer (`""`) renders as `/` rather than a blank
+/// suffix.
+fn at_pointer(diagnostic: &lint::Diagnostic) -> String {
+    let pointer: &str = if diagnostic.pointer.is_empty() {
+        "/"
+    } else {
+        &diagnostic.pointer
+    };
+    format!("{} at {}", diagnostic.message, pointer)
+}
+
 /// Generic, version-agnostic ViewDefinition validation.
 ///
 /// Delegates structural validation to [`lint::lint_view_definition`] (#821)
@@ -2638,6 +2651,18 @@ where
 /// is reached by every [`PreparedViewDefinition::new`] caller, including
 /// ones that never went through that handler at all, so it has to be able
 /// to catch the same problems on its own.
+///
+/// # Which `SofError` variant
+///
+/// A structural problem is reported as [`SofError::InvalidViewDefinition`],
+/// **except** when every error-severity diagnostic the lint found is a
+/// [`lint::DiagnosticCode::FhirPathSyntax`] one — a FHIRPath expression that
+/// doesn't parse. That case reports [`SofError::FhirPathError`] instead, to
+/// preserve the exception *type* `sof-cli` and `pysof` callers have always
+/// been able to match on for a syntax problem (see
+/// `crates/pysof/src/lib.rs`), from before this function caught it here
+/// rather than only during evaluation. A document with a syntax error
+/// *and* some other structural problem reports `InvalidViewDefinition`.
 fn validate_view_definition<VD: ViewDefinitionTrait + Serialize>(
     view_def: &VD,
 ) -> Result<(), SofError> {
@@ -2660,20 +2685,41 @@ fn validate_view_definition<VD: ViewDefinitionTrait + Serialize>(
         );
     }
 
-    let errors: Vec<String> = lint::lint_view_definition(&json)
+    let error_diagnostics: Vec<lint::Diagnostic> = lint::lint_view_definition(&json)
         .into_iter()
         .filter(|diagnostic| diagnostic.severity == lint::Severity::Error)
-        .map(|diagnostic| {
-            let pointer: &str = if diagnostic.pointer.is_empty() {
-                "/"
-            } else {
-                &diagnostic.pointer
-            };
-            format!("{} at {}", diagnostic.message, pointer)
-        })
         .collect();
-    if !errors.is_empty() {
-        return Err(SofError::InvalidViewDefinition(errors.join("; ")));
+    if !error_diagnostics.is_empty() {
+        // `sof-cli` and `pysof` distinguish failures by `SofError` *variant*
+        // (see `crates/pysof/src/lib.rs`'s `RustSofError` -> `PyErr` mapping:
+        // `InvalidViewDefinitionError` vs. `FhirPathError`), not just by
+        // message text, and did so before #821 introduced this lint-based
+        // path. A FHIRPath expression that fails to parse used to only be
+        // caught much later, during evaluation, and surfaced there as
+        // `FhirPathError`; catching it here instead — earlier, and located
+        // by pointer — must keep reporting it under the same variant, or a
+        // caller that matches on the exception type breaks. So: if every
+        // error the lint found is a syntax problem, this is still a
+        // `FhirPathError`. Every other structural rule the lint enforces is
+        // new behavior this crate never validated before #821, and keeps
+        // `InvalidViewDefinition`; a document mixing a syntax error with
+        // another kind of problem reports as `InvalidViewDefinition` too —
+        // "something is structurally broken" is the more general failure
+        // whenever both apply.
+        let all_fhirpath_syntax = error_diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.code == lint::DiagnosticCode::FhirPathSyntax);
+
+        return if all_fhirpath_syntax {
+            let messages: Vec<String> = error_diagnostics
+                .iter()
+                .map(|diagnostic| format!("Invalid FHIRPath syntax: {}", at_pointer(diagnostic)))
+                .collect();
+            Err(SofError::FhirPathError(messages.join("; ")))
+        } else {
+            let messages: Vec<String> = error_diagnostics.iter().map(at_pointer).collect();
+            Err(SofError::InvalidViewDefinition(messages.join("; ")))
+        };
     }
 
     // Checks that depend on the relationship between selects — how a
@@ -4483,6 +4529,16 @@ mod tests {
         }
     }
 
+    /// Unwraps `err` as `SofError::FhirPathError`'s message, or fails the
+    /// test with what it actually got.
+    #[cfg(feature = "R4")]
+    fn fhirpath_error_message(err: SofError) -> String {
+        match err {
+            SofError::FhirPathError(message) => message,
+            other => panic!("expected SofError::FhirPathError, got {other:?}"),
+        }
+    }
+
     #[cfg(feature = "R4")]
     #[test]
     fn validate_view_definition_reports_missing_resource() {
@@ -4549,6 +4605,61 @@ mod tests {
         }));
         let message = invalid_view_definition_message(
             validate_view_definition(&vd).expect_err("forEach + repeat together must fail"),
+        );
+        assert!(message.contains("at most one of"), "got: {message}");
+    }
+
+    /// A document whose only error-severity lint diagnostic is a FHIRPath
+    /// syntax problem reports `SofError::FhirPathError`, not
+    /// `InvalidViewDefinition` (#821) — `sof-cli` and `pysof` callers match
+    /// on the exception/error *type* to tell a syntax problem apart from a
+    /// structural one, exactly as they could before this function started
+    /// catching syntax errors itself.
+    #[cfg(feature = "R4")]
+    #[test]
+    fn validate_view_definition_reports_fhirpath_syntax_error_as_fhirpath_error() {
+        let vd = view_definition_from_json(serde_json::json!({
+            "status": "active",
+            "resource": "Patient",
+            "select": [{
+                "column": [{ "name": "id", "path": "invalid.fhirpath.expression[invalid syntax" }]
+            }]
+        }));
+        let message = fhirpath_error_message(
+            validate_view_definition(&vd).expect_err("invalid FHIRPath syntax must fail"),
+        );
+        assert!(message.contains("FHIRPath"), "got: {message}");
+        assert!(
+            message.contains("at /select/0/column/0/path"),
+            "got: {message}"
+        );
+    }
+
+    /// A document mixing a FHIRPath syntax error with another structural
+    /// problem reports `SofError::InvalidViewDefinition` — the more general
+    /// "something is structurally broken" variant wins whenever more than
+    /// one kind of error is present (#821).
+    #[cfg(feature = "R4")]
+    #[test]
+    fn validate_view_definition_reports_invalid_view_definition_when_syntax_error_is_not_the_only_problem()
+     {
+        // Two independent problems: `forEach` + `repeat` together
+        // (MultipleIterationDirectives) and a `path` that doesn't parse
+        // (FhirPathSyntax) — both survive the typed round-trip
+        // `view_definition_from_json` does (unlike an unknown JSON key,
+        // which the generated struct's `Deserialize` silently drops before
+        // `validate_view_definition` ever sees it).
+        let vd = view_definition_from_json(serde_json::json!({
+            "status": "active",
+            "resource": "Patient",
+            "select": [{
+                "forEach": "name",
+                "repeat": ["telecom"],
+                "column": [{ "name": "id", "path": "invalid.fhirpath.expression[invalid syntax" }]
+            }]
+        }));
+        let message = invalid_view_definition_message(
+            validate_view_definition(&vd).expect_err("mixed errors must fail"),
         );
         assert!(message.contains("at most one of"), "got: {message}");
     }
