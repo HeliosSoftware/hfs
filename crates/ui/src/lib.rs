@@ -5537,6 +5537,57 @@ mod tests {
         );
     }
 
+    /// #821: the vendoring ritual's raw-size budget (`crates/ui/vendor/codemirror/README.md`
+    /// § "Measured sizes") — a regeneration that pulls in an unexpectedly heavy
+    /// package should fail a test, not just a number nobody re-checks in the README.
+    #[test]
+    fn codemirror_vendor_bundle_stays_within_its_raw_size_budget() {
+        let file = Assets::get("vendor/codemirror.bundle.js").expect("CodeMirror bundle embedded");
+        const RAW_SIZE_BUDGET_BYTES: usize = 500_000;
+        assert!(
+            file.data.len() <= RAW_SIZE_BUDGET_BYTES,
+            "codemirror.bundle.js is {} bytes, over the {}-byte raw budget",
+            file.data.len(),
+            RAW_SIZE_BUDGET_BYTES
+        );
+    }
+
+    /// #821: `lezer-fhirpath`'s license is MIT, declared only in its published
+    /// README (no `license` field, no `LICENSE` file — see the vendor README's
+    /// citation) — the banner records that via `rollup.config.js`'s license
+    /// override map and must no longer show the old "not declared" placeholder.
+    #[test]
+    fn codemirror_vendor_bundle_banner_documents_lezer_fhirpath_license() {
+        let file = Assets::get("vendor/codemirror.bundle.js").expect("CodeMirror bundle embedded");
+        let source = std::str::from_utf8(&file.data).expect("bundle is UTF-8");
+        assert!(
+            source.contains("lezer-fhirpath") && source.contains("MIT"),
+            "banner must document lezer-fhirpath's MIT license"
+        );
+        assert!(
+            !source.contains("not declared in package metadata"),
+            "banner must no longer show the unresolved-license placeholder"
+        );
+    }
+
+    /// #821: the vendoring ritual's README documents `eval`/`new Function`/
+    /// `document.write` as a hard constraint on this bundle, checked by hand
+    /// on every regeneration — this makes that check automatic.
+    #[test]
+    fn codemirror_vendor_bundle_has_no_eval_or_dynamic_code() {
+        let file = Assets::get("vendor/codemirror.bundle.js").expect("CodeMirror bundle embedded");
+        let source = std::str::from_utf8(&file.data).expect("bundle is UTF-8");
+        assert!(!source.contains("eval("), "bundle must not call eval(...)");
+        assert!(
+            !source.contains("new Function("),
+            "bundle must not construct dynamic functions"
+        );
+        assert!(
+            !source.contains("document.write("),
+            "bundle must not call document.write(...)"
+        );
+    }
+
     /// #753: vd-editor.js — the hand-written mount script that
     /// progressively enhances the ViewDefinition textarea with the vendored
     /// bundle — is embedded like every other page script.
