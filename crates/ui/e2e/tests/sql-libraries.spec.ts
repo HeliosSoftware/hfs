@@ -3,7 +3,8 @@
 // its depends-on ViewDefinition through $sql-run on arrival — no Run button
 // (#839, generalizing #752's View Definitions playground here).
 import { expect, test } from "../pages/fixtures";
-import { createResource, waitSearchable } from "../pages/api";
+import { createResource, createSqlQueryLibrary, readResource, waitSearchable } from "../pages/api";
+import { Editor } from "../pages/editor";
 
 test("a stored SQLQuery lists, decodes its SQL, and previews rows on arrival", async ({ page, request }) => {
   const patientId = await createResource(request, "Patient", { name: [{ family: "SqlLibE2E" }] });
@@ -357,4 +358,247 @@ test("a parse error's line is tinted in the SQL editor; an execution error and a
   await page.keyboard.insertText("SELECT id AS pid FROM v");
   await expect(notice).toHaveCount(0, { timeout: 3000 });
   await expect(taggedLines).toHaveCount(0);
+});
+
+// Details (#840): the JSON editor + guided-form pairing over the Library
+// minus its SQL attachment — the same shared host (`editor-pair.js`) View
+// Definitions proves in sql-view-definitions.spec.ts, exercised here for
+// the Library-backed pages. Both routes share one template, so a route not
+// named below behaves identically — only the gate test (route-specific by
+// nature) exercises both.
+test.describe("Details", () => {
+  test("editing the guided form updates the JSON pane, and Save persists the merged document", async ({
+    page,
+    request,
+  }) => {
+    const canonical = `http://example.org/ViewDefinition/e2e-details-${Date.now()}`;
+    await createResource(request, "ViewDefinition", {
+      name: "e2e_details_source",
+      url: canonical,
+      status: "active",
+      resource: "Patient",
+      select: [{ column: [{ name: "id", path: "getResourceKey()" }] }],
+    });
+    const libId = await createSqlQueryLibrary(request, `e2e_details_${Date.now()}`, canonical);
+
+    await page.goto(`/ui/sql/queries?lib=${libId}`);
+    const ed = new Editor(page, page.locator("#lib-details-grid"));
+    const nameField = ed.rowAt("name").locator("[data-set='name']");
+    await nameField.fill("e2e_details_renamed");
+    await nameField.blur();
+
+    const jsonPane = page.locator("textarea[name='json']");
+    await expect(jsonPane).toHaveValue(/e2e_details_renamed/, { timeout: 3000 });
+    // The SQL attachment never shows up in the Details JSON pane.
+    expect(await jsonPane.inputValue()).not.toContain("application/sql");
+
+    await page.locator("button[name='action'][value='save']").click();
+    await page.waitForURL(new RegExp(`lib=${libId}&saved=1`));
+    await expect(page.locator("h2.page-head__title--kind")).toContainText("e2e_details_renamed");
+
+    const saved = await readResource(request, "Library", libId);
+    expect(saved.name).toBe("e2e_details_renamed");
+    const content = saved.content as Array<{ contentType: string }>;
+    expect(content.some((a) => a.contentType === "application/sql")).toBe(true);
+  });
+
+  test("an invalid value typed in the JSON pane errors on its row and reports the issue count, without saving; fixing it clears both", async ({
+    page,
+    request,
+  }) => {
+    const libId = await createResource(
+      request,
+      "Library",
+      starterLibrary(`e2e_details_bogus_${Date.now()}`),
+    );
+    await waitSearchable(request, "Library", libId);
+
+    await page.goto(`/ui/sql/queries?lib=${libId}`);
+    const ed = new Editor(page, page.locator("#lib-details-grid"));
+    await expect(ed.validity).toContainText("No issues");
+
+    const cmContent = page.locator("#lib-details-editor .cm-content");
+    const before = await page.locator("textarea[name='json']").inputValue();
+    const broken = before.replace('"status": "active"', '"status": "bogus"');
+
+    await cmContent.click();
+    await page.keyboard.press("ControlOrMeta+a");
+    await page.keyboard.insertText(broken);
+    await expect(ed.rowAt("status")).toHaveClass(/editor-row--error/, { timeout: 3000 });
+    await expect(ed.validity).toContainText("1 issue");
+
+    // Nothing was ever posted to Save.
+    const untouched = await readResource(request, "Library", libId);
+    expect(untouched.status).toBe("active");
+
+    await cmContent.click();
+    await page.keyboard.press("ControlOrMeta+a");
+    await page.keyboard.insertText(before);
+    await expect(ed.rowAt("status")).not.toHaveClass(/editor-row--error/, { timeout: 3000 });
+    await expect(ed.validity).toContainText("No issues");
+  });
+
+  test("Save fuses an edited SQL pane and an edited Details title into one Library", async ({
+    page,
+    request,
+  }) => {
+    const canonical = `http://example.org/ViewDefinition/e2e-merge-${Date.now()}`;
+    await createResource(request, "ViewDefinition", {
+      name: "e2e_merge_source",
+      url: canonical,
+      status: "active",
+      resource: "Patient",
+      select: [{ column: [{ name: "id", path: "getResourceKey()" }] }],
+    });
+    const libId = await createSqlQueryLibrary(request, `e2e_merge_${Date.now()}`, canonical, "SELECT 1");
+
+    await page.goto(`/ui/sql/queries?lib=${libId}`);
+    const ed = new Editor(page, page.locator("#lib-details-grid"));
+    const nameField = ed.rowAt("name").locator("[data-set='name']");
+    await nameField.fill("e2e_merge_renamed");
+    await nameField.blur();
+    await expect(page.locator("textarea[name='json']")).toHaveValue(/e2e_merge_renamed/, {
+      timeout: 3000,
+    });
+
+    const sqlEditor = page.locator(".sql-editor .cm-content[role='textbox']");
+    await sqlEditor.click();
+    await page.keyboard.press("ControlOrMeta+a");
+    await page.keyboard.insertText("SELECT 2");
+
+    await page.locator("button[name='action'][value='save']").click();
+    await page.waitForURL(new RegExp(`lib=${libId}&saved=1`));
+
+    const saved = await readResource(request, "Library", libId);
+    expect(saved.name).toBe("e2e_merge_renamed");
+    const content = saved.content as Array<{ contentType: string; data: string }>;
+    const sqlAttachment = content.find((a) => a.contentType === "application/sql");
+    expect(sqlAttachment).toBeTruthy();
+    expect(Buffer.from(sqlAttachment!.data, "base64").toString()).toBe("SELECT 2");
+  });
+
+  test("Ctrl+Z after a guided-form edit restores the previous JSON as one step", async ({
+    page,
+    request,
+  }) => {
+    const libId = await createResource(
+      request,
+      "Library",
+      starterLibrary(`e2e_details_undo_${Date.now()}`),
+    );
+    await waitSearchable(request, "Library", libId);
+
+    await page.goto(`/ui/sql/queries?lib=${libId}`);
+    const textarea = page.locator("textarea[name='json']");
+    const before = await textarea.inputValue();
+
+    const ed = new Editor(page, page.locator("#lib-details-grid"));
+    const statusField = ed.rowAt("status").locator("[data-set='status']");
+    await statusField.fill("retired");
+    await statusField.blur();
+    await expect(textarea).toHaveValue(/retired/, { timeout: 3000 });
+    const after = await textarea.inputValue();
+    expect(after).not.toBe(before);
+
+    await page.locator("#lib-details-editor .cm-content").click();
+    await page.keyboard.press("ControlOrMeta+z");
+    await expect(textarea).toHaveValue(before);
+  });
+
+  test("the JSON and guided-form cards share one height and each scrolls inside itself", async ({
+    page,
+    request,
+  }) => {
+    // Enough relatedArtifact entries to make both the JSON text and the
+    // guided-form rows tall — the same document, so this only proves the
+    // shared-height/scroll-inside contract, not that the two cards' heights
+    // are independent (View Definitions' own version of this test proves
+    // that independence with two different fields).
+    const relatedArtifact = Array.from({ length: 30 }, (_, i) => ({
+      type: "depends-on",
+      resource: `http://example.org/ViewDefinition/e2e-stretch-${i}`,
+      label: `v${i}`,
+    }));
+    const libId = await createResource(request, "Library", {
+      ...starterLibrary(`e2e_details_stretch_${Date.now()}`),
+      relatedArtifact,
+    });
+    await waitSearchable(request, "Library", libId);
+
+    await page.goto(`/ui/sql/queries?lib=${libId}`);
+    const grid = page.locator("#lib-details-grid");
+    const cards = grid.locator("> .card");
+    await expect(cards).toHaveCount(2);
+
+    const [jsonBox, formBox] = await Promise.all([
+      cards.nth(0).boundingBox(),
+      cards.nth(1).boundingBox(),
+    ]);
+    expect(jsonBox).not.toBeNull();
+    expect(formBox).not.toBeNull();
+    expect(Math.abs(jsonBox!.height - formBox!.height)).toBeLessThanOrEqual(1);
+
+    const viewportHeight = page.viewportSize()!.height;
+    expect(jsonBox!.height).toBeLessThanOrEqual(viewportHeight * 0.7 + 1);
+
+    const scroller = page.locator("#lib-details-editor .cm-scroller");
+    const tree = page.locator("#lib-details-grid .editor-tree");
+    await expect
+      .poll(async () => scroller.evaluate((el) => el.scrollHeight - el.clientHeight))
+      .toBeGreaterThan(0);
+    await expect
+      .poll(async () => tree.evaluate((el) => el.scrollHeight - el.clientHeight))
+      .toBeGreaterThan(0);
+
+    const overflowsX = await page.evaluate(
+      () => document.documentElement.scrollWidth > document.documentElement.clientWidth,
+    );
+    expect(overflowsX).toBe(false);
+  });
+
+  // The Save gate (#840): a document whose type code names the other kind
+  // is rejected with a warning naming the route's own expected code —
+  // exercised on both routes, since each has its own expected code.
+  const GATE_CASES = [
+    { path: "/ui/sql/queries", wrongCode: "sql-view", expectedCode: "sql-query" },
+    { path: "/ui/sql/views", wrongCode: "sql-query", expectedCode: "sql-view" },
+  ] as const;
+
+  for (const { path, wrongCode, expectedCode } of GATE_CASES) {
+    test(`${path}: changing the type code to the other kind rejects Save with a warning naming "${expectedCode}"`, async ({
+      page,
+      request,
+    }) => {
+      const libId = await createResource(
+        request,
+        "Library",
+        starterLibrary(`e2e_details_gate_${Date.now()}`),
+      );
+      await waitSearchable(request, "Library", libId);
+
+      await page.goto(`${path}?lib=${libId}`);
+      const ed = new Editor(page, page.locator("#lib-details-grid"));
+      const codeField = ed.rowAt("type.coding.0.code").locator("[data-set='type.coding.0.code']");
+      await codeField.fill(wrongCode);
+      await codeField.blur();
+      await expect(page.locator("textarea[name='json']")).toHaveValue(new RegExp(wrongCode), {
+        timeout: 3000,
+      });
+
+      await page.locator("button[name='action'][value='save']").click();
+      // Scoped to the title row's own warning, a direct child of
+      // `.filter-center` — `.notice--warn` also matches a live-preview
+      // failure nested inside `#run-notice` (this starter Library has no
+      // real `relatedArtifact` target, so its own live run fails too).
+      const saveNotice = page.locator(".filter-center > p.notice--warn");
+      await expect(saveNotice).toContainText(expectedCode);
+      await expect(page).toHaveURL(new RegExp(path));
+
+      // Nothing was saved.
+      const untouched = await readResource(request, "Library", libId);
+      expect(untouched.type).toMatchObject({
+        coding: [{ code: "sql-query" }],
+      });
+    });
+  }
 });
