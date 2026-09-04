@@ -905,6 +905,41 @@ sql-export-empty-heading = Aún no hay nada que exportar
 sql-export-empty-body = Cada ViewDefinition, consulta SQL y vista SQL almacenada aparece aquí como un elemento exportable. Crea uno primero.
 sql-export-filter-empty = Ningún elemento coincide
 
+## Generador de exportaciones SQL — "Acotar" y "Avanzado" (#836)
+
+sql-export-narrow-title = Acotar
+sql-export-narrow-meta = opcional — déjalo vacío para exportar todo
+sql-export-field-patients = Pacientes
+sql-export-field-patients-placeholder = Buscar pacientes
+sql-export-field-patients-hint = Busca por nombre, apellido o identificador exacto. Déjalo vacío para exportar todos los pacientes.
+sql-export-field-patients-fallback-placeholder = IDs FHIR de pacientes
+sql-export-field-patients-fallback-hint = Ingresa IDs lógicos FHIR exactos separados por comas o saltos de línea. Déjalo vacío para exportar todos los pacientes.
+sql-export-field-patients-id-only-hint = Busca por ID FHIR exacto. Déjalo vacío para exportar todos los pacientes.
+sql-export-field-groups = Grupos
+sql-export-field-groups-placeholder = Buscar grupos
+sql-export-field-groups-hint-r4 = Busca por ID FHIR exacto o identificador.
+sql-export-field-groups-hint-r5 = Busca por nombre, ID FHIR exacto o identificador.
+sql-export-field-groups-fallback-placeholder = IDs FHIR de grupos
+sql-export-field-groups-fallback-hint = Ingresa IDs FHIR o identificadores exactos separados por comas o saltos de línea.
+sql-export-group-options-empty = No se encontraron grupos coincidentes.
+sql-export-field-since = Desde
+sql-export-since-all = Todo el tiempo
+sql-export-since-day = Último día
+sql-export-since-week = Últimos 7 días
+sql-export-since-month = Últimas 4 semanas
+sql-export-since-custom = Personalizado
+sql-export-field-since-custom = Instante personalizado
+sql-export-since-invalid = Ingresa un instante FHIR válido, como 2026-08-01T00:00:00Z.
+sql-export-patient-invalid = Ingresa solo IDs lógicos de Patient válidos, separados por comas o saltos de línea.
+sql-export-group-invalid = Ingresa solo IDs lógicos de Group válidos, separados por comas o saltos de línea.
+sql-export-advanced = Avanzado
+sql-export-advanced-meta = id de seguimiento · encabezado CSV
+sql-export-field-tracking-id = Id de seguimiento
+sql-export-field-tracking-id-hint = Se repite en el manifiesto de finalización como clientTrackingId.
+sql-export-tracking-id-too-long = El id de seguimiento debe tener 200 caracteres o menos.
+sql-export-field-header = Incluir una fila de encabezado
+sql-export-field-header-hint = (solo CSV — se ignora para otros formatos)
+
 ## Lista de exportaciones SQL activas y tarjetas de trabajo (#833)
 
 sql-export-new = Nueva exportación SQL
@@ -973,12 +1008,30 @@ sql-export-detail-field-format = Formato
 sql-export-detail-field-started = Iniciado
 sql-export-detail-field-duration = Duración
 sql-export-detail-field-subjects = Elementos
+sql-export-detail-header-included = con fila de encabezado
+sql-export-detail-header-omitted = sin fila de encabezado
 sql-export-detail-outputs-heading = Archivos de salida
 sql-export-detail-col-output = Salida
 sql-export-detail-col-subject = Elemento
 sql-export-detail-col-files = Archivos
 sql-export-detail-outputs-empty = El trabajo no produjo archivos de salida.
 sql-export-file-fallback = Archivo { $n }
+
+## #837: valores de parámetros por SQL Query en el formulario de SQL Export
+sql-export-param-count = { $count ->
+    [one] { $count } parámetro
+   *[other] { $count } parámetros
+}
+sql-export-param-required = Este valor es obligatorio.
+sql-export-param-type-mismatch = Se esperaba un valor de tipo { $type }.
+sql-export-param-required-chip = obligatorio
+sql-export-toggle-values = Mostrar u ocultar valores
+sql-export-values-missing-one = falta { $count } valor
+sql-export-values-missing-other = faltan { $count } valores
+
+## partials/sql_parameter_fields.html (#837) — compartido con el formulario
+## de parámetros de la página de SQL Query
+sql-param-default = predeterminado
 
 ## UI administrativa de HTS (crates/hts-ui) — stubs de Phase 1
 ##

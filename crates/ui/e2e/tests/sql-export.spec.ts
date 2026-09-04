@@ -518,6 +518,379 @@ test.describe.serial("SQL Export job detail (#835)", () => {
   });
 });
 
+// #836: the job-wide filters ("Narrow it down"/"Advanced") and the browser
+// behavior layered over them — sql-export-form.js's CSV header visibility
+// and Since custom instant, plus combobox.js's Patients/Groups pickers
+// (generic, shared with Bulk Export — its own keyboard/dedupe/removal
+// behavior is bulk-export.spec.ts's job; these tests only cover that it is
+// wired up here). This file's own top-level `afterEach` (above) cleans up
+// both kinds of resource these tests seed.
+test.describe("SQL Export builder job-wide filters (#836)", () => {
+  test("Patients and Groups comboboxes select via keyboard, and Tracking id travels to the detail", async ({
+    page,
+    request,
+    sqlExport,
+  }) => {
+    const stamp = Date.now();
+    const vdName = `e2e_sql_export_filters_${stamp}`;
+    const vdId = await createResource(request, "ViewDefinition", {
+      name: vdName,
+      status: "active",
+      resource: "Patient",
+      select: [{ column: [{ name: "id", path: "getResourceKey()" }] }],
+    });
+    seededViewDefinitionIds.push(vdId);
+    await waitSearchable(request, "ViewDefinition", vdId);
+
+    // `$sql-export` itself validates that every patient/group reference
+    // resolves to a real resource before it will even start the job
+    // (crates/rest/src/handlers/sof/export.rs's `validate_patient_group_refs`
+    // — a direct `storage.read()`, not a search, so no indexing delay to
+    // wait out). The combobox always picks whatever the search itself
+    // found, so mocking its result fragment with real ids is what makes
+    // this AC end in a `complete` job at all.
+    const patientAId = await createResource(request, "Patient", {
+      name: [{ given: ["Ana"], family: "Rivera" }],
+    });
+    const patientBId = await createResource(request, "Patient", {
+      name: [{ given: ["Andrés"], family: "Silva" }],
+    });
+    const groupId = await createResource(request, "Group", {
+      type: "person",
+      actual: true,
+      name: "Diabetes cohort",
+    });
+
+    const patientOptions = `
+      <button type="button" class="combobox__option" data-combobox-option
+              data-value="Patient/${patientAId}" data-label="Ana Rivera">Ana Rivera · Patient/${patientAId}</button>
+      <button type="button" class="combobox__option" data-combobox-option
+              data-value="Patient/${patientBId}" data-label="Andrés Silva">Andrés Silva · Patient/${patientBId}</button>`;
+    const groupOptions = `
+      <button type="button" class="combobox__option" data-combobox-option
+              data-value="Group/${groupId}" data-label="Diabetes cohort">Diabetes cohort</button>`;
+
+    await page.route("**/ui/lookup/patient-options*", (route) =>
+      route.fulfill({ status: 200, contentType: "text/html", body: patientOptions }),
+    );
+    await page.route("**/ui/lookup/group-options*", (route) =>
+      route.fulfill({ status: 200, contentType: "text/html", body: groupOptions }),
+    );
+
+    await sqlExport.gotoNew();
+    await sqlExport.subjectCheckbox(`ViewDefinition/${vdId}`).check();
+
+    // Choose one via keyboard, see its chip, remove it — proving the
+    // combobox's own selection/removal round trip works here — then choose
+    // both options (Home/End land deterministically on the first/last
+    // result regardless of the listbox's current active index).
+    await sqlExport.patientSearch.fill("an");
+    await expect(sqlExport.patientListbox.getByRole("option")).toHaveCount(2);
+    await sqlExport.patientSearch.press("Home");
+    await sqlExport.patientSearch.press("Enter");
+    await expect(sqlExport.selectedPatients).toHaveCount(1);
+    await sqlExport.patientCombobox.getByRole("button", { name: /Remove/ }).click();
+    await expect(sqlExport.selectedPatients).toHaveCount(0);
+
+    // A distinct query string from the first one: htmx's `hx-trigger="input
+    // changed delay:300ms, search"` filters out an `input` event that leaves
+    // the field's value unchanged (`changed`), so repeating the exact same
+    // "an" here would never re-request — the mocked route ignores `q`
+    // entirely, so any new text still answers with both options.
+    await sqlExport.patientSearch.fill("an-again");
+    await expect(sqlExport.patientListbox.getByRole("option")).toHaveCount(2);
+    await sqlExport.patientSearch.press("Home");
+    await sqlExport.patientSearch.press("Enter");
+    await expect(sqlExport.selectedPatients).toHaveCount(1);
+    // select() keeps the listbox open so a second pick needs no re-query.
+    await sqlExport.patientSearch.press("End");
+    await sqlExport.patientSearch.press("Enter");
+    await expect(sqlExport.selectedPatients).toHaveCount(2);
+
+    await sqlExport.groupSearch.fill("dia");
+    await expect(sqlExport.groupListbox.getByRole("option")).toHaveCount(1);
+    await sqlExport.groupSearch.press("ArrowDown");
+    await sqlExport.groupSearch.press("Enter");
+    await expect(sqlExport.selectedGroups).toHaveCount(1);
+
+    await sqlExport.openAdvanced();
+    await sqlExport.trackingIdInput.fill("ward-census-2026-q3");
+
+    await sqlExport.startButton.click();
+    await expect(page).toHaveURL(/\/ui\/sql\/export$/);
+    const card = sqlExport.card(vdName);
+    await expect(card.locator(".tag")).toHaveText("Complete", { timeout: POLL_TIMEOUT });
+    await card.getByRole("link", { name: vdName }).click();
+    await expect(page).toHaveURL(/\/ui\/sql\/export\/[^/]+$/);
+
+    await expect(sqlExport.detailPatients).toHaveCount(2);
+    await expect(sqlExport.detailPatients).toContainText([
+      `Patient/${patientAId}`,
+      `Patient/${patientBId}`,
+    ]);
+    await expect(sqlExport.detailGroups).toHaveCount(1);
+    await expect(sqlExport.detailGroups).toHaveText(`Group/${groupId}`);
+    await expect(sqlExport.detailTrackingId).toHaveText("ward-census-2026-q3");
+  });
+
+  test("the CSV header switch hides for non-csv formats, and an unchecked box is recorded in the detail", async ({
+    page,
+    request,
+    sqlExport,
+  }) => {
+    const stamp = Date.now();
+    const vdName = `e2e_sql_export_header_${stamp}`;
+    const vdId = await createResource(request, "ViewDefinition", {
+      name: vdName,
+      status: "active",
+      resource: "Patient",
+      select: [{ column: [{ name: "id", path: "getResourceKey()" }] }],
+    });
+    seededViewDefinitionIds.push(vdId);
+    await waitSearchable(request, "ViewDefinition", vdId);
+
+    await sqlExport.gotoNew();
+    await sqlExport.openAdvanced();
+    // NDJSON is the default format on a fresh load: the header switch's own
+    // label starts hidden — the box itself is never disabled or unchecked.
+    await expect(sqlExport.headerLabel).toBeHidden();
+
+    await sqlExport.formatOption("csv").check();
+    await expect(sqlExport.headerLabel).toBeVisible();
+    await expect(sqlExport.headerCheckbox).toBeChecked();
+
+    await sqlExport.headerCheckbox.uncheck();
+    await sqlExport.subjectCheckbox(`ViewDefinition/${vdId}`).check();
+    await sqlExport.startButton.click();
+
+    await expect(page).toHaveURL(/\/ui\/sql\/export$/);
+    const card = sqlExport.card(vdName);
+    await expect(card.locator(".tag")).toHaveText("Complete", { timeout: POLL_TIMEOUT });
+    await card.getByRole("link", { name: vdName }).click();
+    await expect(page).toHaveURL(/\/ui\/sql\/export\/[^/]+$/);
+    await expect(sqlExport.detailFormat).toHaveText("CSV · no header row");
+  });
+
+  test("Since's custom instant enables only for Custom, blocks an invalid submit, and a preset resolves in the detail", async ({
+    page,
+    request,
+    sqlExport,
+  }) => {
+    const stamp = Date.now();
+    const vdName = `e2e_sql_export_since_${stamp}`;
+    const vdId = await createResource(request, "ViewDefinition", {
+      name: vdName,
+      status: "active",
+      resource: "Patient",
+      select: [{ column: [{ name: "id", path: "getResourceKey()" }] }],
+    });
+    seededViewDefinitionIds.push(vdId);
+    await waitSearchable(request, "ViewDefinition", vdId);
+
+    await sqlExport.gotoNew();
+    await expect(sqlExport.sinceCustom).toBeDisabled();
+
+    await sqlExport.sincePreset.selectOption("custom");
+    await expect(sqlExport.sinceCustom).toBeEnabled();
+
+    await sqlExport.subjectCheckbox(`ViewDefinition/${vdId}`).check();
+    await sqlExport.sinceCustom.fill("not-a-valid-instant");
+    await sqlExport.startButton.click();
+    // Blocked client-side: no navigation, the field is marked, and the
+    // message is visible.
+    await expect(page).toHaveURL(/\/ui\/sql\/export\/new$/);
+    await expect(sqlExport.sinceCustom).toHaveAttribute("aria-invalid", "true");
+    await expect(sqlExport.sinceCustomError).toBeVisible();
+    await expect(sqlExport.sinceCustom).toBeFocused();
+
+    await sqlExport.sincePreset.selectOption("week");
+    await expect(sqlExport.sinceCustom).toBeDisabled();
+    const beforeSubmit = Date.now();
+    await sqlExport.startButton.click();
+
+    await expect(page).toHaveURL(/\/ui\/sql\/export$/);
+    const card = sqlExport.card(vdName);
+    await expect(card.locator(".tag")).toHaveText("Complete", { timeout: POLL_TIMEOUT });
+    await card.getByRole("link", { name: vdName }).click();
+    await expect(page).toHaveURL(/\/ui\/sql\/export\/[^/]+$/);
+
+    const sinceText = (await sqlExport.detailSince.textContent())?.trim() ?? "";
+    const sinceMs = Date.parse(sinceText);
+    expect(sinceMs, `"${sinceText}" should parse as an instant`).not.toBeNaN();
+    const expectedMs = beforeSubmit - 7 * 24 * 60 * 60 * 1000;
+    // Generous headroom around the exact 7-day mark: only the test's own
+    // wall-clock time between computing `beforeSubmit` and the server
+    // resolving `since_instant("week", "")` should separate them.
+    expect(Math.abs(sinceMs - expectedMs)).toBeLessThan(60_000);
+  });
+});
+
+// #837: the per-SQL-Query parameter values row — expand/collapse chevron,
+// collapsed chip summary, the missing-values count, the submit block on a
+// missing required value, and the detail's own chips (including a Run
+// again round trip). This file's own top-level `afterEach` (above) cleans
+// up the Library subjects these tests seed.
+test.describe("SQL Export builder parameter values row (#837)", () => {
+  test("shows/folds a query's values row, blocks a folded missing required value, and Run again repeats the chips in the detail", async ({
+    page,
+    request,
+    sqlExport,
+  }) => {
+    test.setTimeout(60_000);
+    const stamp = Date.now();
+    const canonical = `http://example.org/ViewDefinition/e2e-sql-export-params-${stamp}`;
+    const vdId = await createResource(request, "ViewDefinition", {
+      name: `e2e_sql_export_params_vd_${stamp}`,
+      url: canonical,
+      status: "active",
+      resource: "Patient",
+      select: [{ column: [{ name: "id", path: "getResourceKey()" }] }],
+    });
+    seededViewDefinitionIds.push(vdId);
+
+    const wardName = `e2e_sql_export_params_ward_${stamp}`;
+    const wardLibId = await createSqlQueryLibrary(request, wardName, canonical, undefined, [
+      { name: "ward", use: "in", type: "string" },
+    ]);
+    seededLibraryIds.push(wardLibId);
+
+    const readmitName = `e2e_sql_export_params_readmit_${stamp}`;
+    const readmitLibId = await createSqlQueryLibrary(request, readmitName, canonical, undefined, [
+      { name: "days", use: "in", type: "integer", defaultInteger: 30 },
+      { name: "from", use: "in", type: "date" },
+    ]);
+    seededLibraryIds.push(readmitLibId);
+
+    await waitSearchable(request, "ViewDefinition", vdId);
+    await waitSearchable(request, "Library", wardLibId);
+    await waitSearchable(request, "Library", readmitLibId);
+
+    const wardRef = `Library/${wardLibId}`;
+    const readmitRef = `Library/${readmitLibId}`;
+
+    await sqlExport.gotoNew();
+
+    // Both values rows start hidden — nothing is checked yet.
+    await expect(sqlExport.paramsRow(wardRef)).toBeHidden();
+    await expect(sqlExport.paramsRow(readmitRef)).toBeHidden();
+
+    // Marking the ward query opens its row and reveals the chevron.
+    await sqlExport.subjectCheckbox(wardRef).check();
+    await expect(sqlExport.paramsRow(wardRef)).toBeVisible();
+    await expect(sqlExport.rowToggle(wardRef)).toBeVisible();
+    await expect(sqlExport.rowToggle(wardRef)).toHaveAttribute("aria-expanded", "true");
+
+    await sqlExport.paramField(wardRef, "ward").fill("W1");
+
+    // Folding hides the values row and shows the chip summary; unfolding
+    // reverses it.
+    await sqlExport.rowToggle(wardRef).click();
+    await expect(sqlExport.rowToggle(wardRef)).toHaveAttribute("aria-expanded", "false");
+    await expect(sqlExport.paramsRow(wardRef)).toBeHidden();
+    await expect(sqlExport.paramSummary(wardRef)).toHaveText(":ward = W1");
+
+    await sqlExport.rowToggle(wardRef).click();
+    await expect(sqlExport.paramsRow(wardRef)).toBeVisible();
+    await expect(sqlExport.paramSummary(wardRef)).toBeHidden();
+
+    // Marking the second query without filling its required `from` shows
+    // the missing-values count.
+    await sqlExport.subjectCheckbox(readmitRef).check();
+    await expect(sqlExport.selectedCount).toHaveText("2 of 3 selected · 1 value missing");
+
+    // Fold it — the summary names both fields, `days` from its default and
+    // `from` in the alert tone — then submit while folded. A hidden
+    // (`display: none`) required field is still a native constraint-
+    // validation candidate in Chromium, so without the script disabling
+    // native validation (`form.noValidate`) the browser would silently
+    // refuse to submit with no visible feedback at all — nothing to focus
+    // or scroll to. The script's own check is what gives this real
+    // feedback: no navigation, the row re-opens, the field is marked and
+    // focused.
+    await sqlExport.rowToggle(readmitRef).click();
+    await expect(sqlExport.paramSummary(readmitRef)).toContainText(":days = 30");
+    await expect(sqlExport.paramSummary(readmitRef)).toContainText(":from — required");
+
+    await sqlExport.startButton.click();
+    await expect(page).toHaveURL(/\/ui\/sql\/export\/new$/);
+    await expect(sqlExport.paramsRow(readmitRef)).toBeVisible();
+    const fromField = sqlExport.paramField(readmitRef, "from");
+    await expect(fromField).toHaveAttribute("aria-invalid", "true");
+    await expect(fromField).toBeFocused();
+
+    await fromField.fill("2026-06-01");
+    await expect(sqlExport.selectedCount).toHaveText("2 of 3 selected");
+
+    await sqlExport.startButton.click();
+    await expect(page).toHaveURL(/\/ui\/sql\/export$/);
+    const card = sqlExport.card(wardName);
+    await expect(card.locator(".tag")).toHaveText("Complete", { timeout: POLL_TIMEOUT });
+    await card.getByRole("link", { name: wardName }).click();
+    await expect(page).toHaveURL(/\/ui\/sql\/export\/[^/]+$/);
+
+    await expect(sqlExport.detailSubjects).toContainText(":ward = W1");
+    await expect(sqlExport.detailSubjects).toContainText(":days = 30");
+    await expect(sqlExport.detailSubjects).toContainText(":from = 2026-06-01");
+
+    // Run again replays the same subjects and their parameters into a
+    // brand-new job — most recent first in the list — whose own detail
+    // repeats the exact same chips.
+    await page.getByRole("button", { name: "Run again" }).click();
+    await expect(page).toHaveURL(/\/ui\/sql\/export$/);
+    const rerunCard = sqlExport.card(wardName).first();
+    await expect(rerunCard.locator(".tag")).toHaveText("Complete", { timeout: POLL_TIMEOUT });
+    await rerunCard.getByRole("link", { name: wardName }).click();
+    await expect(page).toHaveURL(/\/ui\/sql\/export\/[^/]+$/);
+    await expect(sqlExport.detailSubjects).toContainText(":ward = W1");
+    await expect(sqlExport.detailSubjects).toContainText(":days = 30");
+    await expect(sqlExport.detailSubjects).toContainText(":from = 2026-06-01");
+  });
+
+  test("the table filter hides a checked query's values row without losing its typed value", async ({
+    page,
+    request,
+    sqlExport,
+  }) => {
+    const stamp = Date.now();
+    const canonical = `http://example.org/ViewDefinition/e2e-sql-export-params-filter-${stamp}`;
+    const vdId = await createResource(request, "ViewDefinition", {
+      name: `e2e_sql_export_params_filter_vd_${stamp}`,
+      url: canonical,
+      status: "active",
+      resource: "Patient",
+      select: [{ column: [{ name: "id", path: "getResourceKey()" }] }],
+    });
+    seededViewDefinitionIds.push(vdId);
+
+    const queryName = `e2e_sql_export_params_filter_query_${stamp}`;
+    const libId = await createSqlQueryLibrary(request, queryName, canonical, undefined, [
+      { name: "ward", use: "in", type: "string" },
+    ]);
+    seededLibraryIds.push(libId);
+
+    await waitSearchable(request, "ViewDefinition", vdId);
+    await waitSearchable(request, "Library", libId);
+
+    const reference = `Library/${libId}`;
+
+    await sqlExport.gotoNew();
+    await sqlExport.subjectCheckbox(reference).check();
+    await sqlExport.paramField(reference, "ward").fill("W1");
+    await expect(sqlExport.paramsRow(reference)).toBeVisible();
+
+    // A filter text matching nothing hides the subject row and, with it,
+    // its values row — the typed value stays in the DOM throughout.
+    await sqlExport.subjectFilterInput.fill("no-such-subject-name");
+    await expect(sqlExport.subjectRow(queryName)).toBeHidden();
+    await expect(sqlExport.paramsRow(reference)).toBeHidden();
+
+    await sqlExport.subjectFilterInput.fill("");
+    await expect(sqlExport.subjectRow(queryName)).toBeVisible();
+    await expect(sqlExport.paramsRow(reference)).toBeVisible();
+    await expect(sqlExport.paramField(reference, "ward")).toHaveValue("W1");
+  });
+});
+
 // #835: the job-id lookup form is retired — its nav entry is gone (see
 // chrome.spec.ts) and its own URL now only redirects.
 test("the sidebar carries no Files entry, and /ui/sql/files redirects to the list", async ({

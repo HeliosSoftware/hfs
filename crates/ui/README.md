@@ -239,6 +239,7 @@ not just a closed IIFE.
 | `resources.js` | The Resources workspace edit modal and "Create new" |
 | `batch.js` | Bundle pick → lazy highlighted previews → execution plan → per-entry outcomes |
 | `bulk-export.js` | All Resources, individual resource types, and Since/Custom instant state on the Bulk Export builder |
+| `sql-export-form.js` | The SQL Export builder (`/ui/sql/export/new`, #834/#836): the subjects table's type switch, text filter, header select-all, and "n of m selected" count; independently, the CSV header switch's visibility (shown only for `format: csv`, never touching its `checked` state) and the Since custom instant's enabled state and `data-pattern` validation on submit — the same enable-only-for-"custom" rule as `bulk-export.js`'s own Since field, but without its fuller calendar-validity pass, which stays a server-side (`crate::lookup::since_instant`) concern |
 | `sql-export.js` | "Copy job id" on Active SQL Exports job cards — reveals the button only when the Clipboard API is available, writes the id, shows "Copied" |
 | `history.js` | Version selection and diff requests |
 | `nl-search.js` | Natural-language search mode (only loaded when configured) |
@@ -373,6 +374,7 @@ These are the shared primitives. Before styling anything, reach for one; add to
 |---|---|
 | `.btn`, `.btn--primary`, `.btn--danger`, `.btn--current`, `.btn--icon` | The action button: 30px high, 12px horizontal padding, 12px type, and a 9px radius. Primary, danger, and current change emphasis only; `--icon` makes the control a 30px square with no horizontal padding. |
 | `.card`, `.card-head`, `.table-card` | Raised surface; its header row; the padding variant that hosts a table. |
+| `details.card > summary.card-head` | The same card header, native-disclosure flavor (SQL Export's "Advanced", #836): a `<summary class="card-head">` opens/closes its `<details class="card">` with no marker and a pointer cursor, working without JavaScript. |
 | `.panel` | Padding for a full-width card that hosts detail fields without rail behavior. |
 | `.detail__field`, `.detail__field--wide` | One labelled value. The field owns the 5px label/value gap; `--wide` spans all columns when the field is inside a key/value grid. |
 | `.detail-stack` | Padding-free vertical composition for detail fields and form actions, with a 12px gap. Direct `.form-actions` children rely on that gap instead of adding their usual top margin. |
@@ -382,6 +384,8 @@ These are the shared primitives. Before styling anything, reach for one; add to
 | `.table-wrap` > `.data-table`, `.col-num`, `.col-actions`, `.data-table__empty`, `.table-foot` | The table, always in its scroll wrapper: ordinary headers and data align left; `.col-num` uses tabular figures without changing alignment; `.col-actions` aligns right; empty-state rows stay centered; the footer hosts pagination. |
 | `.empty-state` | The same centered, muted empty treatment for non-table content. |
 | `.field`, `.field__label`, `.field__input`, `.field__hint`, `.field__hint--error` | A labelled form field. |
+| `.row--params`, `.param-grid` | A parameterized SQL Query's values row (#837, SQL Export builder): `.row--params` shades the `<tr>` right under a subject with declared `Library.parameter[use=in]` entries; `.param-grid` lays its fields out three per row in the form's own plain `.field` voice (never `.field-row`, which uppercases labels). Rendered by `partials/sql_parameter_fields.html`'s `fields(prefix, params)` macro — shared, unchanged, with the SQL Query page's own parameter form (#841). |
+| `.row-toggle`, `.param-summary` | The values row's own expand/collapse chevron and folded chip strip (#837, SQL Export builder), both in the parameterized subject's Subject cell: `.row-toggle` (24px, `.icon` rotates off `[aria-expanded="false"]`, the same convention `.json-line__arrow` uses) toggles the row; `.param-summary` (inline-flex, 6px gap) holds `sql-export-form.js`'s own `.tag--param`/`.tag--danger` chips while folded. Both server-rendered `hidden`, revealed only for a checked query. |
 | `.combobox`, `.combobox__*` | Shared progressively enhanced multi-select. Render it through `partials/combobox.html`; callers provide localized domain copy and an HTML-fragment endpoint, while `combobox.js` owns selection/keyboard state and repeated hidden inputs. Keep a named textarea fallback usable without JavaScript. |
 | `.addbox`, `.addbox--modal`, `.addbox__panel`, `.addbox__head`, `.addbox__x`, `.addbox__actions` | The `<details>` disclosure for create/add flows; `--modal` centers it as a dialog. |
 | `.choice-grid`, `.choice-card`, `.choice-card__title`, `.choice-card__hint` | The radio-group treatment: one selectable card per choice, `:has(:checked)` accent (#735). |
@@ -556,8 +560,9 @@ cargo run -p helios-hfs   # then open http://127.0.0.1:8080/ui
 | `/ui/version` | POST | Persists the sidebar FHIR-version choice (#343) and redirects back |
 | `/ui/tenant`, `/ui/tenant/options` | POST/GET | Tenant selector (#344), options loaded lazily |
 | `/ui/sql/export` | GET/POST | Active SQL Exports — the user's `$sql-export` jobs as cards, most recent first (#833); POST resolves the checked subjects and kicks off the job, optionally naming it |
-| `/ui/sql/export/new` | GET | SQL Export builder (#834) — an optional name, a single filterable table of stored ViewDefinitions/Libraries with their status, and an output format; `?subject=` (repeatable) pre-checks matching rows |
-| `/ui/sql/export/{id}` | GET | A job's own permalink (#835): header with the contextual action/status/overflow, a failure notice when `failed`, the Job card, and the Output files table — reading the notebook's own persisted record, not the server |
+| `/ui/sql/export/new` | GET/POST | SQL Export builder (#834, #836, #837) — an optional name, a single filterable table of stored ViewDefinitions/Libraries with their status, an optional "Narrow it down" card (patients/groups/since) and "Advanced" disclosure (tracking id, CSV header), and an output format; `?subject=` (repeatable) pre-checks matching rows. Every SQL Query declaring `Library.parameter[use=in]` entries carries an `n parameter(s)` chip and, right under its own row, a values row (`param:{reference}:{name}` fields, one per declared parameter, `partials/sql_parameter_fields.html`) — always rendered, unconditionally visible without JavaScript. `sql-export-form.js` hides an unchecked query's values row, reveals its row-toggle chevron once checked, folds it into a `:name = value`/`:name — required` chip summary, keeps the fields' native `required` in sync with "checked and no default", appends "· k value(s) missing" to the selection count, and blocks a submit with an empty required field — opening the affected row and focusing the field. A resubmission that left a field in error re-renders that row with `data-open`, the script's cue to keep it expanded and focus that field. `POST /ui/sql/export` is the same builder's submit target — validates every checked SQL Query's parameter values by declared type before kick-off — see the row above |
+| `/ui/lookup/patient-options`, `/ui/lookup/group-options` | POST | Shared Patient/Group combobox search fragments (#836), htmx-only; `?target=` selects which field's `#{target}-message` slot the response's `hx-swap-oob` lands in — one of `bulk-export-patients` \| `sql-export-patients` \| `sql-export-groups`, a closed list (an unrecognized value is a bare `400`). Group search adds `Group.name` only for R5+ (`data/search-parameters-{r4,r5}.json`); Patient search shares Bulk Export's own runtime id-only downgrade |
+| `/ui/sql/export/{id}` | GET | A job's own permalink (#835): header with the contextual action/status/overflow, a failure notice when `failed`, the Job card, and the Output files table — reading the notebook's own persisted record, not the server. The Job card surfaces `filters` (#836) when the job carries them: Tracking id, Since, and one `.tag` chip per Patients/Groups reference, each field skipped entirely when empty; Format gains " · with header row"/" · no header row" for a `csv` job with a known `header` choice. Its Subjects field also carries a `:name = value` chip per parameter (#837) right after any SQL Query subject that supplied one, in submission order — empty for every other subject |
 | `/ui/sql/export/{id}/detail` | GET | htmx fragment of the page above (`#job-detail`), polled every 5s while the job is `in-progress`; `404` with no body for an id this user/tenant does not own |
 | `/ui/sql/export/{id}/card` | GET | htmx fragment: one job's card, polling `$sql-export` status while the job is in progress |
 | `/ui/sql/export/{id}/cancel`, `/retry`, `/rerun`, `/remove` | POST | Per-job actions: cancel an in-progress job, resubmit a failed or terminal job as a new record, or drop a terminal job's record from the list |
@@ -596,7 +601,21 @@ falls through to the normal REST surface.
   uses. A SQL Export job optionally carries the builder's trimmed `name`
   (#834); empty is omitted, and the card falls back to the subjects' own
   names. `name` is a label for this notebook only — it is never sent to
-  `$sql-export` itself.
+  `$sql-export` itself. A SQL Export job's `filters` (#836) records the
+  job-wide `patients`/`groups`/`since`/`header`/`clientTrackingId` the
+  "Narrow it down" card and "Advanced" disclosure submitted — resolved and
+  canonicalized the same way the request itself was built, so *Retry*/*Run
+  again* reproduce it exactly; serialization is all-or-nothing (every field
+  present once any one of them is set) and the whole object collapses to
+  `null` only when every field is at its empty default, so a round trip
+  through a resubmission is never lossy. Records persisted before `filters`
+  existed still deserialize, with every field defaulting to empty. Each
+  `subjects[]` entry also carries its own `parameters` (#837) — the
+  name/type/value of every value submitted for that SQL Query's declared
+  `Library.parameter[use=in]` entries, empty for a ViewDefinition, a SQL
+  View, or an unparameterized SQL Query. `type` is the declared FHIR type
+  code, not a hint: it is what `kickoff` types the value as when it rebuilds
+  `subject.parameters` on *Retry*/*Run again*.
 - **SQL Export's self-calls carry the caller's own identity.** `$sql-export`
   kick-off, status polling, cancel, and the completion manifest all go through
   `ConformanceSource`'s four `$sql-export` methods with a `Caller`: the

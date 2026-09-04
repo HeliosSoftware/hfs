@@ -25,12 +25,10 @@ use axum::{
     Extension,
     body::{Body, Bytes},
     extract::{Path, Query, State},
-    http::{HeaderMap, StatusCode, header::CACHE_CONTROL},
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Redirect, Response},
 };
-use axum_htmx::HxRequest;
-use chrono::{Duration, SecondsFormat, Utc};
-use futures_lite::future::zip;
+use chrono::{SecondsFormat, Utc};
 use futures_lite::io::AsyncWriteExt as FuturesAsyncWriteExt;
 use helios_fhir::FhirVersion;
 use serde::{Deserialize, Serialize};
@@ -350,7 +348,10 @@ fn base_url_with_segments<'a>(
 
 /// Internal self-call URL. This is always based on the trusted loopback base,
 /// never a Host header or an advertised/public authority.
-fn internal_api_url<'a>(
+///
+/// `pub(crate)`: `crate::lookup`'s Patient/Group combobox endpoints self-call
+/// through this too (#836).
+pub(crate) fn internal_api_url<'a>(
     state: &WebState,
     tenant: &str,
     segments: impl IntoIterator<Item = &'a str>,
@@ -377,7 +378,7 @@ fn public_api_url<'a>(
     )
 }
 
-fn no_redirect_client() -> Result<reqwest::Client, String> {
+pub(crate) fn no_redirect_client() -> Result<reqwest::Client, String> {
     reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(std::time::Duration::from_secs(15))
@@ -475,7 +476,7 @@ fn public_status_url(
 
 /// Forwards the caller's credentials and tenant onto a self-call, so the
 /// export runs as the user who asked for it.
-fn forward_identity(
+pub(crate) fn forward_identity(
     mut request: reqwest::RequestBuilder,
     headers: &HeaderMap,
     tenant: &str,
@@ -632,20 +633,6 @@ pub(crate) struct ActiveQuery {
     delete_error: Option<String>,
 }
 
-struct PatientOption {
-    value: String,
-    label: String,
-}
-
-#[derive(Template)]
-#[template(path = "partials/bulk_export_patient_options.html")]
-struct PatientOptionsFragment {
-    options: Vec<PatientOption>,
-    message: String,
-    error: bool,
-    id_only: bool,
-}
-
 // ---------------------------------------------------------------------------
 // Handlers
 // ---------------------------------------------------------------------------
@@ -787,390 +774,9 @@ fn parse_start_form(body: &str) -> StartForm {
     form
 }
 
-/// Maps the Since preset (or a valid, non-empty custom stamp) onto `_since`.
-fn has_fhir_r4_instant_lexical_form(value: &str) -> bool {
-    let bytes = value.as_bytes();
-    if bytes.len() < 20
-        || bytes.get(4) != Some(&b'-')
-        || bytes.get(7) != Some(&b'-')
-        || bytes.get(10) != Some(&b'T')
-        || bytes.get(13) != Some(&b':')
-        || bytes.get(16) != Some(&b':')
-    {
-        return false;
-    }
-
-    let number = |start: usize, end: usize| {
-        bytes
-            .get(start..end)?
-            .iter()
-            .try_fold(0_u32, |value, byte| {
-                byte.is_ascii_digit()
-                    .then_some(value * 10 + u32::from(*byte - b'0'))
-            })
-    };
-    let (Some(year), Some(month), Some(day), Some(hour), Some(minute), Some(second)) = (
-        number(0, 4),
-        number(5, 7),
-        number(8, 10),
-        number(11, 13),
-        number(14, 16),
-        number(17, 19),
-    ) else {
-        return false;
-    };
-    if year == 0
-        || !(1..=12).contains(&month)
-        || !(1..=31).contains(&day)
-        || hour > 23
-        || minute > 59
-        || second > 60
-    {
-        return false;
-    }
-
-    let mut zone_start = 19;
-    if bytes.get(zone_start) == Some(&b'.') {
-        zone_start += 1;
-        let fraction_start = zone_start;
-        while bytes.get(zone_start).is_some_and(u8::is_ascii_digit) {
-            zone_start += 1;
-        }
-        if zone_start == fraction_start {
-            return false;
-        }
-    }
-
-    match bytes.get(zone_start) {
-        Some(b'Z') => zone_start + 1 == bytes.len(),
-        Some(b'+') | Some(b'-') => {
-            if bytes.len() != zone_start + 6 || bytes.get(zone_start + 3) != Some(&b':') {
-                return false;
-            }
-            let (Some(offset_hour), Some(offset_minute)) = (
-                number(zone_start + 1, zone_start + 3),
-                number(zone_start + 4, zone_start + 6),
-            ) else {
-                return false;
-            };
-            offset_minute <= 59 && (offset_hour <= 13 || (offset_hour == 14 && offset_minute == 0))
-        }
-        _ => false,
-    }
-}
-
-fn since_instant(preset: &str, custom: &str) -> Result<String, ()> {
-    let ago = |d: Duration| (Utc::now() - d).to_rfc3339_opts(SecondsFormat::Secs, true);
-    match preset {
-        "day" => Ok(ago(Duration::days(1))),
-        "week" => Ok(ago(Duration::days(7))),
-        "month" => Ok(ago(Duration::weeks(4))),
-        "custom" => {
-            let custom = custom.trim();
-            if custom.is_empty() {
-                Ok(String::new())
-            } else {
-                has_fhir_r4_instant_lexical_form(custom)
-                    .then_some(())
-                    .ok_or(())
-                    .and_then(|_| chrono::DateTime::parse_from_rfc3339(custom).map_err(|_| ()))
-                    .map(|_| custom.to_string())
-            }
-        }
-        _ => Ok(String::new()),
-    }
-}
-
-fn canonical_patient_ref(value: &str) -> Option<String> {
-    let value = value.trim();
-    let id = value.strip_prefix("Patient/").unwrap_or(value);
-    if id.is_empty()
-        || id.len() > 64
-        || !id
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-'))
-    {
-        return None;
-    }
-    Some(format!("Patient/{id}"))
-}
-
-fn parse_patient_refs(values: &[String]) -> Result<Vec<String>, ()> {
-    let mut refs = Vec::new();
-    let mut seen = HashSet::new();
-    for raw in values {
-        for candidate in raw.split([',', '\n', '\r']) {
-            let candidate = candidate.trim();
-            if candidate.is_empty() {
-                continue;
-            }
-            let reference = canonical_patient_ref(candidate).ok_or(())?;
-            if seen.insert(reference.clone()) {
-                refs.push(reference);
-            }
-        }
-    }
-    Ok(refs)
-}
-
-fn fhir_json(version: FhirVersion) -> String {
-    format!(
-        "application/fhir+json; fhirVersion={}",
-        version.as_mime_param()
-    )
-}
-
-fn patient_option(resource: &Value) -> Option<PatientOption> {
-    if resource.get("resourceType").and_then(Value::as_str) != Some("Patient") {
-        return None;
-    }
-    let id = resource.get("id")?.as_str()?;
-    let value = canonical_patient_ref(id)?;
-    let name = resource
-        .get("name")
-        .and_then(Value::as_array)
-        .and_then(|names| names.iter().find_map(human_name_label));
-    let label = match name {
-        Some(name) if !name.is_empty() => format!("{name} — {value}"),
-        _ => value.clone(),
-    };
-    Some(PatientOption { value, label })
-}
-
-fn human_name_label(name: &Value) -> Option<String> {
-    if let Some(text) = name.get("text").and_then(Value::as_str) {
-        let text = text.trim();
-        if !text.is_empty() {
-            return Some(text.to_string());
-        }
-    }
-    let given = name
-        .get("given")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(Value::as_str)
-        .map(str::trim)
-        .filter(|part| !part.is_empty());
-    let family = name
-        .get("family")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|part| !part.is_empty());
-    let parts: Vec<&str> = given.chain(family).collect();
-    (!parts.is_empty()).then(|| parts.join(" "))
-}
-
-fn options_response(fragment: PatientOptionsFragment) -> Response {
-    let mut response = render(fragment);
-    response.headers_mut().insert(
-        CACHE_CONTROL,
-        "private, no-store"
-            .parse()
-            .expect("static cache-control value"),
-    );
-    response
-}
-
-fn patient_lookup_error(i18n: &I18n, id_only: bool) -> Response {
-    options_response(PatientOptionsFragment {
-        options: Vec::new(),
-        message: i18n.t("ui-combobox-error"),
-        error: true,
-        id_only,
-    })
-}
-
-fn patient_search_options(bundle: &Value) -> Option<Vec<PatientOption>> {
-    let bundle = bundle.as_object()?;
-    if bundle.get("resourceType").and_then(Value::as_str) != Some("Bundle")
-        || bundle.get("type").and_then(Value::as_str) != Some("searchset")
-    {
-        return None;
-    }
-    let entries = match bundle.get("entry") {
-        None => return Some(Vec::new()),
-        Some(Value::Array(entries)) => entries,
-        Some(_) => return None,
-    };
-    entries
-        .iter()
-        .map(|entry| patient_option(entry.as_object()?.get("resource")?))
-        .collect()
-}
-
-fn append_patient_options(
-    source: Vec<PatientOption>,
-    options: &mut Vec<PatientOption>,
-    seen: &mut HashSet<String>,
-) {
-    for option in source {
-        if options.len() >= 8 {
-            break;
-        }
-        if seen.insert(option.value.clone()) {
-            options.push(option);
-        }
-    }
-}
-
-/// `POST /ui/bulk-export/patient-options` — a small HTML result fragment for
-/// the progressively-enhanced Patient selector.
-pub async fn patient_options(
-    State(state): State<WebState>,
-    locale: RequestLocale,
-    rv: RequestVersion,
-    rt: RequestTenant,
-    HxRequest(is_htmx): HxRequest,
-    headers: HeaderMap,
-    axum::extract::RawForm(body): axum::extract::RawForm,
-) -> Response {
-    if !is_htmx {
-        return Redirect::to("/ui/bulk-export/new").into_response();
-    }
-    let i18n = I18n::new(locale);
-    let q = form_urlencoded::parse(&body)
-        .find(|(key, _)| key == "q")
-        .map(|(_, value)| value.trim().to_string())
-        .unwrap_or_default();
-    let id_only = !state.patient_name_search.load(Ordering::Relaxed);
-    if q.is_empty() {
-        return options_response(PatientOptionsFragment {
-            options: Vec::new(),
-            message: String::new(),
-            error: false,
-            id_only,
-        });
-    }
-    if q.chars().count() > 64 {
-        return patient_lookup_error(&i18n, id_only);
-    }
-
-    let Ok(client) = no_redirect_client() else {
-        return patient_lookup_error(&i18n, id_only);
-    };
-    let media = fhir_json(rv.0);
-    let exact_ref = canonical_patient_ref(&q);
-    let mut options = Vec::new();
-    let mut seen = HashSet::new();
-
-    if let Some(reference) = &exact_ref {
-        let id = reference.trim_start_matches("Patient/");
-        let Ok(url) = internal_api_url(&state, &rt.id, ["Patient", id]) else {
-            return patient_lookup_error(&i18n, id_only);
-        };
-        let request = forward_identity(
-            client
-                .get(url)
-                .header("Accept", &media)
-                .timeout(std::time::Duration::from_secs(10)),
-            &headers,
-            &rt.id,
-        );
-        match request.send().await {
-            Ok(response)
-                if matches!(response.status(), StatusCode::NOT_FOUND | StatusCode::GONE) => {}
-            Ok(response) if response.status().is_success() => {
-                let Ok(resource) = response.json::<Value>().await else {
-                    return patient_lookup_error(&i18n, id_only);
-                };
-                let Some(option) = patient_option(&resource) else {
-                    return patient_lookup_error(&i18n, id_only);
-                };
-                if option.value != *reference {
-                    return patient_lookup_error(&i18n, id_only);
-                }
-                seen.insert(option.value.clone());
-                options.push(option);
-            }
-            Ok(_) | Err(_) => return patient_lookup_error(&i18n, id_only),
-        }
-    }
-
-    let search_patients = q.chars().count() >= 2 && !q.starts_with("Patient/") && !id_only;
-    let mut downgraded = id_only;
-    if search_patients {
-        let Ok(url) = internal_api_url(&state, &rt.id, ["Patient", "_search"]) else {
-            return patient_lookup_error(&i18n, false);
-        };
-        let identifier_request = forward_identity(
-            client
-                .post(url.clone())
-                .header("Accept", &media)
-                .header("Content-Type", "application/x-www-form-urlencoded")
-                .form(&[
-                    ("identifier", q.as_str()),
-                    ("_count", "9"),
-                    ("_elements", "id,name"),
-                ])
-                .timeout(std::time::Duration::from_secs(10)),
-            &headers,
-            &rt.id,
-        );
-        let name_request = forward_identity(
-            client
-                .post(url)
-                .header("Accept", &media)
-                .header("Content-Type", "application/x-www-form-urlencoded")
-                .form(&[
-                    ("name", q.as_str()),
-                    ("_count", "9"),
-                    ("_elements", "id,name"),
-                ])
-                .timeout(std::time::Duration::from_secs(10)),
-            &headers,
-            &rt.id,
-        );
-        let (identifier_result, name_result) =
-            zip(identifier_request.send(), name_request.send()).await;
-
-        let not_implemented = matches!(
-            &identifier_result,
-            Ok(response) if response.status() == StatusCode::NOT_IMPLEMENTED
-        ) || matches!(
-            &name_result,
-            Ok(response) if response.status() == StatusCode::NOT_IMPLEMENTED
-        );
-        if not_implemented {
-            state.patient_name_search.store(false, Ordering::Relaxed);
-            downgraded = true;
-        } else {
-            let (Ok(identifier_response), Ok(name_response)) = (identifier_result, name_result)
-            else {
-                return patient_lookup_error(&i18n, false);
-            };
-            if !identifier_response.status().is_success() || !name_response.status().is_success() {
-                return patient_lookup_error(&i18n, false);
-            }
-            let Ok(identifier_bundle) = identifier_response.json::<Value>().await else {
-                return patient_lookup_error(&i18n, false);
-            };
-            let Ok(name_bundle) = name_response.json::<Value>().await else {
-                return patient_lookup_error(&i18n, false);
-            };
-            let Some(identifier_options) = patient_search_options(&identifier_bundle) else {
-                return patient_lookup_error(&i18n, false);
-            };
-            let Some(name_options) = patient_search_options(&name_bundle) else {
-                return patient_lookup_error(&i18n, false);
-            };
-            append_patient_options(identifier_options, &mut options, &mut seen);
-            append_patient_options(name_options, &mut options, &mut seen);
-        }
-    }
-
-    let message = if options.is_empty() {
-        i18n.t("bulk-export-patient-options-empty")
-    } else {
-        String::new()
-    };
-    options_response(PatientOptionsFragment {
-        options,
-        message,
-        error: false,
-        id_only: downgraded,
-    })
-}
+// Since-preset resolution, instant validation, Patient reference
+// canonicalization/parsing, and the Patient combobox search endpoint moved
+// to crate::lookup (#836) — Bulk Export now calls them from there.
 
 /// `POST /ui/bulk-export` — kick off the export, then land on Exports.
 pub async fn start(
@@ -1188,11 +794,11 @@ pub async fn start(
         _ => "system".to_string(),
     };
     let patient_refs = if scope == "patient" {
-        parse_patient_refs(&form.patients)
+        crate::lookup::parse_reference_list("Patient", &form.patients)
     } else {
         Ok(Vec::new())
     };
-    let since = since_instant(&form.since_preset, &form.since_custom);
+    let since = crate::lookup::since_instant(&form.since_preset, &form.since_custom);
     let i18n = I18n::new(locale);
     let errors = StartErrors {
         name: form
@@ -1275,7 +881,7 @@ async fn kickoff(state: &WebState, job: &mut ExportJob, headers: &HeaderMap, ten
         }
     };
     let version = job.fhir_version.unwrap_or(state.fhir_version);
-    let media = fhir_json(version);
+    let media = crate::lookup::fhir_json(version);
     let mut query: Vec<(&str, &str)> = Vec::new();
     if !job.types.is_empty() {
         query.push(("_type", &job.types));
@@ -1598,7 +1204,7 @@ async fn poll_job(state: &WebState, job: &mut ExportJob, headers: &HeaderMap, te
         job.error = "status poll unavailable: HTTP client setup failed".to_string();
         return;
     };
-    let media = fhir_json(job.fhir_version.unwrap_or(state.fhir_version));
+    let media = crate::lookup::fhir_json(job.fhir_version.unwrap_or(state.fhir_version));
     let request = forward_identity(
         client
             .get(url)
@@ -2103,15 +1709,9 @@ pub async fn download_all(
 mod tests {
     use super::*;
 
-    #[test]
-    fn patient_references_accept_bare_and_canonical_ids_and_deduplicate() {
-        let values = vec![" p-1,Patient/p-2\np-1 ".to_string()];
-        assert_eq!(
-            parse_patient_refs(&values),
-            Ok(vec!["Patient/p-1".to_string(), "Patient/p-2".to_string()])
-        );
-        assert!(parse_patient_refs(&["Patient/not/valid".to_string()]).is_err());
-    }
+    // Reference canonicalization/parsing now lives in crate::lookup, along
+    // with its own test coverage (#836) — see
+    // `reference_lists_accept_bare_and_canonical_ids_and_deduplicate`.
 
     #[test]
     fn legacy_jobs_deserialize_without_patient_or_version_fields() {

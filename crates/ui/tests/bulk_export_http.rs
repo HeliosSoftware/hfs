@@ -118,6 +118,12 @@ struct MockExport {
     name_search_delay_ms: Arc<Mutex<u64>>,
     patient_read_status: Arc<Mutex<u16>>,
     patient_read_body: Arc<Mutex<Option<String>>>,
+    /// Groups readable by exact `GET /Group/{id}` (#836).
+    groups: Arc<Mutex<Vec<serde_json::Value>>>,
+    /// What `POST /Group/_search?identifier=` answers.
+    group_identifier_results: Arc<Mutex<Vec<serde_json::Value>>>,
+    /// What `POST /Group/_search?name=` answers (R5+ only — #836).
+    group_name_results: Arc<Mutex<Vec<serde_json::Value>>>,
 }
 
 impl Default for MockExport {
@@ -161,6 +167,9 @@ impl Default for MockExport {
             name_search_delay_ms: Default::default(),
             patient_read_status: Arc::new(Mutex::new(200)),
             patient_read_body: Default::default(),
+            groups: Default::default(),
+            group_identifier_results: Default::default(),
+            group_name_results: Default::default(),
         }
     }
 }
@@ -453,6 +462,63 @@ fn mock_fhir_app(state: MockExport) -> Router {
             .unwrap_or_else(|| StatusCode::NOT_FOUND.into_response())
     }
 
+    /// Answers `POST /Group/_search` (#836) — `identifier=` or `name=`,
+    /// distinguished the same way [`patient_search`] tells its own two
+    /// search kinds apart. Unlike [`patient_search`], there is no barrier/
+    /// delay/downgrade machinery here: [`group_options`] has no runtime
+    /// id-only fallback to exercise.
+    async fn group_search(
+        AxState(s): AxState<MockExport>,
+        method: Method,
+        uri: axum::http::Uri,
+        headers: HeaderMap,
+        body: Bytes,
+    ) -> axum::response::Response {
+        let form: HashMap<_, _> = form_urlencoded::parse(&body).collect();
+        let identifier = form.contains_key("identifier");
+        s.requests
+            .lock()
+            .unwrap()
+            .push(capture(method, uri, headers, body));
+        let groups = if identifier {
+            s.group_identifier_results.lock().unwrap().clone()
+        } else {
+            s.group_name_results.lock().unwrap().clone()
+        };
+        Json(serde_json::json!({
+            "resourceType": "Bundle",
+            "type": "searchset",
+            "entry": groups.iter()
+                .map(|resource| serde_json::json!({"resource": resource}))
+                .collect::<Vec<_>>()
+        }))
+        .into_response()
+    }
+
+    async fn group_read(
+        AxState(s): AxState<MockExport>,
+        AxPath(params): AxPath<HashMap<String, String>>,
+        method: Method,
+        uri: axum::http::Uri,
+        headers: HeaderMap,
+        body: Bytes,
+    ) -> axum::response::Response {
+        s.requests
+            .lock()
+            .unwrap()
+            .push(capture(method, uri, headers, body));
+        let id = params.get("id").expect("route includes id");
+        s.groups
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|group| group["id"] == *id)
+            .cloned()
+            .map(Json)
+            .map(IntoResponse::into_response)
+            .unwrap_or_else(|| StatusCode::NOT_FOUND.into_response())
+    }
+
     Router::new()
         .route("/$export", axum::routing::get(kickoff).post(kickoff))
         .route(
@@ -469,6 +535,8 @@ fn mock_fhir_app(state: MockExport) -> Router {
         )
         .route("/Group/{id}/$export", axum::routing::get(kickoff))
         .route("/{tenant}/Group/{id}/$export", axum::routing::get(kickoff))
+        .route("/Group/_search", axum::routing::post(group_search))
+        .route("/Group/{id}", axum::routing::get(group_read))
         .route("/Patient/_search", axum::routing::post(patient_search))
         .route("/Patient/{id}", axum::routing::get(patient_read))
         .route(
@@ -552,6 +620,42 @@ async fn serve_with_settings(settings_available: bool) -> (String, MockExport, A
 
 async fn serve() -> (String, MockExport, Arc<SqliteBackend>) {
     serve_with_settings(true).await
+}
+
+/// Like [`serve`], but with the server's default FHIR version set to
+/// `version` — used to exercise #836's version-gated Group name search
+/// (R5+ only), which [`serve`]'s hardcoded R4 default cannot reach.
+///
+/// `cfg`-gated on `R5`: its only caller is R5-only (`FhirVersion::R5` itself
+/// does not exist as an enum variant unless the `R5` feature is on), and the
+/// default build (`R4` only) must compile and pass without it.
+#[cfg(feature = "R5")]
+async fn serve_with_fhir_version(version: FhirVersion) -> (String, MockExport, Arc<SqliteBackend>) {
+    let backend = Arc::new(SqliteBackend::in_memory().expect("in-memory sqlite"));
+    backend.init_schema().expect("init schema");
+    let mock = MockExport::default();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let base = format!("http://{addr}");
+    let app = helios_ui::mount_with_conformance_source(
+        mock_fhir_app(mock.clone()),
+        "9.9.9",
+        Some(std::path::PathBuf::from("../../data")),
+        helios_ui::NlSearch::default(),
+        None,
+        Some(backend.clone() as Arc<dyn SettingsStore>),
+        "default".to_string(),
+        Arc::new(helios_ui::StaticConformanceSource::from_data_dir(
+            std::path::Path::new("../../data"),
+        )),
+        version,
+        None,
+        base.clone(),
+        None,
+    )
+    .layer(axum::middleware::from_fn(inject_test_principal));
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (base, mock, backend)
 }
 
 async fn serve_with_runtime(
@@ -668,6 +772,10 @@ async fn post_form_body(base: &str, path: &str, form: &[(&str, &str)]) -> (u16, 
     (status, response.text().await.unwrap())
 }
 
+/// Posts `q` as an htmx combobox lookup — despite the name, generic over
+/// `path`, so it doubles as the Group combobox's own poster (#836): only
+/// the query-value field name (`q`) and the `HX-Request` contract are
+/// specific to Patient/Group's shared endpoint shape, not to Patient itself.
 async fn post_patient_query(
     base: &str,
     path: &str,
@@ -693,6 +801,24 @@ fn patient(id: &str, given: &str, family: &str) -> serde_json::Value {
         "resourceType": "Patient",
         "id": id,
         "name": [{"given": [given], "family": family}]
+    })
+}
+
+fn group(id: &str, name: &str) -> serde_json::Value {
+    serde_json::json!({"resourceType": "Group", "id": id, "name": name})
+}
+
+/// A `search.mode = "outcome"` entry's own resource — the warning
+/// `OperationOutcome` HFS legitimately includes in a searchset for e.g. an
+/// ignored search parameter, distinct from an actual match (#836 follow-up).
+fn operation_outcome_warning() -> serde_json::Value {
+    serde_json::json!({
+        "resourceType": "OperationOutcome",
+        "issue": [{
+            "severity": "warning",
+            "code": "not-supported",
+            "diagnostics": "ignored search parameter",
+        }],
     })
 }
 
@@ -2430,8 +2556,13 @@ async fn patient_options_merge_exact_first_deduplicate_and_limit_results() {
     ];
     *mock.identifier_search_delay_ms.lock().unwrap() = 20;
 
-    let (status, headers, html) =
-        post_patient_query(&base, "/ui/bulk-export/patient-options", "alice-3", None).await;
+    let (status, headers, html) = post_patient_query(
+        &base,
+        "/ui/lookup/patient-options?target=bulk-export-patients",
+        "alice-3",
+        None,
+    )
+    .await;
     assert_eq!(status, 200);
     assert_eq!(headers["cache-control"], "private, no-store");
     assert_eq!(html.matches("data-combobox-option").count(), 8, "{html}");
@@ -2488,7 +2619,13 @@ async fn patient_parameter_searches_start_concurrently() {
     *mock.search_barrier.lock().unwrap() = Some(barrier.clone());
 
     let lookup = tokio::spawn(async move {
-        post_patient_query(&base, "/ui/bulk-export/patient-options", "Nobody", None).await
+        post_patient_query(
+            &base,
+            "/ui/lookup/patient-options?target=bulk-export-patients",
+            "Nobody",
+            None,
+        )
+        .await
     });
     tokio::time::timeout(std::time::Duration::from_secs(1), barrier.wait())
         .await
@@ -2503,14 +2640,30 @@ async fn patient_options_honor_query_boundaries_and_non_hx_redirect() {
     let (base, mock, _) = serve().await;
     *mock.patients.lock().unwrap() = vec![patient("a", "Ada", "Lovelace")];
 
-    let (_, _, html) = post_patient_query(&base, "/ui/bulk-export/patient-options", "", None).await;
+    let (_, _, html) = post_patient_query(
+        &base,
+        "/ui/lookup/patient-options?target=bulk-export-patients",
+        "",
+        None,
+    )
+    .await;
     assert!(html.contains("hx-swap-oob=\"innerHTML\""), "{html}");
     assert!(!html.contains("data-combobox-message-content"), "{html}");
-    let (_, _, html) =
-        post_patient_query(&base, "/ui/bulk-export/patient-options", "a", None).await;
+    let (_, _, html) = post_patient_query(
+        &base,
+        "/ui/lookup/patient-options?target=bulk-export-patients",
+        "a",
+        None,
+    )
+    .await;
     assert!(html.contains("Patient/a"));
-    let (_, _, html) =
-        post_patient_query(&base, "/ui/bulk-export/patient-options", "Patient/a", None).await;
+    let (_, _, html) = post_patient_query(
+        &base,
+        "/ui/lookup/patient-options?target=bulk-export-patients",
+        "Patient/a",
+        None,
+    )
+    .await;
     assert!(html.contains("Patient/a"));
     assert_eq!(
         mock.requests
@@ -2524,7 +2677,7 @@ async fn patient_options_honor_query_boundaries_and_non_hx_redirect() {
     );
     let (_, _, html) = post_patient_query(
         &base,
-        "/ui/bulk-export/patient-options",
+        "/ui/lookup/patient-options?target=bulk-export-patients",
         &"x".repeat(65),
         None,
     )
@@ -2533,7 +2686,9 @@ async fn patient_options_honor_query_boundaries_and_non_hx_redirect() {
     assert!(html.contains("field__hint--error"), "{html}");
 
     let response = client()
-        .post(format!("{base}/ui/bulk-export/patient-options"))
+        .post(format!(
+            "{base}/ui/lookup/patient-options?target=bulk-export-patients"
+        ))
         .form(&[("q", "Ada")])
         .send()
         .await
@@ -2547,8 +2702,13 @@ async fn exact_patient_read_treats_gone_as_no_match_and_rejects_invalid_success_
     let (base, mock, _) = serve().await;
     *mock.patient_read_status.lock().unwrap() = 410;
     *mock.patients.lock().unwrap() = vec![patient("search-result", "Gone", "Replacement")];
-    let (_, _, html) =
-        post_patient_query(&base, "/ui/bulk-export/patient-options", "gone", None).await;
+    let (_, _, html) = post_patient_query(
+        &base,
+        "/ui/lookup/patient-options?target=bulk-export-patients",
+        "gone",
+        None,
+    )
+    .await;
     assert!(html.contains("Patient/search-result"), "{html}");
     assert!(
         mock.requests
@@ -2567,8 +2727,13 @@ async fn exact_patient_read_treats_gone_as_no_match_and_rejects_invalid_success_
     ] {
         let (base, mock, _) = serve().await;
         *mock.patient_read_body.lock().unwrap() = Some(body);
-        let (_, _, html) =
-            post_patient_query(&base, "/ui/bulk-export/patient-options", "broken", None).await;
+        let (_, _, html) = post_patient_query(
+            &base,
+            "/ui/lookup/patient-options?target=bulk-export-patients",
+            "broken",
+            None,
+        )
+        .await;
         assert!(html.contains("Suggestions could not be loaded"), "{html}");
         assert_eq!(
             mock.requests
@@ -2608,8 +2773,13 @@ async fn not_implemented_patient_search_downgrades_once_and_wins_over_sibling_er
             _ => unreachable!(),
         }
 
-        let (_, _, html) =
-            post_patient_query(&base, "/ui/bulk-export/patient-options", "p-1", None).await;
+        let (_, _, html) = post_patient_query(
+            &base,
+            "/ui/lookup/patient-options?target=bulk-export-patients",
+            "p-1",
+            None,
+        )
+        .await;
         assert!(
             html.contains("Patient/p-1"),
             "exact read must survive downgrade: {html}"
@@ -2619,8 +2789,13 @@ async fn not_implemented_patient_search_downgrades_once_and_wins_over_sibling_er
             "a 501 must discard successful sibling search results: {html}"
         );
         assert!(html.contains("data-combobox-use-alternate"), "{html}");
-        let (_, _, html) =
-            post_patient_query(&base, "/ui/bulk-export/patient-options", "Nobody", None).await;
+        let (_, _, html) = post_patient_query(
+            &base,
+            "/ui/lookup/patient-options?target=bulk-export-patients",
+            "Nobody",
+            None,
+        )
+        .await;
         assert!(html.contains("data-combobox-use-alternate"), "{html}");
         assert_eq!(
             mock.requests
@@ -2638,8 +2813,13 @@ async fn not_implemented_patient_search_downgrades_once_and_wins_over_sibling_er
         let (base, mock, _) = serve().await;
         *mock.identifier_patients.lock().unwrap() = vec![patient("partial", "Must Not", "Leak")];
         *mock.name_search_status.lock().unwrap() = status;
-        let (_, _, html) =
-            post_patient_query(&base, "/ui/bulk-export/patient-options", "Nobody", None).await;
+        let (_, _, html) = post_patient_query(
+            &base,
+            "/ui/lookup/patient-options?target=bulk-export-patients",
+            "Nobody",
+            None,
+        )
+        .await;
         assert!(html.contains("Suggestions could not be loaded"), "{html}");
         assert!(!html.contains("Patient/partial"), "{html}");
         assert!(!html.contains("data-combobox-use-alternate"), "{html}");
@@ -2659,8 +2839,13 @@ async fn malformed_patient_search_responses_fail_without_partial_results_or_down
             *mock.name_search_body.lock().unwrap() = Some("not json".to_string());
         }
 
-        let (_, _, html) =
-            post_patient_query(&base, "/ui/bulk-export/patient-options", "Nobody", None).await;
+        let (_, _, html) = post_patient_query(
+            &base,
+            "/ui/lookup/patient-options?target=bulk-export-patients",
+            "Nobody",
+            None,
+        )
+        .await;
         assert!(html.contains("Suggestions could not be loaded"), "{html}");
         assert!(!html.contains("Patient/identifier-partial"), "{html}");
         assert!(!html.contains("Patient/name-partial"), "{html}");
@@ -2695,8 +2880,13 @@ async fn structurally_invalid_search_bundles_fail_before_either_result_set_is_me
                 *mock.name_search_body.lock().unwrap() = Some(malformed.to_string());
             }
 
-            let (_, _, html) =
-                post_patient_query(&base, "/ui/bulk-export/patient-options", "Nobody", None).await;
+            let (_, _, html) = post_patient_query(
+                &base,
+                "/ui/lookup/patient-options?target=bulk-export-patients",
+                "Nobody",
+                None,
+            )
+            .await;
             assert!(html.contains("Suggestions could not be loaded"), "{html}");
             assert!(!html.contains("Patient/identifier-partial"), "{html}");
             assert!(!html.contains("Patient/name-partial"), "{html}");
@@ -2712,8 +2902,13 @@ async fn a_searchset_without_entry_is_a_valid_empty_result() {
         Some(serde_json::json!({"resourceType": "Bundle", "type": "searchset"}).to_string());
     *mock.patients.lock().unwrap() = vec![patient("name-result", "Name", "Result")];
 
-    let (_, _, html) =
-        post_patient_query(&base, "/ui/bulk-export/patient-options", "Nobody", None).await;
+    let (_, _, html) = post_patient_query(
+        &base,
+        "/ui/lookup/patient-options?target=bulk-export-patients",
+        "Nobody",
+        None,
+    )
+    .await;
     assert!(html.contains("Patient/name-result"), "{html}");
     assert!(!html.contains("Suggestions could not be loaded"), "{html}");
 }
@@ -2732,12 +2927,22 @@ async fn id_only_mode_renders_its_hint_and_never_attempts_parameter_search() {
     );
     assert!(page.contains("placeholder=\"Patient FHIR IDs\""), "{page}");
 
-    let (_, _, html) =
-        post_patient_query(&base, "/ui/bulk-export/patient-options", "p-1", None).await;
+    let (_, _, html) = post_patient_query(
+        &base,
+        "/ui/lookup/patient-options?target=bulk-export-patients",
+        "p-1",
+        None,
+    )
+    .await;
     assert!(html.contains("Patient/p-1"), "{html}");
 
-    let (_, _, missing_html) =
-        post_patient_query(&base, "/ui/bulk-export/patient-options", "an", None).await;
+    let (_, _, missing_html) = post_patient_query(
+        &base,
+        "/ui/lookup/patient-options?target=bulk-export-patients",
+        "an",
+        None,
+    )
+    .await;
     assert!(
         missing_html.contains("No matching patients found"),
         "{missing_html}"
@@ -2767,7 +2972,13 @@ async fn patient_copy_is_localized_and_the_placeholder_stays_generic_after_downg
     assert!(!page.contains("such as Patient/"), "{page}");
 
     *mock.identifier_search_status.lock().unwrap() = 501;
-    post_patient_query(&base, "/ui/bulk-export/patient-options", "Nobody", None).await;
+    post_patient_query(
+        &base,
+        "/ui/lookup/patient-options?target=bulk-export-patients",
+        "Nobody",
+        None,
+    )
+    .await;
     let (_, page) = get_text(&base, "/ui/bulk-export/new").await;
     assert!(page.contains("placeholder=\"Search patients\""), "{page}");
     assert!(page.contains("Search by exact FHIR ID."), "{page}");
@@ -2816,7 +3027,7 @@ async fn patient_lookup_uses_tenant_path_version_and_forwarded_identity() {
     *mock.patients.lock().unwrap() = vec![patient("p-1", "Pat", "One")];
     let (_, _, html) = post_patient_query(
         &base,
-        "/ui/bulk-export/patient-options",
+        "/ui/lookup/patient-options?target=bulk-export-patients",
         "p-1",
         Some("Bearer patient-token"),
     )
@@ -2839,6 +3050,168 @@ async fn patient_lookup_uses_tenant_path_version_and_forwarded_identity() {
             .iter()
             .all(|request| request.accept.contains("fhirVersion=4.0"))
     );
+}
+
+// ---------------------------------------------------------------------------
+// Group combobox search (#836): POST /ui/lookup/group-options
+// ---------------------------------------------------------------------------
+
+const GROUP_OPTIONS: &str = "/ui/lookup/group-options?target=sql-export-groups";
+
+#[tokio::test]
+async fn group_options_with_an_empty_query_offers_nothing() {
+    let (base, _mock, _) = serve().await;
+    let (_, _, html) = post_patient_query(&base, GROUP_OPTIONS, "", None).await;
+    assert!(html.contains("hx-swap-oob=\"innerHTML\""), "{html}");
+    assert!(!html.contains("data-combobox-message-content"), "{html}");
+    assert!(!html.contains("data-combobox-option"), "{html}");
+}
+
+/// `Group/g1` (or the bare id `g1`) reads exactly, with the option's label
+/// taken from `Group.name`.
+#[tokio::test]
+async fn group_options_reads_an_exact_group_by_id_or_reference() {
+    let (base, mock, _) = serve().await;
+    *mock.groups.lock().unwrap() = vec![group("g1", "Diabetes cohort")];
+
+    let (_, _, html) = post_patient_query(&base, GROUP_OPTIONS, "Group/g1", None).await;
+    assert!(html.contains("data-value=\"Group/g1\""), "{html}");
+    assert!(html.contains("Diabetes cohort"), "{html}");
+    assert_eq!(html.matches("data-combobox-option").count(), 1, "{html}");
+
+    let (_, _, html) = post_patient_query(&base, GROUP_OPTIONS, "g1", None).await;
+    assert!(html.contains("data-value=\"Group/g1\""), "{html}");
+}
+
+/// A Group with no `name` falls back to the bare id as its label.
+#[tokio::test]
+async fn group_options_falls_back_to_the_bare_id_when_unnamed() {
+    let (base, mock, _) = serve().await;
+    *mock.groups.lock().unwrap() = vec![serde_json::json!({"resourceType": "Group", "id": "g2"})];
+    let (_, _, html) = post_patient_query(&base, GROUP_OPTIONS, "g2", None).await;
+    assert!(html.contains("data-label=\"g2\""), "{html}");
+}
+
+/// R4 (this suite's default version, [`serve`]) never calls `Group?name=`,
+/// only `Group?identifier=`; a match by identifier still surfaces.
+#[tokio::test]
+async fn group_options_on_r4_searches_identifier_only() {
+    let (base, mock, _) = serve().await;
+    *mock.group_identifier_results.lock().unwrap() = vec![group("g3", "Identifier match")];
+    let (_, _, html) = post_patient_query(&base, GROUP_OPTIONS, "diabetes", None).await;
+    assert!(html.contains("Group/g3"), "{html}");
+    assert!(html.contains("Identifier match"), "{html}");
+
+    let requests = mock.requests.lock().unwrap().clone();
+    let searches: Vec<_> = requests
+        .iter()
+        .filter(|request| request.path.ends_with("/Group/_search"))
+        .collect();
+    assert_eq!(searches.len(), 1, "{searches:?}");
+    let form: HashMap<_, _> = form_urlencoded::parse(searches[0].body.as_bytes()).collect();
+    assert!(form.contains_key("identifier"));
+    assert!(!form.contains_key("name"));
+    assert_eq!(form.get("_count").map(|v| v.as_ref()), Some("9"));
+    assert_eq!(
+        form.get("_elements").map(|v| v.as_ref()),
+        Some("id,name,identifier")
+    );
+}
+
+/// R5+ additionally searches `Group?name=`, merging both result sets
+/// without duplicates.
+#[tokio::test]
+#[cfg(feature = "R5")]
+async fn group_options_on_r5_also_searches_by_name() {
+    let (base, mock, _) = serve_with_fhir_version(FhirVersion::R5).await;
+    *mock.group_identifier_results.lock().unwrap() = vec![group("g3", "By identifier")];
+    *mock.group_name_results.lock().unwrap() =
+        vec![group("g3", "By identifier"), group("g4", "By name")];
+    let (_, _, html) = post_patient_query(&base, GROUP_OPTIONS, "diabetes", None).await;
+    assert!(html.contains("Group/g3"), "{html}");
+    assert!(html.contains("Group/g4"), "{html}");
+    assert!(html.contains("By name"), "{html}");
+    // g3 was returned by both searches — the union deduplicates it.
+    assert_eq!(html.matches("Group/g3").count(), 1, "{html}");
+
+    let requests = mock.requests.lock().unwrap().clone();
+    let searches: Vec<_> = requests
+        .iter()
+        .filter(|request| request.path.ends_with("/Group/_search"))
+        .collect();
+    assert_eq!(searches.len(), 2, "{searches:?}");
+    let forms: Vec<HashMap<_, _>> = searches
+        .iter()
+        .map(|search| form_urlencoded::parse(search.body.as_bytes()).collect())
+        .collect();
+    assert!(forms.iter().any(|form| form.contains_key("identifier")));
+    assert!(forms.iter().any(|form| form.contains_key("name")));
+}
+
+/// A `q` over 64 characters is rejected before any request reaches the mock
+/// FHIR backend; an unrecognized `target` is a bare `400`; a non-htmx
+/// submission redirects back to `/ui/sql/export/new`.
+#[tokio::test]
+async fn group_options_rejects_long_queries_unknown_targets_and_redirects_without_htmx() {
+    let (base, mock, _) = serve().await;
+    let (_, _, html) = post_patient_query(&base, GROUP_OPTIONS, &"g".repeat(65), None).await;
+    assert!(html.contains("Suggestions could not be loaded"), "{html}");
+    assert!(
+        mock.requests.lock().unwrap().is_empty(),
+        "an over-long query never reaches the backend"
+    );
+
+    let response = client()
+        .post(format!("{base}/ui/lookup/group-options?target=nope"))
+        .header("HX-Request", "true")
+        .form(&[("q", "g1")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    let response = client()
+        .post(format!("{base}{GROUP_OPTIONS}"))
+        .form(&[("q", "g1")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert_eq!(response.headers()["location"], "/ui/sql/export/new");
+}
+
+/// No matches renders the translated empty message.
+#[tokio::test]
+async fn group_options_with_no_matches_shows_the_empty_message() {
+    let (base, _mock, _) = serve().await;
+    let (_, _, html) = post_patient_query(&base, GROUP_OPTIONS, "nobody-here", None).await;
+    assert!(html.contains("No matching groups found."), "{html}");
+}
+
+/// A `search.mode = "outcome"` entry — HFS's own warning `OperationOutcome`
+/// for an ignored search parameter, among other legitimate reasons a
+/// searchset carries a non-matching entry — must not abort the parse of the
+/// entries that *do* match (#836 follow-up).
+#[tokio::test]
+async fn group_options_ignores_an_operation_outcome_entry_alongside_a_match() {
+    let (base, mock, _) = serve().await;
+    *mock.group_identifier_results.lock().unwrap() =
+        vec![group("g3", "Diabetes cohort"), operation_outcome_warning()];
+    let (_, _, html) = post_patient_query(&base, GROUP_OPTIONS, "diabetes", None).await;
+    assert!(html.contains("Group/g3"), "{html}");
+    assert!(!html.contains("Suggestions could not be loaded"), "{html}");
+    assert_eq!(html.matches("data-combobox-option").count(), 1, "{html}");
+}
+
+/// The same tolerance when the `OperationOutcome` is the *only* entry: no
+/// matches, not an error.
+#[tokio::test]
+async fn group_options_with_only_an_operation_outcome_entry_shows_no_matches() {
+    let (base, mock, _) = serve().await;
+    *mock.group_identifier_results.lock().unwrap() = vec![operation_outcome_warning()];
+    let (_, _, html) = post_patient_query(&base, GROUP_OPTIONS, "nomatch", None).await;
+    assert!(html.contains("No matching groups found."), "{html}");
+    assert!(!html.contains("Suggestions could not be loaded"), "{html}");
 }
 
 #[tokio::test]

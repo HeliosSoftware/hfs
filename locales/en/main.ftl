@@ -926,6 +926,41 @@ sql-export-empty-heading = Nothing to export yet
 sql-export-empty-body = Every stored view definition, SQL query and SQL view shows up here as an export subject. Create one first.
 sql-export-filter-empty = No subjects match
 
+## SQL Export builder — "Narrow it down" and "Advanced" (#836)
+
+sql-export-narrow-title = Narrow it down
+sql-export-narrow-meta = optional — leave empty to export everything
+sql-export-field-patients = Patients
+sql-export-field-patients-placeholder = Search patients
+sql-export-field-patients-hint = Search by name, surname or exact identifier. Leave empty to export every patient.
+sql-export-field-patients-fallback-placeholder = Patient FHIR IDs
+sql-export-field-patients-fallback-hint = Enter exact logical FHIR IDs separated by commas or new lines. Leave empty to export every patient.
+sql-export-field-patients-id-only-hint = Search by exact FHIR ID. Leave empty to export every patient.
+sql-export-field-groups = Groups
+sql-export-field-groups-placeholder = Search groups
+sql-export-field-groups-hint-r4 = Search by exact FHIR ID or identifier.
+sql-export-field-groups-hint-r5 = Search by name, exact FHIR ID or identifier.
+sql-export-field-groups-fallback-placeholder = Group FHIR IDs
+sql-export-field-groups-fallback-hint = Enter exact FHIR IDs or identifiers separated by commas or new lines.
+sql-export-group-options-empty = No matching groups found.
+sql-export-field-since = Since
+sql-export-since-all = All time
+sql-export-since-day = Last day
+sql-export-since-week = Last 7 days
+sql-export-since-month = Last 4 weeks
+sql-export-since-custom = Custom
+sql-export-field-since-custom = Custom instant
+sql-export-since-invalid = Enter a valid FHIR instant, such as 2026-08-01T00:00:00Z.
+sql-export-patient-invalid = Enter only valid logical Patient IDs, separated by commas or new lines.
+sql-export-group-invalid = Enter only valid logical Group IDs, separated by commas or new lines.
+sql-export-advanced = Advanced
+sql-export-advanced-meta = tracking id · CSV header
+sql-export-field-tracking-id = Tracking id
+sql-export-field-tracking-id-hint = Echoed in the completion manifest as clientTrackingId.
+sql-export-tracking-id-too-long = Tracking id must be 200 characters or fewer.
+sql-export-field-header = Include a header row
+sql-export-field-header-hint = (CSV only — ignored for other formats)
+
 ## Active SQL Exports list and job cards (#833)
 
 sql-export-new = New SQL Export
@@ -994,12 +1029,30 @@ sql-export-detail-field-format = Format
 sql-export-detail-field-started = Started
 sql-export-detail-field-duration = Duration
 sql-export-detail-field-subjects = Subjects
+sql-export-detail-header-included = with header row
+sql-export-detail-header-omitted = no header row
 sql-export-detail-outputs-heading = Output files
 sql-export-detail-col-output = Output
 sql-export-detail-col-subject = Subject
 sql-export-detail-col-files = Files
 sql-export-detail-outputs-empty = The job produced no output files.
 sql-export-file-fallback = File { $n }
+
+## #837: per-SQL-Query parameter values on the SQL Export builder
+sql-export-param-count = { $count ->
+    [one] { $count } parameter
+   *[other] { $count } parameters
+}
+sql-export-param-required = This value is required.
+sql-export-param-type-mismatch = Expected a { $type } value.
+sql-export-param-required-chip = required
+sql-export-toggle-values = Show or hide values
+sql-export-values-missing-one = { $count } value missing
+sql-export-values-missing-other = { $count } values missing
+
+## partials/sql_parameter_fields.html (#837) — shared with the SQL Query
+## page's own parameter form
+sql-param-default = default
 
 ## HTS administrative UI (crates/hts-ui) — Phase 1 scaffold stubs
 ##

@@ -1,10 +1,18 @@
+<!--
+  Shared combobox result fragment (#836) — the Patient/Group search results
+  for Bulk Export's own picker and SQL Export's "Narrow it down" pickers.
+  `target` is the combobox's own `id` (validated against a closed list by
+  the handler before this ever renders), reused here as the `hx-swap-oob`
+  id so the fragment lands in the caller's own message slot regardless of
+  which page rendered it.
+-->
 {% for option in options %}
 <button type="button" class="combobox__option" data-combobox-option
         data-value="{{ option.value }}" data-label="{{ option.label }}">
   {{ option.label }}
 </button>
 {% endfor %}
-<div id="bulk-export-patients-message" hx-swap-oob="innerHTML">
+<div id="{{ target }}-message" hx-swap-oob="innerHTML">
   {% if id_only %}
   <span data-combobox-use-alternate hidden></span>
   {% endif %}

@@ -1,0 +1,61 @@
+<!--
+  Shared parameter-value fields (#837): one `.field` per declared
+  `Library.parameter[use=in]` entry, laid out three to a row (`.param-grid`)
+  in the form's own plain `.field` voice — a `:name · type` label (plus
+  `· default {value}` when the
+  declaration carries one) over an input picked by FHIR type. This is the
+  SQL Export builder's values row today; #841 reuses it unchanged for the
+  SQL Query page's own parameter form, which is why it owns only the field
+  markup and never the surrounding row/card chrome.
+
+  `prefix` names every input `{prefix}:{name}` — on the export builder,
+  `param:{reference}` (e.g. `param:Library/q1:ward`). `:` is safe as a
+  separator because it can appear in neither half: a FHIR reference and a
+  parameter name (the SQLQuery profile's `sql-name` invariant) both match
+  `^[A-Za-z][A-Za-z0-9_]*$`, and `reference` itself is `Type/id`.
+
+  Each `params` entry supplies its own `required` rather than this macro
+  deriving it from `default` — the export builder only requires a field on
+  a subject the user actually checked (an unmarked query's fields render
+  without `required`, so a plain HTML submit is never blocked by a query
+  nobody selected; see NewFormState/subject_rows in `sql_export.rs`). A
+  future caller with no such distinction can simply always pass
+  `default.is_none()`.
+
+  `data-param-name`/`data-default` (#837) are read by `sql-export-form.js`
+  alone, to build the collapsed row's `:name = value` summary chips without
+  re-deriving the parameter name from the input's `{prefix}:{name}` `name`
+  attribute: `data-default` is present (holding the declared default's text)
+  only when `p.default` is `Some`, so its mere presence, not its value,
+  is JS's own "has a default" check.
+-->
+{% macro fields(prefix, params) %}
+<div class="param-grid">
+  {% for p in params %}
+  <label class="field" data-param-name="{{ p.name }}"{% if let Some(default) = p.default %} data-default="{{ default }}"{% endif %}>
+    <span class="field__label"><code>:{{ p.name }}</code> · {{ p.type_code }}{% if let Some(default) = p.default %} · {{ i18n.t("sql-param-default") }} {{ default }}{% endif %}</span>
+    {% match p.type_code.as_str() %}
+    {% when "integer" | "positiveInt" | "unsignedInt" | "integer64" %}
+    <input class="field__input" type="number" step="1" name="{{ prefix }}:{{ p.name }}" value="{{ p.value }}"{% if p.required %} required{% endif %}{% if p.error.is_some() %} aria-invalid="true" aria-describedby="{{ prefix }}:{{ p.name }}-error"{% endif %}>
+    {% when "decimal" %}
+    <input class="field__input" type="number" step="any" name="{{ prefix }}:{{ p.name }}" value="{{ p.value }}"{% if p.required %} required{% endif %}{% if p.error.is_some() %} aria-invalid="true" aria-describedby="{{ prefix }}:{{ p.name }}-error"{% endif %}>
+    {% when "date" %}
+    <input class="field__input" type="date" name="{{ prefix }}:{{ p.name }}" value="{{ p.value }}"{% if p.required %} required{% endif %}{% if p.error.is_some() %} aria-invalid="true" aria-describedby="{{ prefix }}:{{ p.name }}-error"{% endif %}>
+    {% when "boolean" %}
+    <select class="field__input" name="{{ prefix }}:{{ p.name }}"{% if p.required %} required{% endif %}{% if p.error.is_some() %} aria-invalid="true" aria-describedby="{{ prefix }}:{{ p.name }}-error"{% endif %}>
+      {% if p.default.is_some() %}<option value=""{% if p.value.is_empty() %} selected{% endif %}></option>{% endif %}
+      <option value="true"{% if p.value == "true" %} selected{% endif %}>true</option>
+      <option value="false"{% if p.value == "false" %} selected{% endif %}>false</option>
+    </select>
+    {% when "dateTime" | "instant" %}
+    <input class="field__input" type="text" name="{{ prefix }}:{{ p.name }}" value="{{ p.value }}" placeholder="2026-08-01T00:00:00Z"{% if p.required %} required{% endif %}{% if p.error.is_some() %} aria-invalid="true" aria-describedby="{{ prefix }}:{{ p.name }}-error"{% endif %}>
+    {% when "time" %}
+    <input class="field__input" type="text" name="{{ prefix }}:{{ p.name }}" value="{{ p.value }}" placeholder="13:45:00"{% if p.required %} required{% endif %}{% if p.error.is_some() %} aria-invalid="true" aria-describedby="{{ prefix }}:{{ p.name }}-error"{% endif %}>
+    {% else %}
+    <input class="field__input" type="text" name="{{ prefix }}:{{ p.name }}" value="{{ p.value }}"{% if p.required %} required{% endif %}{% if p.error.is_some() %} aria-invalid="true" aria-describedby="{{ prefix }}:{{ p.name }}-error"{% endif %}>
+    {% endmatch %}
+    <span id="{{ prefix }}:{{ p.name }}-error" class="field__hint field__hint--error" role="alert"{% if p.error.is_none() %} hidden{% endif %}>{% if let Some(message) = p.error %}{{ message }}{% endif %}</span>
+  </label>
+  {% endfor %}
+</div>
+{% endmacro %}

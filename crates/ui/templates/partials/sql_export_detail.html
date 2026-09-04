@@ -125,10 +125,32 @@
         <div class="detail__field"><span>{{ i18n.t("sql-export-detail-field-format") }}</span><div>{{ detail.format_label }}</div></div>
         <div class="detail__field"><span>{{ i18n.t("sql-export-detail-field-started") }}</span><div>{{ detail.started_label }}</div></div>
         <div class="detail__field"><span>{{ i18n.t("sql-export-detail-field-duration") }}</span><div>{{ detail.duration_label }}</div></div>
+        {% if !detail.tracking_id.is_empty() %}
+        <div class="detail__field"><span>{{ i18n.t("sql-export-field-tracking-id") }}</span><div><code>{{ detail.tracking_id }}</code></div></div>
+        {% endif %}
+        {% if !detail.since_label.is_empty() %}
+        <div class="detail__field"><span>{{ i18n.t("sql-export-field-since") }}</span><div>{{ detail.since_label }}</div></div>
+        {% endif %}
+        {% if !detail.patients.is_empty() %}
+        <div class="detail__field">
+          <span>{{ i18n.t("sql-export-field-patients") }}</span>
+          <div class="detail__tags">
+            {% for reference in detail.patients %}<span class="tag tag--type">{{ reference }}</span>{% endfor %}
+          </div>
+        </div>
+        {% endif %}
+        {% if !detail.groups.is_empty() %}
+        <div class="detail__field">
+          <span>{{ i18n.t("sql-export-field-groups") }}</span>
+          <div class="detail__tags">
+            {% for reference in detail.groups %}<span class="tag tag--type">{{ reference }}</span>{% endfor %}
+          </div>
+        </div>
+        {% endif %}
         <div class="detail__field detail__field--wide">
           <span>{{ i18n.t("sql-export-detail-field-subjects") }}</span>
           <div class="job-detail__subjects">
-            {% for tag in detail.subjects %}<span class="tag tag--type">{{ tag.kind_label }}</span> {{ tag.name }} {% endfor %}
+            {% for tag in detail.subjects %}<span class="tag tag--type">{{ tag.kind_label }}</span> {{ tag.name }} {% for pair in tag.parameters %}<span class="tag tag--param">:{{ pair.0 }} = {{ pair.1 }}</span>{% endfor %}{% endfor %}
           </div>
         </div>
       </div>

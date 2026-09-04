@@ -905,6 +905,41 @@ sql-export-empty-heading = Noch nichts zu exportieren
 sql-export-empty-body = Jede gespeicherte ViewDefinition, SQL-Abfrage und SQL-View erscheint hier als exportierbares Element. Legen Sie zuerst eines an.
 sql-export-filter-empty = Keine Elemente gefunden
 
+## SQL-Export-Generator — „Eingrenzen" und „Erweitert" (#836)
+
+sql-export-narrow-title = Eingrenzen
+sql-export-narrow-meta = optional — leer lassen, um alles zu exportieren
+sql-export-field-patients = Patienten
+sql-export-field-patients-placeholder = Patienten suchen
+sql-export-field-patients-hint = Suchen Sie nach Vorname, Nachname oder exaktem Identifier. Leer lassen, um alle Patienten zu exportieren.
+sql-export-field-patients-fallback-placeholder = FHIR-IDs der Patienten
+sql-export-field-patients-fallback-hint = Geben Sie exakte logische FHIR-IDs durch Kommas oder Zeilenumbrüche getrennt ein. Leer lassen, um alle Patienten zu exportieren.
+sql-export-field-patients-id-only-hint = Suchen Sie nach einer exakten FHIR-ID. Leer lassen, um alle Patienten zu exportieren.
+sql-export-field-groups = Gruppen
+sql-export-field-groups-placeholder = Gruppen suchen
+sql-export-field-groups-hint-r4 = Suchen Sie nach exakter FHIR-ID oder Identifier.
+sql-export-field-groups-hint-r5 = Suchen Sie nach Namen, exakter FHIR-ID oder Identifier.
+sql-export-field-groups-fallback-placeholder = FHIR-IDs der Gruppen
+sql-export-field-groups-fallback-hint = Geben Sie exakte FHIR-IDs oder Identifier durch Kommas oder Zeilenumbrüche getrennt ein.
+sql-export-group-options-empty = Keine passenden Gruppen gefunden.
+sql-export-field-since = Seit
+sql-export-since-all = Gesamter Zeitraum
+sql-export-since-day = Letzter Tag
+sql-export-since-week = Letzte 7 Tage
+sql-export-since-month = Letzte 4 Wochen
+sql-export-since-custom = Benutzerdefiniert
+sql-export-field-since-custom = Benutzerdefinierter Zeitpunkt
+sql-export-since-invalid = Geben Sie einen gültigen FHIR-Zeitpunkt ein, zum Beispiel 2026-08-01T00:00:00Z.
+sql-export-patient-invalid = Geben Sie nur gültige logische Patient-IDs ein, getrennt durch Kommas oder Zeilenumbrüche.
+sql-export-group-invalid = Geben Sie nur gültige logische Group-IDs ein, getrennt durch Kommas oder Zeilenumbrüche.
+sql-export-advanced = Erweitert
+sql-export-advanced-meta = Tracking-ID · CSV-Kopfzeile
+sql-export-field-tracking-id = Tracking-ID
+sql-export-field-tracking-id-hint = Wird im Abschlussmanifest als clientTrackingId wiedergegeben.
+sql-export-tracking-id-too-long = Die Tracking-ID darf höchstens 200 Zeichen lang sein.
+sql-export-field-header = Kopfzeile einschließen
+sql-export-field-header-hint = (nur CSV — wird für andere Formate ignoriert)
+
 ## Liste der aktiven SQL-Exporte und Auftragskarten (#833)
 
 sql-export-new = Neuer SQL-Export
@@ -973,12 +1008,30 @@ sql-export-detail-field-format = Format
 sql-export-detail-field-started = Gestartet
 sql-export-detail-field-duration = Dauer
 sql-export-detail-field-subjects = Elemente
+sql-export-detail-header-included = mit Kopfzeile
+sql-export-detail-header-omitted = ohne Kopfzeile
 sql-export-detail-outputs-heading = Ausgabedateien
 sql-export-detail-col-output = Ausgabe
 sql-export-detail-col-subject = Element
 sql-export-detail-col-files = Dateien
 sql-export-detail-outputs-empty = Der Auftrag hat keine Ausgabedateien erzeugt.
 sql-export-file-fallback = Datei { $n }
+
+## #837: Parameterwerte je SQL-Query im SQL-Export-Formular
+sql-export-param-count = { $count ->
+    [one] { $count } Parameter
+   *[other] { $count } Parameter
+}
+sql-export-param-required = Dieser Wert ist erforderlich.
+sql-export-param-type-mismatch = Erwartet wurde ein Wert vom Typ { $type }.
+sql-export-param-required-chip = erforderlich
+sql-export-toggle-values = Werte ein- oder ausblenden
+sql-export-values-missing-one = { $count } Wert fehlt
+sql-export-values-missing-other = { $count } Werte fehlen
+
+## partials/sql_parameter_fields.html (#837) — gemeinsam mit dem
+## Parameterformular der SQL-Query-Seite
+sql-param-default = Standardwert
 
 ## Administrative HTS-UI (crates/hts-ui) — Phase-1-Stubs
 ##

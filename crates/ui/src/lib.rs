@@ -46,6 +46,7 @@ mod conformance;
 mod editor;
 mod history;
 mod i18n;
+mod lookup;
 mod rail_state;
 mod search_params;
 mod sql_export;
@@ -64,7 +65,8 @@ mod tenants;
 
 #[doc(hidden)]
 pub use conformance::{
-    Caller, ConformanceSource, RecordedExportCall, SqlExportStatus, StaticConformanceSource,
+    Caller, ConformanceSource, RecordedExportCall, SqlExportParameter, SqlExportRequest,
+    SqlExportStatus, SqlExportSubject, StaticConformanceSource, sql_export_parameters_body,
 };
 
 /// The locale plumbing, re-exported out of the private `i18n` module.
@@ -1261,6 +1263,17 @@ pub fn mount_with_conformance_source_and_runtime(
             get(sql_export::list).post(sql_export::start),
         )
         .route("/ui/sql/export/new", get(sql_export::new_page))
+        // Shared Patient/Group combobox search endpoints (#836): Bulk Export's
+        // own Patients field and SQL Export's "Narrow it down" Patients/Groups
+        // fields all post here, distinguished by `?target=`.
+        .route(
+            "/ui/lookup/patient-options",
+            axum::routing::post(lookup::patient_options),
+        )
+        .route(
+            "/ui/lookup/group-options",
+            axum::routing::post(lookup::group_options),
+        )
         // The job detail permalink (#835). `new` above is a literal segment,
         // matched ahead of the `{id}` param at the same depth regardless of
         // route registration order — axum's router always prefers a static
@@ -1329,10 +1342,6 @@ pub fn mount_with_conformance_source_and_runtime(
             get(bulk_export::active).post(bulk_export::start),
         )
         .route("/ui/bulk-export/new", get(bulk_export::page))
-        .route(
-            "/ui/bulk-export/patient-options",
-            axum::routing::post(bulk_export::patient_options),
-        )
         .route("/ui/bulk-export/active", get(bulk_export::active_redirect))
         .route("/ui/bulk-export/active/{id}/card", get(bulk_export::card))
         .route(
