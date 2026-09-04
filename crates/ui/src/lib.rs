@@ -3135,11 +3135,130 @@ async fn sql_view_definitions_run(
     respond(run_state)
 }
 
-/// #753 (evaluation POC, not merged upstream): structural +
-/// FHIRPath-syntax lint for the ViewDefinition editor's async CodeMirror 6
-/// linter (`vd-editor.js`). Delegates entirely to
-/// [`helios_sof::lint::lint_view_definition`] — this handler only decodes
-/// the request body and shapes the response; it never touches storage, the
+/// One [`helios_sof::lint::Fix`], translated (#821): the fix's own JSON
+/// shape (`kind`, `pointer`, and whichever of `to`/`value` that `kind`
+/// carries — [`helios_sof::lint::Fix`]'s own `#[serde(tag = "kind")]`
+/// representation, flattened in here unchanged) plus a `label` rendered from
+/// the matching `vd-fix-*` catalog key, ready for a button or menu item that
+/// offers this fix with no further lookup on the browser's part.
+#[derive(serde::Serialize)]
+struct LintFixDto {
+    #[serde(flatten)]
+    fix: helios_sof::lint::Fix,
+    label: String,
+}
+
+/// One [`helios_sof::lint::Diagnostic`], translated (#821): every field
+/// except `message` passes through unchanged (`args` included — a client
+/// that wants the raw value behind a translated sentence, e.g. `args.name`
+/// for `undeclared-constant`, still has it). `message` here is **not**
+/// [`helios_sof::lint::Diagnostic::message`] (that field is always English —
+/// `$sql-run`, `sof-cli`, and `pysof` all use it verbatim); it is the
+/// negotiated-locale rendering of `code` + `args` against the `vd-lint-*`
+/// catalog, matching #821's split: `helios_sof` never localizes, only this
+/// handler does.
+#[derive(serde::Serialize)]
+struct LintDiagnosticDto {
+    pointer: String,
+    message: String,
+    severity: helios_sof::lint::Severity,
+    code: helios_sof::lint::DiagnosticCode,
+    span: Option<helios_sof::lint::Span>,
+    args: std::collections::BTreeMap<String, String>,
+    fixes: Vec<LintFixDto>,
+}
+
+/// The kebab-case wire string [`helios_sof::lint::DiagnosticCode`] already
+/// serializes as (`fhirpath-syntax`, `unknown-key`, ...) — read back through
+/// `serde_json` rather than hand-duplicating the mapping, so the `vd-lint-*`
+/// catalog key this builds can never drift from the lint's own JSON `code`.
+/// `crates/sof/src/error.rs` carries the identical trick for
+/// `$sql-run`'s `422` coding, one crate over and with no code to share it
+/// through.
+fn diagnostic_catalog_key(code: helios_sof::lint::DiagnosticCode) -> String {
+    match serde_json::to_value(code) {
+        Ok(serde_json::Value::String(wire)) => format!("vd-lint-{wire}"),
+        _ => unreachable!("DiagnosticCode serializes to a JSON string"),
+    }
+}
+
+/// The translated `message` for one diagnostic (#821): `code` + `args`
+/// against the matching `vd-lint-*` catalog key.
+///
+/// `vd-lint-missing-required` and `vd-lint-wrong-type` select their wording
+/// on `$variant` — set only by the two diagnostics `check_constant_value`
+/// reports for a constant's `value[x]` choice, never by the generic
+/// `missing-required`/`wrong-type` diagnostics (a plain missing/wrong-typed
+/// key), whose own `args` (per `helios_sof::lint`'s contract) has no
+/// `variant` at all. `fluent-templates`' selector lookup fails the *entire*
+/// message when the selector variable is completely absent from the args
+/// map — unlike a present-but-unmatched value, which falls to `*[other]`
+/// normally (see `t_args_selector_falls_back_only_when_the_variable_is_present_but_unmatched`
+/// in `i18n.rs`) — so an empty `variant` is added here before rendering
+/// those two codes specifically, for the lookup only: the diagnostic's own
+/// `args` in the JSON response (`LintDiagnosticDto::args`) is untouched.
+fn translate_diagnostic_message(
+    i18n: I18n,
+    code: helios_sof::lint::DiagnosticCode,
+    args: &std::collections::BTreeMap<String, String>,
+) -> String {
+    use helios_sof::lint::DiagnosticCode;
+    let key = diagnostic_catalog_key(code);
+    if matches!(
+        code,
+        DiagnosticCode::MissingRequired | DiagnosticCode::WrongType
+    ) && !args.contains_key("variant")
+    {
+        let mut with_variant = args.clone();
+        with_variant.insert("variant".to_string(), String::new());
+        i18n.t_args(&key, &with_variant)
+    } else {
+        i18n.t_args(&key, args)
+    }
+}
+
+/// The last segment of an RFC 6901 pointer, unescaped (`~1` → `/` before
+/// `~0` → `~`, undoing the encoding's own order) — what `vd-fix-remove-key`'s
+/// `$key` names: the property being removed, not its full path.
+fn pointer_last_segment(pointer: &str) -> String {
+    pointer
+        .rsplit('/')
+        .next()
+        .unwrap_or_default()
+        .replace("~1", "/")
+        .replace("~0", "~")
+}
+
+/// The translated label for one fix, from its matching `vd-fix-*` catalog
+/// key — see the module-level `## ViewDefinition lint messages and fixes`
+/// section of `main.ftl` for the exact wording and argument per kind.
+fn fix_label(i18n: I18n, fix: &helios_sof::lint::Fix) -> String {
+    use helios_sof::lint::Fix;
+    match fix {
+        Fix::RenameKey { to, .. } => i18n.t_arg("vd-fix-rename-key", "to", to.clone()),
+        Fix::RemoveKey { pointer } => {
+            i18n.t_arg("vd-fix-remove-key", "key", pointer_last_segment(pointer))
+        }
+        Fix::SetString { value, .. } => i18n.t_arg("vd-fix-set-string", "value", value.clone()),
+        // `Fix` is `#[non_exhaustive]`: a variant this crate doesn't know a
+        // `vd-fix-*` key for yet must not crash the handler. Fall back to
+        // the fix's own `kind` tag rather than a hand-picked English
+        // sentence, so a `helios-sof` upgrade alone still renders
+        // *something* until this match (and the catalog) catch up.
+        _ => serde_json::to_value(fix)
+            .ok()
+            .and_then(|value| value.get("kind")?.as_str().map(str::to_owned))
+            .unwrap_or_default(),
+    }
+}
+
+/// Structural + FHIRPath-syntax lint for the ViewDefinition editor's async
+/// CodeMirror 6 linter (`vd-editor.js`) (#753, #820, #821). Delegates
+/// entirely to [`helios_sof::lint::lint_view_definition`] for the checks
+/// themselves — this handler only decodes the request body, translates each
+/// diagnostic and fix into the negotiated locale (`?lang=` / `hfs_lang`
+/// cookie / `Accept-Language`, same policy as every other page — see
+/// [`i18n`]), and shapes the response; it never touches storage, the
 /// tenant, or the configured FHIR version, because the lint itself is
 /// purely structural and version-agnostic.
 ///
@@ -3149,7 +3268,8 @@ async fn sql_view_definitions_run(
 /// The body is read as raw bytes (not the `Json` extractor) so a malformed
 /// body reports the lint's exact `{"error": "..."}` shape instead of axum's
 /// generic rejection body.
-async fn sql_view_definitions_lint(body: Bytes) -> Response {
+async fn sql_view_definitions_lint(locale: RequestLocale, body: Bytes) -> Response {
+    let i18n = I18n::new(locale);
     let doc: serde_json::Value = match serde_json::from_slice(&body) {
         Ok(doc) => doc,
         Err(error) => {
@@ -3161,7 +3281,25 @@ async fn sql_view_definitions_lint(body: Bytes) -> Response {
         }
     };
 
-    let diagnostics = helios_sof::lint::lint_view_definition(&doc);
+    let diagnostics: Vec<LintDiagnosticDto> = helios_sof::lint::lint_view_definition(&doc)
+        .into_iter()
+        .map(|diagnostic| LintDiagnosticDto {
+            message: translate_diagnostic_message(i18n, diagnostic.code, &diagnostic.args),
+            fixes: diagnostic
+                .fixes
+                .into_iter()
+                .map(|fix| LintFixDto {
+                    label: fix_label(i18n, &fix),
+                    fix,
+                })
+                .collect(),
+            pointer: diagnostic.pointer,
+            severity: diagnostic.severity,
+            code: diagnostic.code,
+            span: diagnostic.span,
+            args: diagnostic.args,
+        })
+        .collect();
     // NF2: never log the document itself — a ViewDefinition's `constant[]`
     // can carry PHI — only how many diagnostics it produced.
     tracing::debug!(

@@ -858,6 +858,50 @@ vd-pagination-label = View definition pages
 vd-page-prev = Previous
 vd-page-next = Next
 
+## ViewDefinition lint messages and fixes (#821): the `/lint` handler's own
+## localization of `helios_sof::lint::Diagnostic` — code + args here, never
+## `Diagnostic.message` (English-only, unlocalized) itself. `vd-lint-*` keys
+## are named after `DiagnosticCode`'s own kebab-case wire form; a
+## `missing-required`/`wrong-type` diagnostic from a constant's value[x]
+## choice carries `$variant` ("missing"/"multiple") instead of the generic
+## `$key`/`$expected`+`$found` args, selected on below. `vd-fix-*` keys label
+## one `Fix` each, shown next to the diagnostic as a one-click action.
+vd-lint-not-a-view-definition = Not a ViewDefinition: found { $found }
+vd-lint-unknown-key = Unknown key "{ $key }"
+vd-lint-missing-required = { $variant ->
+    [missing] A constant must set exactly one value
+   *[other] Missing required key "{ $key }"
+}
+vd-lint-wrong-type = { $variant ->
+    [multiple] A constant may set only one value
+   *[other] Expected { $expected }, found { $found }
+}
+vd-lint-empty-required = Required key "{ $key }" must not be empty
+vd-lint-duplicate-column-name = Duplicate column name "{ $name }"
+vd-lint-multiple-iteration-directives = A select may set at most one of forEach, forEachOrNull, repeat (found { $keys })
+vd-lint-select-without-output = A select must have at least one of column, select, or unionAll
+vd-lint-fhirpath-syntax = FHIRPath syntax: { $detail }
+vd-lint-undeclared-constant = Undeclared constant "%{ $name }"
+vd-fix-rename-key = Rename to "{ $to }"
+vd-fix-remove-key = Remove "{ $key }"
+vd-fix-set-string = Set to "{ $value }"
+
+## ViewDefinition completion (#821): `vd-editor.js` reads this once off
+## `#vd-editor-grid`'s own `data-msg-required` — the marker a required
+## structural key's completion item carries, appended to its `detail` text
+## client-side (never sent by `/complete` itself, which is not locale-aware).
+vd-complete-required = required
+
+## ViewDefinition editor save-with-errors confirmation (#821): `vd-editor.js`
+## picks whichever of these renders `#vd-editor-grid`'s own
+## `data-msg-save-errors-one`/`-other` and substitutes the real count for the
+## literal `{count}` marker below, itself the value `$count` was given —
+## `window.confirm`'s own text has no locale of its own, so this is the only
+## way to translate it. Shown only when submitting as Save (not Duplicate)
+## while the most recently completed lint pass still has at least one error.
+vd-save-with-errors-one = This view definition still has { $count } error. Save it anyway?
+vd-save-with-errors-other = This view definition still has { $count } errors. Save it anyway?
+
 ## $sql-run results partial (#752): shared by the View Definitions, SQL
 ## Queries, and SQL Views playgrounds (#839).
 

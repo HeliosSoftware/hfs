@@ -3991,6 +3991,19 @@ async fn view_definitions_lint_returns_diagnostics_for_an_invalid_document() {
     assert_eq!(unknown_key["pointer"], "/notAField");
     assert_eq!(unknown_key["severity"], "error");
     assert!(unknown_key["span"].is_null());
+    // #821: args/fixes ride along on every diagnostic, and — with nothing
+    // close enough to suggest for `notAField` — the only fix offered is
+    // dropping the key.
+    assert_eq!(unknown_key["args"]["key"], "notAField");
+    assert!(unknown_key["args"]["suggestion"].is_null());
+    assert_eq!(
+        unknown_key["fixes"],
+        serde_json::json!([{
+            "kind": "remove-key",
+            "pointer": "/notAField",
+            "label": r#"Remove "notAField""#
+        }])
+    );
 
     let syntax = diagnostics
         .iter()
@@ -4001,6 +4014,255 @@ async fn view_definitions_lint_returns_diagnostics_for_an_invalid_document() {
     assert!(syntax["span"].is_object());
     assert!(syntax["span"]["start"].is_u64());
     assert!(syntax["span"]["end"].is_u64());
+    assert!(syntax["args"]["detail"].is_string());
+    assert_eq!(syntax["fixes"], serde_json::json!([]));
+}
+
+/// #821: the generic `missing-required` diagnostic never sets `args.variant`
+/// (only the constant `value[x]` ones do) — it must still translate, not
+/// degrade to the raw catalog key, exercising the handler's own workaround
+/// for `fluent-templates` failing a selector lookup outright when the
+/// selector variable is completely absent (see
+/// `translate_diagnostic_message` in `crates/ui/src/lib.rs`).
+#[tokio::test]
+async fn view_definitions_lint_translates_a_generic_missing_required_diagnostic() {
+    let doc = serde_json::json!({ "resourceType": "ViewDefinition" });
+    let response = app()
+        .oneshot(
+            Request::post("/ui/sql/view-definitions/lint")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(doc.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = serde_json::from_str(&body_text(response).await).unwrap();
+    let diagnostics = body["diagnostics"].as_array().expect("diagnostics array");
+    let select_missing = diagnostics
+        .iter()
+        .find(|d| d["code"] == "missing-required" && d["args"]["key"] == "select")
+        .expect("a missing-required diagnostic for select");
+    assert_eq!(
+        select_missing["message"],
+        r#"Missing required key "select""#
+    );
+}
+
+/// #821: `message` is the negotiated-locale rendering of `code` + `args`
+/// against the `vd-lint-*` catalog — `?lang=es` (the same negotiation every
+/// page uses) renders it in Spanish while `code` stays the literal wire
+/// value the browser matches on either way.
+#[tokio::test]
+async fn view_definitions_lint_translates_message_with_lang_query() {
+    let doc = serde_json::json!({
+        "resourceType": "ViewDefinition",
+        "status": "active",
+        "resource": "Patient",
+        "select": [{ "column": [{ "name": "id", "path": "getResourceKey()" }] }],
+        "notAField": "oops"
+    });
+    let response = app()
+        .oneshot(
+            Request::post("/ui/sql/view-definitions/lint?lang=es")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(doc.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = serde_json::from_str(&body_text(response).await).unwrap();
+    let diagnostics = body["diagnostics"].as_array().expect("diagnostics array");
+    let unknown_key = diagnostics
+        .iter()
+        .find(|d| d["code"] == "unknown-key")
+        .expect("an unknown-key diagnostic for notAField");
+    assert_eq!(unknown_key["code"], "unknown-key");
+    assert_eq!(unknown_key["message"], r#"Clave desconocida "notAField""#);
+}
+
+/// `?lang=en` and no `?lang=`/cookie/`Accept-Language` at all both render
+/// English — the default and an explicit choice must agree.
+#[tokio::test]
+async fn view_definitions_lint_defaults_to_english_message() {
+    let doc = serde_json::json!({
+        "resourceType": "ViewDefinition",
+        "status": "active",
+        "resource": "Patient",
+        "select": [{ "column": [{ "name": "id", "path": "getResourceKey()" }] }],
+        "notAField": "oops"
+    });
+    for target in [
+        "/ui/sql/view-definitions/lint",
+        "/ui/sql/view-definitions/lint?lang=en",
+    ] {
+        let response = app()
+            .oneshot(
+                Request::post(target)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(doc.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_str(&body_text(response).await).unwrap();
+        let diagnostics = body["diagnostics"].as_array().expect("diagnostics array");
+        let unknown_key = diagnostics
+            .iter()
+            .find(|d| d["code"] == "unknown-key")
+            .unwrap_or_else(|| panic!("an unknown-key diagnostic for {target}"));
+        assert_eq!(unknown_key["message"], r#"Unknown key "notAField""#);
+    }
+}
+
+/// The `hfs_lang` cookie (the language switcher's persisted choice) drives
+/// negotiation exactly like `?lang=` does — set via the `Cookie` header
+/// here, the way a returning browser would send it back on every request.
+#[tokio::test]
+async fn view_definitions_lint_translates_message_with_lang_cookie() {
+    let doc = serde_json::json!({
+        "resourceType": "ViewDefinition",
+        "status": "active",
+        "resource": "Patient",
+        "select": [{ "column": [{ "name": "id", "path": "getResourceKey()" }] }],
+        "notAField": "oops"
+    });
+    let response = app()
+        .oneshot(
+            Request::post("/ui/sql/view-definitions/lint")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::COOKIE, "hfs_lang=es")
+                .body(Body::from(doc.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = serde_json::from_str(&body_text(response).await).unwrap();
+    let diagnostics = body["diagnostics"].as_array().expect("diagnostics array");
+    let unknown_key = diagnostics
+        .iter()
+        .find(|d| d["code"] == "unknown-key")
+        .expect("an unknown-key diagnostic for notAField");
+    assert_eq!(unknown_key["message"], r#"Clave desconocida "notAField""#);
+}
+
+/// The one fix `unknown-key` offers when there's a typo suggestion
+/// (`rename-key`) gets its own translated `label`, distinct from
+/// `message` — and it interpolates the fix's own literal suggestion, not a
+/// translated word, since `to` is a JSON key name.
+#[tokio::test]
+async fn view_definitions_lint_fix_label_is_translated_and_carries_the_suggestion() {
+    let doc = serde_json::json!({
+        "resourceType": "ViewDefinition",
+        "status": "active",
+        "resource": "Patient",
+        "select": [{ "columns": [{ "name": "id", "path": "getResourceKey()" }] }]
+    });
+    let response = app()
+        .oneshot(
+            Request::post("/ui/sql/view-definitions/lint?lang=es")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(doc.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = serde_json::from_str(&body_text(response).await).unwrap();
+    let diagnostics = body["diagnostics"].as_array().expect("diagnostics array");
+    let unknown_key = diagnostics
+        .iter()
+        .find(|d| d["code"] == "unknown-key")
+        .expect("an unknown-key diagnostic for columns");
+    let fixes = unknown_key["fixes"].as_array().expect("fixes array");
+    let rename = fixes
+        .iter()
+        .find(|f| f["kind"] == "rename-key")
+        .expect("a rename-key fix");
+    assert_eq!(rename["to"], "column");
+    let label = rename["label"].as_str().expect("a translated label");
+    assert!(label.contains("column"), "{label}");
+    assert_eq!(label, r#"Renombrar a "column""#);
+}
+
+/// `duplicate-column-name`'s own `set-string` fix — not exercised by any
+/// other translation test in this file, which only covers `unknown-key`'s
+/// `rename-key`/`remove-key` — gets a translated `label` too, distinct from
+/// `message`, and both interpolate the diagnostic's own column name.
+#[tokio::test]
+async fn view_definitions_lint_translates_a_duplicate_column_name_diagnostic_and_its_set_string_fix()
+ {
+    let doc = serde_json::json!({
+        "resourceType": "ViewDefinition",
+        "status": "active",
+        "resource": "Patient",
+        "select": [{ "column": [
+            { "name": "id", "path": "getResourceKey()" },
+            { "name": "id", "path": "name.family" }
+        ] }]
+    });
+    let response = app()
+        .oneshot(
+            Request::post("/ui/sql/view-definitions/lint")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(doc.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = serde_json::from_str(&body_text(response).await).unwrap();
+    let diagnostics = body["diagnostics"].as_array().expect("diagnostics array");
+    let duplicate = diagnostics
+        .iter()
+        .find(|d| d["code"] == "duplicate-column-name")
+        .expect("a duplicate-column-name diagnostic for the second \"id\"");
+    assert_eq!(duplicate["pointer"], "/select/0/column/1/name");
+    assert_eq!(duplicate["message"], r#"Duplicate column name "id""#);
+    let fixes = duplicate["fixes"].as_array().expect("fixes array");
+    assert_eq!(fixes.len(), 1);
+    assert_eq!(fixes[0]["kind"], "set-string");
+    assert_eq!(fixes[0]["value"], "id_2");
+    assert_eq!(fixes[0]["label"], r#"Set to "id_2""#);
+}
+
+/// `undeclared-constant`'s message and `span` — the diagnostic
+/// `vd-editor-lint.spec.ts` relies on to underline exactly the `%name`
+/// token, not the whole expression.
+#[tokio::test]
+async fn view_definitions_lint_translates_an_undeclared_constant_diagnostic() {
+    let doc = serde_json::json!({
+        "resourceType": "ViewDefinition",
+        "status": "active",
+        "resource": "Patient",
+        "select": [{ "column": [{ "name": "computed", "path": "%bogus + 1" }] }]
+    });
+    let response = app()
+        .oneshot(
+            Request::post("/ui/sql/view-definitions/lint?lang=es")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(doc.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = serde_json::from_str(&body_text(response).await).unwrap();
+    let diagnostics = body["diagnostics"].as_array().expect("diagnostics array");
+    let undeclared = diagnostics
+        .iter()
+        .find(|d| d["code"] == "undeclared-constant")
+        .expect("an undeclared-constant diagnostic for %bogus");
+    assert_eq!(undeclared["pointer"], "/select/0/column/0/path");
+    assert_eq!(undeclared["message"], r#"Constante no declarada "%bogus""#);
+    assert_eq!(
+        undeclared["span"],
+        serde_json::json!({ "start": 0, "end": 6 })
+    );
+    assert_eq!(undeclared["fixes"], serde_json::json!([]));
 }
 
 #[tokio::test]

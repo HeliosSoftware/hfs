@@ -843,6 +843,53 @@ vd-pagination-label = View-Definitionsseiten
 vd-page-prev = Zurück
 vd-page-next = Weiter
 
+## ViewDefinition-Lint-Meldungen und -Fixes (#821): eigene Lokalisierung des
+## `/lint`-Handlers für `helios_sof::lint::Diagnostic` — code + args, niemals
+## `Diagnostic.message` selbst (immer Englisch, nicht lokalisiert). Die
+## Schlüssel `vd-lint-*` tragen den Kebab-Case-Namen von `DiagnosticCode`; ein
+## `missing-required`/`wrong-type`-Diagnosewert aus der value[x]-Auswahl einer
+## Konstante trägt `$variant` ("missing"/"multiple") statt der generischen
+## `$key`/`$expected`+`$found`, unten ausgewählt. Jeder `vd-fix-*`-Schlüssel
+## beschriftet einen `Fix`, neben dem Diagnosewert als Ein-Klick-Aktion
+## angezeigt.
+vd-lint-not-a-view-definition = Kein ViewDefinition: gefunden { $found }
+vd-lint-unknown-key = Unbekannter Schlüssel "{ $key }"
+vd-lint-missing-required = { $variant ->
+    [missing] Eine Konstante muss genau einen Wert setzen
+   *[other] Erforderlicher Schlüssel "{ $key }" fehlt
+}
+vd-lint-wrong-type = { $variant ->
+    [multiple] Eine Konstante darf nur einen Wert setzen
+   *[other] Erwartet { $expected }, gefunden { $found }
+}
+vd-lint-empty-required = Der erforderliche Schlüssel "{ $key }" darf nicht leer sein
+vd-lint-duplicate-column-name = Doppelter Spaltenname "{ $name }"
+vd-lint-multiple-iteration-directives = Ein select darf höchstens eines von forEach, forEachOrNull, repeat setzen (gefunden { $keys })
+vd-lint-select-without-output = Ein select muss mindestens eines von column, select oder unionAll enthalten
+vd-lint-fhirpath-syntax = FHIRPath-Syntax: { $detail }
+vd-lint-undeclared-constant = Nicht deklarierte Konstante "%{ $name }"
+vd-fix-rename-key = Umbenennen zu "{ $to }"
+vd-fix-remove-key = "{ $key }" entfernen
+vd-fix-set-string = Auf "{ $value }" setzen
+
+## ViewDefinition-Vervollständigung (#821): `vd-editor.js` liest dies einmal
+## aus `data-msg-required` von `#vd-editor-grid` — die Markierung, die das
+## Vervollständigungselement eines erforderlichen strukturellen Schlüssels
+## trägt, clientseitig an seinen `detail`-Text angehängt (`/complete` sendet
+## sie nie selbst, da der Endpunkt nicht lokalisiert).
+vd-complete-required = erforderlich
+
+## Speichern-mit-Fehlern-Bestätigung des ViewDefinition-Editors (#821):
+## `vd-editor.js` wählt eine dieser beiden Renderings von
+## `data-msg-save-errors-one`/`-other` von `#vd-editor-grid` und ersetzt den
+## literalen Platzhalter `{count}` (den Wert, den `$count` erhielt) durch die
+## tatsächliche Anzahl — der Text von `window.confirm` hat keine eigene
+## Lokalisierung, das ist der einzige Weg, ihn zu übersetzen. Erscheint nur
+## beim Absenden als Save (nicht Duplicate), solange der zuletzt
+## abgeschlossene Lint-Durchlauf noch mindestens einen Fehler hat.
+vd-save-with-errors-one = Diese View-Definition hat noch { $count } Fehler. Trotzdem speichern?
+vd-save-with-errors-other = Diese View-Definition hat noch { $count } Fehler. Trotzdem speichern?
+
 ## $sql-run-Ergebnispartial (#752): gemeinsam genutzt von den Playgrounds
 ## View-Definitionen, SQL-Abfragen und SQL-Views (#839).
 
