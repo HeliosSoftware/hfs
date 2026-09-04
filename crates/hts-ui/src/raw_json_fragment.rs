@@ -763,11 +763,11 @@ fn render_json_expand(
                 .eq_ignore_ascii_case("application/x-www-form-urlencoded")
         })
     {
-        return bad_request("Invalid JSON page state");
+        return *bad_request("Invalid JSON page state");
     }
     let pages = match capability_json::parse_page_descriptors(body) {
         Ok(pages) => pages,
-        Err(_) => return bad_request("Invalid JSON page state"),
+        Err(_) => return *bad_request("Invalid JSON page state"),
     };
     let endpoint = FragmentEndpoint {
         base_path,
@@ -776,7 +776,7 @@ fn render_json_expand(
     };
     let expanded = match capability_json::plan_expanded(document, &pages, endpoint) {
         Ok(expanded) => expanded,
-        Err(_) => return bad_request("Invalid JSON page state"),
+        Err(_) => return *bad_request("Invalid JSON page state"),
     };
     let i18n = I18n::new(*locale);
     match capability_json::render_expanded(&i18n, &expanded) {
@@ -794,23 +794,32 @@ fn render_json_expand(
     }
 }
 
-fn bad_request(message: &'static str) -> Response {
-    (axum::http::StatusCode::BAD_REQUEST, message).into_response()
+/// The early-return of a `*_document` helper.
+///
+/// Boxed to keep `Result<_, DocumentError>` below clippy's
+/// `result_large_err` threshold — the same reason
+/// [`crate::upstream::UpstreamError::Outcome`] boxes its view.
+type DocumentError = Box<Response>;
+
+fn bad_request(message: &'static str) -> DocumentError {
+    Box::new((axum::http::StatusCode::BAD_REQUEST, message).into_response())
 }
 
-fn unavailable(message: &'static str) -> Response {
-    (axum::http::StatusCode::SERVICE_UNAVAILABLE, message).into_response()
+fn unavailable(message: &'static str) -> DocumentError {
+    Box::new((axum::http::StatusCode::SERVICE_UNAVAILABLE, message).into_response())
 }
 
 /// Parses the selected half of the exchange as JSON, or the 500 that tells
 /// the viewer nothing renderable came back.
-fn parse_payload(payload: &str) -> Result<serde_json::Value, Response> {
+fn parse_payload(payload: &str) -> Result<serde_json::Value, DocumentError> {
     serde_json::from_str(payload).map_err(|_| {
-        (
-            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-            "Payload is not valid JSON",
+        Box::new(
+            (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "Payload is not valid JSON",
+            )
+                .into_response(),
         )
-            .into_response()
     })
 }
 
@@ -825,7 +834,7 @@ fn parse_payload(payload: &str) -> Result<serde_json::Value, Response> {
 async fn cs_lookup_document(
     state: &HtsUiState,
     query: CsLookupFragmentQuery,
-) -> Result<(serde_json::Value, String), Response> {
+) -> Result<(serde_json::Value, String), DocumentError> {
     let target = PaneTarget::from_query(query.target.as_deref());
     // Parse comma-separated properties into Vec
     let properties: Vec<String> = query
@@ -881,7 +890,7 @@ async fn cs_lookup_fragment(
             CS_LOOKUP_FRAGMENT_URL,
             &extra_query,
         ),
-        Err(response) => response,
+        Err(response) => *response,
     }
 }
 
@@ -903,7 +912,7 @@ async fn cs_lookup_expand(
             CS_LOOKUP_FRAGMENT_URL,
             &extra_query,
         ),
-        Err(response) => response,
+        Err(response) => *response,
     }
 }
 
@@ -911,7 +920,7 @@ async fn cs_lookup_expand(
 async fn cs_validate_document(
     state: &HtsUiState,
     query: CsValidateFragmentQuery,
-) -> Result<(serde_json::Value, String), Response> {
+) -> Result<(serde_json::Value, String), DocumentError> {
     let target = PaneTarget::from_query(query.target.as_deref());
     let mode = ValidateInputMode::from_form(query.mode.as_deref());
     let params = ValidateCodeParams {
@@ -958,7 +967,7 @@ async fn cs_validate_fragment(
             CS_VALIDATE_FRAGMENT_URL,
             &extra_query,
         ),
-        Err(response) => response,
+        Err(response) => *response,
     }
 }
 
@@ -980,7 +989,7 @@ async fn cs_validate_expand(
             CS_VALIDATE_FRAGMENT_URL,
             &extra_query,
         ),
-        Err(response) => response,
+        Err(response) => *response,
     }
 }
 
@@ -988,7 +997,7 @@ async fn cs_validate_expand(
 async fn cs_subsumes_document(
     state: &HtsUiState,
     query: CsSubsumesFragmentQuery,
-) -> Result<(serde_json::Value, String), Response> {
+) -> Result<(serde_json::Value, String), DocumentError> {
     let target = PaneTarget::from_query(query.target.as_deref());
     let params = SubsumesParams {
         code_a: query.code_a.trim().to_owned(),
@@ -1033,7 +1042,7 @@ async fn cs_subsumes_fragment(
             CS_SUBSUMES_FRAGMENT_URL,
             &extra_query,
         ),
-        Err(response) => response,
+        Err(response) => *response,
     }
 }
 
@@ -1055,7 +1064,7 @@ async fn cs_subsumes_expand(
             CS_SUBSUMES_FRAGMENT_URL,
             &extra_query,
         ),
-        Err(response) => response,
+        Err(response) => *response,
     }
 }
 
@@ -1063,7 +1072,7 @@ async fn cs_subsumes_expand(
 async fn vs_expand_document(
     state: &HtsUiState,
     query: VsExpandFragmentQuery,
-) -> Result<(serde_json::Value, String), Response> {
+) -> Result<(serde_json::Value, String), DocumentError> {
     let target = PaneTarget::from_query(query.target.as_deref());
     // Convert mode string to hierarchical/exclude_nested flags
     let tree_mode = query.mode.as_deref() == Some("tree");
@@ -1113,7 +1122,7 @@ async fn vs_expand_fragment(
             VS_EXPAND_FRAGMENT_URL,
             &extra_query,
         ),
-        Err(response) => response,
+        Err(response) => *response,
     }
 }
 
@@ -1135,7 +1144,7 @@ async fn vs_expand_expand(
             VS_EXPAND_FRAGMENT_URL,
             &extra_query,
         ),
-        Err(response) => response,
+        Err(response) => *response,
     }
 }
 
@@ -1143,7 +1152,7 @@ async fn vs_expand_expand(
 async fn cm_translate_document(
     state: &HtsUiState,
     query: CmTranslateFragmentQuery,
-) -> Result<(serde_json::Value, String), Response> {
+) -> Result<(serde_json::Value, String), DocumentError> {
     use crate::upstream::TranslateDirection;
 
     let target = PaneTarget::from_query(query.target.as_deref());
@@ -1194,7 +1203,7 @@ async fn cm_translate_fragment(
             CM_TRANSLATE_FRAGMENT_URL,
             &extra_query,
         ),
-        Err(response) => response,
+        Err(response) => *response,
     }
 }
 
@@ -1216,6 +1225,6 @@ async fn cm_translate_expand(
             CM_TRANSLATE_FRAGMENT_URL,
             &extra_query,
         ),
-        Err(response) => response,
+        Err(response) => *response,
     }
 }

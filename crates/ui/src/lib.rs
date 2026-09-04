@@ -83,7 +83,7 @@ use axum::{
     Json, Router,
     body::Bytes,
     extract::{DefaultBodyLimit, Query, RawQuery, State},
-    http::{HeaderMap, StatusCode},
+    http::StatusCode,
     middleware,
     response::{Html, IntoResponse, Response},
     routing::get,
