@@ -1217,7 +1217,13 @@ impl SqliteBackend {
     ) -> StorageResult<()> {
         use super::search::fts::extract_searchable_content;
 
-        if !fts_table_exists(conn)? {
+        let t = std::time::Instant::now();
+        let table_exists = fts_table_exists(conn)?;
+        ingest_timing::FTS_EXISTS_NS.fetch_add(
+            t.elapsed().as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        if !table_exists {
             // FTS5 not available - skip silently
             return Ok(());
         }
@@ -1229,6 +1235,7 @@ impl SqliteBackend {
             return Ok(());
         }
 
+        let t = std::time::Instant::now();
         // Insert into FTS table
         conn.execute(
             "INSERT INTO resource_fts (resource_id, resource_type, tenant_id, narrative_text, full_content)
@@ -1242,6 +1249,10 @@ impl SqliteBackend {
             ],
         )
         .map_err(|e| internal_error(format!("Failed to insert FTS content: {}", e)))?;
+        ingest_timing::FTS_INSERT_NS.fetch_add(
+            t.elapsed().as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
 
         Ok(())
     }
@@ -1258,21 +1269,33 @@ impl SqliteBackend {
         resource: &Value,
     ) -> StorageResult<usize> {
         // Extract values using the tenant's registry-driven extractor
+        let t = std::time::Instant::now();
         let values = self
             .tenant_extractor(tenant_id)
             .extract(resource, resource_type)
             .map_err(|e| internal_error(format!("Search parameter extraction failed: {}", e)))?;
+        ingest_timing::EXTRACT_NS.fetch_add(
+            t.elapsed().as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
 
+        let t = std::time::Instant::now();
         let mut count = 0;
         for value in values {
             self.write_index_entry(conn, tenant_id, resource_type, resource_id, &value)?;
             count += 1;
         }
+        ingest_timing::INDEX_ROWS_NS.fetch_add(
+            t.elapsed().as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        ingest_timing::INDEX_ROWS.fetch_add(count as u64, std::sync::atomic::Ordering::Relaxed);
 
         // Also index any contained resources for `_contained` search.
         count +=
             self.index_contained_resources(conn, tenant_id, resource_type, resource_id, resource)?;
 
+        ingest_timing::bump_resource();
         Ok(count)
     }
 
@@ -1318,7 +1341,12 @@ impl SqliteBackend {
             .map(|p| self.sql_value_to_ref(p))
             .collect();
 
-        conn.execute(SqliteSearchIndexWriter::insert_sql(), param_refs.as_slice())
+        // `prepare_cached` rather than `execute`: this statement runs once per
+        // index row (~15–30 per resource on every write and reindex), and
+        // re-preparing the ~20-column INSERT each time costs more than
+        // stepping it.
+        conn.prepare_cached(SqliteSearchIndexWriter::insert_sql())
+            .and_then(|mut stmt| stmt.execute(param_refs.as_slice()))
             .map_err(|e| internal_error(format!("Failed to insert search index entry: {}", e)))?;
 
         Ok(())
@@ -6672,5 +6700,35 @@ mod tests {
             Some("MR"),
             "Identifier type code should be populated"
         );
+    }
+}
+
+/// Temporary write-path instrumentation for the ingest benchmark (#903
+/// follow-up): cumulative nanoseconds per phase, dumped every 1,000 indexed
+/// resources via tracing. Strip before merging.
+pub(crate) mod ingest_timing {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    pub static EXTRACT_NS: AtomicU64 = AtomicU64::new(0);
+    pub static INDEX_ROWS_NS: AtomicU64 = AtomicU64::new(0);
+    pub static INDEX_ROWS: AtomicU64 = AtomicU64::new(0);
+    pub static FTS_EXISTS_NS: AtomicU64 = AtomicU64::new(0);
+    pub static FTS_INSERT_NS: AtomicU64 = AtomicU64::new(0);
+    pub static RESOURCES: AtomicU64 = AtomicU64::new(0);
+
+    pub fn bump_resource() {
+        let n = RESOURCES.fetch_add(1, Ordering::Relaxed) + 1;
+        if n % 1000 == 0 {
+            let ms = |a: &AtomicU64| a.load(Ordering::Relaxed) as f64 / 1e6;
+            tracing::info!(
+                resources = n,
+                extract_ms = format!("{:.0}", ms(&EXTRACT_NS)),
+                index_rows_ms = format!("{:.0}", ms(&INDEX_ROWS_NS)),
+                index_rows = INDEX_ROWS.load(Ordering::Relaxed),
+                fts_exists_ms = format!("{:.0}", ms(&FTS_EXISTS_NS)),
+                fts_insert_ms = format!("{:.0}", ms(&FTS_INSERT_NS)),
+                "ingest timing (cumulative)"
+            );
+        }
     }
 }
