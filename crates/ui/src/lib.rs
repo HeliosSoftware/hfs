@@ -61,6 +61,7 @@ mod sql_libraries;
 mod sql_views;
 mod subscriptions;
 mod tenants;
+mod vd_complete;
 
 #[doc(hidden)]
 pub use conformance::{
@@ -1240,6 +1241,12 @@ pub fn mount_with_conformance_source_and_runtime(
         .route(
             "/ui/sql/view-definitions/lint",
             axum::routing::post(sql_view_definitions_lint),
+        )
+        // #821: the editor's context-completion endpoint — "where is the
+        // cursor" from the browser, "what fits there" back from the server.
+        .route(
+            "/ui/sql/view-definitions/complete",
+            axum::routing::post(vd_complete::complete),
         )
         // The playground's live preview fragment (#752, generalized to all
         // three SQL on FHIR pages in #839).
