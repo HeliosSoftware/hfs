@@ -1067,8 +1067,11 @@ async fn test_parquet_response_uses_native_parquet_content_type() {
 }
 
 /// Audit item #9: an invalid ViewDefinition body (well-formed Parameters
-/// wrapper, but the inner ViewDefinition has a type mismatch serde can't
-/// parse) must surface as `422 Unprocessable Entity`, not `400 Bad Request`.
+/// wrapper, but the inner ViewDefinition has a type mismatch) must surface
+/// as `422 Unprocessable Entity`, not `400 Bad Request`. `select` being a
+/// string rather than an array of Select objects is a `WrongType` lint
+/// diagnostic (#821), so this is caught by the structural lint before the
+/// typed parse that used to be the only thing rejecting it ever runs.
 #[tokio::test]
 async fn test_invalid_view_definition_returns_422() {
     let server = common::test_server().await;
@@ -1083,8 +1086,6 @@ async fn test_invalid_view_definition_returns_422() {
                     "resourceType": "ViewDefinition",
                     "status": "active",
                     "resource": "Patient",
-                    // Type mismatch: select must be an array of Select objects,
-                    // not a string. Serde rejects deserialization.
                     "select": "not-an-array"
                 }
             }
@@ -1106,6 +1107,197 @@ async fn test_invalid_view_definition_returns_422() {
     );
     let json: serde_json::Value = response.json();
     assert_eq!(json["resourceType"], "OperationOutcome");
+}
+
+/// A `ViewDefinition` with more than one structural problem gets one
+/// `OperationOutcome.issue` per lint error (#821), in the same order
+/// `helios_sof::lint::lint_view_definition` itself reports them (document
+/// position, not pointer text) — computed independently here rather than
+/// hard-coded, so this doesn't silently stop testing anything if the lint's
+/// own rule set changes.
+#[tokio::test]
+async fn test_invalid_view_definition_returns_one_issue_per_lint_error() {
+    let server = common::test_server().await;
+
+    let bad_view = json!({
+        "resourceType": "ViewDefinition",
+        "status": "active",
+        "resource": "Patient",
+        "select": [{
+            "column": [{ "name": "id", "path": "getResourceKey(" }]
+        }],
+        "notAField": true
+    });
+
+    let expected: Vec<_> = helios_sof::lint::lint_view_definition(&bad_view)
+        .into_iter()
+        .filter(|d| d.severity == helios_sof::lint::Severity::Error)
+        .collect();
+    assert!(
+        expected.len() >= 2,
+        "fixture must exercise more than one lint error, got {expected:?}"
+    );
+
+    let response = server
+        .post("/$sql-run")
+        .add_header("Content-Type", "application/json")
+        .json(&bad_view)
+        .await;
+
+    assert_eq!(response.status_code(), StatusCode::UNPROCESSABLE_ENTITY);
+    let outcome: serde_json::Value = response.json();
+    assert_eq!(outcome["resourceType"], "OperationOutcome");
+    let issues = outcome["issue"].as_array().expect("issue must be an array");
+    assert_eq!(
+        issues.len(),
+        expected.len(),
+        "one issue per lint error, got {issues:?}"
+    );
+    for (issue, diagnostic) in issues.iter().zip(&expected) {
+        assert_eq!(issue["severity"], "error");
+        assert_eq!(issue["diagnostics"], diagnostic.message);
+        assert_eq!(
+            issue["expression"][0],
+            helios_sof::lint::pointer_to_fhirpath(&diagnostic.pointer)
+        );
+    }
+}
+
+/// An unknown key at `select[0]` (`columns`, a typo for `column`) is a
+/// `structure`-coded issue located at the offending node — previously
+/// invisible entirely, since the typed parse silently ignores keys it
+/// doesn't recognize (#821).
+#[tokio::test]
+async fn test_unknown_key_in_select_returns_structure_issue() {
+    let server = common::test_server().await;
+
+    let bad_view = json!({
+        "resourceType": "ViewDefinition",
+        "status": "active",
+        "resource": "Patient",
+        "select": [{
+            "columns": [{ "name": "id", "path": "id" }]
+        }]
+    });
+
+    let response = server
+        .post("/$sql-run")
+        .add_header("Content-Type", "application/json")
+        .json(&bad_view)
+        .await;
+
+    assert_eq!(response.status_code(), StatusCode::UNPROCESSABLE_ENTITY);
+    let outcome: serde_json::Value = response.json();
+    let issues = outcome["issue"].as_array().expect("issue must be an array");
+    let unknown_key_issue = issues
+        .iter()
+        .find(|issue| issue["details"]["coding"][0]["code"] == "unknown-key")
+        .expect("must report the unknown `columns` key");
+    assert_eq!(unknown_key_issue["severity"], "error");
+    assert_eq!(unknown_key_issue["code"], "structure");
+    assert_eq!(
+        unknown_key_issue["expression"][0],
+        "ViewDefinition.select[0].columns"
+    );
+    assert_eq!(
+        unknown_key_issue["details"]["coding"][0]["system"],
+        "http://heliossoftware.com/fhir/CodeSystem/view-definition-lint"
+    );
+}
+
+/// A `Parameters`-wrapped subject that fails the lint (not a typed-parse
+/// type mismatch, but a structural rule the lint alone models) must also be
+/// `422`, not the wrapper's generic `400` — the round-trip through the
+/// strict typed `Parameters` deserialize must not have already stripped the
+/// problem the lint would otherwise have caught (#821).
+#[tokio::test]
+async fn test_invalid_view_definition_in_parameters_wrapper_returns_422() {
+    let server = common::test_server().await;
+
+    let body = json!({
+        "resourceType": "Parameters",
+        "parameter": [{
+            "name": "subjectResource",
+            "resource": {
+                "resourceType": "ViewDefinition",
+                "status": "active",
+                // Missing required `resource` — a `Parameters`-wrapped
+                // subject exercises the round-trip-safe extraction path,
+                // not the bare-body shortcut.
+                "select": [{
+                    "column": [{ "name": "id", "path": "id" }]
+                }]
+            }
+        }]
+    });
+
+    let response = server
+        .post("/$sql-run")
+        .add_header("Content-Type", "application/json")
+        .json(&body)
+        .await;
+
+    assert_eq!(
+        response.status_code(),
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "got {} with body: {}",
+        response.status_code(),
+        response.text()
+    );
+    let outcome: serde_json::Value = response.json();
+    assert_eq!(outcome["resourceType"], "OperationOutcome");
+    let issues = outcome["issue"].as_array().expect("issue must be an array");
+    assert!(
+        issues
+            .iter()
+            .any(|issue| issue["diagnostics"] == "missing required key `resource`"),
+        "must report the missing `resource` key: {issues:?}"
+    );
+}
+
+/// A ViewDefinition the lint accepts must still run and return `200` — the
+/// new pre-parse lint gate (#821) must not reject anything it didn't
+/// already reject.
+#[tokio::test]
+async fn test_valid_view_definition_still_returns_200() {
+    let server = common::test_server().await;
+
+    let body = json!({
+        "resourceType": "Parameters",
+        "parameter": [
+            {
+                "name": "subjectResource",
+                "resource": {
+                    "resourceType": "ViewDefinition",
+                    "status": "active",
+                    "resource": "Patient",
+                    "select": [{
+                        "column": [{ "name": "id", "path": "id" }]
+                    }]
+                }
+            },
+            {
+                "name": "resource",
+                "resource": { "resourceType": "Patient", "id": "example" }
+            }
+        ]
+    });
+
+    let response = server
+        .post("/$sql-run")
+        .add_header("Accept", "application/json")
+        .json(&body)
+        .await;
+
+    assert_eq!(
+        response.status_code(),
+        StatusCode::OK,
+        "got: {}",
+        response.text()
+    );
+    let rows: serde_json::Value = response.json();
+    assert_eq!(rows.as_array().unwrap().len(), 1);
+    assert_eq!(rows[0]["id"], "example");
 }
 
 /// The pre-ballot `GET /$sql-on-fhir-capabilities` endpoint was a

@@ -852,6 +852,50 @@ vd-pagination-label = Páginas de definiciones de vistas
 vd-page-prev = Anterior
 vd-page-next = Siguiente
 
+## Mensajes y arreglos del lint de ViewDefinition (#821): localización propia
+## del handler `/lint` para `helios_sof::lint::Diagnostic` — code + args,
+## nunca `Diagnostic.message` (siempre en inglés, sin localizar). Las claves
+## `vd-lint-*` llevan el nombre kebab-case de `DiagnosticCode`; el diagnóstico
+## `missing-required`/`wrong-type` de la elección value[x] de una constante
+## lleva `$variant` ("missing"/"multiple") en vez de los `$key`/`$expected`+
+## `$found` genéricos, seleccionado abajo. Cada clave `vd-fix-*` etiqueta un
+## `Fix`, mostrado junto al diagnóstico como una acción de un clic.
+vd-lint-not-a-view-definition = No es un ViewDefinition: se encontró { $found }
+vd-lint-unknown-key = Clave desconocida "{ $key }"
+vd-lint-missing-required = { $variant ->
+    [missing] Una constante debe establecer exactamente un valor
+   *[other] Falta la clave obligatoria "{ $key }"
+}
+vd-lint-wrong-type = { $variant ->
+    [multiple] Una constante solo puede establecer un valor
+   *[other] Se esperaba { $expected }, se encontró { $found }
+}
+vd-lint-empty-required = La clave obligatoria "{ $key }" no puede estar vacía
+vd-lint-duplicate-column-name = Nombre de columna duplicado "{ $name }"
+vd-lint-multiple-iteration-directives = Un select solo puede establecer una de forEach, forEachOrNull, repeat (se encontraron { $keys })
+vd-lint-select-without-output = Un select debe tener al menos uno de column, select o unionAll
+vd-lint-fhirpath-syntax = Sintaxis FHIRPath: { $detail }
+vd-lint-undeclared-constant = Constante no declarada "%{ $name }"
+vd-fix-rename-key = Renombrar a "{ $to }"
+vd-fix-remove-key = Quitar "{ $key }"
+vd-fix-set-string = Establecer en "{ $value }"
+
+## Completado de ViewDefinition (#821): `vd-editor.js` lo lee una vez desde
+## `data-msg-required` de `#vd-editor-grid` — el marcador que lleva el
+## elemento de completado de una clave estructural obligatoria, añadido a su
+## texto `detail` en el cliente (nunca lo envía `/complete`, que no traduce).
+vd-complete-required = obligatorio
+
+## Aviso de guardado con errores del editor de ViewDefinition (#821):
+## `vd-editor.js` elige cuál de estos renderiza `data-msg-save-errors-one`/
+## `-other` de `#vd-editor-grid` y sustituye el marcador literal `{count}`
+## (el valor que se le dio a `$count`) por el número real — el texto de
+## `window.confirm` no tiene traducción propia, así que esta es la única
+## forma de traducirlo. Se muestra solo al enviar como Save (no Duplicate)
+## mientras la última pasada de lint completada aún tenga algún error.
+vd-save-with-errors-one = Esta definición de vista aún tiene { $count } error. ¿Guardar de todas formas?
+vd-save-with-errors-other = Esta definición de vista aún tiene { $count } errores. ¿Guardar de todas formas?
+
 ## Partial de resultados de $sql-run (#752): compartido por los playgrounds
 ## de View Definitions, SQL Queries y SQL Views (#839).
 

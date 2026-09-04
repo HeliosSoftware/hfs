@@ -3853,6 +3853,103 @@ async fn view_definitions_page_renders_the_stretch_grid_and_the_guided_form_inli
     );
 }
 
+/// #821: `vd-editor.js` reads the completion popup's translated "required"
+/// marker straight off `#vd-editor-grid`'s own `data-msg-required` — this
+/// negotiates exactly like every other page (`?lang=`/cookie/
+/// `Accept-Language` → `en`), not through the `/complete` endpoint (which is
+/// not locale-aware at all: see its own tests).
+#[tokio::test]
+async fn view_definitions_page_carries_the_required_completion_marker_translated() {
+    let source = helios_ui::StaticConformanceSource::empty().with(
+        "ViewDefinition",
+        helios_fhir::FhirVersion::R4,
+        Vec::new(),
+    );
+    let app = view_definitions_app(source);
+
+    let en = body_text(
+        app.clone()
+            .oneshot(
+                Request::get("/ui/sql/view-definitions?vd=new")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert!(en.contains(r#"data-msg-required="required""#), "{en}");
+
+    let es = body_text(
+        app.oneshot(
+            Request::get("/ui/sql/view-definitions?vd=new&lang=es")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap(),
+    )
+    .await;
+    assert!(es.contains(r#"data-msg-required="obligatorio""#), "{es}");
+}
+
+/// #821: the two plural forms of the Save-with-errors confirmation
+/// text, negotiated exactly like `data-msg-required` above — rendered with
+/// the literal `{count}` marker `vd-editor.js` substitutes client-side once
+/// it knows the real error count, never a real number baked in server-side.
+#[tokio::test]
+async fn view_definitions_page_carries_the_save_with_errors_confirmation_translated() {
+    let source = helios_ui::StaticConformanceSource::empty().with(
+        "ViewDefinition",
+        helios_fhir::FhirVersion::R4,
+        Vec::new(),
+    );
+    let app = view_definitions_app(source);
+
+    let en = body_text(
+        app.clone()
+            .oneshot(
+                Request::get("/ui/sql/view-definitions?vd=new")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert!(
+        en.contains(r#"data-msg-save-errors-one="This view definition still has {count} error. Save it anyway?""#),
+        "{en}"
+    );
+    assert!(
+        en.contains(r#"data-msg-save-errors-other="This view definition still has {count} errors. Save it anyway?""#),
+        "{en}"
+    );
+
+    let es = body_text(
+        app.oneshot(
+            Request::get("/ui/sql/view-definitions?vd=new&lang=es")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap(),
+    )
+    .await;
+    assert!(
+        es.contains(
+            r#"data-msg-save-errors-one="Esta definición de vista aún tiene {count} error. ¿Guardar de todas formas?""#
+        ),
+        "{es}"
+    );
+    assert!(
+        es.contains(
+            r#"data-msg-save-errors-other="Esta definición de vista aún tiene {count} errores. ¿Guardar de todas formas?""#
+        ),
+        "{es}"
+    );
+}
+
 /// #843: a stored view's document — not just the starter one — also
 /// gets its guided-form card built inline, and the two disagreeing about the
 /// selected document would be a real bug (the panel out of sync with the
@@ -4330,6 +4427,19 @@ async fn view_definitions_lint_returns_diagnostics_for_an_invalid_document() {
     assert_eq!(unknown_key["pointer"], "/notAField");
     assert_eq!(unknown_key["severity"], "error");
     assert!(unknown_key["span"].is_null());
+    // #821: args/fixes ride along on every diagnostic, and — with nothing
+    // close enough to suggest for `notAField` — the only fix offered is
+    // dropping the key.
+    assert_eq!(unknown_key["args"]["key"], "notAField");
+    assert!(unknown_key["args"]["suggestion"].is_null());
+    assert_eq!(
+        unknown_key["fixes"],
+        serde_json::json!([{
+            "kind": "remove-key",
+            "pointer": "/notAField",
+            "label": r#"Remove "notAField""#
+        }])
+    );
 
     let syntax = diagnostics
         .iter()
@@ -4340,6 +4450,255 @@ async fn view_definitions_lint_returns_diagnostics_for_an_invalid_document() {
     assert!(syntax["span"].is_object());
     assert!(syntax["span"]["start"].is_u64());
     assert!(syntax["span"]["end"].is_u64());
+    assert!(syntax["args"]["detail"].is_string());
+    assert_eq!(syntax["fixes"], serde_json::json!([]));
+}
+
+/// #821: the generic `missing-required` diagnostic never sets `args.variant`
+/// (only the constant `value[x]` ones do) — it must still translate, not
+/// degrade to the raw catalog key, exercising the handler's own workaround
+/// for `fluent-templates` failing a selector lookup outright when the
+/// selector variable is completely absent (see
+/// `translate_diagnostic_message` in `crates/ui/src/lib.rs`).
+#[tokio::test]
+async fn view_definitions_lint_translates_a_generic_missing_required_diagnostic() {
+    let doc = serde_json::json!({ "resourceType": "ViewDefinition" });
+    let response = app()
+        .oneshot(
+            Request::post("/ui/sql/view-definitions/lint")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(doc.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = serde_json::from_str(&body_text(response).await).unwrap();
+    let diagnostics = body["diagnostics"].as_array().expect("diagnostics array");
+    let select_missing = diagnostics
+        .iter()
+        .find(|d| d["code"] == "missing-required" && d["args"]["key"] == "select")
+        .expect("a missing-required diagnostic for select");
+    assert_eq!(
+        select_missing["message"],
+        r#"Missing required key "select""#
+    );
+}
+
+/// #821: `message` is the negotiated-locale rendering of `code` + `args`
+/// against the `vd-lint-*` catalog — `?lang=es` (the same negotiation every
+/// page uses) renders it in Spanish while `code` stays the literal wire
+/// value the browser matches on either way.
+#[tokio::test]
+async fn view_definitions_lint_translates_message_with_lang_query() {
+    let doc = serde_json::json!({
+        "resourceType": "ViewDefinition",
+        "status": "active",
+        "resource": "Patient",
+        "select": [{ "column": [{ "name": "id", "path": "getResourceKey()" }] }],
+        "notAField": "oops"
+    });
+    let response = app()
+        .oneshot(
+            Request::post("/ui/sql/view-definitions/lint?lang=es")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(doc.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = serde_json::from_str(&body_text(response).await).unwrap();
+    let diagnostics = body["diagnostics"].as_array().expect("diagnostics array");
+    let unknown_key = diagnostics
+        .iter()
+        .find(|d| d["code"] == "unknown-key")
+        .expect("an unknown-key diagnostic for notAField");
+    assert_eq!(unknown_key["code"], "unknown-key");
+    assert_eq!(unknown_key["message"], r#"Clave desconocida "notAField""#);
+}
+
+/// `?lang=en` and no `?lang=`/cookie/`Accept-Language` at all both render
+/// English — the default and an explicit choice must agree.
+#[tokio::test]
+async fn view_definitions_lint_defaults_to_english_message() {
+    let doc = serde_json::json!({
+        "resourceType": "ViewDefinition",
+        "status": "active",
+        "resource": "Patient",
+        "select": [{ "column": [{ "name": "id", "path": "getResourceKey()" }] }],
+        "notAField": "oops"
+    });
+    for target in [
+        "/ui/sql/view-definitions/lint",
+        "/ui/sql/view-definitions/lint?lang=en",
+    ] {
+        let response = app()
+            .oneshot(
+                Request::post(target)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(doc.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_str(&body_text(response).await).unwrap();
+        let diagnostics = body["diagnostics"].as_array().expect("diagnostics array");
+        let unknown_key = diagnostics
+            .iter()
+            .find(|d| d["code"] == "unknown-key")
+            .unwrap_or_else(|| panic!("an unknown-key diagnostic for {target}"));
+        assert_eq!(unknown_key["message"], r#"Unknown key "notAField""#);
+    }
+}
+
+/// The `hfs_lang` cookie (the language switcher's persisted choice) drives
+/// negotiation exactly like `?lang=` does — set via the `Cookie` header
+/// here, the way a returning browser would send it back on every request.
+#[tokio::test]
+async fn view_definitions_lint_translates_message_with_lang_cookie() {
+    let doc = serde_json::json!({
+        "resourceType": "ViewDefinition",
+        "status": "active",
+        "resource": "Patient",
+        "select": [{ "column": [{ "name": "id", "path": "getResourceKey()" }] }],
+        "notAField": "oops"
+    });
+    let response = app()
+        .oneshot(
+            Request::post("/ui/sql/view-definitions/lint")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::COOKIE, "hfs_lang=es")
+                .body(Body::from(doc.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = serde_json::from_str(&body_text(response).await).unwrap();
+    let diagnostics = body["diagnostics"].as_array().expect("diagnostics array");
+    let unknown_key = diagnostics
+        .iter()
+        .find(|d| d["code"] == "unknown-key")
+        .expect("an unknown-key diagnostic for notAField");
+    assert_eq!(unknown_key["message"], r#"Clave desconocida "notAField""#);
+}
+
+/// The one fix `unknown-key` offers when there's a typo suggestion
+/// (`rename-key`) gets its own translated `label`, distinct from
+/// `message` — and it interpolates the fix's own literal suggestion, not a
+/// translated word, since `to` is a JSON key name.
+#[tokio::test]
+async fn view_definitions_lint_fix_label_is_translated_and_carries_the_suggestion() {
+    let doc = serde_json::json!({
+        "resourceType": "ViewDefinition",
+        "status": "active",
+        "resource": "Patient",
+        "select": [{ "columns": [{ "name": "id", "path": "getResourceKey()" }] }]
+    });
+    let response = app()
+        .oneshot(
+            Request::post("/ui/sql/view-definitions/lint?lang=es")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(doc.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = serde_json::from_str(&body_text(response).await).unwrap();
+    let diagnostics = body["diagnostics"].as_array().expect("diagnostics array");
+    let unknown_key = diagnostics
+        .iter()
+        .find(|d| d["code"] == "unknown-key")
+        .expect("an unknown-key diagnostic for columns");
+    let fixes = unknown_key["fixes"].as_array().expect("fixes array");
+    let rename = fixes
+        .iter()
+        .find(|f| f["kind"] == "rename-key")
+        .expect("a rename-key fix");
+    assert_eq!(rename["to"], "column");
+    let label = rename["label"].as_str().expect("a translated label");
+    assert!(label.contains("column"), "{label}");
+    assert_eq!(label, r#"Renombrar a "column""#);
+}
+
+/// `duplicate-column-name`'s own `set-string` fix — not exercised by any
+/// other translation test in this file, which only covers `unknown-key`'s
+/// `rename-key`/`remove-key` — gets a translated `label` too, distinct from
+/// `message`, and both interpolate the diagnostic's own column name.
+#[tokio::test]
+async fn view_definitions_lint_translates_a_duplicate_column_name_diagnostic_and_its_set_string_fix()
+ {
+    let doc = serde_json::json!({
+        "resourceType": "ViewDefinition",
+        "status": "active",
+        "resource": "Patient",
+        "select": [{ "column": [
+            { "name": "id", "path": "getResourceKey()" },
+            { "name": "id", "path": "name.family" }
+        ] }]
+    });
+    let response = app()
+        .oneshot(
+            Request::post("/ui/sql/view-definitions/lint")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(doc.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = serde_json::from_str(&body_text(response).await).unwrap();
+    let diagnostics = body["diagnostics"].as_array().expect("diagnostics array");
+    let duplicate = diagnostics
+        .iter()
+        .find(|d| d["code"] == "duplicate-column-name")
+        .expect("a duplicate-column-name diagnostic for the second \"id\"");
+    assert_eq!(duplicate["pointer"], "/select/0/column/1/name");
+    assert_eq!(duplicate["message"], r#"Duplicate column name "id""#);
+    let fixes = duplicate["fixes"].as_array().expect("fixes array");
+    assert_eq!(fixes.len(), 1);
+    assert_eq!(fixes[0]["kind"], "set-string");
+    assert_eq!(fixes[0]["value"], "id_2");
+    assert_eq!(fixes[0]["label"], r#"Set to "id_2""#);
+}
+
+/// `undeclared-constant`'s message and `span` — the diagnostic
+/// `vd-editor-lint.spec.ts` relies on to underline exactly the `%name`
+/// token, not the whole expression.
+#[tokio::test]
+async fn view_definitions_lint_translates_an_undeclared_constant_diagnostic() {
+    let doc = serde_json::json!({
+        "resourceType": "ViewDefinition",
+        "status": "active",
+        "resource": "Patient",
+        "select": [{ "column": [{ "name": "computed", "path": "%bogus + 1" }] }]
+    });
+    let response = app()
+        .oneshot(
+            Request::post("/ui/sql/view-definitions/lint?lang=es")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(doc.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = serde_json::from_str(&body_text(response).await).unwrap();
+    let diagnostics = body["diagnostics"].as_array().expect("diagnostics array");
+    let undeclared = diagnostics
+        .iter()
+        .find(|d| d["code"] == "undeclared-constant")
+        .expect("an undeclared-constant diagnostic for %bogus");
+    assert_eq!(undeclared["pointer"], "/select/0/column/0/path");
+    assert_eq!(undeclared["message"], r#"Constante no declarada "%bogus""#);
+    assert_eq!(
+        undeclared["span"],
+        serde_json::json!({ "start": 0, "end": 6 })
+    );
+    assert_eq!(undeclared["fixes"], serde_json::json!([]));
 }
 
 #[tokio::test]
@@ -4383,6 +4742,338 @@ async fn view_definitions_lint_rejects_a_non_json_body() {
     let body: serde_json::Value = serde_json::from_str(&body_text(response).await).unwrap();
     let error = body["error"].as_str().expect("error message");
     assert!(error.starts_with("invalid JSON: "), "{error}");
+}
+
+// ---------------------------------------------------------------------------
+// POST /ui/sql/view-definitions/complete (#821)
+// ---------------------------------------------------------------------------
+
+async fn complete(body: Value) -> (StatusCode, Value) {
+    let response = app()
+        .oneshot(
+            Request::post("/ui/sql/view-definitions/complete")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let body: Value = serde_json::from_str(&body_text(response).await).unwrap();
+    (status, body)
+}
+
+fn item_labels<'a>(body: &'a Value, kind: &str) -> Vec<&'a str> {
+    body["items"]
+        .as_array()
+        .expect("items array")
+        .iter()
+        .filter(|item| item["kind"] == kind)
+        .map(|item| item["label"].as_str().expect("label"))
+        .collect()
+}
+
+/// A minimal, `/lint`-clean ViewDefinition on `Patient` — the base document
+/// most `fhirpath`-kind tests below start from.
+fn patient_view_definition() -> Value {
+    serde_json::json!({
+        "resourceType": "ViewDefinition",
+        "status": "active",
+        "resource": "Patient",
+        "select": [{ "column": [{ "name": "id", "path": "getResourceKey()" }] }]
+    })
+}
+
+/// `present` excludes keys already on the node, and `key` items carry
+/// `detail`/`required` from the key model — `path` is required on a column,
+/// `name` is not (both offered) unless already present.
+#[tokio::test]
+async fn view_definitions_complete_key_excludes_present_and_reports_required() {
+    let (status, body) = complete(serde_json::json!({
+        "kind": "key",
+        "pointer": "/select/0/column/1",
+        "present": ["name"]
+    }))
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["from"], 0);
+    let items = body["items"].as_array().expect("items array");
+    assert!(
+        !items.iter().any(|i| i["label"] == "name"),
+        "present key excluded: {items:?}"
+    );
+    let path = items
+        .iter()
+        .find(|i| i["label"] == "path")
+        .expect("path key offered");
+    assert_eq!(path["kind"], "key");
+    assert_eq!(path["detail"], "string");
+    assert_eq!(path["required"], true);
+}
+
+/// The document root offers `resource`, `select`, and friends.
+#[tokio::test]
+async fn view_definitions_complete_key_at_root() {
+    let (status, body) = complete(serde_json::json!({ "kind": "key", "pointer": "" })).await;
+    assert_eq!(status, StatusCode::OK);
+    let labels = item_labels(&body, "key");
+    assert!(labels.contains(&"resource"), "{labels:?}");
+    assert!(labels.contains(&"select"), "{labels:?}");
+}
+
+/// A pointer the key model does not recognize answers with no candidates,
+/// not an error.
+#[tokio::test]
+async fn view_definitions_complete_key_at_an_unmodeled_pointer_is_empty() {
+    let (status, body) = complete(serde_json::json!({
+        "kind": "key",
+        "pointer": "/select/0/column/0/path"
+    }))
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["items"], serde_json::json!([]));
+}
+
+/// Right after a `.`, offers the resolved type's children plus every
+/// function — `Patient.name.` resolves `name` to `HumanName` off the root
+/// type (`Patient`, the first segment, is recognized and skipped).
+#[tokio::test]
+async fn view_definitions_complete_fhirpath_after_dot_offers_children_and_functions() {
+    let expression = "Patient.name.";
+    let (status, body) = complete(serde_json::json!({
+        "kind": "fhirpath",
+        "pointer": "/select/0/column/0/path",
+        "document": patient_view_definition(),
+        "expression": expression,
+        "cursor": expression.chars().count()
+    }))
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["from"], 13);
+    let elements = item_labels(&body, "element");
+    assert!(elements.contains(&"given"), "{elements:?}");
+    assert!(elements.contains(&"family"), "{elements:?}");
+    assert!(
+        item_labels(&body, "function").contains(&"where"),
+        "functions always ride along in member mode"
+    );
+}
+
+/// A function call chained mid-expression (`where(...)`, in the
+/// type-preserving list) doesn't disturb the resolved type — completion
+/// after it still resolves against `HumanName`.
+#[tokio::test]
+async fn view_definitions_complete_fhirpath_resolves_through_a_type_preserving_function() {
+    let expression = "name.where(use = 'official').giv";
+    let (status, body) = complete(serde_json::json!({
+        "kind": "fhirpath",
+        "pointer": "/select/0/column/0/path",
+        "document": patient_view_definition(),
+        "expression": expression,
+        "cursor": expression.chars().count()
+    }))
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["from"],
+        expression.chars().count() - 3,
+        "start of \"giv\""
+    );
+    let elements = item_labels(&body, "element");
+    assert!(elements.contains(&"given"), "{elements:?}");
+}
+
+/// A `select`'s own `forEach` narrows `%context` for everything under it —
+/// root-mode completion (no dot before the cursor) against a `forEach:
+/// "name"` select resolves straight to `HumanName`'s children.
+#[tokio::test]
+async fn view_definitions_complete_fhirpath_root_mode_uses_the_ancestor_foreach_context() {
+    let mut document = patient_view_definition();
+    document["select"][0]["forEach"] = serde_json::json!("name");
+    let (status, body) = complete(serde_json::json!({
+        "kind": "fhirpath",
+        "pointer": "/select/0/column/0/path",
+        "document": document,
+        "expression": "giv",
+        "cursor": 3
+    }))
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["from"], 0);
+    assert!(item_labels(&body, "element").contains(&"given"), "{body:?}");
+}
+
+/// `where[].path` is not nested under any `select`, so it always resolves
+/// against the root type regardless of ancestor `select`s.
+#[tokio::test]
+async fn view_definitions_complete_fhirpath_where_path_uses_root_context() {
+    let mut document = patient_view_definition();
+    document["where"] = serde_json::json!([{ "path": "x" }]);
+    let (status, body) = complete(serde_json::json!({
+        "kind": "fhirpath",
+        "pointer": "/where/0/path",
+        "document": document,
+        "expression": "act",
+        "cursor": 3
+    }))
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        item_labels(&body, "element").contains(&"active"),
+        "{body:?}"
+    );
+}
+
+/// `%` alone puts the cursor in constant mode — declared `constant[]`
+/// entries and the FHIRPath environment variables, nothing else, and `from`
+/// points at the `%` itself.
+#[tokio::test]
+async fn view_definitions_complete_fhirpath_percent_offers_constants_and_variables() {
+    let mut document = patient_view_definition();
+    document["constant"] = serde_json::json!([{ "name": "official", "valueString": "official" }]);
+    let (status, body) = complete(serde_json::json!({
+        "kind": "fhirpath",
+        "pointer": "/select/0/column/0/path",
+        "document": document,
+        "expression": "%",
+        "cursor": 1
+    }))
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["from"], 0);
+    let constants = item_labels(&body, "constant");
+    assert!(constants.contains(&"%official"), "{constants:?}");
+    let official = body["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["label"] == "%official")
+        .unwrap();
+    assert_eq!(official["detail"], "string");
+    let variables = item_labels(&body, "variable");
+    assert!(variables.contains(&"%resource"), "{variables:?}");
+    assert!(
+        item_labels(&body, "element").is_empty(),
+        "constant mode offers no elements"
+    );
+}
+
+/// `resolve()` is not in the type-preserving list, so a chain through it
+/// resolves to an unknown type — `element` is empty, but `function`
+/// candidates are still offered.
+#[tokio::test]
+async fn view_definitions_complete_fhirpath_unknown_type_still_offers_functions() {
+    let expression = "id.resolve().";
+    let (status, body) = complete(serde_json::json!({
+        "kind": "fhirpath",
+        "pointer": "/select/0/column/0/path",
+        "document": patient_view_definition(),
+        "expression": expression,
+        "cursor": expression.chars().count()
+    }))
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(item_labels(&body, "element").is_empty(), "{body:?}");
+    assert!(!item_labels(&body, "function").is_empty());
+}
+
+/// A cursor inside an unterminated `'...'` string literal never completes
+/// anything.
+#[tokio::test]
+async fn view_definitions_complete_fhirpath_inside_a_string_literal_is_empty() {
+    let expression = "name.where(use = 'offic";
+    let (status, body) = complete(serde_json::json!({
+        "kind": "fhirpath",
+        "pointer": "/select/0/column/0/path",
+        "document": patient_view_definition(),
+        "expression": expression,
+        "cursor": expression.chars().count()
+    }))
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["items"], serde_json::json!([]));
+}
+
+/// A `resource` the registry cannot resolve degrades to an unknown root
+/// type — no `element` candidates, never an error.
+#[tokio::test]
+async fn view_definitions_complete_fhirpath_unresolvable_resource_offers_no_elements() {
+    let mut document = patient_view_definition();
+    document["resource"] = serde_json::json!("Nope");
+    let (status, body) = complete(serde_json::json!({
+        "kind": "fhirpath",
+        "pointer": "/select/0/column/0/path",
+        "document": document,
+        "expression": "act",
+        "cursor": 3
+    }))
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(item_labels(&body, "element").is_empty(), "{body:?}");
+}
+
+/// A bare choice-group segment (`value[x]`, with nothing narrowing it)
+/// resolves to an unknown type.
+#[tokio::test]
+async fn view_definitions_complete_fhirpath_bare_choice_element_is_unknown() {
+    let mut document = patient_view_definition();
+    document["resource"] = serde_json::json!("Observation");
+    let expression = "Observation.value.";
+    let (status, body) = complete(serde_json::json!({
+        "kind": "fhirpath",
+        "pointer": "/select/0/column/0/path",
+        "document": document,
+        "expression": expression,
+        "cursor": expression.chars().count()
+    }))
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(item_labels(&body, "element").is_empty(), "{body:?}");
+}
+
+/// `ofType(T)` narrows a choice group to `T` regardless of the ambiguity
+/// `value` alone would carry.
+#[tokio::test]
+async fn view_definitions_complete_fhirpath_of_type_narrows_a_choice_element() {
+    let mut document = patient_view_definition();
+    document["resource"] = serde_json::json!("Observation");
+    let expression = "Observation.value.ofType(Quantity).";
+    let (status, body) = complete(serde_json::json!({
+        "kind": "fhirpath",
+        "pointer": "/select/0/column/0/path",
+        "document": document,
+        "expression": expression,
+        "cursor": expression.chars().count()
+    }))
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let elements = item_labels(&body, "element");
+    assert!(elements.contains(&"value"), "{elements:?}");
+    assert!(elements.contains(&"unit"), "{elements:?}");
+    assert!(elements.contains(&"system"), "{elements:?}");
+}
+
+#[tokio::test]
+async fn view_definitions_complete_rejects_an_unknown_kind() {
+    let (status, body) = complete(serde_json::json!({ "kind": "bogus", "pointer": "/" })).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body["error"].as_str().is_some(), "{body:?}");
+}
+
+#[tokio::test]
+async fn view_definitions_complete_rejects_a_non_json_body() {
+    let response = app()
+        .oneshot(
+            Request::post("/ui/sql/view-definitions/complete")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from("not json"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: Value = serde_json::from_str(&body_text(response).await).unwrap();
+    assert!(body["error"].as_str().is_some());
 }
 
 /// #649: Save is a plain form post — a valid document redirects to the stored
