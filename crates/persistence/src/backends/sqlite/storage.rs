@@ -2703,6 +2703,12 @@ impl DifferentialHistoryProvider for SqliteBackend {
 
 // Helper function to parse simple search parameters
 // Supports basic formats like: identifier=X, _id=Y, name=Z
+/// Why conditional criteria cannot be resolved inside a transaction when
+/// search is offloaded to a secondary backend (#511, #859).
+const OFFLOADED_CONDITIONAL_REFUSAL: &str = "conditional criteria cannot be resolved inside a \
+     transaction when search is offloaded to a secondary backend; submit the entry in a batch \
+     Bundle instead";
+
 fn parse_simple_search_params(params: &str) -> Vec<(String, String)> {
     params
         .split('&')
@@ -2899,19 +2905,23 @@ impl SqliteBackend {
     /// the match set includes what earlier entries of the same bundle wrote
     /// (#511). The pooled-connection twin above cannot see those rows under
     /// `BEGIN IMMEDIATE`.
-    fn find_matching_resources_in_tx(
+    ///
+    /// The string form `ifNoneExist` carries is parsed here and handed to the
+    /// typed [`ConditionalTransaction::find_matching`], so both criteria
+    /// forms run one search body (#859).
+    async fn find_matching_resources_in_tx(
         &self,
         tenant: &TenantContext,
-        tx: &crate::backends::sqlite::transaction::SqliteTransaction,
+        tx: &mut crate::backends::sqlite::transaction::SqliteTransaction,
         resource_type: &str,
         search_params_str: &str,
     ) -> StorageResult<Vec<StoredResource>> {
+        use crate::core::ConditionalTransaction;
+
         let Some(query) = self.conditional_query(tenant, resource_type, search_params_str)? else {
             return Ok(Vec::new());
         };
-
-        tx.with_connection(|conn| self.search_with_connection(conn, tenant, &query, None))
-            .map(|result| result.resources.items)
+        tx.find_matching(resource_type, &query.parameters).await
     }
 
     /// Builds the search a conditional interaction's criteria describe, or
@@ -3201,6 +3211,14 @@ impl BundleProvider for SqliteBackend {
         true
     }
 
+    /// With search offloaded to a secondary backend the local index is empty
+    /// for every row, so an in-transaction search would always find nothing
+    /// and every conditional write would create the duplicate its criteria
+    /// exist to prevent.
+    fn supports_conditional_in_transaction(&self) -> bool {
+        !self.is_search_offloaded()
+    }
+
     async fn process_transaction(
         &self,
         tenant: &TenantContext,
@@ -3225,6 +3243,34 @@ impl BundleProvider for SqliteBackend {
         // This maps urn:uuid:xxx to ResourceType/assigned-id after creates
         let mut reference_map: HashMap<String, String> = HashMap::new();
 
+        // URL-borne conditional entries (`PUT/DELETE [type]?[criteria]`)
+        // resolve against the transaction's starting view before any entry is
+        // written, and an overlap between resolved identities and the other
+        // entries fails the bundle (R4 §3.1.0.11.2; #859). A match with a
+        // `fullUrl` is known now, so `urn:uuid` references to it resolve
+        // regardless of entry order.
+        let targets = match crate::core::resolve_conditional_targets(
+            &mut tx,
+            &entries,
+            (!self.supports_conditional_in_transaction()).then_some(OFFLOADED_CONDITIONAL_REFUSAL),
+        )
+        .await
+        {
+            Ok(targets) => targets,
+            Err(e) => {
+                let _ = Box::new(tx).rollback().await;
+                return Err(e);
+            }
+        };
+        for target in targets.values() {
+            if let (Some(full_url), Some(identity)) = (
+                entries[target.entry_index].full_url.as_ref(),
+                target.identity(),
+            ) {
+                reference_map.insert(full_url.clone(), identity);
+            }
+        }
+
         // Whether any entry in this transaction writes a SearchParameter that
         // affects this tenant's cached overlay (#787: transaction-bundle writes
         // never invalidated the registry, so a SearchParameter POSTed inside a
@@ -3244,7 +3290,9 @@ impl BundleProvider for SqliteBackend {
                 resolve_bundle_references(resource, &reference_map);
             }
 
-            let result = self.process_bundle_entry_tx(tenant, &mut tx, entry).await;
+            let result = self
+                .process_bundle_entry_tx(tenant, &mut tx, entry, targets.get(&idx))
+                .await;
 
             match result {
                 Ok(entry_result) => {
@@ -3280,17 +3328,22 @@ impl BundleProvider for SqliteBackend {
                                     }) == Some("SearchParameter")
                                 }
                                 // Deleted: the emptied result carries no resource, so
-                                // parse the type from the entry's URL instead.
-                                204 => self
-                                    .parse_url(&entry.url)
-                                    .map(|(resource_type, _)| resource_type == "SearchParameter")
+                                // take the type from the entry's URL instead.
+                                204 => crate::core::conditional_resource_type(entry)
+                                    .map(|resource_type| resource_type == "SearchParameter")
+                                    .or_else(|| {
+                                        self.parse_url(&entry.url).ok().map(|(resource_type, _)| {
+                                            resource_type == "SearchParameter"
+                                        })
+                                    })
                                     .unwrap_or(false),
                                 _ => false,
                             };
                     }
 
-                    // If this was a create (POST) and we have a fullUrl, record the mapping
-                    if entry.method == BundleMethod::Post {
+                    // A create (POST, or a conditional PUT that created) with a
+                    // fullUrl records the assigned identity for later references.
+                    if matches!(entry.method, BundleMethod::Post | BundleMethod::Put) {
                         if let Some(ref full_url) = entry.full_url {
                             if let Some(ref location) = entry_result.location {
                                 // location is in format "ResourceType/id/_history/version"
@@ -3345,11 +3398,16 @@ impl BundleProvider for SqliteBackend {
 
 impl SqliteBackend {
     /// Process a single bundle entry within a transaction.
+    ///
+    /// `target` is the pre-pass resolution of a URL-borne conditional entry
+    /// (#859): its `PUT` updates the match or creates, its `DELETE` deletes
+    /// the match or is a no-op `204`, without re-resolving the criteria.
     async fn process_bundle_entry_tx(
         &self,
         tenant: &TenantContext,
         tx: &mut crate::backends::sqlite::transaction::SqliteTransaction,
         entry: &BundleEntry,
+        target: Option<&crate::core::ConditionalTarget>,
     ) -> StorageResult<BundleEntryResult> {
         use crate::core::transaction::Transaction;
 
@@ -3396,13 +3454,12 @@ impl SqliteBackend {
                     // Refuse the entry instead; the bundle rolls back (#511).
                     if self.is_search_offloaded() {
                         return Ok(crate::core::not_supported_entry(
-                            "ifNoneExist cannot be resolved inside a transaction when search \
-                             is offloaded to a secondary backend; submit the entry in a batch \
-                             Bundle instead",
+                            OFFLOADED_CONDITIONAL_REFUSAL,
                         ));
                     }
-                    let matches =
-                        self.find_matching_resources_in_tx(tenant, tx, &resource_type, criteria)?;
+                    let matches = self
+                        .find_matching_resources_in_tx(tenant, tx, &resource_type, criteria)
+                        .await?;
                     if let Some(gated) = crate::core::bundle_if_none_exist_gate(matches) {
                         return Ok(gated);
                     }
@@ -3418,6 +3475,17 @@ impl SqliteBackend {
                         field: "resource".to_string(),
                     })
                 })?;
+
+                if let Some(target) = target {
+                    return Ok(match &target.resolved {
+                        Some(existing) => crate::core::conditional_update_entry(
+                            tx.update(existing, resource).await?,
+                        ),
+                        None => BundleEntryResult::created(
+                            tx.create(&target.resource_type, resource).await?,
+                        ),
+                    });
+                }
 
                 let (resource_type, id) = self.parse_url(&entry.url)?;
 
@@ -3452,6 +3520,16 @@ impl SqliteBackend {
                 }
             }
             BundleMethod::Delete => {
+                if let Some(target) = target {
+                    return Ok(match &target.resolved {
+                        Some(existing) => {
+                            tx.delete(&target.resource_type, existing.id()).await?;
+                            crate::core::conditional_delete_entry(existing)
+                        }
+                        None => BundleEntryResult::deleted(),
+                    });
+                }
+
                 let (resource_type, id) = self.parse_url(&entry.url)?;
 
                 // Honor `ifMatch` on DELETE — it was previously ignored here, so
@@ -6347,6 +6425,7 @@ mod tests {
             if_none_match: None,
             if_none_exist: None,
             full_url: None,
+            criteria: None,
         };
 
         let tx_result = backend
@@ -6395,6 +6474,7 @@ mod tests {
                 if_none_match: None,
                 if_none_exist: None,
                 full_url: None,
+                criteria: None,
             },
             // This should fail (duplicate ID)
             BundleEntry {
@@ -6405,6 +6485,7 @@ mod tests {
                 if_none_match: None,
                 if_none_exist: None,
                 full_url: None,
+                criteria: None,
             },
         ];
 
@@ -6436,6 +6517,7 @@ mod tests {
                 if_none_match: None,
                 if_none_exist: None,
                 full_url: None,
+                criteria: None,
             },
             BundleEntry {
                 method: BundleMethod::Post,
@@ -6445,6 +6527,7 @@ mod tests {
                 if_none_match: None,
                 if_none_exist: None,
                 full_url: None,
+                criteria: None,
             },
         ];
 

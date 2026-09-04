@@ -571,11 +571,38 @@ Conditional interactions expressed in the entry URL (`PUT [type]?[criteria]`,
   compare-and-swap. `ifMatch` on a conditional entry is `400`: it names a
   version of an instance the server has yet to resolve. Criteria on a `POST` are
   `400`; a conditional create is expressed through `ifNoneExist`.
-- In a `transaction`, any non-`GET` entry whose URL carries a query string still
-  declines the whole bundle with `400 not-supported` before anything executes.
-  Resolving URL criteria inside a transaction's atomic scope needs a search
-  surface on the `Transaction` trait and the R4 §3.1.0.11.2 overlapping-identity
-  pre-pass, and is tracked by #859.
+- In a `transaction`, they are **resolved inside the open transaction** (#859).
+  The criteria are percent-decoded and parsed with the search parser against the
+  tenant's search-parameter registry before anything executes, so a modifier the
+  parameter's type does not define, an unknown parameter, or a result-shaping `_`
+  parameter (`_count`, `_sort`, `_include`, `_has`, …) is a `400` for the whole
+  bundle rather than a silent "matches nothing". The typed criteria reach the
+  backend on `BundleEntry.criteria` and are resolved through the
+  `ConditionalTransaction` trait, the search surface design discussion #28
+  proposed. Every conditional entry is resolved against the transaction's
+  starting view **before any entry is written**, per the R4 transaction
+  processing rules, and the outcome is pinned: `PUT` updates the match (`200`,
+  `location` = the updated version) or creates (`201`); `DELETE` deletes the match
+  (`204`, `location` = the deleted version, so the AuditEvent and a composite's
+  secondaries can name it) or is a no-op `204`. Several matches fail the whole
+  bundle with `412 multiple-matches`. Per R4 §3.1.0.11.2, a resolved identity that
+  another entry also addresses — an instance-addressed `PUT`/`DELETE`, or another
+  conditional entry resolving to the same resource — fails the bundle with `400`
+  naming both entries. Because resolution precedes execution, a conditional entry
+  does not see a sibling `POST`'s write (unlike `ifNoneExist`, which resolves in
+  entry order); a conditional `PUT` that matched can be referenced by `urn:uuid`
+  from any entry, whatever its position. `ifMatch` on a conditional entry and
+  criteria on a `POST` are `400`, as in a batch. A control parameter on an
+  instance URL (`PUT Patient/123?_format=json`) is dropped; the entry addresses
+  the instance either way.
+- A backend answers `BundleProvider::supports_conditional_in_transaction`. When it
+  is `false` — search offloaded to a secondary (composite SQLite/PostgreSQL +
+  Elasticsearch), whose local index is empty — a transaction carrying URL criteria
+  or `ifNoneExist` is declined intact with `501` before anything executes, rather
+  than failing at the entry. MongoDB's session-scoped matcher evaluates criteria in
+  application memory and understands plain `name=value` only: a criterion with a
+  modifier, chain, comparison prefix, or comma OR-list fails the bundle with the
+  same `501` text (#709 owns an index-backed matcher).
 
 Note that `/metadata` advertises `conditionalCreate`, `conditionalUpdate` and
 `conditionalDelete` for every resource type regardless of backend; gating it per
@@ -584,7 +611,6 @@ backend is #514.
 ### Current Limitations
 
 The following FHIR transaction features are not yet implemented:
-- **Conditional URL criteria in transactions** - `[type]?[criteria]` entries are declined whole in a `transaction` (resolved in a `batch`; #859)
 - **Conditional reference resolution** - References like `Patient?identifier=12345` are not resolved
 - **PATCH method** - PATCH operations in bundles return 501 Not Implemented, in both `batch` (per entry) and `transaction` (whole bundle). Send the patch to the instance endpoint instead
 - **HEAD entries** - refused with 405. `HEAD` is a legal `http-verb` code and is served on the instance-read route, but not inside a Bundle

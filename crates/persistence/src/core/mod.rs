@@ -97,6 +97,7 @@ pub mod bulk_provider;
 pub mod bulk_submit;
 pub mod bulk_submit_input;
 pub mod bulk_submit_worker;
+pub mod bundle_conditionals;
 pub mod capabilities;
 pub mod history;
 pub mod preconditions;
@@ -138,6 +139,11 @@ pub use bulk_submit_worker::{
     ManifestLease, ManifestWorkerView, PollTokenTarget, SubmitClaimStrategy, SubmitFileRecord,
     SubmitFileRow, SubmitWorkerStorage,
 };
+pub use bundle_conditionals::{
+    CONDITIONAL_MATCH_LIMIT, ConditionalTarget, check_identity_overlap, conditional_delete_entry,
+    conditional_query, conditional_resource_type, conditional_target, conditional_update_entry,
+    resolve_conditional_targets, unsupported_conditional_entry,
+};
 pub use capabilities::{
     CapabilityProvider, GlobalSearchCapabilities, Interaction, ResourceCapabilities,
     ResourceSearchCapabilities, SearchCapabilityProvider, SearchParamCapability,
@@ -165,7 +171,8 @@ pub use storage::{
 };
 pub use transaction::{
     BundleEntry, BundleEntryResult, BundleMethod, BundleProvider, BundleResult, BundleType,
-    IsolationLevel, LockingStrategy, Transaction, TransactionOptions, TransactionProvider,
+    ConditionalTransaction, IsolationLevel, LockingStrategy, Transaction, TransactionOptions,
+    TransactionProvider,
 };
 pub use user_settings::{
     BY_TENANT_KEY, GLOBAL_SETTINGS_KEYS, SettingsStore, StoredUserSettings, apply_merge_patch,

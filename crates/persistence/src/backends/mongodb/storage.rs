@@ -364,6 +364,50 @@ fn parse_history_row(
     })
 }
 
+/// Flattens typed conditional criteria into the `(name, value)` pairs the
+/// session-scoped matcher evaluates, or names the first criterion whose shape
+/// that matcher cannot evaluate: a modifier, a chain, composite components,
+/// an OR-list, or a comparison prefix.
+///
+/// Refusing is the honest answer — the SQL backends evaluate all of these
+/// through their query builders, and a silent "no match" here would create a
+/// duplicate or delete nothing (#865, #709).
+fn bundle_criteria_pairs(
+    criteria: &[crate::types::SearchParameter],
+) -> Result<Vec<(String, String)>, String> {
+    use crate::types::SearchPrefix;
+
+    criteria
+        .iter()
+        .map(|param| {
+            let plain = param.modifier.is_none()
+                && param.chain.is_empty()
+                && param.components.is_empty()
+                && param.values.len() == 1
+                && param.values[0].prefix == SearchPrefix::Eq;
+            if !plain {
+                // `eq` is the implicit prefix: spelling it out would echo the
+                // criterion back in a form the client never sent.
+                let values = param
+                    .values
+                    .iter()
+                    .map(|v| match v.prefix {
+                        SearchPrefix::Eq => v.value.clone(),
+                        prefix => format!("{prefix}{}", v.value),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let name = match &param.modifier {
+                    Some(modifier) => format!("{}:{modifier}", param.name),
+                    None => param.name.clone(),
+                };
+                return Err(format!("{name}={values}"));
+            }
+            Ok((param.name.clone(), param.values[0].value.clone()))
+        })
+        .collect()
+}
+
 fn parse_simple_bundle_search_params(params: &str) -> Vec<(String, String)> {
     params
         .split('&')
@@ -2542,6 +2586,14 @@ impl BundleProvider for MongoBackend {
         true
     }
 
+    /// The in-transaction matcher scans the resources collection itself
+    /// rather than the search index, so an offloaded index does not blind
+    /// it. Criteria shapes it cannot evaluate refuse the entry instead
+    /// (see `bundle_criteria_pairs`).
+    fn supports_conditional_in_transaction(&self) -> bool {
+        true
+    }
+
     async fn process_transaction(
         &self,
         tenant: &TenantContext,
@@ -2557,9 +2609,34 @@ impl BundleProvider for MongoBackend {
 
         let mut session = begin_required_bundle_transaction_session(&db).await?;
 
+        // URL-borne conditional entries (`PUT/DELETE [type]?[criteria]`)
+        // resolve against the transaction's starting view before any entry is
+        // written, and an overlap between resolved identities and the other
+        // entries fails the bundle (R4 §3.1.0.11.2; #859).
+        let targets = match self
+            .resolve_conditional_targets_in_bundle_transaction(&db, &mut session, tenant, &entries)
+            .await
+        {
+            Ok(targets) => targets,
+            Err(e) => {
+                let _ = session.abort_transaction().await;
+                return Err(e);
+            }
+        };
+
         let mut results = Vec::with_capacity(entries.len());
         let mut error_info: Option<(usize, String)> = None;
+        // A conditional entry that matched is known now, so `urn:uuid`
+        // references to it resolve regardless of entry order.
         let mut reference_map: HashMap<String, String> = HashMap::new();
+        for target in targets.values() {
+            if let (Some(full_url), Some(identity)) = (
+                entries[target.entry_index].full_url.as_ref(),
+                target.identity(),
+            ) {
+                reference_map.insert(full_url.clone(), identity);
+            }
+        }
         let mut pending_search_parameter_changes: Vec<PendingSearchParameterChange> = Vec::new();
         let mut entries = entries;
 
@@ -2576,6 +2653,7 @@ impl BundleProvider for MongoBackend {
                     entry,
                     fhir_version,
                     &mut pending_search_parameter_changes,
+                    targets.get(&idx),
                 )
                 .await;
 
@@ -2589,7 +2667,9 @@ impl BundleProvider for MongoBackend {
                         break;
                     }
 
-                    if entry.method == BundleMethod::Post {
+                    // A create (POST, or a conditional PUT that created) with a
+                    // fullUrl records the assigned identity for later references.
+                    if matches!(entry.method, BundleMethod::Post | BundleMethod::Put) {
                         if let Some(full_url) = entry.full_url.as_ref() {
                             if let Some(location) = entry_result.location.as_ref() {
                                 let reference = location
@@ -2640,6 +2720,75 @@ impl BundleProvider for MongoBackend {
 }
 
 impl MongoBackend {
+    /// Resolves every URL-borne conditional entry inside the session, before
+    /// any write, and enforces the R4 §3.1.0.11.2 overlap rule (#859).
+    ///
+    /// The session-scoped matcher evaluates criteria in application memory
+    /// and understands plain `name=value` only, so a criterion with a
+    /// modifier, chain, prefix or OR-list refuses the entry with the `501`
+    /// the offloaded-search case answers on the other backends; #709 owns
+    /// an index-backed matcher.
+    async fn resolve_conditional_targets_in_bundle_transaction(
+        &self,
+        db: &mongodb::Database,
+        session: &mut ClientSession,
+        tenant: &TenantContext,
+        entries: &[BundleEntry],
+    ) -> Result<HashMap<usize, crate::core::ConditionalTarget>, TransactionError> {
+        let mut targets = Vec::new();
+        for (index, entry) in entries.iter().enumerate() {
+            let Some(criteria) = entry.criteria.as_deref() else {
+                continue;
+            };
+            let resource_type = crate::core::conditional_resource_type(entry)
+                .filter(|t| !t.is_empty())
+                .ok_or_else(|| TransactionError::BundleError {
+                    index,
+                    message: format!("Entry request.url '{}' names no resource type", entry.url),
+                })?
+                .to_string();
+            let pairs = bundle_criteria_pairs(criteria).map_err(|shape| {
+                crate::core::unsupported_conditional_entry(
+                    index,
+                    &format!(
+                        "criteria '{shape}' cannot be evaluated inside a MongoDB transaction; \
+                         submit the entry in a batch Bundle instead"
+                    ),
+                )
+            })?;
+            let matches = self
+                .find_matching_pairs_in_bundle_transaction(
+                    db,
+                    session,
+                    tenant,
+                    &resource_type,
+                    &pairs,
+                )
+                .await
+                .map_err(|e| TransactionError::BundleError {
+                    index,
+                    message: format!("Entry processing failed: {e}"),
+                })?;
+            targets.push(crate::core::conditional_target(
+                index,
+                entry,
+                &resource_type,
+                matches,
+            )?);
+        }
+        crate::core::check_identity_overlap(entries, &targets)?;
+        Ok(targets
+            .into_iter()
+            .map(|target| (target.entry_index, target))
+            .collect())
+    }
+
+    /// Process a single bundle entry within the session's transaction.
+    ///
+    /// `target` is the pre-pass resolution of a URL-borne conditional entry
+    /// (#859): its `PUT` updates the match or creates, its `DELETE` deletes
+    /// the match or is a no-op `204`, without re-resolving the criteria.
+    #[allow(clippy::too_many_arguments)]
     async fn process_bundle_entry_transaction(
         &self,
         db: &mongodb::Database,
@@ -2648,6 +2797,7 @@ impl MongoBackend {
         entry: &BundleEntry,
         fhir_version: helios_fhir::FhirVersion,
         pending_search_parameter_changes: &mut Vec<PendingSearchParameterChange>,
+        target: Option<&crate::core::ConditionalTarget>,
     ) -> StorageResult<BundleEntryResult> {
         match entry.method {
             BundleMethod::Get => {
@@ -2724,6 +2874,34 @@ impl MongoBackend {
                     })
                 })?;
 
+                if let Some(target) = target {
+                    return Ok(match &target.resolved {
+                        Some(existing) => crate::core::conditional_update_entry(
+                            self.update_resource_in_bundle_transaction(
+                                db,
+                                session,
+                                tenant,
+                                existing,
+                                resource,
+                                pending_search_parameter_changes,
+                            )
+                            .await?,
+                        ),
+                        None => BundleEntryResult::created(
+                            self.create_resource_in_bundle_transaction(
+                                db,
+                                session,
+                                tenant,
+                                &target.resource_type,
+                                resource,
+                                fhir_version,
+                                pending_search_parameter_changes,
+                            )
+                            .await?,
+                        ),
+                    });
+                }
+
                 let (resource_type, id) = self.parse_url(&entry.url)?;
 
                 match self
@@ -2782,6 +2960,24 @@ impl MongoBackend {
                 }
             }
             BundleMethod::Delete => {
+                if let Some(target) = target {
+                    return Ok(match &target.resolved {
+                        Some(existing) => {
+                            self.delete_resource_in_bundle_transaction(
+                                db,
+                                session,
+                                tenant,
+                                &target.resource_type,
+                                existing.id(),
+                                pending_search_parameter_changes,
+                            )
+                            .await?;
+                            crate::core::conditional_delete_entry(existing)
+                        }
+                        None => BundleEntryResult::deleted(),
+                    });
+                }
+
                 let (resource_type, id) = self.parse_url(&entry.url)?;
 
                 if let Some(if_match) = entry.if_match.as_ref() {
@@ -3324,6 +3520,27 @@ impl MongoBackend {
         search_params: &str,
     ) -> StorageResult<Vec<StoredResource>> {
         let parsed_params = parse_simple_bundle_search_params(search_params);
+        self.find_matching_pairs_in_bundle_transaction(
+            db,
+            session,
+            tenant,
+            resource_type,
+            &parsed_params,
+        )
+        .await
+    }
+
+    /// The session-scoped matcher both criteria forms end in: `ifNoneExist`'s
+    /// string, parsed above, and a URL-borne conditional entry's typed
+    /// criteria, flattened by `bundle_criteria_pairs` (#859).
+    async fn find_matching_pairs_in_bundle_transaction(
+        &self,
+        db: &mongodb::Database,
+        session: &mut ClientSession,
+        tenant: &TenantContext,
+        resource_type: &str,
+        parsed_params: &[(String, String)],
+    ) -> StorageResult<Vec<StoredResource>> {
         if parsed_params.is_empty() {
             return Ok(Vec::new());
         }
@@ -3358,7 +3575,7 @@ impl MongoBackend {
             })?;
             let resource = document_to_value(payload)?;
 
-            if resource_matches_bundle_search_params(&resource, &parsed_params)
+            if resource_matches_bundle_search_params(&resource, parsed_params)
                 && doc
                     .get_str("resource_type")
                     .map(|rt| rt == resource_type)
@@ -3907,5 +4124,147 @@ fn resolve_bundle_references(value: &mut Value, reference_map: &HashMap<String, 
             }
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{
+        ChainedParameter, CompositeSearchComponent, SearchModifier, SearchParamType,
+        SearchParameter, SearchPrefix, SearchValue,
+    };
+
+    fn plain(name: &str, value: &str) -> SearchParameter {
+        SearchParameter {
+            name: name.to_string(),
+            param_type: SearchParamType::Token,
+            values: vec![SearchValue::eq(value)],
+            ..Default::default()
+        }
+    }
+
+    /// The shapes the session-scoped matcher does understand: one `eq` value
+    /// per criterion, flattened in order.
+    #[test]
+    fn plain_criteria_flatten_to_name_value_pairs() {
+        let pairs = bundle_criteria_pairs(&[
+            plain("identifier", "http://example.org|12345"),
+            plain("family", "Nguyen"),
+        ])
+        .expect("plain criteria are evaluable");
+
+        assert_eq!(
+            pairs,
+            vec![
+                (
+                    "identifier".to_string(),
+                    "http://example.org|12345".to_string()
+                ),
+                ("family".to_string(), "Nguyen".to_string()),
+            ]
+        );
+        assert_eq!(bundle_criteria_pairs(&[]).expect("no criteria"), vec![]);
+    }
+
+    /// A modifier the matcher cannot evaluate names itself in the refusal, so
+    /// the 501 says which criterion the entry has to lose (#709, #865).
+    #[test]
+    fn a_modifier_is_refused_and_named_with_its_modifier() {
+        let mut param = plain("family", "Nguyen");
+        param.modifier = Some(SearchModifier::Exact);
+
+        assert_eq!(
+            bundle_criteria_pairs(&[param]).expect_err("a modifier is not evaluable"),
+            "family:exact=Nguyen"
+        );
+    }
+
+    /// A chain resolves through another resource, which the in-memory matcher
+    /// never loads: refusing beats silently matching nothing.
+    #[test]
+    fn a_chain_is_refused() {
+        let mut param = plain("subject", "Nguyen");
+        param.chain = vec![ChainedParameter {
+            reference_param: "subject".to_string(),
+            target_type: Some("Patient".to_string()),
+            target_param: "family".to_string(),
+        }];
+
+        assert_eq!(
+            bundle_criteria_pairs(&[param]).expect_err("a chain is not evaluable"),
+            "subject=Nguyen"
+        );
+    }
+
+    /// A comparison prefix is kept in the refusal's value, so `gt2020` reads
+    /// back as it was sent rather than as a bare `2020`.
+    #[test]
+    fn a_comparison_prefix_is_refused_and_shown() {
+        let param = SearchParameter {
+            name: "birthdate".to_string(),
+            param_type: SearchParamType::Date,
+            values: vec![SearchValue::new(SearchPrefix::Gt, "2020-01-01")],
+            ..Default::default()
+        };
+
+        assert_eq!(
+            bundle_criteria_pairs(&[param]).expect_err("a prefix is not evaluable"),
+            "birthdate=gt2020-01-01"
+        );
+    }
+
+    /// An OR-list is one criterion with several values; the matcher tests a
+    /// single value, so the whole list is refused, comma-joined as sent.
+    #[test]
+    fn an_or_list_is_refused_whole() {
+        let mut param = plain("identifier", "12345");
+        param.values.push(SearchValue::eq("67890"));
+
+        assert_eq!(
+            bundle_criteria_pairs(&[param]).expect_err("an OR-list is not evaluable"),
+            "identifier=12345,67890"
+        );
+    }
+
+    /// A composite parameter carries components rather than a plain value.
+    #[test]
+    fn a_composite_is_refused() {
+        let mut param = plain("component-code-value-quantity", "loinc|8480-6$lt60");
+        param.components = vec![CompositeSearchComponent {
+            param_type: SearchParamType::Token,
+            param_name: "component-code".to_string(),
+        }];
+
+        assert!(bundle_criteria_pairs(&[param]).is_err());
+    }
+
+    /// The first criterion the matcher cannot evaluate decides the refusal,
+    /// even when a later one could have been flattened.
+    #[test]
+    fn the_first_unevaluable_criterion_refuses_the_entry() {
+        let mut param = plain("family", "Nguyen");
+        param.modifier = Some(SearchModifier::Contains);
+
+        assert_eq!(
+            bundle_criteria_pairs(&[param, plain("identifier", "12345")])
+                .expect_err("one unevaluable criterion refuses the entry"),
+            "family:contains=Nguyen"
+        );
+    }
+
+    /// A criterion with no value at all is not a plain `name=value` either.
+    #[test]
+    fn a_valueless_criterion_is_refused() {
+        let param = SearchParameter {
+            name: "identifier".to_string(),
+            param_type: SearchParamType::Token,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            bundle_criteria_pairs(&[param]).expect_err("no value is not evaluable"),
+            "identifier="
+        );
     }
 }

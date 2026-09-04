@@ -21,6 +21,11 @@ use helios_persistence::core::BackendKind;
 #[path = "transactions/if_match_suite.rs"]
 mod if_match_suite;
 
+/// Backend-agnostic `PUT/DELETE [type]?[criteria]` transaction scenarios
+/// (#859), shared with the SQLite and MongoDB suites.
+#[path = "transactions/conditional_url_suite.rs"]
+mod conditional_url_suite;
+
 /// The backend-agnostic tenant-id fidelity scenarios (issue #447), shared
 /// verbatim with the SQLite and MongoDB suites. Declared at the top level for
 /// the same `#[path]` resolution reason as `if_match_suite` above.
@@ -4614,6 +4619,7 @@ mod postgres_integration {
             if_none_match: None,
             if_none_exist: Some("identifier=http://example.org/mrn|MRN-TX-COND-1".to_string()),
             full_url: Some(full_url.to_string()),
+            criteria: None,
         }
     }
 
@@ -4715,6 +4721,7 @@ mod postgres_integration {
                         if_none_match: None,
                         if_none_exist: None,
                         full_url: Some("urn:uuid:observation".to_string()),
+                        criteria: None,
                     },
                 ],
                 FhirVersion::default(),
@@ -4759,6 +4766,7 @@ mod postgres_integration {
                         if_none_match: None,
                         if_none_exist: None,
                         full_url: None,
+                        criteria: None,
                     },
                     if_none_exist_entry("Ambiguous", "urn:uuid:ambiguous"),
                 ],
@@ -6366,6 +6374,56 @@ mod postgres_integration {
             }
         };
     }
+
+    /// One `#[tokio::test]` per shared #859 scenario, each on its own
+    /// UUID-suffixed tenant so they cannot collide on the shared container.
+    macro_rules! pg_conditional_url_test {
+        ($test_name:ident, $scenario:ident) => {
+            #[tokio::test]
+            async fn $test_name() {
+                let backend = create_backend().await;
+                let tenant = create_tenant(concat!("cond_url_", stringify!($scenario)));
+                super::conditional_url_suite::$scenario(&backend, &tenant).await;
+            }
+        };
+    }
+
+    pg_conditional_url_test!(
+        postgres_integration_conditional_put_updates_the_single_match,
+        conditional_put_updates_the_single_match
+    );
+    pg_conditional_url_test!(
+        postgres_integration_conditional_put_creates_when_nothing_matches,
+        conditional_put_creates_when_nothing_matches
+    );
+    pg_conditional_url_test!(
+        postgres_integration_conditional_put_with_several_matches_rolls_back,
+        conditional_put_with_several_matches_rolls_back
+    );
+    pg_conditional_url_test!(
+        postgres_integration_conditional_delete_removes_the_single_match,
+        conditional_delete_removes_the_single_match
+    );
+    pg_conditional_url_test!(
+        postgres_integration_conditional_delete_with_no_match_is_204,
+        conditional_delete_with_no_match_is_204
+    );
+    pg_conditional_url_test!(
+        postgres_integration_conditional_delete_with_several_matches_rolls_back,
+        conditional_delete_with_several_matches_rolls_back
+    );
+    pg_conditional_url_test!(
+        postgres_integration_overlap_with_an_instance_entry_fails_the_bundle,
+        overlap_with_an_instance_entry_fails_the_bundle
+    );
+    pg_conditional_url_test!(
+        postgres_integration_two_conditional_entries_resolving_to_one_resource_fail,
+        two_conditional_entries_resolving_to_one_resource_fail
+    );
+    pg_conditional_url_test!(
+        postgres_integration_matched_conditional_put_resolves_urn_references,
+        matched_conditional_put_resolves_urn_references
+    );
 
     pg_if_match_test!(
         postgres_integration_multi_valued_if_match_matches_any_member,
