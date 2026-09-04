@@ -169,6 +169,35 @@ struct PreparedExpression {
     /// Computed for every parameter and applied, as before, only to `reference`
     /// ones; computing it eagerly costs one extra union split per cache miss.
     target_types: Option<Vec<String>>,
+    /// `filtered` compiled to direct JSON navigation, when its shape allows it.
+    ///
+    /// ~90% of the R4 spec's expressions are plain element paths
+    /// (`Patient.birthDate`) or a path with one `field='literal'` filter
+    /// (`Patient.telecom.where(system='phone')`) — shapes a raw
+    /// `serde_json::Value` walk answers without the FHIRPath engine or the
+    /// per-resource tree conversion it requires. Evaluating parameters is the
+    /// dominant per-resource indexing cost, so those shapes take this path;
+    /// anything else (`None`) evaluates through the engine unchanged. The
+    /// compiler is deliberately conservative: any construct it does not
+    /// recognize falls back to the engine rather than risking different
+    /// semantics.
+    fast: Option<Vec<FastMember>>,
+}
+
+/// One union member of a search-parameter expression compiled to direct JSON
+/// navigation. Segments are element names below the resource root; arrays fan
+/// out at every step, mirroring FHIRPath collection semantics.
+enum FastMember {
+    /// `Type.a.b` — walk the segments, yield the leaves.
+    Path(Vec<String>),
+    /// `Type.a.where(field='value').b` — walk `pre`, keep the items whose
+    /// `field` equals the literal, then walk `post` from each survivor.
+    WhereEq {
+        pre: Vec<String>,
+        field: String,
+        value: String,
+        post: Vec<String>,
+    },
 }
 
 /// A composite component's sub-expression, rewritten and parsed.
@@ -265,29 +294,15 @@ impl SearchParameterExtractor {
             }
         }
 
-        // One conversion of this resource into the evaluator's own tree, shared
-        // by every parameter below. It used to live inside `evaluate_fhirpath`,
-        // i.e. it was redone from scratch for each of the ~32 (Patient) to ~47
-        // (Observation) active parameters — making the deep copy of the
-        // resource, not the FHIRPath evaluation, the dominant cost of indexing
-        // it. See the `PreparedExpression` note for the arithmetic.
-        //
-        // A conversion failure used to surface once per parameter, get logged
-        // and skipped, and leave `extract` returning an empty vector. It still
-        // returns an empty vector, with one warning instead of N. (In practice
-        // it cannot fail: the only fallible arm is a `serde_json` number that is
-        // neither `i64` nor `f64`, which the parser cannot produce.)
-        let context = match Self::evaluation_context(resource) {
-            Ok(ctx) => ctx,
-            Err(e) => {
-                tracing::warn!(
-                    "Failed to convert {} into an evaluation tree for indexing: {}",
-                    resource_type,
-                    e
-                );
-                return Ok(Vec::new());
-            }
-        };
+        // The conversion of this resource into the evaluator's own tree is
+        // shared by every engine-evaluated parameter below — and built lazily,
+        // on the first parameter that actually needs the engine. Fast-path
+        // parameters (the majority) navigate the raw JSON directly, so a
+        // resource whose applicable parameters all compile to fast members
+        // never pays the conversion at all. The conversion is a full recursive
+        // copy of the resource, historically the single most expensive fixed
+        // cost of indexing (see the `PreparedExpression` note).
+        let mut context = LazyEvaluationContext::new(resource);
 
         // Base instances for composite parameters, memoized per resource by
         // base expression. See `extract_composite`.
@@ -305,7 +320,7 @@ impl SearchParameterExtractor {
             if !self.indexes(&param.code) {
                 continue;
             }
-            match self.extract_for_param_in(resource, &context, &mut composite_bases, param) {
+            match self.extract_for_param_in(resource, &mut context, &mut composite_bases, param) {
                 Ok(values) => results.extend(values),
                 Err(e) => {
                     // Log the error but continue with other parameters
@@ -337,7 +352,8 @@ impl SearchParameterExtractor {
                 if !self.indexes(&param.code) {
                     continue;
                 }
-                match self.extract_for_param_in(resource, &context, &mut composite_bases, param) {
+                match self.extract_for_param_in(resource, &mut context, &mut composite_bases, param)
+                {
                     Ok(values) => results.extend(values),
                     Err(e) => {
                         tracing::warn!(
@@ -395,27 +411,28 @@ impl SearchParameterExtractor {
 
     /// Extracts values for a specific parameter from a resource.
     ///
-    /// Builds a one-off evaluation context for `resource`. Callers indexing a
-    /// whole resource should go through [`Self::extract`], which builds one
-    /// context and reuses it across every parameter.
+    /// Builds at most a one-off evaluation context for `resource`. Callers
+    /// indexing a whole resource should go through [`Self::extract`], which
+    /// shares one lazy context across every parameter.
     pub fn extract_for_param(
         &self,
         resource: &Value,
         param: &SearchParameterDefinition,
     ) -> Result<Vec<ExtractedValue>, ExtractionError> {
-        let context = Self::evaluation_context(resource)?;
+        let mut context = LazyEvaluationContext::new(resource);
         let mut composite_bases = HashMap::new();
-        self.extract_for_param_in(resource, &context, &mut composite_bases, param)
+        self.extract_for_param_in(resource, &mut context, &mut composite_bases, param)
     }
 
-    /// Extracts values for one parameter against an already-built context.
+    /// Extracts values for one parameter.
     ///
-    /// `context` must have `resource` as its `this`; `resource` itself is still
-    /// read for the `resourceType` the expression is filtered against.
+    /// `context` lazily holds the resource converted for the engine; fast-path
+    /// parameters never touch it. `resource` itself is still read for the
+    /// `resourceType` the expression is filtered against.
     fn extract_for_param_in(
         &self,
         resource: &Value,
-        context: &EvaluationContext,
+        context: &mut LazyEvaluationContext<'_>,
         composite_bases: &mut HashMap<String, Vec<EvaluationContext>>,
         param: &SearchParameterDefinition,
     ) -> Result<Vec<ExtractedValue>, ExtractionError> {
@@ -426,7 +443,7 @@ impl SearchParameterExtractor {
         // Composite parameters are indexed component-by-component, with all the
         // components of one composite instance sharing a `composite_group`.
         if matches!(param.param_type, SearchParamType::Composite) {
-            return self.extract_composite(resource, context, composite_bases, param);
+            return self.extract_composite(resource, context.get()?, composite_bases, param);
         }
 
         if param.expression.is_empty() {
@@ -439,19 +456,28 @@ impl SearchParameterExtractor {
             .and_then(|v| v.as_str())
             .unwrap_or("");
 
-        // Choice-type rewriting, union filtering, parsing, and the reference
-        // target restriction are all pure functions of
-        // (`param.expression`, `resource_type`) and are done once per pair.
+        // Choice-type rewriting, union filtering, parsing, the reference
+        // target restriction, and the fast-path compilation are all pure
+        // functions of (`param.expression`, `resource_type`) and are done once
+        // per pair.
         let prepared = self.prepared(&param.expression, resource_type);
         let Some(ast) = prepared.ast.as_ref() else {
             return Ok(Vec::new());
         };
-        let ast = ast.as_ref().map_err(|e| ExtractionError::FhirPathError {
-            expression: prepared.filtered.clone(),
-            message: e.clone(),
-        })?;
 
-        let values = Self::evaluate_prepared(context, ast, &prepared.filtered)?;
+        let values = if let Some(fast) = prepared.fast.as_ref() {
+            let mut values = Vec::new();
+            for member in fast {
+                eval_fast_member(resource, member, &mut values);
+            }
+            values
+        } else {
+            let ast = ast.as_ref().map_err(|e| ExtractionError::FhirPathError {
+                expression: prepared.filtered.clone(),
+                message: e.clone(),
+            })?;
+            Self::evaluate_prepared(context.get()?, ast, &prepared.filtered)?
+        };
 
         let mut results = Vec::new();
         for value in values {
@@ -775,7 +801,35 @@ impl SearchParameterExtractor {
         context.set_this(json_to_evaluation_result(resource)?);
         Ok(context)
     }
+}
 
+/// [`SearchParameterExtractor::evaluation_context`], built on first use.
+///
+/// Fast-path parameters navigate the raw JSON and never need the engine's
+/// tree; building it eagerly would charge every resource the conversion even
+/// when no parameter uses it.
+struct LazyEvaluationContext<'a> {
+    resource: &'a Value,
+    built: Option<EvaluationContext>,
+}
+
+impl<'a> LazyEvaluationContext<'a> {
+    fn new(resource: &'a Value) -> Self {
+        Self {
+            resource,
+            built: None,
+        }
+    }
+
+    fn get(&mut self) -> Result<&EvaluationContext, ExtractionError> {
+        if self.built.is_none() {
+            self.built = Some(SearchParameterExtractor::evaluation_context(self.resource)?);
+        }
+        Ok(self.built.as_ref().expect("just built"))
+    }
+}
+
+impl SearchParameterExtractor {
     /// Evaluates an already-parsed expression against an already-built context.
     ///
     /// The error text is assembled exactly as
@@ -842,11 +896,15 @@ impl SearchParameterExtractor {
         let filtered = self.filter_expression_for_resource(&rewritten, resource_type);
         let ast = (!filtered.is_empty()).then(|| parse_prepared(&filtered));
         let target_types = self.resolve_target_types(&rewritten, resource_type);
+        let fast = (!filtered.is_empty())
+            .then(|| compile_fast_path(&filtered, resource_type))
+            .flatten();
 
         let entry = Arc::new(PreparedExpression {
             filtered,
             ast,
             target_types,
+            fast,
         });
         prepared_cache()
             .write()
@@ -943,6 +1001,145 @@ fn reference_target_type(reference: &str) -> Option<&str> {
 /// A `|` inside `(...)`, `[...]`, `'...'` (with `\'` escapes) or a backtick
 /// delimited identifier therefore stays part of its member. Members are
 /// returned trimmed.
+/// A bare identifier: letters and digits, starting with a letter.
+fn is_ident(s: &str) -> bool {
+    !s.is_empty()
+        && s.starts_with(|c: char| c.is_ascii_alphabetic())
+        && s.chars().all(|c| c.is_ascii_alphanumeric())
+}
+
+/// Splits a plain dotted identifier chain into segments; `None` if any
+/// segment is not a bare identifier (a function call, an index, an operator)
+/// or is a FHIR choice-element base (`effective`, `onset`, `deceased`, …).
+///
+/// Choice bases resolve to typed JSON fields (`effective` →
+/// `effectiveDateTime`) through the engine's per-version metadata table; the
+/// walker reads literal fields only, so those expressions stay on the engine.
+/// The check uses the same default FHIR version the engine's evaluation
+/// context is built with.
+fn ident_chain(s: &str) -> Option<Vec<String>> {
+    let segs: Vec<&str> = s.split('.').collect();
+    segs.iter()
+        .all(|seg| {
+            is_ident(seg)
+                && !helios_fhirpath::is_choice_element_with_context(
+                    seg,
+                    None,
+                    helios_fhir::FhirVersion::default_enabled(),
+                )
+        })
+        .then(|| segs.iter().map(|s| s.to_string()).collect())
+}
+
+/// Compiles a filtered expression to direct-navigation members, or `None`
+/// when any union member has a shape the walker does not cover.
+fn compile_fast_path(filtered: &str, resource_type: &str) -> Option<Vec<FastMember>> {
+    let members = split_union_members(filtered);
+    if members.is_empty() {
+        return None;
+    }
+    members
+        .iter()
+        .map(|m| compile_fast_member(m, resource_type))
+        .collect()
+}
+
+fn compile_fast_member(member: &str, resource_type: &str) -> Option<FastMember> {
+    // The root segment must name this resource type or an abstract base every
+    // resource satisfies; anything else goes to the engine.
+    let strip_root = |segs: Vec<String>| -> Option<Vec<String>> {
+        let first = segs.first()?;
+        (first == resource_type || first == "Resource" || first == "DomainResource")
+            .then(|| segs[1..].to_vec())
+    };
+
+    if let Some(idx) = member.find(".where(") {
+        let pre = strip_root(ident_chain(&member[..idx])?)?;
+        if pre.is_empty() {
+            return None;
+        }
+        let rest = &member[idx + ".where(".len()..];
+        let close = rest.find(')')?;
+        // Only the exact shape `field = 'literal'` (no escapes, no operators).
+        let (field, value) = rest[..close].split_once('=')?;
+        let field = field.trim();
+        if !is_ident(field) {
+            return None;
+        }
+        let value = value.trim().strip_prefix('\'')?.strip_suffix('\'')?;
+        if value.contains('\'') || value.contains('\\') {
+            return None;
+        }
+        let after = &rest[close + 1..];
+        let post = if after.is_empty() {
+            Vec::new()
+        } else {
+            ident_chain(after.strip_prefix('.')?)?
+        };
+        return Some(FastMember::WhereEq {
+            pre,
+            field: field.to_string(),
+            value: value.to_string(),
+            post,
+        });
+    }
+
+    let segs = strip_root(ident_chain(member)?)?;
+    (!segs.is_empty()).then_some(FastMember::Path(segs))
+}
+
+/// Walks a dotted element path over raw JSON with FHIRPath collection
+/// semantics: arrays fan out at every step, missing elements and JSON nulls
+/// contribute nothing, and a trailing array contributes its elements rather
+/// than itself.
+fn collect_path(node: &Value, segs: &[String], out: &mut Vec<Value>) {
+    match segs.split_first() {
+        None => match node {
+            Value::Array(items) => out.extend(items.iter().filter(|v| !v.is_null()).cloned()),
+            Value::Null => {}
+            v => out.push(v.clone()),
+        },
+        Some((first, rest)) => match node {
+            Value::Array(items) => {
+                for item in items {
+                    collect_path(item, segs, out);
+                }
+            }
+            Value::Object(map) => {
+                if let Some(child) = map.get(first.as_str()) {
+                    collect_path(child, rest, out);
+                }
+            }
+            _ => {}
+        },
+    }
+}
+
+/// Evaluates one compiled member against the raw resource JSON.
+fn eval_fast_member(resource: &Value, member: &FastMember, out: &mut Vec<Value>) {
+    match member {
+        FastMember::Path(segs) => collect_path(resource, segs, out),
+        FastMember::WhereEq {
+            pre,
+            field,
+            value,
+            post,
+        } => {
+            let mut candidates = Vec::new();
+            collect_path(resource, pre, &mut candidates);
+            for candidate in candidates {
+                if candidate.get(field.as_str()).and_then(|v| v.as_str()) == Some(value.as_str()) {
+                    if post.is_empty() {
+                        out.push(candidate);
+                    } else {
+                        collect_path(&candidate, post, out);
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn split_union_members(expression: &str) -> Vec<&str> {
     let bytes = expression.as_bytes();
     let mut members = Vec::new();
@@ -1441,6 +1638,146 @@ mod tests {
         }
     }
 
+    /// The fast path must be semantically invisible: for every active R4
+    /// parameter whose expression compiles to fast members, the direct JSON
+    /// walk must produce exactly the values the FHIRPath engine produces —
+    /// same items, same order — on richly-populated resources. A divergence
+    /// here means the index would silently change, which is worse than being
+    /// slow.
+    #[test]
+    fn fast_path_matches_the_engine_for_every_compiled_parameter() {
+        let extractor = create_test_extractor();
+
+        let resources = vec![
+            json!({
+                "resourceType": "Patient",
+                "id": "fp-1",
+                "active": true,
+                "identifier": [
+                    {"system": "http://hospital.org/mrn", "value": "MRN-1"},
+                    {"system": "http://other.org", "value": "X-2"}
+                ],
+                "name": [
+                    {"use": "official", "family": "Smith", "given": ["John", "Q"]},
+                    {"use": "nickname", "family": "Smitty", "given": ["Johnny"]}
+                ],
+                "telecom": [
+                    {"system": "phone", "value": "555-1234", "use": "home"},
+                    {"system": "email", "value": "j@example.org"},
+                    {"system": "phone", "value": "555-9999", "use": "work"}
+                ],
+                "gender": "male",
+                "birthDate": "1990-05-01",
+                "deceasedBoolean": false,
+                "address": [{"city": "Springfield", "state": "IL", "country": "US",
+                             "postalCode": "62701", "use": "home"}],
+                "maritalStatus": {"coding": [{"system": "http://hl7.org/fhir/v3/MaritalStatus", "code": "M"}]},
+                "communication": [{"language": {"coding": [{"code": "en"}]}, "preferred": true}],
+                "generalPractitioner": [{"reference": "Practitioner/gp-1"}],
+                "managingOrganization": {"reference": "Organization/org-1"},
+                "link": [{"other": {"reference": "Patient/other-1"}, "type": "seealso"}]
+            }),
+            json!({
+                "resourceType": "Observation",
+                "id": "fp-2",
+                "status": "final",
+                "category": [{"coding": [{"system": "http://terminology.hl7.org/CodeSystem/observation-category", "code": "vital-signs"}]}],
+                "code": {"coding": [{"system": "http://loinc.org", "code": "8867-4", "display": "Heart rate"}]},
+                "subject": {"reference": "Patient/fp-1"},
+                "encounter": {"reference": "Encounter/e-1"},
+                "effectiveDateTime": "2024-03-01T10:00:00Z",
+                "issued": "2024-03-01T10:05:00Z",
+                "valueQuantity": {"value": 72, "unit": "beats/minute", "system": "http://unitsofmeasure.org", "code": "/min"},
+                "component": [
+                    {"code": {"coding": [{"system": "http://loinc.org", "code": "8480-6"}]},
+                     "valueQuantity": {"value": 120, "unit": "mmHg"}},
+                    {"code": {"coding": [{"system": "http://loinc.org", "code": "8462-4"}]},
+                     "valueQuantity": {"value": 80, "unit": "mmHg"}}
+                ],
+                "performer": [{"reference": "Practitioner/gp-1"}],
+                "derivedFrom": [{"reference": "Observation/prev-1"}]
+            }),
+            json!({
+                "resourceType": "Condition",
+                "id": "fp-3",
+                "clinicalStatus": {"coding": [{"system": "http://terminology.hl7.org/CodeSystem/condition-clinical", "code": "active"}]},
+                "verificationStatus": {"coding": [{"code": "confirmed"}]},
+                "code": {"coding": [{"system": "http://snomed.info/sct", "code": "44054006"}]},
+                "subject": {"reference": "Patient/fp-1"},
+                "encounter": {"reference": "Encounter/e-1"},
+                "onsetDateTime": "2023-06-01",
+                "recordedDate": "2023-06-02",
+                "severity": {"coding": [{"code": "moderate"}]},
+                "bodySite": [{"coding": [{"code": "band"}]}],
+                "evidence": [{"detail": [{"reference": "Observation/fp-2"}]}]
+            }),
+            json!({
+                "resourceType": "Encounter",
+                "id": "fp-4",
+                "status": "finished",
+                "class": {"system": "http://terminology.hl7.org/CodeSystem/v3-ActCode", "code": "AMB"},
+                "type": [{"coding": [{"code": "checkup"}]}],
+                "subject": {"reference": "Patient/fp-1"},
+                "participant": [{"individual": {"reference": "Practitioner/gp-1"}}],
+                "period": {"start": "2024-03-01T09:00:00Z", "end": "2024-03-01T11:00:00Z"},
+                "reasonCode": [{"coding": [{"code": "r1"}]}],
+                "serviceProvider": {"reference": "Organization/org-1"},
+                "location": [{"location": {"reference": "Location/l-1"}}]
+            }),
+        ];
+
+        let mut compiled_total = 0;
+        for resource in &resources {
+            let rt = resource["resourceType"].as_str().unwrap();
+            let params = {
+                let registry = extractor.registry.read();
+                registry.get_active_params(rt)
+            };
+            let context = SearchParameterExtractor::evaluation_context(resource).unwrap();
+
+            for param in &params {
+                if matches!(param.param_type, SearchParamType::Composite)
+                    || param.expression.is_empty()
+                {
+                    continue;
+                }
+                let prepared = extractor.prepared(&param.expression, rt);
+                let Some(fast) = prepared.fast.as_ref() else {
+                    continue;
+                };
+                let Some(Ok(ast)) = prepared.ast.as_ref() else {
+                    continue;
+                };
+
+                let engine =
+                    SearchParameterExtractor::evaluate_prepared(&context, ast, &prepared.filtered)
+                        .unwrap();
+                let mut fast_values = Vec::new();
+                for member in fast {
+                    eval_fast_member(resource, member, &mut fast_values);
+                }
+
+                assert_eq!(
+                    fast_values, engine,
+                    "fast path diverges from the engine for {rt} parameter '{}' \
+                     (expression: {})",
+                    param.code, prepared.filtered
+                );
+                compiled_total += 1;
+            }
+        }
+
+        // The point of the fast path is coverage: a compiler regression that
+        // silently sends everything to the engine must fail loudly. 50 is the
+        // measured coverage across these four types at the time of writing —
+        // choice-element bases (`effective`, `value`, `onset`, …) and anything
+        // the conservative compiler does not recognize stay on the engine.
+        assert!(
+            compiled_total >= 45,
+            "expected most parameters to compile to the fast path, got {compiled_total}"
+        );
+    }
+
     #[test]
     fn index_only_restricts_to_the_allowlist() {
         let patient = json!({
@@ -1611,19 +1948,20 @@ mod tests {
             };
             let json: Value = serde_json::from_slice(&bytes).unwrap();
             let rt = json["resourceType"].as_str().unwrap();
-            let context = SearchParameterExtractor::evaluation_context(&json).unwrap();
             let params = {
                 let reg = extractor.registry.read();
                 reg.get_active_params(rt)
             };
             let mut rows: Vec<(String, f64)> = Vec::new();
             for param in &params {
+                let mut context = LazyEvaluationContext::new(&json);
                 let mut bases = HashMap::new();
-                let _ = extractor.extract_for_param_in(&json, &context, &mut bases, param);
+                let _ = extractor.extract_for_param_in(&json, &mut context, &mut bases, param);
                 let t = Instant::now();
                 for _ in 0..iters {
+                    let mut context = LazyEvaluationContext::new(&json);
                     let mut bases = HashMap::new();
-                    let _ = extractor.extract_for_param_in(&json, &context, &mut bases, param);
+                    let _ = extractor.extract_for_param_in(&json, &mut context, &mut bases, param);
                 }
                 rows.push((
                     param.code.clone(),
