@@ -678,6 +678,46 @@ The server automatically sets appropriate response headers based on the output f
 
 **Note:** The `Transfer-Encoding: chunked` header is automatically managed by the server. Clients don't need to set any special headers to receive chunked responses - they will automatically receive data in chunks if the response is large.
 
+##### Error Responses
+
+An invalid `subjectResource` (whether supplied as a bare `ViewDefinition` body or wrapped in
+a `Parameters` resource) is rejected with `422 Unprocessable Entity` before any rows are
+evaluated. The ViewDefinition is linted structurally — resource shape, unknown/missing keys,
+duplicate column names, at most one of `forEach`/`forEachOrNull`/`repeat`, FHIRPath syntax, and
+undeclared `%constant` references — exactly as received, before any typed parsing. The response
+is an `OperationOutcome` with **one `issue` per lint error**:
+
+```json
+{
+  "resourceType": "OperationOutcome",
+  "issue": [
+    {
+      "severity": "error",
+      "code": "required",
+      "diagnostics": "missing required key `resource`",
+      "details": {
+        "text": "missing required key `resource`",
+        "coding": [{
+          "system": "http://heliossoftware.com/fhir/CodeSystem/view-definition-lint",
+          "code": "missing-required"
+        }]
+      },
+      "expression": ["ViewDefinition"]
+    }
+  ]
+}
+```
+
+`issue.code` follows a fixed mapping from the lint's own diagnostic code: `structure` for a
+malformed document, an unknown key, or a wrong JSON type; `required` for a missing or empty
+required key; `invalid` for everything else (duplicate column names, more than one iteration
+directive, an empty `select`, invalid FHIRPath syntax, or an undeclared constant).
+`issue.expression[0]` locates the offending node as a FHIRPath-style path
+(`ViewDefinition.select[0].column[1].path`). This is the same engine used by the ViewDefinition
+editor's `/ui/sql/view-definitions/lint` endpoint, and by `validate_view_definition` — so
+`sof-cli` and `pysof` report the same underlying messages (as plain text, not this
+`OperationOutcome` shape).
+
 ##### Examples
 
 ```bash

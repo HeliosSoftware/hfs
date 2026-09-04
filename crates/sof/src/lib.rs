@@ -2576,7 +2576,7 @@ pub(crate) fn process_view_definition_generic<VD, B>(
     external: Vec<helios_fhir::FhirResource>,
 ) -> Result<ProcessedResult, SofError>
 where
-    VD: ViewDefinitionTrait,
+    VD: ViewDefinitionTrait + Serialize,
     B: BundleTrait,
     B::Resource: ResourceTrait + Sync,
     VD::Select: Sync,
@@ -2628,49 +2628,65 @@ where
     })
 }
 
-// Generic version-agnostic validation
-fn validate_view_definition<VD: ViewDefinitionTrait>(view_def: &VD) -> Result<(), SofError> {
-    // Basic validation
-    if view_def.resource().is_none_or(|s| s.is_empty()) {
-        return Err(SofError::InvalidViewDefinition(
-            "ViewDefinition must specify a resource type".to_string(),
-        ));
+/// Generic, version-agnostic ViewDefinition validation.
+///
+/// Delegates structural validation to [`lint::lint_view_definition`] (#821)
+/// — the same engine `$sql-run`'s handler runs against the raw request JSON
+/// — so `sof-cli`, `pysof`, and any other caller of this library see
+/// identical rules and messages. This re-lints a document the HTTP handler
+/// may already have linted once; that's expected, not a bug: this function
+/// is reached by every [`PreparedViewDefinition::new`] caller, including
+/// ones that never went through that handler at all, so it has to be able
+/// to catch the same problems on its own.
+fn validate_view_definition<VD: ViewDefinitionTrait + Serialize>(
+    view_def: &VD,
+) -> Result<(), SofError> {
+    let mut json = serde_json::to_value(view_def).map_err(|e| {
+        SofError::InvalidViewDefinition(format!(
+            "failed to serialize ViewDefinition for validation: {e}"
+        ))
+    })?;
+    // The generated FHIR struct carries no `resourceType` field of its own —
+    // it's implied by which enum variant / concrete type the caller is on,
+    // not part of the struct's own JSON shape (see the
+    // `validate_view_definition_lints_a_view_definition_missing_resource_type_in_its_own_serialization`
+    // test) — so a plain serialization never includes it. Add it back
+    // before linting, or `lint_view_definition` reports a spurious
+    // `not-a-view-definition` for every otherwise-valid document.
+    if let Some(object) = json.as_object_mut() {
+        object.insert(
+            "resourceType".to_string(),
+            serde_json::Value::String("ViewDefinition".to_string()),
+        );
     }
 
-    if view_def.select().is_none_or(|s| s.is_empty()) {
-        return Err(SofError::InvalidViewDefinition(
-            "ViewDefinition must have at least one select".to_string(),
-        ));
+    let errors: Vec<String> = lint::lint_view_definition(&json)
+        .into_iter()
+        .filter(|diagnostic| diagnostic.severity == lint::Severity::Error)
+        .map(|diagnostic| {
+            let pointer: &str = if diagnostic.pointer.is_empty() {
+                "/"
+            } else {
+                &diagnostic.pointer
+            };
+            format!("{} at {}", diagnostic.message, pointer)
+        })
+        .collect();
+    if !errors.is_empty() {
+        return Err(SofError::InvalidViewDefinition(errors.join("; ")));
     }
 
-    // Validate where clauses
-    if let Some(where_clauses) = view_def.where_clauses() {
-        validate_where_clauses(where_clauses)?;
-    }
-
-    // Validate selects
+    // Checks that depend on the relationship between selects — how a
+    // `collection` attribute reads against an ancestor's `forEach`/
+    // `forEachOrNull`/`repeat`, and whether `unionAll` branches agree on
+    // column names and order — which the structural lint above deliberately
+    // doesn't model (its own module docs: "structural and syntactic only").
     if let Some(selects) = view_def.select() {
         for select in selects {
             validate_select(select)?;
         }
     }
 
-    Ok(())
-}
-
-// Generic where clause validation
-fn validate_where_clauses<W: ViewDefinitionWhereTrait>(
-    where_clauses: &[W],
-) -> Result<(), SofError> {
-    // Basic validation - just ensure paths are provided
-    // Type checking will be done during actual evaluation
-    for where_clause in where_clauses {
-        if where_clause.path().is_none() {
-            return Err(SofError::InvalidViewDefinition(
-                "Where clause must have a path specified".to_string(),
-            ));
-        }
-    }
     Ok(())
 }
 
@@ -2705,29 +2721,12 @@ fn validate_select_with_context<S: ViewDefinitionSelectTrait>(
 where
     S::Select: ViewDefinitionSelectTrait,
 {
-    // `sql-expressions` invariant (SQL on FHIR 3.0.0-ballot): a select carries at
-    // most one iteration directive.
-    //
-    //   (forEach.exists().toInteger() + forEachOrNull.exists().toInteger()
-    //    + repeat.exists().toInteger()) <= 1
-    //
-    // 2.0.0 stated this as `(forEach | forEachOrNull | repeat).count() <= 1`, but
-    // FHIRPath `|` discards duplicates, so two directives sharing one expression
-    // slipped through. The ballot counts the elements present instead, so any two
-    // are an error whatever their values. Without this check the evaluator below
-    // silently honours whichever directive it tests for first and drops the rest.
-    let directives = [
-        select.for_each().is_some(),
-        select.for_each_or_null().is_some(),
-        select.repeat().is_some(),
-    ];
-    if directives.iter().filter(|present| **present).count() > 1 {
-        return Err(SofError::InvalidViewDefinition(
-            "A select may specify at most one of 'forEach', 'forEachOrNull' and 'repeat' \
-             (sql-expressions invariant)"
-                .to_string(),
-        ));
-    }
+    // The `sql-expressions` invariant that a select carries at most one of
+    // `forEach`/`forEachOrNull`/`repeat` is structural — `lint_view_definition`
+    // already reports every violation of it (#821) — so it is not
+    // re-checked here. What *is* checked below (the `collection` attribute
+    // and unionAll column consistency) depends on how selects relate to
+    // each other, which the lint deliberately doesn't model.
 
     // Determine if we're entering an iteration context at this level. `repeat`
     // counts here alongside forEach/forEachOrNull: it iterates the traversed nodes
@@ -4459,4 +4458,161 @@ pub fn format_parquet_multi_file(
     file_buffers.push(current_buffer);
 
     Ok(file_buffers)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A typed R4 ViewDefinition built from `json`, for exercising
+    /// `validate_view_definition` (#821) the same way a real caller of this
+    /// library — `sof-cli`, `pysof`, or `PreparedViewDefinition::new` itself
+    /// — would end up with one.
+    #[cfg(feature = "R4")]
+    fn view_definition_from_json(json: serde_json::Value) -> helios_fhir::r4::ViewDefinition {
+        serde_json::from_value(json).expect("test fixture must deserialize as a ViewDefinition")
+    }
+
+    /// Unwraps `err` as `SofError::InvalidViewDefinition`'s message, or
+    /// fails the test with what it actually got.
+    #[cfg(feature = "R4")]
+    fn invalid_view_definition_message(err: SofError) -> String {
+        match err {
+            SofError::InvalidViewDefinition(message) => message,
+            other => panic!("expected SofError::InvalidViewDefinition, got {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "R4")]
+    #[test]
+    fn validate_view_definition_reports_missing_resource() {
+        let vd = view_definition_from_json(serde_json::json!({
+            "status": "active",
+            "select": [{ "column": [{ "name": "id", "path": "id" }] }]
+        }));
+        let message = invalid_view_definition_message(
+            validate_view_definition(&vd).expect_err("missing `resource` must fail"),
+        );
+        assert!(
+            message.contains("missing required key `resource`"),
+            "got: {message}"
+        );
+        // The document root's own pointer is empty, which the library-facing
+        // message renders as `/` rather than a blank suffix.
+        assert!(message.ends_with("at /"), "got: {message}");
+    }
+
+    #[cfg(feature = "R4")]
+    #[test]
+    fn validate_view_definition_reports_missing_select() {
+        let vd = view_definition_from_json(serde_json::json!({
+            "status": "active",
+            "resource": "Patient"
+        }));
+        let message = invalid_view_definition_message(
+            validate_view_definition(&vd).expect_err("missing `select` must fail"),
+        );
+        assert!(
+            message.contains("missing required key `select`"),
+            "got: {message}"
+        );
+    }
+
+    #[cfg(feature = "R4")]
+    #[test]
+    fn validate_view_definition_reports_empty_select() {
+        let vd = view_definition_from_json(serde_json::json!({
+            "status": "active",
+            "resource": "Patient",
+            "select": []
+        }));
+        let message = invalid_view_definition_message(
+            validate_view_definition(&vd).expect_err("empty `select` must fail"),
+        );
+        assert!(
+            message.contains("required value must not be empty"),
+            "got: {message}"
+        );
+    }
+
+    #[cfg(feature = "R4")]
+    #[test]
+    fn validate_view_definition_reports_multiple_iteration_directives() {
+        let vd = view_definition_from_json(serde_json::json!({
+            "status": "active",
+            "resource": "Patient",
+            "select": [{
+                "forEach": "name",
+                "repeat": ["telecom"],
+                "column": [{ "name": "id", "path": "id" }]
+            }]
+        }));
+        let message = invalid_view_definition_message(
+            validate_view_definition(&vd).expect_err("forEach + repeat together must fail"),
+        );
+        assert!(message.contains("at most one of"), "got: {message}");
+    }
+
+    /// The one check `validate_view_definition` still runs itself (#821):
+    /// `collection: false` depends on whether an ancestor `forEach` /
+    /// `forEachOrNull` / `repeat` is in scope, which is a relationship
+    /// between selects the structural lint deliberately doesn't model.
+    /// Its message is unchanged by the delegation to the lint above.
+    #[cfg(feature = "R4")]
+    #[test]
+    fn validate_view_definition_reports_collection_false_outside_foreach() {
+        let vd = view_definition_from_json(serde_json::json!({
+            "status": "active",
+            "resource": "Patient",
+            "select": [{
+                "column": [{ "name": "id", "path": "id", "collection": false }]
+            }]
+        }));
+        let message = invalid_view_definition_message(
+            validate_view_definition(&vd).expect_err("collection: false outside forEach must fail"),
+        );
+        assert_eq!(
+            message,
+            "Column 'collection' attribute must be true when specified"
+        );
+    }
+
+    #[cfg(feature = "R4")]
+    #[test]
+    fn validate_view_definition_accepts_a_valid_document() {
+        let vd = view_definition_from_json(serde_json::json!({
+            "status": "active",
+            "resource": "Patient",
+            "select": [{ "column": [{ "name": "id", "path": "id" }] }]
+        }));
+        assert!(validate_view_definition(&vd).is_ok());
+    }
+
+    /// #821: the generated FHIR struct's own `Serialize` impl carries no
+    /// `resourceType` field (it's implied by which concrete type/enum
+    /// variant the caller is on, not part of the struct's own JSON shape).
+    /// `validate_view_definition` must add it back before linting, or every
+    /// otherwise-valid document would be rejected as `not-a-view-definition`.
+    #[cfg(feature = "R4")]
+    #[test]
+    fn validate_view_definition_lints_a_view_definition_missing_resource_type_in_its_own_serialization()
+     {
+        let vd = view_definition_from_json(serde_json::json!({
+            "status": "active",
+            "resource": "Patient",
+            "select": [{ "column": [{ "name": "id", "path": "id" }] }]
+        }));
+
+        let bare_json = serde_json::to_value(&vd).expect("struct must serialize");
+        assert!(
+            bare_json.get("resourceType").is_none(),
+            "test assumption: the struct's own Serialize impl carries no \
+             resourceType, got {bare_json}"
+        );
+
+        assert!(
+            validate_view_definition(&vd).is_ok(),
+            "validate_view_definition must add resourceType back before linting a valid document"
+        );
+    }
 }
