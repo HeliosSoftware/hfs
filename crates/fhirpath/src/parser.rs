@@ -308,7 +308,7 @@ pub enum Invocation {
 // Removed Unit, DateTimePrecision, PluralDateTimePrecision enums
 
 /// Span information: (start_position, length) in the source text
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExprSpan {
     pub position: usize,
     pub length: usize,
