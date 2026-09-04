@@ -816,6 +816,13 @@ cap-json-limit-reached = The JSON display limit was reached. Collapse another br
 cap-json-expand-error = The JSON tree could not be expanded. The current view was kept; try again.
 cap-unavailable = The CapabilityStatement could not be fetched from the server — the self-call may need an outbound token when authentication is enabled.
 
+## Generic JSON fold labels (#898) — used by raw response folds in HTS-UI.
+## The cap-* keys above are kept for CapabilityStatement specifically.
+json-fold-loading = Loading JSON…
+json-fold-load-error = This JSON section could not be loaded. Collapse and reopen it to retry.
+json-fold-open-plain = Open plain JSON
+json-fold-plain = Plain JSON fallback. Highlighting is loaded incrementally when JavaScript is available.
+
 ## SQL on FHIR section stubs (#649)
 
 

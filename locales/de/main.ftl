@@ -801,6 +801,13 @@ cap-json-limit-reached = Das Anzeigelimit für JSON wurde erreicht. Klappen Sie 
 cap-json-expand-error = Der JSON-Baum konnte nicht ausgeklappt werden. Die aktuelle Ansicht wurde beibehalten; versuchen Sie es erneut.
 cap-unavailable = Das CapabilityStatement konnte nicht vom Server geladen werden — der Selbstaufruf benötigt bei aktivierter Authentifizierung eventuell ein Ausgangs-Token.
 
+## Generische JSON-Fold-Labels (#898) — verwendet von Raw-Response-Folds in HTS-UI.
+## Die cap-*-Keys oben bleiben spezifisch für CapabilityStatement.
+json-fold-loading = JSON wird geladen…
+json-fold-load-error = Dieser JSON-Abschnitt konnte nicht geladen werden. Zuklappen und erneut öffnen, um es zu wiederholen.
+json-fold-open-plain = Rohes JSON öffnen
+json-fold-plain = Roh-JSON-Fallback. Hervorhebung wird inkrementell geladen, wenn JavaScript verfügbar ist.
+
 ## Stubs der SQL-on-FHIR-Sektion (#649)
 
 

@@ -4227,6 +4227,7 @@ fn capability_json_fragment_endpoint(
     capability_json::FragmentEndpoint {
         base_path: "/ui/capability-statement/json-fragment",
         version: version.as_str(),
+        extra_query: "",
     }
 }
 
