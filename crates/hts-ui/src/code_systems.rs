@@ -31,7 +31,9 @@ use std::{collections::HashMap, sync::Arc};
 use crate::i18n::{I18n, RequestLocale};
 use crate::raw_fold::RawFold;
 use crate::raw_json_fragment::{
-    cs_lookup_fragment_url, cs_subsumes_fragment_url, cs_validate_fragment_url,
+    PaneTarget, cs_lookup_expand_url, cs_lookup_extra_query, cs_lookup_fragment_endpoint,
+    cs_subsumes_expand_url, cs_subsumes_extra_query, cs_subsumes_fragment_endpoint,
+    cs_validate_expand_url, cs_validate_extra_query, cs_validate_fragment_endpoint,
 };
 use crate::upstream::{
     CodeSystemSummary, CsBrowserFilters, CsBrowserPage, LookupParams, LookupResult, OpFailure,
@@ -617,19 +619,30 @@ async fn lookup_run(
         };
         match result {
             Ok(result) => {
-                // Build fragment URL for incremental loading (#898)
-                let fragment_url = if !canonical.is_empty() {
-                    Some(cs_lookup_fragment_url(
-                        &canonical,
-                        &params_for_fragment,
-                        state.fhir_version,
-                    ))
-                } else {
-                    None
-                };
                 let mut raw =
                     RawFold::new(&result.request_url, &result.request_body, &result.raw_body);
-                raw.response_fragment_url = fragment_url;
+                // Plan both incremental JSON panes (#898). Only possible when
+                // the canonical url resolved — the fragment endpoints pin the
+                // CodeSystem via `system=<canonical>`.
+                if !canonical.is_empty() {
+                    let req = cs_lookup_extra_query(
+                        &canonical,
+                        &params_for_fragment,
+                        PaneTarget::Request,
+                    );
+                    let resp = cs_lookup_extra_query(
+                        &canonical,
+                        &params_for_fragment,
+                        PaneTarget::Response,
+                    );
+                    raw.plan_panes(
+                        cs_lookup_fragment_endpoint(state.fhir_version, &req),
+                        cs_lookup_expand_url(&req),
+                        cs_lookup_fragment_endpoint(state.fhir_version, &resp),
+                        cs_lookup_expand_url(&resp),
+                        &chrome.i18n,
+                    );
+                }
                 WorkbenchResultView {
                     op: CsTab::Lookup,
                     mode: ValidateInputMode::default(),
@@ -710,15 +723,20 @@ async fn validate_run(
         let params_for_fragment = params.clone();
         match state.upstream.cs_validate_code(&canonical, params).await {
             Ok(result) => {
-                // Build fragment URL for incremental loading (#898)
-                let fragment_url = Some(cs_validate_fragment_url(
-                    &canonical,
-                    &params_for_fragment,
-                    state.fhir_version,
-                ));
                 let mut raw =
                     RawFold::new(&result.request_url, &result.request_body, &result.raw_body);
-                raw.response_fragment_url = fragment_url;
+                // Plan both incremental JSON panes (#898).
+                let req =
+                    cs_validate_extra_query(&canonical, &params_for_fragment, PaneTarget::Request);
+                let resp =
+                    cs_validate_extra_query(&canonical, &params_for_fragment, PaneTarget::Response);
+                raw.plan_panes(
+                    cs_validate_fragment_endpoint(state.fhir_version, &req),
+                    cs_validate_expand_url(&req),
+                    cs_validate_fragment_endpoint(state.fhir_version, &resp),
+                    cs_validate_expand_url(&resp),
+                    &chrome.i18n,
+                );
                 WorkbenchResultView {
                     op: CsTab::Validate,
                     mode: submitted_mode,
@@ -780,15 +798,20 @@ async fn subsumes_run(
         let params_for_fragment = params.clone();
         match state.upstream.cs_subsumes(&canonical, params).await {
             Ok(result) => {
-                // Build fragment URL for incremental loading (#898)
-                let fragment_url = Some(cs_subsumes_fragment_url(
-                    &canonical,
-                    &params_for_fragment,
-                    state.fhir_version,
-                ));
                 let mut raw =
                     RawFold::new(&result.request_url, &result.request_body, &result.raw_body);
-                raw.response_fragment_url = fragment_url;
+                // Plan both incremental JSON panes (#898).
+                let req =
+                    cs_subsumes_extra_query(&canonical, &params_for_fragment, PaneTarget::Request);
+                let resp =
+                    cs_subsumes_extra_query(&canonical, &params_for_fragment, PaneTarget::Response);
+                raw.plan_panes(
+                    cs_subsumes_fragment_endpoint(state.fhir_version, &req),
+                    cs_subsumes_expand_url(&req),
+                    cs_subsumes_fragment_endpoint(state.fhir_version, &resp),
+                    cs_subsumes_expand_url(&resp),
+                    &chrome.i18n,
+                );
                 WorkbenchResultView {
                     op: CsTab::Subsumes,
                     mode: ValidateInputMode::default(),

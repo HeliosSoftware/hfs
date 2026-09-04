@@ -7,58 +7,22 @@
   Kept last in every result partial so the readable summary above stays
   visually primary.
 
-  #898: Updated to use the card-shaped `json-fold` pattern matching the
-  CapabilityStatement raw fold. When `response_fragment_url` is set, the
-  response body uses incremental JSON loading via the same htmx-driven
-  pattern as capability-raw-card.html. Request body stays inline (small
-  Parameters resource).
-
-  The fold uses `data-json-fold-root` so it participates in the shared
-  `capability-json.js` mechanics (sibling collapse, aria-busy, etc.).
+  #898: The fold is the container; inside it the request URL comes first,
+  then the incremental JSON viewer (partials/hts-json-pane.html — the same
+  component as the CapabilityStatement raw card) appears twice: once for
+  the POSTed `Parameters`, once for the response. Each pane carries its own
+  Expand all / Collapse all controls. A pane that could not be planned
+  (payload missing, not JSON, or over budget) falls back to the highlighted
+  view or a plain `<pre>`.
 -#}
 {% if !view.raw.is_empty() %}
-<details class="card json-fold" id="workbench-json-fold" data-json-fold-root{% if view.raw.response_fragment_url.is_some() %} data-capability-json-node{% endif %}>
+<details class="card json-fold" id="workbench-json-fold" open>
   <summary class="card-head">
     <h3>{{ chrome.i18n.t("hts-workbench-raw-response") }}</h3>
     <span class="icon">{% include "icons/chevron-down.svg" %}</span>
   </summary>
-  {#- When fragment_url is set, use incremental loading for response body -#}
-  {% match view.raw.response_fragment_url %}
-  {% when Some with (fragment_url) %}
-  <div class="card__body json-fold-body"
-       data-capability-json-body
-       data-loading-text="{{ chrome.i18n.t("cap-raw-loading") }}"
-       data-error-text="{{ chrome.i18n.t("cap-json-load-error") }}"
-       data-fragment-url="{{ fragment_url }}">
-    {#- URL and request body shown inline before the response loads -#}
-    {% if !view.raw.request_url.is_empty() %}
-    <div class="kv-grid" style="margin-bottom:14px">
-      <div class="detail__field detail__field--wide">
-        <span>{{ chrome.i18n.t("hts-workbench-copy-url") }}</span>
-        <code>{{ view.raw.request_url }}</code>
-      </div>
-    </div>
-    {% endif %}
-    {% if !view.raw.request_body.is_empty() %}
-    <div class="detail__field detail__field--wide" style="margin-bottom:14px">
-      <span>{{ chrome.i18n.t("hts-workbench-request-body") }}</span>
-      {% if !view.raw.request_json.is_empty() %}{{ view.raw.request_json|safe }}{% else %}<pre class="detail__code" tabindex="0">{{ view.raw.request_body }}</pre>{% endif %}
-    </div>
-    {% endif %}
-    {#- No-JS fallback link and loading indicator -#}
-    {% match view.raw.raw_url %}
-    {% when Some with (raw_url) %}
-    <a class="btn" href="{{ raw_url }}#workbench-json-fold">{{ chrome.i18n.t("cap-raw-load") }}</a>
-    {% when None %}
-    {% endmatch %}
-    <p class="busy-status htmx-indicator json-fold-loading" role="status">
-      <span class="spinner" aria-hidden="true"></span>
-      {{ chrome.i18n.t("cap-raw-loading") }}
-    </p>
-  </div>
-  {% when None %}
-  {#- Fallback: inline rendering (legacy or no fragment endpoint) -#}
   <div class="card__body json-fold-body">
+    {#- 1. The request URL -#}
     {% if !view.raw.request_url.is_empty() %}
     <div class="kv-grid" style="margin-bottom:14px">
       <div class="detail__field detail__field--wide">
@@ -67,19 +31,28 @@
       </div>
     </div>
     {% endif %}
-    {% if !view.raw.request_body.is_empty() %}
+    {#- 2. The POSTed Parameters -#}
+    {% if !view.raw.request_pane.is_empty() %}
+    {% let pane = view.raw.request_pane.clone() %}
+    {% let pane_label = chrome.i18n.t("hts-workbench-request-body") %}
+    {% include "partials/hts-json-pane.html" %}
+    {% else if !view.raw.request_body.is_empty() %}
     <div class="detail__field detail__field--wide" style="margin-bottom:14px">
       <span>{{ chrome.i18n.t("hts-workbench-request-body") }}</span>
       {% if !view.raw.request_json.is_empty() %}{{ view.raw.request_json|safe }}{% else %}<pre class="detail__code" tabindex="0">{{ view.raw.request_body }}</pre>{% endif %}
     </div>
     {% endif %}
-    {% if !view.raw.response_body.is_empty() %}
+    {#- 3. The response body -#}
+    {% if !view.raw.response_pane.is_empty() %}
+    {% let pane = view.raw.response_pane.clone() %}
+    {% let pane_label = chrome.i18n.t("hts-workbench-response-body") %}
+    {% include "partials/hts-json-pane.html" %}
+    {% else if !view.raw.response_body.is_empty() %}
     <div class="detail__field detail__field--wide">
       <span>{{ chrome.i18n.t("hts-workbench-response-body") }}</span>
       {% if !view.raw.response_json.is_empty() %}{{ view.raw.response_json|safe }}{% else %}<pre class="detail__code" tabindex="0">{{ view.raw.response_body }}</pre>{% endif %}
     </div>
     {% endif %}
   </div>
-  {% endmatch %}
 </details>
 {% endif %}

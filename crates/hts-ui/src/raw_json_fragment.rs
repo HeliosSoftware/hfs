@@ -11,6 +11,14 @@
 //! 2. Plans one bounded level using `capability_json::plan()`
 //! 3. Renders either a full view (small subtrees) or an outline (large containers)
 //!
+//! Every workbench endpoint exists twice: a GET `…/json-fragment` for one
+//! bounded level, and a POST `…/json-expand` that takes the client's page
+//! descriptors (form-encoded, same wire format as the CapabilityStatement
+//! expand-all) and returns the whole tree in one response. Both accept a
+//! `target=request|response` parameter selecting which half of the exchange
+//! to render — the raw fold shows the POSTed `Parameters` and the response
+//! through the same incremental viewer (#898).
+//!
 //! The endpoints are mounted at paths like:
 //! - `/ui/hts/concepts/identity/json-fragment` (re-issues `$lookup`)
 //! - `/ui/hts/concepts/mappings/json-fragment` (re-issues `$translate`)
@@ -18,15 +26,17 @@
 //! - `/ui/hts/code-systems/workbench/validate/json-fragment` (re-issues `$validate-code`)
 //! - `/ui/hts/code-systems/workbench/subsumes/json-fragment` (re-issues `$subsumes`)
 //! - `/ui/hts/value-sets/workbench/expand/json-fragment` (re-issues `$expand`)
-//! - `/ui/hts/value-sets/workbench/validate/json-fragment` (re-issues `$validate-code`)
 //! - `/ui/hts/concept-maps/workbench/translate/json-fragment` (re-issues `$translate`)
-//! - `/ui/hts/concept-maps/workbench/closure/json-fragment` (re-issues `$closure`)
+//!
+//! VS `$validate-code` and CM `$closure` are deferred to Slice E.
 
 use axum::{
     Router,
+    body::Bytes,
     extract::{Query, State},
+    http::HeaderMap,
     response::{Html, IntoResponse, Response},
-    routing::get,
+    routing::{get, post},
 };
 use helios_ui_chrome::capability_json::{self, FragmentEndpoint};
 use serde::Deserialize;
@@ -74,6 +84,43 @@ pub struct ConceptMappingsFragmentQuery {
     pub limit: Option<usize>,
 }
 
+/// Which half of the raw exchange a workbench fragment/expand request
+/// addresses (#898). Carried as `target=` on both endpoint kinds.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PaneTarget {
+    /// The `Parameters` resource the UI POSTed upstream.
+    Request,
+    /// The upstream response body.
+    #[default]
+    Response,
+}
+
+impl PaneTarget {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Request => "request",
+            Self::Response => "response",
+        }
+    }
+
+    /// Anything but a literal `request` is the response — a stale or
+    /// hand-edited URL still lands on the payload the fold showed by default.
+    fn from_query(value: Option<&str>) -> Self {
+        if value == Some("request") {
+            Self::Request
+        } else {
+            Self::Response
+        }
+    }
+
+    fn pick(self, request_body: String, raw_body: String) -> String {
+        match self {
+            Self::Request => request_body,
+            Self::Response => raw_body,
+        }
+    }
+}
+
 // ── Workbench query structs ─────────────────────────────────────────────
 
 /// CodeSystem `$lookup` workbench fragment query.
@@ -95,6 +142,8 @@ pub struct CsLookupFragmentQuery {
     #[serde(default)]
     pub property: Option<String>,
     pub date: Option<String>,
+    /// `request` or `response` — which half of the exchange to render.
+    pub target: Option<String>,
     // JSON fragment parameters (version is the FHIR version, handled by
     // capability_json::root_fragment_url)
     #[serde(default)]
@@ -119,6 +168,8 @@ pub struct CsValidateFragmentQuery {
     pub coding_display: Option<String>,
     #[serde(rename = "displayLanguage")]
     pub display_language: Option<String>,
+    /// `request` or `response` — which half of the exchange to render.
+    pub target: Option<String>,
     // JSON fragment parameters
     #[serde(default)]
     pub path: String,
@@ -140,6 +191,8 @@ pub struct CsSubsumesFragmentQuery {
     /// CodeSystem version (renamed from `version` to avoid FHIR version collision)
     #[serde(rename = "csVersion")]
     pub cs_version: Option<String>,
+    /// `request` or `response` — which half of the exchange to render.
+    pub target: Option<String>,
     // JSON fragment parameters
     #[serde(default)]
     pub path: String,
@@ -157,6 +210,8 @@ pub struct VsExpandFragmentQuery {
     #[serde(rename = "_offset")]
     pub vs_offset: Option<String>,
     pub mode: Option<String>,
+    /// `request` or `response` — which half of the exchange to render.
+    pub target: Option<String>,
     // JSON fragment parameters
     #[serde(default)]
     pub path: String,
@@ -173,6 +228,8 @@ pub struct CmTranslateFragmentQuery {
     pub code: Option<String>,
     pub system: Option<String>,
     pub display: Option<String>,
+    /// `request` or `response` — which half of the exchange to render.
+    pub target: Option<String>,
     // JSON fragment parameters
     #[serde(default)]
     pub path: String,
@@ -209,22 +266,42 @@ pub fn workbench_fragment_routes() -> Router<Arc<HtsUiState>> {
             get(cs_lookup_fragment),
         )
         .route(
+            "/hts/code-systems/workbench/lookup/json-expand",
+            post(cs_lookup_expand),
+        )
+        .route(
             "/hts/code-systems/workbench/validate/json-fragment",
             get(cs_validate_fragment),
         )
         .route(
+            "/hts/code-systems/workbench/validate/json-expand",
+            post(cs_validate_expand),
+        )
+        .route(
             "/hts/code-systems/workbench/subsumes/json-fragment",
             get(cs_subsumes_fragment),
+        )
+        .route(
+            "/hts/code-systems/workbench/subsumes/json-expand",
+            post(cs_subsumes_expand),
         )
         // ValueSet operations
         .route(
             "/hts/value-sets/workbench/expand/json-fragment",
             get(vs_expand_fragment),
         )
+        .route(
+            "/hts/value-sets/workbench/expand/json-expand",
+            post(vs_expand_expand),
+        )
         // ConceptMap operations
         .route(
             "/hts/concept-maps/workbench/translate/json-fragment",
             get(cm_translate_fragment),
+        )
+        .route(
+            "/hts/concept-maps/workbench/translate/json-expand",
+            post(cm_translate_expand),
         )
 }
 
@@ -241,18 +318,112 @@ const CS_SUBSUMES_FRAGMENT_URL: &str = "/ui/hts/code-systems/workbench/subsumes/
 const VS_EXPAND_FRAGMENT_URL: &str = "/ui/hts/value-sets/workbench/expand/json-fragment";
 const CM_TRANSLATE_FRAGMENT_URL: &str = "/ui/hts/concept-maps/workbench/translate/json-fragment";
 
-// ── Workbench fragment URL builders (#898) ──────────────────────────────
+// Workbench expand-all URL constants (#898)
+const CS_LOOKUP_EXPAND_URL: &str = "/ui/hts/code-systems/workbench/lookup/json-expand";
+const CS_VALIDATE_EXPAND_URL: &str = "/ui/hts/code-systems/workbench/validate/json-expand";
+const CS_SUBSUMES_EXPAND_URL: &str = "/ui/hts/code-systems/workbench/subsumes/json-expand";
+const VS_EXPAND_EXPAND_URL: &str = "/ui/hts/value-sets/workbench/expand/json-expand";
+const CM_TRANSLATE_EXPAND_URL: &str = "/ui/hts/concept-maps/workbench/translate/json-expand";
 
-/// Build a fragment URL for CodeSystem `$lookup` workbench.
+// ── Workbench fragment endpoints (#898) ──────────────────────────────────
+//
+// Each endpoint carries the operation's re-issue parameters (built by the
+// matching `*_extra_query` below) so every nested fragment URL the planner
+// mints can stand alone.
+
+/// Returns the fragment endpoint for CodeSystem `$lookup` workbench.
+pub fn cs_lookup_fragment_endpoint<'a>(
+    fhir_version: &'a str,
+    extra_query: &'a str,
+) -> FragmentEndpoint<'a> {
+    FragmentEndpoint {
+        base_path: CS_LOOKUP_FRAGMENT_URL,
+        version: fhir_version,
+        extra_query,
+    }
+}
+
+/// Returns the fragment endpoint for CodeSystem `$validate-code` workbench.
+pub fn cs_validate_fragment_endpoint<'a>(
+    fhir_version: &'a str,
+    extra_query: &'a str,
+) -> FragmentEndpoint<'a> {
+    FragmentEndpoint {
+        base_path: CS_VALIDATE_FRAGMENT_URL,
+        version: fhir_version,
+        extra_query,
+    }
+}
+
+/// Returns the fragment endpoint for CodeSystem `$subsumes` workbench.
+pub fn cs_subsumes_fragment_endpoint<'a>(
+    fhir_version: &'a str,
+    extra_query: &'a str,
+) -> FragmentEndpoint<'a> {
+    FragmentEndpoint {
+        base_path: CS_SUBSUMES_FRAGMENT_URL,
+        version: fhir_version,
+        extra_query,
+    }
+}
+
+/// Returns the fragment endpoint for ValueSet `$expand` workbench.
+pub fn vs_expand_fragment_endpoint<'a>(
+    fhir_version: &'a str,
+    extra_query: &'a str,
+) -> FragmentEndpoint<'a> {
+    FragmentEndpoint {
+        base_path: VS_EXPAND_FRAGMENT_URL,
+        version: fhir_version,
+        extra_query,
+    }
+}
+
+/// Returns the fragment endpoint for ConceptMap `$translate` workbench.
+pub fn cm_translate_fragment_endpoint<'a>(
+    fhir_version: &'a str,
+    extra_query: &'a str,
+) -> FragmentEndpoint<'a> {
+    FragmentEndpoint {
+        base_path: CM_TRANSLATE_FRAGMENT_URL,
+        version: fhir_version,
+        extra_query,
+    }
+}
+
+// ── Workbench expand-all URLs (#898) ─────────────────────────────────────
+
+pub fn cs_lookup_expand_url(extra_query: &str) -> String {
+    format!("{CS_LOOKUP_EXPAND_URL}?{extra_query}")
+}
+
+pub fn cs_validate_expand_url(extra_query: &str) -> String {
+    format!("{CS_VALIDATE_EXPAND_URL}?{extra_query}")
+}
+
+pub fn cs_subsumes_expand_url(extra_query: &str) -> String {
+    format!("{CS_SUBSUMES_EXPAND_URL}?{extra_query}")
+}
+
+pub fn vs_expand_expand_url(extra_query: &str) -> String {
+    format!("{VS_EXPAND_EXPAND_URL}?{extra_query}")
+}
+
+pub fn cm_translate_expand_url(extra_query: &str) -> String {
+    format!("{CM_TRANSLATE_EXPAND_URL}?{extra_query}")
+}
+
+// ── Workbench extra-query builders (#898) ────────────────────────────────
+//
+// The percent-encoded operation parameters plus `target=`, appended to every
+// fragment URL (via `FragmentEndpoint::extra_query`) and to the expand-all
+// URL, so both endpoint kinds can re-issue the operation.
+
+/// Extra query for the CodeSystem `$lookup` workbench.
 ///
 /// The CodeSystem version is encoded as `csVersion` to avoid collision with
 /// the FHIR version parameter (`version=R4`).
-pub fn cs_lookup_fragment_url(system: &str, params: &LookupParams, fhir_version: &str) -> String {
-    let endpoint = FragmentEndpoint {
-        base_path: CS_LOOKUP_FRAGMENT_URL,
-        version: fhir_version,
-    };
-    let root_url = capability_json::root_fragment_url(endpoint);
+pub fn cs_lookup_extra_query(system: &str, params: &LookupParams, target: PaneTarget) -> String {
     let mut ser = form_urlencoded::Serializer::new(String::new());
     ser.append_pair("system", system);
     ser.append_pair("code", &params.code);
@@ -269,20 +440,16 @@ pub fn cs_lookup_fragment_url(system: &str, params: &LookupParams, fhir_version:
     if let Some(date) = &params.date {
         ser.append_pair("date", date);
     }
-    format!("{}&{}", root_url, ser.finish())
+    ser.append_pair("target", target.as_str());
+    ser.finish()
 }
 
-/// Build a fragment URL for CodeSystem `$validate-code` workbench.
-pub fn cs_validate_fragment_url(
+/// Extra query for the CodeSystem `$validate-code` workbench.
+pub fn cs_validate_extra_query(
     system: &str,
     params: &ValidateCodeParams,
-    fhir_version: &str,
+    target: PaneTarget,
 ) -> String {
-    let endpoint = FragmentEndpoint {
-        base_path: CS_VALIDATE_FRAGMENT_URL,
-        version: fhir_version,
-    };
-    let root_url = capability_json::root_fragment_url(endpoint);
     let mut ser = form_urlencoded::Serializer::new(String::new());
     ser.append_pair("system", system);
     ser.append_pair("mode", params.mode.as_str());
@@ -304,23 +471,16 @@ pub fn cs_validate_fragment_url(
     if let Some(display_language) = &params.display_language {
         ser.append_pair("displayLanguage", display_language);
     }
-    format!("{}&{}", root_url, ser.finish())
+    ser.append_pair("target", target.as_str());
+    ser.finish()
 }
 
-/// Build a fragment URL for CodeSystem `$subsumes` workbench.
-///
-/// The CodeSystem version is encoded as `csVersion` to avoid collision with
-/// the FHIR version parameter (`version=R4`).
-pub fn cs_subsumes_fragment_url(
+/// Extra query for the CodeSystem `$subsumes` workbench.
+pub fn cs_subsumes_extra_query(
     system: &str,
     params: &SubsumesParams,
-    fhir_version: &str,
+    target: PaneTarget,
 ) -> String {
-    let endpoint = FragmentEndpoint {
-        base_path: CS_SUBSUMES_FRAGMENT_URL,
-        version: fhir_version,
-    };
-    let root_url = capability_json::root_fragment_url(endpoint);
     let mut ser = form_urlencoded::Serializer::new(String::new());
     ser.append_pair("system", system);
     ser.append_pair("codeA", &params.code_a);
@@ -328,24 +488,20 @@ pub fn cs_subsumes_fragment_url(
     if let Some(version) = &params.version {
         ser.append_pair("csVersion", version);
     }
-    format!("{}&{}", root_url, ser.finish())
+    ser.append_pair("target", target.as_str());
+    ser.finish()
 }
 
-/// Build a fragment URL for ValueSet `$expand` workbench.
+/// Extra query for the ValueSet `$expand` workbench.
 ///
-/// `tree_mode` indicates whether the expand was done in tree mode (`hierarchical=true`)
-/// or flat mode (`excludeNested=true`).
-pub fn vs_expand_fragment_url(
+/// `tree_mode` indicates whether the expand was done in tree mode
+/// (`hierarchical=true`) or flat mode (`excludeNested=true`).
+pub fn vs_expand_extra_query(
     url: &str,
     params: &ExpandParams,
     tree_mode: bool,
-    fhir_version: &str,
+    target: PaneTarget,
 ) -> String {
-    let endpoint = FragmentEndpoint {
-        base_path: VS_EXPAND_FRAGMENT_URL,
-        version: fhir_version,
-    };
-    let root_url = capability_json::root_fragment_url(endpoint);
     let mut ser = form_urlencoded::Serializer::new(String::new());
     ser.append_pair("url", url);
     if let Some(filter) = &params.filter {
@@ -359,37 +515,30 @@ pub fn vs_expand_fragment_url(
     }
     // Encode tree/flat mode
     ser.append_pair("mode", if tree_mode { "tree" } else { "flat" });
-    format!("{}&{}", root_url, ser.finish())
+    ser.append_pair("target", target.as_str());
+    ser.finish()
 }
 
-/// Build a fragment URL for ConceptMap `$translate` workbench.
-pub fn cm_translate_fragment_url(
-    url: &str,
-    params: &TranslateParams,
-    fhir_version: &str,
-) -> String {
-    let endpoint = FragmentEndpoint {
-        base_path: CM_TRANSLATE_FRAGMENT_URL,
-        version: fhir_version,
-    };
-    let root_url = capability_json::root_fragment_url(endpoint);
+/// Extra query for the ConceptMap `$translate` workbench.
+pub fn cm_translate_extra_query(url: &str, params: &TranslateParams, target: PaneTarget) -> String {
     let mut ser = form_urlencoded::Serializer::new(String::new());
     ser.append_pair("url", url);
     ser.append_pair("direction", params.direction.as_str());
-    if let Some(code) = &params.code {
-        if !code.is_empty() {
-            ser.append_pair("code", code);
-        }
+    if let Some(code) = &params.code
+        && !code.is_empty()
+    {
+        ser.append_pair("code", code);
     }
-    if let Some(system) = &params.system {
-        if !system.is_empty() {
-            ser.append_pair("system", system);
-        }
+    if let Some(system) = &params.system
+        && !system.is_empty()
+    {
+        ser.append_pair("system", system);
     }
     if let Some(display) = &params.display {
         ser.append_pair("display", display);
     }
-    format!("{}&{}", root_url, ser.finish())
+    ser.append_pair("target", target.as_str());
+    ser.finish()
 }
 
 // ── Fragment handlers ───────────────────────────────────────────────────
@@ -458,6 +607,7 @@ async fn concept_identity_fragment(
         query.offset,
         query.limit,
         IDENTITY_FRAGMENT_URL,
+        "",
     )
 }
 
@@ -526,10 +676,16 @@ async fn concept_mappings_fragment(
         query.offset,
         query.limit,
         MAPPINGS_FRAGMENT_URL,
+        "",
     )
 }
 
 /// Shared fragment rendering logic.
+///
+/// `extra_query` rides along on every nested fragment URL the planner mints
+/// (empty for the Concept Explorer endpoints, the operation's re-issue
+/// parameters for the workbenches).
+#[allow(clippy::too_many_arguments)]
 fn render_json_fragment(
     state: &HtsUiState,
     locale: &RequestLocale,
@@ -538,12 +694,14 @@ fn render_json_fragment(
     offset: usize,
     limit: Option<usize>,
     base_path: &str,
+    extra_query: &str,
 ) -> Response {
     let limit = limit.unwrap_or(capability_json::DEFAULT_PAGE_SIZE);
     let i18n = I18n::new(*locale);
     let endpoint = FragmentEndpoint {
         base_path,
         version: state.fhir_version,
+        extra_query,
     };
 
     match capability_json::plan(document, path, offset, limit, endpoint) {
@@ -582,14 +740,93 @@ fn bounded_fragment(rendered: Result<String, askama::Error>) -> Response {
     }
 }
 
-// ── Workbench fragment handlers (#898) ──────────────────────────────────
-
-/// CodeSystem `$lookup` workbench fragment handler.
-async fn cs_lookup_fragment(
-    State(state): State<Arc<HtsUiState>>,
-    locale: RequestLocale,
-    Query(query): Query<CsLookupFragmentQuery>,
+/// Shared expand-all rendering logic (#898), mirroring the HFS
+/// CapabilityStatement `json-expand` handler: validate the form Content-Type,
+/// parse the client's page descriptors, plan the aggregate expansion, and
+/// render it whole (or refuse with 413 when it exceeds the budget).
+fn render_json_expand(
+    state: &HtsUiState,
+    locale: &RequestLocale,
+    document: &serde_json::Value,
+    headers: &HeaderMap,
+    body: &[u8],
+    base_path: &str,
+    extra_query: &str,
 ) -> Response {
+    if !headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .is_some_and(|value| {
+            value
+                .trim()
+                .eq_ignore_ascii_case("application/x-www-form-urlencoded")
+        })
+    {
+        return bad_request("Invalid JSON page state");
+    }
+    let pages = match capability_json::parse_page_descriptors(body) {
+        Ok(pages) => pages,
+        Err(_) => return bad_request("Invalid JSON page state"),
+    };
+    let endpoint = FragmentEndpoint {
+        base_path,
+        version: state.fhir_version,
+        extra_query,
+    };
+    let expanded = match capability_json::plan_expanded(document, &pages, endpoint) {
+        Ok(expanded) => expanded,
+        Err(_) => return bad_request("Invalid JSON page state"),
+    };
+    let i18n = I18n::new(*locale);
+    match capability_json::render_expanded(&i18n, &expanded) {
+        Ok(html) => Html(html).into_response(),
+        Err(capability_json::ExpandedRenderError::TooLarge) => (
+            axum::http::StatusCode::PAYLOAD_TOO_LARGE,
+            "JSON expansion exceeds the rendering budget",
+        )
+            .into_response(),
+        Err(capability_json::ExpandedRenderError::Template(error)) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            format!("template render error: {error}"),
+        )
+            .into_response(),
+    }
+}
+
+fn bad_request(message: &'static str) -> Response {
+    (axum::http::StatusCode::BAD_REQUEST, message).into_response()
+}
+
+fn unavailable(message: &'static str) -> Response {
+    (axum::http::StatusCode::SERVICE_UNAVAILABLE, message).into_response()
+}
+
+/// Parses the selected half of the exchange as JSON, or the 500 that tells
+/// the viewer nothing renderable came back.
+fn parse_payload(payload: &str) -> Result<serde_json::Value, Response> {
+    serde_json::from_str(payload).map_err(|_| {
+        (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "Payload is not valid JSON",
+        )
+            .into_response()
+    })
+}
+
+// ── Workbench fragment handlers (#898) ──────────────────────────────────
+//
+// Each operation has one `*_document` helper that re-issues the upstream
+// call and returns the requested half of the exchange (parsed) plus the
+// canonical extra query, and two thin handlers on top of it: the GET
+// fragment and the POST expand-all.
+
+/// Re-issues CodeSystem `$lookup` and returns the requested payload half.
+async fn cs_lookup_document(
+    state: &HtsUiState,
+    query: CsLookupFragmentQuery,
+) -> Result<(serde_json::Value, String), Response> {
+    let target = PaneTarget::from_query(query.target.as_deref());
     // Parse comma-separated properties into Vec
     let properties: Vec<String> = query
         .property
@@ -609,58 +846,73 @@ async fn cs_lookup_fragment(
         properties,
         date: query.date.filter(|v| !v.trim().is_empty()),
     };
+    let system = query.system.trim().to_owned();
 
-    if params.code.is_empty() || query.system.trim().is_empty() {
-        return (
-            axum::http::StatusCode::BAD_REQUEST,
-            "Missing system or code parameter",
-        )
-            .into_response();
+    if params.code.is_empty() || system.is_empty() {
+        return Err(bad_request("Missing system or code parameter"));
     }
 
-    let result = state
-        .upstream
-        .cs_lookup_type_level(query.system.trim(), params)
-        .await;
-
-    let document = match result {
-        Ok(lookup) => match serde_json::from_str::<serde_json::Value>(&lookup.raw_body) {
-            Ok(doc) => doc,
-            Err(_) => {
-                return (
-                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                    "Response is not valid JSON",
-                )
-                    .into_response();
-            }
-        },
+    let extra_query = cs_lookup_extra_query(&system, &params, target);
+    let payload = match state.upstream.cs_lookup_type_level(&system, params).await {
+        Ok(lookup) => target.pick(lookup.request_body, lookup.raw_body),
         Err(err) => {
             tracing::warn!("CS lookup fragment fetch failed: {err:?}");
-            return (
-                axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                "CodeSystem lookup is unavailable",
-            )
-                .into_response();
+            return Err(unavailable("CodeSystem lookup is unavailable"));
         }
     };
-
-    render_json_fragment(
-        &state,
-        &locale,
-        &document,
-        &query.path,
-        query.offset,
-        query.limit,
-        CS_LOOKUP_FRAGMENT_URL,
-    )
+    Ok((parse_payload(&payload)?, extra_query))
 }
 
-/// CodeSystem `$validate-code` workbench fragment handler.
-async fn cs_validate_fragment(
+/// CodeSystem `$lookup` workbench fragment handler.
+async fn cs_lookup_fragment(
     State(state): State<Arc<HtsUiState>>,
     locale: RequestLocale,
-    Query(query): Query<CsValidateFragmentQuery>,
+    Query(query): Query<CsLookupFragmentQuery>,
 ) -> Response {
+    let (path, offset, limit) = (query.path.clone(), query.offset, query.limit);
+    match cs_lookup_document(&state, query).await {
+        Ok((document, extra_query)) => render_json_fragment(
+            &state,
+            &locale,
+            &document,
+            &path,
+            offset,
+            limit,
+            CS_LOOKUP_FRAGMENT_URL,
+            &extra_query,
+        ),
+        Err(response) => response,
+    }
+}
+
+/// CodeSystem `$lookup` workbench expand-all handler.
+async fn cs_lookup_expand(
+    State(state): State<Arc<HtsUiState>>,
+    locale: RequestLocale,
+    Query(query): Query<CsLookupFragmentQuery>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    match cs_lookup_document(&state, query).await {
+        Ok((document, extra_query)) => render_json_expand(
+            &state,
+            &locale,
+            &document,
+            &headers,
+            &body,
+            CS_LOOKUP_FRAGMENT_URL,
+            &extra_query,
+        ),
+        Err(response) => response,
+    }
+}
+
+/// Re-issues CodeSystem `$validate-code` and returns the requested payload half.
+async fn cs_validate_document(
+    state: &HtsUiState,
+    query: CsValidateFragmentQuery,
+) -> Result<(serde_json::Value, String), Response> {
+    let target = PaneTarget::from_query(query.target.as_deref());
     let mode = ValidateInputMode::from_form(query.mode.as_deref());
     let params = ValidateCodeParams {
         mode,
@@ -671,58 +923,73 @@ async fn cs_validate_fragment(
         coding_display: query.coding_display,
         display_language: query.display_language,
     };
+    let system = query.system.trim().to_owned();
 
-    if query.system.trim().is_empty() {
-        return (
-            axum::http::StatusCode::BAD_REQUEST,
-            "Missing system parameter",
-        )
-            .into_response();
+    if system.is_empty() {
+        return Err(bad_request("Missing system parameter"));
     }
 
-    let result = state
-        .upstream
-        .cs_validate_code(query.system.trim(), params)
-        .await;
-
-    let document = match result {
-        Ok(validate) => match serde_json::from_str::<serde_json::Value>(&validate.raw_body) {
-            Ok(doc) => doc,
-            Err(_) => {
-                return (
-                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                    "Response is not valid JSON",
-                )
-                    .into_response();
-            }
-        },
+    let extra_query = cs_validate_extra_query(&system, &params, target);
+    let payload = match state.upstream.cs_validate_code(&system, params).await {
+        Ok(validate) => target.pick(validate.request_body, validate.raw_body),
         Err(err) => {
             tracing::warn!("CS validate-code fragment fetch failed: {err:?}");
-            return (
-                axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                "CodeSystem validate-code is unavailable",
-            )
-                .into_response();
+            return Err(unavailable("CodeSystem validate-code is unavailable"));
         }
     };
-
-    render_json_fragment(
-        &state,
-        &locale,
-        &document,
-        &query.path,
-        query.offset,
-        query.limit,
-        CS_VALIDATE_FRAGMENT_URL,
-    )
+    Ok((parse_payload(&payload)?, extra_query))
 }
 
-/// CodeSystem `$subsumes` workbench fragment handler.
-async fn cs_subsumes_fragment(
+/// CodeSystem `$validate-code` workbench fragment handler.
+async fn cs_validate_fragment(
     State(state): State<Arc<HtsUiState>>,
     locale: RequestLocale,
-    Query(query): Query<CsSubsumesFragmentQuery>,
+    Query(query): Query<CsValidateFragmentQuery>,
 ) -> Response {
+    let (path, offset, limit) = (query.path.clone(), query.offset, query.limit);
+    match cs_validate_document(&state, query).await {
+        Ok((document, extra_query)) => render_json_fragment(
+            &state,
+            &locale,
+            &document,
+            &path,
+            offset,
+            limit,
+            CS_VALIDATE_FRAGMENT_URL,
+            &extra_query,
+        ),
+        Err(response) => response,
+    }
+}
+
+/// CodeSystem `$validate-code` workbench expand-all handler.
+async fn cs_validate_expand(
+    State(state): State<Arc<HtsUiState>>,
+    locale: RequestLocale,
+    Query(query): Query<CsValidateFragmentQuery>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    match cs_validate_document(&state, query).await {
+        Ok((document, extra_query)) => render_json_expand(
+            &state,
+            &locale,
+            &document,
+            &headers,
+            &body,
+            CS_VALIDATE_FRAGMENT_URL,
+            &extra_query,
+        ),
+        Err(response) => response,
+    }
+}
+
+/// Re-issues CodeSystem `$subsumes` and returns the requested payload half.
+async fn cs_subsumes_document(
+    state: &HtsUiState,
+    query: CsSubsumesFragmentQuery,
+) -> Result<(serde_json::Value, String), Response> {
+    let target = PaneTarget::from_query(query.target.as_deref());
     let params = SubsumesParams {
         code_a: query.code_a.trim().to_owned(),
         code_b: query.code_b.trim().to_owned(),
@@ -731,58 +998,73 @@ async fn cs_subsumes_fragment(
             .map(|v| v.trim().to_owned())
             .filter(|v| !v.is_empty()),
     };
+    let system = query.system.trim().to_owned();
 
-    if params.code_a.is_empty() || params.code_b.is_empty() || query.system.trim().is_empty() {
-        return (
-            axum::http::StatusCode::BAD_REQUEST,
-            "Missing system, codeA, or codeB parameter",
-        )
-            .into_response();
+    if params.code_a.is_empty() || params.code_b.is_empty() || system.is_empty() {
+        return Err(bad_request("Missing system, codeA, or codeB parameter"));
     }
 
-    let result = state
-        .upstream
-        .cs_subsumes(query.system.trim(), params)
-        .await;
-
-    let document = match result {
-        Ok(subsumes) => match serde_json::from_str::<serde_json::Value>(&subsumes.raw_body) {
-            Ok(doc) => doc,
-            Err(_) => {
-                return (
-                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                    "Response is not valid JSON",
-                )
-                    .into_response();
-            }
-        },
+    let extra_query = cs_subsumes_extra_query(&system, &params, target);
+    let payload = match state.upstream.cs_subsumes(&system, params).await {
+        Ok(subsumes) => target.pick(subsumes.request_body, subsumes.raw_body),
         Err(err) => {
             tracing::warn!("CS subsumes fragment fetch failed: {err:?}");
-            return (
-                axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                "CodeSystem subsumes is unavailable",
-            )
-                .into_response();
+            return Err(unavailable("CodeSystem subsumes is unavailable"));
         }
     };
-
-    render_json_fragment(
-        &state,
-        &locale,
-        &document,
-        &query.path,
-        query.offset,
-        query.limit,
-        CS_SUBSUMES_FRAGMENT_URL,
-    )
+    Ok((parse_payload(&payload)?, extra_query))
 }
 
-/// ValueSet `$expand` workbench fragment handler.
-async fn vs_expand_fragment(
+/// CodeSystem `$subsumes` workbench fragment handler.
+async fn cs_subsumes_fragment(
     State(state): State<Arc<HtsUiState>>,
     locale: RequestLocale,
-    Query(query): Query<VsExpandFragmentQuery>,
+    Query(query): Query<CsSubsumesFragmentQuery>,
 ) -> Response {
+    let (path, offset, limit) = (query.path.clone(), query.offset, query.limit);
+    match cs_subsumes_document(&state, query).await {
+        Ok((document, extra_query)) => render_json_fragment(
+            &state,
+            &locale,
+            &document,
+            &path,
+            offset,
+            limit,
+            CS_SUBSUMES_FRAGMENT_URL,
+            &extra_query,
+        ),
+        Err(response) => response,
+    }
+}
+
+/// CodeSystem `$subsumes` workbench expand-all handler.
+async fn cs_subsumes_expand(
+    State(state): State<Arc<HtsUiState>>,
+    locale: RequestLocale,
+    Query(query): Query<CsSubsumesFragmentQuery>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    match cs_subsumes_document(&state, query).await {
+        Ok((document, extra_query)) => render_json_expand(
+            &state,
+            &locale,
+            &document,
+            &headers,
+            &body,
+            CS_SUBSUMES_FRAGMENT_URL,
+            &extra_query,
+        ),
+        Err(response) => response,
+    }
+}
+
+/// Re-issues ValueSet `$expand` and returns the requested payload half.
+async fn vs_expand_document(
+    state: &HtsUiState,
+    query: VsExpandFragmentQuery,
+) -> Result<(serde_json::Value, String), Response> {
+    let target = PaneTarget::from_query(query.target.as_deref());
     // Convert mode string to hierarchical/exclude_nested flags
     let tree_mode = query.mode.as_deref() == Some("tree");
     let params = ExpandParams {
@@ -796,56 +1078,75 @@ async fn vs_expand_fragment(
         exclude_nested: if !tree_mode { Some(true) } else { None },
         ..Default::default()
     };
+    let url = query.url.trim().to_owned();
 
-    if query.url.trim().is_empty() {
-        return (axum::http::StatusCode::BAD_REQUEST, "Missing url parameter").into_response();
+    if url.is_empty() {
+        return Err(bad_request("Missing url parameter"));
     }
 
-    let result = state
-        .upstream
-        .vs_expand_by_url(query.url.trim(), &params)
-        .await;
-
-    let document = match result {
-        Ok(expand) => match serde_json::from_str::<serde_json::Value>(&expand.raw_body) {
-            Ok(doc) => doc,
-            Err(_) => {
-                return (
-                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                    "Response is not valid JSON",
-                )
-                    .into_response();
-            }
-        },
+    let extra_query = vs_expand_extra_query(&url, &params, tree_mode, target);
+    let payload = match state.upstream.vs_expand_by_url(&url, &params).await {
+        Ok(expand) => target.pick(expand.request_body, expand.raw_body),
         Err(err) => {
             tracing::warn!("VS expand fragment fetch failed: {err:?}");
-            return (
-                axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                "ValueSet expand is unavailable",
-            )
-                .into_response();
+            return Err(unavailable("ValueSet expand is unavailable"));
         }
     };
-
-    render_json_fragment(
-        &state,
-        &locale,
-        &document,
-        &query.path,
-        query.offset,
-        query.limit,
-        VS_EXPAND_FRAGMENT_URL,
-    )
+    Ok((parse_payload(&payload)?, extra_query))
 }
 
-/// ConceptMap `$translate` workbench fragment handler.
-async fn cm_translate_fragment(
+/// ValueSet `$expand` workbench fragment handler.
+async fn vs_expand_fragment(
     State(state): State<Arc<HtsUiState>>,
     locale: RequestLocale,
-    Query(query): Query<CmTranslateFragmentQuery>,
+    Query(query): Query<VsExpandFragmentQuery>,
 ) -> Response {
+    let (path, offset, limit) = (query.path.clone(), query.offset, query.limit);
+    match vs_expand_document(&state, query).await {
+        Ok((document, extra_query)) => render_json_fragment(
+            &state,
+            &locale,
+            &document,
+            &path,
+            offset,
+            limit,
+            VS_EXPAND_FRAGMENT_URL,
+            &extra_query,
+        ),
+        Err(response) => response,
+    }
+}
+
+/// ValueSet `$expand` workbench expand-all handler.
+async fn vs_expand_expand(
+    State(state): State<Arc<HtsUiState>>,
+    locale: RequestLocale,
+    Query(query): Query<VsExpandFragmentQuery>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    match vs_expand_document(&state, query).await {
+        Ok((document, extra_query)) => render_json_expand(
+            &state,
+            &locale,
+            &document,
+            &headers,
+            &body,
+            VS_EXPAND_FRAGMENT_URL,
+            &extra_query,
+        ),
+        Err(response) => response,
+    }
+}
+
+/// Re-issues ConceptMap `$translate` and returns the requested payload half.
+async fn cm_translate_document(
+    state: &HtsUiState,
+    query: CmTranslateFragmentQuery,
+) -> Result<(serde_json::Value, String), Response> {
     use crate::upstream::TranslateDirection;
 
+    let target = PaneTarget::from_query(query.target.as_deref());
     let direction = TranslateDirection::from_form(query.direction.as_deref());
     let params = TranslateParams {
         direction,
@@ -858,44 +1159,63 @@ async fn cm_translate_fragment(
         target_url: None,
         date: None,
     };
+    let url = query.url.trim().to_owned();
 
-    if query.url.trim().is_empty() {
-        return (axum::http::StatusCode::BAD_REQUEST, "Missing url parameter").into_response();
+    if url.is_empty() {
+        return Err(bad_request("Missing url parameter"));
     }
 
-    let result = state
-        .upstream
-        .cm_translate_by_url(query.url.trim(), &params)
-        .await;
-
-    let document = match result {
-        Ok(translate) => match serde_json::from_str::<serde_json::Value>(&translate.raw_body) {
-            Ok(doc) => doc,
-            Err(_) => {
-                return (
-                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                    "Response is not valid JSON",
-                )
-                    .into_response();
-            }
-        },
+    let extra_query = cm_translate_extra_query(&url, &params, target);
+    let payload = match state.upstream.cm_translate_by_url(&url, &params).await {
+        Ok(translate) => target.pick(translate.request_body, translate.raw_body),
         Err(err) => {
             tracing::warn!("CM translate fragment fetch failed: {err:?}");
-            return (
-                axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                "ConceptMap translate is unavailable",
-            )
-                .into_response();
+            return Err(unavailable("ConceptMap translate is unavailable"));
         }
     };
+    Ok((parse_payload(&payload)?, extra_query))
+}
 
-    render_json_fragment(
-        &state,
-        &locale,
-        &document,
-        &query.path,
-        query.offset,
-        query.limit,
-        CM_TRANSLATE_FRAGMENT_URL,
-    )
+/// ConceptMap `$translate` workbench fragment handler.
+async fn cm_translate_fragment(
+    State(state): State<Arc<HtsUiState>>,
+    locale: RequestLocale,
+    Query(query): Query<CmTranslateFragmentQuery>,
+) -> Response {
+    let (path, offset, limit) = (query.path.clone(), query.offset, query.limit);
+    match cm_translate_document(&state, query).await {
+        Ok((document, extra_query)) => render_json_fragment(
+            &state,
+            &locale,
+            &document,
+            &path,
+            offset,
+            limit,
+            CM_TRANSLATE_FRAGMENT_URL,
+            &extra_query,
+        ),
+        Err(response) => response,
+    }
+}
+
+/// ConceptMap `$translate` workbench expand-all handler.
+async fn cm_translate_expand(
+    State(state): State<Arc<HtsUiState>>,
+    locale: RequestLocale,
+    Query(query): Query<CmTranslateFragmentQuery>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    match cm_translate_document(&state, query).await {
+        Ok((document, extra_query)) => render_json_expand(
+            &state,
+            &locale,
+            &document,
+            &headers,
+            &body,
+            CM_TRANSLATE_FRAGMENT_URL,
+            &extra_query,
+        ),
+        Err(response) => response,
+    }
 }

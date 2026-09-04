@@ -845,29 +845,46 @@ async fn raw_fold_reads_as_a_control_and_highlights_both_payloads() {
         "`.field__label` on a summary is what removed the disclosure marker",
     );
 
-    // 2. Request body goes through the shared highlighted JSON view;
-    //    response body uses incremental loading (#898) when a fragment URL
-    //    is available.
+    // 2. Two incremental JSON panes (#898): one for the POSTed Parameters,
+    //    one for the response, each a self-contained capability-json root
+    //    with its own Expand all / Collapse all controls.
     assert_eq!(
-        html.matches(r#"class="json-view""#).count(),
-        1,
-        "request must render a JSON view inline; got:\n{html}",
+        html.matches("data-capability-json-root").count(),
+        2,
+        "request and response must each render an incremental pane; got:\n{html}",
+    );
+    assert_eq!(
+        html.matches(r#"data-capability-json-page data-path="""#)
+            .count(),
+        2,
+        "each pane needs its own root page marker for enhance(); got:\n{html}",
+    );
+    assert_eq!(
+        html.matches("data-capability-json-actions hidden").count(),
+        2,
+        "each pane carries its own expand/collapse controls; got:\n{html}",
     );
     assert!(
         html.contains(r#"class="jt--key""#),
         "tokens must be coloured"
     );
-    // Verify incremental loading attributes are present for response body
-    assert!(
-        html.contains("data-capability-json-body") && html.contains("data-fragment-url"),
-        "response body must use incremental loading pattern; got:\n{html}",
-    );
 
-    // 3. The request body is shown at all — the heading has promised it
-    //    since it was written.
+    // 3. Both panes can re-issue the call: the expand URLs carry the
+    //    operation parameters plus the pane's `target=`. An empty expand
+    //    URL is the whole-page-injection bug.
     assert!(
-        html.contains("valueCode") && html.contains("001"),
-        "the POSTed Parameters must be visible; got:\n{html}",
+        html.contains("/ui/hts/code-systems/workbench/lookup/json-expand?")
+            && html.contains("target=request")
+            && html.contains("target=response"),
+        "expand URLs must address both payload halves; got:\n{html}",
+    );
+    assert!(
+        !html.contains(r#"data-expand-url="""#),
+        "an empty expand URL POSTs the current page into the tree",
+    );
+    assert!(
+        html.contains("code=001"),
+        "the fragment URLs must carry the operation parameters; got:\n{html}",
     );
     assert!(html.contains("/CodeSystem/$lookup"), "and the request URL");
 }

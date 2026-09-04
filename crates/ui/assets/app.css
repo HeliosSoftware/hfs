@@ -98,6 +98,38 @@
   margin: 0 0 10px;
 }
 
+/* One incremental JSON pane inside the HTS workbench raw fold (#898):
+   a labelled data-capability-json-root with its own expand/collapse
+   controls, stacked twice (request body, response body). */
+.capability-json-pane {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  min-width: 0;
+}
+
+.capability-json-pane + .capability-json-pane {
+  margin-top: 14px;
+}
+
+/* Like `.capability-raw-card > .card-head`: label and controls sit together,
+   left-aligned. */
+.capability-json-pane__head {
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.capability-json-pane__head > span {
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.6px;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
 @media (max-width: 520px) {
   .cap-resource-card > .card-head {
     flex-direction: column;
@@ -1674,16 +1706,19 @@ select.field__input {
   color: var(--muted);
 }
 
-/* The Raw CapabilityStatement has one keyboard-focusable scroll owner. Every
-   nested outline and shared JSON fragment remains overflow-visible inside it. */
-#capability-json-body {
+/* The Raw CapabilityStatement — and each HTS workbench pane body (#898) —
+   has one keyboard-focusable scroll owner. Every nested outline and shared
+   JSON fragment remains overflow-visible inside it. */
+#capability-json-body,
+.capability-json-pane__body {
   max-height: 70vh;
   overflow: auto;
   scrollbar-gutter: stable;
   outline: none;
 }
 
-#capability-json-body:focus-visible {
+#capability-json-body:focus-visible,
+.capability-json-pane__body:focus-visible {
   border-radius: 8px;
   box-shadow: 0 0 0 3px var(--accent-soft);
 }
@@ -1695,7 +1730,8 @@ select.field__input {
   line-height: 1.6;
 }
 
-#capability-json-body .capability-json-outline {
+#capability-json-body .capability-json-outline,
+.capability-json-pane__body .capability-json-outline {
   max-height: none;
   overflow: visible;
 }
@@ -4641,9 +4677,11 @@ details.json-fold[open] > summary .icon {
   line-height: 1.6;
 }
 
-/* The CapabilityStatement owns the only scroll container for its incremental
-   tree. Keep bounded scalar fragments from creating nested 70vh scrollers. */
-#capability-json-body .json-view {
+/* The CapabilityStatement — and each HTS workbench pane (#898) — owns the
+   only scroll container for its incremental tree. Keep bounded scalar
+   fragments from creating nested 70vh scrollers. */
+#capability-json-body .json-view,
+.capability-json-pane__body .json-view {
   max-height: none;
   overflow: visible;
 }
