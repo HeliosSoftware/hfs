@@ -50,8 +50,18 @@
  * itself and the page is the textarea as it is today - the guided-form
  * wiring then drives that plain textarea instead (`getDoc` reads its value,
  * `setDoc` writes it and fires `input`, sync listens for `input` on it
- * directly), no CodeMirror concept involved. Diagnostics, completion, and
- * i18n for the lint are out of scope here.
+ * directly), no CodeMirror concept involved. Save's own with-errors
+ * confirmation (#821, below) never fires either, since without a mounted
+ * editor no lint pass has ever run to have found anything to warn about.
+ *
+ * Each server lint diagnostic's `fixes` (#821) becomes a `Diagnostic.action`
+ * - a button in the hover tooltip and the lint panel alike, and reachable
+ * by keyboard as Ctrl+. - that edits the document by the fix's own RFC 6901
+ * pointer, resolved against the browser's live syntax tree at the moment
+ * it is actually clicked, never at diagnostic time. `message`/fix `label`
+ * strings already arrive translated from the server; the one string this
+ * file localizes itself is the save-with-errors confirmation's plural
+ * count, via `data-msg-save-errors-one`/`-other` on `#vd-editor-grid`.
  *
  * `minimalChange` is exported for its own unit test
  * (`crates/ui/e2e/unit/vd-editor.test.cjs`) via the same UMD-ish shape
@@ -677,17 +687,119 @@
         return valueRange(doc, node);
       };
 
+      /* ---- Diagnostic actions: applying a fix by pointer (#821) -----------
+       *
+       * `stringContentRange`/`escapeJsonStringContent`/`removeKeyRange`
+       * above are the pure half of turning a `Fix` into a CodeMirror change;
+       * this is the half that needs a real, *live* tree - resolved at apply
+       * time (a click, or Ctrl+.), never at the moment the diagnostic first
+       * arrived: the document may have changed since, and a
+       * pointer that no longer resolves against its current shape means the
+       * fix does nothing rather than mangling unrelated text.
+       */
+
+      /* The `Property` node *itself* (not its value - see `resolveByPointer`
+       * for that) that `pointer` names: its parent object resolved from
+       * every segment but the last, then that last segment looked up by key
+       * - the same two-step `unknownKeyRange` above already does to find a
+       * key's own `PropertyName`. `null` for the document root (`pointer
+       * === ""`, which never names a property) or for any segment that
+       * fails to resolve. */
+      var resolvePropertyByPointer = function (tree, doc, pointer) {
+        var cut = pointer.lastIndexOf("/");
+        if (cut < 0) return null;
+        var parent = resolveByPointer(tree, doc, pointer.slice(0, cut));
+        if (!parent || parent.name !== "Object") return null;
+        return findProperty(parent, unescapePointerSegment(pointer.slice(cut + 1)), doc);
+      };
+
+      /* One `{from, to, insert}` CodeMirror change per `Fix` kind, or `null`
+       * when the pointer no longer resolves to the shape that kind expects
+       * (an `Object`'s own `Property` for rename/remove-key, a `String` for
+       * set-string). */
+      var renameKeyChange = function (tree, doc, pointer, to) {
+        var property = resolvePropertyByPointer(tree, doc, pointer);
+        var nameNode = property ? property.firstChild : null;
+        if (!nameNode || nameNode.name !== "PropertyName") return null;
+        var range = stringContentRange(nameNode);
+        return { from: range.from, to: range.to, insert: to };
+      };
+
+      var removeKeyChange = function (tree, doc, pointer) {
+        var property = resolvePropertyByPointer(tree, doc, pointer);
+        if (!property) return null;
+        var range = removeKeyRange(property);
+        return { from: range.from, to: range.to, insert: "" };
+      };
+
+      var setStringChange = function (tree, doc, pointer, value) {
+        var node = resolveByPointer(tree, doc, pointer);
+        if (!node || node.name !== "String") return null;
+        var range = stringContentRange(node);
+        return { from: range.from, to: range.to, insert: escapeJsonStringContent(value) };
+      };
+
+      /* Dispatches one fix as one transaction (`userEvent: "lint.fix"` -
+       * Ctrl+Z undoes it in a single step) and reports whether it actually
+       * changed anything, so `buildFixAction` below only relaunches the
+       * lint (`forceLinting`) when there is something new for it to find. A
+       * `Fix` kind this client does not recognize (the server's own type is
+       * `#[non_exhaustive]`) is treated exactly like an unresolved pointer -
+       * a no-op, never a throw. */
+      var applyStructuralFix = function (view, fix) {
+        var tree = CM.syntaxTree(view.state);
+        var doc = view.state.doc;
+        var change =
+          fix.kind === "rename-key"
+            ? renameKeyChange(tree, doc, fix.pointer, fix.to)
+            : fix.kind === "remove-key"
+              ? removeKeyChange(tree, doc, fix.pointer)
+              : fix.kind === "set-string"
+                ? setStringChange(tree, doc, fix.pointer, fix.value)
+                : null;
+        if (!change) return false;
+        view.dispatch({ changes: change, userEvent: "lint.fix" });
+        return true;
+      };
+
+      /* One `Diagnostic.action` (`@codemirror/lint`'s own shape -
+       * `{name, apply(view, from, to)}`, rendered as a button in the hover
+       * tooltip and the lint panel alike) per `Fix`: `name` is the fix's
+       * already-translated `label`; `apply` ignores the `from`/`to` CM6
+       * hands it (this diagnostic's own range, not where the fix itself
+       * needs to edit) in favor of resolving the fix's own pointer fresh,
+       * exactly like every other caller of `applyStructuralFix`. */
+      var buildFixAction = function (fix) {
+        return {
+          name: fix.label,
+          apply: function (view) {
+            if (applyStructuralFix(view, fix)) CM.forceLinting(view);
+          },
+        };
+      };
+
       var toCmDiagnostic = function (view, serverDiagnostic) {
         var docLength = view.state.doc.length;
         var range = diagnosticRange(view, serverDiagnostic);
         var from = Math.max(0, Math.min(range.from, docLength));
         var to = Math.max(from, Math.min(range.to, docLength));
-        return {
+        var diagnostic = {
           from: from,
           to: to,
           severity: serverDiagnostic.severity === "warning" ? "warning" : "error",
           message: serverDiagnostic.message,
+          // #821: the diagnostic's own `code` (e.g. "unknown-key") as
+          // @codemirror/lint's `source` - an intentionally untranslated
+          // technical tag, rendered dim and monospace (`.cm-diagnosticSource`,
+          // app.css), the same way a linter/rule name reads elsewhere.
+          source: serverDiagnostic.code,
         };
+        // #821: a diagnostic with no fixes carries no `actions` key at all
+        // (not an empty array) - the literal contract, even though
+        // @codemirror/lint's own rendering treats both the same.
+        var fixes = Array.isArray(serverDiagnostic.fixes) ? serverDiagnostic.fixes : [];
+        if (fixes.length > 0) diagnostic.actions = fixes.map(buildFixAction);
+        return diagnostic;
       };
 
       var fetchServerDiagnostics = function (view) {
@@ -1472,6 +1584,79 @@
         extensions: [
           CM.linter(vdLinter, { delay: 400 }),
           CM.lintGutter(),
+          // #821: Mod-. applies the single fix under the cursor, or
+          // opens the lint panel when more than one applies; `lintKeymap`
+          // rides along in the same extension, adding F8 (next diagnostic)
+          // and Ctrl-Shift-M (open panel). Added here, in `vd-editor.js`,
+          // not `code-editor.js`: no other editor in this crate has fixes
+          // to apply. Ordered ahead of `code-editor.js`'s own
+          // `keymap.of(...)` (built from its own `extensions` array, added
+          // after this one) so these bindings are checked first - moot
+          // today (none collide with `completionKeymap`/`defaultKeymap`),
+          // but keeps the intent explicit.
+          CM.keymap.of([{ key: "Mod-.", run: applyFixAtCursor }].concat(CM.lintKeymap)),
+          // #821 (axe `nested-interactive`, WCAG 4.1.2): the bottom lint
+          // panel (`openLintPanel`) renders each diagnostic as `<li
+          // role="option" aria-selected="...">`, and a diagnostic with fixes
+          // nests its `<button class="cm-diagnosticAction">` actions
+          // *inside* that same `<li>` - a real, if unusual, ARIA
+          // anti-pattern (`role="option"` is meant to be a non-interactive
+          // leaf; nesting a focusable control inside one is exactly what
+          // this check exists to catch, and several screen readers'
+          // list-browsing modes genuinely cannot reach a nested control).
+          // The hover tooltip renders the identical `<li
+          // class="cm-diagnostic">` markup but never sets `role="option"`
+          // on it, so this is scoped to the panel alone. Since this
+          // "listbox of selectable-and-independently-actionable rows" shape
+          // is not really an ARIA listbox to begin with (a listbox's own
+          // options are supposed to be the interactive part, not the
+          // buttons living inside them), the panel is normalized to a plain
+          // list instead - `role="list"` on the panel's own `<ul>` (`<li>`
+          // already has an implicit `listitem` role from being an `<li>` in
+          // a list, so nothing needs setting there), each `<li>`'s own
+          // `role="option"` and `aria-selected` removed (neither is a valid
+          // attribute for the resulting implicit `listitem` role, so they
+          // must go together, not just the offending `role`), and the
+          // panel's own `aria-activedescendant` (`listbox`-only) removed
+          // from the `<ul>`. The current-item highlight this app's own CSS
+          // paints (`app.css`'s `.cm-panel.cm-panel-lint ul li[data-
+          // selected]`) is *not* lost - `aria-selected`'s own true/false is
+          // mirrored onto `data-selected` (a plain, non-ARIA attribute, so
+          // it carries no semantics of its own to be invalid) before the
+          // ARIA attribute is removed. Runs on every update rather than
+          // once: the panel reassigns `aria-selected` to a *different*
+          // `<li>` on every F8/arrow-key move through it, each one its own
+          // transition this listener has to re-sync - and every selector
+          // below is written to still match an `<li>`/`<ul>` this listener
+          // already stripped on an earlier update, not just a freshly-
+          // created one (gating on `[role='listbox']`/`li[role='option']`,
+          // this file's own first draft's bug, matches exactly once: the
+          // very next selection change re-adds `aria-selected` to that
+          // same, by-then-role-less `<li>`, and a selector still requiring
+          // the role this listener already removed never looks at it
+          // again). A page with no panel open (or no CodeMirror-owned
+          // document at all) never matches `.cm-panel-lint ul`, so this is
+          // a no-op cost the rest of the time.
+          CM.EditorView.updateListener.of(function (update) {
+            var panelList = update.view.dom.ownerDocument.querySelector(".cm-panel-lint ul");
+            if (!panelList) return;
+            if (panelList.getAttribute("role") !== "list") {
+              panelList.setAttribute("role", "list");
+            }
+            if (panelList.hasAttribute("aria-activedescendant")) {
+              panelList.removeAttribute("aria-activedescendant");
+            }
+            panelList.querySelectorAll("li").forEach(function (li) {
+              if (li.getAttribute("role") === "option") li.removeAttribute("role");
+              if (li.getAttribute("aria-selected") === "true") {
+                li.setAttribute("data-selected", "true");
+                li.removeAttribute("aria-selected");
+              } else if (li.hasAttribute("aria-selected")) {
+                li.removeAttribute("data-selected");
+                li.removeAttribute("aria-selected");
+              }
+            });
+          }),
           // `.cm-content` is `contenteditable`, genuinely reachable by Tab
           // in every real browser without this - but axe's own
           // `scrollable-region-focusable` check does not credit a bare
@@ -1498,9 +1683,72 @@
             if (update.selectionSet || update.docChanged) handleSelectionUpdate();
           }),
         ],
+        // #821: one source, `vdCompletionSource` above - `code-editor.js`
+        // wires it through `autocompletion({ override: ..., activateOnTyping:
+        // true })` plus `completionKeymap`. Not offered on the SQL pane
+        // editors (`sql-editor.js` never passes this option).
+        completion: [vdCompletionSource],
         fold: true,
         wrapperClass: "vd-editor",
         id: "vd-editor",
+      });
+
+      /* ---- Save-with-errors confirmation (#821) ---------------------------
+       *
+       * Plain-form semantics stay the primary contract (NF1): without this
+       * script, Save always just submits, exactly as it does today. With
+       * it, submitting as Save - not Duplicate; the two submit buttons
+       * share this one form and are told apart by `event.submitter`, both
+       * carrying `name="action"` with a different `value` rather than one
+       * of them lacking the attribute - while the most recently *completed*
+       * lint pass (`lastLintDiagnostics` above) still has at least one
+       * `error`-severity diagnostic pops a native `window.confirm` naming
+       * the count, plural-correct in the negotiated locale. Cancelling it
+       * keeps the page as it is and returns focus to the editor, the same
+       * shape as cancelling any other destructive confirm in this crate
+       * (`data-crud-delete`); accepting it lets the submit continue.
+       * Warnings alone, or no diagnostics yet, submit with no prompt.
+       */
+      var isDuplicateSubmit = function (submitter) {
+        return !!submitter && submitter.name === "action" && submitter.value === "duplicate";
+      };
+
+      var errorCountFrom = function (diagnostics) {
+        var count = 0;
+        for (var i = 0; i < diagnostics.length; i++) {
+          if (diagnostics[i].severity === "error") count++;
+        }
+        return count;
+      };
+
+      /* `data-msg-save-errors-one`/`-other` on `#vd-editor-grid` (Fluent
+       * `vd-save-with-errors-one`/`-other`, rendered server-side with the
+       * literal placeholder text `{count}` standing in for `$count` - the
+       * same trick `search-results.html`'s own `data-msg-total` uses,
+       * since the real count is known only here, once a lint pass has
+       * actually completed). `null` when the marker is missing (no `grid`,
+       * or a page fragment that never set it) rather than an untranslated
+       * English fallback - matching `requiredLabel` above, a missing
+       * translation degrades to no confirmation at all, never one in the
+       * wrong language. */
+      var saveConfirmMessage = function (errorCount) {
+        if (!grid) return null;
+        var template =
+          errorCount === 1 ? grid.dataset.msgSaveErrorsOne : grid.dataset.msgSaveErrorsOther;
+        return template ? template.replace("{count}", String(errorCount)) : null;
+      };
+
+      form.addEventListener("submit", function (event) {
+        if (isDuplicateSubmit(event.submitter)) return;
+        var errorCount = errorCountFrom(lastLintDiagnostics);
+        if (errorCount === 0) return;
+        var message = saveConfirmMessage(errorCount);
+        if (!message) return;
+        if (!root.confirm(message)) {
+          event.preventDefault();
+          if (view) view.focus();
+          else textarea.focus();
+        }
       });
     }
 
@@ -1659,5 +1907,22 @@
     }
   }
 
-  return { minimalChange: minimalChange, mount: mount };
+  return {
+    minimalChange: minimalChange,
+    // #821: the completion pure helpers (NF5) - see their own doc comments
+    // above for what each covers.
+    skeletonForDetail: skeletonForDetail,
+    skeletonCursorOffset: skeletonCursorOffset,
+    classifyObjectGap: classifyObjectGap,
+    objectGapAt: objectGapAt,
+    buildKeyInsertion: buildKeyInsertion,
+    codePointOffset: codePointOffset,
+    utf16OffsetForCodePoints: utf16OffsetForCodePoints,
+    // #821 (NF3): the pure half of applying a diagnostic's `Fix` by pointer
+    // - see their own doc comments above for what each covers.
+    stringContentRange: stringContentRange,
+    escapeJsonStringContent: escapeJsonStringContent,
+    removeKeyRange: removeKeyRange,
+    mount: mount,
+  };
 });

@@ -6559,6 +6559,17 @@ body.app-shell .pane {
   background: var(--accent-soft);
 }
 
+/* #821: `.cm-gutters`' own `color: var(--muted)` above, over the active
+   line's `--accent-soft` wash, measures 4.44:1 in the light theme — just
+   under WCAG AA's 4.5:1 (axe-caught: `a11y.spec.ts`'s targeted lint-panel/
+   tooltip states are the first scan to ever exercise a focused, active-line
+   editor). The active line's own content already renders full-strength
+   (`.cm-content`'s `color: var(--text)`, never dimmed) rather than muted;
+   its gutter number matching that is the same fix, not a one-off color. */
+.code-editor .cm-activeLineGutter {
+  color: var(--text);
+}
+
 .code-editor .cm-selectionBackground {
   background: var(--accent-soft);
 }
@@ -6617,10 +6628,13 @@ body.app-shell .pane {
    matches neither surface in light. Recolored here as an ordinary app
    popover instead: the same surface/border/radius/shadow recipe
    `.menu__panel` already uses, so it reads as this UI's own chrome, not a
-   library default. (The bottom `cm-panel-lint` diagnostics panel is left
-   alone: nothing in the ViewDefinition editor's keymap can open it — no
-   `lintKeymap` is wired in `vd-editor.js` — so it is unreachable, not just
-   unstyled.) */
+   library default. Reachable — and, since #821, also *actionable* — three
+   ways: hovering the underline, resting the cursor inside it (both native
+   `@codemirror/lint` behavior, left at its default `hoverTime`), or
+   Ctrl+. (`vd-editor.js`'s own `Mod-.` binding); Ctrl-Shift-M opens the
+   bottom `cm-panel-lint` list of every diagnostic at once (`lintKeymap`,
+   also wired in `vd-editor.js`), styled together with this tooltip further
+   down since both render the identical `.cm-diagnostic` markup. */
 .code-editor .cm-tooltip {
   background: var(--surface);
   color: var(--text);
@@ -6648,6 +6662,51 @@ body.app-shell .pane {
    keeps the bar fully inside the rounded box instead of flush with its edge. */
 .code-editor .cm-diagnostic {
   margin-left: 0;
+}
+
+/* Quick-fix action buttons (#821): one per `Fix` the diagnostic
+   carries, rendered by @codemirror/lint itself inside `.cm-diagnostic` (the
+   tooltip) and each `<li>` of `.cm-panel-lint` alike. CM6's own baseTheme
+   hardcodes a dark `#444` pill with white text, unthemed and out of step
+   with everything else in this popover - recolored here as this app's own
+   secondary-button recipe (`.btn`'s own surface/border/radius, scaled down
+   to the tooltip's own type size) instead. */
+.code-editor .cm-diagnosticAction {
+  font: inherit;
+  font-size: 11px;
+  font-weight: 500;
+  padding: 3px 8px;
+  margin-left: 8px;
+  color: var(--text);
+  background: var(--surface);
+  border: 1px solid var(--surface-border);
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.code-editor .cm-diagnosticAction:hover {
+  background: var(--accent-soft);
+  border-color: var(--accent);
+}
+
+/* The app's own focus indicator (#682, same recipe as `.btn:focus-visible`
+   above) - these buttons are reached by Tab while the tooltip/panel has
+   focus, not just by mouse. */
+.code-editor .cm-diagnosticAction:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+/* The diagnostic's own `source` (#821: the lint's `code`, e.g.
+   "unknown-key") - an intentionally untranslated technical tag, so it reads
+   as secondary/reference text rather than part of the message itself. CM6's
+   own baseTheme already dims it (`opacity: .7`); recolored to `--muted` so
+   both themes keep AA contrast against `--surface` rather than an
+   arbitrary opacity over whatever `--text` happens to be. */
+.code-editor .cm-diagnosticSource {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  color: var(--muted);
+  opacity: 1;
 }
 
 /* Server lint presentation (#753): the underline, gutter
