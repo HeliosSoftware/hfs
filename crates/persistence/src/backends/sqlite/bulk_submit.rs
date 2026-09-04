@@ -23,7 +23,9 @@ use crate::core::bulk_submit_worker::{
     ManifestFetchParams, ManifestLease, ManifestWorkerView, PollTokenTarget, SubmitClaimStrategy,
     SubmitFileRecord, SubmitFileRow, SubmitWorkerStorage,
 };
-use crate::error::{BackendError, BulkSubmitError, StorageError, StorageResult};
+use crate::error::{
+    BackendError, BulkSubmitError, StorageError, StorageResult, classify_sqlite_error,
+};
 use crate::tenant::{TenantContext, TenantId, TenantPermissions};
 
 use super::SqliteBackend;
@@ -59,6 +61,54 @@ fn internal_error(message: String) -> StorageError {
         message,
         source: None,
     })
+}
+
+/// Bounded retry for the manifest bookkeeping writes (`bulk_manifests` /
+/// `bulk_submissions` counter and progress `UPDATE`s).
+///
+/// Under file fan-out (#933) every ingest batch holds SQLite's single write
+/// lock for its whole extraction + insert span, so a bookkeeping `UPDATE`
+/// queued behind several such holds can outlast `busy_timeout` and fail with
+/// `SQLITE_BUSY` even though the database is healthy. Aborting the whole
+/// manifest over a contended counter update is disproportionate (#942):
+/// these writes are safe to reissue — an attempt that fails busy/locked
+/// never acquired the write lock, so it changed nothing — and they are
+/// guarded by the lease's `worker_id`/`fencing_token` where staleness
+/// matters. Each attempt checks out a fresh pooled connection so no pool
+/// slot is held across the backoff sleep.
+///
+/// Only busy/locked — classified as [`BackendError::Unavailable`] by
+/// [`classify_sqlite_error`] — is retried; every other error surfaces
+/// immediately.
+async fn retry_bookkeeping_on_busy<T>(
+    what: &str,
+    mut attempt: impl FnMut() -> StorageResult<T>,
+) -> StorageResult<T> {
+    /// Total attempts before the busy error is surfaced. Each attempt already
+    /// waits up to the connection's `busy_timeout` (30 s by default), so a
+    /// handful of retries rides out a fan-out contention spike without
+    /// masking a genuinely wedged database forever.
+    const MAX_ATTEMPTS: u32 = 5;
+    let mut backoff = StdDuration::from_millis(50);
+    let mut attempt_no = 1u32;
+    loop {
+        match attempt() {
+            Err(StorageError::Backend(BackendError::Unavailable { message, .. }))
+                if attempt_no < MAX_ATTEMPTS =>
+            {
+                tracing::warn!(
+                    attempt = attempt_no,
+                    max_attempts = MAX_ATTEMPTS,
+                    backoff_ms = backoff.as_millis() as u64,
+                    "sqlite busy during {what}; retrying: {message}"
+                );
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(StdDuration::from_secs(1));
+                attempt_no += 1;
+            }
+            other => return other,
+        }
+    }
 }
 
 #[async_trait]
@@ -746,8 +796,13 @@ impl BulkSubmitProvider for SqliteBackend {
         // write lock, while a standalone flush (the lease keeper's) can
         // starve for tens of seconds against back-to-back batch
         // transactions. MAX keeps a late keeper flush from regressing it.
+        //
+        // Both bookkeeping writes retry on SQLITE_BUSY instead of aborting
+        // the manifest (#942): under fan-out this counter update can queue
+        // behind several batch-long write-lock holds and outlast
+        // busy_timeout, and a failed attempt applied nothing, so reissuing
+        // the increment is safe.
         let now = Utc::now().to_rfc3339();
-        let conn = self.get_connection()?;
         let (consumed, bytes_total) = options
             .byte_progress
             .as_ref()
@@ -758,40 +813,54 @@ impl BulkSubmitProvider for SqliteBackend {
                 )
             })
             .unwrap_or((0, 0));
-        conn.execute(
-            "UPDATE bulk_manifests SET
-                total_entries = total_entries + ?1,
-                processed_entries = processed_entries + ?2,
-                failed_entries = failed_entries + ?3,
-                bytes_processed = MAX(bytes_processed, ?8),
-                bytes_total = MAX(bytes_total, ?9)
-             WHERE tenant_id = ?4 AND submitter = ?5 AND submission_id = ?6 AND manifest_id = ?7",
-            params![
-                results.len() as i64,
-                results.iter().filter(|r| r.is_success()).count() as i64,
-                error_count as i64,
-                tenant_id,
-                &submission_id.submitter,
-                &submission_id.submission_id,
-                manifest_id,
-                consumed,
-                bytes_total
-            ],
-        )
-        .map_err(|e| internal_error(format!("Failed to update manifest counts: {}", e)))?;
+        let total_count = results.len() as i64;
+        let success_count = results.iter().filter(|r| r.is_success()).count() as i64;
+        retry_bookkeeping_on_busy("manifest counts update", || {
+            let conn = self.get_connection()?;
+            conn.execute(
+                "UPDATE bulk_manifests SET
+                    total_entries = total_entries + ?1,
+                    processed_entries = processed_entries + ?2,
+                    failed_entries = failed_entries + ?3,
+                    bytes_processed = MAX(bytes_processed, ?8),
+                    bytes_total = MAX(bytes_total, ?9)
+                 WHERE tenant_id = ?4 AND submitter = ?5 AND submission_id = ?6 AND manifest_id = ?7",
+                params![
+                    total_count,
+                    success_count,
+                    error_count as i64,
+                    tenant_id,
+                    &submission_id.submitter,
+                    &submission_id.submission_id,
+                    manifest_id,
+                    consumed,
+                    bytes_total
+                ],
+            )
+            .map_err(|e| {
+                StorageError::Backend(classify_sqlite_error("Failed to update manifest counts", e))
+            })
+        })
+        .await?;
 
         // Update submission updated_at
-        conn.execute(
-            "UPDATE bulk_submissions SET updated_at = ?1
-             WHERE tenant_id = ?2 AND submitter = ?3 AND submission_id = ?4",
-            params![
-                now,
-                tenant_id,
-                &submission_id.submitter,
-                &submission_id.submission_id
-            ],
-        )
-        .map_err(|e| internal_error(format!("Failed to update submission: {}", e)))?;
+        retry_bookkeeping_on_busy("submission updated_at write", || {
+            let conn = self.get_connection()?;
+            conn.execute(
+                "UPDATE bulk_submissions SET updated_at = ?1
+                 WHERE tenant_id = ?2 AND submitter = ?3 AND submission_id = ?4",
+                params![
+                    now,
+                    tenant_id,
+                    &submission_id.submitter,
+                    &submission_id.submission_id
+                ],
+            )
+            .map_err(|e| {
+                StorageError::Backend(classify_sqlite_error("Failed to update submission", e))
+            })
+        })
+        .await?;
 
         Ok(results)
     }
@@ -1605,9 +1674,11 @@ impl SubmitWorkerStorage for SqliteBackend {
         failed_entries: u64,
         last_processed_line: u64,
     ) -> Result<(), LeaseError> {
-        let conn = self.get_connection().map_err(LeaseError::Storage)?;
-        let affected = conn
-            .execute(
+        // Absolute-value write guarded by worker_id + fencing_token, so a
+        // busy retry is idempotent and a stale lease still loses (#942).
+        let affected = retry_bookkeeping_on_busy("manifest progress update", || {
+            let conn = self.get_connection()?;
+            conn.execute(
                 "UPDATE bulk_manifests
                  SET processed_entries = ?1, failed_entries = ?2, last_processed_line = ?3
                  WHERE tenant_id = ?4 AND submitter = ?5 AND submission_id = ?6
@@ -1624,7 +1695,10 @@ impl SubmitWorkerStorage for SqliteBackend {
                     lease.fencing_token as i64
                 ],
             )
-            .map_err(|e| LeaseError::Storage(internal_error(format!("update progress: {e}"))))?;
+            .map_err(|e| StorageError::Backend(classify_sqlite_error("update progress", e)))
+        })
+        .await
+        .map_err(LeaseError::Storage)?;
         if affected == 0 {
             Err(lease_lost(lease))
         } else {
@@ -1638,9 +1712,11 @@ impl SubmitWorkerStorage for SqliteBackend {
         bytes_processed: u64,
         bytes_total: u64,
     ) -> Result<(), LeaseError> {
-        let conn = self.get_connection().map_err(LeaseError::Storage)?;
-        let affected = conn
-            .execute(
+        // MAX() keeps the write monotonic, so a busy retry is idempotent and
+        // the worker_id + fencing_token guard still fences stale leases (#942).
+        let affected = retry_bookkeeping_on_busy("manifest bytes update", || {
+            let conn = self.get_connection()?;
+            conn.execute(
                 "UPDATE bulk_manifests
                  SET bytes_processed = MAX(bytes_processed, ?1),
                      bytes_total = MAX(bytes_total, ?2)
@@ -1657,7 +1733,10 @@ impl SubmitWorkerStorage for SqliteBackend {
                     lease.fencing_token as i64
                 ],
             )
-            .map_err(|e| LeaseError::Storage(internal_error(format!("update bytes: {e}"))))?;
+            .map_err(|e| StorageError::Backend(classify_sqlite_error("update bytes", e)))
+        })
+        .await
+        .map_err(LeaseError::Storage)?;
         if affected == 0 {
             Err(lease_lost(lease))
         } else {
@@ -2631,5 +2710,65 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    /// #942: a bookkeeping write that hits SQLITE_BUSY (classified as
+    /// `Unavailable`) is retried and succeeds once the contention clears,
+    /// instead of aborting the manifest. `start_paused` auto-advances the
+    /// backoff sleeps.
+    #[tokio::test(start_paused = true)]
+    async fn busy_bookkeeping_write_is_retried_until_it_succeeds() {
+        let attempts = std::sync::atomic::AtomicU32::new(0);
+        let result = retry_bookkeeping_on_busy("test write", || {
+            let n = attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if n < 2 {
+                Err(StorageError::Backend(BackendError::Unavailable {
+                    backend_name: "sqlite".to_string(),
+                    message: "database is locked".to_string(),
+                }))
+            } else {
+                Ok(7usize)
+            }
+        })
+        .await;
+        assert_eq!(result.unwrap(), 7);
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
+
+    /// #942: sustained contention is still surfaced — the retry loop is
+    /// bounded, and the final error is the classified busy error.
+    #[tokio::test(start_paused = true)]
+    async fn busy_bookkeeping_write_gives_up_after_bounded_attempts() {
+        let attempts = std::sync::atomic::AtomicU32::new(0);
+        let result: StorageResult<()> = retry_bookkeeping_on_busy("test write", || {
+            attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(StorageError::Backend(BackendError::Unavailable {
+                backend_name: "sqlite".to_string(),
+                message: "database is locked".to_string(),
+            }))
+        })
+        .await;
+        assert!(matches!(
+            result,
+            Err(StorageError::Backend(BackendError::Unavailable { .. }))
+        ));
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 5);
+    }
+
+    /// #942: only busy/locked retries — any other error surfaces on the
+    /// first attempt, exactly as before.
+    #[tokio::test]
+    async fn non_busy_bookkeeping_error_is_not_retried() {
+        let attempts = std::sync::atomic::AtomicU32::new(0);
+        let result: StorageResult<()> = retry_bookkeeping_on_busy("test write", || {
+            attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(internal_error("constraint violation".to_string()))
+        })
+        .await;
+        assert!(matches!(
+            result,
+            Err(StorageError::Backend(BackendError::Internal { .. }))
+        ));
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 }
