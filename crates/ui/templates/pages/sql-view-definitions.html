@@ -146,8 +146,26 @@
          textarea below (`form_pane`, built by `render_vd_form_pane`); it
          carries `needs-js` (`editor-form-pane.html`) so the grid collapses
          to the editor alone until `theme.js` marks `<html class="js">` and
-         `vd-editor.js` wires it up. -->
-    <div class="editor__grid editor__grid--stretch" id="vd-editor-grid">
+         `vd-editor.js` wires it up.
+
+         `data-msg-required` (#821): the translated marker `vd-editor.js`
+         appends to a required structural key's completion item — read once,
+         directly off this grid (already looked up by id at mount time), so
+         nothing English ever needs to be baked into the completion source
+         itself.
+
+         `data-msg-save-errors-one`/`-other` (#821): the two plural forms of
+         the Save-with-errors confirmation text, each rendered here with the
+         literal placeholder `{count}` standing in for `$count` — the same
+         trick `search-results.html`'s own `data-msg-total` uses — since the
+         real error count is known only client-side, once a lint pass has
+         actually completed. `vd-editor.js` substitutes it and picks the
+         singular/plural form itself before handing the result to
+         `window.confirm`. -->
+    <div class="editor__grid editor__grid--stretch" id="vd-editor-grid"
+         data-msg-required="{{ i18n.t("vd-complete-required") }}"
+         data-msg-save-errors-one="{{ i18n.t_arg("vd-save-with-errors-one", "count", "{count}".to_string()) }}"
+         data-msg-save-errors-other="{{ i18n.t_arg("vd-save-with-errors-other", "count", "{count}".to_string()) }}">
       <!-- The editor card (#752): always open, no fold — the definition
            lives in one place and the results below follow it live. The
            textarea itself carries the live-preview wiring: htmx reposts it

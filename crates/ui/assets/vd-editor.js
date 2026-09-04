@@ -108,6 +108,231 @@
     };
   }
 
+  /* ---- completion: pure helpers (#821) ------------------------------------
+   *
+   * `vdCompletionSource` (below, only defined once CodeMirror is actually
+   * mounted - it closes over `CM`) locates *where* the cursor is and asks
+   * `POST /ui/sql/view-definitions/complete` *what* fits there; these four
+   * functions are the part of "what to do with the answer" that needs no
+   * CodeMirror object at all - given as plain values, so they are exported
+   * (alongside `minimalChange`) for `vd-editor.test.cjs` to exercise
+   * directly under Node.
+   */
+
+  /* The JSON skeleton a freshly-inserted key gets, keyed by the `detail`
+   * kind `/complete`'s `kind: "key"` response carries for it (the same
+   * `helios_sof::lint::KeyKind` names `/lint`'s `unknown-key` check already
+   * uses) - one representative empty value per kind, valid JSON on its own,
+   * with the cursor landing inside it (see `skeletonCursorOffset`) rather
+   * than after it, so typing continues straight into the value. `"other"`,
+   * and anything this client does not otherwise recognize, is `null` - not
+   * a guess at a real default.
+   */
+  function skeletonForDetail(detail) {
+    switch (detail) {
+      case "string":
+        return '""';
+      case "boolean":
+        return "true";
+      case "number":
+        return "0";
+      case "string[]":
+        return '[""]';
+      case "object":
+        return "{}";
+      case "object[]":
+        return "[{}]";
+      default:
+        return "null";
+    }
+  }
+
+  /* Where inside a `skeletonForDetail` result the cursor belongs - inside
+   * the empty string/object it just inserted, so the next keystroke fills
+   * the value in directly; a skeleton with no natural "inside" (`true`,
+   * `0`, `null`) instead places it right after, ready to overtype. */
+  function skeletonCursorOffset(skeleton) {
+    switch (skeleton) {
+      case '""':
+        return 1;
+      case '[""]':
+        return 2;
+      case "{}":
+        return 1;
+      case "[{}]":
+        return 2;
+      default:
+        return skeleton.length;
+    }
+  }
+
+  /* Classifies one candidate "new key" gap inside a JSON `Object` node and
+   * says which comma(s) an insertion there needs to keep the document
+   * valid - pure, given only the direct child node names of that `Object`
+   * in document order (e.g. `["{", "Property", ",", "Property", "}"]`,
+   * `arrayItemAt`'s sibling-walk equivalent for an `Object`) and the index
+   * of the child immediately before the gap (`-1` for the gap right after
+   * `"{"`, before any child).
+   *
+   * A gap counts as a key position right after `"{"`, right after `","`, or
+   * right after a `"Property"` with no comma of its own yet - the last one
+   * reached whenever the user starts a new key before adding the separating
+   * comma themselves (or the document is mid-edit and missing one already),
+   * which `keyContextAt` below folds into the exact same "gap" handling
+   * rather than treating as a separate, unrecognized position. Anything
+   * else (right after `"}"`, i.e. past the object entirely) is `null` - not
+   * a key position at all. `leadingComma`/`trailingComma` say whether the
+   * insertion itself must supply the comma on that side; a `","` already
+   * sitting there needs no more help. */
+  function classifyObjectGap(childNames, beforeIndex) {
+    var before = beforeIndex >= 0 ? childNames[beforeIndex] : null;
+    var isKeyPosition = before === null || before === "{" || before === "," || before === "Property";
+    if (!isKeyPosition) return null;
+    var after = beforeIndex + 1 < childNames.length ? childNames[beforeIndex + 1] : null;
+    return {
+      leadingComma: before === "Property",
+      trailingComma: after === "Property",
+    };
+  }
+
+  /* `classifyObjectGap` above, fed from a JSON `Object`'s *real* direct
+   * children (`children`, each a plain `{name, from, to}` - a live
+   * `SyntaxNode` already duck-types this, so `keyContextAt` below passes
+   * those straight through with no conversion) instead of a hand-picked
+   * name list, plus the one bit of real-tree noise a plain array of names
+   * can't express: `lezer-json`'s own error recovery splices a zero-width
+   * node (named `"⚠"`, `from === to`) into exactly this gap - at the same
+   * offset as whichever real token follows it, a trailing `","` before the
+   * object's own `"}"`, or a missing one between two `Property`s - the
+   * moment the object does not simply end there. That placeholder is never
+   * a real "before" sibling; skipped here before building `classifyObjectGap`'s
+   * own `childNames`/`beforeIndex` inputs, since left in, its `.to <= pos`
+   * (true at the very `pos` the real `","`/`Property` one slot earlier
+   * already satisfies) silently overwrites the right answer with a name
+   * `classifyObjectGap` does not recognize - collapsing "right after a
+   * comma" (and "between two properties with a missing one") to "not a key
+   * position" for any object that is not already at its very end. */
+  function objectGapAt(children, pos) {
+    var childNames = [];
+    var beforeIndex = -1;
+    for (var i = 0; i < children.length; i++) {
+      var child = children[i];
+      if (child.from === child.to) continue;
+      childNames.push(child.name);
+      if (child.to <= pos) beforeIndex = childNames.length - 1;
+    }
+    return classifyObjectGap(childNames, beforeIndex);
+  }
+
+  /* The literal text (and, within it, the offset the cursor belongs at) for
+   * inserting a brand-new `"label": skeleton` property, wrapped in whatever
+   * leading/trailing comma text (`","` or `""`) `classifyObjectGap` above
+   * decided the surrounding gap needs. */
+  function buildKeyInsertion(label, skeleton, leadingComma, trailingComma) {
+    var body = '"' + label + '": ' + skeleton;
+    var cursor = leadingComma.length + (body.length - skeleton.length) + skeletonCursorOffset(skeleton);
+    return { text: leadingComma + body + trailingComma, cursor: cursor };
+  }
+
+  /* ---- completion: FHIRPath char-offset conversion (#821) -----------------
+   *
+   * `/complete`'s `kind: "fhirpath"` request and response both count
+   * `cursor`/`from` in Unicode code points ("chars", matching Rust's own
+   * `str::chars()`), never CodeMirror's own UTF-16 code-unit document
+   * positions - identical for the ASCII/BMP text a FHIRPath expression
+   * almost always is, but not in general (an astral character - e.g. an
+   * emoji some human-readable `%constant` value happens to contain - is one
+   * JS UTF-16 code unit pair but a single Unicode code point). These two
+   * pure conversions are the only place that distinction matters. */
+
+  /* The code-point count of `text.slice(0, utf16Offset)` - `utf16Offset`
+   * itself when `text` holds no astral character, since every code unit is
+   * then also its own code point. */
+  function codePointOffset(text, utf16Offset) {
+    return Array.from(text.slice(0, utf16Offset)).length;
+  }
+
+  /* The inverse: the UTF-16 code-unit offset into `text` that is
+   * `codePoints` Unicode code points in - `text.length` if `text` has fewer
+   * code points than that. */
+  function utf16OffsetForCodePoints(text, codePoints) {
+    var offset = 0;
+    var seen = 0;
+    while (seen < codePoints && offset < text.length) {
+      var code = text.codePointAt(offset);
+      offset += code > 0xffff ? 2 : 1;
+      seen++;
+    }
+    return offset;
+  }
+
+  /* ---- diagnostic actions: structural JSON edits, pure pieces (#821) -----
+   *
+   * `POST /lint`'s `fixes` are intentions against the document's own
+   * structure, addressed by RFC 6901 pointer - never a text position, since
+   * the server has no notion of one. Turning one into a CodeMirror change is
+   * "resolve the pointer against the *live* syntax tree, then compute a
+   * range" - the resolving half needs a real tree (`mount`'s own
+   * `resolvePropertyByPointer`/`renameKeyChange`/`removeKeyChange`/
+   * `setStringChange`, closing over `CM`, further down this file), but the
+   * range/text arithmetic itself does not. These three are that pure half -
+   * given already-resolved node positions (or, for the escape, a plain
+   * string) they need no CodeMirror object at all, so `vd-editor.test.cjs`
+   * exercises them directly under Node with hand-built node stubs.
+   */
+
+  /* The `[from, to)` range of a JSON string's *content*, excluding its
+   * surrounding quotes - shared by a key rename (on the `Property`'s
+   * `PropertyName`) and a `set-string` fix (on the value's own `String`),
+   * both of which replace only what sits inside the quotes. `Math.max`
+   * guards the degenerate `""` case, where `to` would otherwise land one
+   * before `from`. */
+  function stringContentRange(node) {
+    return { from: node.from + 1, to: Math.max(node.from + 1, node.to - 1) };
+  }
+
+  /* `value`, ready to sit inside a JSON string's quotes: `\` first (so a
+   * `"` this produces is not itself re-escaped a second time), then `"`. */
+  function escapeJsonStringContent(value) {
+    return value.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+  }
+
+  /* The `[from, to)` range that removes `propertyNode` (a JSON `Property`)
+   * *and* exactly the comma that would otherwise dangle - the next one if
+   * it has one, else the previous one - so the result is always valid JSON
+   * with every other property's own indentation untouched:
+   *
+   *   - a following comma exists: delete from wherever the *previous* token
+   *     ends (the prior comma, or the object's own "{" when this is the
+   *     first property) through that following comma - the removed
+   *     property's own leading whitespace/newline goes with it, so the next
+   *     property's is the only one left between the two survivors.
+   *   - no following comma, but a preceding one does (this was the last
+   *     property): delete from that comma itself (not just after it - the
+   *     comma must go too, since the property before it is now last)
+   *     through the end of this property's own value.
+   *   - neither (the object's only property): delete from the "{" through
+   *     the end of the value - the same shape as the first case with no
+   *     preceding token to speak of.
+   *
+   * Takes only `propertyNode` - its own `.parent`/`.prevSibling`/
+   * `.nextSibling`/`.from`/`.to` are all this needs, so no `doc` parameter:
+   * every quantity here is a position, never text. */
+  function removeKeyRange(propertyNode) {
+    var prev = propertyNode.prevSibling;
+    var next = propertyNode.nextSibling;
+    var prevComma = prev && prev.name === "," ? prev : null;
+    var nextComma = next && next.name === "," ? next : null;
+    var openBrace = propertyNode.parent.firstChild;
+    if (nextComma) {
+      return { from: prevComma ? prevComma.to : openBrace.to, to: nextComma.to };
+    }
+    if (prevComma) {
+      return { from: prevComma.from, to: propertyNode.to };
+    }
+    return { from: openBrace.to, to: propertyNode.to };
+  }
+
   /* ---- mount -------------------------------------------------------------- */
 
   function mount(root) {
@@ -121,6 +346,12 @@
     if (!textarea) return;
 
     var grid = document.getElementById("vd-editor-grid");
+    // #821: the translated "required" marker completion items for a
+    // structural key carry - read once here (rather than inside the
+    // completion source itself) since `grid` is already looked up at this
+    // point in `mount`; `undefined` when absent (no `data-msg-required`, or
+    // no grid at all) degrades to no marker rather than an English literal.
+    var requiredLabel = grid ? grid.dataset.msgRequired : undefined;
 
     // The CodeMirror mount's own `updateListener` extension needs this
     // reference before the guided-form wiring below exists to fill it in
@@ -488,9 +719,524 @@
 
       var jsonSyntaxLinter = CM.jsonParseLinter();
 
+      /* #821: the diagnostics the most recently *completed* lint pass
+       * produced - local JSON syntax errors, or the server's structural +
+       * FHIRPath checks, whichever branch of `vdLinter` below actually ran.
+       * Read by the save-confirmation submit handler further down `mount`:
+       * a Save pressed while a server round trip is still in flight sees
+       * whatever this held before that pass started, not a half-finished
+       * one - there is no reliable "pass in progress" signal to block on
+       * instead, and the previous pass's result is the closest
+       * approximation available without delaying the click on the network. */
+      var lastLintDiagnostics = [];
+
+      var recordLintResult = function (diagnostics) {
+        lastLintDiagnostics = diagnostics;
+        return diagnostics;
+      };
+
       var vdLinter = function (view) {
         var syntaxErrors = jsonSyntaxLinter(view);
-        return syntaxErrors.length > 0 ? syntaxErrors : fetchServerDiagnostics(view);
+        if (syntaxErrors.length > 0) return recordLintResult(syntaxErrors);
+        return fetchServerDiagnostics(view).then(recordLintResult);
+      };
+
+      /* ---- Ctrl+. : apply the fix under the cursor (#821) -----------------
+       *
+       * `Mod-.` collects every action of every diagnostic whose range
+       * touches the current cursor or selection via `forEachDiagnostic` -
+       * the live set CM6's own lint state already tracks, so no separate
+       * bookkeeping of "diagnostics at the cursor" is needed here. A
+       * zero-width selection (the common case, a plain cursor) "touches" a
+       * diagnostic range it sits anywhere inside, endpoints included; a real
+       * selection "touches" one it actually overlaps. Exactly one action
+       * across all of them applies it directly; more than one opens the
+       * lint panel (`openLintPanel` - navigable and clickable from there,
+       * `lintKeymap` below adds F8/Ctrl-Shift-M to reach it by keyboard
+       * too); none returns `false`, letting `.` fall through to its normal
+       * self-insertion.
+       */
+      var diagnosticTouchesSelection = function (diagFrom, diagTo, selFrom, selTo) {
+        if (selFrom === selTo) return selFrom >= diagFrom && selFrom <= diagTo;
+        return selFrom < diagTo && selTo > diagFrom;
+      };
+
+      var applyFixAtCursor = function (view) {
+        var sel = view.state.selection.main;
+        var actions = [];
+        CM.forEachDiagnostic(view.state, function (diagnostic, from, to) {
+          if (!diagnosticTouchesSelection(from, to, sel.from, sel.to)) return;
+          (diagnostic.actions || []).forEach(function (action) {
+            actions.push(action);
+          });
+        });
+        if (actions.length === 1) {
+          actions[0].apply(view, sel.from, sel.to);
+          return true;
+        }
+        if (actions.length > 1) return CM.openLintPanel(view);
+        return false;
+      };
+
+      /* ---- Completion (#821) ----------------------------------------------
+       *
+       * The browser resolves *where* the cursor is (this section); the
+       * server (`POST /ui/sql/view-definitions/complete`, `vd_complete.rs`)
+       * decides *what* fits there. `vdCompletionSource`, registered as
+       * `code-editor.js`'s `completion` option below, is the single entry
+       * point CodeMirror calls on every keystroke (`activateOnTyping`) and
+       * on Ctrl-Space (`completionKeymap`): it classifies `context.pos`
+       * against the browser's own syntax tree into exactly one of two
+       * request shapes - a structural JSON key (`keyContextAt`) or a
+       * partial FHIRPath expression (`fhirpathContextAt`, gated by the same
+       * injection rule `nestFhirpath` above uses, so completion and syntax
+       * coloring never disagree about which strings hold FHIRPath) - or
+       * `null` for anywhere else, which shows no popup at all.
+       *
+       * Every fetch is same-origin, `AbortController`-linked to CodeMirror's
+       * own `context.addEventListener("abort", ...)` (fired the moment a
+       * newer keystroke supersedes this request), and any failure - network,
+       * a non-2xx status, a body that is not the JSON this expects -
+       * degrades to `null` with a `console.debug`, exactly like the lint
+       * fetch above: a completion source is not a place to surface an error
+       * the user did not ask for.
+       */
+
+      /* The `Object` node that is `pos`'s innermost ancestor - `pos` itself
+       * when `resolveInner` already lands there (an empty object, or a
+       * whitespace gap between children with no leaf node of its own to
+       * resolve to), or its parent when `pos` resolved to one of that
+       * `Object`'s own direct children (`"{"`, `","`, `"}"`, or a
+       * `"Property"`) instead. `null` when neither is an `Object` at all. */
+      var objectAncestor = function (node) {
+        if (node.name === "Object") return node;
+        return node.parent && node.parent.name === "Object" ? node.parent : null;
+      };
+
+      /* `resolveInner(pos, -1)` picks the *deepest* node ending exactly at
+       * `pos`, not the outermost one - right after a property's value
+       * (`{"a": 1|}`), that is the value node itself (`Number`, `String`,
+       * a nested `Object`/`Array`, ...), not the `Property` wrapping it,
+       * even though both end at the same offset. Climbs from `node` through
+       * every ancestor whose own end also lands exactly on `pos` - a value
+       * up to its `Property`, and a `Property` up to its `Object` only if
+       * the object itself has no closing `"}"` yet - so the gap scan below
+       * always sees a `Property` (or the enclosing `Object`) as `pos`'s
+       * immediate predecessor, never a value node one level too deep. Never
+       * climbs out of an open key string (`node.name === "PropertyName"`
+       * is checked, and returns, before this ever runs). */
+      var climbToBoundary = function (node, pos) {
+        while (node.parent && node.to === pos && node.parent.to === pos) {
+          node = node.parent;
+        }
+        return node;
+      };
+
+      /* Where `pos` sits relative to a JSON `Object`'s structure - either
+       * inside an already-open key string (renaming it, or resuming a key
+       * that has no `:`/value yet), or in a "new key" gap between its
+       * children - or `null` for anywhere else (a value position, an array,
+       * or past the object's own closing `"}"`, none of which this editor
+       * offers key completion for).
+       *
+       * Returns, for an open string: `{openString: true, from, contentFrom,
+       * contentTo, propertyEnd, hasColon, objectNode, excludeProperty}`.
+       * For a gap: `{openString: false, from, objectNode, excludeProperty:
+       * null, leadingComma, trailingComma}` (`classifyObjectGap` above
+       * supplies the last two). `objectNode`/`excludeProperty` are read by
+       * the completion *source* (building the `pointer`/`present` request
+       * fields); `contentFrom`/`contentTo`/`propertyEnd`/`hasColon`/
+       * `leadingComma`/`trailingComma` are read by `applyKeyCompletion`,
+       * which calls this again fresh at accept time rather than trusting
+       * whatever this returned when the request went out - the document may
+       * have changed underneath it since. */
+      var keyContextAt = function (tree, doc, pos) {
+        var node = tree.resolveInner(pos, -1);
+
+        if (node.name === "PropertyName") {
+          var property = node.parent;
+          var objectNode = property && property.parent && property.parent.name === "Object" ? property.parent : null;
+          if (!objectNode) return null;
+          var contentFrom = node.from + 1;
+          var contentTo = Math.max(contentFrom, node.to - 1);
+          if (pos < contentFrom || pos > contentTo) return null;
+          var colon = node.nextSibling;
+          return {
+            openString: true,
+            from: contentFrom,
+            contentFrom: contentFrom,
+            contentTo: contentTo,
+            propertyEnd: property.to,
+            hasColon: !!colon && colon.name === ":",
+            objectNode: objectNode,
+            excludeProperty: property,
+          };
+        }
+
+        var ancestor = objectAncestor(climbToBoundary(node, pos));
+        if (!ancestor) return null;
+
+        var children = [];
+        for (var child = ancestor.firstChild; child; child = child.nextSibling) children.push(child);
+        var gap = objectGapAt(children, pos);
+        if (!gap) return null;
+
+        return {
+          openString: false,
+          from: pos,
+          objectNode: ancestor,
+          excludeProperty: null,
+          leadingComma: gap.leadingComma,
+          trailingComma: gap.trailingComma,
+        };
+      };
+
+      /* The keys `objectNode`'s own `Property` children already declare, in
+       * document order - `excludeProperty` (compared by range, not
+       * reference: see `arrayIndexOfChild`'s own comment on why a node
+       * handed back by `resolveInner` cannot be compared by identity
+       * against one reached by a sibling walk) left out, so completing the
+       * very key currently being typed or renamed never excludes itself. */
+      var presentKeys = function (objectNode, doc, excludeProperty) {
+        var keys = [];
+        for (var child = objectNode.firstChild; child; child = child.nextSibling) {
+          if (child.name !== "Property") continue;
+          if (
+            excludeProperty &&
+            child.from === excludeProperty.from &&
+            child.to === excludeProperty.to
+          ) {
+            continue;
+          }
+          var nameNode = child.firstChild;
+          if (nameNode && nameNode.name === "PropertyName") {
+            keys.push(propertyKeyText(nameNode, doc));
+          }
+        }
+        return keys;
+      };
+
+      var escapePointerSegment = function (segment) {
+        return segment.replace(/~/g, "~0").replace(/\//g, "~1");
+      };
+
+      /* The RFC 6901 pointer for `node` itself (not a descendant) - the
+       * inverse of `resolveByPointer` above, and the same ancestor walk
+       * `nodePathAtCursor` already does for the dotted row-path form, with
+       * pointer escaping instead of a plain `.` join. Shared by both
+       * `completeKey` (the containing `Object`'s own pointer) and
+       * `completeFhirpath` (the `String` node's own pointer). */
+      var pointerForNode = function (node, doc) {
+        var segments = [];
+        while (node) {
+          if (node.name === "Property") {
+            var nameNode = node.firstChild;
+            if (nameNode && nameNode.name === "PropertyName") {
+              segments.unshift(escapePointerSegment(propertyKeyText(nameNode, doc)));
+            }
+            node = node.parent;
+            continue;
+          }
+          var parent = node.parent;
+          if (!parent) break;
+          if (parent.name === "Array") {
+            var arrayIndex = arrayIndexOfChild(parent, node);
+            if (arrayIndex !== -1) segments.unshift(String(arrayIndex));
+          }
+          node = parent;
+        }
+        return segments.length ? "/" + segments.join("/") : "";
+      };
+
+      /* FHIRPath injection context at `pos` - the same "is this string a
+       * FHIRPath expression" test `nestFhirpath` above applies while
+       * building the syntax tree, run again here (not shared - the
+       * injection rule itself is left untouched, above) against the
+       * finished tree instead of mid-parse, plus the additional constraint
+       * that `pos` sits strictly within the string's *content* (excluding
+       * its quotes) and that content has no `\` - exactly `nestFhirpath`'s
+       * own escape bail-out, so a string this editor declines to inject
+       * FHIRPath coloring into is never offered FHIRPath completion either.
+       *
+       * `pos` almost never resolves to the outer JSON `String` node itself
+       * once it has real FHIRPath content: `resolveInner` picks the
+       * *deepest* match, which inside injected content is one of that
+       * grammar's own nodes (`Identifier`, `Invocation`, a FHIRPath string
+       * literal's own `'...'`, itself *also* named `"String"` by
+       * `lezer-fhirpath` - confirmed directly against `CM.fhirpath.parser`,
+       * not assumed) - so the climb below cannot just stop at the first
+       * `"String"` it meets. It keeps going past one whose parent is not
+       * `"Property"` (or `"Array"` under one, the `repeat` case) - only the
+       * *outer* JSON string has that shape, since a FHIRPath literal's own
+       * parent is always that grammar's `"Literal"` wrapper, never a JSON
+       * `"Property"`. */
+      var fhirpathContextAt = function (tree, doc, pos) {
+        var node = tree.resolveInner(pos, -1);
+        var property = null;
+        var mustBeRepeat = false;
+        while (node) {
+          if (node.name === "String") {
+            var parent = node.parent;
+            if (parent && parent.name === "Property") {
+              property = parent;
+              break;
+            }
+            if (parent && parent.name === "Array" && parent.parent && parent.parent.name === "Property") {
+              property = parent.parent;
+              mustBeRepeat = true;
+              break;
+            }
+          }
+          node = node.parent;
+        }
+        if (!property) return null;
+
+        var nameNode = property.firstChild;
+        if (!nameNode || nameNode.name !== "PropertyName") return null;
+        var key = propertyKeyText(nameNode, doc);
+        var matches = mustBeRepeat ? key === "repeat" : EXPRESSION_PROPERTIES.hasOwnProperty(key);
+        if (!matches) return null;
+
+        var contentFrom = node.from + 1;
+        var contentTo = node.to - 1;
+        if (contentTo < contentFrom || pos < contentFrom || pos > contentTo) return null;
+        if (doc.sliceString(contentFrom, contentTo).indexOf("\\") !== -1) return null;
+
+        return { stringNode: node, contentFrom: contentFrom, contentTo: contentTo };
+      };
+
+      /* Same-origin POST to `/complete`, `AbortController`-linked to
+       * CodeMirror's own completion `context` so an in-flight request is
+       * cancelled the moment it is superseded - resolves to the parsed
+       * response body, or `null` for any failure at all (never a thrown
+       * rejection: `vdCompletionSource`'s two callers both just treat a
+       * `null` result as "no popup"). */
+      var postComplete = function (context, body) {
+        var controller = new AbortController();
+        context.addEventListener("abort", function () {
+          controller.abort();
+        });
+        return fetch("/ui/sql/view-definitions/complete", {
+          method: "POST",
+          credentials: "same-origin",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+          signal: controller.signal,
+        })
+          .then(function (response) {
+            if (!response.ok) throw new Error("complete endpoint status " + response.status);
+            return response.json();
+          })
+          .catch(function (error) {
+            if (root.console && root.console.debug) {
+              root.console.debug("vd-editor: completion unavailable", error);
+            }
+            return null;
+          });
+      };
+
+      /* The required-item marker: appended to the kind label the server
+       * already sent (`"string"`, `"object[]"`, ...) rather than replacing
+       * it, and left off entirely when `requiredLabel` is not available
+       * (`mount`'s own read of `data-msg-required` came back empty) - never
+       * an English fallback string. */
+      var formatKeyDetail = function (item) {
+        if (!item.required || !requiredLabel) return item.detail;
+        return item.detail ? item.detail + " · " + requiredLabel : requiredLabel;
+      };
+
+      /* Re-resolves the key context fresh at `to` (rather than trusting
+       * whatever the completion source captured when the request went out -
+       * the document, and so the syntax tree, may have changed since) and
+       * dispatches the one transaction that inserts/renames a key for
+       * `completion` (built by `buildKeyOption` below, `vdSkeleton` its own
+       * private field carrying the raw kind - `completion.detail` is by now
+       * the *formatted*, translated-marker-appended text, not something
+       * `skeletonForDetail` can read back).
+       *
+       * Renaming/completing an open key string replaces just its content -
+       * whatever the user has typed so far - and, only when it has no `:`
+       * yet, appends `": " + skeleton` right after the property - both
+       * computed from the same fresh snapshot, so the two changes in one
+       * `dispatch` never straddle two different documents. A new-key gap
+       * replaces `[from, to)` (CodeMirror's own live tracking of how much
+       * has been typed since the popup opened) with `"label": skeleton`, comma-
+       * wrapped by `buildKeyInsertion`. If the document's shape no longer
+       * resolves a key context here at all (a rare edit-while-a-completion-
+       * is-open race), this falls back to replacing `[from, to)` with the
+       * bare label - never nothing, and never a throw. */
+      var applyKeyCompletion = function (view, completion, from, to) {
+        var skeleton = completion.vdSkeleton;
+        var label = completion.label;
+        var fresh = keyContextAt(CM.syntaxTree(view.state), view.state.doc, to);
+
+        if (fresh && fresh.openString) {
+          var nameChange = { from: fresh.contentFrom, to: fresh.contentTo, insert: label };
+          if (fresh.hasColon) {
+            view.dispatch({ changes: nameChange, selection: { anchor: fresh.contentFrom + label.length } });
+            return;
+          }
+          var delta = label.length - (fresh.contentTo - fresh.contentFrom);
+          view.dispatch({
+            changes: [nameChange, { from: fresh.propertyEnd, insert: ": " + skeleton }],
+            selection: { anchor: fresh.propertyEnd + delta + 2 + skeletonCursorOffset(skeleton) },
+          });
+          return;
+        }
+
+        if (fresh && !fresh.openString) {
+          var built = buildKeyInsertion(
+            label,
+            skeleton,
+            fresh.leadingComma ? "," : "",
+            fresh.trailingComma ? "," : ""
+          );
+          view.dispatch({
+            changes: { from: from, to: to, insert: built.text },
+            selection: { anchor: from + built.cursor },
+          });
+          return;
+        }
+
+        view.dispatch({ changes: { from: from, to: to, insert: label } });
+      };
+
+      var buildKeyOption = function (item) {
+        return {
+          label: item.label,
+          type: "property",
+          detail: formatKeyDetail(item),
+          // CodeMirror sorts by `boost` before falling back to alphabetical
+          // order - a required key is the one most worth seeing first.
+          boost: item.required ? 1 : 0,
+          apply: applyKeyCompletion,
+          vdSkeleton: skeletonForDetail(item.detail),
+        };
+      };
+
+      /* `kind: "key"`: `keyCtx.objectNode`'s own pointer and its
+       * current keys are the whole request - the popup's `from` is
+       * `keyCtx.from` (query time; CodeMirror tracks `to` live against
+       * `validFor` as the user keeps typing), matched against typed text by
+       * `/^"?[\w]*$/` (an optional leading quote, then word characters -
+       * covers both an open key string and typing straight into a gap). */
+      var completeKey = function (context, keyCtx, doc) {
+        var pointer = pointerForNode(keyCtx.objectNode, doc);
+        var present = presentKeys(keyCtx.objectNode, doc, keyCtx.excludeProperty);
+        return postComplete(context, { kind: "key", pointer: pointer, present: present }).then(function (data) {
+          if (!data || !Array.isArray(data.items) || data.items.length === 0) return null;
+          return {
+            from: keyCtx.from,
+            options: data.items.map(buildKeyOption),
+            validFor: /^"?[\w]*$/,
+          };
+        });
+      };
+
+      /* A `function` item inserts `name()` with the cursor between the
+       * parens as a plain two-change-free single insert - unlike the
+       * key case, nothing here depends on the live syntax tree, so no
+       * re-resolution at accept time is needed. `completion.detail` is the
+       * catalog's own call signature (`"where(criteria)"`, `"first()"`);
+       * a signature with empty parens means the function takes no
+       * arguments, so the cursor lands after the whole call instead of
+       * inside it. */
+      var applyFunctionCompletion = function (view, completion, from, to) {
+        var noArgs = /^[A-Za-z_]\w*\(\)$/.test(completion.detail || "");
+        var insertText = completion.label + "()";
+        var cursor = from + (noArgs ? insertText.length : completion.label.length + 1);
+        view.dispatch({ changes: { from: from, to: to, insert: insertText }, selection: { anchor: cursor } });
+      };
+
+      /* `kind: "element"`/`"function"`/`"constant"`/`"variable"`:
+       * `element`/`constant`/`variable` all take CodeMirror's own default
+       * `apply` (a plain `[from, to)` replace with `completion.label`,
+       * exactly right since `constant`/`variable` labels already carry
+       * their own `%`) - only `function` supplies one.
+       *
+       * `boost` orders the merged list by kind rather than leaving it to
+       * alphabetical chance: a member position can easily return a type's
+       * own elements alongside the *entire* function catalog (100+ names),
+       * and CodeMirror sorts by `boost` before falling back to alphabetical
+       * order - without one, a function whose name sorts late (`where`)
+       * competes on equal footing with every element and can end up well
+       * past what fits on screen. Elements (what the user is most likely
+       * typing a member chain toward) rank above constants/variables, which
+       * rank above functions - each kind's own items still sort
+       * alphabetically among themselves. */
+      var FHIRPATH_KIND_BOOST = { element: 2, constant: 1, variable: 1, function: 0 };
+
+      var buildFhirpathOption = function (item) {
+        var boost = FHIRPATH_KIND_BOOST[item.kind] || 0;
+        if (item.kind === "function") {
+          return {
+            label: item.label,
+            type: "function",
+            detail: item.detail,
+            boost: boost,
+            apply: applyFunctionCompletion,
+          };
+        }
+        var option = {
+          label: item.label,
+          type: item.kind === "element" ? "property" : "variable",
+          detail: item.detail,
+          boost: boost,
+        };
+        if (item.kind === "element" && item.doc) option.info = item.doc;
+        return option;
+      };
+
+      /* `kind: "fhirpath"`: a document that does not parse as
+       * JSON never reaches the server at all - the field being edited is
+       * necessarily inside that same document, so a syntax error anywhere
+       * in it means there is no reliable `document.resource`/`%context`
+       * type to complete against. `cursor`/`from` cross the code-point/
+       * UTF-16 boundary via `codePointOffset`/`utf16OffsetForCodePoints`
+       * above; everything else is exactly the fields `vd_complete.rs`
+       * documents. */
+      var completeFhirpath = function (context, fpCtx, doc) {
+        var text = doc.sliceString(fpCtx.contentFrom, fpCtx.contentTo);
+        var cursor = codePointOffset(text, context.pos - fpCtx.contentFrom);
+        var document;
+        try {
+          document = JSON.parse(doc.toString());
+        } catch (invalidJson) {
+          return null;
+        }
+        var pointer = pointerForNode(fpCtx.stringNode, doc);
+        return postComplete(context, {
+          kind: "fhirpath",
+          pointer: pointer,
+          document: document,
+          expression: text,
+          cursor: cursor,
+        }).then(function (data) {
+          if (!data || !Array.isArray(data.items) || data.items.length === 0) return null;
+          return {
+            from: fpCtx.contentFrom + utf16OffsetForCodePoints(text, data.from),
+            options: data.items.map(buildFhirpathOption),
+            validFor: /^%?[\w]*$/,
+          };
+        });
+      };
+
+      /* The one `CompletionSource` `code-editor.js`'s `completion` option
+       * gets: classify, then delegate. Neither classifier touches the
+       * network - only the branch that actually matches does, so moving
+       * the cursor somewhere this editor has no opinion about never
+       * fires a request at all. */
+      var vdCompletionSource = function (context) {
+        var tree = CM.syntaxTree(context.state);
+        var doc = context.state.doc;
+
+        var keyCtx = keyContextAt(tree, doc, context.pos);
+        if (keyCtx) return completeKey(context, keyCtx, doc);
+
+        var fpCtx = fhirpathContextAt(tree, doc, context.pos);
+        if (fpCtx) return completeFhirpath(context, fpCtx, doc);
+
+        return null;
       };
 
       /* ---- #843: the transaction-origin marker --------------------------

@@ -3514,6 +3514,103 @@ async fn view_definitions_page_renders_the_stretch_grid_and_the_guided_form_inli
     );
 }
 
+/// #821: `vd-editor.js` reads the completion popup's translated "required"
+/// marker straight off `#vd-editor-grid`'s own `data-msg-required` — this
+/// negotiates exactly like every other page (`?lang=`/cookie/
+/// `Accept-Language` → `en`), not through the `/complete` endpoint (which is
+/// not locale-aware at all: see its own tests).
+#[tokio::test]
+async fn view_definitions_page_carries_the_required_completion_marker_translated() {
+    let source = helios_ui::StaticConformanceSource::empty().with(
+        "ViewDefinition",
+        helios_fhir::FhirVersion::R4,
+        Vec::new(),
+    );
+    let app = view_definitions_app(source);
+
+    let en = body_text(
+        app.clone()
+            .oneshot(
+                Request::get("/ui/sql/view-definitions?vd=new")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert!(en.contains(r#"data-msg-required="required""#), "{en}");
+
+    let es = body_text(
+        app.oneshot(
+            Request::get("/ui/sql/view-definitions?vd=new&lang=es")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap(),
+    )
+    .await;
+    assert!(es.contains(r#"data-msg-required="obligatorio""#), "{es}");
+}
+
+/// #821: the two plural forms of the Save-with-errors confirmation
+/// text, negotiated exactly like `data-msg-required` above — rendered with
+/// the literal `{count}` marker `vd-editor.js` substitutes client-side once
+/// it knows the real error count, never a real number baked in server-side.
+#[tokio::test]
+async fn view_definitions_page_carries_the_save_with_errors_confirmation_translated() {
+    let source = helios_ui::StaticConformanceSource::empty().with(
+        "ViewDefinition",
+        helios_fhir::FhirVersion::R4,
+        Vec::new(),
+    );
+    let app = view_definitions_app(source);
+
+    let en = body_text(
+        app.clone()
+            .oneshot(
+                Request::get("/ui/sql/view-definitions?vd=new")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert!(
+        en.contains(r#"data-msg-save-errors-one="This view definition still has {count} error. Save it anyway?""#),
+        "{en}"
+    );
+    assert!(
+        en.contains(r#"data-msg-save-errors-other="This view definition still has {count} errors. Save it anyway?""#),
+        "{en}"
+    );
+
+    let es = body_text(
+        app.oneshot(
+            Request::get("/ui/sql/view-definitions?vd=new&lang=es")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap(),
+    )
+    .await;
+    assert!(
+        es.contains(
+            r#"data-msg-save-errors-one="Esta definición de vista aún tiene {count} error. ¿Guardar de todas formas?""#
+        ),
+        "{es}"
+    );
+    assert!(
+        es.contains(
+            r#"data-msg-save-errors-other="Esta definición de vista aún tiene {count} errores. ¿Guardar de todas formas?""#
+        ),
+        "{es}"
+    );
+}
+
 /// #843: a stored view's document — not just the starter one — also
 /// gets its guided-form card built inline, and the two disagreeing about the
 /// selected document would be a real bug (the panel out of sync with the

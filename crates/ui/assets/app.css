@@ -6708,6 +6708,132 @@ body.app-shell .pane {
   border-bottom-color: var(--warn);
 }
 
+/* The bottom lint panel (#821: opened by Ctrl-Shift-M or Ctrl+.
+   with more than one fix under the cursor) - CM6 appends it as a sibling
+   of `.cm-scroller` inside `.cm-editor`'s own flex column, so it only ever
+   eats into the scroller's share of `.cm-editor`'s fixed height (`app.css`'s
+   own "ViewDefinition editor" section further down sets that height, min
+   320px/max 70vh or 100% inside the guided-form stretch pairing); the
+   editor itself never grows or shrinks to make room, so opening it causes
+   no layout shift outside the card. Every diagnostic renders as the exact
+   same `.cm-diagnostic`/`.cm-diagnosticAction`/`.cm-diagnosticSource`
+   markup the hover tooltip above uses, one per `<li>` - already themed by
+   those same rules; only the panel's own chrome (surface, the scrollable
+   list CM6 caps at 100px tall by default, the selected row, and the close
+   button) needs its own recoloring here. */
+.code-editor .cm-panel.cm-panel-lint {
+  background: var(--surface);
+  color: var(--text);
+  border-top: 1px solid var(--surface-border);
+}
+
+.code-editor .cm-panel.cm-panel-lint ul {
+  background: var(--surface);
+}
+
+.code-editor .cm-panel.cm-panel-lint ul li {
+  border-bottom: 1px solid var(--surface-border);
+}
+
+/* #821: the panel's own `<li>` no longer carries `[aria-selected]` at all
+   (`vd-editor.js`'s own update listener strips it, alongside `role="option"`,
+   for the `nested-interactive` fix below — mirroring its true/false onto
+   this plain `[data-selected]` attribute first) so this selector never
+   fights `@codemirror/lint`'s own baseTheme rules for the same attribute —
+   including its `ul:focus [aria-selected]` variant, which swapped in the
+   OS `Highlight`/`HighlightText` system colors the moment the panel
+   actually had keyboard focus (`openLintPanel` focuses it on open) and
+   measured a 2.05:1 contrast ratio against `.cm-diagnosticSource`'s own
+   `--muted` text in axe's own reported environment; `data-selected` simply
+   has no such competing rule to lose to. */
+.code-editor .cm-panel.cm-panel-lint ul li[data-selected="true"] {
+  background: var(--accent-soft);
+  color: var(--text);
+}
+
+/* #821 (axe `target-size`, WCAG 2.2 AA): CM6's own baseTheme sizes this
+   purely from its `font-size`/line-height/padding, landing at 28.7x18px —
+   under the 24x24 minimum. Fixed to the same `.icon-button` recipe (above)
+   every other icon-only control in this crate already uses, rather than a
+   one-off size just for this button. */
+.code-editor .cm-panel.cm-panel-lint button[name="close"] {
+  display: inline-grid;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  color: var(--muted);
+  background: none;
+  border: none;
+  padding: 0;
+  font-size: 14px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.code-editor .cm-panel.cm-panel-lint button[name="close"]:hover {
+  color: var(--text);
+}
+
+.code-editor .cm-panel.cm-panel-lint button[name="close"]:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+/* Completion popup chrome (#821, code-editor.js's `completion` option):
+   `.cm-tooltip-autocomplete` is itself a `.cm-tooltip` (recolored as an app
+   popover above — surface/border/radius/shadow, the same recipe
+   `.menu__panel` uses), so only what is specific to the option list itself
+   needs its own rules here: each row's layout, the label/matched-substring/
+   detail text, its kind icon, and the selected row. `@codemirror/
+   autocomplete`'s own baseTheme hardcodes the selected row
+   (`&light .../li[aria-selected]{background:"#17c",color:"white"}`, the
+   same always-`&light` gap the lint tooltip comment above explains) and the
+   kind icons (a plain glyph per `Completion.type` via `content` — already
+   text, never an image) — recolored below rather than turned off
+   (`icons: false`), so each kind stays visually distinct. */
+.code-editor .cm-tooltip-autocomplete ul {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+}
+
+.code-editor .cm-tooltip-autocomplete ul li {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.code-editor .cm-tooltip-autocomplete ul li[aria-selected] {
+  background: var(--accent-soft);
+  color: var(--text);
+}
+
+.code-editor .cm-completionIcon {
+  opacity: 0.7;
+}
+
+.code-editor .cm-completionIcon-property::after { color: var(--json-key); }
+.code-editor .cm-completionIcon-function::after,
+.code-editor .cm-completionIcon-method::after { color: var(--fp-function); }
+.code-editor .cm-completionIcon-variable::after { color: var(--fp-constant); }
+
+.code-editor .cm-completionLabel {
+  color: var(--text);
+}
+
+.code-editor .cm-completionMatchedText {
+  text-decoration: none;
+  color: var(--accent-text);
+  font-weight: 600;
+}
+
+.code-editor .cm-completionDetail {
+  margin-left: auto;
+  padding-left: 8px;
+  font-style: normal;
+  color: var(--muted);
+  white-space: nowrap;
+}
+
 /* The textarea code-editor.js mounts over: present for the form (its
    `name` attribute still submits), hidden from sight and the accessibility
    tree so it does not shadow the editor's own role="textbox" (CM6's
