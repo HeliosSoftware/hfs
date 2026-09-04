@@ -25,7 +25,7 @@ use helios_persistence::error::{ResourceError, StorageError, TransactionError};
 use serde_json::Value;
 use tracing::{debug, error, warn};
 
-use crate::error::{RestError, RestResult};
+use crate::error::{RestError, RestResult, create_operation_outcome};
 use crate::extractors::{FhirVersionExtractor, TenantExtractor};
 use crate::fhir_types::{admit_resource_type, is_valid_resource_type};
 use crate::handlers::extract_patient_from_resource;
@@ -488,7 +488,11 @@ where
                 // Transactions are atomic so any denied entry rejects the whole bundle.
                 if let Some(principal) = principal {
                     let (resource_type, _) = parse_request_url(&bundle_entry.url).map_err(|e| {
-                        RestError::BadRequest {
+                        // `value`, not its parent `invalid`: `request.url` is
+                        // present and its value cannot be used. Its batch twin
+                        // makes the same choice, so the arms classify it
+                        // identically (#504).
+                        RestError::InvalidElementValue {
                             message: format!("Entry {}: {}", index, e),
                         }
                     })?;
@@ -572,14 +576,17 @@ where
             parse_search_entry_url(&entry.url).expect("partitioned on is_some");
         let reg = state.storage().search_param_registry(tenant.context());
         let registry = reg.read();
+        // The builder's error keeps its own variant — and so its issue code —
+        // with the entry named in front. Re-wrapping it as `BadRequest` from
+        // `client_response().2` was the same code-discard #504 removed from
+        // the per-entry paths.
         crate::extractors::build_search_query_from_pairs(&search_type, &pairs, &registry).map_err(
-            |e| RestError::BadRequest {
-                message: format!(
-                    "Entry {}: invalid search '{}': {}",
-                    index,
-                    entry.url,
-                    e.client_response().2
-                ),
+            |e| match e {
+                RestError::InvalidParameter { param, message } => RestError::InvalidParameter {
+                    param,
+                    message: format!("entry {} search '{}': {}", index, entry.url, message),
+                },
+                other => other,
             },
         )?;
     }
@@ -604,7 +611,7 @@ where
             continue;
         };
         let (resource_type, _) =
-            parse_request_url(&entry.url).map_err(|e| RestError::BadRequest {
+            parse_request_url(&entry.url).map_err(|e| RestError::InvalidElementValue {
                 message: format!("Entry {}: {}", index, e),
             })?;
         state
@@ -729,14 +736,24 @@ where
             // rolled-back/internal transaction error never reaches the client
             // response, the audit trail, or the entry outcome. The raw detail is
             // preserved server-side by the `error!` log below.
-            // The search entries join the rollback fan-out: they were
-            // partitioned out of `indexed_entries` before execution, but the
-            // audit trail owes every entry of the failed bundle a record.
-            // (The status/code threading from the stacked #504 refinement
-            // lands with that PR; main's message-based result stays here.)
-            let (_, _, rollback_reason) = transaction_error_response_parts(&e);
-            let rollback_result =
-                create_error_result(500, &format!("Transaction rolled back: {rollback_reason}"));
+            //
+            // The status and the code come from the same triple as the reason,
+            // so this synthetic per-entry result cannot contradict the
+            // whole-bundle response it accompanies — a rollback is `transient`
+            // and retryable, where the hardcoded `processing` it carried meant
+            // "there is no point resubmitting the same content unchanged".
+            // Audit-only: the client gets `transaction_error_to_response(e)`
+            // below, so nothing here is observable on the wire (#504).
+            let (rollback_status, rollback_code, rollback_reason) =
+                transaction_error_response_parts(&e);
+            let rollback_result = BundleEntryResult::error(
+                rollback_status.as_u16(),
+                create_operation_outcome(
+                    "error",
+                    rollback_code,
+                    &format!("Transaction rolled back: {rollback_reason}"),
+                ),
+            );
             for (orig_idx, entry, _) in indexed_entries.iter().chain(&search_entries) {
                 let correlation_details =
                     EntryAuditCorrelation::from_bundle(&correlation, *orig_idx);
@@ -797,10 +814,7 @@ where
         // precondition rather than a storage error — the same mapping
         // `handlers::update` and the backends' own batch arms make.
         Err(StorageError::Resource(ResourceError::Gone { .. })) => None,
-        Err(e) => {
-            let (status, message) = entry_error(e);
-            return Some(create_error_result(status, &message));
-        }
+        Err(e) => return Some(entry_storage_failure(e)),
     };
 
     bundle_if_match_gate(if_match, current.as_ref().map(|r| r.version_id()))
@@ -833,7 +847,7 @@ where
     let request = match entry.get("request") {
         Some(r) => r,
         None => {
-            return create_error_result(400, &format!("Entry {} missing request", index));
+            return entry_failure(missing_request(index));
         }
     };
 
@@ -844,10 +858,18 @@ where
     let method = match parse_entry_method(request) {
         Ok(method) => method,
         Err(refusal) => {
-            return create_error_result(refusal.status(), &refusal.message(index));
+            return entry_failure(refusal.into_rest_error(index));
         }
     };
-    let url = request.get("url").and_then(|v| v.as_str()).unwrap_or("");
+    // An absent `request.url` is a cardinality violation (1..1), reported as
+    // `required` — distinct from a url that is present and unusable, which
+    // `parse_request_url` refuses below as `value`. Splitting them also closes
+    // a divergence: an absent url was caught by `parse_bundle_entry` on the
+    // transaction arm and, one line later, by `unwrap_or("")` here, so the two
+    // arms described the same entry differently (#504).
+    let Some(url) = request.get("url").and_then(|v| v.as_str()) else {
+        return entry_failure(missing_url(index));
+    };
     let if_match = request.get("ifMatch").and_then(|v| v.as_str());
     let if_none_exist = request.get("ifNoneExist").and_then(|v| v.as_str());
 
@@ -855,7 +877,7 @@ where
     let (resource_type, id) = match parse_bundle_request_url(&method, url) {
         Ok(parsed) => parsed,
         Err(e) => {
-            return create_error_result(400, &e);
+            return entry_failure(RestError::InvalidElementValue { message: e });
         }
     };
 
@@ -868,13 +890,16 @@ where
         // authorized as a read and then executed as whatever it was.
         let operation = bundle_method_to_fhir_operation(&method);
         if SmartScopePolicy::check(principal, &resource_type, operation).is_err() {
-            return create_error_result(
-                403,
-                &format!(
+            // `forbidden` is a child of `security`; `processing` is not an
+            // ancestor of it in any supported version, so a client filtering
+            // `code is-a security` to trigger re-auth or re-consent saw a
+            // false negative on this denial and only this one (#504).
+            return entry_failure(RestError::Forbidden {
+                message: format!(
                     "Insufficient scope for {} on {} (batch entry {})",
                     operation, resource_type, index
                 ),
-            );
+            });
         }
     }
 
@@ -894,36 +919,43 @@ where
         // FHIR defines no `POST [type]?[criteria]`; a conditional create is
         // expressed through `request.ifNoneExist`. Refuse rather than guess.
         if matches!(method, BundleMethod::Post) {
-            return create_error_result(
-                400,
-                &format!(
+            // `value`, not `not-supported`: this is not a spec-defined
+            // interaction the server declines, it is a url carrying something
+            // FHIR gives no meaning for this method. `not-supported` would
+            // invite the client to retry elsewhere; there is nowhere (#504).
+            return entry_failure(RestError::InvalidElementValue {
+                message: format!(
                     "Entry {index}: POST {url} carries criteria, but a conditional \
                      create is expressed through request.ifNoneExist, not the URL. \
                      Nothing was written."
                 ),
-            );
+            });
         }
         if criteria.is_empty() {
             // `Patient?&` decodes to nothing. Empty criteria would match every
             // resource of the type on a literal reading; no conditional
             // interaction means that.
-            return create_error_result(
-                400,
-                &format!("Entry {index}: {method} {url} carries no usable criteria"),
-            );
+            //
+            // `value`: the url is present and its value cannot address what the
+            // method needs — the same call the `PUT Patient` guard below makes.
+            return entry_failure(RestError::InvalidElementValue {
+                message: format!("Entry {index}: {method} {url} carries no usable criteria"),
+            });
         }
     }
 
     // `ifMatch` names a version of one instance; a conditional entry names no
     // instance until the server resolves it. FHIR gives the pairing no meaning.
     if if_match.is_some() && (criteria.is_some() || if_none_exist.is_some()) {
-        return create_error_result(
-            400,
-            &format!(
+        // `invalid` — the parent — rather than either child: both elements are
+        // individually well-formed, so neither "a required element is missing"
+        // nor one unusable value names the fault. It is the combination (#504).
+        return entry_failure(RestError::BadRequest {
+            message: format!(
                 "Entry {index}: ifMatch cannot be combined with a conditional \
                  interaction ({method} {url}); address the instance directly"
             ),
-        );
+        });
     }
 
     match method {
@@ -957,11 +989,16 @@ where
                 .await
             {
                 Ok(Some(stored)) => BundleEntryResult::ok(stored),
-                Ok(None) => create_error_result(404, "Resource not found"),
-                Err(e) => {
-                    let (status, message) = entry_error(e);
-                    create_error_result(status, &message)
-                }
+                // The one expression this PR changes on the arm #478/#481 is
+                // rewriting. `not-found` is the only issue-type code whose
+                // definition names HTTP 404, and all three backends already
+                // emit it for the byte-identical condition inside their own
+                // transaction executors — this entry was the outlier.
+                Ok(None) => entry_failure(RestError::NotFound {
+                    resource_type: resource_type.clone(),
+                    id: id.clone(),
+                }),
+                Err(e) => entry_storage_failure(e),
             }
         }
         BundleMethod::Post => {
@@ -969,7 +1006,15 @@ where
             let resource = match entry.get("resource") {
                 Some(r) => r.clone(),
                 None => {
-                    return create_error_result(400, "POST entry missing resource");
+                    // `invalid`, not `required`: `Bundle.entry.resource` is
+                    // 0..1, and only R5/R6's bdl-3c makes it mandatory for a
+                    // POST/PUT/PATCH entry. R4 and R4B have no equivalent —
+                    // bdl-5 is satisfied by a request-only entry — so a single
+                    // call site serving four versions must not claim a rule
+                    // half of them do not have.
+                    return entry_failure(RestError::BadRequest {
+                        message: "POST entry missing resource".to_string(),
+                    });
                 }
             };
 
@@ -980,12 +1025,18 @@ where
             }
 
             // Write-path validation (per-entry outcome in batch semantics).
+            //
+            // The error carries the validator's own multi-issue outcome —
+            // per-issue code, severity and `expression` — and
+            // `client_outcome` surfaces it verbatim. It used to be flattened
+            // to a joined string of `details.text` and re-wrapped under
+            // `processing`, which is the lossiest case in #504.
             if let Err(e) = state
                 .validation()
                 .check_write(tenant.tenant_id(), fhir_version, &resource_type, &resource)
                 .await
             {
-                return create_error_result(422, &validation_failure_message(&e));
+                return entry_failure(e);
             }
 
             // Conditional create. The criteria are passed verbatim, as the
@@ -1024,10 +1075,7 @@ where
                             count,
                         })
                     }
-                    Err(e) => {
-                        let (status, message) = entry_error(e);
-                        create_error_result(status, &message)
-                    }
+                    Err(e) => entry_storage_failure(e),
                 };
             }
 
@@ -1040,10 +1088,7 @@ where
                     record_stored_profile(state, tenant, fhir_version, &stored);
                     BundleEntryResult::created(stored)
                 }
-                Err(e) => {
-                    let (status, message) = entry_error(e);
-                    create_error_result(status, &message)
-                }
+                Err(e) => entry_storage_failure(e),
             }
         }
         BundleMethod::Put => {
@@ -1051,7 +1096,11 @@ where
             let resource = match entry.get("resource") {
                 Some(r) => r.clone(),
                 None => {
-                    return create_error_result(400, "PUT entry missing resource");
+                    // See the POST arm: `invalid` rather than `required`,
+                    // because R4 and R4B do not require the element.
+                    return entry_failure(RestError::BadRequest {
+                        message: "PUT entry missing resource".to_string(),
+                    });
                 }
             };
 
@@ -1069,7 +1118,9 @@ where
                     .check_write(tenant.tenant_id(), fhir_version, &resource_type, &resource)
                     .await
                 {
-                    return create_error_result(422, &validation_failure_message(&e));
+                    // Same funnel as the unconditional PUT below: the
+                    // validator's own multi-issue outcome, verbatim (#504).
+                    return entry_failure(e);
                 }
 
                 return match state
@@ -1107,10 +1158,7 @@ where
                             count,
                         })
                     }
-                    Err(e) => {
-                        let (status, message) = entry_error(e);
-                        create_error_result(status, &message)
-                    }
+                    Err(e) => entry_storage_failure(e),
                 };
             }
 
@@ -1121,10 +1169,13 @@ where
             // an absent id, not an empty one. Every later such entry then reads
             // that row back and overwrites it (#503).
             if id.is_empty() {
-                return create_error_result(
-                    400,
-                    "PUT entry request.url must address an instance ('[type]/[id]')",
-                );
+                // `value`: the element is present and its value cannot address
+                // what the method needs. Its sibling guard on DELETE makes the
+                // same choice.
+                return entry_failure(RestError::InvalidElementValue {
+                    message: "PUT entry request.url must address an instance ('[type]/[id]')"
+                        .to_string(),
+                });
             }
 
             // Ahead of validation, because every backend evaluates `ifMatch`
@@ -1142,7 +1193,7 @@ where
                 .check_write(tenant.tenant_id(), fhir_version, &resource_type, &resource)
                 .await
             {
-                return create_error_result(422, &validation_failure_message(&e));
+                return entry_failure(e);
             }
 
             match state
@@ -1167,10 +1218,11 @@ where
                         result
                     }
                 }
-                Err(e) => {
-                    let (status, message) = entry_error(e);
-                    create_error_result(status, &message)
-                }
+                // Also closes a divergence internal to the batch arm: an
+                // optimistic-lock failure surfacing here now answers 412 +
+                // `conflict`, the pair the `ifMatch` gate above already
+                // answers, where it used to answer 412 + `processing`.
+                Err(e) => entry_storage_failure(e),
             }
         }
         BundleMethod::Delete => {
@@ -1198,10 +1250,7 @@ where
                             count,
                         })
                     }
-                    Err(e) => {
-                        let (status, message) = entry_error(e);
-                        create_error_result(status, &message)
-                    }
+                    Err(e) => entry_storage_failure(e),
                 };
             }
 
@@ -1209,10 +1258,10 @@ where
             // type-level delete, and an empty id would otherwise target the
             // empty-id row a pre-#503 conditional PUT could have written.
             if id.is_empty() {
-                return create_error_result(
-                    400,
-                    "DELETE entry request.url must address an instance ('[type]/[id]')",
-                );
+                return entry_failure(RestError::InvalidElementValue {
+                    message: "DELETE entry request.url must address an instance ('[type]/[id]')"
+                        .to_string(),
+                });
             }
 
             // Honour `ifMatch` on DELETE: a client asking to delete only the
@@ -1230,10 +1279,7 @@ where
                 .await
             {
                 Ok(()) => BundleEntryResult::deleted(),
-                Err(e) => {
-                    let (status, message) = entry_error(e);
-                    create_error_result(status, &message)
-                }
+                Err(e) => entry_storage_failure(e),
             }
         }
         // Declined rather than dispatched, matching the transaction arm and all
@@ -1242,14 +1288,17 @@ where
         // derives the patch format entirely from it, so there is nothing here
         // to dispatch on; R4 designates FHIRPath Patch as the bundle format and
         // `apply_patch` does not implement it. Tracked by #502's follow-up.
-        BundleMethod::Patch => create_error_result(
-            501,
-            &format!(
-                "Entry {index}: PATCH is not implemented in Bundle entries, so \
-                 nothing was applied. Send the patch to the instance endpoint \
-                 (PATCH [base]/[type]/[id])."
+        //
+        // `NotImplemented` wraps its `feature` as "Feature '…' is not
+        // implemented", so this message changes shape while keeping its
+        // guidance. The arm label stays: an audit trail wants to know which
+        // arm refused, and the transaction twin identifies itself the same way.
+        BundleMethod::Patch => entry_failure(RestError::NotImplemented {
+            feature: format!(
+                "PATCH in a Bundle entry (batch entry {index}); nothing was applied — \
+                 send the patch to the instance endpoint instead, PATCH [base]/[type]/[id]"
             ),
-        ),
+        }),
         // No catch-all: the match is exhaustive over `BundleMethod`, so adding a
         // variant is a compile error here rather than a silent 405. Codes
         // outside the value set never reach this point — `parse_entry_method`
@@ -1551,14 +1600,20 @@ fn bundle_method_to_http_method(method: &BundleMethod) -> &'static str {
     }
 }
 
+/// Reads the first issue's text for an audit event's `outcomeDesc`.
+///
+/// Falls back to `diagnostics`. The one batch entry outcome #504 deliberately
+/// leaves alone — the 412 from
+/// [`helios_persistence::core::preconditions::precondition_failed_entry`] —
+/// writes its text there rather than to `details.text`, so a failed `ifMatch`
+/// produced an AuditEvent with no description at all.
 fn extract_outcome_description(outcome: Option<&Value>) -> Option<String> {
-    outcome
-        .and_then(|value| value.get("issue"))
-        .and_then(|issues| issues.as_array())
-        .and_then(|issues| issues.first())
-        .and_then(|issue| issue.get("details"))
+    let issue = outcome?.get("issue")?.as_array()?.first()?;
+    issue
+        .get("details")
         .and_then(|details| details.get("text"))
         .and_then(|text| text.as_str())
+        .or_else(|| issue.get("diagnostics").and_then(Value::as_str))
         .map(ToString::to_string)
 }
 
@@ -1708,39 +1763,78 @@ enum EntryMethodRefusal {
 }
 
 impl EntryMethodRefusal {
-    fn status(&self) -> u16 {
-        match self {
-            Self::Missing | Self::NotCanonical(_) => 400,
-            Self::Head => 405,
-        }
-    }
-
-    fn message(&self, index: usize) -> String {
-        match self {
-            Self::Missing => format!("Entry {index}: request.method is required"),
-            Self::NotCanonical(raw) => format!(
-                "Entry {index}: '{raw}' is not an http-verb code. \
-                 Bundle.entry.request.method is a code with a required binding to \
-                 http://hl7.org/fhir/ValueSet/http-verb, and FHIR codes are \
-                 case-sensitive — use GET, POST, PUT, PATCH or DELETE."
-            ),
-            Self::Head => format!(
-                "Entry {index}: HEAD is not supported in Bundle entries. Use GET, \
-                 or send HEAD to the instance endpoint directly."
-            ),
-        }
-    }
-
-    /// Renders the refusal for the transaction arm, where it fails the bundle.
+    /// Renders the refusal as the error **both** arms report.
+    ///
+    /// #515 gave this type a `status()` beside this function and pinned the two
+    /// with a test — agreement by hand. There is now one function, so the
+    /// status *and* the issue code are decided once, by the [`RestError`] this
+    /// produces: the batch arm wraps it with [`entry_failure`] and the
+    /// transaction arm returns it as the whole-bundle error (#504).
+    ///
+    /// The per-variant text was previously a separate `message()`, whose `Head`
+    /// arm this function computed and then discarded — which is why the batch
+    /// arm printed HEAD guidance the transaction arm never showed.
     fn into_rest_error(self, index: usize) -> RestError {
-        let message = self.message(index);
         match self {
+            // 405 + `not-supported`. HEAD is a legal `http-verb` code, so the
+            // entry is well-formed instance data and it is the interaction the
+            // server does not implement inside a Bundle. The guidance rides in
+            // `resource_type` because `MethodNotAllowed` renders
+            // "Method {method} not allowed on {resource_type}" and has no
+            // detail slot — that is how both arms come to print it.
             Self::Head => RestError::MethodNotAllowed {
                 method: "HEAD".to_string(),
-                resource_type: format!("a Bundle entry (entry {index})"),
+                resource_type: format!(
+                    "a Bundle entry (entry {index}) — use GET, or send HEAD to the \
+                     instance endpoint directly"
+                ),
             },
-            Self::Missing | Self::NotCanonical(_) => RestError::BadRequest { message },
+            // 400 + `required`: `Bundle.entry.request.method` is 1..1 in every
+            // supported version, so an absent code is a cardinality violation
+            // rather than an unusable value.
+            Self::Missing => RestError::MissingElement {
+                message: format!("Entry {index}: request.method is required"),
+            },
+            // 400 + `value`: the element is present and its value fails the
+            // required binding. Deliberately not `code-invalid`, which names
+            // that mechanism precisely but is a **child of `processing`** —
+            // emitting it would move a malformed-instance failure back into the
+            // branch #504 exists to escape.
+            Self::NotCanonical(raw) => RestError::InvalidElementValue {
+                message: format!(
+                    "Entry {index}: '{raw}' is not an http-verb code. \
+                     Bundle.entry.request.method is a code with a required binding to \
+                     http://hl7.org/fhir/ValueSet/http-verb, and FHIR codes are \
+                     case-sensitive — use GET, POST, PUT, PATCH or DELETE."
+                ),
+            },
         }
+    }
+}
+
+/// `Bundle.entry.request` is absent.
+///
+/// Shared by both arms so the batch entry outcome and the whole-bundle
+/// transaction error carry one message and one code. `request` is 0..1 in the
+/// StructureDefinition, but it is mandatory for these bundle types — `bdl-3` in
+/// R4/R4B, and transitively `bdl-3c` in R5/R6, which requires
+/// `request.method.exists()`. The invariant key stays out of the message: the
+/// handler serves all four versions and `bdl-3` does not exist in R5 or R6.
+fn missing_request(index: usize) -> RestError {
+    RestError::MissingElement {
+        message: format!(
+            "Entry {index}: request is required — a batch or transaction entry must carry it."
+        ),
+    }
+}
+
+/// `Bundle.entry.request.url` is absent.
+///
+/// Distinct from a url that is present but names nothing (`""`, `"/"`,
+/// `"?identifier=x"`), which [`parse_request_url`] refuses as `value`.
+fn missing_url(index: usize) -> RestError {
+    RestError::MissingElement {
+        message: format!("Entry {index}: request.url is required (it is 1..1)."),
     }
 }
 
@@ -1784,46 +1878,30 @@ fn parse_entry_method(request: &Value) -> Result<BundleMethod, EntryMethodRefusa
 #[derive(Debug)]
 enum EntryParseError {
     Method(EntryMethodRefusal),
-    Malformed(String),
+    /// `Bundle.entry.request` is absent.
+    MissingRequest,
+    /// `Bundle.entry.request.url` is absent.
+    MissingUrl,
+    /// `Bundle.entry.request.url` is present but names nothing a mutation
+    /// can address (from [`canonical_bundle_mutation_url`]).
+    MalformedUrl(String),
 }
 
 impl EntryParseError {
     fn into_rest_error(self, index: usize) -> RestError {
         match self {
             Self::Method(refusal) => refusal.into_rest_error(index),
-            Self::Malformed(message) => RestError::BadRequest {
+            // Both arms now reach the same helper, so an absent element is
+            // described once rather than by whichever arm noticed it first.
+            Self::MissingRequest => missing_request(index),
+            Self::MissingUrl => missing_url(index),
+            // The batch arm renders the same parser's error as
+            // `InvalidElementValue` (400 `value`); keep the arms agreeing.
+            Self::MalformedUrl(message) => RestError::InvalidElementValue {
                 message: format!("Entry {}: {}", index, message),
             },
         }
     }
-}
-
-/// Creates an error BundleEntryResult.
-/// Flatten an enforce-mode validation failure into a per-entry message
-/// (batch entry outcomes are message-based).
-fn validation_failure_message(error: &RestError) -> String {
-    if let RestError::ValidationFailed { outcome } = error {
-        let details: Vec<String> = outcome
-            .get("issue")
-            .and_then(|i| i.as_array())
-            .map(|issues| {
-                issues
-                    .iter()
-                    .filter_map(|issue| {
-                        issue
-                            .get("details")
-                            .and_then(|d| d.get("text"))
-                            .and_then(|t| t.as_str())
-                            .map(str::to_string)
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        if !details.is_empty() {
-            return format!("Validation failed: {}", details.join("; "));
-        }
-    }
-    format!("Validation failed: {error}")
 }
 
 /// Interprets a bundle-entry GET url as a type-level search, if it is one.
@@ -1863,32 +1941,45 @@ fn searchset_result(bundle: Value) -> BundleEntryResult {
     }
 }
 
-/// Renders a failed Bundle entry through the status/details pair the
-/// single-resource handlers compute.
+/// Renders a failed Bundle entry.
 ///
-/// One seam on purpose: the stacked issue-code refinement (#516) upgrades
-/// this to the full `OperationOutcome` mapping; until it lands, entries keep
-/// main's message-based outcomes.
+/// **Replaces `create_error_result`,** which hardcoded `"code": "processing"`
+/// across nineteen call sites, so a scope denial, a missing resource, a
+/// malformed entry and an unsupported method were distinguishable only by
+/// `response.status` and free-text English (#504).
+///
+/// The status and the OperationOutcome both come from
+/// [`RestError::client_outcome`] — the same function `impl IntoResponse for
+/// RestError` uses — so a per-entry outcome and the single-resource response
+/// for the identical failure are produced by one mapping rather than by two
+/// kept in step by review. That is what makes the two describable as the same
+/// error rather than two errors that happen to agree.
 fn entry_failure(err: RestError) -> BundleEntryResult {
-    let (status, _, details) = err.client_response();
-    create_error_result(status.as_u16(), &details)
+    let (status, outcome) = err.client_outcome();
+    BundleEntryResult::error(status.as_u16(), outcome)
 }
 
-fn create_error_result(status: u16, message: &str) -> BundleEntryResult {
-    let outcome = serde_json::json!({
-        "resourceType": "OperationOutcome",
-        "issue": [{
-            "severity": "error",
-            "code": "processing",
-            "details": {
-                "text": message
-            }
-        }]
-    });
-    BundleEntryResult::error(status, outcome)
+/// Renders a storage error as a failed Bundle entry.
+///
+/// **Replaces `entry_error`,** which called `client_response()`, bound the
+/// correct FHIR issue code to `_code` and discarded it, after which
+/// `create_error_result` stamped `processing` over the result. Deleting that
+/// one underscore-binding corrects five call sites by construction.
+///
+/// The sanitizing behaviour is unchanged and is now strictly stronger: the code
+/// comes from the same sanitized triple as the message, so it cannot classify
+/// an error more specifically than the message is permitted to describe it.
+fn entry_storage_failure(err: StorageError) -> BundleEntryResult {
+    entry_failure(RestError::from(err))
 }
 
 /// Returns HTTP status text for a status code.
+///
+/// Every status [`RestError::client_response`] can produce for an entry has an
+/// arm here; anything else renders as `"<code> Unknown"`. The 413/429/503/504
+/// arms were missing while every entry error carried `processing`, so nothing
+/// noticed — an entry hitting an exhausted pool rendered `"503 Unknown"`
+/// beside a correct `transient` code once the codes were threaded (#504).
 fn status_text(code: &str) -> &'static str {
     match code {
         "200" => "OK",
@@ -1903,10 +1994,14 @@ fn status_text(code: &str) -> &'static str {
         "409" => "Conflict",
         "410" => "Gone",
         "412" => "Precondition Failed",
+        "413" => "Payload Too Large",
         "415" => "Unsupported Media Type",
         "422" => "Unprocessable Entity",
+        "429" => "Too Many Requests",
         "500" => "Internal Server Error",
         "501" => "Not Implemented",
+        "503" => "Service Unavailable",
+        "504" => "Gateway Timeout",
         _ => "Unknown",
     }
 }
@@ -2060,7 +2155,7 @@ fn rewrite_conditional_references(
 fn parse_bundle_entry(entry: &Value) -> Result<(BundleEntry, Option<String>), EntryParseError> {
     let request = entry
         .get("request")
-        .ok_or_else(|| EntryParseError::Malformed("Entry missing 'request'".to_string()))?;
+        .ok_or(EntryParseError::MissingRequest)?;
 
     // Was an independently-written `to_uppercase()` ladder — the second of the
     // two matchers #502 is about. It no longer case-folds: `request.method` is a
@@ -2073,13 +2168,13 @@ fn parse_bundle_entry(entry: &Value) -> Result<(BundleEntry, Option<String>), En
     let raw_url = request
         .get("url")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| EntryParseError::Malformed("Entry request missing 'url'".to_string()))?
+        .ok_or(EntryParseError::MissingUrl)?
         .to_string();
     let url = if matches!(
         method,
         BundleMethod::Post | BundleMethod::Put | BundleMethod::Patch | BundleMethod::Delete
     ) {
-        canonical_bundle_mutation_url(&method, &raw_url).map_err(EntryParseError::Malformed)?
+        canonical_bundle_mutation_url(&method, &raw_url).map_err(EntryParseError::MalformedUrl)?
     } else {
         raw_url
     };
@@ -2248,17 +2343,6 @@ fn build_full_url(result: &BundleEntryResult, base_url: &str) -> Option<String> 
     None
 }
 
-/// Derives a sanitized `(status, message)` for a batch/transaction entry
-/// OperationOutcome from a storage error.
-///
-/// Reuses [`RestError`]'s client-facing mapping so backend/internal detail is
-/// never leaked to callers (and is logged server-side) while safe classes keep
-/// their specific, actionable message and correct HTTP status.
-fn entry_error(err: StorageError) -> (u16, String) {
-    let (status, _code, message) = RestError::from(err).client_response();
-    (status.as_u16(), message)
-}
-
 /// Computes the sanitized `(status, issue code, message)` for a failed
 /// transaction.
 ///
@@ -2335,20 +2419,14 @@ fn transaction_error_response_parts(err: &TransactionError) -> (StatusCode, &'st
 }
 
 /// Converts a TransactionError to an HTTP response with OperationOutcome.
+///
+/// The twin of [`RestError::client_outcome`] for the one error type that is not
+/// a [`RestError`]: it builds the outcome through the same
+/// `create_operation_outcome` every other error in this crate uses, rather than
+/// carrying its own `json!` literal.
 fn transaction_error_to_response(err: TransactionError) -> RestResult<Response> {
     let (status_code, issue_code, message) = transaction_error_response_parts(&err);
-
-    let outcome = serde_json::json!({
-        "resourceType": "OperationOutcome",
-        "issue": [{
-            "severity": "error",
-            "code": issue_code,
-            "details": {
-                "text": message
-            }
-        }]
-    });
-
+    let outcome = create_operation_outcome("error", issue_code, &message);
     Ok((status_code, Json(outcome)).into_response())
 }
 
@@ -2498,8 +2576,16 @@ mod tests {
         details
     }
 
+    /// The first issue of an entry result's outcome.
+    fn entry_issue(result: &BundleEntryResult) -> &Value {
+        &result
+            .outcome
+            .as_ref()
+            .expect("a failed entry carries an outcome")["issue"][0]
+    }
+
     #[test]
-    fn test_entry_error_sanitizes_backend_detail() {
+    fn entry_storage_failure_sanitizes_backend_detail() {
         // A backend/internal storage error whose Display embeds sensitive DB
         // detail (table/column names, SQL fragments) must be collapsed to the
         // generic client message with a 5xx status.
@@ -2510,8 +2596,17 @@ mod tests {
             message: raw_detail.to_string(),
         });
 
-        let (status, message) = entry_error(err);
-        assert_eq!(status, 500);
+        let result = entry_storage_failure(err);
+        assert_eq!(result.status, 500);
+
+        let issue = entry_issue(&result);
+        // Threading the code strengthens this guarantee rather than diluting
+        // it: the code now comes from the same sanitized `client_response`
+        // triple as the message, so it cannot classify the error more
+        // specifically than the message is permitted to describe it (#504).
+        assert_eq!(issue["code"], "exception");
+
+        let message = issue["details"]["text"].as_str().unwrap();
         assert!(
             !message.contains("resources"),
             "entry outcome leaked raw backend detail: {message}"
@@ -2527,7 +2622,7 @@ mod tests {
     }
 
     #[test]
-    fn test_entry_error_preserves_not_found() {
+    fn entry_storage_failure_preserves_not_found() {
         // Safe error classes keep their specific message and correct status.
         use helios_persistence::error::ResourceError;
 
@@ -2536,8 +2631,12 @@ mod tests {
             id: "123".to_string(),
         });
 
-        let (status, message) = entry_error(err);
-        assert_eq!(status, 404);
+        let result = entry_storage_failure(err);
+        assert_eq!(result.status, 404);
+
+        let issue = entry_issue(&result);
+        assert_eq!(issue["code"], "not-found");
+        let message = issue["details"]["text"].as_str().unwrap();
         assert!(message.contains("Patient/123"), "message was: {message}");
     }
 
@@ -2627,6 +2726,146 @@ mod tests {
         assert!(msg.contains("serializable"), "isolation message: {msg}");
     }
 
+    /// A failed entry carries the issue code the single-resource endpoint
+    /// would return for the identical `RestError`.
+    ///
+    /// This is #504's whole claim in one table. Every row is a `RestError` the
+    /// batch arm now constructs, and the pair asserted is the one
+    /// [`RestError::client_outcome`] produces — the same function
+    /// `impl IntoResponse for RestError` uses to build an HTTP body.
+    #[test]
+    fn entry_failure_renders_the_single_resource_mapping() {
+        let cases: Vec<(RestError, u16, &str)> = vec![
+            (
+                RestError::MissingElement {
+                    message: "m".to_string(),
+                },
+                400,
+                "required",
+            ),
+            (
+                RestError::InvalidElementValue {
+                    message: "m".to_string(),
+                },
+                400,
+                "value",
+            ),
+            (
+                RestError::BadRequest {
+                    message: "m".to_string(),
+                },
+                400,
+                "invalid",
+            ),
+            (
+                RestError::NotSupported {
+                    feature: "m".to_string(),
+                },
+                400,
+                "not-supported",
+            ),
+            (
+                RestError::Forbidden {
+                    message: "m".to_string(),
+                },
+                403,
+                "forbidden",
+            ),
+            (
+                RestError::NotFound {
+                    resource_type: "Patient".to_string(),
+                    id: "ghost".to_string(),
+                },
+                404,
+                "not-found",
+            ),
+            (
+                RestError::MethodNotAllowed {
+                    method: "HEAD".to_string(),
+                    resource_type: "a Bundle entry".to_string(),
+                },
+                405,
+                "not-supported",
+            ),
+            (
+                RestError::Gone {
+                    resource_type: "Patient".to_string(),
+                    id: "p1".to_string(),
+                },
+                410,
+                "deleted",
+            ),
+            (
+                RestError::PreconditionFailed {
+                    message: "m".to_string(),
+                },
+                412,
+                "conflict",
+            ),
+            (
+                RestError::NotImplemented {
+                    feature: "m".to_string(),
+                },
+                501,
+                "not-supported",
+            ),
+            (
+                RestError::ServiceUnavailable {
+                    message: "m".to_string(),
+                },
+                503,
+                "transient",
+            ),
+            (
+                RestError::InternalError {
+                    message: "m".to_string(),
+                },
+                500,
+                "exception",
+            ),
+        ];
+
+        for (err, status, code) in cases {
+            let label = format!("{err:?}");
+            let result = entry_failure(err);
+            assert_eq!(result.status, status, "{label}");
+            assert!(result.resource.is_none(), "{label}");
+
+            let issue = entry_issue(&result);
+            assert_eq!(issue["code"], code, "{label}");
+            assert_eq!(issue["severity"], "error", "{label}");
+            assert!(
+                issue["details"]["text"].is_string(),
+                "{label} carried no details.text"
+            );
+        }
+    }
+
+    /// A failed `ifMatch` must still produce an audit description.
+    ///
+    /// The 412 gate is the one entry outcome #504 leaves alone, and it writes
+    /// its text to `diagnostics` rather than `details.text` — so before the
+    /// fallback below, `outcomeDesc` was absent for exactly that case.
+    #[test]
+    fn extract_outcome_description_reads_the_gates_diagnostics() {
+        let gate = helios_persistence::core::preconditions::precondition_failed_entry("stale tag");
+        assert_eq!(
+            extract_outcome_description(gate.outcome.as_ref()),
+            Some("stale tag".to_string()),
+            "the 412 gate writes to `diagnostics`"
+        );
+
+        // `details.text` still wins, and still works on its own.
+        let both = serde_json::json!({
+            "issue": [{ "details": { "text": "text wins" }, "diagnostics": "ignored" }]
+        });
+        assert_eq!(
+            extract_outcome_description(Some(&both)),
+            Some("text wins".to_string())
+        );
+        assert_eq!(extract_outcome_description(None), None);
+    }
+
     #[test]
     fn test_status_text_covers_known_and_unknown_codes() {
         // The batch response builder renders a reason phrase per entry status; the
@@ -2644,16 +2883,28 @@ mod tests {
             ("409", "Conflict"),
             ("410", "Gone"),
             ("412", "Precondition Failed"),
+            // Reachable, and unmapped until #504. `BackendError::PoolExhausted`
+            // / `Unavailable` / `ConnectionFailed` reach an entry as 503 and
+            // `Timeout` as 504, so an entry hitting an exhausted pool rendered
+            // `"503 Unknown"` beside a correct `transient` code.
+            ("413", "Payload Too Large"),
             ("415", "Unsupported Media Type"),
             ("422", "Unprocessable Entity"),
+            ("429", "Too Many Requests"),
             ("500", "Internal Server Error"),
             ("501", "Not Implemented"),
+            ("503", "Service Unavailable"),
+            ("504", "Gateway Timeout"),
         ];
         for (code, phrase) in known {
             assert_eq!(status_text(code), phrase, "reason phrase for {code}");
         }
         // Any unmapped code falls through to the catch-all.
         assert_eq!(status_text("418"), "Unknown");
+        // Every status a batch entry can now carry has a phrase.
+        for (code, _) in known {
+            assert_ne!(status_text(code), "Unknown", "unmapped entry status {code}");
+        }
         assert_eq!(status_text(""), "Unknown");
     }
 
@@ -3163,6 +3414,65 @@ mod tests {
         AppState::new(Arc::new(storage), crate::config::ServerConfig::default())
     }
 
+    /// Like [`state_with`], but with write-path validation in `enforce` mode.
+    /// `ServerConfig::default()`'s validation mode is `off`, so no other test
+    /// in this module can reach the 422 arm.
+    fn enforcing_state_with(storage: DelayStorage) -> AppState<DelayStorage> {
+        AppState::new(
+            Arc::new(storage),
+            crate::config::ServerConfig {
+                validation: crate::config::ValidationConfig {
+                    mode: "enforce".to_string(),
+                    ..Default::default()
+                },
+                ..crate::config::ServerConfig::default()
+            },
+        )
+    }
+
+    /// A validation failure carries the validator's own issues, and is refused
+    /// before the entry reaches storage.
+    ///
+    /// The wire-level parity with `POST [base]/Patient` is asserted by
+    /// `the_two_surfaces_report_the_same_validation_issues` in
+    /// `tests/validation_enforcement_tests.rs`; what this adds is the ordering
+    /// guarantee. `DelayStorage::create` is `unimplemented!()`, so a validation
+    /// failure moved after dispatch panics here rather than quietly writing,
+    /// and `peak() == 0` proves not even a read occurred.
+    #[tokio::test]
+    async fn a_validation_failure_carries_the_validators_own_issues() {
+        let state = enforcing_state_with(DelayStorage::new(8, 0));
+
+        let bundle = serde_json::json!({
+            "resourceType": "Bundle",
+            "type": "batch",
+            "entry": [{
+                "request": { "method": "POST", "url": "Patient" },
+                "resource": { "resourceType": "Patient", "bogusElement": true }
+            }]
+        });
+
+        let response = run_batch(&state, &bundle, None).await;
+        let entry = &response["entry"][0]["response"];
+        assert_eq!(entry["status"], "422 Unprocessable Entity", "{response}");
+
+        let issues = entry["outcome"]["issue"]
+            .as_array()
+            .expect("the validator's issue array");
+        assert!(
+            issues.iter().any(|i| {
+                i["code"] == "structure" && i["expression"][0] == "Patient.bogusElement"
+            }),
+            "the entry must carry the validator's coded, located issues: {entry}"
+        );
+
+        assert_eq!(
+            state.storage().peak(),
+            0,
+            "the entry must not reach storage"
+        );
+    }
+
     /// Response entry *i* must answer request entry *i*, even when entry *i*
     /// finishes last.
     ///
@@ -3444,7 +3754,16 @@ mod tests {
         // HEAD *is* served on the instance-read route.
         let head = serde_json::json!({ "method": "HEAD", "url": "Patient/p1" });
         assert_eq!(parse_entry_method(&head), Err(EntryMethodRefusal::Head));
-        assert_eq!(EntryMethodRefusal::Head.status(), 405);
+        // Read through the only remaining source of the status since #504
+        // deleted `EntryMethodRefusal::status()`, which held a second copy of
+        // it beside `into_rest_error`'s choice of variant.
+        assert_eq!(
+            EntryMethodRefusal::Head
+                .into_rest_error(0)
+                .client_response()
+                .0,
+            StatusCode::METHOD_NOT_ALLOWED
+        );
 
         // Case-folded spellings are invalid instance data, not valid entries a
         // strict server wrongly rejects — this is the premise #502 inverted.
@@ -3457,8 +3776,11 @@ mod tests {
             );
         }
         assert_eq!(
-            EntryMethodRefusal::NotCanonical("post".to_string()).status(),
-            400
+            EntryMethodRefusal::NotCanonical("post".to_string())
+                .into_rest_error(0)
+                .client_response()
+                .0,
+            StatusCode::BAD_REQUEST
         );
 
         // Absent or non-string is distinguishable from a bogus code. It used to
@@ -3474,26 +3796,62 @@ mod tests {
                 "request: {request}"
             );
         }
-        assert_eq!(EntryMethodRefusal::Missing.status(), 400);
+        assert_eq!(
+            EntryMethodRefusal::Missing
+                .into_rest_error(0)
+                .client_response()
+                .0,
+            StatusCode::BAD_REQUEST
+        );
     }
 
-    /// The refusal keeps its status across the transaction boundary. Flattening
-    /// it to a bare 400 there would re-create #502's divergence in a new place:
-    /// HEAD would be 405 per-entry in a batch and 400 for the whole bundle.
+    /// A refusal is rendered identically by both arms — status, issue code and
+    /// message.
+    ///
+    /// #515 pinned only the status, and did it by asserting the `RestError`
+    /// *variant* as a proxy for the pair. That assertion survives #504
+    /// unchanged while saying nothing about the code, so it is replaced rather
+    /// than kept: the batch arm's per-entry outcome and the transaction arm's
+    /// whole-bundle error must now agree on all three, which is strictly
+    /// stronger than what it replaces.
     #[test]
-    fn a_method_refusal_keeps_its_status_on_the_transaction_path() {
-        let head = EntryMethodRefusal::Head.into_rest_error(3);
-        assert!(
-            matches!(head, RestError::MethodNotAllowed { .. }),
-            "HEAD must stay 405, got {head:?}"
-        );
+    fn a_method_refusal_renders_identically_on_both_arms() {
+        // (refusal, status, issue code)
+        let cases = [
+            (
+                EntryMethodRefusal::Head,
+                StatusCode::METHOD_NOT_ALLOWED,
+                "not-supported",
+            ),
+            (
+                EntryMethodRefusal::Missing,
+                StatusCode::BAD_REQUEST,
+                "required",
+            ),
+            (
+                EntryMethodRefusal::NotCanonical("post".to_string()),
+                StatusCode::BAD_REQUEST,
+                "value",
+            ),
+        ];
 
-        let lowercase = EntryMethodRefusal::NotCanonical("post".to_string()).into_rest_error(0);
-        assert!(matches!(lowercase, RestError::BadRequest { .. }));
-        assert!(matches!(
-            EntryMethodRefusal::Missing.into_rest_error(0),
-            RestError::BadRequest { .. }
-        ));
+        for (refusal, status, code) in cases {
+            // What the transaction arm returns as the whole-bundle error…
+            let (tx_status, tx_code, tx_message) =
+                refusal.clone().into_rest_error(7).client_response();
+            // …and what the batch arm records for that entry.
+            let entry = entry_failure(refusal.clone().into_rest_error(7));
+            let issue = entry_issue(&entry);
+
+            assert_eq!(tx_status, status, "{refusal:?}");
+            assert_eq!(tx_code, code, "{refusal:?}");
+            assert_eq!(entry.status, status.as_u16(), "{refusal:?}");
+            assert_eq!(issue["code"], code, "{refusal:?}");
+            assert_eq!(
+                issue["details"]["text"], tx_message,
+                "the two arms must print one sentence for {refusal:?}"
+            );
+        }
     }
 
     /// The transaction matcher no longer case-folds. `to_uppercase()` was the
@@ -3561,6 +3919,22 @@ mod tests {
                 "400 Bad Request",
             ]
         );
+        // The four refusals were indistinguishable below the status line until
+        // #504 — every one carried `processing`. PATCH and HEAD are capability
+        // gaps, a lowercase verb is an unusable value, and an absent method is
+        // a missing element.
+        let codes: Vec<&str> = entries
+            .iter()
+            .map(|e| {
+                e["response"]["outcome"]["issue"][0]["code"]
+                    .as_str()
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(
+            codes,
+            vec!["not-supported", "not-supported", "value", "required"]
+        );
         assert_eq!(state.storage().peak(), 0, "no entry may reach storage");
     }
 
@@ -3623,6 +3997,24 @@ mod tests {
                 "entry {index}: {entry}"
             );
         }
+        // The five refusals were indistinguishable below the status line until
+        // #504 — every one carried `processing`. Two are a url whose value FHIR
+        // gives no meaning (`POST` criteria, criteria decoding to nothing); the
+        // other three are pairings in which both elements are individually
+        // well-formed, so `invalid` — the parent of `value` — is as precise as
+        // the fault allows.
+        let codes: Vec<&str> = entries
+            .iter()
+            .map(|e| {
+                e["response"]["outcome"]["issue"][0]["code"]
+                    .as_str()
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(
+            codes,
+            vec!["value", "invalid", "invalid", "invalid", "value"]
+        );
         assert_eq!(state.storage().peak(), 0, "no entry may reach storage");
         assert!(state.storage().conditional_calls().is_empty());
     }
@@ -3857,6 +4249,11 @@ mod tests {
                 entry["response"]["status"], "400 Bad Request",
                 "entry {index}: {entry}"
             );
+            // `request.url` is present; its value cannot address an instance.
+            assert_eq!(
+                entry["response"]["outcome"]["issue"][0]["code"], "value",
+                "entry {index}: {entry}"
+            );
         }
         assert_eq!(state.storage().peak(), 0, "no entry may reach storage");
     }
@@ -3927,6 +4324,14 @@ mod tests {
                 assert!(
                     status.starts_with("403"),
                     "entry {i} (Observation) must be denied: {status}"
+                );
+                // `forbidden` is a child of `security`, and `processing` — what
+                // this denial carried until #504 — is not an ancestor of it in
+                // any supported version. A client filtering `code is-a
+                // security` to trigger re-auth saw a false negative here.
+                assert_eq!(
+                    entry["response"]["outcome"]["issue"][0]["code"], "forbidden",
+                    "entry {i}: {entry}"
                 );
             }
         }
