@@ -3160,7 +3160,7 @@ details.json-fold[open] > summary .icon {
      element in this file already uses (.chip, .tab, .nav-item,
      .filter-rail__item), so a selected row paints like everything else.
    They touch different selectors in the same list; both are kept. */
-.data-table tbody tr:not(.data-table__empty):hover td,
+.data-table tbody tr:not(.data-table__empty):not(.row--params):hover td,
 .data-table tbody tr[aria-selected="true"] td,
 .data-table tbody tr[aria-current="true"] td {
   background: var(--accent-soft);
@@ -3322,6 +3322,77 @@ details.json-fold[open] > summary .icon {
 /* A failing row carries the frame's red left edge. */
 .data-table tr.row--alert > td:first-child {
   box-shadow: inset 3px 0 0 var(--danger);
+}
+
+/* #837: the SQL Export builder's parameter values row, right under a
+   parameterized SQL Query subject's own `<tr>` — the "client's notebook" of
+   values the checked row needs before it can run. Shaded off the plain row
+   background so the boundary between "picking a subject" and "filling in
+   its values" reads at a glance, without the weight of a border. */
+.row--params {
+  background: var(--input-bg);
+}
+
+.row--params td {
+  padding: 10px 14px 12px;
+}
+
+/* Field grid inside a values row (#837): plain `.field` voice, three per
+   row, no icon. `.field` already carries its own bottom margin for stacked
+   forms; inside this grid every field sits in its own column instead, so
+   that margin only adds uneven whitespace. */
+.param-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 14px;
+  max-width: 720px;
+}
+
+.row--params .field {
+  margin: 0;
+}
+
+/* The values row's expand/collapse chevron (#837), in the Subject cell of a
+   parameterized SQL Query — sql-export-form.js reveals it (server-rendered
+   `hidden`) only once its row is checked, then toggles `aria-expanded` on
+   click. The icon itself rotates purely off that attribute, matching
+   `.json-line__arrow`'s own collapsed-state rotation. */
+.row-toggle {
+  display: inline-grid;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  vertical-align: middle;
+}
+
+.row-toggle:hover {
+  color: var(--text);
+}
+
+.row-toggle .icon {
+  display: inline-flex;
+  transition: transform 0.15s ease;
+}
+
+.row-toggle[aria-expanded="false"] .icon {
+  transform: rotate(-90deg);
+}
+
+/* The folded values row's own chip summary (#837), next to the chevron:
+   `sql-export-form.js` fills it with one `.tag--param`/`.tag--danger` chip
+   per parameter while the row is collapsed, and empties/hides it again on
+   expand. */
+.param-summary {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  vertical-align: middle;
 }
 
 /* The Last 24 hrs sparkline (#782): the engine's half-hour delivery series,
@@ -4639,6 +4710,19 @@ details.json-fold[open] > summary .icon {
   font-size: 13px;
   font-weight: 600;
   color: var(--text-strong);
+}
+
+/* A `<details class="card">` whose `<summary>` is itself a `.card-head`
+   (SQL Export's "Advanced" disclosure, #836): a card that opens and closes
+   like every other native disclosure in this file, without a second markup
+   language for "collapsible card" versus "collapsible section". */
+details.card > summary.card-head {
+  list-style: none;
+  cursor: pointer;
+}
+
+details.card > summary.card-head::-webkit-details-marker {
+  display: none;
 }
 
 .card-head__tools {

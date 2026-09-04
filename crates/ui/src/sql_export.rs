@@ -65,6 +65,8 @@
 //! Remove only ever deletes the local record; the server is never called; a
 //! job's outputs are the reaper's to reclaim, not this UI's.
 
+use std::sync::atomic::Ordering;
+
 use askama::Template;
 use axum::{
     Extension,
@@ -78,8 +80,9 @@ use serde_json::{Value, json};
 
 use crate::i18n::{I18n, RequestLocale};
 use crate::{
-    Caller, RequestTenant, RequestVersion, SqlExportStatus, Status, WebState, current_status,
-    render, render_not_found, settings_user_key,
+    Caller, RequestTenant, RequestVersion, SqlExportParameter, SqlExportRequest, SqlExportStatus,
+    SqlExportSubject, Status, WebState, current_status, render, render_not_found,
+    settings_user_key,
 };
 
 // ---------------------------------------------------------------------------
@@ -171,6 +174,78 @@ pub struct JobSubject {
     /// `view-definition` | `sql-query` | `sql-view` — a stable code, not the
     /// display label; the card meta line translates it back through i18n.
     pub kind: String,
+    /// The values submitted for this subject's `Library.parameter`
+    /// declarations (#837) — empty for a ViewDefinition, a SQL View, or an
+    /// unparameterized SQL Query. Carried verbatim from the builder form into
+    /// [`kickoff`]'s `SqlExportRequest`, and copied unchanged by
+    /// [`resubmit`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub parameters: Vec<JobParameter>,
+}
+
+/// One subject parameter value as the job record stores it (#837): the
+/// declared name (without a leading `:`), the `Library.parameter.type` code,
+/// and the value text exactly as the user entered it — already validated by
+/// the time it is stored.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct JobParameter {
+    pub name: String,
+    #[serde(rename = "type")]
+    pub r#type: String,
+    pub value: String,
+}
+
+/// The job-wide filters `$sql-export` applies across every subject (#836):
+/// which patients/groups to scope to, how far back `_since` reaches, whether
+/// the CSV output carries a header row, and a client tracking id. Verified
+/// against `crates/rest/src/handlers/sof/export.rs`: `patient`/`group`/
+/// `_since` fold into a single `ViewFilters` for the whole `ExportTask`, so
+/// this is one record per job, never one per subject.
+///
+/// Serialization is deliberately all-or-nothing and field-stable: when at
+/// least one filter is set, every one of the five keys below is written —
+/// an empty `Vec` as `[]`, `header: None` as `null` — never individually
+/// omitted. Omitting an empty `patients`/`groups`/etc. per-field would make
+/// a round trip through [`job_merge_value`] lossy: [`resubmit`] deserializes
+/// a stored record back into a `JobFilters` and re-serializes it into the
+/// new record, and a field that silently vanished when empty would make the
+/// new record's `filters` unequal to the original's, even though nothing
+/// about that filter changed. Only the whole object collapses — to
+/// `filters: null` — and only when [`JobFilters::is_empty`] is `true`; see
+/// [`ExportJob::filters`] and [`job_merge_value`].
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct JobFilters {
+    /// `Patient/{id}` references, in submission order.
+    #[serde(default)]
+    pub patients: Vec<String>,
+    /// `Group/{id}` references, in submission order.
+    #[serde(default)]
+    pub groups: Vec<String>,
+    /// An RFC 3339 instant already resolved from whatever preset/custom input
+    /// the form offered; empty means no filter — never a raw preset name.
+    #[serde(default)]
+    pub since: String,
+    /// The CSV header switch; only meaningful for `format: "csv"`.
+    #[serde(default)]
+    pub header: Option<bool>,
+    #[serde(default)]
+    pub client_tracking_id: String,
+}
+
+impl JobFilters {
+    /// `true` when every field is at its empty default — the signal
+    /// [`job_merge_value`] uses to write `filters: null` instead of an empty
+    /// object, and [`ExportJob`]'s own `filters` field uses to skip itself on
+    /// serialization.
+    fn is_empty(&self) -> bool {
+        self.patients.is_empty()
+            && self.groups.is_empty()
+            && self.since.is_empty()
+            && self.header.is_none()
+            && self.client_tracking_id.is_empty()
+    }
 }
 
 /// One `output` entry of a persisted completion manifest.
@@ -211,6 +286,11 @@ pub struct ExportJob {
     /// `ndjson` | `csv` | `json` | `parquet`.
     #[serde(default)]
     pub format: String,
+    /// The job-wide patient/group/since/header/tracking-id filters this job
+    /// was submitted with (#836); its empty default deserializes cleanly from
+    /// a record persisted before this field existed.
+    #[serde(default, skip_serializing_if = "JobFilters::is_empty")]
+    pub filters: JobFilters,
     /// `in-progress` | `complete` | `failed` | `cancelled`.
     #[serde(default)]
     pub status: String,
@@ -306,6 +386,11 @@ fn job_merge_value(job: &ExportJob) -> Value {
             Value::Null
         } else {
             serde_json::to_value(&job.outputs).unwrap_or(Value::Null)
+        },
+        "filters": if job.filters.is_empty() {
+            Value::Null
+        } else {
+            serde_json::to_value(&job.filters).unwrap_or(Value::Null)
         },
     })
 }
@@ -479,10 +564,13 @@ fn subject_output_names(subjects: &[JobSubject]) -> Vec<String> {
         .collect()
 }
 
-/// Submits the job's subjects to `$sql-export`. On success, records the
-/// server's job id; on failure, the job becomes `failed` on the spot — the
-/// caller still stores and redirects to the list, which is the feedback.
-async fn kickoff(state: &WebState, job: &mut ExportJob, caller: &Caller) {
+/// Builds the `$sql-export` request `kickoff` submits from `job`: subjects
+/// under their disambiguated output names carrying their own parameter
+/// values, plus `job.filters` mapped field by field — an empty
+/// `since`/`client_tracking_id` becomes `None` rather than an empty `Some`,
+/// matching [`sql_export_parameters_body`](crate::sql_export_parameters_body)'s
+/// own "set and not empty" rule for `clientTrackingId`.
+fn export_request(job: &ExportJob) -> SqlExportRequest {
     // The output name is the subject's display name (the card already shows
     // the same name) rather than the reference's id segment (#833): the
     // manifest's output name is what Files shows and what a downloaded shard
@@ -490,17 +578,43 @@ async fn kickoff(state: &WebState, job: &mut ExportJob, caller: &Caller) {
     // subject_output_names() disambiguates two subjects that happen to share
     // a display name.
     let names = subject_output_names(&job.subjects);
-    let subjects: Vec<(String, String)> = job
+    let subjects: Vec<SqlExportSubject> = job
         .subjects
         .iter()
         .zip(names)
-        .map(|(subject, name)| (name, subject.reference.clone()))
+        .map(|(subject, name)| SqlExportSubject {
+            name,
+            reference: subject.reference.clone(),
+            parameters: subject
+                .parameters
+                .iter()
+                .map(|p| SqlExportParameter {
+                    name: p.name.clone(),
+                    type_code: p.r#type.clone(),
+                    value: p.value.clone(),
+                })
+                .collect(),
+        })
         .collect();
-    match state
-        .conformance
-        .sql_export_start(&subjects, &job.format, caller)
-        .await
-    {
+    SqlExportRequest {
+        subjects,
+        format: job.format.clone(),
+        header: job.filters.header,
+        since: (!job.filters.since.is_empty()).then(|| job.filters.since.clone()),
+        patients: job.filters.patients.clone(),
+        groups: job.filters.groups.clone(),
+        client_tracking_id: (!job.filters.client_tracking_id.is_empty())
+            .then(|| job.filters.client_tracking_id.clone()),
+    }
+}
+
+/// Submits the job's subjects and filters to `$sql-export`. On success,
+/// records the server's job id; on failure, the job becomes `failed` on the
+/// spot — the caller still stores and redirects to the list, which is the
+/// feedback.
+async fn kickoff(state: &WebState, job: &mut ExportJob, caller: &Caller) {
+    let request = export_request(job);
+    match state.conformance.sql_export_start(&request, caller).await {
         Ok(job_id) => job.job_id = job_id,
         Err(error) => {
             job.status = "failed".to_string();
@@ -626,6 +740,12 @@ pub(crate) struct ExportSubject {
     /// `ViewDefinition.status` / `Library.status` — `draft`, `active`,
     /// `retired`, `unknown`, or empty when the resource carries none (#834).
     pub(crate) status: String,
+    /// The Library's declared `Library.parameter[use=in]` entries (#837),
+    /// read by [`crate::sql_libraries::parameters`] — always empty for a
+    /// ViewDefinition or a SQL View, even when the underlying JSON carries a
+    /// `parameter` array (the SQLView profile forbids it; a stray one there
+    /// is simply not a query parameter this UI can bind).
+    pub(crate) parameters: Vec<crate::sql_libraries::DeclaredParameter>,
 }
 
 /// The stored subjects `$sql-export` can run: every ViewDefinition, and every
@@ -651,6 +771,7 @@ async fn export_subjects(
                     kind_label: "ViewDefinition",
                     kind_code: "view-definition",
                     status: e.status,
+                    parameters: Vec::new(),
                 });
             }
         }
@@ -663,12 +784,27 @@ async fn export_subjects(
                 ("sql-view", "SQL View", "sql-view"),
             ] {
                 for e in crate::sql_libraries::summarize(&libs, code) {
+                    // A SQL Query's parameter values (#837) come from the
+                    // full resource `summarize` already read `id`/`name`/
+                    // `status` out of — re-found here by id in the same
+                    // fetched list rather than fetched a second time. SQL
+                    // Views never carry parameters (the profile forbids
+                    // them), so this lookup is skipped entirely for them.
+                    let parameters = if kind_code == "sql-query" {
+                        libs.iter()
+                            .find(|l| l.get("id").and_then(Value::as_str) == Some(e.id.as_str()))
+                            .map(crate::sql_libraries::parameters)
+                            .unwrap_or_default()
+                    } else {
+                        Vec::new()
+                    };
                     subjects.push(ExportSubject {
                         reference: format!("Library/{}", e.id),
                         name: e.name,
                         kind_label,
                         kind_code,
                         status: e.status,
+                        parameters,
                     });
                 }
             }
@@ -919,6 +1055,35 @@ struct SubjectRow {
     /// the template so the fallback lives in exactly one place.
     status: String,
     checked: bool,
+    /// `param:{reference}` — the shared `partials/sql_parameter_fields.html`
+    /// partial's `prefix` argument (#837). Empty (and unused by the
+    /// template) when `parameters` is empty.
+    param_prefix: String,
+    /// This subject's declared parameters, paired with the value/error this
+    /// render should show for each (#837) — empty for every subject but a
+    /// parameterized SQL Query, which is what both the values row and the
+    /// `n parameter(s)` chip key off of.
+    parameters: Vec<ParamFieldView>,
+    /// The already-localized `n parameter(s)` chip text (#837), `None` when
+    /// `parameters` is empty. Shown next to the subject's name whether or
+    /// not the row is checked, so a parameterized query's requirement is
+    /// visible before it is ever selected.
+    param_chip: Option<String>,
+    /// `sql-export-params-{reference, "/" replaced with "-"}` (#837) — the
+    /// values row's own element `id`, and the row-toggle chevron's
+    /// `aria-controls`. Empty (and unused by the template) when `parameters`
+    /// is empty. A slug rather than the raw reference: an HTML `id` must not
+    /// contain whitespace, and this keeps it free of `/` too so it can also
+    /// serve, unescaped, as a CSS/`querySelector` target if ever needed.
+    param_row_id: String,
+    /// Whether this render's values row should carry `data-open` (#837): the
+    /// browser's JavaScript treats this as an explicit, server-authoritative
+    /// signal to keep the row expanded and focus its first invalid field,
+    /// independent of whatever fold state the row would otherwise start
+    /// in — set exactly when a resubmission left at least one of this
+    /// subject's parameter fields in error (always a checked subject, since
+    /// [`validate_subject_parameters`] only ever runs over checked ones).
+    open: bool,
 }
 
 /// `status`, or an em dash when the resource carries none.
@@ -930,23 +1095,117 @@ fn status_display(status: &str) -> String {
     }
 }
 
-/// Pairs `subjects` with `checked`, and counts how many ended up checked —
-/// the "n of m selected" hint's `n`. A `selected` reference that matches no
-/// current subject (an unknown `?subject=`, or a resubmitted reference the
-/// store no longer has) simply checks nothing rather than erroring — unknown
-/// references are ignored in silence.
-fn subject_rows(subjects: Vec<ExportSubject>, selected: &[String]) -> (Vec<SubjectRow>, usize) {
+/// One `param:{reference}:{name}` value as `start` reads it off the raw form
+/// body (#837): which subject it belongs to (by reference, not table
+/// position — the form can submit these in any order), the declared
+/// parameter name, and the raw text exactly as submitted (not yet trimmed —
+/// [`validate_subject_parameters`] does that once, at the point it decides
+/// whether the field is empty).
+#[derive(Debug, Clone)]
+struct ParamValue {
+    reference: String,
+    name: String,
+    value: String,
+}
+
+/// A field-level validation failure for one `param:{reference}:{name}`
+/// input (#837) — [`start`]'s equivalent, for parameter fields, of
+/// [`NewFormErrors::since_custom`]/`client_tracking_id`. Unlike those two,
+/// a single submission can fail several parameter fields across several
+/// subjects at once, so [`NewFormErrors::param_errors`] collects every one
+/// instead of stopping at the first.
+#[derive(Debug, Clone)]
+struct ParamFieldError {
+    reference: String,
+    name: String,
+    message: String,
+}
+
+/// One parameter field as `partials/sql_parameter_fields.html` renders it:
+/// the declaration ([`name`](Self::name)/[`type_code`](Self::type_code)/
+/// [`default`](Self::default)) plus this render's own
+/// [`value`](Self::value), [`error`](Self::error), and
+/// [`required`](Self::required) — [`subject_rows`] is the only place that
+/// builds these, from a [`crate::sql_libraries::DeclaredParameter`] plus
+/// whatever this render's [`ParamValue`]s/[`ParamFieldError`]s say about it.
+struct ParamFieldView {
+    name: String,
+    type_code: String,
+    default: Option<String>,
+    /// The value submitted for this field on a re-render, or the declared
+    /// default when nothing was submitted at all — never both at once, so a
+    /// submission that deliberately blanked a defaulted field renders back
+    /// blank rather than snapping to the default (#837).
+    value: String,
+    error: Option<String>,
+    /// Whether this render marks the input `required`: only when the
+    /// parameter has no default **and** its subject is checked in this
+    /// render. An unmarked query's fields never carry `required` — the
+    /// no-JavaScript requirement this page must keep working under — so the
+    /// browser's native validation can never block the whole form on a
+    /// query nobody selected; `start` is still the one place that actually
+    /// enforces this.
+    required: bool,
+}
+
+/// Pairs `subjects` with `checked`, resolves each parameterized SQL Query's
+/// fields against `param_values`/`param_errors`, and counts how many
+/// subjects ended up checked — the "n of m selected" hint's `n`. A
+/// `selected` reference that matches no current subject (an unknown
+/// `?subject=`, or a resubmitted reference the store no longer has) simply
+/// checks nothing rather than erroring — unknown references are ignored in
+/// silence, same as before #837.
+fn subject_rows(
+    subjects: Vec<ExportSubject>,
+    selected: &[String],
+    param_values: &[ParamValue],
+    param_errors: &[ParamFieldError],
+    i18n: &I18n,
+) -> (Vec<SubjectRow>, usize) {
     let rows: Vec<SubjectRow> = subjects
         .into_iter()
         .map(|s| {
             let checked = selected.contains(&s.reference);
+            let parameters: Vec<ParamFieldView> = s
+                .parameters
+                .iter()
+                .map(|p| {
+                    let submitted = param_values
+                        .iter()
+                        .find(|v| v.reference == s.reference && v.name == p.name)
+                        .map(|v| v.value.as_str());
+                    let value = submitted
+                        .unwrap_or_else(|| p.default.as_deref().unwrap_or(""))
+                        .to_string();
+                    let error = param_errors
+                        .iter()
+                        .find(|e| e.reference == s.reference && e.name == p.name)
+                        .map(|e| e.message.clone());
+                    ParamFieldView {
+                        name: p.name.clone(),
+                        type_code: p.type_code.clone(),
+                        default: p.default.clone(),
+                        value,
+                        error,
+                        required: checked && p.default.is_none(),
+                    }
+                })
+                .collect();
+            let param_chip = (!parameters.is_empty())
+                .then(|| i18n.t_arg("sql-export-param-count", "count", parameters.len() as i64));
+            let open = parameters.iter().any(|p| p.error.is_some());
             SubjectRow {
+                param_prefix: format!("param:{}", s.reference),
+                param_row_id: format!("sql-export-params-{}", s.reference.replace('/', "-")),
                 reference: s.reference,
                 name: s.name,
                 kind_label: s.kind_label,
                 kind_code: s.kind_code,
                 status: status_display(&s.status),
                 checked,
+                parameters,
+                param_chip,
+                open,
             }
         })
         .collect();
@@ -956,14 +1215,39 @@ fn subject_rows(subjects: Vec<ExportSubject>, selected: &[String]) -> (Vec<Subje
 
 /// The builder's conserved form state across a re-render: a `?subject=`
 /// prefill on a fresh `GET`, or — after a rejected `POST` — the
-/// `name`/`format`/selection the submission itself carried, so the user
-/// never has to redo the parts that were fine. Defaults to a bare `GET /new`
-/// with no prefill: no name, NDJSON (the default output format), nothing
-/// checked.
+/// `name`/`format`/selection/filters the submission itself carried, so the
+/// user never has to redo the parts that were fine. Defaults to a bare `GET
+/// /new` with no prefill: no name, NDJSON (the default output format),
+/// nothing checked, every "Narrow it down" filter empty, and the header
+/// checkbox on (#836).
 struct NewFormState {
     name: String,
     format: String,
     selected: Vec<String>,
+    /// Raw submitted `patient` values, one per repeated field — each may
+    /// itself carry several comma/newline-separated references, the
+    /// combobox fallback textarea's own shape (#836). Never canonicalized:
+    /// an invalid entry must echo back exactly as typed.
+    patients: Vec<String>,
+    /// Same shape as `patients`, for `group` (#836).
+    groups: Vec<String>,
+    since_preset: String,
+    since_custom: String,
+    /// Trimmed once by `start` before it is ever stored here, so every
+    /// re-render echoes the same value the length check itself validated
+    /// (#836).
+    client_tracking_id: String,
+    /// Whether the "Include a header row" checkbox renders checked (#836):
+    /// always `true`, except a submission that paired `format: csv`
+    /// with an unchecked box — the box's meaning outside `csv` is purely
+    /// cosmetic (the server never receives it), so every other format keeps
+    /// showing it checked regardless of what was actually submitted.
+    header_checked: bool,
+    /// Every submitted `param:{reference}:{name}` field (#837), verbatim —
+    /// echoed back on a re-render exactly like `patients`/`groups`, whether
+    /// or not its subject ended up checked (an unmarked query's typed
+    /// values are never lost, only ignored at submission time).
+    param_values: Vec<ParamValue>,
 }
 
 impl Default for NewFormState {
@@ -972,8 +1256,162 @@ impl Default for NewFormState {
             name: String::new(),
             format: "ndjson".to_string(),
             selected: Vec::new(),
+            patients: Vec::new(),
+            groups: Vec::new(),
+            since_preset: String::new(),
+            since_custom: String::new(),
+            client_tracking_id: String::new(),
+            header_checked: true,
+            param_values: Vec::new(),
         }
     }
+}
+
+impl NewFormState {
+    /// A `since_preset` outside the known list renders as "All time" rather
+    /// than echoing a value the `<select>` has no matching `<option>` for
+    /// (#836) — the same normalization Bulk Export's own `StartForm`
+    /// applies to its Since field.
+    fn normalize_since_preset(&mut self) {
+        if !matches!(
+            self.since_preset.as_str(),
+            "" | "day" | "week" | "month" | "custom"
+        ) {
+            self.since_preset.clear();
+        }
+    }
+}
+
+/// Field-level validation errors [`start`] can produce beyond the single
+/// `start_error` banner shared with the subjects-selection checks (#836):
+/// the "Narrow it down"/"Advanced" fields each own an inline error slot,
+/// the same idiom Bulk Export's Since field uses.
+#[derive(Default)]
+struct NewFormErrors {
+    since_custom: Option<String>,
+    client_tracking_id: Option<String>,
+    /// One entry per invalid `param:{reference}:{name}` field (#837) — see
+    /// [`ParamFieldError`] for why this collects every failing field
+    /// instead of stopping at the first.
+    param_errors: Vec<ParamFieldError>,
+}
+
+/// Validates and types every value submitted for one checked SQL Query
+/// subject's declared parameters (#837): for each of `declared`, the
+/// trimmed value found in `submitted` under `reference`/its name —
+///
+/// 1. empty with no default → a "required" [`ParamFieldError`];
+/// 2. empty with a default → skipped: the server applies its own default,
+///    so nothing is stored or sent for it;
+/// 3. non-empty → checked against [`value_matches_type`]; a mismatch is a
+///    "expected a {type}" [`ParamFieldError`], a match becomes a
+///    [`JobParameter`].
+///
+/// Every declared parameter is checked, not just up to the first failure —
+/// [`start`] accumulates every subject's errors together so a submission
+/// with several bad fields is corrected in one round trip.
+fn validate_subject_parameters(
+    reference: &str,
+    declared: &[crate::sql_libraries::DeclaredParameter],
+    submitted: &[ParamValue],
+    i18n: &I18n,
+) -> (Vec<JobParameter>, Vec<ParamFieldError>) {
+    let mut params = Vec::with_capacity(declared.len());
+    let mut errors = Vec::new();
+    for p in declared {
+        let raw = submitted
+            .iter()
+            .find(|v| v.reference == reference && v.name == p.name)
+            .map(|v| v.value.trim().to_string())
+            .unwrap_or_default();
+        if raw.is_empty() {
+            if p.default.is_none() {
+                errors.push(ParamFieldError {
+                    reference: reference.to_string(),
+                    name: p.name.clone(),
+                    message: i18n.t("sql-export-param-required"),
+                });
+            }
+            continue;
+        }
+        if value_matches_type(&p.type_code, &raw) {
+            params.push(JobParameter {
+                name: p.name.clone(),
+                r#type: p.type_code.clone(),
+                value: raw,
+            });
+        } else {
+            errors.push(ParamFieldError {
+                reference: reference.to_string(),
+                name: p.name.clone(),
+                message: i18n.t_arg(
+                    "sql-export-param-type-mismatch",
+                    "type",
+                    p.type_code.clone(),
+                ),
+            });
+        }
+    }
+    (params, errors)
+}
+
+/// Whether `value` (already trimmed and known non-empty) is well-formed for
+/// `type_code` — the same FHIR primitive shapes
+/// [`crate::conformance::typed_parameter_value`] eventually encodes a valid
+/// value of that type as (#837), so a value this accepts is a value that
+/// function will never have to fall back to `valueString` for. A type this
+/// function does not specifically recognize (`string`, `code`, `uri`, an
+/// unrecognized code, …) accepts anything: the profile itself does not
+/// further constrain those shapes, and the server is the authority on
+/// whether the value it eventually binds actually parses as its declared
+/// type.
+fn value_matches_type(type_code: &str, value: &str) -> bool {
+    match type_code {
+        "integer" | "integer64" => value.parse::<i64>().is_ok(),
+        "positiveInt" => value.parse::<i64>().is_ok_and(|n| n >= 1),
+        "unsignedInt" => value.parse::<i64>().is_ok_and(|n| n >= 0),
+        "decimal" => value.parse::<f64>().is_ok_and(f64::is_finite),
+        "boolean" => matches!(value, "true" | "false"),
+        "date" => is_valid_date(value),
+        "dateTime" | "instant" => chrono::DateTime::parse_from_rfc3339(value).is_ok(),
+        "time" => is_valid_time(value),
+        _ => true,
+    }
+}
+
+/// A strict `YYYY-MM-DD` calendar date: fixed-width digit groups (so
+/// `2026-1-1` is rejected, unlike a lenient `chrono` parse) that also name a
+/// real day (so `2026-02-30` is rejected).
+fn is_valid_date(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    if bytes.len() != 10 || bytes[4] != b'-' || bytes[7] != b'-' {
+        return false;
+    }
+    if !value[0..4].bytes().all(|b| b.is_ascii_digit())
+        || !value[5..7].bytes().all(|b| b.is_ascii_digit())
+        || !value[8..10].bytes().all(|b| b.is_ascii_digit())
+    {
+        return false;
+    }
+    chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d").is_ok()
+}
+
+/// A strict `HH:MM:SS` or `HH:MM:SS.fff` time of day, fixed-width the same
+/// way [`is_valid_date`] is.
+fn is_valid_time(value: &str) -> bool {
+    let (main, fraction) = match value.split_once('.') {
+        Some((main, fraction)) => (main, Some(fraction)),
+        None => (value, None),
+    };
+    if main.len() != 8 || main.as_bytes()[2] != b':' || main.as_bytes()[5] != b':' {
+        return false;
+    }
+    if let Some(fraction) = fraction
+        && (fraction.is_empty() || !fraction.bytes().all(|b| b.is_ascii_digit()))
+    {
+        return false;
+    }
+    chrono::NaiveTime::parse_from_str(main, "%H:%M:%S").is_ok()
 }
 
 /// The SQL Export builder (#833, #834): pick stored subjects from a single
@@ -996,6 +1434,23 @@ struct ExportNewPage {
     format: String,
     degraded: Option<String>,
     start_error: Option<String>,
+    /// "Narrow it down" (#836): the combobox fallback textareas' own value —
+    /// every submitted reference, one per line — plus the version-aware
+    /// search hint each field currently has.
+    patients_value: String,
+    patients_hint: String,
+    groups_value: String,
+    groups_hint: String,
+    since_preset: String,
+    since_custom: String,
+    since_custom_error: Option<String>,
+    /// "Advanced" (#836): the tracking id field's value/error, the header
+    /// checkbox's rendered state, and whether the disclosure starts open —
+    /// `true` the moment either field carries something worth showing.
+    client_tracking_id: String,
+    client_tracking_id_error: Option<String>,
+    header_checked: bool,
+    advanced_open: bool,
 }
 
 #[derive(Template)]
@@ -1098,6 +1553,7 @@ pub(crate) async fn new_page(
             selected,
             ..Default::default()
         },
+        NewFormErrors::default(),
     )
     .await
 }
@@ -1112,14 +1568,43 @@ async fn render_new_page(
     version: helios_fhir::FhirVersion,
     rt: &RequestTenant,
     start_error: Option<String>,
-    form: NewFormState,
+    mut form: NewFormState,
+    errors: NewFormErrors,
 ) -> Response {
+    form.normalize_since_preset();
     let (subjects, degraded) = export_subjects(state, version, &rt.id).await;
     let total = subjects.len();
-    let (rows, selected_count) = subject_rows(subjects, &form.selected);
+    let i18n = I18n::new(locale);
+    let (rows, selected_count) = subject_rows(
+        subjects,
+        &form.selected,
+        &form.param_values,
+        &errors.param_errors,
+        &i18n,
+    );
+    // Patients' search hint degrades the same way Bulk Export's own field
+    // does — a shared, process-wide capability flag, not a per-page one
+    // (#836).
+    let patients_hint = if state.patient_name_search.load(Ordering::Relaxed) {
+        i18n.t("sql-export-field-patients-hint")
+    } else {
+        i18n.t("sql-export-field-patients-id-only-hint")
+    };
+    let groups_hint = if crate::lookup::supports_group_name_search(version) {
+        i18n.t("sql-export-field-groups-hint-r5")
+    } else {
+        i18n.t("sql-export-field-groups-hint-r4")
+    };
+    // Open the moment either "Advanced" field carries something worth
+    // showing: a tracking id, its error, or a header box the submission
+    // actually unchecked (#836) — never merely because the checkbox sits at
+    // its own default `true`.
+    let advanced_open = !form.client_tracking_id.is_empty()
+        || errors.client_tracking_id.is_some()
+        || !form.header_checked;
     render(ExportNewPage {
         status: current_status(state, version, rt),
-        i18n: I18n::new(locale),
+        i18n,
         active_page: "sql-export",
         subjects: rows,
         total,
@@ -1128,13 +1613,26 @@ async fn render_new_page(
         format: form.format,
         degraded,
         start_error,
+        patients_value: form.patients.join("\n"),
+        patients_hint,
+        groups_value: form.groups.join("\n"),
+        groups_hint,
+        since_preset: form.since_preset,
+        since_custom: form.since_custom,
+        since_custom_error: errors.since_custom,
+        client_tracking_id: form.client_tracking_id,
+        client_tracking_id_error: errors.client_tracking_id,
+        header_checked: form.header_checked,
+        advanced_open,
     })
 }
 
 /// `POST /ui/sql/export` — resolve the checked subjects against the same
-/// list `/new` offered, create the job record, kick it off, and land on the
-/// list. The form repeats `subject=` per checkbox, which `Form`-into-a-struct
-/// cannot express, so the raw body is parsed by hand.
+/// list `/new` offered, validate the job-wide filters (#836), create the job
+/// record, kick it off, and land on the list. The form repeats several
+/// fields (`subject=` per checkbox, `patient=`/`group=` per combobox
+/// selection), which `Form`-into-a-struct cannot express, so the raw body is
+/// parsed by hand.
 pub(crate) async fn start(
     State(state): State<WebState>,
     locale: RequestLocale,
@@ -1148,18 +1646,77 @@ pub(crate) async fn start(
     let mut name = String::new();
     let mut format = "ndjson".to_string();
     let mut refs: Vec<String> = Vec::new();
+    let mut patients: Vec<String> = Vec::new();
+    let mut groups: Vec<String> = Vec::new();
+    let mut since_preset = String::new();
+    let mut since_custom = String::new();
+    let mut client_tracking_id = String::new();
+    let mut header_present = false;
+    let mut param_values: Vec<ParamValue> = Vec::new();
     for (key, value) in form_urlencoded::parse(&body) {
+        // `param:{reference}:{name}` (#837) — the reference itself never
+        // contains `:` (neither a FHIR reference nor a parameter name does,
+        // per the `sql-name` invariant `^[A-Za-z][A-Za-z0-9_]*$`), so
+        // splitting on the first `:` after the fixed `param:` prefix always
+        // separates the two cleanly. A key with no second `:` (malformed,
+        // never produced by this page's own markup) is simply dropped.
+        if let Some(rest) = key.strip_prefix("param:") {
+            if let Some((reference, name)) = rest.split_once(':') {
+                param_values.push(ParamValue {
+                    reference: reference.to_string(),
+                    name: name.to_string(),
+                    value: value.into_owned(),
+                });
+            }
+            continue;
+        }
         match key.as_ref() {
             "name" => name = value.into_owned(),
             "subject" => refs.push(value.into_owned()),
             "format" => format = value.into_owned(),
+            "patient" => patients.push(value.into_owned()),
+            "group" => groups.push(value.into_owned()),
+            "since_preset" => since_preset = value.into_owned(),
+            "since_custom" => since_custom = value.into_owned(),
+            "client_tracking_id" => client_tracking_id = value.into_owned(),
+            // The checkbox contract is presence, like Bulk Export's own
+            // `all_types` — its submitted value is never inspected.
+            "header" => header_present = true,
             _ => {}
         }
     }
     // Trimmed once, up front — an empty result is never stored (the job's
-    // `name` serialization already skips an empty string), and every
-    // re-render below echoes back the exact same trimmed value.
+    // `name`/`filters.clientTrackingId` serialization already skips an empty
+    // string), and every re-render below echoes back the exact same trimmed
+    // value.
     let name = name.trim().to_string();
+    let client_tracking_id = client_tracking_id.trim().to_string();
+    // The checkbox's re-rendered state (#836): checked unless this exact
+    // submission paired `csv` with an unchecked box. Computed once so every
+    // re-render below — whichever field actually failed — shows it exactly
+    // as [`start`] would send it.
+    let header_checked = if format == "csv" {
+        header_present
+    } else {
+        true
+    };
+    // A closure rather than a value: every early-return below needs its own
+    // independent `NewFormState`, and inlining the same nine-field struct
+    // literal at each of seven call sites would otherwise dwarf the actual
+    // validation logic.
+    let conserved_form = || NewFormState {
+        name: name.clone(),
+        format: format.clone(),
+        selected: refs.clone(),
+        patients: patients.clone(),
+        groups: groups.clone(),
+        since_preset: since_preset.clone(),
+        since_custom: since_custom.clone(),
+        client_tracking_id: client_tracking_id.clone(),
+        header_checked,
+        param_values: param_values.clone(),
+    };
+
     if refs.is_empty() {
         return render_new_page(
             &state,
@@ -1167,11 +1724,8 @@ pub(crate) async fn start(
             rv.0,
             &rt,
             Some(i18n.t("sql-export-select-subject")),
-            NewFormState {
-                name: name.clone(),
-                format: format.clone(),
-                selected: refs.clone(),
-            },
+            conserved_form(),
+            NewFormErrors::default(),
         )
         .await;
     }
@@ -1189,15 +1743,15 @@ pub(crate) async fn start(
             rv.0,
             &rt,
             Some(message),
-            NewFormState {
-                name: name.clone(),
-                format: format.clone(),
-                selected: refs.clone(),
-            },
+            conserved_form(),
+            NewFormErrors::default(),
         )
         .await;
     }
     let mut subjects = Vec::with_capacity(refs.len());
+    // #837: every parameter field error across every checked subject,
+    // collected rather than stopped-at-first — see [`ParamFieldError`].
+    let mut param_errors: Vec<ParamFieldError> = Vec::new();
     for reference in &refs {
         let Some(found) = available_subjects
             .iter()
@@ -1209,26 +1763,122 @@ pub(crate) async fn start(
                 rv.0,
                 &rt,
                 Some(i18n.t("sql-export-unknown-subject")),
-                NewFormState {
-                    name: name.clone(),
-                    format: format.clone(),
-                    selected: refs.clone(),
-                },
+                conserved_form(),
+                NewFormErrors::default(),
             )
             .await;
         };
+        let (parameters, mut errors) =
+            validate_subject_parameters(reference, &found.parameters, &param_values, &i18n);
+        param_errors.append(&mut errors);
         subjects.push(JobSubject {
             name: found.name.clone(),
             reference: reference.clone(),
             kind: found.kind_code.to_string(),
+            parameters,
         });
     }
+    if !param_errors.is_empty() {
+        return render_new_page(
+            &state,
+            locale,
+            rv.0,
+            &rt,
+            None,
+            conserved_form(),
+            NewFormErrors {
+                param_errors,
+                ..Default::default()
+            },
+        )
+        .await;
+    }
+
+    // #836: the job-wide filters, validated patients, then groups, then
+    // since, then the tracking id — the first failing check re-renders with
+    // its own message/field error, and every step that already passed keeps
+    // its now-known-good value instead of being re-parsed from the raw
+    // submission a second time.
+    let patient_refs = match crate::lookup::parse_reference_list("Patient", &patients) {
+        Ok(refs) => refs,
+        Err(()) => {
+            return render_new_page(
+                &state,
+                locale,
+                rv.0,
+                &rt,
+                Some(i18n.t("sql-export-patient-invalid")),
+                conserved_form(),
+                NewFormErrors::default(),
+            )
+            .await;
+        }
+    };
+    let group_refs = match crate::lookup::parse_reference_list("Group", &groups) {
+        Ok(refs) => refs,
+        Err(()) => {
+            return render_new_page(
+                &state,
+                locale,
+                rv.0,
+                &rt,
+                Some(i18n.t("sql-export-group-invalid")),
+                conserved_form(),
+                NewFormErrors::default(),
+            )
+            .await;
+        }
+    };
+    let since = match crate::lookup::since_instant(&since_preset, &since_custom) {
+        Ok(since) => since,
+        Err(()) => {
+            return render_new_page(
+                &state,
+                locale,
+                rv.0,
+                &rt,
+                None,
+                conserved_form(),
+                NewFormErrors {
+                    since_custom: Some(i18n.t("sql-export-since-invalid")),
+                    ..Default::default()
+                },
+            )
+            .await;
+        }
+    };
+    if client_tracking_id.chars().count() > 200 {
+        return render_new_page(
+            &state,
+            locale,
+            rv.0,
+            &rt,
+            None,
+            conserved_form(),
+            NewFormErrors {
+                client_tracking_id: Some(i18n.t("sql-export-tracking-id-too-long")),
+                ..Default::default()
+            },
+        )
+        .await;
+    }
+    // `header` is only ever meaningful for `csv` — every other format sends
+    // no filter at all, matching `sql_export_parameters_body`'s own "only
+    // when `Some`" rule.
+    let header = (format == "csv").then_some(header_present);
 
     let caller = Caller::from_request(&headers, &rt.id);
     let mut job = ExportJob {
         name,
         subjects,
         format,
+        filters: JobFilters {
+            patients: patient_refs,
+            groups: group_refs,
+            since,
+            header,
+            client_tracking_id,
+        },
         status: "in-progress".to_string(),
         started_at: now_stamp(),
         ..Default::default()
@@ -1281,9 +1931,11 @@ async fn store_new_job(state: &WebState, user_key: &str, tenant: &str, job: Expo
 }
 
 /// Builds a fresh `in-progress` job that copies `source`'s
-/// `name`/`subjects`/`format`, kicks it off under `caller`, and stores it as
-/// a brand-new record via [`store_new_job`] — the resubmission [`retry`] and
-/// [`rerun`] share: `source` itself is never written back to.
+/// `name`/`subjects`/`format`/`filters` — each subject's own `parameters`
+/// travel along inside its cloned `JobSubject` — kicks it off under
+/// `caller`, and stores it as a brand-new record via [`store_new_job`] — the
+/// resubmission [`retry`] and [`rerun`] share: `source` itself is never
+/// written back to.
 async fn resubmit(
     state: &WebState,
     user_key: &str,
@@ -1295,6 +1947,7 @@ async fn resubmit(
         name: source.name.clone(),
         subjects: source.subjects.clone(),
         format: source.format.clone(),
+        filters: source.filters.clone(),
         status: "in-progress".to_string(),
         started_at: now_stamp(),
         ..Default::default()
@@ -1486,6 +2139,13 @@ fn kind_label(kind: &str) -> &'static str {
 struct SubjectTag {
     kind_label: &'static str,
     name: String,
+    /// This subject's stored parameter values (#837), `(name, value)` pairs
+    /// in submission order — rendered as `:name = value` chips right after
+    /// the subject's name in the Job card's Subjects field. Always empty for
+    /// a ViewDefinition, a SQL View, or an unparameterized SQL Query, and
+    /// always empty on an Output row's own Subject column (only the Job
+    /// card's Subjects field shows chips; see [`resolve_output_subject`]).
+    parameters: Vec<(String, String)>,
 }
 
 /// One download link in an Output row's Files column: the label shown next
@@ -1545,6 +2205,10 @@ fn resolve_output_subject(job: &ExportJob, output_name: &str) -> Option<SubjectT
         .map(|(_, subject)| SubjectTag {
             kind_label: kind_label(&subject.kind),
             name: subject.name.clone(),
+            // Deliberately empty (#837): the Output files table's Subject
+            // column is a resolved-by-name pointer back to the Job card's
+            // own Subjects field, which is the only place chips render.
+            parameters: Vec::new(),
         })
 }
 
@@ -1712,6 +2376,27 @@ fn detail_lede(i18n: &I18n, job: &ExportJob) -> String {
     }
 }
 
+/// The Job card's Format field (#836): [`format_label`] unchanged for every
+/// job except a `csv` one whose `filters.header` is a known choice, which
+/// appends " · with header row" / " · no header row" — the same suffix the
+/// Playwright AC (`sql-export.spec.ts`) checks for after unchecking the
+/// header switch and submitting. `filters.header` is `None` for any
+/// non-`csv` job and for a record persisted before #836, in which case this
+/// falls back to the plain label exactly as the list card's own
+/// [`job_meta`] still renders it — that line is deliberately left
+/// untouched by #836.
+fn detail_format_label(i18n: &I18n, job: &ExportJob) -> String {
+    let base = format_label(i18n, &job.format);
+    if job.format != "csv" {
+        return base;
+    }
+    match job.filters.header {
+        Some(true) => format!("{base} · {}", i18n.t("sql-export-detail-header-included")),
+        Some(false) => format!("{base} · {}", i18n.t("sql-export-detail-header-omitted")),
+        None => base,
+    }
+}
+
 /// The `/ui/sql/export/{id}` job detail's view model (#835): everything that
 /// varies with the job's status, built once by [`build_job_detail`] over
 /// [`ExportJob`] + i18n so neither template branches on raw job fields
@@ -1727,9 +2412,25 @@ struct JobDetail {
     /// `in-progress`.
     progress_pct: String,
     job_id: String,
+    /// [`detail_format_label`]'s own header-aware label — not the plain
+    /// [`format_label`] the list card uses.
     format_label: String,
     started_label: String,
     duration_label: String,
+    /// The Job card's Tracking id field (#836): `filters.client_tracking_id`
+    /// verbatim, empty when the job carries none — the template skips the
+    /// whole `detail__field` in that case.
+    tracking_id: String,
+    /// The Job card's Since field (#836): `filters.since`, the RFC 3339
+    /// instant already resolved at submission time — never a raw preset
+    /// name — empty (and unrendered) when the job carries no Since filter.
+    since_label: String,
+    /// The Job card's Patients field (#836): `filters.patients` verbatim, one
+    /// `.tag` chip per reference; empty (and unrendered) when the job
+    /// carries no Patients filter.
+    patients: Vec<String>,
+    /// The Job card's Groups field (#836), the same shape as `patients`.
+    groups: Vec<String>,
     subjects: Vec<SubjectTag>,
     outputs: Vec<OutputRow>,
     /// The toolbar's file count: the sum of every output's `locations`, not
@@ -1747,15 +2448,24 @@ fn build_job_detail(i18n: &I18n, id: &str, job: &ExportJob) -> JobDetail {
         warning: failure_notice(job),
         progress_pct: progress_pct(&job.status, &job.progress),
         job_id: job.job_id.clone(),
-        format_label: format_label(i18n, &job.format),
+        format_label: detail_format_label(i18n, job),
         started_label: format_timestamp_seconds(&job.started_at),
         duration_label: duration_label(i18n, job),
+        tracking_id: job.filters.client_tracking_id.clone(),
+        since_label: job.filters.since.clone(),
+        patients: job.filters.patients.clone(),
+        groups: job.filters.groups.clone(),
         subjects: job
             .subjects
             .iter()
             .map(|subject| SubjectTag {
                 kind_label: kind_label(&subject.kind),
                 name: subject.name.clone(),
+                parameters: subject
+                    .parameters
+                    .iter()
+                    .map(|p| (p.name.clone(), p.value.clone()))
+                    .collect(),
             })
             .collect(),
         output_count: job.outputs.iter().map(|o| o.locations.len()).sum(),
@@ -1960,6 +2670,7 @@ mod tests {
             name: name.to_string(),
             reference: format!("ViewDefinition/{name}"),
             kind: kind.to_string(),
+            parameters: vec![],
         }
     }
 
@@ -2024,8 +2735,112 @@ mod tests {
         assert_eq!(value["pollError"], Value::Null);
         assert_eq!(value["finishedAt"], Value::Null);
         assert_eq!(value["outputs"], Value::Null);
+        assert_eq!(value["filters"], Value::Null);
         assert_eq!(value["status"], "in-progress");
         assert_eq!(value["format"], "csv");
+    }
+
+    /// #836: a job with every filter set serializes `filters`, and
+    /// `job_merge_value` carries it through instead of nulling it out.
+    #[test]
+    fn job_merge_value_writes_filters_when_present() {
+        let job = ExportJob {
+            status: "in-progress".to_string(),
+            started_at: "2026-09-01T09:00:00Z".to_string(),
+            format: "csv".to_string(),
+            filters: JobFilters {
+                patients: vec!["Patient/p1".to_string()],
+                groups: vec![],
+                since: "2026-01-01T00:00:00Z".to_string(),
+                header: Some(true),
+                client_tracking_id: "trk-1".to_string(),
+            },
+            ..Default::default()
+        };
+        let value = job_merge_value(&job);
+        assert_eq!(value["filters"]["patients"], json!(["Patient/p1"]));
+        assert_eq!(value["filters"]["since"], "2026-01-01T00:00:00Z");
+        assert_eq!(value["filters"]["header"], true);
+        assert_eq!(value["filters"]["clientTrackingId"], "trk-1");
+        // An empty `groups` is still an explicit key with `[]`, not omitted —
+        // serialization is all-or-nothing per JobFilters' own docs, so a
+        // round trip through job_merge_value never silently drops a field.
+        assert_eq!(value["filters"]["groups"], json!([]));
+    }
+
+    /// A `JobFilters` with only one field set (e.g. just `header`) still
+    /// serializes every key — the "all-or-nothing" rule is about the whole
+    /// object collapsing to `null`, never about individual fields dropping
+    /// out while siblings are set.
+    #[test]
+    fn job_merge_value_writes_every_filter_key_even_when_only_one_filter_is_set() {
+        let job = ExportJob {
+            status: "in-progress".to_string(),
+            started_at: "2026-09-01T09:00:00Z".to_string(),
+            filters: JobFilters {
+                header: Some(false),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let value = job_merge_value(&job);
+        assert_eq!(value["filters"]["patients"], json!([]));
+        assert_eq!(value["filters"]["groups"], json!([]));
+        assert_eq!(value["filters"]["since"], "");
+        assert_eq!(value["filters"]["header"], false);
+        assert_eq!(value["filters"]["clientTrackingId"], "");
+    }
+
+    /// #836/#837: a job carrying `filters` and a parameterized subject
+    /// round-trips through JSON unchanged.
+    #[test]
+    fn export_job_round_trips_filters_and_subject_parameters() {
+        let job = ExportJob {
+            subjects: vec![JobSubject {
+                name: "ward_counts".to_string(),
+                reference: "Library/q1".to_string(),
+                kind: "sql-query".to_string(),
+                parameters: vec![JobParameter {
+                    name: "ward".to_string(),
+                    r#type: "string".to_string(),
+                    value: "west".to_string(),
+                }],
+            }],
+            format: "csv".to_string(),
+            filters: JobFilters {
+                patients: vec!["Patient/p1".to_string()],
+                groups: vec!["Group/g1".to_string()],
+                since: "2026-01-01T00:00:00Z".to_string(),
+                header: Some(true),
+                client_tracking_id: "trk-1".to_string(),
+            },
+            ..Default::default()
+        };
+        let value = serde_json::to_value(&job).expect("job serializes");
+        let round_tripped: ExportJob =
+            serde_json::from_value(value).expect("job deserializes back");
+        assert_eq!(round_tripped.filters, job.filters);
+        assert_eq!(round_tripped.subjects, job.subjects);
+    }
+
+    /// #836/#837: a record persisted before `filters`/`parameters` existed
+    /// still deserializes, with both defaulting to empty.
+    #[test]
+    fn export_job_deserializes_a_pre_filters_record_with_empty_defaults() {
+        let legacy = json!({
+            "jobId": "job-1",
+            "subjects": [{
+                "name": "patients",
+                "reference": "ViewDefinition/vd1",
+                "kind": "view-definition",
+            }],
+            "format": "csv",
+            "status": "complete",
+            "startedAt": "2026-01-01T09:00:00Z",
+        });
+        let job: ExportJob = serde_json::from_value(legacy).expect("legacy record deserializes");
+        assert_eq!(job.filters, JobFilters::default());
+        assert!(job.subjects[0].parameters.is_empty());
     }
 
     // -----------------------------------------------------------------------
@@ -2200,5 +3015,37 @@ mod tests {
             failure_notice(&job),
             Some(FailureNotice::Subject(name, _)) if name == "v03_counts"
         ));
+    }
+
+    /// #836: the header suffix only ever appears for `csv` with a known
+    /// `filters.header` — every other combination falls back to the plain
+    /// [`format_label`].
+    #[test]
+    fn detail_format_label_adds_the_header_choice_only_for_csv_with_a_known_header() {
+        let i18n = I18n::from_tag("en").unwrap();
+        let mut job = ExportJob {
+            format: "csv".to_string(),
+            filters: JobFilters {
+                header: Some(true),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(detail_format_label(&i18n, &job), "CSV · with header row");
+
+        job.filters.header = Some(false);
+        assert_eq!(detail_format_label(&i18n, &job), "CSV · no header row");
+
+        // No header choice recorded (a pre-#836 record, or a csv job that
+        // never went through the "Advanced" disclosure at all): the plain
+        // label, matching the list card's own format_label.
+        job.filters.header = None;
+        assert_eq!(detail_format_label(&i18n, &job), "CSV");
+
+        // A header choice is only ever meaningful for csv — a non-csv job
+        // ignores it even if a stray `filters.header` were somehow set.
+        job.format = "parquet".to_string();
+        job.filters.header = Some(true);
+        assert_eq!(detail_format_label(&i18n, &job), "Parquet");
     }
 }

@@ -198,12 +198,20 @@ export async function waitSearchable(
  * Library. `sql` defaults to a query that always succeeds; the chromium and
  * `nojs` SQL Export job-detail specs both pass a deliberately broken one to
  * seed a `failed` job.
+ *
+ * `parameters` (#837) is the Library's own `parameter` array, verbatim —
+ * each entry the exact FHIR shape `Library.parameter[use=in]` takes (e.g.
+ * `{ name: "ward", use: "in", type: "string" }`, or with a
+ * `defaultString`/`defaultInteger`/… for an optional one) — omitted
+ * entirely from the created resource when left undefined, exactly like an
+ * unparameterized SQL Query.
  */
 export async function createSqlQueryLibrary(
   request: APIRequestContext,
   name: string,
   canonical: string,
   sql = "SELECT COUNT(*) AS n FROM v",
+  parameters?: Record<string, unknown>[],
 ): Promise<string> {
   return createResource(request, "Library", {
     name,
@@ -218,5 +226,6 @@ export async function createSqlQueryLibrary(
     },
     relatedArtifact: [{ type: "depends-on", resource: canonical, label: "v" }],
     content: [{ contentType: "application/sql", data: Buffer.from(sql).toString("base64") }],
+    ...(parameters ? { parameter: parameters } : {}),
   });
 }

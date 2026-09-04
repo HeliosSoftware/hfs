@@ -158,6 +158,81 @@ pub(crate) fn starter_library(code: &str) -> String {
 /// The starter SQL paired with [`starter_library`]'s `label`.
 pub(crate) const STARTER_SQL: &str = "SELECT * FROM v";
 
+/// One declared `Library.parameter[use=in]` entry (#837), read with the same
+/// semantics `helios_sof::sqlquery::library::extract_parameters` applies:
+/// only `use=in` entries carry SQL on FHIR's binding semantics, and `name`/
+/// `type` are both required by the SQLQuery profile. Unlike that function —
+/// which fails the whole Library on a malformed entry, appropriate for the
+/// engine about to run it — this reader is forgiving: a Library the UI
+/// cannot fully describe must still let every other stored subject render.
+/// If the server itself rejects a malformed Library at kick-off, the job
+/// fails with its own message, exactly as it does today.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DeclaredParameter {
+    /// The bare name, without its `:` SQL placeholder prefix.
+    pub name: String,
+    /// The FHIR type code from `Library.parameter.type` (`string`,
+    /// `integer`, `date`, …).
+    pub type_code: String,
+    /// The declared `default[X]` value in plain-text form — `defaultString`
+    /// verbatim, a number's `to_string()`, `true`/`false` for a boolean —
+    /// or `None` when the entry carries no `default[X]` field, or that
+    /// field's JSON shape has no plain-text representation. A parameter
+    /// with a default is optional everywhere this type is consumed; one
+    /// without is required.
+    pub default: Option<String>,
+}
+
+/// Reads every `use=in` parameter declaration off a `sql-query` Library, in
+/// document order. An entry missing `use=in`, `name`, or `type` is skipped
+/// (logged at `debug`) rather than surfaced as a page-wide error — see
+/// [`DeclaredParameter`]'s own docs for why.
+pub(crate) fn parameters(library: &Value) -> Vec<DeclaredParameter> {
+    let Some(entries) = library.get("parameter").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    entries
+        .iter()
+        .filter(|p| p.get("use").and_then(Value::as_str) == Some("in"))
+        .filter_map(|p| {
+            let name = p.get("name").and_then(Value::as_str);
+            let type_code = p.get("type").and_then(Value::as_str);
+            let (Some(name), Some(type_code)) = (name, type_code) else {
+                tracing::debug!(
+                    entry = ?p,
+                    "skipping Library.parameter entry missing name or type"
+                );
+                return None;
+            };
+            Some(DeclaredParameter {
+                name: name.to_string(),
+                type_code: type_code.to_string(),
+                default: default_text(p),
+            })
+        })
+        .collect()
+}
+
+/// The plain-text form of a `default[X]` field on one `parameter` entry, per
+/// [`DeclaredParameter::default`]'s own rule. Any key starting with
+/// `default` and carrying at least one more character (`defaultString`,
+/// `defaultValueInteger`, …) counts, forward-compatible with the same
+/// tolerant match `helios_sof::sqlquery::library::read_default` applies.
+fn default_text(entry: &Value) -> Option<String> {
+    entry.as_object()?.iter().find_map(|(key, value)| {
+        let rest = key.strip_prefix("default")?;
+        if rest.is_empty() {
+            return None;
+        }
+        match value {
+            Value::String(s) => Some(s.clone()),
+            Value::Number(n) => Some(n.to_string()),
+            Value::Bool(b) => Some(b.to_string()),
+            _ => None,
+        }
+    })
+}
+
 /// Returns a copy of `library` without any `content[]` attachment whose
 /// `contentType` starts with `application/sql` (#840) — the document
 /// Details edits, since the SQL attachment lives in its own card. `content`
@@ -329,5 +404,90 @@ mod tests {
         let lib = library("sql-query", LIBRARY_TYPES_SYSTEM);
         assert_eq!(extract_status(&lib), "active");
         assert_eq!(extract_status(&json!({"resourceType": "Library"})), "");
+    }
+
+    // -----------------------------------------------------------------
+    // parameters() (#837)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn parameters_ignores_out_entries_and_entries_missing_a_type() {
+        let lib = json!({
+            "resourceType": "Library",
+            "parameter": [
+                {"name": "ward", "use": "in", "type": "string"},
+                {"name": "result", "use": "out", "type": "string"},
+                {"name": "untyped", "use": "in"},
+            ],
+        });
+        let params = parameters(&lib);
+        assert_eq!(params.len(), 1);
+        assert_eq!(params[0].name, "ward");
+        assert_eq!(params[0].type_code, "string");
+        assert_eq!(params[0].default, None);
+    }
+
+    #[test]
+    fn parameters_ignores_entries_missing_a_name() {
+        let lib = json!({
+            "resourceType": "Library",
+            "parameter": [{"use": "in", "type": "string"}],
+        });
+        assert!(parameters(&lib).is_empty());
+    }
+
+    #[test]
+    fn parameters_reads_a_numeric_default_as_its_text_form() {
+        let lib = json!({
+            "resourceType": "Library",
+            "parameter": [
+                {"name": "days", "use": "in", "type": "integer", "defaultInteger": 30},
+            ],
+        });
+        let params = parameters(&lib);
+        assert_eq!(params[0].default.as_deref(), Some("30"));
+    }
+
+    #[test]
+    fn parameters_reads_string_and_boolean_defaults_and_falls_back_to_none_otherwise() {
+        let lib = json!({
+            "resourceType": "Library",
+            "parameter": [
+                {"name": "a", "use": "in", "type": "string", "defaultString": "west"},
+                {"name": "b", "use": "in", "type": "boolean", "defaultBoolean": true},
+                {"name": "c", "use": "in", "type": "string", "defaultCodeableConcept": {"text": "x"}},
+            ],
+        });
+        let params = parameters(&lib);
+        assert_eq!(params[0].default.as_deref(), Some("west"));
+        assert_eq!(params[1].default.as_deref(), Some("true"));
+        assert_eq!(params[2].default, None);
+    }
+
+    #[test]
+    fn parameters_matches_parse_sqlquery_library_on_a_valid_library() {
+        let sql = base64::engine::general_purpose::STANDARD.encode("SELECT * FROM v");
+        let lib = json!({
+            "resourceType": "Library",
+            "type": {"coding": [{"system": LIBRARY_TYPES_SYSTEM, "code": "sql-query"}]},
+            "content": [{"contentType": "application/sql", "data": sql}],
+            "parameter": [
+                {"name": "ward", "use": "in", "type": "string"},
+                {"name": "days", "use": "in", "type": "integer", "defaultInteger": 30},
+                {"name": "ignored", "use": "out", "type": "string"},
+            ],
+        });
+        let ours: Vec<(String, String, bool)> = parameters(&lib)
+            .into_iter()
+            .map(|p| (p.name, p.type_code, p.default.is_some()))
+            .collect();
+        let theirs: Vec<(String, String, bool)> =
+            helios_sof::sqlquery::parse_sqlquery_library(&lib)
+                .expect("valid Library parses")
+                .parameters
+                .into_iter()
+                .map(|p| (p.name, p.type_code, p.has_default))
+                .collect();
+        assert_eq!(ours, theirs);
     }
 }
