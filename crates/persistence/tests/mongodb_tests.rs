@@ -4781,3 +4781,115 @@ async fn mongodb_integration_if_none_exist_offloaded_search_uses_resource_scan()
         "no duplicate should have been created"
     );
 }
+
+#[tokio::test]
+async fn mongodb_integration_if_none_exist_broad_param_beyond_probe_limit() {
+    let Some(backend) = create_backend_with_full_registry("if_none_exist_broad_param").await else {
+        eprintln!(
+            "Skipping mongodb_integration_if_none_exist_broad_param_beyond_probe_limit \
+             (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+
+    let tenant = create_tenant("tenant-a");
+
+    const NOISE_COUNT: usize = 200;
+
+    for chunk_start in (0..NOISE_COUNT).step_by(50) {
+        let entries: Vec<BundleEntry> = (chunk_start..chunk_start + 50)
+            .map(|i| BundleEntry {
+                method: BundleMethod::Post,
+                url: "Patient".to_string(),
+                resource: Some(serde_json::json!({
+                    "resourceType": "Patient",
+                    "active": true,
+                    "identifier": [{"system": "http://example.org/noise", "value": format!("NOISE-{i}")}]
+                })),
+                if_match: None,
+                if_none_match: None,
+                if_none_exist: None,
+                full_url: Some(format!("urn:uuid:noise-{i}")),
+            })
+            .collect();
+        let Some(result) = process_transaction_or_skip(
+            &backend,
+            &tenant,
+            entries,
+            "mongodb_integration_if_none_exist_broad_param_beyond_probe_limit (setup)",
+        )
+        .await
+        else {
+            return;
+        };
+        assert!(
+            result.entries.iter().all(|e| e.status == 201),
+            "all noise patients must be created"
+        );
+    }
+
+    let target_entry = BundleEntry {
+        method: BundleMethod::Post,
+        url: "Patient".to_string(),
+        resource: Some(serde_json::json!({
+            "resourceType": "Patient",
+            "active": true,
+            "identifier": [{"system": "http://example.org/mrn", "value": "TARGET-BROAD-1"}]
+        })),
+        if_match: None,
+        if_none_match: None,
+        if_none_exist: None,
+        full_url: Some("urn:uuid:target-broad".to_string()),
+    };
+    let Some(target_result) = process_transaction_or_skip(
+        &backend,
+        &tenant,
+        vec![target_entry],
+        "mongodb_integration_if_none_exist_broad_param_beyond_probe_limit (target create)",
+    )
+    .await
+    else {
+        return;
+    };
+    assert_eq!(
+        target_result.entries[0].status, 201,
+        "target patient must be created"
+    );
+
+    let total = backend.count(&tenant, Some("Patient")).await.unwrap();
+    assert_eq!(total, (NOISE_COUNT + 1) as u64, "all patients present");
+
+    let if_none_exist_entry = BundleEntry {
+        method: BundleMethod::Post,
+        url: "Patient".to_string(),
+        resource: Some(serde_json::json!({
+            "resourceType": "Patient",
+            "active": true,
+            "identifier": [{"system": "http://example.org/mrn", "value": "TARGET-BROAD-1"}]
+        })),
+        if_match: None,
+        if_none_match: None,
+        if_none_exist: Some("identifier=http://example.org/mrn|TARGET-BROAD-1".to_string()),
+        full_url: Some("urn:uuid:ine-broad".to_string()),
+    };
+    let Some(ine_result) = process_transaction_or_skip(
+        &backend,
+        &tenant,
+        vec![if_none_exist_entry],
+        "mongodb_integration_if_none_exist_broad_param_beyond_probe_limit",
+    )
+    .await
+    else {
+        return;
+    };
+
+    assert_eq!(
+        ine_result.entries[0].status, 200,
+        "ifNoneExist must find the existing target patient and suppress the create"
+    );
+    assert_eq!(
+        backend.count(&tenant, Some("Patient")).await.unwrap(),
+        (NOISE_COUNT + 1) as u64,
+        "no duplicate should have been created"
+    );
+}
