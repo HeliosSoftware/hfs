@@ -327,6 +327,15 @@ impl SqliteBackend {
             if enable_foreign_keys {
                 conn.execute_batch("PRAGMA foreign_keys = ON;")?;
             }
+            // 64 MiB page cache (negative = KiB). SQLite's 2 MiB default
+            // thrashes once the search_index B-trees outgrow it: during a
+            // bulk import every index INSERT and batch commit evicts and
+            // rewrites hot pages. Measured on a real 31 GB import, raising it
+            // took ingest from 232/s to 289/s (+25%), cutting index-row
+            // INSERT cost 1.71→1.24 ms and commit cost 1.95→1.72 ms per
+            // entry. The limit is per pooled connection (pool of 10), but
+            // only connections that touch that many pages grow their cache.
+            conn.execute_batch("PRAGMA cache_size = -65536;")?;
             crate::sof::sqlite_udfs::register(conn).map_err(|e| {
                 rusqlite::Error::SqliteFailure(
                     rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_ERROR),
