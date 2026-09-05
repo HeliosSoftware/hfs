@@ -1458,11 +1458,19 @@ impl SqliteBackend {
         )
         .map_err(|e| internal_error(format!("Failed to delete search index: {}", e)))?;
 
-        // Delete from FTS table if it exists
-        let _ = conn.execute(
-            "DELETE FROM resource_fts WHERE tenant_id = ?1 AND resource_type = ?2 AND resource_id = ?3",
-            params![tenant_id, resource_type, resource_id],
-        );
+        // Delete from FTS. resource_fts is an FTS5 virtual table: a WHERE on
+        // its plain columns cannot use an index, so this statement scans the
+        // whole FTS table — per ingested entry, that made bulk imports
+        // quadratic in the table size. A resource that had no search_index
+        // rows was never FTS-indexed (every indexed resource carries at least
+        // its _id row), so the scan only needs to run when something was
+        // actually removed above.
+        if deleted > 0 {
+            let _ = conn.execute(
+                "DELETE FROM resource_fts WHERE tenant_id = ?1 AND resource_type = ?2 AND resource_id = ?3",
+                params![tenant_id, resource_type, resource_id],
+            );
+        }
 
         Ok(deleted as u64)
     }
