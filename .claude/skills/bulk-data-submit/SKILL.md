@@ -62,6 +62,7 @@ status-only kick-off (no `manifestUrl`) they have nothing to attach to and are i
 | `HFS_BULK_SUBMIT_S3_BUCKET` | none | S3 bucket, required when output backend is s3 |
 | `HFS_BULK_SUBMIT_REQUIRES_ACCESS_TOKEN` | `auto` | Manifest posture; false is invalid with local-fs |
 | `HFS_BULK_SUBMIT_WORKER_CONCURRENCY` | `2` | In-process submit worker count |
+| `HFS_BULK_SUBMIT_FILE_CONCURRENCY` | `1` | Files of one manifest ingested at once (fan-out); clamped to `2` on SQLite |
 | `HFS_BULK_SUBMIT_DISABLE_LOCAL_WORKER` | `false` | Disable in-pod workers |
 | `HFS_BULK_SUBMIT_MAX_CONCURRENT_PER_TENANT` | `4` | Per-tenant active submission cap; returns `429` |
 | `HFS_BULK_SUBMIT_BATCH_SIZE` | `1000` | Ingestion batch size |
@@ -108,4 +109,6 @@ The backend capability splits into `BulkSubmitIngest` (the synchronous `BulkSubm
   identically on each page. Fetch pages from the status URL with `?page=N` (1-based) — out of range is `404`,
   malformed is `400`. Page size `0` disables pagination and yields one manifest with an empty `link`.
 - Status-poll pacing: the `202` advertises `HFS_BULK_SUBMIT_RETRY_AFTER`, and a client that polls past `HFS_BULK_SUBMIT_POLL_RATE_LIMIT` within the window gets `429` plus a `Retry-After` pointing at the end of that window. Buckets are keyed by poll token plus principal, falling back to peer address; the check runs before any job-store work, so throttled polls stay cheap.
+- File fan-out is backend-aware. `HFS_BULK_SUBMIT_FILE_CONCURRENCY` is honoured as configured on the concurrent-writer backends (PostgreSQL, MongoDB, S3), but clamped to `2` on SQLite, which logs the clamp at startup. SQLite serialises writers, so a higher fan-out queues each batch's writes behind one exclusive lock until they outlast `busy_timeout` and abort the manifest outright — the clamp keeps a high configured value slow rather than fatal. Raising fan-out past 2 requires PostgreSQL.
+- The manifest bookkeeping writes (counts, progress, byte progress) retry with bounded exponential backoff when SQLite reports the database busy or locked, instead of failing the ingest. Every other error still surfaces on the first attempt.
 - Cleanup periodically removes status artifacts for submissions whose `updated_at` exceeds `HFS_BULK_SUBMIT_OUTPUT_TTL`.

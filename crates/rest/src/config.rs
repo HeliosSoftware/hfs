@@ -590,6 +590,17 @@ impl ValidationConfig {
     }
 }
 
+/// Effective cap on [`BulkSubmitConfig::file_concurrency`] when the primary
+/// storage backend is SQLite.
+///
+/// SQLite serialises writers: a manifest's files may be fetched and parsed in
+/// parallel, but their batch writes queue behind one exclusive write lock. Past
+/// a couple of in-flight files the queued writers wait longer than
+/// `busy_timeout` and the ingest fails outright rather than merely running
+/// slowly (#942). Two still overlaps fetch and extraction — the part that does
+/// parallelise — without pushing the write queue past the timeout.
+pub const SQLITE_MAX_FILE_CONCURRENCY: u32 = 2;
+
 /// Bulk Data **Submit** (`$bulk-submit`) configuration, loaded from
 /// `HFS_BULK_SUBMIT_*` environment variables.
 ///
@@ -619,6 +630,10 @@ pub struct BulkSubmitConfig {
     /// overlap per-file fetch, parse, and write; a concurrent-writer backend
     /// (PostgreSQL) turns this into near-linear throughput, while SQLite's
     /// single writer caps the gain. Set with `HFS_BULK_SUBMIT_FILE_CONCURRENCY`.
+    ///
+    /// This is the *configured* value. On SQLite the value actually used is
+    /// clamped to [`SQLITE_MAX_FILE_CONCURRENCY`] — see
+    /// [`Self::effective_file_concurrency`].
     pub file_concurrency: u32,
     /// Bulk fast-load (#903): ingest without search-index/FTS writes and
     /// rebuild them with an automatic per-type reindex when each manifest
@@ -705,6 +720,25 @@ impl Default for BulkSubmitConfig {
 }
 
 impl BulkSubmitConfig {
+    /// Returns the file fan-out this pod should actually use on `backend`.
+    ///
+    /// The configured [`Self::file_concurrency`] is honoured on every
+    /// concurrent-writer backend. SQLite is clamped to
+    /// [`SQLITE_MAX_FILE_CONCURRENCY`]: its single write lock turns a higher
+    /// fan-out into a queue of writers that outlast `busy_timeout`, which
+    /// aborts the manifest instead of just slowing it down (#942). Clamping is
+    /// therefore a correctness guard, not a tuning preference — an operator who
+    /// asks for 8 gets a slower import rather than a failed one.
+    ///
+    /// The result is always at least `1`, so a configured `0` still ingests.
+    pub fn effective_file_concurrency(&self, backend: BackendKind) -> u32 {
+        let configured = self.file_concurrency.max(1);
+        match backend {
+            BackendKind::Sqlite => configured.min(SQLITE_MAX_FILE_CONCURRENCY),
+            _ => configured,
+        }
+    }
+
     /// Loads bulk-submit configuration from `HFS_BULK_SUBMIT_*` env vars.
     pub fn from_env() -> Self {
         fn env_bool(key: &str, default: bool) -> bool {
@@ -2399,5 +2433,43 @@ mod tests {
             assert_eq!(variant.to_string(), expected);
             assert_eq!(expected.parse::<StorageBackendMode>().unwrap(), variant);
         }
+    }
+
+    // ── bulk submit file fan-out clamp (#942) ─────────────────────
+
+    #[test]
+    fn sqlite_clamps_effective_file_concurrency() {
+        let cfg = BulkSubmitConfig {
+            file_concurrency: 8,
+            ..Default::default()
+        };
+        // The single-writer backend is capped regardless of what was asked for.
+        assert_eq!(
+            cfg.effective_file_concurrency(BackendKind::Sqlite),
+            SQLITE_MAX_FILE_CONCURRENCY
+        );
+        // Concurrent-writer backends keep the operator's value.
+        assert_eq!(cfg.effective_file_concurrency(BackendKind::Postgres), 8);
+        assert_eq!(cfg.effective_file_concurrency(BackendKind::MongoDB), 8);
+        assert_eq!(cfg.effective_file_concurrency(BackendKind::S3), 8);
+    }
+
+    #[test]
+    fn effective_file_concurrency_never_drops_below_one() {
+        let cfg = BulkSubmitConfig {
+            file_concurrency: 0,
+            ..Default::default()
+        };
+        assert_eq!(cfg.effective_file_concurrency(BackendKind::Sqlite), 1);
+        assert_eq!(cfg.effective_file_concurrency(BackendKind::Postgres), 1);
+    }
+
+    #[test]
+    fn a_configured_value_under_the_sqlite_cap_is_untouched() {
+        let cfg = BulkSubmitConfig {
+            file_concurrency: 1,
+            ..Default::default()
+        };
+        assert_eq!(cfg.effective_file_concurrency(BackendKind::Sqlite), 1);
     }
 }
