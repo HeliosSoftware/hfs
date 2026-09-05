@@ -606,6 +606,7 @@ impl BulkSubmitProvider for SqliteBackend {
         options: &BulkProcessingOptions,
     ) -> StorageResult<Vec<BulkEntryResult>> {
         let tenant_id = tenant.tenant_id().as_str();
+        let batch_prologue = crate::perf::span(crate::perf::Phase::BatchOverhead);
 
         // Verify manifest exists
         if self
@@ -619,26 +620,6 @@ impl BulkSubmitProvider for SqliteBackend {
                     manifest_id: manifest_id.to_string(),
                 },
             ));
-        }
-
-        // Update manifest status to processing. The connection is scoped to
-        // this one statement: a pooled sync connection held across the entry
-        // loop's awaits is what deadlocked two concurrent workers (#646) —
-        // every per-entry storage call takes its own connection, and the held
-        // one starved them under load.
-        {
-            let conn = self.get_connection()?;
-            conn.execute(
-                "UPDATE bulk_manifests SET status = 'processing'
-                 WHERE tenant_id = ?1 AND submitter = ?2 AND submission_id = ?3 AND manifest_id = ?4",
-                params![
-                    tenant_id,
-                    &submission_id.submitter,
-                    &submission_id.submission_id,
-                    manifest_id
-                ],
-            )
-            .map_err(|e| internal_error(format!("Failed to update manifest status: {}", e)))?;
         }
 
         let mut results = Vec::new();
@@ -665,6 +646,29 @@ impl BulkSubmitProvider for SqliteBackend {
         )
         .await?;
 
+        // Manifest status, on the batch transaction's own connection. It used
+        // to be a standalone autocommit statement before the transaction
+        // opened: a second write-lock acquisition and a second fsync per
+        // batch, for a flag whose only reader is a status poller. Riding the
+        // batch costs neither, and cannot report "processing" for work that
+        // then rolls back.
+        txn.with_connection(|conn| {
+            conn.prepare_cached(
+                "UPDATE bulk_manifests SET status = 'processing'
+                 WHERE tenant_id = ?1 AND submitter = ?2 AND submission_id = ?3 AND manifest_id = ?4",
+            )
+            .map_err(|e| internal_error(format!("prepare manifest status update: {e}")))?
+            .execute(params![
+                tenant_id,
+                &submission_id.submitter,
+                &submission_id.submission_id,
+                manifest_id
+            ])
+            .map_err(|e| internal_error(format!("Failed to update manifest status: {}", e)))?;
+            Ok(())
+        })?;
+        drop(batch_prologue);
+
         for entry in entries {
             // Check if we've hit max errors
             if options.max_errors > 0 && error_count >= options.max_errors {
@@ -690,6 +694,7 @@ impl BulkSubmitProvider for SqliteBackend {
                 continue;
             }
 
+            let _entry_span = crate::perf::span(crate::perf::Phase::Entry);
             let result = self
                 .ingest_entry_in_txn(&mut txn, manifest_id, &entry, options)
                 .await;
@@ -718,15 +723,82 @@ impl BulkSubmitProvider for SqliteBackend {
                 error_count += 1;
             }
 
-            write_entry_rows(
-                &txn,
-                submission_id,
-                manifest_id,
-                file_url,
-                &entry_result,
-                change.as_ref(),
-            )?;
+            {
+                let _span = crate::perf::span(crate::perf::Phase::Bookkeeping);
+                write_entry_rows(
+                    &txn,
+                    submission_id,
+                    manifest_id,
+                    file_url,
+                    &entry_result,
+                    change.as_ref(),
+                )?;
+            }
+            drop(_entry_span);
             results.push(entry_result);
+        }
+
+        // Manifest counters and the submission's timestamp, on the batch
+        // transaction. These were two autocommit statements after the commit:
+        // two more write-lock acquisitions and two more fsyncs per batch, and
+        // a window in which the entries were durable but the counts that
+        // describe them were not. Byte progress still rides this write — the
+        // reason it is here at all is that a standalone flush (the lease
+        // keeper's) starves against back-to-back batch transactions on SQLite,
+        // and MAX keeps a late keeper flush from regressing it.
+        {
+            let _span = crate::perf::span(crate::perf::Phase::BatchOverhead);
+            let now = Utc::now().to_rfc3339();
+            let (consumed, bytes_total) = options
+                .byte_progress
+                .as_ref()
+                .map(|bp| {
+                    (
+                        bp.consumed.load(std::sync::atomic::Ordering::Relaxed) as i64,
+                        bp.total.load(std::sync::atomic::Ordering::Relaxed) as i64,
+                    )
+                })
+                .unwrap_or((0, 0));
+            let total = results.len() as i64;
+            let succeeded = results.iter().filter(|r| r.is_success()).count() as i64;
+            txn.with_connection(|conn| {
+                conn.prepare_cached(
+                    "UPDATE bulk_manifests SET
+                        total_entries = total_entries + ?1,
+                        processed_entries = processed_entries + ?2,
+                        failed_entries = failed_entries + ?3,
+                        bytes_processed = MAX(bytes_processed, ?8),
+                        bytes_total = MAX(bytes_total, ?9)
+                     WHERE tenant_id = ?4 AND submitter = ?5 AND submission_id = ?6 AND manifest_id = ?7",
+                )
+                .map_err(|e| internal_error(format!("prepare manifest counts update: {e}")))?
+                .execute(params![
+                    total,
+                    succeeded,
+                    error_count as i64,
+                    tenant_id,
+                    &submission_id.submitter,
+                    &submission_id.submission_id,
+                    manifest_id,
+                    consumed,
+                    bytes_total
+                ])
+                .map_err(|e| internal_error(format!("Failed to update manifest counts: {}", e)))?;
+
+                conn.prepare_cached(
+                    "UPDATE bulk_submissions SET updated_at = ?1
+                     WHERE tenant_id = ?2 AND submitter = ?3 AND submission_id = ?4",
+                )
+                .map_err(|e| internal_error(format!("prepare submission touch: {e}")))?
+                .execute(params![
+                    now,
+                    tenant_id,
+                    &submission_id.submitter,
+                    &submission_id.submission_id
+                ])
+                .map_err(|e| internal_error(format!("Failed to update submission: {}", e)))?;
+                Ok(())
+            })?;
         }
 
         crate::core::Transaction::commit(Box::new(txn)).await?;
@@ -739,59 +811,6 @@ impl BulkSubmitProvider for SqliteBackend {
                 },
             ));
         }
-
-        // Update manifest counts, on a fresh connection: the loop above is
-        // long and its per-entry calls pool their own. Byte progress rides
-        // this write: it lands right after the batch commit releases the
-        // write lock, while a standalone flush (the lease keeper's) can
-        // starve for tens of seconds against back-to-back batch
-        // transactions. MAX keeps a late keeper flush from regressing it.
-        let now = Utc::now().to_rfc3339();
-        let conn = self.get_connection()?;
-        let (consumed, bytes_total) = options
-            .byte_progress
-            .as_ref()
-            .map(|bp| {
-                (
-                    bp.consumed.load(std::sync::atomic::Ordering::Relaxed) as i64,
-                    bp.total.load(std::sync::atomic::Ordering::Relaxed) as i64,
-                )
-            })
-            .unwrap_or((0, 0));
-        conn.execute(
-            "UPDATE bulk_manifests SET
-                total_entries = total_entries + ?1,
-                processed_entries = processed_entries + ?2,
-                failed_entries = failed_entries + ?3,
-                bytes_processed = MAX(bytes_processed, ?8),
-                bytes_total = MAX(bytes_total, ?9)
-             WHERE tenant_id = ?4 AND submitter = ?5 AND submission_id = ?6 AND manifest_id = ?7",
-            params![
-                results.len() as i64,
-                results.iter().filter(|r| r.is_success()).count() as i64,
-                error_count as i64,
-                tenant_id,
-                &submission_id.submitter,
-                &submission_id.submission_id,
-                manifest_id,
-                consumed,
-                bytes_total
-            ],
-        )
-        .map_err(|e| internal_error(format!("Failed to update manifest counts: {}", e)))?;
-
-        // Update submission updated_at
-        conn.execute(
-            "UPDATE bulk_submissions SET updated_at = ?1
-             WHERE tenant_id = ?2 AND submitter = ?3 AND submission_id = ?4",
-            params![
-                now,
-                tenant_id,
-                &submission_id.submitter,
-                &submission_id.submission_id
-            ],
-        )
-        .map_err(|e| internal_error(format!("Failed to update submission: {}", e)))?;
 
         Ok(results)
     }
@@ -993,7 +1012,11 @@ impl SqliteBackend {
         use crate::core::Transaction;
 
         if let Some(id) = entry.resource_id.as_ref() {
-            match txn.read(&entry.resource_type, id).await? {
+            let existing = {
+                let _span = crate::perf::span(crate::perf::Phase::EntryRead);
+                txn.read(&entry.resource_type, id).await?
+            };
+            match existing {
                 Some(current) => {
                     if !options.allow_updates {
                         return Ok((
@@ -1114,7 +1137,11 @@ impl StreamingBulkSubmitProvider for SqliteBackend {
             }
 
             // Parse the line
-            match NdjsonEntry::parse(line_number, line) {
+            let parsed = {
+                let _span = crate::perf::span(crate::perf::Phase::NdjsonParse);
+                NdjsonEntry::parse(line_number, line)
+            };
+            match parsed {
                 Ok(entry) => {
                     // Validate resource type matches
                     if entry.resource_type != resource_type {
@@ -2286,6 +2313,65 @@ mod tests {
     /// #457: a manifest with several output files restarts line numbers in
     /// each file, so the stored entry-result key must include the file — the
     /// old key collided on every file after the first.
+    /// #947: the manifest's status, its entry counters and the submission's
+    /// timestamp used to be three autocommit statements around the batch —
+    /// three extra write-lock acquisitions and fsyncs per batch, and a window
+    /// where the entries were durable but the counts describing them were not.
+    /// They now ride the batch transaction, and must still land.
+    #[tokio::test]
+    async fn batch_bookkeeping_lands_with_the_entries_it_describes() {
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+
+        let sub_id = SubmissionId::generate("test-system");
+        backend
+            .create_submission(&tenant, &sub_id, None)
+            .await
+            .unwrap();
+        let manifest = backend
+            .add_manifest(&tenant, &sub_id, None, None)
+            .await
+            .unwrap();
+
+        let entries = (1..=3)
+            .map(|i| {
+                NdjsonEntry::new(
+                    i,
+                    "Patient",
+                    json!({"resourceType": "Patient", "id": format!("p{i}")}),
+                )
+            })
+            .collect();
+        backend
+            .process_entries(
+                &tenant,
+                &sub_id,
+                &manifest.manifest_id,
+                entries,
+                &BulkProcessingOptions::new(),
+            )
+            .await
+            .unwrap();
+
+        let stored = backend
+            .get_manifest(&tenant, &sub_id, &manifest.manifest_id)
+            .await
+            .unwrap()
+            .expect("manifest");
+        assert_eq!(stored.status, ManifestStatus::Processing);
+        assert_eq!(stored.total_entries, 3);
+        assert_eq!(stored.processed_entries, 3);
+        assert_eq!(stored.failed_entries, 0);
+
+        // And the resources really are there — the counters describe committed work.
+        let counts = backend
+            .get_entry_counts(&tenant, &sub_id, &manifest.manifest_id)
+            .await
+            .unwrap();
+        assert_eq!(counts.total, 3);
+        assert_eq!(counts.success, 3);
+    }
+
     #[tokio::test]
     async fn test_process_entries_from_multiple_files_do_not_collide() {
         let backend = create_test_backend();

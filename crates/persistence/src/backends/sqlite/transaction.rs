@@ -15,6 +15,7 @@ use crate::core::{Transaction, TransactionOptions, TransactionProvider};
 use crate::error::{
     BackendError, ConcurrencyError, ResourceError, StorageError, StorageResult, TransactionError,
 };
+use crate::perf::{self, Phase};
 use crate::tenant::{Operation, TenantContext};
 use crate::types::StoredResource;
 
@@ -123,9 +124,23 @@ impl SqliteTransaction {
         resource_type: &str,
         resource_id: &str,
         resource: &Value,
+        clear_stale_rows: bool,
     ) -> StorageResult<()> {
-        self.backend
-            .delete_search_index(conn, tenant_id, resource_type, resource_id)?;
+        let _index_span = perf::span(Phase::Index);
+        // `clear_stale_rows` is false only on the create path, where the
+        // caller has just proved no `resources` row exists for this id. No
+        // resource row means no index rows: every path that removes a
+        // `resources` row — soft delete keeps the row, `purge`, `purge_all`
+        // and `purge_tenant_data` delete `search_index` in the same
+        // transaction, and the table's foreign key cascades besides — so the
+        // DELETE could only ever match nothing. It is not free: it is an
+        // index seek per ingested resource, plus (before #949) a full scan of
+        // the FTS table.
+        if clear_stale_rows {
+            let _span = perf::span(Phase::IndexDelete);
+            self.backend
+                .delete_search_index(conn, tenant_id, resource_type, resource_id)?;
+        }
         // Fast-load (#903): the delete above still runs so an updated
         // resource's stale rows are gone, but the rebuild is deferred to the
         // post-ingest reindex — extraction plus FTS is the dominant per-byte
@@ -145,6 +160,7 @@ impl Transaction for SqliteTransaction {
         resource_type: &str,
         resource: Value,
     ) -> StorageResult<StoredResource> {
+        let _create_span = perf::span(Phase::Create);
         self.tenant
             .check_permission(Operation::Create, resource_type)?;
 
@@ -165,13 +181,16 @@ impl Transaction for SqliteTransaction {
             .unwrap_or_else(Self::generate_id);
 
         // Check if resource already exists
-        let exists: bool = conn
-            .query_row(
+        let exists: bool = {
+            let _span = perf::span(Phase::CreateExists);
+            conn.prepare_cached(
                 "SELECT 1 FROM resources WHERE tenant_id = ?1 AND resource_type = ?2 AND id = ?3",
-                params![tenant_id, resource_type, id],
-                |_| Ok(true),
             )
-            .unwrap_or(false);
+            .and_then(|mut stmt| {
+                stmt.query_row(params![tenant_id, resource_type, id], |_| Ok(true))
+            })
+            .unwrap_or(false)
+        };
 
         if exists {
             return Err(StorageError::Resource(ResourceError::AlreadyExists {
@@ -191,8 +210,11 @@ impl Transaction for SqliteTransaction {
         }
 
         // Serialize the resource data
-        let data_bytes = serde_json::to_vec(&data)
-            .map_err(|e| serialization_error(format!("Failed to serialize resource: {}", e)))?;
+        let data_bytes = {
+            let _span = perf::span(Phase::Serialize);
+            serde_json::to_vec(&data)
+                .map_err(|e| serialization_error(format!("Failed to serialize resource: {}", e)))?
+        };
 
         let now = Utc::now();
         let last_updated = now.to_rfc3339();
@@ -201,23 +223,32 @@ impl Transaction for SqliteTransaction {
         let fhir_version_str = self.fhir_version.as_mime_param();
 
         // Insert the resource
-        conn.execute(
-            "INSERT INTO resources (tenant_id, resource_type, id, version_id, data, last_updated, is_deleted, fhir_version)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7)",
-            params![tenant_id, resource_type, id, version_id, data_bytes, last_updated, fhir_version_str],
-        )
-        .map_err(|e| internal_error(format!("Failed to insert resource: {}", e)))?;
+        {
+            let _span = perf::span(Phase::ResourceInsert);
+            conn.prepare_cached(
+                "INSERT INTO resources (tenant_id, resource_type, id, version_id, data, last_updated, is_deleted, fhir_version)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7)",
+            )
+            .map_err(|e| internal_error(format!("Failed to prepare resource insert: {}", e)))?
+            .execute(params![tenant_id, resource_type, id, version_id, data_bytes, last_updated, fhir_version_str])
+            .map_err(|e| internal_error(format!("Failed to insert resource: {}", e)))?;
+        }
 
         // Insert into history
-        conn.execute(
-            "INSERT INTO resource_history (tenant_id, resource_type, id, version_id, data, last_updated, is_deleted, fhir_version)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7)",
-            params![tenant_id, resource_type, id, version_id, data_bytes, last_updated, fhir_version_str],
-        )
-        .map_err(|e| internal_error(format!("Failed to insert history: {}", e)))?;
+        {
+            let _span = perf::span(Phase::HistoryInsert);
+            conn.prepare_cached(
+                "INSERT INTO resource_history (tenant_id, resource_type, id, version_id, data, last_updated, is_deleted, fhir_version)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7)",
+            )
+            .map_err(|e| internal_error(format!("Failed to prepare history insert: {}", e)))?
+            .execute(params![tenant_id, resource_type, id, version_id, data_bytes, last_updated, fhir_version_str])
+            .map_err(|e| internal_error(format!("Failed to insert history: {}", e)))?;
+        }
 
-        // Index the resource for search
-        self.index_resource(&conn, tenant_id, resource_type, &id, &data)?;
+        // Index the resource for search. Nothing to clear: the existence
+        // probe above established there is no row for this id.
+        self.index_resource(&conn, tenant_id, resource_type, &id, &data, false)?;
         drop(conn);
 
         // Mirrors the storage path: an overlay-affecting SearchParameter
@@ -313,6 +344,7 @@ impl Transaction for SqliteTransaction {
         current: &StoredResource,
         resource: Value,
     ) -> StorageResult<StoredResource> {
+        let _update_span = perf::span(Phase::Update);
         self.tenant
             .check_permission(Operation::Update, current.resource_type())?;
 
@@ -377,8 +409,11 @@ impl Transaction for SqliteTransaction {
         }
 
         // Serialize the resource data
-        let data_bytes = serde_json::to_vec(&data)
-            .map_err(|e| serialization_error(format!("Failed to serialize resource: {}", e)))?;
+        let data_bytes = {
+            let _span = perf::span(Phase::Serialize);
+            serde_json::to_vec(&data)
+                .map_err(|e| serialization_error(format!("Failed to serialize resource: {}", e)))?
+        };
 
         let now = Utc::now();
         let last_updated = now.to_rfc3339();
@@ -388,6 +423,7 @@ impl Transaction for SqliteTransaction {
         let fhir_version_str = fhir_version.as_mime_param();
 
         // Update the resource
+        let _update_row_span = perf::span(Phase::ResourceUpdate);
         conn.execute(
             "UPDATE resources SET version_id = ?1, data = ?2, last_updated = ?3
              WHERE tenant_id = ?4 AND resource_type = ?5 AND id = ?6",
@@ -401,17 +437,21 @@ impl Transaction for SqliteTransaction {
             ],
         )
         .map_err(|e| internal_error(format!("Failed to update resource: {}", e)))?;
+        drop(_update_row_span);
 
         // Insert into history
-        conn.execute(
-            "INSERT INTO resource_history (tenant_id, resource_type, id, version_id, data, last_updated, is_deleted, fhir_version)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7)",
-            params![tenant_id, resource_type, id, new_version_str, data_bytes, last_updated, fhir_version_str],
-        )
-        .map_err(|e| internal_error(format!("Failed to insert history: {}", e)))?;
+        {
+            let _span = perf::span(Phase::HistoryInsert);
+            conn.execute(
+                "INSERT INTO resource_history (tenant_id, resource_type, id, version_id, data, last_updated, is_deleted, fhir_version)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7)",
+                params![tenant_id, resource_type, id, new_version_str, data_bytes, last_updated, fhir_version_str],
+            )
+            .map_err(|e| internal_error(format!("Failed to insert history: {}", e)))?;
+        }
 
-        // Re-index the resource for search
-        self.index_resource(&conn, tenant_id, resource_type, id, &data)?;
+        // Re-index the resource for search, clearing the previous version's rows.
+        self.index_resource(&conn, tenant_id, resource_type, id, &data, true)?;
         drop(conn);
 
         // A SearchParameter write invalidates this tenant's cached registry
@@ -506,11 +546,14 @@ impl Transaction for SqliteTransaction {
         }
 
         let conn = self.conn.lock();
-        conn.execute("COMMIT", []).map_err(|e| {
-            StorageError::Transaction(TransactionError::RolledBack {
-                reason: format!("Commit failed: {}", e),
-            })
-        })?;
+        {
+            let _span = perf::span(Phase::Commit);
+            conn.execute("COMMIT", []).map_err(|e| {
+                StorageError::Transaction(TransactionError::RolledBack {
+                    reason: format!("Commit failed: {}", e),
+                })
+            })?;
+        }
         drop(conn);
 
         self.active = false;
@@ -743,6 +786,85 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(read.version_id(), "2");
+    }
+
+    /// #947: a transactional `create` no longer runs the "clear stale index
+    /// rows" DELETE, because the existence probe it just ran proves there is
+    /// nothing to clear. The two properties that has to preserve: a create
+    /// writes exactly its own index rows, and an `update` — which does still
+    /// clear — leaves none of the previous version's behind.
+    ///
+    /// The tag is the observed value because an in-memory backend carries only
+    /// the embedded search parameters (`_id`, `_lastUpdated`, `_tag`,
+    /// `_profile`, `_security`).
+    #[tokio::test]
+    async fn create_writes_only_its_own_index_rows_and_update_still_clears_stale_ones() {
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+
+        let tagged = |tag: &str| {
+            json!({
+                "resourceType": "Patient",
+                "id": "p1",
+                "meta": {"tag": [{"system": "http://example.com/tags", "code": tag}]}
+            })
+        };
+        let rows_with_tag = |tag: &str| -> i64 {
+            let conn = backend.get_connection().unwrap();
+            conn.query_row(
+                "SELECT COUNT(*) FROM search_index
+                 WHERE resource_type = 'Patient' AND resource_id = 'p1'
+                   AND param_name = '_tag' AND value_token_code = ?1",
+                params![tag],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        let total_rows = || -> i64 {
+            let conn = backend.get_connection().unwrap();
+            conn.query_row(
+                "SELECT COUNT(*) FROM search_index
+                 WHERE resource_type = 'Patient' AND resource_id = 'p1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+
+        let mut tx = backend
+            .begin_transaction(&tenant, TransactionOptions::default())
+            .await
+            .unwrap();
+        tx.create("Patient", tagged("before")).await.unwrap();
+        Box::new(tx).commit().await.unwrap();
+
+        let after_create = total_rows();
+        assert!(after_create > 0, "the create must index the resource");
+        assert_eq!(rows_with_tag("before"), 1, "the tag must be indexed");
+
+        let current = backend
+            .read(&tenant, "Patient", "p1")
+            .await
+            .unwrap()
+            .unwrap();
+        let mut tx = backend
+            .begin_transaction(&tenant, TransactionOptions::default())
+            .await
+            .unwrap();
+        tx.update(&current, tagged("after")).await.unwrap();
+        Box::new(tx).commit().await.unwrap();
+
+        assert_eq!(
+            rows_with_tag("before"),
+            0,
+            "the update must clear the previous version's index rows"
+        );
+        assert_eq!(rows_with_tag("after"), 1, "the new tag must be indexed");
+        assert_eq!(
+            total_rows(),
+            after_create,
+            "an update must not accumulate rows on top of the create's"
+        );
     }
 
     #[tokio::test]
