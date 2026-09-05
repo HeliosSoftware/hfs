@@ -83,9 +83,6 @@ impl SqliteSearchIndexWriter {
         "DELETE FROM search_index WHERE tenant_id = ?1 AND resource_type = ?2 AND resource_id = ?3 AND param_name = ?4"
     }
 
-    /// Converts an ExtractedValue to SQL parameters.
-    ///
-    /// Returns a tuple of (column_values) where each value corresponds to a column.
     /// Multi-row variant of [`Self::insert_sql`]: one INSERT carrying eight
     /// rows (8 x 24 positional parameters). Bulk indexing executes this once
     /// per chunk instead of stepping the single-row statement eight times.
@@ -99,6 +96,9 @@ impl SqliteSearchIndexWriter {
         })
     }
 
+    /// Converts an ExtractedValue to SQL parameters.
+    ///
+    /// Returns a tuple of (column_values) where each value corresponds to a column.
     pub fn to_sql_params(
         tenant_id: &str,
         resource_type: &str,
