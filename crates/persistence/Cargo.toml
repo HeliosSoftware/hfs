@@ -140,6 +140,12 @@ name = "config-advisor"
 path = "src/advisor/main.rs"
 required-features = ["advisor"]
 
+# Bulk-submit ingest benchmark (#947). Needs the SQLite backend it drives, so
+# a `--no-default-features` build of this crate does not try to compile it.
+[[example]]
+name = "bulk_submit_bench"
+required-features = ["sqlite"]
+
 # Benchmarks will be added later
 # [[bench]]
 # name = "crud_benchmark"
