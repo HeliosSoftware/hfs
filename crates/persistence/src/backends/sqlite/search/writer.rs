@@ -86,6 +86,19 @@ impl SqliteSearchIndexWriter {
     /// Converts an ExtractedValue to SQL parameters.
     ///
     /// Returns a tuple of (column_values) where each value corresponds to a column.
+    /// Multi-row variant of [`Self::insert_sql`]: one INSERT carrying eight
+    /// rows (8 x 24 positional parameters). Bulk indexing executes this once
+    /// per chunk instead of stepping the single-row statement eight times.
+    pub fn insert_sql_rows8() -> &'static str {
+        static SQL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        SQL.get_or_init(|| {
+            let base = Self::insert_sql();
+            let cols = &base[..base.find("VALUES").expect("insert_sql has VALUES")];
+            let group = format!("({})", ["?"; 24].join(", "));
+            format!("{cols}VALUES {}", vec![group; 8].join(", "))
+        })
+    }
+
     pub fn to_sql_params(
         tenant_id: &str,
         resource_type: &str,
