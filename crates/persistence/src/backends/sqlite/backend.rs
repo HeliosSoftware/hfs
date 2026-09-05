@@ -336,6 +336,15 @@ impl SqliteBackend {
             // entry. The limit is per pooled connection (pool of 10), but
             // only connections that touch that many pages grow their cache.
             conn.execute_batch("PRAGMA cache_size = -65536;")?;
+            // Checkpoint every ~10,000 WAL pages (~40 MiB) instead of every
+            // 1,000 (~4 MiB). A bulk-ingest batch writes far more than 4 MiB
+            // of WAL, so with the default every batch commit also ran a
+            // checkpoint and paid the WAL->database copy inline; fewer,
+            // larger checkpoints move the same bytes sequentially. Measured
+            // on the same real-manifest window: 289/s -> 382/s (+32%), with
+            // batch-commit cost falling 1.72 -> 0.96 ms per entry. Cost: the
+            // -wal file grows to ~40 MiB between checkpoints.
+            conn.execute_batch("PRAGMA wal_autocheckpoint = 10000;")?;
             crate::sof::sqlite_udfs::register(conn).map_err(|e| {
                 rusqlite::Error::SqliteFailure(
                     rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_ERROR),
