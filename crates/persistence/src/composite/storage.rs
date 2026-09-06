@@ -665,46 +665,86 @@ impl CompositeStorage {
     }
 
     /// Syncs bundle results to secondaries by extracting resource info from responses.
+    ///
+    /// Entries are grouped by resource type and synced as batches
+    /// ([`Self::sync_creates_to_secondaries`]) rather than one event each: a
+    /// transaction Bundle's entries each waited on the secondary in turn, and
+    /// under Elasticsearch `refresh=wait_for` (one refresh interval per write)
+    /// a bundle of a few dozen entries outran the 30s request timeout.
+    /// Ordering across types does not matter to a search secondary, and the
+    /// primary has already committed the whole bundle.
     async fn sync_bundle_results(
         &self,
         tenant: &TenantContext,
         result: &BundleResult,
         fhir_version: FhirVersion,
     ) {
+        let mut by_type: Vec<(String, Vec<(String, Value)>)> = Vec::new();
         for entry_result in &result.entries {
             // Only sync successful mutating operations that have a resource body
-            if let Some(ref resource_json) = entry_result.resource {
-                let resource_type = resource_json
-                    .get("resourceType")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default();
-                let resource_id = resource_json
-                    .get("id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default();
-
-                if resource_type.is_empty() || resource_id.is_empty() {
-                    continue;
-                }
-
-                if let Err(e) = self
-                    .sync_to_secondaries(SyncEvent::Create {
-                        resource_type: resource_type.to_string(),
-                        resource_id: resource_id.to_string(),
-                        content: resource_json.clone(),
-                        tenant_id: tenant.tenant_id().clone(),
-                        fhir_version,
-                    })
-                    .await
-                {
-                    warn!(
-                        error = %e,
-                        resource_type = resource_type,
-                        resource_id = resource_id,
-                        "Failed to sync bundle entry to secondaries"
-                    );
-                }
+            let Some(ref resource_json) = entry_result.resource else {
+                continue;
+            };
+            let resource_type = resource_json
+                .get("resourceType")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            let resource_id = resource_json
+                .get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            if resource_type.is_empty() || resource_id.is_empty() {
+                continue;
             }
+            let group = match by_type.iter_mut().find(|(t, _)| t == resource_type) {
+                Some(group) => group,
+                None => {
+                    by_type.push((resource_type.to_string(), Vec::new()));
+                    by_type.last_mut().expect("just pushed")
+                }
+            };
+            group
+                .1
+                .push((resource_id.to_string(), resource_json.clone()));
+        }
+        for (resource_type, resources) in by_type {
+            self.sync_creates_to_secondaries(tenant, &resource_type, fhir_version, resources)
+                .await;
+        }
+    }
+
+    /// Syncs a batch of resources of one type to the secondaries as a batch
+    /// ([`SyncManager::sync_creates`]), logging rather than failing: the
+    /// primary already holds them, and a secondary that missed the batch is
+    /// repaired by `$reindex`.
+    pub(crate) async fn sync_creates_to_secondaries(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        fhir_version: FhirVersion,
+        resources: Vec<(String, Value)>,
+    ) {
+        if resources.is_empty() {
+            return;
+        }
+        let Some(ref sync_manager) = self.sync_manager else {
+            return;
+        };
+        if let Err(e) = sync_manager
+            .sync_creates(
+                tenant.tenant_id(),
+                resource_type,
+                fhir_version,
+                resources,
+                &self.secondaries,
+            )
+            .await
+        {
+            warn!(
+                error = %e,
+                resource_type,
+                "Failed to sync batch of resources to secondaries"
+            );
         }
     }
 
@@ -802,6 +842,46 @@ impl ResourceStorage for CompositeStorage {
         }
 
         Ok(stored)
+    }
+
+    /// The batch goes to the primary as a batch, and then what the primary
+    /// accepted goes to every secondary as a batch too
+    /// ([`SyncManager::sync_creates`]): a bulk load pays the secondary's batch
+    /// write (one Elasticsearch `_bulk` request, one refresh wait) rather than
+    /// one synchronous per-resource sync each, which is what turned the
+    /// startup conformance seed into a twenty-minute stall under
+    /// `refresh=wait_for`.
+    async fn create_many(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        resources: Vec<Value>,
+        fhir_version: FhirVersion,
+    ) -> Vec<StorageResult<StoredResource>> {
+        let results = self
+            .primary
+            .create_many(tenant, resource_type, resources, fhir_version)
+            .await;
+
+        // `AlreadyExists` and validation errors are per-resource outcomes, not
+        // evidence about the backend; only a backend error counts against its
+        // health.
+        let primary_id = self.config.primary_id().unwrap_or("primary");
+        let backend_failure = results.iter().find_map(|result| match result {
+            Err(error @ StorageError::Backend(_)) => Some(error.to_string()),
+            _ => None,
+        });
+        self.update_health(primary_id, backend_failure.is_none(), backend_failure);
+
+        let created: Vec<(String, Value)> = results
+            .iter()
+            .filter_map(|result| result.as_ref().ok())
+            .map(|stored| (stored.id().to_string(), stored.content().clone()))
+            .collect();
+        self.sync_creates_to_secondaries(tenant, resource_type, fhir_version, created)
+            .await;
+
+        results
     }
 
     #[instrument(skip(self, tenant, resource), fields(resource_type = %resource_type, id = %id))]

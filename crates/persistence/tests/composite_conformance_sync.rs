@@ -89,3 +89,221 @@ async fn conformance_seeding_reaches_the_search_secondary() {
         "secondary CompartmentDefinitions after sync (#462: these were the ones going missing)"
     );
 }
+
+/// Synchronous sync is the mode the Inferno legs run in, and the one where the
+/// seed's writes each waited on the secondary: seeding now goes through
+/// `create_many`, which the composite forwards to the secondary as a batch
+/// (`SyncManager::sync_creates`). Both sets must be in the secondary the
+/// moment seeding returns — no worker to wait for — and a second seed must
+/// find everything already there without writing a duplicate.
+#[tokio::test]
+async fn synchronous_batch_seeding_reaches_the_search_secondary() {
+    let primary = Arc::new(SqliteBackend::in_memory().expect("primary"));
+    primary.init_schema().expect("primary schema");
+    let secondary = Arc::new(SqliteBackend::in_memory().expect("secondary"));
+    secondary.init_schema().expect("secondary schema");
+
+    let config = CompositeConfig::builder()
+        .primary("sqlite", BackendKind::Sqlite)
+        .search_backend("search", BackendKind::Sqlite)
+        .sync_mode(SyncMode::Synchronous)
+        .build()
+        .expect("composite config");
+
+    let mut backends: HashMap<String, DynStorage> = HashMap::new();
+    backends.insert("sqlite".to_string(), primary.clone() as DynStorage);
+    backends.insert("search".to_string(), secondary.clone() as DynStorage);
+
+    let composite = CompositeStorage::new(config, backends).expect("composite");
+
+    let first = helios_persistence::search::seed_tenant_conformance(
+        &composite,
+        FhirVersion::R4,
+        &data_dir(),
+        "default",
+    )
+    .await;
+    assert!(first.created > 1000, "first seed created: {first:?}");
+    assert_eq!(first.failed, 0, "first seed: {first:?}");
+
+    let t = tenant();
+    for resource_type in ["SearchParameter", "CompartmentDefinition"] {
+        let in_primary = primary.count(&t, Some(resource_type)).await.unwrap();
+        let in_secondary = secondary.count(&t, Some(resource_type)).await.unwrap();
+        assert!(in_primary > 0, "{resource_type} in primary");
+        assert_eq!(
+            in_secondary, in_primary,
+            "{resource_type}: synchronous batch sync leaves the secondary complete on return"
+        );
+    }
+
+    let second = helios_persistence::search::seed_tenant_conformance(
+        &composite,
+        FhirVersion::R4,
+        &data_dir(),
+        "default",
+    )
+    .await;
+    assert_eq!(second.created, 0, "second seed: {second:?}");
+    assert_eq!(second.failed, 0, "second seed: {second:?}");
+    assert_eq!(
+        second.existing,
+        first.created + first.existing,
+        "second seed finds every resource already present"
+    );
+    let sp_after = secondary.count(&t, Some("SearchParameter")).await.unwrap();
+    assert_eq!(
+        sp_after,
+        primary.count(&t, Some("SearchParameter")).await.unwrap(),
+        "re-seeding writes nothing new to the secondary"
+    );
+}
+
+/// Per-item semantics survive the batch: the primary's `AlreadyExists` for a
+/// duplicate id comes back in that item's slot, and only the resources the
+/// primary accepted are synced to the secondary.
+#[tokio::test]
+async fn create_many_reports_per_item_outcomes_and_syncs_only_accepted_ones() {
+    use serde_json::json;
+
+    let primary = Arc::new(SqliteBackend::in_memory().expect("primary"));
+    primary.init_schema().expect("primary schema");
+    let secondary = Arc::new(SqliteBackend::in_memory().expect("secondary"));
+    secondary.init_schema().expect("secondary schema");
+
+    let config = CompositeConfig::builder()
+        .primary("sqlite", BackendKind::Sqlite)
+        .search_backend("search", BackendKind::Sqlite)
+        .sync_mode(SyncMode::Synchronous)
+        .build()
+        .expect("composite config");
+    let mut backends: HashMap<String, DynStorage> = HashMap::new();
+    backends.insert("sqlite".to_string(), primary.clone() as DynStorage);
+    backends.insert("search".to_string(), secondary.clone() as DynStorage);
+    let composite = CompositeStorage::new(config, backends).expect("composite");
+
+    let t = tenant();
+    composite
+        .create(
+            &t,
+            "Patient",
+            json!({"resourceType": "Patient", "id": "taken"}),
+            FhirVersion::R4,
+        )
+        .await
+        .expect("seed the duplicate");
+
+    let results = composite
+        .create_many(
+            &t,
+            "Patient",
+            vec![
+                json!({"resourceType": "Patient", "id": "fresh-1"}),
+                json!({"resourceType": "Patient", "id": "taken"}),
+                json!({"resourceType": "Patient", "id": "fresh-2"}),
+            ],
+            FhirVersion::R4,
+        )
+        .await;
+
+    assert_eq!(results.len(), 3);
+    assert_eq!(results[0].as_ref().expect("fresh-1").id(), "fresh-1");
+    assert!(
+        matches!(
+            results[1],
+            Err(helios_persistence::error::StorageError::Resource(
+                helios_persistence::error::ResourceError::AlreadyExists { .. }
+            ))
+        ),
+        "duplicate id reports AlreadyExists in its own slot: {:?}",
+        results[1]
+    );
+    assert_eq!(results[2].as_ref().expect("fresh-2").id(), "fresh-2");
+
+    assert_eq!(primary.count(&t, Some("Patient")).await.unwrap(), 3);
+    assert_eq!(
+        secondary.count(&t, Some("Patient")).await.unwrap(),
+        3,
+        "the two accepted resources (plus the earlier one) reached the secondary"
+    );
+    assert!(
+        secondary
+            .read(&t, "Patient", "fresh-2")
+            .await
+            .unwrap()
+            .is_some(),
+        "an item after a rejected one is still synced"
+    );
+}
+
+/// A transaction Bundle's entries used to be synced to the secondary one
+/// event at a time; they now go as one batch per resource type
+/// (`CompositeStorage::sync_bundle_results` → `SyncManager::sync_creates`).
+/// Every entry must be in the secondary when the transaction returns.
+#[tokio::test]
+async fn transaction_entries_reach_the_secondary_as_a_batch() {
+    use helios_persistence::core::{BundleEntry, BundleMethod, BundleProvider};
+    use serde_json::json;
+
+    let primary = Arc::new(SqliteBackend::in_memory().expect("primary"));
+    primary.init_schema().expect("primary schema");
+    let secondary = Arc::new(SqliteBackend::in_memory().expect("secondary"));
+    secondary.init_schema().expect("secondary schema");
+
+    let config = CompositeConfig::builder()
+        .primary("sqlite", BackendKind::Sqlite)
+        .search_backend("search", BackendKind::Sqlite)
+        .sync_mode(SyncMode::Synchronous)
+        .build()
+        .expect("composite config");
+    let mut backends: HashMap<String, DynStorage> = HashMap::new();
+    backends.insert("sqlite".to_string(), primary.clone() as DynStorage);
+    backends.insert("search".to_string(), secondary.clone() as DynStorage);
+    let composite = CompositeStorage::new(config, backends)
+        .expect("composite")
+        .with_full_primary(primary.clone());
+
+    let mut entries = Vec::new();
+    for i in 0..3 {
+        entries.push(BundleEntry {
+            method: BundleMethod::Post,
+            url: "Patient".to_string(),
+            resource: Some(json!({"resourceType": "Patient", "id": format!("tx-p{i}")})),
+            full_url: Some(format!("urn:uuid:tx-p{i}")),
+            ..Default::default()
+        });
+        entries.push(BundleEntry {
+            method: BundleMethod::Post,
+            url: "Observation".to_string(),
+            resource: Some(json!({
+                "resourceType": "Observation",
+                "id": format!("tx-o{i}"),
+                "status": "final",
+                "code": {"text": "hr"},
+                "subject": {"reference": format!("urn:uuid:tx-p{i}")}
+            })),
+            full_url: Some(format!("urn:uuid:tx-o{i}")),
+            ..Default::default()
+        });
+    }
+
+    let result = composite
+        .process_transaction(&tenant(), entries, FhirVersion::R4)
+        .await
+        .expect("transaction");
+    assert_eq!(result.entries.len(), 6);
+
+    let t = tenant();
+    assert_eq!(secondary.count(&t, Some("Patient")).await.unwrap(), 3);
+    assert_eq!(secondary.count(&t, Some("Observation")).await.unwrap(), 3);
+    let synced = secondary
+        .read(&t, "Observation", "tx-o2")
+        .await
+        .unwrap()
+        .expect("last observation synced");
+    assert_eq!(
+        synced.content()["subject"]["reference"],
+        json!("Patient/tx-p2"),
+        "the secondary holds the committed content, references resolved"
+    );
+}

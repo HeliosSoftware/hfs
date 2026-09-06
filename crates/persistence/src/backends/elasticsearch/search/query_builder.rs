@@ -403,22 +403,18 @@ impl<'a> EsQueryBuilder<'a> {
     }
 }
 
-/// Builds a count query (no sorting, no source, size=0).
+/// Builds the body for the `_count` API: the search's `query` clause and
+/// nothing else.
+///
+/// `_count` accepts only `query`; every search-only field the full builder
+/// sets — `sort`, `size`, `from`, `search_after`, `track_total_hits`,
+/// `track_scores` — is a `parsing_exception` there, which surfaced as a 500
+/// on every `_total=accurate` search served by Elasticsearch.
 pub fn build_count_query(tenant_id: &str, resource_type: &str, query: &SearchQuery) -> Value {
     let builder = EsQueryBuilder::new(tenant_id, resource_type, String::new());
-    let es_query = builder.build(query);
+    let mut es_query = builder.build(query);
 
-    // Strip unnecessary fields for count
-    let mut body = es_query.body;
-    if let Some(obj) = body.as_object_mut() {
-        obj.remove("sort");
-        obj.remove("size");
-        obj.remove("from");
-        obj.remove("search_after");
-    }
-    body["size"] = json!(0);
-
-    body
+    json!({ "query": es_query.body["query"].take() })
 }
 
 #[cfg(test)]

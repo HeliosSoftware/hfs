@@ -311,6 +311,153 @@ impl SyncManager {
         }
     }
 
+    /// Synchronizes a batch of creates — one tenant, one resource type — to
+    /// the secondary backends as a batch.
+    ///
+    /// In the synchronous modes every backend receives the whole batch
+    /// through [`ResourceStorage::create_many`], so a secondary with a native
+    /// batch write (Elasticsearch `_bulk`) pays one round trip and, under
+    /// `refresh=wait_for`, one refresh wait rather than one per resource.
+    /// Items the batch rejects are retried one at a time through the same
+    /// retrying path a single [`sync`](Self::sync) takes, so a partial batch
+    /// failure degrades to per-resource sync rather than to lost writes.
+    /// Asynchronous mode queues one event per resource, exactly as `sync`
+    /// would for each.
+    pub async fn sync_creates(
+        &self,
+        tenant_id: &TenantId,
+        resource_type: &str,
+        fhir_version: FhirVersion,
+        resources: Vec<(String, Value)>,
+        backends: &HashMap<String, Arc<dyn ResourceStorage + Send + Sync>>,
+    ) -> StorageResult<Vec<SyncStatus>> {
+        let create_event = |(id, content): &(String, Value)| SyncEvent::Create {
+            resource_type: resource_type.to_string(),
+            resource_id: id.clone(),
+            content: content.clone(),
+            tenant_id: tenant_id.clone(),
+            fhir_version,
+        };
+        let synchronous = match self.config.mode {
+            SyncMode::Synchronous => true,
+            SyncMode::Asynchronous => false,
+            SyncMode::Hybrid { sync_for_search } => sync_for_search,
+        };
+        if !synchronous {
+            let mut statuses = Vec::new();
+            for resource in &resources {
+                statuses.extend(
+                    self.sync_asynchronous(&create_event(resource), backends)
+                        .await?,
+                );
+            }
+            return Ok(statuses);
+        }
+        if resources.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        use tokio::task::JoinSet;
+
+        let resources = Arc::new(resources);
+        let tenant = TenantContext::new(tenant_id.clone(), TenantPermissions::full_access());
+        let resource_type = resource_type.to_string();
+        let mut tasks: JoinSet<(SyncStatus, usize, usize)> = JoinSet::new();
+
+        for (backend_id, backend) in backends {
+            let resources = resources.clone();
+            let tenant = tenant.clone();
+            let resource_type = resource_type.clone();
+            let backend = backend.clone();
+            let backend_id = backend_id.clone();
+            let retry_config = self.config.retry.clone();
+
+            tasks.spawn(async move {
+                let start = std::time::Instant::now();
+                let contents = resources
+                    .iter()
+                    .map(|(_, content)| content.clone())
+                    .collect();
+                let results = backend
+                    .create_many(&tenant, &resource_type, contents, fhir_version)
+                    .await;
+
+                let mut synced = 0;
+                let mut errors = 0;
+                let mut last_error = None;
+                for ((resource_id, content), result) in resources.iter().zip(results) {
+                    let Err(batch_error) = result else {
+                        synced += 1;
+                        continue;
+                    };
+                    warn!(
+                        backend_id = %backend_id,
+                        resource_type = %resource_type,
+                        resource_id = %resource_id,
+                        error = %batch_error,
+                        "Batch sync rejected a resource; retrying it individually"
+                    );
+                    let event = SyncEvent::Create {
+                        resource_type: resource_type.clone(),
+                        resource_id: resource_id.clone(),
+                        content: content.clone(),
+                        tenant_id: tenant.tenant_id().clone(),
+                        fhir_version,
+                    };
+                    match Self::sync_event_to_backend(&event, backend.as_ref(), &retry_config).await
+                    {
+                        Ok(()) => synced += 1,
+                        Err(e) => {
+                            errors += 1;
+                            last_error = Some(e.to_string());
+                        }
+                    }
+                }
+
+                (
+                    SyncStatus {
+                        backend_id,
+                        success: errors == 0,
+                        error: last_error,
+                        retry_count: if errors == 0 {
+                            0
+                        } else {
+                            retry_config.max_retries
+                        },
+                        duration: start.elapsed(),
+                    },
+                    synced,
+                    errors,
+                )
+            });
+        }
+
+        let mut results = Vec::new();
+        while let Some(result) = tasks.join_next().await {
+            match result {
+                Ok((status, synced, errors)) => {
+                    let mut status_map = self.status.write();
+                    let backend_status = status_map.entry(status.backend_id.clone()).or_default();
+                    if synced > 0 {
+                        backend_status.last_success = Some(std::time::Instant::now());
+                        backend_status.total_synced += synced as u64;
+                    }
+                    backend_status.total_errors += errors as u64;
+                    if status.success {
+                        backend_status.healthy = true;
+                    }
+                    drop(status_map);
+                    results.push(status);
+                }
+                Err(e) => {
+                    warn!(error = %e, "Batch sync task failed");
+                }
+            }
+        }
+
+        Ok(results)
+    }
+
     /// Synchronous sync - waits for all backends.
     async fn sync_synchronous(
         &self,
