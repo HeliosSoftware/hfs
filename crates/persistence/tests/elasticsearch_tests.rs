@@ -2105,6 +2105,142 @@ mod es_integration {
         assert_eq!(result.resources.items[0].id(), "raw-composite-1");
     }
 
+    /// `create_many` is one `_bulk` request per batch, so under
+    /// `refresh=wait_for` a batch pays one refresh wait — not one per
+    /// document. With a 5s refresh interval, 40 per-document writes would
+    /// take over three minutes; the batch must finish in a few seconds. This
+    /// is the shape of the startup conformance seed that stalled the
+    /// sqlite-elasticsearch server past its readiness timeout.
+    #[tokio::test]
+    async fn es_integration_create_many_pays_one_refresh_wait_per_batch() {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::types::SearchQuery;
+
+        let backend = create_backend_with("5s", WriteRefreshPolicy::WaitFor).await;
+        let tenant = create_tenant("bulk-wait-for");
+
+        let patients: Vec<_> = (0..40)
+            .map(|i| {
+                json!({
+                    "resourceType": "Patient",
+                    "id": format!("bulk-{i}"),
+                    "name": [{"family": "Bulk", "given": [format!("P{i}")]}]
+                })
+            })
+            .collect();
+
+        let started = std::time::Instant::now();
+        let results = backend
+            .create_many(&tenant, "Patient", patients, FhirVersion::default())
+            .await;
+        let elapsed = started.elapsed();
+
+        assert_eq!(results.len(), 40, "one result per input");
+        for (i, result) in results.iter().enumerate() {
+            let stored = result
+                .as_ref()
+                .unwrap_or_else(|e| panic!("resource {i} failed: {e}"));
+            assert_eq!(stored.id(), format!("bulk-{i}"), "results keep input order");
+            assert_eq!(stored.version_id(), "1");
+        }
+        assert!(
+            elapsed < std::time::Duration::from_secs(20),
+            "40 resources under wait_for with a 5s refresh interval took {elapsed:?}; \
+             a batch must not pay one refresh wait per document"
+        );
+
+        // wait_for on the bulk request means every document is already
+        // searchable — no refresh needed.
+        let visible = backend
+            .search_count(&tenant, &SearchQuery::new("Patient"))
+            .await
+            .expect("count after batch create");
+        assert_eq!(
+            visible, 40,
+            "the whole batch is visible once the request returns"
+        );
+    }
+
+    /// The bulk path carries every document a resource contributes: a
+    /// server-assigned id when the resource has none, and the `_contained`
+    /// documents, which land in *their* type's index.
+    #[tokio::test]
+    async fn es_integration_create_many_assigns_ids_and_indexes_contained() {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::types::{ContainedMode, SearchQuery};
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("bulk-contained");
+
+        let results = backend
+            .create_many(
+                &tenant,
+                "Observation",
+                vec![
+                    json!({
+                        "resourceType": "Observation",
+                        "status": "final",
+                        "code": {"text": "no id, server assigns one"}
+                    }),
+                    json!({
+                        "resourceType": "Observation",
+                        "id": "obs-with-contained",
+                        "status": "final",
+                        "code": {"text": "hr"},
+                        "contained": [{
+                            "resourceType": "Patient",
+                            "id": "inner",
+                            "name": [{"family": "Containedbulk"}]
+                        }],
+                        "subject": {"reference": "#inner"}
+                    }),
+                ],
+                FhirVersion::default(),
+            )
+            .await;
+        assert_eq!(results.len(), 2);
+        let assigned = results[0].as_ref().expect("first create").id().to_string();
+        assert!(!assigned.is_empty(), "server-assigned id");
+        assert_eq!(
+            results[0].as_ref().unwrap().content()["id"],
+            json!(assigned),
+            "the returned content carries the assigned id"
+        );
+        assert_eq!(
+            results[1].as_ref().expect("second create").id(),
+            "obs-with-contained"
+        );
+
+        backend
+            .refresh_index("bulk-contained", "Observation")
+            .await
+            .ok();
+        backend
+            .refresh_index("bulk-contained", "Patient")
+            .await
+            .ok();
+
+        let both = backend
+            .search(&tenant, &SearchQuery::new("Observation"))
+            .await
+            .expect("search observations");
+        assert_eq!(both.resources.items.len(), 2);
+
+        // The contained Patient is findable through `_contained=true`, which
+        // only works if its document reached the Patient index.
+        let mut contained = SearchQuery::new("Patient");
+        contained.contained = ContainedMode::On;
+        let found = backend
+            .search(&tenant, &contained)
+            .await
+            .expect("contained search");
+        assert_eq!(
+            found.resources.items.len(),
+            1,
+            "the contained Patient document was written to the Patient index"
+        );
+    }
+
     #[tokio::test]
     async fn es_integration_compartment_search() {
         // Compartment membership: a resource joins the Patient compartment if it

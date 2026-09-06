@@ -195,6 +195,18 @@ impl ResourceStorage for CompositeSubmitJobs {
             .await
     }
 
+    async fn create_many(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        resources: Vec<Value>,
+        fhir_version: FhirVersion,
+    ) -> Vec<StorageResult<StoredResource>> {
+        self.composite
+            .create_many(tenant, resource_type, resources, fhir_version)
+            .await
+    }
+
     async fn create_or_update(
         &self,
         tenant: &TenantContext,

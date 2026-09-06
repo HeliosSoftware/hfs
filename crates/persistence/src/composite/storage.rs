@@ -804,6 +804,58 @@ impl ResourceStorage for CompositeStorage {
         Ok(stored)
     }
 
+    /// The batch goes to the primary as a batch, and then what the primary
+    /// accepted goes to every secondary as a batch too
+    /// ([`SyncManager::sync_creates`]): a bulk load pays the secondary's batch
+    /// write (one Elasticsearch `_bulk` request, one refresh wait) rather than
+    /// one synchronous per-resource sync each, which is what turned the
+    /// startup conformance seed into a twenty-minute stall under
+    /// `refresh=wait_for`.
+    async fn create_many(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        resources: Vec<Value>,
+        fhir_version: FhirVersion,
+    ) -> Vec<StorageResult<StoredResource>> {
+        let results = self
+            .primary
+            .create_many(tenant, resource_type, resources, fhir_version)
+            .await;
+
+        // `AlreadyExists` and validation errors are per-resource outcomes, not
+        // evidence about the backend; only a backend error counts against its
+        // health.
+        let primary_id = self.config.primary_id().unwrap_or("primary");
+        let backend_failure = results.iter().find_map(|result| match result {
+            Err(error @ StorageError::Backend(_)) => Some(error.to_string()),
+            _ => None,
+        });
+        self.update_health(primary_id, backend_failure.is_none(), backend_failure);
+
+        let created: Vec<StoredResource> = results
+            .iter()
+            .filter_map(|result| result.as_ref().ok().cloned())
+            .collect();
+        if !created.is_empty()
+            && let Some(ref sync_manager) = self.sync_manager
+            && let Err(e) = sync_manager
+                .sync_creates(
+                    tenant.tenant_id(),
+                    resource_type,
+                    fhir_version,
+                    created,
+                    &self.secondaries,
+                )
+                .await
+        {
+            warn!(error = %e, "Failed to sync batch create to secondaries");
+            // Don't fail the operation - primary succeeded
+        }
+
+        results
+    }
+
     #[instrument(skip(self, tenant, resource), fields(resource_type = %resource_type, id = %id))]
     async fn create_or_update(
         &self,
