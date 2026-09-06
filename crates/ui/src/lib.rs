@@ -6257,7 +6257,7 @@ async fn resolve_table_target(
         "ViewDefinition" => true,
         "Library" => {
             sql_libraries::has_library_code(&artifact, "sql-view")
-                && !(!own_id.is_empty() && id == own_id)
+                && (own_id.is_empty() || id != own_id)
         }
         _ => false,
     };
