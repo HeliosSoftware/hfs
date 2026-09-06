@@ -19,8 +19,10 @@
 //!   time `false`, every guard folds away, and the counters are never
 //!   referenced.
 //!
-//!       RUSTFLAGS='--cfg perf_phases' cargo run --release -p helios-persistence \
-//!           --example bulk_submit_bench -- --limit 25000 CarePlan.ndjson
+//!   ```text
+//!   RUSTFLAGS='--cfg perf_phases' cargo run --release -p helios-persistence \
+//!       --example bulk_submit_bench -- --limit 25000 CarePlan.ndjson
+//!   ```
 //!
 //! * **Zero cost when built in but switched off.** Every call site starts with
 //!   one relaxed atomic load. `HFS_PERF_PHASES=1` (read once, at first use)
