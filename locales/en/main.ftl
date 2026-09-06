@@ -1052,6 +1052,11 @@ sql-export-more-actions = More actions
 sql-export-copy-job-id = Copy job id
 sql-export-copied = Copied
 sql-export-progress-waiting = Waiting for the first status report…
+sql-export-writing = Writing { $name }
+sql-export-subjects-progress = { $total ->
+    [one] { $done } of { $total } subject
+   *[other] { $done } of { $total } subjects
+}
 sql-export-started = started
 sql-export-finished-in = finished in
 sql-export-cancelled-at = cancelled at
