@@ -351,9 +351,14 @@ mod query_builder_tests {
         let query = SearchQuery::new("Patient");
         let body = build_count_query("acme", "Patient", &query);
 
-        // Count query should have size=0 and no sort
-        assert_eq!(body["size"], 0);
-        assert!(body.get("sort").is_none());
+        // `_count` accepts only `query`: anything else the search builder
+        // sets (size, sort, track_total_hits, ...) is a parsing_exception.
+        let keys: Vec<&String> = body.as_object().expect("object body").keys().collect();
+        assert_eq!(keys, vec!["query"], "count body: {body}");
+        assert!(
+            body["query"]["bool"].is_object(),
+            "the tenant filter survives"
+        );
     }
 }
 
