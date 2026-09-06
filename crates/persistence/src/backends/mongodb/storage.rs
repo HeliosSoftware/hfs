@@ -1,6 +1,6 @@
 //! ResourceStorage implementation for MongoDB.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -28,7 +28,7 @@ use crate::search::converters::IndexValue;
 use crate::search::extractor::ExtractedValue;
 use crate::search::reindex::{ReindexSource, ReindexTarget, ResourcePage};
 use crate::tenant::{Operation, TenantContext};
-use crate::types::{CursorValue, Page, PageCursor, PageInfo, StoredResource};
+use crate::types::{CursorValue, Page, PageCursor, PageInfo, SearchQuery, StoredResource};
 
 use super::MongoBackend;
 
@@ -3328,44 +3328,291 @@ impl MongoBackend {
             return Ok(Vec::new());
         }
 
+        if self.is_search_offloaded() {
+            return self
+                .if_none_exist_offloaded_scan(db, session, tenant, resource_type, &parsed_params)
+                .await;
+        }
+
+        let typed_params = self.build_search_parameters(tenant, resource_type, &parsed_params);
+        let index_params: Vec<_> = typed_params
+            .iter()
+            .filter(|p| !matches!(p.name.as_str(), "_id" | "_lastUpdated"))
+            .collect();
+
+        if index_params.is_empty() {
+            let query = SearchQuery {
+                resource_type: resource_type.to_string(),
+                parameters: typed_params,
+                count: Some(2),
+                ..Default::default()
+            };
+            let tenant_id = tenant.tenant_id().as_str();
+            let filter =
+                self.build_resource_filter(tenant_id, resource_type, &query, None, None)?;
+            let resources = db.collection::<Document>(MongoBackend::RESOURCES_COLLECTION);
+            let cursor = resources
+                .find(filter)
+                .limit(2)
+                .session(&mut *session)
+                .await
+                .map_err(|e| {
+                    internal_error(format!("Failed to query resources in transaction: {}", e))
+                })?;
+            let docs = collect_session_documents(cursor, session).await?;
+            return docs
+                .into_iter()
+                .map(|doc| document_to_stored_resource(&doc, tenant, resource_type))
+                .collect();
+        }
+
+        let tenant_id = tenant.tenant_id().as_str();
+        let search_index = db.collection::<Document>(MongoBackend::SEARCH_INDEX_COLLECTION);
+
+        const PROBE_LIMIT: i64 = 2;
+        const BATCH_SIZE: i64 = 128;
+
+        let driver_idx = {
+            let mut best: Option<(usize, i64)> = None;
+            for (i, param) in index_params.iter().enumerate() {
+                let filter = self.build_search_index_filter(tenant_id, resource_type, param)?;
+                let pipeline = vec![
+                    doc! { "$match": filter },
+                    doc! { "$group": { "_id": "$resource_id" } },
+                    doc! { "$limit": PROBE_LIMIT },
+                    doc! { "$count": "n" },
+                ];
+                let cursor = search_index
+                    .aggregate(pipeline)
+                    .session(&mut *session)
+                    .await
+                    .map_err(|e| {
+                        internal_error(format!("Failed probe for ifNoneExist driver: {}", e))
+                    })?;
+                let probe_docs = collect_session_documents(cursor, session).await?;
+                let count = probe_docs
+                    .first()
+                    .and_then(|d| d.get_i32("n").ok())
+                    .map(|n| n as i64)
+                    .unwrap_or(0);
+                if count == 0 {
+                    return Ok(Vec::new());
+                }
+                if best.is_none_or(|(_, prev)| count < prev) {
+                    best = Some((i, count));
+                }
+            }
+            best.map(|(i, _)| i).unwrap_or(0)
+        };
+
+        let driver_filter =
+            self.build_search_index_filter(tenant_id, resource_type, index_params[driver_idx])?;
+
+        let mut last_index_id: Option<Bson> = None;
+        let mut matches: Vec<StoredResource> = Vec::with_capacity(2);
+        let mut matched_ids: HashSet<String> = HashSet::new();
         let resources = db.collection::<Document>(MongoBackend::RESOURCES_COLLECTION);
+
+        loop {
+            let page_filter = match &last_index_id {
+                Some(last_id) => doc! {
+                    "$and": [driver_filter.clone(), { "_id": { "$gt": last_id.clone() } }]
+                },
+                None => driver_filter.clone(),
+            };
+
+            let mut cursor = search_index
+                .find(page_filter)
+                .sort(doc! { "_id": 1 })
+                .projection(doc! { "_id": 1, "resource_id": 1 })
+                .limit(BATCH_SIZE)
+                .session(&mut *session)
+                .await
+                .map_err(|e| {
+                    internal_error(format!(
+                        "Failed to page search_index for ifNoneExist: {}",
+                        e
+                    ))
+                })?;
+
+            let mut candidate_ids: HashSet<String> = HashSet::new();
+            let mut docs_read: i64 = 0;
+
+            while cursor.advance(&mut *session).await.map_err(|e| {
+                internal_error(format!("Failed to advance search_index cursor: {}", e))
+            })? {
+                let doc = cursor.deserialize_current().map_err(|e| {
+                    internal_error(format!("Failed to deserialize search_index doc: {}", e))
+                })?;
+                last_index_id = doc.get("_id").cloned();
+                docs_read += 1;
+                if let Ok(rid) = doc.get_str("resource_id") {
+                    candidate_ids.insert(rid.to_string());
+                }
+            }
+
+            if docs_read == 0 {
+                break;
+            }
+
+            for (i, param) in index_params.iter().enumerate() {
+                if i == driver_idx || candidate_ids.is_empty() {
+                    continue;
+                }
+                let param_filter =
+                    self.build_search_index_filter(tenant_id, resource_type, param)?;
+                let bounded_filter = doc! {
+                    "$and": [
+                        param_filter,
+                        { "resource_id": { "$in": candidate_ids.iter().cloned().collect::<Vec<_>>() } }
+                    ]
+                };
+                let passing: HashSet<String> = search_index
+                    .distinct("resource_id", bounded_filter)
+                    .session(&mut *session)
+                    .await
+                    .map_err(|e| {
+                        internal_error(format!(
+                            "Failed distinct for ifNoneExist intersection: {}",
+                            e
+                        ))
+                    })?
+                    .into_iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect();
+                candidate_ids.retain(|id| passing.contains(id));
+            }
+
+            if !candidate_ids.is_empty() {
+                let remaining = (2 - matches.len()) as i64;
+                let mut res_cursor = resources
+                    .find(doc! {
+                        "tenant_id": tenant_id,
+                        "resource_type": resource_type,
+                        "is_deleted": false,
+                        "id": { "$in": candidate_ids.into_iter().collect::<Vec<_>>() }
+                    })
+                    .limit(remaining)
+                    .session(&mut *session)
+                    .await
+                    .map_err(|e| {
+                        internal_error(format!("Failed to fetch resources for ifNoneExist: {}", e))
+                    })?;
+
+                while res_cursor.advance(&mut *session).await.map_err(|e| {
+                    internal_error(format!("Failed to advance resources cursor: {}", e))
+                })? {
+                    let doc = res_cursor.deserialize_current().map_err(|e| {
+                        internal_error(format!("Failed to deserialize resource doc: {}", e))
+                    })?;
+                    let resource = document_to_stored_resource(&doc, tenant, resource_type)?;
+                    if matched_ids.insert(resource.id().to_string()) {
+                        matches.push(resource);
+                    }
+                }
+            }
+
+            if matches.len() >= 2 || docs_read < BATCH_SIZE {
+                break;
+            }
+        }
+
+        Ok(matches)
+    }
+
+    async fn if_none_exist_offloaded_scan(
+        &self,
+        db: &mongodb::Database,
+        session: &mut ClientSession,
+        tenant: &TenantContext,
+        resource_type: &str,
+        parsed_params: &[(String, String)],
+    ) -> StorageResult<Vec<StoredResource>> {
         let tenant_id = tenant.tenant_id().as_str();
 
-        let cursor = resources
-            .find(doc! {
-                "tenant_id": tenant_id,
-                "resource_type": resource_type,
-                "is_deleted": false,
-            })
+        for (name, _) in parsed_params {
+            match name.as_str() {
+                "_id" | "_lastUpdated" | "identifier" => {}
+                other => {
+                    return Err(StorageError::Search(
+                        crate::error::SearchError::QueryParseError {
+                            message: format!(
+                                "ifNoneExist parameter '{other}' cannot be evaluated \
+                                 against the resource collection when search is offloaded; \
+                                 use a supported parameter (_id, identifier) or disable \
+                                 search offloading"
+                            ),
+                        },
+                    ));
+                }
+            }
+        }
+
+        let mut conditions = vec![doc! {
+            "tenant_id": tenant_id,
+            "resource_type": resource_type,
+            "is_deleted": false,
+        }];
+
+        for (name, value) in parsed_params {
+            match name.as_str() {
+                "_id" => {
+                    conditions.push(doc! { "id": value.as_str() });
+                }
+                "_lastUpdated" => {}
+                "identifier" => {
+                    let mut elem_match = Document::new();
+                    if let Some((system, val)) = value.split_once('|') {
+                        if !system.is_empty() {
+                            elem_match.insert("system", system);
+                        }
+                        if !val.is_empty() {
+                            elem_match.insert("value", val);
+                        }
+                    } else if !value.is_empty() {
+                        elem_match.insert("value", value.as_str());
+                    }
+                    if !elem_match.is_empty() {
+                        conditions.push(doc! { "data.identifier": { "$elemMatch": elem_match } });
+                    }
+                }
+                _ => unreachable!("unsupported params are rejected above"),
+            }
+        }
+
+        let filter = if conditions.len() == 1 {
+            conditions.remove(0)
+        } else {
+            doc! { "$and": Bson::Array(conditions.into_iter().map(Bson::Document).collect()) }
+        };
+
+        let resources = db.collection::<Document>(MongoBackend::RESOURCES_COLLECTION);
+        let mut matches: Vec<StoredResource> = Vec::with_capacity(2);
+        let mut cursor = resources
+            .find(filter)
+            .limit(2)
             .session(&mut *session)
             .await
             .map_err(|e| {
                 internal_error(format!(
-                    "Failed to query conditional matches in transaction: {}",
+                    "Failed to scan resources for offloaded ifNoneExist: {}",
                     e
                 ))
             })?;
 
-        let docs = collect_session_documents(cursor, session).await?;
-        let mut matches = Vec::new();
-
-        for doc in docs {
-            let payload = doc.get_document("data").map_err(|e| {
+        while cursor.advance(&mut *session).await.map_err(|e| {
+            internal_error(format!(
+                "Failed to advance resources cursor for offloaded ifNoneExist: {}",
+                e
+            ))
+        })? {
+            let doc = cursor.deserialize_current().map_err(|e| {
                 internal_error(format!(
-                    "Missing payload while matching conditionals: {}",
+                    "Failed to deserialize resource for offloaded ifNoneExist: {}",
                     e
                 ))
             })?;
-            let resource = document_to_value(payload)?;
-
-            if resource_matches_bundle_search_params(&resource, &parsed_params)
-                && doc
-                    .get_str("resource_type")
-                    .map(|rt| rt == resource_type)
-                    .unwrap_or(true)
-            {
-                matches.push(document_to_stored_resource(&doc, tenant, resource_type)?);
-            }
+            matches.push(document_to_stored_resource(&doc, tenant, resource_type)?);
         }
 
         Ok(matches)
@@ -3491,93 +3738,6 @@ impl MongoBackend {
                 },
             ))
         }
-    }
-}
-
-fn resource_matches_bundle_search_params(resource: &Value, params: &[(String, String)]) -> bool {
-    params.iter().all(|(name, expected)| match name.as_str() {
-        "_id" => resource
-            .get("id")
-            .and_then(Value::as_str)
-            .is_some_and(|id| id == expected),
-        "identifier" => resource_identifier_matches(resource, expected),
-        _ => resource_field_matches(resource.get(name), expected),
-    })
-}
-
-fn resource_identifier_matches(resource: &Value, expected: &str) -> bool {
-    let Some(identifier_value) = resource.get("identifier") else {
-        return false;
-    };
-
-    let (system, value, has_separator) = if let Some((system, value)) = expected.split_once('|') {
-        (system, value, true)
-    } else {
-        ("", expected, false)
-    };
-
-    match identifier_value {
-        Value::Array(items) => items
-            .iter()
-            .any(|item| match_identifier_item(item, system, value, has_separator)),
-        Value::Object(_) => match_identifier_item(identifier_value, system, value, has_separator),
-        _ => false,
-    }
-}
-
-fn match_identifier_item(item: &Value, system: &str, value: &str, has_separator: bool) -> bool {
-    let item_system = item.get("system").and_then(Value::as_str);
-    let item_value = item.get("value").and_then(Value::as_str);
-
-    if has_separator {
-        let system_matches = if system.is_empty() {
-            true
-        } else {
-            item_system == Some(system)
-        };
-        let value_matches = if value.is_empty() {
-            true
-        } else {
-            item_value == Some(value)
-        };
-
-        system_matches && value_matches
-    } else {
-        item_value == Some(value)
-    }
-}
-
-fn resource_field_matches(value: Option<&Value>, expected: &str) -> bool {
-    let Some(value) = value else {
-        return false;
-    };
-
-    match value {
-        Value::String(s) => s == expected,
-        Value::Array(items) => items
-            .iter()
-            .any(|item| resource_field_matches(Some(item), expected)),
-        Value::Object(map) => {
-            if map
-                .get("reference")
-                .and_then(Value::as_str)
-                .is_some_and(|reference| reference == expected)
-            {
-                return true;
-            }
-
-            if map
-                .get("value")
-                .and_then(Value::as_str)
-                .is_some_and(|value| value == expected)
-            {
-                return true;
-            }
-
-            map.values()
-                .any(|nested| resource_field_matches(Some(nested), expected))
-        }
-        _ => false,
     }
 }
 
