@@ -164,6 +164,13 @@
 
   /* ---- post the two versions to be diffed ------------------------------ */
 
+  /* Each renderDiff() call takes a ticket; a response only lands if its
+   * ticket is still the newest. Two quick selections (a `change` on each
+   * select, say) start two fetches, and the server does not answer them in
+   * order — the first one's HTML arriving last would leave the diff showing
+   * a comparison nobody is asking for any more. */
+  var diffTicket = 0;
+
   function renderDiff() {
     var fromIndex = Number(fromSel.value);
     var toIndex = Number(toSel.value);
@@ -172,6 +179,7 @@
     if (!from || !to) return;
 
     markSelected(fromIndex, toIndex);
+    var ticket = ++diffTicket;
 
     var body = new URLSearchParams();
     body.set("from", JSON.stringify(from.resource));
@@ -186,6 +194,7 @@
         return response.text();
       })
       .then(function (html) {
+        if (ticket !== diffTicket) return;
         diffEl.innerHTML = html;
       });
   }

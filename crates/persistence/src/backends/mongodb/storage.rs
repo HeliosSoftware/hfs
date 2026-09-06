@@ -429,6 +429,55 @@ fn document_to_stored_resource(
     ))
 }
 
+/// The in-process SQL-on-FHIR runner's view of the `resources` collection:
+/// every live resource of one type for a tenant, as FHIR JSON with the
+/// server's `meta.versionId`/`meta.lastUpdated` merged in (a `since` filter
+/// reads the latter). Backs the compartment-filter fallback in
+/// [`MongoBackend::sof_runner`](crate::core::ResourceStorage::sof_runner).
+struct MongoResourceScan {
+    client: std::sync::Arc<tokio::sync::OnceCell<mongodb::Client>>,
+    config: super::backend::MongoBackendConfig,
+}
+
+#[async_trait]
+impl crate::sof::in_process::ResourceScan for MongoResourceScan {
+    async fn scan_resources(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+    ) -> Result<Vec<Value>, crate::core::sof_runner::SofError> {
+        use crate::core::sof_runner::SofError;
+
+        let client = self
+            .client
+            .get_or_try_init(|| super::backend::connect_client(&self.config))
+            .await
+            .map_err(|e| SofError::Storage(e.to_string()))?;
+        let resources = client
+            .database(&self.config.database_name)
+            .collection::<Document>(MongoBackend::RESOURCES_COLLECTION);
+        let filter = doc! {
+            "tenant_id": tenant.tenant_id().as_str(),
+            "resource_type": resource_type,
+            "is_deleted": false,
+        };
+        let cursor = resources
+            .find(filter)
+            .await
+            .map_err(|e| SofError::Storage(e.to_string()))?;
+        let docs = collect_documents(cursor)
+            .await
+            .map_err(|e| SofError::Storage(e.to_string()))?;
+        docs.iter()
+            .map(|doc| {
+                document_to_stored_resource(doc, tenant, resource_type)
+                    .map(StoredResource::into_content_with_meta)
+                    .map_err(|e| SofError::Storage(e.to_string()))
+            })
+            .collect()
+    }
+}
+
 async fn begin_required_bundle_transaction_session(
     db: &mongodb::Database,
 ) -> Result<ClientSession, TransactionError> {
@@ -540,13 +589,25 @@ impl ResourceStorage for MongoBackend {
     }
 
     fn sof_runner(&self) -> Option<std::sync::Arc<dyn crate::core::sof_runner::SofRunner>> {
+        use crate::sof::in_process::{InProcessSofRunner, ResourceScan};
         use crate::sof::mongodb::MongoInDbRunner;
         // Native in-DB runner: compiles the ViewDefinition to an aggregation
-        // pipeline executed against the `resources` collection.
-        Some(std::sync::Arc::new(MongoInDbRunner::new(
-            self.client_cell(),
-            self.config().clone(),
-        )))
+        // pipeline executed against the `resources` collection. Patient/group
+        // compartment filters are the one thing the pipeline compiler does not
+        // cover, so runs carrying them go to the in-process engine over a scan
+        // of the same collection — the runner S3 uses for everything — rather
+        // than failing as uncompilable (the SQL Export UI's job-wide filters
+        // ended every such job as `failed` on this backend).
+        let scan: std::sync::Arc<dyn ResourceScan> = std::sync::Arc::new(MongoResourceScan {
+            client: self.client_cell(),
+            config: self.config().clone(),
+        });
+        let fallback =
+            InProcessSofRunner::new(scan, self.config().fhir_version, "mongo-in-process");
+        Some(std::sync::Arc::new(
+            MongoInDbRunner::new(self.client_cell(), self.config().clone())
+                .with_compartment_fallback(std::sync::Arc::new(fallback)),
+        ))
     }
 
     async fn create(
