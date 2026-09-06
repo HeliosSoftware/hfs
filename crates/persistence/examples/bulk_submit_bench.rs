@@ -9,8 +9,13 @@
 //! out of the loop: this measures the write path #947 is about, with no network
 //! or fixture-server variance between runs.
 //!
+//! The phase table needs `--cfg perf_phases`; without it the ingest still runs
+//! and reports its rate, but every phase reads zero (see
+//! [`helios_persistence::perf`] for why that is a cfg and not a feature).
+//!
 //! ```text
-//! cargo run --release -p helios-persistence --example bulk_submit_bench -- \
+//! RUSTFLAGS='--cfg perf_phases' \
+//!   cargo run --release -p helios-persistence --example bulk_submit_bench -- \
 //!     --db /tmp/bench.db --limit 30000 \
 //!     /path/to/CarePlan.ndjson /path/to/Condition.ndjson
 //! ```
@@ -239,6 +244,14 @@ async fn main() {
     println!();
     if args.no_phases {
         println!("(phase collection off)");
+    } else if !perf::enabled() {
+        println!(
+            "(no phase table: this binary was built without `--cfg perf_phases`, so the\n\
+             counters are compiled out. Rebuild with\n\
+             \x20   RUSTFLAGS='--cfg perf_phases' cargo run --release -p helios-persistence \\\n\
+             \x20       --example bulk_submit_bench -- ...\n\
+             The rate above is unaffected — that is the point of the flag.)"
+        );
     } else {
         print!("{}", perf::report(total_lines as u64, wall));
     }

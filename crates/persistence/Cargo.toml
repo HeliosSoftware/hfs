@@ -114,6 +114,13 @@ axum = { version = "0.8", optional = true }
 tower-http = { version = "0.6", features = ["cors"], optional = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
 
+# `--cfg perf_phases` gates the ingest phase counters (`src/perf.rs`). It is a
+# cfg rather than a cargo feature on purpose: `ci.yml`'s release build runs
+# `cargo build --workspace --all-features`, which would have switched a feature
+# on in every published binary and Docker image.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(perf_phases)'] }
+
 [package.metadata.docs.rs]
 features = ["sqlite", "postgres", "elasticsearch", "mongodb"]
 rustdoc-args = ["--cfg", "docsrs"]

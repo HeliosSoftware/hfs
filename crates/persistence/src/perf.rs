@@ -9,9 +9,23 @@
 //!
 //! Design constraints:
 //!
-//! * **Zero cost when off.** Every call site starts with one relaxed atomic
-//!   load. `HFS_PERF_PHASES=1` (read once, at first use) turns collection on;
-//!   with it unset the guards return `None` and no clock is read.
+//! * **Absent unless asked for.** The whole thing is behind `--cfg
+//!   perf_phases`, *not* a cargo feature. Release artifacts are built with
+//!   `cargo build --workspace --all-features --release` (`ci.yml`, the `build`
+//!   job whose output the `release` job publishes and the Docker images copy),
+//!   and `--all-features` enables every feature there is — so a feature could
+//!   not have kept this out of a shipped binary. A `cfg` flag can, for the
+//!   same reason `tokio_unstable` is one. Without it [`enabled`] is a compile
+//!   time `false`, every guard folds away, and the counters are never
+//!   referenced.
+//!
+//!       RUSTFLAGS='--cfg perf_phases' cargo run --release -p helios-persistence \
+//!           --example bulk_submit_bench -- --limit 25000 CarePlan.ndjson
+//!
+//! * **Zero cost when built in but switched off.** Every call site starts with
+//!   one relaxed atomic load. `HFS_PERF_PHASES=1` (read once, at first use)
+//!   turns collection on; with it unset the guards return `None` and no clock
+//!   is read.
 //! * **Process-global, lock-free.** Counters are plain `AtomicU64` pairs
 //!   (nanos, hits) indexed by phase, so instrumented code can sit inside a
 //!   `&self` method on a shared backend without threading a profiler handle
@@ -20,7 +34,9 @@
 //!   encloses another double-counts by design. [`Phase::nested_in`] declares
 //!   the containment, and the report renders children indented under their
 //!   parent instead of pretending the columns sum to the wall clock.
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+#[cfg(perf_phases)]
+use std::sync::atomic::{AtomicBool, AtomicUsize};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 /// One measured step of the ingest write path.
@@ -152,11 +168,14 @@ static HITS: [AtomicU64; PHASE_COUNT] = [ZERO; PHASE_COUNT];
 /// (index rows per resource, above all).
 static ROWS: [AtomicU64; PHASE_COUNT] = [ZERO; PHASE_COUNT];
 
+#[cfg(perf_phases)]
 static ENABLED: AtomicBool = AtomicBool::new(false);
+#[cfg(perf_phases)]
 static ENABLED_INIT: AtomicUsize = AtomicUsize::new(0);
 
 /// Whether phase collection is on. Set by `HFS_PERF_PHASES` (`1`/`true`), read
 /// once per process; [`set_enabled`] overrides it for in-process harnesses.
+#[cfg(perf_phases)]
 #[inline]
 pub fn enabled() -> bool {
     if ENABLED_INIT.load(Ordering::Relaxed) == 0 {
@@ -165,6 +184,18 @@ pub fn enabled() -> bool {
     ENABLED.load(Ordering::Relaxed)
 }
 
+/// Constant `false` in a build without `--cfg perf_phases`, which is every
+/// build that is not explicitly a profiling one. Each call site is
+/// `if !enabled() { return None; }`, so this folds the guard, the clock read,
+/// and the counter update out of the binary — there is nothing left to switch
+/// on, and `HFS_PERF_PHASES` is not read or even present in the executable.
+#[cfg(not(perf_phases))]
+#[inline(always)]
+pub fn enabled() -> bool {
+    false
+}
+
+#[cfg(perf_phases)]
 #[cold]
 fn init_from_env() {
     let on = std::env::var("HFS_PERF_PHASES")
@@ -178,10 +209,18 @@ fn init_from_env() {
 }
 
 /// Turns collection on or off explicitly (benchmark harnesses, tests).
+#[cfg(perf_phases)]
 pub fn set_enabled(on: bool) {
     ENABLED.store(on, Ordering::Relaxed);
     ENABLED_INIT.store(1, Ordering::Relaxed);
 }
+
+/// No-op without `--cfg perf_phases`: there is no switch to throw, because
+/// there are no call sites left to record. A harness that calls this and then
+/// finds [`snapshot`] all zeros was built without the flag — see the module
+/// docs for the invocation.
+#[cfg(not(perf_phases))]
+pub fn set_enabled(_on: bool) {}
 
 /// A running phase measurement. Adds its elapsed time to the phase on drop.
 pub struct Span {
@@ -334,8 +373,10 @@ mod tests {
     /// The exact-equality assertions below hold only because `Span::drop`
     /// re-checks the switch: with collection off, a span another thread
     /// started while it was on cannot land a sample afterwards.
+    #[cfg(perf_phases)]
     static SWITCH: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
+    #[cfg(perf_phases)]
     #[test]
     fn disabled_collection_records_nothing() {
         let _guard = SWITCH.lock();
@@ -350,6 +391,7 @@ mod tests {
         assert_eq!(snapshot()[Phase::Commit as usize].hits, before);
     }
 
+    #[cfg(perf_phases)]
     #[test]
     fn enabled_collection_accumulates_time_and_rows() {
         let _guard = SWITCH.lock();
@@ -388,6 +430,7 @@ mod tests {
 
     /// `reset()` zeroes every counter. Run under the switch lock and with
     /// collection off, so nothing else can be writing while it is checked.
+    #[cfg(perf_phases)]
     #[test]
     fn reset_zeroes_every_counter() {
         let _guard = SWITCH.lock();
@@ -402,6 +445,28 @@ mod tests {
             snapshot()
                 .iter()
                 .all(|t| t.hits == 0 && t.rows == 0 && t.elapsed == Duration::ZERO)
+        );
+    }
+
+    /// The property release artifacts depend on: without `--cfg perf_phases`
+    /// nothing records, and `set_enabled` cannot change that. `ci.yml` builds
+    /// them with `--all-features`, so this must not be reachable through any
+    /// feature combination.
+    #[cfg(not(perf_phases))]
+    #[test]
+    fn without_the_cfg_nothing_records_even_when_switched_on() {
+        set_enabled(true);
+        {
+            let _s = span(Phase::Commit);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        add_rows(Phase::IndexInsert, 14);
+        assert!(!enabled());
+        assert!(
+            snapshot()
+                .iter()
+                .all(|t| t.hits == 0 && t.rows == 0 && t.elapsed == Duration::ZERO),
+            "a build without --cfg perf_phases must record nothing"
         );
     }
 
