@@ -53,6 +53,10 @@ use crate::types::StoredResource;
 use super::storage::CompositeStorage;
 use super::sync::SyncEvent;
 
+/// One batch of ingested resources bound for the secondaries: the resource
+/// type and FHIR version they share, and their `(id, content)` pairs.
+type SyncGroup = ((String, FhirVersion), Vec<(String, Value)>);
+
 /// The composite's `$bulk-submit` job store: the primary's engine for all
 /// state and ingestion, plus secondary-index sync at manifest boundaries.
 pub struct CompositeSubmitJobs {
@@ -105,6 +109,11 @@ impl CompositeSubmitJobs {
                 }
             };
             let n = batch.len() as u32;
+            // One batch per (type, FHIR version) per page, so the secondary
+            // takes a page of ingested resources as one write rather than one
+            // synchronous event each — under Elasticsearch `refresh=wait_for`
+            // that is one refresh wait per page instead of per resource.
+            let mut by_type: Vec<SyncGroup> = Vec::new();
             for entry in batch {
                 let Some(resource_id) = entry.resource_id else {
                     continue;
@@ -112,7 +121,30 @@ impl CompositeSubmitJobs {
                 if !seen.insert((entry.resource_type.clone(), resource_id.clone())) {
                     continue;
                 }
-                self.sync_one(lease, &entry.resource_type, &resource_id)
+                let Some(stored) = self
+                    .read_ingested(lease, &entry.resource_type, &resource_id)
+                    .await
+                else {
+                    continue;
+                };
+                let key = (entry.resource_type.clone(), stored.fhir_version());
+                let group = match by_type.iter_mut().find(|(k, _)| *k == key) {
+                    Some(group) => group,
+                    None => {
+                        by_type.push((key, Vec::new()));
+                        by_type.last_mut().expect("just pushed")
+                    }
+                };
+                group.1.push((resource_id, stored.content().clone()));
+            }
+            for ((resource_type, fhir_version), resources) in by_type {
+                self.composite
+                    .sync_creates_to_secondaries(
+                        &lease.tenant,
+                        &resource_type,
+                        fhir_version,
+                        resources,
+                    )
                     .await;
             }
             if n < limit {
@@ -122,15 +154,21 @@ impl CompositeSubmitJobs {
         }
     }
 
-    /// Reads one resource from the primary and emits the matching sync event.
-    async fn sync_one(&self, lease: &ManifestLease, resource_type: &str, resource_id: &str) {
-        let stored = match self
+    /// Reads one ingested resource back from the primary for syncing. A
+    /// resource deleted (or rolled back) since ingestion is reflected as a
+    /// delete on the secondaries instead, and `None` is returned.
+    async fn read_ingested(
+        &self,
+        lease: &ManifestLease,
+        resource_type: &str,
+        resource_id: &str,
+    ) -> Option<StoredResource> {
+        match self
             .primary
             .read(&lease.tenant, resource_type, resource_id)
             .await
         {
-            Ok(Some(stored)) => stored,
-            // Deleted (or rolled back) since ingestion — reflect that instead.
+            Ok(Some(stored)) => Some(stored),
             Ok(None) | Err(_) => {
                 let _ = self
                     .composite
@@ -140,26 +178,8 @@ impl CompositeSubmitJobs {
                         tenant_id: lease.tenant.tenant_id().clone(),
                     })
                     .await;
-                return;
+                None
             }
-        };
-        if let Err(e) = self
-            .composite
-            .sync_to_secondaries(SyncEvent::Create {
-                resource_type: resource_type.to_string(),
-                resource_id: resource_id.to_string(),
-                content: stored.content().clone(),
-                tenant_id: lease.tenant.tenant_id().clone(),
-                fhir_version: stored.fhir_version(),
-            })
-            .await
-        {
-            warn!(
-                resource_type,
-                resource_id,
-                error = %e,
-                "secondary sync of an ingested resource failed; repair via $reindex"
-            );
         }
     }
 }

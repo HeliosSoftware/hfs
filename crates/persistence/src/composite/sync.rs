@@ -328,13 +328,13 @@ impl SyncManager {
         tenant_id: &TenantId,
         resource_type: &str,
         fhir_version: FhirVersion,
-        resources: Vec<StoredResource>,
+        resources: Vec<(String, Value)>,
         backends: &HashMap<String, Arc<dyn ResourceStorage + Send + Sync>>,
     ) -> StorageResult<Vec<SyncStatus>> {
-        let create_event = |resource: &StoredResource| SyncEvent::Create {
+        let create_event = |(id, content): &(String, Value)| SyncEvent::Create {
             resource_type: resource_type.to_string(),
-            resource_id: resource.id().to_string(),
-            content: resource.content().clone(),
+            resource_id: id.clone(),
+            content: content.clone(),
             tenant_id: tenant_id.clone(),
             fhir_version,
         };
@@ -374,7 +374,10 @@ impl SyncManager {
 
             tasks.spawn(async move {
                 let start = std::time::Instant::now();
-                let contents = resources.iter().map(|r| r.content().clone()).collect();
+                let contents = resources
+                    .iter()
+                    .map(|(_, content)| content.clone())
+                    .collect();
                 let results = backend
                     .create_many(&tenant, &resource_type, contents, fhir_version)
                     .await;
@@ -382,7 +385,7 @@ impl SyncManager {
                 let mut synced = 0;
                 let mut errors = 0;
                 let mut last_error = None;
-                for (resource, result) in resources.iter().zip(results) {
+                for ((resource_id, content), result) in resources.iter().zip(results) {
                     let Err(batch_error) = result else {
                         synced += 1;
                         continue;
@@ -390,14 +393,14 @@ impl SyncManager {
                     warn!(
                         backend_id = %backend_id,
                         resource_type = %resource_type,
-                        resource_id = %resource.id(),
+                        resource_id = %resource_id,
                         error = %batch_error,
                         "Batch sync rejected a resource; retrying it individually"
                     );
                     let event = SyncEvent::Create {
                         resource_type: resource_type.clone(),
-                        resource_id: resource.id().to_string(),
-                        content: resource.content().clone(),
+                        resource_id: resource_id.clone(),
+                        content: content.clone(),
                         tenant_id: tenant.tenant_id().clone(),
                         fhir_version,
                     };
