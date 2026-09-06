@@ -4205,3 +4205,92 @@ mod cross_tenant_search_isolation {
         );
     }
 }
+
+/// Inferno US Core's `_lastUpdated` search: a resource's own
+/// `meta.lastUpdated`, searched with `eq` at millisecond precision, must find
+/// that resource and only resources sharing that millisecond. Two things
+/// broke this: the date handler compared through `datetime()`, which drops
+/// fractional seconds (so a whole second matched), and the `last_updated`
+/// column carried nanoseconds that SQLite rounds to the nearest millisecond
+/// while `meta.lastUpdated` truncates — off by one millisecond either way.
+mod last_updated_millisecond_precision {
+    use super::*;
+    use helios_persistence::core::SearchProvider;
+    use helios_persistence::types::{
+        SearchParamType, SearchParameter, SearchPrefix, SearchQuery, SearchValue,
+    };
+
+    fn last_updated_query(prefix: SearchPrefix, value: &str) -> SearchQuery {
+        SearchQuery::new("Patient").with_parameter(SearchParameter {
+            name: "_lastUpdated".to_string(),
+            param_type: SearchParamType::Date,
+            modifier: None,
+            values: vec![SearchValue::new(prefix, value)],
+            chain: vec![],
+            components: vec![],
+        })
+    }
+
+    fn bump_millis(instant: &str, delta_ms: i64) -> String {
+        let parsed = chrono::DateTime::parse_from_rfc3339(instant).expect("rfc3339");
+        (parsed + chrono::Duration::milliseconds(delta_ms))
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+    }
+
+    #[tokio::test]
+    async fn eq_on_a_resources_own_last_updated_finds_exactly_that_millisecond() {
+        let backend = create_backend();
+        let tenant = create_tenant("ms-precision");
+
+        // Several resources written back to back land in the same second.
+        let mut ids = Vec::new();
+        for i in 0..5 {
+            let stored = backend
+                .create(
+                    &tenant,
+                    "Patient",
+                    json!({"resourceType": "Patient", "id": format!("ms-{i}")}),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+            let last_updated = stored.content_with_meta()["meta"]["lastUpdated"]
+                .as_str()
+                .expect("meta.lastUpdated")
+                .to_string();
+            ids.push((stored.id().to_string(), last_updated));
+        }
+
+        for (id, last_updated) in &ids {
+            let found = backend
+                .search(&tenant, &last_updated_query(SearchPrefix::Eq, last_updated))
+                .await
+                .unwrap();
+            let found_ids: Vec<&str> = found.resources.items.iter().map(|r| r.id()).collect();
+            assert!(
+                found_ids.contains(&id.as_str()),
+                "{id} must match its own lastUpdated {last_updated}, got {found_ids:?}"
+            );
+            for item in &found.resources.items {
+                assert_eq!(
+                    item.content_with_meta()["meta"]["lastUpdated"].as_str(),
+                    Some(last_updated.as_str()),
+                    "eq at millisecond precision must not return another millisecond"
+                );
+            }
+
+            // The neighbouring milliseconds are not this resource.
+            for delta in [-1, 1] {
+                let neighbour = bump_millis(last_updated, delta);
+                let found = backend
+                    .search(&tenant, &last_updated_query(SearchPrefix::Eq, &neighbour))
+                    .await
+                    .unwrap();
+                assert!(
+                    !found.resources.items.iter().any(|r| r.id() == id),
+                    "{id} ({last_updated}) must not match {neighbour}"
+                );
+            }
+        }
+    }
+}
