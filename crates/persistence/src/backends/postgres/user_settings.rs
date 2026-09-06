@@ -2,9 +2,13 @@
 //!
 //! Each user owns a single row in the `user_settings` table holding an opaque
 //! JSONB document plus a monotonic `version` used for optimistic locking. Writes
-//! run a `SELECT … FOR UPDATE` read-modify-write inside a transaction so
-//! concurrent updates to the same user serialize correctly and the `If-Match`
-//! precondition is checked against the live row.
+//! take a transaction-scoped, two-part `pg_advisory_xact_lock` — this module's
+//! [`USER_SETTINGS_LOCK_NAMESPACE`] paired with `hashtext(user_key)` — before
+//! the read-modify-write, then run a `SELECT … FOR UPDATE` inside that same
+//! transaction so concurrent updates to the same user serialize correctly and
+//! the `If-Match` precondition is checked against the live row — the advisory
+//! lock is what makes that true even for a user's very first write, where
+//! `FOR UPDATE` has no row yet to lock (see [`PostgresBackend::write_settings`]).
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -17,6 +21,23 @@ use crate::error::{BackendError, ConcurrencyError, StorageError, StorageResult};
 
 use super::PostgresBackend;
 
+/// First key of the two-part [`pg_advisory_xact_lock`][pg-advisory] this module
+/// takes in [`PostgresBackend::write_settings`].
+///
+/// PostgreSQL keeps the single-bigint-key form (used by the migration lock in
+/// [`schema::MIGRATION_LOCK_KEY`](super::schema)) and the two-int4-key form in
+/// entirely separate lock spaces, so `user_settings`' locks can never collide
+/// with the migration lock regardless of this constant's value. What this
+/// namespace guards against is a *future* two-int4-key advisory lock elsewhere
+/// in HFS: pairing every `user_settings` lock with this fixed first key
+/// reserves it as this module's own sub-space of the two-key form, so a later
+/// caller's second key — whatever it hashes to — can never land on a key this
+/// module also holds. Arbitrary but must stay stable across releases: changing
+/// it only changes which in-flight locks a rolling deploy's old and new
+/// instances fail to recognize as the same key, which matters only while an
+/// upgrade is in progress.
+const USER_SETTINGS_LOCK_NAMESPACE: i32 = 0x4855_5354; // "HUST" (HFS User SeTtings)
+
 impl PostgresBackend {
     /// Read-modify-write a user's settings document inside a single transaction,
     /// locking the row with `SELECT … FOR UPDATE`.
@@ -25,6 +46,25 @@ impl PostgresBackend {
     /// has no settings yet) and returns the document to persist. The optimistic
     /// `if_match_version` precondition — where `Some(0)` asserts "does not yet
     /// exist" — is checked against the locked row before `compute` runs.
+    ///
+    /// Before that `SELECT`, this takes a transaction-scoped
+    /// [`pg_advisory_xact_lock`][pg-advisory] keyed on
+    /// `(USER_SETTINGS_LOCK_NAMESPACE, hashtext(user_key))`: `FOR UPDATE`
+    /// only blocks on a row that already exists, so two concurrent writers
+    /// creating the *same* user's first document both read `None`, both compute
+    /// `new_version = 1`, and the `INSERT … ON CONFLICT DO UPDATE` loser
+    /// silently clobbers the winner instead of hitting the `if_match_version`
+    /// check. The advisory lock closes that gap by serializing the whole
+    /// read-modify-write — including the case with no row to lock — per user
+    /// key. It is released automatically on commit or rollback (the `_xact`
+    /// variant), never needs an explicit unlock, and is cheap because
+    /// PostgreSQL hashes the lock id into an in-memory table rather than
+    /// touching disk. Under `READ COMMITTED` (this pool's default), the
+    /// `SELECT` that runs once the lock is acquired sees a fresh snapshot that
+    /// already includes whatever the previous holder committed, so the second
+    /// writer correctly observes the row the first one just created.
+    ///
+    /// [pg-advisory]: https://www.postgresql.org/docs/current/explicit-locking.html#ADVISORY-LOCKS
     async fn write_settings(
         &self,
         user_key: &str,
@@ -36,6 +76,21 @@ impl PostgresBackend {
             .transaction()
             .await
             .map_err(|e| backend_err(format!("begin user_settings transaction: {e}")))?;
+
+        // `hashtext` folds the user key into an `int4` lock id computed by the
+        // server, so every HFS instance — even a different version mid rolling
+        // deploy — hashes a given `user_key` to the same id; see
+        // `USER_SETTINGS_LOCK_NAMESPACE` for why it is paired with a fixed
+        // first key. Collisions between unrelated users are possible but
+        // harmless: they only cause writes to two different users to
+        // serialize against each other on rare hash collisions, never a
+        // correctness issue.
+        txn.execute(
+            "SELECT pg_advisory_xact_lock($1, hashtext($2))",
+            &[&USER_SETTINGS_LOCK_NAMESPACE, &user_key],
+        )
+        .await
+        .map_err(|e| backend_err(format!("lock user_settings: {e}")))?;
 
         let current = txn
             .query_opt(
@@ -95,6 +150,18 @@ impl PostgresBackend {
     /// an offboarding must not be able to half-apply, leaving a tenant's saved
     /// queries behind after its records are gone. `FOR UPDATE` serialises against
     /// a concurrent `/_user/settings` write, which locks the same rows.
+    ///
+    /// Deliberately does *not* take [`write_settings`](Self::write_settings)'s
+    /// per-user `pg_advisory_xact_lock` before its bulk `FOR UPDATE`: doing so
+    /// would need one lock per existing row, for no benefit — a purge has no
+    /// "row does not exist yet" case to protect against, since it only ever
+    /// touches rows a `SELECT` already found. Skipping it also rules out a
+    /// deadlock between the two paths. A writer only ever waits on its own
+    /// resources, in order (its advisory lock, then its own row); a purge only
+    /// ever waits on rows locked by another transaction. So the one lock a
+    /// blocked writer can be holding while it waits — its advisory lock — is
+    /// never something a purge waits on, which is what would be required to
+    /// close a cycle.
     ///
     /// The edit is done on a parsed `Value` via the shared
     /// [`purge_tenant_subtree`] rather than with `jsonb #-`, for two reasons: all
