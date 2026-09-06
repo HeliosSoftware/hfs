@@ -191,6 +191,14 @@ pub struct Span {
 
 impl Drop for Span {
     fn drop(&mut self) {
+        // Re-check the switch. A span can outlive it — collection is turned
+        // off while this one is in flight — and "stop collecting" has to mean
+        // that, or a sample lands after the caller believes recording has
+        // stopped. The load is only reached when a `Span` exists at all, which
+        // already implies collection was on.
+        if !enabled() {
+            return;
+        }
         let idx = self.phase as usize;
         NANOS[idx].fetch_add(self.start.elapsed().as_nanos() as u64, Ordering::Relaxed);
         HITS[idx].fetch_add(1, Ordering::Relaxed);
@@ -313,32 +321,88 @@ pub fn report(resources: u64, wall: Duration) -> String {
 mod tests {
     use super::*;
 
+    /// The counters are process-global by design, and `cargo test` runs a
+    /// crate's tests as threads of one process. So while these tests have
+    /// collection switched on, *every other test in the crate* that performs
+    /// an indexed write also lands hits and rows in the same counters — this
+    /// module's first version asserted `rows == 14` and CI duly reported 15.
+    ///
+    /// Two rules follow, and both matter: the tests here take this lock so no
+    /// two of them disagree about whether collection is on, and they assert on
+    /// *deltas* they caused rather than on absolute totals they do not own.
+    ///
+    /// The exact-equality assertions below hold only because `Span::drop`
+    /// re-checks the switch: with collection off, a span another thread
+    /// started while it was on cannot land a sample afterwards.
+    static SWITCH: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
     #[test]
     fn disabled_collection_records_nothing() {
+        let _guard = SWITCH.lock();
         set_enabled(false);
-        reset();
+        let before = snapshot()[Phase::Commit as usize].hits;
         {
             let _s = span(Phase::Commit);
             std::thread::sleep(Duration::from_millis(1));
         }
-        assert_eq!(snapshot()[Phase::Commit as usize].hits, 0);
+        // Exact, not a bound: with the switch held off, no thread in the
+        // process can be recording.
+        assert_eq!(snapshot()[Phase::Commit as usize].hits, before);
     }
 
     #[test]
     fn enabled_collection_accumulates_time_and_rows() {
+        let _guard = SWITCH.lock();
+        let idx = Phase::IndexInsert as usize;
         set_enabled(true);
-        reset();
+        let before = snapshot()[idx];
         {
             let _s = span(Phase::IndexInsert);
             std::thread::sleep(Duration::from_millis(2));
         }
         add_rows(Phase::IndexInsert, 14);
-        let totals = snapshot();
-        let idx = Phase::IndexInsert as usize;
-        assert_eq!(totals[idx].hits, 1);
-        assert_eq!(totals[idx].rows, 14);
-        assert!(totals[idx].elapsed >= Duration::from_millis(1));
+        let after = snapshot()[idx];
         set_enabled(false);
+
+        // `>=`, because a concurrent test writing search-index rows adds to
+        // these same counters while the switch is on.
+        assert!(
+            after.hits > before.hits,
+            "hits {} -> {}",
+            before.hits,
+            after.hits
+        );
+        assert!(
+            after.rows >= before.rows + 14,
+            "rows {} -> {}",
+            before.rows,
+            after.rows
+        );
+        assert!(
+            after.elapsed >= before.elapsed + Duration::from_millis(1),
+            "elapsed {:?} -> {:?}",
+            before.elapsed,
+            after.elapsed
+        );
+    }
+
+    /// `reset()` zeroes every counter. Run under the switch lock and with
+    /// collection off, so nothing else can be writing while it is checked.
+    #[test]
+    fn reset_zeroes_every_counter() {
+        let _guard = SWITCH.lock();
+        set_enabled(true);
+        {
+            let _s = span(Phase::Commit);
+        }
+        add_rows(Phase::IndexInsert, 3);
+        set_enabled(false);
+        reset();
+        assert!(
+            snapshot()
+                .iter()
+                .all(|t| t.hits == 0 && t.rows == 0 && t.elapsed == Duration::ZERO)
+        );
     }
 
     #[test]
