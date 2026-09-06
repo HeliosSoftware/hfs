@@ -9,6 +9,17 @@
 })(typeof window !== "undefined" ? window : null, function () {
   "use strict";
 
+  // #842: whether choosing one more option, on top of `currentCount`
+  // already selected, must first clear the field instead of adding —
+  // single-value mode (`data-combobox-max="1"`) once it already holds one.
+  // `max <= 0` (every caller before #842's own *Add table* field) never
+  // hits capacity, matching this field's pre-#842 unlimited behavior
+  // exactly. Exported (and used by `add()` below, never duplicated) so a
+  // Node unit test can exercise the single-value decision without a DOM.
+  function atCapacity(currentCount, max) {
+    return max > 0 && currentCount >= max;
+  }
+
   function parseValues(value) {
     var seen = Object.create(null);
     return String(value || "")
@@ -29,6 +40,15 @@
     return option.getAttribute("data-label") || option.textContent.trim();
   }
 
+  // #842: only `table_options` (`lookup_options.html`) ever sets
+  // `data-name` — the bare artifact name, distinct from `optionLabel`'s own
+  // " — ViewDefinition"/" — SQL View" suffix (see `LookupOption::name`'s own
+  // doc comment, `crates/ui/src/lookup.rs`). Every other option (Patient,
+  // Group) carries none, so this is `""` for them.
+  function optionName(option) {
+    return option.getAttribute("data-name") || "";
+  }
+
   function initialize(root) {
     if (root.getAttribute("data-combobox-ready") === "true") return;
 
@@ -44,6 +64,24 @@
     var status = root.querySelector("[data-combobox-status]");
     if (!name || !queryName || !fallback || !fallbackInput || !enhancement || !input || !listbox || !responseMessage || !selections || !status) return;
 
+    // #842: `data-combobox-max="1"` (the only value any caller sets today)
+    // switches this instance to single-value mode — choosing an option
+    // replaces the current selection rather than adding to it, so `values`
+    // never holds more than one entry. `0` (the default, every other
+    // caller) means unlimited, matching this field's pre-#842 behavior
+    // exactly.
+    var max = parseInt(root.getAttribute("data-combobox-max"), 10) || 0;
+    // #842: `data-combobox-form` — set only by a caller whose fieldset sits
+    // outside the `<form>` it submits with (`sql_tables_card.html`'s own
+    // "form-associated" fields, `form="lib-editor-form"` on each of its
+    // siblings). Every hidden input `render()` creates below needs the same
+    // `form` attribute the fallback textarea already carries, or neither a
+    // plain submit nor `hx-include="#{form}"` (which serializes via the
+    // browser's own `FormData(form)`, form-associated elements only) ever
+    // sees a selection made through this field. Absent for every caller
+    // whose fieldset already lives inside its `<form>` (Bulk Export, SQL
+    // Export) — natural descendants need no explicit association.
+    var formId = root.getAttribute("data-combobox-form") || "";
     var values = [];
     var activeIndex = -1;
 
@@ -147,6 +185,7 @@
         hidden.name = name;
         hidden.value = item.value;
         hidden.setAttribute("data-combobox-selected-input", "");
+        if (formId) hidden.setAttribute("form", formId);
         root.appendChild(hidden);
 
         var chip = ownerDocument.createElement("span");
@@ -172,6 +211,9 @@
 
     function add(value, label, announce) {
       if (!value || values.some(function (item) { return item.value === value; })) return false;
+      // #842: single-value mode — choosing an option replaces whatever was
+      // already selected instead of adding a second chip.
+      if (atCapacity(values.length, max)) values = [];
       values.push({ value: value, label: label || value });
       render();
       if (announce) message("added", label || value);
@@ -191,7 +233,19 @@
 
     function select(option) {
       var value = optionValue(option);
-      add(value, optionLabel(option), true);
+      var label = optionLabel(option);
+      var added = add(value, label, true);
+      // #842: only on an actual selection (never a repeat click on the
+      // option already chosen, which `add` no-ops) — the payload a caller
+      // like `sql-library-panels.js` needs to autofill a sibling field from
+      // the option's own bare name, distinct from `hfs:combobox-change`'s
+      // whole-values-list payload every combobox already emits.
+      if (added) {
+        root.dispatchEvent(new CustomEvent("hfs:combobox-select", {
+          bubbles: true,
+          detail: { value: value, label: label, name: optionName(option) },
+        }));
+      }
       // Keep results open so another item can be chosen without repeating the
       // query. Escape, Tab and outside clicks remain the explicit close paths.
       setActive(-1);
@@ -301,5 +355,26 @@
     });
   }
 
-  return { install: install, parseValues: parseValues };
+  // #842/04: an htmx OOB swap (`sql_tables_card.html`'s own `#lib-tables`,
+  // re-rendered whenever the unknown-table lint's own findings change the
+  // Tables panel's signature) replaces a `[data-combobox]` field with a
+  // fresh, un-enhanced one straight from the server — `initialize()` never
+  // ran on it, so it would stay the plain fallback textarea, disabled
+  // search input and all. `event.target` is the settled swapped-in element
+  // itself (the same idiom `sql-editor.js`/`sql-library-panels.js` already
+  // use for their own `htmx:afterSwap` listeners), so `install(target)`
+  // only ever re-scans a freshly inserted subtree — never `document` as a
+  // whole, which would re-register `install`'s own `click` listener on it
+  // every single swap. `initialize()`'s own `data-combobox-ready` guard
+  // makes this safe to call on content that already contains a live,
+  // enhanced combobox (a swap elsewhere on the page that happens to be an
+  // ancestor of one) — it simply does nothing for those.
+  if (typeof document !== "undefined") {
+    document.addEventListener("htmx:afterSwap", function (event) {
+      var target = event.target;
+      if (target && typeof target.querySelectorAll === "function") install(target);
+    });
+  }
+
+  return { install: install, parseValues: parseValues, atCapacity: atCapacity };
 });

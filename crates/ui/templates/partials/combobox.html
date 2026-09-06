@@ -3,10 +3,32 @@
   domain copy and the HTML-fragment endpoint; combobox.js owns only generic
   selection and keyboard behavior. The fallback textarea remains the usable
   control until JavaScript completes initialization.
+
+  `max` (#842, default `"0"` — unlimited, every caller before #842's own
+  *Add table* field): when set to `"1"`, `combobox.js` runs in single-value
+  mode — choosing an option replaces the current selection instead of
+  adding to it, so the field always carries at most one chip/hidden input,
+  and it fires its own `hfs:combobox-select` event (`{value, label, name}`)
+  on every choice, for a caller that needs to react to *which* option was
+  picked (`sql-library-panels.js`'s own alias autocomplete) rather than
+  just the resulting value list `hfs:combobox-change` already reports.
+
+  `form` (#842, default `""`): the id of the `<form>` this field submits
+  with, needed only when this fieldset itself sits *outside* that form —
+  `sql_tables_card.html`'s own *Add table* field, whose siblings are each
+  explicitly form-associated (`form="lib-editor-form"`) rather than nested
+  inside a `<form>` the way every caller before it is (Bulk Export, SQL
+  Export). Threads onto the fallback textarea directly, and onto
+  `data-combobox-form` for `combobox.js` to carry onto every hidden input it
+  creates — without it, neither a plain submit nor `hx-include="#{form}"`
+  (which serializes via the browser's own `FormData(form)`, form-associated
+  elements only) ever sees a selection made through this field.
 -->
-{% macro multi_select(id, name, label, placeholder, hint, fallback_placeholder, fallback_hint, endpoint, extra_class="", alternate_hint="", alternate_placeholder="", query_name="q", initial_value="") %}
+{% macro multi_select(id, name, label, placeholder, hint, fallback_placeholder, fallback_hint, endpoint, extra_class="", alternate_hint="", alternate_placeholder="", query_name="q", initial_value="", max="0", form="") %}
 <fieldset id="{{ id }}" class="field combobox{% if !extra_class.is_empty() %} {{ extra_class }}{% endif %}"
           data-combobox data-combobox-name="{{ name }}" data-combobox-query-name="{{ query_name }}"
+          {% if max != "0" %}data-combobox-max="{{ max }}"{% endif %}
+          {% if !form.is_empty() %}data-combobox-form="{{ form }}"{% endif %}
           {% if !alternate_hint.is_empty() %}data-combobox-alternate-hint="{{ alternate_hint }}"{% endif %}
           {% if !alternate_placeholder.is_empty() %}data-combobox-alternate-placeholder="{{ alternate_placeholder }}"{% endif %}
           data-combobox-added-message="{{ i18n.t("ui-combobox-added") }}"
@@ -19,6 +41,7 @@
 
   <div data-combobox-fallback>
     <textarea class="field__input" name="{{ name }}" rows="2"
+              {% if !form.is_empty() %}form="{{ form }}"{% endif %}
               placeholder="{{ fallback_placeholder }}"
               aria-labelledby="{{ id }}-label"
               aria-describedby="{{ id }}-fallback-hint">{{ initial_value }}</textarea>

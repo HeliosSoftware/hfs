@@ -1,0 +1,114 @@
+{% import "partials/sql_parameter_fields.html" as param_fields %}
+{#
+  The Parameters card (#841, SQL Query only — `sql-library.html` never
+  includes this for SQL Views, since `LibraryKind::declares_parameters` is
+  `false` there): one `.field` per `Library.parameter[use=in]` declaration
+  for this run's own values (`sql_parameter_fields.html`, `prefix="param"`,
+  `form="lib-editor-form"` — the same shared partial #837's SQL Export
+  builder uses), the `:name` placeholders the SQL uses but does not declare
+  as one-click *Declare* hints, and the *Add parameter* panel that writes a
+  fresh declaration into the Details document.
+
+  Rendered three ways, all built by `crate::build_params_card` from one
+  `crate::ParamsAnalysis` so none of them can disagree about what is
+  declared or what the signature is:
+    - The page's own inline render (`oob: false`, `data_document: None`) —
+      part of the normal document flow, nothing to swap into.
+    - The `/run` fragment's OOB companion (`oob: true`) — only when the
+      freshly computed `signature` differs from what the browser posted
+      (`crate::sql_library_run`'s own comparison); typing a parameter value
+      never changes the signature, so the card never re-renders — and never
+      loses focus — just from that (#841's NF2).
+    - The `document` endpoint's own `HX-Request` response (`oob: false` —
+      the request's own `hx-target="#lib-params"` swaps this element
+      directly, no OOB needed): `data_document` carries the updated Details
+      JSON on a successful `add-parameter`, which `sql-library-panels.js`
+      applies through the JSON editor's own undo-tracked host
+      (`host.setDoc`) and then strips off this element.
+
+  The card itself carries the live-run wiring (#841): every value
+  field's own `input` event bubbles up to `hx-trigger="input delay:500ms"`
+  here, `hx-include="#lib-editor-form"` gathers the rest of the document
+  (Details JSON, SQL, every other declared value) the same way that form's
+  own JSON/SQL panes already do, and the response lands in `#run-notice`
+  exactly like every other edit on this page.
+
+  `Add parameter`/`Declare` are real `type="submit"` buttons —
+  `form="lib-editor-form"` and `formaction="{{ document_href }}"` — so both
+  work with no JavaScript at all (#841's NF3): a plain submit posts the
+  whole document to the `document` endpoint, which re-renders the entire
+  page with the mutation applied and nothing saved. With JavaScript, each
+  button's own `hx-post`/`hx-target="#lib-params"`/`hx-swap="outerHTML"`
+  intercepts that same submit and swaps only this card. A *Declare :name*
+  button carries no separate `op` field of its own — its `name="declare_param"
+  value="{{ hint }}"` pair alone is what `crate::sql_library_document` reads
+  as "add this name, type string" (#841); the *Add parameter*
+  panel's own button carries `name="op" value="add-parameter"` instead,
+  alongside the panel's own `param_name`/`param_type` fields.
+#}
+<section class="card" id="lib-params"{% if oob %} hx-swap-oob="outerHTML"{% endif %}{% if let Some(document) = data_document %} data-document="{{ document }}"{% endif %} hx-post="{{ run_href }}" hx-trigger="input delay:500ms" hx-include="#lib-editor-form" hx-target="#run-notice" hx-swap="outerHTML">
+  <div class="card-head">
+    <h3>
+      <span class="icon">{% include "icons/sliders.svg" %}</span>
+      {{ i18n.t("lib-params-heading") }}
+      <span class="toolbar__count">{{ fields.len() }}</span>
+    </h3>
+    <div class="card-head__tools">
+      <span class="card-head__meta">{{ i18n.t("lib-params-meta") }}</span>
+    </div>
+  </div>
+  <div class="card__body">
+    <input type="hidden" name="params_sig" form="lib-editor-form" value="{{ signature }}">
+
+    {% if fields.is_empty() && hints.is_empty() %}
+    <p class="page-head__lede">{{ i18n.t("lib-params-empty") }}</p>
+    {% else %}
+    {% if !fields.is_empty() %}
+    {% call param_fields::fields("param", &fields, "lib-editor-form") %}{% endcall %}
+    {% endif %}
+
+    {% for hint in hints %}
+    <div class="lib-params-hint">
+      <span>{{ i18n.t_arg("lib-params-hint", "name", hint.clone()) }}</span>
+      <button type="submit" class="btn" form="lib-editor-form" formaction="{{ document_href }}"
+              hx-post="{{ document_href }}" hx-include="#lib-editor-form"
+              hx-target="#lib-params" hx-swap="outerHTML"
+              name="declare_param" value="{{ hint }}">
+        {{ i18n.t_arg("lib-params-declare", "name", hint.clone()) }}
+      </button>
+    </div>
+    {% endfor %}
+    {% endif %}
+
+    <details class="editor-add"{% if add_open %} open{% endif %}>
+      <summary class="editor-add__toggle">+ {{ i18n.t("lib-params-add-toggle") }}</summary>
+      <div class="editor-add__panel">
+        <div class="lib-params-add__fields">
+          <label class="field">
+            <span class="field__label">{{ i18n.t("lib-params-add-name-label") }}</span>
+            <input class="field__input" type="text" name="param_name" form="lib-editor-form"
+                   value="{{ add_name }}" placeholder="ward" pattern="[A-Za-z][A-Za-z0-9_]*"
+                   {% if add_error.is_some() %} aria-invalid="true" aria-describedby="lib-params-add-error"{% endif %}>
+          </label>
+          <label class="field">
+            <span class="field__label">{{ i18n.t("lib-params-add-type-label") }}</span>
+            <select class="field__input" name="param_type" form="lib-editor-form">
+              {% for t in type_options %}
+              <option value="{{ t }}"{% if (!add_type.is_empty() && add_type == *t) || (add_type.is_empty() && *t == "string") %} selected{% endif %}>{{ t }}</option>
+              {% endfor %}
+            </select>
+          </label>
+        </div>
+        <div class="form-actions">
+          <button type="submit" class="btn btn--primary" form="lib-editor-form" formaction="{{ document_href }}"
+                  hx-post="{{ document_href }}" hx-include="#lib-editor-form"
+                  hx-target="#lib-params" hx-swap="outerHTML"
+                  name="op" value="add-parameter">
+            {{ i18n.t("lib-params-add-submit") }}
+          </button>
+        </div>
+        <span id="lib-params-add-error" class="field__hint field__hint--error" role="alert"{% if add_error.is_none() %} hidden{% endif %}>{% if let Some(message) = add_error %}{{ message }}{% endif %}</span>
+      </div>
+    </details>
+  </div>
+</section>

@@ -935,6 +935,70 @@ lib-details-json-heading = Library (JSON)
 lib-details-json-note = Das SQL-Attachment wird in der SQL-Karte unten bearbeitet und ist nicht Teil dieser Ansicht.
 lib-details-new-lede = Benennen Sie sie um und lassen Sie relatedArtifact[0] auf eine vorhandene ViewDefinition verweisen.
 lib-save-wrong-kind = Der SQL-on-FHIR-Library-Typ muss „{ $code }" sein, um sie hier zu speichern.
+lib-save-view-parameters = Ein SQL View kann keine Parameter deklarieren (SQLView-Profil, Library.parameter 0..0). Entfernen Sie parameter[] in Details.
+
+## Parameters-Karte (#841, nur SQL Query)
+
+lib-params-heading = Parameters
+lib-params-meta = auf der Library deklariert · die Werte unten gelten nur für diesen Lauf
+lib-params-empty = Keine Parameter deklariert. Fügen Sie hier oder in Details einen hinzu.
+lib-params-hint = :{ $name } wird im SQL verwendet, ist aber auf der Library nicht deklariert.
+lib-params-declare = :{ $name } deklarieren
+lib-params-add-toggle = Parameter hinzufügen
+lib-params-add-name-label = Name
+lib-params-add-type-label = Typ
+lib-params-add-submit = Hinzufügen
+lib-params-add-invalid-name = Parameternamen müssen ^[A-Za-z][A-Za-z0-9_]*$ entsprechen
+lib-params-add-duplicate = Ein Parameter namens { $name } ist bereits deklariert
+lib-params-add-unknown-type = Unbekannter Parametertyp
+lib-run-waiting = Warten auf einen Wert für { $names } – die Ergebnisse unten stammen vom letzten erfolgreichen Lauf.
+lib-run-unknown-table = Unbekannte Tabelle { $name } – Zeile { $line }. Deklarieren Sie sie unter Reads from oder korrigieren Sie den Namen. Ihre SQL-Abfrage ist unverändert; die Ergebnisse unten stammen vom letzten erfolgreichen Lauf.
+lib-run-unknown-table-more = Unbekannte Tabelle { $name } – Zeile { $line }.
+
+## Tabellenbereich (#842, beide Arten) — Reads from / Used by / Columns
+
+lib-tables-heading = Liest von
+lib-tables-col-alias = Alias
+lib-tables-col-target = Liest von
+lib-tables-no-alias = (kein Label)
+lib-tables-empty = Noch keine Tabellen deklariert.
+lib-tables-note = Jede Tabelle, die die SQL-Abfrage liest, als relatedArtifact-depends-on-Einträge: Alias links, die ViewDefinition oder SQL View, zu der es aufgelöst wird, rechts.
+lib-tables-remove = Entfernen
+lib-tables-kind-view-definition = ViewDefinition
+lib-tables-target-not-found = Nicht gefunden
+lib-tables-target-not-found-detail = Keine ViewDefinition oder SQL View entspricht { $resource }. Korrigieren Sie den kanonischen Wert in Details oder entfernen Sie die Zeile.
+lib-tables-target-not-a-table = Keine Tabelle
+lib-tables-target-not-a-table-detail = Es kann nur eine ViewDefinition oder eine SQL View gelesen werden.
+lib-tables-add-toggle = Tabelle hinzufügen
+lib-tables-add-table-label = Tabelle
+lib-tables-add-table-placeholder = View Definitions und SQL Views durchsuchen
+lib-tables-add-table-hint = Zum Suchen nach Namen tippen oder aus der Liste wählen.
+lib-tables-add-table-fallback-placeholder = ViewDefinition/{"{"}id{"}"} oder Library/{"{"}id{"}"}
+lib-tables-add-table-fallback-hint = Geben Sie eine ViewDefinition- oder SQL-View-Referenz ein.
+lib-tables-alias-label = Alias
+lib-tables-alias-hint = Standardmäßig der Name des Artefakts
+lib-tables-add-submit = Hinzufügen
+lib-tables-add-error-required = Wählen Sie eine ViewDefinition oder eine SQL View
+lib-tables-add-error-alias-required = Alias ist erforderlich
+lib-tables-add-error-alias-invalid = Der Alias muss ^[A-Za-z][A-Za-z0-9_]*$ entsprechen
+lib-tables-add-error-alias-duplicate = Der Alias { $alias } ist bereits deklariert
+lib-tables-options-empty = Keine Treffer.
+lib-tables-unknown = Unbekannte Tabelle
+lib-tables-unknown-detail = Wird in der SQL-Abfrage verwendet, ist aber nicht deklariert. Wählen Sie eine ViewDefinition oder SQL View, oder korrigieren Sie den Namen.
+lib-tables-declare = { $name } deklarieren
+
+lib-used-by-heading = Verwendet von
+lib-used-by-empty = Wird noch von nichts verwendet.
+lib-used-by-export-kind = SQL-Export
+
+lib-columns-heading = Spalten
+lib-columns-meta-query = was die Abfrage liefert
+lib-columns-meta-view = was die View liefert
+lib-columns-empty-query = Führen Sie die Abfrage aus, um ihre Spalten zu sehen.
+lib-columns-empty-view = Führen Sie die View aus, um ihre Spalten zu sehen.
+lib-columns-col-name = Spalte
+lib-columns-col-type = Typ
+lib-columns-col-from = Von
 
 ## SQL-Export-Seiten (#649, #833)
 

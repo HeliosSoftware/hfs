@@ -1,0 +1,36 @@
+{#
+  The Library-backed `/run` fragment's whole response (#841, extended for
+  #842 and #842/04): the results notice — targeted directly by the request
+  that triggered it, either the shared `partials/sql_run_results.html` or
+  the unknown-table lint's own `partials/lib_run_unknown_tables.html`
+  (`crate::LibRunNotice`) — plus, only when `params_card`/`tables_card` is
+  `Some`, that card riding along as its own `hx-swap-oob` companion, and,
+  always, the Columns card's own update (`crate::ColumnsFragment`).
+  `crate::sql_library_run` only sets `params_card` for a SQL Query render
+  whose freshly computed `params_sig` differs from what the browser posted,
+  and only sets `tables_card` (either kind) when the freshly computed
+  (unknown-table-extended) `tables_sig` differs — every other run leaves
+  the matching card `None`, so its own inputs (a parameter value being
+  typed, the *Add table* panel mid-search) are never touched by a response
+  that has nothing new to tell them. `columns` is never `None`: a good run
+  replaces the whole `#lib-columns` card by OOB; anything else (including
+  the unknown-table notice itself) only relabels its own meta.
+#}
+{% match run_results %}
+{% when LibRunNotice::Standard(partial) %}
+{{ partial.render()?|safe }}
+{% when LibRunNotice::UnknownTables(notice) %}
+{{ notice.render()?|safe }}
+{% endmatch %}
+{% if let Some(card) = params_card %}
+{{ card.render()?|safe }}
+{% endif %}
+{% if let Some(card) = tables_card %}
+{{ card.render()?|safe }}
+{% endif %}
+{% match columns %}
+{% when ColumnsFragment::Filled(card) %}
+{{ card.render()?|safe }}
+{% when ColumnsFragment::Stale(meta) %}
+<span id="lib-columns-meta" class="card-head__meta" hx-swap-oob="outerHTML">{{ meta }}</span>
+{% endmatch %}

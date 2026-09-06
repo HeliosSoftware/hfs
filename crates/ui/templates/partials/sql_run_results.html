@@ -95,6 +95,19 @@
 <div id="run-results"></div>
 {% endif %}
 
+{% when RunResultsState::Waiting(message) %}
+{#- #841: a declared SQL Query parameter has no value yet — an expected
+    pause, not a failure, so the notice carries no `notice--warn` and no
+    `data-error-line` (there is no SQL error to tint). Otherwise the exact
+    same OOB shape as `Failure` above: the previous table (if any) is left
+    untouched, and only its meta is relabelled "last successful run". -#}
+<div id="run-notice"><p class="notice">{{ message }}</p></div>
+{% if fragment %}
+<span id="run-results-meta" class="card-head__meta" hx-swap-oob="outerHTML">{{ i18n.t("vd-results-stale") }}</span>
+{% else %}
+<div id="run-results"></div>
+{% endif %}
+
 {% when RunResultsState::Empty %}
 {#- Nothing has run on the server yet — the current selection has no
     `?…saved=1` result. The empty shell below is what fires the one

@@ -356,6 +356,28 @@ async fn load_jobs(state: &WebState, user_key: &str, tenant: &str) -> JobsSnapsh
         .unwrap_or_default()
 }
 
+/// Every stored `$sql-export` job, most recently started first — the same
+/// shape and sort [`list`] itself shows, reused by the SQL Query/SQL View
+/// *Used by* card (`sql_libraries::used_by_exports`, #842) to find which
+/// jobs' `subjects[].reference` name a given Library. Unlike [`list`], this
+/// never polls a job's live status: the card only needs each job's own id
+/// and display name to link to its detail page, not its current progress,
+/// so a *Used by* render never pays for a poll it does not show.
+pub(crate) async fn jobs_for_used_by(
+    state: &WebState,
+    user_key: &str,
+    tenant: &str,
+) -> Vec<(String, ExportJob)> {
+    let snapshot = load_jobs(state, user_key, tenant).await;
+    let mut entries: Vec<(String, ExportJob)> = snapshot
+        .jobs
+        .iter()
+        .map(|(id, value)| (id.clone(), parse_job(value)))
+        .collect();
+    entries.sort_by(|a, b| b.1.started_at.cmp(&a.1.started_at));
+    entries
+}
+
 fn optional_string(value: &str) -> Value {
     if value.is_empty() {
         Value::Null
