@@ -109,3 +109,17 @@ The backend capability splits into `BulkSubmitIngest` (the synchronous `BulkSubm
   malformed is `400`. Page size `0` disables pagination and yields one manifest with an empty `link`.
 - Status-poll pacing: the `202` advertises `HFS_BULK_SUBMIT_RETRY_AFTER`, and a client that polls past `HFS_BULK_SUBMIT_POLL_RATE_LIMIT` within the window gets `429` plus a `Retry-After` pointing at the end of that window. Buckets are keyed by poll token plus principal, falling back to peer address; the check runs before any job-store work, so throttled polls stay cheap.
 - Cleanup periodically removes status artifacts for submissions whose `updated_at` exceeds `HFS_BULK_SUBMIT_OUTPUT_TTL`.
+
+## Ingest performance
+
+`HFS_BULK_SUBMIT_DEFER_INDEXING=true` relocates search indexing to a post-ingest
+reindex and is by far the biggest lever (~6.7x on SQLite); the stored resources,
+history, receipts and rollback records are identical either way.
+
+To find out where the rest of the time goes, profile the write path with the
+phase counters in `helios_persistence::perf` and the `bulk_submit_bench`
+example — both gated behind `--cfg perf_phases`, which keeps them out of
+released binaries (`ci.yml` builds those with `--all-features`, so a cargo
+feature could not have). See `/test-hfs` for the invocation and for the two
+traps that have produced wrong numbers here (the search-parameter data
+directory, and comparing runs across sessions instead of interleaving arms).
