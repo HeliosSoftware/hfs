@@ -5,7 +5,7 @@ use rusqlite::Connection;
 use crate::error::StorageResult;
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 20;
+pub const SCHEMA_VERSION: i32 = 22;
 
 /// Initialize the database schema.
 pub fn initialize_schema(conn: &Connection) -> StorageResult<()> {
@@ -213,10 +213,13 @@ fn create_indexes(conn: &Connection) -> StorageResult<()> {
         "CREATE INDEX IF NOT EXISTS idx_search_quantity ON search_index(tenant_id, resource_type, param_name, value_quantity_value, value_quantity_unit) WHERE value_quantity_value IS NOT NULL",
         "CREATE INDEX IF NOT EXISTS idx_search_reference ON search_index(tenant_id, resource_type, param_name, value_reference) WHERE value_reference IS NOT NULL",
         "CREATE INDEX IF NOT EXISTS idx_search_uri ON search_index(tenant_id, resource_type, param_name, value_uri) WHERE value_uri IS NOT NULL",
-        // Index for composite parameter matching
+        // Index for composite parameter matching, and for every lookup keyed
+        // by the owning resource. `idx_search_resource` used to sit alongside
+        // it on `(tenant_id, resource_type, resource_id)` — a strict leftmost
+        // prefix of this one, so it served no query this index cannot, while
+        // every single index row paid a second full b-tree insertion for it
+        // (schema v21).
         "CREATE INDEX IF NOT EXISTS idx_search_composite ON search_index(tenant_id, resource_type, resource_id, param_name, composite_group)",
-        // Index for resource-based lookups
-        "CREATE INDEX IF NOT EXISTS idx_search_resource ON search_index(tenant_id, resource_type, resource_id)",
         // Index for :text modifier searches (token display text)
         "CREATE INDEX IF NOT EXISTS idx_search_token_display ON search_index(tenant_id, resource_type, param_name, value_token_display) WHERE value_token_display IS NOT NULL",
         // Index for :of-type modifier searches (identifier type)
@@ -302,6 +305,8 @@ fn migrate_schema(conn: &Connection, from_version: i32) -> StorageResult<()> {
             17 => migrate_v17_to_v18(conn)?,
             18 => migrate_v18_to_v19(conn)?,
             19 => migrate_v19_to_v20(conn)?,
+            20 => migrate_v20_to_v21(conn)?,
+            21 => migrate_v21_to_v22(conn)?,
             _ => {
                 return Err(crate::error::StorageError::Backend(
                     crate::error::BackendError::Internal {
@@ -1486,6 +1491,86 @@ fn migrate_v19_to_v20(conn: &Connection) -> StorageResult<()> {
     Ok(())
 }
 
+/// Migrate from schema version 20 to version 21.
+///
+/// Drops `idx_search_resource`. It indexed
+/// `(tenant_id, resource_type, resource_id)` — a strict leftmost prefix of
+/// `idx_search_composite`'s `(tenant_id, resource_type, resource_id,
+/// param_name, composite_group)`, which every SQLite query planner will use
+/// for the same lookups. It therefore answered no query the composite index
+/// could not, while every row written to `search_index` (about 14 per
+/// ingested resource) paid a second b-tree insertion to maintain it.
+///
+/// Measured on a 86,453-resource bulk-submit ingest of the Synthea manifest
+/// (1.18M index rows): 1,946 -> 2,106 resources/s (+8%), with the
+/// `search_index` INSERT phase falling from 0.249 ms to 0.225 ms per resource
+/// and the database 85 MB smaller (#947).
+fn migrate_v20_to_v21(conn: &Connection) -> StorageResult<()> {
+    conn.execute("DROP INDEX IF EXISTS idx_search_resource", [])
+        .map_err(|e| migration_err(format!("v21 drop idx_search_resource: {e}")))?;
+    Ok(())
+}
+
+/// Migrate from schema version 21 to version 22.
+///
+/// Rebuilds the last three `search_index` indexes that were still *full*
+/// indexes over a column almost every row leaves NULL, as partial indexes
+/// (#947). #944 did this for the v20 set and skipped these three because they
+/// were added later, by the v10 and v11 migrations.
+///
+/// A full index takes an entry for **every** row in the table, NULL or not.
+/// On a 86,453-resource ingest of the Synthea manifest — 1,182,409 index rows,
+/// of which 150,000 carry a reference display and none carry a canonical
+/// quantity or a contained flag — those three indexes held 1.18M entries each
+/// and cost 134 MB:
+///
+/// ```text
+///                                  before    after
+/// idx_search_reference_display     51.6 MB   9.8 MB
+/// idx_search_quantity_canonical    47.9 MB   0.0 MB
+/// idx_search_contained             34.0 MB   0.0 MB
+/// ```
+///
+/// Every row therefore paid three b-tree insertions it could never be found
+/// by. `idx_search_string_folded` is deliberately **not** in this list: it is
+/// also the only index leading with `(tenant_id, resource_type, param_name)`
+/// that covers every row, and the query planner falls back to it for the
+/// `LIKE`-shaped modifier searches (`:text`, `:contains`) whose predicate
+/// SQLite cannot prove implies `IS NOT NULL`. Making it partial pushed those
+/// onto `idx_search_composite`'s `(tenant_id, resource_type)` prefix, and
+/// replacing it with a narrow `(tenant_id, resource_type, param_name)` index
+/// made the planner prefer that for token searches too — a selective
+/// `code=…` lookup went from 2.9 ms to 22.1 ms because the value could no
+/// longer be filtered inside the index.
+///
+/// `EXPLAIN QUERY PLAN` over 15 representative search shapes (token, token
+/// `:text`, reference, reference `:text`, string prefix and exact, quantity
+/// raw and canonical, date, uri, identifier `:of-type`, `_contained`,
+/// composite, delete-by-resource) is byte-identical before and after this
+/// migration. Ingest of the same manifest went 2,238 -> 2,543 resources/s
+/// (+14%) with the database 124 MB (11%) smaller.
+fn migrate_v21_to_v22(conn: &Connection) -> StorageResult<()> {
+    let statements = [
+        "DROP INDEX IF EXISTS idx_search_reference_display",
+        "CREATE INDEX idx_search_reference_display
+         ON search_index(tenant_id, resource_type, param_name, value_reference_display)
+         WHERE value_reference_display IS NOT NULL",
+        "DROP INDEX IF EXISTS idx_search_quantity_canonical",
+        "CREATE INDEX idx_search_quantity_canonical
+         ON search_index(tenant_id, resource_type, param_name, value_quantity_canonical_unit, value_quantity_canonical_value)
+         WHERE value_quantity_canonical_value IS NOT NULL",
+        "DROP INDEX IF EXISTS idx_search_contained",
+        "CREATE INDEX idx_search_contained
+         ON search_index(tenant_id, contained_type, is_contained, param_name)
+         WHERE is_contained = 1",
+    ];
+    for sql in &statements {
+        conn.execute(sql, [])
+            .map_err(|e| migration_err(format!("v22 partial index rebuild: {e}")))?;
+    }
+    Ok(())
+}
+
 /// Drop all tables (for testing).
 #[cfg(test)]
 #[allow(dead_code)]
@@ -1654,6 +1739,107 @@ mod tests {
 
         let version = get_schema_version(&conn).unwrap();
         assert_eq!(version, SCHEMA_VERSION);
+    }
+
+    /// The index layout the write path pays for on every `search_index` row
+    /// (#947). Two properties, both load-bearing:
+    ///
+    /// * `idx_search_resource` is gone (v21). It was a strict leftmost prefix
+    ///   of `idx_search_composite`, so it answered no query that index cannot
+    ///   while charging every row a second b-tree insertion.
+    /// * The three indexes rebuilt in v22 are partial. A full index over a
+    ///   column almost every row leaves NULL takes an entry per row for
+    ///   nothing.
+    ///
+    /// `idx_search_string_folded` is asserted to be *non*-partial on purpose:
+    /// it is also the only full index leading with
+    /// `(tenant_id, resource_type, param_name)`, and the planner falls back to
+    /// it for the `LIKE`-shaped modifier searches whose predicate SQLite
+    /// cannot prove implies `IS NOT NULL`. Making it partial silently pushes
+    /// `:text` and `:contains` onto a `(tenant_id, resource_type)` scan.
+    #[test]
+    fn search_index_carries_no_redundant_or_full_value_indexes() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+
+        let index_sql = |name: &str| -> Option<String> {
+            conn.query_row(
+                "SELECT sql FROM sqlite_master WHERE type='index' AND name=?1",
+                [name],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .ok()
+            .flatten()
+        };
+
+        assert!(
+            index_sql("idx_search_resource").is_none(),
+            "idx_search_resource is a prefix of idx_search_composite and must not be recreated"
+        );
+        assert!(
+            index_sql("idx_search_composite")
+                .expect("composite index")
+                .contains("resource_id"),
+            "idx_search_composite must still lead with the resource key"
+        );
+
+        for (name, predicate) in [
+            (
+                "idx_search_reference_display",
+                "value_reference_display IS NOT NULL",
+            ),
+            (
+                "idx_search_quantity_canonical",
+                "value_quantity_canonical_value IS NOT NULL",
+            ),
+            ("idx_search_contained", "is_contained = 1"),
+        ] {
+            let sql = index_sql(name).unwrap_or_else(|| panic!("{name} must exist"));
+            assert!(
+                sql.contains(predicate),
+                "{name} must be partial on `{predicate}`, got: {sql}"
+            );
+        }
+
+        let folded = index_sql("idx_search_string_folded").expect("folded index");
+        assert!(
+            !folded.to_ascii_uppercase().contains("WHERE"),
+            "idx_search_string_folded must stay full: it is the fallback index for \
+             LIKE-shaped modifier searches. Got: {folded}"
+        );
+    }
+
+    /// A database upgraded through the ladder must end up with exactly the
+    /// index set a fresh one gets — otherwise a long-lived server keeps paying
+    /// for indexes new installs no longer create.
+    #[test]
+    fn upgraded_database_has_the_same_search_index_indexes_as_a_fresh_one() {
+        let index_set = |conn: &Connection| -> Vec<(String, Option<String>)> {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT name, sql FROM sqlite_master
+                     WHERE type='index' AND tbl_name='search_index' ORDER BY name",
+                )
+                .unwrap();
+            let rows: Vec<(String, Option<String>)> = stmt
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap()
+                .filter_map(|r| r.ok())
+                .collect();
+            rows
+        };
+
+        let fresh = Connection::open_in_memory().unwrap();
+        initialize_schema(&fresh).unwrap();
+
+        let upgraded = Connection::open_in_memory().unwrap();
+        create_schema_v1(&upgraded).unwrap();
+        // Creates the version table, as `initialize_schema` would.
+        let _ = get_schema_version(&upgraded).unwrap();
+        set_schema_version(&upgraded, 1).unwrap();
+        initialize_schema(&upgraded).unwrap();
+
+        assert_eq!(index_set(&fresh), index_set(&upgraded));
     }
 
     /// Migrations must be re-runnable: a database already carrying the latest

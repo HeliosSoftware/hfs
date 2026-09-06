@@ -324,6 +324,13 @@ impl SqliteBackend {
         let enable_foreign_keys = config.enable_foreign_keys;
         let manager = manager.with_init(move |conn| {
             conn.busy_timeout(std::time::Duration::from_millis(busy_timeout_ms as u64))?;
+            // The write path runs its statements through `prepare_cached`, so
+            // a bulk import compiles each one once per connection instead of
+            // once per row. rusqlite's default cache holds 16 statements; the
+            // ingest path alone uses about a dozen and the read/search paths
+            // share the same pooled connections, so a too-small cache would
+            // evict the hot inserts and quietly restore the per-row compile.
+            conn.set_prepared_statement_cache_capacity(64);
             if enable_foreign_keys {
                 conn.execute_batch("PRAGMA foreign_keys = ON;")?;
             }
@@ -335,7 +342,13 @@ impl SqliteBackend {
             // INSERT cost 1.71→1.24 ms and commit cost 1.95→1.72 ms per
             // entry. The limit is per pooled connection (pool of 10), but
             // only connections that touch that many pages grow their cache.
-            conn.execute_batch("PRAGMA cache_size = -65536;")?;
+            conn.execute_batch(&format!(
+                "PRAGMA cache_size = -{};",
+                std::env::var("HFS_EXPERIMENT_CACHE_KB")
+                    .ok()
+                    .and_then(|v| v.parse::<i64>().ok())
+                    .unwrap_or(65536)
+            ))?;
             // Checkpoint every ~50,000 WAL pages (~200 MiB) instead of every
             // 1,000 (~4 MiB). A bulk-ingest batch writes far more than 4 MiB
             // of WAL, so with the default every batch commit also ran a
