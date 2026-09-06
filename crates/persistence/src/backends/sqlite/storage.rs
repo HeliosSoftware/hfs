@@ -63,14 +63,10 @@ fn serialization_error(message: String) -> StorageError {
 pub(crate) fn fts_table_exists(conn: &rusqlite::Connection) -> StorageResult<bool> {
     use rusqlite::OptionalExtension;
 
-    conn.query_row(
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='resource_fts'",
-        [],
-        |_| Ok(()),
-    )
-    .optional()
-    .map(|found| found.is_some())
-    .map_err(|e| internal_error(format!("Failed to probe for resource_fts: {e}")))
+    conn.prepare_cached("SELECT 1 FROM sqlite_master WHERE type='table' AND name='resource_fts'")
+        .and_then(|mut stmt| stmt.query_row([], |_| Ok(())).optional())
+        .map(|found| found.is_some())
+        .map_err(|e| internal_error(format!("Failed to probe for resource_fts: {e}")))
 }
 
 /// Runs a `DELETE FROM resource_fts …` on a purge path, skipping it when FTS5
@@ -1185,7 +1181,10 @@ impl SqliteBackend {
         }
 
         // Index FTS content for _text and _content searches
-        self.index_fts_content(conn, tenant_id, resource_type, resource_id, resource)?;
+        {
+            let _span = crate::perf::span(crate::perf::Phase::Fts);
+            self.index_fts_content(conn, tenant_id, resource_type, resource_id, resource)?;
+        }
 
         Ok(())
     }
@@ -1216,17 +1215,18 @@ impl SqliteBackend {
         }
 
         // Insert into FTS table
-        conn.execute(
+        conn.prepare_cached(
             "INSERT INTO resource_fts (resource_id, resource_type, tenant_id, narrative_text, full_content)
              VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![
-                resource_id,
-                resource_type,
-                tenant_id,
-                content.narrative,
-                content.full_content
-            ],
         )
+        .map_err(|e| internal_error(format!("Failed to prepare FTS insert: {}", e)))?
+        .execute(params![
+            resource_id,
+            resource_type,
+            tenant_id,
+            content.narrative,
+            content.full_content
+        ])
         .map_err(|e| internal_error(format!("Failed to insert FTS content: {}", e)))?;
 
         Ok(())
@@ -1244,10 +1244,12 @@ impl SqliteBackend {
         resource: &Value,
     ) -> StorageResult<usize> {
         // Extract values using the tenant's registry-driven extractor
-        let values = self
-            .tenant_extractor(tenant_id)
-            .extract(resource, resource_type)
-            .map_err(|e| internal_error(format!("Search parameter extraction failed: {}", e)))?;
+        let values = {
+            let _span = crate::perf::span(crate::perf::Phase::Extract);
+            self.tenant_extractor(tenant_id)
+                .extract(resource, resource_type)
+                .map_err(|e| internal_error(format!("Search parameter extraction failed: {}", e)))?
+        };
 
         // Rows are written eight at a time: a single-row INSERT stepped once
         // per row spends a measurable share of its time entering and leaving
@@ -1256,7 +1258,12 @@ impl SqliteBackend {
         // (measured +9% bulk-ingest throughput on the real 31 GB manifest).
         let mut count = 0;
         {
+            // The whole insert, plus its Rust-side half (normalising values and
+            // building the bound parameters) as a nested phase, so a profile can
+            // tell our marshalling apart from SQLite's b-tree work (#947).
+            let _span = crate::perf::span(crate::perf::Phase::IndexInsert);
             use crate::search::converters::IndexValue;
+            let marshal_span = crate::perf::span(crate::perf::Phase::IndexMarshal);
             let owned: Vec<_> = values
                 .into_iter()
                 .map(|v| match &v.value {
@@ -1280,6 +1287,7 @@ impl SqliteBackend {
                     SqliteSearchIndexWriter::to_sql_params(tenant_id, resource_type, resource_id, v)
                 })
                 .collect();
+            drop(marshal_span);
             let mut i = 0;
             while i + 8 <= rows.len() {
                 let refs: Vec<&dyn ToSql> = rows[i..i + 8]
@@ -1301,6 +1309,7 @@ impl SqliteBackend {
                 count += 1;
             }
         }
+        crate::perf::add_rows(crate::perf::Phase::IndexInsert, count as u64);
 
         // Also index any contained resources for `_contained` search.
         count +=
@@ -1320,6 +1329,7 @@ impl SqliteBackend {
     ) -> StorageResult<()> {
         use crate::search::converters::IndexValue;
 
+        let marshal_span = crate::perf::span(crate::perf::Phase::IndexMarshal);
         // For date values, normalize the date format for consistent SQLite comparisons
         let normalized_value = match &value.value {
             IndexValue::Date {
@@ -1351,7 +1361,15 @@ impl SqliteBackend {
             .map(|p| self.sql_value_to_ref(p))
             .collect();
 
-        conn.execute(SqliteSearchIndexWriter::insert_sql(), param_refs.as_slice())
+        drop(marshal_span);
+        // `prepare_cached`, not `execute`: `Connection::execute` compiles the
+        // statement on every call, and a bulk import runs this one ~14 times
+        // per resource. The 24-column INSERT costs more to compile than to
+        // run, and the cache is keyed on the `&'static str` above, so every
+        // row after the first on a given connection reuses the same program.
+        conn.prepare_cached(SqliteSearchIndexWriter::insert_sql())
+            .map_err(|e| internal_error(format!("Failed to prepare search index insert: {}", e)))?
+            .execute(param_refs.as_slice())
             .map_err(|e| internal_error(format!("Failed to insert search index entry: {}", e)))?;
 
         Ok(())
@@ -1436,16 +1454,20 @@ impl SqliteBackend {
             .map(|p| self.sql_value_to_ref(p))
             .collect();
 
-        conn.execute(
-            SqliteSearchIndexWriter::insert_contained_sql(),
-            param_refs.as_slice(),
-        )
-        .map_err(|e| {
-            internal_error(format!(
-                "Failed to insert contained search index entry: {}",
-                e
-            ))
-        })?;
+        conn.prepare_cached(SqliteSearchIndexWriter::insert_contained_sql())
+            .map_err(|e| {
+                internal_error(format!(
+                    "Failed to prepare contained search index insert: {}",
+                    e
+                ))
+            })?
+            .execute(param_refs.as_slice())
+            .map_err(|e| {
+                internal_error(format!(
+                    "Failed to insert contained search index entry: {}",
+                    e
+                ))
+            })?;
 
         Ok(())
     }
@@ -1499,11 +1521,13 @@ impl SqliteBackend {
         }
 
         // Delete from main search index
-        let deleted = conn.execute(
-            "DELETE FROM search_index WHERE tenant_id = ?1 AND resource_type = ?2 AND resource_id = ?3",
-            params![tenant_id, resource_type, resource_id],
-        )
-        .map_err(|e| internal_error(format!("Failed to delete search index: {}", e)))?;
+        let deleted = conn
+            .prepare_cached(
+                "DELETE FROM search_index WHERE tenant_id = ?1 AND resource_type = ?2 AND resource_id = ?3",
+            )
+            .map_err(|e| internal_error(format!("Failed to prepare search index delete: {}", e)))?
+            .execute(params![tenant_id, resource_type, resource_id])
+            .map_err(|e| internal_error(format!("Failed to delete search index: {}", e)))?;
 
         // Delete from FTS. resource_fts is an FTS5 virtual table: a WHERE on
         // its plain columns cannot use an index, so this statement scans the
