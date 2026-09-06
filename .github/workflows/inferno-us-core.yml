@@ -431,12 +431,19 @@ jobs:
           echo "HFS_LOG=$HFS_LOG" >> $GITHUB_ENV
           echo "HFS_BASE_URL=$HFS_BASE_URL" >> $GITHUB_ENV
 
+          # The Elasticsearch legs pair synchronous sync with wait_for so a
+          # write is searchable when the API responds. wait_for blocks each
+          # write until the next refresh, so the refresh interval is the price
+          # of every synchronous write: at the 1s default a 473-entry batch
+          # Bundle (entries synced one at a time, 16-wide) ran into the 30s
+          # request timeout; 200ms keeps it to a few seconds.
           if [ "${{ matrix.backend }}" = "sqlite-elasticsearch" ]; then
             HFS_BASE_URL="$HFS_BASE_URL" \
             HFS_STORAGE_BACKEND=sqlite-elasticsearch \
             HFS_ELASTICSEARCH_NODES=http://$DOCKER_HOST_IP:$ES_PORT \
             HFS_COMPOSITE_SYNC_MODE=synchronous \
             HFS_ELASTICSEARCH_WRITE_REFRESH=wait_for \
+            HFS_ELASTICSEARCH_REFRESH_INTERVAL=200ms \
             ./target/debug/hfs --database-url :memory: --log-level info --port $HFS_PORT --host 0.0.0.0 > "$HFS_LOG" 2>&1 &
           elif [ "${{ matrix.backend }}" = "postgres" ]; then
             HFS_BASE_URL="$HFS_BASE_URL" \
@@ -463,6 +470,7 @@ jobs:
             HFS_ELASTICSEARCH_NODES=http://$DOCKER_HOST_IP:$ES_PORT \
             HFS_COMPOSITE_SYNC_MODE=synchronous \
             HFS_ELASTICSEARCH_WRITE_REFRESH=wait_for \
+            HFS_ELASTICSEARCH_REFRESH_INTERVAL=200ms \
             ./target/debug/hfs --log-level info --port $HFS_PORT --host 0.0.0.0 > "$HFS_LOG" 2>&1 &
           else
             HFS_BASE_URL="$HFS_BASE_URL" \
