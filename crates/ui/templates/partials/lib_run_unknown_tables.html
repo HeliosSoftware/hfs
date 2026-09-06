@@ -1,0 +1,29 @@
+{#
+  The unknown-table lint's own `#run-notice` (#842/04): the SQL reads a
+  table no declared `relatedArtifact[depends-on]` label names, so `$sql-run`
+  is never called at all — see `crate::sql_libraries::unknown_tables` and
+  `crate::unknown_tables_notice`, which builds every field below.
+
+  Otherwise the exact same OOB shape `partials/sql_run_results.html`'s own
+  `Failure` arm uses (that partial is never edited to add this — see its
+  own header comment): the previous `#run-results` table (if any) is left
+  untouched, and only its meta is relabelled "last successful run"
+  (fragment mode) or replaced with an empty placeholder (page mode, nothing
+  to swap into yet).
+
+  Two attributes `sql-editor.js` reads off the notice `<p>` on every
+  `htmx:afterSwap` of `#run-notice`:
+    - `data-error-line`: the *first* unknown table's own 1-based line — the
+      same attribute a `$sql-run` parse failure already carries, tinting
+      that line in the editor.
+    - `data-diagnostics`: a JSON array of `{ from, to, message, table }`
+      objects (character offsets into the posted SQL text), one per
+      unknown table — `setDiagnostics`'s own input, underlining each one
+      with a hover tooltip and a lint-gutter mark.
+#}
+<div id="run-notice"><p class="notice notice--warn" data-error-line="{{ first_line }}" data-diagnostics="{{ diagnostics_json }}">{{ message }}</p></div>
+{% if fragment %}
+<span id="run-results-meta" class="card-head__meta" hx-swap-oob="outerHTML">{{ i18n.t("vd-results-stale") }}</span>
+{% else %}
+<div id="run-results"></div>
+{% endif %}

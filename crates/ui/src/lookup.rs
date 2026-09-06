@@ -45,6 +45,7 @@ use serde_json::Value;
 
 use crate::bulk_export::{forward_identity, internal_api_url, no_redirect_client};
 use crate::i18n::{I18n, RequestLocale};
+use crate::sql_libraries;
 use crate::{RequestTenant, RequestVersion, WebState, render};
 
 // ---------------------------------------------------------------------------
@@ -219,6 +220,13 @@ pub(crate) fn fhir_json(version: FhirVersion) -> String {
 struct LookupOption {
     value: String,
     label: String,
+    /// The referenced artifact's own `name` (#842's own `table_options`
+    /// only — [`patient_option`]/[`group_option`] never set this; see
+    /// `partials/lookup_options.html`'s own `data-name` for why it needs
+    /// one of its own rather than reusing `label`, which already carries a
+    /// " — ViewDefinition"/" — SQL View" suffix a JS-side alias
+    /// autocomplete has no use for).
+    name: Option<String>,
 }
 
 /// The closed list of `target` values [`patient_options`] accepts — one per
@@ -230,17 +238,40 @@ const PATIENT_TARGETS: [&str; 2] = ["bulk-export-patients", "sql-export-patients
 /// The closed list of `target` values [`group_options`] accepts.
 const GROUP_TARGETS: [&str; 1] = ["sql-export-groups"];
 
+/// The closed list of `target` values [`table_options`] accepts (#842) — one
+/// per SQL Query/SQL View *Add table* combobox; both routes share the same
+/// `id`/`target` (`#lib-tables-add-table`) since only one can ever be on
+/// screen at a time.
+const TABLE_TARGETS: [&str; 1] = ["lib-tables"];
+
 #[derive(Deserialize)]
 pub(crate) struct TargetQuery {
     target: String,
 }
 
+/// [`table_options`]'s own query (#842): `target`, plus the artifact
+/// currently open — omitted (`?lib=new`) rather than an empty string, so
+/// [`table_option`]'s `exclude` comparison never accidentally matches a
+/// resource with no `id` at all.
+#[derive(Deserialize)]
+pub(crate) struct TableOptionsQuery {
+    target: String,
+    exclude: Option<String>,
+}
+
 /// Where a non-htmx submission to either lookup endpoint redirects back to —
-/// a `bulk-export-*` target belongs to the Bulk Export builder, everything
-/// else (every `sql-export-*` target today) to the SQL Export builder.
+/// a `bulk-export-*` target belongs to the Bulk Export builder, a
+/// `sql-export-*` target to the SQL Export builder, and `lib-tables` (#842)
+/// to SQL Queries — an arbitrary but reasonable default, since that target
+/// alone gives no clue whether it was SQL Queries or SQL Views that posted
+/// it, and this redirect only exists as a defensive fallback: the combobox
+/// that posts here only ever fires through htmx, which always sets the
+/// header this branch checks for.
 fn fallback_page(target: &str) -> &'static str {
     if target.starts_with("bulk-export") {
         "/ui/bulk-export/new"
+    } else if target == "lib-tables" {
+        "/ui/sql/queries"
     } else {
         "/ui/sql/export/new"
     }
@@ -383,7 +414,11 @@ fn patient_option(resource: &Value) -> Option<LookupOption> {
         Some(name) if !name.is_empty() => format!("{name} — {value}"),
         _ => value.clone(),
     };
-    Some(LookupOption { value, label })
+    Some(LookupOption {
+        value,
+        label,
+        name: None,
+    })
 }
 
 fn patient_search_options(bundle: &Value) -> Option<Vec<LookupOption>> {
@@ -581,7 +616,11 @@ fn group_option(resource: &Value) -> Option<LookupOption> {
         .filter(|name| !name.is_empty())
         .map(str::to_string)
         .unwrap_or_else(|| id.to_string());
-    Some(LookupOption { value, label })
+    Some(LookupOption {
+        value,
+        label,
+        name: None,
+    })
 }
 
 fn group_search_options(bundle: &Value) -> Option<Vec<LookupOption>> {
@@ -761,6 +800,158 @@ pub(crate) async fn group_options(
 
     let message = if options.is_empty() {
         i18n.t("sql-export-group-options-empty")
+    } else {
+        String::new()
+    };
+    options_response(LookupOptionsFragment {
+        target,
+        options,
+        message,
+        error: false,
+        id_only: false,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Tables (new, #842) — the SQL Query/SQL View *Add table* combobox
+// ---------------------------------------------------------------------------
+
+/// A `Value` — either a ViewDefinition or a `sql-view` Library — into the
+/// `value`/`label`/`name` shape [`table_options`] emits: `value` the
+/// `{resourceType}/{id}` reference the combobox submits and #842's own
+/// `document` endpoint resolves right back with [`sql_libraries::
+/// dependency_lookup`]; `label` "{name} — {kind}" for the listbox row;
+/// `name` (#842's own `data-name`) the bare artifact name alone, for the
+/// alias field's autocomplete (`sql-library-panels.js`), which has no use
+/// for `label`'s own " — ViewDefinition"/" — SQL View" suffix. `None` for a
+/// resource missing `id`, or one whose reference equals `exclude`.
+fn table_option(
+    resource: &Value,
+    resource_type: &str,
+    kind_label: &str,
+    exclude: Option<&str>,
+) -> Option<LookupOption> {
+    let id = resource.get("id").and_then(Value::as_str)?;
+    let value = format!("{resource_type}/{id}");
+    if exclude == Some(value.as_str()) {
+        return None;
+    }
+    let name = resource
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or(id)
+        .to_string();
+    let label = format!("{name} — {kind_label}");
+    Some(LookupOption {
+        value,
+        label,
+        name: Some(name),
+    })
+}
+
+/// `POST /ui/lookup/table-options` — the *Add table* combobox's own result
+/// fragment (#842): up to 8 ViewDefinitions and `sql-view` Libraries whose
+/// `name` contains `q` — all of them, name-sorted, when `q` is empty (#842's
+/// own "browse" default; unlike the Patient/Group pickers above, which stay
+/// closed until the visitor types, an artifact list this short is worth
+/// showing up front) — excluding `exclude` (the artifact currently open, so
+/// *Add table* never offers a self-dependency) and, for Libraries, every
+/// `sql-query` one: only a ViewDefinition or a `sql-view` Library can ever
+/// be a table. ViewDefinitions are listed first, mirroring both the
+/// server's own dependency-resolution order (`crates/rest/.../graph.rs`,
+/// ViewDefinition tried before Library) and this file's own
+/// [`append_options`] idiom for the Patient/Group pickers above, rather
+/// than a name-interleaved merge of the two resource types.
+pub(crate) async fn table_options(
+    State(state): State<WebState>,
+    locale: RequestLocale,
+    rv: RequestVersion,
+    rt: RequestTenant,
+    HxRequest(is_htmx): HxRequest,
+    axum::extract::Query(query): axum::extract::Query<TableOptionsQuery>,
+    axum::extract::RawForm(body): axum::extract::RawForm,
+) -> Response {
+    if !TABLE_TARGETS.contains(&query.target.as_str()) {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    let target = query.target;
+    if !is_htmx {
+        return Redirect::to(fallback_page(&target)).into_response();
+    }
+    let i18n = I18n::new(locale);
+    let q = form_urlencoded::parse(&body)
+        .find(|(key, _)| key == "q")
+        .map(|(_, value)| value.trim().to_string())
+        .unwrap_or_default();
+    if q.chars().count() > 64 {
+        return lookup_error(&i18n, &target, false);
+    }
+    let exclude = query.exclude.as_deref();
+
+    // A generous buffer over the 8 the response ever shows: `exclude` (and,
+    // for Libraries, a `sql-query` skip) can remove a candidate the server
+    // already returned, and re-fetching to top the count back up is not
+    // worth another request for a combobox's own result list.
+    const FETCH_BUFFER: usize = 16;
+
+    let mut vd_params = vec![("_sort".to_string(), "name".to_string())];
+    if !q.is_empty() {
+        vd_params.push(("name:contains".to_string(), q.clone()));
+    }
+    let view_definition_kind = i18n.t("lib-tables-kind-view-definition");
+    let vd_options: Vec<LookupOption> = match state
+        .conformance
+        .search_page("ViewDefinition", &vd_params, FETCH_BUFFER, 0, rv.0, &rt.id)
+        .await
+    {
+        Ok(page) => page
+            .resources
+            .iter()
+            .filter_map(|vd| table_option(vd, "ViewDefinition", &view_definition_kind, exclude))
+            .collect(),
+        // A search failure degrades to "no ViewDefinition matches" for this
+        // one result list — there is no banner slot in a result fragment to
+        // explain it in, and the sql-view half below can still answer.
+        Err(_) => Vec::new(),
+    };
+
+    let mut sql_view_candidates: Vec<Value> = state
+        .conformance
+        .fetch("Library", rv.0, &rt.id)
+        .await
+        .unwrap_or_default();
+    sql_view_candidates.retain(|lib| sql_libraries::has_library_code(lib, "sql-view"));
+    if !q.is_empty() {
+        let needle = q.to_lowercase();
+        sql_view_candidates.retain(|lib| {
+            lib.get("name")
+                .and_then(Value::as_str)
+                .is_some_and(|n| n.to_lowercase().contains(&needle))
+        });
+    }
+    sql_view_candidates.sort_by(|a, b| {
+        let name_of = |v: &Value| {
+            v.get("name")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string()
+        };
+        name_of(a).cmp(&name_of(b))
+    });
+    let sql_view_kind = i18n.t("sql-views-chip");
+    let sql_view_options: Vec<LookupOption> = sql_view_candidates
+        .iter()
+        .filter_map(|lib| table_option(lib, "Library", &sql_view_kind, exclude))
+        .take(FETCH_BUFFER)
+        .collect();
+
+    let mut options = Vec::new();
+    let mut seen = HashSet::new();
+    append_options(vd_options, &mut options, &mut seen);
+    append_options(sql_view_options, &mut options, &mut seen);
+
+    let message = if options.is_empty() {
+        i18n.t("lib-tables-options-empty")
     } else {
         String::new()
     };

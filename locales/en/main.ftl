@@ -963,6 +963,104 @@ lib-details-new-lede = Rename it and point relatedArtifact[0] at a ViewDefinitio
 # which would otherwise silently vanish it from the rail it was just edited
 # on. `$code` is the route's own expected code ("sql-query"/"sql-view").
 lib-save-wrong-kind = The Library's SQL on FHIR type must be "{ $code }" to save it here.
+# The Save gate's SQL View counterpart (#841): the SQLView profile
+# fixes `Library.parameter` to 0..0, so a non-empty declaration is rejected
+# the same way the wrong `type.coding` above is. The identical text also
+# backs the `/run` fragment's own pre-`$sql-run` check for the same case —
+# one message, two call sites.
+lib-save-view-parameters = A SQL View cannot declare parameters (SQLView profile, Library.parameter 0..0). Remove parameter[] in Details.
+
+## Parameters card (#841, SQL Query only)
+
+lib-params-heading = Parameters
+lib-params-meta = declared on the Library · values below are for this run only
+lib-params-empty = No parameters declared. Add one here or in Details.
+# `$name` is the bare placeholder name, without its leading `:` — both
+# messages below add it themselves so a translation can place it anywhere
+# in the sentence.
+lib-params-hint = :{ $name } is used in the SQL but not declared on the Library.
+lib-params-declare = Declare :{ $name }
+lib-params-add-toggle = Add parameter
+lib-params-add-name-label = Name
+lib-params-add-type-label = Type
+lib-params-add-submit = Add
+# `add-parameter`'s own validation messages (#841) — type codes
+# (`string`, `integer`, …) are never translated.
+lib-params-add-invalid-name = Parameter names must match ^[A-Za-z][A-Za-z0-9_]*$
+lib-params-add-duplicate = A parameter named { $name } is already declared
+lib-params-add-unknown-type = Unknown parameter type
+# The live-run "waiting for a value" notice (#841): `$names` is
+# already comma-joined with each name's own leading `:` by the caller (one
+# name, or several), since a Fluent list can't format an arbitrary-length
+# collection on its own.
+lib-run-waiting = Waiting for a value for { $names } — the results below are from the last successful run.
+
+# The unknown-table lint's own live-run notice (#842/04): the SQL reads a
+# table no declared `relatedArtifact[depends-on]` label names, so `$sql-run`
+# is never called. `lib-run-unknown-table` is the *first* unknown table's
+# own full sentence (the notice's own banner text when there is only one);
+# `lib-run-unknown-table-more` is the short form every additional table
+# (and every table's own hover tooltip in the editor) uses instead. `$line`
+# is the table's own 1-based line number.
+lib-run-unknown-table = Unknown table { $name } — line { $line }. Declare it under Reads from or fix the name. Your SQL is unchanged; the results below are from the last successful run.
+lib-run-unknown-table-more = Unknown table { $name } — line { $line }.
+
+## Tables panel (#842, both kinds) — Reads from / Used by / Columns
+
+lib-tables-heading = Reads from
+lib-tables-col-alias = Alias
+lib-tables-col-target = Reads from
+# The `<code>` cell's own placeholder for a `relatedArtifact[depends-on]`
+# entry with no `label` at all — a malformed document, most commonly one
+# hand-edited in Details.
+lib-tables-no-alias = (no label)
+lib-tables-empty = No tables declared yet.
+lib-tables-note = Every table the SQL reads, as relatedArtifact depends-on entries: alias on the left, the view definition or SQL view it resolves to on the right.
+lib-tables-remove = Remove
+# The resolved-target chip text. "SQL View" reuses `sql-views-chip` — the
+# same chip the title row and *Used by* already show for that kind.
+lib-tables-kind-view-definition = ViewDefinition
+lib-tables-target-not-found = Not found
+lib-tables-target-not-found-detail = No ViewDefinition or SQL View answers to { $resource }. Fix the canonical in Details or remove the row.
+lib-tables-target-not-a-table = Not a table
+lib-tables-target-not-a-table-detail = Only a ViewDefinition or a SQL View can be read.
+lib-tables-add-toggle = Add table
+lib-tables-add-table-label = Table
+lib-tables-add-table-placeholder = Search view definitions and SQL views
+lib-tables-add-table-hint = Type to search by name, or pick from the list.
+lib-tables-add-table-fallback-placeholder = ViewDefinition/{"{"}id{"}"} or Library/{"{"}id{"}"}
+lib-tables-add-table-fallback-hint = Enter a ViewDefinition or SQL View reference.
+lib-tables-alias-label = Alias
+lib-tables-alias-hint = Defaults to the artifact's name
+lib-tables-add-submit = Add
+# `add-table`'s own validation messages (#842), in the order they are
+# checked.
+lib-tables-add-error-required = Pick a view definition or SQL view
+lib-tables-add-error-alias-required = Alias is required
+lib-tables-add-error-alias-invalid = Alias must match ^[A-Za-z][A-Za-z0-9_]*$
+lib-tables-add-error-alias-duplicate = Alias { $alias } is already declared
+# The *Add table* combobox's own "no matches" result message
+# (`partials/lookup_options.html`), mirroring `bulk-export-patient-options-
+# empty`/`sql-export-group-options-empty` for the two existing pickers.
+lib-tables-options-empty = No matches.
+# The unknown-table lint's own row (#842/04): a table the SQL reads that no
+# dependency declares, appended after every resolved row.
+lib-tables-unknown = Unknown table
+lib-tables-unknown-detail = Used in the SQL but not declared. Pick a view definition or SQL view, or fix the name.
+lib-tables-declare = Declare { $name }
+
+lib-used-by-heading = Used by
+lib-used-by-empty = Nothing uses this yet.
+lib-used-by-export-kind = SQL Export
+
+lib-columns-heading = Columns
+lib-columns-meta-query = what the query produces
+lib-columns-meta-view = what the view produces
+lib-columns-empty-query = Run the query to see its columns.
+lib-columns-empty-view = Run the view to see its columns.
+lib-columns-col-name = Column
+lib-columns-col-type = Type
+lib-columns-col-from = From
 
 ## SQL Export pages (#649, #833)
 

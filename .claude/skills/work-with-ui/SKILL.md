@@ -101,10 +101,24 @@ through to the normal REST surface.
   editor, `/ui/sql/view-definitions` — JSON + injected FHIRPath language,
   highlighting, and lint; hands its mounted `EditorView` to
   `editor-pair.js`), `sql-editor.js` (SQL pane editor, `/ui/sql/queries` and
-  `/ui/sql/views`), and `sql-library-details.js` (Details JSON editor on
-  those same two pages — plain JSON language and highlighting, no lint;
-  hands its mounted view, `hidden: "content"` and `legend: "sql-library"`,
-  to `editor-pair.js`, #840).
+  `/ui/sql/views`), `sql-library-details.js` (Details JSON editor on those
+  same two pages — plain JSON language and highlighting, no lint; hands its
+  mounted view, `hidden: "content"` and `legend: "sql-library"`, to
+  `editor-pair.js`, #840, and keeps `EditorPair.mount`'s own `{formApi,
+  host}` return value exposed as `window.HfsSqlLibraryDetails` instead of
+  discarding it, #841), and `sql-library-panels.js` (the Parameters, #841,
+  and Tables, #842, cards: on `htmx:afterSwap` of a `#lib-params`/`#lib-
+  tables` carrying `data-document`, hands that text to
+  `window.HfsSqlLibraryDetails.host.setDoc()` so a mutation from the
+  `document` endpoint below lands as one undoable transaction that also
+  refreshes the guided form and re-fires the live run; also autofills the
+  Tables panel's Alias field from the *Add table* combobox's own
+  `hfs:combobox-select` selection, and, #842/04, opens that same panel with
+  the alias pre-filled when a row's own *Declare {name}* button is
+  clicked). `combobox.js` reinitializes any `[data-combobox]` field an htmx
+  swap introduces (`htmx:afterSwap`, #842/04) — needed the moment the
+  unknown-table lint's own OOB refresh of `#lib-tables` replaces the *Add
+  table* combobox with a fresh, un-enhanced one.
 
 `/ui/sql/queries` and `/ui/sql/views` (`pages/sql-library.html`, one
 template keyed by the route's own `LibraryKind`) each edit `Library`
@@ -112,10 +126,39 @@ resources of their own SQL on FHIR type code (`sql-query`/`sql-view`): a
 title row, a Details section — the Details JSON editor (`sql-library-
 details.js`) beside the same guided-form card View Definitions uses,
 `content` hidden from it since the SQL card below owns that attachment —,
-the SQL card itself (`sql-editor.js`), and a `$sql-run` preview that
-follows whichever text is current. Save fuses the two cards' documents
-server-side (`sql_libraries::embed_sql`); a document whose type code names
-the other kind is rejected with a warning.
+the SQL card itself (`sql-editor.js`), a Parameters card (#841, SQL Query
+only — `LibraryKind::declares_parameters` is the template's own gate, never
+an `if` on the route's code) with one value field per declared
+`Library.parameter[use=in]` entry, an undeclared-`:placeholder` hint with a
+one-click *Declare*, and an *Add parameter* panel that writes a fresh
+declaration via `POST /ui/sql/{queries,views}/document` — and a `$sql-run`
+preview that follows whichever text is current, blocked by a "waiting"
+notice while a SQL Query has a declared, required parameter with no value
+yet, and a Tables panel (#842, both kinds): `#lib-tables` (*Reads from* —
+one row per `relatedArtifact[type=depends-on]` resolved the same way
+`$sql-run`'s own graph walk resolves them, with *Add table*/*Remove*; *Used
+by* — other Libraries and `$sql-export` jobs depending on this one) beside
+`#lib-columns` (the last good run's own column list — name, type, and, when
+it traces to exactly one resolved ViewDefinition dependency, its origin).
+Save fuses the two cards' documents server-side (`sql_libraries::
+embed_sql`); a document whose type code names the other kind is rejected
+with a warning, and so is a SQL View document whose `Library.parameter[]`
+is non-empty (its own profile fixes it to `0..0`).
+
+**Unknown-table lint (#842/04).** Ahead of `$sql-run`, `/run` checks — in
+order — a SQL View's own non-empty `parameter[]`, then whether the SQL
+reads a table no declared `relatedArtifact[depends-on]` label names
+(`helios_sof::sqlquery::{scan_sql, undeclared_tables}`, case-insensitive),
+then a SQL Query's own unfilled required parameter — never calling
+`$sql-run` on the second check, so the last good table and Columns stay on
+screen (their meta relabelled "last successful run") and the editor gets a
+`data-diagnostics` JSON array (`@codemirror/lint`'s `setDiagnostics` +
+`lintGutter()`) underlining every unknown table with a hover tooltip and a
+gutter mark. The same tables render as their own `.tag--failed` rows in
+*Reads from*, each with a *Declare {name}* button that opens *Add table*
+with that exact alias pre-filled. `?…&saved=1` and the `document`
+endpoint's own no-JS re-render apply the identical check before deciding
+what to show in place of results.
 
   `vd-editor.js` also drives completion and quick fixes (#821), server-
   backed like the async lint above it — the browser only locates the cursor

@@ -176,13 +176,7 @@ pub fn sql_export_parameters_body(request: &SqlExportRequest) -> Value {
             let parameter: Vec<Value> = subject
                 .parameters
                 .iter()
-                .map(|p| {
-                    let (key, value) = typed_parameter_value(&p.type_code, &p.value);
-                    let mut entry = serde_json::Map::new();
-                    entry.insert("name".to_string(), Value::String(p.name.clone()));
-                    entry.insert(key.to_string(), value);
-                    Value::Object(entry)
-                })
+                .map(parameter_value_entry)
                 .collect();
             part.push(serde_json::json!({
                 "name": "parameters",
@@ -243,6 +237,30 @@ fn typed_parameter_value(type_code: &str, value: &str) -> (&'static str, Value) 
     }
 }
 
+/// Builds one `Parameters.parameter` entry — `{name, value[x]}` — for a
+/// supplied SQL parameter value, typed via [`typed_parameter_value`]. Shared
+/// by [`sql_export_parameters_body`]'s per-subject `parameters` part and
+/// [`HttpConformanceSource::sql_run`]'s live-preview bindings body (#841),
+/// so both type the exact same `(name, type_code, value)` triple identically
+/// — a value never binds differently depending on whether the run came from
+/// a live preview or a `$sql-export` job.
+fn parameter_value_entry(p: &SqlExportParameter) -> Value {
+    let (key, value) = typed_parameter_value(&p.type_code, &p.value);
+    let mut entry = serde_json::Map::new();
+    entry.insert("name".to_string(), Value::String(p.name.clone()));
+    entry.insert(key.to_string(), value);
+    Value::Object(entry)
+}
+
+/// Builds the nested `Parameters` resource `$sql-run`'s own `parameters`
+/// input parameter expects, from the live-preview bindings a SQL Query card
+/// supplies (#841) — the same [`parameter_value_entry`] typing
+/// [`sql_export_parameters_body`] uses for a subject's declared parameters.
+fn sql_run_parameters_resource(bindings: &[SqlExportParameter]) -> Value {
+    let parameter: Vec<Value> = bindings.iter().map(parameter_value_entry).collect();
+    serde_json::json!({ "resourceType": "Parameters", "parameter": parameter })
+}
+
 /// Fetches all FHIR resources of a conformance type for a FHIR version, as the
 /// raw resource JSON `Value`s (the `entry[].resource` of a searchset Bundle).
 #[async_trait]
@@ -267,14 +285,21 @@ pub trait ConformanceSource: Send + Sync {
     /// Runs `$sql-run` with `view_definition` as the inline subject and
     /// returns the output rows (`_format=json`), or an `Err` message the page
     /// shows in place of the results table (#649).
+    ///
+    /// `bindings` supplies this run's values for whichever
+    /// `Library.parameter` declarations `view_definition` carries — empty
+    /// for a ViewDefinition subject, which has none (#841). A binding whose
+    /// name the subject doesn't declare is the callee's problem to reject,
+    /// not this method's to filter.
     async fn sql_run(
         &self,
         view_definition: &Value,
+        bindings: &[SqlExportParameter],
         limit: usize,
         version: FhirVersion,
         tenant: &str,
     ) -> Result<Vec<Value>, String> {
-        let _ = (view_definition, limit, version, tenant);
+        let _ = (view_definition, bindings, limit, version, tenant);
         Err("$sql-run is not available from this source".to_string())
     }
 
@@ -620,9 +645,15 @@ impl ConformanceSource for HttpConformanceSource {
     /// body). Storage holds the seeded default version only, so any other
     /// version degrades with a message rather than running against the wrong
     /// data.
+    ///
+    /// `bindings` (#841), when non-empty, is sent as a nested `parameters`
+    /// input built by [`sql_run_parameters_resource`]; when empty the body
+    /// is byte-for-byte what this method sent before `bindings` existed —
+    /// no test asserting on that shape needs to change.
     async fn sql_run(
         &self,
         view_definition: &Value,
+        bindings: &[SqlExportParameter],
         limit: usize,
         version: FhirVersion,
         tenant: &str,
@@ -637,9 +668,18 @@ impl ConformanceSource for HttpConformanceSource {
         // The Parameters envelope, not the raw-resource shorthand: the
         // shorthand is ViewDefinition-only, while `subjectResource` carries
         // Library subjects (SQL Queries / SQL Views) just the same.
+        let mut parameter = vec![serde_json::json!({
+            "name": "subjectResource", "resource": view_definition,
+        })];
+        if !bindings.is_empty() {
+            parameter.push(serde_json::json!({
+                "name": "parameters",
+                "resource": sql_run_parameters_resource(bindings),
+            }));
+        }
         let body = serde_json::json!({
             "resourceType": "Parameters",
-            "parameter": [{ "name": "subjectResource", "resource": view_definition }],
+            "parameter": parameter,
         });
         let mut request = self
             .client
@@ -1049,6 +1089,10 @@ pub struct StaticConformanceSource {
     export_calls: Arc<Mutex<Vec<RecordedExportCall>>>,
     saved_resources: Arc<Mutex<Vec<Value>>>,
     sql_run_calls: Arc<Mutex<Vec<Value>>>,
+    /// One entry per [`sql_run`](ConformanceSource::sql_run) call, in call
+    /// order — parallel to `sql_run_calls`, so a test can pair up call `i`'s
+    /// subject with call `i`'s bindings (#841).
+    sql_run_bindings_calls: Arc<Mutex<Vec<Vec<SqlExportParameter>>>>,
 }
 
 impl StaticConformanceSource {
@@ -1064,6 +1108,7 @@ impl StaticConformanceSource {
             export_calls: Arc::new(Mutex::new(Vec::new())),
             saved_resources: Arc::new(Mutex::new(Vec::new())),
             sql_run_calls: Arc::new(Mutex::new(Vec::new())),
+            sql_run_bindings_calls: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -1086,6 +1131,17 @@ impl StaticConformanceSource {
         self.sql_run_calls
             .lock()
             .expect("sql_run_calls mutex is never held across a panic")
+            .clone()
+    }
+
+    /// The parameter bindings `sql_run` has received so far, in call order —
+    /// parallel to [`Self::sql_run_calls`] (#841): `sql_run_bindings_calls()
+    /// [i]` is the bindings supplied on the same call whose subject is
+    /// `sql_run_calls()[i]`.
+    pub fn sql_run_bindings_calls(&self) -> Vec<Vec<SqlExportParameter>> {
+        self.sql_run_bindings_calls
+            .lock()
+            .expect("sql_run_bindings_calls mutex is never held across a panic")
             .clone()
     }
 
@@ -1221,6 +1277,7 @@ impl ConformanceSource for StaticConformanceSource {
     async fn sql_run(
         &self,
         view_definition: &Value,
+        bindings: &[SqlExportParameter],
         limit: usize,
         _version: FhirVersion,
         _tenant: &str,
@@ -1229,6 +1286,10 @@ impl ConformanceSource for StaticConformanceSource {
             .lock()
             .expect("sql_run_calls mutex is never held across a panic")
             .push(view_definition.clone());
+        self.sql_run_bindings_calls
+            .lock()
+            .expect("sql_run_bindings_calls mutex is never held across a panic")
+            .push(bindings.to_vec());
         match &self.sql_rows {
             Some(Ok(rows)) => Ok(rows.iter().take(limit).cloned().collect()),
             Some(Err(e)) => Err(e.clone()),
@@ -1274,12 +1335,14 @@ impl ConformanceSource for StaticConformanceSource {
     }
 
     /// Filters and paginates the seeded resources in memory. Implements the
-    /// subset of search semantics the View Definitions page actually sends
-    /// (#741): `name:contains` (case-insensitive substring on `name`) and
-    /// `_sort=name` (also the default with no `_sort` param, matching the
-    /// server's own default order). Other params are accepted but ignored —
-    /// this is a test double standing in for the real search engine, not a
-    /// reimplementation of it.
+    /// subset of search semantics the View Definitions page and #842's own
+    /// table resolution actually send: `name:contains` (case-insensitive
+    /// substring on `name`, #741), `url` (exact match on `url`, #842's own
+    /// canonical dependency resolution) and `_sort=name` (also the default
+    /// with no `_sort` param, matching the server's own default order).
+    /// Other params are accepted but ignored — this is a test double
+    /// standing in for the real search engine, not a reimplementation of
+    /// it.
     async fn search_page(
         &self,
         resource_type: &str,
@@ -1302,6 +1365,10 @@ impl ConformanceSource for StaticConformanceSource {
                     .and_then(Value::as_str)
                     .is_some_and(|n| n.to_lowercase().contains(&needle))
             });
+        }
+
+        if let Some((_, url)) = params.iter().find(|(name, _)| name == "url") {
+            resources.retain(|r| r.get("url").and_then(Value::as_str) == Some(url.as_str()));
         }
 
         let sort = params
@@ -1994,6 +2061,127 @@ mod tests {
             SqlExportStatus::Unavailable(_) => {}
             other => panic!("expected Unavailable, got {other:?}"),
         }
+    }
+
+    /// #841: a live-preview binding rides `$sql-run`'s own `parameters`
+    /// input, typed the same way [`sql_export_parameters_body`] types a
+    /// declared subject parameter — so a value binds identically whether it
+    /// runs live or through `$sql-export`. No bindings at all means the
+    /// body carries no `parameters` input, byte-for-byte what `sql_run`
+    /// sent before bindings existed.
+    #[tokio::test]
+    async fn http_sql_run_sends_bindings_only_when_present() {
+        use axum::extract::State;
+        use axum::routing::post;
+
+        async fn capture(
+            State(captured): State<Arc<Mutex<Vec<Value>>>>,
+            axum::Json(body): axum::Json<Value>,
+        ) -> axum::Json<Vec<Value>> {
+            captured
+                .lock()
+                .expect("captured mutex is never held across a panic")
+                .push(body);
+            axum::Json(Vec::new())
+        }
+
+        let captured: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let app = axum::Router::new()
+            .route("/$sql-run", post(capture))
+            .with_state(captured.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let source = HttpConformanceSource::new(
+            format!("http://{addr}"),
+            Arc::new(helios_auth::outbound::NoOpOutboundAuthProvider),
+            FhirVersion::R4,
+            None,
+        );
+        let subject = serde_json::json!({"resourceType": "Library"});
+
+        source
+            .sql_run(&subject, &[], 50, FhirVersion::R4, "")
+            .await
+            .expect("run without bindings succeeds");
+        source
+            .sql_run(
+                &subject,
+                &[SqlExportParameter {
+                    name: "ward".to_string(),
+                    type_code: "string".to_string(),
+                    value: "3B".to_string(),
+                }],
+                50,
+                FhirVersion::R4,
+                "",
+            )
+            .await
+            .expect("run with bindings succeeds");
+
+        let bodies = captured
+            .lock()
+            .expect("captured mutex is never held across a panic")
+            .clone();
+        assert_eq!(bodies.len(), 2);
+
+        let without_bindings = &bodies[0];
+        assert!(
+            without_bindings["parameter"]
+                .as_array()
+                .expect("parameter array")
+                .iter()
+                .all(|p| p["name"] != "parameters"),
+            "no bindings must not add a `parameters` input: {without_bindings}"
+        );
+
+        let with_bindings = &bodies[1];
+        let parameters_part = with_bindings["parameter"]
+            .as_array()
+            .expect("parameter array")
+            .iter()
+            .find(|p| p["name"] == "parameters")
+            .expect("a `parameters` input is present when bindings are supplied");
+        assert_eq!(
+            parameters_part["resource"]["parameter"][0],
+            serde_json::json!({"name": "ward", "valueString": "3B"})
+        );
+    }
+
+    /// #841: [`StaticConformanceSource`] records the bindings a `sql_run`
+    /// call carried, parallel to [`StaticConformanceSource::sql_run_calls`]
+    /// — call `i` of each accessor describes the same call.
+    #[tokio::test]
+    async fn static_source_records_sql_run_bindings() {
+        let source = StaticConformanceSource::empty().with_sql_run(Ok(Vec::new()));
+        let subject = serde_json::json!({"resourceType": "Library"});
+
+        source
+            .sql_run(&subject, &[], 10, FhirVersion::R4, "")
+            .await
+            .expect("seeded sql_run succeeds");
+        source
+            .sql_run(
+                &subject,
+                &[SqlExportParameter {
+                    name: "ward".to_string(),
+                    type_code: "string".to_string(),
+                    value: "3B".to_string(),
+                }],
+                10,
+                FhirVersion::R4,
+                "",
+            )
+            .await
+            .expect("seeded sql_run succeeds");
+
+        let bindings = source.sql_run_bindings_calls();
+        assert_eq!(bindings.len(), 2);
+        assert!(bindings[0].is_empty(), "first call carried no bindings");
+        assert_eq!(bindings[1].len(), 1);
+        assert_eq!(bindings[1][0].name, "ward");
+        assert_eq!(bindings[1][0].value, "3B");
     }
 
     /// #833: [`StaticConformanceSource`] records every `$sql-export` call it

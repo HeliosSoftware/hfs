@@ -1,0 +1,199 @@
+{#
+  The Tables panel's left-hand card (#842): *Reads from* — one row per
+  `relatedArtifact[type=depends-on]`, resolved the same way `$sql-run`'s own
+  graph walk resolves them (`crate::resolve_table_reference`) — and *Used
+  by* — other Libraries and SQL Export jobs that depend on this one
+  (`sql_libraries::used_by_artifacts`/`used_by_exports`). Both are read-only
+  lists except *Reads from*'s own *Add table*/*Remove* mutations.
+
+  Rendered three ways, all built by `crate::build_tables_card` from one
+  `crate::TablesAnalysis` so none of them can disagree about what is
+  declared or resolved — mirrors `sql_parameters_card.html`'s own three-way
+  split exactly:
+    - The page's own inline render (`oob: false`, `data_document: None`).
+    - The `/run` fragment's OOB companion (`oob: true`) — only when the
+      freshly computed `tables_sig` differs from what the browser posted
+      (`crate::sql_library_run`'s own comparison, #842/NF1): editing
+      Details (adding/removing/relabeling a dependency) re-resolves this
+      card; nothing else on the page does.
+    - The `document` endpoint's own `HX-Request` response (`oob: false` —
+      the request's own `hx-target="#lib-tables"` swaps this element
+      directly): `data_document` carries the updated Details JSON on a
+      successful `add-table`/`remove-table`, applied through
+      `sql-library-panels.js`'s own `host.setDoc()`, exactly like
+      `#lib-params`.
+
+  *Add table*/*Remove* are real `type="submit"` buttons —
+  `form="lib-editor-form"` and `formaction="{{ document_href }}"` — so both
+  work with no JavaScript at all: a plain submit posts the whole document to
+  the `document` endpoint, which re-renders the entire page with the
+  mutation applied and nothing saved. With JavaScript, each button's own
+  `hx-post`/`hx-target="#lib-tables"`/`hx-swap="outerHTML"` intercepts that
+  same submit and swaps only this card.
+
+  The *Add table* toggle is a `<summary>`, not a plain `<button>` a script
+  would have to wire up — the same disclosure `sql_parameters_card.html`'s
+  own *Add parameter* panel uses, so it opens/closes with no JavaScript at
+  all and needs none to work correctly on first paint.
+
+  #842/04: `unknown_rows` — tables the SQL reads that no dependency
+  declares — render after every resolved `rows` entry, each with its own
+  *Declare {name}* button. With JavaScript, `sql-library-panels.js` opens
+  the *Add table* `<details>` and fills the alias field with that row's own
+  name when clicked (`data-declare-table`, a plain `type="button"`, never a
+  submit); without it, `crate::build_tables_card` already opened the panel
+  and pre-filled the *first* unknown table's own name, the only affordance
+  a no-JS visitor has. `.toolbar__count` above still counts only `rows` —
+  the *declared* dependencies — never `unknown_rows`.
+#}
+{% import "partials/combobox.html" as combobox %}
+<section class="card" id="lib-tables"{% if oob %} hx-swap-oob="outerHTML"{% endif %}{% if let Some(document) = data_document %} data-document="{{ document }}"{% endif %}>
+  <input type="hidden" name="tables_sig" form="lib-editor-form" value="{{ signature }}">
+
+  <div class="card-head">
+    <h3>
+      <span class="icon">{% include "icons/import.svg" %}</span>
+      {{ i18n.t("lib-tables-heading") }}
+      <span class="toolbar__count">{{ rows.len() }}</span>
+    </h3>
+  </div>
+  <div class="card__body">
+    {% if rows.is_empty() && unknown_rows.is_empty() %}
+    <p class="page-head__lede">{{ i18n.t("lib-tables-empty") }}</p>
+    {% else %}
+    <div class="table-wrap">
+      <table class="data-table">
+        <thead>
+          <tr>
+            <th>{{ i18n.t("lib-tables-col-alias") }}</th>
+            <th>{{ i18n.t("lib-tables-col-target") }}</th>
+            <th class="visually-hidden">{{ i18n.t("lib-tables-remove") }}</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for row in rows %}
+          <tr{% if row.link_href.is_none() %} class="row--alert"{% endif %}>
+            <td><code>{% if row.label.is_empty() %}{{ i18n.t("lib-tables-no-alias") }}{% else %}{{ row.label }}{% endif %}</code></td>
+            <td>
+              <span class="tag tag--{{ row.chip_class }}">{{ row.chip }}</span>
+              {% if let Some(href) = row.link_href %}
+              <a href="{{ href }}">{% if let Some(label) = row.link_label %}{{ label }}{% endif %}</a>
+              {% endif %}
+              {% if let Some(detail) = row.detail %}
+              <p class="field__hint field__hint--error" role="alert">{{ detail }}</p>
+              {% endif %}
+            </td>
+            <td>
+              {#- One shared form, one row removed per click: this button's
+                  own `name="table_label"` pair is the only one the browser
+                  submits (unclicked submit buttons contribute nothing),
+                  the same "the field's presence is the operation" idiom
+                  `sql_parameters_card.html`'s own `declare_param` hint
+                  buttons use — see `crate::parse_doc_mutation`. -#}
+              <button type="submit" class="btn" form="lib-editor-form" formaction="{{ document_href }}"
+                      hx-post="{{ document_href }}" hx-include="#lib-editor-form"
+                      hx-target="#lib-tables" hx-swap="outerHTML"
+                      name="table_label" value="{{ row.label }}">
+                {{ i18n.t("lib-tables-remove") }}
+              </button>
+            </td>
+          </tr>
+          {% endfor %}
+          {% for row in unknown_rows %}
+          <tr class="row--alert">
+            <td><code>{{ row.name }}</code></td>
+            <td>
+              <span class="tag tag--failed">{{ i18n.t("lib-tables-unknown") }}</span>
+              <p class="field__hint field__hint--error" role="alert">{{ i18n.t("lib-tables-unknown-detail") }}</p>
+            </td>
+            <td>
+              {#- Never a submit: *Declare* only opens the *Add table*
+                  panel and pre-fills its alias (`sql-library-panels.js`)
+                  — the target itself still needs picking from the
+                  combobox, unlike a Parameters hint's one-click
+                  *Declare*. -#}
+              <button type="button" class="btn" data-declare-table="{{ row.name }}">
+                {{ i18n.t_arg("lib-tables-declare", "name", row.name.clone()) }}
+              </button>
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% endif %}
+    <p class="editor__source-hint">{{ i18n.t("lib-tables-note") }}</p>
+
+    <details class="editor-add"{% if add_open %} open{% endif %}>
+      <summary class="editor-add__toggle">+ {{ i18n.t("lib-tables-add-toggle") }}</summary>
+      <div class="editor-add__panel">
+        {% call combobox::multi_select(
+          "lib-tables-add-table",
+          "table",
+          i18n.t("lib-tables-add-table-label"),
+          i18n.t("lib-tables-add-table-placeholder"),
+          i18n.t("lib-tables-add-table-hint"),
+          i18n.t("lib-tables-add-table-fallback-placeholder"),
+          i18n.t("lib-tables-add-table-fallback-hint"),
+          table_options_href,
+          "",
+          "",
+          "",
+          "q",
+          add_table,
+          "1",
+          "lib-editor-form"
+        ) %}{% endcall %}
+        <label class="field">
+          <span class="field__label">{{ i18n.t("lib-tables-alias-label") }}</span>
+          <input class="field__input" type="text" name="table_alias" form="lib-editor-form"
+                 value="{{ add_alias }}" pattern="[A-Za-z][A-Za-z0-9_]*"
+                 {% if add_error.is_some() %} aria-invalid="true" aria-describedby="lib-tables-add-error"{% endif %}>
+          <span class="field__hint">{{ i18n.t("lib-tables-alias-hint") }}</span>
+        </label>
+        <div class="form-actions">
+          <button type="submit" class="btn btn--primary" form="lib-editor-form" formaction="{{ document_href }}"
+                  hx-post="{{ document_href }}" hx-include="#lib-editor-form"
+                  hx-target="#lib-tables" hx-swap="outerHTML"
+                  name="op" value="add-table">
+            {{ i18n.t("lib-tables-add-submit") }}
+          </button>
+        </div>
+        <span id="lib-tables-add-error" class="field__hint field__hint--error" role="alert"{% if add_error.is_none() %} hidden{% endif %}>{% if let Some(message) = add_error %}{{ message }}{% endif %}</span>
+      </div>
+    </details>
+  </div>
+
+  <div class="card-head">
+    <h3>
+      <span class="icon">{% include "icons/export.svg" %}</span>
+      {{ i18n.t("lib-used-by-heading") }}
+      <span class="toolbar__count">{{ used_by.len() }}</span>
+    </h3>
+  </div>
+  <div class="card__body">
+    {% if used_by.is_empty() %}
+    <p class="page-head__lede">{{ i18n.t("lib-used-by-empty") }}</p>
+    {% else %}
+    <div class="table-wrap">
+      <table class="data-table">
+        <thead>
+          <tr>
+            <th class="visually-hidden">{{ i18n.t("lib-used-by-heading") }}</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for row in used_by %}
+          <tr>
+            <td>
+              <span class="tag tag--type">{{ row.chip }}</span>
+              <a href="{{ row.href }}">{{ row.label }}</a>
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% endif %}
+  </div>
+</section>
