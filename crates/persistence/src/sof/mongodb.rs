@@ -35,12 +35,28 @@ pub struct MongoInDbRunner {
     /// Shared (lazily initialised) client cell — the same pool the backend uses.
     client: Arc<OnceCell<Client>>,
     config: MongoBackendConfig,
+    /// Where a run with `patient`/`group` filters goes: the pipeline compiler
+    /// has no compartment predicate yet, so those runs are handed to another
+    /// runner (the backend wires the in-process engine over a scan of the
+    /// same collection) instead of failing as uncompilable.
+    compartment_fallback: Option<Arc<dyn SofRunner>>,
 }
 
 impl MongoInDbRunner {
     /// Creates a runner sharing the backend's client cell and configuration.
     pub fn new(client: Arc<OnceCell<Client>>, config: MongoBackendConfig) -> Self {
-        Self { client, config }
+        Self {
+            client,
+            config,
+            compartment_fallback: None,
+        }
+    }
+
+    /// Routes runs that carry `patient`/`group` filters to `runner`. Without
+    /// one, such a run is refused as uncompilable.
+    pub fn with_compartment_fallback(mut self, runner: Arc<dyn SofRunner>) -> Self {
+        self.compartment_fallback = Some(runner);
+        self
     }
 
     /// Resolves the `resources` collection, initialising the shared client on
@@ -70,11 +86,22 @@ impl SofRunner for MongoInDbRunner {
         filters: ViewFilters,
     ) -> Result<RowStream, SofError> {
         if !filters.patient.is_empty() || !filters.group.is_empty() {
-            // Compartment filtering for the Mongo runner lands in a later stage.
-            return Err(SofError::Uncompilable {
-                reason: "patient/group filters are not yet supported by the MongoDB runner"
-                    .to_string(),
-            });
+            // Compartment filtering has no pipeline form yet: hand the run to
+            // the fallback runner when the backend wired one.
+            return match &self.compartment_fallback {
+                Some(runner) => {
+                    debug!(
+                        runner = runner.runner_name(),
+                        tenant = %tenant.tenant_id(),
+                        "patient/group filters: delegating the view run"
+                    );
+                    runner.run_view(tenant, view_definition, filters).await
+                }
+                None => Err(SofError::Uncompilable {
+                    reason: "patient/group filters are not yet supported by the MongoDB runner"
+                        .to_string(),
+                }),
+            };
         }
 
         let compiled = compile_view_definition_mongo(&view_definition, self.config.fhir_version)?;

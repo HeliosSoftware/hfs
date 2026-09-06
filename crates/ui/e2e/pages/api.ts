@@ -97,6 +97,23 @@ export async function deleteResources(
   ids: string[],
   tenant?: string,
 ): Promise<void> {
+  // One request per DELETE_BATCH ids: a batch runs its entries at the
+  // backend's write concurrency inside the server's 30s request timeout,
+  // and on the ES composites (synchronous sync, refreshed writes) a 400-entry
+  // padding cleanup ran past it — a 408 with half the entries still live.
+  for (let start = 0; start < ids.length; start += DELETE_BATCH) {
+    await deleteBatch(request, type, ids.slice(start, start + DELETE_BATCH), tenant);
+  }
+}
+
+const DELETE_BATCH = 100;
+
+async function deleteBatch(
+  request: APIRequestContext,
+  type: string,
+  ids: string[],
+  tenant?: string,
+): Promise<void> {
   if (ids.length === 0) return;
   const bundle = {
     resourceType: "Bundle",

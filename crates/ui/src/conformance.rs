@@ -701,7 +701,11 @@ impl ConformanceSource for HttpConformanceSource {
         }
         let url = format!("{}/{resource_type}", self.base_url);
         let mut query: Vec<(String, String)> = params.to_vec();
-        query.push(("_count".to_string(), count.to_string()));
+        // One more than the page: whether a further page exists is read off
+        // the overflow row, not only the Bundle's `next` link — MongoDB
+        // issues no page cursors (and so no `next` link) for a search sorted
+        // by a search parameter, and the rails always sort by `name`.
+        query.push(("_count".to_string(), (count + 1).to_string()));
         query.push(("_offset".to_string(), offset.to_string()));
         let request = self.client.get(&url).query(&query).header(
             "Accept",
@@ -722,9 +726,12 @@ impl ConformanceSource for HttpConformanceSource {
             .json()
             .await
             .map_err(|e| format!("parsing {resource_type} search results failed: {e}"))?;
+        let mut resources = extract_bundle_resources(&bundle);
+        let overflow = resources.len() > count;
+        resources.truncate(count);
         Ok(SearchPage {
-            resources: extract_bundle_resources(&bundle),
-            has_next: next_link(&bundle).is_some(),
+            resources,
+            has_next: overflow || next_link(&bundle).is_some(),
         })
     }
 
@@ -1524,8 +1531,10 @@ mod tests {
     }
 
     /// #741: `search_page` issues one request with the given params plus
-    /// `_count`/`_offset`, and derives `has_next` from the response Bundle's
-    /// `next` link (present or absent).
+    /// `_count` (one over the page, so a further page shows up as an
+    /// overflow row even from a server that issues no `next` link — MongoDB
+    /// on a parameter sort) and `_offset`, and derives `has_next` from that
+    /// overflow or the response Bundle's `next` link (present or absent).
     #[tokio::test]
     async fn http_search_page_sends_params_count_offset_and_reports_has_next() {
         use axum::extract::Query;
@@ -1579,7 +1588,7 @@ mod tests {
             .await
             .expect("search succeeds");
         assert_eq!(first.resources[0]["name:contains"], "pat");
-        assert_eq!(first.resources[0]["_count"], "50");
+        assert_eq!(first.resources[0]["_count"], "51");
         assert_eq!(first.resources[0]["_offset"], "0");
         assert!(first.has_next, "server advertised a next link");
 

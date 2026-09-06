@@ -326,21 +326,33 @@ jobs:
           export HFS_DATA_DIR="$GITHUB_WORKSPACE/data"
           export HFS_NL_SEARCH_API_KEY="e2e-placeholder-not-a-real-key"
           export HFS_DEFAULT_FHIR_VERSION=R4
+          # The browser runs in the Playwright container and reaches HFS over
+          # the runner's IP, so that is the origin HFS must advertise: every
+          # Bundle paging link, fullUrl and export manifest URL is built from
+          # HFS_BASE_URL, and the default (http://localhost:8080) is dead from
+          # inside the container — the results table's Next button fetched it
+          # and rendered nothing (nightly reds on every leg since #629 / PR #720 made the
+          # links honor the configured base).
+          export HFS_BASE_URL="http://$RUNNER_IP:$HFS_PORT"
           # The suite creates and immediately searches; on the ES composites
           # the default asynchronous sync races the specs (nightly reds since
           # the SearchParameter CRUD spec landed). Synchronous puts the write
           # in ES before the API responds, and wait_for blocks the write until
           # the index refresh so the document is searchable on return (the
-          # specs' waitSearchable remains as a backstop). Only the S3 composite stays
-          # asynchronous: against real S3 the extra per-write latency tipped
-          # the seed-heavy dashboard specs over their budgets (run 62), so
-          # that leg stays asynchronous and leans on the polls alone.
-          if [ "${{ matrix.backend }}" = "sqlite-elasticsearch" ] || \
-             [ "${{ matrix.backend }}" = "postgres-elasticsearch" ] || \
-             [ "${{ matrix.backend }}" = "mongodb-elasticsearch" ]; then
-            export HFS_COMPOSITE_SYNC_MODE=synchronous
-            export HFS_ELASTICSEARCH_WRITE_REFRESH=wait_for
-          fi
+          # specs' waitSearchable remains as a backstop). The conformance
+          # seed at boot and on tenant provisioning goes through ES `_bulk`,
+          # so wait_for is paid once per batch, not once per resource (#962).
+          #
+          # The S3 composite joins in now that it runs against MinIO on the
+          # Docker host: the real-S3 latency that once tipped the seed-heavy
+          # specs over budget (run 62) is gone, and asynchronous indexing left
+          # the SQL pages reading stale rails after every save.
+          case "${{ matrix.backend }}" in
+            *elasticsearch*)
+              export HFS_COMPOSITE_SYNC_MODE=synchronous
+              export HFS_ELASTICSEARCH_WRITE_REFRESH=wait_for
+              ;;
+          esac
 
           if [ "${{ matrix.backend }}" = "sqlite-elasticsearch" ]; then
             HFS_STORAGE_BACKEND=sqlite-elasticsearch \
