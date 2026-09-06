@@ -340,6 +340,11 @@ jobs:
              [ "${{ matrix.backend }}" = "mongodb-elasticsearch" ]; then
             export HFS_COMPOSITE_SYNC_MODE=synchronous
             export HFS_ELASTICSEARCH_WRITE_REFRESH=wait_for
+            # wait_for blocks each write until the next refresh, so the
+            # interval is the per-write price of read-after-write: 200ms keeps
+            # a large batch Bundle (entries synced one at a time, 16-wide)
+            # inside the 30s request timeout where 1s did not.
+            export HFS_ELASTICSEARCH_REFRESH_INTERVAL=200ms
           fi
 
           if [ "${{ matrix.backend }}" = "sqlite-elasticsearch" ]; then
