@@ -17,8 +17,16 @@ use super::super::query_builder::{SqlFragment, SqlParam};
 /// modifier (`'+1 day'`), so a single parameter serves both ends of the range
 /// wherever the caller can only bind one.
 ///
-/// `datetime()` truncates fractional seconds, so millisecond-precision values
-/// compare at second precision — a match too many beats never matching.
+/// `datetime()` truncates fractional seconds, which is right for a search
+/// value of second precision (its range is the whole second) but not for one
+/// of millisecond precision: `_lastUpdated=eq2026-09-06T08:44:27.804Z` would
+/// match every resource written in that second, which is exactly what a
+/// transaction Bundle produces once the writes are fast enough to land in one.
+/// Millisecond-precision values therefore go through `strftime('%f')`, which
+/// keeps `SS.SSS` (SQLite carries dates as integer milliseconds internally, so
+/// this is exact) and still folds timezone offsets to UTC. The approximate
+/// prefix keeps `datetime()`: its ±10-second window is coarser than a second
+/// anyway.
 ///
 /// Returns the SQL and the value to bind for its (single) parameter.
 pub(crate) fn date_condition(
@@ -38,8 +46,21 @@ pub(crate) fn date_condition(
         _ => (value.to_string(), None),
     };
 
-    let col = format!("datetime({column})");
-    let p = format!("datetime(?{param_num})");
+    // Decided on the value's own text rather than `DatePrecision`, which reads
+    // a negative offset (`...:42-04:00`) as extra length and calls a plain
+    // second-precision value millisecond.
+    let has_fractional_seconds = value
+        .split_once('T')
+        .is_some_and(|(_, time)| time.contains('.'));
+    let normalize = |expr: &str| {
+        if has_fractional_seconds && prefix != SearchPrefix::Ap {
+            format!("strftime('%Y-%m-%d %H:%M:%f', {expr})")
+        } else {
+            format!("datetime({expr})")
+        }
+    };
+    let col = normalize(column);
+    let p = normalize(&format!("?{param_num}"));
     let end = |m: &str| format!("datetime(?{param_num}, '{m}')");
 
     let sql = match (prefix, bump) {
@@ -163,6 +184,111 @@ mod tests {
         let value = SearchValue::new(SearchPrefix::Eq, "2024-01-15");
         let frag = DateHandler::build_sql(&value, 0);
         assert_eq!(frag.params.len(), 1);
+    }
+
+    #[test]
+    fn eq_millisecond_precision_keeps_the_milliseconds() {
+        let (sql, param) = sql_and_param(SearchPrefix::Eq, "2026-09-06T08:44:27.804Z");
+        assert_eq!(
+            sql,
+            "strftime('%Y-%m-%d %H:%M:%f', value_date) = strftime('%Y-%m-%d %H:%M:%f', ?1)"
+        );
+        assert_eq!(param, "2026-09-06T08:44:27.804Z");
+    }
+
+    #[test]
+    fn second_precision_still_covers_the_whole_second() {
+        let (sql, _) = sql_and_param(SearchPrefix::Eq, "2026-09-06T08:44:27Z");
+        assert_eq!(sql, "datetime(value_date) = datetime(?1)");
+        // A negative offset is not fractional seconds.
+        let (sql, _) = sql_and_param(SearchPrefix::Eq, "2026-09-06T04:44:27-04:00");
+        assert_eq!(sql, "datetime(value_date) = datetime(?1)");
+    }
+
+    /// Evaluates the generated condition in SQLite itself against one stored
+    /// `last_updated` value (the `Utc::now().to_rfc3339()` shape the resources
+    /// table holds), returning whether the search value matches it.
+    fn sqlite_matches(prefix: SearchPrefix, search: &str, stored: &str) -> bool {
+        let conn = rusqlite::Connection::open_in_memory().expect("in-memory sqlite");
+        let (sql, bound) = date_condition("?2", prefix, search, 1);
+        conn.query_row(
+            &format!("SELECT {sql}"),
+            rusqlite::params![bound, stored],
+            |row| row.get::<_, bool>(0),
+        )
+        .unwrap_or_else(|e| panic!("evaluating `{sql}`: {e}"))
+    }
+
+    /// The Inferno US Core `_lastUpdated` case: a transaction Bundle writes
+    /// several resources within one second, and a search for one resource's
+    /// exact `meta.lastUpdated` must not return its neighbours from the same
+    /// second.
+    #[test]
+    fn millisecond_precision_evaluates_at_millisecond_in_sqlite() {
+        let stored = "2026-09-06T08:44:27.828123+00:00";
+
+        assert!(
+            !sqlite_matches(SearchPrefix::Eq, "2026-09-06T08:44:27.804Z", stored),
+            "a different millisecond in the same second is not a match"
+        );
+        assert!(sqlite_matches(
+            SearchPrefix::Eq,
+            "2026-09-06T08:44:27.828Z",
+            stored
+        ));
+        assert!(
+            sqlite_matches(SearchPrefix::Eq, "2026-09-06T08:44:27Z", stored),
+            "a second-precision search still covers the whole second"
+        );
+        assert!(
+            sqlite_matches(SearchPrefix::Eq, "2026-09-06T04:44:27.828-04:00", stored),
+            "timezone offsets still fold to UTC"
+        );
+
+        assert!(sqlite_matches(
+            SearchPrefix::Ne,
+            "2026-09-06T08:44:27.804Z",
+            stored
+        ));
+        assert!(!sqlite_matches(
+            SearchPrefix::Ne,
+            "2026-09-06T08:44:27.828Z",
+            stored
+        ));
+        assert!(sqlite_matches(
+            SearchPrefix::Ge,
+            "2026-09-06T08:44:27.828Z",
+            stored
+        ));
+        assert!(sqlite_matches(
+            SearchPrefix::Gt,
+            "2026-09-06T08:44:27.827Z",
+            stored
+        ));
+        assert!(!sqlite_matches(
+            SearchPrefix::Gt,
+            "2026-09-06T08:44:27.828Z",
+            stored
+        ));
+        assert!(sqlite_matches(
+            SearchPrefix::Lt,
+            "2026-09-06T08:44:27.829Z",
+            stored
+        ));
+        assert!(!sqlite_matches(
+            SearchPrefix::Lt,
+            "2026-09-06T08:44:27.828Z",
+            stored
+        ));
+        assert!(sqlite_matches(
+            SearchPrefix::Le,
+            "2026-09-06T08:44:27.828Z",
+            stored
+        ));
+        assert!(
+            sqlite_matches(SearchPrefix::Ap, "2026-09-06T08:44:30.000Z", stored),
+            "approximate keeps its ±10-second window"
+        );
     }
 }
 
