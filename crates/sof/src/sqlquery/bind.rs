@@ -6,6 +6,39 @@ use serde_json::Value;
 
 use super::{LibraryParameter, SqlQueryError};
 
+/// FHIR type codes this binder knows how to map to a
+/// `Parameters.parameter.value[x]` — the source of truth for what a
+/// `Library.parameter[].type` value this module can actually bind, and the
+/// list a caller building a type picker (#841's "Add parameter") should
+/// offer so it never diverges from what running the query actually
+/// supports.
+///
+/// Ordered for display, not alphabetically: the seven types issue #841
+/// names first (`string`, `integer`, `decimal`, `boolean`, `date`,
+/// `dateTime`, `code`), then every other type code [`value_x_suffix_for`]
+/// and [`expected_value_keys_for`] already handle.
+pub const BINDABLE_PARAMETER_TYPES: &[&str] = &[
+    "string",
+    "integer",
+    "decimal",
+    "boolean",
+    "date",
+    "dateTime",
+    "code",
+    "integer64",
+    "positiveInt",
+    "unsignedInt",
+    "instant",
+    "time",
+    "uri",
+    "url",
+    "canonical",
+    "id",
+    "markdown",
+    "oid",
+    "uuid",
+];
+
 /// A named, type-checked binding. The handler passes a `Vec<BoundParam>` to
 /// the engine; `name` is the `Library.parameter.name` without a leading colon.
 #[derive(Debug, Clone)]
@@ -304,6 +337,44 @@ mod tests {
             "parameter": [{"name": "ts", "valueDateTime": "2025-01-02T03:04:05Z"}]
         });
         assert!(bind_supplied_params(&declared, Some(&ok)).is_ok());
+    }
+
+    /// #841: every code in [`BINDABLE_PARAMETER_TYPES`] must actually
+    /// bind a well-typed sample value — guards against the list drifting
+    /// from `value_x_suffix_for`/`bind_value`'s own match arms (a code that
+    /// silently fell through to the string-ish fallback would still "bind",
+    /// just not the way its FHIR type promises).
+    #[test]
+    fn every_bindable_parameter_type_resolves_in_the_binder() {
+        fn sample_value(type_code: &str) -> Value {
+            match type_code {
+                "boolean" => json!(true),
+                "integer" | "positiveInt" | "unsignedInt" | "integer64" => json!(1),
+                "decimal" => json!(1.5),
+                "date" => json!("2025-01-02"),
+                "dateTime" | "instant" => json!("2025-01-02T03:04:05Z"),
+                "time" => json!("03:04:05"),
+                _ => json!("sample"),
+            }
+        }
+
+        for &type_code in BINDABLE_PARAMETER_TYPES {
+            let declared = vec![decl("p", type_code)];
+            let key = format!("value{}", value_x_suffix_for(type_code));
+            let mut entry = serde_json::Map::new();
+            entry.insert("name".to_string(), json!("p"));
+            entry.insert(key, sample_value(type_code));
+            let supplied = json!({
+                "resourceType": "Parameters",
+                "parameter": [Value::Object(entry)],
+            });
+            let result = bind_supplied_params(&declared, Some(&supplied));
+            assert!(
+                result.is_ok(),
+                "type code '{type_code}' failed to bind a sample value: {:?}",
+                result.err()
+            );
+        }
     }
 
     #[test]

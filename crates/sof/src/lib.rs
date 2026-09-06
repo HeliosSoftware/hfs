@@ -188,8 +188,8 @@ pub mod data_source;
 mod error;
 pub mod fhir_format;
 mod handlers;
-/// Structural + FHIRPath-syntax linting for ViewDefinition documents (#753
-/// evaluation POC, ticket 03) - see [`lint::lint_view_definition`].
+/// Structural + FHIRPath-syntax linting for ViewDefinition documents (#753)
+/// - see [`lint::lint_view_definition`].
 pub mod lint;
 mod models;
 pub mod params;
@@ -212,9 +212,11 @@ pub use remote_resolver::{
     is_disallowed_ip, parse_allowed_base_urls,
 };
 pub use sqlquery::{
-    BoundParam, ColumnFhirType, DependsOnView, InMemorySqlEngine, LibraryParameter, QueryResult,
-    SqlQueryError, SqlQueryLibrary, SqlQueryRunParams, TableSchema, bind_supplied_params,
-    extract_sqlquery_params_from_json, format_fhir_parameters, parse_sqlquery_library,
+    BINDABLE_PARAMETER_TYPES, BoundParam, ColumnFhirType, DependsOnView, InMemorySqlEngine,
+    LibraryParameter, Placeholder, QueryResult, ScanError, ScanResult, SourcePosition,
+    SqlQueryError, SqlQueryLibrary, SqlQueryRunParams, TableRef, TableSchema, bind_supplied_params,
+    extract_sqlquery_params_from_json, format_fhir_parameters, parse_sqlquery_library, scan_sql,
+    undeclared_tables,
 };
 
 use chrono::{DateTime, Utc};
