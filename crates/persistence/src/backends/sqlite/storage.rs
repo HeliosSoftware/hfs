@@ -1251,11 +1251,61 @@ impl SqliteBackend {
                 .map_err(|e| internal_error(format!("Search parameter extraction failed: {}", e)))?
         };
 
+        // Rows are written eight at a time: a single-row INSERT stepped once
+        // per row spends a measurable share of its time entering and leaving
+        // the statement, and every resource writes ~10-30 rows. The B-tree
+        // work is unchanged; only the per-statement overhead is amortized
+        // (measured +9% bulk-ingest throughput on the real 31 GB manifest).
         let mut count = 0;
         {
+            // The whole insert, plus its Rust-side half (normalising values and
+            // building the bound parameters) as a nested phase, so a profile can
+            // tell our marshalling apart from SQLite's b-tree work (#947).
             let _span = crate::perf::span(crate::perf::Phase::IndexInsert);
-            for value in values {
-                self.write_index_entry(conn, tenant_id, resource_type, resource_id, &value)?;
+            use crate::search::converters::IndexValue;
+            let marshal_span = crate::perf::span(crate::perf::Phase::IndexMarshal);
+            let owned: Vec<_> = values
+                .into_iter()
+                .map(|v| match &v.value {
+                    IndexValue::Date {
+                        value: d,
+                        precision,
+                    } => {
+                        let mut n = v.clone();
+                        n.value = IndexValue::Date {
+                            value: Self::normalize_date_for_sqlite(d),
+                            precision: *precision,
+                        };
+                        n
+                    }
+                    _ => v,
+                })
+                .collect();
+            let rows: Vec<Vec<_>> = owned
+                .iter()
+                .map(|v| {
+                    SqliteSearchIndexWriter::to_sql_params(tenant_id, resource_type, resource_id, v)
+                })
+                .collect();
+            drop(marshal_span);
+            let mut i = 0;
+            while i + 8 <= rows.len() {
+                let refs: Vec<&dyn ToSql> = rows[i..i + 8]
+                    .iter()
+                    .flatten()
+                    .map(|p| self.sql_value_to_ref(p))
+                    .collect();
+                conn.prepare_cached(SqliteSearchIndexWriter::insert_sql_rows8())
+                    .and_then(|mut s| s.execute(refs.as_slice()))
+                    .map_err(|e| internal_error(format!("multi-row index insert: {e}")))?;
+                i += 8;
+                count += 8;
+            }
+            for row in &rows[i..] {
+                let refs: Vec<&dyn ToSql> = row.iter().map(|p| self.sql_value_to_ref(p)).collect();
+                conn.prepare_cached(SqliteSearchIndexWriter::insert_sql())
+                    .and_then(|mut s| s.execute(refs.as_slice()))
+                    .map_err(|e| internal_error(format!("index insert: {e}")))?;
                 count += 1;
             }
         }
