@@ -3395,6 +3395,43 @@ details.json-fold[open] > summary .icon {
   vertical-align: middle;
 }
 
+/* One undeclared-placeholder hint (#841's Parameters card, `.lib-params-
+   hint`): the ":name is used but not declared" text and its own one-click
+   *Declare* button, side by side — an informational row, not a `.notice`
+   (this is expected while a query is still being written, never an error),
+   so it gets its own quieter surface instead of `.notice--warn`'s. */
+.lib-params-hint {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 12px;
+  margin: 0 0 8px;
+  font-size: 13px;
+  color: var(--text);
+  background: var(--bg-content);
+  border: 1px solid var(--surface-border);
+  border-radius: 8px;
+}
+
+.lib-params-hint:last-of-type {
+  margin-bottom: 0;
+}
+
+/* The `Add parameter` panel's own name/type row (#841) — plain `.field`s
+   side by side, unlike `.param-grid`'s fixed three-up layout (built for a
+   *values* row that can hold many, not this always-exactly-two form). */
+.lib-params-add__fields {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 14px;
+}
+
+.lib-params-add__fields .field {
+  flex: 1 1 160px;
+  margin-bottom: 0;
+}
+
 /* The Last 24 hrs sparkline (#782): the engine's half-hour delivery series,
    scaled server-side; color follows the row's state — the frame's dotted
    amber marks a listener-less websocket. */

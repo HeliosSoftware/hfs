@@ -15,8 +15,9 @@
  * construction error) belongs to `code-editor.js` and is not duplicated
  * here - this file only owns what is specific to the SQL editor: the
  * language (SQLite dialect, the engine `$sqlquery-run` actually executes
- * on), its HighlightStyle, and the failed-line tint below. No fold, no
- * lint, no autocomplete yet (#842).
+ * on), its HighlightStyle, the failed-line tint, and the unknown-table
+ * lint's own diagnostics/gutter (#842/04) below. No fold, no
+ * autocomplete yet (follow-up A of #842).
  *
  * The Library JSON pane on the same page (`input[type="hidden"][name="json"]`,
  * no fold since #839) is untouched - #840 replaces it with a Details view.
@@ -116,12 +117,54 @@
   var view = CodeEditor.mount(textarea, {
     language: sqlLanguage,
     highlight: CM.syntaxHighlighting(sqlHighlightStyle),
-    extensions: [errorLineField],
+    extensions: [errorLineField, CM.lintGutter()],
     fold: false,
     wrapperClass: "sql-editor",
     id: "sql-editor",
   });
   if (!view) return;
+
+  /* ---- Unknown-table diagnostics (#842/04): `partials/lib_run_unknown_
+   * tables.html` marks its own notice with `data-diagnostics` - a JSON
+   * array of `{ from, to, message, table }` objects, character offsets
+   * into the SQL text as posted. `applyDiagnostics` turns that into
+   * `@codemirror/lint`'s own `Diagnostic[]` shape (`severity: "error"`,
+   * `source: "unknown-table"`) and hands it to `setDiagnostics`, which
+   * `lintGutter()` above renders as an underline with a hover tooltip and a
+   * mark in the gutter. `from`/`to` are clamped to the document's current
+   * length - the posted SQL and the editor's own text are normally
+   * identical, but a swap can in principle land a moment after the
+   * visitor kept typing. Missing or unparseable `data-diagnostics` (every
+   * other notice - a good run, a plain execution failure, "waiting for a
+   * value") clears whatever the previous notice set, exactly like
+   * `errorLineEffect.of(null)` above. */
+  function applyDiagnostics(target) {
+    var el = target.querySelector("[data-diagnostics]");
+    var raw = el ? el.getAttribute("data-diagnostics") : null;
+    var diagnostics = [];
+    if (raw) {
+      try {
+        var parsed = JSON.parse(raw);
+        var docLength = view.state.doc.length;
+        if (Array.isArray(parsed)) {
+          diagnostics = parsed.map(function (d) {
+            var from = Math.max(0, Math.min(docLength, d.from | 0));
+            var to = Math.max(from, Math.min(docLength, d.to | 0));
+            return {
+              from: from,
+              to: to,
+              severity: "error",
+              source: "unknown-table",
+              message: String(d.message || ""),
+            };
+          });
+        }
+      } catch (e) {
+        diagnostics = [];
+      }
+    }
+    view.dispatch(CM.setDiagnostics(view.state, diagnostics));
+  }
 
   /* `#run-notice` is always swapped wholesale (`hx-swap="outerHTML"`, both
    * the live-run trigger and the page's own initial load in
@@ -137,5 +180,6 @@
     var line = notice ? parseInt(notice.getAttribute("data-error-line"), 10) : NaN;
     var inRange = Number.isInteger(line) && line >= 1 && line <= view.state.doc.lines;
     view.dispatch({ effects: errorLineEffect.of(inRange ? line : null) });
+    applyDiagnostics(target);
   });
 })();

@@ -143,6 +143,15 @@ test.describe.serial("Active SQL Exports", () => {
     const initialProgress = await progressbar.getAttribute("aria-valuenow");
     expect(Number(initialProgress)).toBeLessThan(100);
 
+    // #853: the list page polls every in-progress job once before its own
+    // first render, so the meta line already carries the server's own
+    // subjectsDone/subjectsTotal fraction at this point — tolerant of
+    // whichever done count landed by then, and of the optional
+    // "Writing <name>" clause preceding it.
+    await expect(card.locator(".job-card__meta")).toHaveText(
+      new RegExp(`\\d+ of ${PADDING_SUBJECTS} subjects`),
+    );
+
     // (d) Without ever reloading, the card's own `hx-trigger="every 5s"`
     // fragment carries it to Complete: chip, full progress bar, and a meta
     // line naming the output files.

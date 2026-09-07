@@ -244,6 +244,18 @@ fn in_progress_job(server_job_id: &str) -> serde_json::Value {
     })
 }
 
+/// Same as [`in_progress_job`], but already carrying `subjectsDone`/
+/// `subjectsTotal`/`currentSubject` from an earlier poll (#853) — for tests
+/// asserting the three clear on a terminal transition, or survive an
+/// `Unavailable` one untouched.
+fn in_progress_job_with_subject_progress(server_job_id: &str) -> serde_json::Value {
+    let mut job = in_progress_job(server_job_id);
+    job["subjectsDone"] = serde_json::json!(2);
+    job["subjectsTotal"] = serde_json::json!(6);
+    job["currentSubject"] = serde_json::json!("encounters_flat");
+    job
+}
+
 /// A `failed` job record, ready to seed for the job-actions tests below.
 fn failed_job(server_job_id: &str) -> serde_json::Value {
     serde_json::json!({
@@ -665,7 +677,7 @@ async fn starting_an_export_stores_an_in_progress_record_and_the_list_polls_its_
         )
         // Keeps the list-page poll from moving the job past in-progress, so
         // this test can focus on the kick-off record and the card shape.
-        .with_export_status(SqlExportStatus::Running(None));
+        .with_export_status(SqlExportStatus::running(None));
     let app = app(&backend, source);
 
     let response = app
@@ -767,7 +779,7 @@ async fn a_running_job_shows_progress_and_keeps_polling() {
     let backend = backend_with_schema().await;
     seed_job(&backend, "default", "job-a", in_progress_job("job-1")).await;
     let source = StaticConformanceSource::empty()
-        .with_export_status(SqlExportStatus::Running(Some("35%".to_string())));
+        .with_export_status(SqlExportStatus::running(Some("35%".to_string())));
     let app = app(&backend, source);
 
     let response = app
@@ -788,10 +800,135 @@ async fn a_running_job_shows_progress_and_keeps_polling() {
     assert_eq!(job["progress"], "35%");
 }
 
+/// #853: with `subjectsTotal`/`subjectsDone`/`currentSubject` in the poll
+/// answer, the meta line leads with "Writing <name>" and swaps the local
+/// subject count for the server's own done/total fraction — the parenthesized
+/// kind breakdown still comes from the local roster, and the percentage is
+/// not repeated as text (only the progress bar's `aria-valuenow` announces
+/// it).
+#[tokio::test]
+async fn a_running_job_with_subject_progress_shows_writing_and_the_fraction() {
+    let backend = backend_with_schema().await;
+    seed_job(&backend, "default", "job-a", in_progress_job("job-1")).await;
+    let source = StaticConformanceSource::empty().with_export_status(SqlExportStatus::Running {
+        progress: Some("35%".to_string()),
+        subjects_total: Some(6),
+        subjects_done: Some(2),
+        current_subject: Some("encounters_flat".to_string()),
+    });
+    let app = app(&backend, source);
+
+    let response = app
+        .clone()
+        .oneshot(get("/ui/sql/export/job-a/card"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    // The meta line never repeats the percentage as text — only the
+    // progress bar's `aria-valuenow`/width announce it.
+    assert!(html.contains(
+        "Writing encounters_flat · 2 of 6 subjects (1 ViewDefinition) · CSV · started 2026-01-01 09:00 UTC"
+    ));
+    assert!(html.contains(r#"aria-valuenow="35""#));
+
+    let stored = backend.get_settings("l2:").await.unwrap().unwrap();
+    let job = &stored.document["byTenant"]["default"]["sqlExport"]["jobs"]["job-a"];
+    assert_eq!(job["subjectsDone"], 2);
+    assert_eq!(job["subjectsTotal"], 6);
+    assert_eq!(job["currentSubject"], "encounters_flat");
+}
+
+/// #853: counts without a subject currently in flight (between two subjects,
+/// or just after the last one finished but before the manifest is ready) —
+/// no "Writing" clause.
+#[tokio::test]
+async fn a_running_job_with_subject_progress_and_no_current_subject_omits_writing() {
+    let backend = backend_with_schema().await;
+    seed_job(&backend, "default", "job-a", in_progress_job("job-1")).await;
+    let source = StaticConformanceSource::empty().with_export_status(SqlExportStatus::Running {
+        progress: Some("99%".to_string()),
+        subjects_total: Some(6),
+        subjects_done: Some(6),
+        current_subject: None,
+    });
+    let app = app(&backend, source);
+
+    let response = app
+        .clone()
+        .oneshot(get("/ui/sql/export/job-a/card"))
+        .await
+        .unwrap();
+    let html = body_text(response).await;
+    assert!(!html.contains("Writing"));
+    assert!(
+        html.contains("6 of 6 subjects (1 ViewDefinition) · CSV · started 2026-01-01 09:00 UTC")
+    );
+    // The bar still tracks `X-Progress` on its own, independent of the meta
+    // line's own cascade (#853).
+    assert!(html.contains(r#"aria-valuenow="99""#));
+}
+
+/// #853: the done/total fraction pluralizes on `$total`, not on the local
+/// subject count — `1 of 1 subject`, singular, even though the breakdown
+/// still names one subject.
+#[tokio::test]
+async fn a_running_job_pluralizes_the_fraction_on_a_single_total_subject() {
+    let backend = backend_with_schema().await;
+    seed_job(&backend, "default", "job-a", in_progress_job("job-1")).await;
+    let source = StaticConformanceSource::empty().with_export_status(SqlExportStatus::Running {
+        progress: Some("0%".to_string()),
+        subjects_total: Some(1),
+        subjects_done: Some(1),
+        current_subject: None,
+    });
+    let app = app(&backend, source);
+
+    let response = app
+        .clone()
+        .oneshot(get("/ui/sql/export/job-a/card"))
+        .await
+        .unwrap();
+    let html = body_text(response).await;
+    assert!(html.contains("1 of 1 subject (1 ViewDefinition)"));
+}
+
+/// #853: a server that predates `subjectsTotal`/`subjectsDone`/
+/// `currentSubject` (only `X-Progress`, no body parameters) leaves the meta
+/// line exactly as it reads today — the same compatibility case
+/// [`a_running_job_shows_progress_and_keeps_polling`] above already covers,
+/// spelled out explicitly here as the fallback cascade's third rung.
+#[tokio::test]
+async fn a_running_job_without_subject_progress_falls_back_to_the_percentage() {
+    let backend = backend_with_schema().await;
+    seed_job(&backend, "default", "job-a", in_progress_job("job-1")).await;
+    let source =
+        StaticConformanceSource::empty().with_export_status(SqlExportStatus::running(None));
+    let app = app(&backend, source);
+
+    let response = app
+        .clone()
+        .oneshot(get("/ui/sql/export/job-a/card"))
+        .await
+        .unwrap();
+    let html = body_text(response).await;
+    assert!(html.contains(
+        "Waiting for the first status report… · 1 subject (1 ViewDefinition) · CSV · started 2026-01-01 09:00 UTC"
+    ));
+    // No `X-Progress` at all yet either: the bar floors to 0, same as today.
+    assert!(html.contains(r#"aria-valuenow="0""#));
+}
+
 #[tokio::test]
 async fn a_done_job_with_a_successful_manifest_completes_and_persists_its_outputs() {
     let backend = backend_with_schema().await;
-    seed_job(&backend, "default", "job-a", in_progress_job("job-1")).await;
+    seed_job(
+        &backend,
+        "default",
+        "job-a",
+        in_progress_job_with_subject_progress("job-1"),
+    )
+    .await;
     let manifest = serde_json::json!({
         "resourceType": "Parameters",
         "parameter": [{"name": "output", "part": [
@@ -827,12 +964,23 @@ async fn a_done_job_with_a_successful_manifest_completes_and_persists_its_output
         serde_json::json!([{"name": "patients", "locations": ["/export/job-1/patients-0.csv"]}])
     );
     assert!(!job["finishedAt"].as_str().unwrap_or_default().is_empty());
+    // #853: a terminal transition clears the subject-progress fields a
+    // prior poll had recorded — a finished job never shows a stale fraction.
+    assert!(job["subjectsDone"].is_null());
+    assert!(job["subjectsTotal"].is_null());
+    assert!(job["currentSubject"].is_null());
 }
 
 #[tokio::test]
 async fn a_done_job_with_a_failing_manifest_fails_with_the_message() {
     let backend = backend_with_schema().await;
-    seed_job(&backend, "default", "job-a", in_progress_job("job-1")).await;
+    seed_job(
+        &backend,
+        "default",
+        "job-a",
+        in_progress_job_with_subject_progress("job-1"),
+    )
+    .await;
     let source = StaticConformanceSource::empty()
         .with_export_status(SqlExportStatus::Done)
         .with_export_manifest(Err("the result endpoint returned 500".to_string()));
@@ -851,12 +999,23 @@ async fn a_done_job_with_a_failing_manifest_fails_with_the_message() {
     let job = &stored.document["byTenant"]["default"]["sqlExport"]["jobs"]["job-a"];
     assert_eq!(job["status"], "failed");
     assert_eq!(job["error"], "the result endpoint returned 500");
+    // #853: cleared here too — a failed job doesn't keep the fraction of a
+    // subject it never finished writing.
+    assert!(job["subjectsDone"].is_null());
+    assert!(job["subjectsTotal"].is_null());
+    assert!(job["currentSubject"].is_null());
 }
 
 #[tokio::test]
 async fn an_unknown_job_is_marked_cancelled_with_a_translated_reason() {
     let backend = backend_with_schema().await;
-    seed_job(&backend, "default", "job-a", in_progress_job("job-1")).await;
+    seed_job(
+        &backend,
+        "default",
+        "job-a",
+        in_progress_job_with_subject_progress("job-1"),
+    )
+    .await;
     let source = StaticConformanceSource::empty().with_export_status(SqlExportStatus::Unknown);
     let app = app(&backend, source);
 
@@ -873,12 +1032,22 @@ async fn an_unknown_job_is_marked_cancelled_with_a_translated_reason() {
     let job = &stored.document["byTenant"]["default"]["sqlExport"]["jobs"]["job-a"];
     assert_eq!(job["status"], "cancelled");
     assert_eq!(job["error"], "the server no longer knows this job");
+    // #853: the reaper declaring a job gone is a terminal transition too.
+    assert!(job["subjectsDone"].is_null());
+    assert!(job["subjectsTotal"].is_null());
+    assert!(job["currentSubject"].is_null());
 }
 
 #[tokio::test]
 async fn an_unavailable_poll_keeps_the_job_in_progress_and_still_polls() {
     let backend = backend_with_schema().await;
-    seed_job(&backend, "default", "job-a", in_progress_job("job-1")).await;
+    seed_job(
+        &backend,
+        "default",
+        "job-a",
+        in_progress_job_with_subject_progress("job-1"),
+    )
+    .await;
     let source = StaticConformanceSource::empty().with_export_status(SqlExportStatus::Unavailable(
         "status poll answered 401".to_string(),
     ));
@@ -893,11 +1062,17 @@ async fn an_unavailable_poll_keeps_the_job_in_progress_and_still_polls() {
     assert!(html.contains(">In progress<"));
     assert!(html.contains("status unavailable: status poll answered 401"));
     assert!(html.contains("every 5s"), "still polling while unavailable");
+    // #853: an unavailable poll leaves the previous subject-progress fields
+    // exactly as they were — same rule as `progress` already followed.
+    assert!(html.contains("Writing encounters_flat · 2 of 6 subjects"));
 
     let stored = backend.get_settings("l2:").await.unwrap().unwrap();
     let job = &stored.document["byTenant"]["default"]["sqlExport"]["jobs"]["job-a"];
     assert_eq!(job["status"], "in-progress");
     assert_eq!(job["pollError"], "status poll answered 401");
+    assert_eq!(job["subjectsDone"], 2);
+    assert_eq!(job["subjectsTotal"], 6);
+    assert_eq!(job["currentSubject"], "encounters_flat");
 }
 
 /// The list page itself polls an in-progress job before rendering, not just
@@ -1042,7 +1217,7 @@ async fn starting_an_export_submits_display_names_disambiguating_duplicates() {
                 view_definition("vd2", "patients_flat"),
             ],
         )
-        .with_export_status(SqlExportStatus::Running(None));
+        .with_export_status(SqlExportStatus::running(None));
     let app = app(&backend, source.clone());
 
     let response = app
@@ -1098,7 +1273,7 @@ async fn starting_an_export_from_the_form_submits_a_body_with_only_format_header
                 view_definition("vd2", "patients_flat"),
             ],
         )
-        .with_export_status(SqlExportStatus::Running(None));
+        .with_export_status(SqlExportStatus::running(None));
     let app = app(&backend, source.clone());
 
     let response = app
@@ -1205,7 +1380,7 @@ async fn starting_an_export_with_every_filter_set_submits_the_exact_body() {
             FhirVersion::R4,
             vec![view_definition("vd1", "patients_flat")],
         )
-        .with_export_status(SqlExportStatus::Running(None));
+        .with_export_status(SqlExportStatus::running(None));
     let app = app(&backend, source.clone());
 
     let response = app
@@ -1300,7 +1475,7 @@ async fn header_is_only_sent_for_csv_and_mirrors_the_checkbox() {
             FhirVersion::R4,
             vec![view_definition("vd1", "patients")],
         )
-        .with_export_status(SqlExportStatus::Running(None));
+        .with_export_status(SqlExportStatus::running(None));
 
     // ndjson with the checkbox submitted anyway — never sent, the format
     // decides, not the checkbox's presence.
@@ -1507,7 +1682,7 @@ async fn the_fallback_textarea_shape_splits_into_one_patient_parameter_each() {
             FhirVersion::R4,
             vec![view_definition("vd1", "patients")],
         )
-        .with_export_status(SqlExportStatus::Running(None));
+        .with_export_status(SqlExportStatus::running(None));
     let app = app(&backend, source.clone());
 
     let response = app
@@ -1640,7 +1815,7 @@ async fn new_page_shows_parameter_chips_and_open_values_rows_only_for_parameteri
 #[tokio::test]
 async fn marking_a_parameterized_query_sends_its_value_as_a_typed_subject_parameter() {
     let backend = backend_with_schema().await;
-    let source = parameterized_subjects_source().with_export_status(SqlExportStatus::Running(None));
+    let source = parameterized_subjects_source().with_export_status(SqlExportStatus::running(None));
     let app = app(&backend, source.clone());
 
     // The AC in #837: mark `ward_query`, submit `ward=Ward 3B`.
@@ -1690,7 +1865,7 @@ async fn marking_a_parameterized_query_sends_its_value_as_a_typed_subject_parame
 #[tokio::test]
 async fn an_empty_defaulted_parameter_is_omitted_while_a_required_one_is_sent() {
     let backend = backend_with_schema().await;
-    let source = parameterized_subjects_source().with_export_status(SqlExportStatus::Running(None));
+    let source = parameterized_subjects_source().with_export_status(SqlExportStatus::running(None));
     let app = app(&backend, source.clone());
 
     let response = app
@@ -1787,7 +1962,7 @@ async fn an_invalid_typed_parameter_value_rerenders_with_a_type_error_and_no_kic
 #[tokio::test]
 async fn parameter_values_for_an_unmarked_subject_are_ignored() {
     let backend = backend_with_schema().await;
-    let source = parameterized_subjects_source().with_export_status(SqlExportStatus::Running(None));
+    let source = parameterized_subjects_source().with_export_status(SqlExportStatus::running(None));
     let app = app(&backend, source.clone());
 
     // Only `q1` is checked; `q2` carries a (bogus) value even though it is
@@ -1822,7 +1997,7 @@ async fn parameter_values_for_an_unmarked_subject_are_ignored() {
 #[tokio::test]
 async fn a_view_definition_subject_never_carries_parameters_even_when_submitted() {
     let backend = backend_with_schema().await;
-    let source = parameterized_subjects_source().with_export_status(SqlExportStatus::Running(None));
+    let source = parameterized_subjects_source().with_export_status(SqlExportStatus::running(None));
     let app = app(&backend, source.clone());
 
     let response = app
@@ -1860,7 +2035,13 @@ async fn a_view_definition_subject_never_carries_parameters_even_when_submitted(
 #[tokio::test]
 async fn cancelling_an_in_progress_job_marks_it_cancelled_with_a_clean_slate() {
     let backend = backend_with_schema().await;
-    seed_job(&backend, "default", "job-a", in_progress_job("job-1")).await;
+    seed_job(
+        &backend,
+        "default",
+        "job-a",
+        in_progress_job_with_subject_progress("job-1"),
+    )
+    .await;
     let source = StaticConformanceSource::empty();
     let app = app(&backend, source.clone());
 
@@ -1877,6 +2058,11 @@ async fn cancelling_an_in_progress_job_marks_it_cancelled_with_a_clean_slate() {
     assert_eq!(job["status"], "cancelled");
     assert!(job["error"].is_null(), "a user cancel carries no error");
     assert!(job["progress"].is_null());
+    // #853: a user-initiated cancel is a terminal transition too — the
+    // subject progress from the last poll before cancelling is stale now.
+    assert!(job["subjectsDone"].is_null());
+    assert!(job["subjectsTotal"].is_null());
+    assert!(job["currentSubject"].is_null());
     assert!(!job["finishedAt"].as_str().unwrap_or_default().is_empty());
 
     let calls = source.export_calls();
@@ -1913,7 +2099,7 @@ async fn retrying_a_failed_job_creates_a_new_record_and_leaves_the_original_unto
     let backend = backend_with_schema().await;
     seed_job(&backend, "default", "job-a", failed_job("job-1")).await;
     let source =
-        StaticConformanceSource::empty().with_export_status(SqlExportStatus::Running(None));
+        StaticConformanceSource::empty().with_export_status(SqlExportStatus::running(None));
     let app = app(&backend, source.clone());
 
     let response = app
@@ -2555,7 +2741,7 @@ async fn detail_page_shows_progress_in_progress_and_the_fragment_completes_it() 
     let running_app = app(
         &backend,
         StaticConformanceSource::empty()
-            .with_export_status(SqlExportStatus::Running(Some("40%".to_string()))),
+            .with_export_status(SqlExportStatus::running(Some("40%".to_string()))),
     );
     let response = running_app
         .oneshot(get("/ui/sql/export/job-a"))
@@ -2600,6 +2786,127 @@ async fn detail_page_shows_progress_in_progress_and_the_fragment_completes_it() 
         stored.document["byTenant"]["default"]["sqlExport"]["jobs"]["job-a"]["status"],
         "complete"
     );
+}
+
+/// #853: the detail lede and Duration field pick up the same
+/// `subjectsTotal`/`subjectsDone`/`currentSubject` cascade as the list
+/// card's meta line — no kind breakdown here, unlike the card — and both
+/// clear once the job completes.
+#[tokio::test]
+async fn detail_page_shows_subject_progress_and_clears_it_on_completion() {
+    let backend = backend_with_schema().await;
+    seed_job(&backend, "default", "job-a", in_progress_job("job-1")).await;
+
+    let running_app = app(
+        &backend,
+        StaticConformanceSource::empty().with_export_status(SqlExportStatus::Running {
+            progress: Some("35%".to_string()),
+            subjects_total: Some(6),
+            subjects_done: Some(2),
+            current_subject: Some("encounters_flat".to_string()),
+        }),
+    );
+    let response = running_app
+        .oneshot(get("/ui/sql/export/job-a"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains(
+        "Started 2026-01-01 09:00 UTC · Writing encounters_flat · 2 of 6 subjects · CSV"
+    ));
+    // Duration mirrors the bare fraction only — no "Writing" clause there.
+    assert!(html.contains(">2 of 6 subjects<"));
+    assert!(html.contains(r#"aria-valuenow="35""#));
+
+    let stored = backend.get_settings("l2:").await.unwrap().unwrap();
+    let job = &stored.document["byTenant"]["default"]["sqlExport"]["jobs"]["job-a"];
+    assert_eq!(job["subjectsDone"], 2);
+    assert_eq!(job["subjectsTotal"], 6);
+    assert_eq!(job["currentSubject"], "encounters_flat");
+
+    let manifest = serde_json::json!({
+        "resourceType": "Parameters",
+        "parameter": [{"name": "output", "part": [
+            {"name": "name", "valueString": "patients"},
+            {"name": "location", "valueUri": "http://s/export/job-1/patients-0.csv"},
+        ]}]
+    });
+    let done_app = app(
+        &backend,
+        StaticConformanceSource::empty()
+            .with_export_status(SqlExportStatus::Done)
+            .with_export_manifest(Ok(manifest)),
+    );
+    let response = done_app
+        .oneshot(get("/ui/sql/export/job-a/detail"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains(">Complete<"));
+
+    let stored = backend.get_settings("l2:").await.unwrap().unwrap();
+    let job = &stored.document["byTenant"]["default"]["sqlExport"]["jobs"]["job-a"];
+    assert!(job["subjectsDone"].is_null());
+    assert!(job["subjectsTotal"].is_null());
+    assert!(job["currentSubject"].is_null());
+}
+
+/// #853: same cascade as the card, on the detail page — with subject counts
+/// but no subject currently being written, the lede omits the "Writing …"
+/// clause and Duration mirrors the bare fraction (no kind breakdown here,
+/// unlike the list card's meta line).
+#[tokio::test]
+async fn detail_page_shows_subject_progress_with_no_current_subject() {
+    let backend = backend_with_schema().await;
+    seed_job(&backend, "default", "job-a", in_progress_job("job-1")).await;
+
+    let running_app = app(
+        &backend,
+        StaticConformanceSource::empty().with_export_status(SqlExportStatus::Running {
+            progress: Some("99%".to_string()),
+            subjects_total: Some(6),
+            subjects_done: Some(6),
+            current_subject: None,
+        }),
+    );
+    let response = running_app
+        .oneshot(get("/ui/sql/export/job-a"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(!html.contains("Writing"));
+    assert!(html.contains("Started 2026-01-01 09:00 UTC · 6 of 6 subjects · CSV"));
+    assert!(html.contains(">6 of 6 subjects<"));
+    assert!(html.contains(r#"aria-valuenow="99""#));
+}
+
+/// #853: without subject counts at all (a server that predates them, or
+/// before the first poll carries a body), the lede and Duration fall back to
+/// today's percentage text — the same compatibility case the list card's own
+/// [`a_running_job_without_subject_progress_falls_back_to_the_percentage`]
+/// covers.
+#[tokio::test]
+async fn detail_page_falls_back_to_the_percentage_without_subject_progress() {
+    let backend = backend_with_schema().await;
+    seed_job(&backend, "default", "job-a", in_progress_job("job-1")).await;
+
+    let running_app = app(
+        &backend,
+        StaticConformanceSource::empty()
+            .with_export_status(SqlExportStatus::running(Some("40%".to_string()))),
+    );
+    let response = running_app
+        .oneshot(get("/ui/sql/export/job-a"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains("Started 2026-01-01 09:00 UTC · 40% · CSV"));
+    assert!(html.contains(">40%<"));
+    assert!(html.contains(r#"aria-valuenow="40""#));
 }
 
 #[tokio::test]
@@ -2688,7 +2995,7 @@ async fn card_shows_the_right_contextual_action_and_overflow_items_per_status() 
         let backend = backend_with_schema().await;
         seed_job(&backend, "default", "job-a", seed).await;
         let source = StaticConformanceSource::empty()
-            .with_export_status(SqlExportStatus::Running(Some("10%".to_string())));
+            .with_export_status(SqlExportStatus::running(Some("10%".to_string())));
         let app = app(&backend, source);
         let response = app.oneshot(get("/ui/sql/export/job-a/card")).await.unwrap();
         body_text(response).await

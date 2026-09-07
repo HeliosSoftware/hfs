@@ -47,6 +47,29 @@ impl ColumnFhirType {
         }
     }
 
+    /// The canonical FHIR type code for this type (#842/04): the
+    /// representative code [`Self::from_code`] maps every original code in
+    /// this variant's family to (`"integer"` for `integer`, `positiveInt`,
+    /// and `unsignedInt` alike), except [`ColumnFhirType::String`], which
+    /// returns the exact code it was built from. Used to display a
+    /// resolved dependency's own declared column type (the SQL Library
+    /// Columns card's *Type* cell, #842) without re-deriving it from the
+    /// source `ViewDefinition` JSON a second time.
+    pub fn code(&self) -> &str {
+        match self {
+            ColumnFhirType::Boolean => "boolean",
+            ColumnFhirType::Integer => "integer",
+            ColumnFhirType::Integer64 => "integer64",
+            ColumnFhirType::Decimal => "decimal",
+            ColumnFhirType::Date => "date",
+            ColumnFhirType::DateTime => "dateTime",
+            ColumnFhirType::Instant => "instant",
+            ColumnFhirType::Time => "time",
+            ColumnFhirType::Base64Binary => "base64Binary",
+            ColumnFhirType::String(code) => code,
+        }
+    }
+
     /// SQLite type-affinity declaration for `CREATE TABLE`.
     pub fn sqlite_affinity(&self) -> &'static str {
         match self {
@@ -495,6 +518,19 @@ mod tests {
             .execute_select("SELECT n FROM t WHERE n >= :min ORDER BY n", &bindings, 100)
             .unwrap();
         assert_eq!(result.rows.len(), 3);
+    }
+
+    #[test]
+    fn code_returns_the_representative_fhir_type_code() {
+        assert_eq!(ColumnFhirType::Boolean.code(), "boolean");
+        assert_eq!(ColumnFhirType::Integer.code(), "integer");
+        assert_eq!(ColumnFhirType::Decimal.code(), "decimal");
+        // `from_code`'s own family members collapse to the same
+        // representative code `code()` reports back.
+        assert_eq!(ColumnFhirType::from_code("positiveInt").code(), "integer");
+        // `String` returns the exact code it was built from, never a
+        // generic "string".
+        assert_eq!(ColumnFhirType::String("id".into()).code(), "id");
     }
 
     #[test]
