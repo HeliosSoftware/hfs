@@ -5693,6 +5693,167 @@ mod postgres_integration {
         assert_eq!(ok.version, 2);
     }
 
+    /// A dedicated backend with one physical connection per writer, so a
+    /// concurrency test can put every racer in flight at once instead of
+    /// queuing behind `create_backend`'s shared 5-connection pool. Mirrors
+    /// `postgres_integration_concurrent_pool_connections_all_carry_statement_timeout`'s
+    /// pattern of building a bespoke config against the shared container.
+    async fn create_backend_with_pool_size(pool_size: usize) -> PostgresBackend {
+        let pg = shared_pg().await;
+        let data_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .map(|p| p.join("data"))
+            .unwrap_or_else(|| PathBuf::from("data"));
+        let config = PostgresConfig {
+            host: pg.host.clone(),
+            port: pg.port,
+            dbname: "postgres".to_string(),
+            user: "postgres".to_string(),
+            password: Some("postgres".to_string()),
+            max_connections: pool_size,
+            data_dir: Some(data_dir),
+            ..Default::default()
+        };
+        PostgresBackend::new(config)
+            .await
+            .expect("Failed to create PostgresBackend")
+    }
+
+    /// Forces `count` physical connections into existence and back into the
+    /// idle pool before a race starts.
+    ///
+    /// deadpool creates connections lazily, and establishing a fresh one
+    /// (TCP handshake + PostgreSQL startup/auth) can take longer than the
+    /// whole read-modify-write these concurrency tests race — so on a cold
+    /// pool, a barrier-released batch can end up serialized by connection
+    /// setup alone: writer 1 finishes its entire transaction while writer 2
+    /// is still waiting for its connection, which defeats the test. Holding
+    /// `count` clients at once (forcing that many distinct connections) and
+    /// then dropping them back into the pool removes that confound.
+    async fn warm_pool(backend: &PostgresBackend, count: usize) {
+        let mut clients = Vec::with_capacity(count);
+        for _ in 0..count {
+            clients.push(backend.get_client().await.expect("warm connection"));
+        }
+        drop(clients);
+    }
+
+    /// A user's very first write is the case `SELECT … FOR UPDATE` cannot
+    /// protect on its own: with no row yet, there is nothing for the lock to
+    /// block on, so racing writers must instead serialize on
+    /// `write_settings`'s `pg_advisory_xact_lock`. Without it, every racer
+    /// reads `None`, computes `new_version = 1` from an empty document, and
+    /// the `INSERT … ON CONFLICT DO UPDATE` losers silently overwrite the
+    /// winner — a lost update on creation. Firing many unconditional
+    /// single-key patches at a brand-new user key and requiring every key to
+    /// survive, with the version landing on exactly the writer count, is the
+    /// same shape as `mongodb_integration_settings_concurrent_patches_serialize`.
+    ///
+    /// Runs on a multi-thread runtime with a dedicated pool sized to the
+    /// writer count and a [`tokio::sync::Barrier`] releasing every task at
+    /// once — a single-threaded runtime, or a shared pool a racer might queue
+    /// behind, can make the whole batch execute close enough to sequentially
+    /// that even the unfixed code never actually hits the race.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn postgres_integration_settings_concurrent_first_writes_never_lose_an_update() {
+        use std::sync::Arc;
+
+        const WRITERS: usize = 8;
+        let backend = Arc::new(create_backend_with_pool_size(WRITERS).await);
+        warm_pool(&backend, WRITERS).await;
+        let user = unique_user_key("concurrent-first-write");
+        let barrier = Arc::new(tokio::sync::Barrier::new(WRITERS));
+
+        let mut handles = Vec::with_capacity(WRITERS);
+        for i in 0..WRITERS {
+            let backend = backend.clone();
+            let user = user.clone();
+            let barrier = barrier.clone();
+            handles.push(tokio::spawn(async move {
+                barrier.wait().await;
+                backend
+                    .patch_settings(&user, json!({ format!("k{i}"): i }), None)
+                    .await
+            }));
+        }
+        for h in handles {
+            h.await
+                .expect("patch task panicked")
+                .expect("patch_settings failed");
+        }
+
+        let final_doc = backend
+            .get_settings(&user)
+            .await
+            .unwrap()
+            .expect("settings document missing after concurrent first writes");
+        let obj = final_doc.document.as_object().unwrap();
+        for i in 0..WRITERS {
+            assert_eq!(
+                obj.get(&format!("k{i}")),
+                Some(&json!(i)),
+                "key k{i} was lost to a read-modify-write race on the user's first write"
+            );
+        }
+        // WRITERS patches, each a distinct successful write from version 0 upward.
+        assert_eq!(final_doc.version, WRITERS as i64);
+    }
+
+    /// The `if_match_version = Some(0)` half of the same race: every racer
+    /// asserts "this user does not exist yet", so exactly one `put_settings`
+    /// call may succeed and the rest must observe the loser's own creation as
+    /// an optimistic-lock conflict — never a raw backend error, and never a
+    /// second silent `Ok`. Uses the same error shape as
+    /// `postgres_integration_settings_optimistic_lock`.
+    ///
+    /// Same multi-thread + dedicated-pool + barrier setup as
+    /// `postgres_integration_settings_concurrent_first_writes_never_lose_an_update`,
+    /// for the same reason: this must exercise real concurrent creates, not a
+    /// batch that happens to run one at a time.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn postgres_integration_settings_concurrent_creates_have_a_single_winner() {
+        use std::sync::Arc;
+
+        const WRITERS: usize = 8;
+        let backend = Arc::new(create_backend_with_pool_size(WRITERS).await);
+        warm_pool(&backend, WRITERS).await;
+        let user = unique_user_key("concurrent-create");
+        let barrier = Arc::new(tokio::sync::Barrier::new(WRITERS));
+
+        let mut handles = Vec::with_capacity(WRITERS);
+        for i in 0..WRITERS {
+            let backend = backend.clone();
+            let user = user.clone();
+            let barrier = barrier.clone();
+            handles.push(tokio::spawn(async move {
+                barrier.wait().await;
+                backend
+                    .put_settings(&user, json!({"createdBy": i}), Some(0))
+                    .await
+            }));
+        }
+
+        let mut ok_count = 0;
+        let mut conflict_count = 0;
+        for h in handles {
+            match h.await.expect("put task panicked") {
+                Ok(stored) => {
+                    ok_count += 1;
+                    assert_eq!(stored.version, 1);
+                }
+                Err(StorageError::Concurrency(ConcurrencyError::OptimisticLockFailure {
+                    ..
+                })) => {
+                    conflict_count += 1;
+                }
+                Err(other) => panic!("expected an optimistic-lock conflict, got {other:?}"),
+            }
+        }
+        assert_eq!(ok_count, 1, "exactly one create should win the race");
+        assert_eq!(conflict_count, WRITERS - 1);
+    }
+
     /// Issue #313: a tenant purge must reach the PHI-derived query strings a
     /// client stores in its settings document. Those rows are keyed by *user*,
     /// so none of `purge_tenant_data`'s tenant-scoped deletes touch them.

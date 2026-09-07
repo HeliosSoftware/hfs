@@ -2688,6 +2688,112 @@ async fn mongodb_integration_search_missing_not_and_param_sort() {
     assert!(page2.resources.page_info.has_previous);
 }
 
+/// The in-DB runner compiles no compartment predicate, so a run carrying
+/// `patient`/`group` filters is handed to the in-process engine over a scan
+/// of the same collection instead of failing as uncompilable — and answers
+/// the rows the SQL runners answer for the same filters. An unfiltered run
+/// still takes the aggregation pipeline.
+#[tokio::test]
+async fn mongodb_integration_sof_runner_compartment_filters_fall_back_in_process() {
+    use helios_persistence::core::sof_runner::{SofRunner, ViewFilters};
+    use tokio_stream::StreamExt;
+
+    let Some(backend) = create_backend("sof_compartment_fallback").await else {
+        eprintln!(
+            "Skipping mongodb_integration_sof_runner_compartment_filters_fall_back_in_process (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = create_tenant("tenant-sof-compartment-fallback");
+
+    for resource in [
+        json!({ "resourceType": "Patient", "id": "sof-p1" }),
+        json!({ "resourceType": "Patient", "id": "sof-p2" }),
+        json!({
+            "resourceType": "Group",
+            "id": "sof-g1",
+            "type": "person",
+            "actual": true,
+            "member": [{ "entity": { "reference": "Patient/sof-p1" } }]
+        }),
+        json!({
+            "resourceType": "Observation",
+            "id": "sof-o1",
+            "status": "final",
+            "code": { "text": "x" },
+            "subject": { "reference": "Patient/sof-p1" }
+        }),
+        json!({
+            "resourceType": "Observation",
+            "id": "sof-o2",
+            "status": "final",
+            "code": { "text": "x" },
+            "subject": { "reference": "Patient/sof-p2" }
+        }),
+    ] {
+        let resource_type = resource["resourceType"].as_str().unwrap().to_string();
+        backend
+            .create(&tenant, &resource_type, resource, FhirVersion::default())
+            .await
+            .unwrap();
+    }
+
+    async fn observation_ids(
+        runner: &dyn SofRunner,
+        tenant: &TenantContext,
+        filters: ViewFilters,
+    ) -> Vec<String> {
+        let view = json!({
+            "resourceType": "ViewDefinition",
+            "resource": "Observation",
+            "status": "active",
+            "select": [{ "column": [{ "path": "id", "name": "obs_id" }] }]
+        });
+        let mut stream = runner
+            .run_view(tenant, view, filters)
+            .await
+            .expect("run_view must succeed");
+        let mut ids = Vec::new();
+        while let Some(row) = stream.next().await {
+            let row = row.expect("row must not be an error");
+            ids.push(row["obs_id"].as_str().unwrap().to_string());
+        }
+        ids.sort();
+        ids
+    }
+
+    let runner = backend.sof_runner().expect("MongoDB provides a SOF runner");
+
+    assert_eq!(
+        observation_ids(runner.as_ref(), &tenant, ViewFilters::default()).await,
+        vec!["sof-o1", "sof-o2"]
+    );
+    assert_eq!(
+        observation_ids(
+            runner.as_ref(),
+            &tenant,
+            ViewFilters {
+                patient: vec!["Patient/sof-p2".to_string()],
+                ..Default::default()
+            },
+        )
+        .await,
+        vec!["sof-o2"]
+    );
+    assert_eq!(
+        observation_ids(
+            runner.as_ref(),
+            &tenant,
+            ViewFilters {
+                group: vec!["Group/sof-g1".to_string()],
+                ..Default::default()
+            },
+        )
+        .await,
+        vec!["sof-o1"]
+    );
+}
+
 #[tokio::test]
 async fn mongodb_integration_conditional_create_exists() {
     let Some(backend) = create_backend_with_full_registry("conditional_create").await else {
