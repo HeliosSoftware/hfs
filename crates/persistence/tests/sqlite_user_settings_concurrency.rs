@@ -1,12 +1,16 @@
-//! #833 (ticket 02 validation, FALLA V4): concurrent writers to the same
-//! `user_settings` row on a file-backed SQLite store (WAL) used to fail with
-//! a raw "database is locked" backend error instead of either succeeding or
-//! reporting an optimistic-lock conflict — `write_settings` and
-//! `purge_tenant_settings` opened a DEFERRED transaction that reads before it
-//! writes, and under WAL a deferred transaction's read-to-write upgrade fails
-//! with `SQLITE_BUSY_SNAPSHOT` the instant another connection committed in
-//! between, a failure mode the busy handler (and its configured
-//! `busy_timeout`) never sees. This drives the real symptom — the UI's SQL
+//! Regression coverage for #833: concurrent writers racing the same
+//! `user_settings` row on a file-backed SQLite store (WAL) used to surface a
+//! raw "database is locked" backend error instead of either succeeding or
+//! reporting an optimistic-lock conflict. `write_settings` and
+//! `purge_tenant_settings` read the current row before writing the new one,
+//! so opening that transaction as the SQLite default, DEFERRED, let it take
+//! its read snapshot on the first `SELECT` and then fail the read-to-write
+//! upgrade with `SQLITE_BUSY_SNAPSHOT` the instant another connection
+//! committed in between — a failure mode the busy handler (and its
+//! configured `busy_timeout`) never gets a chance to retry. The fix opens
+//! these transactions as `BEGIN IMMEDIATE` instead, taking the write lock up
+//! front so the conflict is resolved by SQLite's normal lock queue rather
+//! than a snapshot failure. This exercises the real symptom — the UI's SQL
 //! Export kick-off, which reads-then-writes the settings document per job —
 //! against a real file, not `:memory:`, since only a real file exercises
 //! WAL's multi-connection snapshot behavior.
