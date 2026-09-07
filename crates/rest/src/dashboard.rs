@@ -254,6 +254,11 @@ where
         );
         let now = Utc::now();
 
+        // Set by every degradation below. A half-failed snapshot reads exactly
+        // like a real one — empty series, zero totals — and is then cached as
+        // truth, so it has to carry the fact that it is incomplete (#956).
+        let mut partial = false;
+
         // What the tenant actually stores, largest first — the picker's option
         // list, and the pool defaults are drawn from (#555).
         let raw_counts = self
@@ -262,6 +267,7 @@ where
             .await
             .unwrap_or_else(|error| {
                 warn!(%error, "dashboard snapshot: distinct-type query failed");
+                partial = true;
                 Vec::new()
             });
         // The stat card counts only types the tenant actually stores —
@@ -329,7 +335,9 @@ where
         };
 
         // Degrade to an empty/zeroed snapshot rather than surfacing an error —
-        // the operator dashboard should render even if a count query hiccups.
+        // the operator dashboard should render even if a count query hiccups —
+        // but flag it, so the page says the figures are incomplete instead of
+        // charting the fallback as data.
         let series = match resource_count_series(
             self.storage.as_ref(),
             &tenant,
@@ -342,6 +350,7 @@ where
             Ok(series) => series,
             Err(error) => {
                 warn!(%error, "dashboard snapshot: resource-count series query failed");
+                partial = true;
                 Vec::new()
             }
         };
@@ -352,13 +361,17 @@ where
             .await
             .unwrap_or_else(|error| {
                 warn!(%error, "dashboard snapshot: total count query failed");
+                partial = true;
                 0
             });
 
         // Job counts degrade to `None` (unavailable) rather than zero on a read
         // error: a zero here would tell an operator "no jobs" when the truth is
         // "could not ask". `None` also covers the normal case of a deployment
-        // with no bulk-export/bulk-submit job store wired at all.
+        // with no bulk-export/bulk-submit job store wired at all. They carry
+        // their own unavailable state on the page, so they do not set
+        // `partial` — that flag is for figures with no honest rendering of
+        // their own.
         let export_jobs = match &self.export_jobs {
             None => None,
             Some(store) => {
@@ -398,6 +411,7 @@ where
             available,
             export_jobs,
             import_jobs_active,
+            partial,
         }
     }
 }
@@ -433,6 +447,9 @@ mod tests {
         assert_eq!(snapshot.total_resources, 0);
         assert_eq!(snapshot.distinct_types, 0);
         assert!(!snapshot.fhir_version.is_empty());
+        // Every query answered: these zeros are measurements, not fallbacks,
+        // and the page may present them as such (#956).
+        assert!(!snapshot.partial);
     }
 
     /// Every window yields a dense series of exactly its own length, on
