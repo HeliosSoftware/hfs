@@ -469,6 +469,15 @@ impl BulkEntryResult {
             BulkEntryOutcome::ValidationError | BulkEntryOutcome::ProcessingError
         )
     }
+
+    /// Returns true if this entry was handled without failing — a success or a
+    /// deliberate skip.
+    ///
+    /// What a manifest's `processed_entries` counts, so that
+    /// `processed_entries + failed_entries` equals the entries walked.
+    pub fn is_processed(&self) -> bool {
+        !self.is_error()
+    }
 }
 
 /// Summary of a submission's status.
@@ -989,6 +998,16 @@ pub struct StreamProcessingResult {
     /// Abort reason if applicable.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub abort_reason: Option<String>,
+    /// Lines the stream rejected before they ever reached a batch — malformed
+    /// JSON, and resources whose type contradicts the manifest's.
+    ///
+    /// They are included in `counts`, but no `process_entries` call saw them,
+    /// so nothing wrote them to the entry table or charged them to the
+    /// manifest's `failed_entries`. The worker adds them itself, which is why
+    /// they are reported separately from the failures batches already own
+    /// (#969).
+    #[serde(default)]
+    pub unbatched_errors: u64,
 }
 
 impl StreamProcessingResult {
@@ -999,6 +1018,7 @@ impl StreamProcessingResult {
             counts: EntryCountSummary::new(),
             aborted: false,
             abort_reason: None,
+            unbatched_errors: 0,
         }
     }
 

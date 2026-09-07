@@ -4263,7 +4263,7 @@ mod bulk_submit {
                 .err()
                 .map(|e| format!("{e:?}")),
             backend
-                .update_manifest_progress(&stale, 1, 0, 1)
+                .add_manifest_progress(&stale, 1, 0, 1)
                 .await
                 .err()
                 .map(|e| format!("{e:?}")),

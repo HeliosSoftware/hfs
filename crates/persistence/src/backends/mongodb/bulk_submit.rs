@@ -916,13 +916,18 @@ impl BulkSubmitProvider for MongoBackend {
             results.push(result);
         }
 
+        // These counters are cumulative across every run of this manifest (including
+        // resumes) and are exactly what the $bulk-submit status endpoint reports, so
+        // every delta must be additive here (#969). "Processed" counts every entry we
+        // handled without failing, i.e. successes plus deliberate skips.
         manifests
             .update_one(
                 manifest_filter(tenant, submission_id, manifest_id),
                 doc! { "$inc": {
                     "total_entries": results.len() as i64,
-                    "processed_entries": results.iter().filter(|r| r.is_success()).count() as i64,
+                    "processed_entries": results.iter().filter(|r| r.is_processed()).count() as i64,
                     "failed_entries": error_count as i64,
+                    "last_processed_line": results.len() as i64,
                 }},
             )
             .await
@@ -1012,7 +1017,10 @@ impl StreamingBulkSubmitProvider for MongoBackend {
             match NdjsonEntry::parse(line_number, line) {
                 Ok(entry) => {
                     if entry.resource_type != resource_type {
+                        // Rejected here, so no batch will charge it to the
+                        // manifest's counters; the worker adds it (#969).
                         result.counts.increment(BulkEntryOutcome::ValidationError);
+                        result.unbatched_errors += 1;
                         if !options.continue_on_error
                             && (options.max_errors == 0
                                 || result.counts.error_count() >= options.max_errors as u64)
@@ -1025,6 +1033,7 @@ impl StreamingBulkSubmitProvider for MongoBackend {
                 }
                 Err(parse_err) => {
                     result.counts.increment(BulkEntryOutcome::ValidationError);
+                    result.unbatched_errors += 1;
                     if !options.continue_on_error
                         && (options.max_errors == 0
                             || result.counts.error_count() >= options.max_errors as u64)
@@ -1335,19 +1344,19 @@ impl SubmitWorkerStorage for MongoBackend {
         .await
     }
 
-    async fn update_manifest_progress(
+    async fn add_manifest_progress(
         &self,
         lease: &ManifestLease,
-        processed_entries: u64,
-        failed_entries: u64,
-        last_processed_line: u64,
+        processed_delta: u64,
+        failed_delta: u64,
+        lines_delta: u64,
     ) -> Result<(), LeaseError> {
         self.fenced_update(
             lease,
-            doc! { "$set": {
-                "processed_entries": processed_entries as i64,
-                "failed_entries": failed_entries as i64,
-                "last_processed_line": last_processed_line as i64,
+            doc! { "$inc": {
+                "processed_entries": processed_delta as i64,
+                "failed_entries": failed_delta as i64,
+                "last_processed_line": lines_delta as i64,
             }},
         )
         .await
