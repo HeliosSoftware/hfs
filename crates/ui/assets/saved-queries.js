@@ -2063,7 +2063,11 @@
   function locationSearchValue() {
     var params = new URLSearchParams(window.location.search);
     if (params.has("url")) return params.get("url") || "";
-    return "/" + resolvedSelectedType();
+    /* No explicit query in the location: the fresh-open default matches a
+     * rail click — `_summary=true` seeded, deletable from the URL (#958).
+     * This rebuild used to drop the server-seeded parameter, which is why
+     * a manually typed `_summary` looked like it did nothing. */
+    return "/" + resolvedSelectedType() + "?_summary=true";
   }
 
   /* Resources opens on the resolved type (#605): the same path as a rail

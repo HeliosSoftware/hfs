@@ -2248,7 +2248,7 @@ fn default_result_columns(version: helios_fhir::FhirVersion, resource_type: &str
         #[allow(unreachable_patterns)]
         _ => &[],
     };
-    const INFRASTRUCTURE: [&str; 8] = [
+    const INFRASTRUCTURE: [&str; 9] = [
         "resourceType",
         "id",
         "meta",
@@ -2257,13 +2257,32 @@ fn default_result_columns(version: helios_fhir::FhirVersion, resource_type: &str
         "text",
         "contained",
         "extension",
+        "modifierExtension",
     ];
     summary_fields
         .iter()
-        .filter(|f| !INFRASTRUCTURE.contains(f) && !f.starts_with("modifierExtension"))
+        .map(|f| snake_to_camel(f))
+        .filter(|f| !INFRASTRUCTURE.contains(&f.as_str()))
         .take(5)
-        .map(|f| f.to_string())
         .collect()
+}
+
+/// `get_summary_fields` returns Rust field names; resources carry camelCase
+/// JSON keys, which is what the results table indexes by.
+fn snake_to_camel(field: &str) -> String {
+    let mut out = String::with_capacity(field.len());
+    let mut upper_next = false;
+    for c in field.chars() {
+        if c == '_' {
+            upper_next = true;
+        } else if upper_next {
+            out.extend(c.to_uppercase());
+            upper_next = false;
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// Query string for the SearchParameter viewer. Every filter is a link and
