@@ -1734,22 +1734,23 @@ async fn build_bulk_submit(
         .with_decryption_keys(decryption_keys),
     );
 
-    // SQLite serialises writers, so a high fan-out queues batch writes behind
-    // one lock until they outlast `busy_timeout` and abort the manifest (#942).
-    // Clamp there, and say so, rather than letting the operator's value fail
-    // the import.
+    // SQLite serialises writers, so a fan-out queues batch writes behind one
+    // lock until they outlast `busy_timeout` and abort the manifest (#942).
+    // Ignore the configured value there, and warn about it, rather than letting
+    // it fail the import.
     let backend_kind = config
         .storage_backend_mode()
         .map(|mode| mode.primary_backend_kind())
         .unwrap_or(BackendKind::Sqlite);
     let file_concurrency = cfg.effective_file_concurrency(backend_kind);
     if file_concurrency < cfg.file_concurrency.max(1) {
-        info!(
+        warn!(
             configured = cfg.file_concurrency,
             effective = file_concurrency,
-            "Bulk submit fan-out clamped: SQLite serialises writers, and a \
-             higher fan-out queues batch writes past busy_timeout and aborts \
-             the import. Use PostgreSQL for a higher file concurrency."
+            "Bulk submit file fan-out is not supported on SQLite and is \
+             running at 1: SQLite serialises writers, so a fan-out queues \
+             batch writes past busy_timeout and aborts the import. Use \
+             PostgreSQL for a higher file concurrency."
         );
     }
 

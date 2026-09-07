@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 #
-# Gap 2 of issue #942: check that the clamp is NOT applied when the primary
-# backend is PostgreSQL, which is the `_ => configured` arm of
-# `effective_file_concurrency` (crates/rest/src/config.rs:737).
+# Gap 2 of issue #942: check that the SQLite fan-out restriction is NOT applied
+# when the primary backend is PostgreSQL, which is the `_ => configured` arm of
+# `effective_file_concurrency` in crates/rest/src/config.rs.
 #
 # Requires a PostgreSQL listening on PG_PORT. Start one with:
 #   docker run -d --name hfs-bulk-submit-pg \
@@ -68,12 +68,18 @@ echo "=== bulk submit lines ==="
 grep 'Bulk submit' "$LOG" || echo "(none)"
 
 echo
-if grep -q 'fan-out clamped' "$LOG"; then
-  echo "RESULT: FAIL - the clamp was applied with PostgreSQL"
+# On SQLite the server emits a WARN carrying the `configured=` and `effective=`
+# fields, because the file fan-out is not supported there and is forced to 1.
+# Matching those two fields instead of the English sentence keeps this check
+# independent of the wording. On PostgreSQL the line must be absent.
+RESTRICTION_LINE=$(grep 'configured=' "$LOG" | grep 'effective=' || true)
+if [ -n "$RESTRICTION_LINE" ]; then
+  echo "RESULT: FAIL - the SQLite fan-out restriction was applied with PostgreSQL"
+  echo "  $RESTRICTION_LINE"
   exit 1
 fi
 if grep -q "file_concurrency=$FILE_CONCURRENCY" "$LOG"; then
-  echo "RESULT: OK - no clamp, effective fan-out = $FILE_CONCURRENCY"
+  echo "RESULT: OK - not restricted, effective fan-out = $FILE_CONCURRENCY"
 else
   echo "RESULT: INCONCLUSIVE - file_concurrency=$FILE_CONCURRENCY was not seen"
   exit 1

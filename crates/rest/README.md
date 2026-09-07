@@ -296,9 +296,11 @@ Configured via `HFS_BULK_SUBMIT_*` environment variables:
 | `HFS_BULK_SUBMIT_POLL_RATE_LIMIT` | `10` | Status polls allowed per client, per submission, per rate window. `0` disables poll rate limiting. |
 | `HFS_BULK_SUBMIT_POLL_RATE_WINDOW` | `60` | Sliding window for the poll rate limit, seconds. |
 | `HFS_BULK_SUBMIT_WORKER_CONCURRENCY` | `2` | In-process submit-worker pool size. |
+| `HFS_BULK_SUBMIT_FILE_CONCURRENCY` | `1` | How many of a single manifest's files one worker ingests at once (fan-out). **SQLite always runs at `1` regardless of the configured value** — it serialises writers, so a higher fan-out queues batch writes behind one lock until they outlast `busy_timeout` and abort the import (#942). A higher value only helps on a concurrent-writer backend such as PostgreSQL. |
 | `HFS_BULK_SUBMIT_DISABLE_LOCAL_WORKER` | `false` | Disable in-pod workers. |
 | `HFS_BULK_SUBMIT_MAX_CONCURRENT_PER_TENANT` | `4` | Per-tenant active-submission cap (kick-off returns `429` if exceeded). |
 | `HFS_BULK_SUBMIT_BATCH_SIZE` | `1000` | Resources per ingestion batch. |
+| `HFS_BULK_SUBMIT_DEFER_INDEXING` | `false` | Bulk fast-load (#903): ingest without search-index/FTS writes, then rebuild them with an automatic per-type reindex when each manifest finishes. Reads and history stay complete throughout; search sees a manifest's resources once its reindex lands. |
 | `HFS_BULK_SUBMIT_LEASE_DURATION` | `60` | Initial manifest lease length, seconds. Must exceed the heartbeat interval. |
 | `HFS_BULK_SUBMIT_HEARTBEAT_INTERVAL` | `20` | Worker heartbeat cadence, seconds. |
 | `HFS_BULK_SUBMIT_CLEANUP_INTERVAL` | `300` | Cleanup-task scan interval, seconds. |

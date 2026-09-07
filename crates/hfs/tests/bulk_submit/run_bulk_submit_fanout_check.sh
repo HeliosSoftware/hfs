@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 #
-# Manual check of the $bulk-submit file fan-out on SQLite: that the clamp to
-# SQLITE_MAX_FILE_CONCURRENCY is applied and announced in the log, and that a
-# full ingest finishes cleanly.
+# Manual check of the $bulk-submit file fan-out on SQLite: that the configured
+# fan-out is forced down to 1 and announced in the log, and that a full ingest
+# finishes cleanly.
 #
 # Origin: issue #942, "import aborts with 'database is locked' at high file
 # concurrency with the full search-parameter registry".
@@ -11,8 +11,8 @@
 #
 #   1. A static "Data Provider" (python -m http.server) serving a Bulk Export
 #      Manifest and one .ndjson with 2 Patients.
-#   2. HFS with HFS_BULK_SUBMIT_FILE_CONCURRENCY=8, which is the value that
-#      triggers the clamp introduced by the fix.
+#   2. HFS with HFS_BULK_SUBMIT_FILE_CONCURRENCY=8, a value SQLite cannot
+#      honour, so the fix forces the effective fan-out down to 1 and warns.
 #
 # It kills no processes and frees no ports: it picks free ports >18000 and runs
 # both servers under `timeout`, so they shut themselves down when the TTL runs
@@ -160,7 +160,12 @@ ready.
   PROVIDER_URL = $PROVIDER_URL
   logs         = $WORKDIR/hfs.log , $WORKDIR/provider.log
 
-Both shut themselves down in ${TTL}s. Fan-out lines from startup:
+Both shut themselves down in ${TTL}s. Bulk submit lines from startup:
 
 $(grep 'Bulk submit' "$WORKDIR/hfs.log" || true)
+
+Effective fan-out (a WARN carrying configured= and effective= means SQLite
+forced the configured value down to 1):
+
+$(grep 'configured=' "$WORKDIR/hfs.log" | grep 'effective=' || echo '(no such line: the configured fan-out was already 1)')
 EOF

@@ -2,18 +2,27 @@
 #
 # $bulk-submit ingest at realistic volume on SQLite.
 #
-# Origin: issue #942. The smoke fixture (1 file, 2 Patients) does not exercise
-# the fan-out, so it cannot tell whether the clamp and the retries hold up.
+# Origin: issue #942. The smoke fixture (1 file, 2 Patients) is far too small to
+# put the writer under pressure, so it cannot tell whether the forced fan-out of
+# 1 and the busy retries hold up.
 #
 # This generates a manifest with FILES files of PER_FILE Patients each, ingests
-# all of it through $bulk-submit and checks that:
+# all of it through $bulk-submit and ASSERTS that:
 #
-#   - the import finishes (poll -> 200) with no "database is locked"
-#   - the output manifest declares the FILES files and the counts
-#   - the resources can be read back with GET /Patient/{id}
-#   - the bookkeeping retries that happened are counted (grep on the log)
+#   - the import finishes (poll -> 200)
+#   - the log contains no "database is locked"
+#   - the log contains no "database table is locked"
+#   - the three sampled resources read back with GET /Patient/{id} -> HTTP 200
 #
-# All of it on SQLite, which is where the clamp to 2 applies.
+# and reports, without failing on them:
+#
+#   - the output manifest's declared files, counts and bytes
+#   - the busy retries that happened ("sqlite busy during", grep on the log).
+#     A non-zero count is the expected good case: it means a writer hit a busy
+#     database and the bounded retry absorbed it instead of aborting the import.
+#
+# All of it on SQLite, where the file fan-out is not supported: whatever
+# HFS_BULK_SUBMIT_FILE_CONCURRENCY asks for, the effective value is 1.
 #
 # Requirements: cargo, curl and python on PATH. On Windows the interpreter is
 # invoked as `python`; `python3` resolves to the Microsoft Store stub.
@@ -21,6 +30,7 @@
 #   crates/hfs/tests/bulk_submit/run_bulk_submit_volume_check.sh
 #   FILES=24 PER_FILE=1000 TTL=1500 MAX_POLLS=90 \
 #     crates/hfs/tests/bulk_submit/run_bulk_submit_volume_check.sh
+#   SKIP_BUILD=1 crates/hfs/tests/bulk_submit/run_bulk_submit_volume_check.sh
 #
 set -euo pipefail
 
@@ -105,16 +115,44 @@ manifest = {
 print(f"    manifest with {len(out)} output entries")
 PY
 
+# --- build ---------------------------------------------------------------
+# On Windows/MSVC the debug hfs binary overflows the main thread stack while
+# building the SearchParameter registry, so it is relinked with a 32 MB stack.
+# That is only a link flag: it does not change the code.
+# SKIP_BUILD=1 avoids recompiling: on Windows the linker cannot replace
+# target/debug/hfs.exe while another instance holds it open ("Access is
+# denied", os error 5), and killing that instance is not an option.
+if [ "${SKIP_BUILD:-0}" = "1" ]; then
+  echo "==> SKIP_BUILD=1: reusing the already built binary"
+else
+  echo "==> building hfs (debug)"
+  case "$(uname -s)" in
+    MINGW* | MSYS* | CYGWIN*)
+      cargo rustc -p helios-hfs --bin hfs -- -C link-arg=/STACK:33554432
+      ;;
+    *)
+      cargo build -p helios-hfs
+      ;;
+  esac
+fi
+
+# An explicit HFS_BIN still wins; otherwise probe both names so the script runs
+# unchanged on Linux/macOS and on Windows.
+if [ -z "${HFS_BIN:-}" ]; then
+  HFS_BIN="target/debug/hfs"
+  [ -x "$HFS_BIN" ] || HFS_BIN="target/debug/hfs.exe"
+fi
+
 echo "==> provider on $PROVIDER_URL"
 ( cd "$WORKDIR" && timeout "$TTL" python -u -m http.server "$PROVIDER_PORT" --bind 127.0.0.1 ) \
   > "$WORKDIR/provider.log" 2>&1 &
 
-echo "==> HFS on $HFS_URL (requested fan-out: $FILE_CONCURRENCY)"
+echo "==> HFS on $HFS_URL (requested fan-out: $FILE_CONCURRENCY, effective on SQLite: 1)"
 HFS_BASE_URL="$HFS_URL" \
 HFS_BULK_SUBMIT_ENABLED=true \
 HFS_BULK_SUBMIT_FILE_CONCURRENCY="$FILE_CONCURRENCY" \
 HFS_LOG_LEVEL=info \
-  timeout "$TTL" "${HFS_BIN:-target/debug/hfs.exe}" \
+  timeout "$TTL" "$HFS_BIN" \
     --database-url "$DB_URL" --log-level info \
     --host 127.0.0.1 --port "$HFS_PORT" \
   > "$WORKDIR/hfs.log" 2>&1 &
@@ -189,23 +227,70 @@ PY
 echo
 echo "=== resource read-back (first, middle, last) ==="
 LAST_F=$((FILES - 1)); LAST_I=$((PER_FILE - 1)); MID_F=$((FILES / 2))
-for id in "vol942-0-0" "vol942-$MID_F-0" "vol942-$LAST_F-$LAST_I"; do
-  curl -sS -o /dev/null -w "  GET Patient/$id -> HTTP %{http_code}\n" "$HFS_URL/Patient/$id"
-done
+READ_FAILURES=0
+# `|| true` inside the substitution because a connection failure makes curl
+# exit non-zero, which under `set -e` would abort before the assertion runs.
+# curl still writes "000" for %{http_code} in that case, so it is counted.
+read_back() {
+  local id="$1"
+  local code
+  code=$(curl -sS -o /dev/null -w '%{http_code}' "$HFS_URL/Patient/$id" || true)
+  echo "  GET Patient/$id -> HTTP $code"
+  [ "$code" = "200" ] || READ_FAILURES=$((READ_FAILURES + 1))
+}
+read_back "vol942-0-0"
+read_back "vol942-$MID_F-0"
+read_back "vol942-$LAST_F-$LAST_I"
 
 echo
 echo "=== lock errors / retries ==="
-echo "  journal_mode         : ${DB_URL}"
-echo "  'database is locked' : $(grep -c 'database is locked' "$WORKDIR/hfs.log" || true)"
-echo "  'table is locked'    : $(grep -c 'database table is locked' "$WORKDIR/hfs.log" || true)"
-echo "  busy retries         : $(grep -c 'sqlite busy during' "$WORKDIR/hfs.log" || true)"
-# This path does NOT go through retry_bookkeeping_on_busy: bulk_submit.rs:1488
-# still wraps the claim UPDATE with internal_error, and main.rs:1825 logs it as
-# ERROR and sleeps 5s. It is the same failure class as issue #942.
-echo "  failed claims        : $(grep -c 'submit worker claim failed' "$WORKDIR/hfs.log" || true)"
-echo "  ERROR lines in log   : $(grep -c ' ERROR ' "$WORKDIR/hfs.log" || true)"
+# `grep -c` exits 1 on zero matches, so every count is guarded with `|| true`.
+#
+# The retry's own WARN line embeds the rusqlite text, so it reads
+# "sqlite busy during <what>; retrying: ...: database is locked". Those lines
+# are the fix WORKING and must not count as failures, hence the `grep -v`:
+# what has to be zero is a lock that was *surfaced*, not one that was absorbed.
+BUSY_RETRIES=$(grep -c 'sqlite busy during' "$WORKDIR/hfs.log" || true)
+LOCKED=$(grep 'database is locked' "$WORKDIR/hfs.log" \
+  | grep -vc 'sqlite busy during' || true)
+TABLE_LOCKED=$(grep 'database table is locked' "$WORKDIR/hfs.log" \
+  | grep -vc 'sqlite busy during' || true)
+# A failed claim is the same failure class as issue #942: the worker loop
+# reports it as an ERROR and sleeps before trying again, so it never fails the
+# poll. Counted here only to keep it visible.
+FAILED_CLAIMS=$(grep -c 'submit worker claim failed' "$WORKDIR/hfs.log" || true)
+ERROR_LINES=$(grep -c ' ERROR ' "$WORKDIR/hfs.log" || true)
+
+echo "  database file        : ${DB_URL}"
+echo "  'database is locked' : $LOCKED"
+echo "  'table is locked'    : $TABLE_LOCKED"
+echo "  busy retries         : $BUSY_RETRIES (non-zero is fine: the retry absorbed the contention)"
+echo "  failed claims        : $FAILED_CLAIMS"
+echo "  ERROR lines in log   : $ERROR_LINES"
 echo "  ingest seconds       : ${ELAPSED}"
 echo "  log                  : $WORKDIR/hfs.log"
 
-[ "$CODE" = "200" ] || { echo "RESULT: FAIL - the poll never reached 200"; exit 1; }
-echo "RESULT: OK - $TOTAL resources across $FILES files ingested with effective fan-out 2"
+echo
+FAILURES=0
+if [ "$CODE" != "200" ]; then
+  echo "  FAIL: the poll never reached 200 (last HTTP ${CODE:-none})"
+  FAILURES=$((FAILURES + 1))
+fi
+if [ "$LOCKED" != "0" ]; then
+  echo "  FAIL: $LOCKED 'database is locked' line(s) in the log"
+  FAILURES=$((FAILURES + 1))
+fi
+if [ "$TABLE_LOCKED" != "0" ]; then
+  echo "  FAIL: $TABLE_LOCKED 'database table is locked' line(s) in the log"
+  FAILURES=$((FAILURES + 1))
+fi
+if [ "$READ_FAILURES" != "0" ]; then
+  echo "  FAIL: $READ_FAILURES of 3 read-backs did not return HTTP 200"
+  FAILURES=$((FAILURES + 1))
+fi
+
+if [ "$FAILURES" -ne 0 ]; then
+  echo "RESULT: FAIL - $FAILURES check(s) failed; see $WORKDIR/hfs.log"
+  exit 1
+fi
+echo "RESULT: OK - $TOTAL resources across $FILES files ingested with effective fan-out 1, no lock errors, $BUSY_RETRIES busy retries"
