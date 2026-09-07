@@ -610,6 +610,7 @@ bulk-import-status-in-progress = En curso
 bulk-import-status-stopped = Detenida
 bulk-import-status-completed = Completada
 bulk-import-status-failed = Fallido
+bulk-import-status-error = El último cambio de estado no llegó al receptor de datos, así que esta submission sigue igual: inténtelo de nuevo. ({ $detail })
 bulk-import-detail-recipient = Receptor de datos
 bulk-import-detail-id = ID de submission
 bulk-import-detail-submitter = Remitente

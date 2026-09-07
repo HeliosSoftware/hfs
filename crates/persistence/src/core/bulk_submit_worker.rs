@@ -24,7 +24,8 @@ use crate::core::bulk_export_output::{ExportOutputStore, ExportPartKey};
 use crate::core::bulk_export_worker::{LeaseError, WorkerId};
 use crate::core::bulk_submit::{
     BulkEntryOutcome, BulkProcessingOptions, BulkSubmitProvider, BulkSubmitRollbackProvider,
-    ByteProgress, ImportMode, StreamingBulkSubmitProvider, SubmissionId,
+    ByteProgress, CancelToken, ImportMode, StreamingBulkSubmitProvider, SubmissionId,
+    SubmissionStatus,
 };
 use crate::core::bulk_submit_input::{SubmitInputFetcher, submission_output_job_id};
 use crate::error::{StorageError, StorageResult};
@@ -471,20 +472,34 @@ impl tokio::io::AsyncBufRead for CountingReader {
 /// monotonic (`MAX`), so a stale flush can never walk progress backwards.
 /// The heartbeat alone decides lease health.
 ///
+/// On the same schedule the keeper re-reads the submission's status and trips
+/// the ingest's [`CancelToken`] once it stops being ingestable (#968). The
+/// keeper is the only part of a running job that touches the database on a
+/// fixed schedule no matter what the ingest is doing, which makes it the one
+/// place an abort can be noticed promptly; nothing else in the loop would look
+/// until the current file ended.
+///
 /// Dropping the keeper stops the renewal task.
 struct LeaseKeeper {
     lost: Arc<AtomicBool>,
+    cancel: CancelToken,
     handle: tokio::task::JoinHandle<()>,
 }
 
 impl LeaseKeeper {
-    fn spawn<Js>(jobs: Arc<Js>, lease: ManifestLease, progress: ByteProgress) -> Self
+    fn spawn<Js>(
+        jobs: Arc<Js>,
+        lease: ManifestLease,
+        progress: ByteProgress,
+        cancel: CancelToken,
+    ) -> Self
     where
         Js: BulkSubmitJobStore + ?Sized + 'static,
     {
         const FLUSH_EVERY: Duration = Duration::from_secs(3);
         let lost = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&lost);
+        let watched = cancel.clone();
         let handle = tokio::spawn(async move {
             let mut expiry = lease.lease_expiry;
             let mut last_flushed: u64 = 0;
@@ -506,6 +521,14 @@ impl LeaseKeeper {
                         last_flushed = consumed;
                         let _ = jobs.update_manifest_bytes(&lease, consumed, total).await;
                     }
+                    // Watch for an abort on the flush cadence rather than the
+                    // (up to a minute) heartbeat cadence: a lease renewal is
+                    // cheap to defer, a user waiting for Abort to do something
+                    // is not. One indexed row read every few seconds per
+                    // running manifest.
+                    if !watched.is_cancelled() {
+                        watch_submission(jobs.as_ref(), &lease, &watched).await;
+                    }
                 }
                 match jobs.heartbeat(&lease).await {
                     Ok(new_expiry) => expiry = new_expiry,
@@ -524,17 +547,91 @@ impl LeaseKeeper {
                 }
             }
         });
-        Self { lost, handle }
+        Self {
+            lost,
+            cancel,
+            handle,
+        }
     }
 
-    fn lease_lost(&self) -> bool {
-        self.lost.load(Ordering::SeqCst)
+    /// Whether the job in flight should wind down: either the lease is gone or
+    /// the submission stopped being ingestable (#968). Both exit the same way —
+    /// leave the manifest alone and let whoever owns its outcome record it.
+    fn should_stop(&self) -> bool {
+        self.lost.load(Ordering::SeqCst) || self.cancel.is_cancelled()
+    }
+
+    /// Whether the stop is an abort rather than a lost lease. The two exit
+    /// identically but read very differently in an operator's log.
+    fn cancelled(&self) -> bool {
+        self.cancel.is_cancelled()
     }
 }
 
 impl Drop for LeaseKeeper {
     fn drop(&mut self) {
         self.handle.abort();
+    }
+}
+
+/// Trips `cancel` when the submission behind `lease` has stopped being
+/// ingestable, so an abort reaches the manifest already in flight and not only
+/// future claims (#968).
+///
+/// The admitted set mirrors `claim_next_manifest`'s: `complete` means the
+/// submitter will send no further manifests, not that the registered ones
+/// should be dropped, so only `aborted` stops the ingest. A submission that
+/// reads back as missing is left alone — the lease machinery already covers
+/// deletion, and a transient read is not worth throwing away a running job
+/// over. Storage errors likewise never cancel: an unreachable database must
+/// not look like an abort.
+async fn watch_submission<Js>(jobs: &Js, lease: &ManifestLease, cancel: &CancelToken)
+where
+    Js: BulkSubmitJobStore + ?Sized,
+{
+    match jobs
+        .get_submission(&lease.tenant, &lease.submission_id)
+        .await
+    {
+        Ok(Some(summary))
+            if !matches!(
+                summary.status,
+                SubmissionStatus::InProgress | SubmissionStatus::Complete
+            ) =>
+        {
+            tracing::info!(
+                submission = %lease.submission_id,
+                manifest = %lease.manifest_id,
+                status = %summary.status,
+                "bulk-submit submission is no longer ingestable; stopping the manifest in flight"
+            );
+            cancel.cancel();
+        }
+        Ok(_) => {}
+        Err(e) => {
+            tracing::debug!(
+                submission = %lease.submission_id,
+                manifest = %lease.manifest_id,
+                error = %e,
+                "bulk-submit submission status check failed; retrying"
+            );
+        }
+    }
+}
+
+/// Logs a claimed manifest winding down before its natural end.
+///
+/// A cancelled manifest is deliberately left untouched: `abort_submission`
+/// already moved it out of `processing`, and marking it here would either
+/// fight that write or fabricate a terminal state for work that simply
+/// stopped. Its partial counts stay recorded.
+fn log_wind_down(lease: &ManifestLease, cancelled: bool) {
+    if cancelled {
+        tracing::info!(
+            submission = %lease.submission_id,
+            manifest = %lease.manifest_id,
+            "bulk-submit manifest stopped by abort; partial counts kept, no result artifacts written"
+        );
     }
 }
 
@@ -634,10 +731,16 @@ where
             );
         }
         let progress = ByteProgress::default();
+        // Abort is cooperative and means "stop soon": the keeper trips this
+        // token when the submission stops being ingestable, the ingest loops
+        // check it between batches, and this job checks it between files. Every
+        // per-file clone of `opts` shares the one token (#968).
+        let cancel = CancelToken::new();
         let opts = BulkProcessingOptions::new()
             .with_import_mode(import_mode)
             .with_defer_indexing(self.defer_indexing)
-            .with_byte_progress(progress.clone());
+            .with_byte_progress(progress.clone())
+            .with_cancel(cancel.clone());
         // Pre-size the byte denominator: every output file's advertised size
         // up front, so the percentage never recomputes against a partial
         // total — learned lazily per file, each newly opened file yanked the
@@ -680,7 +783,12 @@ where
         // gzip-decompressed stream) poisons the total for the whole manifest
         // and the status endpoint falls back to manifest-count progress.
         let totals_known = AtomicBool::new(true);
-        let keeper = LeaseKeeper::spawn(Arc::clone(&self.jobs), lease.clone(), progress.clone());
+        let keeper = LeaseKeeper::spawn(
+            Arc::clone(&self.jobs),
+            lease.clone(),
+            progress.clone(),
+            cancel,
+        );
 
         // 2. Ingest the `output` files. Up to `file_concurrency` at a time run
         // concurrently (fan-out): each file's fetch, parse, and write overlaps
@@ -709,7 +817,7 @@ where
 
         let mut ingest = futures::stream::iter(0..manifest.output.len())
             .map(|i| async move {
-                if keeper_ref.lease_lost() {
+                if keeper_ref.should_stop() {
                     return Ok::<(), StorageError>(());
                 }
                 let file = &manifest_ref.output[i];
@@ -834,7 +942,8 @@ where
         // 2b. Process `deleted` files — transaction Bundles / resource refs to remove.
         let mut deleted_refs: Vec<String> = Vec::new();
         for file in &manifest.deleted {
-            if keeper.lease_lost() {
+            if keeper.should_stop() {
+                log_wind_down(&lease, keeper.cancelled());
                 return Ok(());
             }
             match self
@@ -868,7 +977,11 @@ where
         }
 
         // 3. Emit per-type `output` receipts and an aggregated `error` artifact.
-        if keeper.lease_lost() {
+        // A wound-down job writes neither these nor a terminal manifest status:
+        // the receipts would claim a manifest that never finished, and an
+        // aborted manifest's outcome is already recorded by the abort (#968).
+        if keeper.should_stop() {
+            log_wind_down(&lease, keeper.cancelled());
             return Ok(());
         }
         self.write_result_artifacts(&lease, &manifest_url, view.fhir_version, failed)
