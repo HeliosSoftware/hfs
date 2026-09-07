@@ -633,9 +633,13 @@ pub struct BulkSubmitConfig {
     /// `run_defer_indexing_crash_check.sh`:
     ///
     /// - Speed: end to end — kick-off until search returns every resource —
-    ///   `true` is ~1.3x faster (2.7x if the clock stops at the `200` instead).
-    ///   The ~6.7x sometimes quoted comes from `bulk_submit_bench`, which runs
-    ///   no reindex and so measures ingestion with the indexing work removed.
+    ///   `true` measured ~1.3x faster (2.7x if the clock stops at the `200`
+    ///   instead). Treat the end-to-end figure as a direction rather than a
+    ///   number: it comes from a loaded machine where identical work varied
+    ///   ~8x round to round, and `true` won 7 of 9 rounds on that metric
+    ///   against 9 of 9 on the earlier one. The ~6.7x sometimes quoted comes
+    ///   from `bulk_submit_bench`, which runs no reindex and so measures
+    ///   ingestion with the indexing work removed.
     /// - Durability: the rebuild starts only after the manifest is already
     ///   terminal and is fire-and-forget, so `$bulk-submit-status` reports
     ///   `200` while search is still incomplete; the job exists only in an

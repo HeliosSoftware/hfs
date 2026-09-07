@@ -128,20 +128,28 @@ a searchable database. Measured end to end against a running server — kick-off
 until a search returns the full count — the gain is far smaller, because the
 deferred arm still has to pay for the rebuild:
 
-| stop the clock at | `false` | `true` | ratio |
-|---|---|---|---|
-| `$bulk-submit-status` returns `200` | 12.3s | 4.6s | 2.67x |
-| search returns every ingested resource | 12.7s | 9.7s | **1.31x** |
+| stop the clock at | `false` | `true` | ratio | rounds won by `true` |
+|---|---|---|---|---|
+| `$bulk-submit-status` returns `200` | 12.3s | 4.6s | 2.67x | 9 of 9 (p≈0.004) |
+| search returns every ingested resource | 12.7s | 9.7s | 1.31x | 7 of 9 (p≈0.18) |
 
 (9 interleaved rounds, 10 000 Patients per arm, release build, SQLite; minimum of
 each arm, which is the estimate least distorted by unrelated load on the box.
 Reproduce with `crates/hfs/tests/bulk_submit/run_defer_indexing_benchmark.sh`.)
 
-So quote 1.31x, not 6.7x, when the question is how fast a user can start
-querying. That margin is what has to be weighed against the unrecoverable
-window described above: `run_defer_indexing_crash_check.sh` restarts the server
-at the instant the API reports `200` and finds 16 000 of 20 000 resources
-stored, readable by id, and permanently absent from search.
+**Quote those ratios with their uncertainty, not as point estimates.** The box
+was shared during the run and identical work took anywhere from 12.7s to 99s,
+so the per-round spread is roughly 8x. The `t_ingest` direction survives that
+(9 of 9, and the one near-tie was 14.7 vs 14.5); the `t_search` direction does
+not clear significance at 7 of 9, and the 1.31x comes from the single quietest
+round. An honest statement of the end-to-end gain is "probably favours `true`,
+somewhere between about 1x and 2x". Re-run on an idle machine, with more
+rounds, before treating it as firmer than that.
+
+What is *not* load-sensitive is the failure mode: `run_defer_indexing_crash_check.sh`
+restarts the server at the instant the API reports `200` and finds 16 000 of
+20 000 resources stored, readable by id, and permanently absent from search.
+Load changes how wide that window is, not whether it exists.
 
 Which way that trade should fall for the *default* is a maintainer decision,
 open on #946. Report both numbers; do not invent a rationale for whichever
