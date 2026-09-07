@@ -5,7 +5,7 @@ use rusqlite::Connection;
 use crate::error::StorageResult;
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 22;
+pub const SCHEMA_VERSION: i32 = 23;
 
 /// Initialize the database schema.
 pub fn initialize_schema(conn: &Connection) -> StorageResult<()> {
@@ -307,6 +307,7 @@ fn migrate_schema(conn: &Connection, from_version: i32) -> StorageResult<()> {
             19 => migrate_v19_to_v20(conn)?,
             20 => migrate_v20_to_v21(conn)?,
             21 => migrate_v21_to_v22(conn)?,
+            22 => migrate_v22_to_v23(conn)?,
             _ => {
                 return Err(crate::error::StorageError::Backend(
                     crate::error::BackendError::Internal {
@@ -1571,12 +1572,73 @@ fn migrate_v21_to_v22(conn: &Connection) -> StorageResult<()> {
     Ok(())
 }
 
+/// Migrate from schema version 22 to version 23.
+///
+/// Adds `resource_fts_map`, which records the `rowid` FTS5 assigned to each
+/// resource's `resource_fts` row, and backfills it from the rows already there
+/// (#967).
+///
+/// `resource_fts` is an FTS5 virtual table whose plain columns are
+/// `UNINDEXED`, so
+///
+/// ```text
+/// DELETE FROM resource_fts WHERE tenant_id = ? AND resource_type = ? AND resource_id = ?
+/// ```
+///
+/// cannot seek: it scans the whole table. That delete runs once per resource
+/// on every re-index — an update, a re-import, `$reindex` — which makes those
+/// operations quadratic in corpus size. Measured on a 104 GB database holding
+/// 6,036,052 FTS documents (3.02 GB of `resource_fts_data`): a resumed bulk
+/// import advanced 16,700 entries in 20 hours, one core at 100%, 835,000 page
+/// reads per second and no writes. #949 guarded the *create* path (a resource
+/// with no `search_index` rows was never FTS-indexed); every other path still
+/// paid the scan.
+///
+/// FTS5 does index `rowid`, so with the mapping the delete becomes a b-tree
+/// lookup. The backfill is one scan of the FTS table — the cost of a single
+/// delete under the old scheme.
+fn migrate_v22_to_v23(conn: &Connection) -> StorageResult<()> {
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS resource_fts_map (
+            tenant_id TEXT NOT NULL,
+            resource_type TEXT NOT NULL,
+            resource_id TEXT NOT NULL,
+            fts_rowid INTEGER NOT NULL,
+            PRIMARY KEY (tenant_id, resource_type, resource_id, fts_rowid)
+        ) WITHOUT ROWID",
+        [],
+    )
+    .map_err(|e| migration_err(format!("v23 create resource_fts_map: {e}")))?;
+
+    // The FTS table is optional: a build without FTS5 never created it, and
+    // there is then nothing to map.
+    let fts_exists: bool = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='resource_fts'",
+            [],
+            |_| Ok(true),
+        )
+        .unwrap_or(false);
+    if fts_exists {
+        // `OR IGNORE`: the primary key includes the rowid, so a resource that
+        // somehow has two FTS rows keeps both mappings and both get deleted.
+        conn.execute(
+            "INSERT OR IGNORE INTO resource_fts_map (tenant_id, resource_type, resource_id, fts_rowid)
+             SELECT tenant_id, resource_type, resource_id, rowid FROM resource_fts",
+            [],
+        )
+        .map_err(|e| migration_err(format!("v23 backfill resource_fts_map: {e}")))?;
+    }
+    Ok(())
+}
+
 /// Drop all tables (for testing).
 #[cfg(test)]
 #[allow(dead_code)]
 pub fn drop_all_tables(conn: &Connection) -> StorageResult<()> {
     // Drop FTS5 table first (if exists)
     let _ = conn.execute("DROP TABLE IF EXISTS resource_fts", []);
+    let _ = conn.execute("DROP TABLE IF EXISTS resource_fts_map", []);
     let _ = conn.execute("DROP TABLE IF EXISTS search_index_fts", []);
 
     // Drop bulk tables (order matters due to foreign keys)
@@ -1840,6 +1902,65 @@ mod tests {
         initialize_schema(&upgraded).unwrap();
 
         assert_eq!(index_set(&fresh), index_set(&upgraded));
+    }
+
+    /// #967: the v23 mapping must exist and be backfilled from whatever FTS
+    /// rows a pre-v23 database already had, or those rows could never be
+    /// deleted by rowid and would linger as stale `_text`/`_content` matches.
+    #[test]
+    fn v23_backfills_the_fts_rowid_mapping_from_existing_rows() {
+        let conn = Connection::open_in_memory().unwrap();
+        // A database at v22, with FTS content written the pre-v23 way.
+        create_schema_v1(&conn).unwrap();
+        let _ = get_schema_version(&conn).unwrap();
+        set_schema_version(&conn, 1).unwrap();
+        migrate_schema(&conn, 1).unwrap();
+        conn.execute("DROP TABLE IF EXISTS resource_fts_map", [])
+            .unwrap();
+        set_schema_version(&conn, 22).unwrap();
+
+        let fts_exists: bool = conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='resource_fts'",
+                [],
+                |_| Ok(true),
+            )
+            .unwrap_or(false);
+        if !fts_exists {
+            return; // built without FTS5; nothing to map
+        }
+        for (id, text) in [("a", "alpha"), ("b", "beta")] {
+            conn.execute(
+                "INSERT INTO resource_fts (resource_id, resource_type, tenant_id, narrative_text, full_content)
+                 VALUES (?1, 'Patient', 't', ?2, ?2)",
+                rusqlite::params![id, text],
+            )
+            .unwrap();
+        }
+
+        initialize_schema(&conn).unwrap();
+        assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
+
+        let mapped: Vec<(String, i64)> = conn
+            .prepare("SELECT resource_id, fts_rowid FROM resource_fts_map ORDER BY resource_id")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        assert_eq!(mapped.len(), 2, "both pre-existing FTS rows must be mapped");
+
+        // Every mapping must point at the row it claims to.
+        for (resource_id, rowid) in mapped {
+            let found: String = conn
+                .query_row(
+                    "SELECT resource_id FROM resource_fts WHERE rowid = ?1",
+                    [rowid],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(found, resource_id);
+        }
     }
 
     /// Migrations must be re-runnable: a database already carrying the latest

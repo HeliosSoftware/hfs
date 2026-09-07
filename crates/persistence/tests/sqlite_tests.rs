@@ -3410,6 +3410,114 @@ async fn test_text_search_narrative() {
     assert_eq!(result.resources.items[0].id(), "text-1");
 }
 
+/// #967: an update replaces the resource's full-text row, and the old text
+/// must stop matching. The delete behind that used to scan the whole
+/// `resource_fts` table; it now goes through the rowid mapping, and this is
+/// the behaviour that has to survive the change — the mapping must be
+/// maintained accurately enough that the *right* row is removed.
+#[tokio::test]
+async fn updating_a_resource_replaces_its_full_text_content() {
+    let backend = create_backend();
+    let tenant = create_tenant("test-tenant");
+
+    let narrative = |text: &str| {
+        json!({
+            "resourceType": "Patient",
+            "id": "fts-update",
+            "text": {
+                "status": "generated",
+                "div": format!("<div xmlns=\"http://www.w3.org/1999/xhtml\"><p>{text}</p></div>")
+            }
+        })
+    };
+    let text_search = |term: &str| {
+        SearchQuery::new("Patient").with_parameter(SearchParameter {
+            name: "_text".to_string(),
+            param_type: SearchParamType::Special,
+            modifier: None,
+            values: vec![SearchValue::eq(term)],
+            chain: vec![],
+            components: vec![],
+        })
+    };
+
+    let created = backend
+        .create(
+            &tenant,
+            "Patient",
+            narrative("pneumonia"),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        backend
+            .search(&tenant, &text_search("pneumonia"))
+            .await
+            .unwrap()
+            .resources
+            .items
+            .len(),
+        1,
+        "the created narrative must be searchable"
+    );
+
+    // A second resource that must be untouched by the update below — a delete
+    // that removed the wrong rowid would take this one out.
+    backend
+        .create(
+            &tenant,
+            "Patient",
+            json!({
+                "resourceType": "Patient",
+                "id": "fts-bystander",
+                "text": {"status": "generated", "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\"><p>bystander</p></div>"}
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+
+    backend
+        .update(&tenant, &created, narrative("influenza"))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        backend
+            .search(&tenant, &text_search("pneumonia"))
+            .await
+            .unwrap()
+            .resources
+            .items
+            .len(),
+        0,
+        "the replaced narrative must no longer match"
+    );
+    assert_eq!(
+        backend
+            .search(&tenant, &text_search("influenza"))
+            .await
+            .unwrap()
+            .resources
+            .items
+            .len(),
+        1,
+        "the new narrative must match"
+    );
+    assert_eq!(
+        backend
+            .search(&tenant, &text_search("bystander"))
+            .await
+            .unwrap()
+            .resources
+            .items
+            .len(),
+        1,
+        "an unrelated resource's full text must survive the update"
+    );
+}
+
 // ============================================================================
 // Composite Search Parameter Tests
 // ============================================================================
