@@ -27,6 +27,15 @@
  * The SQL pane on the same page (`#lib-editor-form textarea[name='sql']`,
  * `sql-editor.js`) is a separate document entirely and untouched here.
  *
+ * `EditorPair.mount`'s own return value — `{formApi, host}` — is kept and
+ * exposed as `window.HfsSqlLibraryDetails` (#841), the one point a page
+ * script reaches the Details pairing through: `host.setDoc(text)` applies a
+ * document-mutation endpoint's `data-document` response as one undoable
+ * transaction (Ctrl+Z restores the pre-mutation text) that also refreshes
+ * the guided form and, via the textarea's own `input` event, re-fires the
+ * live run — see `sql-library-panels.js`. `undefined` when `EditorPair.mount`
+ * itself did nothing (no bundle, no `editor-pair.js`, no textarea).
+ *
  * Without the bundle, without the helper, without the textarea, without
  * `editor-pair.js`, without JS, or if anything below throws, this file does
  * nothing (or — no CodeMirror, but `editor-pair.js` present — hands it the
@@ -66,7 +75,7 @@
   // Missing `grid` (a page fragment other than this one's own template) or
   // a missing `editor-form.js` load leaves the editor above exactly as it
   // is and touches nothing else — `EditorPair.mount` guards both itself.
-  EditorPair.mount({
+  window.HfsSqlLibraryDetails = EditorPair.mount({
     textarea: textarea,
     view: view,
     grid: grid,

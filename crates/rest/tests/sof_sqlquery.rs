@@ -1067,4 +1067,98 @@ mod sof_sqlquery_tests {
 
         response.assert_status(StatusCode::NOT_FOUND);
     }
+
+    // =========================================================================
+    // Undeclared table check (#841/#842)
+    // =========================================================================
+
+    /// A table the subject's own SQL reads but doesn't declare as a
+    /// `relatedArtifact[depends-on]` label is rejected before SQLite ever
+    /// runs — `422` with one `OperationOutcome.issue` whose `diagnostics`
+    /// carries the same `Line: N, Column: M` marker a SQL parse error
+    /// already uses.
+    #[tokio::test]
+    async fn undeclared_table_returns_422_with_line_and_column() {
+        let (server, backend) = create_test_server().await;
+        let vd_url = seed_patient_view(&backend).await;
+        let lib = library_with_canonical_vd("SELECT * FROM vv", &vd_url, "v", vec![]);
+        let body = run_body_inline(lib, "json", None);
+        let response = server
+            .post("/$sql-run")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .add_header(
+                CONTENT_TYPE,
+                HeaderValue::from_static("application/fhir+json"),
+            )
+            .json(&body)
+            .await;
+        response.assert_status(StatusCode::UNPROCESSABLE_ENTITY);
+        let outcome: Value = response.json();
+        let issues = outcome["issue"].as_array().expect("issue array");
+        assert_eq!(issues.len(), 1);
+        assert_eq!(
+            issues[0]["diagnostics"],
+            "unknown table 'vv' at Line: 1, Column: 15; declare it as a \
+             relatedArtifact depends-on label or fix the name"
+        );
+    }
+
+    /// Two tables the subject's SQL reads and doesn't declare produce two
+    /// issues, not one — every problem is reported together, the same way
+    /// the dependency-graph resolver reports multiple structural problems
+    /// found at once.
+    #[tokio::test]
+    async fn two_undeclared_tables_return_two_issues() {
+        let (server, backend) = create_test_server().await;
+        let vd_url = seed_patient_view(&backend).await;
+        let lib = library_with_canonical_vd(
+            "SELECT * FROM aa JOIN bb ON aa.id = bb.id",
+            &vd_url,
+            "v",
+            vec![],
+        );
+        let body = run_body_inline(lib, "json", None);
+        let response = server
+            .post("/$sql-run")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .add_header(
+                CONTENT_TYPE,
+                HeaderValue::from_static("application/fhir+json"),
+            )
+            .json(&body)
+            .await;
+        response.assert_status(StatusCode::UNPROCESSABLE_ENTITY);
+        let outcome: Value = response.json();
+        let issues = outcome["issue"].as_array().expect("issue array");
+        assert_eq!(issues.len(), 2);
+        let diagnostics: Vec<&str> = issues
+            .iter()
+            .map(|i| i["diagnostics"].as_str().unwrap_or_default())
+            .collect();
+        assert!(diagnostics[0].contains("'aa'"), "{diagnostics:?}");
+        assert!(diagnostics[1].contains("'bb'"), "{diagnostics:?}");
+    }
+
+    /// A SQL whose tables all match a declared label runs exactly as it did
+    /// before this check existed — same `200`, same rows.
+    #[tokio::test]
+    async fn declared_tables_run_unchanged() {
+        let (server, backend) = create_test_server().await;
+        seed_patient(&backend, "p1", "Smith", true).await;
+        let vd_url = seed_patient_view(&backend).await;
+        let lib = library_with_canonical_vd("SELECT patient_id FROM t", &vd_url, "t", vec![]);
+        let body = run_body_inline(lib, "json", None);
+        let response = server
+            .post("/$sql-run")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .add_header(
+                CONTENT_TYPE,
+                HeaderValue::from_static("application/fhir+json"),
+            )
+            .json(&body)
+            .await;
+        response.assert_status(StatusCode::OK);
+        let rows: Value = response.json();
+        assert_eq!(rows.as_array().map(|a| a.len()), Some(1));
+    }
 }

@@ -247,13 +247,24 @@ field, and each has its own `POST …/run` fragment endpoint
 (`/ui/sql/view-definitions/run`, `/ui/sql/queries/run`, `/ui/sql/views/run`)
 that runs the editor's *posted* text — saved or not — through `$sql-run` and
 renders that same partial as its whole response, with `hx-swap-oob`
-attributes so only the results card and its meta move. `/run` always answers
-`200` (htmx does not swap `4xx`/`5xx` by default) except for a malformed
-request body. Each caller supplies its own surface — the fragment URL, the
-id of the form to `hx-include`, the results heading and failure-prefix i18n
-keys, and an optional "Export as files" action (SQL Queries only, once the
-Library has a saved id) — so the partial itself never branches on which page
-is rendering it.
+attributes so only the results card and its meta move. View Definitions'
+`/run` always answers `200` (htmx does not swap `4xx`/`5xx` by default)
+except for a malformed request body; the Library-backed `/run` endpoints
+(#841) answer `200` unconditionally instead, since their own by-hand form
+parse (below) never fails to extract. Each caller supplies its own surface —
+the fragment URL, the id of the form to `hx-include`, the results heading
+and failure-prefix i18n keys, and an optional "Export as files" action (SQL
+Queries only, once the Library has a saved id) — so the partial itself never
+branches on which page is rendering it.
+
+`RunResultsState` (`crate::lib`) has a fourth arm beyond
+Success/Failure/Empty: `Waiting(message)` (#841), a SQL Query's own
+"a declared, required parameter has no value yet" pause — rendered as a
+plain, non-`--warn` notice (no `data-error-line` either, there is no SQL
+error to tint), with the same OOB shape `Failure` uses otherwise (the stale-
+meta relabel, no `#run-results` swap, so the previous table stays on
+screen). Only SQL Query's own `/run` and `?…&saved=1` render can produce it;
+View Definitions and SQL View never do.
 
 None of the three pages has a Run button: the editor card is always open,
 and the results region below it wires straight to `/run` with plain `hx-*`
@@ -275,6 +286,35 @@ never edits the document or touches the textarea. With JavaScript disabled
 there is no live preview at all: Save's own redirect (`?vd=<id>&saved=1` /
 `?lib=<id>&saved=1`) is what renders the just-stored resource's results,
 server-side, once.
+
+**Unknown-table lint (#842/04, Library-backed pages only).** `crate::
+sql_library_run` decides, in this order, ahead of `$sql-run`: (1) a SQL
+View's own non-empty `parameter[]` (#841); (2) the SQL reads a table no
+declared `relatedArtifact[depends-on]` label names, case-insensitively
+(`sql_libraries::unknown_tables`, `helios_sof::sqlquery::{scan_sql,
+undeclared_tables}`) — never calls `$sql-run` at all; (3) a SQL Query's own
+declared, required parameter with no value (`Waiting`, above); (4) only once
+every check passes does it call `$sql-run`. `?…&saved=1`'s own server-side
+run and the `document` endpoint's own no-JS re-render apply the same
+unknown-table check (steps 2 and, for `?…&saved=1`, 1 and 3 too) before
+deciding what to show in place of results. `crate::LibRunNotice` is the
+enum that decision produces — `Standard(RunResultsPartial)` for every other
+case, or `UnknownTables(crate::UnknownTablesNotice)` — rendered in place of
+`partials/sql_run_results.html` (never edited to add this; see its own
+header comment) by `partials/lib_run_unknown_tables.html`, the identical
+OOB shape as a `Failure`. The notice text is the first table's own full
+sentence ("Unknown table {name} — line {line}. Declare it under Reads from
+or fix the name. …") then a short sentence per additional table; `#run-
+notice`'s `<p>` carries `data-error-line` (the *first* table's own line) and
+`data-diagnostics` — a JSON array of `{from, to, message, table}` objects
+(Unicode-character offsets into the posted SQL, from `helios_sof::sqlquery
+::TableRef::position`) `sql-editor.js` feeds straight to `@codemirror/lint`'s
+`setDiagnostics` (below). The same tables also enter the *Reads from* card's
+own signature as `?name` hints (`sql_libraries::tables_signature_with_
+unknown`, mirroring the Parameters card's own undeclared-placeholder
+hints) and render as their own `.tag--failed` "Unknown table" rows there,
+each with a *Declare {name}* button (opens *Add table* and pre-fills its
+alias, see "Tables panel" below).
 
 Beside the editor sits a guided-form card (#843, `.editor__grid--stretch` in
 `assets/app.css`): the two cards stretch to match each other's height, capped
@@ -371,6 +411,205 @@ together in one plain submit; the guided-form card stays `needs-js`-hidden
 and the grid collapses to the JSON card alone, exactly like View
 Definitions' own card does.
 
+### Parameters card (#841, SQL Query only)
+
+Between the SQL card and the results region, `/ui/sql/queries` renders one
+more card — `partials/sql_parameters_card.html` — that SQL View never shows:
+`LibraryKind::declares_parameters` (`true` for SQL Query, `false` for SQL
+View, whose SQLView profile fixes `Library.parameter` to `0..0`) is the one
+field the template gates on, never an `if` on the route's own `code`. The
+card holds one `.field` per declared `Library.parameter[use=in]` entry (the
+shared `partials/sql_parameter_fields.html` macro #837's SQL Export builder
+also uses, now with an optional `form` argument so its inputs — physically
+outside `#lib-editor-form` — still submit and live-preview with it, HTML5
+form-associated the same way the Details JSON textarea already does), the
+`:name` placeholders the SQL uses but does not declare as one-click
+*Declare* hints, and an *Add parameter* `<details>` that writes a fresh
+declaration into the Details document.
+
+**Signature and OOB (#841).** The card carries a hidden `params_sig` field —
+every declared parameter's `name:type` pair, declaration order, then one
+`?name` per undeclared-placeholder hint, comma-joined
+(`sql_libraries::params_signature`) — and every `/run` submission echoes it
+back. `crate::analyze_params` recomputes the same signature from the posted
+document/SQL on every request; only when it differs from what the browser
+sent does the response carry the card again, as its own `hx-swap-oob`
+companion (`partials/lib_run_fragment.html`, which nests
+`sql_run_results.html`'s render next to an optional `LibParamsCard` render —
+the same "nest one `Template`'s output inside another's" idiom the rest of
+this crate uses instead of concatenating markup by hand). A hint appearing
+or resolving changes the signature (so the card refreshes); typing a
+parameter *value* never does, so the card is never swapped mid-keystroke and
+never loses focus.
+
+**Live-run values and bindings.** A value field's own `input` event bubbles
+up to the card's own `hx-post`/`hx-trigger="input delay:500ms"`, which
+`hx-include`s the whole `#lib-editor-form`. The `/run` handler
+(`crate::sql_library_run`) reads every `param:{name}` off the raw form body
+(`crate::parse_lib_run_form` — needed because a `#[derive(Deserialize)]`
+struct cannot express an arbitrary set of keys, the same reason
+`sql_export::start` parses its own `param:{reference}:{name}` fields by
+hand) and, for each declared parameter with a non-empty value, supplies a
+`{name, type_code, value}` binding to `$sql-run` via `ConformanceSource::
+sql_run`'s own `bindings` parameter (#841's own seam from the SQL scanning
+ticket) — a value left blank on a defaulted parameter is omitted so the
+server applies its own default, never sent as an empty string. A value that
+fails to bind its declared type is sent anyway and left to `$sql-run`'s own
+error message; this card never duplicates that validation client-side.
+
+**The "waiting" pause.** A declared, default-less parameter with no
+non-empty value blocks the run before `$sql-run` is ever called:
+`RunResultsState::Waiting` (above) names every missing `:name` in one
+notice. `?…&saved=1`'s own server-side run applies the identical gate
+(always against an empty value map — the just-saved redirect never carries
+the POST's own `param:*` fields forward), so a parameterized query's first
+paint after Save shows "waiting" rather than a stale or empty table.
+
+**`POST /ui/sql/queries/document` and `POST /ui/sql/views/document`**
+(`crate::sql_library_document`, both routes exist so SQL View's own
+programmatic mutations #842 will add later share the endpoint shape, though
+SQL View's Parameters card never renders to trigger one): the *Add
+parameter*/*Declare* mutations, applied to the **submitted** Details
+document — never a stored resource — and handed back unsaved, matching
+Save's own "reject without touching storage" contract. `op=add-parameter`
+with `param_name`/`param_type` (the *Add parameter* panel's own submit) or a
+`declare_param={name}` field alone (a *Declare :name* button's own name/
+value pair, implying type `string`) both reach
+`sql_libraries::add_parameter`, which validates the name against the
+`sql-name` invariant (`^[A-Za-z][A-Za-z0-9_]*$`), rejects a duplicate
+`use=in` name, and checks the type against
+`helios_sof::sqlquery::BINDABLE_PARAMETER_TYPES` before appending
+`{name, use: "in", type}` to `parameter[]` (creating it if absent). An
+`HX-Request` gets the Parameters card alone — `data-document` on its root
+carrying the updated (Details-shaped, SQL-attachment-free) JSON on success,
+absent on a validation failure (the message lands in the *Add parameter*
+panel's own field instead, panel left open); no `HX-Request` gets the whole
+page re-rendered around the same (possibly mutated) document, unsaved,
+exactly like Save's own validation-error path
+(`crate::render_lib_document_page`, shared by both). Both buttons are real
+`type="submit"` elements with a `formaction` to this endpoint, so *Add
+parameter*/*Declare* work with no JavaScript; their own `hx-post`/
+`hx-target="#lib-params"`/`hx-swap="outerHTML"` intercept that same submit
+when JavaScript is available. `assets/sql-library-panels.js` is the one
+JavaScript-only step neither path handles alone: on `htmx:afterSwap` of a
+`#lib-params` carrying `data-document`, it hands that text to
+`window.HfsSqlLibraryDetails.host.setDoc()` — the Details JSON pane's own
+undo-tracked host, exposed by `sql-library-details.js` (below) rather than
+discarded — so the mutation becomes one Ctrl+Z-able transaction that also
+refreshes the guided form and re-fires the live run.
+
+### Tables panel (#842, both kinds)
+
+Below the SQL card (and the Parameters card, on SQL Query), both routes
+render a two-column `#lib-tables-panel`: `section.card#lib-tables` (left,
+`partials/sql_tables_card.html`) and `section.card.table-card#lib-columns`
+(right, `partials/sql_columns_card.html`), present whenever a Library is
+selected — including `?lib=new`'s starter document. `crate::TablesAnalysis`
+(`crate::analyze_tables`) computes everything both cards need from one
+(document, already-fetched Library list, already-loaded `$sql-export` job
+list) triple, so *Reads from*'s own signature and *Used by*'s own rows can
+never disagree about what the document currently declares; `crate::
+full_tables_analysis` is the "nothing already fetched" path every mutation
+endpoint uses, while the page's own render reuses the rail's Library list
+instead of fetching it twice (NF1).
+
+**Reads from.** One row per `relatedArtifact[type=depends-on]`, in document
+order: an alias (`label`, or a placeholder when absent) and the target it
+resolves to. `crate::resolve_table_reference` mirrors `crates/rest/
+.../graph.rs`'s own `StorageArtifactFetcher::fetch` (imitates, never
+replaces, the server's own resolution) — `sql_libraries::dependency_lookup`
+tells a relative `Type/id` reference from an absolute canonical (optionally
+`|version`, compared only when pinned); a `Type/id` is read directly, a
+canonical is searched among stored ViewDefinitions first
+(`search_page("ViewDefinition", url=…)`, the more common dependency), then
+matched against the already-fetched Library list by `url`/`url|version`
+(`sql_libraries::matches_reference`) — never a second request. `sql_libraries
+::classify_table_artifact` turns what resolved (or didn't) into a
+[`TableTarget`]: a ViewDefinition or `sql-view` Library become a chip and a
+link (`?vd=`/`?lib=`, the artifact's own `name`); nothing answering to the
+reference is `NotFound` (`.tag--failed` "Not found"); a `sql-query` Library
+or any other resource type is `NotATable` (`.tag--failed` "Not a table") —
+distinct messages, since the first is a bad reference and the second names
+something the server itself would refuse to read from. Resolution runs once
+per render, is memoized per request by `dep.resource` (a repeated dependency
+never triggers a second lookup), and only ever runs again — on `/run` — when
+the posted `tables_sig` no longer matches; #842/04 extends that signature
+with one `?name` per unknown table the SQL reads
+(`sql_libraries::tables_signature_with_unknown`), so a table appearing or
+resolving re-renders this card too. *Remove* is a form-associated
+`type="submit"` per row (`name="table_label"`, its own exact `label`) —
+present means clicked, the same "the field's own presence is the operation"
+idiom the Parameters card's *Declare* buttons use.
+
+**Used by.** Two groups, artifacts first then exports, both name-sorted:
+`sql_libraries::used_by_artifacts` scans the same in-memory Library list for
+any (other) Library whose own `relatedArtifact[depends-on]` names the
+selected artifact's identity (`id`, `url`, or `url|version`) — chip `SQL
+Query`/`SQL View` from its own type coding, link to its own page;
+`sql_libraries::used_by_exports` scans the current user's `$sql-export` jobs
+(`sql_export::jobs_for_used_by`, same tenant) for a `subjects[].reference ==
+"Library/{id}"`, most recent first, linking to `/ui/sql/export/{jobId}`. A
+`?lib=new` document with no `id` can still be found by artifacts through its
+own `url`, though never by an export — nothing has been saved yet for one to
+reference — and an empty result reads "Nothing uses this yet."
+
+**Add table.** A native `<details>` opened by the head's own button, holding
+`combobox.html`'s field in single-value mode (`max="1"`, `form=
+"lib-editor-form"` — see "Client-side scripts" below) against `/ui/lookup/
+table-options` (see the routes table), and an Alias field
+(`table_alias`, `pattern="[A-Za-z][A-Za-z0-9_]*"`) that `sql-library-
+panels.js` autofills from the chosen option's own name. `POST
+.../document`'s `op=add-table` (`crate::apply_add_table`) resolves `table`
+through `crate::resolve_table_target` — the *Add table* field's own extra
+gate on top of `dependency_lookup`/`classify_table_artifact`: `table_ref`
+must actually resolve, resolve to a ViewDefinition or `sql-view` Library,
+and — for a Library — not be the artifact's own id (a `Type/id` reference
+alone cannot rule out a self-canonical one) — then validates the alias in
+order: present (falling back to the target's own `name`), shape
+(`sql_libraries::is_valid_parameter_name`), and uniqueness among the
+existing labels, case-insensitively (`sql_libraries::label_declared` — `V`
+collides with `v`). On success it appends `{type: "depends-on", label,
+resource: R}` (`R` = the target's own `url`, else `Type/id`, never
+version-pinned) via `sql_libraries::add_table`; `op`'s validation-error
+shape and `remove-table` (`crate::apply_remove_table`, always a silent
+no-op for an unmatched label) otherwise mirror the Parameters card's own
+`add-parameter`/`document` contract exactly — see "Parameters card" above.
+
+A table the SQL reads but no dependency declares (#842/04, "Unknown-table
+lint" above) appends its own row after every resolved one — `<code>` the
+name as the SQL spells it, `.tag--failed` "Unknown table", and a *Declare
+{name}* button. With JavaScript (`assets/sql-library-panels.js`, event
+delegation on `[data-declare-table]`) it opens the *Add table* `<details>`
+and fills the Alias field with that row's own name, without submitting —
+the target itself still needs picking from the combobox, unlike a
+Parameters hint's one-click *Declare*; without it, `crate::build_tables_card`
+already opens the panel and pre-fills the *first* unknown table's own name
+whenever `options.add` is still its own untouched default. The head's own
+`.toolbar__count` still counts only the *declared* rows.
+
+**Columns** (`section.card.table-card#lib-columns`, `partials/sql_columns_
+card.html`, filled in for #842/04): the last good run's own column list, in
+the result table's own order — `crate::build_columns_card`/`sql_libraries
+::analyze_columns`, fed the run's raw JSON rows (`crate::run_sql_preview`
+now returns them alongside the stringified table, #842/04) and every
+dependency resolved to a ViewDefinition (`crate::
+resolve_view_definition_dependencies` — a SQL View dependency never
+contributes an origin, out of scope). A column's own name existing in
+*exactly one* resolved ViewDefinition's `select[].column[]`
+(`helios_sof::sqlquery::TableSchema::from_view_definition`) gives it that
+column's own type (`ColumnFhirType::code()`) and an `{label}.{column}`
+origin; none or several matching dependencies fall back to inferring a type
+from the row values themselves (`boolean`/`integer`/`decimal`/`string`, a
+mix or an unrepresentable value becoming `string`, no non-null value at all
+"—") with no origin. With no rows yet — every render but a successful
+`?…&saved=1` — the card is its own skeleton (heading, a fixed `0` count,
+and a per-kind "what the query/view produces" meta and empty body); on
+`/run`'s own fragment, `crate::ColumnsFragment` decides between sending the
+whole card by OOB (`Filled`, a good run only) or just relabelling
+`#lib-columns-meta` to "last successful run" (`Stale`, every other outcome —
+NF1: the ViewDefinition resolution above never runs on a request that never
+reaches a successful `$sql-run`). Never rendered for View Definitions.
+
 ### Client-side scripts
 
 Each is a small, self-contained IIFE. Page-specific scripts load with `defer`;
@@ -389,7 +628,7 @@ not just a closed IIFE.
 | `saved-queries.js` | Saved queries, the visual search builder, the `/_user/settings` read/modify/write cycle, and — on Resources/Search/Saved Queries — writing `rails.<page>` back on an in-page rail click (#754/#755) |
 | `editor.js` | The schema-driven editor loop — posts the document to `/ui/editor/render` and swaps in the server's HTML |
 | `json-view.js` | Delegated folding and accessibility state for every server-rendered JSON view |
-| `combobox.js` | Shared multi-select state, chips, keyboard/ARIA behavior, and progressive fallback upgrade; htmx owns transport and callers own result semantics |
+| `combobox.js` | Shared multi-select state, chips, keyboard/ARIA behavior, and progressive fallback upgrade; htmx owns transport and callers own result semantics. `data-combobox-max="1"` (#842, *Add table* only) switches a field to single-value mode — choosing an option replaces the current selection rather than adding to it — and fires `hfs:combobox-select` (`{value, label, name}`, `name` from the option's own optional `data-name`) on every actual choice, for a caller that needs to react to *which* option was picked rather than the whole-list `hfs:combobox-change` every field already emits. `data-combobox-form` (#842) gives every hidden input this field creates the same `form=` attribute its fallback textarea carries — needed only when the field's own fieldset sits outside the `<form>` it submits with, as `sql_tables_card.html`'s *Add table* field does (its siblings are each explicitly form-associated, `form="lib-editor-form"`, rather than DOM descendants of a `<form>` the way every caller before it is). `install()` also runs on every htmx `afterSwap` target (#842/04) — needed the moment the unknown-table lint's own OOB refresh replaces `#lib-tables`, and so its *Add table* field, with a fresh, un-enhanced one straight from the server; `initialize()`'s own `data-combobox-ready` guard makes this safe to call repeatedly |
 | `resources.js` | The Resources workspace edit modal and "Create new" |
 | `batch.js` | Bundle pick → lazy highlighted previews → execution plan → per-entry outcomes |
 | `bulk-export.js` | All Resources, individual resource types, and Since/Custom instant state on the Bulk Export builder |
@@ -403,8 +642,9 @@ not just a closed IIFE.
 | `editor-form.js` | The guided-form loop (#843), extracted from `editor.js`'s original: `[data-add]`/`[data-remove]`/`[data-extension]`/`[data-choose]`/`[data-set]`, the add-picker's typeahead, live `$expand` — driven against a caller-supplied `root` and `host` (`{ getDoc, setDoc, renderUrl?, fields? }`) instead of page ids, so it works over any document a host owns; `host.fields` (#840) adds constant extra fields (e.g. `hidden`/`legend`) to every request. `window.HfsEditorForm.attach(root, host)` |
 | `editor-pair.js` | The shared host between a CodeMirror/textarea JSON editor and the guided-form card beside it (#840, extracted from `vd-editor.js`'s original #843 implementation): two-way JSON↔form sync (a form-driven change lands as one minimal common-prefix/common-suffix transaction, tagged so the sync listener skips its own echo; an editor change 600ms after the last keystroke re-requests the panel alone when its canonical JSON actually moved, or flips the `.editor-validity` chip to "Invalid JSON" when it does not parse), and the row↔editor cross-highlight (a `StateField` of line decorations for a hovered/focused row, a debounced cursor listener that marks the row for whichever node the caret sits in). Adds its own CodeMirror extensions onto an already-mounted `EditorView` via `StateEffect.appendConfig`, so callers pass nothing pair-specific into `HfsCodeEditor.mount`. Falls back to driving the plain `<textarea>` when no `EditorView` is given. `window.HfsEditorPair.mount({ textarea, view?, grid, fields? })`, consumed by `vd-editor.js` on `/ui/sql/view-definitions` and the Library Details editor (#840) |
 | `vd-editor.js` | The ViewDefinition editor on `/ui/sql/view-definitions`: JSON + injected FHIRPath language and highlighting, fold, and the async server lint (#753, generalized onto `code-editor.js` in #838); hands the mounted `EditorView` to `editor-pair.js` (#840) to drive the guided-form card beside it. `vdCompletionSource` (#821, `code-editor.js`'s `completion` option) classifies the cursor against the browser's own syntax tree — inside a `PropertyName` string, or in an `Object` at a "new key" gap (right after `{`/`,`, or right after a `Property` with no comma of its own yet — a JSON-error-recovery state reached mid-edit as often as a genuinely new key) → `POST .../complete` with `kind: "key"`; inside the content of a `String` the same injection rule `nestFhirpath` already applies to (`path`/`forEach`/`forEachOrNull`/a `repeat` element, no `\` in the string) → `kind: "fhirpath"`, `document` the editor's own currently-parsed JSON (a document that does not parse never queries at all); anywhere else, no request. Every request is same-origin, `AbortController`-linked to CodeMirror's own completion `context`, and degrades to no popup (`console.debug`) on any failure. A key item's `apply` re-resolves the same classification fresh against the *live* tree at accept time rather than trusting what the source captured — inserting/renaming just the key's own text, and (only when it has no `:` yet) a `": " + skeleton` alongside it, comma-wrapped as the surrounding gap needs (`classifyObjectGap`/`buildKeyInsertion`, both pure and unit-tested); a `function` item inserts `name()` with the cursor between the parens, or after it for a no-argument signature like `first()`; `element`/`constant`/`variable` items take CodeMirror's own default replace. The required-key marker (`data-msg-required` on `#vd-editor-grid`, Fluent `vd-complete-required`) is the only translated string this file owns for completion — every label/detail/message otherwise comes from the server already localized or, for FHIRPath identifiers, untranslatable by nature. Each lint diagnostic's `fixes` (#821) becomes a `Diagnostic.action` that resolves its own RFC 6901 `pointer` against the live tree at apply time and dispatches one `userEvent: "lint.fix"` transaction (`renameKeyChange`/`removeKeyChange`/`setStringChange`, atop the pure, unit-tested `removeKeyRange`/`stringContentRange`/`escapeJsonStringContent`), then relaunches the lint; **Ctrl+.** applies the single fix under the cursor or opens the lint panel for several, `lintKeymap` adding F8/Ctrl-Shift-M alongside it. `#vd-editor-form`'s own `submit` listener pops a plural-correct `window.confirm` (`data-msg-save-errors-one`/`-other` on `#vd-editor-grid`) when submitting as Save while the most recently completed lint pass still has an error |
-| `sql-editor.js` | The SQL pane editor on `/ui/sql/queries` and `/ui/sql/views`: SQLite-dialect SQL language and highlighting, and — after each `#run-notice` swap — tinting the line a parse failure names via `data-error-line` (#839); no fold or lint yet (#838) |
-| `sql-library-details.js` | The Details JSON editor on `/ui/sql/queries` and `/ui/sql/views` (#840): plain JSON language and the shared highlight preset, no injected grammar or lint; hands the mounted `EditorView` to `editor-pair.js` with `fields: { hidden: "content", legend: "sql-library" }` to drive the guided-form card beside it |
+| `sql-editor.js` | The SQL pane editor on `/ui/sql/queries` and `/ui/sql/views`: SQLite-dialect SQL language and highlighting; after each `#run-notice` swap, tints the line a parse failure names via `data-error-line` (#839) and, via `@codemirror/lint`'s `setDiagnostics`/`lintGutter()` (#842/04), underlines every unknown table `data-diagnostics` locates (JSON `{from, to, message, table}`, character offsets clamped to the document's current length), each with its own hover tooltip and gutter mark — a missing or unparseable attribute clears whatever the previous notice set. No autocomplete yet (follow-up A of #842) |
+| `sql-library-details.js` | The Details JSON editor on `/ui/sql/queries` and `/ui/sql/views` (#840): plain JSON language and the shared highlight preset, no injected grammar or lint; hands the mounted `EditorView` to `editor-pair.js` with `fields: { hidden: "content", legend: "sql-library" }` to drive the guided-form card beside it. Keeps `EditorPair.mount`'s own return value — `{formApi, host}` — instead of discarding it, exposed as `window.HfsSqlLibraryDetails` (#841) so a page script can drive the same pairing programmatically |
+| `sql-library-panels.js` | The Parameters (#841), Tables (#842), and Columns (#842/04) cards: on `htmx:afterSwap` of a `#lib-params`/`#lib-tables` that carries `data-document` (the `document` endpoint's own successful `add-parameter`/`add-table`/`remove-table` response), hands that text to `window.HfsSqlLibraryDetails.host.setDoc()` so the mutation lands as one Ctrl+Z-able transaction that also refreshes the guided form and re-fires the live run, then strips the attribute. Falls back to writing the JSON textarea directly and firing `input` when that host is not mounted. Also listens for *Add table*'s own combobox `hfs:combobox-select` (#842) and fills the sibling `table_alias` field with the chosen option's `name` — only while that field is still empty or still holds the *previous* autofill, so a value the person typed themselves is never overwritten — and, event-delegated on `[data-declare-table]` (#842/04), opens the *Add table* `<details>` and fills that same field with an unknown-table row's own name on click, without submitting. The *Add parameter*/*Declare*/*Add table*/*Remove* buttons' own mutation requests are plain `hx-post`/`hx-target`/`formaction` in the template — this file only wires the steps none of those handles alone |
 
 `editor.js` is deliberately thin, and that is the architectural point: it does
 not model the resource, know what a choice type is, or understand cardinality.
@@ -542,6 +782,7 @@ These are the shared primitives. Before styling anything, reach for one; add to
 | `.field`, `.field__label`, `.field__input`, `.field__hint`, `.field__hint--error` | A labelled form field. |
 | `.row--params`, `.param-grid` | A parameterized SQL Query's values row (#837, SQL Export builder): `.row--params` shades the `<tr>` right under a subject with declared `Library.parameter[use=in]` entries; `.param-grid` lays its fields out three per row in the form's own plain `.field` voice (never `.field-row`, which uppercases labels). Rendered by `partials/sql_parameter_fields.html`'s `fields(prefix, params)` macro — shared, unchanged, with the SQL Query page's own parameter form (#841). |
 | `.row-toggle`, `.param-summary` | The values row's own expand/collapse chevron and folded chip strip (#837, SQL Export builder), both in the parameterized subject's Subject cell: `.row-toggle` (24px, `.icon` rotates off `[aria-expanded="false"]`, the same convention `.json-line__arrow` uses) toggles the row; `.param-summary` (inline-flex, 6px gap) holds `sql-export-form.js`'s own `.tag--param`/`.tag--danger` chips while folded. Both server-rendered `hidden`, revealed only for a checked query. |
+| `.lib-params-hint`, `.lib-params-add__fields` | The Parameters card's own extras (#841, `partials/sql_parameters_card.html`): `.lib-params-hint` is one undeclared-placeholder hint row (text + its own *Declare* button), a quieter informational surface than `.notice--warn` since it is expected while a query is still being written, not an error; `.lib-params-add__fields` lays the *Add parameter* panel's name/type fields side by side (`.editor-add`/`.editor-add__toggle`/`.editor-add__panel` are the shared "+ Add" disclosure chrome, reused unchanged from the guided-form editor). |
 | `.combobox`, `.combobox__*` | Shared progressively enhanced multi-select. Render it through `partials/combobox.html`; callers provide localized domain copy and an HTML-fragment endpoint, while `combobox.js` owns selection/keyboard state and repeated hidden inputs. Keep a named textarea fallback usable without JavaScript. |
 | `.addbox`, `.addbox--modal`, `.addbox__panel`, `.addbox__head`, `.addbox__x`, `.addbox__actions` | The `<details>` disclosure for create/add flows; `--modal` centers it as a dialog. |
 | `.choice-grid`, `.choice-card`, `.choice-card__title`, `.choice-card__hint` | The radio-group treatment: one selectable card per choice, `:has(:checked)` accent (#735). |
@@ -715,9 +956,13 @@ cargo run -p helios-hfs   # then open http://127.0.0.1:8080/ui
 | `/ui/status` | GET | System-status read path; the fragment-vs-full-page reference |
 | `/ui/version` | POST | Persists the sidebar FHIR-version choice (#343) and redirects back |
 | `/ui/tenant`, `/ui/tenant/options` | POST/GET | Tenant selector (#344), options loaded lazily |
+| `/ui/sql/queries`, `/ui/sql/views` | GET/POST | SQL Query / SQL View workspaces (#649, #838–#842): rail, Details (JSON editor + guided form), the SQL card, the live `$sql-run` preview, — SQL Query only — the Parameters card, and the Tables panel (*Reads from*/*Used by*/*Columns*). POST is Save/Duplicate. See "SQL on FHIR playgrounds", "Details", "Parameters card", and "Tables panel" above |
+| `/ui/sql/queries/run`, `/ui/sql/views/run` | POST | The pages' own live-preview fragment (#839, extended in #841 with the Parameters card's OOB companion and the "waiting"/SQL-View-parameter gates, in #842 with the Tables card's own OOB companion when the posted `tables_sig` no longer matches, and in #842/04 with the unknown-table lint gate — no `$sql-run` call, `data-diagnostics` — and the Columns card's own OOB update on every response) — see "SQL on FHIR playgrounds" above |
+| `/ui/sql/queries/document`, `/ui/sql/views/document` | POST | The Parameters card's *Add parameter*/*Declare* mutations (#841) and the Tables card's *Add table*/*Remove* mutations (#842) — see "Parameters card" and "Tables panel" above |
 | `/ui/sql/export` | GET/POST | Active SQL Exports — the user's `$sql-export` jobs as cards, most recent first (#833); POST resolves the checked subjects and kicks off the job, optionally naming it |
 | `/ui/sql/export/new` | GET/POST | SQL Export builder (#834, #836, #837) — an optional name, a single filterable table of stored ViewDefinitions/Libraries with their status, an optional "Narrow it down" card (patients/groups/since) and "Advanced" disclosure (tracking id, CSV header), and an output format; `?subject=` (repeatable) pre-checks matching rows. Every SQL Query declaring `Library.parameter[use=in]` entries carries an `n parameter(s)` chip and, right under its own row, a values row (`param:{reference}:{name}` fields, one per declared parameter, `partials/sql_parameter_fields.html`) — always rendered, unconditionally visible without JavaScript. `sql-export-form.js` hides an unchecked query's values row, reveals its row-toggle chevron once checked, folds it into a `:name = value`/`:name — required` chip summary, keeps the fields' native `required` in sync with "checked and no default", appends "· k value(s) missing" to the selection count, and blocks a submit with an empty required field — opening the affected row and focusing the field. A resubmission that left a field in error re-renders that row with `data-open`, the script's cue to keep it expanded and focus that field. `POST /ui/sql/export` is the same builder's submit target — validates every checked SQL Query's parameter values by declared type before kick-off — see the row above |
 | `/ui/lookup/patient-options`, `/ui/lookup/group-options` | POST | Shared Patient/Group combobox search fragments (#836), htmx-only; `?target=` selects which field's `#{target}-message` slot the response's `hx-swap-oob` lands in — one of `bulk-export-patients` \| `sql-export-patients` \| `sql-export-groups`, a closed list (an unrecognized value is a bare `400`). Group search adds `Group.name` only for R5+ (`data/search-parameters-{r4,r5}.json`); Patient search shares Bulk Export's own runtime id-only downgrade |
+| `/ui/lookup/table-options` | POST | *Add table*'s own combobox search fragment (#842), htmx-only; `?target=lib-tables` (the only accepted value, else `400`) and an optional `?exclude=Library/{id}`. Up to 8 results: ViewDefinitions whose `name` contains the posted `q` (`search_page` with `name:contains`, `_sort=name`) and `sql-view` Libraries whose `name` contains it (from the already-fetched rail list — `sql-query` Libraries never appear), minus `exclude`; empty `q` returns the first 8 by name. Each option's `value` is `ViewDefinition/{id}` or `Library/{id}`, its label carries the " — ViewDefinition"/" — SQL View" suffix, and it carries an extra `data-name` — the artifact's bare name, for *Add table*'s own alias autofill — that the Patient/Group options above never set |
 | `/ui/sql/export/{id}` | GET | A job's own permalink (#835): header with the contextual action/status/overflow, a failure notice when `failed`, the Job card, and the Output files table — reading the notebook's own persisted record, not the server. The Job card surfaces `filters` (#836) when the job carries them: Tracking id, Since, and one `.tag` chip per Patients/Groups reference, each field skipped entirely when empty; Format gains " · with header row"/" · no header row" for a `csv` job with a known `header` choice. Its Subjects field also carries a `:name = value` chip per parameter (#837) right after any SQL Query subject that supplied one, in submission order — empty for every other subject |
 | `/ui/sql/export/{id}/detail` | GET | htmx fragment of the page above (`#job-detail`), polled every 5s while the job is `in-progress`; `404` with no body for an id this user/tenant does not own |
 | `/ui/sql/export/{id}/card` | GET | htmx fragment: one job's card, polling `$sql-export` status while the job is in progress |

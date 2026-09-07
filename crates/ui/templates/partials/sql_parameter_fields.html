@@ -28,31 +28,43 @@
   attribute: `data-default` is present (holding the declared default's text)
   only when `p.default` is `Some`, so its mere presence, not its value,
   is JS's own "has a default" check.
+
+  `form` (#841, optional — empty by default, which renders no `form`
+  attribute at all and leaves every field physically inside its own
+  `<form>` as before): the id of a `<form>` these fields live outside of in
+  the DOM, the same "form-associated control" idiom this crate already uses
+  for the Details JSON textarea and the Duplicate button on the SQL Query/
+  SQL View workspace (`sql-library.html`). The Parameters card (#841) is its
+  own `section.card` sitting after that page's `#lib-editor-form`, so its
+  value inputs need this to submit — and be gathered by that form's own
+  `hx-include` — alongside the rest of the document; the SQL Export builder
+  passes nothing (its fields already live inside their own `<form>`), so
+  this is the one caller whose behavior does not change.
 -->
-{% macro fields(prefix, params) %}
+{% macro fields(prefix, params, form="") %}
 <div class="param-grid">
   {% for p in params %}
   <label class="field" data-param-name="{{ p.name }}"{% if let Some(default) = p.default %} data-default="{{ default }}"{% endif %}>
     <span class="field__label"><code>:{{ p.name }}</code> · {{ p.type_code }}{% if let Some(default) = p.default %} · {{ i18n.t("sql-param-default") }} {{ default }}{% endif %}</span>
     {% match p.type_code.as_str() %}
     {% when "integer" | "positiveInt" | "unsignedInt" | "integer64" %}
-    <input class="field__input" type="number" step="1" name="{{ prefix }}:{{ p.name }}" value="{{ p.value }}"{% if p.required %} required{% endif %}{% if p.error.is_some() %} aria-invalid="true" aria-describedby="{{ prefix }}:{{ p.name }}-error"{% endif %}>
+    <input class="field__input" type="number" step="1" name="{{ prefix }}:{{ p.name }}" value="{{ p.value }}"{% if !form.is_empty() %} form="{{ form }}"{% endif %}{% if p.required %} required{% endif %}{% if p.error.is_some() %} aria-invalid="true" aria-describedby="{{ prefix }}:{{ p.name }}-error"{% endif %}>
     {% when "decimal" %}
-    <input class="field__input" type="number" step="any" name="{{ prefix }}:{{ p.name }}" value="{{ p.value }}"{% if p.required %} required{% endif %}{% if p.error.is_some() %} aria-invalid="true" aria-describedby="{{ prefix }}:{{ p.name }}-error"{% endif %}>
+    <input class="field__input" type="number" step="any" name="{{ prefix }}:{{ p.name }}" value="{{ p.value }}"{% if !form.is_empty() %} form="{{ form }}"{% endif %}{% if p.required %} required{% endif %}{% if p.error.is_some() %} aria-invalid="true" aria-describedby="{{ prefix }}:{{ p.name }}-error"{% endif %}>
     {% when "date" %}
-    <input class="field__input" type="date" name="{{ prefix }}:{{ p.name }}" value="{{ p.value }}"{% if p.required %} required{% endif %}{% if p.error.is_some() %} aria-invalid="true" aria-describedby="{{ prefix }}:{{ p.name }}-error"{% endif %}>
+    <input class="field__input" type="date" name="{{ prefix }}:{{ p.name }}" value="{{ p.value }}"{% if !form.is_empty() %} form="{{ form }}"{% endif %}{% if p.required %} required{% endif %}{% if p.error.is_some() %} aria-invalid="true" aria-describedby="{{ prefix }}:{{ p.name }}-error"{% endif %}>
     {% when "boolean" %}
-    <select class="field__input" name="{{ prefix }}:{{ p.name }}"{% if p.required %} required{% endif %}{% if p.error.is_some() %} aria-invalid="true" aria-describedby="{{ prefix }}:{{ p.name }}-error"{% endif %}>
+    <select class="field__input" name="{{ prefix }}:{{ p.name }}"{% if !form.is_empty() %} form="{{ form }}"{% endif %}{% if p.required %} required{% endif %}{% if p.error.is_some() %} aria-invalid="true" aria-describedby="{{ prefix }}:{{ p.name }}-error"{% endif %}>
       {% if p.default.is_some() %}<option value=""{% if p.value.is_empty() %} selected{% endif %}></option>{% endif %}
       <option value="true"{% if p.value == "true" %} selected{% endif %}>true</option>
       <option value="false"{% if p.value == "false" %} selected{% endif %}>false</option>
     </select>
     {% when "dateTime" | "instant" %}
-    <input class="field__input" type="text" name="{{ prefix }}:{{ p.name }}" value="{{ p.value }}" placeholder="2026-08-01T00:00:00Z"{% if p.required %} required{% endif %}{% if p.error.is_some() %} aria-invalid="true" aria-describedby="{{ prefix }}:{{ p.name }}-error"{% endif %}>
+    <input class="field__input" type="text" name="{{ prefix }}:{{ p.name }}" value="{{ p.value }}" placeholder="2026-08-01T00:00:00Z"{% if !form.is_empty() %} form="{{ form }}"{% endif %}{% if p.required %} required{% endif %}{% if p.error.is_some() %} aria-invalid="true" aria-describedby="{{ prefix }}:{{ p.name }}-error"{% endif %}>
     {% when "time" %}
-    <input class="field__input" type="text" name="{{ prefix }}:{{ p.name }}" value="{{ p.value }}" placeholder="13:45:00"{% if p.required %} required{% endif %}{% if p.error.is_some() %} aria-invalid="true" aria-describedby="{{ prefix }}:{{ p.name }}-error"{% endif %}>
+    <input class="field__input" type="text" name="{{ prefix }}:{{ p.name }}" value="{{ p.value }}" placeholder="13:45:00"{% if !form.is_empty() %} form="{{ form }}"{% endif %}{% if p.required %} required{% endif %}{% if p.error.is_some() %} aria-invalid="true" aria-describedby="{{ prefix }}:{{ p.name }}-error"{% endif %}>
     {% else %}
-    <input class="field__input" type="text" name="{{ prefix }}:{{ p.name }}" value="{{ p.value }}"{% if p.required %} required{% endif %}{% if p.error.is_some() %} aria-invalid="true" aria-describedby="{{ prefix }}:{{ p.name }}-error"{% endif %}>
+    <input class="field__input" type="text" name="{{ prefix }}:{{ p.name }}" value="{{ p.value }}"{% if !form.is_empty() %} form="{{ form }}"{% endif %}{% if p.required %} required{% endif %}{% if p.error.is_some() %} aria-invalid="true" aria-describedby="{{ prefix }}:{{ p.name }}-error"{% endif %}>
     {% endmatch %}
     <span id="{{ prefix }}:{{ p.name }}-error" class="field__hint field__hint--error" role="alert"{% if p.error.is_none() %} hidden{% endif %}>{% if let Some(message) = p.error %}{{ message }}{% endif %}</span>
   </label>

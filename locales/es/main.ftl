@@ -932,6 +932,70 @@ lib-details-json-heading = Library (JSON)
 lib-details-json-note = El adjunto SQL se edita en la tarjeta SQL de abajo y no forma parte de esta vista.
 lib-details-new-lede = Cámbiale el nombre y haz que relatedArtifact[0] apunte a una ViewDefinition que exista.
 lib-save-wrong-kind = El tipo de Library de SQL on FHIR debe ser «{ $code }» para guardarla aquí.
+lib-save-view-parameters = Un SQL View no puede declarar parámetros (perfil SQLView, Library.parameter 0..0). Quita parameter[] en Detalles.
+
+## Tarjeta Parameters (#841, solo SQL Query)
+
+lib-params-heading = Parameters
+lib-params-meta = declarado en la Library · los valores de abajo son solo para esta ejecución
+lib-params-empty = No hay parámetros declarados. Añade uno aquí o en Detalles.
+lib-params-hint = :{ $name } se usa en el SQL pero no está declarado en la Library.
+lib-params-declare = Declarar :{ $name }
+lib-params-add-toggle = Añadir parámetro
+lib-params-add-name-label = Nombre
+lib-params-add-type-label = Tipo
+lib-params-add-submit = Añadir
+lib-params-add-invalid-name = Los nombres de parámetro deben coincidir con ^[A-Za-z][A-Za-z0-9_]*$
+lib-params-add-duplicate = Ya existe un parámetro llamado { $name }
+lib-params-add-unknown-type = Tipo de parámetro desconocido
+lib-run-waiting = Esperando un valor para { $names } — los resultados de abajo son de la última ejecución correcta.
+lib-run-unknown-table = Tabla desconocida { $name } — línea { $line }. Decláralo en Reads from o corrige el nombre. Tu SQL no ha cambiado; los resultados de abajo son de la última ejecución correcta.
+lib-run-unknown-table-more = Tabla desconocida { $name } — línea { $line }.
+
+## Panel de tablas (#842, ambos tipos) — Reads from / Used by / Columns
+
+lib-tables-heading = Lee de
+lib-tables-col-alias = Alias
+lib-tables-col-target = Lee de
+lib-tables-no-alias = (sin etiqueta)
+lib-tables-empty = Aún no hay tablas declaradas.
+lib-tables-note = Cada tabla que la consulta SQL lee, como entradas relatedArtifact depends-on: el alias a la izquierda, la ViewDefinition o SQL View a la que resuelve a la derecha.
+lib-tables-remove = Quitar
+lib-tables-kind-view-definition = ViewDefinition
+lib-tables-target-not-found = No encontrado
+lib-tables-target-not-found-detail = Ninguna ViewDefinition ni SQL View responde a { $resource }. Corrige el canónico en Details o quita la fila.
+lib-tables-target-not-a-table = No es una tabla
+lib-tables-target-not-a-table-detail = Solo se puede leer una ViewDefinition o una SQL View.
+lib-tables-add-toggle = Añadir tabla
+lib-tables-add-table-label = Tabla
+lib-tables-add-table-placeholder = Buscar view definitions y SQL views
+lib-tables-add-table-hint = Escribe para buscar por nombre, o elige de la lista.
+lib-tables-add-table-fallback-placeholder = ViewDefinition/{"{"}id{"}"} o Library/{"{"}id{"}"}
+lib-tables-add-table-fallback-hint = Introduce una referencia a una ViewDefinition o una SQL View.
+lib-tables-alias-label = Alias
+lib-tables-alias-hint = Por defecto, el nombre del artefacto
+lib-tables-add-submit = Añadir
+lib-tables-add-error-required = Elige una view definition o una SQL view
+lib-tables-add-error-alias-required = El alias es obligatorio
+lib-tables-add-error-alias-invalid = El alias debe coincidir con ^[A-Za-z][A-Za-z0-9_]*$
+lib-tables-add-error-alias-duplicate = El alias { $alias } ya está declarado
+lib-tables-options-empty = Sin coincidencias.
+lib-tables-unknown = Tabla desconocida
+lib-tables-unknown-detail = Se usa en el SQL pero no está declarada. Elige una view definition o SQL view, o corrige el nombre.
+lib-tables-declare = Declarar { $name }
+
+lib-used-by-heading = Usado por
+lib-used-by-empty = Nada lo usa todavía.
+lib-used-by-export-kind = Exportación SQL
+
+lib-columns-heading = Columnas
+lib-columns-meta-query = lo que produce la consulta
+lib-columns-meta-view = lo que produce la vista
+lib-columns-empty-query = Ejecuta la consulta para ver sus columnas.
+lib-columns-empty-view = Ejecuta la vista para ver sus columnas.
+lib-columns-col-name = Columna
+lib-columns-col-type = Tipo
+lib-columns-col-from = De
 
 ## Páginas de exportación SQL (#649, #833)
 
