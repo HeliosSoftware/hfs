@@ -398,8 +398,20 @@ pub struct SearchPage {
 /// What a `$sql-export` status poll answered (#649).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SqlExportStatus {
-    /// `202` — still running, with the `X-Progress` header when sent.
-    Running(Option<String>),
+    /// `202` — still running. `progress` is the `X-Progress` header, when
+    /// sent. `subjects_total`/`subjects_done`/`current_subject` are this
+    /// server's own extension of the body's `Parameters` (#853, see
+    /// `crates/rest/src/handlers/sof/export.rs`'s module docs): each is
+    /// `None` against a server that predates it, before the body parses as
+    /// JSON, or when that one parameter is simply absent from an otherwise
+    /// valid body (`current_subject` while no subject is currently being
+    /// written).
+    Running {
+        progress: Option<String>,
+        subjects_total: Option<u32>,
+        subjects_done: Option<u32>,
+        current_subject: Option<String>,
+    },
     /// `303` — finished (the manifest tells success from failure).
     Done,
     /// `404` — unknown, cancelled, or reclaimed.
@@ -411,6 +423,22 @@ pub enum SqlExportStatus {
     /// treating it as in progress and retry the poll (#833). The message is
     /// short and names the cause, e.g. `"status poll answered 401"`.
     Unavailable(String),
+}
+
+impl SqlExportStatus {
+    /// Convenience constructor for a `202` carrying only `X-Progress`, with
+    /// no subject-count parameters — a server that predates #853, or simply
+    /// the state before the first poll ever reports one. Used throughout
+    /// this crate's tests, standing in for a real self-call's `Running`
+    /// answer wherever the subject counts don't matter to the scenario.
+    pub fn running(progress: Option<String>) -> Self {
+        Self::Running {
+            progress,
+            subjects_total: None,
+            subjects_done: None,
+            current_subject: None,
+        }
+    }
 }
 
 /// Reads conformance resources from the server's own FHIR API over HTTP.
@@ -942,6 +970,14 @@ impl HttpConformanceSource {
     /// other status (401/403/5xx…) — maps to `Unavailable` rather than being
     /// folded into `Unknown`, so a rejected credential does not read as "the
     /// server forgot this job" (#833).
+    ///
+    /// A `202`'s body is read as the `subjectsTotal`/`subjectsDone`/
+    /// `currentSubject` parameters `crates/rest/src/handlers/sof/export.rs`
+    /// publishes (#853): a missing body, one that isn't valid JSON, or a
+    /// `Parameters` resource without those parameters simply leaves them
+    /// `None` — never an error and never `Unavailable`, since `X-Progress`
+    /// alone is still a perfectly good answer from a server that predates
+    /// this extension.
     async fn export_status(&self, job_id: &str, caller: &Caller) -> SqlExportStatus {
         let url = format!("{}/export/{job_id}/status", self.base_url);
         let request = match self.authorized_for(self.client.get(&url), caller).await {
@@ -952,13 +988,27 @@ impl HttpConformanceSource {
             Ok(response) => {
                 let status = response.status();
                 match status.as_u16() {
-                    202 => SqlExportStatus::Running(
-                        response
+                    202 => {
+                        let progress = response
                             .headers()
                             .get("x-progress")
                             .and_then(|v| v.to_str().ok())
-                            .map(String::from),
-                    ),
+                            .map(String::from);
+                        let params = response
+                            .json::<Value>()
+                            .await
+                            .ok()
+                            .and_then(|body| {
+                                body.get("parameter").and_then(Value::as_array).cloned()
+                            })
+                            .unwrap_or_default();
+                        SqlExportStatus::Running {
+                            progress,
+                            subjects_total: parameter_integer(&params, "subjectsTotal"),
+                            subjects_done: parameter_integer(&params, "subjectsDone"),
+                            current_subject: parameter_string(&params, "currentSubject"),
+                        }
+                    }
                     303 => SqlExportStatus::Done,
                     404 => SqlExportStatus::Unknown,
                     _ => SqlExportStatus::Unavailable(format!("status poll answered {status}")),
@@ -1004,6 +1054,32 @@ impl HttpConformanceSource {
         }
         Ok(body)
     }
+}
+
+/// One `valueInteger` parameter of a `Parameters` resource's `parameter`
+/// array, by name (#853) — `subjectsTotal`/`subjectsDone` are the only
+/// integer parameters [`HttpConformanceSource::export_status`] reads this
+/// way. `None` when the name is absent or its value isn't a `valueInteger`
+/// that fits a `u32` (the server never sends a negative subject count).
+fn parameter_integer(params: &[Value], name: &str) -> Option<u32> {
+    params
+        .iter()
+        .find(|p| p.get("name").and_then(Value::as_str) == Some(name))
+        .and_then(|p| p.get("valueInteger"))
+        .and_then(Value::as_u64)
+        .and_then(|n| u32::try_from(n).ok())
+}
+
+/// One `valueString` parameter of a `Parameters` resource's `parameter`
+/// array, by name (#853) — `currentSubject` is the only string parameter
+/// [`HttpConformanceSource::export_status`] reads this way.
+fn parameter_string(params: &[Value], name: &str) -> Option<String> {
+    params
+        .iter()
+        .find(|p| p.get("name").and_then(Value::as_str) == Some(name))
+        .and_then(|p| p.get("valueString"))
+        .and_then(Value::as_str)
+        .map(String::from)
 }
 
 /// The first issue explanation of an OperationOutcome, if that is what this
@@ -2035,7 +2111,7 @@ mod tests {
 
         assert_eq!(
             source.sql_export_status("running", &caller).await,
-            SqlExportStatus::Running(Some("42".to_string()))
+            SqlExportStatus::running(Some("42".to_string()))
         );
         assert_eq!(
             source.sql_export_status("done", &caller).await,
@@ -2069,6 +2145,109 @@ mod tests {
         match source.sql_export_status("any", &Caller::default()).await {
             SqlExportStatus::Unavailable(_) => {}
             other => panic!("expected Unavailable, got {other:?}"),
+        }
+    }
+
+    /// #853: a `202` body carrying `subjectsTotal`/`subjectsDone`/
+    /// `currentSubject` produces all three; a body that is absent, not JSON,
+    /// or a `Parameters` resource without those parameters produces `None`
+    /// for every one of them — never an error, and `X-Progress` is read
+    /// exactly as before regardless of the body.
+    #[tokio::test]
+    async fn export_status_reads_subject_progress_from_the_body() {
+        use axum::extract::Path;
+        use axum::http::StatusCode as AxStatus;
+        use axum::response::IntoResponse;
+        use axum::routing::get;
+
+        async fn status(Path(id): Path<String>) -> axum::response::Response {
+            match id.as_str() {
+                "full" => (
+                    AxStatus::ACCEPTED,
+                    [("x-progress", "35%")],
+                    axum::Json(serde_json::json!({
+                        "resourceType": "Parameters",
+                        "parameter": [
+                            {"name": "exportId", "valueString": "full"},
+                            {"name": "status", "valueCode": "in-progress"},
+                            {"name": "subjectsTotal", "valueInteger": 6},
+                            {"name": "subjectsDone", "valueInteger": 2},
+                            {"name": "currentSubject", "valueString": "encounters_flat"},
+                        ]
+                    })),
+                )
+                    .into_response(),
+                "no-current-subject" => (
+                    AxStatus::ACCEPTED,
+                    [("x-progress", "99%")],
+                    axum::Json(serde_json::json!({
+                        "resourceType": "Parameters",
+                        "parameter": [
+                            {"name": "subjectsTotal", "valueInteger": 6},
+                            {"name": "subjectsDone", "valueInteger": 6},
+                        ]
+                    })),
+                )
+                    .into_response(),
+                "no-body" => (AxStatus::ACCEPTED, [("x-progress", "10%")], "").into_response(),
+                "not-json" => (
+                    AxStatus::ACCEPTED,
+                    [("x-progress", "10%")],
+                    "not a Parameters resource",
+                )
+                    .into_response(),
+                "unrelated-parameters" => (
+                    AxStatus::ACCEPTED,
+                    [("x-progress", "10%")],
+                    axum::Json(serde_json::json!({
+                        "resourceType": "Parameters",
+                        "parameter": [{"name": "exportId", "valueString": "unrelated-parameters"}]
+                    })),
+                )
+                    .into_response(),
+                other => panic!("unexpected job id {other}"),
+            }
+        }
+
+        let app = axum::Router::new().route("/export/{id}/status", get(status));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let source = HttpConformanceSource::new(
+            format!("http://{addr}"),
+            Arc::new(helios_auth::outbound::NoOpOutboundAuthProvider),
+            FhirVersion::R4,
+            None,
+        );
+        let caller = Caller::default();
+
+        assert_eq!(
+            source.sql_export_status("full", &caller).await,
+            SqlExportStatus::Running {
+                progress: Some("35%".to_string()),
+                subjects_total: Some(6),
+                subjects_done: Some(2),
+                current_subject: Some("encounters_flat".to_string()),
+            }
+        );
+        assert_eq!(
+            source
+                .sql_export_status("no-current-subject", &caller)
+                .await,
+            SqlExportStatus::Running {
+                progress: Some("99%".to_string()),
+                subjects_total: Some(6),
+                subjects_done: Some(6),
+                current_subject: None,
+            }
+        );
+        for id in ["no-body", "not-json", "unrelated-parameters"] {
+            assert_eq!(
+                source.sql_export_status(id, &caller).await,
+                SqlExportStatus::running(Some("10%".to_string())),
+                "job {id} should report no subject progress"
+            );
         }
     }
 

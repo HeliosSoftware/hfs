@@ -1017,6 +1017,26 @@ falls through to the normal REST surface.
   View, or an unparameterized SQL Query. `type` is the declared FHIR type
   code, not a hint: it is what `kickoff` types the value as when it rebuilds
   `subject.parameters` on *Retry*/*Run again*.
+- **A SQL Export job also records the server's own subject progress**
+  (`subjectsDone`/`subjectsTotal`/`currentSubject`, #853) alongside `progress`
+  (the `X-Progress` header): the status poll's `202` body carries them as
+  `Parameters` — see `crates/rest/src/handlers/sof/export.rs`'s module
+  docs — and every `in-progress` poll updates all three verbatim, `None`
+  included, exactly like `progress` already does. They clear on every
+  terminal transition (`complete`/`failed`/`cancelled`, including a
+  user-initiated Cancel) and start empty on a fresh record (kick-off,
+  *Retry*, *Run again*); an `Unavailable` poll leaves them untouched, same
+  as `progress`. Records persisted before #853 deserialize with all three at
+  their empty default. The job card's meta line, the detail page's lede, and
+  its Duration field all read them through the same cascade: with a subject
+  currently being written, `Writing <name> · <done> of <total> subjects`
+  (the parenthesized ViewDefinition/SQL Query/SQL View breakdown, card only,
+  always comes from the local `subjects[]` roster, never the server); with
+  counts but no subject in flight, the `Writing …` clause is simply omitted;
+  without counts at all (a server predating #853, or before its first poll
+  with a body), everything falls back to today's percentage-or-"Waiting for
+  the first status report…" text — never an error, and the progress bar
+  (`aria-valuenow`, fed by `X-Progress` alone) is unaffected either way.
 - **SQL Export's self-calls carry the caller's own identity.** `$sql-export`
   kick-off, status polling, cancel, and the completion manifest all go through
   `ConformanceSource`'s four `$sql-export` methods with a `Caller`: the
