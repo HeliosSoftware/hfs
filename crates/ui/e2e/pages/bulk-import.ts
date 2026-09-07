@@ -6,7 +6,8 @@ import type { APIRequestContext, Locator, Page } from "@playwright/test";
 export class BulkImportPage {
   constructor(readonly page: Page) {}
 
-  async seedAndGoto(request: APIRequestContext, name = "e2e-bulk-import-detail"): Promise<string> {
+  /** Creates a submission and returns its detail path, without navigating. */
+  async seed(request: APIRequestContext, name = "e2e-bulk-import-detail"): Promise<string> {
     const response = await request.post("/ui/bulk-import", {
       form: {
         name,
@@ -21,6 +22,11 @@ export class BulkImportPage {
         `seeding a bulk-import submission did not redirect to detail (got ${response.status()} ${location ?? "no Location"})`,
       );
     }
+    return location;
+  }
+
+  async seedAndGoto(request: APIRequestContext, name = "e2e-bulk-import-detail"): Promise<string> {
+    const location = await this.seed(request, name);
     await this.page.goto(location, { waitUntil: "networkidle" });
     return location;
   }
@@ -49,5 +55,23 @@ export class BulkImportPage {
 
   get logEmptyState(): Locator {
     return this.logCard.locator(".empty-state");
+  }
+
+  get statusCard(): Locator {
+    return this.page.locator("#bulk-status");
+  }
+
+  get statusCell(): Locator {
+    return this.page.locator("#submission-status");
+  }
+
+  /** The log's entries, newest first, as the browser currently renders them. */
+  async logLines(): Promise<string[]> {
+    const entries = this.logCard.locator("pre.detail__code");
+    if ((await entries.count()) === 0) return [];
+    return (await entries.innerText())
+      .split("\n")
+      .map((line) => line.trim())
+      .filter(Boolean);
   }
 }
