@@ -456,9 +456,16 @@ test("the recently-used selection survives a reload", async ({ resources, page }
   // writes anything on its own — only the two picks in between do.
   await resources.goto();
   await resources.pickType("Encounter");
+  // The rail chains its writes (each PATCH waits for the previous one to
+  // settle), so the PATCH to wait on is specifically the one carrying the
+  // second pick: the first match on "any settings PATCH" is Encounter's when
+  // the server is more than a loopback away, and reloading on that one
+  // cancels Observation's before it is even sent.
   const persisted = page.waitForResponse(
     (response) =>
-      response.url().includes("/_user/settings") && response.request().method() === "PATCH",
+      response.url().includes("/_user/settings") &&
+      response.request().method() === "PATCH" &&
+      (response.request().postData() ?? "").includes('"Observation"'),
   );
   await resources.pickType("Observation");
   await persisted;

@@ -32,11 +32,21 @@
 //!
 //! | status answer | job mutation |
 //! |---|---|
-//! | `Running(progress)` | stays `in-progress`; `progress` updated (or cleared); `pollError` cleared |
-//! | `Done` + manifest `Ok` | `complete`; `outputs` recorded; `finishedAt` stamped |
-//! | `Done` + manifest `Err` | `failed`; `error` recorded; `finishedAt` stamped |
-//! | `Unknown` (404) | `cancelled`; `error` set to a fixed, translated reason; `finishedAt` stamped |
-//! | `Unavailable(message)` | stays `in-progress`; `pollError` set; `progress` untouched |
+//! | `Running { progress, subjects_total, subjects_done, current_subject }` | stays `in-progress`; all four updated (or cleared) verbatim; `pollError` cleared |
+//! | `Done` + manifest `Ok` | `complete`; `outputs` recorded; `progress`/subject counts cleared; `finishedAt` stamped |
+//! | `Done` + manifest `Err` | `failed`; `error` recorded; `progress`/subject counts cleared; `finishedAt` stamped |
+//! | `Unknown` (404) | `cancelled`; `error` set to a fixed, translated reason; `progress`/subject counts cleared; `finishedAt` stamped |
+//! | `Unavailable(message)` | stays `in-progress`; `pollError` set; `progress`/subject counts untouched |
+//!
+//! `subjectsTotal`/`subjectsDone`/`currentSubject` (#853) are this server's
+//! own extension of the async export pattern's body — see
+//! `crates/rest/src/handlers/sof/export.rs`'s module docs. A server that
+//! predates them, or a poll before the first one they carry, leaves
+//! [`ExportJob::subjects_total`]/[`ExportJob::subjects_done`]/
+//! [`ExportJob::current_subject`] at their empty default, in which case the
+//! meta line, the detail lede, and the Duration field all fall back to
+//! today's percentage-or-"Waiting…" text — see [`job_meta`], [`detail_lede`],
+//! and [`duration_label`].
 //!
 //! A job polls at most once per request: the Active SQL Exports list polls
 //! every `in-progress` job once before rendering (so a plain reload without
@@ -297,6 +307,24 @@ pub struct ExportJob {
     /// The last `X-Progress` seen (e.g. `35%`); empty in terminal states.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub progress: String,
+    /// Subjects fully finished as of the last poll (#853); `None` before the
+    /// first poll, against a server that doesn't report subject counts, or
+    /// in any terminal state — see [`ExportJob::progress`] for the same
+    /// lifecycle. A record persisted before #853 deserializes with this
+    /// `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subjects_done: Option<u32>,
+    /// The total subjects in the job as of the last poll (#853); see
+    /// [`ExportJob::subjects_done`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subjects_total: Option<u32>,
+    /// The output name of the subject the last poll reported as currently
+    /// being written (#853) — the same name `output.name` will carry in the
+    /// completion manifest. Empty when no subject is currently in flight, the
+    /// server doesn't report it, or in any terminal state; see
+    /// [`ExportJob::progress`].
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub current_subject: String,
     /// A failure message (`failed`), or the reason a job was declared
     /// `cancelled` (e.g. the 404 reaper explanation).
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -312,6 +340,18 @@ pub struct ExportJob {
     pub finished_at: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub outputs: Vec<JobOutput>,
+}
+
+impl ExportJob {
+    /// Clears `subjects_done`/`subjects_total`/`current_subject` (#853) —
+    /// called alongside `progress.clear()` on every transition into a
+    /// terminal state, so a finished job never carries a stale subject count
+    /// from the last poll before it completed.
+    fn clear_subject_progress(&mut self) {
+        self.subjects_done = None;
+        self.subjects_total = None;
+        self.current_subject.clear();
+    }
 }
 
 #[derive(Default)]
@@ -356,6 +396,28 @@ async fn load_jobs(state: &WebState, user_key: &str, tenant: &str) -> JobsSnapsh
         .unwrap_or_default()
 }
 
+/// Every stored `$sql-export` job, most recently started first — the same
+/// shape and sort [`list`] itself shows, reused by the SQL Query/SQL View
+/// *Used by* card (`sql_libraries::used_by_exports`, #842) to find which
+/// jobs' `subjects[].reference` name a given Library. Unlike [`list`], this
+/// never polls a job's live status: the card only needs each job's own id
+/// and display name to link to its detail page, not its current progress,
+/// so a *Used by* render never pays for a poll it does not show.
+pub(crate) async fn jobs_for_used_by(
+    state: &WebState,
+    user_key: &str,
+    tenant: &str,
+) -> Vec<(String, ExportJob)> {
+    let snapshot = load_jobs(state, user_key, tenant).await;
+    let mut entries: Vec<(String, ExportJob)> = snapshot
+        .jobs
+        .iter()
+        .map(|(id, value)| (id.clone(), parse_job(value)))
+        .collect();
+    entries.sort_by(|a, b| b.1.started_at.cmp(&a.1.started_at));
+    entries
+}
+
 fn optional_string(value: &str) -> Value {
     if value.is_empty() {
         Value::Null
@@ -378,6 +440,9 @@ fn job_merge_value(job: &ExportJob) -> Value {
         "format": job.format,
         "status": job.status,
         "progress": optional_string(&job.progress),
+        "subjectsDone": job.subjects_done,
+        "subjectsTotal": job.subjects_total,
+        "currentSubject": optional_string(&job.current_subject),
         "error": optional_string(&job.error),
         "pollError": optional_string(&job.poll_error),
         "startedAt": job.started_at,
@@ -632,9 +697,17 @@ async fn poll_job(state: &WebState, job: &mut ExportJob, caller: &Caller, i18n: 
         .sql_export_status(&job.job_id, caller)
         .await
     {
-        SqlExportStatus::Running(progress) => {
+        SqlExportStatus::Running {
+            progress,
+            subjects_total,
+            subjects_done,
+            current_subject,
+        } => {
             job.status = "in-progress".to_string();
             job.progress = progress.unwrap_or_default();
+            job.subjects_total = subjects_total;
+            job.subjects_done = subjects_done;
+            job.current_subject = current_subject.unwrap_or_default();
             job.poll_error.clear();
         }
         SqlExportStatus::Done => match state
@@ -646,6 +719,7 @@ async fn poll_job(state: &WebState, job: &mut ExportJob, caller: &Caller, i18n: 
                 job.status = "complete".to_string();
                 job.outputs = job_outputs(&manifest);
                 job.progress.clear();
+                job.clear_subject_progress();
                 job.poll_error.clear();
                 job.error.clear();
                 job.finished_at = now_stamp();
@@ -654,6 +728,7 @@ async fn poll_job(state: &WebState, job: &mut ExportJob, caller: &Caller, i18n: 
                 job.status = "failed".to_string();
                 job.error = message;
                 job.progress.clear();
+                job.clear_subject_progress();
                 job.poll_error.clear();
                 job.finished_at = now_stamp();
             }
@@ -662,6 +737,7 @@ async fn poll_job(state: &WebState, job: &mut ExportJob, caller: &Caller, i18n: 
             job.status = "cancelled".to_string();
             job.error = i18n.t("sql-export-cancelled-reason");
             job.progress.clear();
+            job.clear_subject_progress();
             job.poll_error.clear();
             job.finished_at = now_stamp();
         }
@@ -913,9 +989,18 @@ fn format_label(i18n: &I18n, format: &str) -> String {
     }
 }
 
-/// `"6 subjects (4 ViewDefinitions · 1 SQL Query · 1 SQL View)"`: only the
-/// kinds actually present, in a fixed order, every count Fluent-pluralized.
-fn subjects_summary(i18n: &I18n, subjects: &[JobSubject]) -> String {
+/// `"6 subjects (4 ViewDefinitions · 1 SQL Query · 1 SQL View)"` — or, once
+/// the server has reported subject progress (#853), `"2 of 6 subjects
+/// (…)"`: only the kinds actually present, in a fixed order, every count
+/// Fluent-pluralized. `done_total` overrides the leading count phrase with
+/// the server's own done/total (see [`subjects_progress_phrase`]); the
+/// parenthesized kind breakdown always comes from `subjects` — the local
+/// roster — never from the server, which doesn't report kinds.
+fn subjects_summary(
+    i18n: &I18n,
+    subjects: &[JobSubject],
+    done_total: Option<(u32, u32)>,
+) -> String {
     let (mut view_definitions, mut sql_queries, mut sql_views) = (0i64, 0i64, 0i64);
     for subject in subjects {
         match subject.kind.as_str() {
@@ -935,7 +1020,10 @@ fn subjects_summary(i18n: &I18n, subjects: &[JobSubject]) -> String {
     if sql_views > 0 {
         kinds.push(i18n.t_arg("sql-export-kind-sql-view", "count", sql_views));
     }
-    let count = i18n.t_arg("sql-export-subjects-count", "count", subjects.len() as i64);
+    let count = match done_total {
+        Some((done, total)) => subjects_progress_phrase(i18n, done, total),
+        None => i18n.t_arg("sql-export-subjects-count", "count", subjects.len() as i64),
+    };
     if kinds.is_empty() {
         count
     } else {
@@ -943,10 +1031,47 @@ fn subjects_summary(i18n: &I18n, subjects: &[JobSubject]) -> String {
     }
 }
 
+/// `"<done> of <total> subjects"`, Fluent-pluralized on `total` (#853) — the
+/// bare count phrase shared by [`subjects_summary`]'s server-counts branch,
+/// the detail lede, and the Duration field, so the three surfaces cannot
+/// report the fraction differently.
+fn subjects_progress_phrase(i18n: &I18n, done: u32, total: u32) -> String {
+    i18n.t_arg2(
+        "sql-export-subjects-progress",
+        "done",
+        done as i64,
+        "total",
+        total as i64,
+    )
+}
+
+/// The optional `"Writing <name>"` clause for the in-progress meta line and
+/// detail lede (#853) — `Some` only when the last poll named a subject
+/// currently being written. `name` is spliced in raw: it is the subject's own
+/// output name (never re-translated), and the surrounding template escapes it
+/// exactly once when it renders the resulting string.
+fn writing_prefix(i18n: &I18n, current_subject: &str) -> Option<String> {
+    (!current_subject.is_empty())
+        .then(|| i18n.t_arg("sql-export-writing", "name", current_subject.to_string()))
+}
+
+/// `job.progress` verbatim, or the localized "Waiting for the first status
+/// report…" placeholder when the server hasn't sent one yet — the
+/// in-progress fallback shared by the meta line, the lede, and Duration
+/// whenever the server hasn't reported subject counts either (#853).
+fn progress_or_waiting(i18n: &I18n, progress: &str) -> String {
+    if progress.is_empty() {
+        i18n.t("sql-export-progress-waiting")
+    } else {
+        progress.to_string()
+    }
+}
+
 /// The single `.job-card__meta` line: the subjects/format summary is common
 /// to every status, the rest of the line varies.
 fn job_meta(i18n: &I18n, job: &ExportJob) -> String {
-    let subjects = subjects_summary(i18n, &job.subjects);
+    let done_total = job.subjects_done.zip(job.subjects_total);
+    let subjects = subjects_summary(i18n, &job.subjects, done_total);
     let format = format_label(i18n, &job.format);
     match job.status.as_str() {
         "complete" => {
@@ -979,16 +1104,27 @@ fn job_meta(i18n: &I18n, job: &ExportJob) -> String {
         }
         // in-progress, and defensively any other/unknown value.
         _ => {
-            let progress = if job.progress.is_empty() {
-                i18n.t("sql-export-progress-waiting")
-            } else {
-                job.progress.clone()
+            // With subject counts, the leading clause is "Writing <name>"
+            // (or nothing at all with no subject currently in flight) — the
+            // percentage is already the progress bar's job. Without counts
+            // (a pre-#853 server, or before the first poll), the leading
+            // clause falls back to today's percentage-or-waiting text (#853).
+            let leading = match done_total {
+                Some(_) => writing_prefix(i18n, &job.current_subject),
+                None => Some(progress_or_waiting(i18n, &job.progress)),
             };
-            let mut meta = format!(
-                "{progress} · {subjects} · {format} · {} {}",
-                i18n.t("sql-export-started"),
-                format_hour(&job.started_at)
-            );
+            let mut meta = match leading {
+                Some(leading) => format!(
+                    "{leading} · {subjects} · {format} · {} {}",
+                    i18n.t("sql-export-started"),
+                    format_hour(&job.started_at)
+                ),
+                None => format!(
+                    "{subjects} · {format} · {} {}",
+                    i18n.t("sql-export-started"),
+                    format_hour(&job.started_at)
+                ),
+            };
             if !job.poll_error.is_empty() {
                 meta.push_str(&format!(
                     " · {}: {}",
@@ -2007,6 +2143,7 @@ pub(crate) async fn cancel(
                 .await;
             job.status = "cancelled".to_string();
             job.progress.clear();
+            job.clear_subject_progress();
             job.error.clear();
             job.poll_error.clear();
             job.finished_at = now_stamp();
@@ -2291,15 +2428,15 @@ fn failure_notice(job: &ExportJob) -> Option<FailureNotice> {
     })
 }
 
-/// The Job card's Duration field: the elapsed time in a terminal state, or
-/// the same progress-or-waiting text the header lede shows while
-/// `in-progress`.
+/// The Job card's Duration field: the elapsed time in a terminal state; while
+/// `in-progress`, the bare `<done> of <total> subjects` phrase once the
+/// server has reported subject counts (#853), else the same progress-or-
+/// waiting text the header lede falls back to.
 fn duration_label(i18n: &I18n, job: &ExportJob) -> String {
     if job.status == "in-progress" {
-        if job.progress.is_empty() {
-            i18n.t("sql-export-progress-waiting")
-        } else {
-            job.progress.clone()
+        match job.subjects_done.zip(job.subjects_total) {
+            Some((done, total)) => subjects_progress_phrase(i18n, done, total),
+            None => progress_or_waiting(i18n, &job.progress),
         }
     } else {
         elapsed(job)
@@ -2354,16 +2491,30 @@ fn detail_lede(i18n: &I18n, job: &ExportJob) -> String {
         }
         // in-progress, and defensively any other/unknown value.
         _ => {
-            let progress = if job.progress.is_empty() {
-                i18n.t("sql-export-progress-waiting")
-            } else {
-                job.progress.clone()
-            };
             let mut lede = format!(
-                "{} {} · {progress} · {format}",
+                "{} {}",
                 i18n.t("sql-export-detail-started"),
                 format_timestamp_minutes(&job.started_at)
             );
+            // Same cascade as the list card's meta line (#853): with subject
+            // counts, an optional "Writing <name>" clause followed by the
+            // bare done/total phrase; without counts, today's
+            // percentage-or-waiting text.
+            match job.subjects_done.zip(job.subjects_total) {
+                Some((done, total)) => {
+                    if let Some(writing) = writing_prefix(i18n, &job.current_subject) {
+                        lede.push_str(&format!(" · {writing}"));
+                    }
+                    lede.push_str(&format!(
+                        " · {}",
+                        subjects_progress_phrase(i18n, done, total)
+                    ));
+                }
+                None => {
+                    lede.push_str(&format!(" · {}", progress_or_waiting(i18n, &job.progress)));
+                }
+            }
+            lede.push_str(&format!(" · {format}"));
             if !job.poll_error.is_empty() {
                 lede.push_str(&format!(
                     " · {}: {}",
@@ -2713,10 +2864,31 @@ mod tests {
             subject("c", "sql-view"),
         ];
         assert_eq!(
-            subjects_summary(&i18n, &subjects),
+            subjects_summary(&i18n, &subjects, None),
             "3 subjects (2 ViewDefinitions · 1 SQL View)"
         );
-        assert_eq!(subjects_summary(&i18n, &[]), "0 subjects");
+        assert_eq!(subjects_summary(&i18n, &[], None), "0 subjects");
+    }
+
+    /// #853: with server-reported subject counts, the leading count phrase
+    /// becomes `"<done> of <total> subjects"`, but the parenthesized kind
+    /// breakdown keeps coming from the local roster — the server has no
+    /// concept of kinds.
+    #[test]
+    fn subjects_summary_uses_server_counts_when_given() {
+        let i18n = I18n::from_tag("en").unwrap();
+        let subjects = vec![
+            subject("a", "view-definition"),
+            subject("b", "sql-query"),
+            subject("c", "sql-view"),
+        ];
+        assert_eq!(
+            subjects_summary(&i18n, &subjects, Some((2, 6))),
+            "2 of 6 subjects (1 ViewDefinition · 1 SQL Query · 1 SQL View)"
+        );
+        // Plural form of "1 subject" applies to the singular done/total pair
+        // too, matching Fluent's own selector on `$total` (#853).
+        assert_eq!(subjects_summary(&i18n, &[], Some((1, 1))), "1 of 1 subject");
     }
 
     #[test]
@@ -2731,6 +2903,10 @@ mod tests {
         assert_eq!(value["jobId"], Value::Null);
         assert_eq!(value["name"], Value::Null);
         assert_eq!(value["subjects"], Value::Null);
+        assert_eq!(value["progress"], Value::Null);
+        assert_eq!(value["subjectsDone"], Value::Null);
+        assert_eq!(value["subjectsTotal"], Value::Null);
+        assert_eq!(value["currentSubject"], Value::Null);
         assert_eq!(value["error"], Value::Null);
         assert_eq!(value["pollError"], Value::Null);
         assert_eq!(value["finishedAt"], Value::Null);
@@ -2841,6 +3017,12 @@ mod tests {
         let job: ExportJob = serde_json::from_value(legacy).expect("legacy record deserializes");
         assert_eq!(job.filters, JobFilters::default());
         assert!(job.subjects[0].parameters.is_empty());
+        // #853: a record persisted before subject progress existed carries
+        // none of the three keys — they must deserialize to their empty
+        // default rather than fail the whole record.
+        assert_eq!(job.subjects_done, None);
+        assert_eq!(job.subjects_total, None);
+        assert!(job.current_subject.is_empty());
     }
 
     // -----------------------------------------------------------------------
@@ -2998,6 +3180,25 @@ mod tests {
         assert_eq!(
             detail_lede(&i18n, &job),
             "Started 2026-09-01 09:00 UTC · Waiting for the first status report… · Parquet · status unavailable: status poll answered 401"
+        );
+
+        // #853: with subject counts and a subject currently being written,
+        // the lede swaps in "Writing <name> · <done> of <total> subjects" —
+        // no kind breakdown here, unlike the list card's meta line.
+        job.poll_error.clear();
+        job.subjects_total = Some(6);
+        job.subjects_done = Some(2);
+        job.current_subject = "encounters_flat".to_string();
+        assert_eq!(
+            detail_lede(&i18n, &job),
+            "Started 2026-09-01 09:00 UTC · Writing encounters_flat · 2 of 6 subjects · Parquet"
+        );
+
+        // Counts without a subject currently in flight: no "Writing" clause.
+        job.current_subject.clear();
+        assert_eq!(
+            detail_lede(&i18n, &job),
+            "Started 2026-09-01 09:00 UTC · 2 of 6 subjects · Parquet"
         );
     }
 

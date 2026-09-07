@@ -150,6 +150,21 @@ impl SofRunner for InProcessSofRunner {
             resources = filter_resources_by_since(resources, since).map_err(map_engine_error)?;
         }
         if !filters.patient.is_empty() || !filters.group.is_empty() {
+            // The compartment filter resolves `patient`/`group` references
+            // against the resources it is handed — a `Group/{id}` it cannot
+            // find is a hard error, and a Group's members are read off the
+            // Group itself — so the referenced types ride along with the
+            // scanned target type. They are pooled for the filter only: the
+            // engine evaluates the view's target type and ignores the rest.
+            for supporting in ["Patient", "Group"] {
+                let wanted = match supporting {
+                    "Patient" => !filters.patient.is_empty() || !filters.group.is_empty(),
+                    _ => !filters.group.is_empty(),
+                };
+                if wanted && supporting != resource_type {
+                    resources.extend(self.scan.scan_resources(tenant, supporting).await?);
+                }
+            }
             resources = filter_resources_by_patient_and_group(
                 resources,
                 &filters.patient,
@@ -157,6 +172,9 @@ impl SofRunner for InProcessSofRunner {
                 self.fhir_version,
             )
             .map_err(map_engine_error)?;
+            resources.retain(|r| {
+                r.get("resourceType").and_then(Value::as_str) == Some(resource_type.as_str())
+            });
         }
 
         // Storage-backed `resolve()` (opt-in): dereference the relative `Type/id`
@@ -385,6 +403,125 @@ mod tests {
             Value::Null,
             "without a resolver the Patient must not resolve: {:?}",
             rows[0]
+        );
+    }
+
+    fn compartment_pool() -> Vec<Value> {
+        vec![
+            json!({ "resourceType": "Patient", "id": "p1" }),
+            json!({ "resourceType": "Patient", "id": "p2" }),
+            json!({
+                "resourceType": "Group",
+                "id": "g1",
+                "type": "person",
+                "actual": true,
+                "member": [{ "entity": { "reference": "Patient/p1" } }]
+            }),
+            json!({
+                "resourceType": "Observation",
+                "id": "o1",
+                "status": "final",
+                "code": { "text": "x" },
+                "subject": { "reference": "Patient/p1" }
+            }),
+            json!({
+                "resourceType": "Observation",
+                "id": "o2",
+                "status": "final",
+                "code": { "text": "x" },
+                "subject": { "reference": "Patient/p2" }
+            }),
+        ]
+    }
+
+    fn observation_ids_view() -> Value {
+        json!({
+            "resourceType": "ViewDefinition",
+            "resource": "Observation",
+            "status": "active",
+            "select": [{ "column": [{ "path": "id", "name": "obs_id" }] }]
+        })
+    }
+
+    async fn observation_ids(runner: &InProcessSofRunner, filters: ViewFilters) -> Vec<String> {
+        let mut stream = runner
+            .run_view(&tenant(), observation_ids_view(), filters)
+            .await
+            .expect("run_view");
+        let mut ids = Vec::new();
+        while let Some(row) = stream.next().await {
+            ids.push(row.expect("row")["obs_id"].as_str().unwrap().to_string());
+        }
+        ids.sort();
+        ids
+    }
+
+    /// A `patient` filter on a view whose target type is not Patient: the
+    /// scan only yields Observations, so the referenced Patients have to be
+    /// pulled in for the compartment filter to recognise them.
+    #[tokio::test]
+    async fn patient_filter_scans_the_referenced_patients() {
+        let scan = std::sync::Arc::new(StaticScan {
+            resources: compartment_pool(),
+        });
+        let runner = InProcessSofRunner::new(scan, FhirVersion::R4, "test");
+
+        let ids = observation_ids(
+            &runner,
+            ViewFilters {
+                patient: vec!["Patient/p2".to_string()],
+                ..Default::default()
+            },
+        )
+        .await;
+        assert_eq!(ids, vec!["o2"]);
+    }
+
+    /// A `group` filter: the Group and its member Patients ride along with
+    /// the scan, the members' compartment decides the rows, and neither the
+    /// Group nor the Patients leak into the view's output.
+    #[tokio::test]
+    async fn group_filter_scans_the_group_and_its_members() {
+        let scan = std::sync::Arc::new(StaticScan {
+            resources: compartment_pool(),
+        });
+        let runner = InProcessSofRunner::new(scan, FhirVersion::R4, "test");
+
+        let ids = observation_ids(
+            &runner,
+            ViewFilters {
+                group: vec!["Group/g1".to_string()],
+                ..Default::default()
+            },
+        )
+        .await;
+        assert_eq!(ids, vec!["o1"]);
+    }
+
+    /// A `group` reference that resolves to no stored Group is still the
+    /// spec's absent-target error, not an empty result.
+    #[tokio::test]
+    async fn absent_group_is_an_error() {
+        let scan = std::sync::Arc::new(StaticScan {
+            resources: compartment_pool(),
+        });
+        let runner = InProcessSofRunner::new(scan, FhirVersion::R4, "test");
+
+        let err = runner
+            .run_view(
+                &tenant(),
+                observation_ids_view(),
+                ViewFilters {
+                    group: vec!["Group/nope".to_string()],
+                    ..Default::default()
+                },
+            )
+            .await
+            .err()
+            .expect("an absent Group is refused");
+        assert!(
+            matches!(err, SofError::InvalidViewDefinition(ref m) if m.contains("Group/nope")),
+            "{err:?}"
         );
     }
 }

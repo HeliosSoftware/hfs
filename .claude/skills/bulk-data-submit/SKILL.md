@@ -114,3 +114,17 @@ The backend capability splits into `BulkSubmitIngest` (the synchronous `BulkSubm
 - The manifest bookkeeping and resource writes retry with bounded exponential backoff when SQLite reports the database busy or locked, instead of failing the ingest. The retry budget is an elapsed-time deadline bounded by the manifest lease, so a retrying write can never outlive the lease it holds. Every other error still surfaces on the first attempt.
 - With `HFS_BULK_SUBMIT_DEFER_INDEXING=true` (bulk fast-load, #903) ingestion skips the search-index and FTS writes and an automatic per-type reindex rebuilds them when each manifest finishes. Reads and history are complete throughout; search sees a manifest's resources once its reindex lands.
 - Cleanup periodically removes status artifacts for submissions whose `updated_at` exceeds `HFS_BULK_SUBMIT_OUTPUT_TTL`.
+
+## Ingest performance
+
+`HFS_BULK_SUBMIT_DEFER_INDEXING=true` relocates search indexing to a post-ingest
+reindex and is by far the biggest lever (~6.7x on SQLite); the stored resources,
+history, receipts and rollback records are identical either way.
+
+To find out where the rest of the time goes, profile the write path with the
+phase counters in `helios_persistence::perf` and the `bulk_submit_bench`
+example — both gated behind `--cfg perf_phases`, which keeps them out of
+released binaries (`ci.yml` builds those with `--all-features`, so a cargo
+feature could not have). See `/test-hfs` for the invocation and for the two
+traps that have produced wrong numbers here (the search-parameter data
+directory, and comparing runs across sessions instead of interleaving arms).

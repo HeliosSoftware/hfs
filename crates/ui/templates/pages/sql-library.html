@@ -44,10 +44,29 @@
   empty until Save, whose redirect (`?lib=<id>&saved=1`) renders the saved
   Library's results on the server instead.
 
-  Parameters (#841, SQL Query only) and Tables (#842) are still holes in
-  this layout — the comment markers below name where each one lands; #839
-  renders nothing for either, and Details (#840) shows `parameter[]` and
-  `relatedArtifact[]` as generic guided-form rows in the meantime.
+  Parameters (#841, SQL Query only, `declares_parameters`): the card
+  between the SQL card and the results region, `partials/sql_parameters_
+  card.html` (`params_card`, built by `crate::build_params_card`) — a
+  `.field` per declared `Library.parameter[use=in]`, undeclared-placeholder
+  hints with a one-click *Declare*, and an *Add parameter* panel that
+  writes a fresh declaration into the Details document above via
+  `POST {base_href}/document`. Never renders for SQL View, whose profile
+  fixes `Library.parameter` to `0..0` — Details (#840) still shows it as a
+  generic guided-form row if a saved document somehow carries one, and Save
+  rejects trying to persist that.
+
+  Tables (#842, both kinds): the two-column panel between the SQL/
+  Parameters cards and the results region — `partials/sql_tables_card.html`
+  (`tables_card`, `crate::build_tables_card`) on the left, with *Reads
+  from* (one row per `relatedArtifact[depends-on]`, resolved the way
+  `$sql-run`'s own graph walk resolves them, with an *Add table* combobox
+  and a *Remove* button per row, all via `POST {base_href}/document`;
+  tables the SQL reads but no dependency declares append their own rows,
+  #842/04's unknown-table lint) and *Used by* (other Libraries and SQL
+  Export jobs depending on this one); `partials/sql_columns_card.html`
+  (`columns_card`, `crate::build_columns_card`) on the right — the last
+  good run's own column list (name, type, origin), or, before one exists,
+  the same "run it to see its columns" skeleton.
 #}
 
 {% block title %}{{ i18n.t(title_key) }} — {{ i18n.t("app-title") }}{% endblock %}
@@ -202,19 +221,48 @@
       </form>
     </section>
 
-    {#- Parameters (#841, SQL Query only): #839 renders nothing here for
-        either kind — #841 decides how, and whether, this hueco shows on
-        SQL Query. -#}
-    {#- Tables (#842): the dependency/table lint surface lands here. -#}
+    {#- Parameters (#841, SQL Query only): the template decides whether this
+        slot can show at all from `declares_parameters` alone — never an
+        `if` on `code` — with `params_card` itself `Some` only once
+        `crate::sql_library_page`'s own gate (that same field, plus a
+        selection) has already built one; never rendered for SQL View,
+        whose SQLView profile fixes Library.parameter to 0..0. -#}
+    {% if declares_parameters %}{% if let Some(card) = params_card %}
+    {{ card.render()?|safe }}
+    {% endif %}{% endif %}
+
+    {#- Tables (#842, both kinds): the two-column panel between the SQL/
+        Parameters cards and the results region — *Reads from*/*Used by*
+        (`tables_card`, `crate::build_tables_card`) on the left, *Columns*
+        (`columns_card`, `crate::build_columns_card`, filled in for
+        #842/04) on the right. Both are `Some` alongside any selection,
+        including `?lib=new` — `None` only for the "no Library yet" empty
+        state this whole branch is already inside, so no further gate is
+        needed here. -#}
+    {% if let Some(card) = tables_card %}
+    <div class="editor__grid" id="lib-tables-panel">
+      {{ card.render()?|safe }}
+      {% if let Some(columns) = columns_card %}
+      {{ columns.render()?|safe }}
+      {% endif %}
+    </div>
+    {% endif %}
 
     {#- The $sql-run preview region (#752, generalized to Library-backed
-        pages in #839): always renders `#run-notice`, and `#run-results`
-        once the server has something to show — either `?…&saved=1`'s
-        server-side run, or, still empty here, the client-driven live
-        preview the notice's own load trigger kicks off. Rendered once in
-        partials/sql_run_results.html and shared, with View Definitions,
-        verbatim with this kind's own `/run` fragment endpoint. -#}
-    {{ run_results.render()?|safe }}
+        pages in #839, extended for #842/04): always renders `#run-notice`,
+        and `#run-results` once the server has something to show — either
+        `?…&saved=1`'s server-side run, or, still empty here, the
+        client-driven live preview the notice's own load trigger kicks off.
+        `run_results` (`crate::LibRunNotice`) is either the shared
+        `partials/sql_run_results.html` markup (verbatim with View
+        Definitions and this kind's own `/run` fragment endpoint) or the
+        unknown-table lint's own notice in its place. -#}
+    {% match run_results %}
+    {% when LibRunNotice::Standard(partial) %}
+    {{ partial.render()?|safe }}
+    {% when LibRunNotice::UnknownTables(notice) %}
+    {{ notice.render()?|safe }}
+    {% endmatch %}
     {% else %}
     <section class="card">
       <div class="card-head">
@@ -242,12 +290,24 @@
      before either page-specific editor script. editor-form.js and
      editor-pair.js are loaded here, not from base.html, the same as on
      View Definitions — nothing outside this page drives the Details
-     pairing through them yet. Loaded on both /ui/sql/queries and
-     /ui/sql/views, since this one template serves both routes. -->
+     pairing through them yet. sql-library-panels.js (#841) is last: its own
+     `htmx:afterSwap` listener only ever reads `window.HfsSqlLibraryDetails`
+     from inside that handler, well after every script here has already
+     run, so the order relative to sql-library-details.js does not change
+     behavior — it is placed after it anyway, to read the same top-to-
+     bottom as the dependency it names. Loaded on both /ui/sql/queries and
+     /ui/sql/views, since this one template serves both routes — the
+     Parameters card (and so this script's own listener) simply never
+     matches anything on SQL Views, which render no `#lib-params` at all. -->
 <script src="/ui/assets/vendor/codemirror.bundle.js" defer></script>
 <script src="/ui/assets/code-editor.js" defer></script>
 <script src="/ui/assets/editor-form.js" defer></script>
 <script src="/ui/assets/editor-pair.js" defer></script>
 <script src="/ui/assets/sql-editor.js" defer></script>
 <script src="/ui/assets/sql-library-details.js" defer></script>
+<!-- combobox.js (#842): the Tables panel's own *Add table* field — the
+     same shared script Bulk Export and SQL Export load for their own
+     Patient/Group pickers, not otherwise pulled in on this page. -->
+<script src="/ui/assets/combobox.js" defer></script>
+<script src="/ui/assets/sql-library-panels.js" defer></script>
 {% endblock %}

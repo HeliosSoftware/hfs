@@ -898,7 +898,12 @@ impl SubmissionChange {
         new_version: impl Into<String>,
     ) -> Self {
         Self {
-            change_id: Uuid::new_v4().to_string(),
+            // v7, not v4: `change_id` is the primary key of
+            // `bulk_submission_changes`, one row per ingested entry, and a
+            // random key inserts into that index at a random leaf. Time-ordered
+            // ids arrive at its right-hand edge, which is already resident —
+            // the same reason resource ids are v7 (see `new_resource_id`).
+            change_id: Uuid::now_v7().to_string(),
             manifest_id: manifest_id.into(),
             change_type: ChangeType::Create,
             resource_type: resource_type.into(),
@@ -920,7 +925,8 @@ impl SubmissionChange {
         previous_content: Value,
     ) -> Self {
         Self {
-            change_id: Uuid::new_v4().to_string(),
+            // Time-ordered, for the reason given in [`Self::create`].
+            change_id: Uuid::now_v7().to_string(),
             manifest_id: manifest_id.into(),
             change_type: ChangeType::Update,
             resource_type: resource_type.into(),
