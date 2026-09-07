@@ -15,7 +15,8 @@
 //! so the cumulative-bucketing semantics live in exactly one place.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
+use std::time::Instant;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
@@ -28,7 +29,7 @@ use helios_persistence::core::{
 };
 use helios_persistence::error::StorageResult;
 use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
-use tracing::warn;
+use tracing::{debug, warn};
 
 use crate::config::ServerConfig;
 
@@ -55,6 +56,28 @@ const INFRASTRUCTURE_TYPES: &[&str] = &[
 /// bounds the per-type delta queries. The default stays at three; this is how
 /// far an explicit selection can go.
 const MAX_CHARTED_TYPES: usize = 6;
+
+/// How long a tenant's per-type totals (`count_all_types`) are reused before
+/// the grouping query is re-run (#959).
+///
+/// This is deliberately *much* longer than the observability layer's 15s
+/// snapshot TTL, because the two figures have very different cost and
+/// freshness requirements:
+///
+/// * The chart is cheap and interactive — it is keyed on
+///   `(window, tenant, types, include_empty)` and should track recent writes,
+///   so it keeps the 15s freshness.
+/// * The per-type totals are a single `GROUP BY` over every live row of the
+///   tenant — the dominant cost of a dashboard load at scale (~30s at 6M rows
+///   on SQLite) — and they do not depend on `window`, `types`, or
+///   `include_empty` at all. Recomputing them for each window flip or picker
+///   change was pure waste.
+///
+/// The tradeoff: after a large import, the headline "total resources" card,
+/// the "distinct types" card, and the type picker's option list may lag by up
+/// to two minutes. That is an acceptable price for a page that renders
+/// promptly; the chart itself stays 15s-fresh.
+const TYPE_COUNTS_TTL: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// A span to chart, and the bucket width that samples it.
 ///
@@ -187,6 +210,16 @@ where
     Ok(series)
 }
 
+/// Per-tenant `count_all_types` results, each stamped with the instant it was
+/// computed so [`TYPE_COUNTS_TTL`] can be applied on read (#959).
+///
+/// A `std::sync::RwLock` rather than an async lock on purpose: it is only ever
+/// taken for a synchronous map read or insert and released before the next
+/// `.await`, so it never blocks the runtime (and never trips clippy's
+/// `await_holding_lock`). Bounded by the number of tenants the dashboard is
+/// viewed for.
+type TypeCountCache = Arc<RwLock<HashMap<String, (Instant, Vec<(String, u64)>)>>>;
+
 /// [`DashboardProvider`] backed by a live storage backend. Registered once in
 /// [`crate::build_app`]; the tenant to chart arrives per call (#344), with the
 /// server default as the fallback for an empty id.
@@ -198,6 +231,9 @@ pub(crate) struct StorageDashboardProvider<S> {
     export_jobs: Option<Arc<dyn BulkExportJobStore>>,
     /// Bulk-submit job store, when the active backend provides one.
     submit_jobs: Option<Arc<dyn BulkSubmitJobStore>>,
+    /// Per-tenant cache of `count_all_types` (see [`TypeCountCache`] and
+    /// [`TYPE_COUNTS_TTL`], #959).
+    type_counts: TypeCountCache,
 }
 
 impl<S> StorageDashboardProvider<S> {
@@ -213,6 +249,7 @@ impl<S> StorageDashboardProvider<S> {
             storage,
             export_jobs: None,
             submit_jobs: None,
+            type_counts: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -228,6 +265,73 @@ impl<S> StorageDashboardProvider<S> {
         self.export_jobs = export_jobs;
         self.submit_jobs = submit_jobs;
         self
+    }
+}
+
+impl<S> StorageDashboardProvider<S>
+where
+    S: ResourceStorage + Send + Sync + 'static,
+{
+    /// The tenant's per-type live totals, served from the per-tenant cache
+    /// when it is fresher than [`TYPE_COUNTS_TTL`], else recomputed (#959).
+    ///
+    /// This is the dashboard's single most expensive query — a `GROUP BY` over
+    /// every live row of the tenant — and its result depends on nothing but
+    /// the tenant, so it is cached independently of the observability layer's
+    /// `(window, tenant, types, include_empty)` snapshot cache.
+    ///
+    /// Degrades like the rest of the snapshot: on a storage error it logs and
+    /// falls back to the stale entry when there is one (stale beats absent —
+    /// the same principle the observability cache already applies to whole
+    /// snapshots), otherwise to an empty list.
+    async fn cached_count_all_types(&self, tenant: &TenantContext) -> Vec<(String, u64)> {
+        let tenant_key = tenant.tenant_id().as_str().to_string();
+
+        // Fast path. The read guard is scoped to this block and dropped before
+        // the `.await` below, so no lock is ever held across a suspension.
+        {
+            let fresh = self.type_counts.read().ok().and_then(|guard| {
+                guard.get(&tenant_key).and_then(|(at, counts)| {
+                    (at.elapsed() < TYPE_COUNTS_TTL).then(|| counts.clone())
+                })
+            });
+            if let Some(counts) = fresh {
+                debug!(
+                    tenant = %tenant_key,
+                    types = counts.len(),
+                    "dashboard snapshot: per-type counts served from cache"
+                );
+                return counts;
+            }
+        }
+
+        // Cache miss: time the grouping query, so an operator staring at a slow
+        // dashboard can tell from the logs *which* query is responsible (#959).
+        let started = Instant::now();
+        let result = self.storage.count_all_types(tenant).await;
+        debug!(
+            tenant = %tenant_key,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            ok = result.is_ok(),
+            "dashboard snapshot: count_all_types completed"
+        );
+
+        match result {
+            Ok(counts) => {
+                if let Ok(mut guard) = self.type_counts.write() {
+                    guard.insert(tenant_key, (Instant::now(), counts.clone()));
+                }
+                counts
+            }
+            Err(error) => {
+                warn!(%error, "dashboard snapshot: distinct-type query failed");
+                self.type_counts
+                    .read()
+                    .ok()
+                    .and_then(|guard| guard.get(&tenant_key).map(|(_, counts)| counts.clone()))
+                    .unwrap_or_default()
+            }
+        }
     }
 }
 
@@ -255,20 +359,43 @@ where
         let now = Utc::now();
 
         // What the tenant actually stores, largest first — the picker's option
-        // list, and the pool defaults are drawn from (#555).
-        let raw_counts = self
-            .storage
-            .count_all_types(&tenant)
-            .await
-            .unwrap_or_else(|error| {
-                warn!(%error, "dashboard snapshot: distinct-type query failed");
-                Vec::new()
-            });
+        // list, and the pool defaults are drawn from (#555). Cached per tenant
+        // (#959): this grouping query is the dashboard's dominant cost and does
+        // not vary with the window or the selection.
+        let raw_counts = self.cached_count_all_types(&tenant).await;
         // The stat card counts only types the tenant actually stores —
         // `include_empty` (#599, "View all resources") never changes this
         // figure, so it must be taken before the flag relaxes the filter
         // below.
         let distinct_types = raw_counts.iter().filter(|(_, total)| *total > 0).count();
+        // The headline total is *derived* from the per-type counts rather than
+        // read with a second `self.storage.count(&tenant, None)` (#959). That
+        // call was a full `COUNT(*)` over exactly the rows `count_all_types`
+        // had just grouped and counted — roughly doubling the page's cost at
+        // 6M resources.
+        //
+        // The two figures agree by contract: `ResourceStorage::count` with
+        // `None` returns "the count of non-deleted resources" for the tenant,
+        // and `count_all_types` "counts non-deleted resources grouped by
+        // resource type for `tenant`, returning one `(resource_type, count)`
+        // pair per type present". The SQL backends use literally the same
+        // predicate for both (`tenant_id = ? AND is_deleted = 0/FALSE`), and
+        // `CompositeStorage` delegates both to its primary — so summing the
+        // groups reproduces the ungrouped count exactly.
+        //
+        // Behaviour change: when `count_all_types` fails, `total_resources` is
+        // now 0, where before the independent `count()` call might still have
+        // succeeded. Acceptable — the failure is already logged by
+        // `cached_count_all_types`, and this snapshot is explicitly designed to
+        // degrade to zeros rather than to error. Summed saturating so a
+        // pathological backend cannot panic the dashboard on overflow.
+        //
+        // Must be computed here, while `raw_counts` is still alive: the
+        // `into_iter()` below consumes it to build `available`.
+        let total_resources: u64 = raw_counts
+            .iter()
+            .map(|(_, total)| *total)
+            .fold(0u64, u64::saturating_add);
 
         // With `include_empty`, a type storage reports with a zero live count
         // is kept instead of dropped, coherent with the selection guard below
@@ -330,30 +457,32 @@ where
 
         // Degrade to an empty/zeroed snapshot rather than surfacing an error —
         // the operator dashboard should render even if a count query hiccups.
-        let series = match resource_count_series(
+        // Timed at `debug!` alongside the per-type grouping so a slow dashboard
+        // can be attributed to one query or the other without a profiler (#959).
+        let series_started = Instant::now();
+        let series_result = resource_count_series(
             self.storage.as_ref(),
             &tenant,
             &selection,
             SeriesWindow::from_dashboard_window(window),
             now,
         )
-        .await
-        {
+        .await;
+        debug!(
+            tenant = %tenant.tenant_id().as_str(),
+            window = window.as_str(),
+            charted_types = selection.len(),
+            elapsed_ms = series_started.elapsed().as_millis() as u64,
+            ok = series_result.is_ok(),
+            "dashboard snapshot: resource-count series completed"
+        );
+        let series = match series_result {
             Ok(series) => series,
             Err(error) => {
                 warn!(%error, "dashboard snapshot: resource-count series query failed");
                 Vec::new()
             }
         };
-
-        let total_resources = self
-            .storage
-            .count(&tenant, None)
-            .await
-            .unwrap_or_else(|error| {
-                warn!(%error, "dashboard snapshot: total count query failed");
-                0
-            });
 
         // Job counts degrade to `None` (unavailable) rather than zero on a read
         // error: a zero here would tell an operator "no jobs" when the truth is
@@ -411,7 +540,8 @@ mod tests {
     /// The provider builds a well-formed, zeroed snapshot over an empty store:
     /// one dense per-type series, zero totals, and a non-empty FHIR version.
     /// Exercises `StorageDashboardProvider::new` and the `snapshot` success path
-    /// (all three backend queries succeed and return "nothing yet").
+    /// (both backend queries succeed and return "nothing yet"), including the
+    /// derived `total_resources` — an empty grouping sums to zero (#959).
     #[tokio::test]
     async fn snapshot_over_empty_backend_is_zeroed_but_well_formed() {
         let backend = SqliteBackend::in_memory().expect("in-memory sqlite backend");
@@ -717,6 +847,136 @@ mod tests {
             patient_points,
             "every plotted series shares the window's dense bucket count"
         );
+    }
+
+    /// `total_resources` is the sum of the per-type counts, not a second
+    /// full-table `COUNT(*)` (#959) — and it agrees with what the backend's
+    /// own `count(tenant, None)` reports, including after a delete.
+    #[tokio::test]
+    async fn total_resources_is_the_sum_of_the_per_type_counts() {
+        let backend = Arc::new(SqliteBackend::in_memory().expect("in-memory sqlite backend"));
+        backend.init_schema().expect("init schema");
+        let tenant = test_tenant();
+        let config = ServerConfig {
+            default_tenant: "default".to_string(),
+            ..ServerConfig::for_testing()
+        };
+
+        let doomed = backend
+            .create(
+                &tenant,
+                "Patient",
+                serde_json::json!({"resourceType": "Patient"}),
+                helios_fhir::FhirVersion::R4,
+            )
+            .await
+            .expect("create patient");
+        for _ in 0..2 {
+            backend
+                .create(
+                    &tenant,
+                    "Observation",
+                    serde_json::json!({"resourceType": "Observation"}),
+                    helios_fhir::FhirVersion::R4,
+                )
+                .await
+                .expect("create observation");
+        }
+        // Deleted rows must not be counted by either figure.
+        backend
+            .delete(&tenant, "Patient", doomed.id())
+            .await
+            .expect("delete");
+
+        // A fresh provider per snapshot, so the per-tenant type-count cache
+        // never masks the arithmetic under test.
+        let snapshot = StorageDashboardProvider::new(Arc::clone(&backend), &config)
+            .snapshot(DashboardWindow::default(), "", &[], false)
+            .await;
+
+        let ungrouped = backend.count(&tenant, None).await.expect("count");
+        assert_eq!(ungrouped, 2);
+        assert_eq!(
+            snapshot.total_resources, ungrouped,
+            "the derived sum must equal the backend's ungrouped live count"
+        );
+        assert_eq!(
+            snapshot.total_resources,
+            snapshot.available.iter().map(|t| t.total).sum::<u64>()
+        );
+        assert_eq!(snapshot.distinct_types, 1, "Patient's only row is deleted");
+    }
+
+    /// The per-tenant type counts are cached with their own, longer TTL
+    /// (#959), so flipping the window does not re-run the `GROUP BY` over
+    /// every live row. Proven without a fake backend: mutate the store
+    /// between two snapshots on the *same* provider and observe that the
+    /// second still reports the first's cached figures, while the chart
+    /// (which is not cached here) does see the new data.
+    #[tokio::test]
+    async fn per_tenant_type_counts_are_reused_across_windows() {
+        let backend = Arc::new(SqliteBackend::in_memory().expect("in-memory sqlite backend"));
+        backend.init_schema().expect("init schema");
+        let tenant = test_tenant();
+        let config = ServerConfig {
+            default_tenant: "default".to_string(),
+            ..ServerConfig::for_testing()
+        };
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                serde_json::json!({"resourceType": "Patient"}),
+                helios_fhir::FhirVersion::R4,
+            )
+            .await
+            .expect("create patient");
+
+        let provider = StorageDashboardProvider::new(Arc::clone(&backend), &config);
+        let first = provider
+            .snapshot(DashboardWindow::LastHour, "", &[], false)
+            .await;
+        assert_eq!(first.total_resources, 1);
+        assert_eq!(first.distinct_types, 1);
+
+        // A brand-new type lands after the cache was filled.
+        backend
+            .create(
+                &tenant,
+                "Observation",
+                serde_json::json!({"resourceType": "Observation"}),
+                helios_fhir::FhirVersion::R4,
+            )
+            .await
+            .expect("create observation");
+
+        // A different window: a different observability-cache key, so the
+        // provider is called again — but the type counts come from the
+        // provider's own cache, well inside `TYPE_COUNTS_TTL`.
+        let second = provider
+            .snapshot(DashboardWindow::LastMonth, "", &[], false)
+            .await;
+        assert_eq!(
+            second.total_resources, 1,
+            "headline total came from the cached grouping, not a fresh scan"
+        );
+        assert_eq!(second.distinct_types, 1);
+        assert!(
+            second
+                .available
+                .iter()
+                .all(|t| t.resource_type != "Observation"),
+            "the picker list is the cached one too"
+        );
+
+        // A provider with a cold cache does see both types, which is what
+        // makes the assertions above evidence of caching rather than of a
+        // write that never happened.
+        let uncached = StorageDashboardProvider::new(Arc::clone(&backend), &config)
+            .snapshot(DashboardWindow::LastMonth, "", &[], false)
+            .await;
+        assert_eq!(uncached.total_resources, 2);
+        assert_eq!(uncached.distinct_types, 2);
     }
 
     fn test_tenant() -> TenantContext {
