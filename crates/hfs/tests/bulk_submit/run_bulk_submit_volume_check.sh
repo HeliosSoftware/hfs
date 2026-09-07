@@ -51,17 +51,38 @@ WORKDIR="${WORKDIR:-/tmp/hfs-bulk-submit-volume}"
 DB_URL="${DB_URL:-target/hfs-bulk-submit-volume.db}"
 rm -f "$DB_URL" "$DB_URL-wal" "$DB_URL-shm"
 
-# This does a real bind instead of reading `netstat`: its output is not portable
+# This probes the port instead of reading `netstat`: its output is not portable
 # (on Linux the state is printed as LISTEN, not LISTENING, and often the binary
 # is not even installed), and when the pattern does not match every port would
 # look free, so the failure would only show up much later, at server startup.
+#
+# connect() runs FIRST because bind() alone is not a valid liveness test on
+# Windows: there SO_REUSEADDR permits binding a port that is actively
+# LISTENING, so a bind-only check reports every port free and the script
+# happily attaches to somebody else's server.
 port_is_free() {
   python - "$1" <<'PY'
 import socket, sys
+port = int(sys.argv[1])
+
+# Something already accepting connections here?
+c = socket.socket()
+c.settimeout(0.35)
+try:
+    c.connect(("127.0.0.1", port))
+except OSError:
+    pass            # nothing listening
+else:
+    sys.exit(1)     # taken
+finally:
+    c.close()
+
+# Also reject a port that is bound but not yet listening. SO_REUSEADDR here
+# keeps a socket lingering in TIME_WAIT from counting as taken.
 s = socket.socket()
 s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 try:
-    s.bind(("127.0.0.1", int(sys.argv[1])))
+    s.bind(("127.0.0.1", port))
 except OSError:
     sys.exit(1)
 finally:

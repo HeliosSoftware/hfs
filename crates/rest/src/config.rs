@@ -627,6 +627,19 @@ pub struct BulkSubmitConfig {
     /// rebuild them with an automatic per-type reindex when each manifest
     /// finishes. Reads and history are complete throughout; search sees a
     /// manifest's resources once its reindex lands.
+    ///
+    /// Defaults to `false`, and the reason is durability rather than speed.
+    /// The rebuild is started only after the manifest is already terminal and
+    /// is fire-and-forget, so `$bulk-submit-status` reports `200` while search
+    /// is still incomplete; the job exists only in an in-memory map, no column
+    /// records that indexing is outstanding, and nothing re-fires it at
+    /// startup. A restart in that window leaves resources stored and readable
+    /// by id but absent from search until an operator runs `$reindex` by hand.
+    /// Measured end to end — kick-off until search returns every resource —
+    /// `true` is ~1.3x faster, which does not pay for that failure mode; it is
+    /// worth enabling for a supervised bulk load that can be re-run. See
+    /// `crates/hfs/tests/bulk_submit/run_defer_indexing_benchmark.sh` and
+    /// `run_defer_indexing_crash_check.sh`.
     pub defer_indexing: bool,
     /// When `true`, this pod does not run in-process submit workers.
     pub disable_local_worker: bool,

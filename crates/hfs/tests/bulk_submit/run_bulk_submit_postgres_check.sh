@@ -28,14 +28,32 @@ TTL="${TTL:-75}"
 FILE_CONCURRENCY="${FILE_CONCURRENCY:-8}"
 LOG="${LOG:-/tmp/hfs-bulk-submit-postgres.log}"
 
-# Same real bind as the other scripts: `netstat` is not portable.
+# Same real probe as the other scripts: `netstat` is not portable, and bind()
+# alone is not a valid liveness test on Windows, where SO_REUSEADDR permits
+# binding a port that is actively LISTENING.
 port_is_free() {
   python - "$1" <<'PY'
 import socket, sys
+port = int(sys.argv[1])
+
+# Something already accepting connections here?
+c = socket.socket()
+c.settimeout(0.35)
+try:
+    c.connect(("127.0.0.1", port))
+except OSError:
+    pass            # nothing listening
+else:
+    sys.exit(1)     # taken
+finally:
+    c.close()
+
+# Also reject a port that is bound but not yet listening. SO_REUSEADDR here
+# keeps a socket lingering in TIME_WAIT from counting as taken.
 s = socket.socket()
 s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 try:
-    s.bind(("127.0.0.1", int(sys.argv[1])))
+    s.bind(("127.0.0.1", port))
 except OSError:
     sys.exit(1)
 finally:

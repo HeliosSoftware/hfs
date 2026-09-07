@@ -66,7 +66,7 @@ status-only kick-off (no `manifestUrl`) they have nothing to attach to and are i
 | `HFS_BULK_SUBMIT_DISABLE_LOCAL_WORKER` | `false` | Disable in-pod workers |
 | `HFS_BULK_SUBMIT_MAX_CONCURRENT_PER_TENANT` | `4` | Per-tenant active submission cap; returns `429` |
 | `HFS_BULK_SUBMIT_BATCH_SIZE` | `1000` | Ingestion batch size |
-| `HFS_BULK_SUBMIT_DEFER_INDEXING` | `false` | Bulk fast-load (#903): ingest without search-index/FTS writes, then rebuild with an automatic per-type reindex when each manifest finishes |
+| `HFS_BULK_SUBMIT_DEFER_INDEXING` | `false` | Bulk fast-load (#903): ingest without search-index/FTS writes, then rebuild with an automatic per-type reindex when each manifest finishes. A restart before that rebuild lands leaves the data stored but unsearchable — see Ingest performance |
 | `HFS_BULK_SUBMIT_LEASE_DURATION` | `60` | Manifest lease length in seconds; must exceed heartbeat |
 | `HFS_BULK_SUBMIT_HEARTBEAT_INTERVAL` | `20` | Worker heartbeat cadence in seconds |
 | `HFS_BULK_SUBMIT_CLEANUP_INTERVAL` | `300` | Cleanup scan interval in seconds |
@@ -112,14 +112,38 @@ The backend capability splits into `BulkSubmitIngest` (the synchronous `BulkSubm
 - Status-poll pacing: the `202` advertises `HFS_BULK_SUBMIT_RETRY_AFTER`, and a client that polls past `HFS_BULK_SUBMIT_POLL_RATE_LIMIT` within the window gets `429` plus a `Retry-After` pointing at the end of that window. Buckets are keyed by poll token plus principal, falling back to peer address; the check runs before any job-store work, so throttled polls stay cheap.
 - File fan-out is backend-aware. `HFS_BULK_SUBMIT_FILE_CONCURRENCY` is honoured as configured on the concurrent-writer backends (PostgreSQL, MongoDB, S3), but file fan-out is **not supported on SQLite**: `effective_file_concurrency` returns `1` there whatever the operator configured, and a `WARN` at startup names the configured and effective values. SQLite serialises writers, so any fan-out above one queues each batch's writes behind a single exclusive lock until they outlast `busy_timeout` and abort the manifest outright. Any file fan-out at all requires PostgreSQL.
 - The manifest bookkeeping and resource writes retry with bounded exponential backoff when SQLite reports the database busy or locked, instead of failing the ingest. The retry budget is an elapsed-time deadline bounded by the manifest lease, so a retrying write can never outlive the lease it holds. Every other error still surfaces on the first attempt.
-- With `HFS_BULK_SUBMIT_DEFER_INDEXING=true` (bulk fast-load, #903) ingestion skips the search-index and FTS writes and an automatic per-type reindex rebuilds them when each manifest finishes. Reads and history are complete throughout; search sees a manifest's resources once its reindex lands.
+- With `HFS_BULK_SUBMIT_DEFER_INDEXING=true` (bulk fast-load, #903) ingestion skips the search-index and FTS writes and an automatic per-type reindex rebuilds them when each manifest finishes. Reads and history are complete throughout; search sees a manifest's resources once its reindex lands. That rebuild is started *after* the manifest is already terminal and is fire-and-forget (`bulk_submit_worker.rs` → `reindex.rs`, `tokio::spawn`), so `$bulk-submit-status` answers `200` while search is still incomplete, and the job lives only in an in-memory map — no column on `bulk_manifests` records that indexing is outstanding and nothing re-fires it at startup. A restart in that window is not recoverable on its own.
 - Cleanup periodically removes status artifacts for submissions whose `updated_at` exceeds `HFS_BULK_SUBMIT_OUTPUT_TTL`.
 
 ## Ingest performance
 
 `HFS_BULK_SUBMIT_DEFER_INDEXING=true` relocates search indexing to a post-ingest
-reindex and is by far the biggest lever (~6.7x on SQLite); the stored resources,
+reindex and is by far the biggest lever on ingestion alone; the stored resources,
 history, receipts and rollback records are identical either way.
+
+Which number you quote depends on where you stop the clock, and the two differ by
+a lot. The `bulk_submit_bench` example runs **no reindex at all**, so its ~6.7x is
+the cost of ingestion with the indexing work removed, not the cost of arriving at
+a searchable database. Measured end to end against a running server — kick-off
+until a search returns the full count — the gain is far smaller, because the
+deferred arm still has to pay for the rebuild:
+
+| stop the clock at | `false` | `true` | ratio |
+|---|---|---|---|
+| `$bulk-submit-status` returns `200` | 12.3s | 4.6s | 2.67x |
+| search returns every ingested resource | 12.7s | 9.7s | **1.31x** |
+
+(9 interleaved rounds, 10 000 Patients per arm, release build, SQLite; minimum of
+each arm, which is the estimate least distorted by unrelated load on the box.
+Reproduce with `crates/hfs/tests/bulk_submit/run_defer_indexing_benchmark.sh`.)
+
+So quote 1.31x, not 6.7x, when the question is how fast a user can start querying.
+That is the margin to weigh against the unrecoverable window above:
+`run_defer_indexing_crash_check.sh` restarts the server at the instant the API
+reports `200` and finds 16 000 of 20 000 resources stored, readable by id, and
+permanently absent from search. Until the rebuild is persisted and reflected in
+`$bulk-submit-status`, `true` belongs on supervised bulk loads that can be
+re-run, which is why the default is `false`.
 
 To find out where the rest of the time goes, profile the write path with the
 phase counters in `helios_persistence::perf` and the `bulk_submit_bench`
