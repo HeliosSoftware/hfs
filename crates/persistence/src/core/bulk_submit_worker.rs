@@ -24,7 +24,7 @@ use crate::core::bulk_export_output::{ExportOutputStore, ExportPartKey};
 use crate::core::bulk_export_worker::{LeaseError, WorkerId};
 use crate::core::bulk_submit::{
     BulkEntryOutcome, BulkProcessingOptions, BulkSubmitProvider, BulkSubmitRollbackProvider,
-    ByteProgress, ImportMode, StreamingBulkSubmitProvider, SubmissionId,
+    ByteProgress, ImportMode, ManifestPhase, StreamingBulkSubmitProvider, SubmissionId,
 };
 use crate::core::bulk_submit_input::{SubmitInputFetcher, submission_output_job_id};
 use crate::error::{StorageError, StorageResult};
@@ -234,6 +234,19 @@ pub trait SubmitWorkerStorage: Send + Sync {
         lease: &ManifestLease,
         bytes_processed: u64,
         bytes_total: u64,
+    ) -> Result<(), LeaseError>;
+
+    /// Records the coarse pre-ingest phase and its `files_done`/`files_total`
+    /// pair, so the status endpoint has something to say before the byte and
+    /// entry counters move (#953). Purely cosmetic — callers log and continue
+    /// on storage errors — but fenced all the same, so a zombie worker cannot
+    /// rewrite the phase of a manifest that was reclaimed under it.
+    async fn update_manifest_phase(
+        &self,
+        lease: &ManifestLease,
+        phase: ManifestPhase,
+        files_done: u64,
+        files_total: u64,
     ) -> Result<(), LeaseError>;
 
     /// Idempotent upsert of a finalized status-manifest artifact row. Fenced.
@@ -597,7 +610,22 @@ where
             return Ok(());
         };
 
+        let progress = ByteProgress::default();
+        // The lease must stay heartbeated *through* a file, not only between
+        // files, and independently of how often the ingest future yields; the
+        // keeper renews from its own task until dropped.
+        //
+        // Spawned here rather than after pre-sizing (#953): fetching the remote
+        // manifest and HEAD-ing its output files can take minutes on a
+        // file-heavy corpus, and that whole window used to pass without a
+        // single heartbeat. The keeper only *flushes bytes* once
+        // `progress.total` is non-zero, so starting it early adds heartbeats
+        // and nothing else.
+        let keeper = LeaseKeeper::spawn(Arc::clone(&self.jobs), lease.clone(), progress.clone());
+
         // 1. Fetch the remote Bulk Export Manifest.
+        self.report_phase(&lease, ManifestPhase::ReadingManifest, 0, 0)
+            .await;
         let manifest = match self
             .fetcher
             .fetch_manifest(
@@ -616,6 +644,9 @@ where
                     &format!("failed to fetch manifest: {e}"),
                 )
                 .await?;
+                // Stop renewing before the manifest goes terminal, so no
+                // heartbeat lands on a row this task has already failed.
+                drop(keeper);
                 let _ = self.jobs.fail_manifest(&lease, &e.to_string()).await;
                 return Ok(());
             }
@@ -633,54 +664,92 @@ where
                 "ingesting manifest with submission metadata"
             );
         }
-        let progress = ByteProgress::default();
         let opts = BulkProcessingOptions::new()
             .with_import_mode(import_mode)
             .with_defer_indexing(self.defer_indexing)
             .with_byte_progress(progress.clone());
+        let file_count = manifest.output.len() as u64;
         // Pre-size the byte denominator: every output file's advertised size
         // up front, so the percentage never recomputes against a partial
         // total — learned lazily per file, each newly opened file yanked the
         // bar backwards on multi-file manifests (#874). Encrypted files are
         // skipped (wire length ≠ decrypted length); any unknown size falls
         // back to lazy accumulation below.
+        //
+        // The HEADs run `file_concurrency` at a time, like the ingest fan-out
+        // below: serially, a manifest with hundreds of outputs spent hundreds
+        // of sequential round trips here before the first byte was read (#953).
         let mut presized = false;
         if view.file_encryption_key.is_none() && !manifest.output.is_empty() {
-            let mut sum: u64 = 0;
-            let mut all_known = true;
-            for file in &manifest.output {
-                match self
-                    .fetcher
-                    .file_size(
-                        &file.url,
-                        &view.file_request_headers,
-                        manifest.requires_access_token,
-                        &view.oauth_metadata_urls,
-                    )
-                    .await
-                {
-                    Ok(Some(len)) => sum += len,
-                    _ => {
-                        all_known = false;
-                        break;
+            self.report_phase(&lease, ManifestPhase::Sizing, 0, file_count)
+                .await;
+            let sum = AtomicU64::new(0);
+            let all_known = AtomicBool::new(true);
+            let sized = AtomicU64::new(0);
+            let sum_ref = &sum;
+            let all_known_ref = &all_known;
+            let sized_ref = &sized;
+            let view_ref = &view;
+            let lease_ref = &lease;
+            let manifest_ref = &manifest;
+
+            // Indexed like the ingest fan-out below, so the closure's argument
+            // stays owned and the future may borrow `manifest.output[i]`.
+            let mut sizing = futures::stream::iter(0..manifest.output.len())
+                .map(|i| async move {
+                    // One unknown size poisons the total anyway, so stop
+                    // spending round trips on the queued remainder. The
+                    // in-flight ones still finish; their results are discarded.
+                    if !all_known_ref.load(Ordering::Relaxed) {
+                        return;
                     }
-                }
-            }
+                    let file = &manifest_ref.output[i];
+                    match self
+                        .fetcher
+                        .file_size(
+                            &file.url,
+                            &view_ref.file_request_headers,
+                            manifest_ref.requires_access_token,
+                            &view_ref.oauth_metadata_urls,
+                        )
+                        .await
+                    {
+                        Ok(Some(len)) => {
+                            sum_ref.fetch_add(len, Ordering::Relaxed);
+                        }
+                        _ => {
+                            all_known_ref.store(false, Ordering::Relaxed);
+                            return;
+                        }
+                    }
+                    // A fenced UPDATE per HEAD, which is cheap next to the
+                    // network round trip it follows — and it is the only thing
+                    // the status endpoint can report during this window.
+                    let done = sized_ref.fetch_add(1, Ordering::Relaxed) + 1;
+                    self.report_phase(lease_ref, ManifestPhase::Sizing, done, file_count)
+                        .await;
+                })
+                .buffer_unordered(self.file_concurrency.max(1));
+            while sizing.next().await.is_some() {}
+            drop(sizing);
+
             // A zero sum (every file empty, or a source misreporting sizes)
             // presizes nothing — the lazy path below stays the authority.
-            if all_known && sum > 0 {
+            let sum = sum.load(Ordering::Relaxed);
+            if all_known.load(Ordering::Relaxed) && sum > 0 {
                 progress.total.store(sum, Ordering::Relaxed);
                 presized = true;
             }
         }
-        // The lease must stay heartbeated *through* a file, not only between
-        // files, and independently of how often the ingest future yields; the
-        // keeper renews from its own task until dropped.
         // Percentages need every file's size; one sizeless file (e.g. a
         // gzip-decompressed stream) poisons the total for the whole manifest
         // and the status endpoint falls back to manifest-count progress.
         let totals_known = AtomicBool::new(true);
-        let keeper = LeaseKeeper::spawn(Arc::clone(&self.jobs), lease.clone(), progress.clone());
+        // Files whose download has *started*, for the `downloading file N of M`
+        // report. Approximate by construction when `file_concurrency > 1` —
+        // several files are in flight at once — which is fine for a coarse
+        // "it is moving" signal that the byte counters take over from.
+        let opened = AtomicU64::new(0);
 
         // 2. Ingest the `output` files. Up to `file_concurrency` at a time run
         // concurrently (fan-out): each file's fetch, parse, and write overlaps
@@ -698,6 +767,7 @@ where
         // lifetime without a higher-ranked-lifetime bound the closure can't name.
         let processed_ref = &processed_at;
         let failed_ref = &failed_at;
+        let opened_ref = &opened;
         let totals_ref = &totals_known;
         let progress_ref = &progress;
         let keeper_ref = &keeper;
@@ -717,6 +787,12 @@ where
                     .resource_type
                     .clone()
                     .unwrap_or_else(|| "Resource".into());
+                // Opening a file can itself be a long wait (the remote has to
+                // start streaming), and until its first batch commits nothing
+                // else moves — so say which file is being pulled (#953).
+                let nth = opened_ref.fetch_add(1, Ordering::Relaxed) + 1;
+                self.report_phase(lease_ref, ManifestPhase::Downloading, nth, file_count)
+                    .await;
                 let (inner, file_bytes_total) = match self
                     .fetcher
                     .open_file_stream(
@@ -1152,6 +1228,36 @@ where
         Ok(())
     }
 
+    /// Publishes the coarse pre-ingest phase for the status endpoint (#953).
+    ///
+    /// Best-effort by design: the phase is a cosmetic hint, so *no* failure
+    /// here may change what the job does. That includes `LeaseLost` — a lost
+    /// lease is already detected authoritatively by the [`LeaseKeeper`]'s
+    /// heartbeat and checked at each file boundary, and letting a decorative
+    /// write also decide control flow would add a way to abandon a healthy
+    /// job without adding any way to notice a dead one.
+    async fn report_phase(
+        &self,
+        lease: &ManifestLease,
+        phase: ManifestPhase,
+        files_done: u64,
+        files_total: u64,
+    ) {
+        if let Err(e) = self
+            .jobs
+            .update_manifest_phase(lease, phase, files_done, files_total)
+            .await
+        {
+            tracing::debug!(
+                submission = %lease.submission_id,
+                manifest = %lease.manifest_id,
+                %phase,
+                error = %e,
+                "could not record bulk-submit pre-ingest phase"
+            );
+        }
+    }
+
     /// Records a single manifest-level `error` OperationOutcome artifact.
     async fn record_manifest_error(
         &self,
@@ -1328,8 +1434,295 @@ mod tests {
         }
     }
 
+    /// Wraps a [`MockFetcher`] and, on every call the worker makes, reads back
+    /// the phase the worker persisted just before it — so a test can assert
+    /// what a *concurrent status poll* would have seen, rather than only the
+    /// residue left behind at the end of the run.
+    struct PhaseSpyFetcher {
+        inner: MockFetcher,
+        backend: Arc<SqliteBackend>,
+        tenant: TenantContext,
+        sub_id: SubmissionId,
+        seen: std::sync::Mutex<Vec<(String, Option<ManifestPhase>, u64, u64)>>,
+    }
+
+    impl PhaseSpyFetcher {
+        async fn observe(&self, during: &str) {
+            let manifests = self
+                .backend
+                .list_manifests(&self.tenant, &self.sub_id)
+                .await
+                .unwrap();
+            let m = &manifests[0];
+            self.seen.lock().unwrap().push((
+                during.to_string(),
+                m.phase,
+                m.files_done,
+                m.files_total,
+            ));
+        }
+
+        fn phases_during(&self, during: &str) -> Vec<(Option<ManifestPhase>, u64, u64)> {
+            self.seen
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(w, _, _, _)| w == during)
+                .map(|(_, p, d, t)| (*p, *d, *t))
+                .collect()
+        }
+    }
+
+    #[async_trait]
+    impl SubmitInputFetcher for PhaseSpyFetcher {
+        async fn fetch_manifest(
+            &self,
+            url: &str,
+            headers: &[(String, String)],
+            oauth: &[String],
+            encryption_key: Option<&Value>,
+        ) -> StorageResult<RemoteManifest> {
+            self.observe("fetch_manifest").await;
+            self.inner
+                .fetch_manifest(url, headers, oauth, encryption_key)
+                .await
+        }
+
+        async fn open_file_stream(
+            &self,
+            url: &str,
+            headers: &[(String, String)],
+            requires_access_token: bool,
+            oauth: &[String],
+            encryption_key: Option<&Value>,
+        ) -> StorageResult<(Box<dyn tokio::io::AsyncBufRead + Send + Unpin>, Option<u64>)> {
+            self.observe("open_file_stream").await;
+            self.inner
+                .open_file_stream(url, headers, requires_access_token, oauth, encryption_key)
+                .await
+        }
+
+        async fn file_size(
+            &self,
+            url: &str,
+            headers: &[(String, String)],
+            requires_access_token: bool,
+            oauth: &[String],
+        ) -> StorageResult<Option<u64>> {
+            let size = self
+                .inner
+                .file_size(url, headers, requires_access_token, oauth)
+                .await;
+            self.observe("file_size").await;
+            size
+        }
+    }
+
     fn tenant() -> TenantContext {
         TenantContext::new(TenantId::new("t1"), TenantPermissions::full_access())
+    }
+
+    /// #953: everything before the first NDJSON batch used to poll as a flat
+    /// `0%`. The worker must now publish a phase at each pre-ingest step, so
+    /// the status endpoint has something to report during that window.
+    #[tokio::test]
+    async fn test_worker_reports_its_pre_ingest_phases() {
+        let backend = Arc::new(SqliteBackend::in_memory().unwrap());
+        backend.init_schema().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let output = Arc::new(LocalFsOutputStore::new(
+            tmp.path().to_path_buf(),
+            "http://localhost:8080",
+        ));
+
+        let tenant = tenant();
+        let sub_id = SubmissionId::generate("mock-system");
+        backend
+            .create_submission(&tenant, &sub_id, None)
+            .await
+            .unwrap();
+        backend
+            .add_manifest(
+                &tenant,
+                &sub_id,
+                Some("http://provider/manifest.json"),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Distinct resource types: the fan-out assumes a manifest's files do
+        // not collide on type.
+        let types = ["Patient", "Observation", "Condition"];
+        let mut files = std::collections::HashMap::new();
+        let mut output_files = Vec::new();
+        for ty in types {
+            let url = format!("http://provider/{ty}.ndjson");
+            files.insert(
+                url.clone(),
+                format!("{{\"resourceType\":\"{ty}\",\"id\":\"x1\"}}\n").into_bytes(),
+            );
+            output_files.push(RemoteFile {
+                resource_type: Some(ty.to_string()),
+                url,
+                count: None,
+            });
+        }
+        let fetcher = Arc::new(PhaseSpyFetcher {
+            inner: MockFetcher {
+                files,
+                manifest: RemoteManifest {
+                    requires_access_token: false,
+                    output: output_files,
+                    deleted: vec![],
+                },
+            },
+            backend: backend.clone(),
+            tenant: tenant.clone(),
+            sub_id: sub_id.clone(),
+            seen: std::sync::Mutex::new(Vec::new()),
+        });
+
+        let worker = DefaultSubmitWorker::new(
+            backend.clone(),
+            fetcher.clone(),
+            output,
+            WorkerId::new("phase-worker"),
+        );
+        let lease = backend
+            .claim_next_manifest(&WorkerId::new("phase-worker"), StdDuration::from_secs(60))
+            .await
+            .unwrap()
+            .expect("claimable manifest");
+        worker.run_job(lease).await.unwrap();
+
+        // While the remote manifest downloads, the phase says so — and carries
+        // no file counts, because the `output` array is still unread.
+        assert_eq!(
+            fetcher.phases_during("fetch_manifest"),
+            vec![(Some(ManifestPhase::ReadingManifest), 0, 0)],
+            "the manifest fetch must report `reading-manifest`"
+        );
+
+        // Each HEAD advances `files_done` against the now-known denominator,
+        // which is what turns a silent pre-size into `sizing N of M files`.
+        // The counts run 0..2 rather than 1..3 because the spy reads the row
+        // from inside the HEAD, i.e. just *before* the worker records that
+        // file's own increment: what it captures is the run of distinct values
+        // a status poll could have landed on mid-pre-size.
+        assert_eq!(
+            fetcher.phases_during("file_size"),
+            vec![
+                (Some(ManifestPhase::Sizing), 0, 3),
+                (Some(ManifestPhase::Sizing), 1, 3),
+                (Some(ManifestPhase::Sizing), 2, 3),
+            ],
+            "pre-sizing must count files against the manifest's output total"
+        );
+
+        // Opening a file reports `downloading`, restarting the counter — which
+        // is why the phase write overwrites rather than accumulating.
+        let downloads = fetcher.phases_during("open_file_stream");
+        assert_eq!(downloads.len(), 3);
+        for (i, (phase, done, total)) in downloads.iter().enumerate() {
+            assert_eq!(*phase, Some(ManifestPhase::Downloading));
+            assert_eq!(*done, i as u64 + 1);
+            assert_eq!(*total, 3);
+        }
+
+        // The phase outlives the run; the status endpoint is what keeps a
+        // stale one harmless, by letting the byte/entry counters outrank it.
+        let manifests = backend.list_manifests(&tenant, &sub_id).await.unwrap();
+        assert_eq!(manifests[0].phase, Some(ManifestPhase::Downloading));
+        assert_eq!(manifests[0].files_total, 3);
+    }
+
+    /// The pre-size HEADs run `file_concurrency` at a time (#953). Correctness
+    /// must not depend on that: the denominator is the sum the serial loop
+    /// produced, no matter what order the responses land in.
+    #[tokio::test]
+    async fn test_presizing_is_correct_with_file_concurrency() {
+        let backend = Arc::new(SqliteBackend::in_memory().unwrap());
+        backend.init_schema().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let output = Arc::new(LocalFsOutputStore::new(
+            tmp.path().to_path_buf(),
+            "http://localhost:8080",
+        ));
+
+        let tenant = tenant();
+        let sub_id = SubmissionId::generate("mock-system");
+        backend
+            .create_submission(&tenant, &sub_id, None)
+            .await
+            .unwrap();
+        backend
+            .add_manifest(
+                &tenant,
+                &sub_id,
+                Some("http://provider/manifest.json"),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let types = [
+            "Patient",
+            "Observation",
+            "Condition",
+            "Encounter",
+            "Procedure",
+            "Immunization",
+        ];
+        let mut files = std::collections::HashMap::new();
+        let mut output_files = Vec::new();
+        let mut expected: u64 = 0;
+        for (i, ty) in types.iter().enumerate() {
+            let url = format!("http://provider/{ty}.ndjson");
+            // Different lengths per file, so a dropped or double-counted HEAD
+            // cannot coincidentally still sum to `expected`.
+            let body = format!("{{\"resourceType\":\"{ty}\",\"id\":\"c{i}\"}}\n");
+            expected += body.len() as u64;
+            files.insert(url.clone(), body.into_bytes());
+            output_files.push(RemoteFile {
+                resource_type: Some((*ty).to_string()),
+                url,
+                count: None,
+            });
+        }
+        let fetcher = Arc::new(MockFetcher {
+            files,
+            manifest: RemoteManifest {
+                requires_access_token: false,
+                output: output_files,
+                deleted: vec![],
+            },
+        });
+
+        let worker = DefaultSubmitWorker::new(
+            backend.clone(),
+            fetcher,
+            output,
+            WorkerId::new("concurrent-presize"),
+        )
+        .with_file_concurrency(4);
+        let lease = backend
+            .claim_next_manifest(
+                &WorkerId::new("concurrent-presize"),
+                StdDuration::from_secs(60),
+            )
+            .await
+            .unwrap()
+            .expect("claimable manifest");
+        worker.run_job(lease).await.unwrap();
+
+        let manifests = backend.list_manifests(&tenant, &sub_id).await.unwrap();
+        assert_eq!(
+            manifests[0].bytes_total, expected,
+            "concurrent HEADs must sum to the same denominator as the serial loop"
+        );
+        assert_eq!(manifests[0].bytes_processed, expected);
+        assert_eq!(manifests[0].files_total, types.len() as u64);
     }
 
     #[tokio::test]
