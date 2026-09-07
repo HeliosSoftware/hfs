@@ -250,6 +250,29 @@ struct LogLine {
     message: String,
 }
 
+/// The submission's log as `partials/bulk_import_log.html` wants it:
+/// newest-first, so the detail page's first paint and the status fragment's
+/// out-of-band refresh agree on the order (#955).
+fn log_lines(submission: &Submission) -> Vec<LogLine> {
+    submission
+        .log
+        .iter()
+        .rev()
+        .map(|entry| LogLine {
+            at: entry
+                .get("at")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            message: entry
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+        })
+        .collect()
+}
+
 fn status_label(i18n: &I18n, status: &str) -> String {
     match status {
         "in-progress" => i18n.t("bulk-import-status-in-progress"),
@@ -288,6 +311,8 @@ struct BulkImportDetailPage {
     client_id: String,
     token_url: String,
     log: Vec<LogLine>,
+    /// The page paints the log in place, never out-of-band.
+    log_oob: bool,
     error: Option<String>,
     edit_open: bool,
 }
@@ -458,24 +483,7 @@ fn render_detail_page(
         .unwrap_or("")
         .to_string();
 
-    let log: Vec<LogLine> = s
-        .log
-        .iter()
-        .rev()
-        .map(|entry| LogLine {
-            at: entry
-                .get("at")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string(),
-            message: entry
-                .get("message")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string(),
-        })
-        .collect();
-
+    let log = log_lines(&s);
     let label = status_label(&i18n, &s.status);
     render(BulkImportDetailPage {
         status,
@@ -504,6 +512,7 @@ fn render_detail_page(
         client_id: s.client_id,
         token_url: s.token_url,
         log,
+        log_oob: false,
         error,
         edit_open,
     })
@@ -1145,6 +1154,10 @@ struct StatusCard {
     completed_at: String,
     /// Rides out-of-band into the summary card's STATUS cell.
     status_label: String,
+    /// Rides out-of-band into the Submission Log section, whose lines this
+    /// poll may have just written (#955).
+    log: Vec<LogLine>,
+    log_oob: bool,
 }
 
 /// `GET /ui/bulk-import/{id}/status` — at most one recipient poll, then the
@@ -1178,6 +1191,8 @@ pub async fn status_fragment(
         errors: s.result["errors"].as_u64().unwrap_or(0),
         completed_at: s.result["completedAt"].as_str().unwrap_or("").to_string(),
         status_label: label,
+        log: log_lines(&s),
+        log_oob: true,
         i18n,
     })
 }
