@@ -137,13 +137,15 @@ deferred arm still has to pay for the rebuild:
 each arm, which is the estimate least distorted by unrelated load on the box.
 Reproduce with `crates/hfs/tests/bulk_submit/run_defer_indexing_benchmark.sh`.)
 
-So quote 1.31x, not 6.7x, when the question is how fast a user can start querying.
-That is the margin to weigh against the unrecoverable window above:
-`run_defer_indexing_crash_check.sh` restarts the server at the instant the API
-reports `200` and finds 16 000 of 20 000 resources stored, readable by id, and
-permanently absent from search. Until the rebuild is persisted and reflected in
-`$bulk-submit-status`, `true` belongs on supervised bulk loads that can be
-re-run, which is why the default is `false`.
+So quote 1.31x, not 6.7x, when the question is how fast a user can start
+querying. That margin is what has to be weighed against the unrecoverable
+window described above: `run_defer_indexing_crash_check.sh` restarts the server
+at the instant the API reports `200` and finds 16 000 of 20 000 resources
+stored, readable by id, and permanently absent from search.
+
+Which way that trade should fall for the *default* is a maintainer decision,
+open on #946. Report both numbers; do not invent a rationale for whichever
+default happens to be set.
 
 To find out where the rest of the time goes, profile the write path with the
 phase counters in `helios_persistence::perf` and the `bulk_submit_bench`
