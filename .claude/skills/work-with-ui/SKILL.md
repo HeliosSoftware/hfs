@@ -37,12 +37,12 @@ Handlers return a **full page** on a hard navigation and an **HTML fragment** on
 cargo run -p helios-hfs            # then open http://127.0.0.1:8080/ui
 cargo run -p helios-hfs --features ui
 
-# Headless deployments: `headless` wins over `ui`.
-cargo run -p helios-hfs --features headless
+# Headless deployments: a runtime switch, not a build feature.
+HFS_UI_ENABLED=false cargo run -p helios-hfs
 ```
 
-The mount is `#[cfg(all(feature = "ui", not(feature = "headless")))]` in
-`crates/hfs/src/main.rs`. FHIR version features forward through
+The mount is `#[cfg(feature = "ui")]` plus the runtime `config.ui_enabled` check
+in `attach_ui` (`crates/hfs/src/main.rs`). FHIR version features forward through
 `helios-ui?/R4|R4B|R5|R6`, so the UI's viewers cover exactly the versions the
 server was built with.
 
@@ -316,5 +316,11 @@ across every storage backend.
   being on this router — don't hand-roll the header.
 - `/ui/search` does not exist when NL search is disabled; a test that navigates
   there unconditionally will 404.
-- The `headless` feature is checked as `not(feature = "headless")`, so enabling
-  both `ui` and `headless` yields **no UI**.
+- Headless operation is `HFS_UI_ENABLED=false`, **not** a Cargo feature. The old
+  `headless` feature was gated as `not(feature = "headless")` and so was switched
+  on — killing the UI — by `--all-features`, the selection that builds the
+  released binaries (#975). Never add a negative feature here.
+- When the UI is not served (feature off, or `HFS_UI_ENABLED=false`), `/ui`
+  returns **404 + OperationOutcome** from `ui_absent_routes`. It must never fall
+  through to the FHIR router, which reads `ui` as a resource type and answers
+  `200` with an empty searchset.

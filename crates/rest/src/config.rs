@@ -1040,6 +1040,21 @@ pub struct ServerConfig {
     #[arg(long, env = "HFS_SOF_ENABLED", default_value = "true")]
     pub sof_enabled: bool,
 
+    /// Mount the web UI at `/ui`.
+    ///
+    /// On by default. Headless deployments (behind an API gateway, or anywhere
+    /// an HTML surface should not listen at all) opt out with
+    /// `HFS_UI_ENABLED=false`; `/ui` and everything under it then answer
+    /// `404` + OperationOutcome rather than falling through to the FHIR
+    /// router. This replaces the former `headless` *build* feature, which was
+    /// a negative Cargo feature and so was tripped accidentally by
+    /// `--all-features` (see issue #975).
+    ///
+    /// Has no effect on a binary built without the `ui` feature — there the UI
+    /// is not compiled in at all and `/ui` always answers `404`.
+    #[arg(long, env = "HFS_UI_ENABLED", default_value = "true")]
+    pub ui_enabled: bool,
+
     /// Natural-language search master switch. When false the feature is
     /// completely off: the endpoint 404s and the UI renders nothing.
     #[arg(long, env = "HFS_NL_SEARCH_ENABLED", default_value = "true")]
@@ -1255,6 +1270,7 @@ impl Default for ServerConfig {
             elasticsearch_refresh_interval: "1s".to_string(),
             elasticsearch_write_refresh: "false".to_string(),
             sof_enabled: true,
+            ui_enabled: true,
             nl_search_enabled: true,
             nl_search_api_key: None,
             nl_search_model: "claude-opus-4-8".to_string(),
@@ -1477,6 +1493,7 @@ impl ServerConfig {
             elasticsearch_refresh_interval: "1s".to_string(),
             elasticsearch_write_refresh: "false".to_string(),
             sof_enabled: true,
+            ui_enabled: true,
             nl_search_enabled: true,
             nl_search_api_key: None,
             nl_search_model: "claude-opus-4-8".to_string(),

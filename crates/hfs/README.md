@@ -81,6 +81,7 @@ Options:
 | `HFS_SERVER_HOST` | 127.0.0.1 | Host to bind |
 | `HFS_BASE_URL` | http://localhost:8080 | Public HTTP(S) base for response links and `Location` headers |
 | `HFS_LOG_LEVEL` | info | Log level (error, warn, info, debug, trace) |
+| `HFS_UI_ENABLED` | true | Serve the web UI at `/ui`; `false` for headless deployments (`/ui` then returns 404 + OperationOutcome) |
 | `DATABASE_URL` | fhir.db | Database connection string |
 | `HFS_DATA_DIR` | ./data | Path to FHIR data directory (search parameters) |
 | `HFS_SEARCH_PARAM_CACHE_TTL` | 3600 | Seconds between refreshes of the in-memory SearchParameter registry from storage; a param POSTed to one cluster node becomes visible to others within this interval. `0` disables the refresh. |

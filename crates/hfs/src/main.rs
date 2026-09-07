@@ -672,57 +672,7 @@ async fn serve(
     ui_settings: Option<Arc<dyn SettingsStore>>,
     ui_bulk_provider: Option<Arc<dyn BulkProviderStore>>,
 ) -> anyhow::Result<()> {
-    #[cfg(all(feature = "ui", not(feature = "headless")))]
-    let app = {
-        // The UI reads SearchParameter/CompartmentDefinition from the server's
-        // own FHIR API over HTTP. It calls itself on the loopback address, with
-        // the configured outbound service token (HFS_OUTBOUND_BEARER_TOKEN) when
-        // set, or no credentials when auth is disabled.
-        //
-        // TODO(service-token): when auth is enabled, this relies on an operator
-        // provisioning a valid, non-expiring bearer via HFS_OUTBOUND_BEARER_TOKEN;
-        // without one the self-call is rejected and the conformance pages degrade
-        // to a warning. The follow-up is to mint a short-lived, auto-refreshed
-        // `system/SearchParameter.rs system/CompartmentDefinition.rs` token via
-        // the planned `JwtAssertionOutboundAuthProvider` (SMART Backend Services
-        // client_credentials + private_key_jwt; see crates/auth/src/outbound.rs)
-        // configured from HFS_UI_* client credentials. The `$sql-export`
-        // self-calls (#833) are the exception: they already carry the
-        // browser's own `Authorization` when it sent one (the `Caller` seam
-        // in `crates/ui/src/conformance.rs`), falling back to this service
-        // token only when the request had none.
-        let self_base_url = format!("http://127.0.0.1:{}", config.port);
-        let outbound_auth = AuthConfig::from_env().outbound_provider();
-        let patient_name_search = patient_name_search_support(
-            config
-                .storage_backend_mode()
-                .expect("storage backend was validated before server startup"),
-        );
-        helios_ui::mount_with_body_limit_and_tenant_routing(
-            app,
-            env!("CARGO_PKG_VERSION"),
-            config.data_dir.clone(),
-            helios_ui::NlSearch {
-                enabled: config.nl_search_enabled,
-                configured: config.nl_search_api_key.is_some(),
-                model: config.nl_search_model.clone(),
-            },
-            ui_tenants.clone(),
-            ui_settings.clone(),
-            config.default_tenant.clone(),
-            self_base_url,
-            outbound_auth,
-            config.default_fhir_version,
-            config.terminology_server.clone(),
-            config.base_url.clone(),
-            config.max_body_size,
-            config.multitenancy.routing_mode.supports_url_path(),
-            ui_bulk_provider.clone(),
-            patient_name_search,
-        )
-    };
-    #[cfg(not(all(feature = "ui", not(feature = "headless"))))]
-    let _ = (&ui_tenants, &ui_settings, &ui_bulk_provider);
+    let app = attach_ui(app, config, ui_tenants, ui_settings, ui_bulk_provider);
 
     let addr = config.socket_addr();
     info!(address = %addr, "Server listening");
@@ -758,7 +708,129 @@ async fn serve(
     Ok(())
 }
 
-#[cfg(all(feature = "ui", not(feature = "headless")))]
+/// Attaches the web UI surface to the FHIR router.
+///
+/// The UI is served when it is compiled in (the `ui` feature) **and** enabled at
+/// runtime (`HFS_UI_ENABLED`, default `true`). Otherwise `/ui` answers `404`
+/// with an OperationOutcome rather than falling through to the FHIR router,
+/// which reads `ui` as a resource type and replies `200` with an empty
+/// searchset — a missing UI must not present as success.
+///
+/// Headless operation is a *runtime* switch on purpose. It used to be a Cargo
+/// feature gated negatively (`not(feature = "headless")`). Because
+/// `--all-features` — the selection `ci.yml` uses to build the uploaded release
+/// artifacts — turns every feature on, it turned the UI off in every published
+/// binary, silently (#975). Negative Cargo features cannot express mutual
+/// exclusion; don't reintroduce one here.
+fn attach_ui(
+    app: axum::Router,
+    config: &ServerConfig,
+    ui_tenants: Option<Arc<dyn ResourceStorage>>,
+    ui_settings: Option<Arc<dyn SettingsStore>>,
+    ui_bulk_provider: Option<Arc<dyn BulkProviderStore>>,
+) -> axum::Router {
+    #[cfg(feature = "ui")]
+    {
+        if config.ui_enabled {
+            return mount_ui(app, config, ui_tenants, ui_settings, ui_bulk_provider);
+        }
+        info!("Web UI is DISABLED (HFS_UI_ENABLED=false)");
+    }
+    #[cfg(not(feature = "ui"))]
+    {
+        let _ = (config, &ui_tenants, &ui_settings, &ui_bulk_provider);
+    }
+    ui_absent_routes(app)
+}
+
+/// Answers `/ui` with `404` + OperationOutcome when the UI is not served.
+///
+/// Without this the path falls through to the FHIR router, which treats `ui` as
+/// an unknown resource type and returns `200` with an empty searchset — the
+/// reason the #975 regression looked like a healthy server.
+fn ui_absent_routes(app: axum::Router) -> axum::Router {
+    async fn not_found() -> impl axum::response::IntoResponse {
+        (
+            axum::http::StatusCode::NOT_FOUND,
+            [(
+                axum::http::header::CONTENT_TYPE,
+                "application/fhir+json; charset=utf-8",
+            )],
+            axum::Json(serde_json::json!({
+                "resourceType": "OperationOutcome",
+                "issue": [{
+                    "severity": "error",
+                    "code": "not-found",
+                    "diagnostics": "The web UI is not available on this server: it is \
+            either not compiled in (the `ui` build feature is off) or disabled at runtime \
+            (HFS_UI_ENABLED=false)."
+                }]
+            })),
+        )
+    }
+
+    app.route("/ui", axum::routing::any(not_found))
+        .route("/ui/", axum::routing::any(not_found))
+}
+
+/// Builds the UI router and merges it onto the FHIR app.
+#[cfg(feature = "ui")]
+fn mount_ui(
+    app: axum::Router,
+    config: &ServerConfig,
+    ui_tenants: Option<Arc<dyn ResourceStorage>>,
+    ui_settings: Option<Arc<dyn SettingsStore>>,
+    ui_bulk_provider: Option<Arc<dyn BulkProviderStore>>,
+) -> axum::Router {
+    // The UI reads SearchParameter/CompartmentDefinition from the server's
+    // own FHIR API over HTTP. It calls itself on the loopback address, with
+    // the configured outbound service token (HFS_OUTBOUND_BEARER_TOKEN) when
+    // set, or no credentials when auth is disabled.
+    //
+    // TODO(service-token): when auth is enabled, this relies on an operator
+    // provisioning a valid, non-expiring bearer via HFS_OUTBOUND_BEARER_TOKEN;
+    // without one the self-call is rejected and the conformance pages degrade
+    // to a warning. The follow-up is to mint a short-lived, auto-refreshed
+    // `system/SearchParameter.rs system/CompartmentDefinition.rs` token via
+    // the planned `JwtAssertionOutboundAuthProvider` (SMART Backend Services
+    // client_credentials + private_key_jwt; see crates/auth/src/outbound.rs)
+    // configured from HFS_UI_* client credentials. The `$sql-export`
+    // self-calls (#833) are the exception: they already carry the
+    // browser's own `Authorization` when it sent one (the `Caller` seam
+    // in `crates/ui/src/conformance.rs`), falling back to this service
+    // token only when the request had none.
+    let self_base_url = format!("http://127.0.0.1:{}", config.port);
+    let outbound_auth = AuthConfig::from_env().outbound_provider();
+    let patient_name_search = patient_name_search_support(
+        config
+            .storage_backend_mode()
+            .expect("storage backend was validated before server startup"),
+    );
+    helios_ui::mount_with_body_limit_and_tenant_routing(
+        app,
+        env!("CARGO_PKG_VERSION"),
+        config.data_dir.clone(),
+        helios_ui::NlSearch {
+            enabled: config.nl_search_enabled,
+            configured: config.nl_search_api_key.is_some(),
+            model: config.nl_search_model.clone(),
+        },
+        ui_tenants,
+        ui_settings,
+        config.default_tenant.clone(),
+        self_base_url,
+        outbound_auth,
+        config.default_fhir_version,
+        config.terminology_server.clone(),
+        config.base_url.clone(),
+        config.max_body_size,
+        config.multitenancy.routing_mode.supports_url_path(),
+        ui_bulk_provider,
+        patient_name_search,
+    )
+}
+
+#[cfg(feature = "ui")]
 fn patient_name_search_support(mode: StorageBackendMode) -> helios_ui::PatientNameSearchSupport {
     match mode {
         StorageBackendMode::S3 => helios_ui::PatientNameSearchSupport::IdOnly,
@@ -3157,7 +3229,7 @@ mod tests {
         );
     }
 
-    #[cfg(all(feature = "ui", not(feature = "headless")))]
+    #[cfg(feature = "ui")]
     #[test]
     fn test_patient_name_search_support_matches_storage_capability() {
         for (mode, expected) in [
@@ -3241,5 +3313,74 @@ mod tests {
             shared_file.is_ok(),
             "shared SQLite file path must be accepted"
         );
+    }
+
+    /// The regression guard for #975: whatever feature selection this test
+    /// binary was built with — `--all-features` in `ci.yml`'s `test-rust` job,
+    /// the same selection the release job uses for the uploaded artifacts —
+    /// the assembled router must actually serve the UI at `/ui`.
+    ///
+    /// Asserting on the served response rather than on a `cfg!` is the point:
+    /// the old bug was a *negative* feature (`not(feature = "headless")`) that
+    /// `--all-features` tripped, and no `cfg` assertion downstream of the mount
+    /// would have caught it.
+    #[cfg(feature = "ui")]
+    #[tokio::test]
+    async fn ui_is_served_under_this_builds_feature_selection() {
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+
+        let config = ServerConfig::default();
+        assert!(config.ui_enabled, "the UI must default to on");
+
+        let response = attach_ui(axum::Router::new(), &config, None, None, None)
+            .oneshot(
+                axum::http::Request::get("/ui")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::OK,
+            "GET /ui must be served by the UI router"
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let html = String::from_utf8_lossy(&body);
+        assert!(
+            html.contains("<html") || html.contains("<!DOCTYPE"),
+            "GET /ui must return HTML, got: {}",
+            &html[..html.len().min(200)]
+        );
+    }
+
+    /// Headless deployments turn the UI off at runtime, and `/ui` must then say
+    /// so with a 404 + OperationOutcome. Without the explicit stub the path
+    /// falls through to the FHIR router, which reads `ui` as a resource type
+    /// and answers `200` with an empty searchset (#975).
+    #[tokio::test]
+    async fn ui_disabled_at_runtime_answers_404_not_an_empty_searchset() {
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+
+        let mut config = ServerConfig::default();
+        config.ui_enabled = false;
+
+        let response = attach_ui(axum::Router::new(), &config, None, None, None)
+            .oneshot(
+                axum::http::Request::get("/ui")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), axum::http::StatusCode::NOT_FOUND);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let outcome: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(outcome["resourceType"], "OperationOutcome");
+        assert_eq!(outcome["issue"][0]["code"], "not-found");
     }
 }
