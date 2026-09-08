@@ -1173,7 +1173,7 @@ async fn queries_param_catalog_is_a_registry_fed_fragment() {
 
     assert_eq!(response.status(), StatusCode::OK);
     let html = body_text(response).await;
-    assert!(html.contains(r#"<datalist id="param-options">"#));
+    assert!(html.contains(r#"<datalist id="param-options" data-columns="#));
     // Real registry data: Patient's own params plus Resource-level ones.
     assert!(html.contains(r#"value="birthdate""#));
     assert!(html.contains(r#"value="_id""#));
@@ -1925,7 +1925,7 @@ async fn resources_page_has_the_filter_search_and_create_button() {
     // Patient, and the builder's URL is pre-filled so the no-JS form already
     // shows the query the client also runs on load.
     assert!(html.contains("Create new Patient"));
-    assert!(html.contains(r#"value="GET /Patient""#));
+    assert!(html.contains(r#"value="GET /Patient?_summary=true""#));
     // The client-side template for the label update on rail clicks (#605):
     // the literal `{type}` placeholder, not the interpolated per-request value.
     assert!(html.contains(r#"data-msg-create="Create new {type}""#));
@@ -1988,7 +1988,7 @@ async fn resources_deep_links_focus_the_selected_type() {
     assert!(html.contains(r#"class="filter-rail" id="resources""#));
     // Create and the builder prefill both follow the deep-linked type.
     assert!(html.contains("Create new Observation"));
-    assert!(html.contains(r#"value="GET /Observation""#));
+    assert!(html.contains(r#"value="GET /Observation?_summary=true""#));
 }
 
 #[tokio::test]

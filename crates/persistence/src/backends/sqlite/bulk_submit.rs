@@ -23,7 +23,9 @@ use crate::core::bulk_submit_worker::{
     ManifestFetchParams, ManifestLease, ManifestWorkerView, PollTokenTarget, SubmitClaimStrategy,
     SubmitFileRecord, SubmitFileRow, SubmitWorkerStorage,
 };
-use crate::error::{BackendError, BulkSubmitError, StorageError, StorageResult};
+use crate::error::{
+    BackendError, BulkSubmitError, StorageError, StorageResult, classify_sqlite_error,
+};
 use crate::tenant::{TenantContext, TenantId, TenantPermissions};
 
 use super::SqliteBackend;
@@ -59,6 +61,89 @@ fn internal_error(message: String) -> StorageError {
         message,
         source: None,
     })
+}
+
+/// Retry budget for a write guarded by `lease`.
+///
+/// Half the lease so the retries always end while the lease is still ours:
+/// each attempt can itself block for up to the connection's `busy_timeout`,
+/// so a budget counted in *attempts* rather than wall-clock time could run
+/// well past the lease, let it lapse, and let a second worker claim the
+/// manifest under us (#942).
+fn lease_retry_budget(lease: &ManifestLease) -> StdDuration {
+    lease.lease_duration / 2
+}
+
+/// Bounded retry for the manifest bookkeeping writes — the `bulk_manifests`
+/// lease, progress and lifecycle `UPDATE`s, and the `bulk_submit_files`
+/// insert — each of which runs outside the ingest batch's own transaction.
+///
+/// Every ingest batch holds SQLite's single write lock for its whole
+/// extraction + insert span, so a bookkeeping write queued behind such a hold
+/// can outlast `busy_timeout` and fail with `SQLITE_BUSY` even though the
+/// database is healthy. Aborting the whole manifest over one contended
+/// bookkeeping write is disproportionate (#942): these writes are safe to
+/// reissue — an attempt that fails busy/locked never acquired the write lock,
+/// so the statement was rolled back and changed nothing — and every one of
+/// them is guarded by the lease's `worker_id`/`fencing_token`. Each attempt
+/// checks out a fresh pooled connection so no pool slot is held across the
+/// backoff sleep.
+///
+/// `budget` bounds the *elapsed time* spent retrying, not the number of
+/// attempts, because a single attempt can block for a whole `busy_timeout`.
+/// The first attempt always runs, so a zero budget still issues the write
+/// once. Every caller holds a lease and so passes [`lease_retry_budget`].
+///
+/// Only busy/locked — classified as [`BackendError::Unavailable`] by
+/// [`classify_sqlite_error`] — is retried; every other error surfaces
+/// immediately. Call sites that report [`LeaseError`] must therefore classify
+/// with [`classify_sqlite_error`] *before* wrapping, or the busy never
+/// reaches this loop.
+///
+/// # Write paths deliberately left outside this helper
+///
+/// Two classes of write still abort on a busy, because retrying them is not
+/// obviously safe and needs its own design rather than being folded in here:
+///
+/// * The manifest **claim** (`claim_next_manifest`): a `SELECT` followed by an
+///   `UPDATE` that are not one atomic statement, and the `UPDATE` matches on
+///   the *old* fencing token, so a retry has to re-read the row rather than
+///   reissue the same statement. A lost claim is also self-healing — the
+///   manifest stays `pending` and the next poll picks it up.
+/// * The **per-entry** `bulk_submit_entries` inserts inside a batch
+///   transaction, and the manifest counter/`updated_at` writes that ride that
+///   same transaction. There the busy can surface on `COMMIT`, which leaves
+///   the transaction open, so a retry must roll back and replay the whole
+///   batch, not just the failing statement.
+async fn retry_bookkeeping_on_busy<T>(
+    what: &str,
+    budget: StdDuration,
+    mut attempt: impl FnMut() -> StorageResult<T>,
+) -> StorageResult<T> {
+    // Tokio's clock, not `std`'s, so the budget can be exercised under
+    // `tokio::time::pause()`. Identical behaviour on a live runtime.
+    let started = tokio::time::Instant::now();
+    let mut backoff = StdDuration::from_millis(50);
+    let mut attempt_no = 1u32;
+    loop {
+        match attempt() {
+            Err(StorageError::Backend(BackendError::Unavailable { message, .. }))
+                if started.elapsed() + backoff < budget =>
+            {
+                tracing::warn!(
+                    attempt = attempt_no,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    budget_ms = budget.as_millis() as u64,
+                    backoff_ms = backoff.as_millis() as u64,
+                    "sqlite busy during {what}; retrying: {message}"
+                );
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(StdDuration::from_secs(1));
+                attempt_no += 1;
+            }
+            other => return other,
+        }
+    }
 }
 
 #[async_trait]
@@ -1457,10 +1542,16 @@ impl SubmitClaimStrategy for SqliteBackend {
     }
 
     async fn heartbeat(&self, lease: &ManifestLease) -> Result<DateTime<Utc>, LeaseError> {
-        let conn = self.get_connection().map_err(LeaseError::Storage)?;
         let new_expiry = lease.renewed_expiry();
-        let affected = conn
-            .execute(
+        // The heartbeat competes with the ingest batches for the write lock, so
+        // it is exactly the write that must not give up on the first
+        // SQLITE_BUSY: dropping it is what lets the lease lapse under a healthy
+        // database (#942). Absolute expiry guarded by worker_id +
+        // fencing_token, so a retry is idempotent and a stale lease still
+        // loses.
+        let affected = retry_bookkeeping_on_busy("heartbeat", lease_retry_budget(lease), || {
+            let conn = self.get_connection()?;
+            conn.execute(
                 "UPDATE bulk_manifests SET lease_expiry = ?1
                  WHERE tenant_id = ?2 AND submitter = ?3 AND submission_id = ?4
                    AND manifest_id = ?5 AND worker_id = ?6 AND fencing_token = ?7",
@@ -1474,7 +1565,10 @@ impl SubmitClaimStrategy for SqliteBackend {
                     lease.fencing_token as i64
                 ],
             )
-            .map_err(|e| LeaseError::Storage(internal_error(format!("heartbeat failed: {e}"))))?;
+            .map_err(|e| StorageError::Backend(classify_sqlite_error("heartbeat failed", e)))
+        })
+        .await
+        .map_err(LeaseError::Storage)?;
         if affected == 0 {
             Err(lease_lost(lease))
         } else {
@@ -1602,22 +1696,31 @@ impl SubmitWorkerStorage for SqliteBackend {
     }
 
     async fn mark_manifest_processing(&self, lease: &ManifestLease) -> Result<(), LeaseError> {
-        let conn = self.get_connection().map_err(LeaseError::Storage)?;
-        let affected = conn
-            .execute(
-                "UPDATE bulk_manifests SET status = 'processing'
+        // Idempotent status write guarded by worker_id + fencing_token: a busy
+        // retry re-applies the same value, and a stale lease still loses (#942).
+        let affected = retry_bookkeeping_on_busy(
+            "mark manifest processing",
+            lease_retry_budget(lease),
+            || {
+                let conn = self.get_connection()?;
+                conn.execute(
+                    "UPDATE bulk_manifests SET status = 'processing'
                  WHERE tenant_id = ?1 AND submitter = ?2 AND submission_id = ?3
                    AND manifest_id = ?4 AND worker_id = ?5 AND fencing_token = ?6",
-                params![
-                    lease.tenant.tenant_id().as_str(),
-                    lease.submission_id.submitter,
-                    lease.submission_id.submission_id,
-                    lease.manifest_id,
-                    lease.worker_id.as_str(),
-                    lease.fencing_token as i64
-                ],
-            )
-            .map_err(|e| LeaseError::Storage(internal_error(format!("mark processing: {e}"))))?;
+                    params![
+                        lease.tenant.tenant_id().as_str(),
+                        lease.submission_id.submitter,
+                        lease.submission_id.submission_id,
+                        lease.manifest_id,
+                        lease.worker_id.as_str(),
+                        lease.fencing_token as i64
+                    ],
+                )
+                .map_err(|e| StorageError::Backend(classify_sqlite_error("mark processing", e)))
+            },
+        )
+        .await
+        .map_err(LeaseError::Storage)?;
         if affected == 0 {
             Err(lease_lost(lease))
         } else {
@@ -1632,26 +1735,35 @@ impl SubmitWorkerStorage for SqliteBackend {
         failed_entries: u64,
         last_processed_line: u64,
     ) -> Result<(), LeaseError> {
-        let conn = self.get_connection().map_err(LeaseError::Storage)?;
-        let affected = conn
-            .execute(
-                "UPDATE bulk_manifests
+        // Absolute-value write guarded by worker_id + fencing_token, so a
+        // busy retry is idempotent and a stale lease still loses (#942).
+        let affected = retry_bookkeeping_on_busy(
+            "manifest progress update",
+            lease_retry_budget(lease),
+            || {
+                let conn = self.get_connection()?;
+                conn.execute(
+                    "UPDATE bulk_manifests
                  SET processed_entries = ?1, failed_entries = ?2, last_processed_line = ?3
                  WHERE tenant_id = ?4 AND submitter = ?5 AND submission_id = ?6
                    AND manifest_id = ?7 AND worker_id = ?8 AND fencing_token = ?9",
-                params![
-                    processed_entries as i64,
-                    failed_entries as i64,
-                    last_processed_line as i64,
-                    lease.tenant.tenant_id().as_str(),
-                    lease.submission_id.submitter,
-                    lease.submission_id.submission_id,
-                    lease.manifest_id,
-                    lease.worker_id.as_str(),
-                    lease.fencing_token as i64
-                ],
-            )
-            .map_err(|e| LeaseError::Storage(internal_error(format!("update progress: {e}"))))?;
+                    params![
+                        processed_entries as i64,
+                        failed_entries as i64,
+                        last_processed_line as i64,
+                        lease.tenant.tenant_id().as_str(),
+                        lease.submission_id.submitter,
+                        lease.submission_id.submission_id,
+                        lease.manifest_id,
+                        lease.worker_id.as_str(),
+                        lease.fencing_token as i64
+                    ],
+                )
+                .map_err(|e| StorageError::Backend(classify_sqlite_error("update progress", e)))
+            },
+        )
+        .await
+        .map_err(LeaseError::Storage)?;
         if affected == 0 {
             Err(lease_lost(lease))
         } else {
@@ -1665,26 +1777,32 @@ impl SubmitWorkerStorage for SqliteBackend {
         bytes_processed: u64,
         bytes_total: u64,
     ) -> Result<(), LeaseError> {
-        let conn = self.get_connection().map_err(LeaseError::Storage)?;
-        let affected = conn
-            .execute(
-                "UPDATE bulk_manifests
+        // MAX() keeps the write monotonic, so a busy retry is idempotent and
+        // the worker_id + fencing_token guard still fences stale leases (#942).
+        let affected =
+            retry_bookkeeping_on_busy("manifest bytes update", lease_retry_budget(lease), || {
+                let conn = self.get_connection()?;
+                conn.execute(
+                    "UPDATE bulk_manifests
                  SET bytes_processed = MAX(bytes_processed, ?1),
                      bytes_total = MAX(bytes_total, ?2)
                  WHERE tenant_id = ?3 AND submitter = ?4 AND submission_id = ?5
                    AND manifest_id = ?6 AND worker_id = ?7 AND fencing_token = ?8",
-                params![
-                    bytes_processed as i64,
-                    bytes_total as i64,
-                    lease.tenant.tenant_id().as_str(),
-                    lease.submission_id.submitter,
-                    lease.submission_id.submission_id,
-                    lease.manifest_id,
-                    lease.worker_id.as_str(),
-                    lease.fencing_token as i64
-                ],
-            )
-            .map_err(|e| LeaseError::Storage(internal_error(format!("update bytes: {e}"))))?;
+                    params![
+                        bytes_processed as i64,
+                        bytes_total as i64,
+                        lease.tenant.tenant_id().as_str(),
+                        lease.submission_id.submitter,
+                        lease.submission_id.submission_id,
+                        lease.manifest_id,
+                        lease.worker_id.as_str(),
+                        lease.fencing_token as i64
+                    ],
+                )
+                .map_err(|e| StorageError::Backend(classify_sqlite_error("update bytes", e)))
+            })
+            .await
+            .map_err(LeaseError::Storage)?;
         if affected == 0 {
             Err(lease_lost(lease))
         } else {
@@ -1697,75 +1815,98 @@ impl SubmitWorkerStorage for SqliteBackend {
         lease: &ManifestLease,
         file: &SubmitFileRecord,
     ) -> Result<(), LeaseError> {
-        let conn = self.get_connection().map_err(LeaseError::Storage)?;
-        // Fence: only record if we still hold the lease.
-        let holds: bool = conn
-            .query_row(
-                "SELECT 1 FROM bulk_manifests
-                 WHERE tenant_id = ?1 AND submitter = ?2 AND submission_id = ?3
-                   AND manifest_id = ?4 AND worker_id = ?5 AND fencing_token = ?6",
-                params![
-                    lease.tenant.tenant_id().as_str(),
-                    lease.submission_id.submitter,
-                    lease.submission_id.submission_id,
-                    lease.manifest_id,
-                    lease.worker_id.as_str(),
-                    lease.fencing_token as i64
-                ],
-                |_| Ok(true),
-            )
-            .unwrap_or(false);
-        if !holds {
-            return Err(lease_lost(lease));
-        }
-
         let count_severity = file
             .count_severity
             .as_ref()
             .and_then(|v| serde_json::to_string(v).ok());
-        conn.execute(
-            "INSERT INTO bulk_submit_files
+        // This row is what the status manifest lists a file from, so dropping
+        // it on a busy silently truncates the output (#942). The INSERT is a
+        // single statement: a busy one never took the write lock and applied
+        // nothing, so reissuing it cannot duplicate the row. The fence is
+        // re-read on every attempt so a lease lost while we were backing off
+        // still stops the write. `false` means the fence no longer matches.
+        let holds =
+            retry_bookkeeping_on_busy("record submit file", lease_retry_budget(lease), || {
+                let conn = self.get_connection()?;
+                let holds: bool = conn
+                    .query_row(
+                        "SELECT 1 FROM bulk_manifests
+                 WHERE tenant_id = ?1 AND submitter = ?2 AND submission_id = ?3
+                   AND manifest_id = ?4 AND worker_id = ?5 AND fencing_token = ?6",
+                        params![
+                            lease.tenant.tenant_id().as_str(),
+                            lease.submission_id.submitter,
+                            lease.submission_id.submission_id,
+                            lease.manifest_id,
+                            lease.worker_id.as_str(),
+                            lease.fencing_token as i64
+                        ],
+                        |_| Ok(true),
+                    )
+                    .unwrap_or(false);
+                if !holds {
+                    return Ok(false);
+                }
+                conn.execute(
+                    "INSERT INTO bulk_submit_files
              (tenant_id, submitter, submission_id, manifest_url, file_type, resource_type,
               part_index, fencing_token, file_path, line_count, byte_count, count_severity,
               created_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
-            params![
-                lease.tenant.tenant_id().as_str(),
-                lease.submission_id.submitter,
-                lease.submission_id.submission_id,
-                file.manifest_url,
-                file.file_type,
-                file.resource_type,
-                file.part_index as i64,
-                lease.fencing_token as i64,
-                file.file_path,
-                file.line_count as i64,
-                file.byte_count as i64,
-                count_severity,
-                Utc::now().to_rfc3339()
-            ],
-        )
-        .map_err(|e| LeaseError::Storage(internal_error(format!("record submit file: {e}"))))?;
+                    params![
+                        lease.tenant.tenant_id().as_str(),
+                        lease.submission_id.submitter,
+                        lease.submission_id.submission_id,
+                        file.manifest_url,
+                        file.file_type,
+                        file.resource_type,
+                        file.part_index as i64,
+                        lease.fencing_token as i64,
+                        file.file_path,
+                        file.line_count as i64,
+                        file.byte_count as i64,
+                        count_severity,
+                        Utc::now().to_rfc3339()
+                    ],
+                )
+                .map_err(|e| {
+                    StorageError::Backend(classify_sqlite_error("record submit file", e))
+                })?;
+                Ok(true)
+            })
+            .await
+            .map_err(LeaseError::Storage)?;
+        if !holds {
+            return Err(lease_lost(lease));
+        }
         Ok(())
     }
 
     async fn finish_manifest(&self, lease: &ManifestLease) -> Result<(), LeaseError> {
-        let conn = self.get_connection().map_err(LeaseError::Storage)?;
-        let affected = conn
-            .execute(
-                "UPDATE bulk_manifests SET status = 'completed', worker_id = NULL, lease_expiry = NULL
+        // Losing this write to a busy would leave a fully ingested manifest
+        // stuck in 'processing' until its lease expires and a worker redoes it
+        // (#942). Guarded by worker_id + fencing_token, and it clears both, so
+        // only the first attempt to land can match.
+        let affected =
+            retry_bookkeeping_on_busy("finish manifest", lease_retry_budget(lease), || {
+                let conn = self.get_connection()?;
+                conn.execute(
+                    "UPDATE bulk_manifests SET status = 'completed', worker_id = NULL, lease_expiry = NULL
                  WHERE tenant_id = ?1 AND submitter = ?2 AND submission_id = ?3
                    AND manifest_id = ?4 AND worker_id = ?5 AND fencing_token = ?6",
-                params![
-                    lease.tenant.tenant_id().as_str(),
-                    lease.submission_id.submitter,
-                    lease.submission_id.submission_id,
-                    lease.manifest_id,
-                    lease.worker_id.as_str(),
-                    lease.fencing_token as i64
-                ],
-            )
-            .map_err(|e| LeaseError::Storage(internal_error(format!("finish manifest: {e}"))))?;
+                    params![
+                        lease.tenant.tenant_id().as_str(),
+                        lease.submission_id.submitter,
+                        lease.submission_id.submission_id,
+                        lease.manifest_id,
+                        lease.worker_id.as_str(),
+                        lease.fencing_token as i64
+                    ],
+                )
+                .map_err(|e| StorageError::Backend(classify_sqlite_error("finish manifest", e)))
+            })
+            .await
+            .map_err(LeaseError::Storage)?;
         if affected == 0 {
             Err(lease_lost(lease))
         } else {
@@ -1778,9 +1919,13 @@ impl SubmitWorkerStorage for SqliteBackend {
         lease: &ManifestLease,
         _error_message: &str,
     ) -> Result<(), LeaseError> {
-        let conn = self.get_connection().map_err(LeaseError::Storage)?;
-        let affected = conn
-            .execute(
+        // Same reasoning as `finish_manifest`: a busy here would hide the
+        // terminal state and leave the manifest to be retried on lease expiry
+        // (#942). Guarded and self-clearing, so the retry is idempotent.
+        let affected =
+            retry_bookkeeping_on_busy("fail manifest", lease_retry_budget(lease), || {
+                let conn = self.get_connection()?;
+                conn.execute(
                 "UPDATE bulk_manifests SET status = 'failed', worker_id = NULL, lease_expiry = NULL
                  WHERE tenant_id = ?1 AND submitter = ?2 AND submission_id = ?3
                    AND manifest_id = ?4 AND worker_id = ?5 AND fencing_token = ?6",
@@ -1793,7 +1938,10 @@ impl SubmitWorkerStorage for SqliteBackend {
                     lease.fencing_token as i64
                 ],
             )
-            .map_err(|e| LeaseError::Storage(internal_error(format!("fail manifest: {e}"))))?;
+            .map_err(|e| StorageError::Backend(classify_sqlite_error("fail manifest", e)))
+            })
+            .await
+            .map_err(LeaseError::Storage)?;
         if affected == 0 {
             Err(lease_lost(lease))
         } else {
@@ -2717,5 +2865,106 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    fn sqlite_busy() -> StorageError {
+        StorageError::Backend(BackendError::Unavailable {
+            backend_name: "sqlite".to_string(),
+            message: "database is locked".to_string(),
+        })
+    }
+
+    /// #942: a bookkeeping write that hits SQLITE_BUSY (classified as
+    /// `Unavailable`) is retried and succeeds once the contention clears,
+    /// instead of aborting the manifest. `start_paused` auto-advances the
+    /// backoff sleeps.
+    #[tokio::test(start_paused = true)]
+    async fn busy_bookkeeping_write_is_retried_until_it_succeeds() {
+        let attempts = std::sync::atomic::AtomicU32::new(0);
+        let result = retry_bookkeeping_on_busy("test write", StdDuration::from_secs(30), || {
+            let n = attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if n < 2 {
+                Err(sqlite_busy())
+            } else {
+                Ok(7usize)
+            }
+        })
+        .await;
+        assert_eq!(result.unwrap(), 7);
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
+
+    /// #942: sustained contention is still surfaced — the retry loop is
+    /// bounded, and the final error is the classified busy error.
+    #[tokio::test(start_paused = true)]
+    async fn busy_bookkeeping_write_gives_up_when_the_budget_runs_out() {
+        let attempts = std::sync::atomic::AtomicU32::new(0);
+        let started = tokio::time::Instant::now();
+        // 50 + 100 + 200 ms of backoff fit; the next 400 ms would not.
+        let result: StorageResult<()> =
+            retry_bookkeeping_on_busy("test write", StdDuration::from_millis(500), || {
+                attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Err(sqlite_busy())
+            })
+            .await;
+        assert!(matches!(
+            result,
+            Err(StorageError::Backend(BackendError::Unavailable { .. }))
+        ));
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 4);
+        // The point of the budget: it never overruns what the caller allowed.
+        assert!(started.elapsed() < StdDuration::from_millis(500));
+    }
+
+    /// #942: the budget is wall-clock, not a number of attempts, so a caller
+    /// with no time to spare still issues the write exactly once rather than
+    /// skipping it.
+    #[tokio::test(start_paused = true)]
+    async fn a_zero_budget_still_attempts_the_write_once() {
+        let attempts = std::sync::atomic::AtomicU32::new(0);
+        let result: StorageResult<()> =
+            retry_bookkeeping_on_busy("test write", StdDuration::ZERO, || {
+                attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Err(sqlite_busy())
+            })
+            .await;
+        assert!(result.is_err());
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// #942: the reason the budget exists — a lease-guarded write must finish
+    /// retrying well inside the lease, so another worker cannot claim the
+    /// manifest while we are still backing off.
+    #[test]
+    fn lease_retry_budget_is_half_the_lease() {
+        let lease = ManifestLease {
+            tenant: create_test_tenant(),
+            submission_id: SubmissionId::new("s", "m"),
+            manifest_id: "manifest-1".to_string(),
+            worker_id: WorkerId::new("w1"),
+            lease_expiry: Utc::now(),
+            lease_duration: StdDuration::from_secs(60),
+            fencing_token: 1,
+        };
+        assert_eq!(lease_retry_budget(&lease), StdDuration::from_secs(30));
+        assert!(lease_retry_budget(&lease) < lease.lease_duration);
+    }
+
+    /// #942: only busy/locked retries — any other error surfaces on the
+    /// first attempt, exactly as before.
+    #[tokio::test]
+    async fn non_busy_bookkeeping_error_is_not_retried() {
+        let attempts = std::sync::atomic::AtomicU32::new(0);
+        let result: StorageResult<()> =
+            retry_bookkeeping_on_busy("test write", StdDuration::from_secs(30), || {
+                attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Err(internal_error("constraint violation".to_string()))
+            })
+            .await;
+        assert!(matches!(
+            result,
+            Err(StorageError::Backend(BackendError::Internal { .. }))
+        ));
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 }

@@ -31,6 +31,7 @@ use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use tracing::warn;
 
 /// A window the dashboard chart can be viewed over, pairing a span with the
 /// bucket width that samples it.
@@ -251,6 +252,26 @@ const CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(15);
 /// placeholder figures. Long enough for row-store backends (milliseconds);
 /// deliberately far below what an object-store scan can take.
 const COLD_WAIT: std::time::Duration = std::time::Duration::from_millis(800);
+/// How long a background compute may run before the cache stops waiting on it
+/// and frees the refresh slot (#959).
+///
+/// Without this, a compute that never returns — a snapshot stuck behind a
+/// 30s connection-pool acquire, say — leaves its cache entry pinned at
+/// `computing: true` forever, and *no* later request ever spawns a refresh:
+/// the entry goes permanently stale (or, if it was cold, permanently absent)
+/// for the lifetime of the process.
+///
+/// The value is deliberately ≥ 2× [`CACHE_TTL`]. Anything shorter and a
+/// slow-but-progressing compute would be abandoned on nearly every pass, so
+/// the cache would never land a value while detached computes piled up behind
+/// each other — replacing a stuck entry with a stampede.
+///
+/// Honest limitation: elapsing only releases the `computing` flag. It does
+/// **not** cancel the underlying work — for the SQLite backend that work runs
+/// on `spawn_blocking` and is not cancellable at all, and even for async
+/// backends the detached task is free to finish and write its (late) value.
+/// So this prevents permanent lockout, not wasted work.
+const COMPUTE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// The outcome of a dashboard read. The two ways of not having a snapshot are
 /// kept apart on purpose (#956): "this build has no metrics" and "the metrics
@@ -308,6 +329,9 @@ pub async fn snapshot(
 /// where computing the snapshot walks storage (the S3 primary reads one object
 /// per resource — minutes once conformance seeding has populated the store,
 /// #326).
+///
+/// A background refresh that overruns [`COMPUTE_TIMEOUT`] releases its refresh
+/// slot, so a single stuck compute cannot freeze the entry forever (#959).
 pub async fn snapshot_state(
     window: DashboardWindow,
     tenant: &str,
@@ -326,6 +350,7 @@ pub async fn snapshot_state(
         include_empty,
         CACHE_TTL,
         COLD_WAIT,
+        COMPUTE_TIMEOUT,
     )
     .await
 }
@@ -344,6 +369,7 @@ async fn snapshot_via(
     include_empty: bool,
     ttl: std::time::Duration,
     cold_wait: std::time::Duration,
+    compute_timeout: std::time::Duration,
 ) -> SnapshotState {
     // The charted set (and the "View all resources" toggle, #599) is part of
     // the cache identity: two selections — or the same selection with the
@@ -381,14 +407,42 @@ async fn snapshot_via(
         let tenant = tenant.to_string();
         let types = types.to_vec();
         tokio::spawn(async move {
-            let value = provider
-                .snapshot(window, &tenant, &types, include_empty)
-                .await;
-            if let Ok(mut guard) = cache.write()
-                && let Some(entry) = guard.get_mut(&key)
-            {
-                entry.value = Some((std::time::Instant::now(), value));
-                entry.computing = false;
+            // Time-boxed: a compute that never returns must not pin
+            // `computing: true` forever, which would stop every later request
+            // from ever spawning a refresh and freeze the entry permanently
+            // (#959). Note this releases the *slot*, not the work: the inner
+            // future is dropped here, but a `spawn_blocking` query behind it
+            // (the SQLite backend) keeps running to completion regardless.
+            let computed = tokio::time::timeout(
+                compute_timeout,
+                provider.snapshot(window, &tenant, &types, include_empty),
+            )
+            .await;
+            match computed {
+                Ok(value) => {
+                    if let Ok(mut guard) = cache.write()
+                        && let Some(entry) = guard.get_mut(&key)
+                    {
+                        entry.value = Some((std::time::Instant::now(), value));
+                        entry.computing = false;
+                    }
+                }
+                Err(_elapsed) => {
+                    warn!(
+                        window = window.as_str(),
+                        tenant = %tenant,
+                        timeout_ms = compute_timeout.as_millis() as u64,
+                        "dashboard snapshot compute timed out; releasing the refresh slot"
+                    );
+                    // Clear the flag but write no value: the entry keeps
+                    // whatever (stale) snapshot it had, and the next request
+                    // is free to retry.
+                    if let Ok(mut guard) = cache.write()
+                        && let Some(entry) = guard.get_mut(&key)
+                    {
+                        entry.computing = false;
+                    }
+                }
             }
         });
     }
@@ -420,6 +474,10 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+
+    /// Compute budget for the tests that are not about the timeout: far longer
+    /// than any fake provider's delay, so it never fires.
+    const TEST_COMPUTE_TIMEOUT: Duration = Duration::from_secs(30);
 
     /// Counts computes and answers with that count as `total_resources`, after
     /// an optional delay — enough to tell cached from recomputed values apart.
@@ -474,6 +532,7 @@ mod tests {
             false,
             ttl,
             cold,
+            TEST_COMPUTE_TIMEOUT,
         )
         .await
         .ready()
@@ -489,6 +548,7 @@ mod tests {
             false,
             ttl,
             cold,
+            TEST_COMPUTE_TIMEOUT,
         )
         .await
         .ready()
@@ -517,6 +577,7 @@ mod tests {
             false,
             ttl,
             cold,
+            TEST_COMPUTE_TIMEOUT,
         )
         .await
         .ready()
@@ -532,6 +593,7 @@ mod tests {
             false,
             ttl,
             cold,
+            TEST_COMPUTE_TIMEOUT,
         )
         .await
         .ready()
@@ -554,6 +616,7 @@ mod tests {
             false,
             ttl,
             cold,
+            TEST_COMPUTE_TIMEOUT,
         )
         .await
         .ready()
@@ -585,6 +648,7 @@ mod tests {
             false,
             ttl,
             cold,
+            TEST_COMPUTE_TIMEOUT,
         )
         .await;
         assert!(
@@ -602,6 +666,7 @@ mod tests {
             false,
             ttl,
             cold,
+            TEST_COMPUTE_TIMEOUT,
         )
         .await
         .ready()
@@ -611,6 +676,127 @@ mod tests {
             provider.hits.load(Ordering::SeqCst),
             1,
             "single-flight: no compute stampede"
+        );
+    }
+
+    /// Hangs on its first compute — past any timeout a test would use — and
+    /// answers instantly afterwards. That asymmetry is what makes the timeout
+    /// observable: only a *second* spawned compute can land a value, and a
+    /// second compute is only spawned if the first one's refresh slot was
+    /// released.
+    struct HangsOnce {
+        hits: AtomicUsize,
+        first_delay: Duration,
+    }
+
+    impl HangsOnce {
+        fn new(first_delay: Duration) -> Arc<Self> {
+            Arc::new(HangsOnce {
+                hits: AtomicUsize::new(0),
+                first_delay,
+            })
+        }
+    }
+
+    #[async_trait]
+    impl DashboardProvider for HangsOnce {
+        async fn snapshot(
+            &self,
+            window: DashboardWindow,
+            _tenant: &str,
+            _types: &[String],
+            _include_empty: bool,
+        ) -> DashboardSnapshot {
+            let hit = self.hits.fetch_add(1, Ordering::SeqCst) + 1;
+            if hit == 1 {
+                tokio::time::sleep(self.first_delay).await;
+            }
+            DashboardSnapshot {
+                total_resources: hit as u64,
+                window,
+                ..DashboardSnapshot::default()
+            }
+        }
+    }
+
+    /// A compute that overruns `compute_timeout` must release its refresh slot
+    /// (#959). Before the time-box, `computing` stayed `true` forever and the
+    /// entry could never be refreshed again for the life of the process — this
+    /// test would hang at [`SnapshotState::Pending`] on the second call.
+    #[tokio::test]
+    async fn timed_out_compute_releases_the_slot_so_a_later_request_retries() {
+        let cache = SnapCache::default();
+        // Effectively never returns within this test.
+        let provider = HangsOnce::new(Duration::from_secs(30));
+        let ttl = Duration::from_secs(60);
+        let cold = Duration::from_millis(80);
+        let compute_timeout = Duration::from_millis(150);
+
+        let first = snapshot_via(
+            cache.clone(),
+            provider.clone(),
+            DashboardWindow::LastMonth,
+            "default",
+            &[],
+            false,
+            ttl,
+            cold,
+            compute_timeout,
+        )
+        .await;
+        assert!(
+            matches!(first, SnapshotState::Pending),
+            "the stuck compute cannot fill the cache, and a registered provider \
+             that is merely slow is pending, never absent (#956)"
+        );
+        assert_eq!(provider.hits.load(Ordering::SeqCst), 1);
+
+        // Let the time-box elapse and the spawned task clear `computing`.
+        for _ in 0..40 {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            if cache
+                .read()
+                .ok()
+                .and_then(|g| g.values().next().map(|e| !e.computing))
+                .unwrap_or(false)
+            {
+                break;
+            }
+        }
+        {
+            let guard = cache.read().expect("cache readable");
+            let entry = guard.values().next().expect("the entry exists");
+            assert!(
+                !entry.computing,
+                "the elapsed compute must free the refresh slot"
+            );
+            assert!(
+                entry.value.is_none(),
+                "a timed-out compute writes no value, it only frees the slot"
+            );
+        }
+
+        // With the slot free, the next request spawns a fresh compute — which
+        // is instant this time — and a value finally lands.
+        let second = snapshot_via(
+            cache,
+            provider.clone(),
+            DashboardWindow::LastMonth,
+            "default",
+            &[],
+            false,
+            ttl,
+            cold,
+            compute_timeout,
+        )
+        .await
+        .ready()
+        .expect("a new compute was spawned and landed");
+        assert_eq!(second.total_resources, 2);
+        assert_eq!(
+            provider.hits.load(Ordering::SeqCst),
+            2,
+            "exactly one retry, not a stampede"
         );
     }
 
@@ -690,6 +876,7 @@ mod tests {
             false,
             ttl,
             cold,
+            TEST_COMPUTE_TIMEOUT,
         )
         .await
         .ready()
@@ -705,6 +892,7 @@ mod tests {
             true,
             ttl,
             cold,
+            TEST_COMPUTE_TIMEOUT,
         )
         .await
         .ready()
