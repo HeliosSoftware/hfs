@@ -2553,6 +2553,248 @@ async fn mongodb_integration_search_cursor_pagination_roundtrip() {
 }
 
 #[tokio::test]
+async fn mongodb_integration_search_missing_not_and_param_sort() {
+    let Some(backend) = create_backend_with_full_registry("search_missing_not_sort").await else {
+        eprintln!(
+            "Skipping mongodb_integration_search_missing_not_and_param_sort (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+
+    let tenant = create_tenant("tenant-missing-not-sort");
+
+    for (id, gender, birth_date) in [
+        ("patient-mns-1", Some("male"), Some("1990-05-01")),
+        ("patient-mns-2", Some("female"), Some("1975-03-20")),
+        ("patient-mns-3", None, Some("2001-11-11")),
+        ("patient-mns-4", Some("female"), None),
+    ] {
+        let mut resource = json!({
+            "resourceType": "Patient",
+            "id": id,
+            "name": [{"family": format!("Mns-{}", id)}],
+        });
+        if let Some(gender) = gender {
+            resource["gender"] = json!(gender);
+        }
+        if let Some(birth_date) = birth_date {
+            resource["birthDate"] = json!(birth_date);
+        }
+        backend
+            .create(&tenant, "Patient", resource, FhirVersion::default())
+            .await
+            .unwrap();
+    }
+
+    let ids = |result: &helios_persistence::core::SearchResult| {
+        result
+            .resources
+            .items
+            .iter()
+            .map(|r| r.id().to_string())
+            .collect::<Vec<_>>()
+    };
+
+    // :missing=true — only the patient with no gender at all.
+    let missing_true = SearchQuery::new("Patient").with_parameter(SearchParameter {
+        name: "gender".to_string(),
+        param_type: SearchParamType::Token,
+        modifier: Some(SearchModifier::Missing),
+        values: vec![SearchValue::eq("true")],
+        chain: vec![],
+        components: vec![],
+    });
+    let result = backend.search(&tenant, &missing_true).await.unwrap();
+    assert_eq!(ids(&result), vec!["patient-mns-3"]);
+
+    // :missing=false — everyone with a gender value.
+    let missing_false = SearchQuery::new("Patient").with_parameter(SearchParameter {
+        name: "gender".to_string(),
+        param_type: SearchParamType::Token,
+        modifier: Some(SearchModifier::Missing),
+        values: vec![SearchValue::eq("false")],
+        chain: vec![],
+        components: vec![],
+    });
+    let result = backend.search(&tenant, &missing_false).await.unwrap();
+    let mut got = ids(&result);
+    got.sort();
+    assert_eq!(got, vec!["patient-mns-1", "patient-mns-2", "patient-mns-4"]);
+
+    // :not — excludes matches AND includes resources without the value (per spec).
+    let not_male = SearchQuery::new("Patient").with_parameter(SearchParameter {
+        name: "gender".to_string(),
+        param_type: SearchParamType::Token,
+        modifier: Some(SearchModifier::Not),
+        values: vec![SearchValue::eq("male")],
+        chain: vec![],
+        components: vec![],
+    });
+    let result = backend.search(&tenant, &not_male).await.unwrap();
+    let mut got = ids(&result);
+    got.sort();
+    assert_eq!(got, vec!["patient-mns-2", "patient-mns-3", "patient-mns-4"]);
+
+    // _sort by an indexed date parameter, ascending; the patient without a
+    // birthDate sorts last.
+    let sorted = SearchQuery::new("Patient")
+        .with_sort(SortDirective::parse("birthdate").with_param_type(Some(SearchParamType::Date)));
+    let result = backend.search(&tenant, &sorted).await.unwrap();
+    assert_eq!(
+        ids(&result),
+        vec![
+            "patient-mns-2",
+            "patient-mns-1",
+            "patient-mns-3",
+            "patient-mns-4"
+        ]
+    );
+
+    // Descending; keyed resources reverse, the unkeyed one still sorts last.
+    let sorted_desc = SearchQuery::new("Patient")
+        .with_sort(SortDirective::parse("-birthdate").with_param_type(Some(SearchParamType::Date)));
+    let result = backend.search(&tenant, &sorted_desc).await.unwrap();
+    assert_eq!(
+        ids(&result),
+        vec![
+            "patient-mns-3",
+            "patient-mns-1",
+            "patient-mns-2",
+            "patient-mns-4"
+        ]
+    );
+
+    // Param sort composes with filters and offset pagination.
+    let mut filtered_sorted = SearchQuery::new("Patient")
+        .with_parameter(SearchParameter {
+            name: "gender".to_string(),
+            param_type: SearchParamType::Token,
+            modifier: Some(SearchModifier::Missing),
+            values: vec![SearchValue::eq("false")],
+            chain: vec![],
+            components: vec![],
+        })
+        .with_sort(SortDirective::parse("birthdate").with_param_type(Some(SearchParamType::Date)))
+        .with_count(2);
+    let page1 = backend.search(&tenant, &filtered_sorted).await.unwrap();
+    assert_eq!(ids(&page1), vec!["patient-mns-2", "patient-mns-1"]);
+    assert!(page1.resources.page_info.has_next);
+    assert!(page1.resources.page_info.next_cursor.is_none());
+
+    filtered_sorted.offset = Some(2);
+    let page2 = backend.search(&tenant, &filtered_sorted).await.unwrap();
+    assert_eq!(ids(&page2), vec!["patient-mns-4"]);
+    assert!(!page2.resources.page_info.has_next);
+    assert!(page2.resources.page_info.has_previous);
+}
+
+/// The in-DB runner compiles no compartment predicate, so a run carrying
+/// `patient`/`group` filters is handed to the in-process engine over a scan
+/// of the same collection instead of failing as uncompilable — and answers
+/// the rows the SQL runners answer for the same filters. An unfiltered run
+/// still takes the aggregation pipeline.
+#[tokio::test]
+async fn mongodb_integration_sof_runner_compartment_filters_fall_back_in_process() {
+    use helios_persistence::core::sof_runner::{SofRunner, ViewFilters};
+    use tokio_stream::StreamExt;
+
+    let Some(backend) = create_backend("sof_compartment_fallback").await else {
+        eprintln!(
+            "Skipping mongodb_integration_sof_runner_compartment_filters_fall_back_in_process (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = create_tenant("tenant-sof-compartment-fallback");
+
+    for resource in [
+        json!({ "resourceType": "Patient", "id": "sof-p1" }),
+        json!({ "resourceType": "Patient", "id": "sof-p2" }),
+        json!({
+            "resourceType": "Group",
+            "id": "sof-g1",
+            "type": "person",
+            "actual": true,
+            "member": [{ "entity": { "reference": "Patient/sof-p1" } }]
+        }),
+        json!({
+            "resourceType": "Observation",
+            "id": "sof-o1",
+            "status": "final",
+            "code": { "text": "x" },
+            "subject": { "reference": "Patient/sof-p1" }
+        }),
+        json!({
+            "resourceType": "Observation",
+            "id": "sof-o2",
+            "status": "final",
+            "code": { "text": "x" },
+            "subject": { "reference": "Patient/sof-p2" }
+        }),
+    ] {
+        let resource_type = resource["resourceType"].as_str().unwrap().to_string();
+        backend
+            .create(&tenant, &resource_type, resource, FhirVersion::default())
+            .await
+            .unwrap();
+    }
+
+    async fn observation_ids(
+        runner: &dyn SofRunner,
+        tenant: &TenantContext,
+        filters: ViewFilters,
+    ) -> Vec<String> {
+        let view = json!({
+            "resourceType": "ViewDefinition",
+            "resource": "Observation",
+            "status": "active",
+            "select": [{ "column": [{ "path": "id", "name": "obs_id" }] }]
+        });
+        let mut stream = runner
+            .run_view(tenant, view, filters)
+            .await
+            .expect("run_view must succeed");
+        let mut ids = Vec::new();
+        while let Some(row) = stream.next().await {
+            let row = row.expect("row must not be an error");
+            ids.push(row["obs_id"].as_str().unwrap().to_string());
+        }
+        ids.sort();
+        ids
+    }
+
+    let runner = backend.sof_runner().expect("MongoDB provides a SOF runner");
+
+    assert_eq!(
+        observation_ids(runner.as_ref(), &tenant, ViewFilters::default()).await,
+        vec!["sof-o1", "sof-o2"]
+    );
+    assert_eq!(
+        observation_ids(
+            runner.as_ref(),
+            &tenant,
+            ViewFilters {
+                patient: vec!["Patient/sof-p2".to_string()],
+                ..Default::default()
+            },
+        )
+        .await,
+        vec!["sof-o2"]
+    );
+    assert_eq!(
+        observation_ids(
+            runner.as_ref(),
+            &tenant,
+            ViewFilters {
+                group: vec!["Group/sof-g1".to_string()],
+                ..Default::default()
+            },
+        )
+        .await,
+        vec!["sof-o1"]
+    );
+}
+
+#[tokio::test]
 async fn mongodb_integration_conditional_create_exists() {
     let Some(backend) = create_backend_with_full_registry("conditional_create").await else {
         eprintln!(
@@ -4513,5 +4755,383 @@ async fn mongodb_integration_export_until_is_inclusive() {
         batch.lines.len(),
         1,
         "a resource exactly on the bound is included"
+    );
+}
+
+#[tokio::test]
+async fn mongodb_integration_if_none_exist_multi_param_and_semantics() {
+    let Some(backend) = create_backend_with_full_registry("if_none_exist_multi_param").await else {
+        eprintln!(
+            "Skipping mongodb_integration_if_none_exist_multi_param_and_semantics (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+
+    let tenant = create_tenant("tenant-if-none-exist-multi");
+
+    backend
+        .create(
+            &tenant,
+            "Patient",
+            json!({
+                "resourceType": "Patient",
+                "identifier": [{"system": "http://example.org/mrn", "value": "MRN-MULTI-1"}],
+                "active": true
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+
+    backend
+        .create(
+            &tenant,
+            "Patient",
+            json!({
+                "resourceType": "Patient",
+                "identifier": [{"system": "http://example.org/mrn", "value": "MRN-MULTI-1"}],
+                "active": false
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+
+    let active_entry = BundleEntry {
+        method: BundleMethod::Post,
+        url: "Patient".to_string(),
+        resource: Some(json!({
+            "resourceType": "Patient",
+            "identifier": [{"system": "http://example.org/mrn", "value": "MRN-MULTI-1"}],
+            "active": true
+        })),
+        if_match: None,
+        if_none_match: None,
+        if_none_exist: Some(
+            "identifier=http://example.org/mrn|MRN-MULTI-1&active=true".to_string(),
+        ),
+        full_url: Some("urn:uuid:active-patient".to_string()),
+    };
+
+    let Some(result) = process_transaction_or_skip(
+        &backend,
+        &tenant,
+        vec![active_entry],
+        "mongodb_integration_if_none_exist_multi_param_and_semantics",
+    )
+    .await
+    else {
+        return;
+    };
+
+    assert_eq!(
+        result.entries[0].status, 200,
+        "both params match the active patient — should not create a duplicate"
+    );
+
+    let count = backend.count(&tenant, Some("Patient")).await.unwrap();
+    assert_eq!(count, 2, "no third patient should have been created");
+}
+
+#[tokio::test]
+async fn mongodb_integration_if_none_exist_same_transaction_read_your_writes() {
+    let Some(backend) = create_backend_with_full_registry("if_none_exist_ryw").await else {
+        eprintln!(
+            "Skipping mongodb_integration_if_none_exist_same_transaction_read_your_writes (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+
+    let tenant = create_tenant("tenant-if-none-exist-ryw");
+
+    let entry = |full_url: &str| BundleEntry {
+        method: BundleMethod::Post,
+        url: "Patient".to_string(),
+        resource: Some(json!({
+            "resourceType": "Patient",
+            "identifier": [{"system": "http://example.org/mrn", "value": "MRN-RYW-1"}]
+        })),
+        if_match: None,
+        if_none_match: None,
+        if_none_exist: Some("identifier=http://example.org/mrn|MRN-RYW-1".to_string()),
+        full_url: Some(full_url.to_string()),
+    };
+
+    let Some(result) = process_transaction_or_skip(
+        &backend,
+        &tenant,
+        vec![entry("urn:uuid:first"), entry("urn:uuid:second")],
+        "mongodb_integration_if_none_exist_same_transaction_read_your_writes",
+    )
+    .await
+    else {
+        return;
+    };
+
+    assert_eq!(
+        result.entries[0].status, 201,
+        "first entry creates the patient"
+    );
+    assert_eq!(
+        result.entries[1].status, 200,
+        "second entry must see the first entry's write via session"
+    );
+    assert_eq!(
+        result.entries[1].location, result.entries[0].location,
+        "second entry must resolve to the same resource as the first"
+    );
+    assert_eq!(backend.count(&tenant, Some("Patient")).await.unwrap(), 1);
+}
+
+#[tokio::test]
+async fn mongodb_integration_if_none_exist_multiple_matches_rolls_back() {
+    let Some(backend) = create_backend_with_full_registry("if_none_exist_multi_match").await else {
+        eprintln!(
+            "Skipping mongodb_integration_if_none_exist_multiple_matches_rolls_back (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+
+    let tenant = create_tenant("tenant-if-none-exist-ambiguous");
+
+    for family in ["One", "Two"] {
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({
+                    "resourceType": "Patient",
+                    "identifier": [{"system": "http://example.org/mrn", "value": "MRN-AMB-1"}],
+                    "name": [{"family": family}]
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+    }
+
+    let entries = vec![
+        BundleEntry {
+            method: BundleMethod::Post,
+            url: "Patient".to_string(),
+            resource: Some(
+                json!({ "resourceType": "Patient", "name": [{"family": "ShouldRollBack"}] }),
+            ),
+            if_match: None,
+            if_none_match: None,
+            if_none_exist: None,
+            full_url: None,
+        },
+        BundleEntry {
+            method: BundleMethod::Post,
+            url: "Patient".to_string(),
+            resource: Some(json!({
+                "resourceType": "Patient",
+                "identifier": [{"system": "http://example.org/mrn", "value": "MRN-AMB-1"}]
+            })),
+            if_match: None,
+            if_none_match: None,
+            if_none_exist: Some("identifier=http://example.org/mrn|MRN-AMB-1".to_string()),
+            full_url: Some("urn:uuid:ambiguous".to_string()),
+        },
+    ];
+
+    match backend
+        .process_transaction(&tenant, entries, FhirVersion::default())
+        .await
+    {
+        Err(helios_persistence::error::TransactionError::UnsupportedIsolationLevel { .. }) => {
+            eprintln!("Skipping multiple_matches_rolls_back (replica-set required)");
+            return;
+        }
+        Err(helios_persistence::error::TransactionError::BundleError { index, message }) => {
+            assert_eq!(index, 1);
+            assert!(
+                message.contains("412"),
+                "expected 412 in message, got: {message}"
+            );
+        }
+        Err(other) => panic!("unexpected error: {other:?}"),
+        Ok(_) => panic!("ambiguous ifNoneExist must fail the bundle"),
+    }
+
+    assert_eq!(
+        backend.count(&tenant, Some("Patient")).await.unwrap(),
+        2,
+        "the plain create in entry 0 must have been rolled back"
+    );
+}
+
+#[tokio::test]
+async fn mongodb_integration_if_none_exist_offloaded_search_uses_resource_scan() {
+    let Some(mut backend) = create_backend_with_full_registry("if_none_exist_offloaded").await
+    else {
+        eprintln!(
+            "Skipping mongodb_integration_if_none_exist_offloaded_search_uses_resource_scan (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+
+    let tenant = create_tenant("tenant-if-none-exist-offloaded");
+
+    backend
+        .create(
+            &tenant,
+            "Patient",
+            json!({
+                "resourceType": "Patient",
+                "identifier": [{"system": "http://example.org/mrn", "value": "MRN-OFFL-1"}]
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+
+    backend.set_search_offloaded(true);
+
+    let entry = BundleEntry {
+        method: BundleMethod::Post,
+        url: "Patient".to_string(),
+        resource: Some(json!({
+            "resourceType": "Patient",
+            "identifier": [{"system": "http://example.org/mrn", "value": "MRN-OFFL-1"}]
+        })),
+        if_match: None,
+        if_none_match: None,
+        if_none_exist: Some("identifier=http://example.org/mrn|MRN-OFFL-1".to_string()),
+        full_url: Some("urn:uuid:offloaded".to_string()),
+    };
+
+    let Some(result) = process_transaction_or_skip(
+        &backend,
+        &tenant,
+        vec![entry],
+        "mongodb_integration_if_none_exist_offloaded_search_uses_resource_scan",
+    )
+    .await
+    else {
+        return;
+    };
+
+    assert_eq!(
+        result.entries[0].status, 200,
+        "offloaded-search fallback must find the existing resource and suppress the create"
+    );
+    assert_eq!(
+        backend.count(&tenant, Some("Patient")).await.unwrap(),
+        1,
+        "no duplicate should have been created"
+    );
+}
+
+#[tokio::test]
+async fn mongodb_integration_if_none_exist_broad_param_beyond_probe_limit() {
+    let Some(backend) = create_backend_with_full_registry("if_none_exist_broad_param").await else {
+        eprintln!(
+            "Skipping mongodb_integration_if_none_exist_broad_param_beyond_probe_limit \
+             (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+
+    let tenant = create_tenant("tenant-a");
+
+    const NOISE_COUNT: usize = 200;
+
+    for chunk_start in (0..NOISE_COUNT).step_by(50) {
+        let entries: Vec<BundleEntry> = (chunk_start..chunk_start + 50)
+            .map(|i| BundleEntry {
+                method: BundleMethod::Post,
+                url: "Patient".to_string(),
+                resource: Some(serde_json::json!({
+                    "resourceType": "Patient",
+                    "active": true,
+                    "identifier": [{"system": "http://example.org/noise", "value": format!("NOISE-{i}")}]
+                })),
+                if_match: None,
+                if_none_match: None,
+                if_none_exist: None,
+                full_url: Some(format!("urn:uuid:noise-{i}")),
+            })
+            .collect();
+        let Some(result) = process_transaction_or_skip(
+            &backend,
+            &tenant,
+            entries,
+            "mongodb_integration_if_none_exist_broad_param_beyond_probe_limit (setup)",
+        )
+        .await
+        else {
+            return;
+        };
+        assert!(
+            result.entries.iter().all(|e| e.status == 201),
+            "all noise patients must be created"
+        );
+    }
+
+    let target_entry = BundleEntry {
+        method: BundleMethod::Post,
+        url: "Patient".to_string(),
+        resource: Some(serde_json::json!({
+            "resourceType": "Patient",
+            "active": true,
+            "identifier": [{"system": "http://example.org/mrn", "value": "TARGET-BROAD-1"}]
+        })),
+        if_match: None,
+        if_none_match: None,
+        if_none_exist: None,
+        full_url: Some("urn:uuid:target-broad".to_string()),
+    };
+    let Some(target_result) = process_transaction_or_skip(
+        &backend,
+        &tenant,
+        vec![target_entry],
+        "mongodb_integration_if_none_exist_broad_param_beyond_probe_limit (target create)",
+    )
+    .await
+    else {
+        return;
+    };
+    assert_eq!(
+        target_result.entries[0].status, 201,
+        "target patient must be created"
+    );
+
+    let total = backend.count(&tenant, Some("Patient")).await.unwrap();
+    assert_eq!(total, (NOISE_COUNT + 1) as u64, "all patients present");
+
+    let if_none_exist_entry = BundleEntry {
+        method: BundleMethod::Post,
+        url: "Patient".to_string(),
+        resource: Some(serde_json::json!({
+            "resourceType": "Patient",
+            "active": true,
+            "identifier": [{"system": "http://example.org/mrn", "value": "TARGET-BROAD-1"}]
+        })),
+        if_match: None,
+        if_none_match: None,
+        if_none_exist: Some("identifier=http://example.org/mrn|TARGET-BROAD-1".to_string()),
+        full_url: Some("urn:uuid:ine-broad".to_string()),
+    };
+    let Some(ine_result) = process_transaction_or_skip(
+        &backend,
+        &tenant,
+        vec![if_none_exist_entry],
+        "mongodb_integration_if_none_exist_broad_param_beyond_probe_limit",
+    )
+    .await
+    else {
+        return;
+    };
+
+    assert_eq!(
+        ine_result.entries[0].status, 200,
+        "ifNoneExist must find the existing target patient and suppress the create"
+    );
+    assert_eq!(
+        backend.count(&tenant, Some("Patient")).await.unwrap(),
+        (NOISE_COUNT + 1) as u64,
+        "no duplicate should have been created"
     );
 }

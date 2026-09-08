@@ -1,4 +1,17 @@
 import { expect, test } from "@playwright/test";
+import type { Locator } from "@playwright/test";
+
+async function openJsonNode(scope: Locator, key: string): Promise<Locator> {
+  const node = scope
+    .locator("summary.capability-json-row")
+    .filter({ hasText: `"${key}":` })
+    .locator("..")
+    .first();
+  const body = node.locator(":scope > [data-capability-json-body]");
+  await node.locator(":scope > summary").click();
+  await expect(body.locator("[data-capability-json-page], .json-view").first()).toBeVisible();
+  return node;
+}
 
 // The Capability & Conformance page at `/ui/hts/capability-statement`.
 //
@@ -9,8 +22,8 @@ import { expect, test } from "@playwright/test";
 // lived at `/ui/hts/diagnostics` until this rename; that path now 308s here.
 //
 // Mirrors the Rust-side coverage in `crates/hts-ui/tests/capability.rs` but
-// exercises what HTML-only Rust tests cannot reach: real layout, real
-// `<details>` disclosure behaviour, and heading structure as the
+// exercises what HTML-only Rust tests cannot reach: real layout, aggregate
+// expansion behaviour, and heading structure as the
 // accessibility tree sees it.
 //
 // Handler: `crates/hts-ui/src/capability.rs`. Template:
@@ -66,7 +79,7 @@ test.describe("HTS Capability & Conformance shell", () => {
     ).toBe(PATH);
   });
 
-  test("carries no tab strip and no JS-only affordance", async ({ page }) => {
+  test("carries no tab strip and uses the shared raw-tree affordance", async ({ page }) => {
     await page.goto(PATH);
     // The tab era is over: no tablist, no tabs, no tabpanel, no
     // `#diag-panel` swap target.
@@ -74,8 +87,10 @@ test.describe("HTS Capability & Conformance shell", () => {
     await expect(page.getByRole("tab")).toHaveCount(0);
     await expect(page.getByRole("tabpanel")).toHaveCount(0);
     await expect(page.locator("#diag-panel")).toHaveCount(0);
-    // Nothing on the page swaps over htmx, so nothing breaks without JS.
-    await expect(page.locator("[hx-get]")).toHaveCount(0);
+    const raw = page.locator("#capability-json-fold");
+    await expect(raw.locator(":scope > .card-head > h3")).toHaveText(/^Raw CapabilityStatement/);
+    await expect(raw.locator(":scope > .card-head > [data-capability-json-actions]")).toBeVisible();
+    await expect(raw.locator("[data-capability-json-tree] > [data-path='']")).toBeVisible();
   });
 
   test("nav exposes HFS's own label, after Import", async ({ page }) => {
@@ -152,21 +167,151 @@ test.describe("HTS Capability & Conformance card content", () => {
     await expect(card).not.toContainText(/Base URL/i);
   });
 
-  test("the raw statement hides behind a <details>", async ({ page }) => {
+  test("the raw statement starts at the first level and expands through one POST", async ({ page }) => {
+    test.setTimeout(120_000);
     await page.goto(PATH);
-    const card = page.locator("section.card").last();
-    // A bare <details> + <summary> + `.detail__code`, the same disclosure
-    // HFS uses. Never `.addbox` — that is the Add-tenant dropdown and
-    // `.addbox__panel` is absolutely positioned, so it would float a 340px
-    // popover.
+    const card = page.locator("#capability-json-fold");
     await expect(card.locator(".addbox")).toHaveCount(0);
-    const body = card.locator("pre.detail__code");
-    // Collapsed by default — the payload is opt-in noise.
-    await expect(body).toBeHidden();
-    await card.locator("details summary").click();
-    await expect(body).toBeVisible();
-    await expect(body).toContainText(/CapabilityStatement/);
+    const region = card.locator("#capability-json-body");
+    const tree = card.locator("[data-capability-json-tree]");
+    const initial = await tree.innerHTML();
+    await expect(region).toHaveAttribute("role", "region");
+    await expect(region).toHaveAttribute("aria-labelledby", "capability-json-heading");
+    await expect(region).toHaveAttribute("tabindex", "0");
+    await expect(region).toHaveCSS("overflow-y", "auto");
+    expect(parseFloat(await region.evaluate((node) => getComputedStyle(node).maxHeight))).toBeGreaterThan(0);
+    await expect(tree.locator(":scope > [data-path=''][data-offset='0']")).toBeVisible();
+    await expect(tree.locator("details[open]")).toHaveCount(0);
+
+    const requests: string[] = [];
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    page.on("request", (request) => {
+      if (request.method() === "POST" && new URL(request.url()).pathname.endsWith("/json-expand")) {
+        requests.push(request.postData() ?? "");
+      }
+    });
+    await page.route("**/ui/hts/capability-statement/json-expand", async (route) => {
+      await gate;
+      await route.continue();
+    });
+    await card.locator("[data-capability-json-expand-all]").click();
+    await expect(region).toHaveAttribute("aria-busy", "true");
+    await expect(card.locator("[data-capability-json-status]")).toContainText(/Expanding/i);
+    await expect(card.locator("[data-capability-json-collapse-all]")).toBeEnabled();
+    expect(requests).toHaveLength(1);
+    release();
+    await expect(region).not.toHaveAttribute("aria-busy", "true");
+    expect(requests).toHaveLength(1);
+    const form = new URLSearchParams(requests[0]);
+    expect(form.getAll("path")).toContain("");
+    await expect(tree.locator(":scope > [data-expansion-state]")).toHaveAttribute(
+      "data-expansion-state", /complete|partial/,
+    );
+    await expect(card.locator("[data-capability-json-status]")).toContainText(/expanded|limit|partially/i);
+
+    await card.locator("[data-capability-json-collapse-all]").click();
+    expect(await tree.innerHTML()).toBe(initial);
+    await expect(card).toBeVisible();
+    await expect(tree.locator("details[open]")).toHaveCount(0);
+
+    const outline = tree.locator(":scope > [data-capability-json-page]");
+    const format = await openJsonNode(outline, "format");
+    const rest = await openJsonNode(outline, "rest");
+    await expect(format).toHaveAttribute("open", "");
+    await expect(rest).toHaveAttribute("open", "");
   });
+
+  test("Collapse all cancels a late HTS aggregate response", async ({ page }) => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    await page.route("**/ui/hts/capability-statement/json-expand", async (route) => {
+      await gate;
+      try {
+        await route.fulfill({
+          status: 200,
+          contentType: "text/html",
+          body: '<div data-expansion-state="complete"><p id="late-hts-json">late</p></div>',
+        });
+      } catch {}
+    });
+    await page.goto(PATH);
+    const card = page.locator("#capability-json-fold");
+    const region = card.locator("#capability-json-body");
+    const tree = card.locator("[data-capability-json-tree]");
+    const initial = await tree.innerHTML();
+    await card.locator("[data-capability-json-expand-all]").click();
+    await expect(region).toHaveAttribute("aria-busy", "true");
+    await card.locator("[data-capability-json-collapse-all]").click();
+    release();
+    await page.waitForTimeout(100);
+    await expect(page.locator("#late-hts-json")).toHaveCount(0);
+    await expect(region).not.toHaveAttribute("aria-busy", "true");
+    expect(await tree.innerHTML()).toBe(initial);
+  });
+
+  test("the expanded HTS tree scrolls by wheel and PageDown", async ({ page }) => {
+    test.setTimeout(120_000);
+    await page.setViewportSize({ width: 1280, height: 500 });
+    await page.goto(PATH);
+    const card = page.locator("#capability-json-fold");
+    const region = card.locator("#capability-json-body");
+    await card.locator("[data-capability-json-expand-all]").click();
+    await expect(region).not.toHaveAttribute("aria-busy", "true");
+    expect(await region.evaluate((node) => node.scrollHeight)).toBeGreaterThan(
+      await region.evaluate((node) => node.clientHeight),
+    );
+    await region.evaluate((node) => { node.scrollTop = 0; });
+    await region.hover();
+    await page.mouse.wheel(0, 500);
+    await expect.poll(() => region.evaluate((node) => node.scrollTop)).toBeGreaterThan(0);
+    const afterWheel = await region.evaluate((node) => node.scrollTop);
+    await region.focus();
+    await page.keyboard.press("PageDown");
+    await expect.poll(() => region.evaluate((node) => node.scrollTop)).toBeGreaterThan(afterWheel);
+  });
+
+  test("aggregate failure retains the HTS tree and retry succeeds", async ({ page }) => {
+    let fail = true;
+    await page.route("**/ui/hts/capability-statement/json-expand", async (route) => {
+      if (fail) {
+        fail = false;
+        await route.fulfill({ status: 503, body: "temporarily unavailable" });
+      } else {
+        await route.continue();
+      }
+    });
+    await page.goto(PATH);
+    const card = page.locator("#capability-json-fold");
+    const tree = card.locator("[data-capability-json-tree]");
+    const initial = await tree.innerHTML();
+    await card.locator("[data-capability-json-expand-all]").click();
+    await expect(card.locator("[data-capability-json-status]")).toContainText(/could not|try again|error/i);
+    expect(await tree.innerHTML()).toBe(initial);
+    await card.locator("[data-capability-json-expand-all]").click();
+    await expect(tree.locator(":scope > [data-expansion-state]")).toBeVisible();
+  });
+
+  for (const theme of ["light", "dark"] as const) {
+    test(`raw toolbar wraps without horizontal overflow at 390px — ${theme}`, async ({ page }) => {
+      await page.addInitScript((value) => localStorage.setItem("hfs-theme", value), theme);
+      await page.setViewportSize({ width: 390, height: 844 });
+      await page.goto(PATH);
+      await expect(page.locator("html")).toHaveAttribute("data-theme", theme);
+      const metrics = await page.locator("#capability-json-fold").evaluate((card) => {
+        const header = card.querySelector<HTMLElement>(":scope > .card-head")!;
+        const tools = header.querySelector<HTMLElement>("[data-capability-json-actions]")!;
+        const box = card.getBoundingClientRect();
+        const toolsBox = tools.getBoundingClientRect();
+        return {
+          wraps: getComputedStyle(header).flexWrap,
+          toolsInside: toolsBox.left >= box.left && toolsBox.right <= box.right + 1,
+          overflow: document.documentElement.scrollWidth > document.documentElement.clientWidth,
+        };
+      });
+      expect(metrics).toEqual({ wraps: "wrap", toolsInside: true, overflow: false });
+    });
+  }
 });
 
 test.describe("HTS Capability & Conformance per-source isolation", () => {

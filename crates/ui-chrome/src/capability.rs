@@ -583,12 +583,12 @@ impl<'a> CapabilityCards<'a> {
         .render()
     }
 
-    /// Raw CapabilityStatement — the foldable, htmx-lazy JSON block shared by
-    /// both products (#808 follow-up to #798). Neither the fetch nor the
-    /// fragment endpoint lives here — see [`crate::capability_json`] — this
-    /// card is only the shell: a "Load JSON" link against `fragment_url` by
-    /// default, or the fully resolved `raw` text when `raw_requested` (the
-    /// no-JS fallback, driven by `raw_url`).
+    /// Raw CapabilityStatement — the always-visible, bounded JSON block shared
+    /// by both products. The caller supplies the root outline planned from its
+    /// existing metadata fetch; deeper nodes remain incremental and the
+    /// progressively enhanced toolbar posts visible page state to `expand_url`.
+    /// `raw_requested` keeps the fully resolved plain `<pre>` fallback driven
+    /// by `raw_url` and renders no inert JavaScript controls.
     ///
     /// Unlike the other four cards this one ignores `self.notice`: a failed
     /// fetch means the caller has no statement to fold at all, and skips
@@ -598,14 +598,16 @@ impl<'a> CapabilityCards<'a> {
         raw_requested: bool,
         raw: &str,
         raw_url: &str,
-        fragment_url: &str,
+        expand_url: &str,
+        initial_outline: Option<&crate::capability_json::Outline>,
     ) -> Result<String, askama::Error> {
         RawCardTemplate {
             i18n: self.i18n,
             raw_requested,
             raw,
             raw_url,
-            fragment_url,
+            expand_url,
+            initial_outline,
         }
         .render()
     }
@@ -618,7 +620,8 @@ struct RawCardTemplate<'a> {
     raw_requested: bool,
     raw: &'a str,
     raw_url: &'a str,
-    fragment_url: &'a str,
+    expand_url: &'a str,
+    initial_outline: Option<&'a crate::capability_json::Outline>,
 }
 
 #[derive(Template)]
@@ -1257,5 +1260,63 @@ mod tests {
         assert!(summary.contains("&#60;script&#62;"));
         let resources = cards.resources().unwrap();
         assert!(!resources.contains("<img src=x"));
+    }
+
+    #[test]
+    fn raw_card_is_an_open_section_with_an_initial_outline_and_adjacent_controls() {
+        let document = json!({"resourceType": "CapabilityStatement", "rest": []});
+        let outline = match crate::capability_json::plan(
+            &document,
+            "",
+            0,
+            crate::capability_json::DEFAULT_PAGE_SIZE,
+            crate::capability_json::FragmentEndpoint {
+                base_path: "/ui/capability-statement/json-fragment",
+                version: "R4",
+                extra_query: "",
+            },
+        )
+        .unwrap()
+        {
+            crate::capability_json::View::Outline(outline) => outline,
+            crate::capability_json::View::Full(_) => panic!("root must be an outline"),
+        };
+        let html = CapabilityCards::new(&Labels, &sample_view())
+            .raw(
+                false,
+                "",
+                "/ui/capability-statement?raw=1",
+                "/ui/capability-statement/json-expand?version=R4",
+                Some(&outline),
+            )
+            .unwrap();
+
+        assert!(html.contains(r#"<section class="card capability-raw-card""#));
+        assert!(!html.contains("<details class=\"card json-fold\""));
+        assert!(html.contains(r#"<h3 id="capability-json-heading">"#));
+        assert!(html.contains(r#"data-capability-json-actions hidden"#));
+        assert!(html.contains(r#"role="region""#));
+        assert!(html.contains(r#"aria-labelledby="capability-json-heading""#));
+        assert!(html.contains(r#"tabindex="0""#));
+        assert!(html.contains(r#"data-path="""#));
+    }
+
+    #[test]
+    fn raw_plain_fallback_has_no_inert_enhancement_controls() {
+        let html = CapabilityCards::new(&Labels, &sample_view())
+            .raw(
+                true,
+                r#"{"resourceType":"CapabilityStatement"}"#,
+                "/ui/capability-statement?raw=1",
+                "/ui/capability-statement/json-expand?version=R4",
+                None,
+            )
+            .unwrap();
+
+        assert!(html.contains(r#"<section class="card capability-raw-card""#));
+        assert!(html.contains(r#"<pre class="detail__code">"#));
+        assert!(!html.contains("data-capability-json-actions"));
+        assert!(!html.contains("data-capability-json-expand-all"));
+        assert!(!html.contains("data-capability-json-body"));
     }
 }

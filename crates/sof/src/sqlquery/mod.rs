@@ -13,12 +13,16 @@ pub mod engine;
 pub mod library;
 pub mod output;
 pub mod params;
+pub mod scan;
 
-pub use bind::{BoundParam, bind_supplied_params};
+pub use bind::{BINDABLE_PARAMETER_TYPES, BoundParam, bind_supplied_params};
 pub use engine::{ColumnFhirType, InMemorySqlEngine, QueryResult, TableSchema};
 pub use library::{DependsOnView, LibraryParameter, SqlQueryLibrary, parse_sqlquery_library};
 pub use output::format_fhir_parameters;
 pub use params::{SqlQueryRunParams, extract_sqlquery_params_from_json};
+pub use scan::{
+    Placeholder, ScanError, ScanResult, SourcePosition, TableRef, scan_sql, undeclared_tables,
+};
 
 use thiserror::Error;
 

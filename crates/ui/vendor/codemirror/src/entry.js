@@ -36,9 +36,11 @@ import {
   drawSelection,
   highlightActiveLine,
   highlightActiveLineGutter,
+  hoverTooltip,
   keymap,
   lineNumbers,
   placeholder,
+  showTooltip,
 } from '@codemirror/view';
 import {
   HighlightStyle,
@@ -55,12 +57,32 @@ import {
 } from '@codemirror/language';
 import { defaultKeymap, history, historyKeymap, indentWithTab } from '@codemirror/commands';
 import {
+  acceptCompletion,
   autocompletion,
   closeBrackets,
   closeBracketsKeymap,
+  closeCompletion,
   completionKeymap,
+  completionStatus,
+  currentCompletions,
+  insertCompletionText,
+  snippet,
+  snippetCompletion,
+  startCompletion,
 } from '@codemirror/autocomplete';
-import { forceLinting, linter, lintGutter, lintKeymap, setDiagnostics } from '@codemirror/lint';
+import {
+  closeLintPanel,
+  diagnosticCount,
+  forEachDiagnostic,
+  forceLinting,
+  linter,
+  lintGutter,
+  lintKeymap,
+  nextDiagnostic,
+  openLintPanel,
+  previousDiagnostic,
+  setDiagnostics,
+} from '@codemirror/lint';
 import { highlightSelectionMatches, searchKeymap } from '@codemirror/search';
 import { json, jsonLanguage, jsonParseLinter } from '@codemirror/lang-json';
 import {
@@ -104,9 +126,11 @@ const HfsCodeMirror = {
   drawSelection,
   highlightActiveLine,
   highlightActiveLineGutter,
+  hoverTooltip,
   keymap,
   lineNumbers,
   placeholder,
+  showTooltip,
 
   // @codemirror/language
   HighlightStyle,
@@ -128,16 +152,30 @@ const HfsCodeMirror = {
   indentWithTab,
 
   // @codemirror/autocomplete
+  acceptCompletion,
   autocompletion,
   closeBrackets,
   closeBracketsKeymap,
+  closeCompletion,
   completionKeymap,
+  completionStatus,
+  currentCompletions,
+  insertCompletionText,
+  snippet,
+  snippetCompletion,
+  startCompletion,
 
   // @codemirror/lint
+  closeLintPanel,
+  diagnosticCount,
+  forEachDiagnostic,
   forceLinting,
   linter,
   lintGutter,
   lintKeymap,
+  nextDiagnostic,
+  openLintPanel,
+  previousDiagnostic,
   setDiagnostics,
 
   // @codemirror/search

@@ -709,6 +709,12 @@ pub struct BulkProcessingOptions {
     /// file every file after the first collides on the stored key (#457).
     #[serde(default)]
     pub file_url: Option<String>,
+    /// Bulk fast-load (#903): defer search-index and FTS writes to a
+    /// post-ingest reindex. The stored resources, history, receipts, and
+    /// rollback records are identical either way — only the derived search
+    /// structures are rebuilt later instead of inline.
+    #[serde(default)]
+    pub defer_indexing: bool,
     /// Live byte counters for the manifest ingest, when the caller tracks
     /// them. Batch bookkeeping persists these alongside the entry counters —
     /// that write already wins the database's write lock between batches,
@@ -746,6 +752,7 @@ impl BulkProcessingOptions {
             allow_updates: default_allow_updates(),
             import_mode: ImportMode::default(),
             file_url: None,
+            defer_indexing: false,
             byte_progress: None,
         }
     }
@@ -753,6 +760,12 @@ impl BulkProcessingOptions {
     /// Names the manifest output file the entries come from (#457).
     pub fn with_file_url(mut self, file_url: impl Into<String>) -> Self {
         self.file_url = Some(file_url.into());
+        self
+    }
+
+    /// Defers search indexing to a post-ingest reindex (#903).
+    pub fn with_defer_indexing(mut self, defer: bool) -> Self {
+        self.defer_indexing = defer;
         self
     }
 
@@ -885,7 +898,12 @@ impl SubmissionChange {
         new_version: impl Into<String>,
     ) -> Self {
         Self {
-            change_id: Uuid::new_v4().to_string(),
+            // v7, not v4: `change_id` is the primary key of
+            // `bulk_submission_changes`, one row per ingested entry, and a
+            // random key inserts into that index at a random leaf. Time-ordered
+            // ids arrive at its right-hand edge, which is already resident —
+            // the same reason resource ids are v7 (see `new_resource_id`).
+            change_id: Uuid::now_v7().to_string(),
             manifest_id: manifest_id.into(),
             change_type: ChangeType::Create,
             resource_type: resource_type.into(),
@@ -907,7 +925,8 @@ impl SubmissionChange {
         previous_content: Value,
     ) -> Self {
         Self {
-            change_id: Uuid::new_v4().to_string(),
+            // Time-ordered, for the reason given in [`Self::create`].
+            change_id: Uuid::now_v7().to_string(),
             manifest_id: manifest_id.into(),
             change_type: ChangeType::Update,
             resource_type: resource_type.into(),

@@ -67,7 +67,7 @@
   {% if !view.raw_body.is_empty() %}
     <details>
       <summary><span class="detail__hint-inline">{{ chrome.i18n.t("hts-import-raw-toggle") }}</span> <code>{{ view.request_url }}</code></summary>
-      <pre class="detail__code">{{ view.raw_body }}</pre>
+      {% if !view.raw_body_json.is_empty() %}{{ view.raw_body_json|safe }}{% else %}<pre class="detail__code" tabindex="0">{{ view.raw_body }}</pre>{% endif %}
     </details>
   {% endif %}
 {% else if view.is_success || view.is_partial %}
@@ -126,7 +126,7 @@
   {% if !view.raw_body.is_empty() %}
     <details>
       <summary><span class="detail__hint-inline">{{ chrome.i18n.t("hts-import-raw-toggle") }}</span> <code>{{ view.request_url }}</code></summary>
-      <pre class="detail__code">{{ view.raw_body }}</pre>
+      {% if !view.raw_body_json.is_empty() %}{{ view.raw_body_json|safe }}{% else %}<pre class="detail__code" tabindex="0">{{ view.raw_body }}</pre>{% endif %}
     </details>
   {% endif %}
 {% endif %}

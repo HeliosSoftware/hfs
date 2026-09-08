@@ -8,9 +8,10 @@
   exactly what #808 removed. Card *content* changes belong in
   `crates/ui-chrome/templates/partials/capability-*.html`.
 
-  The raw fold is not a `<pre>` of the whole document but a bounded,
-  paginated JSON-fragment tree loaded on demand (#798, generalized in #808).
-  Its endpoint (`/ui/capability-statement/json-fragment`) stays HFS's own —
+  Raw is not a `<pre>` of the whole document: its first level is rendered
+  from the page's existing metadata fetch, then nested nodes load bounded,
+  paginated HTML fragments (#798/#808/#902). Its incremental endpoint
+  (`/ui/capability-statement/json-fragment`) stays HFS's own —
   HTS mounts an equivalent at `/ui/hts/capability-statement/json-fragment`
   against its own upstream fetch — but the card shell, the fragment
   templates and the JSON-rendering engine behind both are the same code.
