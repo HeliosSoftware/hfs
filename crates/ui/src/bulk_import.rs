@@ -250,6 +250,29 @@ struct LogLine {
     message: String,
 }
 
+/// The submission's log as `partials/bulk_import_log.html` wants it:
+/// newest-first, so the detail page's first paint and the status fragment's
+/// out-of-band refresh agree on the order (#955).
+fn log_lines(submission: &Submission) -> Vec<LogLine> {
+    submission
+        .log
+        .iter()
+        .rev()
+        .map(|entry| LogLine {
+            at: entry
+                .get("at")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            message: entry
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+        })
+        .collect()
+}
+
 fn status_label(i18n: &I18n, status: &str) -> String {
     match status {
         "in-progress" => i18n.t("bulk-import-status-in-progress"),
@@ -288,6 +311,8 @@ struct BulkImportDetailPage {
     client_id: String,
     token_url: String,
     log: Vec<LogLine>,
+    /// The page paints the log in place, never out-of-band.
+    log_oob: bool,
     error: Option<String>,
     edit_open: bool,
 }
@@ -458,24 +483,7 @@ fn render_detail_page(
         .unwrap_or("")
         .to_string();
 
-    let log: Vec<LogLine> = s
-        .log
-        .iter()
-        .rev()
-        .map(|entry| LogLine {
-            at: entry
-                .get("at")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string(),
-            message: entry
-                .get("message")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string(),
-        })
-        .collect();
-
+    let log = log_lines(&s);
     let label = status_label(&i18n, &s.status);
     render(BulkImportDetailPage {
         status,
@@ -504,6 +512,7 @@ fn render_detail_page(
         client_id: s.client_id,
         token_url: s.token_url,
         log,
+        log_oob: false,
         error,
         edit_open,
     })
@@ -1195,6 +1204,10 @@ struct StatusCard {
     completed_at: String,
     /// Rides out-of-band into the summary card's STATUS cell.
     status_label: String,
+    /// Rides out-of-band into the Submission Log section, whose lines this
+    /// poll may have just written (#955).
+    log: Vec<LogLine>,
+    log_oob: bool,
 }
 
 /// `GET /ui/bulk-import/{id}/status` — at most one recipient poll, then the
@@ -1228,6 +1241,8 @@ pub async fn status_fragment(
         errors: s.result["errors"].as_u64().unwrap_or(0),
         completed_at: s.result["completedAt"].as_str().unwrap_or("").to_string(),
         status_label: label,
+        log: log_lines(&s),
+        log_oob: true,
         i18n,
     })
 }
@@ -1237,7 +1252,13 @@ pub async fn status_fragment(
 /// bar about to fill, not a percentage that never moves — the indeterminate
 /// sweep is reserved for recipients that report no percentage at all.
 fn progress_percent(progress: &str) -> Option<u8> {
-    let rest = progress.strip_prefix("processing ")?;
+    // Case-insensitive: HFS capitalizes the line ("Processing 3% of bytes —
+    // …", #954), older HFS versions and foreign recipients may send lowercase
+    // "processing 3% complete …". Either way the digits follow the prefix.
+    let rest = progress
+        .get(..11)
+        .filter(|p| p.eq_ignore_ascii_case("processing "))
+        .and_then(|_| progress.get(11..))?;
     let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
     let pct: u8 = digits.parse().ok().filter(|p| *p <= 100)?;
     Some(pct)
@@ -1291,6 +1312,24 @@ pub async fn test_auth(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn progress_percent_reads_both_hfs_wordings_and_foreign_case() {
+        // Current HFS wording (#954).
+        assert_eq!(
+            progress_percent("Processing 3% of bytes — 609,191 resources written"),
+            Some(3)
+        );
+        assert_eq!(progress_percent("Processing 0% of bytes"), Some(0));
+        // Pre-#954 HFS and lowercase foreign recipients.
+        assert_eq!(
+            progress_percent("processing 10% complete (5 entries ingested)"),
+            Some(10)
+        );
+        // Non-matching recipients keep the indeterminate sweep.
+        assert_eq!(progress_percent("halfway there"), None);
+        assert_eq!(progress_percent("processing lots"), None);
+    }
 
     #[test]
     fn recipient_base_preserves_prefix_and_adds_path_tenant() {

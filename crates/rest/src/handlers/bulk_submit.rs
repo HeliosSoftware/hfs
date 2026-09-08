@@ -38,6 +38,20 @@ const SUBMIT_SCOPE: &str = "bulk-submit";
 /// Query parameter selecting a status-manifest page (1-based).
 const PAGE_PARAM: &str = "page";
 
+/// Groups a count into thousands (`609191` → `"609,191"`) for the
+/// operator-facing progress line (#954).
+fn group_thousands(n: u64) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
 fn external_download_url(download: &DownloadUrl) -> Option<String> {
     (!download.requires_access_token).then(|| download.url.clone())
 }
@@ -807,9 +821,16 @@ where
             );
             format!("stalled at {pct}% - a worker stopped without handoff; see server logs")
         } else if entries > 0 {
-            format!("processing {pct}% complete ({entries} entries ingested)")
+            // Operator-facing wording (#954): the percentage is byte progress,
+            // the count is FHIR resources written to the store ("written", not
+            // "searchable" — under deferred indexing search follows the
+            // per-manifest reindex).
+            format!(
+                "Processing {pct}% of bytes — {} resources written",
+                group_thousands(entries)
+            )
         } else {
-            format!("processing {pct}% complete")
+            format!("Processing {pct}% of bytes")
         };
         return Response::builder()
             .status(StatusCode::ACCEPTED)
@@ -1146,6 +1167,17 @@ where
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn group_thousands_groups_digits_from_the_right() {
+        assert_eq!(group_thousands(0), "0");
+        assert_eq!(group_thousands(7), "7");
+        assert_eq!(group_thousands(999), "999");
+        assert_eq!(group_thousands(1_000), "1,000");
+        assert_eq!(group_thousands(609_191), "609,191");
+        assert_eq!(group_thousands(14_709_697), "14,709,697");
+        assert_eq!(group_thousands(100_000_000), "100,000,000");
+    }
 
     #[test]
     fn presigned_download_url_is_preserved_byte_for_byte() {
