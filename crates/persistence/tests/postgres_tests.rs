@@ -816,6 +816,79 @@ mod postgres_integration {
     use testcontainers_modules::postgres::Postgres;
     use tokio::sync::{Mutex, OnceCell};
 
+    mod receipt_paging_contract {
+        use helios_persistence as persistence;
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/bulk_submit/paging_contract.rs"
+        ));
+    }
+
+    mod receipt_consumer_contract {
+        use helios_persistence as persistence;
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/bulk_submit/consumer_contract.rs"
+        ));
+    }
+
+    #[tokio::test]
+    async fn postgres_bulk_submit_worker_exact_artifacts_across_pages() {
+        let _guard = BULK_SUBMIT_TEST_LOCK.lock().await;
+        receipt_consumer_contract::worker_receipts(
+            std::sync::Arc::new(create_backend().await),
+            &create_tenant("receipt-worker"),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn postgres_bulk_submit_composite_deduplicates_all_pages_on_finish_and_failure() {
+        let _guard = BULK_SUBMIT_TEST_LOCK.lock().await;
+        for (fail, secondary_failure) in
+            [(false, false), (true, false), (false, true), (true, true)]
+        {
+            receipt_consumer_contract::composite_receipts(
+                std::sync::Arc::new(create_backend().await),
+                &create_tenant("receipt-composite"),
+                BackendKind::Postgres,
+                fail,
+                secondary_failure,
+            )
+            .await;
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl receipt_paging_contract::ReceiptFixture for PostgresBackend {
+        async fn seed_receipts(
+            &self,
+            tenant: &TenantContext,
+            submission: &helios_persistence::core::SubmissionId,
+            manifest: &str,
+            rows: &[receipt_paging_contract::ReceiptRow],
+        ) {
+            let client = self.get_client().await.unwrap();
+            let tid = tenant.tenant_id().as_str();
+            client.execute("INSERT INTO bulk_submissions (tenant_id,submitter,submission_id,status,created_at,updated_at) VALUES ($1,$2,$3,'complete',NOW(),NOW()) ON CONFLICT DO NOTHING", &[&tid, &submission.submitter, &submission.submission_id]).await.unwrap();
+            client.execute("INSERT INTO bulk_manifests (tenant_id,submitter,submission_id,manifest_id,status,added_at) VALUES ($1,$2,$3,$4,'completed',NOW()) ON CONFLICT DO NOTHING", &[&tid, &submission.submitter, &submission.submission_id, &manifest]).await.unwrap();
+            for row in rows {
+                let line = i32::try_from(row.line).unwrap();
+                client.execute("INSERT INTO bulk_entry_results (tenant_id,submitter,submission_id,manifest_id,file_url,line_number,resource_type,resource_id,outcome) VALUES ($1,$2,$3,$4,$5,$6,'Patient',$7,$8)", &[&tid, &submission.submitter, &submission.submission_id, &manifest, &row.file, &line, &row.id, &row.outcome]).await.unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn postgres_bulk_submit_exact_keyset_pages() {
+        receipt_paging_contract::exact_sql_pages(
+            &create_backend().await,
+            &create_tenant("receipt-pages"),
+            i64::from(i32::MAX),
+        )
+        .await;
+    }
+
     /// Shared PostgreSQL container reused across all tests in this module.
     struct SharedPg {
         host: String,

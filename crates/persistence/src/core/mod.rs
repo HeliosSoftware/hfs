@@ -125,8 +125,9 @@ pub use bulk_export_worker::{
 pub use bulk_provider::{BulkProviderStore, StoredProviderSubmission};
 pub use bulk_submit::{
     BulkEntryOutcome, BulkEntryResult, BulkProcessingOptions, BulkSubmitProvider,
-    BulkSubmitRollbackProvider, ChangeType, EntryCountSummary, IMPORT_MODE_PARAMETER_URL,
-    ImportMode, ManifestStatus, NdjsonEntry, StreamProcessingResult, StreamingBulkSubmitProvider,
+    BulkSubmitRollbackProvider, ChangeType, EntryCountSummary, EntryResultContinuation,
+    EntryResultCursor, EntryResultPage, IMPORT_MODE_PARAMETER_URL, ImportMode, ManifestStatus,
+    NdjsonEntry, PagedEntryResult, StreamProcessingResult, StreamingBulkSubmitProvider,
     SubmissionChange, SubmissionId, SubmissionManifest, SubmissionStatus, SubmissionSummary,
     merge_resource,
 };

@@ -56,7 +56,7 @@ use tokio::io::AsyncBufRead;
 use uuid::Uuid;
 
 use crate::core::storage::ResourceStorage;
-use crate::error::StorageResult;
+use crate::error::{StorageError, StorageResult};
 use crate::tenant::TenantContext;
 
 /// Audit event helpers for bulk submit operations.
@@ -469,6 +469,79 @@ impl BulkEntryResult {
             BulkEntryOutcome::ValidationError | BulkEntryOutcome::ProcessingError
         )
     }
+}
+
+/// Stored receipt identity within one tenant, submission and manifest.
+/// SQL backends compare this pair using the database's ordering, not Rust's
+/// string ordering. Empty file URLs and line zero are valid stored values.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EntryResultCursor {
+    /// Original input file URL, as stored by the ingestion engine.
+    pub file_url: String,
+    /// Line number in that file.
+    pub line_number: u64,
+}
+
+/// Backend continuation for receipt traversal. Callers pass this back unchanged
+/// to the same provider with the same scope, outcome filter and page limit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EntryResultContinuation {
+    /// PostgreSQL and SQLite continue strictly after this stored identity.
+    Keyset(EntryResultCursor),
+    /// MongoDB and S3 retain their existing offset-based traversal internally.
+    /// SQL providers reject this variant, including offset zero.
+    Offset(u32),
+}
+
+/// One receipt and, when available, its original persisted identity.
+#[derive(Debug, Clone)]
+pub struct PagedEntryResult {
+    /// The unchanged ingestion result, also used by persisted S3 objects.
+    pub result: BulkEntryResult,
+    /// Always present for PostgreSQL and SQLite. Other adapters may omit this:
+    /// old S3 receipt objects do not retain a recoverable original file URL.
+    pub stored_identity: Option<EntryResultCursor>,
+}
+
+/// A bounded receipt page. Only `next == None` means traversal is complete;
+/// an empty page may still carry a continuation.
+#[derive(Debug, Clone)]
+pub struct EntryResultPage {
+    /// At most the requested page limit of receipts, already outcome-filtered.
+    pub entries: Vec<PagedEntryResult>,
+    /// Continuation to pass unchanged to the next request.
+    pub next: Option<EntryResultContinuation>,
+}
+
+pub(crate) fn invalid_entry_result_page(message: impl Into<String>) -> StorageError {
+    crate::error::ValidationError::InvalidResource {
+        message: message.into(),
+        details: Vec::new(),
+    }
+    .into()
+}
+
+/// Traverse opaque backend continuations without treating an empty page as EOF.
+/// Consumers retain page boundaries for batching and choose their error policy.
+pub(crate) fn entry_result_pages<F, Fut>(
+    fetch: F,
+) -> impl futures::Stream<Item = StorageResult<EntryResultPage>>
+where
+    F: FnMut(Option<EntryResultContinuation>) -> Fut,
+    Fut: std::future::Future<Output = StorageResult<EntryResultPage>>,
+{
+    futures::stream::try_unfold(
+        (fetch, None, false),
+        |(mut fetch, continuation, finished)| async move {
+            if finished {
+                return Ok(None);
+            }
+            let page = fetch(continuation).await?;
+            let next = page.next.clone();
+            let finished = next.is_none();
+            Ok(Some((page, (fetch, next, finished))))
+        },
+    )
 }
 
 /// Summary of a submission's status.
@@ -1221,29 +1294,29 @@ pub trait BulkSubmitProvider: ResourceStorage {
         options: &BulkProcessingOptions,
     ) -> StorageResult<Vec<BulkEntryResult>>;
 
-    /// Gets entry results for a manifest.
+    /// Reads one bounded page of persisted receipts for a fixed scope and filter.
     ///
-    /// # Arguments
+    /// Start with `continuation = None`, then pass each page's `next` unchanged
+    /// until it is `None`. Keep tenant, submission, manifest, outcome filter and
+    /// nonzero limit unchanged throughout that traversal. Filtering happens
+    /// before limiting; a full last page may require a final empty request.
     ///
-    /// * `tenant` - The tenant context
-    /// * `submission_id` - The submission identifier
-    /// * `manifest_id` - The manifest identifier
-    /// * `outcome_filter` - Optional filter by outcome
-    /// * `limit` - Maximum number of results
-    /// * `offset` - Offset for pagination
+    /// SQL providers use native keyset pagination and return every stored
+    /// identity. MongoDB/S3 encapsulate their existing offset mechanism. A
+    /// continuation of the wrong kind is an error, never a fallback request.
     ///
-    /// # Returns
-    ///
-    /// List of entry results.
-    async fn get_entry_results(
+    /// This replaces the former `get_entry_results` offset method and is a
+    /// source-incompatible change to the Rust provider API. It does not change
+    /// the bulk-submit HTTP protocol or serialized `BulkEntryResult` objects.
+    async fn get_entry_results_page(
         &self,
         tenant: &TenantContext,
         submission_id: &SubmissionId,
         manifest_id: &str,
         outcome_filter: Option<BulkEntryOutcome>,
         limit: u32,
-        offset: u32,
-    ) -> StorageResult<Vec<BulkEntryResult>>;
+        continuation: Option<&EntryResultContinuation>,
+    ) -> StorageResult<EntryResultPage>;
 
     /// Gets entry counts for a manifest.
     ///
@@ -1360,6 +1433,21 @@ pub trait BulkSubmitRollbackProvider: BulkSubmitProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn receipt_page_errors_end_traversal_without_retry() {
+        use futures::StreamExt;
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = calls.clone();
+        let pages = entry_result_pages(move |_| {
+            observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            std::future::ready(Err(invalid_entry_result_page("scripted read failure")))
+        });
+        futures::pin_mut!(pages);
+        assert!(pages.next().await.unwrap().is_err());
+        assert!(pages.next().await.is_none());
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
 
     #[test]
     fn test_submission_id() {

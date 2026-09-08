@@ -4186,6 +4186,87 @@ mod bulk_submit {
             counts.total, 2,
             "both files' line 1 must survive as separate results"
         );
+        let mut next = None;
+        let mut ids = Vec::new();
+        for page_index in 0..3 {
+            let page = backend
+                .get_entry_results_page(&tenant, &id, &manifest_id, None, 1, next.as_ref())
+                .await
+                .unwrap();
+            assert!(
+                page.entries
+                    .iter()
+                    .all(|entry| entry.stored_identity.is_none())
+            );
+            ids.extend(
+                page.entries
+                    .into_iter()
+                    .map(|entry| entry.result.resource_id.unwrap()),
+            );
+            next = page.next;
+            if page_index < 2 {
+                assert_eq!(
+                    next,
+                    Some(helios_persistence::core::EntryResultContinuation::Offset(
+                        page_index + 1
+                    ))
+                );
+            } else {
+                assert!(next.is_none(), "exact multiple must terminate");
+            }
+        }
+        assert_eq!(ids, ["pa", "pb"]);
+        assert!(
+            backend
+                .get_entry_results_page(&tenant, &id, &manifest_id, None, 0, None)
+                .await
+                .is_err()
+        );
+        assert!(
+            backend
+                .get_entry_results_page(
+                    &tenant,
+                    &id,
+                    &manifest_id,
+                    None,
+                    1,
+                    Some(&helios_persistence::core::EntryResultContinuation::Keyset(
+                        helios_persistence::core::EntryResultCursor {
+                            file_url: String::new(),
+                            line_number: 0,
+                        }
+                    ))
+                )
+                .await
+                .is_err()
+        );
+        let primary = Arc::new(backend);
+        let config = helios_persistence::composite::config::CompositeConfig::builder()
+            .primary("mongo", BackendKind::MongoDB)
+            .build()
+            .unwrap();
+        let storage = Arc::new(
+            helios_persistence::composite::storage::CompositeStorage::new(
+                config,
+                std::collections::HashMap::from([(
+                    "mongo".to_string(),
+                    primary.clone() as helios_persistence::composite::storage::DynStorage,
+                )]),
+            )
+            .unwrap(),
+        );
+        let jobs =
+            helios_persistence::composite::bulk_submit::CompositeSubmitJobs::new(primary, storage);
+        let delegated = jobs
+            .get_entry_results_page(&tenant, &id, &manifest_id, None, 1, None)
+            .await
+            .unwrap();
+        assert!(delegated.entries[0].stored_identity.is_none());
+        assert_eq!(
+            delegated.next,
+            Some(helios_persistence::core::EntryResultContinuation::Offset(1))
+        );
+        eprintln!("Verified MongoDB bulk-submit receipt pagination and Composite delegation");
     }
 
     #[tokio::test]

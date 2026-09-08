@@ -46,9 +46,10 @@ use crate::core::bulk_export::ExportJobId;
 use crate::core::bulk_export_worker::{LeaseError, WorkerId};
 use crate::core::bulk_submit::{
     BulkEntryOutcome, BulkEntryResult, BulkProcessingOptions, BulkSubmitProvider,
-    BulkSubmitRollbackProvider, ChangeType, EntryCountSummary, ManifestStatus, NdjsonEntry,
-    StreamProcessingResult, StreamingBulkSubmitProvider, SubmissionChange, SubmissionId,
-    SubmissionManifest, SubmissionStatus, SubmissionSummary,
+    BulkSubmitRollbackProvider, ChangeType, EntryCountSummary, EntryResultContinuation,
+    EntryResultPage, ManifestStatus, NdjsonEntry, PagedEntryResult, StreamProcessingResult,
+    StreamingBulkSubmitProvider, SubmissionChange, SubmissionId, SubmissionManifest,
+    SubmissionStatus, SubmissionSummary, invalid_entry_result_page,
 };
 use crate::core::bulk_submit_worker::{
     ManifestFetchParams, ManifestLease, ManifestWorkerView, PollTokenTarget, SubmitClaimStrategy,
@@ -932,15 +933,29 @@ impl BulkSubmitProvider for MongoBackend {
         Ok(results)
     }
 
-    async fn get_entry_results(
+    async fn get_entry_results_page(
         &self,
         tenant: &TenantContext,
         submission_id: &SubmissionId,
         manifest_id: &str,
         outcome_filter: Option<BulkEntryOutcome>,
         limit: u32,
-        offset: u32,
-    ) -> StorageResult<Vec<BulkEntryResult>> {
+        continuation: Option<&EntryResultContinuation>,
+    ) -> StorageResult<EntryResultPage> {
+        if limit == 0 {
+            return Err(invalid_entry_result_page(
+                "Receipt page limit must be greater than zero",
+            ));
+        }
+        let offset = match continuation {
+            None => 0,
+            Some(EntryResultContinuation::Offset(offset)) => *offset,
+            Some(EntryResultContinuation::Keyset(_)) => {
+                return Err(invalid_entry_result_page(
+                    "mongodb receipt pages require an offset continuation",
+                ));
+            }
+        };
         let mut filter = manifest_filter(tenant, submission_id, manifest_id);
         if let Some(outcome) = outcome_filter {
             filter.insert("outcome", outcome.to_string());
@@ -957,11 +972,30 @@ impl BulkSubmitProvider for MongoBackend {
             .with_options(options)
             .await
             .map_err(|e| internal_error(format!("query entry results: {e}")))?;
-        Ok(collect(cursor)
+        let results: Vec<_> = collect(cursor)
             .await?
             .iter()
             .map(decode_entry_result)
-            .collect())
+            .collect();
+        let next = if results.len() == limit as usize {
+            Some(EntryResultContinuation::Offset(
+                offset
+                    .checked_add(limit)
+                    .ok_or_else(|| invalid_entry_result_page("Receipt offset exceeds u32 range"))?,
+            ))
+        } else {
+            None
+        };
+        Ok(EntryResultPage {
+            entries: results
+                .into_iter()
+                .map(|result| PagedEntryResult {
+                    result,
+                    stored_identity: None,
+                })
+                .collect(),
+            next,
+        })
     }
 
     async fn get_entry_counts(
