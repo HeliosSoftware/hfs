@@ -6,7 +6,9 @@
 
 use async_trait::async_trait;
 use chrono::Utc;
-use elasticsearch::{DeleteByQueryParts, DeleteParts, GetParts, IndexParts};
+use elasticsearch::{
+    BulkOperation, BulkParts, DeleteByQueryParts, DeleteParts, GetParts, IndexParts,
+};
 use helios_fhir::FhirVersion;
 use serde_json::{Value, json};
 
@@ -20,6 +22,12 @@ use crate::types::StoredResource;
 
 use super::backend::ElasticsearchBackend;
 use super::schema;
+
+/// Upper bound on operations per `_bulk` request in
+/// [`ResourceStorage::create_many`]. Keeps a request body bounded (conformance
+/// resources are a few KB each; contained documents ride along) without
+/// making a load pay one refresh wait per handful of documents.
+const BULK_OPS_PER_REQUEST: usize = 500;
 
 fn internal_error(message: String) -> StorageError {
     StorageError::Backend(BackendError::Internal {
@@ -584,6 +592,236 @@ impl ResourceStorage for ElasticsearchBackend {
             None,
             fhir_version,
         ))
+    }
+
+    /// One `_bulk` request per [`BULK_OPS_PER_REQUEST`] operations, with the
+    /// configured write-refresh policy applied once per request rather than
+    /// once per document.
+    ///
+    /// This is what makes a bulk load survivable under `refresh=wait_for`:
+    /// that policy blocks each write until the next scheduled refresh (the
+    /// index's `refresh_interval`, 1s by default), so N per-document writes
+    /// cost N refresh waits — the ~1.4k-resource conformance seed took over
+    /// twenty minutes and the server never came up — while one bulk request
+    /// costs one.
+    async fn create_many(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        resources: Vec<Value>,
+        fhir_version: FhirVersion,
+    ) -> Vec<StorageResult<StoredResource>> {
+        if resources.is_empty() {
+            return Vec::new();
+        }
+        if tenant
+            .check_permission(Operation::Create, resource_type)
+            .is_err()
+        {
+            return resources
+                .iter()
+                .map(|_| {
+                    tenant
+                        .check_permission(Operation::Create, resource_type)
+                        .map(|()| unreachable!("permission check failed a moment ago"))
+                        .map_err(StorageError::from)
+                })
+                .collect();
+        }
+
+        let tenant_id = tenant.tenant_id().as_str();
+        let version_id = "1";
+        let extractor = self.tenant_extractor(tenant_id);
+
+        // Every document each resource contributes — its own, plus one per
+        // `contained` entry — addressed by (index, doc id). Built up front so
+        // the indices can be ensured once each and the operations streamed
+        // out in a few requests.
+        struct Prepared {
+            id: String,
+            resource: Value,
+            docs: Vec<(String, String, Value)>,
+        }
+        let mut types_touched = vec![resource_type.to_string()];
+        let prepared: Vec<Prepared> = resources
+            .into_iter()
+            .map(|mut resource| {
+                let id = resource
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+                    .unwrap_or_else(crate::types::new_resource_id);
+                if let Some(obj) = resource.as_object_mut() {
+                    obj.insert(
+                        "resourceType".to_string(),
+                        Value::String(resource_type.to_string()),
+                    );
+                    obj.insert("id".to_string(), Value::String(id.clone()));
+                }
+                let extracted_values = extractor
+                    .extract(&resource, resource_type)
+                    .unwrap_or_default();
+                let mut docs = vec![(
+                    self.index_name(tenant_id, resource_type),
+                    Self::document_id(resource_type, &id),
+                    build_es_document(
+                        tenant_id,
+                        resource_type,
+                        &id,
+                        version_id,
+                        &resource,
+                        fhir_version,
+                        &extracted_values,
+                    ),
+                )];
+                for contained in extractor.extract_contained(&resource) {
+                    types_touched.push(contained.contained_type.clone());
+                    docs.push((
+                        self.index_name(tenant_id, &contained.contained_type),
+                        Self::document_id(
+                            &contained.contained_type,
+                            &contained_resource_id(&id, &contained.local_id),
+                        ),
+                        build_es_contained_document(
+                            tenant_id,
+                            resource_type,
+                            &id,
+                            &contained.contained_type,
+                            &contained.local_id,
+                            &contained.content,
+                            version_id,
+                            fhir_version,
+                            &contained.values,
+                        ),
+                    ));
+                }
+                Prepared { id, resource, docs }
+            })
+            .collect();
+
+        // Ensure every index touched exists, once each.
+        let mut ensured = std::collections::HashSet::new();
+        for ty in types_touched {
+            if ensured.insert(ty.clone())
+                && let Err(e) = schema::ensure_index(self, tenant_id, &ty).await
+            {
+                let message = e.to_string();
+                return prepared
+                    .iter()
+                    .map(|_| Err(internal_error(message.clone())))
+                    .collect();
+            }
+        }
+
+        // Flatten to operations, remembering which resource each belongs to,
+        // and send them in bounded requests. A resource's outcome is the first
+        // failure among its own operations, if any.
+        let ops: Vec<(usize, &str, &str, &Value)> = prepared
+            .iter()
+            .enumerate()
+            .flat_map(|(i, p)| {
+                p.docs
+                    .iter()
+                    .map(move |(index, doc_id, doc)| (i, index.as_str(), doc_id.as_str(), doc))
+            })
+            .collect();
+        let mut failures: Vec<Option<String>> = vec![None; prepared.len()];
+        fn fail_chunk(
+            failures: &mut [Option<String>],
+            chunk: &[(usize, &str, &str, &Value)],
+            message: String,
+        ) {
+            for (i, ..) in chunk {
+                failures[*i].get_or_insert_with(|| message.clone());
+            }
+        }
+        for chunk in ops.chunks(BULK_OPS_PER_REQUEST) {
+            let body: Vec<BulkOperation<Value>> = chunk
+                .iter()
+                .map(|(_, index, doc_id, doc)| {
+                    BulkOperation::index((*doc).clone())
+                        .index(*index)
+                        .id(*doc_id)
+                        .into()
+                })
+                .collect();
+            let mut request = self.client().bulk(BulkParts::None).body(body);
+            if let Some(refresh) = self.write_refresh_param() {
+                request = request.refresh(refresh);
+            }
+            let response = match request.send().await {
+                Ok(response) => response,
+                Err(e) => {
+                    fail_chunk(
+                        &mut failures,
+                        chunk,
+                        format!("Failed to send bulk index request: {e}"),
+                    );
+                    continue;
+                }
+            };
+            let status = response.status_code();
+            let payload: Value = match response.json().await {
+                Ok(payload) if status.is_success() => payload,
+                Ok(payload) => {
+                    fail_chunk(
+                        &mut failures,
+                        chunk,
+                        format!("Bulk index request failed (status {status}): {payload}"),
+                    );
+                    continue;
+                }
+                Err(e) => {
+                    fail_chunk(
+                        &mut failures,
+                        chunk,
+                        format!("Failed to read bulk index response: {e}"),
+                    );
+                    continue;
+                }
+            };
+            let items = payload
+                .get("items")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+            for (position, (i, ..)) in chunk.iter().enumerate() {
+                let item = items.get(position).and_then(|item| item.get("index"));
+                let item_status = item
+                    .and_then(|v| v.get("status"))
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                if !(200..300).contains(&item_status) {
+                    let error = item
+                        .and_then(|v| v.get("error"))
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|| "no item in bulk response".to_string());
+                    failures[*i].get_or_insert_with(|| {
+                        format!("Failed to index document (status {item_status}): {error}")
+                    });
+                }
+            }
+        }
+
+        let now = Utc::now();
+        prepared
+            .into_iter()
+            .zip(failures)
+            .map(|(p, failure)| match failure {
+                Some(message) => Err(internal_error(message)),
+                None => Ok(StoredResource::from_storage(
+                    resource_type,
+                    &p.id,
+                    version_id,
+                    tenant.tenant_id().clone(),
+                    p.resource,
+                    now,
+                    now,
+                    None,
+                    fhir_version,
+                )),
+            })
+            .collect()
     }
 
     async fn create_or_update(

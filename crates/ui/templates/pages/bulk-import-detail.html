@@ -52,10 +52,5 @@
 
 <div id="bulk-status" hx-get="/ui/bulk-import/{{ id }}/status" hx-trigger="load" hx-swap="outerHTML"></div>
 
-<section class="card table-card">
-  <div class="toolbar"><h2 class="toolbar__title">{{ i18n.t("bulk-import-log") }}</h2></div>
-  {% if log.is_empty() %}<div class="empty-state">{{ i18n.t("bulk-import-log-empty") }}</div>
-  {% else %}<pre class="detail__code">{% for line in log %}{{ line.at }}  {{ line.message }}
-{% endfor %}</pre>{% endif %}
-</section>
+{% include "partials/bulk_import_log.html" %}
 {% endblock %}

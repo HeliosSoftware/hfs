@@ -58,6 +58,57 @@ uv run pytest python-tests/ -v
 cargo test
 ```
 
+## Profiling the ingest write path
+
+`helios_persistence::perf` carries per-phase timers across the SQLite ingest
+path — NDJSON parse, read-before-write, resource and history INSERT, search
+extraction, index INSERT, FTS, bulk bookkeeping, commit. They answer "where did
+the time go", which a wall-clock rate cannot.
+
+**They are compiled out unless you ask for them, with `--cfg perf_phases`.**
+That is a cfg and not a cargo feature on purpose: `ci.yml`'s `build` job runs
+`cargo build --workspace --all-features --release` and the `release` job
+publishes exactly those artifacts (the Docker images copy them in), so a
+feature would have shipped the instrumentation in every binary. `--all-features`
+cannot turn a cfg on. Same reasoning as `tokio_unstable`.
+
+```bash
+# Rate only — no phase table, nothing compiled in:
+cargo run --release -p helios-persistence --example bulk_submit_bench -- \
+    --limit 25000 /path/to/CarePlan.ndjson
+
+# With the phase table:
+RUSTFLAGS='--cfg perf_phases' \
+  cargo run --release -p helios-persistence --example bulk_submit_bench -- \
+    --limit 25000 /path/to/CarePlan.ndjson
+```
+
+The example prints a reminder if you ask for phases from a binary built without
+the flag, rather than showing a table of zeros. Within a `--cfg perf_phases`
+build, collection is still off until `HFS_PERF_PHASES=1` or
+`perf::set_enabled(true)` — the benchmark does the latter.
+
+`bulk_submit_bench` drives the real `process_ndjson_stream`, the same call the
+bulk-submit worker makes per manifest file, against local NDJSON on a fresh
+database. Useful flags: `--limit` (resources per file), `--batch`, `--defer-index`
+(the `HFS_BULK_SUBMIT_DEFER_INDEXING` path), `--no-phases`, `--keep` (leave the
+database for `dbstat`), `--data-dir`.
+
+### Benchmarking discipline
+
+Two traps, both of which have produced wrong numbers here:
+
+- **Run it from the repo root, or pass `--data-dir`.** The default `data`
+  directory holds `search-parameters-r4.json`; without it the registry falls
+  back to five embedded parameters, index volume drops from ~14 rows per
+  resource to ~2, and the run is meaninglessly fast. The same applies to a real
+  `hfs` benchmark: set `HFS_DATA_DIR`.
+- **Interleave arms; never compare across sessions.** This workload drifts
+  several percent between runs of a machine on different days. Build each arm
+  in its own worktree and alternate them in one loop, three rounds minimum, and
+  compare medians. A single run against another arm's median is not a
+  measurement — differences under ~1% are below this harness's noise floor.
+
 ## Test Data
 
 - FHIR examples live in `crates/fhir/tests/data/`.

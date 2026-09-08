@@ -155,7 +155,9 @@ impl<Sink: ExportSink + 'static> ExportJobController for InMemoryController<Sink
         self.jobs.insert(
             job_id.clone(),
             JobStatus::Running {
-                percent: 0,
+                subjects_done: 0,
+                subjects_total: task.work.subject_count() as u32,
+                current_subject: None,
                 submitted_at,
             },
         );
@@ -413,23 +415,48 @@ fn set_status_if_running(jobs: &DashMap<String, JobStatus>, jid: &str, status: J
     }
 }
 
-/// Records job progress, capped at 99 while running so callers don't see
-/// "100%" until the manifest is actually available from the status poll.
-/// A job that is no longer `Running` (e.g. cancelled mid-run) is left
-/// untouched — see [`set_status_if_running`].
-fn record_progress(
+/// Records that a subject has started: `subjects_done` is left unchanged and
+/// `current_subject` is set to its output name. A job that is no longer
+/// `Running` (e.g. cancelled mid-run) is left untouched — see
+/// [`set_status_if_running`].
+fn record_subject_started(
     jobs: &DashMap<String, JobStatus>,
     jid: &str,
     submitted_at: DateTime<Utc>,
-    done: u32,
-    total: u32,
+    subjects_done: u32,
+    subjects_total: u32,
+    name: &str,
 ) {
-    let percent = ((done * 100) / total.max(1)).min(99) as u8;
     set_status_if_running(
         jobs,
         jid,
         JobStatus::Running {
-            percent,
+            subjects_done,
+            subjects_total,
+            current_subject: Some(name.to_string()),
+            submitted_at,
+        },
+    );
+}
+
+/// Records that a subject has finished: `subjects_done` advances to the given
+/// count and `current_subject` is cleared, since nothing is in flight between
+/// one subject finishing and the next one starting. A job that is no longer
+/// `Running` is left untouched — see [`set_status_if_running`].
+fn record_subject_finished(
+    jobs: &DashMap<String, JobStatus>,
+    jid: &str,
+    submitted_at: DateTime<Utc>,
+    subjects_done: u32,
+    subjects_total: u32,
+) {
+    set_status_if_running(
+        jobs,
+        jid,
+        JobStatus::Running {
+            subjects_done,
+            subjects_total,
+            current_subject: None,
             submitted_at,
         },
     );
@@ -462,6 +489,15 @@ async fn run_views_job<Sink: ExportSink>(
     // `output.name` in the manifest carries its name. Progress advances by one
     // subject per view finished.
     for (view_idx, named) in views.iter().enumerate() {
+        record_subject_started(
+            jobs,
+            jid,
+            submitted_at,
+            progress_offset + view_idx as u32,
+            total_subjects,
+            &named.name,
+        );
+
         let stream = runner
             .run_view(&task.tenant, named.view.clone(), task.filters.clone())
             .await
@@ -509,7 +545,7 @@ async fn run_views_job<Sink: ExportSink>(
             });
         }
 
-        record_progress(
+        record_subject_finished(
             jobs,
             jid,
             submitted_at,
@@ -550,6 +586,15 @@ async fn run_sqlquery_job<Sink: ExportSink>(
     let mut total_rows: usize = 0;
 
     for (query_idx, query) in queries.iter().enumerate() {
+        record_subject_started(
+            jobs,
+            jid,
+            submitted_at,
+            progress_offset + query_idx as u32,
+            total_subjects,
+            &query.name,
+        );
+
         let result = execute_sql_query(runner, task, query, limits)
             .await
             .map_err(|e| format!("query '{}': {e}", query.name))?;
@@ -574,7 +619,7 @@ async fn run_sqlquery_job<Sink: ExportSink>(
             });
         }
 
-        record_progress(
+        record_subject_finished(
             jobs,
             jid,
             submitted_at,
@@ -927,6 +972,147 @@ mod tests {
         release.notify_one();
     }
 
+    /// A `SofRunner` that reports each `run_view` call, in order, over an
+    /// unbounded channel and then blocks on a shared `Notify` until the test
+    /// releases it. Lets a test observe the export worker's `Running` state
+    /// exactly at the boundary between two subjects, deterministically.
+    struct SteppingRunner {
+        called: tokio::sync::mpsc::UnboundedSender<()>,
+        release: Arc<Notify>,
+    }
+
+    #[async_trait]
+    impl SofRunner for SteppingRunner {
+        async fn run_view(
+            &self,
+            _tenant: &TenantContext,
+            _view_definition: serde_json::Value,
+            _filters: ViewFilters,
+        ) -> Result<RowStream, SofError> {
+            let _ = self.called.send(());
+            self.release.notified().await;
+            Ok(Box::pin(futures::stream::empty()))
+        }
+
+        fn runner_name(&self) -> &'static str {
+            "stepping-test-runner"
+        }
+    }
+
+    /// Spec (#853): the worker records a subject's *start* (`current_subject`
+    /// set, `subjects_done` unchanged) as well as its *finish*
+    /// (`subjects_done + 1`, `current_subject` cleared), in kick-off order —
+    /// views first, then queries. The query subject here depends on a `Leaf`
+    /// ViewDefinition node, so its execution also calls `run_view`, letting
+    /// the same `SteppingRunner` observe both subjects.
+    #[tokio::test]
+    async fn worker_records_subject_start_and_finish_in_kickoff_order() {
+        let (called_tx, mut called_rx) = tokio::sync::mpsc::unbounded_channel();
+        let release = Arc::new(Notify::new());
+        let runner = Arc::new(SteppingRunner {
+            called: called_tx,
+            release: Arc::clone(&release),
+        });
+        let controller =
+            InMemoryController::new(runner, InMemorySink::new("http://localhost"), None);
+
+        let tenant = TenantContext::new(TenantId::new("t1"), TenantPermissions::full_access());
+        let leaf_view = serde_json::json!({
+            "resourceType": "ViewDefinition",
+            "resource": "Patient",
+            "status": "active",
+            "select": [{"column": [{"name": "id", "path": "id"}]}]
+        });
+        let query_plan = crate::handlers::sof::graph::GraphPlan {
+            nodes: vec![crate::handlers::sof::graph::PlanNode::Leaf {
+                internal_name: "vd_0".to_string(),
+                view: leaf_view.clone(),
+            }],
+            subject_edges: Vec::new(),
+        };
+
+        let job_id = controller.submit(ExportTask {
+            work: ExportWork {
+                views: vec![NamedView {
+                    name: "demographics".to_string(),
+                    view: leaf_view,
+                }],
+                queries: vec![NamedSqlQuery {
+                    name: "families".to_string(),
+                    sql: "SELECT * FROM vd_0".to_string(),
+                    plan: query_plan,
+                    bindings: Vec::new(),
+                }],
+                limits: SqlExportLimits {
+                    max_source_rows_per_vd: 1000,
+                    max_rows: 1000,
+                    timeout_secs: 5,
+                },
+            },
+            tenant,
+            filters: ViewFilters::default(),
+            format: "ndjson".to_string(),
+            header: true,
+            client_tracking_id: None,
+        });
+
+        // The view subject ("demographics") starts first, per kick-off order.
+        called_rx
+            .recv()
+            .await
+            .expect("view subject should call run_view");
+        match controller.get_status("t1", &job_id) {
+            Some(JobStatus::Running {
+                subjects_done,
+                subjects_total,
+                current_subject,
+                ..
+            }) => {
+                assert_eq!(subjects_done, 0);
+                assert_eq!(subjects_total, 2);
+                assert_eq!(current_subject.as_deref(), Some("demographics"));
+            }
+            other => panic!("expected Running with demographics in progress, got {other:?}"),
+        }
+        release.notify_one();
+
+        // The query subject ("families") starts only once the view subject
+        // has finished — subjects_done must already read 1.
+        called_rx
+            .recv()
+            .await
+            .expect("query subject should call run_view");
+        match controller.get_status("t1", &job_id) {
+            Some(JobStatus::Running {
+                subjects_done,
+                subjects_total,
+                current_subject,
+                ..
+            }) => {
+                assert_eq!(
+                    subjects_done, 1,
+                    "the view subject must be marked done before the query starts"
+                );
+                assert_eq!(subjects_total, 2);
+                assert_eq!(current_subject.as_deref(), Some("families"));
+            }
+            other => panic!("expected Running with families in progress, got {other:?}"),
+        }
+        release.notify_one();
+
+        // Both subjects done: the job completes with no subject in flight.
+        for _ in 0..40 {
+            if matches!(
+                controller.get_status("t1", &job_id),
+                Some(JobStatus::Completed { .. })
+            ) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("job did not reach Completed after both subjects finished");
+    }
+
     /// The cleanup reaper deletes terminal jobs older than the TTL (output +
     /// bookkeeping) while leaving running jobs untouched.
     #[test]
@@ -971,7 +1157,9 @@ mod tests {
         jobs.insert(
             running.clone(),
             JobStatus::Running {
-                percent: 10,
+                subjects_done: 1,
+                subjects_total: 10,
+                current_subject: Some("still-writing".to_string()),
                 submitted_at: two_hours_ago,
             },
         );

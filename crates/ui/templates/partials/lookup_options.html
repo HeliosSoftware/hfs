@@ -1,14 +1,20 @@
 <!--
   Shared combobox result fragment (#836) — the Patient/Group search results
-  for Bulk Export's own picker and SQL Export's "Narrow it down" pickers.
-  `target` is the combobox's own `id` (validated against a closed list by
-  the handler before this ever renders), reused here as the `hx-swap-oob`
-  id so the fragment lands in the caller's own message slot regardless of
-  which page rendered it.
+  for Bulk Export's own picker and SQL Export's "Narrow it down" pickers,
+  and (#842) the ViewDefinition/SQL View results for the *Add table*
+  picker. `target` is the combobox's own `id` (validated against a closed
+  list by the handler before this ever renders), reused here as the
+  `hx-swap-oob` id so the fragment lands in the caller's own message slot
+  regardless of which page rendered it. `data-name` is optional — only
+  `table_options` (#842) sets it, on the bare artifact name (never
+  `option.label`'s own " — ViewDefinition"/" — SQL View" suffix), for the
+  Add table alias field's own autocomplete (`sql-library-panels.js`); the
+  Patient/Group options above never carry it.
 -->
 {% for option in options %}
 <button type="button" class="combobox__option" data-combobox-option
-        data-value="{{ option.value }}" data-label="{{ option.label }}">
+        data-value="{{ option.value }}" data-label="{{ option.label }}"
+        {% if let Some(name) = option.name %}data-name="{{ name }}"{% endif %}>
   {{ option.label }}
 </button>
 {% endfor %}

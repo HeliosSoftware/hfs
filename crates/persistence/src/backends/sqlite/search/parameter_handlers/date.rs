@@ -17,8 +17,19 @@ use super::super::query_builder::{SqlFragment, SqlParam};
 /// modifier (`'+1 day'`), so a single parameter serves both ends of the range
 /// wherever the caller can only bind one.
 ///
-/// `datetime()` truncates fractional seconds, so millisecond-precision values
-/// compare at second precision — a match too many beats never matching.
+/// `datetime()` truncates fractional seconds, which is right for a search
+/// value of second precision (its range is the whole second) but not for one
+/// of millisecond precision: `_lastUpdated=eq2026-09-06T08:44:27.804Z` would
+/// match every resource written in that second, which is exactly what a
+/// transaction Bundle produces once the writes are fast enough to land in one.
+/// Millisecond-precision values therefore go through `strftime('%f')`, which
+/// keeps `SS.SSS` and still folds timezone offsets to UTC. Both sides are
+/// first cut to three fractional digits in SQL ([`truncated_to_millis`]):
+/// `last_updated` holds nanoseconds, which SQLite would *round* to the
+/// nearest millisecond while `meta.lastUpdated` (what the client searches
+/// with) truncates — off by one millisecond half the time. The approximate
+/// prefix keeps `datetime()`: its ±10-second window is coarser than a second
+/// anyway.
 ///
 /// Returns the SQL and the value to bind for its (single) parameter.
 pub(crate) fn date_condition(
@@ -38,8 +49,24 @@ pub(crate) fn date_condition(
         _ => (value.to_string(), None),
     };
 
-    let col = format!("datetime({column})");
-    let p = format!("datetime(?{param_num})");
+    // Decided on the value's own text rather than `DatePrecision`, which reads
+    // a negative offset (`...:42-04:00`) as extra length and calls a plain
+    // second-precision value millisecond.
+    let has_fractional_seconds = value
+        .split_once('T')
+        .is_some_and(|(_, time)| time.contains('.'));
+    let normalize = |expr: &str| {
+        if has_fractional_seconds && prefix != SearchPrefix::Ap {
+            format!(
+                "strftime('%Y-%m-%d %H:%M:%f', {})",
+                truncated_to_millis(expr)
+            )
+        } else {
+            format!("datetime({expr})")
+        }
+    };
+    let col = normalize(column);
+    let p = normalize(&format!("?{param_num}"));
     let end = |m: &str| format!("datetime(?{param_num}, '{m}')");
 
     let sql = match (prefix, bump) {
@@ -70,6 +97,25 @@ pub(crate) fn date_condition(
         }
     };
     (sql, start)
+}
+
+/// SQL for `expr` (a date/time TEXT value or bind parameter) with its
+/// fractional seconds cut to at most three digits — truncated, never rounded
+/// — and everything after the digits (a timezone offset, `Z`, nothing) kept.
+///
+/// `2026-09-06T20:35:32.364567890+00:00` becomes `2026-09-06T20:35:32.364+00:00`;
+/// `2016-01-23T13:07:42.5-04:00` and values without a fraction are unchanged.
+/// SQLite has no regular expressions, so the digit run after the dot is
+/// measured by stripping leading digits with `ltrim`.
+fn truncated_to_millis(expr: &str) -> String {
+    let rest = format!("substr({expr}, instr({expr}, '.') + 1)");
+    let tail = format!("ltrim({rest}, '0123456789')");
+    format!(
+        "CASE WHEN instr({expr}, '.') = 0 THEN {expr} \
+         ELSE substr({expr}, 1, instr({expr}, '.')) \
+         || substr({rest}, 1, min(3, length({rest}) - length({tail}))) \
+         || {tail} END"
+    )
 }
 
 /// Handles date parameter SQL generation.
@@ -163,6 +209,176 @@ mod tests {
         let value = SearchValue::new(SearchPrefix::Eq, "2024-01-15");
         let frag = DateHandler::build_sql(&value, 0);
         assert_eq!(frag.params.len(), 1);
+    }
+
+    #[test]
+    fn eq_millisecond_precision_keeps_the_milliseconds() {
+        let (sql, param) = sql_and_param(SearchPrefix::Eq, "2026-09-06T08:44:27.804Z");
+        assert!(
+            sql.starts_with("strftime('%Y-%m-%d %H:%M:%f', ")
+                && sql.contains(" = strftime('%Y-%m-%d %H:%M:%f', "),
+            "both sides keep milliseconds: {sql}"
+        );
+        assert!(
+            !sql.contains("datetime("),
+            "no second-precision fold: {sql}"
+        );
+        assert_eq!(param, "2026-09-06T08:44:27.804Z");
+    }
+
+    /// The SQL truncation, evaluated by SQLite on the shapes that occur:
+    /// nanoseconds (`last_updated`), a short fraction with an offset
+    /// (`value_date` as the resource carried it), and no fraction at all.
+    #[test]
+    fn truncation_cuts_fraction_digits_and_keeps_the_offset() {
+        let conn = rusqlite::Connection::open_in_memory().expect("in-memory sqlite");
+        let truncate = |value: &str| -> String {
+            conn.query_row(
+                &format!("SELECT {}", truncated_to_millis("?1")),
+                rusqlite::params![value],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("evaluate truncation")
+        };
+        assert_eq!(
+            truncate("2026-09-06T20:35:32.364567890+00:00"),
+            "2026-09-06T20:35:32.364+00:00"
+        );
+        assert_eq!(
+            truncate("2026-09-06T20:35:32.9996Z"),
+            "2026-09-06T20:35:32.999Z"
+        );
+        assert_eq!(
+            truncate("2016-01-23T13:07:42.5-04:00"),
+            "2016-01-23T13:07:42.5-04:00"
+        );
+        assert_eq!(truncate("2016-01-23T13:07:42.25"), "2016-01-23T13:07:42.25");
+        assert_eq!(
+            truncate("2016-01-23T13:07:42-04:00"),
+            "2016-01-23T13:07:42-04:00"
+        );
+        assert_eq!(truncate("1995-10-02"), "1995-10-02");
+    }
+
+    #[test]
+    fn second_precision_still_covers_the_whole_second() {
+        let (sql, _) = sql_and_param(SearchPrefix::Eq, "2026-09-06T08:44:27Z");
+        assert_eq!(sql, "datetime(value_date) = datetime(?1)");
+        // A negative offset is not fractional seconds.
+        let (sql, _) = sql_and_param(SearchPrefix::Eq, "2026-09-06T04:44:27-04:00");
+        assert_eq!(sql, "datetime(value_date) = datetime(?1)");
+    }
+
+    /// Evaluates the generated condition in SQLite itself against one stored
+    /// `last_updated` value (the `Utc::now().to_rfc3339()` shape the resources
+    /// table holds), returning whether the search value matches it.
+    fn sqlite_matches(prefix: SearchPrefix, search: &str, stored: &str) -> bool {
+        let conn = rusqlite::Connection::open_in_memory().expect("in-memory sqlite");
+        let (sql, bound) = date_condition("?2", prefix, search, 1);
+        conn.query_row(
+            &format!("SELECT {sql}"),
+            rusqlite::params![bound, stored],
+            |row| row.get::<_, bool>(0),
+        )
+        .unwrap_or_else(|e| panic!("evaluating `{sql}`: {e}"))
+    }
+
+    /// The Inferno US Core `_lastUpdated` case: a transaction Bundle writes
+    /// several resources within one second, and a search for one resource's
+    /// exact `meta.lastUpdated` must not return its neighbours from the same
+    /// second.
+    #[test]
+    fn millisecond_precision_evaluates_at_millisecond_in_sqlite() {
+        let stored = "2026-09-06T08:44:27.828123+00:00";
+
+        assert!(
+            !sqlite_matches(SearchPrefix::Eq, "2026-09-06T08:44:27.804Z", stored),
+            "a different millisecond in the same second is not a match"
+        );
+        assert!(sqlite_matches(
+            SearchPrefix::Eq,
+            "2026-09-06T08:44:27.828Z",
+            stored
+        ));
+        assert!(
+            sqlite_matches(SearchPrefix::Eq, "2026-09-06T08:44:27Z", stored),
+            "a second-precision search still covers the whole second"
+        );
+        assert!(
+            sqlite_matches(SearchPrefix::Eq, "2026-09-06T04:44:27.828-04:00", stored),
+            "timezone offsets still fold to UTC"
+        );
+
+        // Truncated, not rounded: `.828567` is `.828` to the client (that is
+        // what `meta.lastUpdated` says), so `.829` must not match it — and a
+        // fraction that would round up into the next second must not either.
+        let rounds_up = "2026-09-06T08:44:27.828567+00:00";
+        assert!(sqlite_matches(
+            SearchPrefix::Eq,
+            "2026-09-06T08:44:27.828Z",
+            rounds_up
+        ));
+        assert!(!sqlite_matches(
+            SearchPrefix::Eq,
+            "2026-09-06T08:44:27.829Z",
+            rounds_up
+        ));
+        let next_second = "2026-09-06T08:44:27.9996+00:00";
+        assert!(sqlite_matches(
+            SearchPrefix::Eq,
+            "2026-09-06T08:44:27.999Z",
+            next_second
+        ));
+        assert!(!sqlite_matches(
+            SearchPrefix::Eq,
+            "2026-09-06T08:44:28.000Z",
+            next_second
+        ));
+
+        assert!(sqlite_matches(
+            SearchPrefix::Ne,
+            "2026-09-06T08:44:27.804Z",
+            stored
+        ));
+        assert!(!sqlite_matches(
+            SearchPrefix::Ne,
+            "2026-09-06T08:44:27.828Z",
+            stored
+        ));
+        assert!(sqlite_matches(
+            SearchPrefix::Ge,
+            "2026-09-06T08:44:27.828Z",
+            stored
+        ));
+        assert!(sqlite_matches(
+            SearchPrefix::Gt,
+            "2026-09-06T08:44:27.827Z",
+            stored
+        ));
+        assert!(!sqlite_matches(
+            SearchPrefix::Gt,
+            "2026-09-06T08:44:27.828Z",
+            stored
+        ));
+        assert!(sqlite_matches(
+            SearchPrefix::Lt,
+            "2026-09-06T08:44:27.829Z",
+            stored
+        ));
+        assert!(!sqlite_matches(
+            SearchPrefix::Lt,
+            "2026-09-06T08:44:27.828Z",
+            stored
+        ));
+        assert!(sqlite_matches(
+            SearchPrefix::Le,
+            "2026-09-06T08:44:27.828Z",
+            stored
+        ));
+        assert!(
+            sqlite_matches(SearchPrefix::Ap, "2026-09-06T08:44:30.000Z", stored),
+            "approximate keeps its ±10-second window"
+        );
     }
 }
 

@@ -176,13 +176,7 @@ pub fn sql_export_parameters_body(request: &SqlExportRequest) -> Value {
             let parameter: Vec<Value> = subject
                 .parameters
                 .iter()
-                .map(|p| {
-                    let (key, value) = typed_parameter_value(&p.type_code, &p.value);
-                    let mut entry = serde_json::Map::new();
-                    entry.insert("name".to_string(), Value::String(p.name.clone()));
-                    entry.insert(key.to_string(), value);
-                    Value::Object(entry)
-                })
+                .map(parameter_value_entry)
                 .collect();
             part.push(serde_json::json!({
                 "name": "parameters",
@@ -243,6 +237,30 @@ fn typed_parameter_value(type_code: &str, value: &str) -> (&'static str, Value) 
     }
 }
 
+/// Builds one `Parameters.parameter` entry — `{name, value[x]}` — for a
+/// supplied SQL parameter value, typed via [`typed_parameter_value`]. Shared
+/// by [`sql_export_parameters_body`]'s per-subject `parameters` part and
+/// [`HttpConformanceSource::sql_run`]'s live-preview bindings body (#841),
+/// so both type the exact same `(name, type_code, value)` triple identically
+/// — a value never binds differently depending on whether the run came from
+/// a live preview or a `$sql-export` job.
+fn parameter_value_entry(p: &SqlExportParameter) -> Value {
+    let (key, value) = typed_parameter_value(&p.type_code, &p.value);
+    let mut entry = serde_json::Map::new();
+    entry.insert("name".to_string(), Value::String(p.name.clone()));
+    entry.insert(key.to_string(), value);
+    Value::Object(entry)
+}
+
+/// Builds the nested `Parameters` resource `$sql-run`'s own `parameters`
+/// input parameter expects, from the live-preview bindings a SQL Query card
+/// supplies (#841) — the same [`parameter_value_entry`] typing
+/// [`sql_export_parameters_body`] uses for a subject's declared parameters.
+fn sql_run_parameters_resource(bindings: &[SqlExportParameter]) -> Value {
+    let parameter: Vec<Value> = bindings.iter().map(parameter_value_entry).collect();
+    serde_json::json!({ "resourceType": "Parameters", "parameter": parameter })
+}
+
 /// Fetches all FHIR resources of a conformance type for a FHIR version, as the
 /// raw resource JSON `Value`s (the `entry[].resource` of a searchset Bundle).
 #[async_trait]
@@ -267,14 +285,21 @@ pub trait ConformanceSource: Send + Sync {
     /// Runs `$sql-run` with `view_definition` as the inline subject and
     /// returns the output rows (`_format=json`), or an `Err` message the page
     /// shows in place of the results table (#649).
+    ///
+    /// `bindings` supplies this run's values for whichever
+    /// `Library.parameter` declarations `view_definition` carries — empty
+    /// for a ViewDefinition subject, which has none (#841). A binding whose
+    /// name the subject doesn't declare is the callee's problem to reject,
+    /// not this method's to filter.
     async fn sql_run(
         &self,
         view_definition: &Value,
+        bindings: &[SqlExportParameter],
         limit: usize,
         version: FhirVersion,
         tenant: &str,
     ) -> Result<Vec<Value>, String> {
-        let _ = (view_definition, limit, version, tenant);
+        let _ = (view_definition, bindings, limit, version, tenant);
         Err("$sql-run is not available from this source".to_string())
     }
 
@@ -373,8 +398,20 @@ pub struct SearchPage {
 /// What a `$sql-export` status poll answered (#649).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SqlExportStatus {
-    /// `202` — still running, with the `X-Progress` header when sent.
-    Running(Option<String>),
+    /// `202` — still running. `progress` is the `X-Progress` header, when
+    /// sent. `subjects_total`/`subjects_done`/`current_subject` are this
+    /// server's own extension of the body's `Parameters` (#853, see
+    /// `crates/rest/src/handlers/sof/export.rs`'s module docs): each is
+    /// `None` against a server that predates it, before the body parses as
+    /// JSON, or when that one parameter is simply absent from an otherwise
+    /// valid body (`current_subject` while no subject is currently being
+    /// written).
+    Running {
+        progress: Option<String>,
+        subjects_total: Option<u32>,
+        subjects_done: Option<u32>,
+        current_subject: Option<String>,
+    },
     /// `303` — finished (the manifest tells success from failure).
     Done,
     /// `404` — unknown, cancelled, or reclaimed.
@@ -386,6 +423,22 @@ pub enum SqlExportStatus {
     /// treating it as in progress and retry the poll (#833). The message is
     /// short and names the cause, e.g. `"status poll answered 401"`.
     Unavailable(String),
+}
+
+impl SqlExportStatus {
+    /// Convenience constructor for a `202` carrying only `X-Progress`, with
+    /// no subject-count parameters — a server that predates #853, or simply
+    /// the state before the first poll ever reports one. Used throughout
+    /// this crate's tests, standing in for a real self-call's `Running`
+    /// answer wherever the subject counts don't matter to the scenario.
+    pub fn running(progress: Option<String>) -> Self {
+        Self::Running {
+            progress,
+            subjects_total: None,
+            subjects_done: None,
+            current_subject: None,
+        }
+    }
 }
 
 /// Reads conformance resources from the server's own FHIR API over HTTP.
@@ -620,9 +673,15 @@ impl ConformanceSource for HttpConformanceSource {
     /// body). Storage holds the seeded default version only, so any other
     /// version degrades with a message rather than running against the wrong
     /// data.
+    ///
+    /// `bindings` (#841), when non-empty, is sent as a nested `parameters`
+    /// input built by [`sql_run_parameters_resource`]; when empty the body
+    /// is byte-for-byte what this method sent before `bindings` existed —
+    /// no test asserting on that shape needs to change.
     async fn sql_run(
         &self,
         view_definition: &Value,
+        bindings: &[SqlExportParameter],
         limit: usize,
         version: FhirVersion,
         tenant: &str,
@@ -637,9 +696,18 @@ impl ConformanceSource for HttpConformanceSource {
         // The Parameters envelope, not the raw-resource shorthand: the
         // shorthand is ViewDefinition-only, while `subjectResource` carries
         // Library subjects (SQL Queries / SQL Views) just the same.
+        let mut parameter = vec![serde_json::json!({
+            "name": "subjectResource", "resource": view_definition,
+        })];
+        if !bindings.is_empty() {
+            parameter.push(serde_json::json!({
+                "name": "parameters",
+                "resource": sql_run_parameters_resource(bindings),
+            }));
+        }
         let body = serde_json::json!({
             "resourceType": "Parameters",
-            "parameter": [{ "name": "subjectResource", "resource": view_definition }],
+            "parameter": parameter,
         });
         let mut request = self
             .client
@@ -701,7 +769,11 @@ impl ConformanceSource for HttpConformanceSource {
         }
         let url = format!("{}/{resource_type}", self.base_url);
         let mut query: Vec<(String, String)> = params.to_vec();
-        query.push(("_count".to_string(), count.to_string()));
+        // One more than the page: whether a further page exists is read off
+        // the overflow row, not only the Bundle's `next` link — MongoDB
+        // issues no page cursors (and so no `next` link) for a search sorted
+        // by a search parameter, and the rails always sort by `name`.
+        query.push(("_count".to_string(), (count + 1).to_string()));
         query.push(("_offset".to_string(), offset.to_string()));
         let request = self.client.get(&url).query(&query).header(
             "Accept",
@@ -722,9 +794,12 @@ impl ConformanceSource for HttpConformanceSource {
             .json()
             .await
             .map_err(|e| format!("parsing {resource_type} search results failed: {e}"))?;
+        let mut resources = extract_bundle_resources(&bundle);
+        let overflow = resources.len() > count;
+        resources.truncate(count);
         Ok(SearchPage {
-            resources: extract_bundle_resources(&bundle),
-            has_next: next_link(&bundle).is_some(),
+            resources,
+            has_next: overflow || next_link(&bundle).is_some(),
         })
     }
 
@@ -895,6 +970,14 @@ impl HttpConformanceSource {
     /// other status (401/403/5xx…) — maps to `Unavailable` rather than being
     /// folded into `Unknown`, so a rejected credential does not read as "the
     /// server forgot this job" (#833).
+    ///
+    /// A `202`'s body is read as the `subjectsTotal`/`subjectsDone`/
+    /// `currentSubject` parameters `crates/rest/src/handlers/sof/export.rs`
+    /// publishes (#853): a missing body, one that isn't valid JSON, or a
+    /// `Parameters` resource without those parameters simply leaves them
+    /// `None` — never an error and never `Unavailable`, since `X-Progress`
+    /// alone is still a perfectly good answer from a server that predates
+    /// this extension.
     async fn export_status(&self, job_id: &str, caller: &Caller) -> SqlExportStatus {
         let url = format!("{}/export/{job_id}/status", self.base_url);
         let request = match self.authorized_for(self.client.get(&url), caller).await {
@@ -905,13 +988,27 @@ impl HttpConformanceSource {
             Ok(response) => {
                 let status = response.status();
                 match status.as_u16() {
-                    202 => SqlExportStatus::Running(
-                        response
+                    202 => {
+                        let progress = response
                             .headers()
                             .get("x-progress")
                             .and_then(|v| v.to_str().ok())
-                            .map(String::from),
-                    ),
+                            .map(String::from);
+                        let params = response
+                            .json::<Value>()
+                            .await
+                            .ok()
+                            .and_then(|body| {
+                                body.get("parameter").and_then(Value::as_array).cloned()
+                            })
+                            .unwrap_or_default();
+                        SqlExportStatus::Running {
+                            progress,
+                            subjects_total: parameter_integer(&params, "subjectsTotal"),
+                            subjects_done: parameter_integer(&params, "subjectsDone"),
+                            current_subject: parameter_string(&params, "currentSubject"),
+                        }
+                    }
                     303 => SqlExportStatus::Done,
                     404 => SqlExportStatus::Unknown,
                     _ => SqlExportStatus::Unavailable(format!("status poll answered {status}")),
@@ -957,6 +1054,32 @@ impl HttpConformanceSource {
         }
         Ok(body)
     }
+}
+
+/// One `valueInteger` parameter of a `Parameters` resource's `parameter`
+/// array, by name (#853) — `subjectsTotal`/`subjectsDone` are the only
+/// integer parameters [`HttpConformanceSource::export_status`] reads this
+/// way. `None` when the name is absent or its value isn't a `valueInteger`
+/// that fits a `u32` (the server never sends a negative subject count).
+fn parameter_integer(params: &[Value], name: &str) -> Option<u32> {
+    params
+        .iter()
+        .find(|p| p.get("name").and_then(Value::as_str) == Some(name))
+        .and_then(|p| p.get("valueInteger"))
+        .and_then(Value::as_u64)
+        .and_then(|n| u32::try_from(n).ok())
+}
+
+/// One `valueString` parameter of a `Parameters` resource's `parameter`
+/// array, by name (#853) — `currentSubject` is the only string parameter
+/// [`HttpConformanceSource::export_status`] reads this way.
+fn parameter_string(params: &[Value], name: &str) -> Option<String> {
+    params
+        .iter()
+        .find(|p| p.get("name").and_then(Value::as_str) == Some(name))
+        .and_then(|p| p.get("valueString"))
+        .and_then(Value::as_str)
+        .map(String::from)
 }
 
 /// The first issue explanation of an OperationOutcome, if that is what this
@@ -1049,6 +1172,10 @@ pub struct StaticConformanceSource {
     export_calls: Arc<Mutex<Vec<RecordedExportCall>>>,
     saved_resources: Arc<Mutex<Vec<Value>>>,
     sql_run_calls: Arc<Mutex<Vec<Value>>>,
+    /// One entry per [`sql_run`](ConformanceSource::sql_run) call, in call
+    /// order — parallel to `sql_run_calls`, so a test can pair up call `i`'s
+    /// subject with call `i`'s bindings (#841).
+    sql_run_bindings_calls: Arc<Mutex<Vec<Vec<SqlExportParameter>>>>,
 }
 
 impl StaticConformanceSource {
@@ -1064,6 +1191,7 @@ impl StaticConformanceSource {
             export_calls: Arc::new(Mutex::new(Vec::new())),
             saved_resources: Arc::new(Mutex::new(Vec::new())),
             sql_run_calls: Arc::new(Mutex::new(Vec::new())),
+            sql_run_bindings_calls: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -1086,6 +1214,17 @@ impl StaticConformanceSource {
         self.sql_run_calls
             .lock()
             .expect("sql_run_calls mutex is never held across a panic")
+            .clone()
+    }
+
+    /// The parameter bindings `sql_run` has received so far, in call order —
+    /// parallel to [`Self::sql_run_calls`] (#841): `sql_run_bindings_calls()
+    /// [i]` is the bindings supplied on the same call whose subject is
+    /// `sql_run_calls()[i]`.
+    pub fn sql_run_bindings_calls(&self) -> Vec<Vec<SqlExportParameter>> {
+        self.sql_run_bindings_calls
+            .lock()
+            .expect("sql_run_bindings_calls mutex is never held across a panic")
             .clone()
     }
 
@@ -1221,6 +1360,7 @@ impl ConformanceSource for StaticConformanceSource {
     async fn sql_run(
         &self,
         view_definition: &Value,
+        bindings: &[SqlExportParameter],
         limit: usize,
         _version: FhirVersion,
         _tenant: &str,
@@ -1229,6 +1369,10 @@ impl ConformanceSource for StaticConformanceSource {
             .lock()
             .expect("sql_run_calls mutex is never held across a panic")
             .push(view_definition.clone());
+        self.sql_run_bindings_calls
+            .lock()
+            .expect("sql_run_bindings_calls mutex is never held across a panic")
+            .push(bindings.to_vec());
         match &self.sql_rows {
             Some(Ok(rows)) => Ok(rows.iter().take(limit).cloned().collect()),
             Some(Err(e)) => Err(e.clone()),
@@ -1274,12 +1418,14 @@ impl ConformanceSource for StaticConformanceSource {
     }
 
     /// Filters and paginates the seeded resources in memory. Implements the
-    /// subset of search semantics the View Definitions page actually sends
-    /// (#741): `name:contains` (case-insensitive substring on `name`) and
-    /// `_sort=name` (also the default with no `_sort` param, matching the
-    /// server's own default order). Other params are accepted but ignored —
-    /// this is a test double standing in for the real search engine, not a
-    /// reimplementation of it.
+    /// subset of search semantics the View Definitions page and #842's own
+    /// table resolution actually send: `name:contains` (case-insensitive
+    /// substring on `name`, #741), `url` (exact match on `url`, #842's own
+    /// canonical dependency resolution) and `_sort=name` (also the default
+    /// with no `_sort` param, matching the server's own default order).
+    /// Other params are accepted but ignored — this is a test double
+    /// standing in for the real search engine, not a reimplementation of
+    /// it.
     async fn search_page(
         &self,
         resource_type: &str,
@@ -1302,6 +1448,10 @@ impl ConformanceSource for StaticConformanceSource {
                     .and_then(Value::as_str)
                     .is_some_and(|n| n.to_lowercase().contains(&needle))
             });
+        }
+
+        if let Some((_, url)) = params.iter().find(|(name, _)| name == "url") {
+            resources.retain(|r| r.get("url").and_then(Value::as_str) == Some(url.as_str()));
         }
 
         let sort = params
@@ -1524,8 +1674,10 @@ mod tests {
     }
 
     /// #741: `search_page` issues one request with the given params plus
-    /// `_count`/`_offset`, and derives `has_next` from the response Bundle's
-    /// `next` link (present or absent).
+    /// `_count` (one over the page, so a further page shows up as an
+    /// overflow row even from a server that issues no `next` link — MongoDB
+    /// on a parameter sort) and `_offset`, and derives `has_next` from that
+    /// overflow or the response Bundle's `next` link (present or absent).
     #[tokio::test]
     async fn http_search_page_sends_params_count_offset_and_reports_has_next() {
         use axum::extract::Query;
@@ -1579,7 +1731,7 @@ mod tests {
             .await
             .expect("search succeeds");
         assert_eq!(first.resources[0]["name:contains"], "pat");
-        assert_eq!(first.resources[0]["_count"], "50");
+        assert_eq!(first.resources[0]["_count"], "51");
         assert_eq!(first.resources[0]["_offset"], "0");
         assert!(first.has_next, "server advertised a next link");
 
@@ -1959,7 +2111,7 @@ mod tests {
 
         assert_eq!(
             source.sql_export_status("running", &caller).await,
-            SqlExportStatus::Running(Some("42".to_string()))
+            SqlExportStatus::running(Some("42".to_string()))
         );
         assert_eq!(
             source.sql_export_status("done", &caller).await,
@@ -1994,6 +2146,230 @@ mod tests {
             SqlExportStatus::Unavailable(_) => {}
             other => panic!("expected Unavailable, got {other:?}"),
         }
+    }
+
+    /// #853: a `202` body carrying `subjectsTotal`/`subjectsDone`/
+    /// `currentSubject` produces all three; a body that is absent, not JSON,
+    /// or a `Parameters` resource without those parameters produces `None`
+    /// for every one of them — never an error, and `X-Progress` is read
+    /// exactly as before regardless of the body.
+    #[tokio::test]
+    async fn export_status_reads_subject_progress_from_the_body() {
+        use axum::extract::Path;
+        use axum::http::StatusCode as AxStatus;
+        use axum::response::IntoResponse;
+        use axum::routing::get;
+
+        async fn status(Path(id): Path<String>) -> axum::response::Response {
+            match id.as_str() {
+                "full" => (
+                    AxStatus::ACCEPTED,
+                    [("x-progress", "35%")],
+                    axum::Json(serde_json::json!({
+                        "resourceType": "Parameters",
+                        "parameter": [
+                            {"name": "exportId", "valueString": "full"},
+                            {"name": "status", "valueCode": "in-progress"},
+                            {"name": "subjectsTotal", "valueInteger": 6},
+                            {"name": "subjectsDone", "valueInteger": 2},
+                            {"name": "currentSubject", "valueString": "encounters_flat"},
+                        ]
+                    })),
+                )
+                    .into_response(),
+                "no-current-subject" => (
+                    AxStatus::ACCEPTED,
+                    [("x-progress", "99%")],
+                    axum::Json(serde_json::json!({
+                        "resourceType": "Parameters",
+                        "parameter": [
+                            {"name": "subjectsTotal", "valueInteger": 6},
+                            {"name": "subjectsDone", "valueInteger": 6},
+                        ]
+                    })),
+                )
+                    .into_response(),
+                "no-body" => (AxStatus::ACCEPTED, [("x-progress", "10%")], "").into_response(),
+                "not-json" => (
+                    AxStatus::ACCEPTED,
+                    [("x-progress", "10%")],
+                    "not a Parameters resource",
+                )
+                    .into_response(),
+                "unrelated-parameters" => (
+                    AxStatus::ACCEPTED,
+                    [("x-progress", "10%")],
+                    axum::Json(serde_json::json!({
+                        "resourceType": "Parameters",
+                        "parameter": [{"name": "exportId", "valueString": "unrelated-parameters"}]
+                    })),
+                )
+                    .into_response(),
+                other => panic!("unexpected job id {other}"),
+            }
+        }
+
+        let app = axum::Router::new().route("/export/{id}/status", get(status));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let source = HttpConformanceSource::new(
+            format!("http://{addr}"),
+            Arc::new(helios_auth::outbound::NoOpOutboundAuthProvider),
+            FhirVersion::R4,
+            None,
+        );
+        let caller = Caller::default();
+
+        assert_eq!(
+            source.sql_export_status("full", &caller).await,
+            SqlExportStatus::Running {
+                progress: Some("35%".to_string()),
+                subjects_total: Some(6),
+                subjects_done: Some(2),
+                current_subject: Some("encounters_flat".to_string()),
+            }
+        );
+        assert_eq!(
+            source
+                .sql_export_status("no-current-subject", &caller)
+                .await,
+            SqlExportStatus::Running {
+                progress: Some("99%".to_string()),
+                subjects_total: Some(6),
+                subjects_done: Some(6),
+                current_subject: None,
+            }
+        );
+        for id in ["no-body", "not-json", "unrelated-parameters"] {
+            assert_eq!(
+                source.sql_export_status(id, &caller).await,
+                SqlExportStatus::running(Some("10%".to_string())),
+                "job {id} should report no subject progress"
+            );
+        }
+    }
+
+    /// #841: a live-preview binding rides `$sql-run`'s own `parameters`
+    /// input, typed the same way [`sql_export_parameters_body`] types a
+    /// declared subject parameter — so a value binds identically whether it
+    /// runs live or through `$sql-export`. No bindings at all means the
+    /// body carries no `parameters` input, byte-for-byte what `sql_run`
+    /// sent before bindings existed.
+    #[tokio::test]
+    async fn http_sql_run_sends_bindings_only_when_present() {
+        use axum::extract::State;
+        use axum::routing::post;
+
+        async fn capture(
+            State(captured): State<Arc<Mutex<Vec<Value>>>>,
+            axum::Json(body): axum::Json<Value>,
+        ) -> axum::Json<Vec<Value>> {
+            captured
+                .lock()
+                .expect("captured mutex is never held across a panic")
+                .push(body);
+            axum::Json(Vec::new())
+        }
+
+        let captured: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let app = axum::Router::new()
+            .route("/$sql-run", post(capture))
+            .with_state(captured.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let source = HttpConformanceSource::new(
+            format!("http://{addr}"),
+            Arc::new(helios_auth::outbound::NoOpOutboundAuthProvider),
+            FhirVersion::R4,
+            None,
+        );
+        let subject = serde_json::json!({"resourceType": "Library"});
+
+        source
+            .sql_run(&subject, &[], 50, FhirVersion::R4, "")
+            .await
+            .expect("run without bindings succeeds");
+        source
+            .sql_run(
+                &subject,
+                &[SqlExportParameter {
+                    name: "ward".to_string(),
+                    type_code: "string".to_string(),
+                    value: "3B".to_string(),
+                }],
+                50,
+                FhirVersion::R4,
+                "",
+            )
+            .await
+            .expect("run with bindings succeeds");
+
+        let bodies = captured
+            .lock()
+            .expect("captured mutex is never held across a panic")
+            .clone();
+        assert_eq!(bodies.len(), 2);
+
+        let without_bindings = &bodies[0];
+        assert!(
+            without_bindings["parameter"]
+                .as_array()
+                .expect("parameter array")
+                .iter()
+                .all(|p| p["name"] != "parameters"),
+            "no bindings must not add a `parameters` input: {without_bindings}"
+        );
+
+        let with_bindings = &bodies[1];
+        let parameters_part = with_bindings["parameter"]
+            .as_array()
+            .expect("parameter array")
+            .iter()
+            .find(|p| p["name"] == "parameters")
+            .expect("a `parameters` input is present when bindings are supplied");
+        assert_eq!(
+            parameters_part["resource"]["parameter"][0],
+            serde_json::json!({"name": "ward", "valueString": "3B"})
+        );
+    }
+
+    /// #841: [`StaticConformanceSource`] records the bindings a `sql_run`
+    /// call carried, parallel to [`StaticConformanceSource::sql_run_calls`]
+    /// — call `i` of each accessor describes the same call.
+    #[tokio::test]
+    async fn static_source_records_sql_run_bindings() {
+        let source = StaticConformanceSource::empty().with_sql_run(Ok(Vec::new()));
+        let subject = serde_json::json!({"resourceType": "Library"});
+
+        source
+            .sql_run(&subject, &[], 10, FhirVersion::R4, "")
+            .await
+            .expect("seeded sql_run succeeds");
+        source
+            .sql_run(
+                &subject,
+                &[SqlExportParameter {
+                    name: "ward".to_string(),
+                    type_code: "string".to_string(),
+                    value: "3B".to_string(),
+                }],
+                10,
+                FhirVersion::R4,
+                "",
+            )
+            .await
+            .expect("seeded sql_run succeeds");
+
+        let bindings = source.sql_run_bindings_calls();
+        assert_eq!(bindings.len(), 2);
+        assert!(bindings[0].is_empty(), "first call carried no bindings");
+        assert_eq!(bindings[1].len(), 1);
+        assert_eq!(bindings[1][0].name, "ward");
+        assert_eq!(bindings[1][0].value, "3B");
     }
 
     /// #833: [`StaticConformanceSource`] records every `$sql-export` call it

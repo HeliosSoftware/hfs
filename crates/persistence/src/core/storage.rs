@@ -393,6 +393,43 @@ pub trait ResourceStorage: Send + Sync {
         fhir_version: FhirVersion,
     ) -> StorageResult<StoredResource>;
 
+    /// Creates a batch of resources of one type, returning one result per
+    /// input in input order.
+    ///
+    /// Each item has exactly [`create`](Self::create)'s semantics — a server-
+    /// assigned id when the resource carries none, `AlreadyExists` when its id
+    /// is taken — and the items are independent: this is a throughput path,
+    /// not a transaction, so one failure neither stops the rest nor rolls
+    /// anything back.
+    ///
+    /// The default fans `create` out at
+    /// [`bulk_write_concurrency`](Self::bulk_write_concurrency), which is the
+    /// right shape for a store whose per-write cost is one round trip.
+    /// Backends with a native batch write override it so a load of N resources
+    /// is one round trip — and, where the backend pays a per-write visibility
+    /// wait (Elasticsearch `refresh=wait_for`, which blocks each write until
+    /// the next scheduled refresh), one wait instead of N. A composite forwards
+    /// the batch to its primary and then to each secondary *as a batch*, so a
+    /// bulk load pays the secondary's batch cost rather than N synchronous
+    /// per-resource syncs. Conformance seeding
+    /// ([`crate::search::seeder`]) writes through this.
+    async fn create_many(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        resources: Vec<Value>,
+        fhir_version: FhirVersion,
+    ) -> Vec<StorageResult<StoredResource>> {
+        use futures::stream::{self, StreamExt};
+
+        let concurrency = self.bulk_write_concurrency().clamp(1, 32);
+        stream::iter(resources)
+            .map(|resource| self.create(tenant, resource_type, resource, fhir_version))
+            .buffered(concurrency)
+            .collect()
+            .await
+    }
+
     /// Creates a resource with a specific ID (PUT semantics).
     ///
     /// If the resource doesn't exist, creates it with version "1".

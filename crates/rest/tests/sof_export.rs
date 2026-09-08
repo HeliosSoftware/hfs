@@ -1259,6 +1259,30 @@ mod sof_export_tests {
                         panic!("X-Progress percent must parse as integer: {xp:?}")
                     });
                     assert!(n <= 99, "running percent must be <= 99, got {n}");
+
+                    // #853: subjectsTotal/subjectsDone are always present
+                    // while running, total matches the single subject sent,
+                    // and X-Progress is derived from the very same counts.
+                    let subjects_total = params
+                        .iter()
+                        .find(|p| p["name"].as_str() == Some("subjectsTotal"))
+                        .and_then(|p| p["valueInteger"].as_i64())
+                        .expect("missing subjectsTotal");
+                    let subjects_done = params
+                        .iter()
+                        .find(|p| p["name"].as_str() == Some("subjectsDone"))
+                        .and_then(|p| p["valueInteger"].as_i64())
+                        .expect("missing subjectsDone");
+                    assert_eq!(subjects_total, 1, "one subject was submitted");
+                    assert!(
+                        (0..=subjects_total).contains(&subjects_done),
+                        "0 <= subjectsDone <= subjectsTotal, got {subjects_done}/{subjects_total}"
+                    );
+                    assert_eq!(
+                        n,
+                        ((subjects_done * 100) / subjects_total.max(1)).min(99) as u32,
+                        "X-Progress must agree with subjectsDone/subjectsTotal"
+                    );
                 }
                 StatusCode::SEE_OTHER => {
                     // Completed — the poll redirects to the result URL, which
@@ -1356,6 +1380,196 @@ mod sof_export_tests {
         assert!(
             output_names.contains(&"demographics2"),
             "manifest missing demographics2: {output_names:?}"
+        );
+    }
+
+    // =========================================================================
+    // 16b. Poll body during a running job publishes subjectsTotal/subjectsDone/
+    //      currentSubject (#853), always consistent with X-Progress. Uses a
+    //      test-only controller that reports a fixed `Running` state so the
+    //      contract can be asserted deterministically rather than racing a
+    //      real background job.
+    // =========================================================================
+
+    struct RunningController {
+        tenant: String,
+        job_id: String,
+        subjects_done: u32,
+        subjects_total: u32,
+        current_subject: Option<String>,
+        submitted_at: chrono::DateTime<chrono::Utc>,
+    }
+
+    impl ExportJobController for RunningController {
+        fn submit(&self, _task: ExportTask) -> String {
+            self.job_id.clone()
+        }
+        fn get_status(&self, tenant_id: &str, job_id: &str) -> Option<JobStatus> {
+            if tenant_id != self.tenant || job_id != self.job_id {
+                return None;
+            }
+            Some(JobStatus::Running {
+                subjects_done: self.subjects_done,
+                subjects_total: self.subjects_total,
+                current_subject: self.current_subject.clone(),
+                submitted_at: self.submitted_at,
+            })
+        }
+        fn cancel(&self, _t: &str, _j: &str) -> bool {
+            false
+        }
+        fn read_shard(&self, _t: &str, _j: &str, _f: &str) -> Option<Vec<u8>> {
+            None
+        }
+        fn download_url(&self, _t: &str, _b: &str, _j: &str, _f: &str) -> Option<String> {
+            None
+        }
+    }
+
+    #[tokio::test]
+    async fn test_export_poll_body_publishes_subject_progress() {
+        let backend = SqliteBackend::with_config(":memory:", Default::default())
+            .expect("failed to create SQLite backend");
+        backend.init_schema().expect("failed to init schema");
+        let backend = Arc::new(backend);
+
+        // The third of six subjects is being written.
+        let submitted_at = chrono::Utc::now() - chrono::Duration::seconds(4);
+        let controller = RunningController {
+            tenant: "test-tenant".to_string(),
+            job_id: "running-1".to_string(),
+            subjects_done: 2,
+            subjects_total: 6,
+            current_subject: Some("encounters_flat".to_string()),
+            submitted_at,
+        };
+        let config = ServerConfig::for_testing();
+        let state = helios_rest::AppState::new(Arc::clone(&backend), config)
+            .with_export_controller(Arc::new(controller));
+        let app = helios_rest::routing::fhir_routes::create_routes(state);
+        let server = TestServer::new(app).expect("failed to create test server");
+
+        let poll = server
+            .get("/export/running-1/status")
+            .add_header(X_TENANT_ID, "test-tenant")
+            .await;
+        assert_eq!(poll.status_code(), StatusCode::ACCEPTED, "{}", poll.text());
+
+        // X-Progress derives from the same subjects_done/subjects_total the
+        // body carries: floor(2*100/6) = 33%.
+        let xp = poll
+            .headers()
+            .get("x-progress")
+            .expect("missing X-Progress")
+            .to_str()
+            .unwrap();
+        assert_eq!(xp, "33%");
+        assert_eq!(
+            poll.headers().get(axum::http::header::RETRY_AFTER).unwrap(),
+            "5"
+        );
+
+        let body: Value = poll.json();
+        assert_eq!(body["resourceType"].as_str(), Some("Parameters"));
+        let params = body["parameter"].as_array().unwrap();
+
+        let find_int = |name: &str| {
+            params
+                .iter()
+                .find(|p| p["name"].as_str() == Some(name))
+                .and_then(|p| p["valueInteger"].as_i64())
+        };
+        let find_str = |name: &str, field: &str| {
+            params
+                .iter()
+                .find(|p| p["name"].as_str() == Some(name))
+                .and_then(|p| p[field].as_str())
+        };
+
+        assert_eq!(find_str("exportId", "valueString"), Some("running-1"));
+        assert_eq!(find_str("status", "valueCode"), Some("in-progress"));
+        assert_eq!(find_int("subjectsTotal"), Some(6));
+        assert_eq!(find_int("subjectsDone"), Some(2));
+        assert_eq!(
+            find_str("currentSubject", "valueString"),
+            Some("encounters_flat")
+        );
+        assert!(
+            find_int("estimatedTimeRemaining").is_some(),
+            "progress > 0 should include an estimate: {body}"
+        );
+
+        // Recommended parameter order: exportId, status, subjectsTotal,
+        // subjectsDone, currentSubject, estimatedTimeRemaining.
+        let order: Vec<&str> = params.iter().filter_map(|p| p["name"].as_str()).collect();
+        assert_eq!(
+            order,
+            vec![
+                "exportId",
+                "status",
+                "subjectsTotal",
+                "subjectsDone",
+                "currentSubject",
+                "estimatedTimeRemaining"
+            ]
+        );
+    }
+
+    /// Between two subjects (none in flight yet, or the last one just
+    /// finished) `currentSubject` is absent — it is never an empty string.
+    /// A single-subject job still publishes `subjectsTotal = 1`.
+    #[tokio::test]
+    async fn test_export_poll_body_omits_current_subject_between_subjects() {
+        let backend = SqliteBackend::with_config(":memory:", Default::default())
+            .expect("failed to create SQLite backend");
+        backend.init_schema().expect("failed to init schema");
+        let backend = Arc::new(backend);
+
+        let controller = RunningController {
+            tenant: "test-tenant".to_string(),
+            job_id: "running-2".to_string(),
+            subjects_done: 0,
+            subjects_total: 1,
+            current_subject: None,
+            submitted_at: chrono::Utc::now(),
+        };
+        let config = ServerConfig::for_testing();
+        let state = helios_rest::AppState::new(Arc::clone(&backend), config)
+            .with_export_controller(Arc::new(controller));
+        let app = helios_rest::routing::fhir_routes::create_routes(state);
+        let server = TestServer::new(app).expect("failed to create test server");
+
+        let poll = server
+            .get("/export/running-2/status")
+            .add_header(X_TENANT_ID, "test-tenant")
+            .await;
+        assert_eq!(poll.status_code(), StatusCode::ACCEPTED, "{}", poll.text());
+        assert_eq!(
+            poll.headers().get("x-progress").unwrap().to_str().unwrap(),
+            "0%"
+        );
+
+        let body: Value = poll.json();
+        let params = body["parameter"].as_array().unwrap();
+        assert!(
+            !params
+                .iter()
+                .any(|p| p["name"].as_str() == Some("currentSubject")),
+            "currentSubject must be absent when no subject is in flight: {body}"
+        );
+        assert!(
+            !params
+                .iter()
+                .any(|p| p["name"].as_str() == Some("estimatedTimeRemaining")),
+            "estimatedTimeRemaining must be absent at 0%: {body}"
+        );
+        assert_eq!(
+            params
+                .iter()
+                .find(|p| p["name"].as_str() == Some("subjectsTotal"))
+                .and_then(|p| p["valueInteger"].as_i64()),
+            Some(1),
+            "a single-subject job must still publish subjectsTotal = 1"
         );
     }
 
