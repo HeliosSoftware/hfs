@@ -150,9 +150,13 @@ echo "==> HFS on $HFS_URL (HFS_BULK_SUBMIT_FILE_CONCURRENCY=$FILE_CONCURRENCY, T
 # HFS_BASE_URL is mandatory: it defaults to http://localhost:8080 and it is the
 # origin HFS uses to build the `content-location` polling header. Without it the
 # poll goes to whatever runs on 8080, not to this instance.
+# DEFER_INDEXING is pinned off, against the `true` default (#946): the fan-out
+# restriction this checks exists because concurrent index writes are what lock
+# the SQLite writer, so the deferred path is not the path under test.
 HFS_BASE_URL="$HFS_URL" \
 HFS_BULK_SUBMIT_ENABLED=true \
 HFS_BULK_SUBMIT_FILE_CONCURRENCY="$FILE_CONCURRENCY" \
+HFS_BULK_SUBMIT_DEFER_INDEXING=false \
 HFS_LOG_LEVEL=info \
   timeout "$TTL" "$HFS_BIN" \
     --database-url "$DB_URL" --log-level info \

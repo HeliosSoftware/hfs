@@ -68,11 +68,15 @@ HFS_BIN="target/debug/hfs"
 
 echo "==> HFS on PostgreSQL at 127.0.0.1:$HFS_PORT (requested fan-out: $FILE_CONCURRENCY)"
 
+# DEFER_INDEXING is pinned off, against the `true` default (#946): the point of
+# the check is that PostgreSQL honours the configured fan-out under the full
+# write path, index writes included.
 HFS_BASE_URL="http://127.0.0.1:$HFS_PORT" \
 HFS_STORAGE_BACKEND=postgres \
 HFS_DATABASE_URL="postgres://helios:helios@127.0.0.1:$PG_PORT/helios" \
 HFS_BULK_SUBMIT_ENABLED=true \
 HFS_BULK_SUBMIT_FILE_CONCURRENCY="$FILE_CONCURRENCY" \
+HFS_BULK_SUBMIT_DEFER_INDEXING=false \
 HFS_LOG_LEVEL=info \
   timeout "$TTL" "$HFS_BIN" --log-level info --host 127.0.0.1 --port "$HFS_PORT" \
   > "$LOG" 2>&1 || true

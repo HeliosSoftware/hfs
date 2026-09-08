@@ -628,7 +628,8 @@ pub struct BulkSubmitConfig {
     /// finishes. Reads and history are complete throughout; search sees a
     /// manifest's resources once its reindex lands.
     ///
-    /// Two measured properties bear on which value to run, both reproducible
+    /// Defaults to `true` for import speed (#946), which trades away the
+    /// durability property below. Both are measured, and both are reproducible
     /// from `crates/hfs/tests/bulk_submit/run_defer_indexing_benchmark.sh` and
     /// `run_defer_indexing_crash_check.sh`:
     ///
@@ -644,9 +645,13 @@ pub struct BulkSubmitConfig {
     ///   in-memory map, no column records that indexing is outstanding, and
     ///   nothing re-fires it at startup. That window is the gap between the
     ///   two clocks above — a median of 14.0s under `true` against 0.4s under
-    ///   `false`, at 10 000 resources. A restart inside it leaves resources
-    ///   stored and readable by id but absent from search until an operator
-    ///   runs `$reindex` by hand — measured at 16k of 20k resources.
+    ///   `false`, at 10 000 resources, and it widens with volume. A restart
+    ///   inside it leaves resources stored and readable by id but absent from
+    ///   search until an operator runs `$reindex` by hand — measured at 16k of
+    ///   20k resources.
+    ///
+    /// Set `HFS_BULK_SUBMIT_DEFER_INDEXING=false` to give up the speed and
+    /// close that window.
     pub defer_indexing: bool,
     /// When `true`, this pod does not run in-process submit workers.
     pub disable_local_worker: bool,
@@ -704,7 +709,7 @@ impl Default for BulkSubmitConfig {
             worker_concurrency: 2,
             file_concurrency: 1,
             disable_local_worker: false,
-            defer_indexing: false,
+            defer_indexing: true,
             max_concurrent_per_tenant: 4,
             batch_size: 1000,
             lease_duration_secs: 60,

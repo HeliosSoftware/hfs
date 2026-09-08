@@ -169,9 +169,15 @@ echo "==> provider on $PROVIDER_URL"
   > "$WORKDIR/provider.log" 2>&1 &
 
 echo "==> HFS on $HFS_URL (requested fan-out: $FILE_CONCURRENCY, effective on SQLite: 1)"
+# DEFER_INDEXING is pinned off, against the `true` default (#946), on purpose:
+# this check exists to put the SQLite writer under pressure and count the busy
+# retries that absorb it. Deferring indexing removes the search-index and FTS
+# writes from the ingest path, which is most of that pressure, so running the
+# default here would quietly stop testing what the script was written to test.
 HFS_BASE_URL="$HFS_URL" \
 HFS_BULK_SUBMIT_ENABLED=true \
 HFS_BULK_SUBMIT_FILE_CONCURRENCY="$FILE_CONCURRENCY" \
+HFS_BULK_SUBMIT_DEFER_INDEXING=false \
 HFS_LOG_LEVEL=info \
   timeout "$TTL" "$HFS_BIN" \
     --database-url "$DB_URL" --log-level info \
