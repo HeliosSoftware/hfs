@@ -633,20 +633,20 @@ pub struct BulkSubmitConfig {
     /// `run_defer_indexing_crash_check.sh`:
     ///
     /// - Speed: end to end — kick-off until search returns every resource —
-    ///   `true` measured ~1.3x faster (2.7x if the clock stops at the `200`
-    ///   instead). Treat the end-to-end figure as a direction rather than a
-    ///   number: it comes from a loaded machine where identical work varied
-    ///   ~8x round to round, and `true` won 7 of 9 rounds on that metric
-    ///   against 9 of 9 on the earlier one. The ~6.7x sometimes quoted comes
+    ///   `true` measured ~1.2x faster, winning all 15 interleaved rounds on an
+    ///   idle machine. Stopping the clock at the `200` instead gives 3.3x, but
+    ///   that instant is before search works. The ~6.7x sometimes quoted comes
     ///   from `bulk_submit_bench`, which runs no reindex and so measures
     ///   ingestion with the indexing work removed.
     /// - Durability: the rebuild starts only after the manifest is already
     ///   terminal and is fire-and-forget, so `$bulk-submit-status` reports
     ///   `200` while search is still incomplete; the job exists only in an
     ///   in-memory map, no column records that indexing is outstanding, and
-    ///   nothing re-fires it at startup. A restart in that window leaves
-    ///   resources stored and readable by id but absent from search until an
-    ///   operator runs `$reindex` by hand — measured at 16k of 20k resources.
+    ///   nothing re-fires it at startup. That window is the gap between the
+    ///   two clocks above — a median of 14.0s under `true` against 0.4s under
+    ///   `false`, at 10 000 resources. A restart inside it leaves resources
+    ///   stored and readable by id but absent from search until an operator
+    ///   runs `$reindex` by hand — measured at 16k of 20k resources.
     pub defer_indexing: bool,
     /// When `true`, this pod does not run in-process submit workers.
     pub disable_local_worker: bool,

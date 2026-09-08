@@ -130,26 +130,37 @@ deferred arm still has to pay for the rebuild:
 
 | stop the clock at | `false` | `true` | ratio | rounds won by `true` |
 |---|---|---|---|---|
-| `$bulk-submit-status` returns `200` | 12.3s | 4.6s | 2.67x | 9 of 9 (p≈0.004) |
-| search returns every ingested resource | 12.7s | 9.7s | 1.31x | 7 of 9 (p≈0.18) |
+| `$bulk-submit-status` returns `200` | 26.4s | 7.9s | 3.34x | 15 of 15 (p<0.0001) |
+| search returns every ingested resource | 26.8s | 22.0s | **1.22x** | 15 of 15 (p<0.0001) |
 
-(9 interleaved rounds, 10 000 Patients per arm, release build, SQLite; minimum of
-each arm, which is the estimate least distorted by unrelated load on the box.
-Reproduce with `crates/hfs/tests/bulk_submit/run_defer_indexing_benchmark.sh`.)
+(15 interleaved rounds, 10 000 Patients per arm, release build, SQLite, on an
+otherwise idle machine; columns are medians and the ratio divides them. Comparing
+the two arms within each round instead and taking the median of those 15 paired
+ratios gives 1.19x, range 1.06x–1.42x — the sounder statistic, since it never
+compares across rounds. Reproduce with
+`crates/hfs/tests/bulk_submit/run_defer_indexing_benchmark.sh`.)
 
-**Quote those ratios with their uncertainty, not as point estimates.** The box
-was shared during the run and identical work took anywhere from 12.7s to 99s,
-so the per-round spread is roughly 8x. The `t_ingest` direction survives that
-(9 of 9, and the one near-tie was 14.7 vs 14.5); the `t_search` direction does
-not clear significance at 7 of 9, and the 1.31x comes from the single quietest
-round. An honest statement of the end-to-end gain is "probably favours `true`,
-somewhere between about 1x and 2x". Re-run on an idle machine, with more
-rounds, before treating it as firmer than that.
+Quote **~1.2x**, not 6.7x and not the 1.31x an earlier contended run produced.
+That earlier run had six servers from other worktrees on the box, identical
+work varied ~8x round to round, and `t_search` came out 7 of 9 — inconclusive.
+Re-running idle collapsed the spread to ~1.5x and made both directions
+unambiguous while revising the end-to-end gain slightly *down*. Absolute times
+are not comparable between the two runs; only ratios within an interleaved run
+are.
 
-What is *not* load-sensitive is the failure mode: `run_defer_indexing_crash_check.sh`
-restarts the server at the instant the API reports `200` and finds 16 000 of
-20 000 resources stored, readable by id, and permanently absent from search.
-Load changes how wide that window is, not whether it exists.
+The same run also prices the window this buys, which is the other half of the
+trade. Time between `$bulk-submit-status` answering `200` and search actually
+being complete, at 10 000 resources:
+
+| | median | range |
+|---|---|---|
+| `false` | 0.4s | 0.3–0.5s |
+| `true` | **14.0s** | 0.5–18.7s |
+
+That window is when the API reports success while search is still wrong, and it
+is not load-sensitive in kind, only in width: `run_defer_indexing_crash_check.sh`
+restarts the server inside it and finds 16 000 of 20 000 resources stored,
+readable by id, and permanently absent from search.
 
 Which way that trade should fall for the *default* is a maintainer decision,
 open on #946. Report both numbers; do not invent a rationale for whichever
