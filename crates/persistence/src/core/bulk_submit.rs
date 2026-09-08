@@ -469,15 +469,6 @@ impl BulkEntryResult {
             BulkEntryOutcome::ValidationError | BulkEntryOutcome::ProcessingError
         )
     }
-
-    /// Returns true if this entry was handled without failing — a success or a
-    /// deliberate skip.
-    ///
-    /// What a manifest's `processed_entries` counts, so that
-    /// `processed_entries + failed_entries` equals the entries walked.
-    pub fn is_processed(&self) -> bool {
-        !self.is_error()
-    }
 }
 
 /// Summary of a submission's status.

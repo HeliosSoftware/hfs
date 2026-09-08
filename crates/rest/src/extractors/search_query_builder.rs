@@ -308,6 +308,49 @@ pub fn unknown_search_params(
     unknown
 }
 
+/// Returns warnings for `_sort` directives the backends cannot honor (#958).
+///
+/// An unknown sort parameter, or one whose type carries no sortable value
+/// column (composite, special), silently degrades to a stable id sort in the
+/// storage backends — indistinguishable from the sort being ignored. Callers
+/// surface these on the searchset as an OperationOutcome entry so the
+/// degradation is reported instead of absorbed.
+pub fn unsortable_sort_warnings(
+    resource_type: &str,
+    params: &SearchParams,
+    registry: &SearchParameterRegistry,
+) -> Vec<String> {
+    let Some(sort) = params.get("_sort") else {
+        return Vec::new();
+    };
+    let mut warnings = Vec::new();
+    for directive in sort.split(',') {
+        let code = directive.trim().trim_start_matches('-');
+        if code.is_empty() || code == "_id" || code == "_lastUpdated" {
+            continue;
+        }
+        let def = registry
+            .get_param(resource_type, code)
+            .or_else(|| registry.get_param("Resource", code));
+        match def {
+            None => warnings.push(format!(
+                "_sort parameter '{code}' is not a search parameter of {resource_type}; \
+                 results are ordered by id instead"
+            )),
+            Some(def) => {
+                let kind = def.param_type.to_string();
+                if kind == "composite" || kind == "special" {
+                    warnings.push(format!(
+                        "_sort parameter '{code}' has type {kind}, which cannot be \
+                         sorted; results are ordered by id instead"
+                    ));
+                }
+            }
+        }
+    }
+    warnings
+}
+
 /// Builds a SearchQuery from ordered key/value pairs.
 ///
 /// Unlike [`build_search_query_from_map`], this preserves repeated parameters

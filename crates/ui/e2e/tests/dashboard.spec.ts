@@ -191,7 +191,11 @@ test("the picker filter narrows the offered types", async ({ dashboard }) => {
   test.skip(noChartData, "no count read path on this backend");
   await dashboard.goto();
   await dashboard.waitForSeries();
-  await dashboard.openPicker();
+  // What is offered comes from the snapshot, which is served stale while it
+  // refreshes — the Patient seeded in beforeEach is not necessarily in the
+  // first load's option list. Outlast that before filtering for it: this test
+  // is about the filter, not about how quickly a new type reaches the picker.
+  await dashboard.waitForPickerOption("Patient");
   const all = await dashboard.page.locator("[data-pick-name]:not([hidden])").count();
   await dashboard.pickerFilter.fill("patient");
   const narrowed = await dashboard.page.locator("[data-pick-name]:not([hidden])").count();

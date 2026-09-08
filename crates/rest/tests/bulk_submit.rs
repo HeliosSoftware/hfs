@@ -1174,7 +1174,7 @@ async fn test_poll_percentage_tracks_ingested_bytes() {
         .unwrap()
         .to_string();
     assert!(
-        progress.contains("processing 35% complete"),
+        progress.contains("Processing 35% of bytes"),
         "the percentage must follow ingested bytes, got: {progress}"
     );
 }

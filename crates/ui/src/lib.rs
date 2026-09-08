@@ -888,6 +888,8 @@ struct ParamOption {
 #[template(path = "partials/param-options.html")]
 struct ParamOptionsPartial {
     params: Vec<ParamOption>,
+    /// Comma-joined default column hint for the selected type (#958).
+    columns: String,
 }
 
 /// History & Versions screen (#236, Figma "History & Versions"): the version
@@ -2023,7 +2025,10 @@ async fn resources(
     .await;
     let selected_type = explicit_type
         .unwrap_or_else(|| resolve_stored_type(rail.last.as_deref(), &resource_types, "Patient"));
-    let builder_url = url_from_query.or_else(|| Some(format!("/{selected_type}")));
+    // First open seeds `_summary=true` (#958): a fresh query returns summary
+    // elements — matching the table's default columns — instead of every
+    // attribute of every resource. Deleting it from the editable URL opts out.
+    let builder_url = url_from_query.or_else(|| Some(format!("/{selected_type}?_summary=true")));
     let targets = match state.conformance.metadata(rv.0, &rt.id).await {
         Ok(statement) => {
             match capability::CreateTargets::from_statement(&resource_types, &statement, rv.0) {
@@ -2220,7 +2225,64 @@ async fn query_params_catalog(
         .collect();
     params.sort_by(|a, b| a.code.cmp(&b.code));
     params.dedup_by(|a, b| a.code == b.code);
-    render(ParamOptionsPartial { params })
+    render(ParamOptionsPartial {
+        params,
+        columns: default_result_columns(rv.0, &resource_type).join(","),
+    })
+}
+
+/// Default result-table columns for a resource type (#958): its summary
+/// elements minus resource infrastructure, capped so the table stays
+/// scannable. Replaces the six-type hardcoded map in the browser — every
+/// type the spec defines summary elements for now gets real columns.
+fn default_result_columns(version: helios_fhir::FhirVersion, resource_type: &str) -> Vec<String> {
+    let summary_fields: &[&str] = match version {
+        #[cfg(feature = "R4")]
+        helios_fhir::FhirVersion::R4 => helios_fhir::r4::get_summary_fields(resource_type),
+        #[cfg(feature = "R4B")]
+        helios_fhir::FhirVersion::R4B => helios_fhir::r4b::get_summary_fields(resource_type),
+        #[cfg(feature = "R5")]
+        helios_fhir::FhirVersion::R5 => helios_fhir::r5::get_summary_fields(resource_type),
+        #[cfg(feature = "R6")]
+        helios_fhir::FhirVersion::R6 => helios_fhir::r6::get_summary_fields(resource_type),
+        #[allow(unreachable_patterns)]
+        _ => &[],
+    };
+    const INFRASTRUCTURE: [&str; 9] = [
+        "resourceType",
+        "id",
+        "meta",
+        "implicitRules",
+        "language",
+        "text",
+        "contained",
+        "extension",
+        "modifierExtension",
+    ];
+    summary_fields
+        .iter()
+        .map(|f| snake_to_camel(f))
+        .filter(|f| !INFRASTRUCTURE.contains(&f.as_str()))
+        .take(5)
+        .collect()
+}
+
+/// `get_summary_fields` returns Rust field names; resources carry camelCase
+/// JSON keys, which is what the results table indexes by.
+fn snake_to_camel(field: &str) -> String {
+    let mut out = String::with_capacity(field.len());
+    let mut upper_next = false;
+    for c in field.chars() {
+        if c == '_' {
+            upper_next = true;
+        } else if upper_next {
+            out.extend(c.to_uppercase());
+            upper_next = false;
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// Query string for the SearchParameter viewer. Every filter is a link and
@@ -8441,11 +8503,14 @@ mod tests {
                     targets: "Organization,Practitioner".into(),
                 },
             ],
+            columns: "name,gender,birthDate".into(),
         }
         .render()
         .expect("partial renders");
 
-        assert!(html.contains(r#"<datalist id="param-options">"#));
+        assert!(
+            html.contains(r#"<datalist id="param-options" data-columns="name,gender,birthDate">"#)
+        );
         assert!(html.contains(r#"value="birthdate""#));
         assert!(html.contains(r#"data-type="date""#));
         assert!(html.contains(r#"data-targets="Organization,Practitioner""#));

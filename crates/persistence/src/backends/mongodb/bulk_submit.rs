@@ -918,14 +918,15 @@ impl BulkSubmitProvider for MongoBackend {
 
         // These counters are cumulative across every run of this manifest (including
         // resumes) and are exactly what the $bulk-submit status endpoint reports, so
-        // every delta must be additive here (#969). "Processed" counts every entry we
-        // handled without failing, i.e. successes plus deliberate skips.
+        // every delta must be additive here (#969). `processed_entries` means resources
+        // written to the store, so skips are excluded and surface through their receipts
+        // (#954); `last_processed_line` is a line cursor and counts them.
         manifests
             .update_one(
                 manifest_filter(tenant, submission_id, manifest_id),
                 doc! { "$inc": {
                     "total_entries": results.len() as i64,
-                    "processed_entries": results.iter().filter(|r| r.is_processed()).count() as i64,
+                    "processed_entries": results.iter().filter(|r| r.is_success()).count() as i64,
                     "failed_entries": error_count as i64,
                     "last_processed_line": results.len() as i64,
                 }},

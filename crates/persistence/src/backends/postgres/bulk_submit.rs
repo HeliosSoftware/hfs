@@ -778,7 +778,7 @@ impl BulkSubmitProvider for PostgresBackend {
                  WHERE tenant_id = $5 AND submitter = $6 AND submission_id = $7 AND manifest_id = $8",
                 &[
                     &(results.len() as i32),
-                    &(results.iter().filter(|r| r.is_processed()).count() as i32),
+                    &(results.iter().filter(|r| r.is_success()).count() as i32),
                     &(error_count as i32),
                     &(results.len() as i64),
                     &tenant_id,

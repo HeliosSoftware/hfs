@@ -267,3 +267,72 @@ test("Test authentication reports its outcome inside the dialog", async ({ page 
   await page.locator("button[formaction='/ui/bulk-import/test-auth']").click();
   await expect(page.locator("#test-auth-result .field__hint")).toBeVisible();
 });
+
+// #955: the status card polls every 5s, but the Submission Log below it used to
+// stay frozen at whatever the page was served with — the entries each poll
+// recorded only surfaced on a full reload. The status fragment now re-emits the
+// log out of band, so this drives the real browser: hold the load-triggered
+// poll, photograph the first paint, let the poll through, and require the DOM
+// to have been patched in place.
+//
+// The Rust ring already asserts the fragment's markup (bulk_import_http.rs);
+// what only a browser can prove is that htmx actually applies the swap, that it
+// lands on the page's own log rather than appending a second card, and that the
+// newest-first order survives it.
+test("the polled status fragment refreshes the Submission Log without a reload", async ({
+  page,
+  request,
+  bulkImport,
+}) => {
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  await page.route("**/ui/bulk-import/*/status", async (route) => {
+    await held;
+    await route.continue();
+  });
+
+  const detail = await bulkImport.seed(request, "e2e-955-oob-log");
+  await page.goto(detail, { waitUntil: "domcontentloaded" });
+
+  // First paint: the log is already populated (kick-off wrote to it) and the
+  // status card is still the empty shell waiting on its `load` trigger.
+  const before = await bulkImport.logLines();
+  expect(before.length).toBeGreaterThan(0);
+  // The page's own copy must not carry the out-of-band attribute, or htmx
+  // would treat the served markup itself as an orphan swap.
+  await expect(bulkImport.logCard).not.toHaveAttribute("hx-swap-oob", /.*/);
+  expect((await bulkImport.statusCard.innerHTML()).trim()).toBe("");
+
+  // A reload would refresh the log too, and would pass a naive assertion.
+  // Tag this document so only an in-place patch can satisfy the checks below.
+  await page.evaluate(() => {
+    (window as unknown as { __sameDocument: boolean }).__sameDocument = true;
+  });
+
+  release();
+
+  await expect
+    .poll(async () => (await bulkImport.logLines()).length, { timeout: 20_000 })
+    .toBeGreaterThan(before.length);
+  const after = await bulkImport.logLines();
+
+  expect(
+    await page.evaluate(
+      () => (window as unknown as { __sameDocument?: boolean }).__sameDocument === true,
+    ),
+  ).toBe(true);
+  // One log, patched — not a second card grafted onto the page.
+  await expect(page.locator("#submission-log")).toHaveCount(1);
+  // Newest first: the fresh entries are prepended and nothing already shown
+  // is reordered or dropped.
+  expect(after.slice(after.length - before.length)).toEqual(before);
+  const stamps = after.map((line) => line.split(/\s+/)[0]);
+  expect(stamps).toEqual([...stamps].sort().reverse());
+  // The same single response also refreshed the card and the STATUS cell, so
+  // no region of the page is left behind by the one that moved.
+  expect((await bulkImport.statusCard.innerHTML()).trim()).not.toBe("");
+  await expect(bulkImport.statusCell).toHaveCount(1);
+  await expect(bulkImport.statusCell).not.toBeEmpty();
+});
