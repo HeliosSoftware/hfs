@@ -116,6 +116,14 @@ const child = spawn(bin, [], {
     // The subscriptions engine advertises itself so the operator page (#580)
     // renders its live (empty) dashboard instead of the unavailable state.
     HFS_SUBSCRIPTIONS_ENABLED: "true",
+    // The Bulk Import card polls the recipient no faster than the Retry-After
+    // it was handed, 120s by default — long enough that a submission's whole
+    // pre-ingest window (#953) would elapse between two reads and never be
+    // observed. Five seconds matches the card's own htmx cadence, which in
+    // turn overruns the default 10-polls-a-minute budget, so the poll rate
+    // limit comes off with it.
+    HFS_BULK_SUBMIT_RETRY_AFTER: "5",
+    HFS_BULK_SUBMIT_POLL_RATE_LIMIT: "0",
     ...authEnv,
   },
 });
