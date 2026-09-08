@@ -4941,6 +4941,7 @@ async fn mongodb_integration_if_none_exist_multi_param_and_semantics() {
             "identifier=http://example.org/mrn|MRN-MULTI-1&active=true".to_string(),
         ),
         full_url: Some("urn:uuid:active-patient".to_string()),
+        criteria: None,
     };
 
     let Some(result) = process_transaction_or_skip(
@@ -4985,6 +4986,7 @@ async fn mongodb_integration_if_none_exist_same_transaction_read_your_writes() {
         if_none_match: None,
         if_none_exist: Some("identifier=http://example.org/mrn|MRN-RYW-1".to_string()),
         full_url: Some(full_url.to_string()),
+        criteria: None,
     };
 
     let Some(result) = process_transaction_or_skip(
@@ -5051,6 +5053,7 @@ async fn mongodb_integration_if_none_exist_multiple_matches_rolls_back() {
             if_none_match: None,
             if_none_exist: None,
             full_url: None,
+            criteria: None,
         },
         BundleEntry {
             method: BundleMethod::Post,
@@ -5063,6 +5066,7 @@ async fn mongodb_integration_if_none_exist_multiple_matches_rolls_back() {
             if_none_match: None,
             if_none_exist: Some("identifier=http://example.org/mrn|MRN-AMB-1".to_string()),
             full_url: Some("urn:uuid:ambiguous".to_string()),
+            criteria: None,
         },
     ];
 
@@ -5130,6 +5134,7 @@ async fn mongodb_integration_if_none_exist_offloaded_search_uses_resource_scan()
         if_none_match: None,
         if_none_exist: Some("identifier=http://example.org/mrn|MRN-OFFL-1".to_string()),
         full_url: Some("urn:uuid:offloaded".to_string()),
+        criteria: None,
     };
 
     let Some(result) = process_transaction_or_skip(
@@ -5182,6 +5187,7 @@ async fn mongodb_integration_if_none_exist_broad_param_beyond_probe_limit() {
                 if_none_match: None,
                 if_none_exist: None,
                 full_url: Some(format!("urn:uuid:noise-{i}")),
+                criteria: None,
             })
             .collect();
         let Some(result) = process_transaction_or_skip(
@@ -5212,6 +5218,7 @@ async fn mongodb_integration_if_none_exist_broad_param_beyond_probe_limit() {
         if_none_match: None,
         if_none_exist: None,
         full_url: Some("urn:uuid:target-broad".to_string()),
+        criteria: None,
     };
     let Some(target_result) = process_transaction_or_skip(
         &backend,
@@ -5243,6 +5250,7 @@ async fn mongodb_integration_if_none_exist_broad_param_beyond_probe_limit() {
         if_none_match: None,
         if_none_exist: Some("identifier=http://example.org/mrn|TARGET-BROAD-1".to_string()),
         full_url: Some("urn:uuid:ine-broad".to_string()),
+        criteria: None,
     };
     let Some(ine_result) = process_transaction_or_skip(
         &backend,
