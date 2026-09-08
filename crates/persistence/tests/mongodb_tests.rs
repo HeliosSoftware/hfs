@@ -4011,11 +4011,12 @@ async fn mongodb_integration_purging_one_tenant_leaves_the_look_alikes_intact() 
 mod bulk_submit {
     use super::*;
 
+    use helios_persistence::core::bulk_submit::{CANCELLED_ABORT_REASON, CancelToken};
     use helios_persistence::core::{
         BulkProcessingOptions, BulkSubmitProvider, BulkSubmitRollbackProvider, ChangeType,
-        DefaultSubmitWorker, IMPORT_MODE_PARAMETER_URL, ManifestFetchParams, ManifestStatus,
-        NdjsonEntry, RemoteFile, RemoteManifest, StreamingBulkSubmitProvider, SubmissionId,
-        SubmissionStatus, SubmitClaimStrategy, SubmitFileRecord, SubmitInputFetcher,
+        DefaultSubmitWorker, IMPORT_MODE_PARAMETER_URL, LeaseError, ManifestFetchParams,
+        ManifestStatus, NdjsonEntry, RemoteFile, RemoteManifest, StreamingBulkSubmitProvider,
+        SubmissionId, SubmissionStatus, SubmitClaimStrategy, SubmitFileRecord, SubmitInputFetcher,
         SubmitWorkerStorage, WorkerId,
     };
     use helios_persistence::error::StorageResult;
@@ -4607,6 +4608,158 @@ mod bulk_submit {
                 .is_none(),
             "a line of the wrong type must not be stored"
         );
+    }
+
+    /// Wraps a reader so that `token` is tripped the first time the ingest
+    /// actually reads from the stream.
+    struct CancelOnFirstRead<R> {
+        inner: R,
+        token: CancelToken,
+        tripped: bool,
+    }
+
+    impl<R: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for CancelOnFirstRead<R> {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            let this = self.get_mut();
+            if !this.tripped {
+                this.tripped = true;
+                this.token.cancel();
+            }
+            std::pin::Pin::new(&mut this.inner).poll_read(cx, buf)
+        }
+    }
+
+    /// Six one-per-line Patients, enough for three batches of two.
+    fn six_patient_lines() -> Vec<u8> {
+        (1..=6)
+            .map(|i| format!("{{\"resourceType\":\"Patient\",\"id\":\"cancel-{i}\"}}\n"))
+            .collect::<String>()
+            .into_bytes()
+    }
+
+    /// #968, MongoDB: cancelling mid-manifest stops at the next batch boundary,
+    /// keeping the batches already committed and skipping the rest. Mongo has no
+    /// enclosing transaction around the manifest, so "durable partial progress"
+    /// is a property of the backend, not of a rollback that never happened.
+    #[tokio::test]
+    async fn cancelled_mid_stream_keeps_committed_batches_and_stops() {
+        let Some(backend) = create_backend("submit_cancel_mid_stream").await else {
+            return;
+        };
+        let tenant = create_tenant("submit-tenant");
+        let (sub_id, manifest_id) = seed(&backend, &tenant).await;
+
+        let cancel = CancelToken::new();
+        let options = BulkProcessingOptions::new()
+            .with_batch_size(2)
+            .with_cancel(cancel.clone());
+
+        let reader = Box::new(tokio::io::BufReader::new(CancelOnFirstRead {
+            inner: std::io::Cursor::new(six_patient_lines()),
+            token: cancel,
+            tripped: false,
+        }));
+        let result = backend
+            .process_ndjson_stream(&tenant, &sub_id, &manifest_id, "Patient", reader, &options)
+            .await
+            .unwrap();
+
+        assert!(result.aborted);
+        assert_eq!(result.abort_reason.as_deref(), Some(CANCELLED_ABORT_REASON));
+        assert_eq!(
+            result.counts.success, 2,
+            "the batch already committed when the token tripped is kept"
+        );
+        assert_eq!(
+            result.lines_processed, 2,
+            "the remaining four lines were never read"
+        );
+
+        let counts = backend
+            .get_entry_counts(&tenant, &sub_id, &manifest_id)
+            .await
+            .unwrap();
+        assert_eq!(counts.total, 2, "the partial counts are durable");
+        assert!(
+            backend
+                .read(&tenant, "Patient", "cancel-2")
+                .await
+                .unwrap()
+                .is_some(),
+            "the first batch really landed"
+        );
+        assert!(
+            backend
+                .read(&tenant, "Patient", "cancel-3")
+                .await
+                .unwrap()
+                .is_none(),
+            "nothing after the cancellation point was ingested"
+        );
+    }
+
+    /// #968, MongoDB: `abort_submission` fails in-flight manifests without
+    /// clearing the lease, so the worker's late verdict must lose rather than
+    /// resurrect the manifest as `completed`. Mongo enforces this with a
+    /// `status: processing` clause added to the fenced-write filter, so this
+    /// also pins that the status is spelled the way the filter expects.
+    #[tokio::test]
+    async fn abort_beats_a_late_finish_manifest() {
+        let Some(backend) = create_backend("submit_abort_beats_finish").await else {
+            return;
+        };
+        let tenant = create_tenant("submit-tenant");
+        let (sub_id, _manifest_id) = seed(&backend, &tenant).await;
+
+        let lease = backend
+            .claim_next_manifest(&WorkerId::new("w1"), lease_duration())
+            .await
+            .unwrap()
+            .expect("a manifest should be claimable");
+        backend.mark_manifest_processing(&lease).await.unwrap();
+
+        // The submitter aborts while the worker still holds a valid lease.
+        backend
+            .abort_submission(&tenant, &sub_id, "user cancelled")
+            .await
+            .unwrap();
+
+        // The worker's verdicts arrive too late and change nothing.
+        assert!(
+            matches!(
+                backend.finish_manifest(&lease).await,
+                Err(LeaseError::LeaseLost { .. })
+            ),
+            "a finish after an abort must not win"
+        );
+        let stored = backend
+            .get_manifest(&tenant, &sub_id, &lease.manifest_id)
+            .await
+            .unwrap()
+            .expect("manifest");
+        assert_eq!(
+            stored.status,
+            ManifestStatus::Failed,
+            "the abort's verdict stands"
+        );
+
+        assert!(
+            matches!(
+                backend.fail_manifest(&lease, "worker gave up").await,
+                Err(LeaseError::LeaseLost { .. })
+            ),
+            "a late failure verdict is equally a no-op"
+        );
+        let stored = backend
+            .get_manifest(&tenant, &sub_id, &lease.manifest_id)
+            .await
+            .unwrap()
+            .expect("manifest");
+        assert_eq!(stored.status, ManifestStatus::Failed);
     }
 }
 
