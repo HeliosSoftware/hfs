@@ -1169,6 +1169,17 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn group_thousands_groups_digits_from_the_right() {
+        assert_eq!(group_thousands(0), "0");
+        assert_eq!(group_thousands(7), "7");
+        assert_eq!(group_thousands(999), "999");
+        assert_eq!(group_thousands(1_000), "1,000");
+        assert_eq!(group_thousands(609_191), "609,191");
+        assert_eq!(group_thousands(14_709_697), "14,709,697");
+        assert_eq!(group_thousands(100_000_000), "100,000,000");
+    }
+
+    #[test]
     fn presigned_download_url_is_preserved_byte_for_byte() {
         let url = "https://s3.example/object?X-Amz-Signature=a%2Fb&x=1";
         let download = DownloadUrl {
