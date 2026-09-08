@@ -732,12 +732,26 @@ async fn run_reindex(
     // longer runs a second extraction just to count entries — the per-page
     // outcomes report what was actually written.
     let _ = registries;
-    // Mark as started
+    // Mark as started — unless the job already reached a terminal state before
+    // this task was first polled.
+    //
+    // `ReindexOperation::cancel` writes `Cancelled` synchronously, but this
+    // task is spawned by `start` and may not run until after that write.
+    // Unconditionally stamping `InProgress` here would then resurrect a job the
+    // caller has already been told is finished, and leave it reporting
+    // "in progress" all the way to the first cancellation check further down —
+    // past `list_resource_types`, every `count_resources`, and the optional
+    // index clear. Bailing out instead is both the honest status and a faster
+    // cancellation: the work below is pointless for a cancelled job.
     {
         let mut jobs_guard = jobs.write();
-        if let Some(progress) = jobs_guard.get_mut(&job_id) {
-            progress.status = ReindexStatus::InProgress;
-            progress.started_at = Some(chrono::Utc::now().to_rfc3339());
+        match jobs_guard.get_mut(&job_id) {
+            Some(progress) if progress.status.is_finished() => return,
+            Some(progress) => {
+                progress.status = ReindexStatus::InProgress;
+                progress.started_at = Some(chrono::Utc::now().to_rfc3339());
+            }
+            None => {}
         }
     }
 

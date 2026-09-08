@@ -1437,6 +1437,52 @@ async fn status_polling_tracks_progress_and_lands_the_result() {
     assert!(detail.contains("got 200 OK"));
 }
 
+/// #955: the polled fragment writes log lines, so it must carry them back.
+/// Before this, an open page kept the log it was loaded with while the card
+/// advanced, and only a reload caught it up.
+#[tokio::test]
+async fn the_polled_status_fragment_refreshes_the_log_out_of_band() {
+    let (recipient_url, _) = mock_recipient_with_status().await;
+    let ctx = ctx(&recipient_url);
+    let detail_path = create_submission(&ctx).await;
+
+    // The page paints the log in place — same section, no out-of-band hook.
+    let (_, page) = get(&ctx, &detail_path).await;
+    assert!(
+        page.contains(r#"<section id="submission-log" class="card table-card">"#),
+        "{page}"
+    );
+    assert!(!page.contains("Status: processing 0% complete"));
+
+    // First poll: the fragment records a new line and ships the whole log
+    // back out-of-band, newest-first like the page renders it.
+    let (status, html) = get(&ctx, &format!("{detail_path}/status")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        html.contains(
+            r#"<section id="submission-log" class="card table-card" hx-swap-oob="true">"#
+        ),
+        "{html}"
+    );
+    assert!(html.contains("Status: processing 0% complete"), "{html}");
+    let newest = html.find("Status: processing 0% complete").unwrap();
+    let oldest = html.find("Bulk status kick-off request").unwrap();
+    assert!(newest < oldest, "log stays newest-first: {html}");
+
+    // Second poll completes the submission: polling stops, and the terminal
+    // response still carries the closing line so the log never trails the
+    // result card.
+    let (_, html) = get(&ctx, &format!("{detail_path}/status")).await;
+    assert!(!html.contains("every 5s"), "polling stopped: {html}");
+    assert!(
+        html.contains(
+            r#"<section id="submission-log" class="card table-card" hx-swap-oob="true">"#
+        ),
+        "{html}"
+    );
+    assert!(html.contains("processing finished cleanly"), "{html}");
+}
+
 /// The UI route became a permanent redirect to the server-level JWKS when
 /// `/.well-known/bulk-submit-jwks.json` landed; existing registrations keep
 /// working through it.

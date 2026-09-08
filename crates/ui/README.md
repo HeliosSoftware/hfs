@@ -47,8 +47,9 @@ Why, over a SPA + JSON API:
   [Locality of Behaviour](https://htmx.org/essays/locality-of-behaviour/).
 
 Keeping the UI in a **separate crate** from `helios-rest` preserves the clean
-FHIR REST surface and lets the UI be feature-gated off (`--no-default-features`
-or the `headless` feature on `hfs`) for headless deployments.
+FHIR REST surface and lets the UI be compiled out (`--no-default-features`, i.e.
+no `ui` feature) or switched off at runtime (`HFS_UI_ENABLED=false`) for headless
+deployments.
 
 ---
 
@@ -927,10 +928,11 @@ inline-validation, and infinite-scroll fragment recipes we'll standardize on.
 
 ## Pages & routes
 
-Mounted under `/ui` when running `hfs` (the `ui` feature is on by default; the
-`headless` feature disables it — the mount is
-`cfg(all(feature = "ui", not(feature = "headless")))`, so enabling both yields
-no UI).
+Mounted under `/ui` when running `hfs` (the `ui` feature is on by default).
+Headless deployments set `HFS_UI_ENABLED=false`; `/ui` then answers 404 +
+OperationOutcome. Headless is deliberately a *runtime* switch — the former
+`headless` Cargo feature was gated as `not(feature = "headless")` and was
+therefore enabled, silently removing the UI, by `--all-features` (#975).
 
 ```bash
 cargo run -p helios-hfs   # then open http://127.0.0.1:8080/ui

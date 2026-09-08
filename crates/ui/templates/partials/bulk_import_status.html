@@ -67,3 +67,6 @@
 {% else %}
 <div id="submission-error" hx-swap-oob="true"></div>
 {% endif %}
+{# So does the Submission Log, whose lines this same poll just recorded
+   (#955) — one response keeps both regions current. #}
+{% include "partials/bulk_import_log.html" %}

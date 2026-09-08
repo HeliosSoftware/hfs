@@ -239,6 +239,7 @@ AWS_REGION=us-east-1 \
 | `HFS_SEARCH_PARAM_CACHE_TTL` | `3600` | Seconds between refreshes of the in-memory SearchParameter registry from storage; a param POSTed to one cluster node becomes visible to others within this interval. `0` disables the refresh. |
 | `HFS_DEFAULT_FHIR_VERSION` | `R4` | FHIR version (R4, R4B, R5, R6) |
 | `HFS_LOG_LEVEL` | `info` | Log level (error, warn, info, debug, trace) |
+| `HFS_UI_ENABLED` | `true` | Serve the web UI at `/ui`. Set `false` for headless deployments; `/ui` then returns `404` + OperationOutcome. Has no effect on a binary built without the `ui` feature. |
 
 Set `HFS_BASE_URL` to the URL clients use, including any reverse-proxy path
 prefix, for example `https://fhir.example.com/fhir`. HFS accepts only absolute

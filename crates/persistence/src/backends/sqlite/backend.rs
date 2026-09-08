@@ -527,6 +527,11 @@ impl SqliteBackend {
     }
 
     /// Get a connection from the pool.
+    ///
+    /// This is a **blocking** acquire: r2d2 parks the calling thread until a
+    /// connection frees up or the pool's connection timeout expires. An
+    /// `async fn` should therefore reach for [`Self::run_blocking`] rather than
+    /// calling this directly — see that method's docs for why (#959).
     pub(crate) fn get_connection(
         &self,
     ) -> StorageResult<PooledConnection<SqliteConnectionManager>> {
@@ -536,6 +541,100 @@ impl SqliteBackend {
                 message: e.to_string(),
             })
         })
+    }
+
+    /// Runs a closure that needs a pooled SQLite connection on a blocking
+    /// thread, off the async runtime.
+    ///
+    /// # Why this exists (#959)
+    ///
+    /// `rusqlite` is a synchronous C library and r2d2's `pool.get()` is a
+    /// *blocking* acquire. Every `async fn` in this backend that calls
+    /// [`Self::get_connection`] and then queries therefore does both on a tokio
+    /// worker thread. With the default pool (10 connections) and a large
+    /// database, a handful of multi-second aggregate scans is enough to occupy
+    /// every worker: the runtime then has no thread left to poll unrelated
+    /// futures, so requests that touch no SQLite at all — the `/ui` dashboard
+    /// being the case that surfaced this — are simply never polled and appear
+    /// to hang.
+    ///
+    /// Both halves of the work must live inside the blocking task, and that is
+    /// the whole point of this helper:
+    ///
+    /// * the **acquire**, because when the pool is exhausted `pool.get()` parks
+    ///   the calling thread for up to r2d2's connection timeout (30s by
+    ///   default). Parking a `spawn_blocking` thread is exactly what that pool
+    ///   is for; parking a tokio worker starves the runtime.
+    /// * the **query**, for the more obvious reason that a full-table
+    ///   `COUNT(*)` over millions of rows is many seconds of uninterrupted
+    ///   CPU/IO with no await point in it.
+    ///
+    /// Acquiring on the runtime and only then handing the connection to a
+    /// blocking task would fix just half the problem, which is why the closure
+    /// receives a `&rusqlite::Connection` instead of the caller passing one in.
+    ///
+    /// # Caveat: not cancellable
+    ///
+    /// `spawn_blocking` work cannot be aborted. Dropping the returned future
+    /// (client disconnect, `tokio::time::timeout`, an axum request timeout)
+    /// only stops *us* from waiting for the answer: the SQL keeps running to
+    /// completion on the blocking thread and keeps holding its pooled
+    /// connection until it does. Expensive scans must therefore still be
+    /// bounded at the query level, not by racing a timeout against them.
+    ///
+    /// # Diagnostics
+    ///
+    /// The pool acquire is timed and logged at `debug` as `acquire_ms`. #959
+    /// had to tell three superficially identical "it took 30 seconds" apart —
+    /// an r2d2 acquire timeout, SQLite's `busy_timeout`, and the HTTP request
+    /// timeout — and only the first of the three shows up in this number. One
+    /// `Instant::now()` plus one `debug!` per call is negligible next to the
+    /// query that follows it.
+    pub(crate) async fn run_blocking<T, F>(&self, f: F) -> StorageResult<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&rusqlite::Connection) -> StorageResult<T> + Send + 'static,
+    {
+        // Clone the pool handle (an `Arc` internally, so this is cheap) and let
+        // the task own it: a spawned task must be `'static`, so capturing
+        // `&self` is not an option.
+        let pool = self.pool();
+
+        let join = tokio::task::spawn_blocking(move || {
+            let started = std::time::Instant::now();
+            // Deliberately the same error shape as `get_connection`: this
+            // helper changes where the work runs, never what a failure looks
+            // like to callers.
+            let conn = pool.get().map_err(|e| {
+                crate::error::StorageError::Backend(BackendError::ConnectionFailed {
+                    backend_name: "sqlite".to_string(),
+                    message: e.to_string(),
+                })
+            });
+            tracing::debug!(
+                acquire_ms = started.elapsed().as_millis() as u64,
+                acquired = conn.is_ok(),
+                "sqlite pool acquire (blocking task)"
+            );
+            // Bind before borrowing: `&conn?` would make the `?` target type
+            // ambiguous, so the deref coercion from `PooledConnection` to
+            // `&rusqlite::Connection` never gets a chance to apply.
+            let conn = conn?;
+            f(&conn)
+        })
+        .await;
+
+        // A `JoinError` means the blocking closure panicked or the runtime is
+        // shutting down. Neither is a SQLite failure, so it maps to `Internal`
+        // rather than to `ConnectionFailed`, matching how the other
+        // "should not happen" paths in this file are reported.
+        join.map_err(|e| {
+            crate::error::StorageError::Backend(BackendError::Internal {
+                backend_name: "sqlite".to_string(),
+                message: format!("Blocking SQLite task failed to complete: {}", e),
+                source: None,
+            })
+        })?
     }
 
     /// The per-tenant registry container (shared with a co-located ES backend).

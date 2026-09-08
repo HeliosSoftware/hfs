@@ -1,6 +1,5 @@
 import { test, expect } from "../pages/fixtures";
 import { createResource, waitSearchable } from "../pages/api";
-import type { DashboardPage } from "../pages/dashboard";
 
 // #553: the dashboard snapshot is tenant-scoped (build_index_page ->
 // dashboard::snapshot(window, &tenant.id, ...) — crates/ui/src/lib.rs), but
@@ -41,18 +40,6 @@ test.afterEach(async ({ page, chrome }) => {
   }
 });
 
-/** Reloads until the picker's option list shows the type — outlasts the 15s
- * dashboard snapshot cache after seeding, like DashboardPage.waitForSeries. */
-async function untilPickerShows(dashboard: DashboardPage, type: string): Promise<void> {
-  for (let attempt = 0; attempt < 12; attempt++) {
-    await dashboard.openPicker();
-    if ((await dashboard.pickerOption(type).count()) > 0) return;
-    await dashboard.page.waitForTimeout(2000);
-    await dashboard.page.reload({ waitUntil: "networkidle" });
-  }
-  throw new Error(`the type picker never offered ${type}`);
-}
-
 test("the dashboard's counts and chart follow the selected tenant, with no leakage either way", async ({
   request,
   dashboard,
@@ -89,7 +76,7 @@ test("the dashboard's counts and chart follow the selected tenant, with no leaka
 
   // The default tenant's dashboard: its own marker, none of the other's.
   await dashboard.goto();
-  await untilPickerShows(dashboard, "Flag");
+  await dashboard.waitForPickerOption("Flag");
   await expect(dashboard.pickerOption("Basic")).toHaveCount(0);
 
   // Switch tenants through the sidebar — the same round trip a user makes.
@@ -99,7 +86,7 @@ test("the dashboard's counts and chart follow the selected tenant, with no leaka
   // The extra tenant's dashboard: its marker with its exact count, and no
   // trace of the default tenant's marker.
   await dashboard.goto();
-  await untilPickerShows(dashboard, "Basic");
+  await dashboard.waitForPickerOption("Basic");
   await expect(dashboard.pickerOption("Basic").locator(".chart-pick__count")).toHaveText("3");
   await expect(dashboard.pickerOption("Flag")).toHaveCount(0);
 
@@ -115,6 +102,6 @@ test("the dashboard's counts and chart follow the selected tenant, with no leaka
   // switching forth and back leaks nothing in either direction.
   await chrome.selectTenant("default");
   await dashboard.goto();
-  await untilPickerShows(dashboard, "Flag");
+  await dashboard.waitForPickerOption("Flag");
   await expect(dashboard.pickerOption("Basic")).toHaveCount(0);
 });

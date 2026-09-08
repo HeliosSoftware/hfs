@@ -565,25 +565,32 @@ impl ResourceStorage for SqliteBackend {
         tenant: &TenantContext,
         resource_type: Option<&str>,
     ) -> StorageResult<u64> {
-        let conn = self.get_connection()?;
-        let tenant_id = tenant.tenant_id().as_str();
+        // An unfiltered `COUNT(*)` is a full index scan — seconds on a
+        // multi-million-row database — so it runs on a blocking thread rather
+        // than on a tokio worker (#959). The closure must be `'static`, hence
+        // the owned copies of both borrowed inputs.
+        let tenant_id = tenant.tenant_id().as_str().to_string();
+        let resource_type = resource_type.map(str::to_string);
 
-        let count: i64 = if let Some(rt) = resource_type {
-            conn.query_row(
-                "SELECT COUNT(*) FROM resources WHERE tenant_id = ?1 AND resource_type = ?2 AND is_deleted = 0",
-                params![tenant_id, rt],
-                |row| row.get(0),
-            )
-        } else {
-            conn.query_row(
-                "SELECT COUNT(*) FROM resources WHERE tenant_id = ?1 AND is_deleted = 0",
-                params![tenant_id],
-                |row| row.get(0),
-            )
-        }
-        .or_query_error("Failed to count resources")?;
+        self.run_blocking(move |conn| {
+            let count: i64 = if let Some(rt) = resource_type {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM resources WHERE tenant_id = ?1 AND resource_type = ?2 AND is_deleted = 0",
+                    params![tenant_id, rt],
+                    |row| row.get(0),
+                )
+            } else {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM resources WHERE tenant_id = ?1 AND is_deleted = 0",
+                    params![tenant_id],
+                    |row| row.get(0),
+                )
+            }
+            .or_query_error("Failed to count resources")?;
 
-        Ok(count as u64)
+            Ok(count as u64)
+        })
+        .await
     }
 
     async fn count_by_day(
@@ -592,8 +599,10 @@ impl ResourceStorage for SqliteBackend {
         resource_type: &str,
         since: chrono::DateTime<chrono::Utc>,
     ) -> StorageResult<Vec<crate::core::DailyResourceCount>> {
-        let conn = self.get_connection()?;
-        let tenant_id = tenant.tenant_id().as_str();
+        // Owned copies of the borrowed inputs: the aggregate below runs in a
+        // blocking task (#959), whose closure must be `'static`.
+        let tenant_id = tenant.tenant_id().as_str().to_string();
+        let resource_type = resource_type.to_string();
         // `last_updated` is stored as an RFC3339 UTC string (Utc::now().to_rfc3339()),
         // e.g. `2026-06-01T14:30:00.123+00:00` — always `+00:00`, with a fixed-width
         // `YYYY-MM-DDTHH:MM:SS` prefix. Its first 10 characters are the UTC calendar
@@ -611,35 +620,38 @@ impl ResourceStorage for SqliteBackend {
             .and_utc()
             .to_rfc3339();
 
-        let mut stmt = conn
-            .prepare(
-                "SELECT substr(last_updated, 1, 10) AS day, COUNT(*) AS n \
-                 FROM resources \
-                 WHERE tenant_id = ?1 AND resource_type = ?2 AND is_deleted = 0 \
-                   AND last_updated >= ?3 \
-                 GROUP BY day ORDER BY day",
-            )
-            .or_query_error("Failed to prepare count_by_day")?;
+        self.run_blocking(move |conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT substr(last_updated, 1, 10) AS day, COUNT(*) AS n \
+                     FROM resources \
+                     WHERE tenant_id = ?1 AND resource_type = ?2 AND is_deleted = 0 \
+                       AND last_updated >= ?3 \
+                     GROUP BY day ORDER BY day",
+                )
+                .or_query_error("Failed to prepare count_by_day")?;
 
-        let rows = stmt
-            .query_map(params![tenant_id, resource_type, since_bound], |row| {
-                let day: String = row.get(0)?;
-                let n: i64 = row.get(1)?;
-                Ok((day, n))
-            })
-            .or_query_error("Failed to query count_by_day")?;
+            let rows = stmt
+                .query_map(params![tenant_id, resource_type, since_bound], |row| {
+                    let day: String = row.get(0)?;
+                    let n: i64 = row.get(1)?;
+                    Ok((day, n))
+                })
+                .or_query_error("Failed to query count_by_day")?;
 
-        let mut out = Vec::new();
-        for row in rows {
-            let (day_str, n) = row.or_query_error("Failed to read count_by_day row")?;
-            if let Ok(day) = chrono::NaiveDate::parse_from_str(&day_str, "%Y-%m-%d") {
-                out.push(crate::core::DailyResourceCount {
-                    day,
-                    count: n.max(0) as u64,
-                });
+            let mut out = Vec::new();
+            for row in rows {
+                let (day_str, n) = row.or_query_error("Failed to read count_by_day row")?;
+                if let Ok(day) = chrono::NaiveDate::parse_from_str(&day_str, "%Y-%m-%d") {
+                    out.push(crate::core::DailyResourceCount {
+                        day,
+                        count: n.max(0) as u64,
+                    });
+                }
             }
-        }
-        Ok(out)
+            Ok(out)
+        })
+        .await
     }
 
     async fn count_deltas_by_bucket(
@@ -654,8 +666,10 @@ impl ResourceStorage for SqliteBackend {
                 "count_deltas_by_bucket: bucket_seconds must be positive".to_string(),
             ));
         }
-        let conn = self.get_connection()?;
-        let tenant_id = tenant.tenant_id().as_str();
+        // Owned copies of the borrowed inputs: the aggregate below runs in a
+        // blocking task (#959), whose closure must be `'static`.
+        let tenant_id = tenant.tenant_id().as_str().to_string();
+        let resource_type = resource_type.to_string();
 
         // Bound the scan by the raw `last_updated` column so the
         // `(tenant_id, last_updated)` history index prunes the range (wrapping the
@@ -670,41 +684,44 @@ impl ResourceStorage for SqliteBackend {
         // seconds; integer-dividing by the bucket width and multiplying back floors
         // each version to its epoch-aligned bucket start. The delta rule mirrors the
         // trait doc: creation `+1`, delete `-1`, plain update `0`.
-        let mut stmt = conn
-            .prepare(
-                "SELECT (CAST(strftime('%s', last_updated) AS INTEGER) / ?4) * ?4 AS bucket, \
-                        SUM(CASE WHEN is_deleted = 1 THEN -1 \
-                                 WHEN version_id = '1' THEN 1 \
-                                 ELSE 0 END) AS delta \
-                 FROM resource_history \
-                 WHERE tenant_id = ?1 AND resource_type = ?2 AND last_updated >= ?3 \
-                 GROUP BY bucket HAVING delta != 0 ORDER BY bucket",
-            )
-            .or_query_error("Failed to prepare count_deltas_by_bucket")?;
+        self.run_blocking(move |conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT (CAST(strftime('%s', last_updated) AS INTEGER) / ?4) * ?4 AS bucket, \
+                            SUM(CASE WHEN is_deleted = 1 THEN -1 \
+                                     WHEN version_id = '1' THEN 1 \
+                                     ELSE 0 END) AS delta \
+                     FROM resource_history \
+                     WHERE tenant_id = ?1 AND resource_type = ?2 AND last_updated >= ?3 \
+                     GROUP BY bucket HAVING delta != 0 ORDER BY bucket",
+                )
+                .or_query_error("Failed to prepare count_deltas_by_bucket")?;
 
-        let rows = stmt
-            .query_map(
-                params![tenant_id, resource_type, since_bound, bucket_seconds],
-                |row| {
-                    let bucket: i64 = row.get(0)?;
-                    let delta: i64 = row.get(1)?;
-                    Ok((bucket, delta))
-                },
-            )
-            .or_query_error("Failed to query count_deltas_by_bucket")?;
+            let rows = stmt
+                .query_map(
+                    params![tenant_id, resource_type, since_bound, bucket_seconds],
+                    |row| {
+                        let bucket: i64 = row.get(0)?;
+                        let delta: i64 = row.get(1)?;
+                        Ok((bucket, delta))
+                    },
+                )
+                .or_query_error("Failed to query count_deltas_by_bucket")?;
 
-        let mut out = Vec::new();
-        for row in rows {
-            let (bucket, delta) =
-                row.or_query_error("Failed to read count_deltas_by_bucket row")?;
-            if let Some(bucket_start) = chrono::DateTime::from_timestamp(bucket, 0) {
-                out.push(crate::core::ResourceCountDelta {
-                    bucket_start,
-                    delta,
-                });
+            let mut out = Vec::new();
+            for row in rows {
+                let (bucket, delta) =
+                    row.or_query_error("Failed to read count_deltas_by_bucket row")?;
+                if let Some(bucket_start) = chrono::DateTime::from_timestamp(bucket, 0) {
+                    out.push(crate::core::ResourceCountDelta {
+                        bucket_start,
+                        delta,
+                    });
+                }
             }
-        }
-        Ok(out)
+            Ok(out)
+        })
+        .await
     }
 
     async fn activity_histogram(
@@ -712,8 +729,9 @@ impl ResourceStorage for SqliteBackend {
         tenant: &TenantContext,
         since: chrono::DateTime<chrono::Utc>,
     ) -> StorageResult<Vec<crate::core::ActivityCell>> {
-        let conn = self.get_connection()?;
-        let tenant_id = tenant.tenant_id().as_str();
+        // Owned copy of the borrowed tenant id: the aggregate below runs in a
+        // blocking task (#959), whose closure must be `'static`.
+        let tenant_id = tenant.tenant_id().as_str().to_string();
         // Start-of-day bound for `since` in the stored RFC3339 UTC format; see
         // `count_by_day` for why a raw-column `last_updated >= ?` range is both
         // sargable (uses the `(tenant_id, last_updated)` history index) and selects
@@ -727,60 +745,70 @@ impl ResourceStorage for SqliteBackend {
 
         // `strftime` parses the stored RFC3339 UTC string and yields UTC weekday
         // (`%w`: 0=Sunday..6=Saturday) and hour (`%H`: 00..23).
-        let mut stmt = conn
-            .prepare(
-                "SELECT CAST(strftime('%w', last_updated) AS INTEGER) AS wd, \
-                        CAST(strftime('%H', last_updated) AS INTEGER) AS hr, \
-                        COUNT(*) AS n \
-                 FROM resource_history \
-                 WHERE tenant_id = ?1 AND last_updated >= ?2 \
-                 GROUP BY wd, hr",
-            )
-            .or_query_error("Failed to prepare activity_histogram")?;
+        self.run_blocking(move |conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT CAST(strftime('%w', last_updated) AS INTEGER) AS wd, \
+                            CAST(strftime('%H', last_updated) AS INTEGER) AS hr, \
+                            COUNT(*) AS n \
+                     FROM resource_history \
+                     WHERE tenant_id = ?1 AND last_updated >= ?2 \
+                     GROUP BY wd, hr",
+                )
+                .or_query_error("Failed to prepare activity_histogram")?;
 
-        let rows = stmt
-            .query_map(params![tenant_id, since_bound], |row| {
-                let wd: i64 = row.get(0)?;
-                let hr: i64 = row.get(1)?;
-                let n: i64 = row.get(2)?;
-                Ok((wd, hr, n))
-            })
-            .or_query_error("Failed to query activity_histogram")?;
+            let rows = stmt
+                .query_map(params![tenant_id, since_bound], |row| {
+                    let wd: i64 = row.get(0)?;
+                    let hr: i64 = row.get(1)?;
+                    let n: i64 = row.get(2)?;
+                    Ok((wd, hr, n))
+                })
+                .or_query_error("Failed to query activity_histogram")?;
 
-        let mut out = Vec::new();
-        for row in rows {
-            let (wd, hr, n) = row.or_query_error("Failed to read activity row")?;
-            out.push(crate::core::ActivityCell {
-                weekday: wd.clamp(0, 6) as u8,
-                hour: hr.clamp(0, 23) as u8,
-                count: n.max(0) as u64,
-            });
-        }
-        Ok(out)
+            let mut out = Vec::new();
+            for row in rows {
+                let (wd, hr, n) = row.or_query_error("Failed to read activity row")?;
+                out.push(crate::core::ActivityCell {
+                    weekday: wd.clamp(0, 6) as u8,
+                    hour: hr.clamp(0, 23) as u8,
+                    count: n.max(0) as u64,
+                });
+            }
+            Ok(out)
+        })
+        .await
     }
 
     async fn count_all_types(&self, tenant: &TenantContext) -> StorageResult<Vec<(String, u64)>> {
-        let conn = self.get_connection()?;
-        let tenant_id = tenant.tenant_id().as_str();
-        let mut stmt = conn
-            .prepare(
-                "SELECT resource_type, COUNT(*) FROM resources \
-                 WHERE tenant_id = ?1 AND is_deleted = 0 \
-                 GROUP BY resource_type",
-            )
-            .or_query_error("Failed to prepare count_all_types")?;
-        let rows = stmt
-            .query_map(params![tenant_id], |row| {
-                let rt: String = row.get(0)?;
-                let n: i64 = row.get(1)?;
-                Ok((rt, n.max(0) as u64))
-            })
-            .or_query_error("Failed to query count_all_types")?;
-        let mut out = Vec::new();
-        for row in rows {
-            out.push(row.or_query_error("count_all_types row")?);
-        }
-        Ok(out)
+        // This is the dashboard's single most expensive query — a grouped
+        // aggregate over every live row of `resources` — so it runs on a
+        // blocking thread instead of stalling a tokio worker for its full
+        // duration (#959). The owned `tenant_id` is what makes the closure
+        // `'static`.
+        let tenant_id = tenant.tenant_id().as_str().to_string();
+        self.run_blocking(move |conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT resource_type, COUNT(*) FROM resources \
+                     WHERE tenant_id = ?1 AND is_deleted = 0 \
+                     GROUP BY resource_type",
+                )
+                .or_query_error("Failed to prepare count_all_types")?;
+            let rows = stmt
+                .query_map(params![tenant_id], |row| {
+                    let rt: String = row.get(0)?;
+                    let n: i64 = row.get(1)?;
+                    Ok((rt, n.max(0) as u64))
+                })
+                .or_query_error("Failed to query count_all_types")?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row.or_query_error("count_all_types row")?);
+            }
+            Ok(out)
+        })
+        .await
     }
 
     async fn count_by_types(
@@ -792,11 +820,10 @@ impl ResourceStorage for SqliteBackend {
         if resource_types.is_empty() {
             return Ok(Vec::new());
         }
-        let conn = self.get_connection()?;
-        let tenant_id = tenant.tenant_id().as_str();
-
         // Bind tenant_id as ?1 and each requested type as ?2, ?3, ...; the type
         // names are bound as parameters, never interpolated into the SQL text.
+        // Building the statement text needs no connection, so it stays out here
+        // and only the query itself moves onto the blocking thread (#959).
         let placeholders = (0..resource_types.len())
             .map(|i| format!("?{}", i + 2))
             .collect::<Vec<_>>()
@@ -809,26 +836,31 @@ impl ResourceStorage for SqliteBackend {
         );
 
         // Positional bind values matching the `?1..?n` order above: tenant first,
-        // then the requested types.
-        let mut binds: Vec<&str> = Vec::with_capacity(resource_types.len() + 1);
-        binds.push(tenant_id);
-        binds.extend_from_slice(resource_types);
+        // then the requested types. Owned `String`s rather than borrowed `&str`,
+        // because the blocking closure has to be `'static` and cannot hold onto
+        // `tenant` or the caller's `resource_types` slice.
+        let mut binds: Vec<String> = Vec::with_capacity(resource_types.len() + 1);
+        binds.push(tenant.tenant_id().as_str().to_string());
+        binds.extend(resource_types.iter().map(|rt| rt.to_string()));
 
-        let mut stmt = conn
-            .prepare(&sql)
-            .or_query_error("Failed to prepare count_by_types")?;
-        let rows = stmt
-            .query_map(rusqlite::params_from_iter(binds), |row| {
-                let rt: String = row.get(0)?;
-                let n: i64 = row.get(1)?;
-                Ok((rt, n.max(0) as u64))
-            })
-            .or_query_error("Failed to query count_by_types")?;
-        let mut out = Vec::new();
-        for row in rows {
-            out.push(row.or_query_error("count_by_types row")?);
-        }
-        Ok(out)
+        self.run_blocking(move |conn| {
+            let mut stmt = conn
+                .prepare(&sql)
+                .or_query_error("Failed to prepare count_by_types")?;
+            let rows = stmt
+                .query_map(rusqlite::params_from_iter(binds), |row| {
+                    let rt: String = row.get(0)?;
+                    let n: i64 = row.get(1)?;
+                    Ok((rt, n.max(0) as u64))
+                })
+                .or_query_error("Failed to query count_by_types")?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row.or_query_error("count_by_types row")?);
+            }
+            Ok(out)
+        })
+        .await
     }
 
     async fn count_by_tenant(&self) -> StorageResult<Vec<(String, u64)>> {
@@ -997,6 +1029,13 @@ impl ResourceStorage for SqliteBackend {
             "DELETE FROM resource_fts WHERE tenant_id = ?1",
             params![id],
         )?;
+        // The rowid mapping (#967) is a plain table, so it neither cascades
+        // nor is reached by the FTS delete above.
+        tx.execute(
+            "DELETE FROM resource_fts_map WHERE tenant_id = ?1",
+            params![id],
+        )
+        .or_query_error("purge FTS mapping")?;
         // Per-user settings are keyed by user, not tenant, so they are not swept
         // by the deletes above — but a client stores PHI-derived query strings in
         // them, which belong to this tenant (issue #313). Same transaction: this
@@ -1228,6 +1267,23 @@ impl SqliteBackend {
             content.full_content
         ])
         .map_err(|e| internal_error(format!("Failed to insert FTS content: {}", e)))?;
+
+        // Remember which rowid FTS5 assigned. `resource_fts`'s plain columns
+        // are UNINDEXED, so deleting by (tenant, type, id) can only scan the
+        // whole table; deleting by rowid is a b-tree lookup (#967).
+        conn.prepare_cached(
+            "INSERT OR REPLACE INTO resource_fts_map
+                (tenant_id, resource_type, resource_id, fts_rowid)
+             VALUES (?1, ?2, ?3, ?4)",
+        )
+        .map_err(|e| internal_error(format!("Failed to prepare FTS map insert: {}", e)))?
+        .execute(params![
+            tenant_id,
+            resource_type,
+            resource_id,
+            conn.last_insert_rowid()
+        ])
+        .map_err(|e| internal_error(format!("Failed to record FTS rowid: {}", e)))?;
 
         Ok(())
     }
@@ -1472,6 +1528,70 @@ impl SqliteBackend {
         Ok(())
     }
 
+    /// Removes one resource's `resource_fts` row(s) through the rowid mapping,
+    /// and the mapping itself.
+    ///
+    /// Falls back to the scanning delete when the resource has no mapping. That
+    /// is the self-heal for a row written before schema v23 by a build that
+    /// never recorded its rowid and that the migration's backfill somehow
+    /// missed: correct, slow, and it maps itself on the next write. After a
+    /// v23 migration it should never fire.
+    fn delete_fts_rows_for(
+        &self,
+        conn: &rusqlite::Connection,
+        tenant_id: &str,
+        resource_type: &str,
+        resource_id: &str,
+    ) -> StorageResult<()> {
+        if !fts_table_exists(conn)? {
+            return Ok(());
+        }
+
+        let rowids: Vec<i64> = {
+            let mut stmt = conn
+                .prepare_cached(
+                    "SELECT fts_rowid FROM resource_fts_map
+                     WHERE tenant_id = ?1 AND resource_type = ?2 AND resource_id = ?3",
+                )
+                .map_err(|e| internal_error(format!("prepare FTS map lookup: {e}")))?;
+            let rows = stmt
+                .query_map(params![tenant_id, resource_type, resource_id], |row| {
+                    row.get(0)
+                })
+                .map_err(|e| internal_error(format!("query FTS map: {e}")))?;
+            rows.filter_map(|r| r.ok()).collect()
+        };
+
+        if rowids.is_empty() {
+            tracing::debug!(
+                resource_type,
+                resource_id,
+                "no FTS rowid mapping; falling back to the scanning delete"
+            );
+            let _ = conn.execute(
+                "DELETE FROM resource_fts WHERE tenant_id = ?1 AND resource_type = ?2 AND resource_id = ?3",
+                params![tenant_id, resource_type, resource_id],
+            );
+            return Ok(());
+        }
+
+        for rowid in rowids {
+            conn.prepare_cached("DELETE FROM resource_fts WHERE rowid = ?1")
+                .map_err(|e| internal_error(format!("prepare FTS delete: {e}")))?
+                .execute(params![rowid])
+                .map_err(|e| internal_error(format!("delete FTS row: {e}")))?;
+        }
+        conn.prepare_cached(
+            "DELETE FROM resource_fts_map
+             WHERE tenant_id = ?1 AND resource_type = ?2 AND resource_id = ?3",
+        )
+        .map_err(|e| internal_error(format!("prepare FTS map delete: {e}")))?
+        .execute(params![tenant_id, resource_type, resource_id])
+        .map_err(|e| internal_error(format!("delete FTS mapping: {e}")))?;
+
+        Ok(())
+    }
+
     /// Normalizes a date string for SQLite comparisons.
     ///
     /// Ensures dates have a time component for consistent range comparisons.
@@ -1529,18 +1649,16 @@ impl SqliteBackend {
             .execute(params![tenant_id, resource_type, resource_id])
             .map_err(|e| internal_error(format!("Failed to delete search index: {}", e)))?;
 
-        // Delete from FTS. resource_fts is an FTS5 virtual table: a WHERE on
-        // its plain columns cannot use an index, so this statement scans the
-        // whole FTS table — per ingested entry, that made bulk imports
-        // quadratic in the table size. A resource that had no search_index
-        // rows was never FTS-indexed (every indexed resource carries at least
-        // its _id row), so the scan only needs to run when something was
-        // actually removed above.
+        // Delete from FTS by rowid. `resource_fts` is an FTS5 virtual table
+        // whose plain columns are UNINDEXED, so a WHERE on them scans the
+        // entire table — once per resource, which made every re-index
+        // quadratic in corpus size (#967: 0.2 entries/s against 6M FTS
+        // documents). FTS5 does index rowid, and `resource_fts_map` records
+        // the one it assigned. #949's `deleted > 0` guard still stands in
+        // front: a resource with no search_index rows was never FTS-indexed,
+        // so there is nothing to look up.
         if deleted > 0 {
-            let _ = conn.execute(
-                "DELETE FROM resource_fts WHERE tenant_id = ?1 AND resource_type = ?2 AND resource_id = ?3",
-                params![tenant_id, resource_type, resource_id],
-            );
+            self.delete_fts_rows_for(conn, tenant_id, resource_type, resource_id)?;
         }
 
         Ok(deleted as u64)
@@ -2582,6 +2700,12 @@ impl PurgableStorage for SqliteBackend {
             "DELETE FROM resource_fts WHERE tenant_id = ?1 AND resource_type = ?2 AND resource_id = ?3",
             params![tenant_id, resource_type, id],
         )?;
+        tx.execute(
+            "DELETE FROM resource_fts_map
+             WHERE tenant_id = ?1 AND resource_type = ?2 AND resource_id = ?3",
+            params![tenant_id, resource_type, id],
+        )
+        .or_query_error("purge FTS mapping")?;
 
         tx.commit()
             .map_err(|e| internal_error(format!("purge commit: {e}")))?;
@@ -2635,6 +2759,11 @@ impl PurgableStorage for SqliteBackend {
             "DELETE FROM resource_fts WHERE tenant_id = ?1 AND resource_type = ?2",
             params![tenant_id, resource_type],
         )?;
+        tx.execute(
+            "DELETE FROM resource_fts_map WHERE tenant_id = ?1 AND resource_type = ?2",
+            params![tenant_id, resource_type],
+        )
+        .or_query_error("purge FTS mapping")?;
 
         tx.commit()
             .map_err(|e| internal_error(format!("purge_all commit: {e}")))?;
@@ -3935,6 +4064,13 @@ impl ReindexTarget for SqliteBackend {
             "DELETE FROM resource_fts WHERE tenant_id = ?1",
             params![tenant_id],
         )?;
+        // …and the rowid mapping that pointed at them (#967), or the reindex
+        // would leave every resource mapped to a row that no longer exists.
+        conn.execute(
+            "DELETE FROM resource_fts_map WHERE tenant_id = ?1",
+            params![tenant_id],
+        )
+        .or_query_error("clear FTS mapping")?;
 
         Ok(deleted as u64)
     }
@@ -6735,5 +6871,109 @@ mod tests {
             Some("MR"),
             "Identifier type code should be populated"
         );
+    }
+
+    /// #967: the FTS delete goes through `resource_fts_map`, so the mapping has
+    /// to stay exactly in step with the rows it points at — one mapping per
+    /// FTS row, pointing at that row, and gone once the row is.
+    #[tokio::test]
+    async fn fts_rowid_mapping_tracks_the_rows_it_points_at() {
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+
+        let doc = |text: &str| {
+            json!({
+                "resourceType": "Patient",
+                "id": "map-1",
+                "text": {"status": "generated", "div": format!("<div>{text}</div>")}
+            })
+        };
+
+        let created = backend
+            .create(&tenant, "Patient", doc("first"), FhirVersion::default())
+            .await
+            .unwrap();
+
+        let mapping = || -> Vec<i64> {
+            let conn = backend.get_connection().unwrap();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT fts_rowid FROM resource_fts_map
+                     WHERE tenant_id = ?1 AND resource_type = 'Patient' AND resource_id = 'map-1'",
+                )
+                .unwrap();
+            let v: Vec<i64> = stmt
+                .query_map([tenant.tenant_id().as_str()], |r| r.get(0))
+                .unwrap()
+                .filter_map(|r| r.ok())
+                .collect();
+            v
+        };
+        let fts_rows_for = |rowids: &[i64]| -> usize {
+            let conn = backend.get_connection().unwrap();
+            rowids
+                .iter()
+                .filter(|rowid| {
+                    conn.query_row(
+                        "SELECT 1 FROM resource_fts WHERE rowid = ?1",
+                        [**rowid],
+                        |_| Ok(()),
+                    )
+                    .is_ok()
+                })
+                .count()
+        };
+
+        let after_create = mapping();
+        assert_eq!(after_create.len(), 1, "the create must map exactly one row");
+        assert_eq!(fts_rows_for(&after_create), 1, "the mapping must resolve");
+
+        backend
+            .update(&tenant, &created, doc("second"))
+            .await
+            .unwrap();
+
+        let after_update = mapping();
+        assert_eq!(
+            after_update.len(),
+            1,
+            "an update must leave exactly one mapping, not accumulate them"
+        );
+        assert_eq!(fts_rows_for(&after_update), 1);
+        // The rowid itself may well be the same integer: FTS5 hands back the
+        // one the delete just freed. What has to be true is that the row it
+        // names now holds the *new* content — i.e. the delete really removed
+        // the old row rather than leaving two, and the mapping points at the
+        // survivor.
+        let content: String = {
+            let conn = backend.get_connection().unwrap();
+            conn.query_row(
+                "SELECT full_content FROM resource_fts WHERE rowid = ?1",
+                [after_update[0]],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert!(
+            content.contains("second") && !content.contains("first"),
+            "the mapped row must hold the updated content, got: {content}"
+        );
+        let total_rows: i64 = {
+            let conn = backend.get_connection().unwrap();
+            conn.query_row(
+                "SELECT COUNT(*) FROM resource_fts WHERE resource_id = 'map-1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(total_rows, 1, "the update must not leave a second FTS row");
+
+        backend.purge(&tenant, "Patient", "map-1").await.unwrap();
+        assert!(
+            mapping().is_empty(),
+            "a purge must clear the mapping with the rows"
+        );
+        assert_eq!(fts_rows_for(&after_update), 0);
     }
 }

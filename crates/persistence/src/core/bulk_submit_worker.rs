@@ -882,10 +882,11 @@ where
                     .await
                 {
                     Ok(result) => {
-                        processed_ref.fetch_add(
-                            result.counts.success + result.counts.skipped,
-                            Ordering::Relaxed,
-                        );
+                        // Successes only, matching the per-batch increment on the
+                        // storage side: `processed_entries` means resources written
+                        // to the store, and the progress line words it that way
+                        // (#954). Skipped entries surface through their receipts.
+                        processed_ref.fetch_add(result.counts.success, Ordering::Relaxed);
                         failed_ref.fetch_add(result.counts.error_count(), Ordering::Relaxed);
                     }
                     Err(e) => {
