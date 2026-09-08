@@ -250,6 +250,29 @@ struct LogLine {
     message: String,
 }
 
+/// The submission's log as `partials/bulk_import_log.html` wants it:
+/// newest-first, so the detail page's first paint and the status fragment's
+/// out-of-band refresh agree on the order (#955).
+fn log_lines(submission: &Submission) -> Vec<LogLine> {
+    submission
+        .log
+        .iter()
+        .rev()
+        .map(|entry| LogLine {
+            at: entry
+                .get("at")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            message: entry
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+        })
+        .collect()
+}
+
 fn status_label(i18n: &I18n, status: &str) -> String {
     match status {
         "in-progress" => i18n.t("bulk-import-status-in-progress"),
@@ -288,6 +311,8 @@ struct BulkImportDetailPage {
     client_id: String,
     token_url: String,
     log: Vec<LogLine>,
+    /// The page paints the log in place, never out-of-band.
+    log_oob: bool,
     error: Option<String>,
     edit_open: bool,
 }
@@ -458,24 +483,7 @@ fn render_detail_page(
         .unwrap_or("")
         .to_string();
 
-    let log: Vec<LogLine> = s
-        .log
-        .iter()
-        .rev()
-        .map(|entry| LogLine {
-            at: entry
-                .get("at")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string(),
-            message: entry
-                .get("message")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string(),
-        })
-        .collect();
-
+    let log = log_lines(&s);
     let label = status_label(&i18n, &s.status);
     render(BulkImportDetailPage {
         status,
@@ -504,6 +512,7 @@ fn render_detail_page(
         client_id: s.client_id,
         token_url: s.token_url,
         log,
+        log_oob: false,
         error,
         edit_open,
     })
@@ -718,7 +727,7 @@ async fn backend_services_token(client_id: &str, token_url: &str) -> Result<Stri
     header.kid = signing_kid(&pem, &alg);
     let assertion = encode(&header, &claims, &key).map_err(|e| e.to_string())?;
 
-    let response = reqwest::Client::new()
+    let response = http_client()
         .post(token_url)
         .form(&[
             ("grant_type", "client_credentials"),
@@ -759,7 +768,7 @@ async fn post_kickoff(
     parameters: &Value,
 ) -> Result<(u16, String, String), String> {
     let target = kickoff_target(submission);
-    let mut request = reqwest::Client::new()
+    let mut request = http_client()
         .post(&target)
         .header("Content-Type", "application/fhir+json")
         .header("Accept", "application/fhir+json")
@@ -837,7 +846,7 @@ async fn status_kickoff(submission: &Submission, id: &str) -> Result<String, Str
         .collect();
     let body = json!({ "resourceType": "Parameters", "parameter": identifying });
 
-    let mut request = reqwest::Client::new()
+    let mut request = http_client()
         .post(&target)
         .header("Content-Type", "application/fhir+json")
         .header("Prefer", "respond-async")
@@ -855,6 +864,49 @@ async fn status_kickoff(submission: &Submission, id: &str) -> Result<String, Str
         .and_then(|v| v.to_str().ok())
         .map(String::from)
         .ok_or_else(|| format!("status kick-off answered {status} without Content-Location"))
+}
+
+/// How long a status poll may take before it is abandoned. During a heavy
+/// ingest the recipient's status handler contends with the writers and is
+/// legitimately slow — measured at 8-13s against a local recipient under a
+/// bulk load, past the previous 10s cap — so the cap is generous rather
+/// than snappy: a slow status is expected under load, not an outage. A poll
+/// that still times out logs its cause and backs off instead of hammering
+/// (#957).
+const STATUS_POLL_TIMEOUT_SECS: u64 = 30;
+
+/// How long to hold polls after a transport failure. The error branch used to
+/// leave `next_poll_at` in the past, so every subsequent 5s htmx tick fired
+/// another poll — the exact hammering the recipient's rate limit (#790)
+/// rejects (#957).
+const STATUS_POLL_FAILURE_BACKOFF_SECS: u64 = 30;
+
+/// Shared HTTP client. A per-request `reqwest::Client::new()` rebuilds the
+/// connection pool and resolver every call, so every poll paid a fresh TCP
+/// connect and nothing was ever kept alive (#957).
+fn http_client() -> &'static reqwest::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    CLIENT.get_or_init(reqwest::Client::new)
+}
+
+/// Renders a poll transport failure with its cause. `reqwest::Error`'s
+/// `Display` stops at the URL and hides the reason in `source()`, which made
+/// a timeout, a refused connection, and a reset log byte-identically (#957).
+fn poll_failure_detail(e: &reqwest::Error) -> String {
+    if e.is_timeout() {
+        return format!(
+            "timed out after {STATUS_POLL_TIMEOUT_SECS}s — the recipient's status \
+             endpoint can be slow while it is ingesting"
+        );
+    }
+    let mut detail = e.to_string();
+    let mut src = std::error::Error::source(e);
+    while let Some(cause) = src {
+        detail.push_str(": ");
+        detail.push_str(&cause.to_string());
+        src = cause.source();
+    }
+    detail
 }
 
 /// Whether the recipient asked us to hold off: a stored `next_poll_at` still
@@ -887,16 +939,23 @@ fn retry_after_seconds(response: &reqwest::Response) -> Option<u64> {
 /// never turns into a poll the recipient would reject (#790).
 async fn poll_status(submission: &mut Submission) {
     let poll_url = submission.poll_url.clone();
-    let response = match reqwest::Client::new()
+    let response = match http_client()
         .get(&poll_url)
         .header("Accept", "application/json")
-        .timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(STATUS_POLL_TIMEOUT_SECS))
         .send()
         .await
     {
         Ok(r) => r,
         Err(e) => {
-            push_log(submission, format!("Status poll failed: {e}"));
+            push_log(
+                submission,
+                format!("Status poll failed: {}", poll_failure_detail(&e)),
+            );
+            // A failed poll honors a backoff too — without this,
+            // `next_poll_at` stays in the past and every 5s tick re-polls,
+            // sailing through the recipient's rate limit (#957).
+            hold_polls_for(submission, STATUS_POLL_FAILURE_BACKOFF_SECS);
             return;
         }
     };
@@ -1145,6 +1204,10 @@ struct StatusCard {
     completed_at: String,
     /// Rides out-of-band into the summary card's STATUS cell.
     status_label: String,
+    /// Rides out-of-band into the Submission Log section, whose lines this
+    /// poll may have just written (#955).
+    log: Vec<LogLine>,
+    log_oob: bool,
 }
 
 /// `GET /ui/bulk-import/{id}/status` — at most one recipient poll, then the
@@ -1178,6 +1241,8 @@ pub async fn status_fragment(
         errors: s.result["errors"].as_u64().unwrap_or(0),
         completed_at: s.result["completedAt"].as_str().unwrap_or("").to_string(),
         status_label: label,
+        log: log_lines(&s),
+        log_oob: true,
         i18n,
     })
 }
@@ -1200,7 +1265,13 @@ pub async fn status_fragment(
 /// 412 files`) would be mis-parsed as a percentage. The recipient owns the
 /// vocabulary; this parser only claims the one prefix.
 fn progress_percent(progress: &str) -> Option<u8> {
-    let rest = progress.strip_prefix("processing ")?;
+    // Case-insensitive: HFS capitalizes the line ("Processing 3% of bytes —
+    // …", #954), older HFS versions and foreign recipients may send lowercase
+    // "processing 3% complete …". Either way the digits follow the prefix.
+    let rest = progress
+        .get(..11)
+        .filter(|p| p.eq_ignore_ascii_case("processing "))
+        .and_then(|_| progress.get(11..))?;
     let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
     let pct: u8 = digits.parse().ok().filter(|p| *p <= 100)?;
     Some(pct)
@@ -1254,6 +1325,24 @@ pub async fn test_auth(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn progress_percent_reads_both_hfs_wordings_and_foreign_case() {
+        // Current HFS wording (#954).
+        assert_eq!(
+            progress_percent("Processing 3% of bytes — 609,191 resources written"),
+            Some(3)
+        );
+        assert_eq!(progress_percent("Processing 0% of bytes"), Some(0));
+        // Pre-#954 HFS and lowercase foreign recipients.
+        assert_eq!(
+            progress_percent("processing 10% complete (5 entries ingested)"),
+            Some(10)
+        );
+        // Non-matching recipients keep the indeterminate sweep.
+        assert_eq!(progress_percent("halfway there"), None);
+        assert_eq!(progress_percent("processing lots"), None);
+    }
 
     #[test]
     fn recipient_base_preserves_prefix_and_adds_path_tenant() {

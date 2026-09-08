@@ -71,4 +71,22 @@ export class DashboardPage {
     }
     throw new Error("no chart series appeared after seeding");
   }
+
+  /** Reloads until the type picker offers `type`, leaving the picker open.
+   *
+   * `waitForSeries` is not enough for anything that asserts on *which* types
+   * are offered: the snapshot cache serves the last computed snapshot while
+   * it refreshes in the background, and a stale snapshot already plots
+   * series, so the wait returns on the first load with the option list still
+   * showing the types of a minute ago. A type seeded moments earlier only
+   * appears once a refresh has landed. */
+  async waitForPickerOption(type: string): Promise<void> {
+    for (let attempt = 0; attempt < 12; attempt++) {
+      await this.openPicker();
+      if ((await this.pickerOption(type).count()) > 0) return;
+      await this.page.waitForTimeout(2000);
+      await this.page.reload({ waitUntil: "networkidle" });
+    }
+    throw new Error(`the type picker never offered ${type}`);
+  }
 }

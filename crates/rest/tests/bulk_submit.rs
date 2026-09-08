@@ -1174,7 +1174,7 @@ async fn test_poll_percentage_tracks_ingested_bytes() {
         .unwrap()
         .to_string();
     assert!(
-        progress.contains("processing 35% complete"),
+        progress.contains("Processing 35% of bytes"),
         "the percentage must follow ingested bytes, got: {progress}"
     );
 }
@@ -1364,7 +1364,7 @@ async fn test_poll_falls_back_when_the_phase_has_no_file_total() {
 
     let progress = poll_progress(&server, &poll_path).await;
     assert_eq!(
-        progress, "processing 0% complete",
+        progress, "Processing 0% of bytes",
         "an unknown file total must not render as 'of 0', got: {progress}"
     );
 }
@@ -1397,7 +1397,7 @@ async fn test_moving_bytes_outrank_a_stale_phase() {
 
     let progress = poll_progress(&server, &poll_path).await;
     assert!(
-        progress.contains("processing 35% complete"),
+        progress.contains("Processing 35% of bytes"),
         "a real percentage must take over from the pre-ingest phase, got: {progress}"
     );
 }

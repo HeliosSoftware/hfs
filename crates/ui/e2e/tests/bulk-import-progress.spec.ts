@@ -1,17 +1,19 @@
 // #953: the pre-ingest window of a bulk submission has to *say something*.
 //
-// Before, every status read taken before the first entry landed reported
-// `processing 0% complete` — a determinate-sounding sentence for a phase whose
+// Before, every status read taken before the first entry landed reported a
+// bare byte percentage — a determinate-sounding sentence for a phase whose
 // duration is unknown, printed under the indeterminate sweep. The handler now
 // names the phase instead (`waiting for a worker`, `reading manifest`,
 // `sizing N of M files`, `downloading file N of M`), and none of those strings
-// may begin with `processing `, because the UI parses that prefix into a
-// percentage and would flip the bar to a determinate fill — the #827 mix.
+// may begin with `processing ` in any case, because the UI parses that prefix
+// case-insensitively into a percentage and would flip the bar to a determinate
+// fill — the #827 mix.
 //
 // Both halves are asserted here against a deliberately slow Data Provider this
 // spec serves itself: every pre-ingest sample must be phase text + an
 // indeterminate track with no aria-valuenow, and the ingest samples that follow
-// must be `processing N% complete` + a determinate track that carries one.
+// must be the byte-percentage wording (#954) + a determinate track that
+// carries one.
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { test, expect } from "../pages/fixtures";
@@ -22,7 +24,7 @@ const FILE_DELAY_MS = 2_500;
 
 const PRE_INGEST =
   /^(waiting for a worker|reading manifest|sizing \d+ of \d+ files|downloading file \d+ of \d+)$/;
-const INGEST = /^processing (\d+)% complete/;
+const INGEST = /^Processing (\d+)% of bytes/;
 
 /** Two Patients per file, so the ingest phase reports several percentages. */
 function ndjson(index: number): string {
@@ -186,7 +188,7 @@ test("the pre-ingest phases name themselves under an indeterminate bar", async (
   const ingest = samples.filter((s) => INGEST.test(s.text));
 
   // The regression #953 fixes: this list used to be empty, because every one
-  // of these reads said `processing 0% complete`.
+  // of these reads was a bare `0%` byte reading.
   expect(preIngest.length, `no pre-ingest phase was ever reported:\n${readings}`).toBeGreaterThan(0);
   expect(ingest.length, `the submission never reached ingest:\n${readings}`).toBeGreaterThan(0);
 
@@ -253,8 +255,9 @@ test("X-Progress names the phase instead of reporting 0% for the whole pre-inges
     true,
   );
   expect(progress.some((p) => INGEST.test(p)), `ingest never reported:\n${seen}`).toBe(true);
-  // The old handler's answer for the entire pre-ingest window.
-  expect(progress, `"processing 0% complete" is the pre-#953 reading`).not.toContain(
-    "processing 0% complete",
+  // The old handler's answer for the entire pre-ingest window: a bare 0% byte
+  // reading, with no phase and no resource count to qualify it.
+  expect(progress, `a bare "0% of bytes" is the pre-#953 reading`).not.toContain(
+    "Processing 0% of bytes",
   );
 });
