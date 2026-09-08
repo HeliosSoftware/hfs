@@ -1401,3 +1401,53 @@ async fn test_moving_bytes_outrank_a_stale_phase() {
         "a real percentage must take over from the pre-ingest phase, got: {progress}"
     );
 }
+
+/// `X-Progress` is an HTTP field value, so RFC 9110 §5.5 confines it to
+/// US-ASCII; a byte above 0x7F is `obs-text` with undefined meaning, and
+/// conservative clients drop the whole value rather than guess. `to_str` is one
+/// of those clients — an em dash in the resource-count wording made our own
+/// Bulk Import card fall back to a literal "in progress", replacing the phase
+/// text with a placeholder.
+///
+/// The count branch is the one that carried it, and no other test reaches that
+/// branch: `poll_progress` would panic on a non-ASCII header, so this asserts
+/// the bytes directly and states the invariant for every branch at once.
+#[tokio::test]
+async fn test_progress_header_stays_ascii_in_every_branch() {
+    let (server, backend, _fetcher, _output, _tmp) =
+        create_submit_server_with(mock_fetcher(), BulkSubmitConfig::default()).await;
+    let poll_path = start_and_get_poll_path(&server).await;
+
+    let lease = backend
+        .claim_next_manifest(&WorkerId::new("ascii-worker"), Duration::from_secs(60))
+        .await
+        .expect("claim")
+        .expect("a manifest to claim");
+    backend
+        .update_manifest_bytes(&lease, 350, 1_000)
+        .await
+        .expect("bytes update");
+    // Entries outrank bytes, so this selects the resource-count wording.
+    backend
+        .update_manifest_progress(&lease, 609_191, 0, 609_191)
+        .await
+        .expect("entry update");
+
+    let resp = server.get(&poll_path).await;
+    assert_eq!(resp.status_code(), StatusCode::ACCEPTED);
+    let raw = resp
+        .headers()
+        .get("x-progress")
+        .expect("X-Progress")
+        .as_bytes()
+        .to_vec();
+    let text = String::from_utf8_lossy(&raw);
+    assert!(
+        raw.is_ascii(),
+        "X-Progress must be US-ASCII; a conservative client discards it otherwise. Got: {text}"
+    );
+    assert!(
+        text.contains("609,191 resources written"),
+        "the count branch must still be the one under test, got: {text}"
+    );
+}

@@ -847,8 +847,18 @@ where
             // the count is FHIR resources written to the store ("written", not
             // "searchable" — under deferred indexing search follows the
             // per-manifest reindex).
+            //
+            // The separator is a plain ASCII hyphen, not the em dash this
+            // comment uses. The string is an HTTP field value, and RFC 9110
+            // §5.5 confines those to US-ASCII: a byte above 0x7F is `obs-text`,
+            // whose meaning is undefined, so conservative clients refuse to
+            // decode it rather than guess an encoding. `HeaderValue::to_str` is
+            // one such client, which is how the em dash silently blanked the
+            // progress line in our own Bulk Import card (it fell through to a
+            // literal "in progress"); any third-party Data Provider polling
+            // this endpoint would have hit the same wall.
             format!(
-                "Processing {pct}% of bytes — {} resources written",
+                "Processing {pct}% of bytes - {} resources written",
                 group_thousands(entries)
             )
         } else if pct > 0 {

@@ -1600,3 +1600,31 @@ async fn pre_ingest_phases_show_their_text_on_an_indeterminate_bar() {
         assert!(detail.contains(phase), "run log missing {phase}: {detail}");
     }
 }
+
+/// A recipient is free to put non-ASCII in `X-Progress` — RFC 9110 §5.5 calls
+/// those bytes `obs-text` and leaves their meaning undefined, but nothing
+/// forbids sending them, and HFS itself shipped an em dash there for a while.
+/// Reading the header with `HeaderValue::to_str` rejected the *whole* value on
+/// the first such byte, so the card showed a hardcoded "in progress" instead of
+/// the recipient's real report: the uninformative status #953 exists to remove,
+/// reintroduced by an encoding detail. Decoding lossily keeps the report.
+#[tokio::test]
+async fn a_non_ascii_progress_report_still_reaches_the_operator() {
+    let recipient =
+        mock_recipient_reporting(&["Processing 35% of bytes — 1,024 resources written"]).await;
+    let ctx = ctx(&recipient);
+    let detail_path = create_submission(&ctx).await;
+
+    let (status, html) = get(&ctx, &format!("{detail_path}/status")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        html.contains("1,024 resources written"),
+        "the report must survive its non-ASCII byte: {html}"
+    );
+    assert!(
+        !html.contains("in progress"),
+        "the placeholder must not stand in for a report we received: {html}"
+    );
+    // And the percentage still parses, so the bar stays determinate.
+    assert!(html.contains(r#"aria-valuenow="35""#), "{html}");
+}

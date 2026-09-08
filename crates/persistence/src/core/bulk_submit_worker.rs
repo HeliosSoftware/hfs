@@ -1435,6 +1435,13 @@ mod tests {
         }
     }
 
+    /// One phase reading: the counters a status poll would have seen, without
+    /// the label saying which fetcher call it was taken during.
+    type PhaseReading = (Option<ManifestPhase>, u64, u64);
+
+    /// A [`PhaseReading`] tagged with that label.
+    type LabelledPhaseReading = (String, Option<ManifestPhase>, u64, u64);
+
     /// Wraps a [`MockFetcher`] and, on every call the worker makes, reads back
     /// the phase the worker persisted just before it — so a test can assert
     /// what a *concurrent status poll* would have seen, rather than only the
@@ -1444,7 +1451,7 @@ mod tests {
         backend: Arc<SqliteBackend>,
         tenant: TenantContext,
         sub_id: SubmissionId,
-        seen: std::sync::Mutex<Vec<(String, Option<ManifestPhase>, u64, u64)>>,
+        seen: std::sync::Mutex<Vec<LabelledPhaseReading>>,
     }
 
     impl PhaseSpyFetcher {
@@ -1463,7 +1470,7 @@ mod tests {
             ));
         }
 
-        fn phases_during(&self, during: &str) -> Vec<(Option<ManifestPhase>, u64, u64)> {
+        fn phases_during(&self, during: &str) -> Vec<PhaseReading> {
             self.seen
                 .lock()
                 .unwrap()

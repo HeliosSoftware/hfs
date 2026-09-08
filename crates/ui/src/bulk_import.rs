@@ -962,12 +962,18 @@ async fn poll_status(submission: &mut Submission) {
     match response.status().as_u16() {
         202 => {
             let retry_after = retry_after_seconds(&response);
+            // Decoded lossily, not via `to_str`: that accessor rejects the
+            // whole value if a single byte sits above 0x7F, and the fallback
+            // it forced here was the literal "in progress" — the recipient's
+            // real phase text replaced by a placeholder, which is exactly the
+            // uninformative status #953 set out to remove. HFS itself now
+            // keeps this header ASCII, but a foreign recipient is free to send
+            // UTF-8 prose, and showing it imperfectly beats discarding it.
             let progress = response
                 .headers()
                 .get("x-progress")
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("in progress")
-                .to_string();
+                .map(|v| String::from_utf8_lossy(v.as_bytes()).into_owned())
+                .unwrap_or_else(|| "in progress".to_string());
             if submission.progress != progress {
                 push_log(submission, format!("Status: {progress}"));
             }
