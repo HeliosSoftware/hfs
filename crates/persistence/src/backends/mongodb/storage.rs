@@ -1866,20 +1866,12 @@ impl MongoBackend {
             }
             .map_err(|e| internal_error(format!("Failed to get current version: {}", e)))?;
 
-            return match actual {
-                Some(doc) => Err(StorageError::Concurrency(
-                    ConcurrencyError::VersionConflict {
-                        resource_type: resource_type.to_string(),
-                        id: id.to_string(),
-                        expected_version: deleted_version,
-                        actual_version: doc.get_str("version_id").unwrap_or("").to_string(),
-                    },
-                )),
-                None => Err(StorageError::Resource(ResourceError::NotFound {
-                    resource_type: resource_type.to_string(),
-                    id: id.to_string(),
-                })),
-            };
+            return Err(crate::core::restore_cas_miss(
+                resource_type,
+                id,
+                deleted_version,
+                actual.map(|doc| doc.get_str("version_id").unwrap_or("").to_string()),
+            ));
         }
 
         let history_doc = doc! {

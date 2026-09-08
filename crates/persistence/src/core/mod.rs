@@ -161,7 +161,7 @@ pub use sof_runner::{RowStream, SofError, SofRunner, ViewFilters, ViewRow};
 pub use storage::{
     ActivityCell, ConditionalCreateResult, ConditionalDeleteResult, ConditionalPatchResult,
     ConditionalStorage, ConditionalUpdateResult, DailyResourceCount, PatchFormat, PurgableStorage,
-    ResourceCountDelta, ResourceStorage, TenantRecord, bucket_floor,
+    ResourceCountDelta, ResourceStorage, TenantRecord, bucket_floor, restore_cas_miss,
 };
 pub use transaction::{
     BundleEntry, BundleEntryResult, BundleMethod, BundleProvider, BundleResult, BundleType,

@@ -1230,20 +1230,12 @@ impl PostgresBackend {
                 .await
                 .map_err(|e| internal_error(format!("Failed to get current version: {}", e)))?;
 
-            return match actual {
-                Some(row) => Err(StorageError::Concurrency(
-                    ConcurrencyError::VersionConflict {
-                        resource_type: resource_type.to_string(),
-                        id: id.to_string(),
-                        expected_version: deleted_version,
-                        actual_version: row.get::<_, String>(0),
-                    },
-                )),
-                None => Err(StorageError::Resource(ResourceError::NotFound {
-                    resource_type: resource_type.to_string(),
-                    id: id.to_string(),
-                })),
-            };
+            return Err(crate::core::restore_cas_miss(
+                resource_type,
+                id,
+                deleted_version,
+                actual.map(|row| row.get::<_, String>(0)),
+            ));
         }
 
         // The delete dropped the search index entries; rebuild them for the
