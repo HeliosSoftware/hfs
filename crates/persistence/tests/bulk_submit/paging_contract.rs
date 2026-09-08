@@ -151,8 +151,8 @@ pub async fn exact_sql_pages<B: ReceiptFixture>(
             let mut references: Vec<_> = actual
                 .iter()
                 .map(|entry| {
-                    assert_eq!(
-                        entry.result.created, false,
+                    assert!(
+                        !entry.result.created,
                         "NULL created retains its existing meaning"
                     );
                     format!(
