@@ -85,9 +85,6 @@ export class SearchResults {
   get meta(): Locator {
     return this.page.locator("#query-results-meta");
   }
-  get openTab(): Locator {
-    return this.page.locator("#query-results-open");
-  }
   get rows(): Locator {
     return this.page.locator("#query-results-body tr");
   }
@@ -111,7 +108,6 @@ export class SearchResults {
   async visibleState(): Promise<{
     rows: string[];
     meta: string;
-    openHref: string | null;
     note: string;
     prevVisible: boolean;
     prevUrl: string | null;
@@ -121,7 +117,6 @@ export class SearchResults {
     return {
       rows: await this.rows.allInnerTexts(),
       meta: await this.meta.innerText(),
-      openHref: await this.openTab.getAttribute("href"),
       note: await this.note.innerText(),
       prevVisible: await this.prev.isVisible(),
       prevUrl: await this.prev.getAttribute("data-url"),

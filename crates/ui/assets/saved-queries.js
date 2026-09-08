@@ -208,6 +208,8 @@
    * type -> { code: { type: "reference"|..., targets: ["Patient", ...] } }.
    * Feeds the chaining controls; promise-cached so each type is fetched once. */
   var PARAM_META = {};
+  /* Per-type default column hints from the catalog fragment (#958). */
+  var TYPE_COLUMNS = {};
   var paramCatalogPromises = {};
   function parseCatalog(html) {
     var tpl = document.createElement("template");
@@ -219,7 +221,14 @@
         targets: (opt.dataset.targets || "").split(",").filter(Boolean),
       };
     });
-    return { meta: meta, datalist: tpl.content.querySelector("datalist") };
+    var datalist = tpl.content.querySelector("datalist");
+    return {
+      meta: meta,
+      datalist: datalist,
+      columns: ((datalist && datalist.dataset.columns) || "")
+        .split(",")
+        .filter(Boolean),
+    };
   }
   function fetchCatalog(type) {
     if (!type) return Promise.resolve({ meta: {}, datalist: null });
@@ -232,8 +241,11 @@
         return response.ok ? response.text() : null;
       })
       .then(function (html) {
-        var parsed = html ? parseCatalog(html) : { meta: {}, datalist: null };
+        var parsed = html
+          ? parseCatalog(html)
+          : { meta: {}, datalist: null, columns: [] };
         PARAM_META[type] = parsed.meta;
+        TYPE_COLUMNS[type] = parsed.columns || [];
         return parsed;
       })
       .catch(function () {
@@ -1939,9 +1951,12 @@
    * panel and the button are absent on the Saved Queries / Search pages,
    * where this rail only drives the search. */
   function selectType(type) {
-    urlInput.value = "GET /" + type;
+    /* Type switches reset to the `_summary=true` default (#958): summary
+     * elements match the table's default columns, and removing the
+     * parameter from the editable URL opts out for that query. */
+    urlInput.value = "GET /" + type + "?_summary=true";
     renderBuilder();
-    runSearch("/" + encodeURIComponent(type), false);
+    runSearch("/" + encodeURIComponent(type) + "?_summary=true", false);
   }
 
   /* Repaints the "Recently used" group locally — cloning the clicked item
@@ -2048,7 +2063,11 @@
   function locationSearchValue() {
     var params = new URLSearchParams(window.location.search);
     if (params.has("url")) return params.get("url") || "";
-    return "/" + resolvedSelectedType();
+    /* No explicit query in the location: the fresh-open default matches a
+     * rail click — `_summary=true` seeded, deletable from the URL (#958).
+     * This rebuild used to drop the server-seeded parameter, which is why
+     * a manually typed `_summary` looked like it did nothing. */
+    return "/" + resolvedSelectedType() + "?_summary=true";
   }
 
   /* Resources opens on the resolved type (#605): the same path as a rail
@@ -2292,6 +2311,43 @@
   var lastSearchPath = null;
   var lastSearchContext = null;
 
+  /* Search-parameter types a server-side `_sort` can order by (#958). */
+  var SORTABLE_TYPES = {
+    string: 1,
+    token: 1,
+    date: 1,
+    number: 1,
+    quantity: 1,
+    reference: 1,
+    uri: 1,
+  };
+
+  /* Replaces the sort select's per-parameter options with the selected
+   * type's sortable search parameters, ascending and descending. The
+   * template's fixed options (default / recency / _id) stay (#958). */
+  function rebuildSortOptions(type) {
+    if (!results.sort || results.sort.dataset.optionsFor === type) return;
+    results.sort.querySelectorAll("option[data-param]").forEach(function (o) {
+      o.remove();
+    });
+    var meta = PARAM_META[type] || {};
+    Object.keys(meta)
+      .sort()
+      .forEach(function (code) {
+        if (!SORTABLE_TYPES[(meta[code] || {}).type]) return;
+        [
+          [code, code + " \u2191"],
+          ["-" + code, code + " \u2193"],
+        ].forEach(function (pair) {
+          var option = document.createElement("option");
+          option.value = pair[0];
+          option.textContent = pair[1];
+          option.dataset.param = "1";
+          results.sort.appendChild(option);
+        });
+      });
+    results.sort.dataset.optionsFor = type;
+  }
   var results = {
     card: document.getElementById("query-results"),
     head: document.getElementById("query-results-head"),
@@ -2299,7 +2355,6 @@
     meta: document.getElementById("query-results-meta"),
     note: document.getElementById("query-results-note"),
     error: document.getElementById("query-results-error"),
-    open: document.getElementById("query-results-open"),
     prev: document.getElementById("query-results-prev"),
     next: document.getElementById("query-results-next"),
     sort: document.getElementById("query-results-sort"),
@@ -2425,6 +2480,8 @@
 
     var columns = elementColumns(context.query);
     if (!columns.length) columns = DEFAULT_COLUMNS[context.type] || [];
+    /* Every other type: summary elements from the catalog hint (#958). */
+    if (!columns.length) columns = TYPE_COLUMNS[context.type] || [];
 
     var head = document.createDocumentFragment();
     var headRow = document.createElement("tr");
@@ -2497,14 +2554,22 @@
     if (!prepared) return false;
 
     card.hidden = false;
-    results.open.href = path;
     results.head.replaceChildren(prepared.head);
     results.body.replaceChildren(prepared.rows);
     results.meta.textContent = prepared.meta;
     results.note.textContent = prepared.note;
     if (results.sort) {
-      results.sort.value = prepared.sort;
-      if (results.sort.value !== prepared.sort) results.sort.value = "";
+      var syncSort = function () {
+        rebuildSortOptions(context.type);
+        results.sort.value = prepared.sort;
+        if (results.sort.value !== prepared.sort) results.sort.value = "";
+      };
+      syncSort();
+      if (!PARAM_META[context.type])
+        fetchCatalog(context.type).then(function () {
+          results.sort.dataset.optionsFor = "";
+          syncSort();
+        });
     }
 
     if (prepared.prev) {
@@ -2556,11 +2621,28 @@
   /* Runs a search against the FHIR API and renders the Bundle in-page.
    * `record` adds it to the roaming recent list (explicit runs only, so
    * paging does not spam recents). */
+  /* Monotonic ticket per search: a slow earlier response must not land on
+   * top of a faster later one (#958). */
+  var searchTicket = 0;
+
+  function setResultsBusy(busy) {
+    if (!results.card) return;
+    results.card.classList.toggle("is-busy", busy);
+    results.card.setAttribute("aria-busy", busy ? "true" : "false");
+    var busyNote = document.getElementById("query-results-busy");
+    if (busyNote) busyNote.hidden = !busy;
+    var run = form && form.querySelector('button[data-intent="run"]');
+    if (run) run.disabled = busy;
+    if (results.sort) results.sort.disabled = busy;
+  }
+
   function runSearch(path, record, context) {
     var requestedContext = context || resultContext(path);
     if (!results.card) {
       window.open(path, "_blank", "noopener");
     } else {
+      var ticket = ++searchTicket;
+      setResultsBusy(true);
       fetch(path, {
         headers: fhirHeaders(),
         credentials: "same-origin",
@@ -2572,10 +2654,14 @@
           });
         })
         .then(function (body) {
+          if (ticket !== searchTicket) return;
+          setResultsBusy(false);
           if (!renderResults(path, body, requestedContext))
             showResultsError(path);
         })
         .catch(function () {
+          if (ticket !== searchTicket) return;
+          setResultsBusy(false);
           showResultsError(path);
         });
     }
@@ -2596,7 +2682,13 @@
         return p && p.indexOf("_sort=") !== 0;
       });
       if (results.sort.value) parts.push("_sort=" + results.sort.value);
-      runSearch(searchPath(lastSearchContext.type, parts.join("&")), false);
+      var path = searchPath(lastSearchContext.type, parts.join("&"));
+      /* The visible query stays in step with what the table shows (#958). */
+      if (urlInput) {
+        urlInput.value = "GET " + path;
+        urlInput.dispatchEvent(new Event("input", { bubbles: true }));
+      }
+      runSearch(path, false);
     });
 
   /* ---- Recent searches & the saved list -------------------------------- */
