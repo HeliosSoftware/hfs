@@ -97,8 +97,9 @@ pub struct ManifestWorkerView {
     ///
     /// Informational only — nothing resumes from it. A reclaimed manifest
     /// re-walks each of its files from the top and the re-ingested entries
-    /// upsert idempotently; per-byte resume is #967. Counted like the other
-    /// progress columns, so it only ever moves forward (#969).
+    /// upsert idempotently; this cursor is the checkpoint a future per-line
+    /// resume would read, but no such consumer exists yet. Counted like the
+    /// other progress columns, so it only ever moves forward (#969).
     pub last_processed_line: u64,
     /// FHIR version this submission ingests against.
     pub fhir_version: FhirVersion,
@@ -234,8 +235,8 @@ pub trait SubmitWorkerStorage: Send + Sync {
     ///
     /// Deltas are therefore *not* idempotent: re-ingesting an entry after a
     /// worker restart adds to `processed_entries` a second time, so the counts
-    /// over-report on a resumed manifest until the re-walk is eliminated
-    /// (#967). Over-reporting is the safe direction — a status poller sees
+    /// over-report on a resumed manifest until the re-walk is eliminated by a
+    /// per-line resume. Over-reporting is the safe direction — a status poller sees
     /// progress that only ever moves forward.
     async fn add_manifest_progress(
         &self,
