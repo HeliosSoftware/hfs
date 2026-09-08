@@ -1,0 +1,85 @@
+<div class="capability-json-outline"
+     data-capability-json-page
+     data-path="{{ expanded.root.pointer }}"
+     data-offset="{{ expanded.root.offset }}"
+     data-limit="{{ expanded.root.limit }}"
+     data-item-count="{{ expanded.root.item_count }}"
+     data-expansion-state="{{ expanded.state.as_str() }}">
+  <div class="capability-json-bracket"><span class="jt--punct">{{ expanded.root.opening }}</span></div>
+  <div class="capability-json-rows">
+    {% for event in expanded.events %}
+    {% match event %}
+    {% when ExpandedEvent::Scalar(row) %}
+    <div class="capability-json-row">
+      <span class="capability-json-row__fold" aria-hidden="true"></span>
+      <code><span class="jt--key">{{ row.prefix }}</span>{% for token in row.tokens %}<span class="jt--{{ token.kind }}">{{ token.text }}</span>{% endfor %}<span class="jt--punct">{% if row.comma %},{% endif %}</span></code>
+      {% if row.truncated %}<span class="capability-json-truncated">{{ i18n.t("cap-json-truncated") }}</span>{% endif %}
+    </div>
+    {% when ExpandedEvent::Collapsed(row) %}
+    <details class="capability-json-node" data-capability-json-node>
+      <summary class="capability-json-row">
+        <span class="capability-json-row__fold" aria-hidden="true">▸</span>
+        <code><span class="jt--key">{{ row.prefix }}</span><span class="jt--punct">{{ row.summary }}{% if row.comma %},{% endif %}</span></code>
+        {% if row.truncated %}<span class="capability-json-truncated">{{ i18n.t("cap-json-truncated") }}</span>{% endif %}
+        {% if !row.expandable %}<span class="capability-json-truncated">{{ i18n.t("cap-json-path-too-deep") }}</span>{% endif %}
+      </summary>
+      {% if row.expandable %}
+      <div class="capability-json-node__body"
+           data-capability-json-body
+           data-loading-text="{{ i18n.t("cap-raw-loading") }}"
+           data-error-text="{{ i18n.t("cap-json-load-error") }}"
+           data-fragment-url="{{ row.fragment_url }}">
+        <p class="busy-status" role="status"><span class="spinner" aria-hidden="true"></span>{{ i18n.t("cap-raw-loading") }}</p>
+      </div>
+      {% endif %}
+    </details>
+    {% when ExpandedEvent::Open(node) %}
+    <details class="capability-json-node" data-capability-json-node open>
+      <summary class="capability-json-row">
+        <span class="capability-json-row__fold" aria-hidden="true">▸</span>
+        <code><span class="jt--key">{{ node.row.prefix }}</span><span class="jt--punct">{{ node.row.summary }}{% if node.row.comma %},{% endif %}</span></code>
+        {% if node.row.truncated %}<span class="capability-json-truncated">{{ i18n.t("cap-json-truncated") }}</span>{% endif %}
+      </summary>
+      <div class="capability-json-node__body"
+           data-capability-json-body
+           data-capability-json-loaded="true"
+           data-loading-text="{{ i18n.t("cap-raw-loading") }}"
+           data-error-text="{{ i18n.t("cap-json-load-error") }}"
+           data-fragment-url="{{ node.row.fragment_url }}">
+        <div class="capability-json-outline"
+             data-capability-json-page
+             data-path="{{ node.page.pointer }}"
+             data-offset="{{ node.page.offset }}"
+             data-limit="{{ node.page.limit }}"
+             data-item-count="{{ node.page.item_count }}">
+          <div class="capability-json-bracket"><span class="jt--punct">{{ node.page.opening }}</span></div>
+          <div class="capability-json-rows">
+    {% when ExpandedEvent::Close(page) %}
+          </div>
+          <div class="capability-json-bracket"><span class="jt--punct">{{ page.closing }}</span></div>
+          {% if page.has_previous || page.has_next %}
+          <nav class="capability-json-pagination" aria-label="{{ i18n.t("cap-json-pagination-label") }}">
+            <button type="button" class="btn" data-capability-json-page-direction="previous"{% if page.has_previous %}
+                    hx-get="{{ page.previous_url }}" hx-target="closest [data-capability-json-body]" hx-swap="innerHTML"{% else %} disabled{% endif %}>{{ i18n.t("cap-json-page-prev") }}</button>
+            <span>{{ page.first_item }}–{{ page.last_item }} / {{ page.total_items }}</span>
+            <button type="button" class="btn" data-capability-json-page-direction="next"{% if page.has_next %}
+                    hx-get="{{ page.next_url }}" hx-target="closest [data-capability-json-body]" hx-swap="innerHTML"{% else %} disabled{% endif %}>{{ i18n.t("cap-json-page-next") }}</button>
+          </nav>
+          {% endif %}
+        </div>
+      </div>
+    </details>
+    {% endmatch %}
+    {% endfor %}
+  </div>
+  <div class="capability-json-bracket"><span class="jt--punct">{{ expanded.root.closing }}</span></div>
+  {% if expanded.root.has_previous || expanded.root.has_next %}
+  <nav class="capability-json-pagination" aria-label="{{ i18n.t("cap-json-pagination-label") }}">
+    <button type="button" class="btn" data-capability-json-page-direction="previous"{% if expanded.root.has_previous %}
+            hx-get="{{ expanded.root.previous_url }}" hx-target="closest [data-capability-json-body]" hx-swap="innerHTML"{% else %} disabled{% endif %}>{{ i18n.t("cap-json-page-prev") }}</button>
+    <span>{{ expanded.root.first_item }}–{{ expanded.root.last_item }} / {{ expanded.root.total_items }}</span>
+    <button type="button" class="btn" data-capability-json-page-direction="next"{% if expanded.root.has_next %}
+            hx-get="{{ expanded.root.next_url }}" hx-target="closest [data-capability-json-body]" hx-swap="innerHTML"{% else %} disabled{% endif %}>{{ i18n.t("cap-json-page-next") }}</button>
+  </nav>
+  {% endif %}
+</div>

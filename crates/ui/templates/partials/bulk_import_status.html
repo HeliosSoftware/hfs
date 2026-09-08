@@ -54,3 +54,6 @@
 {# The summary card's STATUS cell rides along out-of-band, so the page-level
    status never goes stale while the card polls (#765 follow-up). #}
 <div id="submission-status" hx-swap-oob="true">{{ status_label }}</div>
+{# So does the Submission Log, whose lines this same poll just recorded
+   (#955) — one response keeps both regions current. #}
+{% include "partials/bulk_import_log.html" %}

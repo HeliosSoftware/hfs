@@ -47,6 +47,10 @@
     </div>
   </div>
 
+  {% if !card.window.is_empty() %}
+  <p class="job-card__meta job-card__window">{{ card.window }}</p>
+  {% endif %}
+
   <div class="progress progress--{{ card.status }}" role="progressbar"
        aria-valuemin="0" aria-valuemax="100" aria-valuenow="{{ card.progress_pct }}"
        aria-label="{{ card.status_label }}">

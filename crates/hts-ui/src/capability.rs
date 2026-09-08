@@ -44,9 +44,11 @@
 use askama::Template;
 use axum::{
     Router,
+    body::Bytes,
     extract::{Query, State},
+    http::HeaderMap,
     response::{Html, IntoResponse, Redirect, Response},
-    routing::get,
+    routing::{get, post},
 };
 use axum_htmx::HxRequest;
 use helios_ui_chrome::capability::{CapabilityCards, DocsVersion};
@@ -67,16 +69,19 @@ const JSON_FRAGMENT_ROUTE: &str = "/hts/capability-statement/json-fragment";
 /// point at. Must stay `/ui` + [`JSON_FRAGMENT_ROUTE`] in sync with the mount
 /// point [`crate::router`] documents.
 const JSON_FRAGMENT_URL: &str = "/ui/hts/capability-statement/json-fragment";
+const JSON_EXPAND_ROUTE: &str = "/hts/capability-statement/json-expand";
+const JSON_EXPAND_URL: &str = "/ui/hts/capability-statement/json-expand";
 /// The no-JS fallback link: the page itself, requested with the plain-text
 /// query flag. HTS carries no filter or version query params to preserve, so
 /// (unlike HFS's `capability_raw_url`) this needs no builder.
 const PAGE_RAW_URL: &str = "/ui/hts/capability-statement?raw=1";
 
-fn root_fragment_url(state: &HtsUiState) -> String {
-    capability_json::root_fragment_url(FragmentEndpoint {
+fn fragment_endpoint(state: &HtsUiState) -> FragmentEndpoint<'_> {
+    FragmentEndpoint {
         base_path: JSON_FRAGMENT_URL,
         version: state.fhir_version,
-    })
+        extra_query: "",
+    }
 }
 
 // ── Routing ─────────────────────────────────────────────────────────────
@@ -85,6 +90,7 @@ pub(crate) fn routes() -> Router<Arc<HtsUiState>> {
     Router::new()
         .route("/hts/capability-statement", get(capability_page))
         .route(JSON_FRAGMENT_ROUTE, get(capability_json_fragment))
+        .route(JSON_EXPAND_ROUTE, post(capability_json_expand))
         // The page shipped as `/ui/hts/diagnostics` before it was renamed to
         // match HFS. Keep the old path working — it may be bookmarked, and
         // the docs and e2e specs referenced it. `Redirect::permanent` emits
@@ -190,13 +196,30 @@ async fn build_view(
     } else {
         String::new()
     };
+    let initial_outline = if raw_requested {
+        None
+    } else {
+        statement.and_then(|statement| {
+            match capability_json::plan(
+                &statement.document,
+                "",
+                0,
+                capability_json::DEFAULT_PAGE_SIZE,
+                fragment_endpoint(state),
+            ) {
+                Ok(capability_json::View::Outline(outline)) => Some(outline),
+                Ok(capability_json::View::Full(_)) | Err(_) => None,
+            }
+        })
+    };
     let raw_card = statement
         .map(|_| {
             cards.raw(
                 raw_requested,
                 &raw_text,
                 PAGE_RAW_URL,
-                &root_fragment_url(state),
+                JSON_EXPAND_URL,
+                initial_outline.as_ref(),
             )
         })
         .transpose()?;
@@ -289,10 +312,7 @@ async fn capability_json_fragment(
     };
     let limit = query.limit.unwrap_or(capability_json::DEFAULT_PAGE_SIZE);
     let i18n = I18n::new(locale);
-    let endpoint = FragmentEndpoint {
-        base_path: JSON_FRAGMENT_URL,
-        version: state.fhir_version,
-    };
+    let endpoint = fragment_endpoint(&state);
     match capability_json::plan(&document, &query.path, query.offset, limit, endpoint) {
         Ok(capability_json::View::Full(json_lines)) => bounded_fragment(
             capability_json::render_full(&i18n, json_lines, query.path.is_empty()),
@@ -306,6 +326,77 @@ async fn capability_json_fragment(
         Err(capability_json::Error::InvalidPointer | capability_json::Error::InvalidPage) => (
             axum::http::StatusCode::BAD_REQUEST,
             "Invalid JSON fragment request",
+        )
+            .into_response(),
+    }
+}
+
+async fn capability_json_expand(
+    State(state): State<Arc<HtsUiState>>,
+    locale: RequestLocale,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if !headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .is_some_and(|value| {
+            value
+                .trim()
+                .eq_ignore_ascii_case("application/x-www-form-urlencoded")
+        })
+    {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            "Invalid JSON page state",
+        )
+            .into_response();
+    }
+    let pages = match capability_json::parse_page_descriptors(&body) {
+        Ok(pages) => pages,
+        Err(_) => {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                "Invalid JSON page state",
+            )
+                .into_response();
+        }
+    };
+    let version = DocsVersion::from_code(state.fhir_version).unwrap_or_default();
+    let document = match state.upstream.capability_statement(version).await {
+        Ok(statement) => statement.document,
+        Err(error) => {
+            tracing::warn!("CapabilityStatement aggregate fetch failed: {error}");
+            return (
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                "CapabilityStatement is unavailable",
+            )
+                .into_response();
+        }
+    };
+    let expanded =
+        match capability_json::plan_expanded(&document, &pages, fragment_endpoint(&state)) {
+            Ok(expanded) => expanded,
+            Err(_) => {
+                return (
+                    axum::http::StatusCode::BAD_REQUEST,
+                    "Invalid JSON page state",
+                )
+                    .into_response();
+            }
+        };
+    let i18n = I18n::new(locale);
+    match capability_json::render_expanded(&i18n, &expanded) {
+        Ok(html) => Html(html).into_response(),
+        Err(capability_json::ExpandedRenderError::TooLarge) => (
+            axum::http::StatusCode::PAYLOAD_TOO_LARGE,
+            "CapabilityStatement expansion exceeds the rendering budget",
+        )
+            .into_response(),
+        Err(capability_json::ExpandedRenderError::Template(error)) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            format!("template render error: {error}"),
         )
             .into_response(),
     }

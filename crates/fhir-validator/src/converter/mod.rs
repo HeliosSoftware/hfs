@@ -107,9 +107,51 @@ pub(crate) struct Ed {
     pub rest: serde_json::Map<String, Value>,
 }
 
+impl Ed {
+    /// The value-domain type an element's own type resolution must yield when the
+    /// FHIR type model — not the (inconsistent) `structuredefinition-fhir-type`
+    /// extension — is authoritative. Returns `Some("string")` for any element
+    /// deriving from `Element.id`.
+    ///
+    /// # Why (issue #424)
+    ///
+    /// FHIR defines `Element.id` as type `string` ("any string value that does
+    /// not contain spaces"), whereas `Resource.id` is the constrained `id` token
+    /// (`[A-Za-z0-9\-\.]{1,64}`). The spec's own `type[].code` for both is the
+    /// FHIRPath `System.String`; the concrete FHIR type is carried only as a
+    /// `structuredefinition-fhir-type` extension hint — which HL7 populates
+    /// inconsistently across versions: R4B stamps `id` on *every* `.id`
+    /// (including `Element.id`), R5 stamps it on `ElementDefinition.id`, while
+    /// R4/R6 say `string`. Trusting that hint makes the `id` regex reject valid
+    /// element ids that contain `[x]` (choice elements), `:` (named slices), or
+    /// exceed 64 characters — i.e. it rejects StructureDefinitions the spec
+    /// itself publishes.
+    ///
+    /// HL7's own `fhir.schema.json` types every `Element.id` (and
+    /// `ElementDefinition.id`) as `string` in all four versions, confirming the
+    /// extension is the outlier. Keying on `base.path == "Element.id"` fixes the
+    /// whole class — `ElementDefinition.id`, `Element.id`, and every datatype
+    /// `.id` — without relaxing genuine resource-id validation
+    /// (`base.path == "Resource.id"` is left to honor the extension, correctly
+    /// yielding `id`) and without disturbing `Extension.url` (`uri`). It is a
+    /// no-op for the already-correct R4 and R6 packs.
+    pub(crate) fn value_type_override(&self) -> Option<&'static str> {
+        match self.base.as_ref().and_then(|b| b.path.as_deref()) {
+            Some("Element.id") => Some("string"),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub(crate) struct EdBase {
     pub max: Option<String>,
+    /// The path of the base element this ED derives from (e.g. `Element.id`,
+    /// `Resource.id`, `Extension.url`). Used to resolve the value-domain type of
+    /// FHIRPath `System.*`-coded elements structurally rather than trusting the
+    /// (inconsistent) `structuredefinition-fhir-type` extension — see
+    /// [`Ed::value_type_override`].
+    pub path: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

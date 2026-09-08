@@ -722,17 +722,27 @@ mod query_builder_tests {
 
     #[test]
     fn test_prefix_operators() {
-        // Test all prefix-to-operator mappings by using date search
-        let prefixes_and_ops = vec![
-            (SearchPrefix::Eq, "="),
-            (SearchPrefix::Ne, "!="),
-            (SearchPrefix::Gt, ">"),
-            (SearchPrefix::Lt, "<"),
-            (SearchPrefix::Ge, ">="),
-            (SearchPrefix::Le, "<="),
+        // Day-precision prefixes compare against the value's [day, day+1)
+        // range (#871), matching the date-parameter semantics from #463: eq
+        // must mean "inside the named day", gt must exclude it entirely.
+        let cases = vec![
+            (
+                SearchPrefix::Eq,
+                "last_updated >= $1 AND last_updated < $2",
+                2,
+            ),
+            (
+                SearchPrefix::Ne,
+                "(last_updated < $1 OR last_updated >= $2)",
+                2,
+            ),
+            (SearchPrefix::Gt, "last_updated >= $1", 1),
+            (SearchPrefix::Lt, "last_updated < $1", 1),
+            (SearchPrefix::Ge, "last_updated >= $1", 1),
+            (SearchPrefix::Le, "last_updated < $1", 1),
         ];
 
-        for (prefix, expected_op) in prefixes_and_ops {
+        for (prefix, expected_sql, expected_params) in cases {
             let query = SearchQuery::new("Patient").with_parameter(SearchParameter {
                 name: "_lastUpdated".to_string(),
                 param_type: SearchParamType::Date,
@@ -746,15 +756,37 @@ mod query_builder_tests {
             assert!(result.is_some(), "Failed for prefix {:?}", prefix);
             let fragment = result.unwrap();
             assert!(
-                fragment
-                    .sql
-                    .contains(&format!("last_updated {} $", expected_op)),
-                "Expected operator '{}' for prefix {:?}, got SQL: {}",
-                expected_op,
+                fragment.sql.contains(expected_sql),
+                "Expected '{}' for prefix {:?}, got SQL: {}",
+                expected_sql,
                 prefix,
                 fragment.sql
             );
+            assert_eq!(
+                fragment.params.len(),
+                expected_params,
+                "param count for prefix {:?}",
+                prefix
+            );
         }
+
+        // A full-precision instant is a degenerate range and falls back to
+        // scalar comparison.
+        let query = SearchQuery::new("Patient").with_parameter(SearchParameter {
+            name: "_lastUpdated".to_string(),
+            param_type: SearchParamType::Date,
+            modifier: None,
+            values: vec![SearchValue::new(SearchPrefix::Gt, "2024-01-01T10:00:00Z")],
+            chain: vec![],
+            components: vec![],
+        });
+        let fragment = PostgresQueryBuilder::build_search_query(&query, 0)
+            .expect("full-precision instant must build");
+        assert!(
+            fragment.sql.contains("last_updated > $1"),
+            "full-precision gt must stay scalar, got SQL: {}",
+            fragment.sql
+        );
     }
 }
 
@@ -804,6 +836,7 @@ mod postgres_integration {
 
     static SHARED_PG: OnceCell<SharedPg> = OnceCell::const_new();
     static BULK_EXPORT_TEST_LOCK: Mutex<()> = Mutex::const_new(());
+    static BULK_SUBMIT_TEST_LOCK: Mutex<()> = Mutex::const_new(());
 
     async fn shared_pg() -> &'static SharedPg {
         SHARED_PG
@@ -5295,6 +5328,82 @@ mod postgres_integration {
         DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
     }
 
+    /// The `Patient` branch of the compartment fetch applies `_since`, the way
+    /// the non-Patient branch below it always has.
+    #[tokio::test]
+    async fn postgres_integration_since_bounds_the_patient_compartment_branch() {
+        let _guard = BULK_EXPORT_TEST_LOCK.lock().await;
+        let backend = create_backend().await;
+        let tenant = create_tenant("since-patient-branch");
+
+        let stale = seed_patient_at(&backend, &tenant, instant("2026-01-01T00:00:00Z")).await;
+        let fresh = seed_patient_at(&backend, &tenant, instant("2026-07-01T00:00:00Z")).await;
+
+        // Both named explicitly, as a group export or an explicit `patient`
+        // parameter would: the id list reaching this method is NOT pre-filtered.
+        let ids = vec![stale.clone(), fresh.clone()];
+        let request = ExportRequest::patient().with_since(instant("2026-06-01T00:00:00Z"));
+
+        let batch = backend
+            .fetch_patient_compartment_batch(&tenant, &request, "Patient", &ids, None, 10)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            batch.lines.len(),
+            1,
+            "the stale patient must be filtered out"
+        );
+        assert!(batch.lines[0].contains(&fresh));
+    }
+
+    /// The new bound and the keyset cursor coexist: paging a filtered set
+    /// neither drops nor repeats a row, and the bound does not consume the
+    /// `$4`/`$5` the cursor clause needs.
+    #[tokio::test]
+    async fn postgres_integration_since_and_cursor_page_the_patient_branch() {
+        let _guard = BULK_EXPORT_TEST_LOCK.lock().await;
+        let backend = create_backend().await;
+        let tenant = create_tenant("since-patient-paging");
+
+        let stale = seed_patient_at(&backend, &tenant, instant("2026-01-01T00:00:00Z")).await;
+        let a = seed_patient_at(&backend, &tenant, instant("2026-07-01T00:00:00Z")).await;
+        let b = seed_patient_at(&backend, &tenant, instant("2026-07-02T00:00:00Z")).await;
+        let c = seed_patient_at(&backend, &tenant, instant("2026-07-03T00:00:00Z")).await;
+
+        let ids = vec![stale.clone(), a.clone(), b.clone(), c.clone()];
+        let request = ExportRequest::patient().with_since(instant("2026-06-01T00:00:00Z"));
+
+        let first = backend
+            .fetch_patient_compartment_batch(&tenant, &request, "Patient", &ids, None, 2)
+            .await
+            .unwrap();
+        assert_eq!(first.lines.len(), 2);
+        assert!(!first.is_last);
+
+        let second = backend
+            .fetch_patient_compartment_batch(
+                &tenant,
+                &request,
+                "Patient",
+                &ids,
+                first.next_cursor.as_deref(),
+                2,
+            )
+            .await
+            .unwrap();
+
+        let all: Vec<&String> = first.lines.iter().chain(second.lines.iter()).collect();
+        for id in [&a, &b, &c] {
+            let hits = all.iter().filter(|l| l.contains(id.as_str())).count();
+            assert_eq!(hits, 1, "each in-window patient appears exactly once");
+        }
+        assert!(
+            !all.iter().any(|l| l.contains(stale.as_str())),
+            "the stale patient never appears on any page"
+        );
+    }
+
     /// `_until` excludes a resource modified after the bound, and the count
     /// agrees with what the fetch emits.
     #[tokio::test]
@@ -5589,6 +5698,167 @@ mod postgres_integration {
             .await
             .unwrap();
         assert_eq!(ok.version, 2);
+    }
+
+    /// A dedicated backend with one physical connection per writer, so a
+    /// concurrency test can put every racer in flight at once instead of
+    /// queuing behind `create_backend`'s shared 5-connection pool. Mirrors
+    /// `postgres_integration_concurrent_pool_connections_all_carry_statement_timeout`'s
+    /// pattern of building a bespoke config against the shared container.
+    async fn create_backend_with_pool_size(pool_size: usize) -> PostgresBackend {
+        let pg = shared_pg().await;
+        let data_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .map(|p| p.join("data"))
+            .unwrap_or_else(|| PathBuf::from("data"));
+        let config = PostgresConfig {
+            host: pg.host.clone(),
+            port: pg.port,
+            dbname: "postgres".to_string(),
+            user: "postgres".to_string(),
+            password: Some("postgres".to_string()),
+            max_connections: pool_size,
+            data_dir: Some(data_dir),
+            ..Default::default()
+        };
+        PostgresBackend::new(config)
+            .await
+            .expect("Failed to create PostgresBackend")
+    }
+
+    /// Forces `count` physical connections into existence and back into the
+    /// idle pool before a race starts.
+    ///
+    /// deadpool creates connections lazily, and establishing a fresh one
+    /// (TCP handshake + PostgreSQL startup/auth) can take longer than the
+    /// whole read-modify-write these concurrency tests race — so on a cold
+    /// pool, a barrier-released batch can end up serialized by connection
+    /// setup alone: writer 1 finishes its entire transaction while writer 2
+    /// is still waiting for its connection, which defeats the test. Holding
+    /// `count` clients at once (forcing that many distinct connections) and
+    /// then dropping them back into the pool removes that confound.
+    async fn warm_pool(backend: &PostgresBackend, count: usize) {
+        let mut clients = Vec::with_capacity(count);
+        for _ in 0..count {
+            clients.push(backend.get_client().await.expect("warm connection"));
+        }
+        drop(clients);
+    }
+
+    /// A user's very first write is the case `SELECT … FOR UPDATE` cannot
+    /// protect on its own: with no row yet, there is nothing for the lock to
+    /// block on, so racing writers must instead serialize on
+    /// `write_settings`'s `pg_advisory_xact_lock`. Without it, every racer
+    /// reads `None`, computes `new_version = 1` from an empty document, and
+    /// the `INSERT … ON CONFLICT DO UPDATE` losers silently overwrite the
+    /// winner — a lost update on creation. Firing many unconditional
+    /// single-key patches at a brand-new user key and requiring every key to
+    /// survive, with the version landing on exactly the writer count, is the
+    /// same shape as `mongodb_integration_settings_concurrent_patches_serialize`.
+    ///
+    /// Runs on a multi-thread runtime with a dedicated pool sized to the
+    /// writer count and a [`tokio::sync::Barrier`] releasing every task at
+    /// once — a single-threaded runtime, or a shared pool a racer might queue
+    /// behind, can make the whole batch execute close enough to sequentially
+    /// that even the unfixed code never actually hits the race.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn postgres_integration_settings_concurrent_first_writes_never_lose_an_update() {
+        use std::sync::Arc;
+
+        const WRITERS: usize = 8;
+        let backend = Arc::new(create_backend_with_pool_size(WRITERS).await);
+        warm_pool(&backend, WRITERS).await;
+        let user = unique_user_key("concurrent-first-write");
+        let barrier = Arc::new(tokio::sync::Barrier::new(WRITERS));
+
+        let mut handles = Vec::with_capacity(WRITERS);
+        for i in 0..WRITERS {
+            let backend = backend.clone();
+            let user = user.clone();
+            let barrier = barrier.clone();
+            handles.push(tokio::spawn(async move {
+                barrier.wait().await;
+                backend
+                    .patch_settings(&user, json!({ format!("k{i}"): i }), None)
+                    .await
+            }));
+        }
+        for h in handles {
+            h.await
+                .expect("patch task panicked")
+                .expect("patch_settings failed");
+        }
+
+        let final_doc = backend
+            .get_settings(&user)
+            .await
+            .unwrap()
+            .expect("settings document missing after concurrent first writes");
+        let obj = final_doc.document.as_object().unwrap();
+        for i in 0..WRITERS {
+            assert_eq!(
+                obj.get(&format!("k{i}")),
+                Some(&json!(i)),
+                "key k{i} was lost to a read-modify-write race on the user's first write"
+            );
+        }
+        // WRITERS patches, each a distinct successful write from version 0 upward.
+        assert_eq!(final_doc.version, WRITERS as i64);
+    }
+
+    /// The `if_match_version = Some(0)` half of the same race: every racer
+    /// asserts "this user does not exist yet", so exactly one `put_settings`
+    /// call may succeed and the rest must observe the loser's own creation as
+    /// an optimistic-lock conflict — never a raw backend error, and never a
+    /// second silent `Ok`. Uses the same error shape as
+    /// `postgres_integration_settings_optimistic_lock`.
+    ///
+    /// Same multi-thread + dedicated-pool + barrier setup as
+    /// `postgres_integration_settings_concurrent_first_writes_never_lose_an_update`,
+    /// for the same reason: this must exercise real concurrent creates, not a
+    /// batch that happens to run one at a time.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn postgres_integration_settings_concurrent_creates_have_a_single_winner() {
+        use std::sync::Arc;
+
+        const WRITERS: usize = 8;
+        let backend = Arc::new(create_backend_with_pool_size(WRITERS).await);
+        warm_pool(&backend, WRITERS).await;
+        let user = unique_user_key("concurrent-create");
+        let barrier = Arc::new(tokio::sync::Barrier::new(WRITERS));
+
+        let mut handles = Vec::with_capacity(WRITERS);
+        for i in 0..WRITERS {
+            let backend = backend.clone();
+            let user = user.clone();
+            let barrier = barrier.clone();
+            handles.push(tokio::spawn(async move {
+                barrier.wait().await;
+                backend
+                    .put_settings(&user, json!({"createdBy": i}), Some(0))
+                    .await
+            }));
+        }
+
+        let mut ok_count = 0;
+        let mut conflict_count = 0;
+        for h in handles {
+            match h.await.expect("put task panicked") {
+                Ok(stored) => {
+                    ok_count += 1;
+                    assert_eq!(stored.version, 1);
+                }
+                Err(StorageError::Concurrency(ConcurrencyError::OptimisticLockFailure {
+                    ..
+                })) => {
+                    conflict_count += 1;
+                }
+                Err(other) => panic!("expected an optimistic-lock conflict, got {other:?}"),
+            }
+        }
+        assert_eq!(ok_count, 1, "exactly one create should win the race");
+        assert_eq!(conflict_count, WRITERS - 1);
     }
 
     /// Issue #313: a tenant purge must reach the PHI-derived query strings a
@@ -5934,6 +6204,46 @@ mod postgres_integration {
             "expected a backend error from an unmigrated database, got {create:?}"
         );
     }
+    /// Claims manifests in a loop until the lease for `target` comes back,
+    /// holding any other lease it picks up along the way (so the loop cannot
+    /// re-claim the same foreign manifest) and returning those to the queue
+    /// once the target is held. Robust to concurrent tests sharing the
+    /// testcontainers PostgreSQL instance — the submit-side twin of
+    /// `claim_specific` for exports.
+    async fn claim_specific_manifest(
+        backend: &PostgresBackend,
+        worker_id: &helios_persistence::core::WorkerId,
+        submission_id: &helios_persistence::core::SubmissionId,
+        target_manifest_id: &str,
+        lease_duration: std::time::Duration,
+    ) -> helios_persistence::core::ManifestLease {
+        use helios_persistence::core::SubmitClaimStrategy;
+
+        let mut held = Vec::new();
+        let mut found = None;
+        for _ in 0..100 {
+            match backend
+                .claim_next_manifest(worker_id, lease_duration)
+                .await
+                .unwrap()
+            {
+                Some(lease)
+                    if lease.submission_id == *submission_id
+                        && lease.manifest_id == target_manifest_id =>
+                {
+                    found = Some(lease);
+                    break;
+                }
+                Some(other) => held.push(other),
+                None => tokio::time::sleep(std::time::Duration::from_millis(20)).await,
+            }
+        }
+        for other in held {
+            let _ = SubmitClaimStrategy::release(backend, other).await;
+        }
+        found.expect("never claimed the expected manifest")
+    }
+
     /// The `import` / `metadata` kickoff directives must survive the PostgreSQL
     /// round-trip and reach the worker, and `merge` must actually merge.
     ///
@@ -5945,10 +6255,12 @@ mod postgres_integration {
     async fn postgres_bulk_submit_import_directives_round_trip() {
         use helios_persistence::core::{
             BulkProcessingOptions, BulkSubmitProvider, IMPORT_MODE_PARAMETER_URL, ImportMode,
-            ManifestFetchParams, NdjsonEntry, SubmissionId, SubmitClaimStrategy,
-            SubmitWorkerStorage,
+            ManifestFetchParams, NdjsonEntry, SubmissionId, SubmitWorkerStorage,
         };
 
+        // The worker claim queue is intentionally cross-tenant, so keep this
+        // claim isolated from the synchronous bulk-submit test below.
+        let _guard = BULK_SUBMIT_TEST_LOCK.lock().await;
         let backend = create_backend().await;
         let tenant = create_tenant("bulk_submit_import");
         let sub_id = SubmissionId::generate("pg-import-test");
@@ -5978,15 +6290,25 @@ mod postgres_integration {
             .await
             .unwrap();
 
-        // Claim the manifest the way the worker does, then read its view back.
-        let lease = backend
-            .claim_next_manifest(
-                &helios_persistence::core::WorkerId::new("pg-import-worker"),
-                std::time::Duration::from_secs(60),
-            )
-            .await
-            .unwrap()
-            .expect("claimable manifest");
+        // Claim *this* manifest the way the worker does, then read its view
+        // back. The claim queue is cross-tenant and ordered by `added_at`, and
+        // the test binary shares one container database, so a plain
+        // `claim_next_manifest` can hand back another test's manifest — and
+        // an unleased `processing` manifest (the synchronous `process_entries`
+        // path leaves one behind) is reclaimable, so "move it out of pending"
+        // elsewhere is no defence. Loop until ours comes back, returning
+        // anything else to the queue.
+        let lease = claim_specific_manifest(
+            &backend,
+            &helios_persistence::core::WorkerId::new(format!(
+                "pg-import-worker-{}",
+                uuid::Uuid::new_v4()
+            )),
+            &sub_id,
+            &manifest.manifest_id,
+            std::time::Duration::from_secs(60),
+        )
+        .await;
         let view = backend.get_manifest_for_worker(&lease).await.unwrap();
         assert_eq!(view.import_directives, directives);
         assert_eq!(view.metadata, metadata);
@@ -6051,6 +6373,10 @@ mod postgres_integration {
             SubmissionId,
         };
 
+        // A synchronous manifest has no worker lease. Serialize it with the
+        // worker claim test above so the cross-tenant queue cannot hand it to
+        // that test while this one is processing the batch.
+        let _guard = BULK_SUBMIT_TEST_LOCK.lock().await;
         let backend = create_backend().await;
         let tenant = create_tenant("bulk_submit_batch");
         let sub_id = SubmissionId::generate("pg-batch-test");
@@ -6062,10 +6388,11 @@ mod postgres_integration {
             .add_manifest(&tenant, &sub_id, Some("https://provider/b.json"), None)
             .await
             .unwrap();
-        // Move the manifest out of `pending` right away: the test binary
-        // shares one container database, and a concurrently running test that
-        // calls claim_next_manifest would otherwise claim this one (the claim
-        // queue is cross-tenant by design).
+        // Mark the manifest `processing` right away. Note this is not a
+        // defence against other tests' `claim_next_manifest` calls — an
+        // unleased `processing` manifest is reclaimable, so a claimant may
+        // still pick this one up transiently — which is why claiming tests use
+        // `claim_specific_manifest` and hand foreign manifests back.
         backend
             .process_entries(
                 &tenant,
@@ -6129,6 +6456,18 @@ mod postgres_integration {
             )
             .await
             .unwrap();
+
+        // `process_entries` leaves synchronous manifests in `processing`
+        // without a worker lease. Such rows remain eligible for the worker
+        // claim queue, so terminate this test submission before releasing the
+        // lock shared with the claim round-trip test.
+        assert_eq!(
+            backend
+                .abort_submission(&tenant, &sub_id, "test cleanup")
+                .await
+                .unwrap(),
+            1
+        );
 
         assert!(results[0].is_success() && results[0].created);
         assert!(

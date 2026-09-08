@@ -666,6 +666,7 @@ impl BulkSubmitProvider for PostgresBackend {
             tenant,
             crate::core::TransactionOptions {
                 fhir_version: Some(FhirVersion::default_enabled()),
+                defer_search_indexing: options.defer_indexing,
                 ..Default::default()
             },
         )

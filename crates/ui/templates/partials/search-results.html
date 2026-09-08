@@ -12,6 +12,8 @@
   <div class="query-results__head">
     <h2 class="query-group__type">{{ i18n.t("queries-results") }}</h2>
     <span class="query-results__meta" id="query-results-meta"></span>
+    <span class="query-results__busy" id="query-results-busy" hidden
+          role="status">{{ i18n.t("queries-searching") }}</span>
     <label class="query-results__sort">
       <span>{{ i18n.t("queries-sort-label") }}</span>
       <select id="query-results-sort">
@@ -21,7 +23,6 @@
         <option value="_id">{{ i18n.t("queries-sort-id") }}</option>
       </select>
     </label>
-    <a class="btn" id="query-results-open" target="_blank" rel="noopener">{{ i18n.t("queries-open-tab") }}</a>
   </div>
   <div class="table-wrap">
     <table class="data-table">

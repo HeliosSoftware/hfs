@@ -30,6 +30,11 @@ use std::{collections::HashMap, sync::Arc};
 
 use crate::i18n::{I18n, RequestLocale};
 use crate::raw_fold::RawFold;
+use crate::raw_json_fragment::{
+    PaneTarget, cs_lookup_expand_url, cs_lookup_extra_query, cs_lookup_fragment_endpoint,
+    cs_subsumes_expand_url, cs_subsumes_extra_query, cs_subsumes_fragment_endpoint,
+    cs_validate_expand_url, cs_validate_extra_query, cs_validate_fragment_endpoint,
+};
 use crate::upstream::{
     CodeSystemSummary, CsBrowserFilters, CsBrowserPage, LookupParams, LookupResult, OpFailure,
     OutcomeView, SubsumesParams, SubsumesResult, UpstreamError, ValidateCodeParams,
@@ -602,6 +607,8 @@ async fn lookup_run(
             ..WorkbenchResultView::empty(CsTab::Lookup)
         }
     } else {
+        // Clone params for the fragment URL builder before the upstream call consumes them
+        let params_for_fragment = params.clone();
         let result = if !canonical.is_empty() {
             state
                 .upstream
@@ -611,16 +618,42 @@ async fn lookup_run(
             state.upstream.cs_lookup(&id, params).await
         };
         match result {
-            Ok(result) => WorkbenchResultView {
-                op: CsTab::Lookup,
-                mode: ValidateInputMode::default(),
-                raw: RawFold::new(&result.request_url, &result.request_body, &result.raw_body),
-                lookup: Some(result),
-                validate: None,
-                subsumes: None,
-                outcome: None,
-                degraded_reason: None,
-            },
+            Ok(result) => {
+                let mut raw =
+                    RawFold::new(&result.request_url, &result.request_body, &result.raw_body);
+                // Plan both incremental JSON panes (#898). Only possible when
+                // the canonical url resolved — the fragment endpoints pin the
+                // CodeSystem via `system=<canonical>`.
+                if !canonical.is_empty() {
+                    let req = cs_lookup_extra_query(
+                        &canonical,
+                        &params_for_fragment,
+                        PaneTarget::Request,
+                    );
+                    let resp = cs_lookup_extra_query(
+                        &canonical,
+                        &params_for_fragment,
+                        PaneTarget::Response,
+                    );
+                    raw.plan_panes(
+                        cs_lookup_fragment_endpoint(state.fhir_version, &req),
+                        cs_lookup_expand_url(&req),
+                        cs_lookup_fragment_endpoint(state.fhir_version, &resp),
+                        cs_lookup_expand_url(&resp),
+                        &chrome.i18n,
+                    );
+                }
+                WorkbenchResultView {
+                    op: CsTab::Lookup,
+                    mode: ValidateInputMode::default(),
+                    raw,
+                    lookup: Some(result),
+                    validate: None,
+                    subsumes: None,
+                    outcome: None,
+                    degraded_reason: None,
+                }
+            }
             Err(err) => WorkbenchResultView::from_error(CsTab::Lookup, &err),
         }
     };
@@ -686,17 +719,35 @@ async fn validate_run(
             ..WorkbenchResultView::empty(CsTab::Validate)
         }
     } else {
+        // Clone params for the fragment URL builder before the upstream call consumes them
+        let params_for_fragment = params.clone();
         match state.upstream.cs_validate_code(&canonical, params).await {
-            Ok(result) => WorkbenchResultView {
-                op: CsTab::Validate,
-                mode: submitted_mode,
-                raw: RawFold::new(&result.request_url, &result.request_body, &result.raw_body),
-                lookup: None,
-                validate: Some(result),
-                subsumes: None,
-                outcome: None,
-                degraded_reason: None,
-            },
+            Ok(result) => {
+                let mut raw =
+                    RawFold::new(&result.request_url, &result.request_body, &result.raw_body);
+                // Plan both incremental JSON panes (#898).
+                let req =
+                    cs_validate_extra_query(&canonical, &params_for_fragment, PaneTarget::Request);
+                let resp =
+                    cs_validate_extra_query(&canonical, &params_for_fragment, PaneTarget::Response);
+                raw.plan_panes(
+                    cs_validate_fragment_endpoint(state.fhir_version, &req),
+                    cs_validate_expand_url(&req),
+                    cs_validate_fragment_endpoint(state.fhir_version, &resp),
+                    cs_validate_expand_url(&resp),
+                    &chrome.i18n,
+                );
+                WorkbenchResultView {
+                    op: CsTab::Validate,
+                    mode: submitted_mode,
+                    raw,
+                    lookup: None,
+                    validate: Some(result),
+                    subsumes: None,
+                    outcome: None,
+                    degraded_reason: None,
+                }
+            }
             Err(err) => {
                 let mut view = WorkbenchResultView::from_error(CsTab::Validate, &err);
                 view.mode = submitted_mode;
@@ -743,17 +794,35 @@ async fn subsumes_run(
             ..WorkbenchResultView::empty(CsTab::Subsumes)
         }
     } else {
+        // Clone params for the fragment URL builder before the upstream call consumes them
+        let params_for_fragment = params.clone();
         match state.upstream.cs_subsumes(&canonical, params).await {
-            Ok(result) => WorkbenchResultView {
-                op: CsTab::Subsumes,
-                mode: ValidateInputMode::default(),
-                raw: RawFold::new(&result.request_url, &result.request_body, &result.raw_body),
-                lookup: None,
-                validate: None,
-                subsumes: Some(result),
-                outcome: None,
-                degraded_reason: None,
-            },
+            Ok(result) => {
+                let mut raw =
+                    RawFold::new(&result.request_url, &result.request_body, &result.raw_body);
+                // Plan both incremental JSON panes (#898).
+                let req =
+                    cs_subsumes_extra_query(&canonical, &params_for_fragment, PaneTarget::Request);
+                let resp =
+                    cs_subsumes_extra_query(&canonical, &params_for_fragment, PaneTarget::Response);
+                raw.plan_panes(
+                    cs_subsumes_fragment_endpoint(state.fhir_version, &req),
+                    cs_subsumes_expand_url(&req),
+                    cs_subsumes_fragment_endpoint(state.fhir_version, &resp),
+                    cs_subsumes_expand_url(&resp),
+                    &chrome.i18n,
+                );
+                WorkbenchResultView {
+                    op: CsTab::Subsumes,
+                    mode: ValidateInputMode::default(),
+                    raw,
+                    lookup: None,
+                    validate: None,
+                    subsumes: Some(result),
+                    outcome: None,
+                    degraded_reason: None,
+                }
+            }
             Err(err) => WorkbenchResultView::from_error(CsTab::Subsumes, &err),
         }
     };

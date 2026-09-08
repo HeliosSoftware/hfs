@@ -117,7 +117,7 @@ where
 
     // Deleted versions carry no resource body.
     if entry.method != HistoryMethod::Delete {
-        bundle_entry["resource"] = resource.content().clone();
+        bundle_entry["resource"] = resource.content_with_meta();
     }
 
     bundle_entry

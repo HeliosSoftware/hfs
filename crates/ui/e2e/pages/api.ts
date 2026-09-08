@@ -97,6 +97,23 @@ export async function deleteResources(
   ids: string[],
   tenant?: string,
 ): Promise<void> {
+  // One request per DELETE_BATCH ids: a batch runs its entries at the
+  // backend's write concurrency inside the server's 30s request timeout,
+  // and on the ES composites (synchronous sync, refreshed writes) a 400-entry
+  // padding cleanup ran past it — a 408 with half the entries still live.
+  for (let start = 0; start < ids.length; start += DELETE_BATCH) {
+    await deleteBatch(request, type, ids.slice(start, start + DELETE_BATCH), tenant);
+  }
+}
+
+const DELETE_BATCH = 100;
+
+async function deleteBatch(
+  request: APIRequestContext,
+  type: string,
+  ids: string[],
+  tenant?: string,
+): Promise<void> {
   if (ids.length === 0) return;
   const bundle = {
     resourceType: "Bundle",
@@ -189,4 +206,43 @@ export async function waitSearchable(
     }
     await new Promise((r) => setTimeout(r, 250));
   }
+}
+
+/**
+ * Seeds a `Library` sql-query subject depending on `canonical` (an
+ * already-created ViewDefinition's own `url`), aliased "v" in its SQL — the
+ * same shape `sql-libraries.spec.ts` uses for a genuinely runnable SQLQuery
+ * Library. `sql` defaults to a query that always succeeds; the chromium and
+ * `nojs` SQL Export job-detail specs both pass a deliberately broken one to
+ * seed a `failed` job.
+ *
+ * `parameters` (#837) is the Library's own `parameter` array, verbatim —
+ * each entry the exact FHIR shape `Library.parameter[use=in]` takes (e.g.
+ * `{ name: "ward", use: "in", type: "string" }`, or with a
+ * `defaultString`/`defaultInteger`/… for an optional one) — omitted
+ * entirely from the created resource when left undefined, exactly like an
+ * unparameterized SQL Query.
+ */
+export async function createSqlQueryLibrary(
+  request: APIRequestContext,
+  name: string,
+  canonical: string,
+  sql = "SELECT COUNT(*) AS n FROM v",
+  parameters?: Record<string, unknown>[],
+): Promise<string> {
+  return createResource(request, "Library", {
+    name,
+    status: "active",
+    type: {
+      coding: [
+        {
+          system: "http://hl7.org/fhir/uv/sql-on-fhir/CodeSystem/LibraryTypesCodes",
+          code: "sql-query",
+        },
+      ],
+    },
+    relatedArtifact: [{ type: "depends-on", resource: canonical, label: "v" }],
+    content: [{ contentType: "application/sql", data: Buffer.from(sql).toString("base64") }],
+    ...(parameters ? { parameter: parameters } : {}),
+  });
 }

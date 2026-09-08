@@ -22,6 +22,10 @@ pub(crate) struct VdSummary {
     pub name: String,
     /// The FHIR resource type the view flattens (`ViewDefinition.resource`).
     pub resource: String,
+    /// `ViewDefinition.status` (`draft` | `active` | `retired` | `unknown`),
+    /// empty when absent. Added for the SQL Export builder's Status column
+    /// (#834) — the rail itself does not display it.
+    pub status: String,
 }
 
 /// Summarizes fetched ViewDefinitions into rail entries, sorted by name.
@@ -42,7 +46,17 @@ pub(crate) fn summarize(resources: &[Value]) -> Vec<VdSummary> {
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_string();
-            Some(VdSummary { id, name, resource })
+            let status = vd
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            Some(VdSummary {
+                id,
+                name,
+                resource,
+                status,
+            })
         })
         .collect();
     entries.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.id.cmp(&b.id)));
@@ -100,9 +114,9 @@ fn urlencode(value: &str) -> String {
     form_urlencoded::byte_serialize(value.as_bytes()).collect()
 }
 
-/// The `$sql-run` preview's row cap, shared by the page's own `?run=1`
-/// render and the `/run` fragment endpoint (#752 ticket 01): a navigation or
-/// keystroke preview, never an export.
+/// The `$sql-run` preview's row cap, shared by the server-side `?saved=1`
+/// render and all three `/run` fragment endpoints (#752, #839): a
+/// navigation or keystroke preview, never an export.
 pub(crate) const RUN_LIMIT: usize = 50;
 
 /// The view's output column names, in declaration order: a depth-first walk of
@@ -122,10 +136,10 @@ fn collect_columns(select: Option<&Value>, names: &mut Vec<String>) {
     for s in selects {
         if let Some(columns) = s.get("column").and_then(Value::as_array) {
             for c in columns {
-                if let Some(name) = c.get("name").and_then(Value::as_str) {
-                    if !names.iter().any(|n| n == name) {
-                        names.push(name.to_string());
-                    }
+                if let Some(name) = c.get("name").and_then(Value::as_str)
+                    && !names.iter().any(|n| n == name)
+                {
+                    names.push(name.to_string());
                 }
             }
         }
@@ -177,9 +191,28 @@ fn cell_text(value: Option<&Value>) -> String {
     }
 }
 
+/// The 1-based line number out of a `$sql-run` failure message, when the
+/// server's message carries sqlparser's own `Line: N` marker (as in
+/// `… at Line: 2, Column: 8`, the shape a SQL *parse* failure takes — a
+/// SQLite *execution* error carries no such marker). `None` for a message
+/// with no `Line: ` marker at all, or where the text right after it is not a
+/// plain, in-range non-negative integer (#839).
+///
+/// Shared by the View Definitions, SQL Queries, and SQL Views playgrounds so
+/// the editor's own line-tinting (#839) can locate a parse error the same
+/// way regardless of which page ran it.
+pub(crate) fn extract_error_line(message: &str) -> Option<u32> {
+    let after_marker = message.split_once("Line: ")?.1;
+    let digits: String = after_marker
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect();
+    digits.parse().ok()
+}
+
 /// The starter document behind "Create New" — the smallest runnable view.
-pub(crate) fn starter_view_definition() -> String {
-    serde_json::to_string_pretty(&serde_json::json!({
+pub(crate) fn starter_view_definition_value() -> Value {
+    serde_json::json!({
         "resourceType": "ViewDefinition",
         "name": "new_view",
         "status": "draft",
@@ -187,8 +220,15 @@ pub(crate) fn starter_view_definition() -> String {
         "select": [
             { "column": [ { "name": "id", "path": "getResourceKey()" } ] }
         ]
-    }))
-    .expect("static JSON serializes")
+    })
+}
+
+/// The starter document's pretty-printed text, for the editor's textarea.
+/// #843: the page's own render also needs the *value* — to build the
+/// guided-form panel inline — so [`starter_view_definition_value`] is the
+/// one definition and this just formats it.
+pub(crate) fn starter_view_definition() -> String {
+    serde_json::to_string_pretty(&starter_view_definition_value()).expect("static JSON serializes")
 }
 
 #[cfg(test)]
@@ -257,6 +297,24 @@ mod tests {
                 ("name:contains".to_string(), "Blood".to_string()),
             ],
         );
+    }
+
+    #[test]
+    fn error_line_extraction_reads_the_sqlparser_marker() {
+        assert_eq!(
+            extract_error_line("sql parser error: … at Line: 2, Column: 8"),
+            Some(2)
+        );
+        // No marker at all — a SQLite execution error, not a parse error.
+        assert_eq!(extract_error_line("no such table: v"), None);
+        // A marker whose number is out of `u32` range is still "not a
+        // plain number" as far as the tinted line goes.
+        assert_eq!(
+            extract_error_line("… at Line: 99999999999999999999, Column: 1"),
+            None
+        );
+        // A marker with nothing numeric right after it.
+        assert_eq!(extract_error_line("… at Line: , Column: 1"), None);
     }
 
     #[test]

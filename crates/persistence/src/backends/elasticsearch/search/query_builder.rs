@@ -332,16 +332,41 @@ impl<'a> EsQueryBuilder<'a> {
                 "_score" => {
                     sort_clauses.push(json!({ "_score": { "order": order } }));
                 }
-                // For other parameters, sort on the nested search_params field
+                // For other parameters, sort on the nested search_params
+                // group that actually holds the parameter's values. The sort
+                // used to assume every parameter was a string — a date sort
+                // like `_sort=birthdate` filtered `search_params.string` for
+                // a name that only exists under `search_params.date`, matched
+                // nothing, and returned the whole page in arbitrary order
+                // with a 200 (#883).
                 name => {
-                    // Use nested sort on the most likely field type (string)
+                    let (group, field) = match directive.param_type {
+                        Some(SearchParamType::Date) => ("date", "search_params.date.value"),
+                        Some(SearchParamType::Number) => ("number", "search_params.number.value"),
+                        Some(SearchParamType::Quantity) => {
+                            ("quantity", "search_params.quantity.value")
+                        }
+                        Some(SearchParamType::Token) => ("token", "search_params.token.code"),
+                        Some(SearchParamType::Reference) => {
+                            ("reference", "search_params.reference.reference")
+                        }
+                        Some(SearchParamType::Uri) => ("uri", "search_params.uri.value"),
+                        // Strings, composites, and unresolved types sort on
+                        // the string group, the pre-existing behavior.
+                        _ => ("string", "search_params.string.value.keyword"),
+                    };
+                    // FHIR multi-value sort semantics: the smallest value
+                    // orders an ascending sort, the largest a descending one
+                    // (the SQL backends' MIN/MAX).
+                    let mode = if order == "asc" { "min" } else { "max" };
                     sort_clauses.push(json!({
-                        "search_params.string.value.keyword": {
+                        field: {
                             "order": order,
+                            "mode": mode,
                             "nested": {
-                                "path": "search_params.string",
+                                "path": format!("search_params.{group}"),
                                 "filter": {
-                                    "term": { "search_params.string.name": name }
+                                    "term": { format!("search_params.{group}.name"): name }
                                 }
                             },
                             "missing": if order == "asc" { "_last" } else { "_first" }
@@ -378,22 +403,18 @@ impl<'a> EsQueryBuilder<'a> {
     }
 }
 
-/// Builds a count query (no sorting, no source, size=0).
+/// Builds the body for the `_count` API: the search's `query` clause and
+/// nothing else.
+///
+/// `_count` accepts only `query`; every search-only field the full builder
+/// sets — `sort`, `size`, `from`, `search_after`, `track_total_hits`,
+/// `track_scores` — is a `parsing_exception` there, which surfaced as a 500
+/// on every `_total=accurate` search served by Elasticsearch.
 pub fn build_count_query(tenant_id: &str, resource_type: &str, query: &SearchQuery) -> Value {
     let builder = EsQueryBuilder::new(tenant_id, resource_type, String::new());
-    let es_query = builder.build(query);
+    let mut es_query = builder.build(query);
 
-    // Strip unnecessary fields for count
-    let mut body = es_query.body;
-    if let Some(obj) = body.as_object_mut() {
-        obj.remove("sort");
-        obj.remove("size");
-        obj.remove("from");
-        obj.remove("search_after");
-    }
-    body["size"] = json!(0);
-
-    body
+    json!({ "query": es_query.body["query"].take() })
 }
 
 #[cfg(test)]
@@ -584,5 +605,64 @@ mod tests {
 
         let sort = &es_query.body["sort"];
         assert!(sort[0]["resource_id"]["order"].as_str() == Some("asc"));
+    }
+
+    /// #883: a parameter sort must target the nested group that holds the
+    /// parameter's type — a date sort against the string group matched
+    /// nothing and returned arbitrary order with a 200.
+    #[test]
+    fn test_parameter_sort_targets_the_type_group() {
+        let query = SearchQuery::new("Patient").with_sort(SortDirective {
+            parameter: "birthdate".to_string(),
+            direction: SortDirection::Ascending,
+            param_type: Some(SearchParamType::Date),
+        });
+        let builder = EsQueryBuilder::new("acme", "Patient", "hfs_acme_patient".to_string());
+        let sort = &builder.build(&query).body["sort"][0];
+
+        let clause = &sort["search_params.date.value"];
+        assert!(
+            !clause.is_null(),
+            "date parameter must sort on the date group, got {sort}"
+        );
+        assert_eq!(clause["order"], "asc");
+        assert_eq!(clause["mode"], "min");
+        assert_eq!(clause["nested"]["path"], "search_params.date");
+        assert_eq!(
+            clause["nested"]["filter"]["term"]["search_params.date.name"],
+            "birthdate"
+        );
+    }
+
+    #[test]
+    fn test_token_sort_descending_uses_max_mode() {
+        let query = SearchQuery::new("Patient").with_sort(SortDirective {
+            parameter: "gender".to_string(),
+            direction: SortDirection::Descending,
+            param_type: Some(SearchParamType::Token),
+        });
+        let builder = EsQueryBuilder::new("acme", "Patient", "hfs_acme_patient".to_string());
+        let sort = &builder.build(&query).body["sort"][0];
+
+        let clause = &sort["search_params.token.code"];
+        assert!(!clause.is_null(), "token sorts on the code, got {sort}");
+        assert_eq!(clause["order"], "desc");
+        assert_eq!(clause["mode"], "max");
+        assert_eq!(clause["missing"], "_first");
+    }
+
+    #[test]
+    fn test_untyped_sort_falls_back_to_string_group() {
+        let query = SearchQuery::new("Patient").with_sort(SortDirective {
+            parameter: "name".to_string(),
+            direction: SortDirection::Ascending,
+            param_type: None,
+        });
+        let builder = EsQueryBuilder::new("acme", "Patient", "hfs_acme_patient".to_string());
+        let sort = &builder.build(&query).body["sort"][0];
+        assert!(
+            !sort["search_params.string.value.keyword"].is_null(),
+            "untyped parameters keep the string-group sort, got {sort}"
+        );
     }
 }

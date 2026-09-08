@@ -1,0 +1,61 @@
+{#
+  The Tables panel's right-hand card (#842, filled in for #842/04):
+  *Columns* — the last good run's own column list (name, type, and — when
+  it traces to exactly one resolved dependency — its origin), or, with
+  `rows` empty, the very same skeleton #842/03 rendered (a fixed `0` count
+  and `empty_key`'s own "run it to see its columns" body). One template
+  covers both: the skeleton is simply this card with nothing to show yet,
+  never a separate render path — see `crate::build_columns_card`.
+
+  Rendered two ways:
+    - The page's own inline render (`oob: false`) — the skeleton on every
+      render but a successful `?…&saved=1` (`crate::sql_library_page`),
+      which fills `rows` in instead.
+    - The `/run` fragment's own OOB companion (`oob: true`,
+      `crate::ColumnsFragment::Filled`) — only on a successful run; any
+      other outcome relabels `#lib-columns-meta` on its own instead of
+      sending this whole card (`crate::ColumnsFragment::Stale`,
+      `lib_run_fragment.html`), so `rows` is never empty when this
+      variant travels.
+
+  Never rendered for View Definitions (`#842/04`'s own scope): the SQL
+  Query/SQL View pages own the only `#lib-columns` id in the DOM.
+#}
+<section class="card table-card" id="lib-columns"{% if oob %} hx-swap-oob="outerHTML"{% endif %}>
+  <div class="card-head">
+    <h3>
+      <span class="icon">{% include "icons/grid.svg" %}</span>
+      {{ i18n.t("lib-columns-heading") }}
+      <span class="toolbar__count">{{ rows.len() }}</span>
+    </h3>
+    <div class="card-head__tools">
+      <span id="lib-columns-meta" class="card-head__meta">{{ meta }}</span>
+    </div>
+  </div>
+  <div class="card__body">
+    {% if rows.is_empty() %}
+    <p class="page-head__lede">{{ i18n.t(empty_key) }}</p>
+    {% else %}
+    <div class="table-wrap">
+      <table class="data-table">
+        <thead>
+          <tr>
+            <th>{{ i18n.t("lib-columns-col-name") }}</th>
+            <th>{{ i18n.t("lib-columns-col-type") }}</th>
+            <th>{{ i18n.t("lib-columns-col-from") }}</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for row in rows %}
+          <tr>
+            <td><code>{{ row.name }}</code></td>
+            <td>{{ row.type_text }}</td>
+            <td>{{ row.origin_text }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% endif %}
+  </div>
+</section>

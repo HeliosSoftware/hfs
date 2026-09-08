@@ -30,7 +30,7 @@ pub fn emit_subscription_event(
         resource_id: stored.id().to_string(),
         version_id: stored.version_id().to_string(),
         event_type,
-        resource: Some(stored.content().clone()),
+        resource: Some(stored.content_with_meta()),
         previous_resource: None,
         timestamp: chrono::Utc::now(),
     };

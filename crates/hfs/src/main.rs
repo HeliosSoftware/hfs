@@ -612,16 +612,19 @@ async fn start_mongodb(
             None
         }
     };
-    // Bulk submit needs no sidecar: MongoDB hosts the submission, manifest,
-    // lease, and artifact state itself, in the same store the ingestion engine
-    // writes resources to.
-    let submit_bundle = build_bulk_submit(&config, backend.clone()).await?;
-
     let ops = standalone_ops(
         backend.clone(),
         backend.tenant_registries().clone(),
         audit_state.as_ref(),
     );
+    // Bulk submit needs no sidecar: MongoDB hosts the submission, manifest,
+    // lease, and artifact state itself, in the same store the ingestion engine
+    // writes resources to.
+    let reindex_hook = ops.reindex.clone().map(|op| {
+        Arc::new(helios_persistence::search::ReindexOnFinish::new(op))
+            as Arc<dyn helios_persistence::core::DeferredReindexHook>
+    });
+    let submit_bundle = build_bulk_submit(&config, backend.clone(), reindex_hook).await?;
     let app = create_app_with_auth_bulk_settings_and_ops(
         backend.clone(),
         config.clone(),
@@ -669,57 +672,7 @@ async fn serve(
     ui_settings: Option<Arc<dyn SettingsStore>>,
     ui_bulk_provider: Option<Arc<dyn BulkProviderStore>>,
 ) -> anyhow::Result<()> {
-    #[cfg(all(feature = "ui", not(feature = "headless")))]
-    let app = {
-        // The UI reads SearchParameter/CompartmentDefinition from the server's
-        // own FHIR API over HTTP. It calls itself on the loopback address, with
-        // the configured outbound service token (HFS_OUTBOUND_BEARER_TOKEN) when
-        // set, or no credentials when auth is disabled.
-        //
-        // TODO(service-token): when auth is enabled, this relies on an operator
-        // provisioning a valid, non-expiring bearer via HFS_OUTBOUND_BEARER_TOKEN;
-        // without one the self-call is rejected and the conformance pages degrade
-        // to a warning. The follow-up is to mint a short-lived, auto-refreshed
-        // `system/SearchParameter.rs system/CompartmentDefinition.rs` token via
-        // the planned `JwtAssertionOutboundAuthProvider` (SMART Backend Services
-        // client_credentials + private_key_jwt; see crates/auth/src/outbound.rs)
-        // configured from HFS_UI_* client credentials. The `$sql-export`
-        // self-calls (#833) are the exception: they already carry the
-        // browser's own `Authorization` when it sent one (the `Caller` seam
-        // in `crates/ui/src/conformance.rs`), falling back to this service
-        // token only when the request had none.
-        let self_base_url = format!("http://127.0.0.1:{}", config.port);
-        let outbound_auth = AuthConfig::from_env().outbound_provider();
-        let patient_name_search = patient_name_search_support(
-            config
-                .storage_backend_mode()
-                .expect("storage backend was validated before server startup"),
-        );
-        helios_ui::mount_with_body_limit_and_tenant_routing(
-            app,
-            env!("CARGO_PKG_VERSION"),
-            config.data_dir.clone(),
-            helios_ui::NlSearch {
-                enabled: config.nl_search_enabled,
-                configured: config.nl_search_api_key.is_some(),
-                model: config.nl_search_model.clone(),
-            },
-            ui_tenants.clone(),
-            ui_settings.clone(),
-            config.default_tenant.clone(),
-            self_base_url,
-            outbound_auth,
-            config.default_fhir_version,
-            config.terminology_server.clone(),
-            config.base_url.clone(),
-            config.max_body_size,
-            config.multitenancy.routing_mode.supports_url_path(),
-            ui_bulk_provider.clone(),
-            patient_name_search,
-        )
-    };
-    #[cfg(not(all(feature = "ui", not(feature = "headless"))))]
-    let _ = (&ui_tenants, &ui_settings, &ui_bulk_provider);
+    let app = attach_ui(app, config, ui_tenants, ui_settings, ui_bulk_provider);
 
     let addr = config.socket_addr();
     info!(address = %addr, "Server listening");
@@ -755,7 +708,129 @@ async fn serve(
     Ok(())
 }
 
-#[cfg(all(feature = "ui", not(feature = "headless")))]
+/// Attaches the web UI surface to the FHIR router.
+///
+/// The UI is served when it is compiled in (the `ui` feature) **and** enabled at
+/// runtime (`HFS_UI_ENABLED`, default `true`). Otherwise `/ui` answers `404`
+/// with an OperationOutcome rather than falling through to the FHIR router,
+/// which reads `ui` as a resource type and replies `200` with an empty
+/// searchset — a missing UI must not present as success.
+///
+/// Headless operation is a *runtime* switch on purpose. It used to be a Cargo
+/// feature gated negatively (`not(feature = "headless")`). Because
+/// `--all-features` — the selection `ci.yml` uses to build the uploaded release
+/// artifacts — turns every feature on, it turned the UI off in every published
+/// binary, silently (#975). Negative Cargo features cannot express mutual
+/// exclusion; don't reintroduce one here.
+fn attach_ui(
+    app: axum::Router,
+    config: &ServerConfig,
+    ui_tenants: Option<Arc<dyn ResourceStorage>>,
+    ui_settings: Option<Arc<dyn SettingsStore>>,
+    ui_bulk_provider: Option<Arc<dyn BulkProviderStore>>,
+) -> axum::Router {
+    #[cfg(feature = "ui")]
+    {
+        if config.ui_enabled {
+            return mount_ui(app, config, ui_tenants, ui_settings, ui_bulk_provider);
+        }
+        info!("Web UI is DISABLED (HFS_UI_ENABLED=false)");
+    }
+    #[cfg(not(feature = "ui"))]
+    {
+        let _ = (config, &ui_tenants, &ui_settings, &ui_bulk_provider);
+    }
+    ui_absent_routes(app)
+}
+
+/// Answers `/ui` with `404` + OperationOutcome when the UI is not served.
+///
+/// Without this the path falls through to the FHIR router, which treats `ui` as
+/// an unknown resource type and returns `200` with an empty searchset — the
+/// reason the #975 regression looked like a healthy server.
+fn ui_absent_routes(app: axum::Router) -> axum::Router {
+    async fn not_found() -> impl axum::response::IntoResponse {
+        (
+            axum::http::StatusCode::NOT_FOUND,
+            [(
+                axum::http::header::CONTENT_TYPE,
+                "application/fhir+json; charset=utf-8",
+            )],
+            axum::Json(serde_json::json!({
+                "resourceType": "OperationOutcome",
+                "issue": [{
+                    "severity": "error",
+                    "code": "not-found",
+                    "diagnostics": "The web UI is not available on this server: it is \
+            either not compiled in (the `ui` build feature is off) or disabled at runtime \
+            (HFS_UI_ENABLED=false)."
+                }]
+            })),
+        )
+    }
+
+    app.route("/ui", axum::routing::any(not_found))
+        .route("/ui/", axum::routing::any(not_found))
+}
+
+/// Builds the UI router and merges it onto the FHIR app.
+#[cfg(feature = "ui")]
+fn mount_ui(
+    app: axum::Router,
+    config: &ServerConfig,
+    ui_tenants: Option<Arc<dyn ResourceStorage>>,
+    ui_settings: Option<Arc<dyn SettingsStore>>,
+    ui_bulk_provider: Option<Arc<dyn BulkProviderStore>>,
+) -> axum::Router {
+    // The UI reads SearchParameter/CompartmentDefinition from the server's
+    // own FHIR API over HTTP. It calls itself on the loopback address, with
+    // the configured outbound service token (HFS_OUTBOUND_BEARER_TOKEN) when
+    // set, or no credentials when auth is disabled.
+    //
+    // TODO(service-token): when auth is enabled, this relies on an operator
+    // provisioning a valid, non-expiring bearer via HFS_OUTBOUND_BEARER_TOKEN;
+    // without one the self-call is rejected and the conformance pages degrade
+    // to a warning. The follow-up is to mint a short-lived, auto-refreshed
+    // `system/SearchParameter.rs system/CompartmentDefinition.rs` token via
+    // the planned `JwtAssertionOutboundAuthProvider` (SMART Backend Services
+    // client_credentials + private_key_jwt; see crates/auth/src/outbound.rs)
+    // configured from HFS_UI_* client credentials. The `$sql-export`
+    // self-calls (#833) are the exception: they already carry the
+    // browser's own `Authorization` when it sent one (the `Caller` seam
+    // in `crates/ui/src/conformance.rs`), falling back to this service
+    // token only when the request had none.
+    let self_base_url = format!("http://127.0.0.1:{}", config.port);
+    let outbound_auth = AuthConfig::from_env().outbound_provider();
+    let patient_name_search = patient_name_search_support(
+        config
+            .storage_backend_mode()
+            .expect("storage backend was validated before server startup"),
+    );
+    helios_ui::mount_with_body_limit_and_tenant_routing(
+        app,
+        env!("CARGO_PKG_VERSION"),
+        config.data_dir.clone(),
+        helios_ui::NlSearch {
+            enabled: config.nl_search_enabled,
+            configured: config.nl_search_api_key.is_some(),
+            model: config.nl_search_model.clone(),
+        },
+        ui_tenants,
+        ui_settings,
+        config.default_tenant.clone(),
+        self_base_url,
+        outbound_auth,
+        config.default_fhir_version,
+        config.terminology_server.clone(),
+        config.base_url.clone(),
+        config.max_body_size,
+        config.multitenancy.routing_mode.supports_url_path(),
+        ui_bulk_provider,
+        patient_name_search,
+    )
+}
+
+#[cfg(feature = "ui")]
 fn patient_name_search_support(mode: StorageBackendMode) -> helios_ui::PatientNameSearchSupport {
     match mode {
         StorageBackendMode::S3 => helios_ui::PatientNameSearchSupport::IdOnly,
@@ -1252,12 +1327,16 @@ async fn start_sqlite(
     let ui_settings = settings_store.clone();
     let ui_bulk_provider: Option<Arc<dyn BulkProviderStore>> = Some(backend.clone());
     let export_bundle = build_bulk_export(&config, backend.clone(), backend.clone()).await?;
-    let submit_bundle = build_bulk_submit(&config, backend.clone()).await?;
     let ops = standalone_ops(
         backend.clone(),
         backend.tenant_registries().clone(),
         audit_state.as_ref(),
     );
+    let reindex_hook = ops.reindex.clone().map(|op| {
+        Arc::new(helios_persistence::search::ReindexOnFinish::new(op))
+            as Arc<dyn helios_persistence::core::DeferredReindexHook>
+    });
+    let submit_bundle = build_bulk_submit(&config, backend.clone(), reindex_hook).await?;
     let app = create_app_with_auth_bulk_settings_and_ops(
         backend,
         config.clone(),
@@ -1593,9 +1672,36 @@ fn spawn_export_workers<Dp>(
     feature = "mongodb",
     feature = "s3"
 ))]
+/// Picks the `$bulk-submit` job store for a primary + Elasticsearch composite.
+///
+/// The raw primary never feeds Elasticsearch, so by default the store is
+/// wrapped in [`CompositeSubmitJobs`], which syncs each finished manifest's
+/// resources into the secondary index (#882). Under bulk fast-load the worker
+/// fires a per-type reindex after each manifest that rebuilds Elasticsearch
+/// too, so the wrapper's per-resource sync would only duplicate that work; the
+/// raw primary is used instead. Fast-load without a reindex hook still needs
+/// the wrapper, otherwise the data never reaches Elasticsearch.
+///
+/// [`CompositeSubmitJobs`]: helios_persistence::composite::CompositeSubmitJobs
+fn composite_submit_jobs(
+    primary: Arc<dyn BulkSubmitJobStore>,
+    composite: Arc<helios_persistence::composite::CompositeStorage>,
+    defer_indexing: bool,
+    has_reindex_hook: bool,
+) -> Arc<dyn BulkSubmitJobStore> {
+    if defer_indexing && has_reindex_hook {
+        primary
+    } else {
+        Arc::new(helios_persistence::composite::CompositeSubmitJobs::new(
+            primary, composite,
+        ))
+    }
+}
+
 async fn build_bulk_submit(
     config: &ServerConfig,
     jobs: Arc<dyn BulkSubmitJobStore>,
+    reindex_hook: Option<Arc<dyn helios_persistence::core::DeferredReindexHook>>,
 ) -> anyhow::Result<Option<helios_rest::BulkSubmitBundle>> {
     let cfg = config.bulk_submit.clone();
     info!(
@@ -1700,7 +1806,34 @@ async fn build_bulk_submit(
         .with_decryption_keys(decryption_keys),
     );
 
-    spawn_submit_workers(jobs.clone(), fetcher.clone(), output.clone(), &cfg);
+    // SQLite serialises writers, so a fan-out queues batch writes behind one
+    // lock until they outlast `busy_timeout` and abort the manifest (#942).
+    // Ignore the configured value there, and warn about it, rather than letting
+    // it fail the import.
+    let backend_kind = config
+        .storage_backend_mode()
+        .map(|mode| mode.primary_backend_kind())
+        .unwrap_or(BackendKind::Sqlite);
+    let file_concurrency = cfg.effective_file_concurrency(backend_kind);
+    if file_concurrency < cfg.file_concurrency.max(1) {
+        warn!(
+            configured = cfg.file_concurrency,
+            effective = file_concurrency,
+            "Bulk submit file fan-out is not supported on SQLite and is \
+             running at 1: SQLite serialises writers, so a fan-out queues \
+             batch writes past busy_timeout and aborts the import. Use \
+             PostgreSQL for a higher file concurrency."
+        );
+    }
+
+    spawn_submit_workers(
+        jobs.clone(),
+        fetcher.clone(),
+        output.clone(),
+        &cfg,
+        file_concurrency,
+        reindex_hook,
+    );
 
     Ok(Some(helios_rest::BulkSubmitBundle {
         jobs,
@@ -1722,19 +1855,35 @@ fn spawn_submit_workers(
     fetcher: Arc<dyn SubmitInputFetcher>,
     output: Arc<dyn ExportOutputStore>,
     cfg: &helios_rest::config::BulkSubmitConfig,
+    file_concurrency: u32,
+    reindex_hook: Option<Arc<dyn helios_persistence::core::DeferredReindexHook>>,
 ) {
     if cfg.disable_local_worker {
         info!("Bulk submit in-process worker pool is disabled");
         return;
     }
     let lease = std::time::Duration::from_secs(cfg.lease_duration_secs);
+    let defer_indexing = cfg.defer_indexing;
+    if defer_indexing {
+        info!("Bulk submit fast-load: search indexing deferred to post-manifest reindex");
+    }
+    let file_concurrency = file_concurrency.max(1) as usize;
+    if file_concurrency > 1 {
+        info!(
+            file_concurrency,
+            "Bulk submit fan-out: ingesting a manifest's output files concurrently"
+        );
+    }
     for i in 0..cfg.worker_concurrency {
         let jobs = jobs.clone();
         let fetcher = fetcher.clone();
         let output = output.clone();
+        let reindex_hook = reindex_hook.clone();
         let worker_id = WorkerId::new(format!("hfs-submit-worker-{i}"));
         tokio::spawn(async move {
-            let worker = DefaultSubmitWorker::new(jobs.clone(), fetcher, output, worker_id.clone());
+            let worker = DefaultSubmitWorker::new(jobs.clone(), fetcher, output, worker_id.clone())
+                .with_deferred_indexing(defer_indexing, reindex_hook.clone())
+                .with_file_concurrency(file_concurrency);
             loop {
                 match jobs.claim_next_manifest(&worker_id, lease).await {
                     Ok(Some(claimed)) => {
@@ -1933,7 +2082,6 @@ async fn start_sqlite_elasticsearch(
     let ui_bulk_provider: Option<Arc<dyn BulkProviderStore>> = Some(sqlite.clone());
 
     let export_bundle = build_bulk_export(&config, sqlite.clone(), sqlite.clone()).await?;
-    let submit_bundle = build_bulk_submit(&config, sqlite.clone()).await?;
     // Reindex reads from the SQLite primary and rebuilds BOTH indexes: SQLite's
     // own search_index table and the Elasticsearch index that actually serves
     // search here.
@@ -1944,6 +2092,23 @@ async fn start_sqlite_elasticsearch(
         sqlite.tenant_registries().clone(),
         audit_state.as_ref(),
     );
+    let reindex_hook = ops.reindex.clone().map(|op| {
+        Arc::new(helios_persistence::search::ReindexOnFinish::new(op))
+            as Arc<dyn helios_persistence::core::DeferredReindexHook>
+    });
+    // Bulk ingestion runs on the SQLite primary's engine, but wrapped so that
+    // finished manifests sync their resources into Elasticsearch — the raw
+    // primary skips local indexing when search is offloaded, and without the
+    // wrapper bulk-loaded data is invisible to every search (#882). In
+    // fast-load mode the post-manifest reindex already rebuilds Elasticsearch,
+    // so the per-resource sync is skipped rather than done twice (#903).
+    let submit_jobs = composite_submit_jobs(
+        sqlite.clone(),
+        composite.clone(),
+        config.bulk_submit.defer_indexing,
+        reindex_hook.is_some(),
+    );
+    let submit_bundle = build_bulk_submit(&config, submit_jobs, reindex_hook).await?;
     let app = create_app_with_auth_bulk_settings_and_ops(
         composite.clone(),
         config.clone(),
@@ -2004,12 +2169,16 @@ async fn start_postgres(
     let ui_settings = settings_store.clone();
     let ui_bulk_provider: Option<Arc<dyn BulkProviderStore>> = Some(backend.clone());
     let export_bundle = build_bulk_export(&config, backend.clone(), backend.clone()).await?;
-    let submit_bundle = build_bulk_submit(&config, backend.clone()).await?;
     let ops = standalone_ops(
         backend.clone(),
         backend.tenant_registries().clone(),
         audit_state.as_ref(),
     );
+    let reindex_hook = ops.reindex.clone().map(|op| {
+        Arc::new(helios_persistence::search::ReindexOnFinish::new(op))
+            as Arc<dyn helios_persistence::core::DeferredReindexHook>
+    });
+    let submit_bundle = build_bulk_submit(&config, backend.clone(), reindex_hook).await?;
     let app = create_app_with_auth_bulk_settings_and_ops(
         backend.clone(),
         config.clone(),
@@ -2184,7 +2353,6 @@ async fn start_postgres_elasticsearch(
     let ui_bulk_provider: Option<Arc<dyn BulkProviderStore>> = Some(pg.clone());
 
     let export_bundle = build_bulk_export(&config, pg.clone(), pg.clone()).await?;
-    let submit_bundle = build_bulk_submit(&config, pg.clone()).await?;
     let ops = composite_ops(
         composite.clone(),
         pg.clone(),
@@ -2192,6 +2360,20 @@ async fn start_postgres_elasticsearch(
         pg.tenant_registries().clone(),
         audit_state.as_ref(),
     );
+    let reindex_hook = ops.reindex.clone().map(|op| {
+        Arc::new(helios_persistence::search::ReindexOnFinish::new(op))
+            as Arc<dyn helios_persistence::core::DeferredReindexHook>
+    });
+    // Wrapped like sqlite-es: finished manifests sync their ingested
+    // resources into Elasticsearch, which the raw primary never does (#882),
+    // unless fast-load's post-manifest reindex covers it (#903).
+    let submit_jobs = composite_submit_jobs(
+        pg.clone(),
+        composite.clone(),
+        config.bulk_submit.defer_indexing,
+        reindex_hook.is_some(),
+    );
+    let submit_bundle = build_bulk_submit(&config, submit_jobs, reindex_hook).await?;
     let app = create_app_with_auth_bulk_settings_and_ops(
         composite.clone(),
         config.clone(),
@@ -2381,11 +2563,6 @@ async fn start_mongodb_elasticsearch(
             None
         }
     };
-    // Bulk submit runs against the MongoDB primary, which hosts its own job
-    // state. Ingestion deliberately goes to `mongo` rather than the composite:
-    // the composite's search half is fed by the primary's own indexing hooks.
-    let submit_bundle = build_bulk_submit(&config, mongo.clone()).await?;
-
     let ops = composite_ops(
         composite.clone(),
         mongo.clone(),
@@ -2393,6 +2570,14 @@ async fn start_mongodb_elasticsearch(
         mongo.tenant_registries().clone(),
         audit_state.as_ref(),
     );
+    // Bulk submit runs against the MongoDB primary, which hosts its own job
+    // state. Ingestion deliberately goes to `mongo` rather than the composite:
+    // the composite's search half is fed by the primary's own indexing hooks.
+    let reindex_hook = ops.reindex.clone().map(|op| {
+        Arc::new(helios_persistence::search::ReindexOnFinish::new(op))
+            as Arc<dyn helios_persistence::core::DeferredReindexHook>
+    });
+    let submit_bundle = build_bulk_submit(&config, mongo.clone(), reindex_hook).await?;
     let app = create_app_with_auth_bulk_settings_and_ops(
         composite.clone(),
         config.clone(),
@@ -2530,7 +2715,15 @@ async fn start_s3(
     // there the backend does not declare `BulkSubmitRestWorker` and the worker
     // simply never claims anything.
     let submit_bundle = if backend.supports_bulk_submit_worker() {
-        build_bulk_submit(&config, backend.clone()).await?
+        build_bulk_submit(
+            &config,
+            backend.clone(),
+            ops.reindex.clone().map(|op| {
+                Arc::new(helios_persistence::search::ReindexOnFinish::new(op))
+                    as Arc<dyn helios_persistence::core::DeferredReindexHook>
+            }),
+        )
+        .await?
     } else {
         tracing::warn!(
             "S3 is configured bucket-per-tenant with no default system bucket; \
@@ -2801,7 +2994,15 @@ async fn start_s3_elasticsearch(
     // job state. Ingestion goes to `s3` rather than the composite because the
     // composite's Elasticsearch half is fed by the primary's indexing hooks.
     let bulk_submit = if s3.supports_bulk_submit_worker() {
-        build_bulk_submit(&config, s3.clone()).await?
+        build_bulk_submit(
+            &config,
+            s3.clone(),
+            ops.reindex.clone().map(|op| {
+                Arc::new(helios_persistence::search::ReindexOnFinish::new(op))
+                    as Arc<dyn helios_persistence::core::DeferredReindexHook>
+            }),
+        )
+        .await?
     } else {
         tracing::warn!(
             "S3 is configured bucket-per-tenant with no default system bucket; \
@@ -3050,7 +3251,7 @@ mod tests {
         );
     }
 
-    #[cfg(all(feature = "ui", not(feature = "headless")))]
+    #[cfg(feature = "ui")]
     #[test]
     fn test_patient_name_search_support_matches_storage_capability() {
         for (mode, expected) in [
@@ -3134,5 +3335,74 @@ mod tests {
             shared_file.is_ok(),
             "shared SQLite file path must be accepted"
         );
+    }
+
+    /// The regression guard for #975: whatever feature selection this test
+    /// binary was built with — `--all-features` in `ci.yml`'s `test-rust` job,
+    /// the same selection the release job uses for the uploaded artifacts —
+    /// the assembled router must actually serve the UI at `/ui`.
+    ///
+    /// Asserting on the served response rather than on a `cfg!` is the point:
+    /// the old bug was a *negative* feature (`not(feature = "headless")`) that
+    /// `--all-features` tripped, and no `cfg` assertion downstream of the mount
+    /// would have caught it.
+    #[cfg(feature = "ui")]
+    #[tokio::test]
+    async fn ui_is_served_under_this_builds_feature_selection() {
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+
+        let config = ServerConfig::default();
+        assert!(config.ui_enabled, "the UI must default to on");
+
+        let response = attach_ui(axum::Router::new(), &config, None, None, None)
+            .oneshot(
+                axum::http::Request::get("/ui")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::OK,
+            "GET /ui must be served by the UI router"
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let html = String::from_utf8_lossy(&body);
+        assert!(
+            html.contains("<html") || html.contains("<!DOCTYPE"),
+            "GET /ui must return HTML, got: {}",
+            &html[..html.len().min(200)]
+        );
+    }
+
+    /// Headless deployments turn the UI off at runtime, and `/ui` must then say
+    /// so with a 404 + OperationOutcome. Without the explicit stub the path
+    /// falls through to the FHIR router, which reads `ui` as a resource type
+    /// and answers `200` with an empty searchset (#975).
+    #[tokio::test]
+    async fn ui_disabled_at_runtime_answers_404_not_an_empty_searchset() {
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+
+        let mut config = ServerConfig::default();
+        config.ui_enabled = false;
+
+        let response = attach_ui(axum::Router::new(), &config, None, None, None)
+            .oneshot(
+                axum::http::Request::get("/ui")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), axum::http::StatusCode::NOT_FOUND);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let outcome: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(outcome["resourceType"], "OperationOutcome");
+        assert_eq!(outcome["issue"][0]["code"], "not-found");
     }
 }

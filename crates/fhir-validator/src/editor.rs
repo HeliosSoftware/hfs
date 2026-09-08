@@ -307,6 +307,129 @@ fn is_primitive(resolver: &dyn SchemaResolver, element: &FhirSchema) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// Model-only element lookup (#821): what a FHIRPath completion endpoint
+// needs, with no document and no cardinality-spent tracking — just "what can
+// legally sit under this type, at this path".
+// ---------------------------------------------------------------------------
+
+/// One element visible immediately under a schema node, as reported by
+/// [`element_children`].
+///
+/// Deliberately thinner than [`Addable`]/[`Present`]: there is no document to
+/// diff cardinality against, and a choice group (`value[x]`) is collapsed
+/// into one entry carrying every arm's type instead of being split by JSON
+/// key — a FHIRPath completion candidate is offered by its FHIRPath member
+/// name (`value`), never by the JSON key of one concrete choice arm
+/// (`valueString`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ElementChild {
+    /// The FHIRPath member name (also the JSON key, for a non-choice
+    /// element).
+    pub name: String,
+    /// The element's FHIR type(s) — one entry for an ordinary element, and
+    /// one per arm (in the schema's own declared order) for a choice group.
+    /// Empty for an anonymous inline element the pack does not name a type
+    /// for.
+    pub types: Vec<String>,
+    /// Whether the element repeats (`array: true` on any layer).
+    pub is_collection: bool,
+    /// Whether the element's value is a FHIR primitive — always `false` for
+    /// a choice group, since its arms may mix primitive and complex types.
+    pub is_primitive: bool,
+    /// The `short` human label, when the pack carries one.
+    pub short: Option<String>,
+}
+
+/// The elements visible immediately under the schema node at `path` — element
+/// names only, no document, no array indices (an array's items are governed
+/// by the element itself, not by position; see [`schema_at`]).
+///
+/// `path` walks from `root_type` exactly as [`schema_at`] does, so an
+/// intermediate complex type (`HumanName` under `Patient.name`) resolves to
+/// its own schema and contributes its own children, and inherited elements
+/// (`id`, `extension`, `meta`, `modifierExtension`, ...) and a
+/// `BackboneElement`'s inline children are included — [`merged_elements`]
+/// backs both this and [`addable`]/[`present_children`].
+///
+/// Returns `None` when `root_type` itself, or any step of `path`, does not
+/// resolve — a typo'd `resource` or a path segment the schema doesn't
+/// recognize, never an error to propagate. Returns `Some(vec![])` when the
+/// path resolves but the node has no children of its own — a primitive leaf
+/// (`Patient.name.given`) is the common case: it resolves to `string`, whose
+/// schema is a `primitive-type` with nothing to expand into.
+///
+/// # Examples
+///
+/// ```
+/// use helios_fhir_validator::{editor::element_children, packs::core_registry};
+/// use helios_fhir::FhirVersion;
+///
+/// let registry = core_registry(FhirVersion::R4);
+/// let children = element_children(registry.as_ref(), "Patient", &[]).unwrap();
+/// assert!(children.iter().any(|c| c.name == "name"));
+///
+/// // A leaf primitive has no children of its own.
+/// let leaf = element_children(registry.as_ref(), "Patient", &["name", "given"]).unwrap();
+/// assert!(leaf.is_empty());
+///
+/// // An unresolvable root type reports "I don't know", not "nothing here".
+/// assert!(element_children(registry.as_ref(), "NotAType", &[]).is_none());
+/// ```
+pub fn element_children(
+    resolver: &dyn SchemaResolver,
+    root_type: &str,
+    path: &[&str],
+) -> Option<Vec<ElementChild>> {
+    let steps: Vec<Step> = path
+        .iter()
+        .map(|name| Step::Field((*name).to_string()))
+        .collect();
+    let schema = schema_at_in(resolver, root_type, None, &steps)?;
+    let elements = merged_elements(resolver, &schema, &mut HashSet::new());
+
+    let mut out = Vec::new();
+    for (name, element) in &elements {
+        // A concrete choice branch (`valueString`) is reached through its
+        // declarer (`value`), never offered on its own; the declarer's own
+        // literal `value[x]` key is a converter artifact no document ever
+        // carries (see `addable`'s identical guard).
+        if name.contains("[x]") || element.choice_of.is_some() {
+            continue;
+        }
+        // The document's identity, not one of its elements — completion at
+        // the resource root never offers it as a FHIRPath member.
+        if name == "resourceType" && path.is_empty() {
+            continue;
+        }
+
+        if let Some(choices) = &element.choices {
+            let types = choices
+                .iter()
+                .filter_map(|arm| elements.get(arm))
+                .filter_map(|arm_schema| arm_schema.type_.clone())
+                .collect();
+            out.push(ElementChild {
+                name: name.clone(),
+                types,
+                is_collection: element.array.unwrap_or(false),
+                is_primitive: false,
+                short: element.short.clone(),
+            });
+            continue;
+        }
+
+        out.push(ElementChild {
+            name: name.clone(),
+            types: element.type_.iter().cloned().collect(),
+            is_collection: element.array.unwrap_or(false),
+            is_primitive: is_primitive(resolver, element),
+            short: element.short.clone(),
+        });
+    }
+    Some(out)
+}
+
+// ---------------------------------------------------------------------------
 // Document navigation
 // ---------------------------------------------------------------------------
 
@@ -867,15 +990,15 @@ pub fn add_slice_element(
         // The freshly added item is the last in the array at `path.name`.
         let mut item_path: Vec<Step> = path.to_vec();
         item_path.push(Step::Field(name.to_string()));
-        if let Some(Value::Array(items)) = node_at_mut(document, &item_path) {
-            if let Some(last) = items.last_mut() {
-                if last.is_null() {
-                    *last = Value::Object(serde_json::Map::new());
-                }
-                if let Some(target) = last.as_object_mut() {
-                    for (key, value) in pattern {
-                        target.entry(key).or_insert(value);
-                    }
+        if let Some(Value::Array(items)) = node_at_mut(document, &item_path)
+            && let Some(last) = items.last_mut()
+        {
+            if last.is_null() {
+                *last = Value::Object(serde_json::Map::new());
+            }
+            if let Some(target) = last.as_object_mut() {
+                for (key, value) in pattern {
+                    target.entry(key).or_insert(value);
                 }
             }
         }
@@ -1342,6 +1465,94 @@ mod tests {
             "7",
         );
         assert_eq!(patient["unknownField"], json!(7));
+    }
+
+    // -----------------------------------------------------------------
+    // element_children (#821)
+    // -----------------------------------------------------------------
+
+    fn child_names(children: &[ElementChild]) -> Vec<&str> {
+        children.iter().map(|c| c.name.as_str()).collect()
+    }
+
+    #[test]
+    fn element_children_of_patient_root_include_own_and_inherited_elements() {
+        let registry = registry();
+        let children = element_children(registry.as_ref(), "Patient", &[]).expect("resolves");
+        let names = child_names(&children);
+        assert!(names.contains(&"name"), "{names:?}");
+        assert!(names.contains(&"birthDate"), "{names:?}");
+        // Inherited from Element/DomainResource, not declared on Patient
+        // itself — proof `merged_elements`'s base-chain walk backs this too.
+        assert!(names.contains(&"id"), "{names:?}");
+        assert!(names.contains(&"extension"), "{names:?}");
+    }
+
+    #[test]
+    fn element_children_of_patient_name_are_human_name_elements() {
+        let registry = registry();
+        let children = element_children(registry.as_ref(), "Patient", &["name"]).expect("resolves");
+        let given = children
+            .iter()
+            .find(|c| c.name == "given")
+            .expect("given is offered");
+        assert_eq!(given.types, vec!["string".to_string()]);
+        assert!(given.is_collection, "HumanName.given repeats");
+        assert!(given.is_primitive);
+        let names = child_names(&children);
+        assert!(names.contains(&"family"), "{names:?}");
+        assert!(names.contains(&"use"), "{names:?}");
+        assert!(names.contains(&"period"), "{names:?}");
+    }
+
+    /// A choice group (`value[x]`) collapses into one `value` entry carrying
+    /// every arm's type, never split by JSON key (`valueQuantity`, ...).
+    #[test]
+    fn element_children_collapse_a_choice_group_into_one_entry() {
+        let registry = registry();
+        let children = element_children(registry.as_ref(), "Observation", &[]).expect("resolves");
+        let value_entries: Vec<&ElementChild> =
+            children.iter().filter(|c| c.name == "value").collect();
+        assert_eq!(
+            value_entries.len(),
+            1,
+            "exactly one `value` entry, not one per arm: {children:?}"
+        );
+        assert!(
+            value_entries[0].types.len() > 1,
+            "Observation.value[x] has several arms: {:?}",
+            value_entries[0].types
+        );
+        assert!(!value_entries[0].is_primitive);
+        // No stray `valueQuantity`/`valueString`/... arm keys leaked through.
+        assert!(
+            !child_names(&children)
+                .iter()
+                .any(|name| name.starts_with("value") && *name != "value"),
+            "{children:?}"
+        );
+    }
+
+    /// A primitive leaf has nothing under it — `Some(vec![])`, distinct from
+    /// `None` (which means the path itself did not resolve).
+    #[test]
+    fn element_children_of_a_primitive_leaf_is_empty() {
+        let registry = registry();
+        let children = element_children(registry.as_ref(), "Patient", &["name", "given"])
+            .expect("the path itself resolves");
+        assert_eq!(children, vec![]);
+    }
+
+    #[test]
+    fn element_children_of_an_unknown_root_type_is_none() {
+        let registry = registry();
+        assert!(element_children(registry.as_ref(), "NotAType", &[]).is_none());
+    }
+
+    #[test]
+    fn element_children_of_an_unknown_path_segment_is_none() {
+        let registry = registry();
+        assert!(element_children(registry.as_ref(), "Patient", &["nope"]).is_none());
     }
 }
 

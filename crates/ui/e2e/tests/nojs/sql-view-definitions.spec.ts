@@ -1,11 +1,11 @@
 import { expect, test } from "../../pages/fixtures";
 import { createResource, waitSearchable } from "../../pages/api";
 
-// #752 ticket 02, RF6: with JavaScript disabled the ViewDefinitions
-// playground has no live preview at all — htmx, vd-editor.js, and the
-// CodeMirror bundle are all inert here — only Save's own `?saved=1`
-// redirect (a plain form POST followed by a plain GET) fills the results
-// region, running the just-stored definition through $sql-run server-side.
+// #752: with JavaScript disabled the ViewDefinitions playground has no live
+// preview at all — htmx, vd-editor.js, and the CodeMirror bundle are all
+// inert here — only Save's own `?saved=1` redirect (a plain form POST
+// followed by a plain GET) fills the results region, running the
+// just-stored definition through $sql-run server-side.
 test("with JavaScript disabled, the results region only fills after Save", async ({
   page,
   request,
@@ -27,7 +27,7 @@ test("with JavaScript disabled, the results region only fills after Save", async
 
   await page.goto(`/ui/sql/view-definitions?vd=${vdId}`);
   // The editor is a plain, visible textarea — no CodeMirror bundle mounted,
-  // no Run button (RF1 removed it), and nothing has run yet server-side.
+  // no Run button (removed), and nothing has run yet server-side.
   const editor = page.locator("textarea[name='json']");
   await expect(editor).toBeVisible();
   await expect(editor).toContainText("e2e_nojs_playground");
@@ -41,4 +41,76 @@ test("with JavaScript disabled, the results region only fills after Save", async
   await expect(page.locator(".notice", { hasText: "Saved." })).toBeVisible();
   await expect(page.locator(".data-table")).toBeVisible();
   await expect(page.locator(".data-table td", { hasText: patientId }).first()).toBeVisible();
+});
+
+// #843: `theme.js` never runs `<html class="js">` here, so `needs-js`
+// keeps the guided-form card out of the accessibility tree and off-screen —
+// the grid collapses to the editor alone, exactly like the page before this
+// ticket. The Save → results flow above still passes unmodified: nothing
+// about the guided form is on the critical path for it.
+test("with JavaScript disabled, the guided-form card stays hidden and the editor works alone", async ({
+  page,
+  request,
+}) => {
+  const vdId = await createResource(request, "ViewDefinition", {
+    name: "e2e_nojs_no_guided_form",
+    status: "active",
+    resource: "Patient",
+    select: [{ column: [{ name: "id", path: "getResourceKey()" }] }],
+  });
+  await waitSearchable(request, "ViewDefinition", vdId);
+
+  await page.goto(`/ui/sql/view-definitions?vd=${vdId}`);
+  await expect(page.locator("html")).not.toHaveClass(/\bjs\b/);
+  await expect(page.locator("section.editor-form")).toBeHidden();
+  await expect(page.locator("textarea[name='json']")).toBeVisible();
+});
+
+// #821: the lint UI (gutter markers, the tooltip, the save-with-errors
+// confirmation) is CodeMirror's own — with no bundle mounted there is no
+// editor pane at all, so there is nothing to warn about and nothing to
+// block Save. A document with lint errors must still save exactly like a
+// clean one always has, with no dialog (`window.confirm` never runs — the
+// save handler in `vd-editor.js` lives entirely inside its own `if
+// (CodeEditor && CM)` branch, never wired at all when that branch didn't
+// run) and no `.cm-editor` ever appearing on the page.
+test("with JavaScript disabled, a document with lint errors saves through Save with no dialog and no editor pane", async ({
+  page,
+  request,
+}) => {
+  const vdId = await createResource(request, "ViewDefinition", {
+    name: "e2e_nojs_lint_errors",
+    status: "active",
+    resource: "Patient",
+    select: [{ column: [{ name: "id", path: "getResourceKey()" }] }],
+  });
+  await waitSearchable(request, "ViewDefinition", vdId);
+
+  await page.goto(`/ui/sql/view-definitions?vd=${vdId}`);
+  const editor = page.locator("textarea[name='json']");
+  await expect(editor).toBeVisible();
+  await expect(page.locator(".cm-editor")).toHaveCount(0);
+
+  // An unrecognized key ("columns", not "column") — the same shape
+  // `vd-editor-lint.spec.ts` lints server-side — typed straight into the
+  // plain textarea, no CodeMirror concept involved.
+  const withLintErrors = JSON.stringify({
+    resourceType: "ViewDefinition",
+    id: vdId,
+    name: "e2e_nojs_lint_errors",
+    status: "active",
+    resource: "Patient",
+    select: [{ columns: [{ name: "id", path: "getResourceKey()" }] }],
+  });
+  await editor.fill(withLintErrors);
+
+  let dialogFired = false;
+  page.on("dialog", (dialog) => {
+    dialogFired = true;
+    dialog.dismiss();
+  });
+  await page.locator("#vd-editor-form button[name='action'][value='save']").click();
+  await expect(page).toHaveURL(new RegExp(`vd=${vdId}&saved=1`));
+  expect(dialogFired).toBe(false);
+  await expect(page.locator(".cm-editor")).toHaveCount(0);
 });

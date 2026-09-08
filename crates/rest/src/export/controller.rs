@@ -131,9 +131,18 @@ pub struct CompletedFile {
 pub enum JobStatus {
     /// Job is still running.
     Running {
-        /// Completion percentage (0..=100). Surfaced as the spec's
-        /// `X-Progress: {n}%` header on polling responses.
-        percent: u8,
+        /// Number of subjects that have finished completely (all their
+        /// shards written). `0 ≤ subjects_done ≤ subjects_total`.
+        subjects_done: u32,
+        /// Total number of subjects in the job (`ExportWork::subject_count`).
+        subjects_total: u32,
+        /// Output name of the subject currently being written, or `None`
+        /// when no subject is in flight (before the first one starts, or
+        /// after the last one finishes). See [`JobStatus::percent`] for the
+        /// single place the completion percentage is derived from these
+        /// counts — this variant deliberately does not also store a
+        /// percentage, so the two can never disagree (#853).
+        current_subject: Option<String>,
         /// Time the job was submitted.
         submitted_at: DateTime<Utc>,
     },
@@ -180,6 +189,26 @@ impl JobStatus {
             JobStatus::Completed { completed_at, .. } => Some(*completed_at),
             JobStatus::Failed { failed_at, .. } => Some(*failed_at),
             JobStatus::Cancelled { cancelled_at } => Some(*cancelled_at),
+        }
+    }
+
+    /// Returns the job's completion percentage while it is `Running`, or
+    /// `None` for any other variant.
+    ///
+    /// This is the *only* place the percentage is computed
+    /// (`subjects_done * 100 / subjects_total`, capped at 99): both the
+    /// `X-Progress` header and the `subjectsDone`/`subjectsTotal` body
+    /// parameters on a status poll read from this one method, so they can
+    /// never disagree (#853). The 99 cap keeps a client from seeing "100%"
+    /// before the completion manifest actually exists.
+    pub fn percent(&self) -> Option<u8> {
+        match self {
+            JobStatus::Running {
+                subjects_done,
+                subjects_total,
+                ..
+            } => Some((((*subjects_done) * 100) / (*subjects_total).max(1)).min(99) as u8),
+            _ => None,
         }
     }
 }
