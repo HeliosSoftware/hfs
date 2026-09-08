@@ -60,24 +60,28 @@ const MAX_CHARTED_TYPES: usize = 6;
 /// How long a tenant's per-type totals (`count_all_types`) are reused before
 /// the grouping query is re-run (#959).
 ///
-/// This is deliberately *much* longer than the observability layer's 15s
-/// snapshot TTL, because the two figures have very different cost and
-/// freshness requirements:
+/// The per-type totals are a single `GROUP BY` over every live row of the
+/// tenant — the dominant cost of a dashboard load at scale (~30s at 6M rows on
+/// SQLite) — and they do not depend on `window`, `types` or `include_empty` at
+/// all. The observability layer, however, caches whole snapshots keyed on
+/// `(window, tenant, types, include_empty)`, so the *same* figure is asked for
+/// once per sibling key: window flips, picker changes, and the type rails on
+/// `/ui/resources`, `/ui/search` and `/ui/queries` each used to pay for their
+/// own scan. This cache collapses those duplicates into one.
 ///
-/// * The chart is cheap and interactive — it is keyed on
-///   `(window, tenant, types, include_empty)` and should track recent writes,
-///   so it keeps the 15s freshness.
-/// * The per-type totals are a single `GROUP BY` over every live row of the
-///   tenant — the dominant cost of a dashboard load at scale (~30s at 6M rows
-///   on SQLite) — and they do not depend on `window`, `types`, or
-///   `include_empty` at all. Recomputing them for each window flip or picker
-///   change was pure waste.
+/// It must stay *below* the observability layer's 15s snapshot TTL, and that
+/// bound is not a matter of taste. This entry is only ever refreshed as a side
+/// effect of a snapshot recompute, and a given snapshot key recomputes at most
+/// every 15s — so as long as this TTL is shorter than that, the entry is always
+/// already expired by the time that key comes back, and the recompute sees the
+/// current numbers. The cache is then invisible to freshness while still
+/// absorbing every *sibling* key that asks in between.
 ///
-/// The tradeoff: after a large import, the headline "total resources" card,
-/// the "distinct types" card, and the type picker's option list may lag by up
-/// to two minutes. That is an acceptable price for a page that renders
-/// promptly; the chart itself stays 15s-fresh.
-const TYPE_COUNTS_TTL: std::time::Duration = std::time::Duration::from_secs(120);
+/// Set it above 15s and the relationship inverts: a recompute starts serving
+/// itself a value cached under some other key, and this becomes the term that
+/// decides how long the headline "total resources" card, the "distinct types"
+/// card and the type picker's option list keep showing pre-import numbers.
+const TYPE_COUNTS_TTL: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// A span to chart, and the bucket width that samples it.
 ///
@@ -907,12 +911,18 @@ mod tests {
         assert_eq!(snapshot.distinct_types, 1, "Patient's only row is deleted");
     }
 
-    /// The per-tenant type counts are cached with their own, longer TTL
-    /// (#959), so flipping the window does not re-run the `GROUP BY` over
+    /// The per-tenant type counts are cached independently of the snapshot
+    /// key (#959), so flipping the window does not re-run the `GROUP BY` over
     /// every live row. Proven without a fake backend: mutate the store
     /// between two snapshots on the *same* provider and observe that the
     /// second still reports the first's cached figures, while the chart
     /// (which is not cached here) does see the new data.
+    ///
+    /// The two snapshots are back to back, so they land inside
+    /// [`TYPE_COUNTS_TTL`] with seconds to spare. That TTL is short by design
+    /// — it exists to absorb sibling keys asking for the same figure at the
+    /// same time, not to hold numbers past the snapshot layer's own 15s
+    /// freshness — which is exactly the reuse this test pins down.
     #[tokio::test]
     async fn per_tenant_type_counts_are_reused_across_windows() {
         let backend = Arc::new(SqliteBackend::in_memory().expect("in-memory sqlite backend"));
