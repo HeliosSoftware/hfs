@@ -338,6 +338,14 @@ test("counts render next to each type from the dashboard snapshot", async ({
 });
 
 test("every rail type is searchable, while Create opens only eligible targets", async ({ resources }) => {
+  // A whole-set sweep, like the a11y route walk and the capability-statement
+  // tests: 145 rail types, each a click plus — where Create is eligible — a
+  // modal open, an editor read and an Escape close. That is ~27s of real work
+  // on an idle machine, so the 30s default leaves no headroom and the test
+  // times out mid-loop whenever the suite is under load. Budget for the sweep
+  // rather than for a single interaction; the loop itself still visits every
+  // type and asserts the same things.
+  test.setTimeout(120_000);
   await resources.goto("Patient");
   const types = await resources.railTypes();
 
