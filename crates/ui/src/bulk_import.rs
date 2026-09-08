@@ -1237,7 +1237,13 @@ pub async fn status_fragment(
 /// bar about to fill, not a percentage that never moves — the indeterminate
 /// sweep is reserved for recipients that report no percentage at all.
 fn progress_percent(progress: &str) -> Option<u8> {
-    let rest = progress.strip_prefix("processing ")?;
+    // Case-insensitive: HFS capitalizes the line ("Processing 3% of bytes —
+    // …", #954), older HFS versions and foreign recipients may send lowercase
+    // "processing 3% complete …". Either way the digits follow the prefix.
+    let rest = progress
+        .get(..11)
+        .filter(|p| p.eq_ignore_ascii_case("processing "))
+        .and_then(|_| progress.get(11..))?;
     let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
     let pct: u8 = digits.parse().ok().filter(|p| *p <= 100)?;
     Some(pct)
@@ -1291,6 +1297,24 @@ pub async fn test_auth(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn progress_percent_reads_both_hfs_wordings_and_foreign_case() {
+        // Current HFS wording (#954).
+        assert_eq!(
+            progress_percent("Processing 3% of bytes — 609,191 resources written"),
+            Some(3)
+        );
+        assert_eq!(progress_percent("Processing 0% of bytes"), Some(0));
+        // Pre-#954 HFS and lowercase foreign recipients.
+        assert_eq!(
+            progress_percent("processing 10% complete (5 entries ingested)"),
+            Some(10)
+        );
+        // Non-matching recipients keep the indeterminate sweep.
+        assert_eq!(progress_percent("halfway there"), None);
+        assert_eq!(progress_percent("processing lots"), None);
+    }
 
     #[test]
     fn recipient_base_preserves_prefix_and_adds_path_tenant() {
