@@ -7,7 +7,10 @@
 // covers is the whole operator round trip — the sidebar, the New Submission
 // dialog, the redirect to the detail page, the status card polling itself
 // forward, the numbers it prints while it does — so it is driven exclusively
-// through the page. No `request.*` call appears below, on purpose.
+// through the page. Nothing this test *asserts on* is reached by any route but
+// the browser: no `request.*` call appears anywhere in the walkthrough, on
+// purpose. The one exception is teardown, which is not a step an operator
+// performs and is discussed where it happens.
 //
 // Why the Import page can see the ingest at all: the Import page is the Data
 // *Provider* half, but its recipient is this same server (`recipient_base_url`
@@ -21,13 +24,23 @@
 // read off the screen, over a real ingest, exactly as an operator reads it.
 import { test, expect } from "../pages/fixtures";
 import { BulkSubmitSource } from "../pages/bulk-submit-source";
+import { deleteResources } from "../pages/api";
 
-// Roughly 40s of trickled NDJSON (40 chunks, one a second) against a batch size
-// of 100, so the 5s status poll gets ~8 looks at a counter that moves ~20 times.
-// A faster fixture would finish inside one poll interval and the run would have
-// a single sample to check monotonicity against, which is no check at all.
-const RESOURCES = 2000;
-const SOURCE = { resources: RESOURCES, chunkLines: 50, chunkDelayMs: 1000 };
+// What the sampling actually needs is two numbers, and neither of them is the
+// resource count: ~40s of wall clock, so the status card's 5s poll gets ~8
+// looks, and ~20 movements of the counter, so consecutive looks land on
+// different values. A submission that finishes inside one poll interval leaves
+// a single sample, and a single sample is no monotonicity check at all.
+//
+// Both are set by the *fixture's pacing* — 40 chunks, one a second — against
+// the ingest batch size, so the corpus can be as small as those two allow. It
+// is deliberately small: this spec shares its database with every other one
+// (see the teardown at the end), and the 2000 Patients this started at broke
+// twelve SQL-on-FHIR tests ~200 tests later. 400 lines at 10 per chunk buys
+// exactly the same 40s and, at `HFS_BULK_SUBMIT_BATCH_SIZE=20` (boot.mjs),
+// exactly the same 20 movements.
+const RESOURCES = 400;
+const SOURCE = { resources: RESOURCES, chunkLines: 10, chunkDelayMs: 1000 };
 
 // Wall clock: ~40s of ingest, plus dialog work, plus the search at the end.
 // Well inside this, and far enough under it that a genuine hang still fails.
@@ -53,6 +66,7 @@ test("a manifest submitted from the Import page ingests, and its counters only e
   chrome,
   bulkImport,
   queries,
+  request,
 }) => {
   // A per-run family name: the Patients this run writes are the only ones that
   // answer to it, so the search at the end is unambiguous however many times
@@ -159,7 +173,11 @@ test("a manifest submitted from the Import page ingests, and its counters only e
     await test.step("#969 every counter the recipient reported was >= the one before it", async () => {
       const reports = progressReports(await bulkImport.logLines());
       // A submission that completed inside a single poll proves nothing about
-      // a sequence, so refuse to pass on one sample.
+      // a sequence, so refuse to pass on one sample. Two is the floor a
+      // monotonicity check is even defined at; the fixture is paced to clear
+      // it by a wide margin, and measured 6 on consecutive local runs. The
+      // floor stays at the semantic minimum rather than at the measurement:
+      // a slower machine polls fewer times, and that is not this test's bug.
       expect(reports.length).toBeGreaterThanOrEqual(2);
 
       const written = reports.map((r) => r.written);
@@ -200,5 +218,29 @@ test("a manifest submitted from the Import page ingests, and its counters only e
     });
   } finally {
     await source.stop();
+
+    // Teardown, and the only thing here that is not the browser's work.
+    //
+    // The suite runs one server and one database for every spec file
+    // (`playwright.config.ts`: `workers: 1`, `fullyParallel: false`), so
+    // subjects left behind are not this spec's private mess — they are a tax
+    // every later spec pays, and the SQL-on-FHIR specs pay it per row:
+    // `sql-export.spec.ts` and `sql-libraries.spec.ts` run jobs over
+    // `resource: "Patient"` views and poll them on a 30s budget. At the 2000
+    // Patients this file first ingested they went from ~1s to ~30s, and CI
+    // lost twelve of them across the two files — with this test itself green,
+    // ~200 tests earlier, which is what made it worth a comment this long.
+    // Cleaning up is the contract every seeding spec already keeps
+    // (`deleteResources`; sql-export's own `afterEach` does the same).
+    //
+    // No search is needed to find them, and none is wanted: the fixture
+    // assigns each Patient its id, so the ids are known without asking the
+    // server, and a run that failed before ingesting anything deletes
+    // nothing — `deleteResources` treats a 404 entry as already gone.
+    await deleteResources(
+      request,
+      "Patient",
+      Array.from({ length: RESOURCES }, (_, i) => `${family}-${i}`),
+    );
   }
 });

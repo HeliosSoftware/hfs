@@ -128,10 +128,13 @@ const child = spawn(bin, [], {
     // clients ignoring Retry-After. Off here: this client is not ignoring it,
     // it is being told to poll fast.
     HFS_BULK_SUBMIT_POLL_RATE_LIMIT: "0",
-    // Progress counters advance a batch at a time. At the default 1000 a small
-    // fixture data set would report two or three numbers all run; 100 makes the
-    // counter move often enough to actually watch it.
-    HFS_BULK_SUBMIT_BATCH_SIZE: "100",
+    // Progress counters advance a batch at a time, so the batch size is what
+    // decides how many distinct numbers a run ever reports. At the default 1000
+    // a fixture small enough to belong in a shared database would report one or
+    // two all run, which is nothing to check monotonicity against; 20 gets the
+    // 400-line fixture in bulk-submit-ingest.spec.ts to ~20 movements. Lowering
+    // this is what let that fixture shrink 5x without losing a single sample.
+    HFS_BULK_SUBMIT_BATCH_SIZE: "20",
     ...authEnv,
   },
 });
