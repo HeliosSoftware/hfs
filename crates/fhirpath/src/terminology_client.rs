@@ -4,7 +4,7 @@
 //! It implements the standard FHIR terminology operations including expand, lookup,
 //! validate-code, subsumes, and translate.
 
-use reqwest::Client;
+use reqwest::{Client, RequestBuilder, Response};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::time::Duration;
@@ -20,6 +20,13 @@ const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Environment variable overriding [`DEFAULT_REQUEST_TIMEOUT`], in whole seconds.
 const REQUEST_TIMEOUT_ENV: &str = "FHIRPATH_TERMINOLOGY_TIMEOUT";
+
+/// Three retries after the initial request, with 1s, 2s and 4s backoff.
+const GATEWAY_RETRY_DELAYS: [Duration; 3] = [
+    Duration::from_secs(1),
+    Duration::from_secs(2),
+    Duration::from_secs(4),
+];
 
 /// Resolves the request timeout from [`REQUEST_TIMEOUT_ENV`].
 ///
@@ -53,6 +60,37 @@ pub struct TerminologyClient {
 }
 
 impl TerminologyClient {
+    /// These terminology operations only read data, including those sent as POST.
+    /// Retry transient gateway/service failures, but preserve transport, parsing and
+    /// other HTTP errors. Each attempt retains the configured HTTP client timeout.
+    async fn send_with_retry(
+        &self,
+        request: impl Fn() -> RequestBuilder,
+    ) -> FhirPathResult<Response> {
+        let mut delays = GATEWAY_RETRY_DELAYS.into_iter();
+        loop {
+            let response = request()
+                .send()
+                .await
+                .map_err(|e| FhirPathError::NetworkError(e.to_string()))?;
+            // Cloudflare uses HTTP 530 for tunnel failures, including error 1033
+            // when no healthy cloudflared instance can receive the request.
+            if !matches!(response.status().as_u16(), 502 | 503 | 504 | 530) {
+                return Ok(response);
+            }
+            let Some(delay) = delays.next() else {
+                return Ok(response);
+            };
+            tracing::warn!(
+                status = %response.status(),
+                delay_ms = delay.as_millis(),
+                "Retrying terminology request after a transient HTTP failure"
+            );
+            drop(response);
+            tokio::time::sleep(delay).await;
+        }
+    }
+
     /// Creates a new terminology client
     ///
     /// # Arguments
@@ -62,6 +100,7 @@ impl TerminologyClient {
     ///
     /// The request timeout defaults to 30s and can be overridden with
     /// `FHIRPATH_TERMINOLOGY_TIMEOUT` (whole seconds; `0` disables it).
+    /// HTTP 502, 503, 504 and 530 responses are retried up to three times with backoff.
     pub fn new(base_url: String, fhir_version: FhirVersion) -> Self {
         let mut builder = Client::builder();
         if let Some(timeout) = request_timeout() {
@@ -117,18 +156,18 @@ impl TerminologyClient {
         }
 
         let response = self
-            .client
-            .get(&url)
-            .query(
-                &query_params
-                    .iter()
-                    .map(|(k, v)| (k.as_str(), v.as_str()))
-                    .collect::<Vec<_>>(),
-            )
-            .header("Accept", "application/fhir+json")
-            .send()
-            .await
-            .map_err(|e| FhirPathError::NetworkError(e.to_string()))?;
+            .send_with_retry(|| {
+                self.client
+                    .get(&url)
+                    .query(
+                        &query_params
+                            .iter()
+                            .map(|(k, v)| (k.as_str(), v.as_str()))
+                            .collect::<Vec<_>>(),
+                    )
+                    .header("Accept", "application/fhir+json")
+            })
+            .await?;
 
         if response.status().is_success() {
             response
@@ -187,14 +226,14 @@ impl TerminologyClient {
         }
 
         let response = self
-            .client
-            .post(&url)
-            .json(&body)
-            .header("Content-Type", "application/fhir+json")
-            .header("Accept", "application/fhir+json")
-            .send()
-            .await
-            .map_err(|e| FhirPathError::NetworkError(e.to_string()))?;
+            .send_with_retry(|| {
+                self.client
+                    .post(&url)
+                    .json(&body)
+                    .header("Content-Type", "application/fhir+json")
+                    .header("Accept", "application/fhir+json")
+            })
+            .await?;
 
         if response.status().is_success() {
             response
@@ -283,14 +322,14 @@ impl TerminologyClient {
         });
 
         let response = self
-            .client
-            .post(&url)
-            .json(&body)
-            .header("Content-Type", "application/fhir+json")
-            .header("Accept", "application/fhir+json")
-            .send()
-            .await
-            .map_err(|e| FhirPathError::NetworkError(e.to_string()))?;
+            .send_with_retry(|| {
+                self.client
+                    .post(&url)
+                    .json(&body)
+                    .header("Content-Type", "application/fhir+json")
+                    .header("Accept", "application/fhir+json")
+            })
+            .await?;
 
         if response.status().is_success() {
             let result: Value = response
@@ -360,14 +399,14 @@ impl TerminologyClient {
         });
 
         let response = self
-            .client
-            .post(&url)
-            .json(&body)
-            .header("Content-Type", "application/fhir+json")
-            .header("Accept", "application/fhir+json")
-            .send()
-            .await
-            .map_err(|e| FhirPathError::NetworkError(e.to_string()))?;
+            .send_with_retry(|| {
+                self.client
+                    .post(&url)
+                    .json(&body)
+                    .header("Content-Type", "application/fhir+json")
+                    .header("Accept", "application/fhir+json")
+            })
+            .await?;
 
         if response.status().is_success() {
             response
@@ -432,14 +471,14 @@ impl TerminologyClient {
         });
 
         let response = self
-            .client
-            .post(&url)
-            .json(&body)
-            .header("Content-Type", "application/fhir+json")
-            .header("Accept", "application/fhir+json")
-            .send()
-            .await
-            .map_err(|e| FhirPathError::NetworkError(e.to_string()))?;
+            .send_with_retry(|| {
+                self.client
+                    .post(&url)
+                    .json(&body)
+                    .header("Content-Type", "application/fhir+json")
+                    .header("Accept", "application/fhir+json")
+            })
+            .await?;
 
         if response.status().is_success() {
             response
@@ -478,14 +517,14 @@ impl TerminologyClient {
         let body = build_translate_body(concept_map_url, system, code, target_system, params);
 
         let response = self
-            .client
-            .post(&url)
-            .json(&body)
-            .header("Content-Type", "application/fhir+json")
-            .header("Accept", "application/fhir+json")
-            .send()
-            .await
-            .map_err(|e| FhirPathError::NetworkError(e.to_string()))?;
+            .send_with_retry(|| {
+                self.client
+                    .post(&url)
+                    .json(&body)
+                    .header("Content-Type", "application/fhir+json")
+                    .header("Accept", "application/fhir+json")
+            })
+            .await?;
 
         if response.status().is_success() {
             let result: Value = response
@@ -574,6 +613,170 @@ fn build_translate_body(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn call_operation(client: &TerminologyClient, operation: &str) -> FhirPathResult<Value> {
+        match operation {
+            "expand" => client.expand("http://example.org/vs", None).await,
+            "lookup" => client.lookup("http://example.org/cs", "x", None).await,
+            "validate_vs" => {
+                client
+                    .validate_vs("http://example.org/vs", None, "x", None, None)
+                    .await
+            }
+            "validate_cs" => {
+                client
+                    .validate_cs("http://example.org/cs", "x", None, None)
+                    .await
+            }
+            "subsumes" => {
+                client
+                    .subsumes("http://example.org/cs", "x", "y", None)
+                    .await
+            }
+            "translate" => {
+                client
+                    .translate(
+                        "http://example.org/cm",
+                        "http://example.org/cs",
+                        "x",
+                        None,
+                        None,
+                    )
+                    .await
+            }
+            _ => panic!("unknown test operation: {operation}"),
+        }
+    }
+
+    async fn stub_responses(statuses: Vec<u16>, body: &str) -> wiremock::MockServer {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let calls = AtomicUsize::new(0);
+        let body = body.to_owned();
+        Mock::given(|_: &Request| true)
+            .respond_with(move |_: &Request| {
+                let index = calls.fetch_add(1, Ordering::SeqCst).min(statuses.len() - 1);
+                ResponseTemplate::new(statuses[index]).set_body_string(body.clone())
+            })
+            .mount(&server)
+            .await;
+        server
+    }
+
+    #[tokio::test]
+    async fn terminology_retries_transient_gateway_errors_for_all_operations() {
+        for operation in [
+            "expand",
+            "lookup",
+            "validate_vs",
+            "validate_cs",
+            "subsumes",
+            "translate",
+        ] {
+            let body = json!({"resourceType": "Parameters", "parameter": []});
+            let server = stub_responses(vec![502, 503, 504, 200], &body.to_string()).await;
+            let client = TerminologyClient::new(server.uri(), FhirVersion::R4);
+
+            assert_eq!(
+                call_operation(&client, operation).await.unwrap(),
+                body,
+                "{operation}"
+            );
+            let requests = server.received_requests().await.unwrap();
+            assert_eq!(requests.len(), 4, "{operation}");
+            for request in &requests[1..] {
+                assert_eq!(request.method, requests[0].method);
+                assert_eq!(request.url, requests[0].url);
+                assert_eq!(request.body, requests[0].body);
+                assert_eq!(request.headers, requests[0].headers);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn terminology_retries_cloudflare_tunnel_errors_for_all_operations() {
+        for operation in [
+            "expand",
+            "lookup",
+            "validate_vs",
+            "validate_cs",
+            "subsumes",
+            "translate",
+        ] {
+            let body = json!({"resourceType": "Parameters", "parameter": []});
+            let server = stub_responses(vec![530, 200], &body.to_string()).await;
+            let client = TerminologyClient::new(server.uri(), FhirVersion::R4);
+
+            assert_eq!(
+                call_operation(&client, operation).await.unwrap(),
+                body,
+                "{operation}"
+            );
+            let requests = server.received_requests().await.unwrap();
+            assert_eq!(requests.len(), 2, "{operation}");
+            assert_eq!(requests[1].method, requests[0].method);
+            assert_eq!(requests[1].url, requests[0].url);
+            assert_eq!(requests[1].body, requests[0].body);
+            assert_eq!(requests[1].headers, requests[0].headers);
+        }
+    }
+
+    #[tokio::test]
+    async fn terminology_cloudflare_retry_limit_preserves_final_error() {
+        let body = "<html><h1>Error 1033</h1><h2>Cloudflare Tunnel error</h2></html>";
+        let server = stub_responses(vec![530], body).await;
+        let client = TerminologyClient::new(server.uri(), FhirVersion::R4);
+        let error = client
+            .expand("http://example.org/vs", None)
+            .await
+            .unwrap_err();
+        assert!(matches!(&error, FhirPathError::TerminologyError(message)
+            if message.contains("530") && message.contains(body)));
+        assert_eq!(server.received_requests().await.unwrap().len(), 4);
+    }
+
+    #[tokio::test]
+    async fn terminology_retry_limit_preserves_final_error() {
+        let server = stub_responses(vec![502, 503, 502, 504], "gateway unavailable").await;
+        let client = TerminologyClient::new(server.uri(), FhirVersion::R4);
+        let error = client
+            .expand("http://example.org/vs", None)
+            .await
+            .unwrap_err();
+        assert!(matches!(&error, FhirPathError::TerminologyError(message)
+            if message.contains("504 Gateway Timeout") && message.contains("gateway unavailable")));
+        assert_eq!(server.received_requests().await.unwrap().len(), 4);
+    }
+
+    #[tokio::test]
+    async fn terminology_does_not_retry_other_http_errors() {
+        for status in [400, 401, 403, 404, 422, 429, 500] {
+            let server = stub_responses(vec![status, 200], "operation failed").await;
+            let client = TerminologyClient::new(server.uri(), FhirVersion::R4);
+            assert!(matches!(
+                client.expand("http://example.org/vs", None).await,
+                Err(FhirPathError::TerminologyError(_))
+            ));
+            assert_eq!(
+                server.received_requests().await.unwrap().len(),
+                1,
+                "HTTP {status}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn terminology_does_not_retry_invalid_success_body() {
+        let server = stub_responses(vec![200], "invalid JSON").await;
+        let client = TerminologyClient::new(server.uri(), FhirVersion::R4);
+        assert!(matches!(
+            client.expand("http://example.org/vs", None).await,
+            Err(FhirPathError::ParseError(_))
+        ));
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
 
     /// Names of the `Parameters.parameter` entries, in order.
     fn param_names(body: &Value) -> Vec<&str> {

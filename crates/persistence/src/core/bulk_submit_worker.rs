@@ -317,6 +317,16 @@ pub trait SubmitWorkerStorage: Send + Sync {
     /// Marks the manifest `completed`. Fenced.
     async fn finish_manifest(&self, lease: &ManifestLease) -> Result<(), LeaseError>;
 
+    /// Reclaims write-ahead-log space at a file boundary, when the backend
+    /// keeps one (#978). SQLite's WAL grows without bound under a long ingest
+    /// because its passive auto-checkpoint keeps yielding to the back-to-back
+    /// batch writers; a multi-gigabyte WAL then slows every read (the status
+    /// poll included) and doubles disk use. The worker calls this once per
+    /// output file — a point where no batch holds the write lock — so the WAL
+    /// is folded back into the database between files. Backends without a
+    /// SQLite-style WAL (PostgreSQL, MongoDB, S3) leave the default no-op.
+    async fn checkpoint_after_file(&self) {}
+
     /// Marks the manifest `failed` with a message. Fenced.
     async fn fail_manifest(
         &self,
@@ -1108,6 +1118,10 @@ where
                         }
                     }
                 }
+
+                // File boundary: no batch holds the write lock here, so fold
+                // the WAL back into the database before the next file (#978).
+                self.jobs.checkpoint_after_file().await;
 
                 let total = progress_ref.total.load(Ordering::Relaxed);
                 if total > 0 {

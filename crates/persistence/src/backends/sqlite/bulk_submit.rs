@@ -2063,6 +2063,25 @@ impl SubmitWorkerStorage for SqliteBackend {
         SqliteBackend::publish_manifest_artifacts(self, lease, files, terminal).await
     }
 
+    async fn checkpoint_after_file(&self) {
+        // Fold the WAL back into the database at a file boundary (#978). The
+        // passive auto-checkpoint yields to the back-to-back batch writers and
+        // lets the WAL grow into the multi-gigabyte range over a long ingest,
+        // which slows every read and doubles disk use; a TRUNCATE checkpoint
+        // between files reclaims it while no batch holds the write lock. A
+        // busy return (a reader still in a WAL frame) is fine — the next file
+        // boundary tries again — so this is best-effort and never fails the
+        // ingest. Runs on a blocking thread so the checkpoint's I/O does not
+        // stall an async worker.
+        let backend = self.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            if let Ok(conn) = backend.get_connection() {
+                let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
+            }
+        })
+        .await;
+    }
+
     async fn finish_manifest(&self, lease: &ManifestLease) -> Result<(), LeaseError> {
         self.publish_current_manifest_generation(lease, ManifestPublicationStatus::Completed)
             .await
@@ -5129,5 +5148,47 @@ mod tests {
             Err(StorageError::Backend(BackendError::Internal { .. }))
         ));
         assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// #978: `checkpoint_after_file` truncates the WAL back into the database.
+    /// A file-backed WAL grows with each write until a checkpoint folds it in;
+    /// after the call the `-wal` file is reclaimed (0 bytes on TRUNCATE).
+    #[tokio::test]
+    async fn checkpoint_after_file_truncates_the_wal() {
+        use crate::core::bulk_submit_worker::SubmitWorkerStorage;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("wal-test.db");
+        let backend = SqliteBackend::open(&db_path).unwrap();
+        backend.init_schema().unwrap();
+        let tenant = create_test_tenant();
+
+        // Write enough resources to grow the WAL past its initial size.
+        for i in 0..500 {
+            backend
+                .create(
+                    &tenant,
+                    "Patient",
+                    json!({"resourceType": "Patient", "id": format!("wal-{i}")}),
+                    FhirVersion::default_enabled(),
+                )
+                .await
+                .unwrap();
+        }
+
+        let wal_path = db_path.with_extension("db-wal");
+        let before = std::fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0);
+        assert!(
+            before > 0,
+            "the WAL should have grown before the checkpoint"
+        );
+
+        backend.checkpoint_after_file().await;
+
+        let after = std::fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0);
+        assert!(
+            after < before,
+            "TRUNCATE checkpoint should reclaim the WAL: before={before} after={after}"
+        );
     }
 }

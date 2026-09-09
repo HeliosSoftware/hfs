@@ -587,6 +587,30 @@ async fn inject_test_principal(
 
 /// Serves the mounted UI (over the mock FHIR app) on a real port; returns the
 /// base URL and the mock's state handles.
+/// The `data/` spec bundle, parsed once for the whole binary.
+///
+/// `from_data_dir` reads and parses `search-parameters-r4.json` (2.2 MB) plus
+/// the compartment definitions eagerly: 130ms measured, and `serve()` ran it
+/// per test, so 63 tests burned ~8.2s of CPU re-parsing identical bytes —
+/// about 43% of this binary's serial runtime (#1019). None of it lands inside
+/// a test's timeout window, but it is the background load that pushed the
+/// tight ones over on a many-core runner.
+///
+/// Sharing one `Arc` across tests is safe: `from_data_dir` builds a read-only
+/// source, and the interior-mutable recording fields a `StaticConformanceSource`
+/// also carries (`saved_resources`, `sql_run_calls`) are for tests that seed
+/// their own source and assert on it — no test in this file reads them.
+fn shared_conformance() -> Arc<dyn helios_ui::ConformanceSource> {
+    static SRC: std::sync::OnceLock<Arc<helios_ui::StaticConformanceSource>> =
+        std::sync::OnceLock::new();
+    SRC.get_or_init(|| {
+        Arc::new(helios_ui::StaticConformanceSource::from_data_dir(
+            std::path::Path::new("../../data"),
+        ))
+    })
+    .clone()
+}
+
 async fn serve_with_settings(settings_available: bool) -> (String, MockExport, Arc<SqliteBackend>) {
     let backend = Arc::new(SqliteBackend::in_memory().expect("in-memory sqlite"));
     backend.init_schema().expect("init schema");
@@ -605,9 +629,7 @@ async fn serve_with_settings(settings_available: bool) -> (String, MockExport, A
         None,
         settings,
         "default".to_string(),
-        Arc::new(helios_ui::StaticConformanceSource::from_data_dir(
-            std::path::Path::new("../../data"),
-        )),
+        shared_conformance(),
         FhirVersion::R4,
         None,
         base.clone(),
@@ -645,9 +667,7 @@ async fn serve_with_fhir_version(version: FhirVersion) -> (String, MockExport, A
         None,
         Some(backend.clone() as Arc<dyn SettingsStore>),
         "default".to_string(),
-        Arc::new(helios_ui::StaticConformanceSource::from_data_dir(
-            std::path::Path::new("../../data"),
-        )),
+        shared_conformance(),
         version,
         None,
         base.clone(),
@@ -677,9 +697,7 @@ async fn serve_with_runtime(
         None,
         Some(settings),
         "default".to_string(),
-        Arc::new(helios_ui::StaticConformanceSource::from_data_dir(
-            std::path::Path::new("../../data"),
-        )),
+        shared_conformance(),
         FhirVersion::R4,
         None,
         base.clone(),
@@ -2627,7 +2645,14 @@ async fn patient_parameter_searches_start_concurrently() {
         )
         .await
     });
-    tokio::time::timeout(std::time::Duration::from_secs(1), barrier.wait())
+    // 10s, not the 1s this used to allow (#1019). The assertion is *whether*
+    // the two searches overlap, never how fast they get there, so the budget
+    // only has to exceed the worst scheduling delay a loaded runner imposes —
+    // and it is the only wait in this file that was set below the 2s its
+    // siblings use. Instrumented under `--test-threads=32` on 32 cores it
+    // measures 430-560ms typically with 2.0s outliers, so 1s failed about one
+    // run in six even after the client fix above removed the real cost.
+    tokio::time::timeout(std::time::Duration::from_secs(10), barrier.wait())
         .await
         .expect("both searches must reach the backend together");
     let (status, _, _) = lookup.await.unwrap();

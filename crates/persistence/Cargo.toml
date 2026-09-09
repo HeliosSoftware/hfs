@@ -153,6 +153,10 @@ required-features = ["advisor"]
 name = "bulk_submit_bench"
 required-features = ["sqlite"]
 
+[[example]]
+name = "bulk_submit_mongo_bench"
+required-features = ["mongodb"]
+
 # Benchmarks will be added later
 # [[bench]]
 # name = "crud_benchmark"

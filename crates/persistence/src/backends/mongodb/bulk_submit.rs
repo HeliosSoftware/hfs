@@ -62,6 +62,7 @@ use crate::error::{BackendError, BulkSubmitError, ResourceError, StorageError, S
 use crate::tenant::{TenantContext, TenantId, TenantPermissions};
 
 use super::MongoBackend;
+use super::bulk_ingest::BatchOutcome;
 
 /// Submissions: one document per `(tenant, submitter, submission_id)`.
 pub(crate) const SUBMISSIONS_COLLECTION: &str = "bulk_submissions";
@@ -364,111 +365,50 @@ impl MongoBackend {
         Ok(summary)
     }
 
-    /// Ingests one NDJSON entry: upserts the resource per the import mode and
-    /// records a rollback change.
-    async fn process_single_entry(
+    /// The rollback-log document for one change.
+    ///
+    /// Shared with the batched ingest (#1000), which writes a whole batch's
+    /// changes in one `insert` instead of one per entry, so both paths record a
+    /// change identically by construction.
+    pub(super) fn change_document(
         &self,
         tenant: &TenantContext,
         submission_id: &SubmissionId,
-        manifest_id: &str,
-        entry: &NdjsonEntry,
-        options: &BulkProcessingOptions,
-    ) -> StorageResult<BulkEntryResult> {
-        if let Some(resource_type) = entry.resource.get("resourceType").and_then(|v| v.as_str())
-            && resource_type != entry.resource_type
-        {
-            return Ok(BulkEntryResult::validation_error(
-                entry.line_number,
-                &entry.resource_type,
-                serde_json::json!({
-                    "resourceType": "OperationOutcome",
-                    "issue": [{
-                        "severity": "error",
-                        "code": "invalid",
-                        "diagnostics": format!(
-                            "resourceType mismatch: entry={}, payload={}",
-                            entry.resource_type, resource_type
-                        )
-                    }]
-                }),
-            ));
-        }
-
-        let existing = match entry.resource_id.as_deref() {
-            Some(id) => match self.read(tenant, &entry.resource_type, id).await {
-                Ok(found) => found,
-                // A tombstoned resource is a create target, not an error.
-                Err(StorageError::Resource(ResourceError::Gone { .. })) => None,
-                Err(e) => return Err(e),
-            },
+        change: &SubmissionChange,
+    ) -> StorageResult<Document> {
+        let previous_content = match &change.previous_content {
+            Some(v) => Some(json_string(v)?),
             None => None,
         };
-
-        if let Some(current) = existing {
-            if !options.allow_updates {
-                return Ok(BulkEntryResult::skipped(
-                    entry.line_number,
-                    &entry.resource_type,
-                    "updates not allowed",
-                ));
-            }
-            let content = options.content_for_update(current.content(), &entry.resource);
-            let updated = self.update(tenant, &current, content).await?;
-            let change = SubmissionChange::update(
-                manifest_id,
-                &entry.resource_type,
-                updated.id(),
-                current.version_id(),
-                updated.version_id(),
-                current.content().clone(),
-            );
-            self.record_change(tenant, submission_id, &change).await?;
-            return Ok(BulkEntryResult::success(
-                entry.line_number,
-                &entry.resource_type,
-                updated.id(),
-                false,
-            ));
-        }
-
-        let created = self
-            .create(
-                tenant,
-                &entry.resource_type,
-                entry.resource.clone(),
-                FhirVersion::default_enabled(),
-            )
-            .await?;
-        let change = SubmissionChange::create(
-            manifest_id,
-            &entry.resource_type,
-            created.id(),
-            created.version_id(),
-        );
-        self.record_change(tenant, submission_id, &change).await?;
-        Ok(BulkEntryResult::success(
-            entry.line_number,
-            &entry.resource_type,
-            created.id(),
-            true,
-        ))
+        let mut document = submission_filter(tenant, submission_id);
+        document.insert("change_id", &change.change_id);
+        document.insert("manifest_id", &change.manifest_id);
+        document.insert("change_type", change.change_type.to_string());
+        document.insert("resource_type", &change.resource_type);
+        document.insert("resource_id", &change.resource_id);
+        document.insert("previous_version", change.previous_version.as_deref());
+        document.insert("new_version", &change.new_version);
+        document.insert("previous_content", previous_content);
+        document.insert("changed_at", to_bson_time(change.changed_at));
+        Ok(document)
     }
 
-    /// Upserts one entry result.
+    /// One receipt as an `update` statement (`q`/`u`/`upsert`), so a batch sends
+    /// them all in one command.
     ///
     /// Keyed by `(manifest, file_url, line_number)`: line numbers restart in
     /// every manifest output file, so without the file every file after the
     /// first collides with the first (#457). The upsert is what makes a worker
     /// re-fetching a whole file after a transient failure overwrite its own
     /// earlier rows instead of duplicating them.
-    async fn store_entry_result(
+    pub(super) fn entry_result_statement(
         &self,
         tenant: &TenantContext,
         submission_id: &SubmissionId,
         manifest_id: &str,
         file_url: &str,
         result: &BulkEntryResult,
-    ) -> StorageResult<()> {
+    ) -> StorageResult<Document> {
         let mut key = manifest_filter(tenant, submission_id, manifest_id);
         key.insert("file_url", file_url);
         key.insert("line_number", result.line_number as i64);
@@ -488,13 +428,12 @@ impl MongoBackend {
             "$setOnInsert": key.clone(),
         };
 
-        self.entry_results()
-            .await?
-            .update_one(key, update)
-            .upsert(true)
-            .await
-            .map_err(|e| internal_error(format!("store entry result: {e}")))?;
-        Ok(())
+        Ok(doc! {
+            "q": key,
+            "u": update,
+            "upsert": true,
+            "multi": false,
+        })
     }
 
     /// Applies a fenced `$set`/`$inc` to the leased manifest, reporting
@@ -880,63 +819,26 @@ impl BulkSubmitProvider for MongoBackend {
             .await
             .map_err(|e| internal_error(format!("mark manifest processing: {e}")))?;
 
-        let file_url = options.file_url.as_deref().unwrap_or("");
-        let mut results = Vec::new();
-        let mut error_count = 0u32;
-
-        for entry in entries {
-            if options.max_errors > 0 && error_count >= options.max_errors {
-                if !options.continue_on_error {
-                    return Err(StorageError::BulkSubmit(
-                        BulkSubmitError::MaxErrorsExceeded {
-                            submission_id: submission_id.submission_id.clone(),
-                            max_errors: options.max_errors,
-                        },
-                    ));
-                }
-                let skipped = BulkEntryResult::skipped(
-                    entry.line_number,
-                    &entry.resource_type,
-                    "max errors exceeded",
-                );
-                self.store_entry_result(tenant, submission_id, manifest_id, file_url, &skipped)
-                    .await?;
-                results.push(skipped);
-                continue;
-            }
-
-            let result = match self
-                .process_single_entry(tenant, submission_id, manifest_id, &entry, options)
-                .await
-            {
-                Ok(result) => result,
-                Err(e) => BulkEntryResult::processing_error(
-                    entry.line_number,
-                    &entry.resource_type,
-                    serde_json::json!({
-                        "resourceType": "OperationOutcome",
-                        "issue": [{
-                            "severity": "error",
-                            "code": "exception",
-                            "diagnostics": e.to_string()
-                        }]
-                    }),
-                ),
-            };
-            if result.is_error() {
-                error_count += 1;
-            }
-
-            self.store_entry_result(tenant, submission_id, manifest_id, file_url, &result)
-                .await?;
-            results.push(result);
+        // One batch, a fixed number of commands (#1000). The per-entry pipeline
+        // this replaces made ~9 round trips per resource, which held ingest at
+        // ~60 resources/s with the server 68 % idle.
+        let outcome = self
+            .ingest_batch(tenant, submission_id, manifest_id, &entries, options)
+            .await?;
+        if outcome.aborted_on_max_errors {
+            return Err(StorageError::BulkSubmit(
+                BulkSubmitError::MaxErrorsExceeded {
+                    submission_id: submission_id.submission_id.clone(),
+                    max_errors: options.max_errors,
+                },
+            ));
         }
+        let BatchOutcome {
+            results,
+            error_count,
+            ..
+        } = outcome;
 
-        // These counters are cumulative across every run of this manifest (including
-        // resumes) and are exactly what the $bulk-submit status endpoint reports, so
-        // every delta must be additive here (#969). `processed_entries` means resources
-        // written to the store, so skips are excluded and surface through their receipts
-        // (#954); `last_processed_line` is a line cursor and counts them.
         manifests
             .update_one(
                 manifest_filter(tenant, submission_id, manifest_id),
@@ -1136,21 +1038,7 @@ impl BulkSubmitRollbackProvider for MongoBackend {
         submission_id: &SubmissionId,
         change: &SubmissionChange,
     ) -> StorageResult<()> {
-        let previous_content = match &change.previous_content {
-            Some(v) => Some(json_string(v)?),
-            None => None,
-        };
-        let mut document = submission_filter(tenant, submission_id);
-        document.insert("change_id", &change.change_id);
-        document.insert("manifest_id", &change.manifest_id);
-        document.insert("change_type", change.change_type.to_string());
-        document.insert("resource_type", &change.resource_type);
-        document.insert("resource_id", &change.resource_id);
-        document.insert("previous_version", change.previous_version.as_deref());
-        document.insert("new_version", &change.new_version);
-        document.insert("previous_content", previous_content);
-        document.insert("changed_at", to_bson_time(change.changed_at));
-
+        let document = self.change_document(tenant, submission_id, change)?;
         self.submission_changes()
             .await?
             .insert_one(document)

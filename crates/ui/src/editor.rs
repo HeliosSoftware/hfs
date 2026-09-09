@@ -1053,6 +1053,16 @@ pub struct ExpandQuery {
     pub filter: String,
 }
 
+/// Shared client for the `$expand` proxy below, for the reason spelled out on
+/// [`crate::bulk_export::no_redirect_client`] (#1019): building a client is
+/// ~19ms idle but ~716ms with 32 in flight, and this handler runs once per
+/// keystroke against a 2500ms budget — the build alone could consume a third
+/// of it before the terminology server was even contacted.
+fn terminology_client() -> &'static reqwest::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    CLIENT.get_or_init(reqwest::Client::new)
+}
+
 pub async fn expand(State(state): State<WebState>, Query(query): Query<ExpandQuery>) -> Response {
     use axum::http::StatusCode;
     use axum::response::IntoResponse;
@@ -1065,7 +1075,7 @@ pub async fn expand(State(state): State<WebState>, Query(query): Query<ExpandQue
     if !query.filter.is_empty() {
         params.push(("filter", query.filter.as_str()));
     }
-    let response = match reqwest::Client::new()
+    let response = match terminology_client()
         .get(&target)
         .query(&params)
         .header("Accept", "application/fhir+json")
