@@ -16,6 +16,20 @@ import { test, expect } from "../pages/fixtures";
 import { deleteResources } from "../pages/api";
 import { NdjsonProvider } from "../pages/ndjson-provider";
 
+// Not run in CI for now. This is the only spec in the suite that ingests in
+// bulk, and it is a heavy neighbour: it holds a connection open for ~20s and
+// pushes thousands of resources through the server every other spec shares.
+// It stays here and runs locally — `npx playwright test bulk-import-abort` —
+// because it is the only check that exercises Abort against data genuinely in
+// flight, which is the one thing #968 was about.
+//
+// The mechanism underneath it is covered in CI without a browser, by
+// `test_lease_keeper_cancels_an_aborted_submission` in
+// `crates/persistence/src/core/bulk_submit_worker.rs`: the keeper is what
+// re-reads the submission and trips the ingest's cancel token, and that test
+// fails if the trip is removed.
+test.skip(!!process.env.CI, "heavy shared-server ingest; runs locally, see the note above");
+
 let provider: NdjsonProvider;
 
 // ~15 MB dripped at ~128 KB/s. The size is not there to be ingested — the

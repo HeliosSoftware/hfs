@@ -177,7 +177,13 @@ chart-pick-heading = Tipos de recurso graficados
 chart-pick-all = Ver todos los tipos de recurso
 chart-pick-filter = Filtrar tipos
 chart-empty = Nada que graficar todavía: los recursos almacenados aparecerán aquí a medida que se creen.
-chart-sample-note = Datos de muestra: esta build no tiene registrado un proveedor de métricas en vivo.
+# Solo para una build sin proveedor de métricas. Un proveedor que simplemente
+# tardó usa chart-pending-note: no deben confundirse nunca (#956).
+chart-sample-note = Datos de muestra: esta build no tiene proveedor de métricas en vivo, así que el gráfico de abajo es un marcador de posición, no mediciones.
+chart-pending-note = Todavía se están recopilando las cifras en vivo de este intervalo. No se grafica nada hasta que lleguen: no se muestran números de relleno.
+chart-pending-empty = Esperando las cifras en vivo…
+chart-pending-retry = Reintentar ahora
+chart-partial-note = Algunas cifras no se pudieron leer del almacenamiento y se muestran como cero. Recarga para volver a intentarlo.
 chart-table-toggle = Ver como tabla
 chart-table-when = Momento
 chart-focus-series = Enfocar esta serie

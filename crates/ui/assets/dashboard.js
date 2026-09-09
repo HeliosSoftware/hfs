@@ -4,10 +4,12 @@
    this script only maps the pointer to the nearest bucket and shows what is
    there. Without JavaScript the chart, its legend, and the tabular alternative
    are complete; this only adds the readout. init() is re-run whenever the
-   view-all toggle (#599) swaps in a fresh chart card — the swap brings new
-   #chart-wrap/#chart-tip/#chart-data nodes, so the listeners bound below need
-   rebinding to them; the previous nodes are detached, so there is no
-   duplicate-listener risk. */
+   view-all toggle (#599) swaps in a fresh chart card, and whenever htmx
+   settles the pending dashboard's #dash-live region (#956) — either swap
+   brings new #chart-wrap/#chart-tip/#chart-data nodes, so the listeners bound
+   below need rebinding to them. A flag on the wrapper makes re-running init()
+   over an already-bound chart a no-op, so the two triggers cannot stack a
+   second guide element and a second set of listeners on one node. */
 (function () {
   "use strict";
 
@@ -16,6 +18,8 @@
     var tip = document.getElementById("chart-tip");
     var carrier = document.getElementById("chart-data");
     if (!wrap || !tip || !carrier) return;
+    if (wrap.dataset.tipBound) return;
+    wrap.dataset.tipBound = "1";
 
     var data;
     try {
@@ -94,6 +98,7 @@
 
   init();
   document.addEventListener("hfs:chart-swapped", init);
+  document.addEventListener("htmx:afterSettle", init);
 })();
 
 /* Type-pick options (#599, extended): every option row in the picker — the

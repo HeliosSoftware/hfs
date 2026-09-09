@@ -3145,22 +3145,6 @@
       "reason": "Documented gap: core extension StructureDefinitions (`extension-definitions.json`) are not in the vendored spec bundles, so these extension canonicals cannot be resolved."
     },
     {
-      "file": "examplescenario-example-laborder.json",
-      "issues": 21,
-      "kinds": [
-        "not-array"
-      ],
-      "reason": "Engine bug #487: `contentReference` is lowered to `elementReference` and the target element's schema is merged wholesale, inheriting its `max=*`. E.g. `ExampleScenario.process.step.operation.request` is `max=1` but references `ExampleScenario.instance.containedInstance` (`max=*`), so a single object is reported as not-array."
-    },
-    {
-      "file": "examplescenario-example.json",
-      "issues": 4,
-      "kinds": [
-        "not-array"
-      ],
-      "reason": "Engine bug #487: `contentReference` is lowered to `elementReference` and the target element's schema is merged wholesale, inheriting its `max=*`. E.g. `ExampleScenario.process.step.operation.request` is `max=1` but references `ExampleScenario.instance.containedInstance` (`max=*`), so a single object is reported as not-array."
-    },
-    {
       "file": "observation-example-bloodpressure-cancel.json",
       "issues": 1,
       "kinds": [
