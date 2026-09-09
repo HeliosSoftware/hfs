@@ -130,6 +130,16 @@ fn read_prefix(path: &Path, limit: Option<usize>) -> (Vec<u8>, usize) {
     (buf, lines)
 }
 
+/// A receipt is keyed by `(manifest, file_url, line_number)` (#457), so every
+/// input needs its own `file_url` — two files of the same type would otherwise
+/// have their receipts overwrite each other line for line.
+fn file_url_of(path: &Path) -> String {
+    format!(
+        "bench://{}",
+        path.file_name().and_then(|n| n.to_str()).unwrap_or("input")
+    )
+}
+
 /// `.../Observation.ndjson` and `.../Observation.1787920785840.ndjson` both
 /// name `Observation`: the bulk-export file naming puts the type first.
 fn resource_type_of(path: &Path) -> String {
@@ -175,7 +185,7 @@ async fn main() {
         .expect("add manifest");
 
     // Load every input up front: the timed section then measures ingest only.
-    let inputs: Vec<(String, Vec<u8>, usize)> = args
+    let inputs: Vec<(String, String, Vec<u8>, usize)> = args
         .files
         .iter()
         .map(|path| {
@@ -186,12 +196,12 @@ async fn main() {
                 bytes.len() as f64 / 1e6,
                 path.display()
             );
-            (resource_type_of(path), bytes, lines)
+            (resource_type_of(path), file_url_of(path), bytes, lines)
         })
         .collect();
 
-    let total_lines: usize = inputs.iter().map(|(_, _, n)| *n).sum();
-    let total_bytes: usize = inputs.iter().map(|(_, b, _)| b.len()).sum();
+    let total_lines: usize = inputs.iter().map(|(_, _, _, n)| *n).sum();
+    let total_bytes: usize = inputs.iter().map(|(_, _, b, _)| b.len()).sum();
 
     let mut options = BulkProcessingOptions::new();
     options.defer_indexing = args.defer_index;
@@ -201,10 +211,8 @@ async fn main() {
 
     let started = Instant::now();
 
-    for (resource_type, bytes, lines) in &inputs {
-        let file_options = options
-            .clone()
-            .with_file_url(format!("bench://{resource_type}"));
+    for (resource_type, file_url, bytes, lines) in &inputs {
+        let file_options = options.clone().with_file_url(file_url);
         let reader: Box<dyn tokio::io::AsyncBufRead + Send + Unpin> = Box::new(
             tokio::io::BufReader::new(std::io::Cursor::new(bytes.clone())),
         );
