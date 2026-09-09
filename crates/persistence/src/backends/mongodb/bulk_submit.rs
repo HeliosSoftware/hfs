@@ -51,6 +51,9 @@ use crate::core::bulk_submit::{
     StreamProcessingResult, StreamingBulkSubmitProvider, SubmissionChange, SubmissionId,
     SubmissionManifest, SubmissionStatus, SubmissionSummary, invalid_entry_result_page,
 };
+use crate::core::bulk_submit_publication::{
+    ManifestPublicationResult, ManifestPublicationStatus, canonical_publication_files,
+};
 use crate::core::bulk_submit_worker::{
     ManifestFetchParams, ManifestLease, ManifestWorkerView, PollTokenTarget, SubmitClaimStrategy,
     SubmitFileRecord, SubmitFileRow, SubmitWorkerStorage,
@@ -1469,6 +1472,7 @@ impl SubmitWorkerStorage for MongoBackend {
         // token, so a retried write replaces its own row rather than adding a
         // duplicate entry to the status manifest.
         let mut key = submission_filter(&lease.tenant, &lease.submission_id);
+        key.insert("manifest_id", &lease.manifest_id);
         key.insert("file_type", &file.file_type);
         key.insert("resource_type", file.resource_type.as_deref());
         key.insert("part_index", file.part_index as i64);
@@ -1493,6 +1497,28 @@ impl SubmitWorkerStorage for MongoBackend {
             .await
             .map_err(|e| LeaseError::Storage(internal_error(format!("record submit file: {e}"))))?;
         Ok(())
+    }
+
+    /// Publishes by canonical validation, then fenced per-row writes and the
+    /// fenced terminal update. Mongo provides no atomic full-set publication;
+    /// this intentionally preserves the existing non-atomic backend behavior.
+    async fn publish_manifest_artifacts(
+        &self,
+        lease: &ManifestLease,
+        files: &[SubmitFileRecord],
+        terminal: ManifestPublicationStatus,
+    ) -> Result<ManifestPublicationResult, LeaseError> {
+        let canonical = canonical_publication_files(files).map_err(LeaseError::Storage)?;
+        for file in &canonical {
+            self.record_submit_file(lease, file).await?;
+        }
+        match terminal {
+            ManifestPublicationStatus::Completed => self.finish_manifest(lease).await?,
+            ManifestPublicationStatus::Failed { error_message } => {
+                self.fail_manifest(lease, &error_message).await?
+            }
+        }
+        Ok(ManifestPublicationResult::Published)
     }
 
     async fn finish_manifest(&self, lease: &ManifestLease) -> Result<(), LeaseError> {
@@ -1725,6 +1751,8 @@ impl SubmitWorkerStorage for MongoBackend {
                 resource_type: opt_str(d, "resource_type"),
                 part_index: d.get_i64("part_index").unwrap_or(0).max(0) as u32,
                 fencing_token: d.get_i64("fencing_token").unwrap_or(0).max(0) as u64,
+                manifest_id: opt_str(d, "manifest_id"),
+                legacy_locator: opt_str(d, "manifest_id").is_none(),
                 file_path: d.get_str("file_path").unwrap_or_default().to_string(),
                 line_count: d.get_i64("line_count").unwrap_or(0).max(0) as u64,
                 byte_count: d.get_i64("byte_count").unwrap_or(0).max(0) as u64,

@@ -338,15 +338,18 @@ impl S3Keyspace {
 
     /// Key for one finalized status-manifest artifact row of a submission.
     ///
-    /// The identity is `(file_type, resource_type, part_index, fencing_token)`,
-    /// matching the `bulk_submit_files` uniqueness the SQL backends carry. The
-    /// fencing token is in the key so a worker that re-writes an artifact after
-    /// reclaiming a manifest replaces its own row and never collides with the
-    /// row a *previous* lease holder left behind.
+    /// The identity is `(submitter, submission_id, manifest_id, file_type,
+    /// resource_type, part_index, fencing_token)`, matching the manifest-aware
+    /// `bulk_submit_files` uniqueness the SQL backends carry. The fencing token
+    /// is in the key so a worker that re-writes an artifact after reclaiming a
+    /// manifest replaces its own row and never collides with the row a
+    /// *previous* lease holder left behind.
+    #[allow(clippy::too_many_arguments)] // The complete persisted artifact identity.
     pub fn submit_file_key(
         &self,
         submitter: &str,
         submission_id: &str,
+        manifest_id: &str,
         file_type: &str,
         resource_type: Option<&str>,
         part_index: u32,
@@ -359,11 +362,16 @@ impl S3Keyspace {
             submission_id,
             "files",
             &format!(
-                "{}-{}-{}-{}.json",
-                sanitize(file_type),
-                sanitize(resource_type.unwrap_or("_")),
-                part_index,
-                fencing_token
+                "{}.json",
+                submit_file_object_id(
+                    submitter,
+                    submission_id,
+                    manifest_id,
+                    file_type,
+                    resource_type,
+                    part_index,
+                    fencing_token,
+                )
             ),
         ])
     }
@@ -517,6 +525,42 @@ impl S3Keyspace {
         }
         out
     }
+}
+
+const SUBMIT_FILE_KEY_VERSION: u8 = 1;
+
+/// Builds the opaque object id for one manifest-aware submit artifact row.
+///
+/// Raw ids and optional resource types are serialized as an injective typed
+/// JSON tuple — `None` and `Some("")` remain distinct — then SHA-256 digested.
+/// The digest is collision-resistant, not mathematically injective, but it keeps
+/// hostile slashes out of S3 paths while preserving the stable `files/` prefix.
+fn submit_file_object_id(
+    submitter: &str,
+    submission_id: &str,
+    manifest_id: &str,
+    file_type: &str,
+    resource_type: Option<&str>,
+    part_index: u32,
+    fencing_token: u64,
+) -> String {
+    let payload = serde_json::to_vec(&(
+        SUBMIT_FILE_KEY_VERSION,
+        submitter,
+        submission_id,
+        manifest_id,
+        file_type,
+        resource_type,
+        part_index,
+        fencing_token,
+    ))
+    .expect("canonical submit-file key payload must be valid JSON");
+    let digest = Sha256::digest(&payload);
+    format!("{SUBMIT_FILE_KEY_VERSION}-{}", hex_digest(&digest))
+}
+
+fn hex_digest(digest: &[u8]) -> String {
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 /// Replaces characters that are unsafe in S3 key path segments.
@@ -1178,6 +1222,20 @@ mod tests {
                 ks.legacy_tenant_registry_key(id),
                 "previously-colliding id {id:?} must move to a new key"
             );
+        }
+    }
+
+    #[test]
+    fn submit_file_keys_distinguish_manifest_and_nullable_resource() {
+        let ks = S3Keyspace::new(None);
+        let none = ks.submit_file_key("s", "job", "m-a", "output", None, 0, 1);
+        let empty = ks.submit_file_key("s", "job", "m-a", "output", Some(""), 0, 1);
+        let other_manifest = ks.submit_file_key("s", "job", "m-b", "output", None, 0, 1);
+
+        assert_ne!(none, empty);
+        assert_ne!(none, other_manifest);
+        for key in [none, empty, other_manifest] {
+            assert!(key.starts_with("bulk/submit/s/job/files/"));
         }
     }
 }
