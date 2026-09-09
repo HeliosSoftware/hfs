@@ -262,7 +262,7 @@ impl InMemorySqlEngine {
             // Drain the stream without inserting; nothing to persist.
             let mut n = 0usize;
             while let Some(item) = handle.block_on(rows.next()) {
-                item.map_err(SqlQueryError::MalformedLibrary)?;
+                item.map_err(SqlQueryError::SourceStream)?;
                 n += 1;
                 if n > max_rows {
                     return Err(SqlQueryError::RowCapExceeded { max: max_rows });
@@ -287,7 +287,7 @@ impl InMemorySqlEngine {
         let result: Result<usize, SqlQueryError> = (|| {
             let mut stmt = self.conn.prepare(&insert_sql)?;
             while let Some(item) = handle.block_on(rows.next()) {
-                let row = item.map_err(SqlQueryError::MalformedLibrary)?;
+                let row = item.map_err(SqlQueryError::SourceStream)?;
                 inserted += 1;
                 if inserted > max_rows {
                     return Err(SqlQueryError::RowCapExceeded { max: max_rows });
@@ -519,6 +519,36 @@ mod tests {
             Err(e) => e,
         };
         assert!(matches!(err, SqlQueryError::RowCapExceeded { max: 3 }));
+    }
+
+    #[tokio::test]
+    async fn insert_rows_reports_stream_error_as_source_stream() {
+        // A `SofRunner`'s row stream fails mid-materialization (storage
+        // error, backend statement timeout, lost connection). This must be
+        // reported as `SourceStream`, not folded into `MalformedLibrary` —
+        // the Library and its ViewDefinitions are perfectly well-formed.
+        let engine = InMemorySqlEngine::open().unwrap();
+        let s = schema(&[("id", ColumnFhirType::String("id".into()))]);
+        engine.create_table("t", &s).unwrap();
+        let ok_rows = (0..200).map(|i| Ok(json!({"id": format!("p{i}")})));
+        let rows = stream::iter(
+            ok_rows.chain(std::iter::once(Err("connection reset by peer".to_string()))),
+        );
+        let err = match engine.insert_rows("t", &s, Box::pin(rows), 10_000).await {
+            Ok(_) => panic!("expected SourceStream"),
+            Err(e) => e,
+        };
+        let SqlQueryError::SourceStream(msg) = &err else {
+            panic!("expected SourceStream, got {err:?}");
+        };
+        assert!(
+            msg.contains("connection reset by peer"),
+            "unexpected message: {msg}"
+        );
+        assert!(
+            format!("{err}").starts_with("dependency source failed: "),
+            "unexpected display: {err}"
+        );
     }
 
     #[tokio::test]

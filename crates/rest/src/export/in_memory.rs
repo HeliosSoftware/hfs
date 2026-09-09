@@ -661,7 +661,7 @@ async fn execute_sql_query(
         exec_limits,
     )
     .await
-    .map_err(ExportError::Runner)?;
+    .map_err(|e| ExportError::Runner(e.to_string()))?;
 
     Ok(result)
 }
@@ -1222,6 +1222,109 @@ mod tests {
                 assert_eq!(files[0].row_count, 1000);
             }
             other => panic!("expected Completed, got {other:?}"),
+        }
+    }
+
+    /// A `SofRunner` whose `run_view` streams 200 rows and then fails with a
+    /// backend error, simulating a Postgres `statement_timeout` or a lost
+    /// connection partway through materializing a dependency.
+    struct FailingRunner;
+
+    #[async_trait]
+    impl SofRunner for FailingRunner {
+        async fn run_view(
+            &self,
+            _tenant: &TenantContext,
+            _view_definition: serde_json::Value,
+            _filters: ViewFilters,
+        ) -> Result<RowStream, SofError> {
+            let ok_rows = (0..200).map(|i| Ok(serde_json::json!({"id": format!("p{i}")})));
+            let failure = std::iter::once(Err(SofError::Backend(
+                "canceling statement due to statement timeout".to_string(),
+            )));
+            Ok(Box::pin(futures::stream::iter(ok_rows.chain(failure))))
+        }
+
+        fn runner_name(&self) -> &'static str {
+            "failing-test-runner"
+        }
+    }
+
+    /// A storage failure mid-materialization of a SQLQuery dependency must
+    /// fail the export job with a diagnostic that names the real cause (a
+    /// backend statement timeout), not one that blames the client's Library
+    /// as malformed.
+    #[tokio::test]
+    async fn sqlquery_export_fails_with_diagnostic_when_dependency_stream_errors() {
+        let runner = Arc::new(FailingRunner);
+        let controller =
+            InMemoryController::new(runner, InMemorySink::new("http://localhost"), None);
+
+        let tenant = TenantContext::new(TenantId::new("t1"), TenantPermissions::full_access());
+        let leaf_view = serde_json::json!({
+            "resourceType": "ViewDefinition",
+            "resource": "Patient",
+            "status": "active",
+            "select": [{"column": [{"name": "id", "path": "id"}]}]
+        });
+        let query_plan = crate::handlers::sof::graph::GraphPlan {
+            nodes: vec![crate::handlers::sof::graph::PlanNode::Leaf {
+                internal_name: "vd_0".to_string(),
+                view: leaf_view,
+            }],
+            subject_edges: Vec::new(),
+        };
+
+        let job_id = controller.submit(ExportTask {
+            work: ExportWork {
+                views: vec![],
+                queries: vec![NamedSqlQuery {
+                    name: "families".to_string(),
+                    sql: "SELECT * FROM vd_0".to_string(),
+                    plan: query_plan,
+                    bindings: Vec::new(),
+                }],
+                limits: SqlExportLimits {
+                    max_source_rows_per_vd: 10_000,
+                    max_rows: 10_000,
+                    timeout_secs: 5,
+                },
+            },
+            tenant,
+            filters: ViewFilters::default(),
+            format: "ndjson".to_string(),
+            header: true,
+            client_tracking_id: None,
+        });
+
+        let status = tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                match controller.get_status("t1", &job_id) {
+                    Some(status @ JobStatus::Completed { .. })
+                    | Some(status @ JobStatus::Failed { .. }) => return status,
+                    _ => tokio::time::sleep(Duration::from_millis(20)).await,
+                }
+            }
+        })
+        .await
+        .expect("export job must reach a terminal state before the timeout");
+
+        match status {
+            JobStatus::Failed { message, .. } => {
+                assert!(
+                    message.contains("dependency source failed"),
+                    "unexpected message: {message}"
+                );
+                assert!(
+                    message.contains("statement timeout"),
+                    "unexpected message: {message}"
+                );
+                assert!(
+                    !message.contains("malformed"),
+                    "a source failure must not be blamed on a malformed Library: {message}"
+                );
+            }
+            other => panic!("expected Failed, got {other:?}"),
         }
     }
 
