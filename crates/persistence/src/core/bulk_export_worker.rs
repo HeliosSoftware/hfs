@@ -371,6 +371,8 @@ where
             }
             Err(LeaseError::Storage(e)) => {
                 // Best-effort: mark the job failed (also fenced).
+                tracing::error!(job_id = %lease.job_id, error = %e, "export job failed");
+                let public = public_failure_message(&e);
                 let _ = self
                     .jobs
                     .fail_export_job(
@@ -378,7 +380,7 @@ where
                         &lease.job_id,
                         &lease.worker_id,
                         lease.fencing_token,
-                        &e.to_string(),
+                        &public,
                     )
                     .await;
                 self.emit_audit(
@@ -625,6 +627,19 @@ enum JobOutcome {
     Cancelled,
 }
 
+/// The failure text stored on the job and shown to the export's owner.
+///
+/// Domain errors (`BulkExportError`) describe the export itself and are
+/// stored verbatim; anything else may carry backend detail (SQL, table
+/// names, connection strings) and is replaced by a generic message, with
+/// the full error kept in the server log by the caller.
+fn public_failure_message(e: &StorageError) -> String {
+    match e {
+        StorageError::BulkExport(inner) => inner.to_string(),
+        _ => "export failed: internal storage error".to_string(),
+    }
+}
+
 /// Applies `_elements` projection to an NDJSON line.
 ///
 /// When `elements` is non-empty, keeps `resourceType`, `id`, `meta` and the
@@ -690,6 +705,34 @@ mod tests {
         assert!(v.get("name").is_some());
         assert!(v.get("gender").is_none());
         assert_eq!(v["meta"]["tag"][0]["code"], "SUBSETTED");
+    }
+
+    #[test]
+    fn test_public_failure_message_keeps_domain_errors() {
+        use crate::error::BulkExportError;
+
+        let err = StorageError::BulkExport(BulkExportError::GroupNotFound {
+            group_id: "g1".to_string(),
+        });
+        let message = public_failure_message(&err);
+        assert!(
+            message.contains("g1"),
+            "domain errors should be stored verbatim, got: {message}"
+        );
+    }
+
+    #[test]
+    fn test_public_failure_message_masks_backend_errors() {
+        use crate::error::BackendError;
+
+        let err = StorageError::Backend(BackendError::Internal {
+            backend_name: "sqlite".to_string(),
+            message: "SELECT * FROM secret".to_string(),
+            source: None,
+        });
+        let message = public_failure_message(&err);
+        assert_eq!(message, "export failed: internal storage error");
+        assert!(!message.contains("SELECT"));
     }
 
     #[cfg(feature = "sqlite")]
@@ -852,6 +895,60 @@ mod tests {
                     .and_then(|w| w.reference.as_ref())
                     .and_then(|r| r.value.as_deref()),
                 Some("Practitioner/dr-1")
+            );
+        }
+
+        #[tokio::test]
+        async fn test_run_job_stores_public_message_on_failure() {
+            let backend = Arc::new(SqliteBackend::in_memory().unwrap());
+            backend.init_schema().unwrap();
+            let tenant = tenant();
+
+            let tmp = tempfile::tempdir().unwrap();
+            let output = Arc::new(LocalFsOutputStore::new(tmp.path(), "http://localhost:8080"));
+
+            // No `Group/g-missing` was ever created, so resolving its members
+            // during the run fails with a domain `GroupNotFound` error.
+            let job_id = backend
+                .start_export(
+                    &tenant,
+                    StartExportInput {
+                        request: ExportRequest::group("g-missing")
+                            .with_types(vec!["Patient".to_string()]),
+                        transaction_time: Utc::now(),
+                        request_url: "http://localhost/Group/g-missing/$export".to_string(),
+                        owner_subject: Some("sub".to_string()),
+                        fhir_version: helios_fhir::FhirVersion::default(),
+                    },
+                )
+                .await
+                .unwrap();
+
+            let worker_id = WorkerId::new("w-fail");
+            let worker = DefaultExportWorker::new(
+                Arc::clone(&backend),
+                Arc::clone(&backend),
+                Arc::clone(&output),
+                worker_id.clone(),
+            );
+
+            let lease = backend
+                .claim_next(&worker_id, Duration::from_secs(60))
+                .await
+                .unwrap()
+                .expect("job claimable");
+
+            let result = worker.run_job(lease).await;
+            assert!(result.is_err(), "run_job should surface the failure");
+
+            let progress = backend.get_export_status(&tenant, &job_id).await.unwrap();
+            assert_eq!(progress.status, ExportStatus::Error);
+            let error_message = progress
+                .error_message
+                .expect("failed job should carry an error message");
+            assert!(
+                error_message.contains("g-missing"),
+                "error message should name the missing group, got: {error_message}"
             );
         }
     }

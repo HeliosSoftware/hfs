@@ -451,6 +451,90 @@ async fn test_group_export_deleted_group_is_404() {
 }
 
 #[tokio::test]
+async fn test_failed_job_status_poll_returns_operation_outcome_with_diagnostics() {
+    let (server, backend, output, _tmp) = create_bulk_export_server().await;
+    seed_patients(&backend, 2).await;
+
+    let tenant = test_tenant();
+    backend
+        .create(
+            &tenant,
+            "Group",
+            json!({
+                "resourceType": "Group",
+                "id": "g-gone",
+                "member": [{"entity": {"reference": "Patient/p1"}}]
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+
+    // Kick-off succeeds — the Group exists at this point.
+    let resp = server
+        .get("/Group/g-gone/$export")
+        .add_header("x-tenant-id", "test-tenant")
+        .add_header("prefer", "respond-async")
+        .await;
+    assert_eq!(resp.status_code(), StatusCode::ACCEPTED);
+    let status_url = resp
+        .headers()
+        .get("content-location")
+        .expect("Content-Location header")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let status_path = status_url
+        .strip_prefix("http://localhost:8080")
+        .unwrap()
+        .to_string();
+
+    // The Group is removed after kick-off, so the worker fails the job when
+    // it tries to resolve its members.
+    backend.delete(&tenant, "Group", "g-gone").await.unwrap();
+
+    // A local drain loop rather than the shared `drain_workers` helper, which
+    // asserts every run succeeds — this job is expected to fail.
+    let worker_id = WorkerId::new("test-worker-failing");
+    let worker = DefaultExportWorker::new(
+        backend.clone(),
+        backend.clone(),
+        output.clone(),
+        worker_id.clone(),
+    );
+    while let Some(lease) = backend
+        .claim_next(&worker_id, Duration::from_secs(60))
+        .await
+        .expect("claim_next")
+    {
+        let _ = worker.run_job(lease).await;
+    }
+
+    let polled = server
+        .get(&status_path)
+        .add_header("x-tenant-id", "test-tenant")
+        .await;
+    assert_eq!(polled.status_code(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(
+        polled.headers().get("content-type").unwrap(),
+        "application/fhir+json"
+    );
+    let body: Value = polled.json();
+    assert_eq!(body["resourceType"], "OperationOutcome");
+    assert_eq!(body["issue"][0]["severity"], "error");
+    assert_eq!(body["issue"][0]["code"], "processing");
+    let diagnostics = body["issue"][0]["diagnostics"].as_str().unwrap();
+    assert!(
+        diagnostics.contains("g-gone"),
+        "diagnostics should mention the missing group id, got: {diagnostics}"
+    );
+    let lower = diagnostics.to_lowercase();
+    assert!(!lower.contains("sqlite"), "got: {diagnostics}");
+    assert!(!lower.contains("select"), "got: {diagnostics}");
+    assert!(!lower.contains("table"), "got: {diagnostics}");
+}
+
+#[tokio::test]
 async fn test_kickoff_requires_respond_async() {
     let (server, _backend, _output, _tmp) = create_bulk_export_server().await;
     let resp = server

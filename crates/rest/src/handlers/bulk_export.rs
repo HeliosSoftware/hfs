@@ -594,9 +594,33 @@ where
                     message: e.to_string(),
                 })
         }
-        ExportStatus::Error => Err(RestError::InternalError {
-            message: "export job failed".to_string(),
-        }),
+        ExportStatus::Error => {
+            let progress = jobs
+                .get_export_status(tenant.context(), &job_id)
+                .await
+                .map_err(map_storage_err)?;
+            let diagnostics = progress
+                .error_message
+                .unwrap_or_else(|| "export job failed".to_string());
+            let body = serde_json::json!({
+                "resourceType": "OperationOutcome",
+                "issue": [{
+                    "severity": "error",
+                    "code": "processing",
+                    "diagnostics": diagnostics,
+                }],
+            });
+            let body = serde_json::to_vec(&body).map_err(|e| RestError::InternalError {
+                message: e.to_string(),
+            })?;
+            Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .header("Content-Type", "application/fhir+json")
+                .body(Body::from(body))
+                .map_err(|e| RestError::InternalError {
+                    message: e.to_string(),
+                })
+        }
         ExportStatus::Cancelled => Err(RestError::NotFound {
             resource_type: "export-job".to_string(),
             id: job_id.to_string(),
