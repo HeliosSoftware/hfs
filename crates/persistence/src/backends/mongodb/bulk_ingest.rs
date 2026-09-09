@@ -58,7 +58,7 @@
 use std::collections::{HashMap, HashSet};
 
 use chrono::{DateTime, Utc};
-use futures::stream::TryStreamExt;
+use futures::stream::{StreamExt, TryStreamExt};
 use helios_fhir::FhirVersion;
 use mongodb::{
     Database,
@@ -67,6 +67,7 @@ use mongodb::{
 };
 use serde_json::Value;
 
+use crate::core::ResourceStorage;
 use crate::core::{
     BulkEntryResult, BulkProcessingOptions, NdjsonEntry, SubmissionChange, SubmissionId,
 };
@@ -79,13 +80,12 @@ use super::storage::{
     extract_fhir_version, internal_error, next_version, value_to_document,
 };
 
-/// Write statements per `update` command.
+/// Receipt upserts per `update` command.
 ///
-/// The server accepts 100 000, but the command document is capped at 16 MB and a
-/// resource statement carries a whole payload, so the cap that binds is size.
-/// 500 keeps a batch of large resources (Synthea `ExplanationOfBenefit` runs to
-/// tens of KB) inside the limit with room to spare, and any batch at or below it
-/// still goes in a single command.
+/// The server accepts 100 000 statements, but the command document is capped at
+/// 16 MB and a receipt carries an `OperationOutcome` when the entry failed, so
+/// the cap that binds is size. 500 keeps even an all-failed batch inside it with
+/// room to spare, and any batch at or below that goes in a single command.
 const UPDATE_STATEMENTS_PER_COMMAND: usize = 500;
 
 /// Documents per `insert_many`.
@@ -546,8 +546,7 @@ impl MongoBackend {
         let mut failed = HashMap::new();
         let mut create_docs = Vec::new();
         let mut create_plans = Vec::new();
-        let mut update_statements = Vec::new();
-        let mut update_plans = Vec::new();
+        let mut update_ops = Vec::new();
 
         for (plan_idx, plan) in planned.plans.iter().enumerate() {
             let payload = Bson::Document(value_to_document(&plan.content)?);
@@ -569,16 +568,16 @@ impl MongoBackend {
                     });
                 }
                 Some(base_version) => {
-                    update_plans.push(plan_idx);
-                    update_statements.push(doc! {
-                        "q": {
+                    update_ops.push((
+                        plan_idx,
+                        doc! {
                             "tenant_id": tenant_id,
                             "resource_type": &plan.resource_type,
                             "id": &plan.id,
                             "version_id": base_version,
                             "is_deleted": false,
                         },
-                        "u": { "$set": {
+                        doc! { "$set": {
                             "version_id": &plan.version,
                             "data": payload,
                             "last_updated": last_updated,
@@ -586,8 +585,7 @@ impl MongoBackend {
                             "deleted_at": Bson::Null,
                             "fhir_version": plan.fhir_version.as_mime_param(),
                         }},
-                        "multi": false,
-                    });
+                    ));
                 }
             }
         }
@@ -640,48 +638,40 @@ impl MongoBackend {
             }
         }
 
-        if !update_statements.is_empty() {
-            let mut offset = 0;
-            for chunk in update_statements.chunks(UPDATE_STATEMENTS_PER_COMMAND) {
-                let applied = run_update_command(
-                    db,
-                    MongoBackend::RESOURCES_COLLECTION,
-                    chunk,
-                    "update batch resources",
-                )
-                .await?;
-                for (index, message) in applied.failures {
-                    let plan_idx = update_plans[offset + index];
-                    let plan = &planned.plans[plan_idx];
-                    failed.insert(
-                        plan_idx,
-                        format!(
-                            "Failed to update {}/{}: {message}",
-                            plan.resource_type, plan.id
-                        ),
-                    );
-                }
-                // A guard that matched nothing is a version conflict: another
-                // writer moved the row between the batch's pre-read and its
-                // write. `update` reports how many statements matched but not
-                // which, so the losers are identified by re-reading — one extra
-                // round trip, and only when the counts disagree.
-                if applied.matched < chunk.len() {
-                    let unresolved: Vec<usize> = (0..chunk.len())
-                        .filter(|i| !failed.contains_key(&update_plans[offset + i]))
-                        .collect();
-                    for plan_idx in self
-                        .find_version_conflicts(
-                            db,
-                            tenant_id,
-                            planned,
-                            &update_plans,
-                            offset,
-                            &unresolved,
-                        )
-                        .await?
-                    {
-                        let plan = &planned.plans[plan_idx];
+        if !update_ops.is_empty() {
+            let collection = db.collection::<Document>(MongoBackend::RESOURCES_COLLECTION);
+            let concurrency = self.bulk_write_concurrency().clamp(1, 16);
+            let applied: Vec<(usize, StorageResult<bool>)> = futures::stream::iter(update_ops)
+                .map(|(plan_idx, filter, update)| {
+                    let collection = collection.clone();
+                    async move {
+                        let outcome = collection
+                            .update_one(filter, update)
+                            .await
+                            .map(|result| result.matched_count == 1)
+                            .map_err(|e| {
+                                internal_error(format!("Failed to update batch resource: {e}"))
+                            });
+                        (plan_idx, outcome)
+                    }
+                })
+                .buffer_unordered(concurrency)
+                .collect()
+                .await;
+
+            for (plan_idx, outcome) in applied {
+                let plan = &planned.plans[plan_idx];
+                match outcome {
+                    Ok(true) => {}
+                    // The guard matched nothing: another writer moved the row
+                    // between this batch's pre-read and its write. There is no
+                    // way to see that from a batched `update`'s aggregate
+                    // counts — two batches that both read version N both target
+                    // N+1, so the row carrying N+1 afterwards does not say whose
+                    // write put it there — which is why each update is its own
+                    // statement. They still go out `bulk_write_concurrency` at a
+                    // time, and a fresh import has none of them at all.
+                    Ok(false) => {
                         failed.insert(
                             plan_idx,
                             StorageError::Concurrency(ConcurrencyError::VersionConflict {
@@ -693,70 +683,14 @@ impl MongoBackend {
                             .to_string(),
                         );
                     }
+                    Err(e) => {
+                        failed.insert(plan_idx, e.to_string());
+                    }
                 }
-                offset += chunk.len();
             }
         }
 
         Ok(failed)
-    }
-
-    /// Re-reads the rows an `update` command reported as unmatched and returns
-    /// the plans whose version did not land.
-    async fn find_version_conflicts(
-        &self,
-        db: &Database,
-        tenant_id: &str,
-        planned: &PlannedBatch,
-        update_plans: &[usize],
-        offset: usize,
-        candidates: &[usize],
-    ) -> StorageResult<Vec<usize>> {
-        let mut by_key: HashMap<(&str, &str), usize> = HashMap::new();
-        let mut ids_by_type: HashMap<&str, Vec<Bson>> = HashMap::new();
-        for i in candidates {
-            let plan_idx = update_plans[offset + i];
-            let plan = &planned.plans[plan_idx];
-            by_key.insert((plan.resource_type.as_str(), plan.id.as_str()), plan_idx);
-            ids_by_type
-                .entry(plan.resource_type.as_str())
-                .or_default()
-                .push(Bson::from(plan.id.as_str()));
-        }
-
-        let resources = db.collection::<Document>(MongoBackend::RESOURCES_COLLECTION);
-        let mut landed: HashSet<usize> = HashSet::new();
-        for (resource_type, ids) in ids_by_type {
-            let mut cursor = resources
-                .find(doc! {
-                    "tenant_id": tenant_id,
-                    "resource_type": resource_type,
-                    "id": { "$in": ids },
-                })
-                .await
-                .map_err(|e| internal_error(format!("Failed to reconcile batch updates: {e}")))?;
-            while let Some(document) = cursor
-                .try_next()
-                .await
-                .map_err(|e| internal_error(format!("Failed to reconcile batch updates: {e}")))?
-            {
-                let (Ok(id), Ok(version_id)) =
-                    (document.get_str("id"), document.get_str("version_id"))
-                else {
-                    continue;
-                };
-                if let Some(plan_idx) = by_key.get(&(resource_type, id))
-                    && planned.plans[*plan_idx].version == version_id
-                {
-                    landed.insert(*plan_idx);
-                }
-            }
-        }
-
-        Ok(by_key
-            .into_values()
-            .filter(|plan_idx| !landed.contains(plan_idx))
-            .collect())
     }
 
     /// Writes one `resource_history` document per written version.
@@ -919,17 +853,17 @@ impl MongoBackend {
 
 /// A collection `update` command's outcome.
 struct UpdateOutcome {
-    /// Statements whose filter matched a document.
-    matched: usize,
     /// Statements the server reported a write error for, with its message.
     failures: Vec<(usize, String)>,
 }
 
 /// Runs `statements` as one collection `update` command.
 ///
-/// The Rust driver's `bulk_write` is a MongoDB 8.0 command, and this backend
+/// The Rust driver's `bulk_write` is a MongoDB 8.0 command and this backend
 /// supports 7.0, so the multi-statement `update` command is how a batch's
-/// updates go over the wire in one round trip.
+/// receipt upserts go over the wire in one round trip. It suits them because
+/// they need no per-statement attribution: they are keyed by
+/// `(manifest, file_url, line)`, which no other writer contends for.
 async fn run_update_command(
     db: &Database,
     collection: &str,
@@ -945,15 +879,6 @@ async fn run_update_command(
         .await
         .map_err(|e| internal_error(format!("{context}: {e}")))?;
 
-    let matched = response
-        .get_i32("n")
-        .map(|n| n as usize)
-        .unwrap_or_else(|_| {
-            response
-                .get_i64("n")
-                .map(|n| n as usize)
-                .unwrap_or(statements.len())
-        });
     let mut failures = Vec::new();
     if let Ok(write_errors) = response.get_array("writeErrors") {
         for write_error in write_errors {
@@ -971,7 +896,7 @@ async fn run_update_command(
             }
         }
     }
-    Ok(UpdateOutcome { matched, failures })
+    Ok(UpdateOutcome { failures })
 }
 
 /// Inserts `documents` in chunked, unordered `insert` commands.

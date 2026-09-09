@@ -4452,6 +4452,303 @@ mod bulk_submit {
         assert_eq!(stored.content()["gender"], json!("female"));
     }
 
+    /// A tombstoned id is not an update target, and `create` refuses it too —
+    /// its existence probe does not filter `is_deleted`, so it reports
+    /// `AlreadyExists`. That is a pre-existing defect in the resource layer, not
+    /// in the ingest; this pins the behaviour so the batched path is known to
+    /// reproduce it rather than to have quietly changed it.
+    #[tokio::test]
+    async fn test_reimporting_a_deleted_resource_reports_already_exists() {
+        let Some(backend) = create_backend("submit_deleted_reimport").await else {
+            return;
+        };
+        let tenant = create_tenant("submit-tenant");
+        let (id, manifest_id) = seed(&backend, &tenant).await;
+
+        let created = backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType": "Patient", "id": "tombstoned"}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        backend
+            .delete(&tenant, "Patient", created.id())
+            .await
+            .unwrap();
+
+        let results = backend
+            .process_entries(
+                &tenant,
+                &id,
+                &manifest_id,
+                vec![NdjsonEntry::new(
+                    1,
+                    "Patient",
+                    json!({"resourceType": "Patient", "id": "tombstoned"}),
+                )],
+                &BulkProcessingOptions::new(),
+            )
+            .await
+            .unwrap();
+
+        assert!(results[0].is_error());
+        let diagnostics = results[0].operation_outcome.as_ref().unwrap()["issue"][0]["diagnostics"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            diagnostics.contains("already exists"),
+            "expected an already-exists diagnostic, got {diagnostics}"
+        );
+    }
+
+    /// A tenant that may not write the type gets a per-entry processing error,
+    /// not a failed batch — the permission check is per entry, as it was when
+    /// each entry called `create`/`update` for itself.
+    #[tokio::test]
+    async fn test_entries_the_tenant_may_not_write_fail_individually() {
+        let Some(backend) = create_backend("submit_permission_denied").await else {
+            return;
+        };
+        let writer = create_tenant("submit-tenant");
+        let (id, manifest_id) = seed(&backend, &writer).await;
+        let reader = TenantContext::new(writer.tenant_id().clone(), TenantPermissions::read_only());
+
+        let results = backend
+            .process_entries(
+                &reader,
+                &id,
+                &manifest_id,
+                vec![NdjsonEntry::new(
+                    1,
+                    "Patient",
+                    json!({"resourceType": "Patient", "id": "forbidden"}),
+                )],
+                &BulkProcessingOptions::new(),
+            )
+            .await
+            .unwrap();
+
+        assert!(results[0].is_error(), "a read-only tenant cannot create");
+        assert!(
+            backend
+                .read(&writer, "Patient", "forbidden")
+                .await
+                .unwrap()
+                .is_none(),
+            "and nothing was written"
+        );
+    }
+
+    /// `max_errors` with `continue_on_error` off aborts the batch — but the
+    /// entries processed before the abort keep their receipts, which is what the
+    /// per-entry path left behind and what a re-fetch relies on.
+    #[tokio::test]
+    async fn test_max_errors_aborts_the_batch_but_keeps_earlier_receipts() {
+        let Some(backend) = create_backend("submit_max_errors_abort").await else {
+            return;
+        };
+        let tenant = create_tenant("submit-tenant");
+        let (id, manifest_id) = seed(&backend, &tenant).await;
+
+        let outcome = backend
+            .process_entries(
+                &tenant,
+                &id,
+                &manifest_id,
+                vec![
+                    NdjsonEntry::new(
+                        1,
+                        "Patient",
+                        json!({"resourceType": "Observation", "id": "wrong"}),
+                    ),
+                    NdjsonEntry::new(
+                        2,
+                        "Patient",
+                        json!({"resourceType": "Patient", "id": "never-reached"}),
+                    ),
+                ],
+                &BulkProcessingOptions::strict(),
+            )
+            .await;
+        assert!(
+            matches!(
+                outcome,
+                Err(StorageError::BulkSubmit(
+                    helios_persistence::error::BulkSubmitError::MaxErrorsExceeded { .. }
+                ))
+            ),
+            "expected MaxErrorsExceeded, got {outcome:?}"
+        );
+
+        let counts = backend
+            .get_entry_counts(&tenant, &id, &manifest_id)
+            .await
+            .unwrap();
+        assert_eq!(counts.total, 1, "only the entry that ran has a receipt");
+        assert_eq!(counts.validation_error, 1);
+        assert!(
+            backend
+                .read(&tenant, "Patient", "never-reached")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// With `continue_on_error` on, everything past `max_errors` is recorded as
+    /// skipped rather than attempted.
+    #[tokio::test]
+    async fn test_max_errors_with_continue_on_error_skips_the_rest() {
+        let Some(backend) = create_backend("submit_max_errors_skip").await else {
+            return;
+        };
+        let tenant = create_tenant("submit-tenant");
+        let (id, manifest_id) = seed(&backend, &tenant).await;
+
+        let results = backend
+            .process_entries(
+                &tenant,
+                &id,
+                &manifest_id,
+                vec![
+                    NdjsonEntry::new(
+                        1,
+                        "Patient",
+                        json!({"resourceType": "Observation", "id": "wrong"}),
+                    ),
+                    NdjsonEntry::new(2, "Patient", json!({"resourceType": "Patient", "id": "a"})),
+                    NdjsonEntry::new(3, "Patient", json!({"resourceType": "Patient", "id": "b"})),
+                ],
+                &BulkProcessingOptions::new()
+                    .with_max_errors(1)
+                    .with_continue_on_error(true),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(results.len(), 3);
+        assert!(results[0].is_error());
+        assert!(
+            results[1..]
+                .iter()
+                .all(|r| !r.is_success() && !r.is_error()),
+            "entries past max_errors are skipped, got {results:?}"
+        );
+        assert!(
+            backend
+                .read(&tenant, "Patient", "a")
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        let counts = backend
+            .get_entry_counts(&tenant, &id, &manifest_id)
+            .await
+            .unwrap();
+        assert_eq!(counts.skipped, 2);
+    }
+
+    /// Two batches ingesting the same ids at once — the shape
+    /// `HFS_BULK_SUBMIT_FILE_CONCURRENCY > 1` produces when two of a manifest's
+    /// files carry the same resource. Whichever loses the race must lose it
+    /// cleanly: no failed call, no duplicated row, no receipt lost.
+    ///
+    /// Half the ids exist beforehand and half do not, so both collision paths
+    /// are in play: two concurrent inserts of a new id (one loses on the unique
+    /// index) and two concurrent updates of an existing one (one loses the
+    /// version guard, which the batch resolves by re-reading).
+    ///
+    /// The assertions are invariants rather than an expected winner, so the test
+    /// does not depend on how the two interleave.
+    #[tokio::test]
+    async fn test_two_batches_racing_for_the_same_ids_stay_consistent() {
+        let Some(backend) = create_backend("submit_concurrent_same_ids").await else {
+            return;
+        };
+        let backend = std::sync::Arc::new(backend);
+        let tenant = create_tenant("submit-tenant");
+        let (id, manifest_id) = seed(backend.as_ref(), &tenant).await;
+
+        const IDS: usize = 60;
+        for n in (0..IDS).step_by(2) {
+            backend
+                .create(
+                    &tenant,
+                    "Patient",
+                    json!({"resourceType": "Patient", "id": format!("racer-{n}")}),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+
+        let entries = || {
+            (0..IDS)
+                .map(|n| {
+                    NdjsonEntry::new(
+                        n as u64 + 1,
+                        "Patient",
+                        json!({"resourceType": "Patient", "id": format!("racer-{n}")}),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let mut handles = Vec::new();
+        for file in ["race-a.ndjson", "race-b.ndjson"] {
+            let backend = backend.clone();
+            let tenant = tenant.clone();
+            let id = id.clone();
+            let manifest_id = manifest_id.clone();
+            let entries = entries();
+            handles.push(tokio::spawn(async move {
+                backend
+                    .process_entries(
+                        &tenant,
+                        &id,
+                        &manifest_id,
+                        entries,
+                        &BulkProcessingOptions::new().with_file_url(file),
+                    )
+                    .await
+            }));
+        }
+        for handle in handles {
+            let results = handle.await.unwrap().expect("a losing batch still returns");
+            assert_eq!(results.len(), IDS);
+        }
+
+        for n in 0..IDS {
+            let stored = backend
+                .read(&tenant, "Patient", &format!("racer-{n}"))
+                .await
+                .unwrap()
+                .unwrap_or_else(|| panic!("racer-{n} must exist exactly once"));
+            // Pre-existing ids start at 1 and can be bumped once or twice
+            // depending on how the two batches interleaved; new ids start at 1.
+            assert!(
+                ["1", "2", "3"].contains(&stored.version_id()),
+                "racer-{n} landed at version {}",
+                stored.version_id()
+            );
+        }
+
+        let counts = backend
+            .get_entry_counts(&tenant, &id, &manifest_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            counts.total,
+            (IDS * 2) as u64,
+            "every line of both files keeps its own receipt"
+        );
+    }
+
     /// Line numbers restart in every manifest output file, so the file is part
     /// of an entry result's identity (#457). Without it the second file's line 1
     /// overwrites the first file's.
