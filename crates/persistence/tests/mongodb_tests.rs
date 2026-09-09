@@ -4150,6 +4150,308 @@ mod bulk_submit {
         );
     }
 
+    /// `HFS_BULK_SUBMIT_DEFER_INDEXING` (#903) was a no-op on this backend: the
+    /// per-entry path reached the search index through `create`/`update`, which
+    /// have no way to be told to skip it, so a "fast load" still wrote ~21
+    /// `search_index` documents per resource (#1000). The batched ingest owns
+    /// the index write, so the switch now actually defers it — and the resource,
+    /// its history and its receipt still land, because deferring is only ever
+    /// about the derived index.
+    #[tokio::test]
+    async fn test_defer_indexing_skips_the_search_index_but_stores_everything_else() {
+        let Some(backend) = create_backend("submit_defer_indexing").await else {
+            return;
+        };
+        let tenant = create_tenant("submit-tenant");
+        let (id, manifest_id) = seed(&backend, &tenant).await;
+
+        let results = backend
+            .process_entries(
+                &tenant,
+                &id,
+                &manifest_id,
+                vec![NdjsonEntry::new(
+                    1,
+                    "Patient",
+                    json!({
+                        "resourceType": "Patient",
+                        "id": "deferred",
+                        "name": [{"family": "Deferred"}]
+                    }),
+                )],
+                &BulkProcessingOptions::new().with_defer_indexing(true),
+            )
+            .await
+            .unwrap();
+        assert!(results[0].is_success());
+
+        assert_eq!(
+            search_index_entry_count(&backend, &tenant, "Patient", "deferred").await,
+            0,
+            "deferred indexing must not write search_index documents"
+        );
+        assert!(
+            backend
+                .read(&tenant, "Patient", "deferred")
+                .await
+                .unwrap()
+                .is_some(),
+            "the resource itself is stored either way"
+        );
+        assert_eq!(
+            backend
+                .list_versions(&tenant, "Patient", "deferred")
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "history is stored either way"
+        );
+
+        // The default still indexes, so the switch is what makes the difference.
+        backend
+            .process_entries(
+                &tenant,
+                &id,
+                &manifest_id,
+                vec![NdjsonEntry::new(
+                    2,
+                    "Patient",
+                    json!({
+                        "resourceType": "Patient",
+                        "id": "indexed",
+                        "name": [{"family": "Indexed"}]
+                    }),
+                )],
+                &BulkProcessingOptions::new(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            search_index_entry_count(&backend, &tenant, "Patient", "indexed").await > 0,
+            "without the switch the batch still indexes inline"
+        );
+    }
+
+    /// A batch is planned against an overlay of its own staged writes, so an id
+    /// repeated inside one batch versions forward exactly as it did when every
+    /// entry was its own round trip: one history row per entry, the last
+    /// entry's content stored, and one rollback record per entry.
+    #[tokio::test]
+    async fn test_repeated_id_in_one_batch_versions_forward() {
+        let Some(backend) = create_backend("submit_repeated_id").await else {
+            return;
+        };
+        let tenant = create_tenant("submit-tenant");
+        let (id, manifest_id) = seed(&backend, &tenant).await;
+
+        let entries = (1..=3)
+            .map(|n| {
+                NdjsonEntry::new(
+                    n,
+                    "Patient",
+                    json!({
+                        "resourceType": "Patient",
+                        "id": "repeated",
+                        "gender": if n == 3 { "male" } else { "female" },
+                    }),
+                )
+            })
+            .collect();
+        let results = backend
+            .process_entries(
+                &tenant,
+                &id,
+                &manifest_id,
+                entries,
+                &BulkProcessingOptions::new(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(results.len(), 3);
+        assert!(results.iter().all(|r| r.is_success()));
+        assert!(
+            results[0].created && !results[1].created && !results[2].created,
+            "only the first entry creates, got {results:?}"
+        );
+
+        let stored = backend
+            .read(&tenant, "Patient", "repeated")
+            .await
+            .unwrap()
+            .expect("the repeated id is stored once");
+        assert_eq!(stored.version_id(), "3");
+        assert_eq!(stored.content()["gender"], json!("male"));
+
+        let mut versions = backend
+            .list_versions(&tenant, "Patient", "repeated")
+            .await
+            .unwrap();
+        versions.sort();
+        assert_eq!(
+            versions,
+            vec!["1".to_string(), "2".to_string(), "3".to_string()],
+            "every entry contributes its own history version"
+        );
+
+        let changes = backend.list_changes(&tenant, &id, 100, 0).await.unwrap();
+        assert_eq!(
+            changes.len(),
+            3,
+            "the rollback log records one change per entry, got {changes:?}"
+        );
+        assert_eq!(
+            changes
+                .iter()
+                .filter(|c| c.change_type == ChangeType::Create)
+                .count(),
+            1
+        );
+
+        // The index reflects the final version only, not one row set per entry.
+        let indexed = search_index_entry_count(&backend, &tenant, "Patient", "repeated").await;
+        backend
+            .process_entries(
+                &tenant,
+                &id,
+                &manifest_id,
+                vec![NdjsonEntry::new(
+                    4,
+                    "Patient",
+                    json!({"resourceType": "Patient", "id": "single", "gender": "male"}),
+                )],
+                &BulkProcessingOptions::new().with_file_url("second.ndjson"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            indexed,
+            search_index_entry_count(&backend, &tenant, "Patient", "single").await,
+            "three entries for one id leave the same index rows as one entry would"
+        );
+    }
+
+    /// One bad entry must not take the rest of its batch down with it, and every
+    /// entry — success, validation error or skip — still gets a receipt at its
+    /// own line number.
+    #[tokio::test]
+    async fn test_a_mixed_batch_keeps_results_aligned_to_lines() {
+        let Some(backend) = create_backend("submit_mixed_batch").await else {
+            return;
+        };
+        let tenant = create_tenant("submit-tenant");
+        let (id, manifest_id) = seed(&backend, &tenant).await;
+
+        let results = backend
+            .process_entries(
+                &tenant,
+                &id,
+                &manifest_id,
+                vec![
+                    NdjsonEntry::new(
+                        1,
+                        "Patient",
+                        json!({"resourceType": "Patient", "id": "ok-1"}),
+                    ),
+                    // Payload disagrees with the file's declared type.
+                    NdjsonEntry::new(
+                        2,
+                        "Patient",
+                        json!({"resourceType": "Observation", "id": "wrong"}),
+                    ),
+                    NdjsonEntry::new(
+                        3,
+                        "Patient",
+                        json!({"resourceType": "Patient", "id": "ok-2"}),
+                    ),
+                ],
+                &BulkProcessingOptions::new(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(results.len(), 3);
+        assert_eq!(
+            results.iter().map(|r| r.line_number).collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        assert!(results[0].is_success() && results[2].is_success());
+        assert!(results[1].is_error(), "line 2 is a validation error");
+        assert!(
+            backend
+                .read(&tenant, "Patient", "ok-2")
+                .await
+                .unwrap()
+                .is_some(),
+            "an entry after the bad one still lands"
+        );
+
+        let counts = backend
+            .get_entry_counts(&tenant, &id, &manifest_id)
+            .await
+            .unwrap();
+        assert_eq!(counts.total, 3);
+        assert_eq!(counts.success, 2);
+        assert_eq!(counts.validation_error, 1);
+    }
+
+    /// With `allow_updates` off, an id that already exists is skipped rather
+    /// than versioned — and the pre-existing row keeps its content.
+    #[tokio::test]
+    async fn test_create_only_skips_existing_ids() {
+        let Some(backend) = create_backend("submit_create_only").await else {
+            return;
+        };
+        let tenant = create_tenant("submit-tenant");
+        let (id, manifest_id) = seed(&backend, &tenant).await;
+
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType": "Patient", "id": "existing", "gender": "female"}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+
+        let results = backend
+            .process_entries(
+                &tenant,
+                &id,
+                &manifest_id,
+                vec![
+                    NdjsonEntry::new(
+                        1,
+                        "Patient",
+                        json!({"resourceType": "Patient", "id": "existing", "gender": "male"}),
+                    ),
+                    NdjsonEntry::new(
+                        2,
+                        "Patient",
+                        json!({"resourceType": "Patient", "id": "fresh"}),
+                    ),
+                ],
+                &BulkProcessingOptions::create_only(),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            !results[0].is_success() && !results[0].is_error(),
+            "skipped"
+        );
+        assert!(results[1].is_success() && results[1].created);
+        let stored = backend
+            .read(&tenant, "Patient", "existing")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.version_id(), "1");
+        assert_eq!(stored.content()["gender"], json!("female"));
+    }
+
     /// Line numbers restart in every manifest output file, so the file is part
     /// of an entry result's identity (#457). Without it the second file's line 1
     /// overwrites the first file's.
