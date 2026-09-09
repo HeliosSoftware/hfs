@@ -896,7 +896,7 @@ mod es_integration {
             .map(|n| {
                 StoredResource::from_storage(
                     "Patient",
-                    &format!("page-{n}"),
+                    format!("page-{n}"),
                     "7",
                     tenant.tenant_id().clone(),
                     json!({
