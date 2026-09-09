@@ -24,8 +24,8 @@ use crate::core::bulk_export_output::{ExportOutputStore, ExportPartKey};
 use crate::core::bulk_export_worker::{LeaseError, WorkerId};
 use crate::core::bulk_submit::{
     BulkEntryOutcome, BulkProcessingOptions, BulkSubmitProvider, BulkSubmitRollbackProvider,
-    ByteProgress, EntryResultPage, ImportMode, StreamingBulkSubmitProvider, SubmissionId,
-    entry_result_pages,
+    ByteProgress, EntryResultPage, ImportMode, ManifestPhase, StreamingBulkSubmitProvider,
+    SubmissionId, entry_result_pages,
 };
 use crate::core::bulk_submit_input::{SubmitInputFetcher, submission_output_job_id};
 use crate::error::{StorageError, StorageResult};
@@ -94,7 +94,13 @@ pub struct ManifestWorkerView {
     /// manifest and surfaces them to the worker (which logs them) so deployment- or
     /// IG-specific handling can be layered on without another migration.
     pub metadata: Vec<(String, String)>,
-    /// Resume cursor: lines already processed for this manifest.
+    /// Entries this manifest has already walked, across every run of it.
+    ///
+    /// Informational only — nothing resumes from it. A reclaimed manifest
+    /// re-walks each of its files from the top and the re-ingested entries
+    /// upsert idempotently; this cursor is the checkpoint a future per-line
+    /// resume would read, but no such consumer exists yet. Counted like the
+    /// other progress columns, so it only ever moves forward (#969).
     pub last_processed_line: u64,
     /// FHIR version this submission ingests against.
     pub fhir_version: FhirVersion,
@@ -217,13 +223,28 @@ pub trait SubmitWorkerStorage: Send + Sync {
     /// Marks the manifest `processing`. Fenced.
     async fn mark_manifest_processing(&self, lease: &ManifestLease) -> Result<(), LeaseError>;
 
-    /// Idempotent update of per-manifest progress (counts + resume cursor). Fenced.
-    async fn update_manifest_progress(
+    /// Adds to the manifest's progress counters. Fenced.
+    ///
+    /// The counters are **cumulative across every run of the manifest** and are
+    /// owned by the ingestion engine: each committed batch adds its own entries
+    /// atomically with the rows it wrote (`processed_entries += success +
+    /// skipped`, `failed_entries += errors`, `last_processed_line +=
+    /// entries`). The worker only contributes the deltas no batch can see —
+    /// a file it could not fetch or could not ingest at all — so both writers
+    /// share one semantics and a resumed manifest never walks its progress
+    /// backwards (#969).
+    ///
+    /// Deltas are therefore *not* idempotent: re-ingesting an entry after a
+    /// worker restart adds to `processed_entries` a second time, so the counts
+    /// over-report on a resumed manifest until the re-walk is eliminated by a
+    /// per-line resume. Over-reporting is the safe direction — a status poller sees
+    /// progress that only ever moves forward.
+    async fn add_manifest_progress(
         &self,
         lease: &ManifestLease,
-        processed_entries: u64,
-        failed_entries: u64,
-        last_processed_line: u64,
+        processed_delta: u64,
+        failed_delta: u64,
+        lines_delta: u64,
     ) -> Result<(), LeaseError>;
 
     /// Idempotent update of the manifest's byte progress — bytes consumed so
@@ -235,6 +256,19 @@ pub trait SubmitWorkerStorage: Send + Sync {
         lease: &ManifestLease,
         bytes_processed: u64,
         bytes_total: u64,
+    ) -> Result<(), LeaseError>;
+
+    /// Records the coarse pre-ingest phase and its `files_done`/`files_total`
+    /// pair, so the status endpoint has something to say before the byte and
+    /// entry counters move (#953). Purely cosmetic — callers log and continue
+    /// on storage errors — but fenced all the same, so a zombie worker cannot
+    /// rewrite the phase of a manifest that was reclaimed under it.
+    async fn update_manifest_phase(
+        &self,
+        lease: &ManifestLease,
+        phase: ManifestPhase,
+        files_done: u64,
+        files_total: u64,
     ) -> Result<(), LeaseError>;
 
     /// Idempotent upsert of a finalized status-manifest artifact row. Fenced.
@@ -472,20 +506,65 @@ impl tokio::io::AsyncBufRead for CountingReader {
 /// monotonic (`MAX`), so a stale flush can never walk progress backwards.
 /// The heartbeat alone decides lease health.
 ///
+/// A lease that cannot be renewed before it expires is fatal to the run that
+/// holds it (#969). A heartbeat starved behind the ingest loop's writes used to
+/// be retried indefinitely, so the manifest stayed claimable — eligible for
+/// `claim_next_manifest` by a second worker — while this one kept committing
+/// batches: silent duplicate ingestion on a cluster. Each renewal is now bounded
+/// by what is left of the lease, and once `lease_expiry` passes unrenewed the
+/// keeper declares the lease lost, which aborts the run mid-file.
+///
 /// Dropping the keeper stops the renewal task.
 struct LeaseKeeper {
-    lost: Arc<AtomicBool>,
+    /// Held rather than only subscribed to, so `run_job` can declare the lease
+    /// lost too when a fenced write answers `LeaseLost`.
+    lost: tokio::sync::watch::Sender<bool>,
     handle: tokio::task::JoinHandle<()>,
 }
 
+/// The slice of a job store the [`LeaseKeeper`] uses.
+///
+/// Narrow on purpose: a keeper that must be handed a whole [`BulkSubmitJobStore`]
+/// can only be exercised against a real backend, and the failure this guards —
+/// a heartbeat that never lands — is exactly the one a real backend will not
+/// reproduce on demand.
+#[async_trait]
+trait LeaseRenewal: Send + Sync {
+    /// Renews the lease, returning its new expiry.
+    async fn heartbeat(&self, lease: &ManifestLease) -> Result<DateTime<Utc>, LeaseError>;
+
+    /// Persists byte progress, best-effort — failures are not lease-relevant.
+    async fn flush_bytes(&self, lease: &ManifestLease, consumed: u64, total: u64);
+}
+
+/// Adapts a job store to the keeper's narrow surface.
+struct JobStoreRenewal<Js: ?Sized>(Arc<Js>);
+
+#[async_trait]
+impl<Js> LeaseRenewal for JobStoreRenewal<Js>
+where
+    Js: BulkSubmitJobStore + ?Sized + 'static,
+{
+    async fn heartbeat(&self, lease: &ManifestLease) -> Result<DateTime<Utc>, LeaseError> {
+        self.0.heartbeat(lease).await
+    }
+
+    async fn flush_bytes(&self, lease: &ManifestLease, consumed: u64, total: u64) {
+        let _ = self.0.update_manifest_bytes(lease, consumed, total).await;
+    }
+}
+
 impl LeaseKeeper {
-    fn spawn<Js>(jobs: Arc<Js>, lease: ManifestLease, progress: ByteProgress) -> Self
+    fn spawn<R>(jobs: Arc<R>, lease: ManifestLease, progress: ByteProgress) -> Self
     where
-        Js: BulkSubmitJobStore + ?Sized + 'static,
+        R: LeaseRenewal + ?Sized + 'static,
     {
         const FLUSH_EVERY: Duration = Duration::from_secs(3);
-        let lost = Arc::new(AtomicBool::new(false));
-        let flag = Arc::clone(&lost);
+        /// Pause between renewal attempts after a storage error. Short, because
+        /// the whole retry window is capped by the lease's remaining life.
+        const RETRY_AFTER: Duration = Duration::from_millis(500);
+        let (lost, _) = tokio::sync::watch::channel(false);
+        let flag = lost.clone();
         let handle = tokio::spawn(async move {
             let mut expiry = lease.lease_expiry;
             let mut last_flushed: u64 = 0;
@@ -505,31 +584,84 @@ impl LeaseKeeper {
                     let consumed = progress.consumed.load(Ordering::Relaxed);
                     if total > 0 && consumed != last_flushed {
                         last_flushed = consumed;
-                        let _ = jobs.update_manifest_bytes(&lease, consumed, total).await;
+                        jobs.flush_bytes(&lease, consumed, total).await;
                     }
                 }
-                match jobs.heartbeat(&lease).await {
-                    Ok(new_expiry) => expiry = new_expiry,
-                    Err(LeaseError::LeaseLost { .. }) => {
-                        flag.store(true, Ordering::SeqCst);
-                        return;
+                // Renew, retrying only for as long as the lease still covers
+                // the writes the ingest loop is making in parallel. A renewal
+                // that has not landed by `expiry` is indistinguishable from a
+                // lost one: the manifest is claimable either way.
+                let mut renewed = None;
+                loop {
+                    let left = (expiry - Utc::now())
+                        .to_std()
+                        .unwrap_or(Duration::from_secs(0));
+                    if left.is_zero() {
+                        break;
                     }
-                    Err(LeaseError::Storage(e)) => {
-                        tracing::debug!(
-                            submission = %lease.submission_id,
-                            manifest = %lease.manifest_id,
-                            error = %e,
-                            "bulk-submit lease heartbeat failed; retrying"
-                        );
+                    match tokio::time::timeout(left, jobs.heartbeat(&lease)).await {
+                        Ok(Ok(new_expiry)) => {
+                            renewed = Some(new_expiry);
+                            break;
+                        }
+                        // Already reclaimed by another worker — expected, and
+                        // the run aborts quietly.
+                        Ok(Err(LeaseError::LeaseLost { .. })) => {
+                            let _ = flag.send(true);
+                            return;
+                        }
+                        Ok(Err(LeaseError::Storage(e))) => {
+                            tracing::debug!(
+                                submission = %lease.submission_id,
+                                manifest = %lease.manifest_id,
+                                error = %e,
+                                "bulk-submit lease heartbeat failed; retrying"
+                            );
+                            tokio::time::sleep(RETRY_AFTER.min(left)).await;
+                        }
+                        // Starved behind the ingest loop's writer for the rest
+                        // of the lease.
+                        Err(_elapsed) => break,
                     }
                 }
+                let Some(new_expiry) = renewed else {
+                    tracing::warn!(
+                        submission = %lease.submission_id,
+                        manifest = %lease.manifest_id,
+                        worker = %lease.worker_id,
+                        "bulk-submit lease could not be renewed before it expired; \
+                         abandoning the manifest so it can be reclaimed"
+                    );
+                    let _ = flag.send(true);
+                    return;
+                };
+                expiry = new_expiry;
             }
         });
         Self { lost, handle }
     }
 
     fn lease_lost(&self) -> bool {
-        self.lost.load(Ordering::SeqCst)
+        *self.lost.borrow()
+    }
+
+    /// Marks the lease lost from outside the renewal task — used when a fenced
+    /// write answers `LeaseLost`, which is as conclusive as a failed heartbeat.
+    fn declare_lost(&self) {
+        let _ = self.lost.send(true);
+    }
+
+    /// Resolves once the lease is lost, and never otherwise. Raced against the
+    /// ingest so a loss aborts mid-file rather than only between files.
+    async fn lost(&self) {
+        let mut rx = self.lost.subscribe();
+        while !*rx.borrow_and_update() {
+            if rx.changed().await.is_err() {
+                // Only reachable if the sender is dropped, which cannot happen
+                // while `self` is alive.
+                return;
+            }
+        }
     }
 }
 
@@ -598,7 +730,26 @@ where
             return Ok(());
         };
 
+        let progress = ByteProgress::default();
+        // The lease must stay heartbeated *through* a file, not only between
+        // files, and independently of how often the ingest future yields; the
+        // keeper renews from its own task until dropped.
+        //
+        // Spawned here rather than after pre-sizing (#953): fetching the remote
+        // manifest and HEAD-ing its output files can take minutes on a
+        // file-heavy corpus, and that whole window used to pass without a
+        // single heartbeat. The keeper only *flushes bytes* once
+        // `progress.total` is non-zero, so starting it early adds heartbeats
+        // and nothing else.
+        let keeper = LeaseKeeper::spawn(
+            Arc::new(JobStoreRenewal(Arc::clone(&self.jobs))),
+            lease.clone(),
+            progress.clone(),
+        );
+
         // 1. Fetch the remote Bulk Export Manifest.
+        self.report_phase(&lease, ManifestPhase::ReadingManifest, 0, 0)
+            .await;
         let manifest = match self
             .fetcher
             .fetch_manifest(
@@ -617,6 +768,9 @@ where
                     &format!("failed to fetch manifest: {e}"),
                 )
                 .await?;
+                // Stop renewing before the manifest goes terminal, so no
+                // heartbeat lands on a row this task has already failed.
+                drop(keeper);
                 let _ = self.jobs.fail_manifest(&lease, &e.to_string()).await;
                 return Ok(());
             }
@@ -634,71 +788,112 @@ where
                 "ingesting manifest with submission metadata"
             );
         }
-        let progress = ByteProgress::default();
         let opts = BulkProcessingOptions::new()
             .with_import_mode(import_mode)
             .with_defer_indexing(self.defer_indexing)
             .with_byte_progress(progress.clone());
+        let file_count = manifest.output.len() as u64;
         // Pre-size the byte denominator: every output file's advertised size
         // up front, so the percentage never recomputes against a partial
         // total — learned lazily per file, each newly opened file yanked the
         // bar backwards on multi-file manifests (#874). Encrypted files are
         // skipped (wire length ≠ decrypted length); any unknown size falls
         // back to lazy accumulation below.
+        //
+        // The HEADs run `file_concurrency` at a time, like the ingest fan-out
+        // below: serially, a manifest with hundreds of outputs spent hundreds
+        // of sequential round trips here before the first byte was read (#953).
         let mut presized = false;
         if view.file_encryption_key.is_none() && !manifest.output.is_empty() {
-            let mut sum: u64 = 0;
-            let mut all_known = true;
-            for file in &manifest.output {
-                match self
-                    .fetcher
-                    .file_size(
-                        &file.url,
-                        &view.file_request_headers,
-                        manifest.requires_access_token,
-                        &view.oauth_metadata_urls,
-                    )
-                    .await
-                {
-                    Ok(Some(len)) => sum += len,
-                    _ => {
-                        all_known = false;
-                        break;
+            self.report_phase(&lease, ManifestPhase::Sizing, 0, file_count)
+                .await;
+            let sum = AtomicU64::new(0);
+            let all_known = AtomicBool::new(true);
+            let sized = AtomicU64::new(0);
+            let sum_ref = &sum;
+            let all_known_ref = &all_known;
+            let sized_ref = &sized;
+            let view_ref = &view;
+            let lease_ref = &lease;
+            let manifest_ref = &manifest;
+
+            // Indexed like the ingest fan-out below, so the closure's argument
+            // stays owned and the future may borrow `manifest.output[i]`.
+            let mut sizing = futures::stream::iter(0..manifest.output.len())
+                .map(|i| async move {
+                    // One unknown size poisons the total anyway, so stop
+                    // spending round trips on the queued remainder. The
+                    // in-flight ones still finish; their results are discarded.
+                    if !all_known_ref.load(Ordering::Relaxed) {
+                        return;
                     }
-                }
-            }
+                    let file = &manifest_ref.output[i];
+                    match self
+                        .fetcher
+                        .file_size(
+                            &file.url,
+                            &view_ref.file_request_headers,
+                            manifest_ref.requires_access_token,
+                            &view_ref.oauth_metadata_urls,
+                        )
+                        .await
+                    {
+                        Ok(Some(len)) => {
+                            sum_ref.fetch_add(len, Ordering::Relaxed);
+                        }
+                        _ => {
+                            all_known_ref.store(false, Ordering::Relaxed);
+                            return;
+                        }
+                    }
+                    // A fenced UPDATE per HEAD, which is cheap next to the
+                    // network round trip it follows — and it is the only thing
+                    // the status endpoint can report during this window.
+                    let done = sized_ref.fetch_add(1, Ordering::Relaxed) + 1;
+                    self.report_phase(lease_ref, ManifestPhase::Sizing, done, file_count)
+                        .await;
+                })
+                .buffer_unordered(self.file_concurrency.max(1));
+            while sizing.next().await.is_some() {}
+            drop(sizing);
+
             // A zero sum (every file empty, or a source misreporting sizes)
             // presizes nothing — the lazy path below stays the authority.
-            if all_known && sum > 0 {
+            let sum = sum.load(Ordering::Relaxed);
+            if all_known.load(Ordering::Relaxed) && sum > 0 {
                 progress.total.store(sum, Ordering::Relaxed);
                 presized = true;
             }
         }
-        // The lease must stay heartbeated *through* a file, not only between
-        // files, and independently of how often the ingest future yields; the
-        // keeper renews from its own task until dropped.
         // Percentages need every file's size; one sizeless file (e.g. a
         // gzip-decompressed stream) poisons the total for the whole manifest
         // and the status endpoint falls back to manifest-count progress.
         let totals_known = AtomicBool::new(true);
-        let keeper = LeaseKeeper::spawn(Arc::clone(&self.jobs), lease.clone(), progress.clone());
+        // Files whose download has *started*, for the `downloading file N of M`
+        // report. Approximate by construction when `file_concurrency > 1` —
+        // several files are in flight at once — which is fine for a coarse
+        // "it is moving" signal that the byte counters take over from.
+        let opened = AtomicU64::new(0);
 
         // 2. Ingest the `output` files. Up to `file_concurrency` at a time run
         // concurrently (fan-out): each file's fetch, parse, and write overlaps
         // the others', which a concurrent-writer backend turns into throughput.
         // The manifest's files carry disjoint resource types, so their entry
-        // receipts and rollback records never collide. Counts accumulate into
-        // shared atomics; a file's own failures are recorded and counted
-        // without aborting the manifest, exactly as the sequential loop did,
-        // and only a storage error on the bookkeeping path aborts the job.
-        let processed_at = AtomicU64::new(0);
+        // receipts and rollback records never collide. A file's own failures
+        // are recorded and counted without aborting the manifest, exactly as
+        // the sequential loop did, and only a storage error on the bookkeeping
+        // path aborts the job.
+        //
+        // This tally is run-local and feeds the status artifacts only. The
+        // manifest's persisted counters are cumulative across runs and belong
+        // to the ingestion engine's per-batch bookkeeping (#969).
         let failed_at = AtomicU64::new(0);
         // Shared borrows for the concurrent per-file futures. Iterating by
         // index keeps the map closure's argument owned (a `usize`), so the
         // future it returns can borrow `manifest.output[i]` for the manifest's
         // lifetime without a higher-ranked-lifetime bound the closure can't name.
-        let processed_ref = &processed_at;
         let failed_ref = &failed_at;
+        let opened_ref = &opened;
         let totals_ref = &totals_known;
         let progress_ref = &progress;
         let keeper_ref = &keeper;
@@ -718,6 +913,12 @@ where
                     .resource_type
                     .clone()
                     .unwrap_or_else(|| "Resource".into());
+                // Opening a file can itself be a long wait (the remote has to
+                // start streaming), and until its first batch commits nothing
+                // else moves — so say which file is being pulled (#953).
+                let nth = opened_ref.fetch_add(1, Ordering::Relaxed) + 1;
+                self.report_phase(lease_ref, ManifestPhase::Downloading, nth, file_count)
+                    .await;
                 let (inner, file_bytes_total) = match self
                     .fetcher
                     .open_file_stream(
@@ -738,6 +939,11 @@ where
                         )
                         .await?;
                         failed_ref.fetch_add(1, Ordering::Relaxed);
+                        // No batch ran for a file that never opened, so this
+                        // failure is the worker's to add.
+                        if let Err(e) = self.jobs.add_manifest_progress(lease_ref, 0, 1, 0).await {
+                            return fenced_write_outcome(keeper_ref, e);
+                        }
                         return Ok(());
                     }
                 };
@@ -775,11 +981,25 @@ where
                     .await
                 {
                     Ok(result) => {
-                        processed_ref.fetch_add(
-                            result.counts.success + result.counts.skipped,
-                            Ordering::Relaxed,
-                        );
                         failed_ref.fetch_add(result.counts.error_count(), Ordering::Relaxed);
+                        // Every entry a batch committed was counted by that
+                        // batch. The lines the stream threw out before they
+                        // reached one — unparseable, or carrying the wrong
+                        // resource type — were counted by nobody, so they are
+                        // the worker's to add (#969).
+                        if result.unbatched_errors > 0
+                            && let Err(e) = self
+                                .jobs
+                                .add_manifest_progress(
+                                    lease_ref,
+                                    0,
+                                    result.unbatched_errors,
+                                    result.unbatched_errors,
+                                )
+                                .await
+                        {
+                            return fenced_write_outcome(keeper_ref, e);
+                        }
                     }
                     Err(e) => {
                         self.record_manifest_error(
@@ -789,18 +1009,14 @@ where
                         )
                         .await?;
                         failed_ref.fetch_add(1, Ordering::Relaxed);
+                        // Every entry this file did commit was already counted
+                        // by its own batch; the file-level failure was not.
+                        if let Err(e) = self.jobs.add_manifest_progress(lease_ref, 0, 1, 0).await {
+                            return fenced_write_outcome(keeper_ref, e);
+                        }
                     }
                 }
 
-                let p = processed_ref.load(Ordering::Relaxed);
-                let f = failed_ref.load(Ordering::Relaxed);
-                if let Err(LeaseError::Storage(e)) = self
-                    .jobs
-                    .update_manifest_progress(lease_ref, p, f, p + f)
-                    .await
-                {
-                    return Err(e);
-                }
                 let total = progress_ref.total.load(Ordering::Relaxed);
                 if total > 0 {
                     let _ = self
@@ -815,22 +1031,36 @@ where
                 Ok(())
             })
             .buffer_unordered(self.file_concurrency.max(1));
-        while let Some(result) = ingest.next().await {
-            result?;
-        }
+        // Race the whole fan-out against the lease: losing it has to stop the
+        // ingest *inside* a file, not merely between files. A batch already
+        // committed stays committed and re-ingests idempotently when the
+        // manifest is reclaimed; continuing to write past expiry would let a
+        // second worker ingest the same manifest alongside this one (#969).
+        let drain = async {
+            while let Some(result) = ingest.next().await {
+                result?;
+            }
+            Ok::<(), StorageError>(())
+        };
+        let completed = tokio::select! {
+            biased;
+            _ = keeper.lost() => false,
+            result = drain => {
+                result?;
+                true
+            }
+        };
         drop(ingest);
-        let processed = processed_at.load(Ordering::Relaxed);
-        let failed = failed_at.load(Ordering::Relaxed);
-        // Pin the final counts: with files finishing out of order, the last
-        // per-file update already carried the cumulative totals, but a closing
-        // write makes the terminal progress unambiguous.
-        if let Err(LeaseError::Storage(e)) = self
-            .jobs
-            .update_manifest_progress(&lease, processed, failed, processed + failed)
-            .await
-        {
-            return Err(e);
+        if !completed {
+            tracing::warn!(
+                submission = %lease.submission_id,
+                manifest = %lease.manifest_id,
+                worker = %lease.worker_id,
+                "bulk-submit run abandoned mid-manifest: its lease is no longer held"
+            );
+            return Ok(());
         }
+        let failed = failed_at.load(Ordering::Relaxed);
 
         // 2b. Process `deleted` files — transaction Bundles / resource refs to remove.
         let mut deleted_refs: Vec<String> = Vec::new();
@@ -1158,6 +1388,36 @@ where
         Ok(())
     }
 
+    /// Publishes the coarse pre-ingest phase for the status endpoint (#953).
+    ///
+    /// Best-effort by design: the phase is a cosmetic hint, so *no* failure
+    /// here may change what the job does. That includes `LeaseLost` — a lost
+    /// lease is already detected authoritatively by the [`LeaseKeeper`]'s
+    /// heartbeat and checked at each file boundary, and letting a decorative
+    /// write also decide control flow would add a way to abandon a healthy
+    /// job without adding any way to notice a dead one.
+    async fn report_phase(
+        &self,
+        lease: &ManifestLease,
+        phase: ManifestPhase,
+        files_done: u64,
+        files_total: u64,
+    ) {
+        if let Err(e) = self
+            .jobs
+            .update_manifest_phase(lease, phase, files_done, files_total)
+            .await
+        {
+            tracing::debug!(
+                submission = %lease.submission_id,
+                manifest = %lease.manifest_id,
+                %phase,
+                error = %e,
+                "could not record bulk-submit pre-ingest phase"
+            );
+        }
+    }
+
     /// Records a single manifest-level `error` OperationOutcome artifact.
     async fn record_manifest_error(
         &self,
@@ -1232,6 +1492,21 @@ fn lease_err_to_storage(e: LeaseError) -> crate::error::StorageError {
                 message: format!("lease lost for {job_id}"),
                 source: None,
             })
+        }
+    }
+}
+
+/// Resolves what a failed fenced write means for the file being ingested.
+///
+/// A storage error aborts the whole job, as it always has. A lost lease is not
+/// an error at all: the manifest belongs to someone else now, so the keeper is
+/// told, which stops the sibling files too, and this one ends quietly (#969).
+fn fenced_write_outcome(keeper: &LeaseKeeper, e: LeaseError) -> StorageResult<()> {
+    match e {
+        LeaseError::Storage(e) => Err(e),
+        LeaseError::LeaseLost { .. } => {
+            keeper.declare_lost();
+            Ok(())
         }
     }
 }
@@ -1409,8 +1684,302 @@ mod tests {
         }
     }
 
+    /// One phase reading: the counters a status poll would have seen, without
+    /// the label saying which fetcher call it was taken during.
+    type PhaseReading = (Option<ManifestPhase>, u64, u64);
+
+    /// A [`PhaseReading`] tagged with that label.
+    type LabelledPhaseReading = (String, Option<ManifestPhase>, u64, u64);
+
+    /// Wraps a [`MockFetcher`] and, on every call the worker makes, reads back
+    /// the phase the worker persisted just before it — so a test can assert
+    /// what a *concurrent status poll* would have seen, rather than only the
+    /// residue left behind at the end of the run.
+    struct PhaseSpyFetcher {
+        inner: MockFetcher,
+        backend: Arc<SqliteBackend>,
+        tenant: TenantContext,
+        sub_id: SubmissionId,
+        seen: std::sync::Mutex<Vec<LabelledPhaseReading>>,
+    }
+
+    impl PhaseSpyFetcher {
+        async fn observe(&self, during: &str) {
+            let manifests = self
+                .backend
+                .list_manifests(&self.tenant, &self.sub_id)
+                .await
+                .unwrap();
+            let m = &manifests[0];
+            self.seen.lock().unwrap().push((
+                during.to_string(),
+                m.phase,
+                m.files_done,
+                m.files_total,
+            ));
+        }
+
+        fn phases_during(&self, during: &str) -> Vec<PhaseReading> {
+            self.seen
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(w, _, _, _)| w == during)
+                .map(|(_, p, d, t)| (*p, *d, *t))
+                .collect()
+        }
+    }
+
+    #[async_trait]
+    impl SubmitInputFetcher for PhaseSpyFetcher {
+        async fn fetch_manifest(
+            &self,
+            url: &str,
+            headers: &[(String, String)],
+            oauth: &[String],
+            encryption_key: Option<&Value>,
+        ) -> StorageResult<RemoteManifest> {
+            self.observe("fetch_manifest").await;
+            self.inner
+                .fetch_manifest(url, headers, oauth, encryption_key)
+                .await
+        }
+
+        async fn open_file_stream(
+            &self,
+            url: &str,
+            headers: &[(String, String)],
+            requires_access_token: bool,
+            oauth: &[String],
+            encryption_key: Option<&Value>,
+        ) -> StorageResult<(Box<dyn tokio::io::AsyncBufRead + Send + Unpin>, Option<u64>)> {
+            self.observe("open_file_stream").await;
+            self.inner
+                .open_file_stream(url, headers, requires_access_token, oauth, encryption_key)
+                .await
+        }
+
+        async fn file_size(
+            &self,
+            url: &str,
+            headers: &[(String, String)],
+            requires_access_token: bool,
+            oauth: &[String],
+        ) -> StorageResult<Option<u64>> {
+            let size = self
+                .inner
+                .file_size(url, headers, requires_access_token, oauth)
+                .await;
+            self.observe("file_size").await;
+            size
+        }
+    }
+
     fn tenant() -> TenantContext {
         TenantContext::new(TenantId::new("t1"), TenantPermissions::full_access())
+    }
+
+    /// #953: everything before the first NDJSON batch used to poll as a flat
+    /// `0%`. The worker must now publish a phase at each pre-ingest step, so
+    /// the status endpoint has something to report during that window.
+    #[tokio::test]
+    async fn test_worker_reports_its_pre_ingest_phases() {
+        let backend = Arc::new(SqliteBackend::in_memory().unwrap());
+        backend.init_schema().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let output = Arc::new(LocalFsOutputStore::new(
+            tmp.path().to_path_buf(),
+            "http://localhost:8080",
+        ));
+
+        let tenant = tenant();
+        let sub_id = SubmissionId::generate("mock-system");
+        backend
+            .create_submission(&tenant, &sub_id, None)
+            .await
+            .unwrap();
+        backend
+            .add_manifest(
+                &tenant,
+                &sub_id,
+                Some("http://provider/manifest.json"),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Distinct resource types: the fan-out assumes a manifest's files do
+        // not collide on type.
+        let types = ["Patient", "Observation", "Condition"];
+        let mut files = std::collections::HashMap::new();
+        let mut output_files = Vec::new();
+        for ty in types {
+            let url = format!("http://provider/{ty}.ndjson");
+            files.insert(
+                url.clone(),
+                format!("{{\"resourceType\":\"{ty}\",\"id\":\"x1\"}}\n").into_bytes(),
+            );
+            output_files.push(RemoteFile {
+                resource_type: Some(ty.to_string()),
+                url,
+                count: None,
+            });
+        }
+        let fetcher = Arc::new(PhaseSpyFetcher {
+            inner: MockFetcher {
+                files,
+                manifest: RemoteManifest {
+                    requires_access_token: false,
+                    output: output_files,
+                    deleted: vec![],
+                },
+            },
+            backend: backend.clone(),
+            tenant: tenant.clone(),
+            sub_id: sub_id.clone(),
+            seen: std::sync::Mutex::new(Vec::new()),
+        });
+
+        let worker = DefaultSubmitWorker::new(
+            backend.clone(),
+            fetcher.clone(),
+            output,
+            WorkerId::new("phase-worker"),
+        );
+        let lease = backend
+            .claim_next_manifest(&WorkerId::new("phase-worker"), StdDuration::from_secs(60))
+            .await
+            .unwrap()
+            .expect("claimable manifest");
+        worker.run_job(lease).await.unwrap();
+
+        // While the remote manifest downloads, the phase says so — and carries
+        // no file counts, because the `output` array is still unread.
+        assert_eq!(
+            fetcher.phases_during("fetch_manifest"),
+            vec![(Some(ManifestPhase::ReadingManifest), 0, 0)],
+            "the manifest fetch must report `reading-manifest`"
+        );
+
+        // Each HEAD advances `files_done` against the now-known denominator,
+        // which is what turns a silent pre-size into `sizing N of M files`.
+        // The counts run 0..2 rather than 1..3 because the spy reads the row
+        // from inside the HEAD, i.e. just *before* the worker records that
+        // file's own increment: what it captures is the run of distinct values
+        // a status poll could have landed on mid-pre-size.
+        assert_eq!(
+            fetcher.phases_during("file_size"),
+            vec![
+                (Some(ManifestPhase::Sizing), 0, 3),
+                (Some(ManifestPhase::Sizing), 1, 3),
+                (Some(ManifestPhase::Sizing), 2, 3),
+            ],
+            "pre-sizing must count files against the manifest's output total"
+        );
+
+        // Opening a file reports `downloading`, restarting the counter — which
+        // is why the phase write overwrites rather than accumulating.
+        let downloads = fetcher.phases_during("open_file_stream");
+        assert_eq!(downloads.len(), 3);
+        for (i, (phase, done, total)) in downloads.iter().enumerate() {
+            assert_eq!(*phase, Some(ManifestPhase::Downloading));
+            assert_eq!(*done, i as u64 + 1);
+            assert_eq!(*total, 3);
+        }
+
+        // The phase outlives the run; the status endpoint is what keeps a
+        // stale one harmless, by letting the byte/entry counters outrank it.
+        let manifests = backend.list_manifests(&tenant, &sub_id).await.unwrap();
+        assert_eq!(manifests[0].phase, Some(ManifestPhase::Downloading));
+        assert_eq!(manifests[0].files_total, 3);
+    }
+
+    /// The pre-size HEADs run `file_concurrency` at a time (#953). Correctness
+    /// must not depend on that: the denominator is the sum the serial loop
+    /// produced, no matter what order the responses land in.
+    #[tokio::test]
+    async fn test_presizing_is_correct_with_file_concurrency() {
+        let backend = Arc::new(SqliteBackend::in_memory().unwrap());
+        backend.init_schema().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let output = Arc::new(LocalFsOutputStore::new(
+            tmp.path().to_path_buf(),
+            "http://localhost:8080",
+        ));
+
+        let tenant = tenant();
+        let sub_id = SubmissionId::generate("mock-system");
+        backend
+            .create_submission(&tenant, &sub_id, None)
+            .await
+            .unwrap();
+        backend
+            .add_manifest(
+                &tenant,
+                &sub_id,
+                Some("http://provider/manifest.json"),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let types = [
+            "Patient",
+            "Observation",
+            "Condition",
+            "Encounter",
+            "Procedure",
+            "Immunization",
+        ];
+        let mut files = std::collections::HashMap::new();
+        let mut output_files = Vec::new();
+        let mut expected: u64 = 0;
+        for (i, ty) in types.iter().enumerate() {
+            let url = format!("http://provider/{ty}.ndjson");
+            // Different lengths per file, so a dropped or double-counted HEAD
+            // cannot coincidentally still sum to `expected`.
+            let body = format!("{{\"resourceType\":\"{ty}\",\"id\":\"c{i}\"}}\n");
+            expected += body.len() as u64;
+            files.insert(url.clone(), body.into_bytes());
+            output_files.push(RemoteFile {
+                resource_type: Some((*ty).to_string()),
+                url,
+                count: None,
+            });
+        }
+        let fetcher = Arc::new(MockFetcher {
+            files,
+            manifest: RemoteManifest {
+                requires_access_token: false,
+                output: output_files,
+                deleted: vec![],
+            },
+        });
+
+        let worker = DefaultSubmitWorker::new(
+            backend.clone(),
+            fetcher,
+            output,
+            WorkerId::new("concurrent-presize"),
+        )
+        .with_file_concurrency(4);
+        let lease = backend
+            .claim_next_manifest(
+                &WorkerId::new("concurrent-presize"),
+                StdDuration::from_secs(60),
+            )
+            .await
+            .unwrap()
+            .expect("claimable manifest");
+        worker.run_job(lease).await.unwrap();
+
+        let manifests = backend.list_manifests(&tenant, &sub_id).await.unwrap();
+        assert_eq!(
+            manifests[0].bytes_total, expected,
+            "concurrent HEADs must sum to the same denominator as the serial loop"
+        );
+        assert_eq!(manifests[0].bytes_processed, expected);
+        assert_eq!(manifests[0].files_total, types.len() as u64);
     }
 
     #[tokio::test]
@@ -2097,7 +2666,10 @@ mod tests {
         // failure on the manifest and surfaced as a summary error artifact, and
         // the manifest still completes.
         assert_eq!(counts.success, 1);
-        assert!(manifests[0].failed_entries >= 1);
+        // Exactly one: the malformed line, charged by the worker because no
+        // batch saw it, and by nobody else (#969).
+        assert_eq!(manifests[0].failed_entries, 1);
+        assert_eq!(manifests[0].processed_entries, 1);
         assert_eq!(
             manifests[0].status,
             crate::core::bulk_submit::ManifestStatus::Completed
@@ -2105,5 +2677,131 @@ mod tests {
         let files = backend.list_submit_files(&tenant, &sub_id).await.unwrap();
         assert!(files.iter().any(|f| f.file_type == "error"));
         assert!(files.iter().any(|f| f.file_type == "output"));
+    }
+
+    /// A manifest reclaimed after a worker died keeps the progress its earlier
+    /// run recorded (#969).
+    ///
+    /// The worker used to overwrite the counters with the current run's
+    /// absolute totals, so a manifest six million entries in reported a single
+    /// entry the moment it was re-walked.
+    #[tokio::test]
+    async fn test_worker_progress_survives_a_reclaimed_manifest() {
+        let backend = Arc::new(SqliteBackend::in_memory().unwrap());
+        backend.init_schema().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let output = Arc::new(LocalFsOutputStore::new(
+            tmp.path().to_path_buf(),
+            "http://x",
+        ));
+        let tenant = tenant();
+        let sub_id = seed(&backend, &tenant).await;
+
+        let lease = backend
+            .claim_next_manifest(&WorkerId::new("w"), StdDuration::from_secs(60))
+            .await
+            .unwrap()
+            .unwrap();
+        // Stands in for everything an earlier, interrupted run had ingested.
+        backend
+            .add_manifest_progress(&lease, 6_034_873, 7, 5_564_073)
+            .await
+            .unwrap();
+        assert_eq!(
+            backend
+                .get_manifest_for_worker(&lease)
+                .await
+                .unwrap()
+                .last_processed_line,
+            5_564_073
+        );
+
+        let worker = DefaultSubmitWorker::new(
+            backend.clone(),
+            patient_fetcher("{\"resourceType\":\"Patient\",\"id\":\"p1\"}\n"),
+            output,
+            WorkerId::new("w"),
+        );
+        worker.run_job(lease).await.unwrap();
+
+        let manifests = backend.list_manifests(&tenant, &sub_id).await.unwrap();
+        assert_eq!(
+            manifests[0].processed_entries, 6_034_874,
+            "the re-walked entry must add to the earlier run's total, not replace it"
+        );
+        assert_eq!(manifests[0].failed_entries, 7);
+    }
+
+    /// How a stubbed heartbeat behaves, for the [`LeaseKeeper`] tests.
+    enum Renewal {
+        /// Never answers — a heartbeat starved behind the ingest loop's writer,
+        /// which is what let the lease expire in #969.
+        Hangs,
+        /// Answers, but always with a storage error.
+        Fails,
+        /// Renews normally.
+        Lands,
+    }
+
+    struct StubRenewal(Renewal);
+
+    #[async_trait]
+    impl LeaseRenewal for StubRenewal {
+        async fn heartbeat(&self, lease: &ManifestLease) -> Result<DateTime<Utc>, LeaseError> {
+            match self.0 {
+                Renewal::Hangs => std::future::pending().await,
+                Renewal::Fails => Err(LeaseError::Storage(StorageError::Backend(
+                    crate::error::BackendError::Internal {
+                        backend_name: "stub".to_string(),
+                        message: "writer busy".to_string(),
+                        source: None,
+                    },
+                ))),
+                Renewal::Lands => Ok(lease.renewed_expiry()),
+            }
+        }
+
+        async fn flush_bytes(&self, _lease: &ManifestLease, _consumed: u64, _total: u64) {}
+    }
+
+    /// Spawns a keeper over a two-second lease and reports whether it declared
+    /// that lease lost within `wait`.
+    async fn keeper_loses_lease(renewal: Renewal, wait: StdDuration) -> bool {
+        let lease = ManifestLease {
+            tenant: tenant(),
+            submission_id: SubmissionId::generate("mock-system"),
+            manifest_id: "m1".to_string(),
+            worker_id: WorkerId::new("w"),
+            lease_expiry: Utc::now() + chrono::Duration::seconds(2),
+            lease_duration: StdDuration::from_secs(2),
+            fencing_token: 1,
+        };
+        let keeper = LeaseKeeper::spawn(
+            Arc::new(StubRenewal(renewal)),
+            lease,
+            ByteProgress::default(),
+        );
+        tokio::time::timeout(wait, keeper.lost()).await.is_ok()
+    }
+
+    /// A heartbeat that cannot land before the lease expires is fatal (#969).
+    ///
+    /// Retrying it indefinitely left the manifest claimable by a second worker
+    /// while this one kept committing batches under a dead lease.
+    #[tokio::test]
+    async fn test_lease_keeper_gives_up_on_a_starved_heartbeat() {
+        assert!(keeper_loses_lease(Renewal::Hangs, StdDuration::from_secs(15)).await);
+    }
+
+    #[tokio::test]
+    async fn test_lease_keeper_gives_up_when_heartbeats_keep_failing() {
+        assert!(keeper_loses_lease(Renewal::Fails, StdDuration::from_secs(15)).await);
+    }
+
+    /// The converse: a lease that is being renewed is never declared lost, so
+    /// the new expiry check cannot abort a healthy run.
+    #[tokio::test]
+    async fn test_lease_keeper_holds_a_renewable_lease() {
+        assert!(!keeper_loses_lease(Renewal::Lands, StdDuration::from_secs(5)).await);
     }
 }

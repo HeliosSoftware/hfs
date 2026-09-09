@@ -177,7 +177,13 @@ chart-pick-heading = Dargestellte Ressourcentypen
 chart-pick-all = Alle Ressourcentypen anzeigen
 chart-pick-filter = Typen filtern
 chart-empty = Noch nichts darzustellen — gespeicherte Ressourcen erscheinen hier, sobald sie angelegt werden.
-chart-sample-note = Beispieldaten: in diesem Build ist kein Live-Metrikanbieter registriert.
+# Nur für einen Build ganz ohne Metrikanbieter. Ein Anbieter, der lediglich zu
+# langsam war, bekommt chart-pending-note — beides nie verwechseln (#956).
+chart-sample-note = Beispieldaten: dieser Build hat keinen Live-Metrikanbieter, das Diagramm unten ist also ein Platzhalter und keine Messung.
+chart-pending-note = Die Live-Zahlen für dieses Zeitfenster werden noch erhoben. Bis sie eintreffen wird nichts dargestellt — es werden keine Platzhalterzahlen gezeigt.
+chart-pending-empty = Warten auf die Live-Zahlen…
+chart-pending-retry = Jetzt erneut versuchen
+chart-partial-note = Einige Zahlen konnten nicht aus dem Speicher gelesen werden und werden als Null angezeigt. Zum erneuten Versuch neu laden.
 chart-table-toggle = Als Tabelle anzeigen
 chart-table-when = Zeitpunkt
 chart-focus-series = Diese Serie fokussieren
@@ -428,7 +434,7 @@ queries-results = Ergebnisse
 queries-results-total = { $count } Ergebnisse
 queries-results-included = { $count } eingeschlossen
 queries-results-empty = Keine Ergebnisse.
-queries-open-tab = In neuem Tab öffnen
+queries-searching = Suche läuft…
 queries-col-updated = Aktualisiert
 queries-prev = Zurück
 queries-next = Weiter

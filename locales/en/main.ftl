@@ -180,7 +180,13 @@ chart-pick-heading = Charted Resource Types
 chart-pick-all = View all resource types
 chart-pick-filter = Filter types
 chart-empty = Nothing to chart yet — stored resources appear here as they are created.
-chart-sample-note = Sample data: no live metrics provider is registered on this build.
+# Only for a build with no metrics provider at all. A provider that was merely
+# slow gets chart-pending-note instead — the two must never be confused (#956).
+chart-sample-note = Sample data: this build has no live metrics provider, so the chart below is a placeholder, not measurements.
+chart-pending-note = Still gathering the live figures for this window. Nothing is charted until they arrive — no placeholder numbers are shown.
+chart-pending-empty = Waiting for the live figures…
+chart-pending-retry = Retry now
+chart-partial-note = Some figures could not be read from storage and are shown as zero. Reload to try again.
 chart-table-toggle = View as Table
 chart-table-when = Time
 chart-focus-series = Focus this series
@@ -431,7 +437,7 @@ queries-results = Results
 queries-results-total = { $count } results
 queries-results-included = { $count } included
 queries-results-empty = No results.
-queries-open-tab = Open in New Tab
+queries-searching = Searching…
 queries-col-updated = Updated
 queries-prev = Previous
 queries-next = Next

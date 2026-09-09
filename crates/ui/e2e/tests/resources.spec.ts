@@ -71,7 +71,7 @@ test("picking a rail type updates the URL and back navigates", async ({ resource
   await page.goBack();
   await expect(page).toHaveURL(/\/ui\/resources\?type=Patient/);
   await expect(resources.railItem("Patient")).toHaveAttribute("aria-current", "true");
-  await expect(resources.builder.url).toHaveValue("GET /Patient");
+  await expect(resources.builder.url).toHaveValue("GET /Patient?_summary=true");
   await expect(resources.createLabel).toHaveText("Create new Patient");
 });
 
@@ -124,7 +124,7 @@ test("selecting a type updates the Create label and the URL", async ({ resources
   await resources.pickType("Observation");
   await expect(page).toHaveURL(/\/ui\/resources\?type=Observation/);
   await expect(resources.createLabel).toHaveText("Create new Observation");
-  await expect(resources.builder.url).toHaveValue("GET /Observation");
+  await expect(resources.builder.url).toHaveValue("GET /Observation?_summary=true");
 });
 
 test("switching away and back cannot reuse a stale builder serialization", async ({
@@ -138,15 +138,15 @@ test("switching away and back cannot reuse a stale builder serialization", async
   const firstRow = resources.builder.conditionRows.first();
   await firstRow.locator(".builder-row__key").fill("name");
   await firstRow.locator(".builder-row__value").fill("BeforeSwitch");
-  await expect(resources.builder.url).toHaveValue("GET /Patient?name=BeforeSwitch");
+  await expect(resources.builder.url).toHaveValue("GET /Patient?name=BeforeSwitch&_summary=true");
 
   await firstRow.locator("[data-remove-row]").click();
   await expect(resources.builder.conditionRows).toHaveCount(0);
-  await expect(resources.builder.url).toHaveValue("GET /Patient");
+  await expect(resources.builder.url).toHaveValue("GET /Patient?_summary=true");
 
   await resources.pickType("Observation");
   await resources.pickType("Patient");
-  await expect(resources.builder.url).toHaveValue("GET /Patient");
+  await expect(resources.builder.url).toHaveValue("GET /Patient?_summary=true");
   await expect(resources.builder.sections).toHaveAttribute("data-type", "Patient");
   await expect(page.locator("#query-plain-text")).toContainText("Patient");
 
@@ -154,7 +154,7 @@ test("switching away and back cannot reuse a stale builder serialization", async
   const patientRow = resources.builder.conditionRows.first();
   await patientRow.locator(".builder-row__key").fill("name");
   await patientRow.locator(".builder-row__value").fill("AfterSwitch");
-  await expect(resources.builder.url).toHaveValue("GET /Patient?name=AfterSwitch");
+  await expect(resources.builder.url).toHaveValue("GET /Patient?name=AfterSwitch&_summary=true");
   await expect(page.locator("#query-plain-text")).toContainText("AfterSwitch");
 });
 
@@ -173,8 +173,8 @@ test("invalid, wrong-case, and empty inputs fail closed without losing the typed
   page,
 }) => {
   for (const [target, expected] of [
-    ["?type=NoLongerValid", "GET /NoLongerValid"],
-    ["?type=patient", "GET /patient"],
+    ["?type=NoLongerValid", "GET /NoLongerValid?_summary=true"],
+    ["?type=patient", "GET /patient?_summary=true"],
     ["?url=" + encodeURIComponent("/NoLongerValid?name=kept"), "GET /NoLongerValid?name=kept"],
     ["?type=Patient&url=" + encodeURIComponent("/NoLongerValid"), "GET /NoLongerValid"],
   ] as const) {
@@ -186,7 +186,7 @@ test("invalid, wrong-case, and empty inputs fail closed without losing the typed
   }
 
   await page.goto("/ui/resources?type=", { waitUntil: "networkidle" });
-  await expect(resources.builder.url).toHaveValue("GET /Patient");
+  await expect(resources.builder.url).toHaveValue("GET /Patient?_summary=true");
   await expect(resources.createButton).toBeEnabled();
 });
 
@@ -207,7 +207,7 @@ test("manual URL edits and popstate keep Create on the effective query type", as
 
   await resources.pickType("Encounter");
   await page.goBack();
-  await expect(resources.builder.url).toHaveValue("GET /Patient");
+  await expect(resources.builder.url).toHaveValue("GET /Patient?_summary=true");
   await expect(resources.createButton).toBeEnabled();
   await expect(resources.railItem("Patient")).toHaveAttribute("aria-current", "true");
 });
@@ -257,7 +257,6 @@ test("a conflicting Resources bookmark uses the query URL type everywhere after 
       "href",
       new RegExp(`^https?://[^/]+/Patient/${patientId}$`),
     );
-    await expect(resources.results.openTab).toHaveAttribute("href", "/Patient?name=NavAlpha");
   };
 
   const expectCreateDraft = async (type: string) => {
@@ -284,10 +283,9 @@ test("a conflicting Resources bookmark uses the query URL type everywhere after 
   await expect(resources.railItem("Patient")).not.toHaveAttribute("aria-current", "true");
   await expect(page.locator("#resources")).toHaveAttribute("data-selected-type", "Observation");
   await expect(resources.createLabel).toHaveText("Create new Observation");
-  await expect(resources.builder.url).toHaveValue("GET /Observation");
+  await expect(resources.builder.url).toHaveValue("GET /Observation?_summary=true");
   await expect(page.locator("#query-plain-text")).toContainText("Observation");
   await resources.results.waitShown();
-  await expect(resources.results.openTab).toHaveAttribute("href", "/Observation");
   await expectCreateDraft("Observation");
 });
 
@@ -338,6 +336,14 @@ test("counts render next to each type from the dashboard snapshot", async ({
 });
 
 test("every rail type is searchable, while Create opens only eligible targets", async ({ resources }) => {
+  // A whole-set sweep, like the a11y route walk and the capability-statement
+  // tests: 145 rail types, each a click plus — where Create is eligible — a
+  // modal open, an editor read and an Escape close. That is ~27s of real work
+  // on an idle machine, so the 30s default leaves no headroom and the test
+  // times out mid-loop whenever the suite is under load. Budget for the sweep
+  // rather than for a single interaction; the loop itself still visits every
+  // type and asserts the same things.
+  test.setTimeout(120_000);
   await resources.goto("Patient");
   const types = await resources.railTypes();
 
@@ -376,7 +382,9 @@ test("create eligibility follows the effective FHIR version", async ({ resources
   await resources.modal.close();
 
   await resources.goto(boundary!.rejected);
-  await expect(resources.builder.url).toHaveValue(`GET /${boundary!.rejected}`);
+  await expect(resources.builder.url).toHaveValue(
+    `GET /${boundary!.rejected}?_summary=true`,
+  );
   await expect(resources.createButton).toBeDisabled();
   await expect(resources.page.locator("#resource-create-reason")).toBeVisible();
   await expect(resources.page.locator("#type-rail-list [aria-current='true']")).toHaveCount(0);

@@ -1237,6 +1237,52 @@ async fn status_polling_tracks_progress_and_lands_the_result() {
     assert!(detail.contains("got 200 OK"));
 }
 
+/// #955: the polled fragment writes log lines, so it must carry them back.
+/// Before this, an open page kept the log it was loaded with while the card
+/// advanced, and only a reload caught it up.
+#[tokio::test]
+async fn the_polled_status_fragment_refreshes_the_log_out_of_band() {
+    let (recipient_url, _) = mock_recipient_with_status().await;
+    let ctx = ctx(&recipient_url);
+    let detail_path = create_submission(&ctx).await;
+
+    // The page paints the log in place — same section, no out-of-band hook.
+    let (_, page) = get(&ctx, &detail_path).await;
+    assert!(
+        page.contains(r#"<section id="submission-log" class="card table-card">"#),
+        "{page}"
+    );
+    assert!(!page.contains("Status: processing 0% complete"));
+
+    // First poll: the fragment records a new line and ships the whole log
+    // back out-of-band, newest-first like the page renders it.
+    let (status, html) = get(&ctx, &format!("{detail_path}/status")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        html.contains(
+            r#"<section id="submission-log" class="card table-card" hx-swap-oob="true">"#
+        ),
+        "{html}"
+    );
+    assert!(html.contains("Status: processing 0% complete"), "{html}");
+    let newest = html.find("Status: processing 0% complete").unwrap();
+    let oldest = html.find("Bulk status kick-off request").unwrap();
+    assert!(newest < oldest, "log stays newest-first: {html}");
+
+    // Second poll completes the submission: polling stops, and the terminal
+    // response still carries the closing line so the log never trails the
+    // result card.
+    let (_, html) = get(&ctx, &format!("{detail_path}/status")).await;
+    assert!(!html.contains("every 5s"), "polling stopped: {html}");
+    assert!(
+        html.contains(
+            r#"<section id="submission-log" class="card table-card" hx-swap-oob="true">"#
+        ),
+        "{html}"
+    );
+    assert!(html.contains("processing finished cleanly"), "{html}");
+}
+
 /// The UI route became a permanent redirect to the server-level JWKS when
 /// `/.well-known/bulk-submit-jwks.json` landed; existing registrations keep
 /// working through it.
@@ -1432,4 +1478,153 @@ async fn a_poll_server_error_fails_the_submission_and_keeps_the_card() {
         "{fragment}"
     );
     assert!(!fragment.contains("every 5s"), "{fragment}");
+}
+
+/// A recipient that walks its `X-Progress` through the given reports, one per
+/// poll, holding on the last. Every 202 carries `Retry-After: 0`, so each
+/// status fetch is free to poll again immediately and one test can watch the
+/// whole sequence (#953).
+async fn mock_recipient_reporting(reports: &'static [&'static str]) -> String {
+    use axum::extract::State as AxState;
+    #[derive(Clone)]
+    struct S {
+        polls: Arc<std::sync::Mutex<usize>>,
+        base: Arc<std::sync::Mutex<String>>,
+    }
+    let state = S {
+        polls: Arc::new(std::sync::Mutex::new(0)),
+        base: Arc::new(std::sync::Mutex::new(String::new())),
+    };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    *state.base.lock().unwrap() = format!("http://{addr}");
+    let app = Router::new()
+        .route(
+            "/$bulk-submit",
+            axum::routing::post(|| async {
+                axum::Json(serde_json::json!({"resourceType": "OperationOutcome"}))
+            }),
+        )
+        .route(
+            "/$bulk-submit-status",
+            axum::routing::post(|AxState(s): AxState<S>| async move {
+                let base = s.base.lock().unwrap().clone();
+                (
+                    StatusCode::ACCEPTED,
+                    [("content-location", format!("{base}/poll"))],
+                    "",
+                )
+            }),
+        )
+        .route(
+            "/poll",
+            axum::routing::get(move |AxState(s): AxState<S>| async move {
+                let progress = {
+                    let mut polls = s.polls.lock().unwrap();
+                    let report = reports[(*polls).min(reports.len() - 1)];
+                    *polls += 1;
+                    report
+                };
+                (
+                    StatusCode::ACCEPTED,
+                    [
+                        ("retry-after", "0".to_string()),
+                        ("x-progress", progress.to_string()),
+                    ],
+                    String::new(),
+                )
+            }),
+        )
+        .with_state(state);
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    format!("http://{addr}")
+}
+
+/// #953: the recipient now reports a pre-ingest phase before it can report a
+/// percentage. Each phase string must reach the operator verbatim, and each
+/// must draw the *indeterminate* sweep — never a determinate reading, which
+/// is exactly the mismatch #827 removed. The flip to `processing N%` is the
+/// one moment the bar becomes determinate.
+#[tokio::test]
+async fn pre_ingest_phases_show_their_text_on_an_indeterminate_bar() {
+    const PHASES: [&str; 4] = [
+        "waiting for a worker",
+        "reading manifest",
+        "sizing 37 of 412 files",
+        "downloading file 1 of 412",
+    ];
+    let recipient = mock_recipient_reporting(&[
+        "waiting for a worker",
+        "reading manifest",
+        "sizing 37 of 412 files",
+        "downloading file 1 of 412",
+        "processing 35% complete",
+    ])
+    .await;
+    let ctx = ctx(&recipient);
+    let detail_path = create_submission(&ctx).await;
+
+    for phase in PHASES {
+        let (status, html) = get(&ctx, &format!("{detail_path}/status")).await;
+        assert_eq!(status, StatusCode::OK);
+        // The phase text itself is what replaces "processing 0% complete" as
+        // the thing the operator reads during a long pre-ingest.
+        assert!(html.contains(phase), "phase text missing: {html}");
+        assert!(
+            !html.contains("first status report"),
+            "the phase report, not the no-report placeholder: {html}"
+        );
+        // ...and it is paired with the sweep, with no percentage anywhere.
+        assert!(
+            html.contains("progress-track--indeterminate"),
+            "phase must sweep: {html}"
+        );
+        assert!(
+            !html.contains("aria-valuenow"),
+            "a phase must never render a determinate reading: {html}"
+        );
+        assert!(html.contains("every 5s"), "keeps polling: {html}");
+    }
+
+    // Ingest starts: percentage and determinate fill, sweep gone.
+    let (_, html) = get(&ctx, &format!("{detail_path}/status")).await;
+    assert!(html.contains("processing 35% complete"), "{html}");
+    assert!(html.contains(r#"aria-valuenow="35""#), "{html}");
+    assert!(html.contains(r#"style="width: 35%""#), "{html}");
+    assert!(!html.contains("progress-track--indeterminate"), "{html}");
+
+    // Every phase transition is a run-log line, so the detail page keeps the
+    // history of a slow pre-ingest instead of only its last state.
+    let (_, detail) = get(&ctx, &detail_path).await;
+    for phase in PHASES {
+        assert!(detail.contains(phase), "run log missing {phase}: {detail}");
+    }
+}
+
+/// A recipient is free to put non-ASCII in `X-Progress` — RFC 9110 §5.5 calls
+/// those bytes `obs-text` and leaves their meaning undefined, but nothing
+/// forbids sending them, and HFS itself shipped an em dash there for a while.
+/// Reading the header with `HeaderValue::to_str` rejected the *whole* value on
+/// the first such byte, so the card showed a hardcoded "in progress" instead of
+/// the recipient's real report: the uninformative status #953 exists to remove,
+/// reintroduced by an encoding detail. Decoding lossily keeps the report.
+#[tokio::test]
+async fn a_non_ascii_progress_report_still_reaches_the_operator() {
+    let recipient =
+        mock_recipient_reporting(&["Processing 35% of bytes — 1,024 resources written"]).await;
+    let ctx = ctx(&recipient);
+    let detail_path = create_submission(&ctx).await;
+
+    let (status, html) = get(&ctx, &format!("{detail_path}/status")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        html.contains("1,024 resources written"),
+        "the report must survive its non-ASCII byte: {html}"
+    );
+    assert!(
+        !html.contains("in progress"),
+        "the placeholder must not stand in for a report we received: {html}"
+    );
+    // And the percentage still parses, so the bar stays determinate.
+    assert!(html.contains(r#"aria-valuenow="35""#), "{html}");
 }

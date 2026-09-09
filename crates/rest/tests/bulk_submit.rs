@@ -14,9 +14,9 @@ use axum_test::TestServer;
 use helios_persistence::backends::local_fs::LocalFsOutputStore;
 use helios_persistence::backends::sqlite::{SqliteBackend, SqliteBackendConfig};
 use helios_persistence::core::{
-    BulkSubmitJobStore, BulkSubmitProvider, DefaultSubmitWorker, ExportOutputStore, RemoteFile,
-    RemoteManifest, ResourceStorage, SubmitClaimStrategy, SubmitInputFetcher, SubmitWorkerStorage,
-    WorkerId,
+    BulkSubmitJobStore, BulkSubmitProvider, DefaultSubmitWorker, ExportOutputStore, ManifestPhase,
+    RemoteFile, RemoteManifest, ResourceStorage, SubmitClaimStrategy, SubmitInputFetcher,
+    SubmitWorkerStorage, WorkerId,
 };
 use helios_persistence::error::StorageResult;
 use helios_rest::ServerConfig;
@@ -1174,8 +1174,52 @@ async fn test_poll_percentage_tracks_ingested_bytes() {
         .unwrap()
         .to_string();
     assert!(
-        progress.contains("processing 35% complete"),
+        progress.contains("Processing 35% of bytes"),
         "the percentage must follow ingested bytes, got: {progress}"
+    );
+}
+
+/// #969: the resource counter has to survive the trip through the header.
+///
+/// `X-Progress` gained the "N resources written" clause joined by an em dash,
+/// and an em dash is not US-ASCII. `HeaderValue::to_str()` — which is how
+/// `reqwest`, and therefore HFS's own Import page, reads a header — refuses
+/// anything outside visible ASCII, so the poller saw no value at all and fell
+/// back to a bare "in progress". The regression was invisible to the byte-
+/// percentage test above because that one leaves `processed_entries` at zero,
+/// which is exactly the branch that stays ASCII.
+///
+/// So this asserts the readable form, not the bytes: a counter that only a
+/// permissive client can decode is a counter the operator does not have.
+#[tokio::test]
+async fn test_poll_progress_header_is_ascii_readable_with_a_resource_count() {
+    let (server, backend, _fetcher, _output, _tmp) =
+        create_submit_server_with(mock_fetcher(), BulkSubmitConfig::default()).await;
+    let poll_path = start_and_get_poll_path(&server).await;
+
+    let lease = backend
+        .claim_next_manifest(&WorkerId::new("counting-worker"), Duration::from_secs(60))
+        .await
+        .expect("claim")
+        .expect("a manifest to claim");
+    backend
+        .update_manifest_bytes(&lease, 350, 1_000)
+        .await
+        .expect("bytes update");
+    backend
+        .add_manifest_progress(&lease, 1_234, 0, 1_234)
+        .await
+        .expect("progress update");
+
+    let resp = server.get(&poll_path).await;
+    assert_eq!(resp.status_code(), StatusCode::ACCEPTED);
+    let raw = resp.headers().get("x-progress").expect("X-Progress");
+    let progress = raw
+        .to_str()
+        .unwrap_or_else(|e| panic!("X-Progress must be ASCII a client can read: {e}"));
+    assert_eq!(
+        progress, "Processing 35% of bytes - 1,234 resources written",
+        "the poll must report both the byte percentage and the resource count"
     );
 }
 
@@ -1216,5 +1260,240 @@ async fn test_poll_reports_a_stalled_ingestion() {
     assert!(
         progress.contains("stalled"),
         "a dead worker pool must be visible to the poller, got: {progress}"
+    );
+}
+
+// ── Pre-ingest phase vocabulary (issue #953) ─────────────────────────────────
+//
+// Claiming a manifest, fetching the remote Bulk Export Manifest, and HEAD-ing
+// its output files all precede the first counted byte, so the poll used to read
+// a flat "processing 0% complete" for the whole pre-ingest window. Each phase
+// now names itself — and none of the names may start with `processing `, which
+// the UI parses as a determinate percentage (the #827 regression).
+
+/// Polls once and returns the `X-Progress` text, asserting the 202.
+async fn poll_progress(server: &TestServer, poll_path: &str) -> String {
+    let resp = server.get(poll_path).await;
+    assert_eq!(resp.status_code(), StatusCode::ACCEPTED);
+    resp.headers()
+        .get("x-progress")
+        .expect("X-Progress")
+        .to_str()
+        .unwrap()
+        .to_string()
+}
+
+/// A submission whose manifests are all still `pending` is queued, not slow:
+/// no worker has claimed anything, so there is no percentage to report.
+#[tokio::test]
+async fn test_poll_reports_waiting_for_a_worker_before_any_claim() {
+    let (server, ..) = create_submit_server_with(mock_fetcher(), BulkSubmitConfig::default()).await;
+    let poll_path = start_and_get_poll_path(&server).await;
+
+    let progress = poll_progress(&server, &poll_path).await;
+    assert_eq!(
+        progress, "waiting for a worker",
+        "an unclaimed submission must say it is queued, got: {progress}"
+    );
+    assert!(
+        !progress.starts_with("processing "),
+        "an indeterminate phase must not look like a determinate percentage (#827)"
+    );
+}
+
+/// While the worker downloads and parses the remote manifest there is no file
+/// list yet, so the phase carries the status on its own.
+#[tokio::test]
+async fn test_poll_reports_the_manifest_read_phase() {
+    let (server, backend, _fetcher, _output, _tmp) =
+        create_submit_server_with(mock_fetcher(), BulkSubmitConfig::default()).await;
+    let poll_path = start_and_get_poll_path(&server).await;
+
+    let lease = backend
+        .claim_next_manifest(&WorkerId::new("phase-worker"), Duration::from_secs(60))
+        .await
+        .expect("claim")
+        .expect("a manifest to claim");
+    backend
+        .update_manifest_phase(&lease, ManifestPhase::ReadingManifest, 0, 0)
+        .await
+        .expect("phase update");
+
+    let progress = poll_progress(&server, &poll_path).await;
+    assert_eq!(
+        progress, "reading manifest",
+        "the manifest fetch must be visible to the poller, got: {progress}"
+    );
+    assert!(
+        !progress.starts_with("processing "),
+        "an indeterminate phase must not look like a determinate percentage (#827)"
+    );
+}
+
+/// Pre-sizing HEAD-s every output file to learn the byte denominator; on a
+/// large export that alone can take minutes, so it reports file counts.
+#[tokio::test]
+async fn test_poll_reports_the_sizing_phase_with_file_counts() {
+    let (server, backend, _fetcher, _output, _tmp) =
+        create_submit_server_with(mock_fetcher(), BulkSubmitConfig::default()).await;
+    let poll_path = start_and_get_poll_path(&server).await;
+
+    let lease = backend
+        .claim_next_manifest(&WorkerId::new("sizing-worker"), Duration::from_secs(60))
+        .await
+        .expect("claim")
+        .expect("a manifest to claim");
+    backend
+        .update_manifest_phase(&lease, ManifestPhase::Sizing, 37, 412)
+        .await
+        .expect("phase update");
+
+    let progress = poll_progress(&server, &poll_path).await;
+    assert_eq!(
+        progress, "sizing 37 of 412 files",
+        "pre-sizing must report its file counts, got: {progress}"
+    );
+    assert!(
+        !progress.starts_with("processing "),
+        "an indeterminate phase must not look like a determinate percentage (#827)"
+    );
+}
+
+/// The first file is open but no batch has flushed its byte counter yet — the
+/// window that used to read 0%.
+#[tokio::test]
+async fn test_poll_reports_the_downloading_phase_with_file_counts() {
+    let (server, backend, _fetcher, _output, _tmp) =
+        create_submit_server_with(mock_fetcher(), BulkSubmitConfig::default()).await;
+    let poll_path = start_and_get_poll_path(&server).await;
+
+    let lease = backend
+        .claim_next_manifest(&WorkerId::new("download-worker"), Duration::from_secs(60))
+        .await
+        .expect("claim")
+        .expect("a manifest to claim");
+    backend
+        .update_manifest_phase(&lease, ManifestPhase::Downloading, 1, 412)
+        .await
+        .expect("phase update");
+
+    let progress = poll_progress(&server, &poll_path).await;
+    assert_eq!(
+        progress, "downloading file 1 of 412",
+        "the file being fetched must be visible to the poller, got: {progress}"
+    );
+    assert!(
+        !progress.starts_with("processing "),
+        "an indeterminate phase must not look like a determinate percentage (#827)"
+    );
+}
+
+/// A phase whose denominator is not known yet must not print "of 0": it falls
+/// back to the plain percentage instead.
+#[tokio::test]
+async fn test_poll_falls_back_when_the_phase_has_no_file_total() {
+    let (server, backend, _fetcher, _output, _tmp) =
+        create_submit_server_with(mock_fetcher(), BulkSubmitConfig::default()).await;
+    let poll_path = start_and_get_poll_path(&server).await;
+
+    let lease = backend
+        .claim_next_manifest(&WorkerId::new("unsized-worker"), Duration::from_secs(60))
+        .await
+        .expect("claim")
+        .expect("a manifest to claim");
+    backend
+        .update_manifest_phase(&lease, ManifestPhase::Sizing, 0, 0)
+        .await
+        .expect("phase update");
+
+    let progress = poll_progress(&server, &poll_path).await;
+    assert_eq!(
+        progress, "Processing 0% of bytes",
+        "an unknown file total must not render as 'of 0', got: {progress}"
+    );
+}
+
+/// Rules 2-3 outrank the phase, which is what makes a stale phase harmless: a
+/// manifest still flagged `Downloading` while its bytes move reports the real
+/// percentage, never the pre-ingest text.
+#[tokio::test]
+async fn test_moving_bytes_outrank_a_stale_phase() {
+    let (server, backend, _fetcher, _output, _tmp) =
+        create_submit_server_with(mock_fetcher(), BulkSubmitConfig::default()).await;
+    let poll_path = start_and_get_poll_path(&server).await;
+
+    let lease = backend
+        .claim_next_manifest(
+            &WorkerId::new("stale-phase-worker"),
+            Duration::from_secs(60),
+        )
+        .await
+        .expect("claim")
+        .expect("a manifest to claim");
+    backend
+        .update_manifest_phase(&lease, ManifestPhase::Downloading, 1, 412)
+        .await
+        .expect("phase update");
+    backend
+        .update_manifest_bytes(&lease, 350, 1_000)
+        .await
+        .expect("bytes update");
+
+    let progress = poll_progress(&server, &poll_path).await;
+    assert!(
+        progress.contains("Processing 35% of bytes"),
+        "a real percentage must take over from the pre-ingest phase, got: {progress}"
+    );
+}
+
+/// `X-Progress` is an HTTP field value, so RFC 9110 §5.5 confines it to
+/// US-ASCII; a byte above 0x7F is `obs-text` with undefined meaning, and
+/// conservative clients drop the whole value rather than guess. `to_str` is one
+/// of those clients — an em dash in the resource-count wording made our own
+/// Bulk Import card fall back to a literal "in progress", replacing the phase
+/// text with a placeholder.
+///
+/// The count branch is the one that carried it, and no other test reaches that
+/// branch: `poll_progress` would panic on a non-ASCII header, so this asserts
+/// the bytes directly and states the invariant for every branch at once.
+#[tokio::test]
+async fn test_progress_header_stays_ascii_in_every_branch() {
+    let (server, backend, _fetcher, _output, _tmp) =
+        create_submit_server_with(mock_fetcher(), BulkSubmitConfig::default()).await;
+    let poll_path = start_and_get_poll_path(&server).await;
+
+    let lease = backend
+        .claim_next_manifest(&WorkerId::new("ascii-worker"), Duration::from_secs(60))
+        .await
+        .expect("claim")
+        .expect("a manifest to claim");
+    backend
+        .update_manifest_bytes(&lease, 350, 1_000)
+        .await
+        .expect("bytes update");
+    // Entries outrank bytes, so this selects the resource-count wording. The
+    // counters are cumulative deltas (#969) and this manifest starts at zero,
+    // so the added count is the reported one.
+    backend
+        .add_manifest_progress(&lease, 609_191, 0, 609_191)
+        .await
+        .expect("entry update");
+
+    let resp = server.get(&poll_path).await;
+    assert_eq!(resp.status_code(), StatusCode::ACCEPTED);
+    let raw = resp
+        .headers()
+        .get("x-progress")
+        .expect("X-Progress")
+        .as_bytes()
+        .to_vec();
+    let text = String::from_utf8_lossy(&raw);
+    assert!(
+        raw.is_ascii(),
+        "X-Progress must be US-ASCII; a conservative client discards it otherwise. Got: {text}"
+    );
+    assert!(
+        text.contains("609,191 resources written"),
+        "the count branch must still be the one under test, got: {text}"
     );
 }

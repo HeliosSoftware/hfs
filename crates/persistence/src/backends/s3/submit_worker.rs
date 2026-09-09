@@ -53,7 +53,8 @@ use uuid::Uuid;
 use crate::core::bulk_export::ExportJobId;
 use crate::core::bulk_export_worker::{LeaseError, WorkerId};
 use crate::core::bulk_submit::{
-    BulkSubmitProvider, ManifestStatus, SubmissionId, SubmissionManifest, SubmissionStatus,
+    BulkSubmitProvider, ManifestPhase, ManifestStatus, SubmissionId, SubmissionManifest,
+    SubmissionStatus,
 };
 use crate::core::bulk_submit_worker::{
     ManifestFetchParams, ManifestLease, ManifestWorkerView, PollTokenTarget, SubmitClaimStrategy,
@@ -655,17 +656,17 @@ impl SubmitWorkerStorage for S3Backend {
         .await
     }
 
-    async fn update_manifest_progress(
+    async fn add_manifest_progress(
         &self,
         lease: &ManifestLease,
-        processed_entries: u64,
-        failed_entries: u64,
-        last_processed_line: u64,
+        processed_delta: u64,
+        failed_delta: u64,
+        lines_delta: u64,
     ) -> Result<(), LeaseError> {
         self.fenced_mutate(lease, |state| {
-            state.manifest.processed_entries = processed_entries;
-            state.manifest.failed_entries = failed_entries;
-            state.last_processed_line = last_processed_line;
+            state.manifest.processed_entries += processed_delta;
+            state.manifest.failed_entries += failed_delta;
+            state.last_processed_line += lines_delta;
         })
         .await
     }
@@ -679,6 +680,24 @@ impl SubmitWorkerStorage for S3Backend {
         self.fenced_mutate(lease, |state| {
             state.manifest.bytes_processed = state.manifest.bytes_processed.max(bytes_processed);
             state.manifest.bytes_total = state.manifest.bytes_total.max(bytes_total);
+        })
+        .await
+    }
+
+    async fn update_manifest_phase(
+        &self,
+        lease: &ManifestLease,
+        phase: ManifestPhase,
+        files_done: u64,
+        files_total: u64,
+    ) -> Result<(), LeaseError> {
+        // Overwritten, not maxed like the byte counters: `files_done` restarts
+        // at zero when the worker moves from `sizing` to `downloading`, so a
+        // monotonic update would pin it at the previous phase's total.
+        self.fenced_mutate(lease, |state| {
+            state.manifest.phase = Some(phase);
+            state.manifest.files_done = files_done;
+            state.manifest.files_total = files_total;
         })
         .await
     }

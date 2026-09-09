@@ -1305,14 +1305,6 @@
       "reason": "Genuine defect in the published example, not an engine bug: it declares `meta.profile` `shareablecodesystem`/`shareablevalueset` and omits an element that profile requires (a few also omit base-required `status`)."
     },
     {
-      "file": "examplescenario-example.json",
-      "issues": 4,
-      "kinds": [
-        "not-array"
-      ],
-      "reason": "Engine bug #487: `contentReference` is lowered to `elementReference` and the target element's schema is merged wholesale, inheriting its `max=*`. E.g. `ExampleScenario.process.step.operation.request` is `max=1` but references `ExampleScenario.instance.containedInstance` (`max=*`), so a single object is reported as not-array."
-    },
-    {
       "file": "observation-example-bloodpressure-cancel.json",
       "issues": 1,
       "kinds": [

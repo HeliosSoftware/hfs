@@ -279,6 +279,35 @@ async fn dashboard_renders_job_cards_with_unavailable_state_when_no_provider() {
 }
 
 #[tokio::test]
+async fn a_build_with_no_provider_names_that_reason_and_offers_no_retry() {
+    // The other half of #956. Sample data is honest here and nowhere else, so
+    // this router, which registers no provider, is the one page allowed to
+    // carry it, and it has to say why. tests/dashboard_pending_http.rs asserts
+    // the same boundary from the other side; on its own that file only proves
+    // the slow and partial cases stay away from this wording, which would still
+    // hold if the sample branch were deleted or silently relabelled.
+    let response = app()
+        .oneshot(Request::get("/ui").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains("this build has no live metrics provider"));
+    assert!(html.contains("placeholder, not measurements"));
+
+    // A slow provider and a half-answered one keep their own wording and their
+    // own remedy; neither may be confused with a build that has none at all.
+    assert!(!html.contains("Still gathering the live figures"));
+    assert!(!html.contains("could not be read from storage"));
+
+    // There is nothing to wait for, so nothing polls and nothing invites a
+    // retry: re-asking a provider-less build would only redraw the same page.
+    assert!(!html.contains(r#"hx-trigger="load delay:1200ms""#));
+    assert!(!html.contains("Retry now"));
+}
+
+#[tokio::test]
 async fn page_wires_the_hover_rail_nav() {
     let response = app()
         .oneshot(Request::get("/ui").body(Body::empty()).unwrap())
@@ -1144,7 +1173,7 @@ async fn queries_param_catalog_is_a_registry_fed_fragment() {
 
     assert_eq!(response.status(), StatusCode::OK);
     let html = body_text(response).await;
-    assert!(html.contains(r#"<datalist id="param-options">"#));
+    assert!(html.contains(r#"<datalist id="param-options" data-columns="#));
     // Real registry data: Patient's own params plus Resource-level ones.
     assert!(html.contains(r#"value="birthdate""#));
     assert!(html.contains(r#"value="_id""#));
@@ -1896,7 +1925,7 @@ async fn resources_page_has_the_filter_search_and_create_button() {
     // Patient, and the builder's URL is pre-filled so the no-JS form already
     // shows the query the client also runs on load.
     assert!(html.contains("Create new Patient"));
-    assert!(html.contains(r#"value="GET /Patient""#));
+    assert!(html.contains(r#"value="GET /Patient?_summary=true""#));
     // The client-side template for the label update on rail clicks (#605):
     // the literal `{type}` placeholder, not the interpolated per-request value.
     assert!(html.contains(r#"data-msg-create="Create new {type}""#));
@@ -1959,7 +1988,7 @@ async fn resources_deep_links_focus_the_selected_type() {
     assert!(html.contains(r#"class="filter-rail" id="resources""#));
     // Create and the builder prefill both follow the deep-linked type.
     assert!(html.contains("Create new Observation"));
-    assert!(html.contains(r#"value="GET /Observation""#));
+    assert!(html.contains(r#"value="GET /Observation?_summary=true""#));
 }
 
 #[tokio::test]
