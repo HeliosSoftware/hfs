@@ -32,7 +32,7 @@ use crate::types::{CursorValue, Page, PageCursor, PageInfo, SearchQuery, StoredR
 
 use super::MongoBackend;
 
-fn internal_error(message: String) -> StorageError {
+pub(super) fn internal_error(message: String) -> StorageError {
     StorageError::Backend(BackendError::Internal {
         backend_name: "mongodb".to_string(),
         message,
@@ -55,11 +55,11 @@ fn serialization_error(message: String) -> StorageError {
     StorageError::Backend(BackendError::SerializationError { message })
 }
 
-fn is_duplicate_key_error(err: &MongoError) -> bool {
+pub(super) fn is_duplicate_key_error(err: &MongoError) -> bool {
     err.to_string().contains("E11000")
 }
 
-fn ensure_resource_identity(resource_type: &str, id: &str, resource: &mut Value) {
+pub(super) fn ensure_resource_identity(resource_type: &str, id: &str, resource: &mut Value) {
     if let Some(obj) = resource.as_object_mut() {
         obj.insert(
             "resourceType".to_string(),
@@ -69,7 +69,7 @@ fn ensure_resource_identity(resource_type: &str, id: &str, resource: &mut Value)
     }
 }
 
-fn value_to_document(value: &Value) -> StorageResult<Document> {
+pub(super) fn value_to_document(value: &Value) -> StorageResult<Document> {
     let bson = bson::to_bson(value)
         .map_err(|e| serialization_error(format!("Failed to serialize resource: {}", e)))?;
     match bson {
@@ -89,7 +89,7 @@ fn bson_to_chrono(dt: &BsonDateTime) -> DateTime<Utc> {
     DateTime::<Utc>::from_timestamp_millis(dt.timestamp_millis()).unwrap_or_else(Utc::now)
 }
 
-fn chrono_to_bson(dt: DateTime<Utc>) -> BsonDateTime {
+pub(super) fn chrono_to_bson(dt: DateTime<Utc>) -> BsonDateTime {
     BsonDateTime::from_millis(dt.timestamp_millis())
 }
 
@@ -115,7 +115,7 @@ fn normalize_date_for_mongo(value: &str) -> Option<DateTime<Utc>> {
         .map(|dt| dt.with_timezone(&Utc))
 }
 
-fn next_version(version: &str) -> StorageResult<String> {
+pub(super) fn next_version(version: &str) -> StorageResult<String> {
     let parsed = version
         .parse::<u64>()
         .map_err(|e| serialization_error(format!("Invalid version value '{}': {}", version, e)))?;
@@ -129,7 +129,7 @@ fn extract_deleted_at(doc: &Document) -> Option<DateTime<Utc>> {
     }
 }
 
-fn extract_created_at(doc: &Document, fallback: DateTime<Utc>) -> DateTime<Utc> {
+pub(super) fn extract_created_at(doc: &Document, fallback: DateTime<Utc>) -> DateTime<Utc> {
     doc.get_datetime("created_at")
         .map(bson_to_chrono)
         .unwrap_or(fallback)
@@ -141,7 +141,7 @@ fn extract_last_updated(doc: &Document, fallback: DateTime<Utc>) -> DateTime<Utc
         .unwrap_or(fallback)
 }
 
-fn extract_fhir_version(doc: &Document, fallback: FhirVersion) -> FhirVersion {
+pub(super) fn extract_fhir_version(doc: &Document, fallback: FhirVersion) -> FhirVersion {
     doc.get_str("fhir_version")
         .ok()
         .and_then(FhirVersion::from_storage)
@@ -1881,22 +1881,20 @@ impl MongoBackend {
         ))
     }
 
-    pub(crate) async fn index_resource(
+    /// The `search_index` documents one resource contributes — every value the
+    /// extractor yields, plus the `_contained` rows, with no I/O of its own.
+    ///
+    /// Split out of [`Self::index_resource`] so the batched bulk-submit ingest
+    /// (#1000) can build a whole batch's index documents and write them in one
+    /// `insert_many`, instead of one `insert_many` per resource. Both callers
+    /// therefore index a resource identically by construction.
+    pub(super) fn search_index_documents(
         &self,
-        db: &mongodb::Database,
         tenant_id: &str,
         resource_type: &str,
         resource_id: &str,
         resource: &Value,
-        session: &mut Option<ClientSession>,
-    ) -> StorageResult<()> {
-        if self.is_search_offloaded() {
-            return Ok(());
-        }
-
-        self.delete_search_index(db, tenant_id, resource_type, resource_id, session)
-            .await?;
-
+    ) -> Vec<Document> {
         let mut index_docs = match self
             .tenant_extractor(tenant_id)
             .extract(resource, resource_type)
@@ -1924,9 +1922,10 @@ impl MongoBackend {
         };
 
         // Also index any contained resources for `_contained` search. These rows
-        // share the container's (resource_type, resource_id) — so the earlier
-        // delete-by-(type,id) cleans them too — but are flagged `is_contained`
-        // and carry the contained resource's type and local id.
+        // share the container's (resource_type, resource_id) — so the
+        // delete-by-(type,id) that precedes a re-index cleans them too — but are
+        // flagged `is_contained` and carry the contained resource's type and
+        // local id.
         for contained in self.tenant_extractor(tenant_id).extract_contained(resource) {
             for value in &contained.values {
                 if let Some(d) = self.build_contained_index_document(
@@ -1941,6 +1940,28 @@ impl MongoBackend {
                 }
             }
         }
+
+        index_docs
+    }
+
+    pub(crate) async fn index_resource(
+        &self,
+        db: &mongodb::Database,
+        tenant_id: &str,
+        resource_type: &str,
+        resource_id: &str,
+        resource: &Value,
+        session: &mut Option<ClientSession>,
+    ) -> StorageResult<()> {
+        if self.is_search_offloaded() {
+            return Ok(());
+        }
+
+        self.delete_search_index(db, tenant_id, resource_type, resource_id, session)
+            .await?;
+
+        let index_docs =
+            self.search_index_documents(tenant_id, resource_type, resource_id, resource);
 
         if index_docs.is_empty() {
             return Ok(());
