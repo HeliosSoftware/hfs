@@ -3,26 +3,33 @@
 //! `$bulk-submit` ingestion runs on the *primary* backend's engine — that is
 //! where the submission, manifest, lease, and receipt state live, and where
 //! the primary deliberately skips its local search indexing when search is
-//! offloaded to a secondary (Elasticsearch). Nothing on that path ever told
+//! offloaded to a secondary (Elasticsearch). Nothing on that path used to tell
 //! the secondary, so bulk-loaded resources were readable but invisible to
 //! every search (#882) — precisely the "bulk load, then search" workload the
 //! composite exists for.
 //!
-//! [`CompositeSubmitJobs`] wraps the primary's job store and closes the gap
-//! at the manifest boundary: when a manifest reaches a terminal state
-//! (`finish_manifest` / `fail_manifest`), every successfully ingested entry
-//! is read back from the primary and pushed through the composite's normal
-//! secondary-sync machinery — the same [`SyncEvent`] path an interactive
-//! create takes, honoring the configured sync mode. `rollback_change` gets
-//! the mirror-image treatment so an aborted submission's reverts reach the
-//! secondary too.
+//! [`CompositeSubmitJobs`] wraps the primary's job store and closes the gap as
+//! [`SubmitWorkerStorage::sync_ingested`]: the worker calls it as an explicit
+//! step **before** the manifest's receipt is written (#1007), not inside
+//! `finish_manifest`/`fail_manifest` as it used to. Every successfully
+//! ingested entry is read back from the primary and pushed through the
+//! composite's normal secondary-sync machinery — the same [`SyncEvent`] batch
+//! path an interactive `create_many` takes, honoring the configured sync
+//! mode. A resource a secondary rejects after its retries is not silently
+//! dropped: [`BulkSubmitProvider::mark_entries_unindexed`] flips its entry
+//! results to `processing-error` with an OperationOutcome naming the
+//! resource and the `$reindex` repair, so the receipt reflects what is
+//! actually searchable instead of claiming `success` for it. `finish_manifest`
+//! and `fail_manifest` themselves only delegate to the primary now.
+//! `rollback_change` gets the mirror-image treatment so an aborted
+//! submission's reverts reach the secondary too.
 //!
-//! Syncing at manifest completion (rather than per entry or per file) keeps
-//! the ingest engine untouched and the cost linear: one read + one sync
+//! Syncing before the receipt (rather than per entry or per file) keeps the
+//! ingest engine untouched and the cost linear: one read + one batched sync
 //! event per distinct ingested resource. The trade-off is that a manifest's
-//! resources become searchable when the manifest finishes, not while it
-//! streams — the status endpoint's percentage is the progress signal during
-//! ingestion.
+//! resources become searchable just before its receipt is written, not while
+//! it streams — the status endpoint's percentage is the progress signal
+//! during ingestion.
 
 use std::sync::Arc;
 
@@ -39,11 +46,11 @@ use crate::core::bulk_submit::{
     BulkSubmitRollbackProvider, ChangeType, EntryCountSummary, EntryResultContinuation,
     EntryResultPage, ManifestPhase, NdjsonEntry, StreamProcessingResult,
     StreamingBulkSubmitProvider, SubmissionChange, SubmissionId, SubmissionManifest,
-    SubmissionStatus, SubmissionSummary, entry_result_pages,
+    SubmissionStatus, SubmissionSummary, UnindexedEntry, entry_result_pages,
 };
 use crate::core::bulk_submit_worker::{
-    BulkSubmitJobStore, ManifestFetchParams, ManifestLease, ManifestWorkerView, PollTokenTarget,
-    SubmitClaimStrategy, SubmitFileRecord, SubmitFileRow, SubmitWorkerStorage,
+    BulkSubmitJobStore, IngestSyncReport, ManifestFetchParams, ManifestLease, ManifestWorkerView,
+    PollTokenTarget, SubmitClaimStrategy, SubmitFileRecord, SubmitFileRow, SubmitWorkerStorage,
 };
 use crate::core::storage::ResourceStorage;
 use crate::core::{ActivityCell, DailyResourceCount, ResourceCountDelta, SofRunner, TenantRecord};
@@ -71,53 +78,39 @@ impl CompositeSubmitJobs {
         Self { primary, composite }
     }
 
-    /// Pushes every successfully ingested entry of the leased manifest
-    /// through the composite's secondary sync.
+    /// Consumes a stream of successfully-ingested receipt pages — built by
+    /// the caller from either the primary's live paginated cursor or, in
+    /// tests, a scripted continuation sequence — pushing each page's
+    /// resources through the composite's secondary sync in batches grouped
+    /// by `(resource type, FHIR version)`, then marks whatever a secondary
+    /// rejected after retries as `processing-error` on the primary (#1007).
     ///
-    /// Best-effort by design, mirroring the interactive write path: the
-    /// primary commit is the source of truth, a secondary that misses an
-    /// event is repaired by `$reindex`, and a terminal-state transition must
-    /// not be blocked by a search-index hiccup. Distinct resources are
-    /// synced once even when a manifest touched them on several lines.
-    async fn sync_ingested(&self, lease: &ManifestLease) {
-        let pages = entry_result_pages(|continuation| async move {
-            self.primary
-                .get_entry_results_page(
-                    &lease.tenant,
-                    &lease.submission_id,
-                    &lease.manifest_id,
-                    Some(BulkEntryOutcome::Success),
-                    1000,
-                    continuation.as_ref(),
-                )
-                .await
-        });
-        self.sync_ingested_pages(lease, pages).await;
-    }
-
+    /// Distinct resources are synced once even when a manifest touched them
+    /// on several lines; a resource deleted since ingestion (`read_ingested`)
+    /// is reflected as a delete on the secondaries and does not count toward
+    /// `synced`. A page fetch failure propagates instead of being swallowed:
+    /// the receipt must not be written against an incomplete sync.
     async fn sync_ingested_pages(
         &self,
         lease: &ManifestLease,
         pages: impl futures::Stream<Item = StorageResult<EntryResultPage>>,
-    ) {
+    ) -> Result<IngestSyncReport, LeaseError> {
         use futures::StreamExt;
         let mut seen: std::collections::HashSet<(String, String)> =
             std::collections::HashSet::new();
+        // Attempted (not merely seen): a resource deleted since ingestion is
+        // reflected as a delete on the secondaries instead (`read_ingested`)
+        // and never enters a sync batch, so it must not count toward `synced`.
+        let mut attempted = 0u64;
+        // `(resource_type, resource_id)` -> the first backend that rejected it
+        // and its error, for the entries that must be marked unindexed. An id
+        // rejected by several secondaries is reported once, naming whichever
+        // backend's rejection was seen first.
+        let mut rejected: std::collections::HashMap<(String, String), (String, String)> =
+            std::collections::HashMap::new();
         futures::pin_mut!(pages);
         while let Some(page) = pages.next().await {
-            let page = match page {
-                Ok(b) => b,
-                Err(e) => {
-                    warn!(
-                        submission = %lease.submission_id,
-                        manifest = %lease.manifest_id,
-                        error = %e,
-                        "secondary sync: failed to page entry results; \
-                         remaining entries await $reindex"
-                    );
-                    return;
-                }
-            };
+            let page = page.map_err(LeaseError::Storage)?;
             // One batch per (type, FHIR version) per page, so the secondary
             // takes a page of ingested resources as one write rather than one
             // synchronous event each — under Elasticsearch `refresh=wait_for`
@@ -147,7 +140,9 @@ impl CompositeSubmitJobs {
                 group.1.push((resource_id, stored.content().clone()));
             }
             for ((resource_type, fhir_version), resources) in by_type {
-                self.composite
+                attempted += resources.len() as u64;
+                let statuses = self
+                    .composite
                     .sync_creates_to_secondaries(
                         &lease.tenant,
                         &resource_type,
@@ -155,8 +150,63 @@ impl CompositeSubmitJobs {
                         resources,
                     )
                     .await;
+                for status in statuses {
+                    for resource_id in status.failed_resource_ids {
+                        rejected
+                            .entry((resource_type.clone(), resource_id))
+                            .or_insert_with(|| {
+                                (
+                                    status.backend_id.clone(),
+                                    status
+                                        .error
+                                        .clone()
+                                        .unwrap_or_else(|| "unknown error".to_string()),
+                                )
+                            });
+                    }
+                }
             }
         }
+
+        let unindexed = rejected.len() as u64;
+        if unindexed > 0 {
+            let entries: Vec<UnindexedEntry> = rejected
+                .into_iter()
+                .map(|((resource_type, resource_id), (backend_id, error))| {
+                    let operation_outcome = serde_json::json!({
+                        "resourceType": "OperationOutcome",
+                        "issue": [{
+                            "severity": "error",
+                            "code": "incomplete",
+                            "diagnostics": format!(
+                                "{resource_type}/{resource_id} was stored but could not be \
+                                 indexed for search on {backend_id}: {error}. Run \
+                                 POST /{resource_type}/$reindex to repair."
+                            )
+                        }]
+                    });
+                    UnindexedEntry {
+                        resource_type,
+                        resource_id,
+                        operation_outcome,
+                    }
+                })
+                .collect();
+            self.primary
+                .mark_entries_unindexed(
+                    &lease.tenant,
+                    &lease.submission_id,
+                    &lease.manifest_id,
+                    &entries,
+                )
+                .await
+                .map_err(LeaseError::Storage)?;
+        }
+
+        Ok(IngestSyncReport {
+            synced: attempted.saturating_sub(unindexed),
+            unindexed,
+        })
     }
 
     /// Reads one ingested resource back from the primary for syncing. A
@@ -514,6 +564,18 @@ impl BulkSubmitProvider for CompositeSubmitJobs {
             .get_entry_counts(tenant, submission_id, manifest_id)
             .await
     }
+
+    async fn mark_entries_unindexed(
+        &self,
+        tenant: &TenantContext,
+        submission_id: &SubmissionId,
+        manifest_id: &str,
+        entries: &[UnindexedEntry],
+    ) -> StorageResult<u64> {
+        self.primary
+            .mark_entries_unindexed(tenant, submission_id, manifest_id, entries)
+            .await
+    }
 }
 
 #[async_trait]
@@ -695,10 +757,8 @@ impl SubmitWorkerStorage for CompositeSubmitJobs {
     }
 
     async fn finish_manifest(&self, lease: &ManifestLease) -> Result<(), LeaseError> {
-        // Sync before finishing: once the manifest is terminal the lease is
-        // gone, and syncing under the live lease keeps a reclaim from racing
-        // a half-finished sweep with a second ingestion of the same files.
-        self.sync_ingested(lease).await;
+        // The worker calls `sync_ingested` itself, as an explicit step before
+        // the receipt (#1007) — nothing left to do here but delegate.
         self.primary.finish_manifest(lease).await
     }
 
@@ -707,10 +767,24 @@ impl SubmitWorkerStorage for CompositeSubmitJobs {
         lease: &ManifestLease,
         error_message: &str,
     ) -> Result<(), LeaseError> {
-        // A failed manifest still committed its successful entries on the
-        // primary — search must agree with what reads will return.
-        self.sync_ingested(lease).await;
+        // Ditto: the worker syncs before calling this on the fetch-error path too.
         self.primary.fail_manifest(lease, error_message).await
+    }
+
+    async fn sync_ingested(&self, lease: &ManifestLease) -> Result<IngestSyncReport, LeaseError> {
+        let pages = entry_result_pages(|continuation| async move {
+            self.primary
+                .get_entry_results_page(
+                    &lease.tenant,
+                    &lease.submission_id,
+                    &lease.manifest_id,
+                    Some(BulkEntryOutcome::Success),
+                    1000,
+                    continuation.as_ref(),
+                )
+                .await
+        });
+        self.sync_ingested_pages(lease, pages).await
     }
 
     async fn set_manifest_fetch_params(
@@ -823,11 +897,15 @@ mod tests {
     use crate::tenant::{TenantId, TenantPermissions};
     use parking_lot::Mutex;
     use serde_json::json;
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
 
-    /// Records every write the composite syncs into the "secondary".
+    /// Records every write the composite syncs into the "secondary", and
+    /// rejects `create`/`create_many` for any id in `reject` — the shape of a
+    /// secondary search index that could not accept a bulk-submitted resource
+    /// (mapping conflict, timeout, …) even after retries.
     struct SpySecondary {
         events: Arc<Mutex<Vec<String>>>,
+        reject: std::collections::HashSet<String>,
     }
 
     #[async_trait]
@@ -848,6 +926,15 @@ mod tests {
                 .and_then(|v| v.as_str())
                 .unwrap_or("?")
                 .to_string();
+            if self.reject.contains(&id) {
+                return Err(crate::error::StorageError::Backend(
+                    crate::error::BackendError::Internal {
+                        backend_name: "spy-secondary".to_string(),
+                        message: format!("secondary rejected {resource_type}/{id}"),
+                        source: None,
+                    },
+                ));
+            }
             self.events
                 .lock()
                 .push(format!("create {resource_type}/{id}"));
@@ -937,7 +1024,12 @@ mod tests {
         TenantContext::new(TenantId::new("t1"), TenantPermissions::full_access())
     }
 
-    fn harness() -> (
+    /// Builds a primary + composite + spy-secondary harness. `reject` names
+    /// the ids the spy secondary refuses, for the rejection-handling tests;
+    /// pass an empty set for the happy path.
+    fn harness(
+        reject: std::collections::HashSet<String>,
+    ) -> (
         Arc<SqliteBackend>,
         CompositeSubmitJobs,
         Arc<Mutex<Vec<String>>>,
@@ -959,6 +1051,7 @@ mod tests {
             "es".to_string(),
             Arc::new(SpySecondary {
                 events: events.clone(),
+                reject,
             }) as DynStorage,
         );
         // No sync worker started: events apply synchronously, which is what
@@ -976,9 +1069,12 @@ mod tests {
         ));
     }
 
+    /// #986: `sync_ingested_pages` must not treat an empty page carrying a
+    /// continuation as end of traversal — it has to keep fetching until
+    /// `next` is `None`.
     #[tokio::test]
     async fn sync_consumer_reads_beyond_an_empty_page_with_continuation() {
-        let (sqlite, jobs, events) = harness();
+        let (sqlite, jobs, events) = harness(HashSet::new());
         let tenant = tenant();
         let sub = SubmissionId::generate("scripted-sync");
         sqlite.create_submission(&tenant, &sub, None).await.unwrap();
@@ -1006,7 +1102,7 @@ mod tests {
                 .unwrap();
         }
         let (pages, calls) = scripted_pages::pages();
-        jobs.sync_ingested_pages(&lease, pages).await;
+        jobs.sync_ingested_pages(&lease, pages).await.unwrap();
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 3);
         let mut actual = events.lock().clone();
         actual.sort();
@@ -1019,11 +1115,12 @@ mod tests {
         );
     }
 
-    /// #882: a finished manifest pushes every ingested resource into the
-    /// secondary — through the raw primary engine, nothing ever did.
+    /// #882/#1007: `sync_ingested` pushes every ingested resource into the
+    /// secondary — through the raw primary engine, nothing ever did — as its
+    /// own worker step, and `finish_manifest` no longer does this itself.
     #[tokio::test]
-    async fn finished_manifest_syncs_ingested_resources_to_the_secondary() {
-        let (sqlite, jobs, events) = harness();
+    async fn sync_ingested_pushes_every_ingested_resource_to_the_secondary() {
+        let (sqlite, jobs, events) = harness(HashSet::new());
         let tenant = tenant();
         let sub = SubmissionId::generate("sync-test");
         sqlite.create_submission(&tenant, &sub, None).await.unwrap();
@@ -1065,7 +1162,14 @@ mod tests {
             "nothing syncs while the manifest is still streaming"
         );
 
-        jobs.finish_manifest(&lease).await.unwrap();
+        let report = jobs.sync_ingested(&lease).await.unwrap();
+        assert_eq!(
+            report,
+            IngestSyncReport {
+                synced: 2,
+                unindexed: 0
+            }
+        );
 
         let seen = events.lock().clone();
         assert!(
@@ -1077,15 +1181,112 @@ mod tests {
             "every distinct ingested resource syncs, got {seen:?}"
         );
 
+        // The sync already happened as its own step; `finish_manifest` must
+        // not sync again.
+        let synced_event_count = events.lock().len();
+        jobs.finish_manifest(&lease).await.unwrap();
+        assert_eq!(
+            events.lock().len(),
+            synced_event_count,
+            "finish_manifest must not add new sync events (#1007)"
+        );
+
         // And the manifest actually finished on the primary.
         let manifests = sqlite.list_manifests(&tenant, &sub).await.unwrap();
         assert!(manifests[0].status.is_terminal());
     }
 
+    /// #1007: a secondary that rejects a resource after retries must not
+    /// leave its entry result reading `success` — it becomes
+    /// `processing-error` with an OperationOutcome naming the repair.
+    #[tokio::test]
+    async fn sync_ingested_marks_rejected_resources_as_processing_error() {
+        let reject: HashSet<String> = ["p-reject-1".to_string()].into_iter().collect();
+        let (sqlite, jobs, _events) = harness(reject);
+        let tenant = tenant();
+        let sub = SubmissionId::generate("reject-test");
+        sqlite.create_submission(&tenant, &sub, None).await.unwrap();
+        sqlite
+            .add_manifest(&tenant, &sub, Some("http://provider/m.json"), None)
+            .await
+            .unwrap();
+        let lease = sqlite
+            .claim_next_manifest(
+                &WorkerId::new("w-reject"),
+                std::time::Duration::from_secs(60),
+            )
+            .await
+            .unwrap()
+            .expect("claimable manifest");
+
+        sqlite
+            .process_entries(
+                &tenant,
+                &sub,
+                &lease.manifest_id,
+                vec![
+                    NdjsonEntry::new(
+                        1,
+                        "Patient",
+                        json!({"resourceType": "Patient", "id": "p-ok-1"}),
+                    ),
+                    NdjsonEntry::new(
+                        2,
+                        "Patient",
+                        json!({"resourceType": "Patient", "id": "p-reject-1"}),
+                    ),
+                ],
+                &BulkProcessingOptions::new(),
+            )
+            .await
+            .unwrap();
+
+        let report = jobs.sync_ingested(&lease).await.unwrap();
+        assert_eq!(
+            report,
+            IngestSyncReport {
+                synced: 1,
+                unindexed: 1
+            }
+        );
+
+        let page = sqlite
+            .get_entry_results_page(&tenant, &sub, &lease.manifest_id, None, 10, None)
+            .await
+            .unwrap();
+        let results: Vec<_> = page.entries.into_iter().map(|e| e.result).collect();
+        let rejected = results
+            .iter()
+            .find(|r| r.resource_id.as_deref() == Some("p-reject-1"))
+            .expect("rejected entry present");
+        assert_eq!(rejected.outcome, BulkEntryOutcome::ProcessingError);
+        let oo = rejected
+            .operation_outcome
+            .as_ref()
+            .expect("operation outcome recorded");
+        assert_eq!(oo["issue"][0]["code"], "incomplete");
+        let diagnostics = oo["issue"][0]["diagnostics"].as_str().unwrap();
+        assert!(diagnostics.contains("Patient/p-reject-1"));
+        assert!(diagnostics.contains("$reindex"));
+
+        let ok = results
+            .iter()
+            .find(|r| r.resource_id.as_deref() == Some("p-ok-1"))
+            .expect("accepted entry present");
+        assert_eq!(ok.outcome, BulkEntryOutcome::Success);
+
+        let counts = sqlite
+            .get_entry_counts(&tenant, &sub, &lease.manifest_id)
+            .await
+            .unwrap();
+        assert_eq!(counts.success, 1);
+        assert_eq!(counts.processing_error, 1);
+    }
+
     /// A rolled-back create is deleted from the secondary too.
     #[tokio::test]
     async fn rollback_of_a_create_deletes_from_the_secondary() {
-        let (sqlite, jobs, events) = harness();
+        let (sqlite, jobs, events) = harness(HashSet::new());
         let tenant = tenant();
         let sub = SubmissionId::generate("rollback-test");
         sqlite.create_submission(&tenant, &sub, None).await.unwrap();

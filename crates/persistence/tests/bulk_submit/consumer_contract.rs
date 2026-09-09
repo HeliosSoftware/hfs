@@ -477,6 +477,11 @@ pub async fn composite_receipts<B: BulkSubmitJobStore + 'static>(
         delegated.next,
         Some(persistence::core::EntryResultContinuation::Keyset(_))
     ));
+    // #1007: the sync now runs as its own explicit step, mirroring what the
+    // real worker does before calling `finish_manifest`/`fail_manifest` —
+    // neither of those delegates to the primary syncs anything by itself
+    // anymore.
+    jobs.sync_ingested(&lease).await.unwrap();
     if fail {
         jobs.fail_manifest(&lease, "intentional partial failure")
             .await

@@ -18,7 +18,7 @@ use crate::core::bulk_submit::{
     BulkSubmitRollbackProvider, ChangeType, EntryCountSummary, EntryResultContinuation,
     EntryResultPage, ManifestStatus, NdjsonEntry, PagedEntryResult, StreamProcessingResult,
     StreamingBulkSubmitProvider, SubmissionChange, SubmissionId, SubmissionManifest,
-    SubmissionStatus, SubmissionSummary, invalid_entry_result_page,
+    SubmissionStatus, SubmissionSummary, UnindexedEntry, invalid_entry_result_page,
 };
 use crate::error::{BulkSubmitError, ResourceError, StorageError, StorageResult};
 use crate::tenant::TenantContext;
@@ -518,6 +518,21 @@ impl BulkSubmitProvider for S3Backend {
 
         Ok(summary)
     }
+
+    async fn mark_entries_unindexed(
+        &self,
+        tenant: &TenantContext,
+        submission_id: &SubmissionId,
+        manifest_id: &str,
+        entries: &[UnindexedEntry],
+    ) -> StorageResult<u64> {
+        if entries.is_empty() {
+            return Ok(0);
+        }
+        let location = self.tenant_location(tenant)?;
+        self.mark_entry_result_objects_unindexed(&location, submission_id, manifest_id, entries)
+            .await
+    }
 }
 
 #[async_trait]
@@ -929,6 +944,62 @@ impl S3Backend {
         }
 
         Ok(results)
+    }
+
+    /// Flips the outcome of every entry result matching one of `entries`
+    /// (`resource_type` + `resource_id`) to `processing-error`, storing the
+    /// given OperationOutcome, and returns how many objects changed.
+    ///
+    /// Rewrites each matched object at its own key rather than through
+    /// [`Self::persist_entry_result`]: an entry result's key encodes the
+    /// manifest output file it came from (#457), which is not part of
+    /// [`BulkEntryResult`] itself, so re-deriving a key from `file_url: None`
+    /// would land on a different object than the one this scan just read —
+    /// creating a duplicate instead of overwriting it on a multi-file
+    /// manifest. Listing keeps the exact key each result already lives at.
+    async fn mark_entry_result_objects_unindexed(
+        &self,
+        location: &TenantLocation,
+        submission_id: &SubmissionId,
+        manifest_id: &str,
+        entries: &[UnindexedEntry],
+    ) -> StorageResult<u64> {
+        let prefix = format!(
+            "{}results/{}/",
+            location
+                .keyspace
+                .submit_prefix(&submission_id.submitter, &submission_id.submission_id),
+            manifest_id
+        );
+
+        let mut affected = 0u64;
+        for object in self.list_objects_all(&location.bucket, &prefix).await? {
+            if !object.key.ends_with(".json") {
+                continue;
+            }
+            let Some((mut result, _)) = self
+                .get_json_object::<BulkEntryResult>(&location.bucket, &object.key)
+                .await?
+            else {
+                continue;
+            };
+            let Some(resource_id) = result.resource_id.clone() else {
+                continue;
+            };
+            let Some(matched) = entries
+                .iter()
+                .find(|e| e.resource_type == result.resource_type && e.resource_id == resource_id)
+            else {
+                continue;
+            };
+            result.outcome = BulkEntryOutcome::ProcessingError;
+            result.operation_outcome = Some(matched.operation_outcome.clone());
+            let payload = self.serialize_json(&result)?;
+            self.put_json_object(&location.bucket, &object.key, &payload, None, None)
+                .await?;
+            affected += 1;
+        }
+        Ok(affected)
     }
 
     /// Loads all change log records for a submission from S3.

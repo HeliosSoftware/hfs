@@ -6575,6 +6575,99 @@ mod postgres_integration {
         );
     }
 
+    /// #1007: `mark_entries_unindexed` flips only the named `(type, id)`
+    /// entry results to `processing-error`, leaving the rest untouched, and
+    /// is a no-op on an empty entry list.
+    #[tokio::test]
+    async fn mark_entries_unindexed_flips_only_the_named_resources() {
+        use helios_persistence::core::{
+            BulkEntryOutcome, BulkProcessingOptions, BulkSubmitProvider, NdjsonEntry, SubmissionId,
+            UnindexedEntry,
+        };
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("bulk_submit_unindexed");
+        let sub_id = SubmissionId::generate("pg-unindexed-test");
+        backend
+            .create_submission(&tenant, &sub_id, None)
+            .await
+            .unwrap();
+        let manifest = backend
+            .add_manifest(&tenant, &sub_id, None, None)
+            .await
+            .unwrap();
+
+        let entries: Vec<NdjsonEntry> = ["pg-unidx-1", "pg-unidx-2", "pg-unidx-3"]
+            .iter()
+            .enumerate()
+            .map(|(i, id)| {
+                NdjsonEntry::new(
+                    (i + 1) as u64,
+                    "Patient",
+                    json!({"resourceType": "Patient", "id": id}),
+                )
+            })
+            .collect();
+        let results = backend
+            .process_entries(
+                &tenant,
+                &sub_id,
+                &manifest.manifest_id,
+                entries,
+                &BulkProcessingOptions::new(),
+            )
+            .await
+            .unwrap();
+        assert!(results.iter().all(|r| r.is_success()));
+
+        // Empty list is a no-op.
+        assert_eq!(
+            backend
+                .mark_entries_unindexed(&tenant, &sub_id, &manifest.manifest_id, &[])
+                .await
+                .unwrap(),
+            0
+        );
+
+        let oo = json!({
+            "resourceType": "OperationOutcome",
+            "issue": [{
+                "severity": "error",
+                "code": "incomplete",
+                "diagnostics": "Patient/pg-unidx-2 was stored but could not be indexed for \
+                                search on es: timeout. Run POST /Patient/$reindex to repair."
+            }]
+        });
+        let changed = backend
+            .mark_entries_unindexed(
+                &tenant,
+                &sub_id,
+                &manifest.manifest_id,
+                &[UnindexedEntry {
+                    resource_type: "Patient".to_string(),
+                    resource_id: "pg-unidx-2".to_string(),
+                    operation_outcome: oo.clone(),
+                }],
+            )
+            .await
+            .unwrap();
+        assert_eq!(changed, 1);
+
+        let page = backend
+            .get_entry_results_page(&tenant, &sub_id, &manifest.manifest_id, None, 10, None)
+            .await
+            .unwrap();
+        for paged in &page.entries {
+            let result = &paged.result;
+            if result.resource_id.as_deref() == Some("pg-unidx-2") {
+                assert_eq!(result.outcome, BulkEntryOutcome::ProcessingError);
+                assert_eq!(result.operation_outcome.as_ref(), Some(&oo));
+            } else {
+                assert_eq!(result.outcome, BulkEntryOutcome::Success);
+            }
+        }
+    }
+
     // ========================================================================
     // Issue #311 — `ifMatch` on bundle entries, on a real PostgreSQL instance
     //

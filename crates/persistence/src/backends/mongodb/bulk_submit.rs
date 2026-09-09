@@ -49,7 +49,8 @@ use crate::core::bulk_submit::{
     BulkSubmitRollbackProvider, ChangeType, EntryCountSummary, EntryResultContinuation,
     EntryResultPage, ManifestPhase, ManifestStatus, NdjsonEntry, PagedEntryResult,
     StreamProcessingResult, StreamingBulkSubmitProvider, SubmissionChange, SubmissionId,
-    SubmissionManifest, SubmissionStatus, SubmissionSummary, invalid_entry_result_page,
+    SubmissionManifest, SubmissionStatus, SubmissionSummary, UnindexedEntry,
+    invalid_entry_result_page,
 };
 use crate::core::bulk_submit_worker::{
     ManifestFetchParams, ManifestLease, ManifestWorkerView, PollTokenTarget, SubmitClaimStrategy,
@@ -926,6 +927,38 @@ impl BulkSubmitProvider for MongoBackend {
     ) -> StorageResult<EntryCountSummary> {
         self.count_outcomes(tenant, submission_id, Some(manifest_id))
             .await
+    }
+
+    async fn mark_entries_unindexed(
+        &self,
+        tenant: &TenantContext,
+        submission_id: &SubmissionId,
+        manifest_id: &str,
+        entries: &[UnindexedEntry],
+    ) -> StorageResult<u64> {
+        if entries.is_empty() {
+            return Ok(0);
+        }
+        let results = self.entry_results().await?;
+        let mut affected = 0u64;
+        for entry in entries {
+            let mut filter = manifest_filter(tenant, submission_id, manifest_id);
+            filter.insert("resource_type", &entry.resource_type);
+            filter.insert("resource_id", &entry.resource_id);
+            let operation_outcome = json_string(&entry.operation_outcome)?;
+            let update = doc! {
+                "$set": {
+                    "outcome": BulkEntryOutcome::ProcessingError.to_string(),
+                    "operation_outcome": operation_outcome,
+                }
+            };
+            let result = results
+                .update_many(filter, update)
+                .await
+                .map_err(|e| internal_error(format!("mark entry unindexed: {e}")))?;
+            affected += result.modified_count;
+        }
+        Ok(affected)
     }
 }
 

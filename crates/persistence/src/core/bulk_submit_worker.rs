@@ -31,6 +31,17 @@ use crate::core::bulk_submit_input::{SubmitInputFetcher, submission_output_job_i
 use crate::error::{StorageError, StorageResult};
 use crate::tenant::TenantContext;
 
+/// What pushing a manifest's ingested resources into the deployment's
+/// secondary search indexes achieved, reported before the receipt is written.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct IngestSyncReport {
+    /// Resources every secondary accepted.
+    pub synced: u64,
+    /// Resources a secondary rejected after retries; their entry results
+    /// are now `processing-error`.
+    pub unindexed: u64,
+}
+
 /// A lease over a single pending manifest, held by exactly one worker at a time.
 ///
 /// Leases expire; if the holding worker does not heartbeat before `lease_expiry`,
@@ -298,6 +309,15 @@ pub trait SubmitWorkerStorage: Send + Sync {
         error_message: &str,
     ) -> Result<(), LeaseError>;
 
+    /// Pushes every resource this manifest ingested into the deployment's
+    /// secondary search indexes, before the receipt is written, and marks the
+    /// ones a secondary rejected as `processing-error`. Backends that index
+    /// themselves have nothing to push and report an empty sync. Fenced.
+    async fn sync_ingested(&self, lease: &ManifestLease) -> Result<IngestSyncReport, LeaseError> {
+        let _ = lease;
+        Ok(IngestSyncReport::default())
+    }
+
     // ---- REST-facing (unfenced) submission/poll-token/artifact lifecycle ----
 
     /// Persists the remote-fetch parameters for a manifest that the kickoff handler
@@ -441,7 +461,9 @@ pub trait DeferredReindexHook: Send + Sync {
 /// engine), a [`SubmitInputFetcher`] (remote manifest + NDJSON fetch), and an
 /// [`ExportOutputStore`] (where status-manifest artifacts go), and drives a claimed
 /// manifest to completion: fetch → ingest each `output` file via the existing
-/// `process_ndjson_stream` engine → emit `output`/`error` artifacts → finish.
+/// `process_ndjson_stream` engine → sync ingested resources to secondary search
+/// indexes ([`SubmitWorkerStorage::sync_ingested`], #1007) → emit `output`/`error`
+/// artifacts → finish.
 pub struct DefaultSubmitWorker<Js: ?Sized, Fetcher: ?Sized, Os: ?Sized> {
     jobs: Arc<Js>,
     fetcher: Arc<Fetcher>,
@@ -778,6 +800,20 @@ where
                     &format!("failed to fetch manifest: {e}"),
                 )
                 .await?;
+                // Whatever a prior run of this manifest already ingested must
+                // stay searchable even though this run fails outright — sync
+                // it before the manifest goes terminal, while the lease still
+                // covers the write. Best-effort: the manifest fails either
+                // way, and a miss here is repaired by $reindex.
+                if let Err(e) = self.jobs.sync_ingested(&lease).await {
+                    tracing::warn!(
+                        submission = %lease.submission_id,
+                        manifest = %lease.manifest_id,
+                        error = %e,
+                        "bulk-submit: failed to sync ingested resources before failing the \
+                         manifest on a fetch error"
+                    );
+                }
                 // Stop renewing before the manifest goes terminal, so no
                 // heartbeat lands on a row this task has already failed.
                 drop(keeper);
@@ -1074,7 +1110,7 @@ where
             );
             return Ok(());
         }
-        let failed = failed_at.load(Ordering::Relaxed);
+        let mut failed = failed_at.load(Ordering::Relaxed);
 
         // 2b. Process `deleted` files — transaction Bundles / resource refs to remove.
         let mut deleted_refs: Vec<String> = Vec::new();
@@ -1111,6 +1147,42 @@ where
             self.write_deleted_artifact(&lease, &manifest_url, &deleted_refs)
                 .await?;
         }
+
+        // 2c. Push this manifest's ingested resources into the deployment's
+        // secondary search indexes, before the receipt is written (#1007): a
+        // resource a secondary rejects after retries must not read `success`
+        // in the receipt or the status counts.
+        if keeper.lease_lost() {
+            return Ok(());
+        }
+        let sync = match self.jobs.sync_ingested(&lease).await {
+            Ok(report) => report,
+            Err(LeaseError::LeaseLost { .. }) => return Ok(()),
+            Err(LeaseError::Storage(e)) => return Err(e),
+        };
+        if sync.unindexed > 0 {
+            tracing::warn!(
+                submission = %lease.submission_id,
+                manifest = %lease.manifest_id,
+                unindexed = sync.unindexed,
+                synced = sync.synced,
+                "bulk-submit: a secondary rejected ingested resources after retries; \
+                 their entry results are now processing-error"
+            );
+            // `processed_entries` is not corrected: it is cumulative across
+            // runs and over-reporting is the safe direction (see
+            // `SubmitWorkerStorage::add_manifest_progress`'s docs).
+            // `failed_entries` must still grow, so the status counts and this
+            // manifest's own receipt agree.
+            if let Err(e) = self
+                .jobs
+                .add_manifest_progress(&lease, 0, sync.unindexed, 0)
+                .await
+            {
+                return fenced_write_outcome(&keeper, e);
+            }
+        }
+        failed += sync.unindexed;
 
         // 3. Emit per-type `output` receipts and an aggregated `error` artifact.
         if keeper.lease_lost() {
@@ -2077,6 +2149,288 @@ mod tests {
         // Byte progress reached the file's full advertised size.
         assert_eq!(manifests[0].bytes_total, ndjson.len() as u64);
         assert_eq!(manifests[0].bytes_processed, ndjson.len() as u64);
+    }
+
+    /// A minimal secondary that rejects `create`/`create_many` for one
+    /// hard-coded id, and accepts everything else — the composite-sync half
+    /// of the worker test below.
+    struct RejectingSecondary {
+        reject_id: &'static str,
+    }
+
+    #[async_trait]
+    impl ResourceStorage for RejectingSecondary {
+        fn backend_name(&self) -> &'static str {
+            "rejecting-secondary"
+        }
+
+        async fn create(
+            &self,
+            _tenant: &TenantContext,
+            resource_type: &str,
+            resource: Value,
+            fhir_version: FhirVersion,
+        ) -> StorageResult<crate::types::StoredResource> {
+            let id = resource
+                .get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?")
+                .to_string();
+            if id == self.reject_id {
+                return Err(crate::error::StorageError::Backend(
+                    crate::error::BackendError::Internal {
+                        backend_name: "rejecting-secondary".to_string(),
+                        message: format!("secondary rejected {resource_type}/{id}"),
+                        source: None,
+                    },
+                ));
+            }
+            Ok(crate::types::StoredResource::new(
+                resource_type,
+                id,
+                TenantId::new("t1"),
+                resource,
+                fhir_version,
+            ))
+        }
+
+        async fn create_or_update(
+            &self,
+            _tenant: &TenantContext,
+            resource_type: &str,
+            id: &str,
+            resource: Value,
+            fhir_version: FhirVersion,
+        ) -> StorageResult<(crate::types::StoredResource, bool)> {
+            Ok((
+                crate::types::StoredResource::new(
+                    resource_type,
+                    id,
+                    TenantId::new("t1"),
+                    resource,
+                    fhir_version,
+                ),
+                true,
+            ))
+        }
+
+        async fn read(
+            &self,
+            _tenant: &TenantContext,
+            _resource_type: &str,
+            _id: &str,
+        ) -> StorageResult<Option<crate::types::StoredResource>> {
+            Ok(None)
+        }
+
+        async fn update(
+            &self,
+            _tenant: &TenantContext,
+            current: &crate::types::StoredResource,
+            resource: Value,
+        ) -> StorageResult<crate::types::StoredResource> {
+            Ok(crate::types::StoredResource::new(
+                current.resource_type(),
+                current.id(),
+                TenantId::new("t1"),
+                resource,
+                current.fhir_version(),
+            ))
+        }
+
+        async fn delete(
+            &self,
+            _tenant: &TenantContext,
+            _resource_type: &str,
+            _id: &str,
+        ) -> StorageResult<()> {
+            Ok(())
+        }
+
+        async fn count(
+            &self,
+            _tenant: &TenantContext,
+            _resource_type: Option<&str>,
+        ) -> StorageResult<u64> {
+            Ok(0)
+        }
+    }
+
+    /// Reads back a finalized status-manifest artifact's NDJSON lines
+    /// directly from [`LocalFsOutputStore`]'s layout (mirrors
+    /// `LocalFsOutputStore::part_path`, which is private to that module).
+    fn read_submit_file_lines(
+        tmp_root: &std::path::Path,
+        tenant_id: &str,
+        job_id: &str,
+        row: &crate::core::bulk_submit_worker::SubmitFileRow,
+    ) -> Vec<String> {
+        let path = tmp_root.join(tenant_id).join(job_id).join(format!(
+            "{}-{}-{}-{}.ndjson",
+            row.file_type,
+            row.resource_type.as_deref().unwrap_or("Resource"),
+            row.part_index,
+            row.fencing_token
+        ));
+        std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// #1007: a resource the primary ingests but a secondary search index
+    /// rejects (after retries) must not read `success` in the manifest's
+    /// receipt — its entry result becomes `processing-error` with an
+    /// OperationOutcome naming the resource and the `$reindex` repair, and
+    /// the manifest still reaches a terminal state.
+    #[tokio::test]
+    async fn test_worker_reports_unindexed_resources_in_the_receipt() {
+        use crate::composite::{CompositeConfig, CompositeStorage, CompositeSubmitJobs};
+        use crate::core::BackendKind;
+        use crate::core::bulk_submit::BulkEntryOutcome;
+        use crate::core::bulk_submit_worker::BulkSubmitJobStore;
+
+        let sqlite = Arc::new(SqliteBackend::in_memory().unwrap());
+        sqlite.init_schema().unwrap();
+        let config = CompositeConfig::builder()
+            .primary("sqlite", BackendKind::Sqlite)
+            .search_backend("es", BackendKind::Elasticsearch)
+            .sync_mode(crate::composite::config::SyncMode::Synchronous)
+            .build()
+            .unwrap();
+        let mut backends: std::collections::HashMap<String, crate::composite::DynStorage> =
+            std::collections::HashMap::new();
+        backends.insert(
+            "sqlite".to_string(),
+            sqlite.clone() as crate::composite::DynStorage,
+        );
+        backends.insert(
+            "es".to_string(),
+            Arc::new(RejectingSecondary {
+                reject_id: "reject-1",
+            }) as crate::composite::DynStorage,
+        );
+        let composite = Arc::new(CompositeStorage::new(config, backends).unwrap());
+        let jobs = Arc::new(CompositeSubmitJobs::new(
+            sqlite.clone() as Arc<dyn BulkSubmitJobStore>,
+            composite,
+        ));
+
+        let tmp = tempfile::tempdir().unwrap();
+        let output = Arc::new(LocalFsOutputStore::new(
+            tmp.path().to_path_buf(),
+            "http://localhost:8080",
+        ));
+
+        let tenant = tenant();
+        let sub_id = SubmissionId::generate("mock-system");
+        jobs.create_submission(&tenant, &sub_id, None)
+            .await
+            .unwrap();
+        jobs.add_manifest(
+            &tenant,
+            &sub_id,
+            Some("http://provider/manifest.json"),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let ndjson = concat!(
+            "{\"resourceType\":\"Patient\",\"id\":\"ok-1\"}\n",
+            "{\"resourceType\":\"Patient\",\"id\":\"reject-1\"}\n"
+        );
+        let mut files = std::collections::HashMap::new();
+        files.insert(
+            "http://provider/patient.ndjson".to_string(),
+            ndjson.as_bytes().to_vec(),
+        );
+        let fetcher = Arc::new(MockFetcher {
+            files,
+            manifest: RemoteManifest {
+                requires_access_token: false,
+                output: vec![RemoteFile {
+                    resource_type: Some("Patient".to_string()),
+                    url: "http://provider/patient.ndjson".to_string(),
+                    count: Some(2),
+                }],
+                deleted: vec![],
+            },
+        });
+
+        let worker = DefaultSubmitWorker::new(
+            jobs.clone(),
+            fetcher,
+            output,
+            WorkerId::new("unindexed-worker"),
+        );
+        let lease = jobs
+            .claim_next_manifest(
+                &WorkerId::new("unindexed-worker"),
+                StdDuration::from_secs(60),
+            )
+            .await
+            .unwrap()
+            .expect("claimable manifest");
+        worker.run_job(lease).await.unwrap();
+
+        let manifests = jobs.list_manifests(&tenant, &sub_id).await.unwrap();
+        assert!(
+            manifests[0].status.is_terminal(),
+            "the manifest must still reach a terminal state"
+        );
+
+        let job_id = submission_output_job_id(&sub_id);
+        let tenant_id = tenant.tenant_id().as_str();
+        let submit_files = jobs.list_submit_files(&tenant, &sub_id).await.unwrap();
+
+        let output_row = submit_files
+            .iter()
+            .find(|f| f.file_type == "output" && f.resource_type.as_deref() == Some("Patient"))
+            .expect("output receipt for Patient");
+        let output_lines =
+            read_submit_file_lines(tmp.path(), tenant_id, job_id.as_str(), output_row);
+        assert_eq!(
+            output_lines,
+            vec![serde_json::json!({"reference": "Patient/ok-1"}).to_string()],
+            "only the accepted resource is a success receipt"
+        );
+
+        let error_row = submit_files
+            .iter()
+            .find(|f| f.file_type == "error")
+            .expect("error receipt for the rejected resource");
+        let error_lines = read_submit_file_lines(tmp.path(), tenant_id, job_id.as_str(), error_row);
+        assert_eq!(error_lines.len(), 1, "exactly one rejected resource");
+        let oo: Value = serde_json::from_str(&error_lines[0]).unwrap();
+        assert_eq!(oo["issue"][0]["code"], "incomplete");
+        let diagnostics = oo["issue"][0]["diagnostics"].as_str().unwrap();
+        assert!(diagnostics.contains("Patient/reject-1"));
+        assert!(diagnostics.contains("$reindex"));
+        assert_eq!(
+            error_row.count_severity,
+            Some(serde_json::json!({"error": 1}))
+        );
+
+        let counts = jobs
+            .get_entry_counts(&tenant, &sub_id, &manifests[0].manifest_id)
+            .await
+            .unwrap();
+        assert_eq!(counts.success, 1);
+        assert_eq!(counts.processing_error, 1);
+        let page = jobs
+            .get_entry_results_page(&tenant, &sub_id, &manifests[0].manifest_id, None, 10, None)
+            .await
+            .unwrap();
+        let rejected = page
+            .entries
+            .iter()
+            .map(|e| &e.result)
+            .find(|r| r.resource_id.as_deref() == Some("reject-1"))
+            .expect("rejected entry present");
+        assert_eq!(rejected.outcome, BulkEntryOutcome::ProcessingError);
     }
 
     /// #903 fast-load: deferred ingestion stores readable resources that are
