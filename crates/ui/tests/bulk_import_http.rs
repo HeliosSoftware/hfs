@@ -137,6 +137,29 @@ fn app_with_path_tenant(ctx: &Ctx, tenant: &str) -> Router {
     )
 }
 
+/// Same as [`app_with_path_tenant`] but header-only routing
+/// (`tenant_path_routing = false`, HFS's default): the effective tenant of a
+/// request is the server's default tenant, with no tenant registry or
+/// per-tenant settings needed to exercise it (#1006).
+fn app_with_header_tenant(ctx: &Ctx, tenant: &str) -> Router {
+    helios_ui::mount_with_conformance_source_and_body_limit_and_tenant_routing(
+        Router::new(),
+        "9.9.9",
+        None,
+        helios_ui::NlSearch::default(),
+        None,
+        Some(Arc::clone(&ctx.settings)),
+        tenant.to_string(),
+        Arc::new(helios_ui::StaticConformanceSource::empty()),
+        FhirVersion::R4,
+        None,
+        ctx.recipient.clone(),
+        10 * 1024 * 1024,
+        false,
+        Some(Arc::clone(&ctx.bulk_provider)),
+    )
+}
+
 async fn body_text(response: axum::response::Response) -> String {
     let bytes = response.into_body().collect().await.unwrap().to_bytes();
     String::from_utf8(bytes.to_vec()).unwrap()
@@ -497,6 +520,284 @@ async fn mock_recipient(
         .with_state(state);
     tokio::spawn(async move { axum::serve(listener, recipient).await.unwrap() });
     (format!("http://{addr}"), received)
+}
+
+/// One self-call HFS's own Import workspace made against a recipient —
+/// recorded so a test can assert the request actually carried the selected
+/// tenant, not merely that some header existed (#1006).
+#[derive(Debug, Clone)]
+struct SeenSelfCall {
+    method: String,
+    path: String,
+    tenant: Option<String>,
+}
+
+/// A loopback Data Recipient — standing in for this HFS process (#689) —
+/// that records every self-call's method, path and `x-tenant-id` header,
+/// answering both the header-routing paths (no tenant segment) and the
+/// `both`-mode paths (one tenant path segment), the way HFS's own recipient
+/// side does (#1006).
+async fn mock_recipient_capturing_tenant() -> (String, Arc<std::sync::Mutex<Vec<SeenSelfCall>>>) {
+    use axum::extract::{Path as AxPath, State as AxState};
+    use axum::http::HeaderMap;
+
+    #[derive(Clone)]
+    struct S {
+        seen: Arc<std::sync::Mutex<Vec<SeenSelfCall>>>,
+        base: Arc<std::sync::Mutex<String>>,
+    }
+
+    fn tenant_of(headers: &HeaderMap) -> Option<String> {
+        headers
+            .get("x-tenant-id")
+            .and_then(|v| v.to_str().ok())
+            .map(String::from)
+    }
+
+    let state = S {
+        seen: Arc::new(std::sync::Mutex::new(Vec::new())),
+        base: Arc::new(std::sync::Mutex::new(String::new())),
+    };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    *state.base.lock().unwrap() = format!("http://{addr}");
+    let seen = Arc::clone(&state.seen);
+
+    let app = Router::new()
+        .route(
+            "/$bulk-submit",
+            axum::routing::post(|AxState(s): AxState<S>, headers: HeaderMap| async move {
+                s.seen.lock().unwrap().push(SeenSelfCall {
+                    method: "POST".to_string(),
+                    path: "/$bulk-submit".to_string(),
+                    tenant: tenant_of(&headers),
+                });
+                (
+                    StatusCode::OK,
+                    axum::Json(serde_json::json!({"resourceType": "Parameters"})),
+                )
+            }),
+        )
+        .route(
+            "/{tenant}/$bulk-submit",
+            axum::routing::post(
+                |AxState(s): AxState<S>, AxPath(tenant): AxPath<String>, headers: HeaderMap| async move {
+                    s.seen.lock().unwrap().push(SeenSelfCall {
+                        method: "POST".to_string(),
+                        path: format!("/{tenant}/$bulk-submit"),
+                        tenant: tenant_of(&headers),
+                    });
+                    (
+                        StatusCode::OK,
+                        axum::Json(serde_json::json!({"resourceType": "Parameters"})),
+                    )
+                },
+            ),
+        )
+        .route(
+            "/$bulk-submit-status",
+            axum::routing::post(|AxState(s): AxState<S>, headers: HeaderMap| async move {
+                s.seen.lock().unwrap().push(SeenSelfCall {
+                    method: "POST".to_string(),
+                    path: "/$bulk-submit-status".to_string(),
+                    tenant: tenant_of(&headers),
+                });
+                let base = s.base.lock().unwrap().clone();
+                (
+                    StatusCode::ACCEPTED,
+                    [("content-location", format!("{base}/poll"))],
+                    "",
+                )
+            }),
+        )
+        .route(
+            "/{tenant}/$bulk-submit-status",
+            axum::routing::post(
+                |AxState(s): AxState<S>, AxPath(tenant): AxPath<String>, headers: HeaderMap| async move {
+                    s.seen.lock().unwrap().push(SeenSelfCall {
+                        method: "POST".to_string(),
+                        path: format!("/{tenant}/$bulk-submit-status"),
+                        tenant: tenant_of(&headers),
+                    });
+                    let base = s.base.lock().unwrap().clone();
+                    (
+                        StatusCode::ACCEPTED,
+                        [("content-location", format!("{base}/poll"))],
+                        "",
+                    )
+                },
+            ),
+        )
+        .route(
+            "/poll",
+            axum::routing::get(|AxState(s): AxState<S>, headers: HeaderMap| async move {
+                s.seen.lock().unwrap().push(SeenSelfCall {
+                    method: "GET".to_string(),
+                    path: "/poll".to_string(),
+                    tenant: tenant_of(&headers),
+                });
+                (
+                    StatusCode::ACCEPTED,
+                    [
+                        ("retry-after", "120".to_string()),
+                        ("x-progress", "processing 10% complete".to_string()),
+                    ],
+                    String::new(),
+                )
+            }),
+        )
+        .with_state(state);
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (format!("http://{addr}"), seen)
+}
+
+/// Posts the standard one-shot create form against `router`, returning the
+/// created submission's detail path.
+async fn post_create_via(router: Router) -> String {
+    let created = router
+        .oneshot(
+            Request::post("/ui/bulk-import")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from(
+                    "name=BrettTest&manifest_url=http%3A%2F%2Fone.example%2Fm.json&auth=none",
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(created.status(), StatusCode::SEE_OTHER);
+    created
+        .headers()
+        .get(header::LOCATION)
+        .and_then(|v| v.to_str().ok())
+        .expect("redirect to the detail page")
+        .to_string()
+}
+
+/// #1006: under header routing the default (and only) transport for the
+/// tenant, both self-calls a create fires — the kick-off and the recipient
+/// status kick-off — must carry the request's tenant, and neither path may
+/// gain a tenant path segment (that is `both`/`url_path` territory).
+#[tokio::test]
+async fn header_mode_kickoffs_carry_the_selected_tenant() {
+    let (recipient_url, seen) = mock_recipient_capturing_tenant().await;
+    let ctx = ctx(&recipient_url);
+
+    let _detail_path = post_create_via(app_with_header_tenant(&ctx, "acme")).await;
+
+    let calls = seen.lock().unwrap().clone();
+    let kickoff = calls
+        .iter()
+        .find(|c| c.method == "POST" && c.path == "/$bulk-submit")
+        .expect("kick-off recorded");
+    assert_eq!(kickoff.tenant.as_deref(), Some("acme"));
+    let status_kickoff = calls
+        .iter()
+        .find(|c| c.method == "POST" && c.path == "/$bulk-submit-status")
+        .expect("status kick-off recorded");
+    assert_eq!(status_kickoff.tenant.as_deref(), Some("acme"));
+    assert!(
+        calls.iter().all(|c| !c.path.starts_with("/acme/")),
+        "header routing must not add a tenant path segment: {calls:?}"
+    );
+}
+
+/// #1006: the recipient-status poll fired by `GET .../status` must carry the
+/// selected tenant too, or the poll is rejected server-side once it lands on
+/// a real HFS recipient (`crates/rest/src/handlers/bulk_submit.rs`).
+#[tokio::test]
+async fn header_mode_status_poll_carries_the_selected_tenant() {
+    let (recipient_url, seen) = mock_recipient_capturing_tenant().await;
+    let ctx = ctx(&recipient_url);
+
+    let detail_path = post_create_via(app_with_header_tenant(&ctx, "acme")).await;
+    seen.lock().unwrap().clear();
+
+    let status = app_with_header_tenant(&ctx, "acme")
+        .oneshot(
+            Request::get(format!("{detail_path}/status"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(status.status(), StatusCode::OK);
+
+    let calls = seen.lock().unwrap().clone();
+    let poll = calls
+        .iter()
+        .find(|c| c.method == "GET" && c.path == "/poll")
+        .expect("poll recorded");
+    assert_eq!(poll.tenant.as_deref(), Some("acme"));
+}
+
+/// #1006: Abort (`set_status`) reuses `post_kickoff` for a status-only
+/// kick-off — it must carry the selected tenant exactly like the create-time
+/// kick-off does; Complete shares the same code path.
+#[tokio::test]
+async fn header_mode_abort_carries_the_selected_tenant() {
+    let (recipient_url, seen) = mock_recipient_capturing_tenant().await;
+    let ctx = ctx(&recipient_url);
+
+    let detail_path = post_create_via(app_with_header_tenant(&ctx, "acme")).await;
+    seen.lock().unwrap().clear();
+
+    let aborted = app_with_header_tenant(&ctx, "acme")
+        .oneshot(
+            Request::post(format!("{detail_path}/abort"))
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(aborted.status(), StatusCode::SEE_OTHER);
+
+    let calls = seen.lock().unwrap().clone();
+    let kickoff = calls
+        .iter()
+        .find(|c| c.method == "POST" && c.path == "/$bulk-submit")
+        .expect("abort kick-off recorded");
+    assert_eq!(kickoff.tenant.as_deref(), Some("acme"));
+}
+
+/// #1006: under `url_path`/`both` routing the tenant travels both as a URL
+/// path segment (kick-off, status kick-off) and as the header — the poll URL
+/// itself carries no tenant segment (it is the recipient's own
+/// `Content-Location`), so the poll relies on the header alone.
+#[tokio::test]
+async fn url_path_mode_self_calls_carry_tenant_in_path_and_header() {
+    let (recipient_url, seen) = mock_recipient_capturing_tenant().await;
+    let ctx = ctx(&recipient_url);
+
+    let detail_path = post_create_via(app_with_path_tenant(&ctx, "acme")).await;
+
+    let status = app_with_path_tenant(&ctx, "acme")
+        .oneshot(
+            Request::get(format!("{detail_path}/status"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(status.status(), StatusCode::OK);
+
+    let calls = seen.lock().unwrap().clone();
+    let kickoff = calls
+        .iter()
+        .find(|c| c.method == "POST" && c.path == "/acme/$bulk-submit")
+        .expect("kick-off recorded under the tenant path");
+    assert_eq!(kickoff.tenant.as_deref(), Some("acme"));
+    let status_kickoff = calls
+        .iter()
+        .find(|c| c.method == "POST" && c.path == "/acme/$bulk-submit-status")
+        .expect("status kick-off recorded under the tenant path");
+    assert_eq!(status_kickoff.tenant.as_deref(), Some("acme"));
+    let poll = calls
+        .iter()
+        .find(|c| c.method == "GET" && c.path == "/poll")
+        .expect("poll recorded");
+    assert_eq!(poll.tenant.as_deref(), Some("acme"));
 }
 
 #[tokio::test]
