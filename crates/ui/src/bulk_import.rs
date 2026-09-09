@@ -1258,6 +1258,19 @@ pub async fn status_fragment(
 /// one. `0%` counts: HFS reports byte-level progress, so an early zero is a
 /// bar about to fill, not a percentage that never moves — the indeterminate
 /// sweep is reserved for recipients that report no percentage at all.
+///
+/// Pre-ingest phase reports (#953) — `waiting for a worker`, `reading
+/// manifest`, `sizing {done} of {total} files`, `downloading file {done} of
+/// {total}` — deliberately fall through to `None`: there is no meaningful
+/// share-of-the-whole to draw yet, so the card pairs the phase text with the
+/// indeterminate sweep. #827 is the rule being honoured here — a determinate
+/// reading must never be shown beside an indeterminate bar, so "phase text +
+/// sweep" and "percentage + fill" are the only two shapes this card has.
+///
+/// The contract that keeps that true: **a phase string must never begin with
+/// the literal `processing ` prefix**, or its embedded counts (`sizing 37 of
+/// 412 files`) would be mis-parsed as a percentage. The recipient owns the
+/// vocabulary; this parser only claims the one prefix.
 fn progress_percent(progress: &str) -> Option<u8> {
     // Case-insensitive: HFS capitalizes the line ("Processing 3% of bytes -
     // …", #954), older HFS versions and foreign recipients may send lowercase
@@ -1367,5 +1380,63 @@ mod tests {
             recipient_base_url_value("https://public.example/fhir", true, "north clinic"),
             "https://public.example/fhir/north%20clinic"
         );
+    }
+
+    /// #953: the pre-ingest phases carry no share-of-the-whole, so every one
+    /// of them reads as `None` and the card draws the indeterminate sweep
+    /// beside the phase text. The counts inside `sizing …` / `downloading
+    /// file …` are the trap this guards: they must never be mistaken for a
+    /// percentage (#827 — never a determinate reading on an indeterminate
+    /// bar).
+    #[test]
+    fn pre_ingest_phases_report_no_percentage() {
+        for phase in [
+            "waiting for a worker",
+            "reading manifest",
+            "sizing 37 of 412 files",
+            "downloading file 1 of 412",
+        ] {
+            assert_eq!(progress_percent(phase), None, "phase: {phase}");
+            assert!(
+                !phase.starts_with("processing "),
+                "a phase string that starts with the parsed prefix would be \
+                 mis-read as a percentage: {phase}"
+            );
+        }
+    }
+
+    /// The ingest-phase vocabulary is unchanged by #953: `processing N%` is
+    /// still the one shape that yields a determinate bar, with or without the
+    /// entry-count suffix.
+    #[test]
+    fn processing_percentages_still_read_as_determinate() {
+        assert_eq!(progress_percent("processing 35% complete"), Some(35));
+        assert_eq!(
+            progress_percent("processing 35% complete (120 entries ingested)"),
+            Some(35)
+        );
+        assert_eq!(progress_percent("processing 0% complete"), Some(0));
+        assert_eq!(progress_percent("processing 100% complete"), Some(100));
+    }
+
+    /// A stalled report keeps its current behaviour: it does not carry the
+    /// `processing ` prefix, so its `40%` is never lifted into the bar — the
+    /// operator gets the sweep plus the full explanatory sentence.
+    #[test]
+    fn a_stalled_report_stays_indeterminate() {
+        assert_eq!(
+            progress_percent("stalled at 40% - a worker stopped without handoff; see server logs"),
+            None
+        );
+    }
+
+    /// Out-of-range and malformed percentages fall back to the sweep rather
+    /// than clamping to something the recipient never said.
+    #[test]
+    fn unparseable_percentages_fall_back_to_the_sweep() {
+        assert_eq!(progress_percent("processing 101% complete"), None);
+        assert_eq!(progress_percent("processing complete"), None);
+        assert_eq!(progress_percent(""), None);
+        assert_eq!(progress_percent("in progress"), None);
     }
 }

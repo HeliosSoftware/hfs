@@ -21,7 +21,8 @@ use axum::{
 use helios_auth::Principal;
 use helios_persistence::core::{
     DownloadUrl, ExportPartKey, IMPORT_MODE_PARAMETER_URL, ImportMode, ManifestFetchParams,
-    ManifestStatus, ResourceStorage, SubmissionId, SubmissionStatus, submission_output_job_id,
+    ManifestPhase, ManifestStatus, ResourceStorage, SubmissionId, SubmissionStatus,
+    submission_output_job_id,
 };
 use serde_json::{Value, json};
 
@@ -813,6 +814,27 @@ where
         // The entry counter complements the percentage with absolute volume,
         // and carries the progress alone when no byte totals are known (#790).
         let entries: u64 = manifests.iter().map(|m| m.processed_entries).sum();
+        // The pre-ingest window (#953): claiming a manifest, fetching the
+        // remote Bulk Export Manifest, and HEAD-ing its output files all happen
+        // before a single NDJSON byte or entry is counted, so every one of them
+        // used to poll as a flat "processing 0% complete" — indistinguishable
+        // from a wedged job. The vocabulary below names that window instead.
+        //
+        // Ordering matters, and is deliberately "real numbers first": the
+        // stall warning, the entry counter, and any non-zero percentage all
+        // outrank the phase. That is what makes a *stale* phase harmless — a
+        // worker that reported `Downloading` and then never cleared it has its
+        // text taken over by rules 2-3 the moment its counters move, so the
+        // phase is only ever rendered while those counters are still zero.
+        //
+        // CRITICAL: none of the pre-ingest strings may begin with `processing `
+        // in any case. The UI's `progress_percent` parser matches that prefix
+        // case-insensitively (it has to: #954 capitalized this handler's
+        // wording, and foreign recipients still send the lowercase form), then
+        // reads the digits after it as a *determinate* percentage and switches
+        // the bar out of its indeterminate state. Mixing the two was the
+        // regression of #827, so indeterminate phases must stay lexically
+        // distinct from that prefix.
         let progress = if stalled {
             tracing::warn!(
                 submission = %sub_id,
@@ -839,8 +861,42 @@ where
                 "Processing {pct}% of bytes - {} resources written",
                 group_thousands(entries)
             )
-        } else {
+        } else if pct > 0 {
             format!("Processing {pct}% of bytes")
+        } else if !manifests.is_empty()
+            && manifests
+                .iter()
+                .all(|m| m.status == ManifestStatus::Pending)
+        {
+            // Nothing claimed yet: the submission is queued, not slow. (The
+            // emptiness guard is belt-and-braces — an empty manifest list is
+            // vacuously `all_terminal` and never reaches this branch.)
+            "waiting for a worker".to_string()
+        } else {
+            // A worker holds a manifest but has not produced a countable byte.
+            // The first non-terminal manifest carrying a phase speaks for the
+            // submission: a status header is a single line, and the manifest a
+            // worker is actually inside is the interesting one.
+            manifests
+                .iter()
+                .filter(|m| !m.status.is_terminal())
+                .find(|m| m.phase.is_some())
+                .and_then(|m| match m.phase {
+                    Some(ManifestPhase::ReadingManifest) => Some("reading manifest".to_string()),
+                    // `files_total == 0` means the denominator is not known yet
+                    // (the manifest has not been parsed, or advertised no
+                    // output). Fall through rather than emit "of 0 files".
+                    Some(ManifestPhase::Sizing) if m.files_total > 0 => Some(format!(
+                        "sizing {} of {} files",
+                        m.files_done, m.files_total
+                    )),
+                    Some(ManifestPhase::Downloading) if m.files_total > 0 => Some(format!(
+                        "downloading file {} of {}",
+                        m.files_done, m.files_total
+                    )),
+                    _ => None,
+                })
+                .unwrap_or_else(|| format!("Processing {pct}% of bytes"))
         };
         return Response::builder()
             .status(StatusCode::ACCEPTED)

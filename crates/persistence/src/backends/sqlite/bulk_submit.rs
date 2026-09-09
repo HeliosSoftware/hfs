@@ -15,9 +15,9 @@ use crate::core::bulk_export::ExportJobId;
 use crate::core::bulk_export_worker::{LeaseError, WorkerId};
 use crate::core::bulk_submit::{
     BulkEntryOutcome, BulkEntryResult, BulkProcessingOptions, BulkSubmitProvider,
-    BulkSubmitRollbackProvider, ChangeType, EntryCountSummary, ManifestStatus, NdjsonEntry,
-    StreamProcessingResult, StreamingBulkSubmitProvider, SubmissionChange, SubmissionId,
-    SubmissionManifest, SubmissionStatus, SubmissionSummary,
+    BulkSubmitRollbackProvider, ChangeType, EntryCountSummary, ManifestPhase, ManifestStatus,
+    NdjsonEntry, StreamProcessingResult, StreamingBulkSubmitProvider, SubmissionChange,
+    SubmissionId, SubmissionManifest, SubmissionStatus, SubmissionSummary,
 };
 use crate::core::bulk_submit_worker::{
     ManifestFetchParams, ManifestLease, ManifestWorkerView, PollTokenTarget, SubmitClaimStrategy,
@@ -561,6 +561,9 @@ impl BulkSubmitProvider for SqliteBackend {
             lease_expiry: None,
             bytes_processed: 0,
             bytes_total: 0,
+            phase: None,
+            files_done: 0,
+            files_total: 0,
         })
     }
 
@@ -574,7 +577,7 @@ impl BulkSubmitProvider for SqliteBackend {
         let tenant_id = tenant.tenant_id().as_str();
 
         let result = conn.query_row(
-            "SELECT manifest_url, replaces_manifest_url, status, added_at, total_entries, processed_entries, failed_entries, lease_expiry, bytes_processed, bytes_total
+            "SELECT manifest_url, replaces_manifest_url, status, added_at, total_entries, processed_entries, failed_entries, lease_expiry, bytes_processed, bytes_total, phase, files_done, files_total
              FROM bulk_manifests
              WHERE tenant_id = ?1 AND submitter = ?2 AND submission_id = ?3 AND manifest_id = ?4",
             params![tenant_id, &submission_id.submitter, &submission_id.submission_id, manifest_id],
@@ -590,6 +593,9 @@ impl BulkSubmitProvider for SqliteBackend {
                     row.get::<_, Option<String>>(7)?,
                     row.get::<_, i64>(8)?,
                     row.get::<_, i64>(9)?,
+                    row.get::<_, Option<String>>(10)?,
+                    row.get::<_, i64>(11)?,
+                    row.get::<_, i64>(12)?,
                 ))
             },
         );
@@ -606,6 +612,9 @@ impl BulkSubmitProvider for SqliteBackend {
                 lease_expiry,
                 bytes_processed,
                 bytes_total,
+                phase,
+                files_done,
+                files_total,
             )) => {
                 let status: ManifestStatus = status_str.parse().map_err(|_| {
                     internal_error(format!("Invalid manifest status: {}", status_str))
@@ -631,6 +640,11 @@ impl BulkSubmitProvider for SqliteBackend {
                             .ok()
                             .map(|d| d.with_timezone(&Utc))
                     }),
+                    // Cosmetic hint only: an unrecognized value (a newer worker,
+                    // or a hand-edited row) degrades to "no phase", never an error.
+                    phase: phase.and_then(|s| s.parse::<ManifestPhase>().ok()),
+                    files_done: files_done.max(0) as u64,
+                    files_total: files_total.max(0) as u64,
                 }))
             }
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
@@ -1836,6 +1850,44 @@ impl SubmitWorkerStorage for SqliteBackend {
             })
             .await
             .map_err(LeaseError::Storage)?;
+        if affected == 0 {
+            Err(lease_lost(lease))
+        } else {
+            Ok(())
+        }
+    }
+
+    async fn update_manifest_phase(
+        &self,
+        lease: &ManifestLease,
+        phase: ManifestPhase,
+        files_done: u64,
+        files_total: u64,
+    ) -> Result<(), LeaseError> {
+        let conn = self.get_connection().map_err(LeaseError::Storage)?;
+        // Plain overwrite, unlike the monotonic MAX() the byte counters need:
+        // the phase walks forward and back within a run (sizing a file, then
+        // downloading it), and the fence below makes the lease holder the only
+        // writer.
+        let affected = conn
+            .execute(
+                "UPDATE bulk_manifests
+                 SET phase = ?1, files_done = ?2, files_total = ?3
+                 WHERE tenant_id = ?4 AND submitter = ?5 AND submission_id = ?6
+                   AND manifest_id = ?7 AND worker_id = ?8 AND fencing_token = ?9",
+                params![
+                    phase.to_string(),
+                    files_done as i64,
+                    files_total as i64,
+                    lease.tenant.tenant_id().as_str(),
+                    lease.submission_id.submitter,
+                    lease.submission_id.submission_id,
+                    lease.manifest_id,
+                    lease.worker_id.as_str(),
+                    lease.fencing_token as i64
+                ],
+            )
+            .map_err(|e| LeaseError::Storage(internal_error(format!("update phase: {e}"))))?;
         if affected == 0 {
             Err(lease_lost(lease))
         } else {

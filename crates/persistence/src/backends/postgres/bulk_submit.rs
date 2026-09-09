@@ -13,9 +13,9 @@ use crate::core::bulk_export::ExportJobId;
 use crate::core::bulk_export_worker::{LeaseError, WorkerId};
 use crate::core::bulk_submit::{
     BulkEntryOutcome, BulkEntryResult, BulkProcessingOptions, BulkSubmitProvider,
-    BulkSubmitRollbackProvider, ChangeType, EntryCountSummary, ManifestStatus, NdjsonEntry,
-    StreamProcessingResult, StreamingBulkSubmitProvider, SubmissionChange, SubmissionId,
-    SubmissionManifest, SubmissionStatus, SubmissionSummary,
+    BulkSubmitRollbackProvider, ChangeType, EntryCountSummary, ManifestPhase, ManifestStatus,
+    NdjsonEntry, StreamProcessingResult, StreamingBulkSubmitProvider, SubmissionChange,
+    SubmissionId, SubmissionManifest, SubmissionStatus, SubmissionSummary,
 };
 use crate::core::bulk_submit_worker::{
     ManifestFetchParams, ManifestLease, ManifestWorkerView, PollTokenTarget, SubmitClaimStrategy,
@@ -507,6 +507,9 @@ impl BulkSubmitProvider for PostgresBackend {
             lease_expiry: None,
             bytes_processed: 0,
             bytes_total: 0,
+            phase: None,
+            files_done: 0,
+            files_total: 0,
         })
     }
 
@@ -521,7 +524,7 @@ impl BulkSubmitProvider for PostgresBackend {
 
         let rows = client
             .query(
-                "SELECT manifest_url, replaces_manifest_url, status, added_at, total_entries, processed_entries, failed_entries, lease_expiry, bytes_processed, bytes_total
+                "SELECT manifest_url, replaces_manifest_url, status, added_at, total_entries, processed_entries, failed_entries, lease_expiry, bytes_processed, bytes_total, phase, files_done, files_total
                  FROM bulk_manifests
                  WHERE tenant_id = $1 AND submitter = $2 AND submission_id = $3 AND manifest_id = $4",
                 &[
@@ -549,6 +552,12 @@ impl BulkSubmitProvider for PostgresBackend {
         let lease_expiry: Option<chrono::DateTime<Utc>> = row.get(7);
         let bytes_processed: i64 = row.get(8);
         let bytes_total: i64 = row.get(9);
+        // Unlike `status`, an unreadable phase is not an error: it is a
+        // cosmetic hint, and a row written by a newer HFS must still be
+        // readable here (#953).
+        let phase: Option<String> = row.get(10);
+        let files_done: i64 = row.get(11);
+        let files_total: i64 = row.get(12);
 
         let status: ManifestStatus = status_str
             .parse()
@@ -566,6 +575,9 @@ impl BulkSubmitProvider for PostgresBackend {
             lease_expiry,
             bytes_processed: bytes_processed.max(0) as u64,
             bytes_total: bytes_total.max(0) as u64,
+            phase: phase.and_then(|p| p.parse::<ManifestPhase>().ok()),
+            files_done: files_done.max(0) as u64,
+            files_total: files_total.max(0) as u64,
         }))
     }
 
@@ -1676,6 +1688,44 @@ impl SubmitWorkerStorage for PostgresBackend {
             )
             .await
             .map_err(|e| LeaseError::Storage(internal_error(format!("update bytes: {e}"))))?;
+        if affected == 0 {
+            Err(lease_lost(lease))
+        } else {
+            Ok(())
+        }
+    }
+
+    async fn update_manifest_phase(
+        &self,
+        lease: &ManifestLease,
+        phase: ManifestPhase,
+        files_done: u64,
+        files_total: u64,
+    ) -> Result<(), LeaseError> {
+        let client = self.get_client().await.map_err(LeaseError::Storage)?;
+        // A plain overwrite, not the monotonic GREATEST the byte counters use:
+        // the phases advance and their file counters restart per phase, so the
+        // last write from the lease holder is the truth.
+        let affected = client
+            .execute(
+                "UPDATE bulk_manifests
+                 SET phase = $1, files_done = $2, files_total = $3
+                 WHERE tenant_id = $4 AND submitter = $5 AND submission_id = $6
+                   AND manifest_id = $7 AND worker_id = $8 AND fencing_token = $9",
+                &[
+                    &phase.to_string(),
+                    &(files_done as i64),
+                    &(files_total as i64),
+                    &lease.tenant.tenant_id().as_str(),
+                    &lease.submission_id.submitter,
+                    &lease.submission_id.submission_id,
+                    &lease.manifest_id,
+                    &lease.worker_id.as_str(),
+                    &(lease.fencing_token as i64),
+                ],
+            )
+            .await
+            .map_err(|e| LeaseError::Storage(internal_error(format!("update phase: {e}"))))?;
         if affected == 0 {
             Err(lease_lost(lease))
         } else {
