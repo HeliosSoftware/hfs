@@ -64,4 +64,12 @@ pub enum SqlQueryError {
 
     #[error("composite SQL value for column '{0}' cannot be represented as a FHIR scalar")]
     UnsupportedFhirValue(String),
+
+    /// A failure in the server's own execution machinery rather than in the
+    /// client's request — e.g. the blocking worker that materializes a
+    /// depends-on ViewDefinition's row stream panicked. This is never
+    /// caused by malformed client input and should be surfaced as a 500,
+    /// not as a validation error.
+    #[error("internal error: {0}")]
+    Internal(String),
 }

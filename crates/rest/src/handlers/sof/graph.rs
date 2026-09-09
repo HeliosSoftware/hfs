@@ -645,7 +645,7 @@ pub(crate) async fn execute_plan(
                     .await
                     .map_err(|e| format!("dependency failed to materialize: {e}"))?;
                 let row_stream = adapt_row_stream(row_stream);
-                engine
+                let (returned_engine, _inserted) = engine
                     .insert_rows(
                         internal_name,
                         &schema,
@@ -654,6 +654,7 @@ pub(crate) async fn execute_plan(
                     )
                     .await
                     .map_err(|e| e.to_string())?;
+                engine = returned_engine;
                 leaf_schemas.push(schema);
                 engine = materialize_labels(
                     engine,
@@ -780,7 +781,7 @@ fn schema_from_query_result(result: &QueryResult) -> TableSchema {
 /// Materializes a [`QueryResult`] into a fresh physical table named
 /// `table_name`.
 async fn materialize_query_result(
-    mut engine: InMemorySqlEngine,
+    engine: InMemorySqlEngine,
     table_name: &str,
     result: &QueryResult,
 ) -> Result<InMemorySqlEngine, String> {
@@ -802,11 +803,11 @@ async fn materialize_query_result(
         .collect();
     let cap = result.rows.len();
     let stream = futures::stream::iter(rows);
-    engine
+    let (returned_engine, _inserted) = engine
         .insert_rows(table_name, &schema, Box::pin(stream), cap)
         .await
         .map_err(|e| e.to_string())?;
-    Ok(engine)
+    Ok(returned_engine)
 }
 
 /// Runs one SELECT statement on a blocking thread under a watchdog timeout

@@ -524,5 +524,6 @@ pub(crate) fn sqlquery_err_to_rest(e: SqlQueryError) -> RestError {
                 message: format!("SQLite error: {err}"),
             }
         }
+        SqlQueryError::Internal(message) => RestError::InternalError { message },
     }
 }
