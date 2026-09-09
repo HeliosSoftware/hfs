@@ -262,6 +262,52 @@ impl std::str::FromStr for ManifestStatus {
     }
 }
 
+/// What a worker is doing to a manifest *before* the first NDJSON byte lands.
+///
+/// [`ManifestStatus::Processing`] covers the whole run, so every pre-ingest
+/// step — claiming, downloading the remote Bulk Export Manifest, HEAD-ing each
+/// output file to pre-size the byte denominator — used to read as a flat
+/// `0%` at the status endpoint, indistinguishable from a wedged job (#953).
+/// This is the vocabulary for that window: a coarse, cosmetic hint the status
+/// endpoint renders only while the byte/entry counters are still zero.
+///
+/// Deliberately *not* folded into [`ManifestStatus`]: that enum drives lease
+/// claiming, `is_terminal()`, and is persisted as a string across four
+/// backends, so new variants would break `FromStr` on mixed deployments.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ManifestPhase {
+    /// Downloading and parsing the remote Bulk Export Manifest.
+    ReadingManifest,
+    /// HEAD-ing the manifest's `output` files to learn the byte denominator.
+    Sizing,
+    /// Ingesting the `output` files (before the first counters flush).
+    Downloading,
+}
+
+impl std::fmt::Display for ManifestPhase {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ReadingManifest => write!(f, "reading-manifest"),
+            Self::Sizing => write!(f, "sizing"),
+            Self::Downloading => write!(f, "downloading"),
+        }
+    }
+}
+
+impl std::str::FromStr for ManifestPhase {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "reading-manifest" | "reading_manifest" => Ok(Self::ReadingManifest),
+            "sizing" => Ok(Self::Sizing),
+            "downloading" => Ok(Self::Downloading),
+            _ => Err(format!("unknown manifest phase: {}", s)),
+        }
+    }
+}
+
 /// A manifest within a submission.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SubmissionManifest {
@@ -297,6 +343,18 @@ pub struct SubmissionManifest {
     /// carried a length, which degrades the status to count-only progress.
     #[serde(default)]
     pub bytes_total: u64,
+    /// Coarse pre-ingest phase the claiming worker last reported (#953).
+    /// `None` before a worker claims the manifest, and left as-is (stale but
+    /// harmless) once the byte/entry counters take over the status text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase: Option<ManifestPhase>,
+    /// Files finished in the current [`Self::phase`] (sized, or opened).
+    #[serde(default)]
+    pub files_done: u64,
+    /// Files the current [`Self::phase`] has to get through — the manifest's
+    /// `output` count; `0` while that is not yet known.
+    #[serde(default)]
+    pub files_total: u64,
 }
 
 impl SubmissionManifest {
@@ -314,6 +372,9 @@ impl SubmissionManifest {
             lease_expiry: None,
             bytes_processed: 0,
             bytes_total: 0,
+            phase: None,
+            files_done: 0,
+            files_total: 0,
         }
     }
 
@@ -1062,6 +1123,16 @@ pub struct StreamProcessingResult {
     /// Abort reason if applicable.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub abort_reason: Option<String>,
+    /// Lines the stream rejected before they ever reached a batch — malformed
+    /// JSON, and resources whose type contradicts the manifest's.
+    ///
+    /// They are included in `counts`, but no `process_entries` call saw them,
+    /// so nothing wrote them to the entry table or charged them to the
+    /// manifest's `failed_entries`. The worker adds them itself, which is why
+    /// they are reported separately from the failures batches already own
+    /// (#969).
+    #[serde(default)]
+    pub unbatched_errors: u64,
 }
 
 impl StreamProcessingResult {
@@ -1072,6 +1143,7 @@ impl StreamProcessingResult {
             counts: EntryCountSummary::new(),
             aborted: false,
             abort_reason: None,
+            unbatched_errors: 0,
         }
     }
 

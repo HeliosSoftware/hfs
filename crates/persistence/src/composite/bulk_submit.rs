@@ -37,9 +37,9 @@ use crate::core::bulk_export_worker::{LeaseError, WorkerId};
 use crate::core::bulk_submit::{
     BulkEntryOutcome, BulkEntryResult, BulkProcessingOptions, BulkSubmitProvider,
     BulkSubmitRollbackProvider, ChangeType, EntryCountSummary, EntryResultContinuation,
-    EntryResultPage, NdjsonEntry, StreamProcessingResult, StreamingBulkSubmitProvider,
-    SubmissionChange, SubmissionId, SubmissionManifest, SubmissionStatus, SubmissionSummary,
-    entry_result_pages,
+    EntryResultPage, ManifestPhase, NdjsonEntry, StreamProcessingResult,
+    StreamingBulkSubmitProvider, SubmissionChange, SubmissionId, SubmissionManifest,
+    SubmissionStatus, SubmissionSummary, entry_result_pages,
 };
 use crate::core::bulk_submit_worker::{
     BulkSubmitJobStore, ManifestFetchParams, ManifestLease, ManifestWorkerView, PollTokenTarget,
@@ -651,20 +651,15 @@ impl SubmitWorkerStorage for CompositeSubmitJobs {
         self.primary.mark_manifest_processing(lease).await
     }
 
-    async fn update_manifest_progress(
+    async fn add_manifest_progress(
         &self,
         lease: &ManifestLease,
-        processed_entries: u64,
-        failed_entries: u64,
-        last_processed_line: u64,
+        processed_delta: u64,
+        failed_delta: u64,
+        lines_delta: u64,
     ) -> Result<(), LeaseError> {
         self.primary
-            .update_manifest_progress(
-                lease,
-                processed_entries,
-                failed_entries,
-                last_processed_line,
-            )
+            .add_manifest_progress(lease, processed_delta, failed_delta, lines_delta)
             .await
     }
 
@@ -676,6 +671,18 @@ impl SubmitWorkerStorage for CompositeSubmitJobs {
     ) -> Result<(), LeaseError> {
         self.primary
             .update_manifest_bytes(lease, bytes_processed, bytes_total)
+            .await
+    }
+
+    async fn update_manifest_phase(
+        &self,
+        lease: &ManifestLease,
+        phase: ManifestPhase,
+        files_done: u64,
+        files_total: u64,
+    ) -> Result<(), LeaseError> {
+        self.primary
+            .update_manifest_phase(lease, phase, files_done, files_total)
             .await
     }
 

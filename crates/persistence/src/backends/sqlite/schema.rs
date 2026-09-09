@@ -5,7 +5,7 @@ use rusqlite::Connection;
 use crate::error::StorageResult;
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 24;
+pub const SCHEMA_VERSION: i32 = 25;
 
 /// Initialize the database schema.
 pub fn initialize_schema(conn: &Connection) -> StorageResult<()> {
@@ -320,6 +320,7 @@ fn migrate_schema(conn: &Connection, from_version: i32) -> StorageResult<()> {
             21 => migrate_v21_to_v22(conn)?,
             22 => migrate_v22_to_v23(conn)?,
             23 => migrate_v23_to_v24(conn)?,
+            24 => migrate_v24_to_v25(conn)?,
             _ => {
                 return Err(crate::error::StorageError::Backend(
                     crate::error::BackendError::Internal {
@@ -1693,6 +1694,54 @@ fn migrate_v23_to_v24(conn: &Connection) -> StorageResult<()> {
         [],
     )
     .map_err(|e| migration_err(format!("v24 create idx_resources_live_type: {e}")))?;
+    Ok(())
+}
+
+/// Migrate from schema version 24 to version 25: the coarse pre-ingest phase
+/// on manifests (#953).
+///
+/// `ManifestStatus::Processing` covers a worker's whole run, so the window
+/// before the first NDJSON byte lands — fetching the remote Bulk Export
+/// Manifest, HEAD-ing its output files to pre-size the byte denominator —
+/// reported a flat `0%`, indistinguishable at the status endpoint from a
+/// wedged job. `phase` is the kebab-case `ManifestPhase` the claiming worker
+/// last reported (NULL before any worker claims it, and for databases
+/// migrated from earlier versions); `files_done`/`files_total` are that
+/// phase's file counters.
+fn migrate_v24_to_v25(conn: &Connection) -> StorageResult<()> {
+    // SQLite has no `ADD COLUMN IF NOT EXISTS` and a duplicate column is a hard
+    // error, so gate each ALTER on PRAGMA table_info the way the earlier
+    // bulk-submit migrations do. A fresh database reaches this migration too
+    // (v1 is created, then every migration runs), and the guard also keeps the
+    // step re-runnable against a database a pre-release build already stamped.
+    let manifest_columns: Vec<String> = {
+        let mut stmt = conn
+            .prepare("PRAGMA table_info(bulk_manifests)")
+            .map_err(|e| migration_err(format!("pragma bulk_manifests: {e}")))?;
+        let cols: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .map_err(|e| migration_err(format!("pragma rows: {e}")))?
+            .filter_map(|r| r.ok())
+            .collect();
+        cols
+    };
+    let adds = [
+        ("phase", "ALTER TABLE bulk_manifests ADD COLUMN phase TEXT"),
+        (
+            "files_done",
+            "ALTER TABLE bulk_manifests ADD COLUMN files_done INTEGER NOT NULL DEFAULT 0",
+        ),
+        (
+            "files_total",
+            "ALTER TABLE bulk_manifests ADD COLUMN files_total INTEGER NOT NULL DEFAULT 0",
+        ),
+    ];
+    for (col, sql) in &adds {
+        if !manifest_columns.iter().any(|c| c == col) {
+            conn.execute(sql, [])
+                .map_err(|e| migration_err(format!("add manifest phase columns: {e}")))?;
+        }
+    }
     Ok(())
 }
 

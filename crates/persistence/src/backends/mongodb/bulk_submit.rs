@@ -47,9 +47,9 @@ use crate::core::bulk_export_worker::{LeaseError, WorkerId};
 use crate::core::bulk_submit::{
     BulkEntryOutcome, BulkEntryResult, BulkProcessingOptions, BulkSubmitProvider,
     BulkSubmitRollbackProvider, ChangeType, EntryCountSummary, EntryResultContinuation,
-    EntryResultPage, ManifestStatus, NdjsonEntry, PagedEntryResult, StreamProcessingResult,
-    StreamingBulkSubmitProvider, SubmissionChange, SubmissionId, SubmissionManifest,
-    SubmissionStatus, SubmissionSummary, invalid_entry_result_page,
+    EntryResultPage, ManifestPhase, ManifestStatus, NdjsonEntry, PagedEntryResult,
+    StreamProcessingResult, StreamingBulkSubmitProvider, SubmissionChange, SubmissionId,
+    SubmissionManifest, SubmissionStatus, SubmissionSummary, invalid_entry_result_page,
 };
 use crate::core::bulk_submit_worker::{
     ManifestFetchParams, ManifestLease, ManifestWorkerView, PollTokenTarget, SubmitClaimStrategy,
@@ -205,6 +205,12 @@ fn decode_manifest(doc: &Document) -> StorageResult<SubmissionManifest> {
         failed_entries: doc.get_i64("failed_entries").unwrap_or(0).max(0) as u64,
         bytes_processed: doc.get_i64("bytes_processed").unwrap_or(0).max(0) as u64,
         bytes_total: doc.get_i64("bytes_total").unwrap_or(0).max(0) as u64,
+        // Absent on documents written before #953, and an unrecognized value
+        // from a newer writer degrades to `None` rather than failing the read —
+        // the phase is cosmetic, so it must never break a status poll.
+        phase: opt_str(doc, "phase").and_then(|s| s.parse::<ManifestPhase>().ok()),
+        files_done: doc.get_i64("files_done").unwrap_or(0).max(0) as u64,
+        files_total: doc.get_i64("files_total").unwrap_or(0).max(0) as u64,
     })
 }
 
@@ -774,6 +780,9 @@ impl BulkSubmitProvider for MongoBackend {
             lease_expiry: None,
             bytes_processed: 0,
             bytes_total: 0,
+            phase: None,
+            files_done: 0,
+            files_total: 0,
         };
 
         let mut document = manifest_filter(tenant, submission_id, &manifest.manifest_id);
@@ -791,6 +800,9 @@ impl BulkSubmitProvider for MongoBackend {
         document.insert("last_processed_line", 0_i64);
         document.insert("bytes_processed", 0_i64);
         document.insert("bytes_total", 0_i64);
+        // `phase` is deliberately left absent until a worker claims the manifest.
+        document.insert("files_done", 0_i64);
+        document.insert("files_total", 0_i64);
 
         self.manifests()
             .await?
@@ -917,6 +929,11 @@ impl BulkSubmitProvider for MongoBackend {
             results.push(result);
         }
 
+        // These counters are cumulative across every run of this manifest (including
+        // resumes) and are exactly what the $bulk-submit status endpoint reports, so
+        // every delta must be additive here (#969). `processed_entries` means resources
+        // written to the store, so skips are excluded and surface through their receipts
+        // (#954); `last_processed_line` is a line cursor and counts them.
         manifests
             .update_one(
                 manifest_filter(tenant, submission_id, manifest_id),
@@ -924,6 +941,7 @@ impl BulkSubmitProvider for MongoBackend {
                     "total_entries": results.len() as i64,
                     "processed_entries": results.iter().filter(|r| r.is_success()).count() as i64,
                     "failed_entries": error_count as i64,
+                    "last_processed_line": results.len() as i64,
                 }},
             )
             .await
@@ -1046,7 +1064,10 @@ impl StreamingBulkSubmitProvider for MongoBackend {
             match NdjsonEntry::parse(line_number, line) {
                 Ok(entry) => {
                     if entry.resource_type != resource_type {
+                        // Rejected here, so no batch will charge it to the
+                        // manifest's counters; the worker adds it (#969).
                         result.counts.increment(BulkEntryOutcome::ValidationError);
+                        result.unbatched_errors += 1;
                         if !options.continue_on_error
                             && (options.max_errors == 0
                                 || result.counts.error_count() >= options.max_errors as u64)
@@ -1059,6 +1080,7 @@ impl StreamingBulkSubmitProvider for MongoBackend {
                 }
                 Err(parse_err) => {
                     result.counts.increment(BulkEntryOutcome::ValidationError);
+                    result.unbatched_errors += 1;
                     if !options.continue_on_error
                         && (options.max_errors == 0
                             || result.counts.error_count() >= options.max_errors as u64)
@@ -1369,19 +1391,19 @@ impl SubmitWorkerStorage for MongoBackend {
         .await
     }
 
-    async fn update_manifest_progress(
+    async fn add_manifest_progress(
         &self,
         lease: &ManifestLease,
-        processed_entries: u64,
-        failed_entries: u64,
-        last_processed_line: u64,
+        processed_delta: u64,
+        failed_delta: u64,
+        lines_delta: u64,
     ) -> Result<(), LeaseError> {
         self.fenced_update(
             lease,
-            doc! { "$set": {
-                "processed_entries": processed_entries as i64,
-                "failed_entries": failed_entries as i64,
-                "last_processed_line": last_processed_line as i64,
+            doc! { "$inc": {
+                "processed_entries": processed_delta as i64,
+                "failed_entries": failed_delta as i64,
+                "last_processed_line": lines_delta as i64,
             }},
         )
         .await
@@ -1398,6 +1420,27 @@ impl SubmitWorkerStorage for MongoBackend {
             doc! { "$max": {
                 "bytes_processed": bytes_processed as i64,
                 "bytes_total": bytes_total as i64,
+            }},
+        )
+        .await
+    }
+
+    async fn update_manifest_phase(
+        &self,
+        lease: &ManifestLease,
+        phase: ManifestPhase,
+        files_done: u64,
+        files_total: u64,
+    ) -> Result<(), LeaseError> {
+        // `$set`, not `$max`: the counters restart at zero when the worker moves
+        // from `sizing` to `downloading`, so a monotonic update would pin
+        // `files_done` at the previous phase's total.
+        self.fenced_update(
+            lease,
+            doc! { "$set": {
+                "phase": phase.to_string(),
+                "files_done": files_done as i64,
+                "files_total": files_total as i64,
             }},
         )
         .await

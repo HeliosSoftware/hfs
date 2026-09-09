@@ -288,7 +288,15 @@ where
     /// falls back to the stale entry when there is one (stale beats absent —
     /// the same principle the observability cache already applies to whole
     /// snapshots), otherwise to an empty list.
-    async fn cached_count_all_types(&self, tenant: &TenantContext) -> Vec<(String, u64)> {
+    ///
+    /// The returned flag is that last case: an empty list is indistinguishable
+    /// from an empty tenant, and since #959 derives *both* `distinct_types` and
+    /// `total_resources` from this call, a failure with nothing to fall back on
+    /// zeroes both stat cards. The page has to say those zeros are not
+    /// measurements (#956). A stale fallback is deliberately not flagged: those
+    /// figures were read from storage, just not now, which is the same trade
+    /// the snapshot cache already makes when it serves a stale snapshot.
+    async fn cached_count_all_types(&self, tenant: &TenantContext) -> (Vec<(String, u64)>, bool) {
         let tenant_key = tenant.tenant_id().as_str().to_string();
 
         // Fast path. The read guard is scoped to this block and dropped before
@@ -305,7 +313,7 @@ where
                     types = counts.len(),
                     "dashboard snapshot: per-type counts served from cache"
                 );
-                return counts;
+                return (counts, false);
             }
         }
 
@@ -325,15 +333,19 @@ where
                 if let Ok(mut guard) = self.type_counts.write() {
                     guard.insert(tenant_key, (Instant::now(), counts.clone()));
                 }
-                counts
+                (counts, false)
             }
             Err(error) => {
                 warn!(%error, "dashboard snapshot: distinct-type query failed");
-                self.type_counts
+                match self
+                    .type_counts
                     .read()
                     .ok()
                     .and_then(|guard| guard.get(&tenant_key).map(|(_, counts)| counts.clone()))
-                    .unwrap_or_default()
+                {
+                    Some(stale) => (stale, false),
+                    None => (Vec::new(), true),
+                }
             }
         }
     }
@@ -362,11 +374,18 @@ where
         );
         let now = Utc::now();
 
+        // Set by every degradation below. A half-failed snapshot reads exactly
+        // like a real one — empty series, zero totals — and is then cached as
+        // truth, so it has to carry the fact that it is incomplete (#956).
+        let mut partial = false;
+
         // What the tenant actually stores, largest first — the picker's option
         // list, and the pool defaults are drawn from (#555). Cached per tenant
         // (#959): this grouping query is the dashboard's dominant cost and does
-        // not vary with the window or the selection.
-        let raw_counts = self.cached_count_all_types(&tenant).await;
+        // not vary with the window or the selection. It reports whether it had
+        // to fabricate its zeros, because both stat cards derive from it.
+        let (raw_counts, counts_unavailable) = self.cached_count_all_types(&tenant).await;
+        partial |= counts_unavailable;
         // The stat card counts only types the tenant actually stores —
         // `include_empty` (#599, "View all resources") never changes this
         // figure, so it must be taken before the flag relaxes the filter
@@ -460,7 +479,10 @@ where
         };
 
         // Degrade to an empty/zeroed snapshot rather than surfacing an error —
-        // the operator dashboard should render even if a count query hiccups.
+        // the operator dashboard should render even if a count query hiccups —
+        // but flag it, so the page says the figures are incomplete instead of
+        // charting the fallback as data (#956).
+        //
         // Timed at `debug!` alongside the per-type grouping so a slow dashboard
         // can be attributed to one query or the other without a profiler (#959).
         let series_started = Instant::now();
@@ -484,6 +506,7 @@ where
             Ok(series) => series,
             Err(error) => {
                 warn!(%error, "dashboard snapshot: resource-count series query failed");
+                partial = true;
                 Vec::new()
             }
         };
@@ -491,7 +514,10 @@ where
         // Job counts degrade to `None` (unavailable) rather than zero on a read
         // error: a zero here would tell an operator "no jobs" when the truth is
         // "could not ask". `None` also covers the normal case of a deployment
-        // with no bulk-export/bulk-submit job store wired at all.
+        // with no bulk-export/bulk-submit job store wired at all. They carry
+        // their own unavailable state on the page, so they do not set
+        // `partial` — that flag is for figures with no honest rendering of
+        // their own.
         let export_jobs = match &self.export_jobs {
             None => None,
             Some(store) => {
@@ -531,6 +557,7 @@ where
             available,
             export_jobs,
             import_jobs_active,
+            partial,
         }
     }
 }
@@ -567,6 +594,9 @@ mod tests {
         assert_eq!(snapshot.total_resources, 0);
         assert_eq!(snapshot.distinct_types, 0);
         assert!(!snapshot.fhir_version.is_empty());
+        // Every query answered: these zeros are measurements, not fallbacks,
+        // and the page may present them as such (#956).
+        assert!(!snapshot.partial);
     }
 
     /// Every window yields a dense series of exactly its own length, on

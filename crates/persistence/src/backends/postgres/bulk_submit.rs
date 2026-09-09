@@ -14,9 +14,10 @@ use crate::core::bulk_export_worker::{LeaseError, WorkerId};
 use crate::core::bulk_submit::{
     BulkEntryOutcome, BulkEntryResult, BulkProcessingOptions, BulkSubmitProvider,
     BulkSubmitRollbackProvider, ChangeType, EntryCountSummary, EntryResultContinuation,
-    EntryResultCursor, EntryResultPage, ManifestStatus, NdjsonEntry, PagedEntryResult,
-    StreamProcessingResult, StreamingBulkSubmitProvider, SubmissionChange, SubmissionId,
-    SubmissionManifest, SubmissionStatus, SubmissionSummary, invalid_entry_result_page,
+    EntryResultCursor, EntryResultPage, ManifestPhase, ManifestStatus, NdjsonEntry,
+    PagedEntryResult, StreamProcessingResult, StreamingBulkSubmitProvider, SubmissionChange,
+    SubmissionId, SubmissionManifest, SubmissionStatus, SubmissionSummary,
+    invalid_entry_result_page,
 };
 use crate::core::bulk_submit_worker::{
     ManifestFetchParams, ManifestLease, ManifestWorkerView, PollTokenTarget, SubmitClaimStrategy,
@@ -508,6 +509,9 @@ impl BulkSubmitProvider for PostgresBackend {
             lease_expiry: None,
             bytes_processed: 0,
             bytes_total: 0,
+            phase: None,
+            files_done: 0,
+            files_total: 0,
         })
     }
 
@@ -522,7 +526,7 @@ impl BulkSubmitProvider for PostgresBackend {
 
         let rows = client
             .query(
-                "SELECT manifest_url, replaces_manifest_url, status, added_at, total_entries, processed_entries, failed_entries, lease_expiry, bytes_processed, bytes_total
+                "SELECT manifest_url, replaces_manifest_url, status, added_at, total_entries, processed_entries, failed_entries, lease_expiry, bytes_processed, bytes_total, phase, files_done, files_total
                  FROM bulk_manifests
                  WHERE tenant_id = $1 AND submitter = $2 AND submission_id = $3 AND manifest_id = $4",
                 &[
@@ -550,6 +554,12 @@ impl BulkSubmitProvider for PostgresBackend {
         let lease_expiry: Option<chrono::DateTime<Utc>> = row.get(7);
         let bytes_processed: i64 = row.get(8);
         let bytes_total: i64 = row.get(9);
+        // Unlike `status`, an unreadable phase is not an error: it is a
+        // cosmetic hint, and a row written by a newer HFS must still be
+        // readable here (#953).
+        let phase: Option<String> = row.get(10);
+        let files_done: i64 = row.get(11);
+        let files_total: i64 = row.get(12);
 
         let status: ManifestStatus = status_str
             .parse()
@@ -567,6 +577,9 @@ impl BulkSubmitProvider for PostgresBackend {
             lease_expiry,
             bytes_processed: bytes_processed.max(0) as u64,
             bytes_total: bytes_total.max(0) as u64,
+            phase: phase.and_then(|p| p.parse::<ManifestPhase>().ok()),
+            files_done: files_done.max(0) as u64,
+            files_total: files_total.max(0) as u64,
         }))
     }
 
@@ -760,6 +773,13 @@ impl BulkSubmitProvider for PostgresBackend {
         }
 
         // Update manifest counts, on a fresh client for the tail statements.
+        //
+        // Every column here accumulates: these counters are cumulative across
+        // all runs of the manifest (including resumes) and are the ones the
+        // submit status endpoint reports (#969). `processed_entries` counts the
+        // entries that did not fail — successes plus deliberate skips — so that
+        // `processed_entries + failed_entries` equals the entries walked, and
+        // `last_processed_line` advances by the entries this batch consumed.
         let now = Utc::now();
         let client = self.get_client().await?;
         client
@@ -767,12 +787,14 @@ impl BulkSubmitProvider for PostgresBackend {
                 "UPDATE bulk_manifests SET
                     total_entries = total_entries + $1,
                     processed_entries = processed_entries + $2,
-                    failed_entries = failed_entries + $3
-                 WHERE tenant_id = $4 AND submitter = $5 AND submission_id = $6 AND manifest_id = $7",
+                    failed_entries = failed_entries + $3,
+                    last_processed_line = last_processed_line + $4
+                 WHERE tenant_id = $5 AND submitter = $6 AND submission_id = $7 AND manifest_id = $8",
                 &[
                     &(results.len() as i32),
                     &(results.iter().filter(|r| r.is_success()).count() as i32),
                     &(error_count as i32),
+                    &(results.len() as i64),
                     &tenant_id,
                     &submission_id.submitter.as_str(),
                     &submission_id.submission_id.as_str(),
@@ -1194,7 +1216,10 @@ impl StreamingBulkSubmitProvider for PostgresBackend {
                                 }]
                             }),
                         );
+                        // Rejected here, so no batch will charge it to the
+                        // manifest's counters; the worker adds it (#969).
                         result.counts.increment(error_result.outcome);
+                        result.unbatched_errors += 1;
 
                         if !options.continue_on_error
                             && (options.max_errors == 0
@@ -1209,6 +1234,7 @@ impl StreamingBulkSubmitProvider for PostgresBackend {
                 }
                 Err(e) => {
                     result.counts.increment(BulkEntryOutcome::ValidationError);
+                    result.unbatched_errors += 1;
 
                     if !options.continue_on_error
                         && (options.max_errors == 0
@@ -1635,24 +1661,29 @@ impl SubmitWorkerStorage for PostgresBackend {
         }
     }
 
-    async fn update_manifest_progress(
+    async fn add_manifest_progress(
         &self,
         lease: &ManifestLease,
-        processed_entries: u64,
-        failed_entries: u64,
-        last_processed_line: u64,
+        processed_delta: u64,
+        failed_delta: u64,
+        lines_delta: u64,
     ) -> Result<(), LeaseError> {
         let client = self.get_client().await.map_err(LeaseError::Storage)?;
+        // Deltas, not absolutes: the ingestion engine's per-batch bookkeeping
+        // accumulates into the same columns, so an absolute `SET` here would
+        // stomp its writes and walk the counters backwards on resume (#969).
         let affected = client
             .execute(
                 "UPDATE bulk_manifests
-                 SET processed_entries = $1, failed_entries = $2, last_processed_line = $3
+                 SET processed_entries = processed_entries + $1,
+                     failed_entries = failed_entries + $2,
+                     last_processed_line = last_processed_line + $3
                  WHERE tenant_id = $4 AND submitter = $5 AND submission_id = $6
                    AND manifest_id = $7 AND worker_id = $8 AND fencing_token = $9",
                 &[
-                    &(processed_entries as i32),
-                    &(failed_entries as i32),
-                    &(last_processed_line as i64),
+                    &(processed_delta as i32),
+                    &(failed_delta as i32),
+                    &(lines_delta as i64),
                     &lease.tenant.tenant_id().as_str(),
                     &lease.submission_id.submitter,
                     &lease.submission_id.submission_id,
@@ -1697,6 +1728,44 @@ impl SubmitWorkerStorage for PostgresBackend {
             )
             .await
             .map_err(|e| LeaseError::Storage(internal_error(format!("update bytes: {e}"))))?;
+        if affected == 0 {
+            Err(lease_lost(lease))
+        } else {
+            Ok(())
+        }
+    }
+
+    async fn update_manifest_phase(
+        &self,
+        lease: &ManifestLease,
+        phase: ManifestPhase,
+        files_done: u64,
+        files_total: u64,
+    ) -> Result<(), LeaseError> {
+        let client = self.get_client().await.map_err(LeaseError::Storage)?;
+        // A plain overwrite, not the monotonic GREATEST the byte counters use:
+        // the phases advance and their file counters restart per phase, so the
+        // last write from the lease holder is the truth.
+        let affected = client
+            .execute(
+                "UPDATE bulk_manifests
+                 SET phase = $1, files_done = $2, files_total = $3
+                 WHERE tenant_id = $4 AND submitter = $5 AND submission_id = $6
+                   AND manifest_id = $7 AND worker_id = $8 AND fencing_token = $9",
+                &[
+                    &phase.to_string(),
+                    &(files_done as i64),
+                    &(files_total as i64),
+                    &lease.tenant.tenant_id().as_str(),
+                    &lease.submission_id.submitter,
+                    &lease.submission_id.submission_id,
+                    &lease.manifest_id,
+                    &lease.worker_id.as_str(),
+                    &(lease.fencing_token as i64),
+                ],
+            )
+            .await
+            .map_err(|e| LeaseError::Storage(internal_error(format!("update phase: {e}"))))?;
         if affected == 0 {
             Err(lease_lost(lease))
         } else {

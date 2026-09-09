@@ -5,17 +5,39 @@
   <h1 class="page-head__title">{{ i18n.t("nav-home") }}</h1>
 </section>
 
+{#
+  Everything derived from the dashboard snapshot lives in one swappable
+  region (#956). While the snapshot is still being computed the page renders
+  a waiting state and — with JavaScript — re-requests just this region a
+  bounded number of times, so the figures appear without a manual reload and
+  without ever standing in for them with invented ones.
+#}
+<div id="dash-live"
+  {% if let Some(href) = auto_retry_href %}
+     hx-get="{{ href }}" hx-trigger="load delay:1200ms"
+     hx-target="this" hx-select="#dash-live" hx-swap="outerHTML"
+  {% endif %}
+>
+
 <section class="stat-grid stat-grid--5">
   <article class="card stat">
     <span class="stat__label">{{ i18n.t("card-resource-types") }}</span>
-    <span class="stat__value">{{ metrics.resource_types }}</span>
+    {% if let Some(value) = metrics.resource_types %}
+    <span class="stat__value">{{ value }}</span>
+    {% else %}
+    <span class="stat__value stat__value--unavailable" aria-label="{{ i18n.t("chart-pending-empty") }}">&mdash;</span>
+    {% endif %}
     {# The effective request version, same source as the sidebar selector —
        never the snapshot's boot-time default (#553). #}
     <span class="stat__sub">{{ i18n.t_arg("card-resource-types-sub", "version", status.fhir_version_label().to_string()) }}</span>
   </article>
   <article class="card stat">
     <span class="stat__label">{{ i18n.t("card-stored-resources") }}</span>
-    <span class="stat__value">{{ metrics.stored_resources }}</span>
+    {% if let Some(value) = metrics.stored_resources %}
+    <span class="stat__value">{{ value }}</span>
+    {% else %}
+    <span class="stat__value stat__value--unavailable" aria-label="{{ i18n.t("chart-pending-empty") }}">&mdash;</span>
+    {% endif %}
     <span class="stat__sub">{{ i18n.t("card-stored-resources-sub") }}</span>
   </article>
   <a class="card stat stat--link" href="/ui/bulk-export">
@@ -54,7 +76,11 @@
   <header class="chart-card__head">
     <div>
       <span class="stat__label">{{ i18n.t("chart-title") }}</span>
-      <span class="stat__value">{{ metrics.chart_total }}</span>
+      {% if let Some(value) = metrics.chart_total %}
+      <span class="stat__value">{{ value }}</span>
+      {% else %}
+      <span class="stat__value stat__value--unavailable" aria-label="{{ i18n.t("chart-pending-empty") }}">&mdash;</span>
+      {% endif %}
       <span class="stat__sub">{{ chart.types_label }}</span>
     </div>
     <div class="chart-card__tools">
@@ -123,11 +149,25 @@
     </div>
   </header>
 
-  {% if sample_data %}
-  <p class="notice notice--warn">{{ i18n.t("chart-sample-note") }}</p>
+  {#
+    Whatever is short of a complete live reading is named here, and named
+    precisely: waiting is not "no provider", and a half-failed snapshot is
+    not a measurement (#956). `aria-live` so the swap announces itself.
+  #}
+  {% if let Some(key) = notice.key() %}
+  <p class="notice notice--warn" aria-live="polite">
+    {{ i18n.t(key) }}
+    {% if notice.is_pending() %}
+    {# Always present, auto-refresh or not: the page stays recoverable
+       without JavaScript, and after the poll budget it is the only way on. #}
+    <a href="{{ retry_href }}">{{ i18n.t("chart-pending-retry") }}</a>
+    {% endif %}
+  </p>
   {% endif %}
 
-  {% if !chart.has_data %}
+  {% if notice.is_pending() %}
+  <div class="chart-empty">{{ i18n.t("chart-pending-empty") }}</div>
+  {% else if !chart.has_data %}
   <div class="chart-empty">{{ i18n.t("chart-empty") }}</div>
   {% else %}
   <!--
@@ -233,4 +273,6 @@
     {% endfor %}
   </ul>
 </section>
+
+</div>{# /#dash-live #}
 {% endblock %}

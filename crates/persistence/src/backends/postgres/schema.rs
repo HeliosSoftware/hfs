@@ -781,6 +781,12 @@ async fn add_bulk_submit_worker_schema(
         "ALTER TABLE bulk_manifests ADD COLUMN IF NOT EXISTS submission_metadata TEXT",
         "ALTER TABLE bulk_manifests ADD COLUMN IF NOT EXISTS bytes_processed BIGINT NOT NULL DEFAULT 0",
         "ALTER TABLE bulk_manifests ADD COLUMN IF NOT EXISTS bytes_total BIGINT NOT NULL DEFAULT 0",
+        // Pre-ingest phase hint (#953). `phase` is nullable because a manifest
+        // has none until a worker claims it, and an unrecognized string decodes
+        // back to `None` rather than failing the read.
+        "ALTER TABLE bulk_manifests ADD COLUMN IF NOT EXISTS phase TEXT",
+        "ALTER TABLE bulk_manifests ADD COLUMN IF NOT EXISTS files_done BIGINT NOT NULL DEFAULT 0",
+        "ALTER TABLE bulk_manifests ADD COLUMN IF NOT EXISTS files_total BIGINT NOT NULL DEFAULT 0",
     ];
     for sql in &migrations {
         client
