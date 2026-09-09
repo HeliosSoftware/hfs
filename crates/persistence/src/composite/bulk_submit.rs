@@ -36,9 +36,9 @@ use tracing::warn;
 use crate::core::bulk_export_worker::{LeaseError, WorkerId};
 use crate::core::bulk_submit::{
     BulkEntryOutcome, BulkEntryResult, BulkProcessingOptions, BulkSubmitProvider,
-    BulkSubmitRollbackProvider, ChangeType, EntryCountSummary, NdjsonEntry, StreamProcessingResult,
-    StreamingBulkSubmitProvider, SubmissionChange, SubmissionId, SubmissionManifest,
-    SubmissionStatus, SubmissionSummary,
+    BulkSubmitRollbackProvider, ChangeType, EntryCountSummary, ManifestPhase, NdjsonEntry,
+    StreamProcessingResult, StreamingBulkSubmitProvider, SubmissionChange, SubmissionId,
+    SubmissionManifest, SubmissionStatus, SubmissionSummary,
 };
 use crate::core::bulk_submit_worker::{
     BulkSubmitJobStore, ManifestFetchParams, ManifestLease, ManifestWorkerView, PollTokenTarget,
@@ -666,6 +666,18 @@ impl SubmitWorkerStorage for CompositeSubmitJobs {
     ) -> Result<(), LeaseError> {
         self.primary
             .update_manifest_bytes(lease, bytes_processed, bytes_total)
+            .await
+    }
+
+    async fn update_manifest_phase(
+        &self,
+        lease: &ManifestLease,
+        phase: ManifestPhase,
+        files_done: u64,
+        files_total: u64,
+    ) -> Result<(), LeaseError> {
+        self.primary
+            .update_manifest_phase(lease, phase, files_done, files_total)
             .await
     }
 

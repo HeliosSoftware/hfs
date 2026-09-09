@@ -117,7 +117,9 @@ const child = spawn(bin, [], {
     // renders its live (empty) dashboard instead of the unavailable state.
     HFS_SUBSCRIPTIONS_ENABLED: "true",
     // Bulk Submit, tuned so the Import page's ingest is *watchable* in a test
-    // rather than in a manual pass that can wait hours (#969).
+    // rather than in a manual pass that can wait hours (#969), and so a
+    // submission's whole pre-ingest window (#953) cannot elapse between two
+    // reads unobserved.
     //
     // The production Retry-After is 120s, and the Import page honours it: it
     // materializes the header into a "do not poll before" instant, so its 5s
