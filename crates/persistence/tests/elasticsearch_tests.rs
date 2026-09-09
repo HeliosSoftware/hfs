@@ -879,6 +879,84 @@ mod es_integration {
         assert_eq!(created.version_id(), "1");
     }
 
+    /// `$reindex` walks a page at a time and, before #1021, Elasticsearch used
+    /// the default trait implementation: one HTTP round trip per resource. This
+    /// pins the batched override — every resource of the page indexed, its own
+    /// version_id carried, and per-resource outcomes still reported in order —
+    /// so the batching can never silently drop or reorder a page.
+    #[tokio::test]
+    async fn es_integration_reindex_page_writes_every_resource() {
+        use helios_persistence::search::ReindexTarget;
+        use helios_persistence::types::StoredResource;
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("reindex-page-tenant");
+
+        let resources: Vec<StoredResource> = (0..25)
+            .map(|n| {
+                StoredResource::from_storage(
+                    "Patient",
+                    &format!("page-{n}"),
+                    "7",
+                    tenant.tenant_id().clone(),
+                    json!({
+                        "resourceType": "Patient",
+                        "id": format!("page-{n}"),
+                        "name": [{"family": format!("Paged{n}")}]
+                    }),
+                    chrono::Utc::now(),
+                    chrono::Utc::now(),
+                    None,
+                    FhirVersion::default(),
+                )
+            })
+            .collect();
+
+        let outcomes = backend.write_search_entries_page(&tenant, &resources).await;
+        assert_eq!(
+            outcomes.len(),
+            resources.len(),
+            "one outcome per resource, in page order"
+        );
+        for (n, outcome) in outcomes.iter().enumerate() {
+            assert!(outcome.is_ok(), "resource {n} failed: {outcome:?}");
+        }
+
+        // Every document really landed, under its own id and version.
+        for n in [0usize, 12, 24] {
+            let stored = backend
+                .read(&tenant, "Patient", &format!("page-{n}"))
+                .await
+                .unwrap()
+                .unwrap_or_else(|| panic!("page-{n} must be indexed"));
+            assert_eq!(
+                stored.version_id(),
+                "7",
+                "the resource's own version is kept"
+            );
+            assert_eq!(
+                stored.content()["name"][0]["family"],
+                json!(format!("Paged{n}"))
+            );
+        }
+    }
+
+    /// An empty page is a no-op rather than an empty `_bulk` request, which
+    /// Elasticsearch rejects.
+    #[tokio::test]
+    async fn es_integration_reindex_empty_page_is_a_no_op() {
+        use helios_persistence::search::ReindexTarget;
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("reindex-empty-tenant");
+        assert!(
+            backend
+                .write_search_entries_page(&tenant, &[])
+                .await
+                .is_empty()
+        );
+    }
+
     #[tokio::test]
     async fn es_integration_create_with_id() {
         let backend = create_backend().await;
