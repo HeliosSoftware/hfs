@@ -801,7 +801,12 @@ impl BulkSubmitProvider for SqliteBackend {
             let (entry_result, change) = match result {
                 Ok(outcome) => outcome,
                 Err(e) => {
-                    error_count += 1;
+                    // Not counted here: the result built below is an error
+                    // result, and the shared tally right after this match
+                    // counts it. Counting in both places charged an ingest
+                    // failure twice — invisible while the worker overwrote
+                    // `failed_entries` with its own absolute total, and no
+                    // longer (#969).
                     let failed = BulkEntryResult::processing_error(
                         entry.line_number,
                         &entry.resource_type,
@@ -845,6 +850,12 @@ impl BulkSubmitProvider for SqliteBackend {
         // reason it is here at all is that a standalone flush (the lease
         // keeper's) starves against back-to-back batch transactions on SQLite,
         // and MAX keeps a late keeper flush from regressing it.
+        //
+        // The entry counters accumulate: they are cumulative across every run
+        // of the manifest, and this batch — which owns them — is the only
+        // writer that knows what it committed. `processed_entries` counts the
+        // entries that did not fail, successes plus deliberate skips, so
+        // processed + failed is the number of entries walked (#969).
         {
             let _span = crate::perf::span(crate::perf::Phase::BatchOverhead);
             let now = Utc::now().to_rfc3339();
@@ -859,6 +870,10 @@ impl BulkSubmitProvider for SqliteBackend {
                 })
                 .unwrap_or((0, 0));
             let total = results.len() as i64;
+            // `processed_entries` means resources written to the store, so skips
+            // are excluded and surface through their receipts (#954).
+            // `last_processed_line` is a line cursor, not an outcome tally, so it
+            // advances by every entry the batch walked (#969).
             let succeeded = results.iter().filter(|r| r.is_success()).count() as i64;
             txn.with_connection(|conn| {
                 conn.prepare_cached(
@@ -866,6 +881,7 @@ impl BulkSubmitProvider for SqliteBackend {
                         total_entries = total_entries + ?1,
                         processed_entries = processed_entries + ?2,
                         failed_entries = failed_entries + ?3,
+                        last_processed_line = last_processed_line + ?1,
                         bytes_processed = MAX(bytes_processed, ?8),
                         bytes_total = MAX(bytes_total, ?9)
                      WHERE tenant_id = ?4 AND submitter = ?5 AND submission_id = ?6 AND manifest_id = ?7",
@@ -1256,7 +1272,10 @@ impl StreamingBulkSubmitProvider for SqliteBackend {
                                 }]
                             }),
                         );
+                        // Rejected here, so no batch will charge it to the
+                        // manifest's counters; the worker adds it (#969).
                         result.counts.increment(error_result.outcome);
+                        result.unbatched_errors += 1;
 
                         if !options.continue_on_error
                             && (options.max_errors == 0
@@ -1271,6 +1290,7 @@ impl StreamingBulkSubmitProvider for SqliteBackend {
                 }
                 Err(e) => {
                     result.counts.increment(BulkEntryOutcome::ValidationError);
+                    result.unbatched_errors += 1;
 
                     if !options.continue_on_error
                         && (options.max_errors == 0
@@ -1742,15 +1762,26 @@ impl SubmitWorkerStorage for SqliteBackend {
         }
     }
 
-    async fn update_manifest_progress(
+    async fn add_manifest_progress(
         &self,
         lease: &ManifestLease,
-        processed_entries: u64,
-        failed_entries: u64,
-        last_processed_line: u64,
+        processed_delta: u64,
+        failed_delta: u64,
+        lines_delta: u64,
     ) -> Result<(), LeaseError> {
-        // Absolute-value write guarded by worker_id + fencing_token, so a
-        // busy retry is idempotent and a stale lease still loses (#942).
+        // Deltas, not absolutes: the batch bookkeeping in `process_entries`
+        // accumulates into the same columns, so assigning here would stomp it
+        // and walk the counters backwards on resume (#969).
+        //
+        // That makes this the one retried bookkeeping write that is *not*
+        // idempotent, so the fencing token alone would not make a reissue safe
+        // — applying the delta twice would inflate the counters even under a
+        // valid lease. What keeps the retry correct is the narrower argument in
+        // `retry_bookkeeping_on_busy`: only busy/locked is retried, and an
+        // attempt that fails busy/locked never took the write lock, so the
+        // statement rolled back and added nothing. Hence `classify_sqlite_error`
+        // rather than `internal_error` — misclassify the busy and this write
+        // stops being retried at all (#942).
         let affected = retry_bookkeeping_on_busy(
             "manifest progress update",
             lease_retry_budget(lease),
@@ -1758,13 +1789,15 @@ impl SubmitWorkerStorage for SqliteBackend {
                 let conn = self.get_connection()?;
                 conn.execute(
                     "UPDATE bulk_manifests
-                 SET processed_entries = ?1, failed_entries = ?2, last_processed_line = ?3
+                 SET processed_entries = processed_entries + ?1,
+                     failed_entries = failed_entries + ?2,
+                     last_processed_line = last_processed_line + ?3
                  WHERE tenant_id = ?4 AND submitter = ?5 AND submission_id = ?6
                    AND manifest_id = ?7 AND worker_id = ?8 AND fencing_token = ?9",
                     params![
-                        processed_entries as i64,
-                        failed_entries as i64,
-                        last_processed_line as i64,
+                        processed_delta as i64,
+                        failed_delta as i64,
+                        lines_delta as i64,
                         lease.tenant.tenant_id().as_str(),
                         lease.submission_id.submitter,
                         lease.submission_id.submission_id,
@@ -2798,7 +2831,7 @@ mod tests {
         backend.heartbeat(&lease).await.unwrap();
         backend.mark_manifest_processing(&lease).await.unwrap();
         backend
-            .update_manifest_progress(&lease, 5, 1, 6)
+            .add_manifest_progress(&lease, 5, 1, 6)
             .await
             .unwrap();
         backend.finish_manifest(&lease).await.unwrap();
@@ -2810,6 +2843,111 @@ mod tests {
                 .await
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    /// Both writers into a manifest's progress columns add rather than assign,
+    /// so a reclaimed manifest never reports less progress than it had (#969).
+    #[tokio::test]
+    async fn test_progress_counters_only_move_forward() {
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+        let sub_id = seed_claimable(&backend, &tenant).await;
+
+        let lease = backend
+            .claim_next_manifest(&WorkerId::new("w1"), StdDuration::from_secs(60))
+            .await
+            .unwrap()
+            .unwrap();
+
+        // The worker's own contributions accumulate across calls...
+        backend
+            .add_manifest_progress(&lease, 5, 1, 6)
+            .await
+            .unwrap();
+        backend
+            .add_manifest_progress(&lease, 2, 0, 2)
+            .await
+            .unwrap();
+        assert_eq!(
+            backend
+                .get_manifest_for_worker(&lease)
+                .await
+                .unwrap()
+                .last_processed_line,
+            8
+        );
+
+        // ...and the ingestion engine's per-batch bookkeeping adds on top of
+        // them instead of replacing them.
+        backend
+            .process_entries(
+                &tenant,
+                &sub_id,
+                &lease.manifest_id,
+                vec![
+                    NdjsonEntry::new(1, "Patient", json!({"resourceType": "Patient"})),
+                    NdjsonEntry::new(2, "Patient", json!({"resourceType": "Patient"})),
+                ],
+                &BulkProcessingOptions::new(),
+            )
+            .await
+            .unwrap();
+
+        let manifests = backend.list_manifests(&tenant, &sub_id).await.unwrap();
+        assert_eq!(manifests[0].processed_entries, 9);
+        assert_eq!(manifests[0].failed_entries, 1);
+        assert_eq!(manifests[0].total_entries, 2);
+        assert_eq!(
+            backend
+                .get_manifest_for_worker(&lease)
+                .await
+                .unwrap()
+                .last_processed_line,
+            10
+        );
+    }
+
+    /// Lines the stream rejects never reach a batch, so the manifest's
+    /// counters do not move for them — they are reported back for the worker
+    /// to add instead (#969).
+    #[tokio::test]
+    async fn test_stream_reports_the_errors_no_batch_counted() {
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+        let sub_id = seed_claimable(&backend, &tenant).await;
+        let manifests = backend.list_manifests(&tenant, &sub_id).await.unwrap();
+        let manifest_id = manifests[0].manifest_id.clone();
+
+        // One ingestable Patient, one unparseable line, one resource of the
+        // wrong type for this file.
+        let ndjson = concat!(
+            "{\"resourceType\":\"Patient\"}\n",
+            "not-json\n",
+            "{\"resourceType\":\"Observation\"}\n"
+        );
+        let result = backend
+            .process_ndjson_stream(
+                &tenant,
+                &sub_id,
+                &manifest_id,
+                "Patient",
+                Box::new(tokio::io::BufReader::new(std::io::Cursor::new(
+                    ndjson.as_bytes().to_vec(),
+                ))),
+                &BulkProcessingOptions::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.counts.error_count(), 2);
+        assert_eq!(result.unbatched_errors, 2);
+
+        let manifests = backend.list_manifests(&tenant, &sub_id).await.unwrap();
+        assert_eq!(manifests[0].total_entries, 1);
+        assert_eq!(manifests[0].processed_entries, 1);
+        assert_eq!(
+            manifests[0].failed_entries, 0,
+            "a batch only ever counts what it committed"
         );
     }
 

@@ -848,15 +848,15 @@ where
             // "searchable" — under deferred indexing search follows the
             // per-manifest reindex).
             //
-            // The separator is a plain ASCII hyphen, not the em dash this
-            // comment uses. The string is an HTTP field value, and RFC 9110
-            // §5.5 confines those to US-ASCII: a byte above 0x7F is `obs-text`,
-            // whose meaning is undefined, so conservative clients refuse to
-            // decode it rather than guess an encoding. `HeaderValue::to_str` is
-            // one such client, which is how the em dash silently blanked the
-            // progress line in our own Bulk Import card (it fell through to a
-            // literal "in progress"); any third-party Data Provider polling
-            // this endpoint would have hit the same wall.
+            // ASCII only, and the separator is a plain hyphen for that reason
+            // alone. This sentence is a *header* value, and RFC 9110 §5.5
+            // leaves anything outside US-ASCII as opaque obs-text with no
+            // defined meaning; strict clients reject it outright rather than
+            // guess a charset. The em dash this used to carry made
+            // `HeaderValue::to_str()` fail, so HFS's own Import page fell back
+            // to a bare "in progress" the instant the counter became non-zero —
+            // the number #969 exists to show was invisible exactly when it had
+            // something to say.
             format!(
                 "Processing {pct}% of bytes - {} resources written",
                 group_thousands(entries)

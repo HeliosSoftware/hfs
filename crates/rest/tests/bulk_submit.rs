@@ -1179,6 +1179,50 @@ async fn test_poll_percentage_tracks_ingested_bytes() {
     );
 }
 
+/// #969: the resource counter has to survive the trip through the header.
+///
+/// `X-Progress` gained the "N resources written" clause joined by an em dash,
+/// and an em dash is not US-ASCII. `HeaderValue::to_str()` — which is how
+/// `reqwest`, and therefore HFS's own Import page, reads a header — refuses
+/// anything outside visible ASCII, so the poller saw no value at all and fell
+/// back to a bare "in progress". The regression was invisible to the byte-
+/// percentage test above because that one leaves `processed_entries` at zero,
+/// which is exactly the branch that stays ASCII.
+///
+/// So this asserts the readable form, not the bytes: a counter that only a
+/// permissive client can decode is a counter the operator does not have.
+#[tokio::test]
+async fn test_poll_progress_header_is_ascii_readable_with_a_resource_count() {
+    let (server, backend, _fetcher, _output, _tmp) =
+        create_submit_server_with(mock_fetcher(), BulkSubmitConfig::default()).await;
+    let poll_path = start_and_get_poll_path(&server).await;
+
+    let lease = backend
+        .claim_next_manifest(&WorkerId::new("counting-worker"), Duration::from_secs(60))
+        .await
+        .expect("claim")
+        .expect("a manifest to claim");
+    backend
+        .update_manifest_bytes(&lease, 350, 1_000)
+        .await
+        .expect("bytes update");
+    backend
+        .add_manifest_progress(&lease, 1_234, 0, 1_234)
+        .await
+        .expect("progress update");
+
+    let resp = server.get(&poll_path).await;
+    assert_eq!(resp.status_code(), StatusCode::ACCEPTED);
+    let raw = resp.headers().get("x-progress").expect("X-Progress");
+    let progress = raw
+        .to_str()
+        .unwrap_or_else(|e| panic!("X-Progress must be ASCII a client can read: {e}"));
+    assert_eq!(
+        progress, "Processing 35% of bytes - 1,234 resources written",
+        "the poll must report both the byte percentage and the resource count"
+    );
+}
+
 /// #646: a `processing` manifest whose worker lease expired without renewal
 /// or reclaim used to poll as a quiet "processing" forever — a frozen worker
 /// pool was indistinguishable from progress. The poll now names the stall.
@@ -1427,9 +1471,11 @@ async fn test_progress_header_stays_ascii_in_every_branch() {
         .update_manifest_bytes(&lease, 350, 1_000)
         .await
         .expect("bytes update");
-    // Entries outrank bytes, so this selects the resource-count wording.
+    // Entries outrank bytes, so this selects the resource-count wording. The
+    // counters are cumulative deltas (#969) and this manifest starts at zero,
+    // so the added count is the reported one.
     backend
-        .update_manifest_progress(&lease, 609_191, 0, 609_191)
+        .add_manifest_progress(&lease, 609_191, 0, 609_191)
         .await
         .expect("entry update");
 

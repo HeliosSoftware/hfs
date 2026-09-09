@@ -646,20 +646,15 @@ impl SubmitWorkerStorage for CompositeSubmitJobs {
         self.primary.mark_manifest_processing(lease).await
     }
 
-    async fn update_manifest_progress(
+    async fn add_manifest_progress(
         &self,
         lease: &ManifestLease,
-        processed_entries: u64,
-        failed_entries: u64,
-        last_processed_line: u64,
+        processed_delta: u64,
+        failed_delta: u64,
+        lines_delta: u64,
     ) -> Result<(), LeaseError> {
         self.primary
-            .update_manifest_progress(
-                lease,
-                processed_entries,
-                failed_entries,
-                last_processed_line,
-            )
+            .add_manifest_progress(lease, processed_delta, failed_delta, lines_delta)
             .await
     }
 
