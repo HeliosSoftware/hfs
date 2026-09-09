@@ -17,8 +17,8 @@ use helios_fhir::FhirVersion;
 use helios_persistence::backends::local_fs::LocalFsOutputStore;
 use helios_persistence::backends::sqlite::{SqliteBackend, SqliteBackendConfig};
 use helios_persistence::core::{
-    BulkExportJobStore, DefaultExportWorker, ExportClaimStrategy, ExportOutputStore,
-    ResourceStorage, WorkerId,
+    BulkExportJobStore, BulkExportStorage, DefaultExportWorker, ExportClaimStrategy,
+    ExportOutputStore, ResourceStorage, WorkerId,
 };
 use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
 use helios_rest::ServerConfig;
@@ -389,6 +389,65 @@ async fn test_patient_and_group_export_levels() {
     assert_eq!(resp.status_code(), StatusCode::ACCEPTED);
 
     drain_workers(&backend, &output).await;
+}
+
+#[tokio::test]
+async fn test_group_export_missing_group_is_404_and_creates_no_job() {
+    let (server, backend, _output, _tmp) = create_bulk_export_server().await;
+
+    let resp = server
+        .get("/Group/no-such-group/$export")
+        .add_header("x-tenant-id", "test-tenant")
+        .add_header("prefer", "respond-async")
+        .await;
+    assert_eq!(resp.status_code(), StatusCode::NOT_FOUND);
+
+    let body: Value = resp.json();
+    assert_eq!(body["issue"][0]["code"], "not-found");
+    let diagnostics = body["issue"][0]["details"]["text"].as_str().unwrap();
+    assert!(
+        diagnostics.contains("no-such-group"),
+        "diagnostics should mention the missing group id, got: {diagnostics}"
+    );
+
+    let tenant = test_tenant();
+    assert_eq!(
+        backend.count_active_exports(&tenant).await.unwrap(),
+        0,
+        "no job should have been created"
+    );
+    assert!(
+        backend
+            .list_exports(&tenant, true)
+            .await
+            .unwrap()
+            .is_empty(),
+        "no job should be listed for the tenant"
+    );
+}
+
+#[tokio::test]
+async fn test_group_export_deleted_group_is_404() {
+    let (server, backend, _output, _tmp) = create_bulk_export_server().await;
+
+    let tenant = test_tenant();
+    backend
+        .create(
+            &tenant,
+            "Group",
+            json!({"resourceType": "Group", "id": "g-del", "member": []}),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    backend.delete(&tenant, "Group", "g-del").await.unwrap();
+
+    let resp = server
+        .get("/Group/g-del/$export")
+        .add_header("x-tenant-id", "test-tenant")
+        .add_header("prefer", "respond-async")
+        .await;
+    assert_eq!(resp.status_code(), StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]

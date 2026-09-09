@@ -20,7 +20,7 @@ use helios_persistence::core::{
     ExportRequest, ExportStatus, GroupExportProvider, PatientExportProvider, RawManifestEntry,
     ResourceStorage, StartExportInput, TypeFilter,
 };
-use helios_persistence::error::{BulkExportError, StorageError};
+use helios_persistence::error::{BulkExportError, ResourceError, StorageError};
 use tokio::io::AsyncRead;
 use tokio_util::io::ReaderStream;
 
@@ -187,6 +187,28 @@ where
         type_filters.push(TypeFilter::new(rt, query));
     }
 
+    // Group existence — a `Group/{id}/$export` for a Group that does not exist (or is
+    // deleted) must be rejected with 404 before any job is created. `read` reports
+    // "missing" as `Ok(None)` but a soft-deleted resource as `Err(Resource(Gone))`;
+    // both mean the same thing for export purposes, so both map to 404 here.
+    if let ExportLevel::Group { group_id } = &level {
+        let group_missing = match state
+            .storage()
+            .read(tenant.context(), "Group", group_id)
+            .await
+        {
+            Ok(found) => found.is_none(),
+            Err(StorageError::Resource(ResourceError::Gone { .. })) => true,
+            Err(e) => return Err(map_storage_err(e)),
+        };
+        if group_missing {
+            return Err(RestError::NotFound {
+                resource_type: "Group".to_string(),
+                id: group_id.clone(),
+            });
+        }
+    }
+
     // patient (POST only)
     let patient_refs = collect_multi(&pairs, "patient");
     if !patient_refs.is_empty() {
@@ -343,6 +365,12 @@ fn map_storage_err(e: StorageError) -> RestError {
             resource_type: "export-job".to_string(),
             id: job_id,
         },
+        StorageError::BulkExport(BulkExportError::GroupNotFound { group_id }) => {
+            RestError::NotFound {
+                resource_type: "Group".to_string(),
+                id: group_id,
+            }
+        }
         StorageError::Backend(helios_persistence::error::BackendError::UnsupportedCapability {
             ..
         }) => RestError::NotImplemented {

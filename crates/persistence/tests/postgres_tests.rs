@@ -808,7 +808,9 @@ mod postgres_integration {
     use helios_persistence::core::SettingsStore;
     use helios_persistence::core::history::{HistoryParams, InstanceHistoryProvider};
     use helios_persistence::core::{Backend, BackendCapability, BackendKind, ResourceStorage};
-    use helios_persistence::error::{BackendError, ConcurrencyError, ResourceError, StorageError};
+    use helios_persistence::error::{
+        BackendError, BulkExportError, ConcurrencyError, ResourceError, StorageError,
+    };
     use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
 
     use testcontainers::ImageExt;
@@ -6274,8 +6276,8 @@ mod postgres_integration {
 
     use chrono::{DateTime, Utc};
     use helios_persistence::core::bulk_export::{
-        BulkExportStorage, ExportDataProvider, ExportRequest, ExportStatus, PatientExportProvider,
-        StartExportInput, TypeExportProgress,
+        BulkExportStorage, ExportDataProvider, ExportRequest, ExportStatus, GroupExportProvider,
+        PatientExportProvider, StartExportInput, TypeExportProgress,
     };
     use helios_persistence::core::bulk_export_worker::{
         ExportClaimStrategy, ExportWorkerStorage, LeaseError, WorkerId,
@@ -6363,6 +6365,34 @@ mod postgres_integration {
 
         let progress = backend.get_export_status(&tenant, &job_id).await.unwrap();
         assert_eq!(progress.status, ExportStatus::Complete);
+    }
+
+    #[tokio::test]
+    async fn postgres_integration_export_missing_group_is_group_not_found() {
+        let backend = create_backend().await;
+        let tenant = create_tenant("export-missing-group");
+
+        let members_err = backend
+            .get_group_members(&tenant, "nope")
+            .await
+            .expect_err("a nonexistent group must not resolve to an empty member list");
+        match members_err {
+            StorageError::BulkExport(BulkExportError::GroupNotFound { group_id }) => {
+                assert_eq!(group_id, "nope");
+            }
+            other => panic!("expected GroupNotFound, got: {other:?}"),
+        }
+
+        let patients_err = backend
+            .resolve_group_patient_ids(&tenant, "nope")
+            .await
+            .expect_err("resolving patients for a nonexistent group must fail");
+        match patients_err {
+            StorageError::BulkExport(BulkExportError::GroupNotFound { group_id }) => {
+                assert_eq!(group_id, "nope");
+            }
+            other => panic!("expected GroupNotFound, got: {other:?}"),
+        }
     }
 
     /// Pins a stored resource's `last_updated` so a window test does not depend

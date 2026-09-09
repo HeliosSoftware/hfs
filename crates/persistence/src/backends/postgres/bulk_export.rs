@@ -1385,7 +1385,9 @@ impl GroupExportProvider for PostgresBackend {
             .map_err(|e| internal_error(format!("Failed to fetch group: {}", e)))?;
 
         if rows.is_empty() {
-            return Ok(Vec::new());
+            return Err(StorageError::BulkExport(BulkExportError::GroupNotFound {
+                group_id: group_id.to_string(),
+            }));
         }
 
         let data: Value = rows[0].get(0);
