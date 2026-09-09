@@ -4,7 +4,7 @@
 //! It implements the standard FHIR terminology operations including expand, lookup,
 //! validate-code, subsumes, and translate.
 
-use reqwest::{Client, RequestBuilder, Response, StatusCode};
+use reqwest::{Client, RequestBuilder, Response};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::time::Duration;
@@ -73,12 +73,9 @@ impl TerminologyClient {
                 .send()
                 .await
                 .map_err(|e| FhirPathError::NetworkError(e.to_string()))?;
-            if !matches!(
-                response.status(),
-                StatusCode::BAD_GATEWAY
-                    | StatusCode::SERVICE_UNAVAILABLE
-                    | StatusCode::GATEWAY_TIMEOUT
-            ) {
+            // Cloudflare uses HTTP 530 for tunnel failures, including error 1033
+            // when no healthy cloudflared instance can receive the request.
+            if !matches!(response.status().as_u16(), 502 | 503 | 504 | 530) {
                 return Ok(response);
             }
             let Some(delay) = delays.next() else {
@@ -103,7 +100,7 @@ impl TerminologyClient {
     ///
     /// The request timeout defaults to 30s and can be overridden with
     /// `FHIRPATH_TERMINOLOGY_TIMEOUT` (whole seconds; `0` disables it).
-    /// HTTP 502, 503 and 504 responses are retried up to three times with backoff.
+    /// HTTP 502, 503, 504 and 530 responses are retried up to three times with backoff.
     pub fn new(base_url: String, fhir_version: FhirVersion) -> Self {
         let mut builder = Client::builder();
         if let Some(timeout) = request_timeout() {
@@ -696,6 +693,48 @@ mod tests {
                 assert_eq!(request.headers, requests[0].headers);
             }
         }
+    }
+
+    #[tokio::test]
+    async fn terminology_retries_cloudflare_tunnel_errors_for_all_operations() {
+        for operation in [
+            "expand",
+            "lookup",
+            "validate_vs",
+            "validate_cs",
+            "subsumes",
+            "translate",
+        ] {
+            let body = json!({"resourceType": "Parameters", "parameter": []});
+            let server = stub_responses(vec![530, 200], &body.to_string()).await;
+            let client = TerminologyClient::new(server.uri(), FhirVersion::R4);
+
+            assert_eq!(
+                call_operation(&client, operation).await.unwrap(),
+                body,
+                "{operation}"
+            );
+            let requests = server.received_requests().await.unwrap();
+            assert_eq!(requests.len(), 2, "{operation}");
+            assert_eq!(requests[1].method, requests[0].method);
+            assert_eq!(requests[1].url, requests[0].url);
+            assert_eq!(requests[1].body, requests[0].body);
+            assert_eq!(requests[1].headers, requests[0].headers);
+        }
+    }
+
+    #[tokio::test]
+    async fn terminology_cloudflare_retry_limit_preserves_final_error() {
+        let body = "<html><h1>Error 1033</h1><h2>Cloudflare Tunnel error</h2></html>";
+        let server = stub_responses(vec![530], body).await;
+        let client = TerminologyClient::new(server.uri(), FhirVersion::R4);
+        let error = client
+            .expand("http://example.org/vs", None)
+            .await
+            .unwrap_err();
+        assert!(matches!(&error, FhirPathError::TerminologyError(message)
+            if message.contains("530") && message.contains(body)));
+        assert_eq!(server.received_requests().await.unwrap().len(), 4);
     }
 
     #[tokio::test]
