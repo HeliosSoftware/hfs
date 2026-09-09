@@ -276,7 +276,9 @@ where
 fn build_rest_operations<S: ResourceStorage + Send + Sync + 'static>(
     state: &AppState<S>,
 ) -> Vec<serde_json::Value> {
-    use crate::handlers::sof::capability::{SQL_EXPORT_DEFINITION_ID, SQL_RUN_DEFINITION_ID};
+    use crate::handlers::sof::capability::{
+        REINDEX_DEFINITION_ID, SQL_EXPORT_DEFINITION_ID, SQL_RUN_DEFINITION_ID,
+    };
 
     let mut ops = vec![
         serde_json::json!({
@@ -297,6 +299,24 @@ fn build_rest_operations<S: ResourceStorage + Send + Sync + 'static>(
         ops.push(serde_json::json!({
             "name": "sql-export",
             "definition": format!("/OperationDefinition/{SQL_EXPORT_DEFINITION_ID}")
+        }));
+    }
+
+    // `$reindex`, when this deployment has an index to rebuild. It is the
+    // documented recovery for a search index that has fallen behind its
+    // primary, and an operator who cannot find out it exists cannot use it —
+    // which is how a composite deployment whose bulk-loaded data never reached
+    // Elasticsearch had no discoverable way back (#1021). Declared only when
+    // wired: on an S3 primary with no secondary there is no index at all and
+    // the handler answers 501, so advertising it there would be a lie.
+    //
+    // `definition` names this server's own OperationDefinition, like the SQL on
+    // FHIR operations above: `$reindex` is a HFS administrative operation with
+    // no HL7 counterpart to cite.
+    if state.reindex().is_some() {
+        ops.push(serde_json::json!({
+            "name": "reindex",
+            "definition": format!("/OperationDefinition/{REINDEX_DEFINITION_ID}")
         }));
     }
 
