@@ -24,7 +24,8 @@ use crate::core::bulk_export_output::{ExportOutputStore, ExportPartKey};
 use crate::core::bulk_export_worker::{LeaseError, WorkerId};
 use crate::core::bulk_submit::{
     BulkEntryOutcome, BulkProcessingOptions, BulkSubmitProvider, BulkSubmitRollbackProvider,
-    ByteProgress, ImportMode, ManifestPhase, StreamingBulkSubmitProvider, SubmissionId,
+    ByteProgress, EntryResultPage, ImportMode, ManifestPhase, StreamingBulkSubmitProvider,
+    SubmissionId, entry_result_pages,
 };
 use crate::core::bulk_submit_input::{SubmitInputFetcher, submission_output_job_id};
 use crate::error::{StorageError, StorageResult};
@@ -1166,31 +1167,36 @@ where
         _fhir_version: FhirVersion,
         failed_count: u64,
     ) -> StorageResult<()> {
-        let job_id = submission_output_job_id(&lease.submission_id);
-        let tenant_id = lease.tenant.tenant_id().as_str().to_string();
-
-        // Page through all entry results for this manifest.
-        let mut all = Vec::new();
-        let limit = 1000u32;
-        let mut offset = 0u32;
-        loop {
-            let batch = self
-                .jobs
-                .get_entry_results(
+        let pages = entry_result_pages(|continuation| async move {
+            self.jobs
+                .get_entry_results_page(
                     &lease.tenant,
                     &lease.submission_id,
                     &lease.manifest_id,
                     None,
-                    limit,
-                    offset,
+                    1000,
+                    continuation.as_ref(),
                 )
-                .await?;
-            let n = batch.len() as u32;
-            all.extend(batch);
-            if n < limit {
-                break;
-            }
-            offset += limit;
+                .await
+        });
+        self.write_result_artifact_pages(lease, manifest_url, failed_count, pages)
+            .await
+    }
+
+    async fn write_result_artifact_pages(
+        &self,
+        lease: &ManifestLease,
+        manifest_url: &str,
+        failed_count: u64,
+        pages: impl futures::Stream<Item = StorageResult<EntryResultPage>>,
+    ) -> StorageResult<()> {
+        use futures::TryStreamExt;
+        let job_id = submission_output_job_id(&lease.submission_id);
+        let tenant_id = lease.tenant.tenant_id().as_str().to_string();
+        let mut all = Vec::new();
+        futures::pin_mut!(pages);
+        while let Some(page) = pages.try_next().await? {
+            all.extend(page.entries.into_iter().map(|entry| entry.result));
         }
 
         // Partition successes (by type) and errors.
@@ -1559,6 +1565,81 @@ mod tests {
     use crate::core::storage::ResourceStorage;
     use crate::tenant::{TenantContext, TenantId, TenantPermissions};
     use std::time::Duration as StdDuration;
+
+    mod scripted_pages {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/bulk_submit/scripted_pages.rs"
+        ));
+    }
+
+    #[tokio::test]
+    async fn artifact_consumer_reads_beyond_an_empty_page_with_continuation() {
+        use tokio::io::AsyncReadExt;
+        let backend = Arc::new(SqliteBackend::in_memory().unwrap());
+        backend.init_schema().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let output = Arc::new(LocalFsOutputStore::new(
+            tmp.path().to_path_buf(),
+            "http://localhost",
+        ));
+        let tenant = tenant();
+        let sub = SubmissionId::generate("scripted-artifacts");
+        backend
+            .create_submission(&tenant, &sub, None)
+            .await
+            .unwrap();
+        backend
+            .add_manifest(&tenant, &sub, Some("http://provider/m.json"), None)
+            .await
+            .unwrap();
+        let lease = backend
+            .claim_next_manifest(&WorkerId::new("scripted"), StdDuration::from_secs(60))
+            .await
+            .unwrap()
+            .unwrap();
+        let worker = DefaultSubmitWorker::new(
+            backend.clone(),
+            patient_fetcher(""),
+            output.clone(),
+            WorkerId::new("scripted"),
+        );
+        let (pages, calls) = scripted_pages::pages();
+        worker
+            .write_result_artifact_pages(&lease, "http://provider/m.json", 0, pages)
+            .await
+            .unwrap();
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 3);
+        let rows = backend.list_submit_files(&tenant, &sub).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row.line_count, 3);
+        let key = ExportPartKey {
+            tenant_id: tenant.tenant_id().as_str().to_string(),
+            job_id: submission_output_job_id(&sub),
+            resource_type: row.resource_type.clone().unwrap(),
+            file_type: row.file_type.clone(),
+            part_index: row.part_index,
+            fencing_token: row.fencing_token,
+        };
+        let mut reader = output.open_reader(&key).await.unwrap();
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes).await.unwrap();
+        assert_eq!(row.byte_count, bytes.len() as u64);
+        let references: Vec<Value> = std::str::from_utf8(&bytes)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(
+            references,
+            vec![
+                json!({"reference":"Patient/after-empty"}),
+                json!({"reference":"Patient/after-empty"}),
+                json!({"reference":"Patient/exclusive-late"}),
+            ]
+        );
+    }
 
     /// Captures the deferred-reindex callbacks the worker fires.
     struct MockReindexHook {
