@@ -22,6 +22,22 @@ export default defineConfig({
   // Deterministic against a single shared server: no cross-test DB races.
   fullyParallel: false,
   workers: 1,
+  // Playwright's 30s default was never chosen for this suite, it was inherited
+  // by omission — and the suite has been disagreeing with it one test at a time
+  // ever since (a11y, tenants, dashboard-tenants, capability-statement and
+  // sql-export all raise it by hand). Pick a budget deliberately instead.
+  //
+  // A whole run boots three `hfs` servers next to a Chromium tree and drives
+  // ~460 tests on one worker, so a spike anywhere starves everything: full runs
+  // have been seen taking 6.3s to *launch* a browser and 37.8s to close one,
+  // which lands on whichever test happens to be running. Those tests pass in
+  // ~1s when the machine is quiet, so 30s was measuring the machine, not the UI.
+  //
+  // This is a wall-clock budget, not an assertion: `expect` keeps its 5s
+  // default, so a genuinely broken page still goes red in 5s. The only runs
+  // this rescues are the ones where nothing failed and the clock simply ran out
+  // in fixture setup or a navigation, neither of which any assertion covers.
+  timeout: 90_000,
   forbidOnly: !!process.env.CI,
   retries: process.env.CI ? 1 : 0,
   reporter: process.env.CI

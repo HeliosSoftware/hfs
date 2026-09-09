@@ -93,7 +93,13 @@ pub struct ManifestWorkerView {
     /// manifest and surfaces them to the worker (which logs them) so deployment- or
     /// IG-specific handling can be layered on without another migration.
     pub metadata: Vec<(String, String)>,
-    /// Resume cursor: lines already processed for this manifest.
+    /// Entries this manifest has already walked, across every run of it.
+    ///
+    /// Informational only — nothing resumes from it. A reclaimed manifest
+    /// re-walks each of its files from the top and the re-ingested entries
+    /// upsert idempotently; this cursor is the checkpoint a future per-line
+    /// resume would read, but no such consumer exists yet. Counted like the
+    /// other progress columns, so it only ever moves forward (#969).
     pub last_processed_line: u64,
     /// FHIR version this submission ingests against.
     pub fhir_version: FhirVersion,
@@ -216,13 +222,28 @@ pub trait SubmitWorkerStorage: Send + Sync {
     /// Marks the manifest `processing`. Fenced.
     async fn mark_manifest_processing(&self, lease: &ManifestLease) -> Result<(), LeaseError>;
 
-    /// Idempotent update of per-manifest progress (counts + resume cursor). Fenced.
-    async fn update_manifest_progress(
+    /// Adds to the manifest's progress counters. Fenced.
+    ///
+    /// The counters are **cumulative across every run of the manifest** and are
+    /// owned by the ingestion engine: each committed batch adds its own entries
+    /// atomically with the rows it wrote (`processed_entries += success +
+    /// skipped`, `failed_entries += errors`, `last_processed_line +=
+    /// entries`). The worker only contributes the deltas no batch can see —
+    /// a file it could not fetch or could not ingest at all — so both writers
+    /// share one semantics and a resumed manifest never walks its progress
+    /// backwards (#969).
+    ///
+    /// Deltas are therefore *not* idempotent: re-ingesting an entry after a
+    /// worker restart adds to `processed_entries` a second time, so the counts
+    /// over-report on a resumed manifest until the re-walk is eliminated by a
+    /// per-line resume. Over-reporting is the safe direction — a status poller sees
+    /// progress that only ever moves forward.
+    async fn add_manifest_progress(
         &self,
         lease: &ManifestLease,
-        processed_entries: u64,
-        failed_entries: u64,
-        last_processed_line: u64,
+        processed_delta: u64,
+        failed_delta: u64,
+        lines_delta: u64,
     ) -> Result<(), LeaseError>;
 
     /// Idempotent update of the manifest's byte progress — bytes consumed so
@@ -471,20 +492,65 @@ impl tokio::io::AsyncBufRead for CountingReader {
 /// monotonic (`MAX`), so a stale flush can never walk progress backwards.
 /// The heartbeat alone decides lease health.
 ///
+/// A lease that cannot be renewed before it expires is fatal to the run that
+/// holds it (#969). A heartbeat starved behind the ingest loop's writes used to
+/// be retried indefinitely, so the manifest stayed claimable — eligible for
+/// `claim_next_manifest` by a second worker — while this one kept committing
+/// batches: silent duplicate ingestion on a cluster. Each renewal is now bounded
+/// by what is left of the lease, and once `lease_expiry` passes unrenewed the
+/// keeper declares the lease lost, which aborts the run mid-file.
+///
 /// Dropping the keeper stops the renewal task.
 struct LeaseKeeper {
-    lost: Arc<AtomicBool>,
+    /// Held rather than only subscribed to, so `run_job` can declare the lease
+    /// lost too when a fenced write answers `LeaseLost`.
+    lost: tokio::sync::watch::Sender<bool>,
     handle: tokio::task::JoinHandle<()>,
 }
 
+/// The slice of a job store the [`LeaseKeeper`] uses.
+///
+/// Narrow on purpose: a keeper that must be handed a whole [`BulkSubmitJobStore`]
+/// can only be exercised against a real backend, and the failure this guards —
+/// a heartbeat that never lands — is exactly the one a real backend will not
+/// reproduce on demand.
+#[async_trait]
+trait LeaseRenewal: Send + Sync {
+    /// Renews the lease, returning its new expiry.
+    async fn heartbeat(&self, lease: &ManifestLease) -> Result<DateTime<Utc>, LeaseError>;
+
+    /// Persists byte progress, best-effort — failures are not lease-relevant.
+    async fn flush_bytes(&self, lease: &ManifestLease, consumed: u64, total: u64);
+}
+
+/// Adapts a job store to the keeper's narrow surface.
+struct JobStoreRenewal<Js: ?Sized>(Arc<Js>);
+
+#[async_trait]
+impl<Js> LeaseRenewal for JobStoreRenewal<Js>
+where
+    Js: BulkSubmitJobStore + ?Sized + 'static,
+{
+    async fn heartbeat(&self, lease: &ManifestLease) -> Result<DateTime<Utc>, LeaseError> {
+        self.0.heartbeat(lease).await
+    }
+
+    async fn flush_bytes(&self, lease: &ManifestLease, consumed: u64, total: u64) {
+        let _ = self.0.update_manifest_bytes(lease, consumed, total).await;
+    }
+}
+
 impl LeaseKeeper {
-    fn spawn<Js>(jobs: Arc<Js>, lease: ManifestLease, progress: ByteProgress) -> Self
+    fn spawn<R>(jobs: Arc<R>, lease: ManifestLease, progress: ByteProgress) -> Self
     where
-        Js: BulkSubmitJobStore + ?Sized + 'static,
+        R: LeaseRenewal + ?Sized + 'static,
     {
         const FLUSH_EVERY: Duration = Duration::from_secs(3);
-        let lost = Arc::new(AtomicBool::new(false));
-        let flag = Arc::clone(&lost);
+        /// Pause between renewal attempts after a storage error. Short, because
+        /// the whole retry window is capped by the lease's remaining life.
+        const RETRY_AFTER: Duration = Duration::from_millis(500);
+        let (lost, _) = tokio::sync::watch::channel(false);
+        let flag = lost.clone();
         let handle = tokio::spawn(async move {
             let mut expiry = lease.lease_expiry;
             let mut last_flushed: u64 = 0;
@@ -504,31 +570,84 @@ impl LeaseKeeper {
                     let consumed = progress.consumed.load(Ordering::Relaxed);
                     if total > 0 && consumed != last_flushed {
                         last_flushed = consumed;
-                        let _ = jobs.update_manifest_bytes(&lease, consumed, total).await;
+                        jobs.flush_bytes(&lease, consumed, total).await;
                     }
                 }
-                match jobs.heartbeat(&lease).await {
-                    Ok(new_expiry) => expiry = new_expiry,
-                    Err(LeaseError::LeaseLost { .. }) => {
-                        flag.store(true, Ordering::SeqCst);
-                        return;
+                // Renew, retrying only for as long as the lease still covers
+                // the writes the ingest loop is making in parallel. A renewal
+                // that has not landed by `expiry` is indistinguishable from a
+                // lost one: the manifest is claimable either way.
+                let mut renewed = None;
+                loop {
+                    let left = (expiry - Utc::now())
+                        .to_std()
+                        .unwrap_or(Duration::from_secs(0));
+                    if left.is_zero() {
+                        break;
                     }
-                    Err(LeaseError::Storage(e)) => {
-                        tracing::debug!(
-                            submission = %lease.submission_id,
-                            manifest = %lease.manifest_id,
-                            error = %e,
-                            "bulk-submit lease heartbeat failed; retrying"
-                        );
+                    match tokio::time::timeout(left, jobs.heartbeat(&lease)).await {
+                        Ok(Ok(new_expiry)) => {
+                            renewed = Some(new_expiry);
+                            break;
+                        }
+                        // Already reclaimed by another worker — expected, and
+                        // the run aborts quietly.
+                        Ok(Err(LeaseError::LeaseLost { .. })) => {
+                            let _ = flag.send(true);
+                            return;
+                        }
+                        Ok(Err(LeaseError::Storage(e))) => {
+                            tracing::debug!(
+                                submission = %lease.submission_id,
+                                manifest = %lease.manifest_id,
+                                error = %e,
+                                "bulk-submit lease heartbeat failed; retrying"
+                            );
+                            tokio::time::sleep(RETRY_AFTER.min(left)).await;
+                        }
+                        // Starved behind the ingest loop's writer for the rest
+                        // of the lease.
+                        Err(_elapsed) => break,
                     }
                 }
+                let Some(new_expiry) = renewed else {
+                    tracing::warn!(
+                        submission = %lease.submission_id,
+                        manifest = %lease.manifest_id,
+                        worker = %lease.worker_id,
+                        "bulk-submit lease could not be renewed before it expired; \
+                         abandoning the manifest so it can be reclaimed"
+                    );
+                    let _ = flag.send(true);
+                    return;
+                };
+                expiry = new_expiry;
             }
         });
         Self { lost, handle }
     }
 
     fn lease_lost(&self) -> bool {
-        self.lost.load(Ordering::SeqCst)
+        *self.lost.borrow()
+    }
+
+    /// Marks the lease lost from outside the renewal task — used when a fenced
+    /// write answers `LeaseLost`, which is as conclusive as a failed heartbeat.
+    fn declare_lost(&self) {
+        let _ = self.lost.send(true);
+    }
+
+    /// Resolves once the lease is lost, and never otherwise. Raced against the
+    /// ingest so a loss aborts mid-file rather than only between files.
+    async fn lost(&self) {
+        let mut rx = self.lost.subscribe();
+        while !*rx.borrow_and_update() {
+            if rx.changed().await.is_err() {
+                // Only reachable if the sender is dropped, which cannot happen
+                // while `self` is alive.
+                return;
+            }
+        }
     }
 }
 
@@ -680,23 +799,29 @@ where
         // gzip-decompressed stream) poisons the total for the whole manifest
         // and the status endpoint falls back to manifest-count progress.
         let totals_known = AtomicBool::new(true);
-        let keeper = LeaseKeeper::spawn(Arc::clone(&self.jobs), lease.clone(), progress.clone());
+        let keeper = LeaseKeeper::spawn(
+            Arc::new(JobStoreRenewal(Arc::clone(&self.jobs))),
+            lease.clone(),
+            progress.clone(),
+        );
 
         // 2. Ingest the `output` files. Up to `file_concurrency` at a time run
         // concurrently (fan-out): each file's fetch, parse, and write overlaps
         // the others', which a concurrent-writer backend turns into throughput.
         // The manifest's files carry disjoint resource types, so their entry
-        // receipts and rollback records never collide. Counts accumulate into
-        // shared atomics; a file's own failures are recorded and counted
-        // without aborting the manifest, exactly as the sequential loop did,
-        // and only a storage error on the bookkeeping path aborts the job.
-        let processed_at = AtomicU64::new(0);
+        // receipts and rollback records never collide. A file's own failures
+        // are recorded and counted without aborting the manifest, exactly as
+        // the sequential loop did, and only a storage error on the bookkeeping
+        // path aborts the job.
+        //
+        // This tally is run-local and feeds the status artifacts only. The
+        // manifest's persisted counters are cumulative across runs and belong
+        // to the ingestion engine's per-batch bookkeeping (#969).
         let failed_at = AtomicU64::new(0);
         // Shared borrows for the concurrent per-file futures. Iterating by
         // index keeps the map closure's argument owned (a `usize`), so the
         // future it returns can borrow `manifest.output[i]` for the manifest's
         // lifetime without a higher-ranked-lifetime bound the closure can't name.
-        let processed_ref = &processed_at;
         let failed_ref = &failed_at;
         let totals_ref = &totals_known;
         let progress_ref = &progress;
@@ -737,6 +862,11 @@ where
                         )
                         .await?;
                         failed_ref.fetch_add(1, Ordering::Relaxed);
+                        // No batch ran for a file that never opened, so this
+                        // failure is the worker's to add.
+                        if let Err(e) = self.jobs.add_manifest_progress(lease_ref, 0, 1, 0).await {
+                            return fenced_write_outcome(keeper_ref, e);
+                        }
                         return Ok(());
                     }
                 };
@@ -774,12 +904,25 @@ where
                     .await
                 {
                     Ok(result) => {
-                        // Successes only, matching the per-batch increment on the
-                        // storage side: `processed_entries` means resources written
-                        // to the store, and the progress line words it that way
-                        // (#954). Skipped entries surface through their receipts.
-                        processed_ref.fetch_add(result.counts.success, Ordering::Relaxed);
                         failed_ref.fetch_add(result.counts.error_count(), Ordering::Relaxed);
+                        // Every entry a batch committed was counted by that
+                        // batch. The lines the stream threw out before they
+                        // reached one — unparseable, or carrying the wrong
+                        // resource type — were counted by nobody, so they are
+                        // the worker's to add (#969).
+                        if result.unbatched_errors > 0
+                            && let Err(e) = self
+                                .jobs
+                                .add_manifest_progress(
+                                    lease_ref,
+                                    0,
+                                    result.unbatched_errors,
+                                    result.unbatched_errors,
+                                )
+                                .await
+                        {
+                            return fenced_write_outcome(keeper_ref, e);
+                        }
                     }
                     Err(e) => {
                         self.record_manifest_error(
@@ -789,18 +932,14 @@ where
                         )
                         .await?;
                         failed_ref.fetch_add(1, Ordering::Relaxed);
+                        // Every entry this file did commit was already counted
+                        // by its own batch; the file-level failure was not.
+                        if let Err(e) = self.jobs.add_manifest_progress(lease_ref, 0, 1, 0).await {
+                            return fenced_write_outcome(keeper_ref, e);
+                        }
                     }
                 }
 
-                let p = processed_ref.load(Ordering::Relaxed);
-                let f = failed_ref.load(Ordering::Relaxed);
-                if let Err(LeaseError::Storage(e)) = self
-                    .jobs
-                    .update_manifest_progress(lease_ref, p, f, p + f)
-                    .await
-                {
-                    return Err(e);
-                }
                 let total = progress_ref.total.load(Ordering::Relaxed);
                 if total > 0 {
                     let _ = self
@@ -815,22 +954,36 @@ where
                 Ok(())
             })
             .buffer_unordered(self.file_concurrency.max(1));
-        while let Some(result) = ingest.next().await {
-            result?;
-        }
+        // Race the whole fan-out against the lease: losing it has to stop the
+        // ingest *inside* a file, not merely between files. A batch already
+        // committed stays committed and re-ingests idempotently when the
+        // manifest is reclaimed; continuing to write past expiry would let a
+        // second worker ingest the same manifest alongside this one (#969).
+        let drain = async {
+            while let Some(result) = ingest.next().await {
+                result?;
+            }
+            Ok::<(), StorageError>(())
+        };
+        let completed = tokio::select! {
+            biased;
+            _ = keeper.lost() => false,
+            result = drain => {
+                result?;
+                true
+            }
+        };
         drop(ingest);
-        let processed = processed_at.load(Ordering::Relaxed);
-        let failed = failed_at.load(Ordering::Relaxed);
-        // Pin the final counts: with files finishing out of order, the last
-        // per-file update already carried the cumulative totals, but a closing
-        // write makes the terminal progress unambiguous.
-        if let Err(LeaseError::Storage(e)) = self
-            .jobs
-            .update_manifest_progress(&lease, processed, failed, processed + failed)
-            .await
-        {
-            return Err(e);
+        if !completed {
+            tracing::warn!(
+                submission = %lease.submission_id,
+                manifest = %lease.manifest_id,
+                worker = %lease.worker_id,
+                "bulk-submit run abandoned mid-manifest: its lease is no longer held"
+            );
+            return Ok(());
         }
+        let failed = failed_at.load(Ordering::Relaxed);
 
         // 2b. Process `deleted` files — transaction Bundles / resource refs to remove.
         let mut deleted_refs: Vec<String> = Vec::new();
@@ -1227,6 +1380,21 @@ fn lease_err_to_storage(e: LeaseError) -> crate::error::StorageError {
                 message: format!("lease lost for {job_id}"),
                 source: None,
             })
+        }
+    }
+}
+
+/// Resolves what a failed fenced write means for the file being ingested.
+///
+/// A storage error aborts the whole job, as it always has. A lost lease is not
+/// an error at all: the manifest belongs to someone else now, so the keeper is
+/// told, which stops the sibling files too, and this one ends quietly (#969).
+fn fenced_write_outcome(keeper: &LeaseKeeper, e: LeaseError) -> StorageResult<()> {
+    match e {
+        LeaseError::Storage(e) => Err(e),
+        LeaseError::LeaseLost { .. } => {
+            keeper.declare_lost();
+            Ok(())
         }
     }
 }
@@ -2017,7 +2185,10 @@ mod tests {
         // failure on the manifest and surfaced as a summary error artifact, and
         // the manifest still completes.
         assert_eq!(counts.success, 1);
-        assert!(manifests[0].failed_entries >= 1);
+        // Exactly one: the malformed line, charged by the worker because no
+        // batch saw it, and by nobody else (#969).
+        assert_eq!(manifests[0].failed_entries, 1);
+        assert_eq!(manifests[0].processed_entries, 1);
         assert_eq!(
             manifests[0].status,
             crate::core::bulk_submit::ManifestStatus::Completed
@@ -2025,5 +2196,131 @@ mod tests {
         let files = backend.list_submit_files(&tenant, &sub_id).await.unwrap();
         assert!(files.iter().any(|f| f.file_type == "error"));
         assert!(files.iter().any(|f| f.file_type == "output"));
+    }
+
+    /// A manifest reclaimed after a worker died keeps the progress its earlier
+    /// run recorded (#969).
+    ///
+    /// The worker used to overwrite the counters with the current run's
+    /// absolute totals, so a manifest six million entries in reported a single
+    /// entry the moment it was re-walked.
+    #[tokio::test]
+    async fn test_worker_progress_survives_a_reclaimed_manifest() {
+        let backend = Arc::new(SqliteBackend::in_memory().unwrap());
+        backend.init_schema().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let output = Arc::new(LocalFsOutputStore::new(
+            tmp.path().to_path_buf(),
+            "http://x",
+        ));
+        let tenant = tenant();
+        let sub_id = seed(&backend, &tenant).await;
+
+        let lease = backend
+            .claim_next_manifest(&WorkerId::new("w"), StdDuration::from_secs(60))
+            .await
+            .unwrap()
+            .unwrap();
+        // Stands in for everything an earlier, interrupted run had ingested.
+        backend
+            .add_manifest_progress(&lease, 6_034_873, 7, 5_564_073)
+            .await
+            .unwrap();
+        assert_eq!(
+            backend
+                .get_manifest_for_worker(&lease)
+                .await
+                .unwrap()
+                .last_processed_line,
+            5_564_073
+        );
+
+        let worker = DefaultSubmitWorker::new(
+            backend.clone(),
+            patient_fetcher("{\"resourceType\":\"Patient\",\"id\":\"p1\"}\n"),
+            output,
+            WorkerId::new("w"),
+        );
+        worker.run_job(lease).await.unwrap();
+
+        let manifests = backend.list_manifests(&tenant, &sub_id).await.unwrap();
+        assert_eq!(
+            manifests[0].processed_entries, 6_034_874,
+            "the re-walked entry must add to the earlier run's total, not replace it"
+        );
+        assert_eq!(manifests[0].failed_entries, 7);
+    }
+
+    /// How a stubbed heartbeat behaves, for the [`LeaseKeeper`] tests.
+    enum Renewal {
+        /// Never answers — a heartbeat starved behind the ingest loop's writer,
+        /// which is what let the lease expire in #969.
+        Hangs,
+        /// Answers, but always with a storage error.
+        Fails,
+        /// Renews normally.
+        Lands,
+    }
+
+    struct StubRenewal(Renewal);
+
+    #[async_trait]
+    impl LeaseRenewal for StubRenewal {
+        async fn heartbeat(&self, lease: &ManifestLease) -> Result<DateTime<Utc>, LeaseError> {
+            match self.0 {
+                Renewal::Hangs => std::future::pending().await,
+                Renewal::Fails => Err(LeaseError::Storage(StorageError::Backend(
+                    crate::error::BackendError::Internal {
+                        backend_name: "stub".to_string(),
+                        message: "writer busy".to_string(),
+                        source: None,
+                    },
+                ))),
+                Renewal::Lands => Ok(lease.renewed_expiry()),
+            }
+        }
+
+        async fn flush_bytes(&self, _lease: &ManifestLease, _consumed: u64, _total: u64) {}
+    }
+
+    /// Spawns a keeper over a two-second lease and reports whether it declared
+    /// that lease lost within `wait`.
+    async fn keeper_loses_lease(renewal: Renewal, wait: StdDuration) -> bool {
+        let lease = ManifestLease {
+            tenant: tenant(),
+            submission_id: SubmissionId::generate("mock-system"),
+            manifest_id: "m1".to_string(),
+            worker_id: WorkerId::new("w"),
+            lease_expiry: Utc::now() + chrono::Duration::seconds(2),
+            lease_duration: StdDuration::from_secs(2),
+            fencing_token: 1,
+        };
+        let keeper = LeaseKeeper::spawn(
+            Arc::new(StubRenewal(renewal)),
+            lease,
+            ByteProgress::default(),
+        );
+        tokio::time::timeout(wait, keeper.lost()).await.is_ok()
+    }
+
+    /// A heartbeat that cannot land before the lease expires is fatal (#969).
+    ///
+    /// Retrying it indefinitely left the manifest claimable by a second worker
+    /// while this one kept committing batches under a dead lease.
+    #[tokio::test]
+    async fn test_lease_keeper_gives_up_on_a_starved_heartbeat() {
+        assert!(keeper_loses_lease(Renewal::Hangs, StdDuration::from_secs(15)).await);
+    }
+
+    #[tokio::test]
+    async fn test_lease_keeper_gives_up_when_heartbeats_keep_failing() {
+        assert!(keeper_loses_lease(Renewal::Fails, StdDuration::from_secs(15)).await);
+    }
+
+    /// The converse: a lease that is being renewed is never declared lost, so
+    /// the new expiry check cannot abort a healthy run.
+    #[tokio::test]
+    async fn test_lease_keeper_holds_a_renewable_lease() {
+        assert!(!keeper_loses_lease(Renewal::Lands, StdDuration::from_secs(5)).await);
     }
 }

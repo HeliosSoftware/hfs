@@ -962,12 +962,19 @@ async fn poll_status(submission: &mut Submission) {
     match response.status().as_u16() {
         202 => {
             let retry_after = retry_after_seconds(&response);
+            // Decoded from the raw bytes, not through `to_str()`: that
+            // accessor refuses any value outside visible US-ASCII, so a
+            // recipient whose progress sentence carries a dash, an accent or a
+            // non-Latin script would be reported here as a bare "in progress"
+            // — losing the byte percentage and the resource count for the whole
+            // ingest. `X-Progress` is free-form prose meant for a human, so
+            // display whatever arrived and let the fallback mean what it says:
+            // the recipient sent no progress at all.
             let progress = response
                 .headers()
                 .get("x-progress")
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("in progress")
-                .to_string();
+                .map(|v| String::from_utf8_lossy(v.as_bytes()).into_owned())
+                .unwrap_or_else(|| "in progress".to_string());
             if submission.progress != progress {
                 push_log(submission, format!("Status: {progress}"));
             }
@@ -1252,7 +1259,7 @@ pub async fn status_fragment(
 /// bar about to fill, not a percentage that never moves — the indeterminate
 /// sweep is reserved for recipients that report no percentage at all.
 fn progress_percent(progress: &str) -> Option<u8> {
-    // Case-insensitive: HFS capitalizes the line ("Processing 3% of bytes —
+    // Case-insensitive: HFS capitalizes the line ("Processing 3% of bytes -
     // …", #954), older HFS versions and foreign recipients may send lowercase
     // "processing 3% complete …". Either way the digits follow the prefix.
     let rest = progress
@@ -1315,12 +1322,19 @@ mod tests {
 
     #[test]
     fn progress_percent_reads_both_hfs_wordings_and_foreign_case() {
-        // Current HFS wording (#954).
+        // Current HFS wording (#954, ASCII-only since the sentence travels in
+        // a header).
+        assert_eq!(
+            progress_percent("Processing 3% of bytes - 609,191 resources written"),
+            Some(3)
+        );
+        assert_eq!(progress_percent("Processing 0% of bytes"), Some(0));
+        // A recipient that does use non-ASCII still gets its percentage read:
+        // the header is decoded from bytes, so the sentence arrives intact.
         assert_eq!(
             progress_percent("Processing 3% of bytes — 609,191 resources written"),
             Some(3)
         );
-        assert_eq!(progress_percent("Processing 0% of bytes"), Some(0));
         // Pre-#954 HFS and lowercase foreign recipients.
         assert_eq!(
             progress_percent("processing 10% complete (5 entries ingested)"),

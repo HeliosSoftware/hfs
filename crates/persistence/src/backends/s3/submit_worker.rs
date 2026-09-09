@@ -655,17 +655,17 @@ impl SubmitWorkerStorage for S3Backend {
         .await
     }
 
-    async fn update_manifest_progress(
+    async fn add_manifest_progress(
         &self,
         lease: &ManifestLease,
-        processed_entries: u64,
-        failed_entries: u64,
-        last_processed_line: u64,
+        processed_delta: u64,
+        failed_delta: u64,
+        lines_delta: u64,
     ) -> Result<(), LeaseError> {
         self.fenced_mutate(lease, |state| {
-            state.manifest.processed_entries = processed_entries;
-            state.manifest.failed_entries = failed_entries;
-            state.last_processed_line = last_processed_line;
+            state.manifest.processed_entries += processed_delta;
+            state.manifest.failed_entries += failed_delta;
+            state.last_processed_line += lines_delta;
         })
         .await
     }

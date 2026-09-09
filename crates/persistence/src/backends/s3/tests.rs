@@ -2991,7 +2991,7 @@ mod bulk_submit_worker {
                 .err()
                 .map(|e| format!("{e:?}")),
             backend
-                .update_manifest_progress(&stale, 5, 0, 5)
+                .add_manifest_progress(&stale, 5, 0, 5)
                 .await
                 .err()
                 .map(|e| format!("{e:?}")),

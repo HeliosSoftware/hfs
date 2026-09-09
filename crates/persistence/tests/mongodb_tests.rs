@@ -4188,6 +4188,77 @@ mod bulk_submit {
         );
     }
 
+    /// The manifest counters are cumulative across every run of a manifest, so
+    /// both writers into them — the worker's `add_manifest_progress` and the
+    /// ingestion engine's per-batch bookkeeping — must add rather than assign.
+    /// Assigning would stomp the other writer and walk the status endpoint's
+    /// numbers backwards on resume (#969). The SQLite backend pins the same
+    /// invariant in `test_progress_counters_only_move_forward`; this is its
+    /// MongoDB twin, guarding the `$inc` documents.
+    #[tokio::test]
+    async fn test_progress_counters_only_move_forward() {
+        let Some(backend) = create_backend("submit_progress_accumulates").await else {
+            return;
+        };
+        let tenant = create_tenant("submit-tenant");
+        let (id, manifest_id) = seed(&backend, &tenant).await;
+
+        let lease = backend
+            .claim_next_manifest(&WorkerId::new("worker-1"), lease_duration())
+            .await
+            .unwrap()
+            .expect("the seeded manifest is claimable");
+
+        // The worker's own contributions accumulate across calls...
+        backend
+            .add_manifest_progress(&lease, 5, 1, 6)
+            .await
+            .unwrap();
+        backend
+            .add_manifest_progress(&lease, 2, 0, 2)
+            .await
+            .unwrap();
+        assert_eq!(
+            backend
+                .get_manifest_for_worker(&lease)
+                .await
+                .unwrap()
+                .last_processed_line,
+            8
+        );
+
+        // ...and the ingestion engine's per-batch bookkeeping adds on top of
+        // them instead of replacing them.
+        backend
+            .process_entries(
+                &tenant,
+                &id,
+                &manifest_id,
+                vec![
+                    NdjsonEntry::new(1, "Patient", json!({"resourceType": "Patient"})),
+                    NdjsonEntry::new(2, "Patient", json!({"resourceType": "Patient"})),
+                ],
+                &BulkProcessingOptions::new(),
+            )
+            .await
+            .unwrap();
+
+        let manifests = backend.list_manifests(&tenant, &id).await.unwrap();
+        assert_eq!(manifests[0].processed_entries, 9);
+        assert_eq!(manifests[0].failed_entries, 1);
+        // `add_manifest_progress` never touches `total_entries`, so only the two
+        // batched entries are counted here.
+        assert_eq!(manifests[0].total_entries, 2);
+        assert_eq!(
+            backend
+                .get_manifest_for_worker(&lease)
+                .await
+                .unwrap()
+                .last_processed_line,
+            10
+        );
+    }
+
     #[tokio::test]
     async fn test_claim_heartbeat_and_finish() {
         let Some(backend) = create_backend("submit_claim_lifecycle").await else {
@@ -4263,7 +4334,7 @@ mod bulk_submit {
                 .err()
                 .map(|e| format!("{e:?}")),
             backend
-                .update_manifest_progress(&stale, 1, 0, 1)
+                .add_manifest_progress(&stale, 1, 0, 1)
                 .await
                 .err()
                 .map(|e| format!("{e:?}")),

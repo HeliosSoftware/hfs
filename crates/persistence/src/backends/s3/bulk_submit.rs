@@ -403,9 +403,15 @@ impl BulkSubmitProvider for S3Backend {
             .filter(|r| r.outcome == BulkEntryOutcome::Skipped)
             .count() as u64;
 
+        // Cumulative across every run of this manifest — the counters the
+        // status endpoint reports, and the worker's own deltas use the same
+        // semantics (#969). `processed_entries` means resources written to the
+        // store, so skips are excluded and surface through their receipts
+        // (#954); `last_processed_line` is a line cursor and counts them.
         manifest_state.manifest.total_entries += results.len() as u64;
-        manifest_state.manifest.processed_entries += results.len() as u64;
+        manifest_state.manifest.processed_entries += success_count;
         manifest_state.manifest.failed_entries += failed_count;
+        manifest_state.last_processed_line += results.len() as u64;
         // A leased manifest's terminal status belongs to the worker, which calls
         // this once per manifest output file and only then decides. Settling it
         // here would take the manifest out of `processing` mid-run, so a worker
@@ -518,7 +524,10 @@ impl StreamingBulkSubmitProvider for S3Backend {
             match NdjsonEntry::parse(line_number, line) {
                 Ok(entry) => {
                     if entry.resource_type != resource_type {
+                        // Rejected here, so no batch will charge it to the
+                        // manifest's counters; the worker adds it (#969).
                         result.counts.increment(BulkEntryOutcome::ValidationError);
+                        result.unbatched_errors += 1;
                         if !options.continue_on_error
                             && (options.max_errors == 0
                                 || result.counts.error_count() >= options.max_errors as u64)
@@ -531,6 +540,7 @@ impl StreamingBulkSubmitProvider for S3Backend {
                 }
                 Err(parse_err) => {
                     result.counts.increment(BulkEntryOutcome::ValidationError);
+                    result.unbatched_errors += 1;
                     if !options.continue_on_error
                         && (options.max_errors == 0
                             || result.counts.error_count() >= options.max_errors as u64)
