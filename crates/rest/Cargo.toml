@@ -145,6 +145,10 @@ rand = "0.8"
 # registry through `helios-persistence` and never names the lock type.
 parking_lot = "0.12"
 
+# Direct SQLite fixture access for legacy-row REST tests. Bounded to the version
+# already used by helios-persistence; no new backend code is exposed.
+rusqlite = { version = "0.33", features = ["bundled", "serde_json", "functions"] }
+
 # Temp files
 tempfile = "3"
 
