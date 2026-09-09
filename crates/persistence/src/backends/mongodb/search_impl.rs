@@ -129,6 +129,8 @@ fn parse_date_for_query(value: &str) -> Option<DateTime<Utc>> {
         .map(|dt| dt.with_timezone(&Utc))
 }
 
+const CANDIDATE_BATCH_SIZE: i64 = 512;
+
 async fn collect_documents(mut cursor: Cursor<Document>) -> StorageResult<Vec<Document>> {
     let mut docs = Vec::new();
     while cursor
@@ -941,90 +943,322 @@ impl MongoBackend {
         query: &SearchQuery,
     ) -> StorageResult<Option<HashSet<String>>> {
         let search_index = db.collection::<Document>(MongoBackend::SEARCH_INDEX_COLLECTION);
-        let mut matched: Option<HashSet<String>> = None;
+
+        let mut normal: Vec<&SearchParameter> = Vec::new();
+        let mut missing: Vec<&SearchParameter> = Vec::new();
+        let mut not_params: Vec<&SearchParameter> = Vec::new();
 
         for param in &query.parameters {
             if matches!(param.name.as_str(), "_id" | "_lastUpdated") {
                 continue;
             }
+            match &param.modifier {
+                Some(SearchModifier::Missing) => missing.push(param),
+                Some(SearchModifier::Not) => not_params.push(param),
+                _ => normal.push(param),
+            }
+        }
 
-            // `:missing` resolves from index-entry presence alone (#881),
-            // exactly like the SQL backends: `missing=false` is the set of
-            // resources with any entry for the parameter, `missing=true` its
-            // complement over the type's live resources.
-            let ids = if matches!(param.modifier, Some(SearchModifier::Missing)) {
+        let has_compartment = query
+            .compartment
+            .as_ref()
+            .is_some_and(|c| !c.params.is_empty() && !c.reference.is_empty());
+
+        if normal.is_empty() && missing.is_empty() && not_params.is_empty() && !has_compartment {
+            return Ok(None);
+        }
+
+        // :missing=true and :not require complementing against the full resource
+        // universe. When no normal params exist to drive paging, fall back to the
+        // complement-only path that materialises the universe via distinct().
+        if normal.is_empty() {
+            return self
+                .matching_resource_ids_complement_only(
+                    db,
+                    &search_index,
+                    tenant_id,
+                    resource_type,
+                    &missing,
+                    &not_params,
+                    has_compartment,
+                    query,
+                )
+                .await;
+        }
+
+        // Probe each normal param to estimate how many distinct resource_ids it
+        // covers in the first CANDIDATE_BATCH_SIZE+1 raw index rows. Using
+        // [$match, $limit, $group, $count] keeps the per-probe scan bounded
+        // regardless of how many rows the param matches globally.
+        let driver_idx = {
+            let probe_limit = (CANDIDATE_BATCH_SIZE + 1) as i32;
+            let mut best: Option<(usize, i64)> = None;
+            for (i, param) in normal.iter().enumerate() {
+                let filter = self.build_search_index_filter(tenant_id, resource_type, param)?;
+                let pipeline = vec![
+                    doc! { "$match": filter },
+                    doc! { "$limit": probe_limit },
+                    doc! { "$group": { "_id": "$resource_id" } },
+                    doc! { "$count": "n" },
+                ];
+                let cursor = search_index
+                    .aggregate(pipeline)
+                    .await
+                    .or_query_error("Failed to probe search_index for driver selection")?;
+                let docs = collect_documents(cursor).await?;
+                let count = docs
+                    .first()
+                    .and_then(|d| d.get_i32("n").ok())
+                    .map(|n| n as i64)
+                    .unwrap_or(0);
+                if count == 0 {
+                    return Ok(Some(HashSet::new()));
+                }
+                if best.is_none_or(|(_, prev)| count < prev) {
+                    best = Some((i, count));
+                }
+            }
+            best.map(|(i, _)| i).unwrap_or(0)
+        };
+
+        let driver_filter =
+            self.build_search_index_filter(tenant_id, resource_type, normal[driver_idx])?;
+
+        let mut last_index_id: Option<Bson> = None;
+        let mut confirmed: HashSet<String> = HashSet::new();
+
+        loop {
+            let page_filter = match &last_index_id {
+                Some(last_id) => doc! {
+                    "$and": [driver_filter.clone(), { "_id": { "$gt": last_id.clone() } }]
+                },
+                None => driver_filter.clone(),
+            };
+
+            let cursor = search_index
+                .find(page_filter)
+                .sort(doc! { "_id": 1 })
+                .projection(doc! { "_id": 1, "resource_id": 1 })
+                .limit(CANDIDATE_BATCH_SIZE)
+                .await
+                .or_query_error("Failed to page search_index")?;
+
+            let batch_docs = collect_documents(cursor).await?;
+            let docs_read = batch_docs.len() as i64;
+
+            if docs_read == 0 {
+                break;
+            }
+
+            let mut candidates: HashSet<String> = HashSet::new();
+            for doc in &batch_docs {
+                last_index_id = doc.get("_id").cloned();
+                if let Ok(rid) = doc.get_str("resource_id") {
+                    candidates.insert(rid.to_string());
+                }
+            }
+
+            for (i, param) in normal.iter().enumerate() {
+                if i == driver_idx || candidates.is_empty() {
+                    continue;
+                }
+                let param_filter =
+                    self.build_search_index_filter(tenant_id, resource_type, param)?;
+                let bounded = doc! {
+                    "$and": [
+                        param_filter,
+                        { "resource_id": { "$in": candidates.iter().cloned().collect::<Vec<_>>() } }
+                    ]
+                };
+                let passing: HashSet<String> = search_index
+                    .distinct("resource_id", bounded)
+                    .await
+                    .or_query_error("Failed to intersect search_index")?
+                    .into_iter()
+                    .filter_map(|v| v.as_str().map(ToString::to_string))
+                    .collect();
+                candidates.retain(|id| passing.contains(id));
+            }
+
+            // :missing — check per batch against surviving candidates.
+            for param in &missing {
+                if candidates.is_empty() {
+                    break;
+                }
                 let wants_missing = param
                     .values
                     .first()
                     .map(|v| v.value == "true")
                     .unwrap_or(false);
-                let with_entry = self
-                    .distinct_resource_ids(
-                        &search_index,
+                let with_entry: HashSet<String> = search_index
+                    .distinct(
+                        "resource_id",
                         doc! {
                             "tenant_id": tenant_id,
                             "resource_type": resource_type,
                             "param_name": &param.name,
+                            "resource_id": { "$in": candidates.iter().cloned().collect::<Vec<_>>() },
                         },
                     )
-                    .await?;
+                    .await
+                    .or_query_error("Failed to check :missing")?
+                    .into_iter()
+                    .filter_map(|v| v.as_str().map(ToString::to_string))
+                    .collect();
                 if wants_missing {
-                    let all = self.all_resource_ids(db, tenant_id, resource_type).await?;
-                    all.difference(&with_entry).cloned().collect::<HashSet<_>>()
+                    candidates.retain(|id| !with_entry.contains(id));
                 } else {
-                    with_entry
+                    candidates.retain(|id| with_entry.contains(id));
                 }
-            } else if matches!(param.modifier, Some(SearchModifier::Not)) {
-                // `:not` is the complement of the positive match, and per the
-                // spec it includes resources with no value for the parameter
-                // at all (#881).
-                let mut positive = param.clone();
-                positive.modifier = None;
-                let filter = self.build_search_index_filter(tenant_id, resource_type, &positive)?;
-                let matching = self.distinct_resource_ids(&search_index, filter).await?;
-                let all = self.all_resource_ids(db, tenant_id, resource_type).await?;
-                all.difference(&matching).cloned().collect::<HashSet<_>>()
-            } else {
-                let filter = self.build_search_index_filter(tenant_id, resource_type, param)?;
-                self.distinct_resource_ids(&search_index, filter).await?
-            };
+            }
 
+            // :not — per the spec, includes resources with no value for the
+            // parameter at all (#881). Check per batch against surviving candidates.
+            for param in &not_params {
+                if candidates.is_empty() {
+                    break;
+                }
+                let mut positive = (*param).clone();
+                positive.modifier = None;
+                let pos_filter =
+                    self.build_search_index_filter(tenant_id, resource_type, &positive)?;
+                let bounded = doc! {
+                    "$and": [
+                        pos_filter,
+                        { "resource_id": { "$in": candidates.iter().cloned().collect::<Vec<_>>() } }
+                    ]
+                };
+                let matching: HashSet<String> = search_index
+                    .distinct("resource_id", bounded)
+                    .await
+                    .or_query_error("Failed to check :not")?
+                    .into_iter()
+                    .filter_map(|v| v.as_str().map(ToString::to_string))
+                    .collect();
+                candidates.retain(|id| !matching.contains(id));
+            }
+
+            // Compartment — checked per batch against surviving candidates.
+            if has_compartment {
+                if let Some(comp) = &query.compartment {
+                    if !candidates.is_empty() {
+                        let base = strip_reference_version(&comp.reference);
+                        let params: Vec<Bson> =
+                            comp.params.iter().cloned().map(Bson::String).collect();
+                        let comp_filter = doc! {
+                            "tenant_id": tenant_id,
+                            "resource_type": resource_type,
+                            "param_name": { "$in": Bson::Array(params) },
+                            "resource_id": { "$in": candidates.iter().cloned().collect::<Vec<_>>() },
+                            "$or": [
+                                { "value_reference": &base },
+                                { "value_reference": {
+                                    "$regex": format!("^{}/_history/", regex_escape(&base))
+                                }},
+                            ],
+                        };
+                        let in_comp: HashSet<String> = search_index
+                            .distinct("resource_id", comp_filter)
+                            .await
+                            .or_query_error("Failed to check compartment membership")?
+                            .into_iter()
+                            .filter_map(|v| v.as_str().map(ToString::to_string))
+                            .collect();
+                        candidates.retain(|id| in_comp.contains(id));
+                    }
+                }
+            }
+
+            confirmed.extend(candidates);
+
+            if docs_read < CANDIDATE_BATCH_SIZE {
+                break;
+            }
+        }
+
+        Ok(Some(confirmed))
+    }
+
+    async fn matching_resource_ids_complement_only(
+        &self,
+        db: &mongodb::Database,
+        search_index: &mongodb::Collection<Document>,
+        tenant_id: &str,
+        resource_type: &str,
+        missing: &[&SearchParameter],
+        not_params: &[&SearchParameter],
+        has_compartment: bool,
+        query: &SearchQuery,
+    ) -> StorageResult<Option<HashSet<String>>> {
+        let mut matched: Option<HashSet<String>> = None;
+
+        for param in missing {
+            let wants_missing = param
+                .values
+                .first()
+                .map(|v| v.value == "true")
+                .unwrap_or(false);
+            let with_entry = self
+                .distinct_resource_ids(
+                    search_index,
+                    doc! {
+                        "tenant_id": tenant_id,
+                        "resource_type": resource_type,
+                        "param_name": &param.name,
+                    },
+                )
+                .await?;
+            let ids = if wants_missing {
+                let all = self.all_resource_ids(db, tenant_id, resource_type).await?;
+                all.difference(&with_entry).cloned().collect::<HashSet<_>>()
+            } else {
+                with_entry
+            };
             if ids.is_empty() {
                 return Ok(Some(HashSet::new()));
             }
-
             matched = Some(match matched {
-                Some(current) => current
-                    .intersection(&ids)
-                    .cloned()
-                    .collect::<HashSet<String>>(),
+                Some(current) => current.intersection(&ids).cloned().collect(),
                 None => ids,
             });
-
-            if matched.as_ref().is_some_and(|set| set.is_empty()) {
+            if matched.as_ref().is_some_and(|s| s.is_empty()) {
                 return Ok(matched);
             }
         }
 
-        // Compartment membership: a resource joins the compartment if it
-        // references the compartment via ANY of the membership params (OR),
-        // per the FHIR CompartmentDefinition. Computed as a single OR query
-        // over the search_index and intersected with the parameter matches.
-        if let Some(comp) = &query.compartment {
-            if let Some(ids) = self
-                .compartment_resource_ids(&search_index, tenant_id, resource_type, comp)
-                .await?
-            {
-                if ids.is_empty() {
-                    return Ok(Some(HashSet::new()));
+        for param in not_params {
+            let mut positive = (*param).clone();
+            positive.modifier = None;
+            let filter = self.build_search_index_filter(tenant_id, resource_type, &positive)?;
+            let matching = self.distinct_resource_ids(search_index, filter).await?;
+            let all = self.all_resource_ids(db, tenant_id, resource_type).await?;
+            let ids = all.difference(&matching).cloned().collect::<HashSet<_>>();
+            if ids.is_empty() {
+                return Ok(Some(HashSet::new()));
+            }
+            matched = Some(match matched {
+                Some(current) => current.intersection(&ids).cloned().collect(),
+                None => ids,
+            });
+            if matched.as_ref().is_some_and(|s| s.is_empty()) {
+                return Ok(matched);
+            }
+        }
+
+        if has_compartment {
+            if let Some(comp) = &query.compartment {
+                if let Some(ids) = self
+                    .compartment_resource_ids(search_index, tenant_id, resource_type, comp)
+                    .await?
+                {
+                    if ids.is_empty() {
+                        return Ok(Some(HashSet::new()));
+                    }
+                    matched = Some(match matched {
+                        Some(current) => current.intersection(&ids).cloned().collect(),
+                        None => ids,
+                    });
                 }
-                matched = Some(match matched {
-                    Some(current) => current
-                        .intersection(&ids)
-                        .cloned()
-                        .collect::<HashSet<String>>(),
-                    None => ids,
-                });
             }
         }
 
