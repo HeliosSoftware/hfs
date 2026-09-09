@@ -13,23 +13,65 @@
 // the ingest alive long enough to interrupt and turns "did the recipient stop
 // reading?" into a number the test can watch (`bytesServed`).
 import { test, expect } from "../pages/fixtures";
+import { deleteResources } from "../pages/api";
 import { NdjsonProvider } from "../pages/ndjson-provider";
 
 let provider: NdjsonProvider;
 
-// ~9.6 MB dripped at ~128 KB/s. The size is not there to be ingested — the
+// ~15 MB dripped at ~128 KB/s. The size is not there to be ingested — the
 // abort lands seconds in — but to dwarf the roughly one megabyte the socket
 // buffers swallow after the recipient stops reading, so "it stopped well
 // short of the end" stays a wide margin instead of a coin toss.
-const LINES = 200_000;
+//
+// Those megabytes are made of few, fat lines rather than many small ones. The
+// e2e server is shared, and this spec is the only one that ingests in bulk: at
+// the natural ~48 bytes a Patient it left tens of thousands of them behind for
+// every later SQL-on-FHIR spec to scan, which is how it walked the browser
+// suite into an OOM kill. Padding decouples the byte count from the row count.
+const LINES = 30_000;
+const LINE_BYTES = 512;
+
+// Enough of the stream consumed that whole batches have certainly landed (the
+// worker commits every 1000 rows), so the "partial ingest is durable" check
+// below is testing cancellation semantics and not a race with the first batch.
+const ABORT_AFTER_BYTES = 1_000_000;
 
 test.beforeEach(async () => {
-  provider = new NdjsonProvider({ lines: LINES, chunkBytes: 32 * 1024, pauseMs: 250 });
+  provider = new NdjsonProvider({
+    lines: LINES,
+    lineBytes: LINE_BYTES,
+    // Fresh ids per run. The sweep below leaves tombstones, and re-ingesting a
+    // deleted id does not resurrect it — the server still answers `410 Gone` —
+    // so a fixed id space would make the durability check below pass once and
+    // then fail on every subsequent run against the same server.
+    idPrefix: `e2e968-${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`,
+    chunkBytes: 32 * 1024,
+    pauseMs: 250,
+  });
   await provider.start();
 });
 
-test.afterEach(async () => {
+test.afterEach(async ({ request }) => {
+  const served = Math.max(0, ...provider.streams.map((stream) => stream.served));
   await provider.stop();
+
+  // Leave the shared server as it was found. Nothing beyond what crossed the
+  // wire can have been stored, so served bytes bound the sweep; ids that never
+  // landed just come back 404, which `deleteResources` tolerates.
+  const reached = Math.min(LINES, Math.ceil(served / provider.lineBytes) + 1);
+  await deleteResources(
+    request,
+    "Patient",
+    Array.from({ length: reached }, (_, i) => provider.idAt(i)),
+  );
+
+  // A sweep that quietly stopped working would look exactly like a sweep that
+  // had nothing to do, and the cost of not noticing is a suite-wide timeout an
+  // hour later — so make the server say the rows are gone. `410` is the answer
+  // for the usual case, an id that was ingested and then deleted; `404` covers
+  // a run that failed before the ingest ever reached the first line.
+  const swept = await request.get(`/Patient/${provider.idAt(0)}`);
+  expect([404, 410]).toContain(swept.status());
 });
 
 test("Abort stops an ingest that is under way, and the data stops arriving", async ({
@@ -65,8 +107,8 @@ test("Abort stops an ingest that is under way, and the data stops arriving", asy
   // Wait until enough has genuinely crossed the wire that stopping is a real
   // interruption and not a race with the first byte.
   await expect
-    .poll(() => provider.bytesServed, { timeout: 30_000 })
-    .toBeGreaterThan(300_000);
+    .poll(() => provider.bytesServed, { timeout: 60_000 })
+    .toBeGreaterThan(ABORT_AFTER_BYTES);
 
   // --- The operator presses Abort. ---
   await abortButton.click();

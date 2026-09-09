@@ -18,6 +18,16 @@ import type { AddressInfo } from "node:net";
 export type ProviderOptions = {
   /** How many Patient lines the NDJSON file holds. */
   lines?: number;
+  /**
+   * Exact size of every line, padding included.
+   *
+   * The file has to be *large* — the abort has to land far from either end of
+   * a multi-megabyte stream to mean anything — but the e2e server is shared
+   * with every other spec, so the ingest must not leave tens of thousands of
+   * Patients behind for the SQL-on-FHIR specs to scan. Fat lines buy the byte
+   * count without the resource count.
+   */
+  lineBytes?: number;
   /** Bytes written per tick. */
   chunkBytes?: number;
   /** Delay between ticks, in milliseconds. */
@@ -25,6 +35,16 @@ export type ProviderOptions = {
   /** Prefix for the generated Patient ids, so specs can probe for them. */
   idPrefix?: string;
 };
+
+const DEFAULT_PREFIX = "e2e968";
+
+/** Fixed-width ids, so one padding length fits every line. */
+const idOf = (prefix: string, index: number) => `${prefix}-${String(index).padStart(6, "0")}`;
+
+/** One NDJSON line: a valid Patient whose identifier carries the padding. */
+const line = (id: string, pad: string) =>
+  `{"resourceType":"Patient","id":"${id}",` +
+  `"identifier":[{"system":"urn:hfs:e2e-968","value":"${pad}"}]}\n`;
 
 /** One download of the NDJSON file, as the provider saw it. */
 export type Stream = {
@@ -68,24 +88,26 @@ export class NdjsonProvider {
   private readonly body: Buffer;
   private readonly chunkBytes: number;
   private readonly pauseMs: number;
+  /** Size of every line, so specs can turn served bytes into an id range. */
+  readonly lineBytes: number;
 
   constructor(private readonly options: ProviderOptions = {}) {
     const lines = options.lines ?? 40_000;
-    const idPrefix = options.idPrefix ?? "e2e968";
     this.chunkBytes = options.chunkBytes ?? 32 * 1024;
     this.pauseMs = options.pauseMs ?? 250;
+    this.lineBytes = options.lineBytes ?? 512;
+    const prefix = options.idPrefix ?? DEFAULT_PREFIX;
+    // Every id is the same width, so padding computed once fits every line and
+    // `lineBytes` stays an exact figure rather than an average.
+    const pad = "x".repeat(Math.max(0, this.lineBytes - line(idOf(prefix, 0), "").length));
     this.body = Buffer.from(
-      Array.from(
-        { length: lines },
-        (_, i) =>
-          `{"resourceType":"Patient","id":"${idPrefix}-${String(i).padStart(6, "0")}"}\n`,
-      ).join(""),
+      Array.from({ length: lines }, (_, i) => line(idOf(prefix, i), pad)).join(""),
     );
   }
 
   /** The id of the nth line, matching what `patients.ndjson` carries. */
   idAt(index: number): string {
-    return `${this.options.idPrefix ?? "e2e968"}-${String(index).padStart(6, "0")}`;
+    return idOf(this.options.idPrefix ?? DEFAULT_PREFIX, index);
   }
 
   get totalBytes(): number {
