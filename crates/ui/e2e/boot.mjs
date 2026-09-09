@@ -116,6 +116,22 @@ const child = spawn(bin, [], {
     // The subscriptions engine advertises itself so the operator page (#580)
     // renders its live (empty) dashboard instead of the unavailable state.
     HFS_SUBSCRIPTIONS_ENABLED: "true",
+    // Bulk Submit, tuned so the Import page's ingest is *watchable* in a test
+    // rather than in a manual pass that can wait hours (#969).
+    //
+    // The production Retry-After is 120s, and the Import page honours it: it
+    // materializes the header into a "do not poll before" instant, so its 5s
+    // htmx tick would turn into one real recipient poll every two minutes and
+    // a browser test would see a single sample. 1s lets every tick observe.
+    HFS_BULK_SUBMIT_RETRY_AFTER: "1",
+    // Which then exceeds the 10-polls-per-minute limit that exists to punish
+    // clients ignoring Retry-After. Off here: this client is not ignoring it,
+    // it is being told to poll fast.
+    HFS_BULK_SUBMIT_POLL_RATE_LIMIT: "0",
+    // Progress counters advance a batch at a time. At the default 1000 a small
+    // fixture data set would report two or three numbers all run; 100 makes the
+    // counter move often enough to actually watch it.
+    HFS_BULK_SUBMIT_BATCH_SIZE: "100",
     ...authEnv,
   },
 });

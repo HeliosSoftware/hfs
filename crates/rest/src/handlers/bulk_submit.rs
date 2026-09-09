@@ -825,8 +825,18 @@ where
             // the count is FHIR resources written to the store ("written", not
             // "searchable" — under deferred indexing search follows the
             // per-manifest reindex).
+            //
+            // ASCII only, and the separator is a plain hyphen for that reason
+            // alone. This sentence is a *header* value, and RFC 9110 §5.5
+            // leaves anything outside US-ASCII as opaque obs-text with no
+            // defined meaning; strict clients reject it outright rather than
+            // guess a charset. The em dash this used to carry made
+            // `HeaderValue::to_str()` fail, so HFS's own Import page fell back
+            // to a bare "in progress" the instant the counter became non-zero —
+            // the number #969 exists to show was invisible exactly when it had
+            // something to say.
             format!(
-                "Processing {pct}% of bytes — {} resources written",
+                "Processing {pct}% of bytes - {} resources written",
                 group_thousands(entries)
             )
         } else {
