@@ -1261,10 +1261,9 @@ async fn poll_job(state: &WebState, job: &mut ExportJob, headers: &HeaderMap, te
             job.progress = String::new();
         }
         code => {
-            let mut body = response.text().await.unwrap_or_default();
-            body.truncate(300);
+            let body = response.text().await.unwrap_or_default();
             job.status = "failed".to_string();
-            job.error = format!("{code}: {}", body.replace('\n', " "));
+            job.error = format!("{code}: {}", response_diagnostics(&body));
         }
     }
 }

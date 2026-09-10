@@ -124,6 +124,9 @@ struct MockExport {
     group_identifier_results: Arc<Mutex<Vec<serde_json::Value>>>,
     /// What `POST /Group/_search?name=` answers (R5+ only — #836).
     group_name_results: Arc<Mutex<Vec<serde_json::Value>>>,
+    /// When set, status polls answer 500 with this body instead of the
+    /// default 202-then-manifest sequence.
+    status_failure_body: Arc<Mutex<Option<String>>>,
 }
 
 impl Default for MockExport {
@@ -170,6 +173,7 @@ impl Default for MockExport {
             groups: Default::default(),
             group_identifier_results: Default::default(),
             group_name_results: Default::default(),
+            status_failure_body: Default::default(),
         }
     }
 }
@@ -239,6 +243,14 @@ fn mock_fhir_app(state: MockExport) -> Router {
                 .and_then(|value| value.to_str().ok())
                 .map(str::to_string),
         ));
+        if let Some(body) = s.status_failure_body.lock().unwrap().clone() {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                [("content-type", "application/fhir+json")],
+                body,
+            )
+                .into_response();
+        }
         let mut polls = s.polls.lock().unwrap();
         *polls += 1;
         if *polls == 1 {
@@ -1772,6 +1784,67 @@ async fn a_rejected_kickoff_lands_as_failed_and_retry_reruns_it() {
             "retry should preserve the empty all-resources type list: {query}"
         );
     }
+}
+
+#[tokio::test]
+async fn a_failed_status_poll_shows_the_operation_outcome_diagnostics() {
+    let (base, mock, _) = serve().await;
+    post_form(
+        &base,
+        "/ui/bulk-export",
+        &[("name", "Diabetes registry 2024"), ("scope", "system")],
+    )
+    .await;
+
+    let (_, html) = get_text(&base, "/ui/bulk-export").await;
+    let card_path = html
+        .split("hx-get=\"")
+        .map(|s| s.split('"').next().unwrap_or(""))
+        .find(|s| s.starts_with("/ui/bulk-export/active/"))
+        .expect("card poll url")
+        .to_string();
+
+    *mock.status_failure_body.lock().unwrap() = Some(
+        serde_json::json!({
+            "resourceType": "OperationOutcome",
+            "issue": [{
+                "severity": "error",
+                "code": "not-found",
+                "diagnostics": "Group/no-such-group not found"
+            }]
+        })
+        .to_string(),
+    );
+
+    let (_, html) = get_text(&base, &card_path).await;
+    assert!(html.contains("Group/no-such-group not found"), "{html}");
+    assert!(html.contains("500:"), "{html}");
+    assert!(!html.contains("\"resourceType\""), "{html}");
+    assert!(html.contains("Retry"), "{html}");
+}
+
+#[tokio::test]
+async fn a_failed_status_poll_without_operation_outcome_keeps_the_raw_body() {
+    let (base, mock, _) = serve().await;
+    post_form(
+        &base,
+        "/ui/bulk-export",
+        &[("name", "Diabetes registry 2024"), ("scope", "system")],
+    )
+    .await;
+
+    let (_, html) = get_text(&base, "/ui/bulk-export").await;
+    let card_path = html
+        .split("hx-get=\"")
+        .map(|s| s.split('"').next().unwrap_or(""))
+        .find(|s| s.starts_with("/ui/bulk-export/active/"))
+        .expect("card poll url")
+        .to_string();
+
+    *mock.status_failure_body.lock().unwrap() = Some("boom".to_string());
+
+    let (_, html) = get_text(&base, &card_path).await;
+    assert!(html.contains("500: boom"), "{html}");
 }
 
 #[tokio::test]
