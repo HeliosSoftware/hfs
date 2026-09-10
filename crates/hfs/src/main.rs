@@ -1658,20 +1658,6 @@ fn spawn_export_workers<Dp>(
     );
 }
 
-/// Builds the bulk-submit subsystem (input fetcher + output store + file auth +
-/// worker pool) from a caller-supplied job store. Returns `None` when bulk submit
-/// is disabled. The job store is the same backend instance that holds the FHIR
-/// resources (so ingestion writes go to the primary store).
-///
-/// Unlike bulk *export*, every backend that can run `$bulk-submit` hosts its own
-/// job state — MongoDB in its own collections, S3 in the same objects its
-/// ingestion engine already writes — so there is no sidecar variant here.
-#[cfg(any(
-    feature = "sqlite",
-    feature = "postgres",
-    feature = "mongodb",
-    feature = "s3"
-))]
 /// Picks the `$bulk-submit` job store for a primary + Elasticsearch composite.
 ///
 /// The raw primary never feeds Elasticsearch, so by default the store is
@@ -1683,6 +1669,10 @@ fn spawn_export_workers<Dp>(
 /// the wrapper, otherwise the data never reaches Elasticsearch.
 ///
 /// [`CompositeSubmitJobs`]: helios_persistence::composite::CompositeSubmitJobs
+#[cfg(all(
+    feature = "elasticsearch",
+    any(feature = "sqlite", feature = "postgres")
+))]
 fn composite_submit_jobs(
     primary: Arc<dyn BulkSubmitJobStore>,
     composite: Arc<helios_persistence::composite::CompositeStorage>,
@@ -1698,6 +1688,20 @@ fn composite_submit_jobs(
     }
 }
 
+/// Builds the bulk-submit subsystem (input fetcher + output store + file auth +
+/// worker pool) from a caller-supplied job store. Returns `None` when bulk submit
+/// is disabled. The job store is the same backend instance that holds the FHIR
+/// resources (so ingestion writes go to the primary store).
+///
+/// Unlike bulk *export*, every backend that can run `$bulk-submit` hosts its own
+/// job state — MongoDB in its own collections, S3 in the same objects its
+/// ingestion engine already writes — so there is no sidecar variant here.
+#[cfg(any(
+    feature = "sqlite",
+    feature = "postgres",
+    feature = "mongodb",
+    feature = "s3"
+))]
 async fn build_bulk_submit(
     config: &ServerConfig,
     jobs: Arc<dyn BulkSubmitJobStore>,
