@@ -108,13 +108,12 @@ because the bulk import preserves resource ids:
 ## 3. T0 — Build (the full CI build)
 
 `ci.yml` tests with `cargo test --workspace --all-features` and releases with
-`cargo build --workspace --all-features --release`. Use the release form so the
-import and export timings are representative.
+`cargo build --workspace --all-features`.
 
 ```bash
 cd /path/to/hfs
 git status --short | grep -v 'crates/fhir/tests/data' # working tree should be clean apart from R6 fixture churn
-cargo build --workspace --all-features --release 2>&1 | tee "$WORK/build.log"
+cargo build --workspace --all-features 2>&1 | tee "$WORK/build.log"
 ./target/release/hfs --help | head -5
 ```
 
@@ -124,7 +123,7 @@ downloaded on first build; the build also rewrites the checked-in R6 fixture fil
 under `crates/fhir/tests/data` — do not commit those.
 
 If Python is unavailable on the machine, build the default members instead and note
-the deviation in the results: `cargo build --all-features --release` (skips `pysof`).
+the deviation in the results: `cargo build --all-features` (skips `pysof`).
 
 Pass criteria: build exits 0; `hfs --help` prints usage.
 
