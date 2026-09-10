@@ -843,3 +843,337 @@ async fn test_capability_statement_advertises_export() {
         "http://hl7.org/fhir/uv/bulkdata/CapabilityStatement/bulk-data"
     );
 }
+
+/// Downloads an export output file and parses each NDJSON line as JSON.
+async fn fetch_ndjson_lines(server: &TestServer, file_url: &str, base_url: &str) -> Vec<Value> {
+    let file_path = file_url
+        .strip_prefix(base_url)
+        .expect("file URL should be under the server's base URL");
+    let download = server
+        .get(file_path)
+        .add_header("x-tenant-id", "test-tenant")
+        .await;
+    assert_eq!(download.status_code(), StatusCode::OK);
+    download
+        .text()
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("ndjson line parses as JSON"))
+        .collect()
+}
+
+#[tokio::test]
+async fn test_type_filter_is_applied_to_system_export() {
+    let (server, backend, output, _tmp) = create_bulk_export_server().await;
+    let tenant = test_tenant();
+    for (id, active) in [
+        ("p-active-1", true),
+        ("p-active-2", true),
+        ("p-inactive", false),
+    ] {
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType": "Patient", "id": id, "active": active}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+    }
+
+    let resp = server
+        .get("/$export")
+        .add_header("x-tenant-id", "test-tenant")
+        .add_header("prefer", "respond-async")
+        .add_query_param("_type", "Patient")
+        .add_query_param("_typeFilter", "Patient?active=true")
+        .await;
+    assert_eq!(resp.status_code(), StatusCode::ACCEPTED);
+    let status_url = resp
+        .headers()
+        .get("content-location")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    let status_path = status_url.strip_prefix("http://localhost:8080").unwrap();
+
+    drain_workers(&backend, &output).await;
+
+    let done = server
+        .get(status_path)
+        .add_header("x-tenant-id", "test-tenant")
+        .await;
+    assert_eq!(done.status_code(), StatusCode::OK);
+    let manifest: Value = done.json();
+    let output_files = manifest["output"].as_array().expect("output array");
+    assert_eq!(output_files.len(), 1, "one Patient output file");
+
+    let lines = fetch_ndjson_lines(
+        &server,
+        output_files[0]["url"].as_str().unwrap(),
+        "http://localhost:8080",
+    )
+    .await;
+    assert_eq!(
+        lines.len(),
+        2,
+        "only the two active patients should be exported, got: {lines:?}"
+    );
+    let ids: Vec<&str> = lines.iter().map(|v| v["id"].as_str().unwrap()).collect();
+    assert!(
+        !ids.contains(&"p-inactive"),
+        "the inactive patient must not be in the filtered output"
+    );
+}
+
+#[tokio::test]
+async fn test_unfiltered_type_is_exported_whole_next_to_a_filtered_one() {
+    let (server, backend, output, _tmp) = create_bulk_export_server().await;
+    let tenant = test_tenant();
+    backend
+        .create(
+            &tenant,
+            "Patient",
+            json!({"resourceType": "Patient", "id": "p1"}),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    backend
+        .create(
+            &tenant,
+            "Patient",
+            json!({"resourceType": "Patient", "id": "p2"}),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    backend
+        .create(
+            &tenant,
+            "Condition",
+            json!({
+                "resourceType": "Condition",
+                "id": "c-active",
+                "subject": {"reference": "Patient/p1"},
+                "clinicalStatus": {
+                    "coding": [{
+                        "system": "http://terminology.hl7.org/CodeSystem/condition-clinical",
+                        "code": "active"
+                    }]
+                }
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    backend
+        .create(
+            &tenant,
+            "Condition",
+            json!({
+                "resourceType": "Condition",
+                "id": "c-resolved",
+                "subject": {"reference": "Patient/p1"},
+                "clinicalStatus": {
+                    "coding": [{
+                        "system": "http://terminology.hl7.org/CodeSystem/condition-clinical",
+                        "code": "resolved"
+                    }]
+                }
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+
+    let resp = server
+        .get("/$export")
+        .add_header("x-tenant-id", "test-tenant")
+        .add_header("prefer", "respond-async")
+        .add_query_param("_type", "Patient,Condition")
+        .add_query_param("_typeFilter", "Condition?clinical-status=active")
+        .await;
+    assert_eq!(resp.status_code(), StatusCode::ACCEPTED);
+    let status_url = resp
+        .headers()
+        .get("content-location")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    let status_path = status_url.strip_prefix("http://localhost:8080").unwrap();
+
+    drain_workers(&backend, &output).await;
+
+    let done = server
+        .get(status_path)
+        .add_header("x-tenant-id", "test-tenant")
+        .await;
+    assert_eq!(done.status_code(), StatusCode::OK);
+    let manifest: Value = done.json();
+    let output_files = manifest["output"].as_array().expect("output array");
+
+    let patient_file = output_files
+        .iter()
+        .find(|f| f["type"] == "Patient")
+        .expect("Patient output file");
+    let patient_lines = fetch_ndjson_lines(
+        &server,
+        patient_file["url"].as_str().unwrap(),
+        "http://localhost:8080",
+    )
+    .await;
+    assert_eq!(
+        patient_lines.len(),
+        2,
+        "the unfiltered type exports every resource"
+    );
+
+    let condition_file = output_files
+        .iter()
+        .find(|f| f["type"] == "Condition")
+        .expect("Condition output file");
+    let condition_lines = fetch_ndjson_lines(
+        &server,
+        condition_file["url"].as_str().unwrap(),
+        "http://localhost:8080",
+    )
+    .await;
+    assert_eq!(condition_lines.len(), 1);
+    assert_eq!(condition_lines[0]["id"], "c-active");
+}
+
+#[tokio::test]
+async fn test_type_filter_is_applied_to_group_export() {
+    let (server, backend, output, _tmp) = create_bulk_export_server().await;
+    let tenant = test_tenant();
+    backend
+        .create(
+            &tenant,
+            "Patient",
+            json!({"resourceType": "Patient", "id": "p1"}),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    backend
+        .create(
+            &tenant,
+            "Group",
+            json!({
+                "resourceType": "Group",
+                "id": "g1",
+                "member": [{"entity": {"reference": "Patient/p1"}}]
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+
+    let condition_clinical = "http://terminology.hl7.org/CodeSystem/condition-clinical";
+    backend
+        .create(
+            &tenant,
+            "Condition",
+            json!({
+                "resourceType": "Condition",
+                "id": "c-active",
+                "subject": {"reference": "Patient/p1"},
+                "clinicalStatus": {
+                    "coding": [{"system": condition_clinical, "code": "active"}]
+                }
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    for id in ["c-resolved-1", "c-resolved-2"] {
+        backend
+            .create(
+                &tenant,
+                "Condition",
+                json!({
+                    "resourceType": "Condition",
+                    "id": id,
+                    "subject": {"reference": "Patient/p1"},
+                    "clinicalStatus": {
+                        "coding": [{"system": condition_clinical, "code": "resolved"}]
+                    }
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+    }
+    backend
+        .create(
+            &tenant,
+            "Condition",
+            json!({
+                "resourceType": "Condition",
+                "id": "c-none",
+                "subject": {"reference": "Patient/p1"}
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+
+    let resp = server
+        .get("/Group/g1/$export")
+        .add_header("x-tenant-id", "test-tenant")
+        .add_header("prefer", "respond-async")
+        .add_query_param("_type", "Patient,Condition")
+        .add_query_param("_typeFilter", "Condition?clinical-status=active")
+        .await;
+    assert_eq!(resp.status_code(), StatusCode::ACCEPTED);
+    let status_url = resp
+        .headers()
+        .get("content-location")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    let status_path = status_url.strip_prefix("http://localhost:8080").unwrap();
+
+    drain_workers(&backend, &output).await;
+
+    let done = server
+        .get(status_path)
+        .add_header("x-tenant-id", "test-tenant")
+        .await;
+    assert_eq!(done.status_code(), StatusCode::OK);
+    let manifest: Value = done.json();
+    let output_files = manifest["output"].as_array().expect("output array");
+
+    let condition_file = output_files
+        .iter()
+        .find(|f| f["type"] == "Condition")
+        .expect("Condition output file");
+    let condition_lines = fetch_ndjson_lines(
+        &server,
+        condition_file["url"].as_str().unwrap(),
+        "http://localhost:8080",
+    )
+    .await;
+    assert_eq!(
+        condition_lines.len(),
+        1,
+        "only the active Condition should be exported, got: {condition_lines:?}"
+    );
+    assert_eq!(condition_lines[0]["id"], "c-active");
+
+    let patient_file = output_files
+        .iter()
+        .find(|f| f["type"] == "Patient")
+        .expect("Patient output file");
+    let patient_lines = fetch_ndjson_lines(
+        &server,
+        patient_file["url"].as_str().unwrap(),
+        "http://localhost:8080",
+    )
+    .await;
+    assert_eq!(patient_lines.len(), 1, "the sole group member is exported");
+}

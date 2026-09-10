@@ -2085,7 +2085,10 @@ async fn start_sqlite_elasticsearch(
     let ui_settings = settings_store.clone();
     let ui_bulk_provider: Option<Arc<dyn BulkProviderStore>> = Some(sqlite.clone());
 
-    let export_bundle = build_bulk_export(&config, sqlite.clone(), sqlite.clone()).await?;
+    // The worker searches through `composite` (not the bare `sqlite` primary)
+    // so a `_typeFilter` runs against Elasticsearch, the index that actually
+    // serves search in this deployment.
+    let export_bundle = build_bulk_export(&config, composite.clone(), sqlite.clone()).await?;
     // Reindex reads from the SQLite primary and rebuilds BOTH indexes: SQLite's
     // own search_index table and the Elasticsearch index that actually serves
     // search here.
@@ -2356,7 +2359,10 @@ async fn start_postgres_elasticsearch(
     let ui_settings = settings_store.clone();
     let ui_bulk_provider: Option<Arc<dyn BulkProviderStore>> = Some(pg.clone());
 
-    let export_bundle = build_bulk_export(&config, pg.clone(), pg.clone()).await?;
+    // The worker searches through `composite` (not the bare `pg` primary) so a
+    // `_typeFilter` runs against Elasticsearch, the index that actually serves
+    // search in this deployment.
+    let export_bundle = build_bulk_export(&config, composite.clone(), pg.clone()).await?;
     let ops = composite_ops(
         composite.clone(),
         pg.clone(),
@@ -2560,7 +2566,10 @@ async fn start_mongodb_elasticsearch(
         #[cfg(feature = "sqlite")]
         {
             let jobs = build_embedded_job_store(&config)?;
-            build_bulk_export(&config, mongo.clone(), jobs).await?
+            // The worker searches through `composite` (not the bare `mongo`
+            // primary) so a `_typeFilter` runs against Elasticsearch, the
+            // index that actually serves search in this deployment.
+            build_bulk_export(&config, composite.clone(), jobs).await?
         }
         #[cfg(not(feature = "sqlite"))]
         {
@@ -2998,7 +3007,10 @@ async fn start_s3_elasticsearch(
         #[cfg(feature = "sqlite")]
         {
             let jobs = build_embedded_job_store(&config)?;
-            build_bulk_export(&config, s3.clone(), jobs).await?
+            // The worker searches through `composite` (not the bare `s3`
+            // primary) so a `_typeFilter` runs against Elasticsearch, the
+            // only search index in this deployment.
+            build_bulk_export(&config, composite.clone(), jobs).await?
         }
         #[cfg(not(feature = "sqlite"))]
         {
