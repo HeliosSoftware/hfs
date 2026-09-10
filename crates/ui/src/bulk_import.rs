@@ -1330,7 +1330,7 @@ pub async fn status_fragment(
 /// bar about to fill, not a percentage that never moves — the indeterminate
 /// sweep is reserved for recipients that report no percentage at all.
 ///
-/// Pre-ingest phase reports (#953) — `waiting for a worker`, `reading
+/// Pre-ingest phase reports (#953) — `Queued - starting shortly`, `reading
 /// manifest`, `sizing {done} of {total} files`, `downloading file {done} of
 /// {total}` — deliberately fall through to `None`: there is no meaningful
 /// share-of-the-whole to draw yet, so the card pairs the phase text with the
@@ -1462,7 +1462,8 @@ mod tests {
     #[test]
     fn pre_ingest_phases_report_no_percentage() {
         for phase in [
-            "waiting for a worker",
+            "Queued - starting shortly",
+            "Queued - waiting for an external worker",
             "reading manifest",
             "sizing 37 of 412 files",
             "downloading file 1 of 412",
