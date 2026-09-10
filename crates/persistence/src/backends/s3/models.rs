@@ -75,6 +75,13 @@ pub struct SubmissionState {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SubmissionManifestState {
     /// The manifest metadata and current processing status.
+    ///
+    /// Serialized inline, so the progress counters the worker reports —
+    /// including the `phase` / `files_done` / `files_total` trio added for
+    /// #953 — are persisted here without a parallel set of fields. Every one
+    /// of those is `#[serde(default)]` on [`SubmissionManifest`] itself, which
+    /// is what lets state objects written by an older build (and by
+    /// submissions in flight across an upgrade) still deserialize.
     pub manifest: SubmissionManifest,
     /// Worker currently holding the lease, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]

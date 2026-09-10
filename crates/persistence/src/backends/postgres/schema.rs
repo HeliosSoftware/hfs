@@ -1,9 +1,15 @@
 //! PostgreSQL schema definitions and migrations.
 
+use deadpool_postgres::GenericClient;
+use serde_json::Value;
+
+use crate::core::bulk_submit_legacy::{
+    LegacyFile, LegacyManifest, LegacyPublicationAction, classify_legacy_publications,
+};
 use crate::error::{BackendError, StorageResult};
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 36;
+pub const SCHEMA_VERSION: i32 = 37;
 
 /// Advisory-lock key serializing schema migration across HFS instances sharing
 /// one database. Arbitrary but must stay stable across releases.
@@ -22,7 +28,7 @@ const MIGRATION_LOCK_KEY: i64 = 0x4846_5300_4d49_4752; // "HFS\0MIGR"
 ///
 /// The lock is session-scoped, so it is released even if the process is killed
 /// mid-migration.
-pub async fn initialize_schema(client: &deadpool_postgres::Client) -> StorageResult<()> {
+pub async fn initialize_schema(client: &mut deadpool_postgres::Client) -> StorageResult<()> {
     client
         .execute("SELECT pg_advisory_lock($1)", &[&MIGRATION_LOCK_KEY])
         .await
@@ -41,7 +47,7 @@ pub async fn initialize_schema(client: &deadpool_postgres::Client) -> StorageRes
     result
 }
 
-async fn run_migrations(client: &deadpool_postgres::Client) -> StorageResult<()> {
+async fn run_migrations(client: &mut deadpool_postgres::Client) -> StorageResult<()> {
     let current_version = get_schema_version(client).await?;
 
     if current_version == 0 {
@@ -76,7 +82,10 @@ async fn get_schema_version(client: &deadpool_postgres::Client) -> StorageResult
 }
 
 /// Set the schema version.
-async fn set_schema_version(client: &deadpool_postgres::Client, version: i32) -> StorageResult<()> {
+async fn set_schema_version<C>(client: &C, version: i32) -> StorageResult<()>
+where
+    C: GenericClient + ?Sized,
+{
     client
         .execute("DELETE FROM schema_version", &[])
         .await
@@ -314,7 +323,7 @@ async fn create_fts_tables(client: &deadpool_postgres::Client) -> StorageResult<
 
 /// Run schema migrations from current version to latest.
 async fn migrate_schema(
-    client: &deadpool_postgres::Client,
+    client: &mut deadpool_postgres::Client,
     from_version: i32,
 ) -> StorageResult<()> {
     let mut version = from_version;
@@ -356,6 +365,13 @@ async fn migrate_schema(
             33 => migrate_v33_to_v34(client).await?,
             34 => migrate_v34_to_v35(client).await?,
             35 => migrate_v35_to_v36(client).await?,
+            36 => {
+                // The helper commits the v37 marker inside its transaction, so
+                // the common loop must not stamp the same version again.
+                migrate_v36_to_v37(client).await?;
+                version += 1;
+                continue;
+            }
             _ => {
                 return Err(pg_error(format!("Unknown schema version: {}", version)));
             }
@@ -781,6 +797,12 @@ async fn add_bulk_submit_worker_schema(
         "ALTER TABLE bulk_manifests ADD COLUMN IF NOT EXISTS submission_metadata TEXT",
         "ALTER TABLE bulk_manifests ADD COLUMN IF NOT EXISTS bytes_processed BIGINT NOT NULL DEFAULT 0",
         "ALTER TABLE bulk_manifests ADD COLUMN IF NOT EXISTS bytes_total BIGINT NOT NULL DEFAULT 0",
+        // Pre-ingest phase hint (#953). `phase` is nullable because a manifest
+        // has none until a worker claims it, and an unrecognized string decodes
+        // back to `None` rather than failing the read.
+        "ALTER TABLE bulk_manifests ADD COLUMN IF NOT EXISTS phase TEXT",
+        "ALTER TABLE bulk_manifests ADD COLUMN IF NOT EXISTS files_done BIGINT NOT NULL DEFAULT 0",
+        "ALTER TABLE bulk_manifests ADD COLUMN IF NOT EXISTS files_total BIGINT NOT NULL DEFAULT 0",
     ];
     for sql in &migrations {
         client
@@ -3321,6 +3343,286 @@ async fn migrate_v35_to_v36(client: &deadpool_postgres::Client) -> StorageResult
     Ok(())
 }
 
+/// v36 -> v37: manifest-scoped artifact publication.
+///
+/// Legacy artifact rows do not know which status manifest owned them and were
+/// not publication-sealed. Add the same columns and partial unique indexes as
+/// SQLite, then classify the rows with the shared legacy classifier. DDL,
+/// data classification, indexes, and the version marker all commit together.
+async fn migrate_v36_to_v37(client: &mut deadpool_postgres::Client) -> StorageResult<()> {
+    let tx = client
+        .transaction()
+        .await
+        .map_err(|e| pg_error(format!("begin v37 migration: {e}")))?;
+    let result = migrate_v36_to_v37_in_transaction(&tx).await;
+
+    // Errors and cancellation rely on the transaction's rollback-on-drop
+    // behavior; only a successful classification reaches this commit.
+    if result.is_err() {
+        return result;
+    }
+    tx.commit()
+        .await
+        .map_err(|e| pg_error(format!("commit v37 migration: {e}")))
+}
+
+async fn table_columns(
+    tx: &deadpool_postgres::Transaction<'_>,
+    table: &str,
+) -> StorageResult<Vec<String>> {
+    let rows = tx
+        .query(
+            "SELECT column_name FROM information_schema.columns
+             WHERE table_schema = current_schema() AND table_name = $1
+             ORDER BY ordinal_position",
+            &[&table],
+        )
+        .await
+        .map_err(|e| pg_error(format!("read {table} columns: {e}")))?;
+    Ok(rows.iter().map(|row| row.get::<_, String>(0)).collect())
+}
+
+#[allow(clippy::too_many_lines)]
+async fn migrate_v36_to_v37_in_transaction(
+    tx: &deadpool_postgres::Transaction<'_>,
+) -> StorageResult<()> {
+    // ALTERs would take these same ACCESS EXCLUSIVE locks, but acquire them
+    // before the all-column replay check so every initializer observes one
+    // frozen pre-v37 lease/file state. The locks release with the RAII
+    // transaction.
+    tx.batch_execute(
+        "LOCK TABLE bulk_manifests IN ACCESS EXCLUSIVE MODE;
+         LOCK TABLE bulk_submit_files IN ACCESS EXCLUSIVE MODE;",
+    )
+    .await
+    .map_err(|e| pg_error(format!("lock bulk tables for v37 migration: {e}")))?;
+
+    let manifest_columns = table_columns(tx, "bulk_manifests").await?;
+    let file_columns = table_columns(tx, "bulk_submit_files").await?;
+    if manifest_columns.is_empty() || file_columns.is_empty() {
+        return Err(pg_error(
+            "bulk_manifests and bulk_submit_files must exist before v37".to_string(),
+        ));
+    }
+
+    // Capture this before ALTER. Replaying an already committed v37 schema
+    // must not reclassify records or overwrite its publication markers.
+    let new_columns = [
+        ("bulk_manifests", "published_token"),
+        ("bulk_manifests", "publication_status"),
+        ("bulk_manifests", "publication_error_message"),
+        ("bulk_manifests", "publication_worker_id"),
+        ("bulk_submit_files", "manifest_id"),
+        ("bulk_submit_files", "publication_excluded_reason"),
+    ];
+    let classification_already_complete = new_columns.iter().all(|(table, column)| {
+        let columns = match *table {
+            "bulk_manifests" => &manifest_columns,
+            _ => &file_columns,
+        };
+        columns.iter().any(|existing| existing == column)
+    });
+
+    let ddl = [
+        "ALTER TABLE bulk_manifests ADD COLUMN IF NOT EXISTS published_token BIGINT",
+        "ALTER TABLE bulk_manifests ADD COLUMN IF NOT EXISTS publication_status TEXT",
+        "ALTER TABLE bulk_manifests ADD COLUMN IF NOT EXISTS publication_error_message TEXT",
+        "ALTER TABLE bulk_manifests ADD COLUMN IF NOT EXISTS publication_worker_id TEXT",
+        "ALTER TABLE bulk_submit_files ADD COLUMN IF NOT EXISTS manifest_id TEXT",
+        "ALTER TABLE bulk_submit_files ADD COLUMN IF NOT EXISTS publication_excluded_reason TEXT",
+    ];
+    for sql in &ddl {
+        tx.execute(*sql, &[])
+            .await
+            .map_err(|e| pg_error(format!("Migration v36->v37 failed: {}", e)))?;
+    }
+
+    if !classification_already_complete {
+        let manifests = load_legacy_manifests(tx).await?;
+        let files = load_legacy_files(tx).await?;
+        for action in classify_legacy_publications(&manifests, &files) {
+            match action {
+                LegacyPublicationAction::Exclude { id, reason } => {
+                    set_row_reason(tx, id, reason).await?;
+                }
+                LegacyPublicationAction::Assign { id, manifest_id } => {
+                    set_manifest_file_identity(tx, id, &manifest_id).await?;
+                }
+                LegacyPublicationAction::Publish { manifest } => {
+                    mark_manifest_publication(tx, &manifest).await?;
+                }
+            }
+        }
+    }
+
+    let indexes = [
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_bulk_submit_files_artifact_null
+         ON bulk_submit_files(
+             tenant_id, submitter, submission_id, manifest_id, file_type,
+             part_index, fencing_token
+         )
+         WHERE manifest_id IS NOT NULL
+           AND publication_excluded_reason IS NULL
+           AND resource_type IS NULL",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_bulk_submit_files_artifact_not_null
+         ON bulk_submit_files(
+             tenant_id, submitter, submission_id, manifest_id, file_type,
+             resource_type, part_index, fencing_token
+         )
+         WHERE manifest_id IS NOT NULL
+           AND publication_excluded_reason IS NULL
+           AND resource_type IS NOT NULL",
+    ];
+    for sql in &indexes {
+        tx.execute(*sql, &[])
+            .await
+            .map_err(|e| pg_error(format!("create publication artifact index: {e}")))?;
+    }
+
+    set_schema_version(tx, 37).await?;
+    Ok(())
+}
+
+async fn load_legacy_manifests(
+    tx: &deadpool_postgres::Transaction<'_>,
+) -> StorageResult<Vec<LegacyManifest>> {
+    let rows = tx
+        .query(
+            "SELECT tenant_id, submitter, submission_id, manifest_id, manifest_url,
+                    status, fencing_token
+             FROM bulk_manifests
+             ORDER BY tenant_id, submitter, submission_id, added_at, manifest_id",
+            &[],
+        )
+        .await
+        .map_err(|e| pg_error(format!("read legacy manifests: {e}")))?;
+    rows.iter()
+        .map(|row| {
+            Ok(LegacyManifest {
+                tenant_id: row.get(0),
+                submitter: row.get(1),
+                submission_id: row.get(2),
+                manifest_id: row.get(3),
+                manifest_url: row.get(4),
+                status: row.get(5),
+                fencing_token: row.get(6),
+            })
+        })
+        .collect::<StorageResult<Vec<_>>>()
+}
+
+async fn load_legacy_files(
+    tx: &deadpool_postgres::Transaction<'_>,
+) -> StorageResult<Vec<LegacyFile>> {
+    let rows = tx
+        .query(
+            "SELECT id, tenant_id, submitter, submission_id, manifest_url, file_type,
+                    resource_type, part_index, fencing_token, file_path, line_count,
+                    byte_count, count_severity
+             FROM bulk_submit_files
+             WHERE manifest_id IS NULL AND publication_excluded_reason IS NULL
+             ORDER BY id",
+            &[],
+        )
+        .await
+        .map_err(|e| pg_error(format!("read legacy artifacts: {e}")))?;
+    rows.iter()
+        .map(|row| {
+            let count_severity: Option<String> = row.get::<_, Option<String>>(12);
+            let (count_severity, count_severity_invalid) = match count_severity {
+                Some(text) => match serde_json::from_str::<Value>(&text) {
+                    Ok(value) => (Some(value), false),
+                    Err(_) => (Some(Value::String(text)), true),
+                },
+                None => (None, false),
+            };
+            Ok(LegacyFile {
+                id: row.get(0),
+                tenant_id: row.get(1),
+                submitter: row.get(2),
+                submission_id: row.get(3),
+                metadata: crate::core::bulk_submit_legacy::LegacyArtifactMetadata {
+                    manifest_url: row.get(4),
+                    file_type: row.get(5),
+                    resource_type: row.get(6),
+                    part_index: i64::from(row.get::<_, i32>(7)),
+                    file_path: row.get(9),
+                    line_count: row.get(10),
+                    byte_count: row.get(11),
+                    count_severity,
+                    count_severity_invalid,
+                },
+                fencing_token: row.get(8),
+            })
+        })
+        .collect()
+}
+
+async fn set_row_reason(
+    tx: &deadpool_postgres::Transaction<'_>,
+    id: i64,
+    reason: &str,
+) -> StorageResult<()> {
+    tx.execute(
+        "UPDATE bulk_submit_files
+         SET manifest_id = NULL, publication_excluded_reason = $2
+         WHERE id = $1",
+        &[&id, &reason],
+    )
+    .await
+    .map_err(|e| pg_error(format!("classify artifact {id}: {e}")))?;
+    Ok(())
+}
+
+async fn set_manifest_file_identity(
+    tx: &deadpool_postgres::Transaction<'_>,
+    id: i64,
+    manifest_id: &str,
+) -> StorageResult<()> {
+    tx.execute(
+        "UPDATE bulk_submit_files
+         SET manifest_id = $2, publication_excluded_reason = NULL
+         WHERE id = $1",
+        &[&id, &manifest_id],
+    )
+    .await
+    .map_err(|e| pg_error(format!("assign artifact {id}: {e}")))?;
+    Ok(())
+}
+
+async fn mark_manifest_publication(
+    tx: &deadpool_postgres::Transaction<'_>,
+    manifest: &LegacyManifest,
+) -> StorageResult<()> {
+    // Failed legacy messages are unknowable, so publication_status is retained
+    // without inventing publication_error_message. The NULL worker leaves the
+    // marker unable to authorize a fresh publication replay.
+    tx.execute(
+        "UPDATE bulk_manifests
+         SET published_token = $5,
+             publication_status = $6,
+             publication_error_message = NULL,
+             publication_worker_id = NULL
+         WHERE tenant_id = $1 AND submitter = $2 AND submission_id = $3
+           AND manifest_id = $4
+           AND published_token IS NULL
+           AND publication_status IS NULL
+           AND publication_error_message IS NULL
+           AND publication_worker_id IS NULL",
+        &[
+            &manifest.tenant_id,
+            &manifest.submitter,
+            &manifest.submission_id,
+            &manifest.manifest_id,
+            &manifest.fencing_token,
+            &manifest.status,
+        ],
+    )
+    .await
+    .map_err(|e| pg_error(format!("mark legacy publication: {e}")))?;
+    Ok(())
+}
+
 /// v23 -> v24: drop `fk_search_resource`.
 ///
 /// `search_index` carried a composite FK to `resources` with `ON DELETE
@@ -3933,4 +4235,912 @@ fn pg_error(message: String) -> crate::error::StorageError {
         message,
         source: None,
     })
+}
+
+#[cfg(test)]
+mod postgres_integration_v37_migration {
+    use super::*;
+    use chrono::Utc;
+    use testcontainers::ImageExt;
+    use testcontainers::runners::AsyncRunner;
+    use testcontainers_modules::postgres::Postgres;
+    use tokio::sync::{Mutex, OnceCell};
+    use tokio_postgres::NoTls;
+
+    use crate::backends::postgres::{PostgresBackend, PostgresConfig};
+    use crate::core::bulk_submit_legacy::{
+        LEGACY_REASON_CONFLICTING_DUPLICATE, LEGACY_REASON_EXACT_DUPLICATE,
+        LEGACY_REASON_INVALID_DOMAIN,
+    };
+    use crate::error::StorageResult;
+
+    struct SharedPg {
+        host: String,
+        port: u16,
+        /// Kept alive for the test binary; CI cleanup uses the run label.
+        _container: testcontainers::ContainerAsync<Postgres>,
+    }
+
+    static SHARED_PG: OnceCell<SharedPg> = OnceCell::const_new();
+    static POSTGRES_TEST_LOCK: Mutex<()> = Mutex::const_new(());
+
+    async fn shared_pg() -> &'static SharedPg {
+        SHARED_PG
+            .get_or_init(|| async {
+                let run_id = std::env::var("GITHUB_RUN_ID").unwrap_or_default();
+                let container = Postgres::default()
+                    .with_tag("16-alpine")
+                    .with_label("github.run_id", &run_id)
+                    .start()
+                    .await
+                    .expect("start PostgreSQL container");
+                let host = container
+                    .get_host()
+                    .await
+                    .expect("get PostgreSQL host")
+                    .to_string();
+                let port = container
+                    .get_host_port_ipv4(5432)
+                    .await
+                    .expect("get PostgreSQL port");
+                SharedPg {
+                    host,
+                    port,
+                    _container: container,
+                }
+            })
+            .await
+    }
+
+    async fn create_database(pg: &SharedPg, name: &str) -> PostgresBackend {
+        let (admin, connection) = tokio_postgres::connect(
+            &format!(
+                "host={} port={} dbname=postgres user=postgres password=postgres",
+                pg.host, pg.port
+            ),
+            NoTls,
+        )
+        .await
+        .expect("connect to administrative PostgreSQL");
+        tokio::spawn(connection);
+        admin
+            .execute(&format!("CREATE DATABASE {name}"), &[])
+            .await
+            .expect("create migration database");
+        drop(admin);
+
+        PostgresBackend::new(PostgresConfig {
+            host: pg.host.clone(),
+            port: pg.port,
+            dbname: name.to_string(),
+            user: "postgres".to_string(),
+            password: Some("postgres".to_string()),
+            max_connections: 2,
+            ..Default::default()
+        })
+        .await
+        .expect("connect migration test backend")
+    }
+
+    async fn migrate_through_v36(client: &deadpool_postgres::Client) -> StorageResult<()> {
+        assert_eq!(get_schema_version(client).await?, 0);
+        create_schema_v1(client).await?;
+        set_schema_version(client, 1).await?;
+        migrate_v1_to_v2(client).await?;
+        set_schema_version(client, 2).await?;
+        migrate_v2_to_v3(client).await?;
+        set_schema_version(client, 3).await?;
+        migrate_v3_to_v4(client).await?;
+        set_schema_version(client, 4).await?;
+        migrate_v4_to_v5(client).await?;
+        set_schema_version(client, 5).await?;
+        migrate_v5_to_v6(client).await?;
+        set_schema_version(client, 6).await?;
+        migrate_v6_to_v7(client).await?;
+        set_schema_version(client, 7).await?;
+        migrate_v7_to_v8(client).await?;
+        set_schema_version(client, 8).await?;
+        migrate_v8_to_v9(client).await?;
+        set_schema_version(client, 9).await?;
+        migrate_v9_to_v10(client).await?;
+        set_schema_version(client, 10).await?;
+        migrate_v10_to_v11(client).await?;
+        set_schema_version(client, 11).await?;
+        migrate_v11_to_v12(client).await?;
+        set_schema_version(client, 12).await?;
+        migrate_v12_to_v13(client).await?;
+        set_schema_version(client, 13).await?;
+        migrate_v13_to_v14(client).await?;
+        set_schema_version(client, 14).await?;
+        migrate_v14_to_v15(client).await?;
+        set_schema_version(client, 15).await?;
+        migrate_v15_to_v16(client).await?;
+        set_schema_version(client, 16).await?;
+        migrate_v16_to_v17(client).await?;
+        set_schema_version(client, 17).await?;
+        migrate_v17_to_v18(client).await?;
+        set_schema_version(client, 18).await?;
+        migrate_v18_to_v19(client).await?;
+        set_schema_version(client, 19).await?;
+        migrate_v19_to_v20(client).await?;
+        set_schema_version(client, 20).await?;
+        migrate_v20_to_v21(client).await?;
+        set_schema_version(client, 21).await?;
+        migrate_v21_to_v22(client).await?;
+        set_schema_version(client, 22).await?;
+        migrate_v22_to_v23(client).await?;
+        set_schema_version(client, 23).await?;
+        migrate_v23_to_v24(client).await?;
+        set_schema_version(client, 24).await?;
+        migrate_v24_to_v25(client).await?;
+        set_schema_version(client, 25).await?;
+        migrate_v25_to_v26(client).await?;
+        set_schema_version(client, 26).await?;
+        migrate_v26_to_v27(client).await?;
+        set_schema_version(client, 27).await?;
+        migrate_v27_to_v28(client).await?;
+        set_schema_version(client, 28).await?;
+        migrate_v28_to_v29(client).await?;
+        set_schema_version(client, 29).await?;
+        migrate_v29_to_v30(client).await?;
+        set_schema_version(client, 30).await?;
+        migrate_v30_to_v31(client).await?;
+        set_schema_version(client, 31).await?;
+        migrate_v31_to_v32(client).await?;
+        set_schema_version(client, 32).await?;
+        migrate_v32_to_v33(client).await?;
+        set_schema_version(client, 33).await?;
+        migrate_v33_to_v34(client).await?;
+        set_schema_version(client, 34).await?;
+        migrate_v34_to_v35(client).await?;
+        set_schema_version(client, 35).await?;
+        migrate_v35_to_v36(client).await?;
+        set_schema_version(client, 36).await?;
+        assert_eq!(get_schema_version(client).await?, 36);
+        Ok(())
+    }
+
+    async fn seed_submission(
+        client: &deadpool_postgres::Client,
+        tenant: &str,
+        submitter: &str,
+        submission: &str,
+    ) {
+        client
+            .execute(
+                "INSERT INTO bulk_submissions
+                 (tenant_id, submitter, submission_id, status, created_at, updated_at)
+                 VALUES ($1, $2, $3, 'complete', $4, $4)",
+                &[&tenant, &submitter, &submission, &Utc::now()],
+            )
+            .await
+            .expect("seed submission");
+    }
+
+    #[allow(clippy::too_many_arguments)] // Explicit legacy-schema fixture columns.
+    async fn seed_manifest(
+        client: &deadpool_postgres::Client,
+        tenant: &str,
+        submitter: &str,
+        submission: &str,
+        manifest: &str,
+        url: Option<&str>,
+        status: &str,
+        fencing_token: i64,
+    ) {
+        client
+            .execute(
+                "INSERT INTO bulk_manifests
+                 (tenant_id, submitter, submission_id, manifest_id, manifest_url,
+                  status, added_at, fencing_token)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+                &[
+                    &tenant,
+                    &submitter,
+                    &submission,
+                    &manifest,
+                    &url,
+                    &status,
+                    &Utc::now(),
+                    &fencing_token,
+                ],
+            )
+            .await
+            .expect("seed manifest");
+    }
+
+    #[allow(clippy::too_many_arguments)] // Explicit legacy-schema fixture columns.
+    async fn seed_file(
+        client: &deadpool_postgres::Client,
+        tenant: &str,
+        submitter: &str,
+        submission: &str,
+        url: Option<&str>,
+        file_type: &str,
+        resource_type: Option<&str>,
+        part_index: i32,
+        fencing_token: i64,
+        file_path: &str,
+        line_count: i64,
+        byte_count: i64,
+        count_severity: Option<&str>,
+    ) -> i64 {
+        client
+            .query_one(
+                "INSERT INTO bulk_submit_files
+                 (tenant_id, submitter, submission_id, manifest_url, file_type,
+                  resource_type, part_index, fencing_token, file_path, line_count,
+                  byte_count, count_severity, created_at)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+                 RETURNING id",
+                &[
+                    &tenant,
+                    &submitter,
+                    &submission,
+                    &url,
+                    &file_type,
+                    &resource_type,
+                    &part_index,
+                    &fencing_token,
+                    &file_path,
+                    &line_count,
+                    &byte_count,
+                    &count_severity,
+                    &Utc::now(),
+                ],
+            )
+            .await
+            .expect("seed file")
+            .get::<_, i64>(0)
+    }
+
+    async fn classification(
+        client: &deadpool_postgres::Client,
+        id: i64,
+    ) -> (Option<String>, Option<String>) {
+        let row = client
+            .query_one(
+                "SELECT manifest_id, publication_excluded_reason
+                 FROM bulk_submit_files WHERE id = $1",
+                &[&id],
+            )
+            .await
+            .expect("read artifact classification");
+        (row.get(0), row.get(1))
+    }
+
+    async fn publication_marker(
+        client: &deadpool_postgres::Client,
+        tenant: &str,
+        submitter: &str,
+        submission: &str,
+        manifest: &str,
+    ) -> (Option<i64>, Option<String>, Option<String>, Option<String>) {
+        let row = client
+            .query_one(
+                "SELECT published_token, publication_status, publication_error_message,
+                        publication_worker_id
+                 FROM bulk_manifests
+                 WHERE tenant_id = $1 AND submitter = $2
+                   AND submission_id = $3 AND manifest_id = $4",
+                &[&tenant, &submitter, &submission, &manifest],
+            )
+            .await
+            .expect("read publication marker");
+        (row.get(0), row.get(1), row.get(2), row.get(3))
+    }
+
+    async fn index_count(client: &deadpool_postgres::Client) -> i64 {
+        client
+            .query_one(
+                "SELECT COUNT(*) FROM pg_indexes
+                 WHERE schemaname = current_schema()
+                   AND indexname IN (
+                       'idx_bulk_submit_files_artifact_null',
+                       'idx_bulk_submit_files_artifact_not_null'
+                   )",
+                &[],
+            )
+            .await
+            .expect("count publication indexes")
+            .get::<_, i64>(0)
+    }
+
+    async fn column_type(
+        client: &deadpool_postgres::Client,
+        table: &str,
+        column: &str,
+    ) -> Option<String> {
+        client
+            .query_opt(
+                "SELECT data_type FROM information_schema.columns
+                 WHERE table_schema = current_schema()
+                   AND table_name = $1 AND column_name = $2",
+                &[&table, &column],
+            )
+            .await
+            .expect("read column type")
+            .map(|row| row.get(0))
+    }
+
+    #[tokio::test]
+    async fn postgres_integration_v36_to_v37_classifies_and_enforces_uniqueness() {
+        let _guard = POSTGRES_TEST_LOCK.lock().await;
+        let pg = shared_pg().await;
+        let backend = create_database(
+            pg,
+            &format!("hfs_v37_test_{}", uuid::Uuid::new_v4().simple()),
+        )
+        .await;
+        let client = backend.get_client().await.unwrap();
+        migrate_through_v36(&client).await.unwrap();
+
+        // Same submitter/submission/URL/token in two tenant scopes must both
+        // be assigned. This is a direct regression for cross-scope bleed.
+        let mut shared_rows = Vec::new();
+        for tenant in ["tenant-a", "tenant-b"] {
+            seed_submission(&client, tenant, "alice", "shared-submission").await;
+            seed_manifest(
+                &client,
+                tenant,
+                "alice",
+                "shared-submission",
+                "shared-manifest",
+                Some("https://provider/shared.json"),
+                "completed",
+                1,
+            )
+            .await;
+            let shared = seed_file(
+                &client,
+                tenant,
+                "alice",
+                "shared-submission",
+                Some("https://provider/shared.json"),
+                "output",
+                Some("Patient"),
+                0,
+                1,
+                "shared/path.ndjson",
+                1,
+                10,
+                None,
+            )
+            .await;
+            shared_rows.push(shared);
+        }
+
+        seed_submission(&client, "tenant-a", "alice", "terminal-submission").await;
+        seed_manifest(
+            &client,
+            "tenant-a",
+            "alice",
+            "terminal-submission",
+            "manifest-completed",
+            Some("https://provider/completed.json"),
+            "completed",
+            2,
+        )
+        .await;
+        seed_manifest(
+            &client,
+            "tenant-a",
+            "alice",
+            "terminal-submission",
+            "manifest-failed",
+            Some("https://provider/failed.json"),
+            "failed",
+            3,
+        )
+        .await;
+        let completed = seed_file(
+            &client,
+            "tenant-a",
+            "alice",
+            "terminal-submission",
+            Some("https://provider/completed.json"),
+            "output",
+            Some("Patient"),
+            0,
+            2,
+            "completed/output-0.ndjson",
+            1,
+            10,
+            None,
+        )
+        .await;
+        let failed = seed_file(
+            &client,
+            "tenant-a",
+            "alice",
+            "terminal-submission",
+            Some("https://provider/failed.json"),
+            "error",
+            Some("OperationOutcome"),
+            0,
+            3,
+            "failed/error-0.ndjson",
+            2,
+            20,
+            Some(r#"{"error":2,"warning":1}"#),
+        )
+        .await;
+        let exact_duplicate = seed_file(
+            &client,
+            "tenant-a",
+            "alice",
+            "terminal-submission",
+            Some("https://provider/completed.json"),
+            "output",
+            Some("Patient"),
+            0,
+            2,
+            "completed/output-0.ndjson",
+            1,
+            10,
+            None,
+        )
+        .await;
+
+        seed_submission(&client, "tenant-a", "alice", "typed-submission").await;
+        seed_manifest(
+            &client,
+            "tenant-a",
+            "alice",
+            "typed-submission",
+            "manifest-typed",
+            Some("https://provider/types.json"),
+            "completed",
+            4,
+        )
+        .await;
+        let null_type = seed_file(
+            &client,
+            "tenant-a",
+            "alice",
+            "typed-submission",
+            Some("https://provider/types.json"),
+            "output",
+            None,
+            0,
+            4,
+            "types/null.ndjson",
+            1,
+            10,
+            None,
+        )
+        .await;
+        let empty_type = seed_file(
+            &client,
+            "tenant-a",
+            "alice",
+            "typed-submission",
+            Some("https://provider/types.json"),
+            "output",
+            Some(""),
+            0,
+            4,
+            "types/empty.ndjson",
+            1,
+            10,
+            None,
+        )
+        .await;
+
+        let mut quarantined = Vec::new();
+        for (submission, malformed) in [("conflict", false), ("malformed", true)] {
+            seed_submission(&client, "tenant-a", "alice", submission).await;
+            seed_manifest(
+                &client,
+                "tenant-a",
+                "alice",
+                submission,
+                submission,
+                Some("https://provider/quarantine"),
+                "completed",
+                9,
+            )
+            .await;
+            let row = seed_file(
+                &client,
+                "tenant-a",
+                "alice",
+                submission,
+                Some("https://provider/quarantine"),
+                "error",
+                Some("OperationOutcome"),
+                0,
+                9,
+                "legacy-path",
+                1,
+                10,
+                if malformed { Some("{broken") } else { None },
+            )
+            .await;
+            quarantined.push((
+                row,
+                if malformed {
+                    LEGACY_REASON_INVALID_DOMAIN
+                } else {
+                    LEGACY_REASON_CONFLICTING_DUPLICATE
+                },
+            ));
+            if !malformed {
+                let duplicate = seed_file(
+                    &client,
+                    "tenant-a",
+                    "alice",
+                    submission,
+                    Some("https://provider/quarantine"),
+                    "error",
+                    Some("OperationOutcome"),
+                    0,
+                    9,
+                    "conflicting-path",
+                    1,
+                    10,
+                    None,
+                )
+                .await;
+                quarantined.push((duplicate, LEGACY_REASON_CONFLICTING_DUPLICATE));
+            }
+        }
+        let before_count: i64 = client
+            .query_one("SELECT COUNT(*) FROM bulk_submit_files", &[])
+            .await
+            .unwrap()
+            .get(0);
+        let mut migration_client = backend.get_client().await.unwrap();
+        initialize_schema(&mut migration_client)
+            .await
+            .expect("initialize v37");
+        for row in shared_rows {
+            assert_eq!(
+                classification(&client, row).await,
+                (Some("shared-manifest".into()), None)
+            );
+        }
+        for (row, reason) in quarantined {
+            assert_eq!(
+                classification(&client, row).await,
+                (None, Some(reason.into()))
+            );
+        }
+        let after_count: i64 = client
+            .query_one("SELECT COUNT(*) FROM bulk_submit_files", &[])
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(before_count, after_count);
+        let malformed: String = client
+            .query_one(
+                "SELECT count_severity FROM bulk_submit_files WHERE submission_id = 'malformed'",
+                &[],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(malformed, "{broken");
+
+        assert_eq!(get_schema_version(&client).await.unwrap(), 37);
+        assert_eq!(index_count(&client).await, 2);
+        assert_eq!(
+            column_type(&client, "bulk_manifests", "published_token").await,
+            Some("bigint".to_string())
+        );
+        assert_eq!(
+            column_type(&client, "bulk_manifests", "publication_status").await,
+            Some("text".to_string())
+        );
+        assert_eq!(
+            column_type(&client, "bulk_manifests", "publication_error_message").await,
+            Some("text".to_string())
+        );
+        assert_eq!(
+            column_type(&client, "bulk_manifests", "publication_worker_id").await,
+            Some("text".to_string())
+        );
+        assert_eq!(
+            column_type(&client, "bulk_submit_files", "manifest_id").await,
+            Some("text".to_string())
+        );
+        assert_eq!(
+            column_type(&client, "bulk_submit_files", "publication_excluded_reason").await,
+            Some("text".to_string())
+        );
+        assert_eq!(
+            classification(&client, completed).await,
+            (Some("manifest-completed".to_string()), None)
+        );
+        assert_eq!(
+            classification(&client, failed).await,
+            (Some("manifest-failed".to_string()), None)
+        );
+        assert_eq!(
+            classification(&client, exact_duplicate).await,
+            (None, Some(LEGACY_REASON_EXACT_DUPLICATE.to_string()))
+        );
+        assert_eq!(
+            classification(&client, null_type).await,
+            (Some("manifest-typed".to_string()), None)
+        );
+        assert_eq!(
+            classification(&client, empty_type).await,
+            (Some("manifest-typed".to_string()), None)
+        );
+        assert_eq!(
+            publication_marker(
+                &client,
+                "tenant-a",
+                "alice",
+                "terminal-submission",
+                "manifest-completed"
+            )
+            .await,
+            (Some(2), Some("completed".to_string()), None, None)
+        );
+        assert_eq!(
+            publication_marker(
+                &client,
+                "tenant-a",
+                "alice",
+                "terminal-submission",
+                "manifest-failed"
+            )
+            .await,
+            (Some(3), Some("failed".to_string()), None, None)
+        );
+
+        for resource_type in [None::<&str>, Some("")] {
+            let error = client
+                .execute(
+                    "INSERT INTO bulk_submit_files
+                     (tenant_id, submitter, submission_id, manifest_id, manifest_url,
+                      file_type, resource_type, part_index, fencing_token, file_path,
+                      line_count, byte_count, created_at)
+                     VALUES ('tenant-a', 'alice', 'typed-submission', 'manifest-typed',
+                             'https://provider/types.json', 'output', $1, 0, 4,
+                             'types/duplicate.ndjson', 1, 10, $2)",
+                    &[&resource_type, &Utc::now()],
+                )
+                .await
+                .expect_err("duplicate resource_type must violate the partial index");
+            assert_eq!(
+                error.code(),
+                Some(&tokio_postgres::error::SqlState::UNIQUE_VIOLATION)
+            );
+        }
+        let null_count = client
+            .query_one(
+                "SELECT COUNT(*) FROM bulk_submit_files
+                 WHERE manifest_id = 'manifest-typed'
+                   AND publication_excluded_reason IS NULL AND resource_type IS NULL",
+                &[],
+            )
+            .await
+            .unwrap()
+            .get::<_, i64>(0);
+        let empty_count = client
+            .query_one(
+                "SELECT COUNT(*) FROM bulk_submit_files
+                 WHERE manifest_id = 'manifest-typed'
+                   AND publication_excluded_reason IS NULL AND resource_type = ''",
+                &[],
+            )
+            .await
+            .unwrap()
+            .get::<_, i64>(0);
+        assert_eq!(null_count, 1);
+        assert_eq!(empty_count, 1);
+        assert_eq!(index_count(&client).await, 2);
+    }
+
+    #[tokio::test]
+    async fn postgres_integration_v36_to_v37_rolls_back_trigger_failure_and_replays() {
+        let _guard = POSTGRES_TEST_LOCK.lock().await;
+        let pg = shared_pg().await;
+        let backend = create_database(
+            pg,
+            &format!("hfs_v37_test_{}", uuid::Uuid::new_v4().simple()),
+        )
+        .await;
+        let client = backend.get_client().await.unwrap();
+        migrate_through_v36(&client).await.unwrap();
+        seed_submission(&client, "tenant-a", "alice", "submission-rollback").await;
+        seed_manifest(
+            &client,
+            "tenant-a",
+            "alice",
+            "submission-rollback",
+            "manifest-rollback",
+            Some("https://provider/rollback.json"),
+            "completed",
+            5,
+        )
+        .await;
+        let output = seed_file(
+            &client,
+            "tenant-a",
+            "alice",
+            "submission-rollback",
+            Some("https://provider/rollback.json"),
+            "output",
+            Some("Patient"),
+            0,
+            5,
+            "rollback/output-0.ndjson",
+            1,
+            10,
+            None,
+        )
+        .await;
+        let before = client
+            .query_one(
+                "SELECT to_jsonb(f) FROM bulk_submit_files f WHERE id = $1",
+                &[&output],
+            )
+            .await
+            .unwrap();
+
+        client
+            .batch_execute(&format!(
+                "CREATE FUNCTION fail_v37_update() RETURNS trigger LANGUAGE plpgsql AS $$
+                 BEGIN RAISE EXCEPTION 'injected v37 publication failure'; END $$;
+                 CREATE TRIGGER fail_v37_classification BEFORE UPDATE ON bulk_submit_files
+                 FOR EACH ROW WHEN (OLD.id = {output})
+                 EXECUTE FUNCTION fail_v37_update();"
+            ))
+            .await
+            .expect("create failing trigger");
+        let mut migration_client = backend.get_client().await.unwrap();
+        let error = initialize_schema(&mut migration_client)
+            .await
+            .expect_err("rollback expected");
+        assert!(error.to_string().contains("assign artifact"), "{error}");
+
+        // Because all DDL, classification, indexes, and the version marker run
+        // in one transaction, none of them survive the trigger failure.
+        assert_eq!(get_schema_version(&client).await.unwrap(), 36);
+        for (table, column) in [
+            ("bulk_manifests", "published_token"),
+            ("bulk_manifests", "publication_status"),
+            ("bulk_manifests", "publication_error_message"),
+            ("bulk_manifests", "publication_worker_id"),
+            ("bulk_submit_files", "manifest_id"),
+            ("bulk_submit_files", "publication_excluded_reason"),
+        ] {
+            assert_eq!(
+                column_type(&client, table, column).await,
+                None,
+                "{table}.{column} must roll back"
+            );
+        }
+        assert_eq!(index_count(&client).await, 0);
+        let after = client
+            .query_one(
+                "SELECT to_jsonb(f) FROM bulk_submit_files f WHERE id = $1",
+                &[&output],
+            )
+            .await
+            .unwrap();
+        assert_eq!(after.get::<_, Value>(0), before.get::<_, Value>(0));
+
+        client
+            .batch_execute(
+                "DROP TRIGGER fail_v37_classification ON bulk_submit_files;
+                 DROP FUNCTION fail_v37_update();",
+            )
+            .await
+            .expect("drop failing trigger");
+        initialize_schema(&mut migration_client)
+            .await
+            .expect("retry v37");
+        assert_eq!(get_schema_version(&client).await.unwrap(), 37);
+        assert_eq!(
+            classification(&client, output).await,
+            (Some("manifest-rollback".to_string()), None)
+        );
+        assert_eq!(
+            publication_marker(
+                &client,
+                "tenant-a",
+                "alice",
+                "submission-rollback",
+                "manifest-rollback"
+            )
+            .await,
+            (Some(5), Some("completed".to_string()), None, None)
+        );
+        assert_eq!(index_count(&client).await, 2);
+    }
+
+    #[tokio::test]
+    async fn postgres_integration_v36_to_v37_replays_without_reclassification() {
+        let _guard = POSTGRES_TEST_LOCK.lock().await;
+        let pg = shared_pg().await;
+        let backend = create_database(
+            pg,
+            &format!("hfs_v37_test_{}", uuid::Uuid::new_v4().simple()),
+        )
+        .await;
+        let client = backend.get_client().await.unwrap();
+        migrate_through_v36(&client).await.unwrap();
+        seed_submission(&client, "tenant-a", "alice", "submission-replay").await;
+        seed_manifest(
+            &client,
+            "tenant-a",
+            "alice",
+            "submission-replay",
+            "manifest-replay",
+            Some("https://provider/replay.json"),
+            "completed",
+            6,
+        )
+        .await;
+        let output = seed_file(
+            &client,
+            "tenant-a",
+            "alice",
+            "submission-replay",
+            Some("https://provider/replay.json"),
+            "output",
+            Some("Patient"),
+            0,
+            6,
+            "replay/output-0.ndjson",
+            1,
+            10,
+            None,
+        )
+        .await;
+        let mut migration_client = backend.get_client().await.unwrap();
+        initialize_schema(&mut migration_client)
+            .await
+            .expect("initialize v37");
+        let first_marker = publication_marker(
+            &client,
+            "tenant-a",
+            "alice",
+            "submission-replay",
+            "manifest-replay",
+        )
+        .await;
+        let first_classification = classification(&client, output).await;
+        assert_eq!(
+            first_classification,
+            (Some("manifest-replay".to_string()), None)
+        );
+
+        // A current database must not re-run legacy classification and must
+        // preserve both the artifact assignment and publication marker.
+        client
+            .execute(
+                "UPDATE bulk_manifests SET publication_worker_id = 'preserved-publisher'",
+                &[],
+            )
+            .await
+            .unwrap();
+        migrate_v36_to_v37(&mut migration_client)
+            .await
+            .expect("replay current");
+        assert_eq!(get_schema_version(&client).await.unwrap(), 37);
+        assert_eq!(
+            publication_marker(
+                &client,
+                "tenant-a",
+                "alice",
+                "submission-replay",
+                "manifest-replay"
+            )
+            .await,
+            (
+                first_marker.0,
+                first_marker.1,
+                first_marker.2,
+                Some("preserved-publisher".into())
+            )
+        );
+        assert_eq!(classification(&client, output).await, first_classification);
+        assert_eq!(index_count(&client).await, 2);
+    }
 }

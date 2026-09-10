@@ -216,7 +216,7 @@ where
         limits,
     )
     .await
-    .map_err(|e| RestError::UnprocessableEntity { message: e })?;
+    .map_err(sqlquery_err_to_rest)?;
 
     // SoF v2 PR #353: apply caller-supplied `_limit` as a soft cap on the
     // final result set, AFTER SQL evaluation (including any in-query LIMIT).
@@ -524,5 +524,37 @@ pub(crate) fn sqlquery_err_to_rest(e: SqlQueryError) -> RestError {
                 message: format!("SQLite error: {err}"),
             }
         }
+        SqlQueryError::Internal(message) => RestError::InternalError { message },
+        SqlQueryError::SourceStream(msg) => RestError::InternalError {
+            message: format!("dependency source failed: {msg}"),
+        },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn source_stream_and_internal_errors_map_to_500() {
+        let source_stream = sqlquery_err_to_rest(SqlQueryError::SourceStream("x".into()));
+        assert_eq!(
+            source_stream.client_response().0,
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+
+        let internal = sqlquery_err_to_rest(SqlQueryError::Internal("y".into()));
+        assert_eq!(
+            internal.client_response().0,
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+
+        // A source failure must never be reported as if the client sent a
+        // malformed request: row-cap violations still answer 422.
+        let row_cap = sqlquery_err_to_rest(SqlQueryError::RowCapExceeded { max: 5 });
+        assert_eq!(
+            row_cap.client_response().0,
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
     }
 }
