@@ -65,6 +65,9 @@ json-patch = "3"
 humantime = "2"
 futures = "0.3"
 unicode-normalization = "0.1"
+# Bulk-submit result receipts spool to a per-run temp directory (#982) instead
+# of accumulating in memory. Uses the platform temp dir, so `TMPDIR` isolates it.
+tempfile = "3"
 
 # SQLite backend
 rusqlite = { version = "0.33", features = ["bundled", "serde_json", "functions"], optional = true }
@@ -128,7 +131,6 @@ rustdoc-args = ["--cfg", "docsrs"]
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
 tokio-test = "0.4"
-tempfile = "3"
 criterion = { version = "0.5", features = ["async_tokio"] }
 testcontainers-modules = { version = "0.15", features = ["postgres", "elastic_search", "minio", "mongo"] }
 paste = "1.0"
