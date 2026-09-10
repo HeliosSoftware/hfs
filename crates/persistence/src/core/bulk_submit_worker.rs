@@ -30,6 +30,7 @@ use crate::core::bulk_submit::{
 use crate::core::bulk_submit_input::{RemoteFile, SubmitInputFetcher};
 use crate::core::bulk_submit_output::submit_artifact_key;
 use crate::core::bulk_submit_publication::{ManifestPublicationResult, ManifestPublicationStatus};
+use crate::core::bulk_submit_receipts::{ReceiptSpools, SPOOL_BUFFER_BYTES, Spool};
 use crate::error::{StorageError, StorageResult};
 use crate::tenant::TenantContext;
 
@@ -1214,13 +1215,33 @@ where
         }
 
         // 3. Emit per-type `output` receipts and an aggregated `error` artifact.
+        // Receipts spool to disk and replay part by part, so the lease has to
+        // cover the whole step: a reclaimed manifest must not keep writing
+        // artifacts a second worker is about to produce as well.
         if keeper.lease_lost() {
             return Ok(());
         }
-        records.extend(
-            self.write_result_artifacts(&lease, &manifest_url, view.fhir_version, failed)
-                .await?,
-        );
+        let receipts = tokio::select! {
+            biased;
+            _ = keeper.lost() => None,
+            receipts = self.write_result_artifacts(
+                &lease,
+                &manifest_url,
+                view.fhir_version,
+                failed,
+            ) => Some(receipts?),
+        };
+        let Some(receipts) = receipts else {
+            tracing::warn!(
+                submission = %lease.submission_id,
+                manifest = %lease.manifest_id,
+                worker = %lease.worker_id,
+                "bulk-submit run abandoned while writing result receipts: its lease \
+                 is no longer held"
+            );
+            return Ok(());
+        };
+        records.extend(receipts);
 
         // 4. Publish all finalized artifacts and the terminal state together
         // where the storage engine supports it.
@@ -1244,7 +1265,8 @@ where
     }
 
     /// Reads back this manifest's entry results and writes `output` receipts
-    /// (grouped by resource type) plus a single aggregated `error` artifact.
+    /// (grouped by resource type) plus a single aggregated `error` artifact,
+    /// spooling them to disk instead of holding the receipt set in memory (#982).
     async fn write_result_artifacts(
         &self,
         lease: &ManifestLease,
@@ -1264,52 +1286,55 @@ where
                 )
                 .await
         });
-        self.write_result_artifact_pages(lease, manifest_url, failed_count, pages)
+        let spools = ReceiptSpools::new()?;
+        self.write_result_artifact_pages(spools, lease, manifest_url, failed_count, pages)
             .await
     }
 
+    /// Streams the entry-result pages into spools, then replays them into parts.
+    ///
+    /// The spools are owned by the caller so a test can watch the directory a
+    /// run spools into; production callers hand in a fresh temp directory.
     async fn write_result_artifact_pages(
         &self,
+        mut spools: ReceiptSpools,
         lease: &ManifestLease,
         manifest_url: &str,
         failed_count: u64,
         pages: impl futures::Stream<Item = StorageResult<EntryResultPage>>,
     ) -> StorageResult<Vec<SubmitFileRecord>> {
         use futures::TryStreamExt;
-        let mut all = Vec::new();
-        futures::pin_mut!(pages);
-        while let Some(page) = pages.try_next().await? {
-            all.extend(page.entries.into_iter().map(|entry| entry.result));
-        }
-
-        // Partition successes (by type) and errors.
-        let mut by_type: std::collections::BTreeMap<String, Vec<String>> =
-            std::collections::BTreeMap::new();
-        let mut error_lines: Vec<String> = Vec::new();
         let mut severity: std::collections::BTreeMap<String, u64> =
             std::collections::BTreeMap::new();
 
-        for entry in &all {
-            match entry.outcome {
-                BulkEntryOutcome::Success => {
-                    if let Some(id) = &entry.resource_id {
-                        let line = json!({"reference": format!("{}/{}", entry.resource_type, id)})
-                            .to_string();
-                        by_type
-                            .entry(entry.resource_type.clone())
-                            .or_default()
-                            .push(line);
+        // One page at a time: every entry is consumed, serialized, and dropped
+        // before the next page is fetched, so no page's receipts outlive it.
+        futures::pin_mut!(pages);
+        while let Some(page) = pages.try_next().await? {
+            for paged in page.entries {
+                let mut entry = paged.result;
+                match entry.outcome {
+                    BulkEntryOutcome::Success => {
+                        if let Some(id) = &entry.resource_id {
+                            let line =
+                                json!({"reference": format!("{}/{}", entry.resource_type, id)})
+                                    .to_string();
+                            spools.push_output(&entry.resource_type, &line).await?;
+                        }
                     }
+                    BulkEntryOutcome::ValidationError | BulkEntryOutcome::ProcessingError => {
+                        // The stored outcome carries the error; a result without
+                        // one still gets a receipt in the same shape.
+                        let stored = entry.operation_outcome.take();
+                        let oo = match stored {
+                            Some(oo) => oo,
+                            None => default_error_outcome(&entry),
+                        };
+                        tally_severity(&oo, &mut severity);
+                        spools.push_error(&oo.to_string()).await?;
+                    }
+                    BulkEntryOutcome::Skipped => {}
                 }
-                BulkEntryOutcome::ValidationError | BulkEntryOutcome::ProcessingError => {
-                    let oo = entry
-                        .operation_outcome
-                        .clone()
-                        .unwrap_or_else(|| default_error_outcome(entry));
-                    tally_severity(&oo, &mut severity);
-                    error_lines.push(oo.to_string());
-                }
-                BulkEntryOutcome::Skipped => {}
             }
         }
 
@@ -1317,7 +1342,7 @@ where
         // persist them as per-line entry results. Surface any such uncaptured
         // failures as a summary OperationOutcome so the status manifest's `error`
         // array reflects them (partial success).
-        let recorded_errors = error_lines.len() as u64;
+        let recorded_errors = spools.error_rows();
         if failed_count > recorded_errors {
             let uncaptured = failed_count - recorded_errors;
             let oo = json!({
@@ -1332,13 +1357,19 @@ where
                 }]
             });
             tally_severity(&oo, &mut severity);
-            error_lines.push(oo.to_string());
+            spools.push_error(&oo.to_string()).await?;
         }
+
+        // Replay publishes the spool counters, so every writer has to be closed
+        // first.
+        spools.close_writers().await?;
 
         let mut records = Vec::new();
 
-        // Write one `output` part per resource type.
-        for (idx, (resource_type, lines)) in by_type.iter().enumerate() {
+        // Replay one `output` part per observed resource type, alphabetically,
+        // with a dense part index: a type that produced no success receipt has no
+        // spool and consumes no index.
+        for (idx, (resource_type, spool)) in spools.take_outputs().into_iter().enumerate() {
             let key = submit_artifact_key(
                 &lease.tenant,
                 &lease.submission_id,
@@ -1348,21 +1379,25 @@ where
                 idx as u32,
                 lease.fencing_token,
             );
-            let part = self.write_part(&key, lines).await?;
+            let (line_count, byte_count) = self.replay_receipt_spool(&spools, &key, &spool).await?;
             records.push(SubmitFileRecord {
                 manifest_url: Some(manifest_url.to_string()),
                 file_type: "output".to_string(),
-                resource_type: Some(resource_type.clone()),
+                resource_type: Some(resource_type),
                 part_index: idx as u32,
                 file_path: key.resource_type,
-                line_count: part.0,
-                byte_count: part.1,
+                line_count,
+                byte_count,
                 count_severity: None,
             });
+            // The bytes are never replayed twice: dropping the file now keeps the
+            // disk peak lower while the remaining parts and any store scratch
+            // coexist.
+            spools.remove(&spool).await;
         }
 
-        // Write a single aggregated `error` part (if any).
-        if !error_lines.is_empty() {
+        // Write a single aggregated `error` part (if any), last.
+        if let Some(spool) = spools.take_error() {
             let key = submit_artifact_key(
                 &lease.tenant,
                 &lease.submission_id,
@@ -1372,7 +1407,7 @@ where
                 0,
                 lease.fencing_token,
             );
-            let part = self.write_part(&key, &error_lines).await?;
+            let (line_count, byte_count) = self.replay_receipt_spool(&spools, &key, &spool).await?;
             let count_severity = Value::Object(
                 severity
                     .into_iter()
@@ -1385,12 +1420,63 @@ where
                 resource_type: Some("OperationOutcome".to_string()),
                 part_index: 0,
                 file_path: key.resource_type,
-                line_count: part.0,
-                byte_count: part.1,
+                line_count,
+                byte_count,
                 count_severity: Some(count_severity),
             });
+            spools.remove(&spool).await;
         }
         Ok(records)
+    }
+
+    /// Copies one receipt spool into a finalized output part.
+    ///
+    /// The spool already holds exactly the serialized rows — one trailing
+    /// newline each — so replay is a fixed-size byte copy into the part writer's
+    /// sink: no row is re-serialized, parsed, or rematerialized, which is what
+    /// keeps an oversized OperationOutcome from being allocated a second time.
+    /// The part's counters come from the spool bookkeeping that counted those
+    /// bytes. A spool that does not replay exactly that many bytes fails the
+    /// manifest rather than publishing counts that disagree with the artifact.
+    async fn replay_receipt_spool(
+        &self,
+        spools: &ReceiptSpools,
+        key: &ExportPartKey,
+        spool: &Spool,
+    ) -> StorageResult<(u64, u64)> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut reader = spools.open_reader(spool).await?;
+        let mut writer = self.output.open_writer(key).await?;
+        let mut chunk = vec![0_u8; SPOOL_BUFFER_BYTES];
+        let mut copied: u64 = 0;
+        loop {
+            let read = reader.read(&mut chunk).await.map_err(|e| {
+                crate::error::StorageError::Backend(crate::error::BackendError::Internal {
+                    backend_name: "bulk-submit-output".to_string(),
+                    message: format!("read receipt spool: {e}"),
+                    source: None,
+                })
+            })?;
+            if read == 0 {
+                break;
+            }
+            writer
+                .writer
+                .write_all(&chunk[..read])
+                .await
+                .map_err(artifact_write_error)?;
+            copied += read as u64;
+        }
+        if copied != spool.bytes {
+            return Err(internal_error(format!(
+                "receipt spool for {} part {} replayed {copied} bytes, expected {}",
+                key.file_type, key.part_index, spool.bytes
+            )));
+        }
+        writer.line_count = spool.lines;
+        writer.byte_count = spool.bytes;
+        let finalized = self.output.finalize_part(key, writer).await?;
+        Ok((finalized.line_count, finalized.size_bytes))
     }
 
     /// Applies deletions from a `deleted` NDJSON stream (transaction Bundles or
@@ -1544,13 +1630,10 @@ where
     async fn write_part(&self, key: &ExportPartKey, lines: &[String]) -> StorageResult<(u64, u64)> {
         let mut writer = self.output.open_writer(key).await?;
         for line in lines {
-            writer.write_line(line).await.map_err(|e| {
-                crate::error::StorageError::Backend(crate::error::BackendError::Internal {
-                    backend_name: "bulk-submit-output".to_string(),
-                    message: format!("write artifact: {e}"),
-                    source: None,
-                })
-            })?;
+            writer
+                .write_line(line)
+                .await
+                .map_err(artifact_write_error)?;
         }
         let finalized = self.output.finalize_part(key, writer).await?;
         Ok((finalized.line_count, finalized.size_bytes))
@@ -1638,6 +1721,15 @@ fn internal_error(message: impl Into<String>) -> StorageError {
     })
 }
 
+/// Maps a failure writing bytes into an output-store part.
+fn artifact_write_error(e: std::io::Error) -> StorageError {
+    StorageError::Backend(crate::error::BackendError::Internal {
+        backend_name: "bulk-submit-output".to_string(),
+        message: format!("write artifact: {e}"),
+        source: None,
+    })
+}
+
 /// Builds a fallback OperationOutcome when an entry result lacks one.
 fn default_error_outcome(entry: &crate::core::bulk_submit::BulkEntryResult) -> Value {
     json!({
@@ -1674,7 +1766,9 @@ mod tests {
     use crate::backends::local_fs::LocalFsOutputStore;
     use crate::backends::sqlite::SqliteBackend;
     use crate::core::ManifestStatus;
-    use crate::core::bulk_submit::BulkSubmitProvider;
+    use crate::core::bulk_submit::{
+        BulkEntryResult, BulkSubmitProvider, EntryResultContinuation, PagedEntryResult,
+    };
     use crate::core::bulk_submit_input::{RemoteFile, RemoteManifest, submission_output_job_id};
     use crate::core::storage::ResourceStorage;
     use crate::tenant::{TenantContext, TenantId, TenantPermissions};
@@ -1720,11 +1814,23 @@ mod tests {
             WorkerId::new("scripted"),
         );
         let (pages, calls) = scripted_pages::pages();
+        let spool_dir = tempfile::tempdir().unwrap();
+        let spool_path = spool_dir.path().to_path_buf();
         let records = worker
-            .write_result_artifact_pages(&lease, "http://provider/m.json", 0, pages)
+            .write_result_artifact_pages(
+                ReceiptSpools::in_dir(spool_dir),
+                &lease,
+                "http://provider/m.json",
+                0,
+                pages,
+            )
             .await
             .unwrap();
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 3);
+        assert!(
+            !spool_path.exists(),
+            "receipt spools must not outlive the run that built them"
+        );
         assert_eq!(records.len(), 1);
         backend
             .publish_manifest_artifacts(
@@ -1762,6 +1868,1010 @@ mod tests {
                 json!({"reference":"Patient/after-empty"}),
                 json!({"reference":"Patient/exclusive-late"}),
             ]
+        );
+    }
+
+    /// The consumer has to reach the spool between pages instead of passing the
+    /// whole traversal into memory first: the second fetch fails unless the first
+    /// page's oversized row has already put a full writer buffer's worth of bytes
+    /// on disk. The previous in-memory construction spooled nothing at all.
+    #[tokio::test]
+    async fn receipts_reach_the_spool_before_the_next_page_is_fetched() {
+        use tokio::io::AsyncReadExt;
+
+        let backend = Arc::new(SqliteBackend::in_memory().unwrap());
+        backend.init_schema().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let tenant = tenant();
+        let sub = SubmissionId::generate("lazy-receipts");
+        backend
+            .create_submission(&tenant, &sub, None)
+            .await
+            .unwrap();
+        backend
+            .add_manifest(&tenant, &sub, Some("http://provider/lazy.json"), None)
+            .await
+            .unwrap();
+        let lease = backend
+            .claim_next_manifest(&WorkerId::new("lazy-receipts"), StdDuration::from_secs(60))
+            .await
+            .unwrap()
+            .unwrap();
+        let output = Arc::new(LocalFsOutputStore::new(
+            tmp.path().to_path_buf(),
+            "http://localhost",
+        ));
+        let worker = DefaultSubmitWorker::new(
+            backend.clone(),
+            patient_fetcher(""),
+            output.clone(),
+            WorkerId::new("lazy-receipts"),
+        );
+
+        let oversized_id = "p".repeat(SPOOL_BUFFER_BYTES + 4096);
+        let oversized = json!({"reference": format!("Patient/{oversized_id}")}).to_string();
+        let after = json!({"reference": "Patient/after-oversized"}).to_string();
+        let spool_dir = tempfile::tempdir().unwrap();
+        let spool_path = spool_dir.path().to_path_buf();
+        // A row past the writer's buffer cannot be accepted without a full
+        // buffer's worth of bytes having gone through to the file, and that
+        // lower bound is what the next fetch may insist on. The row's trailing
+        // newline can still be sitting in the `BufWriter`, and the file's own
+        // staging buffer is free to hold the tail, so requiring the whole row
+        // would be a race — and flushing per page just to observe it would
+        // change the production buffering to suit a test.
+        let expected_on_disk = SPOOL_BUFFER_BYTES as u64;
+        let spooled_id = oversized_id.clone();
+        let directory = spool_path.clone();
+        let mut script = std::collections::VecDeque::from([
+            (
+                None,
+                EntryResultPage {
+                    entries: vec![PagedEntryResult {
+                        result: BulkEntryResult::success(1, "Patient", spooled_id, true),
+                        stored_identity: None,
+                    }],
+                    next: Some(EntryResultContinuation::Offset(1)),
+                },
+            ),
+            (
+                Some(EntryResultContinuation::Offset(1)),
+                EntryResultPage {
+                    entries: vec![PagedEntryResult {
+                        result: BulkEntryResult::success(2, "Patient", "after-oversized", true),
+                        stored_identity: None,
+                    }],
+                    next: None,
+                },
+            ),
+        ]);
+        let pages = entry_result_pages(move |continuation| {
+            let (expected, page) = script.pop_front().expect("must not fetch after EOF");
+            assert_eq!(continuation, expected, "the opaque token is passed back");
+            let result: StorageResult<EntryResultPage> = match continuation {
+                // Nothing can be on disk before the first page is handed over.
+                None => Ok(page),
+                // A continuation means a previous page was consumed, and its
+                // receipts have to be on disk by now.
+                Some(_) => {
+                    let spooled: u64 = std::fs::read_dir(&directory)
+                        .expect("the spool directory exists while receipts are building")
+                        .map(|entry| entry.unwrap().metadata().unwrap().len())
+                        .sum();
+                    if spooled < expected_on_disk {
+                        Err(internal_error(format!(
+                            "the first page must be spooled before the second is fetched: \
+                             {spooled} bytes on disk, expected at least {expected_on_disk}"
+                        )))
+                    } else {
+                        Ok(page)
+                    }
+                }
+            };
+            std::future::ready(result)
+        });
+
+        let records = worker
+            .write_result_artifact_pages(
+                ReceiptSpools::in_dir(spool_dir),
+                &lease,
+                "http://provider/lazy.json",
+                0,
+                pages,
+            )
+            .await
+            .unwrap();
+        assert!(
+            !spool_path.exists(),
+            "receipt spools must not outlive the run that built them"
+        );
+        assert_eq!(records.len(), 1);
+        let record = &records[0];
+        assert_eq!(
+            (
+                record.file_type.as_str(),
+                record.resource_type.as_deref(),
+                record.part_index
+            ),
+            ("output", Some("Patient"), 0)
+        );
+        assert_eq!(record.line_count, 2);
+        assert_eq!(
+            record.byte_count,
+            (oversized.len() + after.len() + 2) as u64
+        );
+
+        let key = ExportPartKey {
+            tenant_id: tenant.tenant_id().as_str().to_string(),
+            job_id: submission_output_job_id(&sub),
+            resource_type: record.file_path.clone(),
+            file_type: record.file_type.clone(),
+            part_index: record.part_index,
+            fencing_token: lease.fencing_token,
+        };
+        let mut reader = output.open_reader(&key).await.unwrap();
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes).await.unwrap();
+        assert_eq!(bytes.len() as u64, record.byte_count);
+        assert_eq!(bytes, format!("{oversized}\n{after}\n").into_bytes());
+    }
+
+    /// One mixed run over two pages: both sort orders, every outcome that emits
+    /// no receipt, a stored OperationOutcome, a fallback one, and the summary
+    /// for failures the ingestion engine never persisted.
+    #[tokio::test]
+    async fn mixed_outcomes_publish_exact_parts_and_one_summary_error() {
+        use tokio::io::AsyncReadExt;
+
+        let backend = Arc::new(SqliteBackend::in_memory().unwrap());
+        backend.init_schema().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let tenant = tenant();
+        let sub = SubmissionId::generate("mixed-receipts");
+        backend
+            .create_submission(&tenant, &sub, None)
+            .await
+            .unwrap();
+        backend
+            .add_manifest(&tenant, &sub, Some("http://provider/mixed.json"), None)
+            .await
+            .unwrap();
+        let lease = backend
+            .claim_next_manifest(&WorkerId::new("mixed-receipts"), StdDuration::from_secs(60))
+            .await
+            .unwrap()
+            .unwrap();
+        let output = Arc::new(LocalFsOutputStore::new(
+            tmp.path().to_path_buf(),
+            "http://localhost",
+        ));
+        let worker = DefaultSubmitWorker::new(
+            backend.clone(),
+            patient_fetcher(""),
+            output.clone(),
+            WorkerId::new("mixed-receipts"),
+        );
+
+        let stored = json!({
+            "resourceType": "OperationOutcome",
+            "issue": [{
+                "severity": "warning",
+                "code": "informational",
+                "diagnostics": "stored outcome"
+            }]
+        });
+        let fallback = BulkEntryResult {
+            line_number: 5,
+            resource_type: "Observation".to_string(),
+            resource_id: None,
+            created: false,
+            outcome: BulkEntryOutcome::ValidationError,
+            operation_outcome: None,
+        };
+        let without_id = BulkEntryResult {
+            line_number: 4,
+            resource_type: "Patient".to_string(),
+            resource_id: None,
+            created: false,
+            outcome: BulkEntryOutcome::Success,
+            operation_outcome: None,
+        };
+        let mut script = std::collections::VecDeque::from([
+            (
+                None,
+                EntryResultPage {
+                    entries: vec![
+                        PagedEntryResult {
+                            result: BulkEntryResult::success(1, "Patient", "kept", true),
+                            stored_identity: None,
+                        },
+                        PagedEntryResult {
+                            result: BulkEntryResult::success(2, "Observation", "obs", true),
+                            stored_identity: None,
+                        },
+                        PagedEntryResult {
+                            result: BulkEntryResult::skipped(3, "Patient", "duplicate"),
+                            stored_identity: None,
+                        },
+                        PagedEntryResult {
+                            result: without_id,
+                            stored_identity: None,
+                        },
+                        PagedEntryResult {
+                            result: fallback,
+                            stored_identity: None,
+                        },
+                    ],
+                    next: Some(EntryResultContinuation::Offset(1)),
+                },
+            ),
+            (
+                Some(EntryResultContinuation::Offset(1)),
+                EntryResultPage {
+                    entries: vec![PagedEntryResult {
+                        result: BulkEntryResult::processing_error(6, "Patient", stored.clone()),
+                        stored_identity: None,
+                    }],
+                    next: None,
+                },
+            ),
+        ]);
+        let pages = entry_result_pages(move |continuation| {
+            let (expected, page) = script.pop_front().expect("must not fetch after EOF");
+            assert_eq!(continuation, expected, "the opaque token is passed back");
+            std::future::ready(Ok(page))
+        });
+
+        let spool_dir = tempfile::tempdir().unwrap();
+        let spool_path = spool_dir.path().to_path_buf();
+        // Two stored errors are recorded, three parse failures are not.
+        let records = worker
+            .write_result_artifact_pages(
+                ReceiptSpools::in_dir(spool_dir),
+                &lease,
+                "http://provider/mixed.json",
+                5,
+                pages,
+            )
+            .await
+            .unwrap();
+        assert!(!spool_path.exists());
+        assert_eq!(
+            records.len(),
+            3,
+            "Observation, Patient and the aggregated error"
+        );
+
+        // Alphabetical types, dense part index: Observation is part 0 even
+        // though Patient's receipt was stored first.
+        let expected_outputs = [
+            (0, "Observation", "{\"reference\":\"Observation/obs\"}"),
+            (1, "Patient", "{\"reference\":\"Patient/kept\"}"),
+        ];
+        for (index, resource_type, row) in expected_outputs {
+            let record = &records[index];
+            assert_eq!(record.file_type, "output");
+            assert_eq!(record.resource_type.as_deref(), Some(resource_type));
+            assert_eq!(record.part_index, index as u32);
+            assert_eq!(record.count_severity, None);
+            assert_eq!(record.line_count, 1);
+            assert_eq!(record.byte_count, (row.len() + 1) as u64);
+            let expected_key = submit_artifact_key(
+                &tenant,
+                &sub,
+                &lease.manifest_id,
+                "output",
+                Some(resource_type),
+                index as u32,
+                lease.fencing_token,
+            );
+            assert_eq!(record.file_path, expected_key.resource_type);
+            let key = ExportPartKey {
+                tenant_id: tenant.tenant_id().as_str().to_string(),
+                job_id: submission_output_job_id(&sub),
+                resource_type: record.file_path.clone(),
+                file_type: record.file_type.clone(),
+                part_index: record.part_index,
+                fencing_token: lease.fencing_token,
+            };
+            let mut reader = output.open_reader(&key).await.unwrap();
+            let mut bytes = Vec::new();
+            reader.read_to_end(&mut bytes).await.unwrap();
+            assert_eq!(bytes.len() as u64, record.byte_count);
+            assert_eq!(bytes, format!("{row}\n").into_bytes());
+        }
+
+        let error = &records[2];
+        assert_eq!(
+            (
+                error.file_type.as_str(),
+                error.resource_type.as_deref(),
+                error.part_index
+            ),
+            ("error", Some("OperationOutcome"), 0)
+        );
+        assert_eq!(error.line_count, 3);
+        assert_eq!(
+            error.count_severity,
+            Some(json!({"error": 2, "warning": 1}))
+        );
+        let expected_key = submit_artifact_key(
+            &tenant,
+            &sub,
+            &lease.manifest_id,
+            "error",
+            Some("OperationOutcome"),
+            0,
+            lease.fencing_token,
+        );
+        assert_eq!(error.file_path, expected_key.resource_type);
+        let key = ExportPartKey {
+            tenant_id: tenant.tenant_id().as_str().to_string(),
+            job_id: submission_output_job_id(&sub),
+            resource_type: error.file_path.clone(),
+            file_type: error.file_type.clone(),
+            part_index: error.part_index,
+            fencing_token: lease.fencing_token,
+        };
+        let mut reader = output.open_reader(&key).await.unwrap();
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes).await.unwrap();
+        assert_eq!(bytes.len() as u64, error.byte_count);
+        let rows: Vec<Value> = std::str::from_utf8(&bytes)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                json!({"resourceType": "OperationOutcome", "issue": [{
+                    "severity": "error",
+                    "code": "processing",
+                    "diagnostics": "validation-error error on Observation line 5"
+                }]}),
+                stored,
+                json!({"resourceType": "OperationOutcome", "issue": [{
+                    "severity": "error",
+                    "code": "processing",
+                    "diagnostics": "3 submitted resource(s) could not be parsed or did not match the declared resource type"
+                }]}),
+            ]
+        );
+    }
+
+    /// An empty manifest — one listing no output files — stores no entry
+    /// results, so its terminal generation carries no receipts at all.
+    #[tokio::test]
+    async fn a_manifest_without_output_files_publishes_no_artifacts() {
+        let backend = Arc::new(SqliteBackend::in_memory().unwrap());
+        backend.init_schema().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let tenant = tenant();
+        let sub = SubmissionId::generate("empty-receipts");
+        backend
+            .create_submission(&tenant, &sub, None)
+            .await
+            .unwrap();
+        backend
+            .add_manifest(&tenant, &sub, Some("http://provider/empty.json"), None)
+            .await
+            .unwrap();
+        let lease = backend
+            .claim_next_manifest(&WorkerId::new("empty-receipts"), StdDuration::from_secs(60))
+            .await
+            .unwrap()
+            .unwrap();
+        let fetcher = Arc::new(MockFetcher {
+            files: std::collections::HashMap::new(),
+            manifest: RemoteManifest {
+                requires_access_token: false,
+                output: Vec::new(),
+                deleted: Vec::new(),
+            },
+        });
+        let worker = DefaultSubmitWorker::new(
+            backend.clone(),
+            fetcher,
+            Arc::new(LocalFsOutputStore::new(
+                tmp.path().to_path_buf(),
+                "http://localhost",
+            )),
+            WorkerId::new("empty-receipts"),
+        );
+        worker.run_job(lease).await.unwrap();
+
+        assert_eq!(
+            backend.list_manifests(&tenant, &sub).await.unwrap()[0].status,
+            ManifestStatus::Completed
+        );
+        assert!(
+            backend
+                .list_submit_files(&tenant, &sub)
+                .await
+                .unwrap()
+                .is_empty(),
+            "an empty manifest publishes neither output nor error parts"
+        );
+    }
+
+    /// Results that are all errors publish the aggregated `error` part and
+    /// nothing else, and `countSeverity` tallies what the OperationOutcomes
+    /// carry: an unusual severity as itself, an issue with no severity as
+    /// `error`, an empty issue array as nothing, and an outcome with no issue
+    /// array at all as one `error`.
+    #[tokio::test]
+    async fn error_only_results_publish_one_error_part_and_tally_severities() {
+        use tokio::io::AsyncReadExt;
+
+        let backend = Arc::new(SqliteBackend::in_memory().unwrap());
+        backend.init_schema().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let tenant = tenant();
+        let sub = SubmissionId::generate("error-only-receipts");
+        backend
+            .create_submission(&tenant, &sub, None)
+            .await
+            .unwrap();
+        backend
+            .add_manifest(&tenant, &sub, Some("http://provider/error-only.json"), None)
+            .await
+            .unwrap();
+        let lease = backend
+            .claim_next_manifest(
+                &WorkerId::new("error-only-receipts"),
+                StdDuration::from_secs(60),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let output = Arc::new(LocalFsOutputStore::new(
+            tmp.path().to_path_buf(),
+            "http://localhost",
+        ));
+        let worker = DefaultSubmitWorker::new(
+            backend.clone(),
+            patient_fetcher(""),
+            output.clone(),
+            WorkerId::new("error-only-receipts"),
+        );
+
+        let vendor = json!({
+            "resourceType": "OperationOutcome",
+            "issue": [{
+                "severity": "vendor-severity",
+                "code": "processing",
+                "diagnostics": "a severity this build does not know"
+            }]
+        });
+        let unlabelled = json!({
+            "resourceType": "OperationOutcome",
+            "issue": [{
+                "code": "processing",
+                "diagnostics": "an issue without a severity"
+            }]
+        });
+        let no_issues = json!({"resourceType": "OperationOutcome", "issue": []});
+        let no_issue_array = json!({"resourceType": "OperationOutcome"});
+        // A result that stored no OperationOutcome still gets a receipt.
+        let fallback = BulkEntryResult {
+            line_number: 1,
+            resource_type: "Observation".to_string(),
+            resource_id: None,
+            created: false,
+            outcome: BulkEntryOutcome::ValidationError,
+            operation_outcome: None,
+        };
+        let expected_rows = vec![
+            json!({"resourceType": "OperationOutcome", "issue": [{
+                "severity": "error",
+                "code": "processing",
+                "diagnostics": "validation-error error on Observation line 1"
+            }]}),
+            vendor.clone(),
+            unlabelled.clone(),
+            no_issues.clone(),
+            no_issue_array.clone(),
+        ];
+        let mut script = std::collections::VecDeque::from([(
+            None,
+            EntryResultPage {
+                entries: vec![
+                    PagedEntryResult {
+                        result: fallback,
+                        stored_identity: None,
+                    },
+                    PagedEntryResult {
+                        result: BulkEntryResult::processing_error(2, "Patient", vendor),
+                        stored_identity: None,
+                    },
+                    PagedEntryResult {
+                        result: BulkEntryResult::processing_error(3, "Patient", unlabelled),
+                        stored_identity: None,
+                    },
+                    PagedEntryResult {
+                        result: BulkEntryResult::processing_error(4, "Patient", no_issues),
+                        stored_identity: None,
+                    },
+                    PagedEntryResult {
+                        result: BulkEntryResult::processing_error(5, "Patient", no_issue_array),
+                        stored_identity: None,
+                    },
+                ],
+                next: None,
+            },
+        )]);
+        let pages = entry_result_pages(move |continuation| {
+            let (expected, page) = script.pop_front().expect("must not fetch after EOF");
+            assert_eq!(continuation, expected, "the opaque token is passed back");
+            std::future::ready(Ok(page))
+        });
+
+        let spool_dir = tempfile::tempdir().unwrap();
+        let spool_path = spool_dir.path().to_path_buf();
+        // Five recorded errors against a failure count of five: no summary row.
+        let records = worker
+            .write_result_artifact_pages(
+                ReceiptSpools::in_dir(spool_dir),
+                &lease,
+                "http://provider/error-only.json",
+                5,
+                pages,
+            )
+            .await
+            .unwrap();
+        assert!(!spool_path.exists());
+        assert_eq!(
+            records.len(),
+            1,
+            "error-only results publish the error part and no output part"
+        );
+        let error = &records[0];
+        assert_eq!(
+            (
+                error.file_type.as_str(),
+                error.resource_type.as_deref(),
+                error.part_index
+            ),
+            ("error", Some("OperationOutcome"), 0)
+        );
+        assert_eq!(error.line_count, 5);
+        assert_eq!(
+            error.count_severity,
+            Some(json!({"error": 3, "vendor-severity": 1}))
+        );
+
+        let expected_key = submit_artifact_key(
+            &tenant,
+            &sub,
+            &lease.manifest_id,
+            "error",
+            Some("OperationOutcome"),
+            0,
+            lease.fencing_token,
+        );
+        assert_eq!(error.file_path, expected_key.resource_type);
+        let key = ExportPartKey {
+            tenant_id: tenant.tenant_id().as_str().to_string(),
+            job_id: submission_output_job_id(&sub),
+            resource_type: error.file_path.clone(),
+            file_type: error.file_type.clone(),
+            part_index: error.part_index,
+            fencing_token: lease.fencing_token,
+        };
+        let mut reader = output.open_reader(&key).await.unwrap();
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes).await.unwrap();
+        assert_eq!(bytes.len() as u64, error.byte_count);
+        let rows: Vec<Value> = std::str::from_utf8(&bytes)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(rows, expected_rows);
+    }
+
+    /// A spool that vanishes under the run must fail the replay rather than
+    /// publish a part from whatever else is still on disk. The second fetch
+    /// deletes the first type's spool file, so replay reaches the missing file
+    /// after it has already published the type that sorts first. The deletion
+    /// unlinks a file its writer still holds open, which only Unix allows.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_spool_deleted_while_results_stream_fails_the_replay() {
+        let backend = Arc::new(SqliteBackend::in_memory().unwrap());
+        backend.init_schema().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let tenant = tenant();
+        let sub = SubmissionId::generate("vanished-receipts");
+        backend
+            .create_submission(&tenant, &sub, None)
+            .await
+            .unwrap();
+        backend
+            .add_manifest(&tenant, &sub, Some("http://provider/vanished.json"), None)
+            .await
+            .unwrap();
+        let lease = backend
+            .claim_next_manifest(
+                &WorkerId::new("vanished-receipts"),
+                StdDuration::from_secs(60),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let worker = DefaultSubmitWorker::new(
+            backend.clone(),
+            patient_fetcher(""),
+            Arc::new(LocalFsOutputStore::new(
+                tmp.path().to_path_buf(),
+                "http://localhost",
+            )),
+            WorkerId::new("vanished-receipts"),
+        );
+
+        let spool_dir = tempfile::tempdir().unwrap();
+        let spool_path = spool_dir.path().to_path_buf();
+        let directory = spool_path.clone();
+        let mut script = std::collections::VecDeque::from([
+            (
+                None,
+                EntryResultPage {
+                    entries: vec![PagedEntryResult {
+                        result: BulkEntryResult::success(1, "Patient", "p1", true),
+                        stored_identity: None,
+                    }],
+                    next: Some(EntryResultContinuation::Offset(1)),
+                },
+            ),
+            (
+                Some(EntryResultContinuation::Offset(1)),
+                EntryResultPage {
+                    entries: vec![PagedEntryResult {
+                        result: BulkEntryResult::success(2, "Observation", "o1", true),
+                        stored_identity: None,
+                    }],
+                    next: None,
+                },
+            ),
+        ]);
+        let pages = entry_result_pages(move |continuation| {
+            let (expected, page) = script.pop_front().expect("must not fetch after EOF");
+            assert_eq!(continuation, expected, "the opaque token is passed back");
+            if continuation.is_some() {
+                // Patient's spool is the first one allocated and is on disk by
+                // now; the writer still holds it open, as a run that is
+                // streaming results does. POSIX unlinks the open file.
+                std::fs::remove_file(directory.join("000001.ndjson"))
+                    .expect("the first type's spool file exists");
+            }
+            std::future::ready(Ok(page))
+        });
+
+        let error = worker
+            .write_result_artifact_pages(
+                ReceiptSpools::in_dir(spool_dir),
+                &lease,
+                "http://provider/vanished.json",
+                0,
+                pages,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("open receipt spool"),
+            "a vanished spool must fail the run: {error}"
+        );
+        assert!(
+            !spool_path.exists(),
+            "a failed replay still removes the spool directory"
+        );
+        assert!(
+            backend
+                .list_submit_files(&tenant, &sub)
+                .await
+                .unwrap()
+                .is_empty(),
+            "nothing is published when a spool cannot be replayed"
+        );
+    }
+
+    /// Replay is fail-closed: a spool holding fewer bytes than its counters
+    /// describe aborts the run instead of publishing a part whose counts
+    /// disagree with the artifact.
+    #[tokio::test]
+    async fn a_truncated_spool_fails_replay_instead_of_publishing_counts() {
+        let backend = Arc::new(SqliteBackend::in_memory().unwrap());
+        backend.init_schema().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let output = Arc::new(LocalFsOutputStore::new(
+            tmp.path().to_path_buf(),
+            "http://localhost",
+        ));
+        let worker = DefaultSubmitWorker::new(
+            backend,
+            patient_fetcher(""),
+            output,
+            WorkerId::new("truncated-spool"),
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_path_buf();
+        let mut spools = ReceiptSpools::in_dir(dir);
+        let row = "{\"reference\":\"Patient/truncated\"}";
+        spools.push_output("Patient", row).await.unwrap();
+        spools.close_writers().await.unwrap();
+        let (_, spool) = spools.take_outputs().pop().unwrap();
+        assert_eq!(spool.bytes, (row.len() + 1) as u64);
+
+        // The file loses the newline its counters counted. One spool was
+        // allocated, so it is the first file the run named.
+        tokio::fs::write(path.join("000001.ndjson"), row)
+            .await
+            .unwrap();
+        let tenant = tenant();
+        let sub = SubmissionId::generate("truncated-spool");
+        let key = submit_artifact_key(&tenant, &sub, "m1", "output", Some("Patient"), 0, 1);
+        let error = worker
+            .replay_receipt_spool(&spools, &key, &spool)
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("expected {}", spool.bytes)),
+            "replay must fail on a byte-count mismatch: {error}"
+        );
+        drop(spools);
+        assert!(
+            !path.exists(),
+            "a failed replay still removes the spool directory"
+        );
+    }
+
+    /// The replay's own byte copy is the reader the counters came from, so a
+    /// spool that opens and then refuses the read has to fail the run too. A
+    /// directory in the spool's place reaches that branch deterministically on
+    /// Unix; Windows refuses the open instead, so the case is Unix-only like
+    /// the deleted-spool one.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_spool_that_cannot_be_read_fails_the_replay() {
+        let backend = Arc::new(SqliteBackend::in_memory().unwrap());
+        backend.init_schema().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let output = Arc::new(LocalFsOutputStore::new(
+            tmp.path().to_path_buf(),
+            "http://localhost",
+        ));
+        let worker = DefaultSubmitWorker::new(
+            backend,
+            patient_fetcher(""),
+            output,
+            WorkerId::new("unreadable-spool"),
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_path_buf();
+        let mut spools = ReceiptSpools::in_dir(dir);
+        let row = "{\"reference\":\"Patient/unreadable\"}";
+        spools.push_output("Patient", row).await.unwrap();
+        spools.close_writers().await.unwrap();
+        let (_, spool) = spools.take_outputs().pop().unwrap();
+        assert!(spool.bytes > 0);
+
+        // A directory where the spool was: the open succeeds, the read is the
+        // call that fails (`EISDIR`).
+        tokio::fs::remove_file(path.join("000001.ndjson"))
+            .await
+            .unwrap();
+        tokio::fs::create_dir(path.join("000001.ndjson"))
+            .await
+            .unwrap();
+        let tenant = tenant();
+        let sub = SubmissionId::generate("unreadable-spool");
+        let key = submit_artifact_key(&tenant, &sub, "m1", "output", Some("Patient"), 0, 1);
+        let error = worker
+            .replay_receipt_spool(&spools, &key, &spool)
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("read receipt spool"),
+            "the replay must surface its own read failure: {error}"
+        );
+        drop(spools);
+        assert!(
+            !path.exists(),
+            "a failed replay still removes the spool directory"
+        );
+    }
+
+    /// The output store is where the replay's own bytes go, so a failure there
+    /// — the part refusing to open, or the sink refusing the first byte the
+    /// copy writes — has to reach the caller. Nothing is published, and the
+    /// spool directory is removed either way.
+    #[tokio::test]
+    async fn a_failing_output_store_still_cleans_the_spool_directory() {
+        let backend = Arc::new(SqliteBackend::in_memory().unwrap());
+        backend.init_schema().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let tenant = tenant();
+        let sub = SubmissionId::generate("store-failure-receipts");
+        backend
+            .create_submission(&tenant, &sub, None)
+            .await
+            .unwrap();
+        backend
+            .add_manifest(
+                &tenant,
+                &sub,
+                Some("http://provider/store-failure.json"),
+                None,
+            )
+            .await
+            .unwrap();
+        let lease = backend
+            .claim_next_manifest(
+                &WorkerId::new("store-failure-receipts"),
+                StdDuration::from_secs(60),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let objects = tmp.path().join("objects");
+
+        for (fault, expected) in [
+            (OutputFault::Write, "write artifact"),
+            (OutputFault::Open, "refused the part"),
+        ] {
+            let worker = DefaultSubmitWorker::new(
+                backend.clone(),
+                patient_fetcher(""),
+                Arc::new(FaultOutputStore::new(
+                    Arc::new(LocalFsOutputStore::new(objects.clone(), "http://localhost")),
+                    fault,
+                )),
+                WorkerId::new("store-failure-receipts"),
+            );
+            let pages = entry_result_pages(|_continuation| {
+                std::future::ready(Ok(EntryResultPage {
+                    entries: vec![PagedEntryResult {
+                        result: BulkEntryResult::success(1, "Patient", "p1", true),
+                        stored_identity: None,
+                    }],
+                    next: None,
+                }))
+            });
+            let spool_dir = tempfile::tempdir().unwrap();
+            let spool_path = spool_dir.path().to_path_buf();
+            let error = worker
+                .write_result_artifact_pages(
+                    ReceiptSpools::in_dir(spool_dir),
+                    &lease,
+                    "http://provider/store-failure.json",
+                    0,
+                    pages,
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                error.to_string().contains(expected),
+                "expected a {expected} failure, got {error}"
+            );
+            assert!(
+                !spool_path.exists(),
+                "a failed replay still removes the spool directory"
+            );
+            assert!(
+                backend
+                    .list_submit_files(&tenant, &sub)
+                    .await
+                    .unwrap()
+                    .is_empty(),
+                "a failed replay publishes nothing"
+            );
+        }
+    }
+
+    /// The spool directory belongs to the receipt-writing future. Dropping that
+    /// future mid-stream — what a taken-over lease does to the run — removes
+    /// the directory along with the page the consumer was holding.
+    #[tokio::test]
+    async fn dropping_the_receipt_future_removes_its_spool_directory() {
+        let backend = Arc::new(SqliteBackend::in_memory().unwrap());
+        backend.init_schema().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let output = Arc::new(LocalFsOutputStore::new(
+            tmp.path().to_path_buf(),
+            "http://localhost",
+        ));
+        let worker = DefaultSubmitWorker::new(
+            backend,
+            patient_fetcher(""),
+            output,
+            WorkerId::new("dropped-receipts"),
+        );
+        let lease = ManifestLease {
+            tenant: tenant(),
+            submission_id: SubmissionId::generate("dropped-receipts"),
+            manifest_id: "m1".to_string(),
+            worker_id: WorkerId::new("dropped-receipts"),
+            lease_expiry: Utc::now() + chrono::Duration::seconds(60),
+            lease_duration: StdDuration::from_secs(60),
+            fencing_token: 1,
+        };
+
+        let spool_dir = tempfile::tempdir().unwrap();
+        let spool_path = spool_dir.path().to_path_buf();
+        let spooled = spool_path.clone();
+        let fetched = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let mut script = std::collections::VecDeque::from([
+            (
+                None,
+                EntryResultPage {
+                    entries: vec![PagedEntryResult {
+                        result: BulkEntryResult::success(1, "Patient", "p1", true),
+                        stored_identity: None,
+                    }],
+                    next: Some(EntryResultContinuation::Offset(1)),
+                },
+            ),
+            (
+                Some(EntryResultContinuation::Offset(1)),
+                EntryResultPage {
+                    entries: Vec::new(),
+                    next: None,
+                },
+            ),
+        ]);
+        let fetched_signal = Arc::clone(&fetched);
+        let release_signal = Arc::clone(&release);
+        let pages = entry_result_pages(move |continuation| {
+            let (expected, page) = script.pop_front().expect("must not fetch after EOF");
+            assert_eq!(continuation, expected, "the opaque token is passed back");
+            let signal = Arc::clone(&fetched_signal);
+            let held = Arc::clone(&release_signal);
+            let directory = spooled.clone();
+            async move {
+                if continuation.is_some() {
+                    // The first page is spooled by now; hold the consumer here
+                    // so the future is dropped with its directory in use.
+                    assert!(directory.join("000001.ndjson").exists());
+                    signal.notify_one();
+                    held.notified().await;
+                }
+                Ok(page)
+            }
+        });
+
+        let task = tokio::spawn(async move {
+            worker
+                .write_result_artifact_pages(
+                    ReceiptSpools::in_dir(spool_dir),
+                    &lease,
+                    "http://provider/dropped.json",
+                    0,
+                    pages,
+                )
+                .await
+        });
+        tokio::time::timeout(StdDuration::from_secs(10), fetched.notified())
+            .await
+            .expect("the consumer has to reach the second fetch");
+        assert!(spool_path.join("000001.ndjson").exists());
+
+        task.abort();
+        let cancelled = task
+            .await
+            .expect_err("the receipt task must not finish while it is held");
+        assert!(
+            cancelled.is_cancelled(),
+            "the receipt task must be cancelled, got {cancelled}"
+        );
+        assert!(
+            !spool_path.exists(),
+            "dropping the receipt future removes its spool directory"
         );
     }
 
@@ -1822,19 +2932,63 @@ mod tests {
         }
     }
 
-    /// The archived baseline wrapper, narrowed to the second-finalize fault.
-    struct FailSecondFinalize {
+    /// Which step of the output store a [`FaultOutputStore`] breaks.
+    #[derive(Clone, Copy)]
+    enum OutputFault {
+        /// `open_writer` refuses every part.
+        Open,
+        /// Every part writer is a broken pipe: the first byte written into it
+        /// fails, deterministically and without a full device.
+        Write,
+        /// `finalize_part` fails its given 0-based attempt.
+        Finalize(u32),
+    }
+
+    /// The local-filesystem store with one step broken and everything else
+    /// delegated, so a test can fail a part's open, its bytes, or its
+    /// finalization without another copy of the store.
+    struct FaultOutputStore {
         inner: Arc<LocalFsOutputStore>,
+        fault: OutputFault,
         finalized: std::sync::atomic::AtomicU32,
     }
 
+    impl FaultOutputStore {
+        fn new(inner: Arc<LocalFsOutputStore>, fault: OutputFault) -> Self {
+            Self {
+                inner,
+                fault,
+                finalized: std::sync::atomic::AtomicU32::new(0),
+            }
+        }
+    }
+
+    fn fault_error(message: &str) -> StorageError {
+        StorageError::Backend(crate::error::BackendError::Internal {
+            backend_name: "bulk-submit-worker-test".to_string(),
+            message: message.to_string(),
+            source: None,
+        })
+    }
+
     #[async_trait]
-    impl ExportOutputStore for FailSecondFinalize {
+    impl ExportOutputStore for FaultOutputStore {
         async fn open_writer(
             &self,
             key: &ExportPartKey,
         ) -> StorageResult<crate::core::bulk_export_output::ExportPartWriter> {
-            self.inner.open_writer(key).await
+            match self.fault {
+                OutputFault::Open => Err(fault_error("the output store refused the part")),
+                OutputFault::Write => {
+                    let (sink, peer) = tokio::io::duplex(1);
+                    // The peer is gone, so the first write into the sink fails
+                    // with `BrokenPipe` instead of staging the bytes anywhere.
+                    drop(peer);
+                    let sink: std::pin::Pin<Box<dyn tokio::io::AsyncWrite + Send>> = Box::pin(sink);
+                    Ok(crate::core::bulk_export_output::ExportPartWriter::new(sink))
+                }
+                OutputFault::Finalize(_) => self.inner.open_writer(key).await,
+            }
         }
 
         async fn finalize_part(
@@ -1842,17 +2996,15 @@ mod tests {
             key: &ExportPartKey,
             writer: crate::core::bulk_export_output::ExportPartWriter,
         ) -> StorageResult<crate::core::bulk_export_output::FinalizedPart> {
-            let ordinal = self
-                .finalized
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            if ordinal == 1 {
-                return Err(StorageError::Backend(
-                    crate::error::BackendError::Internal {
-                        backend_name: "bulk-submit-worker-test".to_string(),
-                        message: "second finalize forced failure".to_string(),
-                        source: None,
-                    },
-                ));
+            if let OutputFault::Finalize(ordinal) = self.fault {
+                let attempt = self
+                    .finalized
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if attempt == ordinal {
+                    return Err(fault_error(&format!(
+                        "finalize attempt {ordinal} forced failure"
+                    )));
+                }
             }
             self.inner.finalize_part(key, writer).await
         }
@@ -3342,6 +4494,188 @@ mod tests {
         );
     }
 
+    /// Losing the lease while receipts are being finalized is quiet, exactly
+    /// like losing it mid-file: the run abandons the manifest without
+    /// publishing anything, and the worker that took the lease over recovers
+    /// the manifest on its own.
+    #[tokio::test]
+    async fn receipt_finalize_abandons_the_run_when_its_lease_is_taken_over() {
+        use tokio::io::AsyncReadExt;
+
+        let backend = Arc::new(SqliteBackend::in_memory().unwrap());
+        backend.init_schema().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let tenant = tenant();
+        let sub_id = SubmissionId::generate("receipt-lease-loss");
+        backend
+            .create_submission(&tenant, &sub_id, None)
+            .await
+            .unwrap();
+        let manifest = backend
+            .add_manifest(
+                &tenant,
+                &sub_id,
+                Some("http://provider/receipt-lease-loss.json"),
+                None,
+            )
+            .await
+            .unwrap();
+        let lease = backend
+            .claim_next_manifest(
+                &WorkerId::new("receipt-lease-loss"),
+                StdDuration::from_secs(2),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let slow_output = Arc::new(SlowFinalize {
+            inner: Arc::new(LocalFsOutputStore::new(
+                tmp.path().join("objects"),
+                "http://localhost",
+            )),
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+        });
+        let worker = DefaultSubmitWorker::new(
+            backend.clone(),
+            patient_fetcher("{\"resourceType\":\"Patient\",\"id\":\"receipt-lease-loss\"}\n"),
+            Arc::clone(&slow_output),
+            WorkerId::new("receipt-lease-loss"),
+        );
+        let run = {
+            let lease = lease.clone();
+            tokio::spawn(async move { worker.run_job(lease).await })
+        };
+        tokio::time::timeout(StdDuration::from_secs(10), entered.notified())
+            .await
+            .expect("the run has to reach receipt finalization");
+
+        // Expire the lease under the blocked finalize and hand it over, as a
+        // reclaimer would once the heartbeat window has passed. Rewriting the
+        // worker also fails the abandoned run's next heartbeat.
+        backend
+            .get_connection()
+            .unwrap()
+            .execute(
+                "UPDATE bulk_manifests
+                 SET worker_id = 'receipt-lease-loss-reclaimer',
+                     lease_expiry = '1970-01-01T00:00:00Z'
+                 WHERE tenant_id = ?1 AND submitter = ?2 AND submission_id = ?3
+                   AND manifest_id = ?4",
+                params![
+                    tenant.tenant_id().as_str(),
+                    sub_id.submitter,
+                    sub_id.submission_id,
+                    manifest.manifest_id,
+                ],
+            )
+            .unwrap();
+        let replacement = backend
+            .claim_next_manifest(
+                &WorkerId::new("receipt-lease-loss-reclaimer"),
+                StdDuration::from_secs(60),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(replacement.manifest_id, manifest.manifest_id);
+        assert!(replacement.fencing_token > lease.fencing_token);
+
+        let abandoned = tokio::time::timeout(StdDuration::from_secs(5), run)
+            .await
+            .expect("the run must abandon a manifest it no longer holds")
+            .unwrap();
+        abandoned.unwrap();
+        assert_eq!(
+            backend.list_manifests(&tenant, &sub_id).await.unwrap()[0].status,
+            ManifestStatus::Processing,
+            "the reclaimer owns the manifest now"
+        );
+        assert!(
+            backend
+                .list_submit_files(&tenant, &sub_id)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a lease-lost run publishes neither output nor error parts"
+        );
+        // The abandoned run never finalized its part. A scratch file under the
+        // output store may survive the cancellation — that is the store's
+        // pre-existing behavior — but the finalized artifact must not.
+        let abandoned_key = submit_artifact_key(
+            &tenant,
+            &sub_id,
+            &manifest.manifest_id,
+            "output",
+            Some("Patient"),
+            0,
+            lease.fencing_token,
+        );
+        assert!(
+            slow_output.open_reader(&abandoned_key).await.is_err(),
+            "the abandoned run must not leave a finalized part behind"
+        );
+
+        // The reclaimer recovers the manifest normally: exact references, its
+        // own fencing token. It shares the abandoned run's store root on
+        // purpose — the fencing token in the part locator is what keeps the two
+        // runs' artifacts apart. The slow store never finished a part, so
+        // nothing has to release it.
+        let live_output = Arc::clone(&slow_output.inner);
+        let live_worker = DefaultSubmitWorker::new(
+            backend.clone(),
+            patient_fetcher("{\"resourceType\":\"Patient\",\"id\":\"receipt-lease-loss\"}\n"),
+            live_output.clone(),
+            WorkerId::new("receipt-lease-loss-reclaimer"),
+        );
+        live_worker.run_job(replacement.clone()).await.unwrap();
+
+        let manifests = backend.list_manifests(&tenant, &sub_id).await.unwrap();
+        assert_eq!(manifests[0].status, ManifestStatus::Completed);
+        let rows = backend.list_submit_files(&tenant, &sub_id).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(
+            (
+                row.file_type.as_str(),
+                row.resource_type.as_deref(),
+                row.part_index,
+                row.fencing_token
+            ),
+            ("output", Some("Patient"), 0, replacement.fencing_token)
+        );
+        assert_eq!(row.line_count, 1);
+        let expected_key = submit_artifact_key(
+            &tenant,
+            &sub_id,
+            &manifest.manifest_id,
+            "output",
+            Some("Patient"),
+            0,
+            replacement.fencing_token,
+        );
+        assert_eq!(row.file_path, expected_key.resource_type);
+        let key = ExportPartKey {
+            tenant_id: tenant.tenant_id().as_str().to_string(),
+            job_id: submission_output_job_id(&sub_id),
+            resource_type: row.file_path.clone(),
+            file_type: row.file_type.clone(),
+            part_index: row.part_index,
+            fencing_token: row.fencing_token,
+        };
+        let mut reader = live_output.open_reader(&key).await.unwrap();
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes).await.unwrap();
+        assert_eq!(row.byte_count, bytes.len() as u64);
+        assert_eq!(
+            std::str::from_utf8(&bytes).unwrap(),
+            "{\"reference\":\"Patient/receipt-lease-loss\"}\n"
+        );
+    }
+
     #[tokio::test]
     async fn second_finalize_failure_hides_the_set_until_live_recovery() {
         use tokio::io::AsyncReadExt;
@@ -3399,10 +4733,10 @@ mod tests {
             tmp.path().join("objects"),
             "http://localhost",
         ));
-        let failing_output = Arc::new(FailSecondFinalize {
-            inner: Arc::clone(&output),
-            finalized: std::sync::atomic::AtomicU32::new(0),
-        });
+        let failing_output = Arc::new(FaultOutputStore::new(
+            Arc::clone(&output),
+            OutputFault::Finalize(1),
+        ));
         let failing_worker = DefaultSubmitWorker::new(
             backend.clone(),
             fetcher.clone(),
@@ -3417,9 +4751,9 @@ mod tests {
                 source: None,
             })) => {
                 assert_eq!(backend_name, "bulk-submit-worker-test");
-                assert_eq!(message, "second finalize forced failure");
+                assert_eq!(message, "finalize attempt 1 forced failure");
             }
-            other => panic!("expected exact second-finalize error, got {other:?}"),
+            other => panic!("expected the forced second-finalize error, got {other:?}"),
         }
         assert!(
             backend

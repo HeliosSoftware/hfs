@@ -927,6 +927,38 @@ Bulk submit objects:
 - Optimistic locking relies on version checks plus S3 preconditions (`If-Match`, `If-None-Match`) where applicable.
 - Transaction bundle behavior is best-effort: entries are applied sequentially, rollback is attempted in reverse order on failure, but rollback is not guaranteed under concurrent writes or partial failures.
 
+### Bulk Submit Result Receipts
+
+When a manifest finishes, its worker turns the stored per-entry results into `output` receipts — one
+NDJSON part per resource type, alphabetically ordered with a dense part index — plus a single
+aggregated `error` part. Those parts are built through temporary spool files rather than in-memory
+vectors, so a submission with millions of entries no longer grows the worker's heap with its whole
+receipt set. All backends share the same path.
+
+- Memory for receipt construction is `O(Pmax + Lmax + B + M)`. `Pmax` is the largest materialized
+  entry page in bytes; `Lmax` is the largest serialized entry in bytes; `B` is fixed I/O workspace,
+  including the local output writer; `M` is retained metadata in bytes for resource types, issue
+  severities, artifacts, and input files. Requesting at most 1000 results limits the row count,
+  not page or entry bytes. This change adds no per-entry size cap.
+- Up to 8 spool files stay open (64 KiB writer buffer each; the underlying Tokio file copy buffer and
+  the fixed replay chunk are each bounded by the same 64 KiB). The least recently written spool is
+  flushed and closed before another opens, so a manifest with more resource types than that never
+  widens the handle set. Replay opens one reader at a time, after every writer is closed.
+- Replay copies each spool to the output store in fixed 64 KiB chunks instead of re-serializing or
+  parsing rows, and assigns the part's line and byte counters from the spool bookkeeping those bytes
+  were counted with. A spool that does not replay exactly its counted bytes fails the manifest
+  rather than publishing counts that disagree with the artifact.
+- Spools live in a per-run temporary directory (`TMPDIR` picks its parent on Unix) that is removed when the
+  run ends, including on lease loss and cancellation. An abrupt process kill can leave one behind,
+  and disk use grows with the manifest's receipt bytes (rows plus one newline each) while it runs.
+
+This bounds the receipt path only, and is not a whole-process bound: a `deleted` file's references
+are still collected in memory, the S3 **primary** backend loads a manifest's stored results as one
+object, the S3 output store writes each part to a scratch file and then reads that whole file back
+into memory for the upload, and composite `finish_manifest` synchronization (including the
+`mongo-es`/`s3-es` wrappers) still materializes the resource set. The REST artifact download handler
+also reads the requested part into memory before returning it.
+
 ### AWS Credentials and Region
 
 Uses the AWS SDK for Rust ([`aws_sdk_s3`](https://docs.rs/aws-sdk-s3/latest/aws_sdk_s3/)) with standard provider chain:

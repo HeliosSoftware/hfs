@@ -100,6 +100,7 @@ pub mod bulk_submit_input;
 pub(crate) mod bulk_submit_legacy;
 pub mod bulk_submit_output;
 pub mod bulk_submit_publication;
+pub(crate) mod bulk_submit_receipts;
 pub mod bulk_submit_worker;
 pub mod capabilities;
 pub mod history;
