@@ -682,8 +682,16 @@ pub struct BulkSubmitConfig {
     pub decryption_key: Option<String>,
     /// Read scope requested for the outbound file-retrieval token.
     pub outbound_scope: String,
-    /// `Retry-After` (seconds) advertised on an in-progress status poll.
+    /// `Retry-After` (seconds) advertised on an in-progress status poll once
+    /// ingestion is under way.
     pub retry_after_secs: u64,
+    /// `Retry-After` (seconds) advertised while a submission is still
+    /// *pre-ingest*: queued for a worker, reading the remote manifest, or
+    /// sizing/downloading its files (#953). Those phases turn over in seconds,
+    /// so a poller honouring the ingest-phase cadence would sleep through all
+    /// of them and only ever see the first one. Clamped at read time by
+    /// [`Self::effective_pre_ingest_retry_after_secs`].
+    pub pre_ingest_retry_after_secs: u64,
     /// Maximum `output` + `outcome` + `deleted` entries per status-manifest page.
     ///
     /// Larger result sets are split across pages chained by the manifest's
@@ -722,6 +730,7 @@ impl Default for BulkSubmitConfig {
             decryption_key: None,
             outbound_scope: "system/*.rs".to_string(),
             retry_after_secs: 120,
+            pre_ingest_retry_after_secs: 10,
             manifest_page_size: 1000,
             // A client honouring the advertised Retry-After polls twice an
             // hour, so 10 polls a minute is far above any well-behaved cadence
@@ -733,6 +742,25 @@ impl Default for BulkSubmitConfig {
 }
 
 impl BulkSubmitConfig {
+    /// The `Retry-After` to advertise while a submission is pre-ingest.
+    ///
+    /// Two clamps keep the configured value honest. It never exceeds
+    /// [`Self::retry_after_secs`]: an operator who shortened the ingest-phase
+    /// cadence did not mean for the pre-ingest phases to poll *slower*. And
+    /// when poll rate limiting is on it never drops below one poll per
+    /// `window / limit` seconds (rounded up), so a client that does exactly
+    /// what the header says can never be answered with a `429` for it.
+    pub fn effective_pre_ingest_retry_after_secs(&self) -> u64 {
+        let mut secs = self.pre_ingest_retry_after_secs.min(self.retry_after_secs);
+        if self.poll_rate_limit > 0 {
+            let floor = self
+                .poll_rate_window_secs
+                .div_ceil(u64::from(self.poll_rate_limit));
+            secs = secs.max(floor);
+        }
+        secs.max(1)
+    }
+
     /// Returns the file fan-out this pod should actually use on `backend`.
     ///
     /// The configured [`Self::file_concurrency`] is honoured on every
@@ -818,6 +846,10 @@ impl BulkSubmitConfig {
             outbound_scope: std::env::var("HFS_BULK_SUBMIT_OUTBOUND_SCOPE")
                 .unwrap_or(d.outbound_scope),
             retry_after_secs: env_u64("HFS_BULK_SUBMIT_RETRY_AFTER", d.retry_after_secs),
+            pre_ingest_retry_after_secs: env_u64(
+                "HFS_BULK_SUBMIT_PRE_INGEST_RETRY_AFTER",
+                d.pre_ingest_retry_after_secs,
+            ),
             manifest_page_size: env_u32("HFS_BULK_SUBMIT_MANIFEST_PAGE_SIZE", d.manifest_page_size),
             poll_rate_limit: env_u32("HFS_BULK_SUBMIT_POLL_RATE_LIMIT", d.poll_rate_limit),
             poll_rate_window_secs: env_u64(
@@ -2391,6 +2423,53 @@ mod tests {
         };
         let errs = cfg.validate().unwrap_err();
         assert!(errs.iter().any(|e| e.contains("HEARTBEAT_INTERVAL")));
+    }
+
+    #[test]
+    fn test_bulk_submit_pre_ingest_retry_after_defaults_short_and_inside_the_rate_limit() {
+        let cfg = BulkSubmitConfig::default();
+        assert_eq!(cfg.effective_pre_ingest_retry_after_secs(), 10);
+        assert!(cfg.effective_pre_ingest_retry_after_secs() < cfg.retry_after_secs);
+        // 10 polls per 60s window: one poll every 6s is the fastest allowed.
+        assert!(cfg.effective_pre_ingest_retry_after_secs() >= 6);
+    }
+
+    #[test]
+    fn test_bulk_submit_pre_ingest_retry_after_never_exceeds_the_ingest_cadence() {
+        let cfg = BulkSubmitConfig {
+            retry_after_secs: 5,
+            pre_ingest_retry_after_secs: 10,
+            poll_rate_limit: 0,
+            ..BulkSubmitConfig::default()
+        };
+        assert_eq!(cfg.effective_pre_ingest_retry_after_secs(), 5);
+    }
+
+    #[test]
+    fn test_bulk_submit_pre_ingest_retry_after_respects_the_poll_rate_floor() {
+        let cfg = BulkSubmitConfig {
+            pre_ingest_retry_after_secs: 1,
+            poll_rate_limit: 7,
+            poll_rate_window_secs: 60,
+            ..BulkSubmitConfig::default()
+        };
+        // ceil(60 / 7) = 9 — rounded up so an obedient client never lands
+        // an 8th poll inside the window.
+        assert_eq!(cfg.effective_pre_ingest_retry_after_secs(), 9);
+
+        let unlimited = BulkSubmitConfig {
+            pre_ingest_retry_after_secs: 1,
+            poll_rate_limit: 0,
+            ..BulkSubmitConfig::default()
+        };
+        assert_eq!(unlimited.effective_pre_ingest_retry_after_secs(), 1);
+
+        let zero = BulkSubmitConfig {
+            pre_ingest_retry_after_secs: 0,
+            poll_rate_limit: 0,
+            ..BulkSubmitConfig::default()
+        };
+        assert_eq!(zero.effective_pre_ingest_retry_after_secs(), 1, "never 0");
     }
 
     #[test]

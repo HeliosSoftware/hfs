@@ -990,7 +990,17 @@ where
             // Nothing claimed yet: the submission is queued, not slow. (The
             // emptiness guard is belt-and-braces — an empty manifest list is
             // vacuously `all_terminal` and never reaches this branch.)
-            "waiting for a worker".to_string()
+            //
+            // With the in-process pool running, an idle worker claims within
+            // its two-second idle sleep, so this reads as a moment in a queue
+            // rather than a wait on something scarce. With the pool disabled
+            // nothing in this process will ever claim it, and the operator
+            // needs to hear that an external worker is the missing piece.
+            if cfg.disable_local_worker {
+                "Queued - waiting for an external worker".to_string()
+            } else {
+                "Queued - starting shortly".to_string()
+            }
         } else {
             // A worker holds a manifest but has not produced a countable byte.
             // The first non-terminal manifest carrying a phase speaks for the
@@ -1017,10 +1027,23 @@ where
                 })
                 .unwrap_or_else(|| format!("Processing {pct}% of bytes"))
         };
+        // Poll cadence follows the phase. The pre-ingest phases each last
+        // seconds, so a client honouring the ingest cadence (two minutes by
+        // default) would sleep through every one of them and the #953 reports
+        // would never reach a screen — the Import page showed the queued text
+        // for the whole first window. Advertise the short cadence until the
+        // first byte or entry is counted, then fall back to the long one.
+        // A stall keeps the long cadence: nothing is about to change.
+        let pre_ingest = !stalled && entries == 0 && pct == 0;
+        let retry_after = if pre_ingest {
+            cfg.effective_pre_ingest_retry_after_secs()
+        } else {
+            cfg.retry_after_secs
+        };
         return Response::builder()
             .status(StatusCode::ACCEPTED)
             .header("X-Progress", progress)
-            .header("Retry-After", cfg.retry_after_secs.to_string())
+            .header("Retry-After", retry_after.to_string())
             .body(Body::empty())
             .map_err(|e| RestError::InternalError {
                 message: e.to_string(),

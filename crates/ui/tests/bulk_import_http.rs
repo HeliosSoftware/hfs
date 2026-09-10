@@ -1849,13 +1849,13 @@ async fn mock_recipient_reporting(reports: &'static [&'static str]) -> String {
 #[tokio::test]
 async fn pre_ingest_phases_show_their_text_on_an_indeterminate_bar() {
     const PHASES: [&str; 4] = [
-        "waiting for a worker",
+        "Queued - starting shortly",
         "reading manifest",
         "sizing 37 of 412 files",
         "downloading file 1 of 412",
     ];
     let recipient = mock_recipient_reporting(&[
-        "waiting for a worker",
+        "Queued - starting shortly",
         "reading manifest",
         "sizing 37 of 412 files",
         "downloading file 1 of 412",
