@@ -1695,7 +1695,7 @@ async fn test_poll_percentage_tracks_ingested_bytes() {
         .unwrap()
         .to_string();
     assert!(
-        progress.contains("Processing 35% of bytes"),
+        progress.contains("Processing 35%"),
         "the percentage must follow ingested bytes, got: {progress}"
     );
 }
@@ -1739,7 +1739,7 @@ async fn test_poll_progress_header_is_ascii_readable_with_a_resource_count() {
         .to_str()
         .unwrap_or_else(|e| panic!("X-Progress must be ASCII a client can read: {e}"));
     assert_eq!(
-        progress, "Processing 35% of bytes - 1,234 resources written",
+        progress, "Processing 35% - 1,234 Resources written",
         "the poll must report both the byte percentage and the resource count"
     );
 }
@@ -1929,7 +1929,7 @@ async fn test_poll_falls_back_when_the_phase_has_no_file_total() {
 
     let progress = poll_progress(&server, &poll_path).await;
     assert_eq!(
-        progress, "Processing 0% of bytes",
+        progress, "Processing 0%",
         "an unknown file total must not render as 'of 0', got: {progress}"
     );
 }
@@ -1962,7 +1962,7 @@ async fn test_moving_bytes_outrank_a_stale_phase() {
 
     let progress = poll_progress(&server, &poll_path).await;
     assert!(
-        progress.contains("Processing 35% of bytes"),
+        progress.contains("Processing 35%"),
         "a real percentage must take over from the pre-ingest phase, got: {progress}"
     );
 }
@@ -2014,7 +2014,7 @@ async fn test_progress_header_stays_ascii_in_every_branch() {
         "X-Progress must be US-ASCII; a conservative client discards it otherwise. Got: {text}"
     );
     assert!(
-        text.contains("609,191 resources written"),
+        text.contains("609,191 Resources written"),
         "the count branch must still be the one under test, got: {text}"
     );
 }

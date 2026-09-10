@@ -1291,7 +1291,7 @@ pub async fn status_fragment(
 /// 412 files`) would be mis-parsed as a percentage. The recipient owns the
 /// vocabulary; this parser only claims the one prefix.
 fn progress_percent(progress: &str) -> Option<u8> {
-    // Case-insensitive: HFS capitalizes the line ("Processing 3% of bytes -
+    // Case-insensitive: HFS capitalizes the line ("Processing 3% -
     // …", #954), older HFS versions and foreign recipients may send lowercase
     // "processing 3% complete …". Either way the digits follow the prefix.
     let rest = progress
@@ -1357,14 +1357,14 @@ mod tests {
         // Current HFS wording (#954, ASCII-only since the sentence travels in
         // a header).
         assert_eq!(
-            progress_percent("Processing 3% of bytes - 609,191 resources written"),
+            progress_percent("Processing 3% - 609,191 Resources written"),
             Some(3)
         );
-        assert_eq!(progress_percent("Processing 0% of bytes"), Some(0));
+        assert_eq!(progress_percent("Processing 0%"), Some(0));
         // A recipient that does use non-ASCII still gets its percentage read:
         // the header is decoded from bytes, so the sentence arrives intact.
         assert_eq!(
-            progress_percent("Processing 3% of bytes — 609,191 resources written"),
+            progress_percent("Processing 3% — 609,191 Resources written"),
             Some(3)
         );
         // Pre-#954 HFS and lowercase foreign recipients.

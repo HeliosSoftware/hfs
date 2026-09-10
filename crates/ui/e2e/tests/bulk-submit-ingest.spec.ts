@@ -56,7 +56,7 @@ function progressReports(lines: string[]): { pct: number; written: number }[] {
   return lines
     .slice()
     .reverse() // the log renders newest first
-    .map((line) => /Processing (\d+)% of bytes - ([\d,]+) resources written/.exec(line))
+    .map((line) => /Processing (\d+)% - ([\d,]+) Resources written/.exec(line))
     .filter((match): match is RegExpExecArray => match !== null)
     .map((match) => ({ pct: Number(match[1]), written: Number(match[2].replace(/,/g, "")) }));
 }
@@ -139,7 +139,7 @@ test("a manifest submitted from the Import page ingests, and its counters only e
       // lost on the way in.
       await expect(bulkImport.progressBar).toHaveAttribute("aria-valuenow", /^\d+$/);
       await expect(bulkImport.progressText).toHaveText(
-        /Processing \d+% of bytes - [\d,]+ resources written/,
+        /Processing \d+% - [\d,]+ Resources written/,
       );
 
       // HFS fetched both fixture files itself, server-to-server — and sized the
