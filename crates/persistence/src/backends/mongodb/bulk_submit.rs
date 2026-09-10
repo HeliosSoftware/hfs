@@ -46,10 +46,11 @@ use crate::core::bulk_export::ExportJobId;
 use crate::core::bulk_export_worker::{LeaseError, WorkerId};
 use crate::core::bulk_submit::{
     BulkEntryOutcome, BulkEntryResult, BulkProcessingOptions, BulkSubmitProvider,
-    BulkSubmitRollbackProvider, ChangeType, EntryCountSummary, EntryResultContinuation,
-    EntryResultPage, ManifestPhase, ManifestStatus, NdjsonEntry, PagedEntryResult,
-    StreamProcessingResult, StreamingBulkSubmitProvider, SubmissionChange, SubmissionId,
-    SubmissionManifest, SubmissionStatus, SubmissionSummary, invalid_entry_result_page,
+    BulkSubmitRollbackProvider, CANCELLED_ABORT_REASON, ChangeType, EntryCountSummary,
+    EntryResultContinuation, EntryResultPage, ManifestPhase, ManifestStatus, NdjsonEntry,
+    PagedEntryResult, StreamProcessingResult, StreamingBulkSubmitProvider, SubmissionChange,
+    SubmissionId, SubmissionManifest, SubmissionStatus, SubmissionSummary,
+    invalid_entry_result_page,
 };
 use crate::core::bulk_submit_publication::{
     ManifestPublicationResult, ManifestPublicationStatus, canonical_publication_files,
@@ -443,9 +444,39 @@ impl MongoBackend {
         lease: &ManifestLease,
         update: Document,
     ) -> Result<(), LeaseError> {
+        self.fenced_update_filtered(lease, fenced_filter(lease), update)
+            .await
+    }
+
+    /// [`Self::fenced_update`] with `status: processing` added to the guard, for
+    /// the two writes that settle a manifest's final outcome.
+    ///
+    /// `abort_submission` moves in-flight manifests to `failed` without clearing
+    /// `worker_id`/`fencing_token`, so the lease fence alone would let a worker
+    /// finishing just after an abort rewrite that verdict. With the status in the
+    /// guard the write matches nothing and the caller sees `LeaseLost`, which
+    /// callers already read as "someone else owns the outcome" (#968).
+    async fn fenced_update_while_processing(
+        &self,
+        lease: &ManifestLease,
+        update: Document,
+    ) -> Result<(), LeaseError> {
+        let mut filter = fenced_filter(lease);
+        filter.insert("status", ManifestStatus::Processing.to_string());
+        self.fenced_update_filtered(lease, filter, update).await
+    }
+
+    /// Shared body of the fenced updates: apply `update` under `filter`, and
+    /// report `LeaseLost` when the guard matches nothing.
+    async fn fenced_update_filtered(
+        &self,
+        lease: &ManifestLease,
+        filter: Document,
+        update: Document,
+    ) -> Result<(), LeaseError> {
         let manifests = self.manifests().await.map_err(LeaseError::Storage)?;
         let result = manifests
-            .update_one(fenced_filter(lease), update)
+            .update_one(filter, update)
             .await
             .map_err(|e| LeaseError::Storage(internal_error(format!("fenced update: {e}"))))?;
         if result.matched_count == 0 {
@@ -810,10 +841,23 @@ impl BulkSubmitProvider for MongoBackend {
             ));
         }
 
+        // A promotion, not a reset: this runs on *every* batch, so without the
+        // `pending`/`processing` guard the batch that lands right after
+        // `abort_submission` moved the manifest to `failed` would quietly put
+        // it back to `processing` and the abort would read as if it had never
+        // happened (#968).
         let manifests = self.manifests().await?;
+        let mut promote = manifest_filter(tenant, submission_id, manifest_id);
+        promote.insert(
+            "status",
+            doc! { "$in": [
+                ManifestStatus::Pending.to_string(),
+                ManifestStatus::Processing.to_string(),
+            ]},
+        );
         manifests
             .update_one(
-                manifest_filter(tenant, submission_id, manifest_id),
+                promote,
                 doc! { "$set": { "status": ManifestStatus::Processing.to_string() } },
             )
             .await
@@ -947,6 +991,11 @@ impl StreamingBulkSubmitProvider for MongoBackend {
         let mut line_number = 0u64;
         let mut batch = Vec::new();
 
+        // An ingest cancelled before it read anything persists nothing.
+        if options.is_cancelled() {
+            return Ok(result.aborted(CANCELLED_ABORT_REASON));
+        }
+
         loop {
             let mut line = String::new();
             let bytes_read = reader.read_line(&mut line).await.map_err(|e| {
@@ -1013,6 +1062,13 @@ impl StreamingBulkSubmitProvider for MongoBackend {
                     && result.counts.error_count() >= options.max_errors as u64
                 {
                     return Ok(result.aborted("max errors exceeded"));
+                }
+
+                // Abort is cooperative: a claimed manifest checks between
+                // batches, so an aborted submission stops here with its partial
+                // counts intact instead of running to the end (#968).
+                if options.is_cancelled() {
+                    return Ok(result.aborted(CANCELLED_ABORT_REASON));
                 }
             }
         }
@@ -1275,8 +1331,21 @@ impl SubmitWorkerStorage for MongoBackend {
     }
 
     async fn mark_manifest_processing(&self, lease: &ManifestLease) -> Result<(), LeaseError> {
-        self.fenced_update(
+        // Promotion only: an abort landing in the window between the claim and
+        // this call already moved the manifest to `failed`, and re-marking it
+        // `processing` would strand it there with nobody able to claim it
+        // again (#968).
+        let mut filter = fenced_filter(lease);
+        filter.insert(
+            "status",
+            doc! { "$in": [
+                ManifestStatus::Pending.to_string(),
+                ManifestStatus::Processing.to_string(),
+            ]},
+        );
+        self.fenced_update_filtered(
             lease,
+            filter,
             doc! { "$set": { "status": ManifestStatus::Processing.to_string() } },
         )
         .await
@@ -1410,7 +1479,9 @@ impl SubmitWorkerStorage for MongoBackend {
     }
 
     async fn finish_manifest(&self, lease: &ManifestLease) -> Result<(), LeaseError> {
-        self.fenced_update(
+        // Guarded on `processing` so a worker finishing just after an abort
+        // cannot rewrite the abort's `failed` verdict back to `completed` (#968).
+        self.fenced_update_while_processing(
             lease,
             doc! { "$set": {
                 "status": ManifestStatus::Completed.to_string(),
@@ -1426,7 +1497,8 @@ impl SubmitWorkerStorage for MongoBackend {
         lease: &ManifestLease,
         error_message: &str,
     ) -> Result<(), LeaseError> {
-        self.fenced_update(
+        // Same `processing` guard as `finish_manifest` (#968).
+        self.fenced_update_while_processing(
             lease,
             doc! { "$set": {
                 "status": ManifestStatus::Failed.to_string(),

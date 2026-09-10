@@ -193,6 +193,16 @@ export HFS_COMPOSITE_SYNC_MODE=synchronous HFS_ELASTICSEARCH_WRITE_REFRESH=wait_
 submit `$bulk-submit` *to itself* at that URL, so it must be reachable from the HFS
 process.
 
+**If you move `HFS_SERVER_PORT` off 8080, move `HFS_BASE_URL` with it.** They are
+independent settings with independent defaults, and the Import page always uses
+`HFS_BASE_URL` as the Data Recipient — it is not typed per submission (#689/#686).
+Change only the port and every submission fails minutes later with a transport
+error, `POST http://localhost:8080/$bulk-submit failed: error sending request for
+url`, because nothing is listening there. HFS does warn about the mismatch at
+startup (`HFS_BASE_URL '…' advertises a different port from listener …`), but it is
+a `warn!`, not a fatal, and it is easy to miss in the startup log. The rest of this
+document writes `http://localhost:8080`; substitute your own base URL throughout.
+
 ### Per-backend environment
 
 | Backend | Additional environment |
@@ -391,7 +401,9 @@ Whichever manifest is used, the counts in T4 for `Patient`, `Encounter`,
 On the detail page verify:
 
 - The summary card shows **Manifest URL** = the URL you typed, **Data Recipient** =
-  `http://localhost:8080`, a **Submission ID**, **Submitter**
+  your `HFS_BASE_URL` (`http://localhost:8080` unless you moved it — if this shows a
+  port nothing is listening on, stop here and fix `HFS_BASE_URL`; see T1), a
+  **Submission ID**, **Submitter**
   `urn:helios:hfs:bulk-submit | <submission id>`, **Status** = **In Progress**,
   **Authentication** = `none`.
 - The **Submission Log** (newest first) contains
@@ -410,8 +422,10 @@ summary **Status** = **Completed**, and the log to end with
 Record the elapsed time in the matrix.
 
 If the status becomes **Failed**, the **Error files** count is non-zero, or the log
-shows `POST http://localhost:8080/$bulk-submit → …` with an error, record the log text
-and file an issue.
+shows `POST <your HFS_BASE_URL>/$bulk-submit → …` with an error, record the log text
+and file an issue. One cause is not a bug: `error sending request for url` is a
+transport failure, meaning the Data Recipient points at a port with nothing behind
+it — re-check `HFS_BASE_URL` against `HFS_SERVER_PORT` before filing.
 
 ### 7.4 Verify the data landed and is searchable
 

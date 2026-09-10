@@ -15,10 +15,10 @@ use crate::core::bulk_export::ExportJobId;
 use crate::core::bulk_export_worker::{LeaseError, WorkerId};
 use crate::core::bulk_submit::{
     BulkEntryOutcome, BulkEntryResult, BulkProcessingOptions, BulkSubmitProvider,
-    BulkSubmitRollbackProvider, ChangeType, EntryCountSummary, EntryResultContinuation,
-    EntryResultCursor, EntryResultPage, ManifestPhase, ManifestStatus, NdjsonEntry,
-    PagedEntryResult, StreamProcessingResult, StreamingBulkSubmitProvider, SubmissionChange,
-    SubmissionId, SubmissionManifest, SubmissionStatus, SubmissionSummary,
+    BulkSubmitRollbackProvider, CANCELLED_ABORT_REASON, ChangeType, EntryCountSummary,
+    EntryResultContinuation, EntryResultCursor, EntryResultPage, ManifestPhase, ManifestStatus,
+    NdjsonEntry, PagedEntryResult, StreamProcessingResult, StreamingBulkSubmitProvider,
+    SubmissionChange, SubmissionId, SubmissionManifest, SubmissionStatus, SubmissionSummary,
     invalid_entry_result_page,
 };
 use crate::core::bulk_submit_publication::{
@@ -756,11 +756,17 @@ impl BulkSubmitProvider for SqliteBackend {
         // batch, for a flag whose only reader is a status poller. Riding the
         // batch costs neither, and cannot report "processing" for work that
         // then rolls back.
+        //
+        // `status IN ('pending', 'processing')` keeps it a promotion rather
+        // than a reset: the statement runs on *every* batch, so without the
+        // guard the batch that lands right after `abort_submission` moved the
+        // manifest to `'failed'` would quietly put it back to `'processing'`
+        // and the abort would read as if it had never happened (#968).
         txn.with_connection(|conn| {
             conn.prepare_cached(
                 "UPDATE bulk_manifests SET status = 'processing'
-                 WHERE tenant_id = ?1 AND submitter = ?2 AND submission_id = ?3
-                   AND manifest_id = ?4 AND status <> 'replaced'",
+                 WHERE tenant_id = ?1 AND submitter = ?2 AND submission_id = ?3 AND manifest_id = ?4
+                   AND status IN ('pending', 'processing')",
             )
             .map_err(|e| internal_error(format!("prepare manifest status update: {e}")))?
             .execute(params![
@@ -1261,6 +1267,11 @@ impl StreamingBulkSubmitProvider for SqliteBackend {
         let mut line_number = 0u64;
         let mut batch = Vec::new();
 
+        // An ingest cancelled before it read anything persists nothing.
+        if options.is_cancelled() {
+            return Ok(result.aborted(CANCELLED_ABORT_REASON));
+        }
+
         loop {
             let mut line = String::new();
             let bytes_read = reader
@@ -1353,6 +1364,13 @@ impl StreamingBulkSubmitProvider for SqliteBackend {
                     && result.counts.error_count() >= options.max_errors as u64
                 {
                     return Ok(result.aborted("max errors exceeded"));
+                }
+
+                // Abort is cooperative: a claimed manifest checks between
+                // batches, so an aborted submission stops here with its partial
+                // counts intact instead of running to the end (#968).
+                if options.is_cancelled() {
+                    return Ok(result.aborted(CANCELLED_ABORT_REASON));
                 }
             }
         }
@@ -1793,6 +1811,12 @@ impl SubmitWorkerStorage for SqliteBackend {
     async fn mark_manifest_processing(&self, lease: &ManifestLease) -> Result<(), LeaseError> {
         // Idempotent status write guarded by worker_id + fencing_token: a busy
         // retry re-applies the same value, and a stale lease still loses (#942).
+        // Promotion only, same as the per-batch stamp: an abort landing in the
+        // window between the claim and this call already moved the manifest to
+        // `'failed'`, and re-marking it `'processing'` would strand it there
+        // with nobody able to claim it again (#968). That also makes the retry
+        // safe past an abort — the replay matches nothing and reads as a lost
+        // lease, which is what a cancelled manifest should look like here.
         let affected = retry_bookkeeping_on_busy(
             "mark manifest processing",
             lease_retry_budget(lease),
@@ -2083,6 +2107,10 @@ impl SubmitWorkerStorage for SqliteBackend {
     }
 
     async fn finish_manifest(&self, lease: &ManifestLease) -> Result<(), LeaseError> {
+        // The helper's fence (`status = 'processing'` plus this lease's worker
+        // and fencing token) is what makes a finish that lands after
+        // `abort_submission` moved the manifest to `'failed'` a `LeaseLost`
+        // no-op instead of a silent rewrite back to `'completed'` (#968).
         self.publish_current_manifest_generation(lease, ManifestPublicationStatus::Completed)
             .await
     }
@@ -2092,6 +2120,8 @@ impl SubmitWorkerStorage for SqliteBackend {
         lease: &ManifestLease,
         error_message: &str,
     ) -> Result<(), LeaseError> {
+        // Same fence as `finish_manifest`: an aborted manifest's outcome belongs
+        // to the abort, so a late worker verdict gets `LeaseLost` instead (#968).
         self.publish_current_manifest_generation(
             lease,
             ManifestPublicationStatus::Failed {
@@ -2961,6 +2991,7 @@ fn publish_manifest_artifacts_in_tx(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::bulk_submit::CancelToken;
     use crate::tenant::{TenantId, TenantPermissions};
     use serde_json::json;
 
@@ -5047,6 +5078,234 @@ mod tests {
         assert_eq!(publication_status, None);
         assert_eq!(publication_error, None);
         assert_eq!(publication_worker, None);
+    }
+
+    /// Wraps a reader so that `token` is tripped the first time the ingest
+    /// actually reads from the stream.
+    ///
+    /// That makes "cancelled mid-manifest" deterministic: the pre-loop check
+    /// still sees an un-cancelled token, the first batch is read and committed,
+    /// and the between-batches check then sees the cancellation — no sleeps and
+    /// no cross-task race.
+    struct CancelOnFirstRead<R> {
+        inner: R,
+        token: CancelToken,
+        tripped: bool,
+    }
+
+    impl<R: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for CancelOnFirstRead<R> {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            let this = self.get_mut();
+            if !this.tripped {
+                this.tripped = true;
+                this.token.cancel();
+            }
+            std::pin::Pin::new(&mut this.inner).poll_read(cx, buf)
+        }
+    }
+
+    /// Six one-per-line Patients, enough for three batches of two.
+    fn six_patient_lines() -> Vec<u8> {
+        (1..=6)
+            .map(|i| format!("{{\"resourceType\":\"Patient\",\"id\":\"cancel-{i}\"}}\n"))
+            .collect::<String>()
+            .into_bytes()
+    }
+
+    /// #968: a token already tripped when the ingest starts stops it before it
+    /// reads or writes anything.
+    #[tokio::test]
+    async fn cancelled_before_start_persists_nothing() {
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+
+        let sub_id = SubmissionId::generate("test-system");
+        backend
+            .create_submission(&tenant, &sub_id, None)
+            .await
+            .unwrap();
+        let manifest = backend
+            .add_manifest(&tenant, &sub_id, None, None)
+            .await
+            .unwrap();
+
+        let cancel = CancelToken::new();
+        cancel.cancel();
+        let options = BulkProcessingOptions::new()
+            .with_batch_size(2)
+            .with_cancel(cancel);
+
+        let reader = Box::new(tokio::io::BufReader::new(std::io::Cursor::new(
+            six_patient_lines(),
+        )));
+        let result = backend
+            .process_ndjson_stream(
+                &tenant,
+                &sub_id,
+                &manifest.manifest_id,
+                "Patient",
+                reader,
+                &options,
+            )
+            .await
+            .unwrap();
+
+        assert!(result.aborted, "a cancelled ingest reports itself aborted");
+        assert_eq!(
+            result.abort_reason.as_deref(),
+            Some(CANCELLED_ABORT_REASON),
+            "the abort reason distinguishes cancellation from an error budget"
+        );
+        assert_eq!(result.lines_processed, 0, "no line was even read");
+        assert_eq!(result.counts.total, 0);
+
+        // Nothing was written: neither resources nor per-line receipts.
+        let counts = backend
+            .get_entry_counts(&tenant, &sub_id, &manifest.manifest_id)
+            .await
+            .unwrap();
+        assert_eq!(counts.total, 0, "no entry result was persisted");
+        assert!(
+            backend
+                .read(&tenant, "Patient", "cancel-1")
+                .await
+                .unwrap()
+                .is_none(),
+            "no resource was ingested"
+        );
+    }
+
+    /// #968: cancelling mid-manifest stops at the next batch boundary, keeping
+    /// the batches already committed and skipping the rest.
+    #[tokio::test]
+    async fn cancelled_mid_stream_keeps_committed_batches_and_stops() {
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+
+        let sub_id = SubmissionId::generate("test-system");
+        backend
+            .create_submission(&tenant, &sub_id, None)
+            .await
+            .unwrap();
+        let manifest = backend
+            .add_manifest(&tenant, &sub_id, None, None)
+            .await
+            .unwrap();
+
+        let cancel = CancelToken::new();
+        let options = BulkProcessingOptions::new()
+            .with_batch_size(2)
+            .with_cancel(cancel.clone());
+
+        let reader = Box::new(tokio::io::BufReader::new(CancelOnFirstRead {
+            inner: std::io::Cursor::new(six_patient_lines()),
+            token: cancel,
+            tripped: false,
+        }));
+        let result = backend
+            .process_ndjson_stream(
+                &tenant,
+                &sub_id,
+                &manifest.manifest_id,
+                "Patient",
+                reader,
+                &options,
+            )
+            .await
+            .unwrap();
+
+        assert!(result.aborted);
+        assert_eq!(result.abort_reason.as_deref(), Some(CANCELLED_ABORT_REASON));
+        assert_eq!(
+            result.counts.success, 2,
+            "the batch already committed when the token tripped is kept"
+        );
+        assert_eq!(
+            result.lines_processed, 2,
+            "the remaining four lines were never read"
+        );
+
+        let counts = backend
+            .get_entry_counts(&tenant, &sub_id, &manifest.manifest_id)
+            .await
+            .unwrap();
+        assert_eq!(counts.total, 2, "the partial counts are durable");
+        assert!(
+            backend
+                .read(&tenant, "Patient", "cancel-2")
+                .await
+                .unwrap()
+                .is_some(),
+            "the first batch really landed"
+        );
+        assert!(
+            backend
+                .read(&tenant, "Patient", "cancel-3")
+                .await
+                .unwrap()
+                .is_none(),
+            "nothing after the cancellation point was ingested"
+        );
+    }
+
+    /// #968: `abort_submission` fails in-flight manifests without clearing the
+    /// lease, so the worker's late verdict must lose rather than resurrect the
+    /// manifest as `completed`.
+    #[tokio::test]
+    async fn abort_beats_a_late_finish_manifest() {
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+        let sub_id = seed_claimable(&backend, &tenant).await;
+
+        let lease = backend
+            .claim_next_manifest(&WorkerId::new("w1"), StdDuration::from_secs(60))
+            .await
+            .unwrap()
+            .expect("a manifest should be claimable");
+        backend.mark_manifest_processing(&lease).await.unwrap();
+
+        // The submitter aborts while the worker still holds a valid lease.
+        backend
+            .abort_submission(&tenant, &sub_id, "user cancelled")
+            .await
+            .unwrap();
+
+        // The worker's verdicts arrive too late and change nothing.
+        assert!(
+            matches!(
+                backend.finish_manifest(&lease).await,
+                Err(LeaseError::LeaseLost { .. })
+            ),
+            "a finish after an abort must not win"
+        );
+        let stored = backend
+            .get_manifest(&tenant, &sub_id, &lease.manifest_id)
+            .await
+            .unwrap()
+            .expect("manifest");
+        assert_eq!(
+            stored.status,
+            ManifestStatus::Failed,
+            "the abort's verdict stands"
+        );
+
+        assert!(
+            matches!(
+                backend.fail_manifest(&lease, "worker gave up").await,
+                Err(LeaseError::LeaseLost { .. })
+            ),
+            "a late failure verdict is equally a no-op"
+        );
+        let stored = backend
+            .get_manifest(&tenant, &sub_id, &lease.manifest_id)
+            .await
+            .unwrap()
+            .expect("manifest");
+        assert_eq!(stored.status, ManifestStatus::Failed);
     }
 
     fn sqlite_busy() -> StorageError {

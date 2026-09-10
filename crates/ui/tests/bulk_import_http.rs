@@ -936,6 +936,197 @@ async fn a_rejected_status_change_keeps_the_status_and_logs_it() {
     let (_, html) = get(&ctx, &detail_path).await;
     assert!(html.contains("Recipient rejected the status change: 409"));
     assert!(html.contains("In Progress"));
+    // The log line is no longer the only trace: the rejection is banner-level
+    // state on the submission itself (#968).
+    assert!(html.contains(BANNER), "{html}");
+    assert!(html.contains("409:"), "{html}");
+}
+
+/// The localized frame of the persistent status-change banner (#968); every
+/// assertion below matches on it rather than on the whole sentence.
+const BANNER: &str = "The last status change did not reach the Data Recipient";
+
+/// #968: an Abort the recipient never accepted leaves the submission running,
+/// and until now said so only in the run log — a saturated recipient could
+/// swallow the press and the page still read In Progress with no explanation.
+/// The banner must also survive the status card's own 5s refresh, which
+/// re-renders that whole region with `outerHTML`.
+#[tokio::test]
+async fn a_failed_abort_persists_an_error_banner_across_polls() {
+    let (recipient_url, _) = mock_recipient(StatusCode::INTERNAL_SERVER_ERROR).await;
+    let ctx = ctx(&recipient_url);
+
+    let detail_path = create_submission(&ctx).await;
+    set_submission_status(&ctx, &detail_path, "in-progress").await;
+    post_form(&ctx, &format!("{detail_path}/abort"), "").await;
+
+    // A hard reload shows it: the page renders the banner host filled.
+    let (_, html) = get(&ctx, &detail_path).await;
+    assert!(
+        html.contains(r#"<div id="submission-error" class="alert" role="alert">"#),
+        "{html}"
+    );
+    assert!(html.contains(BANNER), "{html}");
+    assert!(
+        html.contains("500:"),
+        "the recipient's own answer rides along"
+    );
+    assert!(html.contains("In Progress"), "the submission is unchanged");
+
+    // And every poll of the status fragment carries it out-of-band. This
+    // submission never got a poll URL, so the card itself renders empty —
+    // exactly the case where a banner nested inside it would disappear.
+    for poll in 1..=2 {
+        let (status, fragment) = get(&ctx, &format!("{detail_path}/status")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            fragment.contains(
+                r#"<div id="submission-error" class="alert" role="alert" hx-swap-oob="true">"#
+            ),
+            "poll {poll}: {fragment}"
+        );
+        assert!(fragment.contains(BANNER), "poll {poll}: {fragment}");
+    }
+
+    // Only the sentence is translated; the recipient's diagnosis is stored
+    // as it came back, so it reads the same in every locale.
+    let (_, german) = get(&ctx, &format!("{detail_path}?lang=de")).await;
+    assert!(
+        german.contains("Die letzte Statusänderung hat den Datenempfänger nicht erreicht"),
+        "{german}"
+    );
+    assert!(german.contains("500:"), "{german}");
+    assert!(!german.contains(BANNER), "{german}");
+}
+
+/// #968: the banner describes the *last* status change, so a retry that lands
+/// clears it — and the now-Stopped submission drops Abort/Mark completed with
+/// it.
+#[tokio::test]
+async fn a_successful_abort_clears_the_error_banner_and_the_buttons() {
+    // The recipient base URL is captured on the submission at create time, so
+    // the retry must reach the same origin — this mock changes its mind
+    // instead.
+    let (recipient_url, answer) = mock_recipient_with_switchable_status(StatusCode::OK).await;
+    let ctx = ctx(&recipient_url);
+    let detail_path = create_submission(&ctx).await;
+
+    // First Abort: the recipient is saturated and rejects it.
+    answer.store(
+        StatusCode::SERVICE_UNAVAILABLE.as_u16(),
+        std::sync::atomic::Ordering::SeqCst,
+    );
+    post_form(&ctx, &format!("{detail_path}/abort"), "").await;
+    let (_, html) = get(&ctx, &detail_path).await;
+    assert!(html.contains(BANNER), "{html}");
+    assert!(html.contains("In Progress"), "{html}");
+    // The card is still polling, so the banner rides beside a rendered card
+    // here — and retrying stays one click away.
+    let (_, fragment) = get(&ctx, &format!("{detail_path}/status")).await;
+    assert!(fragment.contains(BANNER), "{fragment}");
+    assert!(
+        fragment.contains(&format!(r#"action="{detail_path}/abort""#)),
+        "the rejected Abort must stay retryable: {fragment}"
+    );
+
+    // Second Abort: it lands.
+    answer.store(StatusCode::OK.as_u16(), std::sync::atomic::Ordering::SeqCst);
+    post_form(&ctx, &format!("{detail_path}/abort"), "").await;
+
+    let (_, html) = get(&ctx, &detail_path).await;
+    assert!(
+        html.contains(r#"<div id="submission-error"></div>"#),
+        "the banner host is empty again: {html}"
+    );
+    assert!(!html.contains(BANNER), "{html}");
+    assert!(html.contains("Stopped"), "{html}");
+    // The log still remembers the failed attempt: it is the banner, not the
+    // history, that is bound to the *last* status change.
+    assert!(
+        html.contains("Recipient rejected the status change: 503"),
+        "{html}"
+    );
+
+    let (_, fragment) = get(&ctx, &format!("{detail_path}/status")).await;
+    assert!(
+        fragment.contains(r#"<div id="submission-error" hx-swap-oob="true"></div>"#),
+        "{fragment}"
+    );
+    assert!(!fragment.contains(BANNER), "{fragment}");
+    assert!(
+        !fragment.contains(&format!(r#"action="{detail_path}/abort""#)),
+        "a stopped submission cannot be aborted: {fragment}"
+    );
+    assert!(
+        !fragment.contains(&format!(r#"action="{detail_path}/complete""#)),
+        "{fragment}"
+    );
+}
+
+/// A recipient that accepts the submission, hands out a status poll URL, and
+/// whose `$bulk-submit` answer the test can change between requests — the
+/// returned handle holds the status code the *next* kick-off gets.
+///
+/// Two reasons for the shape: a submission stores one recipient base URL for
+/// its whole life, so a retry cannot simply be pointed at a second mock; and
+/// only a submission with a poll URL renders the status card that carries
+/// Abort and Mark completed, which is the state #968 was reported from.
+/// `/poll` answers `202` with a long `Retry-After`, so reading the card never
+/// moves the submission on its own.
+async fn mock_recipient_with_switchable_status(
+    initial: StatusCode,
+) -> (String, Arc<std::sync::atomic::AtomicU16>) {
+    use axum::extract::State as AxState;
+    #[derive(Clone)]
+    struct S {
+        answer: Arc<std::sync::atomic::AtomicU16>,
+        base: Arc<std::sync::Mutex<String>>,
+    }
+    let state = S {
+        answer: Arc::new(std::sync::atomic::AtomicU16::new(initial.as_u16())),
+        base: Arc::new(std::sync::Mutex::new(String::new())),
+    };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    *state.base.lock().unwrap() = format!("http://{addr}");
+    let answer = Arc::clone(&state.answer);
+    let recipient = Router::new()
+        .route(
+            "/$bulk-submit",
+            axum::routing::post(|AxState(s): AxState<S>| async move {
+                let status =
+                    StatusCode::from_u16(s.answer.load(std::sync::atomic::Ordering::SeqCst))
+                        .expect("a valid status code");
+                (
+                    status,
+                    axum::Json(serde_json::json!({"resourceType": "Parameters"})),
+                )
+            }),
+        )
+        .route(
+            "/$bulk-submit-status",
+            axum::routing::post(|AxState(s): AxState<S>| async move {
+                let base = s.base.lock().unwrap().clone();
+                (
+                    StatusCode::ACCEPTED,
+                    [("content-location", format!("{base}/poll"))],
+                    "",
+                )
+            }),
+        )
+        .route(
+            "/poll",
+            axum::routing::get(|| async {
+                (
+                    StatusCode::ACCEPTED,
+                    [("x-progress", "50%"), ("retry-after", "3600")],
+                    "",
+                )
+            }),
+        )
+        .with_state(state);
+    tokio::spawn(async move { axum::serve(listener, recipient).await.unwrap() });
+    (format!("http://{addr}"), answer)
 }
 
 #[tokio::test]
@@ -985,6 +1176,15 @@ async fn an_unreachable_recipient_fails_the_status_change() {
     let (_, html) = get(&ctx, &detail_path).await;
     assert!(html.contains("Status change failed:"));
     assert!(html.contains("In Progress"));
+    // A recipient that never answers is the case #968 was reported against:
+    // the press has to leave a banner on the submission, not just a log line.
+    assert!(html.contains(BANNER), "{html}");
+    assert!(
+        html.contains(r#"<div id="submission-error" class="alert" role="alert">"#),
+        "{html}"
+    );
+    let (_, fragment) = get(&ctx, &format!("{detail_path}/status")).await;
+    assert!(fragment.contains(BANNER), "{fragment}");
 }
 
 #[tokio::test]

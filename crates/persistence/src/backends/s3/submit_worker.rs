@@ -387,6 +387,26 @@ impl S3Backend {
     where
         F: Fn(&mut SubmissionManifestState),
     {
+        self.fenced_mutate_if(lease, |_| true, mutate).await
+    }
+
+    /// [`Self::fenced_mutate`] with an extra `precondition` on the stored state,
+    /// failing with `LeaseLost` when it does not hold.
+    ///
+    /// The two writes that settle a manifest's outcome require it to still be
+    /// `processing`: `abort_submission` moves in-flight manifests to `failed`,
+    /// and a worker that finishes just afterwards must not rewrite that verdict
+    /// (#968).
+    async fn fenced_mutate_if<P, F>(
+        &self,
+        lease: &ManifestLease,
+        precondition: P,
+        mutate: F,
+    ) -> Result<(), LeaseError>
+    where
+        P: Fn(&SubmissionManifestState) -> bool,
+        F: Fn(&mut SubmissionManifestState),
+    {
         let location = self
             .tenant_location(&lease.tenant)
             .map_err(LeaseError::Storage)?;
@@ -399,7 +419,7 @@ impl S3Backend {
             let Some((mut state, etag)) = loaded else {
                 return Err(lease_lost(lease));
             };
-            if !holds_lease(&state, lease) {
+            if !holds_lease(&state, lease) || !precondition(&state) {
                 return Err(lease_lost(lease));
             }
 
@@ -484,6 +504,12 @@ impl S3Backend {
 fn holds_lease(state: &SubmissionManifestState, lease: &ManifestLease) -> bool {
     state.worker_id.as_deref() == Some(lease.worker_id.as_str())
         && state.fencing_token == lease.fencing_token
+}
+
+/// Whether the manifest is still in flight — the precondition on the writes that
+/// settle its outcome, so an abort's verdict is not overwritten (#968).
+fn is_processing(state: &SubmissionManifestState) -> bool {
+    state.manifest.status == ManifestStatus::Processing
 }
 
 #[async_trait]
@@ -778,7 +804,9 @@ impl SubmitWorkerStorage for S3Backend {
     }
 
     async fn finish_manifest(&self, lease: &ManifestLease) -> Result<(), LeaseError> {
-        self.fenced_mutate(lease, |state| {
+        // Guarded on `processing` so a worker finishing just after an abort
+        // cannot rewrite the abort's `failed` verdict back to `completed` (#968).
+        self.fenced_mutate_if(lease, is_processing, |state| {
             state.manifest.status = ManifestStatus::Completed;
             state.worker_id = None;
             state.lease_expiry = None;
@@ -795,7 +823,8 @@ impl SubmitWorkerStorage for S3Backend {
         error_message: &str,
     ) -> Result<(), LeaseError> {
         let message = error_message.to_string();
-        self.fenced_mutate(lease, move |state| {
+        // Same `processing` guard as `finish_manifest` (#968).
+        self.fenced_mutate_if(lease, is_processing, move |state| {
             state.manifest.status = ManifestStatus::Failed;
             state.error_message = Some(message.clone());
             state.worker_id = None;

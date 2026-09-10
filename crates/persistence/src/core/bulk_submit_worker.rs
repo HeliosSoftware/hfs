@@ -24,8 +24,8 @@ use crate::core::bulk_export_output::{ExportOutputStore, ExportPartKey};
 use crate::core::bulk_export_worker::{LeaseError, WorkerId};
 use crate::core::bulk_submit::{
     BulkEntryOutcome, BulkProcessingOptions, BulkSubmitProvider, BulkSubmitRollbackProvider,
-    ByteProgress, EntryResultPage, ImportMode, ManifestPhase, StreamingBulkSubmitProvider,
-    SubmissionId, entry_result_pages,
+    ByteProgress, CancelToken, EntryResultPage, ImportMode, ManifestPhase,
+    StreamingBulkSubmitProvider, SubmissionId, SubmissionStatus, entry_result_pages,
 };
 use crate::core::bulk_submit_input::{RemoteFile, SubmitInputFetcher};
 use crate::core::bulk_submit_output::submit_artifact_key;
@@ -560,11 +560,19 @@ impl tokio::io::AsyncBufRead for CountingReader {
 /// by what is left of the lease, and once `lease_expiry` passes unrenewed the
 /// keeper declares the lease lost, which aborts the run mid-file.
 ///
+/// On the same schedule the keeper re-reads the submission's status and trips
+/// the ingest's [`CancelToken`] once it stops being ingestable (#968). The
+/// keeper is the only part of a running job that touches the database on a
+/// fixed schedule no matter what the ingest is doing, which makes it the one
+/// place an abort can be noticed promptly; nothing else in the loop would look
+/// until the current file ended.
+///
 /// Dropping the keeper stops the renewal task.
 struct LeaseKeeper {
     /// Held rather than only subscribed to, so `run_job` can declare the lease
     /// lost too when a fenced write answers `LeaseLost`.
     lost: tokio::sync::watch::Sender<bool>,
+    cancel: CancelToken,
     handle: tokio::task::JoinHandle<()>,
 }
 
@@ -581,6 +589,18 @@ trait LeaseRenewal: Send + Sync {
 
     /// Persists byte progress, best-effort — failures are not lease-relevant.
     async fn flush_bytes(&self, lease: &ManifestLease, consumed: u64, total: u64);
+
+    /// Re-reads the status of the submission the lease belongs to (#968).
+    ///
+    /// Here rather than on the ingest path because the keeper is the only part
+    /// of a running job that reaches storage on a fixed schedule, so it is the
+    /// only place an abort can be noticed promptly. The three outcomes are kept
+    /// apart deliberately — found, missing, and unreadable mean different
+    /// things to [`watch_submission`], and only the first can stop a job.
+    async fn submission_status(
+        &self,
+        lease: &ManifestLease,
+    ) -> StorageResult<Option<SubmissionStatus>>;
 }
 
 /// Adapts a job store to the keeper's narrow surface.
@@ -598,10 +618,26 @@ where
     async fn flush_bytes(&self, lease: &ManifestLease, consumed: u64, total: u64) {
         let _ = self.0.update_manifest_bytes(lease, consumed, total).await;
     }
+
+    async fn submission_status(
+        &self,
+        lease: &ManifestLease,
+    ) -> StorageResult<Option<SubmissionStatus>> {
+        Ok(self
+            .0
+            .get_submission(&lease.tenant, &lease.submission_id)
+            .await?
+            .map(|summary| summary.status))
+    }
 }
 
 impl LeaseKeeper {
-    fn spawn<R>(jobs: Arc<R>, lease: ManifestLease, progress: ByteProgress) -> Self
+    fn spawn<R>(
+        jobs: Arc<R>,
+        lease: ManifestLease,
+        progress: ByteProgress,
+        cancel: CancelToken,
+    ) -> Self
     where
         R: LeaseRenewal + ?Sized + 'static,
     {
@@ -611,6 +647,7 @@ impl LeaseKeeper {
         const RETRY_AFTER: Duration = Duration::from_millis(500);
         let (lost, _) = tokio::sync::watch::channel(false);
         let flag = lost.clone();
+        let watched = cancel.clone();
         let handle = tokio::spawn(async move {
             let mut expiry = lease.lease_expiry;
             let mut last_flushed: u64 = 0;
@@ -631,6 +668,14 @@ impl LeaseKeeper {
                     if total > 0 && consumed != last_flushed {
                         last_flushed = consumed;
                         jobs.flush_bytes(&lease, consumed, total).await;
+                    }
+                    // Watch for an abort on the flush cadence rather than the
+                    // (up to a minute) heartbeat cadence: a lease renewal is
+                    // cheap to defer, a user waiting for Abort to do something
+                    // is not. One indexed row read every few seconds per
+                    // running manifest.
+                    if !watched.is_cancelled() {
+                        watch_submission(jobs.as_ref(), &lease, &watched).await;
                     }
                 }
                 // Renew, retrying only for as long as the lease still covers
@@ -684,11 +729,24 @@ impl LeaseKeeper {
                 expiry = new_expiry;
             }
         });
-        Self { lost, handle }
+        Self {
+            lost,
+            cancel,
+            handle,
+        }
     }
 
-    fn lease_lost(&self) -> bool {
-        *self.lost.borrow()
+    /// Whether the job in flight should wind down: either the lease is gone or
+    /// the submission stopped being ingestable (#968). Both exit the same way —
+    /// leave the manifest alone and let whoever owns its outcome record it.
+    fn should_stop(&self) -> bool {
+        *self.lost.borrow() || self.cancel.is_cancelled()
+    }
+
+    /// Whether the stop is an abort rather than a lost lease. The two exit
+    /// identically but read very differently in an operator's log.
+    fn cancelled(&self) -> bool {
+        self.cancel.is_cancelled()
     }
 
     /// Marks the lease lost from outside the renewal task — used when a fenced
@@ -699,6 +757,11 @@ impl LeaseKeeper {
 
     /// Resolves once the lease is lost, and never otherwise. Raced against the
     /// ingest so a loss aborts mid-file rather than only between files.
+    ///
+    /// Lease loss only: an abort needs no race here, because its token is
+    /// checked between batches *inside* the ingest, so the files wind
+    /// themselves down and the fan-out ends normally (#968). Resolving this on
+    /// a cancel too would report an aborted run as one whose lease was lost.
     async fn lost(&self) {
         let mut rx = self.lost.subscribe();
         while !*rx.borrow_and_update() {
@@ -714,6 +777,64 @@ impl LeaseKeeper {
 impl Drop for LeaseKeeper {
     fn drop(&mut self) {
         self.handle.abort();
+    }
+}
+
+/// Trips `cancel` when the submission behind `lease` has stopped being
+/// ingestable, so an abort reaches the manifest already in flight and not only
+/// future claims (#968).
+///
+/// The admitted set mirrors `claim_next_manifest`'s: `complete` means the
+/// submitter will send no further manifests, not that the registered ones
+/// should be dropped, so only `aborted` stops the ingest. A submission that
+/// reads back as missing is left alone — the lease machinery already covers
+/// deletion, and a transient read is not worth throwing away a running job
+/// over. Storage errors likewise never cancel: an unreachable database must
+/// not look like an abort.
+async fn watch_submission<R>(jobs: &R, lease: &ManifestLease, cancel: &CancelToken)
+where
+    R: LeaseRenewal + ?Sized,
+{
+    match jobs.submission_status(lease).await {
+        Ok(Some(status))
+            if !matches!(
+                status,
+                SubmissionStatus::InProgress | SubmissionStatus::Complete
+            ) =>
+        {
+            tracing::info!(
+                submission = %lease.submission_id,
+                manifest = %lease.manifest_id,
+                %status,
+                "bulk-submit submission is no longer ingestable; stopping the manifest in flight"
+            );
+            cancel.cancel();
+        }
+        Ok(_) => {}
+        Err(e) => {
+            tracing::debug!(
+                submission = %lease.submission_id,
+                manifest = %lease.manifest_id,
+                error = %e,
+                "bulk-submit submission status check failed; retrying"
+            );
+        }
+    }
+}
+
+/// Logs a claimed manifest winding down before its natural end.
+///
+/// A cancelled manifest is deliberately left untouched: `abort_submission`
+/// already moved it out of `processing`, and marking it here would either
+/// fight that write or fabricate a terminal state for work that simply
+/// stopped. Its partial counts stay recorded.
+fn log_wind_down(lease: &ManifestLease, cancelled: bool) {
+    if cancelled {
+        tracing::info!(
+            submission = %lease.submission_id,
+            manifest = %lease.manifest_id,
+            "bulk-submit manifest stopped by abort; partial counts kept, no result artifacts written"
+        );
     }
 }
 
@@ -779,6 +900,7 @@ where
                 Arc::new(JobStoreRenewal(Arc::clone(&self.jobs))),
                 lease.clone(),
                 ByteProgress::default(),
+                CancelToken::new(),
             );
             let _ = self
                 .publish_collected_artifacts(
@@ -792,6 +914,11 @@ where
         };
 
         let progress = ByteProgress::default();
+        // Abort is cooperative and means "stop soon": the keeper trips this
+        // token when the submission stops being ingestable, the ingest loops
+        // check it between batches, and this job checks it between files. Every
+        // per-file clone of `opts` shares the one token (#968).
+        let cancel = CancelToken::new();
         // The lease must stay heartbeated *through* a file, not only between
         // files, and independently of how often the ingest future yields; the
         // keeper renews from its own task until dropped.
@@ -802,10 +929,17 @@ where
         // single heartbeat. The keeper only *flushes bytes* once
         // `progress.total` is non-zero, so starting it early adds heartbeats
         // and nothing else.
+        //
+        // It also starts the abort watch that much earlier, which those same
+        // minutes are the reason to want: an operator who gives up during
+        // `reading manifest` or `sizing` now has the token tripped before the
+        // first file is opened, so the ingest stops at its first batch check
+        // instead of running the whole corpus first (#968).
         let keeper = LeaseKeeper::spawn(
             Arc::new(JobStoreRenewal(Arc::clone(&self.jobs))),
             lease.clone(),
             progress.clone(),
+            cancel.clone(),
         );
 
         // 1. Fetch the remote Bulk Export Manifest.
@@ -861,7 +995,8 @@ where
         let opts = BulkProcessingOptions::new()
             .with_import_mode(import_mode)
             .with_defer_indexing(self.defer_indexing)
-            .with_byte_progress(progress.clone());
+            .with_byte_progress(progress.clone())
+            .with_cancel(cancel.clone());
         let file_count = manifest.output.len() as u64;
         // Reserve 0 for the aggregated entry-error artifact and 1 for the
         // manifest-fetch failure. Per-file output/deleted indexes follow their
@@ -1001,7 +1136,7 @@ where
 
         let mut ingest = futures::stream::iter(0..manifest.output.len())
             .map(|i| async move {
-                if keeper_ref.lease_lost() {
+                if keeper_ref.should_stop() {
                     return Ok::<(), StorageError>(());
                 }
                 let file = &manifest_ref.output[i];
@@ -1175,7 +1310,8 @@ where
         let mut records = error_records.lock().await.clone();
         let mut deleted_refs = Vec::new();
         for (input_index, file) in manifest.deleted.iter().enumerate() {
-            if keeper.lease_lost() {
+            if keeper.should_stop() {
+                log_wind_down(&lease, keeper.cancelled());
                 return Ok(());
             }
             match self
@@ -1214,7 +1350,11 @@ where
         }
 
         // 3. Emit per-type `output` receipts and an aggregated `error` artifact.
-        if keeper.lease_lost() {
+        // A wound-down job writes neither these nor a terminal manifest status:
+        // the receipts would claim a manifest that never finished, and an
+        // aborted manifest's outcome is already recorded by the abort (#968).
+        if keeper.should_stop() {
+            log_wind_down(&lease, keeper.cancelled());
             return Ok(());
         }
         records.extend(
@@ -3198,6 +3338,7 @@ mod tests {
             Arc::new(JobStoreRenewal(Arc::clone(&backend))),
             lease.clone(),
             ByteProgress::default(),
+            CancelToken::new(),
         );
         let first = worker
             .publish_collected_artifacts(
@@ -3213,6 +3354,7 @@ mod tests {
             Arc::new(JobStoreRenewal(Arc::clone(&backend))),
             lease.clone(),
             ByteProgress::default(),
+            CancelToken::new(),
         );
         let second = worker
             .publish_collected_artifacts(
@@ -3687,12 +3829,16 @@ mod tests {
         Lands,
     }
 
-    struct StubRenewal(Renewal);
+    struct StubRenewal {
+        renewal: Renewal,
+        /// What the submission behind the lease reads back as (#968).
+        status: SubmissionStatus,
+    }
 
     #[async_trait]
     impl LeaseRenewal for StubRenewal {
         async fn heartbeat(&self, lease: &ManifestLease) -> Result<DateTime<Utc>, LeaseError> {
-            match self.0 {
+            match self.renewal {
                 Renewal::Hangs => std::future::pending().await,
                 Renewal::Fails => Err(LeaseError::Storage(StorageError::Backend(
                     crate::error::BackendError::Internal {
@@ -3706,12 +3852,19 @@ mod tests {
         }
 
         async fn flush_bytes(&self, _lease: &ManifestLease, _consumed: u64, _total: u64) {}
+
+        async fn submission_status(
+            &self,
+            _lease: &ManifestLease,
+        ) -> StorageResult<Option<SubmissionStatus>> {
+            Ok(Some(self.status))
+        }
     }
 
-    /// Spawns a keeper over a two-second lease and reports whether it declared
-    /// that lease lost within `wait`.
-    async fn keeper_loses_lease(renewal: Renewal, wait: StdDuration) -> bool {
-        let lease = ManifestLease {
+    /// A two-second lease, short enough that a keeper's timings play out inside
+    /// a test.
+    fn keeper_lease() -> ManifestLease {
+        ManifestLease {
             tenant: tenant(),
             submission_id: SubmissionId::generate("mock-system"),
             manifest_id: "m1".to_string(),
@@ -3719,13 +3872,43 @@ mod tests {
             lease_expiry: Utc::now() + chrono::Duration::seconds(2),
             lease_duration: StdDuration::from_secs(2),
             fencing_token: 1,
-        };
+        }
+    }
+
+    /// Spawns a keeper over a two-second lease and reports whether it declared
+    /// that lease lost within `wait`.
+    async fn keeper_loses_lease(renewal: Renewal, wait: StdDuration) -> bool {
         let keeper = LeaseKeeper::spawn(
-            Arc::new(StubRenewal(renewal)),
-            lease,
+            Arc::new(StubRenewal {
+                renewal,
+                status: SubmissionStatus::InProgress,
+            }),
+            keeper_lease(),
             ByteProgress::default(),
+            CancelToken::new(),
         );
         tokio::time::timeout(wait, keeper.lost()).await.is_ok()
+    }
+
+    /// Spawns a keeper over a healthy lease whose submission reads back as
+    /// `status`, and reports whether it tripped the ingest's cancel token
+    /// within `wait`.
+    async fn keeper_cancels(status: SubmissionStatus, wait: StdDuration) -> bool {
+        let cancel = CancelToken::new();
+        let _keeper = LeaseKeeper::spawn(
+            Arc::new(StubRenewal {
+                renewal: Renewal::Lands,
+                status,
+            }),
+            keeper_lease(),
+            ByteProgress::default(),
+            cancel.clone(),
+        );
+        let deadline = tokio::time::Instant::now() + wait;
+        while tokio::time::Instant::now() < deadline && !cancel.is_cancelled() {
+            tokio::time::sleep(StdDuration::from_millis(50)).await;
+        }
+        cancel.is_cancelled()
     }
 
     /// A heartbeat that cannot land before the lease expires is fatal (#969).
@@ -3747,5 +3930,25 @@ mod tests {
     #[tokio::test]
     async fn test_lease_keeper_holds_a_renewable_lease() {
         assert!(!keeper_loses_lease(Renewal::Lands, StdDuration::from_secs(5)).await);
+    }
+
+    /// An aborted submission trips the ingest's cancel token (#968).
+    ///
+    /// This is the whole mechanism behind Abort reaching a manifest that is
+    /// already in flight: nothing else in a running job re-reads the
+    /// submission, so without this the ingest runs to the end of the file and
+    /// the UI reports "Stopped" over a job still writing rows.
+    #[tokio::test]
+    async fn test_lease_keeper_cancels_an_aborted_submission() {
+        assert!(keeper_cancels(SubmissionStatus::Aborted, StdDuration::from_secs(15)).await);
+    }
+
+    /// The converse, and the reason `complete` is not treated as terminal here:
+    /// it means the submitter will send no further manifests, not that the
+    /// registered ones should be dropped mid-ingest.
+    #[tokio::test]
+    async fn test_lease_keeper_leaves_an_ingestable_submission_running() {
+        assert!(!keeper_cancels(SubmissionStatus::InProgress, StdDuration::from_secs(5)).await);
+        assert!(!keeper_cancels(SubmissionStatus::Complete, StdDuration::from_secs(5)).await);
     }
 }
