@@ -18,23 +18,30 @@ use helios_persistence::core::ExportDataProvider;
 use helios_persistence::core::{
     DownloadUrl, ExportJobId, ExportLevel, ExportManifest, ExportOutputFile, ExportOutputStore,
     ExportRequest, ExportStatus, GroupExportProvider, PatientExportProvider, RawManifestEntry,
-    ResourceStorage, StartExportInput, TypeFilter,
+    ResourceStorage, SearchProvider, StartExportInput, TypeFilter,
 };
 use helios_persistence::error::{BulkExportError, ResourceError, StorageError};
 use tokio::io::AsyncRead;
 use tokio_util::io::ReaderStream;
 
 use crate::error::{RestError, RestResult};
-use crate::extractors::{FhirVersionExtractor, TenantExtractor};
+use crate::extractors::{
+    FhirVersionExtractor, SearchParams, TenantExtractor, build_search_query_from_pairs,
+    unknown_search_params,
+};
 use crate::state::AppState;
 
 /// Trait bound shared by all bulk-export handlers (the resource-store side).
 pub trait ExportResourceStore:
-    ResourceStorage + ExportDataProvider + PatientExportProvider + GroupExportProvider
+    ResourceStorage + ExportDataProvider + PatientExportProvider + GroupExportProvider + SearchProvider
 {
 }
 impl<S> ExportResourceStore for S where
-    S: ResourceStorage + ExportDataProvider + PatientExportProvider + GroupExportProvider
+    S: ResourceStorage
+        + ExportDataProvider
+        + PatientExportProvider
+        + GroupExportProvider
+        + SearchProvider
 {
 }
 
@@ -184,7 +191,29 @@ where
                 )));
             }
         }
-        type_filters.push(TypeFilter::new(rt, query));
+        // Compile the filter against the search parameter registry so the
+        // worker (T5) executes exactly what was validated here, without
+        // re-interpreting text. This is always strict: the Bulk Data Access
+        // spec requires unsupported `_typeFilter` parameters to be rejected
+        // at kick-off, so `Prefer: handling=lenient` does not relax it.
+        let filter_pairs: Vec<(String, String)> = url::form_urlencoded::parse(query.as_bytes())
+            .into_owned()
+            .collect();
+        let compiled = {
+            let reg = state.storage().search_param_registry(tenant.context());
+            let registry = reg.read();
+            let params = SearchParams::from_pairs(filter_pairs.clone());
+            let unknown = unknown_search_params(rt, &params, &registry);
+            if !unknown.is_empty() {
+                return Err(bad_request(format!(
+                    "_typeFilter '{raw}': unknown search parameter(s) for {rt}: {}",
+                    unknown.join(", ")
+                )));
+            }
+            build_search_query_from_pairs(rt, &filter_pairs, &registry)
+                .map_err(|e| bad_request(format!("_typeFilter '{raw}': {e}")))?
+        };
+        type_filters.push(TypeFilter::new(rt, query).with_compiled(compiled));
     }
 
     // Group existence — a `Group/{id}/$export` for a Group that does not exist (or is

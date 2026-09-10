@@ -18,7 +18,7 @@ use helios_persistence::backends::local_fs::LocalFsOutputStore;
 use helios_persistence::backends::sqlite::{SqliteBackend, SqliteBackendConfig};
 use helios_persistence::core::{
     BulkExportJobStore, BulkExportStorage, DefaultExportWorker, ExportClaimStrategy,
-    ExportOutputStore, ResourceStorage, WorkerId,
+    ExportOutputStore, ExportWorkerStorage, ResourceStorage, WorkerId,
 };
 use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
 use helios_rest::ServerConfig;
@@ -605,6 +605,68 @@ async fn test_type_filter_validation() {
 }
 
 #[tokio::test]
+async fn test_type_filter_unknown_param_rejected() {
+    let (server, backend, _output, _tmp) = create_bulk_export_server().await;
+
+    let resp = server
+        .get("/$export")
+        .add_header("x-tenant-id", "test-tenant")
+        .add_header("prefer", "respond-async")
+        .add_query_param("_type", "Patient")
+        .add_query_param("_typeFilter", "Patient?foo=bar")
+        .await;
+    assert_eq!(resp.status_code(), StatusCode::BAD_REQUEST);
+    let body: Value = resp.json();
+    let text = body["issue"][0]["details"]["text"].as_str().unwrap();
+    assert!(text.contains("foo"), "got: {text}");
+    assert!(text.contains("_typeFilter"), "got: {text}");
+
+    let tenant = test_tenant();
+    assert_eq!(
+        backend.count_active_exports(&tenant).await.unwrap(),
+        0,
+        "no job should be created when the type filter is rejected"
+    );
+}
+
+#[tokio::test]
+async fn test_type_filter_invalid_value_rejected() {
+    let (server, _backend, _output, _tmp) = create_bulk_export_server().await;
+
+    // `active` is a Patient token search parameter; `:exact` is only valid
+    // for string parameters, so the builder rejects this combination.
+    let resp = server
+        .get("/$export")
+        .add_header("x-tenant-id", "test-tenant")
+        .add_header("prefer", "respond-async")
+        .add_query_param("_type", "Patient")
+        .add_query_param("_typeFilter", "Patient?active:exact=true")
+        .await;
+    assert_eq!(resp.status_code(), StatusCode::BAD_REQUEST);
+    let body: Value = resp.json();
+    let text = body["issue"][0]["details"]["text"].as_str().unwrap();
+    assert!(text.contains("_typeFilter"), "got: {text}");
+}
+
+#[tokio::test]
+async fn test_type_filter_unknown_param_rejected_even_when_lenient() {
+    let (server, _backend, _output, _tmp) = create_bulk_export_server().await;
+
+    let resp = server
+        .get("/$export")
+        .add_header("x-tenant-id", "test-tenant")
+        .add_header("prefer", "respond-async, handling=lenient")
+        .add_query_param("_type", "Patient")
+        .add_query_param("_typeFilter", "Patient?foo=bar")
+        .await;
+    assert_eq!(
+        resp.status_code(),
+        StatusCode::BAD_REQUEST,
+        "_typeFilter validation is always strict, regardless of Prefer: handling"
+    );
+}
+
+#[tokio::test]
 async fn test_status_and_download_unknown_job() {
     let (server, _backend, _output, _tmp) = create_bulk_export_server().await;
 
@@ -720,7 +782,44 @@ async fn test_valid_type_filter_accepted() {
         .await;
     assert_eq!(resp.status_code(), StatusCode::ACCEPTED);
 
-    drain_workers(&backend, &output).await;
+    // The kick-off must have compiled the filter against the search
+    // parameter registry and persisted it on the job, rather than leaving
+    // the worker to reinterpret the raw query string.
+    let worker_id = WorkerId::new("t");
+    let lease = backend
+        .claim_next(&worker_id, Duration::from_secs(60))
+        .await
+        .expect("claim_next")
+        .expect("a job should be claimable");
+    let view = backend
+        .get_export_job_for_worker(
+            &lease.tenant,
+            &lease.job_id,
+            &lease.worker_id,
+            lease.fencing_token,
+        )
+        .await
+        .expect("get_export_job_for_worker");
+    let compiled = view.request.type_filters[0]
+        .compiled
+        .as_ref()
+        .expect("the compiled filter should be persisted on the job");
+    assert_eq!(compiled.resource_type, "Patient");
+    assert!(
+        compiled.parameters.iter().any(|p| p.name == "active"),
+        "compiled filter should carry the 'active' parameter, got: {:?}",
+        compiled.parameters
+    );
+
+    // Run the job to completion so the leased worker doesn't leak into other
+    // assertions and the output store is exercised end to end.
+    let worker = DefaultExportWorker::new(
+        backend.clone(),
+        backend.clone(),
+        output.clone(),
+        worker_id.clone(),
+    );
+    worker.run_job(lease).await.expect("run_job");
 }
 
 #[tokio::test]
