@@ -15,6 +15,19 @@
   </div>
 </header>
 
+{# Host for the failed-status-change banner (#968): an Abort or Mark completed
+   whose kick-off the recipient never accepted leaves this submission running,
+   and that has to survive a reload, not just scroll past in the log. Rendered
+   here, filled, on a hard navigation; kept current afterwards by the status
+   card's out-of-band swap (partials/bulk_import_status.html), which is why the
+   id and markup must match that fragment's. Empty renders a bare div: no
+   `.alert`, so it costs no space until there is something to say. #}
+{% if !status_error.is_empty() %}
+<div id="submission-error" class="alert" role="alert">{{ status_error }}</div>
+{% else %}
+<div id="submission-error"></div>
+{% endif %}
+
 <section class="card panel bulk-import-section bulk-import-summary-card">
   <div class="kv-grid kv-grid--flush">
     <div class="detail__field detail__field--wide"><span>{{ i18n.t("bulk-import-field-manifest-url") }}</span><code>{{ manifest_url }}</code></div>

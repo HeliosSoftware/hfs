@@ -111,6 +111,19 @@ pub struct Submission {
     /// Abort/Complete can close it out.
     #[serde(default)]
     pub status: String,
+    /// Why the last status change (Abort / Mark completed) did not reach the
+    /// recipient — kept on the submission so a failed Abort is visible on the
+    /// import itself and not only in the log (#968). Named for the operation,
+    /// not for Abort: both buttons go through `set_status` and both leave the
+    /// submission running when the kick-off fails. The value is the
+    /// recipient's or transport's own untranslated diagnosis; the sentence
+    /// around it is localized at render time (`status_error_message`), so the
+    /// banner reads in the *viewer's* language rather than in the language of
+    /// whoever pressed the button. Cleared by the next successful status
+    /// change; `serde(default)` keeps submissions stored before #968
+    /// deserializing.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub status_error: String,
     #[serde(default)]
     pub created_at: String,
     #[serde(default)]
@@ -250,6 +263,23 @@ struct LogLine {
     message: String,
 }
 
+/// The banner text for a submission whose last Abort / Mark completed never
+/// reached the recipient (#968), or an empty string when the last status
+/// change went through. The stored value is a technical diagnosis in whatever
+/// words the recipient or the transport used; only the sentence around it is
+/// translated, the same split the ViewDefinition lint catalog uses.
+fn status_error_message(i18n: &I18n, submission: &Submission) -> String {
+    if submission.status_error.is_empty() {
+        String::new()
+    } else {
+        i18n.t_arg(
+            "bulk-import-status-error",
+            "detail",
+            submission.status_error.clone(),
+        )
+    }
+}
+
 /// The submission's log as `partials/bulk_import_log.html` wants it:
 /// newest-first, so the detail page's first paint and the status fragment's
 /// out-of-band refresh agree on the order (#955).
@@ -307,6 +337,10 @@ struct BulkImportDetailPage {
     submitter_display: String,
     created_at: String,
     status_label: String,
+    /// The persistent failed-status-change banner (#968), already localized;
+    /// empty renders the bare out-of-band host the status card swaps into.
+    /// Distinct from `error`, which is the edit dialog's one-shot failure.
+    status_error: String,
     auth: String,
     client_id: String,
     token_url: String,
@@ -421,6 +455,7 @@ pub async fn create(
         client_id: form.client_id.trim().to_string(),
         token_url: form.token_url.trim().to_string(),
         status: "not-started".to_string(),
+        status_error: String::new(),
         created_at: now_stamp(),
         manifests: serde_json::Map::new(),
         log: Vec::new(),
@@ -485,6 +520,7 @@ fn render_detail_page(
 
     let log = log_lines(&s);
     let label = status_label(&i18n, &s.status);
+    let status_error = status_error_message(&i18n, &s);
     render(BulkImportDetailPage {
         status,
         i18n,
@@ -508,6 +544,7 @@ fn render_detail_page(
         manifest_url,
         created_at: s.created_at,
         status_label: label,
+        status_error,
         auth: s.auth.clone(),
         client_id: s.client_id,
         token_url: s.token_url,
@@ -1193,18 +1230,26 @@ async fn set_status(
         Ok((code, _, _)) if (200..300).contains(&code) => {
             push_log(&mut s, format!("Recipient acknowledged ({code})."));
             s.status = status.to_string();
+            // The change landed, so any banner from an earlier attempt is
+            // stale (#968).
+            s.status_error = String::new();
         }
         Ok((code, content_type, body)) => {
+            let detail = format!("{code}: {}", summarize_error_body(&content_type, &body));
             push_log(
                 &mut s,
-                format!(
-                    "Recipient rejected the status change: {code}: {}",
-                    summarize_error_body(&content_type, &body)
-                ),
+                format!("Recipient rejected the status change: {detail}"),
             );
+            // The submission keeps its own status, so the press left no trace
+            // anywhere but the log until #968 — a saturated recipient that
+            // times out or rejects the kick-off must not look like a
+            // successful Abort. `can_abort` is unchanged, so the retry stays
+            // one click away.
+            s.status_error = detail;
         }
         Err(e) => {
             push_log(&mut s, format!("Status change failed: {e}"));
+            s.status_error = e;
         }
     }
     save_or_warn(&state, &rt, &id, &s, Some(sv)).await;
@@ -1230,6 +1275,11 @@ struct StatusCard {
     completed_at: String,
     /// Rides out-of-band into the summary card's STATUS cell.
     status_label: String,
+    /// Rides out-of-band into the detail page's `#submission-error` host, the
+    /// same way `status_label` does (#968): the card is re-fetched every 5s
+    /// with `outerHTML`, so a banner rendered beside it would either be wiped
+    /// by the next swap or duplicated by it. Empty clears the host.
+    status_error: String,
     /// Rides out-of-band into the Submission Log section, whose lines this
     /// poll may have just written (#955).
     log: Vec<LogLine>,
@@ -1257,6 +1307,7 @@ pub async fn status_fragment(
         save_or_warn(&state, &rt, &id, &s, Some(sv)).await;
     }
     let label = status_label(&i18n, &s.status);
+    let status_error = status_error_message(&i18n, &s);
     render(StatusCard {
         id,
         polling: !s.poll_url.is_empty(),
@@ -1267,6 +1318,7 @@ pub async fn status_fragment(
         errors: s.result["errors"].as_u64().unwrap_or(0),
         completed_at: s.result["completedAt"].as_str().unwrap_or("").to_string(),
         status_label: label,
+        status_error,
         log: log_lines(&s),
         log_oob: true,
         i18n,
@@ -1278,7 +1330,7 @@ pub async fn status_fragment(
 /// bar about to fill, not a percentage that never moves — the indeterminate
 /// sweep is reserved for recipients that report no percentage at all.
 ///
-/// Pre-ingest phase reports (#953) — `waiting for a worker`, `reading
+/// Pre-ingest phase reports (#953) — `Queued - starting shortly`, `reading
 /// manifest`, `sizing {done} of {total} files`, `downloading file {done} of
 /// {total}` — deliberately fall through to `None`: there is no meaningful
 /// share-of-the-whole to draw yet, so the card pairs the phase text with the
@@ -1410,7 +1462,8 @@ mod tests {
     #[test]
     fn pre_ingest_phases_report_no_percentage() {
         for phase in [
-            "waiting for a worker",
+            "Queued - starting shortly",
+            "Queued - waiting for an external worker",
             "reading manifest",
             "sizing 37 of 412 files",
             "downloading file 1 of 412",

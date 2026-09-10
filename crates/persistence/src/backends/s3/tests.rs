@@ -23,8 +23,8 @@ use crate::backends::s3::keyspace::S3Keyspace;
 use crate::backends::s3::user_settings::settings_object_id;
 use crate::core::bulk_export::{ExportDataProvider, ExportRequest};
 use crate::core::bulk_submit::{
-    BulkProcessingOptions, BulkSubmitProvider, BulkSubmitRollbackProvider, NdjsonEntry,
-    StreamingBulkSubmitProvider, SubmissionId, SubmissionStatus,
+    BulkProcessingOptions, BulkSubmitProvider, BulkSubmitRollbackProvider, CANCELLED_ABORT_REASON,
+    CancelToken, NdjsonEntry, StreamingBulkSubmitProvider, SubmissionId, SubmissionStatus,
 };
 use crate::core::history::{
     HistoryParams, InstanceHistoryProvider, SystemHistoryProvider, TypeHistoryProvider,
@@ -1293,6 +1293,120 @@ async fn bulk_submit_stream_and_parallel_manifests_max_errors() {
         ))
     ));
     assert!(r2.is_ok());
+}
+
+/// Wraps a reader so that `token` is tripped the first time the ingest actually
+/// reads from the stream.
+///
+/// That makes "cancelled mid-manifest" deterministic: the pre-loop check still
+/// sees an un-cancelled token, the first batch is read and committed, and the
+/// between-batches check then sees the cancellation — no sleeps, no races.
+struct CancelOnFirstRead<R> {
+    inner: R,
+    token: CancelToken,
+    tripped: bool,
+}
+
+impl<R: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for CancelOnFirstRead<R> {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        if !this.tripped {
+            this.tripped = true;
+            this.token.cancel();
+        }
+        std::pin::Pin::new(&mut this.inner).poll_read(cx, buf)
+    }
+}
+
+/// #968: the S3 ingest loop honours the cancel token, both before it starts and
+/// between committed batches.
+#[tokio::test]
+async fn bulk_submit_stream_honours_cancellation() {
+    let backend = make_prefix_backend(Arc::new(MockS3Client::with_buckets(&["test-bucket"])));
+    let tenant = tenant("tenant-a");
+
+    let submission_id = SubmissionId::new("client-cancel", "sub-cancel");
+    backend
+        .create_submission(&tenant, &submission_id, None)
+        .await
+        .unwrap();
+    let early = backend
+        .add_manifest(&tenant, &submission_id, None, None)
+        .await
+        .unwrap();
+    let midway = backend
+        .add_manifest(&tenant, &submission_id, None, None)
+        .await
+        .unwrap();
+
+    let lines: Vec<u8> = (1..=6)
+        .map(|i| format!("{{\"resourceType\":\"Patient\",\"id\":\"s3-cancel-{i}\"}}\n"))
+        .collect::<String>()
+        .into_bytes();
+
+    // Already cancelled when the ingest starts: nothing is read or written.
+    let tripped = CancelToken::new();
+    tripped.cancel();
+    let result = backend
+        .process_ndjson_stream(
+            &tenant,
+            &submission_id,
+            &early.manifest_id,
+            "Patient",
+            Box::new(BufReader::new(Cursor::new(lines.clone()))),
+            &BulkProcessingOptions::new()
+                .with_batch_size(2)
+                .with_cancel(tripped),
+        )
+        .await
+        .unwrap();
+    assert!(result.aborted);
+    assert_eq!(result.abort_reason.as_deref(), Some(CANCELLED_ABORT_REASON));
+    assert_eq!(result.lines_processed, 0);
+    assert_eq!(result.counts.total, 0);
+
+    // Cancelled while streaming: the batch already committed survives, the rest
+    // is never read.
+    let cancel = CancelToken::new();
+    let result = backend
+        .process_ndjson_stream(
+            &tenant,
+            &submission_id,
+            &midway.manifest_id,
+            "Patient",
+            Box::new(BufReader::new(CancelOnFirstRead {
+                inner: Cursor::new(lines),
+                token: cancel.clone(),
+                tripped: false,
+            })),
+            &BulkProcessingOptions::new()
+                .with_batch_size(2)
+                .with_cancel(cancel),
+        )
+        .await
+        .unwrap();
+    assert!(result.aborted);
+    assert_eq!(result.abort_reason.as_deref(), Some(CANCELLED_ABORT_REASON));
+    assert_eq!(result.counts.success, 2, "the committed batch is kept");
+    assert_eq!(result.lines_processed, 2, "the rest was never read");
+    assert!(
+        backend
+            .read(&tenant, "Patient", "s3-cancel-2")
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        backend
+            .read(&tenant, "Patient", "s3-cancel-3")
+            .await
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[tokio::test]
@@ -3133,6 +3247,57 @@ mod bulk_submit_worker {
             .heartbeat(&fresh)
             .await
             .expect("the live lease survives");
+    }
+
+    /// #968: an abort settles the manifest's outcome, so a worker that finishes
+    /// immediately afterwards must lose rather than flip `failed` to
+    /// `completed`.
+    #[tokio::test]
+    async fn an_abort_beats_a_late_worker_verdict() {
+        let backend = make_prefix_backend(Arc::new(MockS3Client::with_buckets(&["test-bucket"])));
+        let t = tenant("tenant-a");
+        let (id, _manifest_id) = seed(&backend, &t).await;
+
+        let lease = backend
+            .claim_next_manifest(&WorkerId::new("worker-1"), lease_duration())
+            .await
+            .expect("claim")
+            .expect("claimable");
+        backend
+            .mark_manifest_processing(&lease)
+            .await
+            .expect("mark processing");
+
+        backend
+            .abort_submission(&t, &id, "user cancelled")
+            .await
+            .expect("abort");
+
+        for verdict in [
+            backend
+                .finish_manifest(&lease)
+                .await
+                .err()
+                .map(|e| format!("{e:?}")),
+            backend
+                .fail_manifest(&lease, "worker gave up")
+                .await
+                .err()
+                .map(|e| format!("{e:?}")),
+        ] {
+            let message = verdict.expect("a verdict after an abort must fail");
+            assert!(
+                message.contains("LeaseLost"),
+                "expected LeaseLost, got {message}"
+            );
+        }
+
+        let manifests = backend.list_manifests(&t, &id).await.expect("manifests");
+        assert_eq!(
+            manifests[0].status,
+            ManifestStatus::Failed,
+            "the abort's verdict stands"
+        );
     }
 
     #[tokio::test]

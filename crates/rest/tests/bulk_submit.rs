@@ -1586,6 +1586,7 @@ async fn test_in_progress_poll_advertises_the_configured_retry_after() {
         mock_fetcher(),
         BulkSubmitConfig {
             retry_after_secs: 7,
+            pre_ingest_retry_after_secs: 7,
             ..BulkSubmitConfig::default()
         },
     )
@@ -1599,6 +1600,93 @@ async fn test_in_progress_poll_advertises_the_configured_retry_after() {
         resp.headers().get("retry-after").expect("Retry-After"),
         "7",
         "the in-progress poll must advertise HFS_BULK_SUBMIT_RETRY_AFTER"
+    );
+}
+
+/// The pre-ingest phases (#953) each last seconds, while the ingest cadence
+/// is two minutes by default. A poller that honours the long cadence from the
+/// first `202` sleeps straight through queued -> reading -> sizing ->
+/// downloading and the phase reports never reach a screen — HFS's own Import
+/// page showed the queued text for its whole first window. So the short
+/// cadence is advertised until the first counted byte or entry, and the long
+/// one after.
+#[tokio::test]
+async fn test_poll_advertises_the_short_cadence_until_ingest_starts() {
+    let (server, backend, _fetcher, _output, _tmp) = create_submit_server_with(
+        mock_fetcher(),
+        BulkSubmitConfig {
+            retry_after_secs: 90,
+            pre_ingest_retry_after_secs: 8,
+            ..BulkSubmitConfig::default()
+        },
+    )
+    .await;
+    let poll_path = start_and_get_poll_path(&server).await;
+
+    // Queued: nothing claimed.
+    let resp = server.get(&poll_path).await;
+    assert_eq!(resp.status_code(), StatusCode::ACCEPTED);
+    assert_eq!(
+        resp.headers().get("retry-after").expect("Retry-After"),
+        "8",
+        "a queued submission must advertise the pre-ingest cadence"
+    );
+
+    // Claimed and in a named phase: still pre-ingest.
+    let lease = backend
+        .claim_next_manifest(&WorkerId::new("cadence-worker"), Duration::from_secs(60))
+        .await
+        .expect("claim")
+        .expect("a manifest to claim");
+    backend
+        .update_manifest_phase(&lease, ManifestPhase::Sizing, 3, 12)
+        .await
+        .expect("phase update");
+    let resp = server.get(&poll_path).await;
+    assert_eq!(resp.status_code(), StatusCode::ACCEPTED);
+    assert_eq!(
+        resp.headers().get("retry-after").expect("Retry-After"),
+        "8",
+        "a sizing submission must advertise the pre-ingest cadence"
+    );
+
+    // First bytes counted: ingest cadence.
+    backend
+        .update_manifest_bytes(&lease, 350, 1_000)
+        .await
+        .expect("bytes update");
+    let resp = server.get(&poll_path).await;
+    assert_eq!(resp.status_code(), StatusCode::ACCEPTED);
+    assert_eq!(
+        resp.headers().get("retry-after").expect("Retry-After"),
+        "90",
+        "once bytes are counted the poll must advertise HFS_BULK_SUBMIT_RETRY_AFTER"
+    );
+}
+
+/// The advertised pre-ingest cadence must never be one the rate limiter
+/// would punish: a client doing exactly what the header says has to stay
+/// inside `POLL_RATE_LIMIT` per `POLL_RATE_WINDOW`.
+#[tokio::test]
+async fn test_pre_ingest_cadence_is_clamped_to_the_poll_rate_limit() {
+    let (server, ..) = create_submit_server_with(
+        mock_fetcher(),
+        BulkSubmitConfig {
+            pre_ingest_retry_after_secs: 1,
+            poll_rate_limit: 4,
+            poll_rate_window_secs: 60,
+            ..BulkSubmitConfig::default()
+        },
+    )
+    .await;
+    let poll_path = start_and_get_poll_path(&server).await;
+
+    let resp = server.get(&poll_path).await;
+    assert_eq!(resp.status_code(), StatusCode::ACCEPTED);
+    assert_eq!(
+        resp.headers().get("retry-after").expect("Retry-After"),
+        "15",
+        "4 polls per 60s means one poll every 15s at most"
     );
 }
 
@@ -1805,20 +1893,45 @@ async fn poll_progress(server: &TestServer, poll_path: &str) -> String {
 }
 
 /// A submission whose manifests are all still `pending` is queued, not slow:
-/// no worker has claimed anything, so there is no percentage to report.
+/// no worker has claimed anything, so there is no percentage to report. With
+/// the in-process pool running an idle worker claims within seconds, so the
+/// text says "queued", not "waiting" — nothing scarce is being waited on.
 #[tokio::test]
-async fn test_poll_reports_waiting_for_a_worker_before_any_claim() {
+async fn test_poll_reports_queued_before_any_claim() {
     let (server, ..) = create_submit_server_with(mock_fetcher(), BulkSubmitConfig::default()).await;
     let poll_path = start_and_get_poll_path(&server).await;
 
     let progress = poll_progress(&server, &poll_path).await;
     assert_eq!(
-        progress, "waiting for a worker",
+        progress, "Queued - starting shortly",
         "an unclaimed submission must say it is queued, got: {progress}"
     );
     assert!(
-        !progress.starts_with("processing "),
+        !progress.to_ascii_lowercase().starts_with("processing "),
         "an indeterminate phase must not look like a determinate percentage (#827)"
+    );
+}
+
+/// With the in-process worker pool disabled nothing in this process will ever
+/// claim the manifest, so "starting shortly" would be a promise HFS cannot
+/// keep. The operator needs to hear that an external worker is the missing
+/// piece.
+#[tokio::test]
+async fn test_poll_reports_the_external_worker_wait_when_the_local_pool_is_off() {
+    let (server, ..) = create_submit_server_with(
+        mock_fetcher(),
+        BulkSubmitConfig {
+            disable_local_worker: true,
+            ..BulkSubmitConfig::default()
+        },
+    )
+    .await;
+    let poll_path = start_and_get_poll_path(&server).await;
+
+    let progress = poll_progress(&server, &poll_path).await;
+    assert_eq!(
+        progress, "Queued - waiting for an external worker",
+        "an unclaimed submission with no local workers must name the dependency, got: {progress}"
     );
 }
 

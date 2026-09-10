@@ -13,10 +13,10 @@ use crate::core::bulk_export::ExportJobId;
 use crate::core::bulk_export_worker::{LeaseError, WorkerId};
 use crate::core::bulk_submit::{
     BulkEntryOutcome, BulkEntryResult, BulkProcessingOptions, BulkSubmitProvider,
-    BulkSubmitRollbackProvider, ChangeType, EntryCountSummary, EntryResultContinuation,
-    EntryResultCursor, EntryResultPage, ManifestPhase, ManifestStatus, NdjsonEntry,
-    PagedEntryResult, StreamProcessingResult, StreamingBulkSubmitProvider, SubmissionChange,
-    SubmissionId, SubmissionManifest, SubmissionStatus, SubmissionSummary,
+    BulkSubmitRollbackProvider, CANCELLED_ABORT_REASON, ChangeType, EntryCountSummary,
+    EntryResultContinuation, EntryResultCursor, EntryResultPage, ManifestPhase, ManifestStatus,
+    NdjsonEntry, PagedEntryResult, StreamProcessingResult, StreamingBulkSubmitProvider,
+    SubmissionChange, SubmissionId, SubmissionManifest, SubmissionStatus, SubmissionSummary,
     invalid_entry_result_page,
 };
 use crate::core::bulk_submit_publication::{
@@ -660,13 +660,19 @@ impl BulkSubmitProvider for PostgresBackend {
 
         // Update manifest status to processing, on a client scoped to this one
         // statement.
+        //
+        // `status IN ('pending', 'processing')` keeps it a promotion rather
+        // than a reset: the statement runs on *every* batch, so without the
+        // guard the batch that lands right after `abort_submission` moved the
+        // manifest to `'failed'` would quietly put it back to `'processing'`
+        // and the abort would read as if it had never happened (#968).
         {
             let client = self.get_client().await?;
             client
                 .execute(
                     "UPDATE bulk_manifests SET status = 'processing'
-                     WHERE tenant_id = $1 AND submitter = $2 AND submission_id = $3
-                       AND manifest_id = $4 AND status <> 'replaced'",
+                     WHERE tenant_id = $1 AND submitter = $2 AND submission_id = $3 AND manifest_id = $4
+                       AND status IN ('pending', 'processing')",
                     &[
                         &tenant_id,
                         &submission_id.submitter.as_str(),
@@ -1198,6 +1204,11 @@ impl StreamingBulkSubmitProvider for PostgresBackend {
         let mut line_number = 0u64;
         let mut batch = Vec::new();
 
+        // An ingest cancelled before it read anything persists nothing.
+        if options.is_cancelled() {
+            return Ok(result.aborted(CANCELLED_ABORT_REASON));
+        }
+
         loop {
             let mut line = String::new();
             let bytes_read = reader
@@ -1281,6 +1292,13 @@ impl StreamingBulkSubmitProvider for PostgresBackend {
                     && result.counts.error_count() >= options.max_errors as u64
                 {
                     return Ok(result.aborted("max errors exceeded"));
+                }
+
+                // Abort is cooperative: a claimed manifest checks between
+                // batches, so an aborted submission stops here with its partial
+                // counts intact instead of running to the end (#968).
+                if options.is_cancelled() {
+                    return Ok(result.aborted(CANCELLED_ABORT_REASON));
                 }
             }
         }
@@ -1656,6 +1674,10 @@ impl SubmitWorkerStorage for PostgresBackend {
 
     async fn mark_manifest_processing(&self, lease: &ManifestLease) -> Result<(), LeaseError> {
         let client = self.get_client().await.map_err(LeaseError::Storage)?;
+        // Promotion only, same as the per-batch stamp: an abort landing in the
+        // window between the claim and this call already moved the manifest to
+        // `'failed'`, and re-marking it `'processing'` would strand it there
+        // with nobody able to claim it again (#968).
         let affected = client
             .execute(
                 "UPDATE bulk_manifests SET status = 'processing'
@@ -1857,6 +1879,10 @@ impl SubmitWorkerStorage for PostgresBackend {
     }
 
     async fn finish_manifest(&self, lease: &ManifestLease) -> Result<(), LeaseError> {
+        // The helper's fence (`status = 'processing'` plus this lease's worker
+        // and fencing token) is what makes a finish that lands after
+        // `abort_submission` moved the manifest to `'failed'` a `LeaseLost`
+        // no-op instead of a silent rewrite back to `'completed'` (#968).
         self.publish_current_manifest_generation(lease, ManifestPublicationStatus::Completed)
             .await
     }
@@ -1866,6 +1892,8 @@ impl SubmitWorkerStorage for PostgresBackend {
         lease: &ManifestLease,
         error_message: &str,
     ) -> Result<(), LeaseError> {
+        // Same fence as `finish_manifest`: an aborted manifest's outcome belongs
+        // to the abort, so a late worker verdict gets `LeaseLost` instead (#968).
         self.publish_current_manifest_generation(
             lease,
             ManifestPublicationStatus::Failed {

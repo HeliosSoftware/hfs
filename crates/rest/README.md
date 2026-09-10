@@ -263,7 +263,11 @@ them, and exposes results through a status manifest.
 - **Scope**: every surface requires the `system/bulk-submit` SMART scope when auth is
   enabled; status, cancel, and file surfaces also enforce submission ownership.
 - **Poll pacing**: an in-progress poll advertises `Retry-After`
-  (`HFS_BULK_SUBMIT_RETRY_AFTER`); a client that ignores it and hammers the poll URL
+  (`HFS_BULK_SUBMIT_RETRY_AFTER`). While the submission is still pre-ingest — queued,
+  reading the remote manifest, sizing or downloading files — the shorter
+  `HFS_BULK_SUBMIT_PRE_INGEST_RETRY_AFTER` is advertised instead, so those short-lived
+  phase reports are actually observed; it is clamped to the ingest cadence and to the
+  poll rate limit. A client that ignores it and hammers the poll URL
   is throttled with `429` plus a `Retry-After` pointing at the end of the rate window
   (`HFS_BULK_SUBMIT_POLL_RATE_LIMIT` / `_POLL_RATE_WINDOW`). Buckets are per client
   (principal, else peer address) per poll token.
@@ -291,7 +295,8 @@ Configured via `HFS_BULK_SUBMIT_*` environment variables:
 | `HFS_BULK_SUBMIT_REQUIRES_ACCESS_TOKEN` | `auto` | Manifest posture: `auto` / `true` / `false`. **`false` is invalid with `local-fs`.** |
 | `HFS_BULK_SUBMIT_FILE_URL_TTL` | `3600` | Pre-signed artifact-URL lifetime, seconds. |
 | `HFS_BULK_SUBMIT_OUTPUT_TTL` | `86400` | Artifact retention after completion, seconds. |
-| `HFS_BULK_SUBMIT_RETRY_AFTER` | `120` | `Retry-After` (seconds) advertised on an in-progress status poll. |
+| `HFS_BULK_SUBMIT_RETRY_AFTER` | `120` | `Retry-After` (seconds) advertised on an in-progress status poll once ingestion has started. |
+| `HFS_BULK_SUBMIT_PRE_INGEST_RETRY_AFTER` | `10` | `Retry-After` (seconds) advertised while the submission is pre-ingest (queued / reading manifest / sizing / downloading). Never above `RETRY_AFTER`, never below `POLL_RATE_WINDOW / POLL_RATE_LIMIT`. |
 | `HFS_BULK_SUBMIT_MANIFEST_PAGE_SIZE` | `1000` | Max `output` + `outcome` + `deleted` entries per status-manifest page; further pages are chained by `link[]` `next`. `0` disables pagination. |
 | `HFS_BULK_SUBMIT_POLL_RATE_LIMIT` | `10` | Status polls allowed per client, per submission, per rate window. `0` disables poll rate limiting. |
 | `HFS_BULK_SUBMIT_POLL_RATE_WINDOW` | `60` | Sliding window for the poll rate limit, seconds. |

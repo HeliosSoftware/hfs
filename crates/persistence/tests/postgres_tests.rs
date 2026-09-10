@@ -7582,6 +7582,198 @@ mod postgres_integration {
         );
     }
 
+    /// Wraps a reader so that `token` is tripped the first time the ingest
+    /// actually reads from the stream.
+    struct CancelOnFirstRead<R> {
+        inner: R,
+        token: helios_persistence::core::bulk_submit::CancelToken,
+        tripped: bool,
+    }
+
+    impl<R: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for CancelOnFirstRead<R> {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            let this = self.get_mut();
+            if !this.tripped {
+                this.tripped = true;
+                this.token.cancel();
+            }
+            std::pin::Pin::new(&mut this.inner).poll_read(cx, buf)
+        }
+    }
+
+    /// #968, PostgreSQL: cancelling mid-manifest stops at the next batch
+    /// boundary and keeps what was already committed. Each batch is its own
+    /// Postgres transaction, so this pins that stopping does not roll the
+    /// committed ones back — the opposite failure to #942's poisoned batch.
+    #[tokio::test]
+    async fn postgres_bulk_submit_cancel_mid_stream_keeps_committed_batches() {
+        use helios_persistence::core::bulk_submit::{CANCELLED_ABORT_REASON, CancelToken};
+        use helios_persistence::core::{
+            BulkProcessingOptions, BulkSubmitProvider, StreamingBulkSubmitProvider, SubmissionId,
+        };
+
+        // Like the batch test: a synchronous manifest has no worker lease, so
+        // serialize against the claim queue.
+        let _guard = BULK_SUBMIT_TEST_LOCK.lock().await;
+        let backend = create_backend().await;
+        let tenant = create_tenant("bulk_submit_cancel");
+        let sub_id = SubmissionId::generate("pg-cancel-test");
+        backend
+            .create_submission(&tenant, &sub_id, None)
+            .await
+            .unwrap();
+        let manifest = backend
+            .add_manifest(&tenant, &sub_id, Some("https://provider/c.json"), None)
+            .await
+            .unwrap();
+
+        let cancel = CancelToken::new();
+        let options = BulkProcessingOptions::new()
+            .with_batch_size(2)
+            .with_cancel(cancel.clone());
+
+        // Six Patients, enough for three batches of two.
+        let lines = (1..=6)
+            .map(|i| format!("{{\"resourceType\":\"Patient\",\"id\":\"pg-cancel-{i}\"}}\n"))
+            .collect::<String>()
+            .into_bytes();
+        let reader = Box::new(tokio::io::BufReader::new(CancelOnFirstRead {
+            inner: std::io::Cursor::new(lines),
+            token: cancel,
+            tripped: false,
+        }));
+        let result = backend
+            .process_ndjson_stream(
+                &tenant,
+                &sub_id,
+                &manifest.manifest_id,
+                "Patient",
+                reader,
+                &options,
+            )
+            .await
+            .unwrap();
+
+        // Terminate the submission before releasing the shared lock, for the
+        // same reason as the batch test above.
+        backend
+            .abort_submission(&tenant, &sub_id, "test cleanup")
+            .await
+            .unwrap();
+
+        assert!(result.aborted);
+        assert_eq!(result.abort_reason.as_deref(), Some(CANCELLED_ABORT_REASON));
+        assert_eq!(
+            result.counts.success, 2,
+            "the batch already committed when the token tripped is kept"
+        );
+        assert_eq!(
+            result.lines_processed, 2,
+            "the remaining four lines were never read"
+        );
+
+        let counts = backend
+            .get_entry_counts(&tenant, &sub_id, &manifest.manifest_id)
+            .await
+            .unwrap();
+        assert_eq!(counts.total, 2, "the partial counts are durable");
+        assert!(
+            backend
+                .read(&tenant, "Patient", "pg-cancel-2")
+                .await
+                .unwrap()
+                .is_some(),
+            "the first batch really landed"
+        );
+        assert!(
+            backend
+                .read(&tenant, "Patient", "pg-cancel-3")
+                .await
+                .unwrap()
+                .is_none(),
+            "nothing after the cancellation point was ingested"
+        );
+    }
+
+    /// #968, PostgreSQL: `abort_submission` fails in-flight manifests without
+    /// clearing the lease, so the worker's late verdict must lose rather than
+    /// resurrect the manifest as `completed`. Postgres enforces this with an
+    /// `AND status = 'processing'` clause on the fenced update, which is its
+    /// own SQL and so needs its own test.
+    #[tokio::test]
+    async fn postgres_bulk_submit_abort_beats_a_late_finish_manifest() {
+        use helios_persistence::core::{
+            BulkSubmitProvider, LeaseError, ManifestStatus, SubmissionId, SubmitWorkerStorage,
+            WorkerId,
+        };
+
+        let _guard = BULK_SUBMIT_TEST_LOCK.lock().await;
+        let backend = create_backend().await;
+        let tenant = create_tenant("bulk_submit_abort_race");
+        let sub_id = SubmissionId::generate("pg-abort-race-test");
+        backend
+            .create_submission(&tenant, &sub_id, None)
+            .await
+            .unwrap();
+        let manifest = backend
+            .add_manifest(&tenant, &sub_id, Some("https://provider/a.json"), None)
+            .await
+            .unwrap();
+
+        let lease = claim_specific_manifest(
+            &backend,
+            &WorkerId::new(format!("pg-abort-worker-{}", uuid::Uuid::new_v4())),
+            &sub_id,
+            &manifest.manifest_id,
+            std::time::Duration::from_secs(60),
+        )
+        .await;
+        backend.mark_manifest_processing(&lease).await.unwrap();
+
+        // The submitter aborts while the worker still holds a valid lease.
+        backend
+            .abort_submission(&tenant, &sub_id, "user cancelled")
+            .await
+            .unwrap();
+
+        // The worker's verdicts arrive too late and change nothing.
+        assert!(
+            matches!(
+                backend.finish_manifest(&lease).await,
+                Err(LeaseError::LeaseLost { .. })
+            ),
+            "a finish after an abort must not win"
+        );
+        let stored = backend
+            .get_manifest(&tenant, &sub_id, &lease.manifest_id)
+            .await
+            .unwrap()
+            .expect("manifest");
+        assert_eq!(
+            stored.status,
+            ManifestStatus::Failed,
+            "the abort's verdict stands"
+        );
+
+        assert!(
+            matches!(
+                backend.fail_manifest(&lease, "worker gave up").await,
+                Err(LeaseError::LeaseLost { .. })
+            ),
+            "a late failure verdict is equally a no-op"
+        );
+        let stored = backend
+            .get_manifest(&tenant, &sub_id, &lease.manifest_id)
+            .await
+            .unwrap()
+            .expect("manifest");
+        assert_eq!(stored.status, ManifestStatus::Failed);
+    }
+
     // ========================================================================
     // Issue #311 — `ifMatch` on bundle entries, on a real PostgreSQL instance
     //

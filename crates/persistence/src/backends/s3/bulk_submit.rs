@@ -15,10 +15,10 @@ use crate::core::ResourceStorage;
 use crate::core::VersionedStorage;
 use crate::core::bulk_submit::{
     BulkEntryOutcome, BulkEntryResult, BulkProcessingOptions, BulkSubmitProvider,
-    BulkSubmitRollbackProvider, ChangeType, EntryCountSummary, EntryResultContinuation,
-    EntryResultPage, ManifestStatus, NdjsonEntry, PagedEntryResult, StreamProcessingResult,
-    StreamingBulkSubmitProvider, SubmissionChange, SubmissionId, SubmissionManifest,
-    SubmissionStatus, SubmissionSummary, invalid_entry_result_page,
+    BulkSubmitRollbackProvider, CANCELLED_ABORT_REASON, ChangeType, EntryCountSummary,
+    EntryResultContinuation, EntryResultPage, ManifestStatus, NdjsonEntry, PagedEntryResult,
+    StreamProcessingResult, StreamingBulkSubmitProvider, SubmissionChange, SubmissionId,
+    SubmissionManifest, SubmissionStatus, SubmissionSummary, invalid_entry_result_page,
 };
 use crate::error::{BulkSubmitError, ResourceError, StorageError, StorageResult};
 use crate::tenant::TenantContext;
@@ -535,6 +535,11 @@ impl StreamingBulkSubmitProvider for S3Backend {
         let mut line_number = 0u64;
         let mut batch = Vec::new();
 
+        // An ingest cancelled before it read anything persists nothing.
+        if options.is_cancelled() {
+            return Ok(result.aborted(CANCELLED_ABORT_REASON));
+        }
+
         loop {
             let mut line = String::new();
             let bytes_read = reader.read_line(&mut line).await.map_err(|e| {
@@ -605,6 +610,13 @@ impl StreamingBulkSubmitProvider for S3Backend {
                     && result.counts.error_count() >= options.max_errors as u64
                 {
                     return Ok(result.aborted("max errors exceeded"));
+                }
+
+                // Abort is cooperative: a claimed manifest checks between
+                // batches, so an aborted submission stops here with its partial
+                // counts intact instead of running to the end (#968).
+                if options.is_cancelled() {
+                    return Ok(result.aborted(CANCELLED_ABORT_REASON));
                 }
             }
         }

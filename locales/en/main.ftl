@@ -631,6 +631,11 @@ bulk-import-status-in-progress = In Progress
 bulk-import-status-stopped = Stopped
 bulk-import-status-completed = Completed
 bulk-import-status-failed = Failed
+# Persistent banner on a submission whose last Abort / Mark completed never
+# reached the Data Recipient (#968): the submission is still running and the
+# button can simply be pressed again. { $detail } is the recipient's own
+# untranslated diagnosis — an HTTP status and reason, or a transport error.
+bulk-import-status-error = The last status change did not reach the Data Recipient, so this submission is unchanged — try again. ({ $detail })
 bulk-import-detail-recipient = Data Recipient
 bulk-import-detail-id = Submission ID
 bulk-import-detail-submitter = Submitter
