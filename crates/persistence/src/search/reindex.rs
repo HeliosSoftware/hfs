@@ -5,6 +5,8 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use parking_lot::RwLock;
@@ -415,6 +417,97 @@ struct ReindexAudit {
     source_observer: String,
 }
 
+// Terminal status is a polling window, not a permanent in-memory job archive.
+const REINDEX_STATUS_RETENTION_SECONDS: i64 = 24 * 60 * 60;
+const MAX_RETAINED_REINDEX_STATUSES: usize = 1024;
+const REINDEX_CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
+
+type ReindexJobs = RwLock<HashMap<String, ReindexProgress>>;
+type ReindexChannels = RwLock<HashMap<String, mpsc::Sender<()>>>;
+
+/// Only tasks that have exited are eligible, including after cancellation was
+/// already reported to the client. All paths acquire jobs before channels and
+/// release their guards before awaiting or calling external code.
+fn cleanup_reindex_jobs(jobs: &ReindexJobs, channels: &ReindexChannels, max_age_seconds: i64) {
+    let cutoff = chrono::Utc::now() - chrono::Duration::seconds(max_age_seconds);
+    let mut jobs = jobs.write();
+    let channels = channels.read();
+    jobs.retain(|id, progress| {
+        channels.contains_key(id)
+            || !progress.status.is_finished()
+            || progress
+                .completed_at
+                .as_deref()
+                .and_then(|at| chrono::DateTime::parse_from_rfc3339(at).ok())
+                .is_none_or(|at| at >= cutoff)
+    });
+    let eligible = jobs
+        .iter()
+        .filter(|(id, p)| p.status.is_finished() && !channels.contains_key(*id))
+        .count();
+    if eligible > MAX_RETAINED_REINDEX_STATUSES {
+        let mut oldest: Vec<_> = jobs
+            .iter()
+            .filter(|(id, p)| p.status.is_finished() && !channels.contains_key(*id))
+            .map(|(id, p)| {
+                (
+                    p.completed_at
+                        .as_deref()
+                        .and_then(|at| chrono::DateTime::parse_from_rfc3339(at).ok())
+                        .map(|at| at.timestamp_micros())
+                        .unwrap_or(i64::MIN),
+                    id.clone(),
+                )
+            })
+            .collect();
+        oldest.sort_unstable();
+        for (_, id) in oldest
+            .into_iter()
+            .take(eligible - MAX_RETAINED_REINDEX_STATUSES)
+        {
+            jobs.remove(&id);
+        }
+    }
+    // A large burst of active jobs must not leave empty buckets resident forever.
+    if jobs.capacity()
+        > jobs
+            .len()
+            .saturating_mul(2)
+            .max(MAX_RETAINED_REINDEX_STATUSES)
+    {
+        jobs.shrink_to_fit();
+    }
+}
+
+/// Lives from insertion (before kickoff audit awaits) until the spawned task is
+/// dropped. Drop also runs when kickoff is aborted or the worker unwinds.
+struct ReindexJobGuard {
+    job_id: String,
+    jobs: Arc<ReindexJobs>,
+    channels: Arc<ReindexChannels>,
+}
+
+impl Drop for ReindexJobGuard {
+    fn drop(&mut self) {
+        {
+            let mut jobs = self.jobs.write();
+            let mut channels = self.channels.write();
+            if let Some(progress) = jobs.get_mut(&self.job_id)
+                && progress.status.is_running()
+            {
+                progress.status = ReindexStatus::Failed;
+                progress.error_message = Some("Reindex task ended before completing".to_string());
+                progress.completed_at = Some(chrono::Utc::now().to_rfc3339());
+            }
+            channels.remove(&self.job_id);
+            if channels.capacity() > channels.len().saturating_mul(2).max(16) {
+                channels.shrink_to_fit();
+            }
+        }
+        cleanup_reindex_jobs(&self.jobs, &self.channels, REINDEX_STATUS_RETENTION_SECONDS);
+    }
+}
+
 /// Manages reindex operations.
 ///
 /// Deliberately **not** generic over a storage type. A composite deployment
@@ -427,7 +520,10 @@ struct ReindexAudit {
 ///
 /// Jobs live in an in-memory map, so `$reindex-status` for a job started on one
 /// node is not visible from another. In a multi-node deployment, poll the node
-/// that accepted the kick-off.
+/// that accepted the kick-off. Terminal states are retained for up to 24 hours,
+/// subject to a limit of the most recent 1024 states whose tasks have exited.
+/// Expiration is swept every minute; an evicted status is no longer available.
+/// Active tasks (including cancellation still unwinding) are never evicted.
 pub struct ReindexOperation {
     /// Where resources are read from — the primary.
     source: Arc<dyn ReindexSource>,
@@ -436,10 +532,12 @@ pub struct ReindexOperation {
     /// The per-tenant search parameter registries; the extractor is built from
     /// the reindexed tenant's registry so a tenant's stored params are honored.
     registries: Arc<crate::search::TenantSearchRegistries>,
-    /// Active jobs.
+    /// Active and recently finished jobs.
     jobs: Arc<RwLock<HashMap<String, ReindexProgress>>>,
     /// Cancellation channels.
     cancel_channels: Arc<RwLock<HashMap<String, mpsc::Sender<()>>>>,
+    /// Lazily started by the first job, so construction needs no Tokio runtime.
+    cleanup_started: AtomicBool,
     /// Optional audit sink for reindex lifecycle events.
     audit: Option<ReindexAudit>,
 }
@@ -474,8 +572,28 @@ impl ReindexOperation {
             registries,
             jobs: Arc::new(RwLock::new(HashMap::new())),
             cancel_channels: Arc::new(RwLock::new(HashMap::new())),
+            cleanup_started: AtomicBool::new(false),
             audit: None,
         }
+    }
+
+    fn ensure_cleanup_task(&self) {
+        if self.cleanup_started.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        let jobs = Arc::downgrade(&self.jobs);
+        let channels = Arc::downgrade(&self.cancel_channels);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(REINDEX_CLEANUP_INTERVAL).await;
+                // Upgrades are dropped at the end of this iteration, before
+                // sleeping; an idle cleanup task does not keep the maps alive.
+                let (Some(jobs), Some(channels)) = (jobs.upgrade(), channels.upgrade()) else {
+                    break;
+                };
+                cleanup_reindex_jobs(&jobs, &channels, REINDEX_STATUS_RETENTION_SECONDS);
+            }
+        });
     }
 
     /// Emits a BALP `AuditEvent` at each reindex lifecycle transition.
@@ -512,6 +630,8 @@ impl ReindexOperation {
         request: ReindexRequest,
         agent: Option<String>,
     ) -> Result<String, ReindexError> {
+        self.ensure_cleanup_task();
+        self.cleanup_old_jobs(REINDEX_STATUS_RETENTION_SECONDS);
         let job_id = Uuid::new_v4().to_string();
         let progress = ReindexProgress::new(&job_id);
 
@@ -523,6 +643,12 @@ impl ReindexOperation {
         self.cancel_channels
             .write()
             .insert(job_id.clone(), cancel_tx);
+
+        let lifecycle = ReindexJobGuard {
+            job_id: job_id.clone(),
+            jobs: self.jobs.clone(),
+            channels: self.cancel_channels.clone(),
+        };
 
         let requested_types = request.resource_types.clone().unwrap_or_default();
 
@@ -552,6 +678,7 @@ impl ReindexOperation {
 
         // Spawn background task
         tokio::spawn(async move {
+            let _lifecycle = lifecycle;
             run_reindex(
                 job_id_clone.clone(),
                 tenant,
@@ -630,7 +757,9 @@ impl ReindexOperation {
         // Update status
         {
             let mut jobs = self.jobs.write();
-            if let Some(progress) = jobs.get_mut(job_id) {
+            if let Some(progress) = jobs.get_mut(job_id)
+                && progress.status.is_running()
+            {
                 progress.status = ReindexStatus::Cancelled;
                 progress.completed_at = Some(chrono::Utc::now().to_rfc3339());
             }
@@ -644,24 +773,11 @@ impl ReindexOperation {
         self.jobs.read().values().cloned().collect()
     }
 
-    /// Removes completed jobs older than the specified duration.
+    /// Removes terminal states older than the supplied age and limits retained
+    /// terminal states to 1024. A task still owning its cancellation sender is
+    /// protected even if cancellation has already marked its status terminal.
     pub fn cleanup_old_jobs(&self, max_age_seconds: i64) {
-        let cutoff = chrono::Utc::now() - chrono::Duration::seconds(max_age_seconds);
-
-        let mut jobs = self.jobs.write();
-        let mut channels = self.cancel_channels.write();
-
-        jobs.retain(|job_id, progress| {
-            if progress.status.is_finished()
-                && let Some(ref completed_at) = progress.completed_at
-                && let Ok(completed) = chrono::DateTime::parse_from_rfc3339(completed_at)
-                && completed.with_timezone(&chrono::Utc) < cutoff
-            {
-                channels.remove(job_id);
-                return false;
-            }
-            true
-        });
+        cleanup_reindex_jobs(&self.jobs, &self.cancel_channels, max_age_seconds);
     }
 }
 
@@ -677,7 +793,9 @@ impl std::fmt::Debug for ReindexOperation {
 /// Marks a job as failed.
 fn mark_failed(jobs: &Arc<RwLock<HashMap<String, ReindexProgress>>>, job_id: &str, error: String) {
     let mut jobs_guard = jobs.write();
-    if let Some(progress) = jobs_guard.get_mut(job_id) {
+    if let Some(progress) = jobs_guard.get_mut(job_id)
+        && progress.status.is_running()
+    {
         progress.status = ReindexStatus::Failed;
         progress.error_message = Some(error);
         progress.completed_at = Some(chrono::Utc::now().to_rfc3339());
@@ -687,7 +805,9 @@ fn mark_failed(jobs: &Arc<RwLock<HashMap<String, ReindexProgress>>>, job_id: &st
 /// Marks a job as cancelled.
 fn mark_cancelled(jobs: &Arc<RwLock<HashMap<String, ReindexProgress>>>, job_id: &str) {
     let mut jobs_guard = jobs.write();
-    if let Some(progress) = jobs_guard.get_mut(job_id) {
+    if let Some(progress) = jobs_guard.get_mut(job_id)
+        && progress.status.is_running()
+    {
         progress.status = ReindexStatus::Cancelled;
         progress.completed_at = Some(chrono::Utc::now().to_rfc3339());
     }
@@ -896,7 +1016,9 @@ async fn run_reindex(
     // Mark as completed
     {
         let mut jobs_guard = jobs.write();
-        if let Some(progress) = jobs_guard.get_mut(&job_id) {
+        if let Some(progress) = jobs_guard.get_mut(&job_id)
+            && progress.status.is_running()
+        {
             progress.status = ReindexStatus::Completed;
             progress.completed_at = Some(chrono::Utc::now().to_rfc3339());
             progress.current_resource_type = None;
@@ -946,6 +1068,304 @@ impl crate::core::DeferredReindexHook for ReindexOnFinish {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Default)]
+    struct LifecycleSource {
+        blocked: bool,
+        fail: bool,
+        panic: bool,
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+
+    #[async_trait]
+    impl ReindexSource for LifecycleSource {
+        async fn list_resource_types(&self, _: &TenantContext) -> StorageResult<Vec<String>> {
+            self.entered.notify_one();
+            if self.blocked {
+                self.release.notified().await;
+            }
+            assert!(!self.panic, "injected reindex task panic");
+            if self.fail {
+                return Err(crate::error::BackendError::Unavailable {
+                    backend_name: "test".into(),
+                    message: "injected failure".into(),
+                }
+                .into());
+            }
+            Ok(Vec::new())
+        }
+        async fn count_resources(&self, _: &TenantContext, _: &str) -> StorageResult<u64> {
+            unreachable!("empty source has no types")
+        }
+        async fn fetch_resources_page(
+            &self,
+            _: &TenantContext,
+            _: &str,
+            _: Option<&str>,
+            _: u32,
+        ) -> StorageResult<ResourcePage> {
+            unreachable!("empty source has no pages")
+        }
+    }
+
+    fn lifecycle_operation(source: Arc<LifecycleSource>) -> ReindexOperation {
+        ReindexOperation::with_parts(
+            source,
+            Vec::new(),
+            Arc::new(crate::search::TenantSearchRegistries::base_only()),
+        )
+    }
+
+    async fn start_lifecycle_job(op: &ReindexOperation) -> String {
+        op.start(TenantContext::system(), ReindexRequest::default(), None)
+            .await
+            .unwrap()
+    }
+
+    async fn await_terminal(op: &ReindexOperation, id: &str) -> ReindexProgress {
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+            if let Some(progress) = op
+                .jobs
+                .read()
+                .get(id)
+                .filter(|p| p.status.is_finished())
+                .cloned()
+            {
+                return progress;
+            }
+        }
+        panic!("job never reached terminal status");
+    }
+
+    #[tokio::test]
+    async fn test_retention_completed_jobs_release_channels_and_keep_status() {
+        let op = lifecycle_operation(Arc::new(LifecycleSource::default()));
+        for _ in 0..3 {
+            let id = start_lifecycle_job(&op).await;
+            assert_eq!(
+                await_terminal(&op, &id).await.status,
+                ReindexStatus::Completed
+            );
+            assert!(
+                !op.cancel_channels.read().contains_key(&id),
+                "finished job retained sender"
+            );
+            assert_eq!(
+                op.get_progress(&id).await.unwrap().status,
+                ReindexStatus::Completed
+            );
+            op.cancel(&id).await.unwrap(); // Terminal cancellation remains idempotent.
+            assert_eq!(
+                op.get_progress(&id).await.unwrap().status,
+                ReindexStatus::Completed
+            );
+        }
+        assert_eq!(op.list_jobs().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_retention_failed_job_releases_channel() {
+        let op = lifecycle_operation(Arc::new(LifecycleSource {
+            fail: true,
+            ..Default::default()
+        }));
+        let id = start_lifecycle_job(&op).await;
+        let progress = await_terminal(&op, &id).await;
+        assert_eq!(progress.status, ReindexStatus::Failed);
+        assert!(
+            progress
+                .error_message
+                .unwrap()
+                .contains("Failed to list resource types")
+        );
+        assert!(op.cancel_channels.read().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_retention_cancelled_task_is_protected_until_it_returns() {
+        let source = Arc::new(LifecycleSource {
+            blocked: true,
+            ..Default::default()
+        });
+        let op = lifecycle_operation(source.clone());
+        let id = start_lifecycle_job(&op).await;
+        source.entered.notified().await;
+        op.cancel(&id).await.unwrap();
+        op.jobs.write().get_mut(&id).unwrap().completed_at =
+            Some((chrono::Utc::now() - chrono::Duration::hours(25)).to_rfc3339());
+        op.cleanup_old_jobs(0);
+        assert!(
+            op.jobs.read().contains_key(&id),
+            "cleanup evicted a task still using its status"
+        );
+        assert!(op.cancel_channels.read().contains_key(&id));
+        tokio::time::advance(std::time::Duration::from_secs(61)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            op.jobs.read().contains_key(&id),
+            "periodic cleanup evicted a live cancelled task"
+        );
+        // Restore a recent timestamp before allowing the task to return, so
+        // the next assertion tests cancellation state rather than expiry.
+        op.jobs.write().get_mut(&id).unwrap().completed_at = Some(chrono::Utc::now().to_rfc3339());
+        source.release.notify_one();
+        for _ in 0..100 {
+            if op.cancel_channels.read().is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(op.cancel_channels.read().is_empty());
+        assert_eq!(
+            op.get_progress(&id).await.unwrap().status,
+            ReindexStatus::Cancelled
+        );
+    }
+
+    #[tokio::test]
+    async fn test_retention_panicked_task_does_not_leave_active_metadata() {
+        let op = lifecycle_operation(Arc::new(LifecycleSource {
+            panic: true,
+            ..Default::default()
+        }));
+        let id = start_lifecycle_job(&op).await;
+        assert_eq!(await_terminal(&op, &id).await.status, ReindexStatus::Failed);
+        assert!(op.cancel_channels.read().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_retention_idle_sweep_expires_status_without_api_calls() {
+        let op = lifecycle_operation(Arc::new(LifecycleSource::default()));
+        let id = start_lifecycle_job(&op).await;
+        await_terminal(&op, &id).await;
+        op.jobs.write().get_mut(&id).unwrap().completed_at =
+            Some((chrono::Utc::now() - chrono::Duration::hours(25)).to_rfc3339());
+        tokio::time::advance(std::time::Duration::from_secs(61)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            !op.jobs.read().contains_key(&id),
+            "idle manager retained expired status"
+        );
+        assert!(op.cancel_channels.read().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_retention_keeps_latest_1024_terminal_statuses() {
+        let source = Arc::new(LifecycleSource {
+            blocked: true,
+            ..Default::default()
+        });
+        let op = lifecycle_operation(source.clone());
+        let active = start_lifecycle_job(&op).await;
+        source.entered.notified().await;
+        // Empty explicit types let other jobs finish while this one is blocked.
+        let first = op
+            .start(
+                TenantContext::system(),
+                ReindexRequest::for_types(Vec::<String>::new()),
+                None,
+            )
+            .await
+            .unwrap();
+        await_terminal(&op, &first).await;
+        op.jobs.write().get_mut(&first).unwrap().completed_at =
+            Some((chrono::Utc::now() - chrono::Duration::minutes(1)).to_rfc3339());
+        let mut latest = first.clone();
+        for _ in 0..1024 {
+            latest = op
+                .start(
+                    TenantContext::system(),
+                    ReindexRequest::for_types(Vec::<String>::new()),
+                    None,
+                )
+                .await
+                .unwrap();
+            await_terminal(&op, &latest).await;
+        }
+        assert_eq!(op.jobs.read().len(), 1025); // 1024 terminal plus the active task.
+        assert!(op.get_progress(&first).await.is_none());
+        assert_eq!(
+            op.get_progress(&latest).await.unwrap().status,
+            ReindexStatus::Completed
+        );
+        assert_eq!(
+            op.get_progress(&active).await.unwrap().status,
+            ReindexStatus::InProgress
+        );
+        assert_eq!(op.cancel_channels.read().len(), 1);
+        op.cancel(&active).await.unwrap();
+        source.release.notify_one();
+        for _ in 0..100 {
+            if op.cancel_channels.read().is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(op.cancel_channels.read().is_empty());
+        assert_eq!(
+            op.get_progress(&active).await.unwrap().status,
+            ReindexStatus::Cancelled
+        );
+    }
+
+    #[cfg(feature = "R4")]
+    #[derive(Default)]
+    struct BlockingStartAudit {
+        entered: tokio::sync::Notify,
+    }
+
+    #[cfg(feature = "R4")]
+    #[async_trait]
+    impl helios_audit::AuditSink for BlockingStartAudit {
+        async fn record(&self, _: helios_fhir::r4::AuditEvent) {
+            self.entered.notify_one();
+            std::future::pending::<()>().await;
+        }
+        async fn flush(&self) {}
+        fn name(&self) -> &str {
+            "blocking-start-audit"
+        }
+    }
+
+    #[cfg(feature = "R4")]
+    #[tokio::test]
+    async fn test_retention_aborted_kickoff_does_not_leave_queued_metadata() {
+        let audit = Arc::new(BlockingStartAudit::default());
+        let op = Arc::new(
+            lifecycle_operation(Arc::new(LifecycleSource::default()))
+                .with_audit(audit.clone(), "Device/test"),
+        );
+        let kickoff = tokio::spawn({
+            let op = op.clone();
+            async move { start_lifecycle_job(&op).await }
+        });
+        audit.entered.notified().await;
+        assert_eq!(op.jobs.read().len(), 1);
+        kickoff.abort();
+        assert!(kickoff.await.unwrap_err().is_cancelled());
+        assert!(op.cancel_channels.read().is_empty());
+        assert!(
+            op.jobs
+                .read()
+                .values()
+                .all(|p| p.status == ReindexStatus::Failed && p.completed_at.is_some())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_retention_sweeper_does_not_keep_manager_state_alive() {
+        let op = lifecycle_operation(Arc::new(LifecycleSource::default()));
+        let id = start_lifecycle_job(&op).await;
+        await_terminal(&op, &id).await;
+        let jobs = Arc::downgrade(&op.jobs);
+        let channels = Arc::downgrade(&op.cancel_channels);
+        drop(op);
+        tokio::task::yield_now().await;
+        assert!(jobs.upgrade().is_none());
+        assert!(channels.upgrade().is_none());
+    }
 
     #[test]
     fn test_reindex_request() {
