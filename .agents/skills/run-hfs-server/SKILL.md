@@ -124,6 +124,26 @@ curl -H "X-Tenant-ID: clinic-a" http://localhost:8080/Patient
 curl http://localhost:8080/clinic-a/Patient
 ```
 
+## Clustering
+
+`HFS_CLUSTER=true` declares the process one of N instances behind a load
+balancer. Boot then refuses configurations that cannot be clustered and prints
+one `Configuration error:` line per violation naming the variable to change.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `HFS_CLUSTER` | `false` | Master switch: fail fast on unsafe configurations and flip cluster-safe defaults |
+| `HFS_JOB_STORE_BACKEND` | unset (`memory`; `database` when clustered) | Unified async-job store: `memory` (in-process) or `database` (shared primary). Parsed and validated ahead of the subsystems that consume it |
+
+Refused under `HFS_CLUSTER=true`: a SQLite primary (`HFS_STORAGE_BACKEND`),
+`local-fs` bulk export or submit output (`HFS_BULK_EXPORT_OUTPUT_BACKEND`,
+`HFS_BULK_SUBMIT_OUTPUT_BACKEND`), bulk export on a MongoDB or S3 primary (its
+job store is a node-local SQLite sidecar), a file audit sink
+(`HFS_AUDIT_BACKEND=file`), and an explicit `HFS_JOB_STORE_BACKEND=memory`.
+Warned, not refused: SQL-on-FHIR `$sql-export` job state is still per-instance
+(pin export clients or use sticky sessions), and `HFS_EXPORT_SINK=fs` needs a
+directory shared by every instance.
+
 ## Behavior
 
 | Variable | Default | Description |
