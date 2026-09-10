@@ -134,3 +134,13 @@ Python syntax checks passed for all four measurement/summary scripts, and
 `git diff --check` passed. No commit, push or issue comment was made. This closes
 the confirmed reindex metadata retention finding; #995's ingestion-peak
 investigation remains separate.
+
+## PR branch validation after synchronization
+
+The PR branch was rebased onto origin/main at
+`5d738d3fb84d629870d35d5ac01dabe9fd9682c1`. All thirteen selected reindex
+tests passed again (0 failed; 0.09 seconds execution) with the same command
+and one Cargo build job. Build plus tests took about 176 seconds, with normal
+host pressure and no new swapouts. Evidence: `target/issue-995-fix/tests-rebased.*`.
+The workload measurements above predate this rebase and are not measurements
+of the updated base.
