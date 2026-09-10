@@ -24,7 +24,7 @@ const FILE_DELAY_MS = 2_500;
 
 const PRE_INGEST =
   /^(waiting for a worker|reading manifest|sizing \d+ of \d+ files|downloading file \d+ of \d+)$/;
-const INGEST = /^Processing (\d+)% of bytes/;
+const INGEST = /^Processing (\d+)%/;
 
 /** Two Patients per file, so the ingest phase reports several percentages. */
 function ndjson(index: number): string {
@@ -257,7 +257,7 @@ test("X-Progress names the phase instead of reporting 0% for the whole pre-inges
   expect(progress.some((p) => INGEST.test(p)), `ingest never reported:\n${seen}`).toBe(true);
   // The old handler's answer for the entire pre-ingest window: a bare 0% byte
   // reading, with no phase and no resource count to qualify it.
-  expect(progress, `a bare "0% of bytes" is the pre-#953 reading`).not.toContain(
-    "Processing 0% of bytes",
+  expect(progress, `a bare "0%" is the pre-#953 reading`).not.toContain(
+    "Processing 0%",
   );
 });

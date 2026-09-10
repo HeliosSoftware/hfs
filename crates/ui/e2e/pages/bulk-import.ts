@@ -123,7 +123,7 @@ export class BulkImportPage {
   }
 
   /** The recipient's own progress sentence, e.g.
-   * "Processing 42% of bytes - 1,300 resources written". */
+   * "Processing 42% - 1,300 Resources written". */
   get progressText(): Locator {
     return this.statusCard.locator(".detail__field--wide > div").last();
   }
@@ -143,7 +143,7 @@ export class BulkImportPage {
   async resourcesWritten(): Promise<number | null> {
     if ((await this.progressText.count()) === 0) return null;
     const text = await this.progressText.innerText();
-    const match = /([\d,]+)\s+resources written/.exec(text);
+    const match = /([\d,]+)\s+Resources written/.exec(text);
     return match ? Number(match[1].replace(/,/g, "")) : null;
   }
 }

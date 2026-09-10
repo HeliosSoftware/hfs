@@ -977,11 +977,11 @@ where
             // the number #969 exists to show was invisible exactly when it had
             // something to say.
             format!(
-                "Processing {pct}% of bytes - {} resources written",
+                "Processing {pct}% - {} Resources written",
                 group_thousands(entries)
             )
         } else if pct > 0 {
-            format!("Processing {pct}% of bytes")
+            format!("Processing {pct}%")
         } else if !manifests.is_empty()
             && manifests
                 .iter()
@@ -1025,7 +1025,7 @@ where
                     )),
                     _ => None,
                 })
-                .unwrap_or_else(|| format!("Processing {pct}% of bytes"))
+                .unwrap_or_else(|| format!("Processing {pct}%"))
         };
         // Poll cadence follows the phase. The pre-ingest phases each last
         // seconds, so a client honouring the ingest cadence (two minutes by

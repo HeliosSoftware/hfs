@@ -2111,15 +2111,14 @@ async fn pre_ingest_phases_show_their_text_on_an_indeterminate_bar() {
 /// reintroduced by an encoding detail. Decoding lossily keeps the report.
 #[tokio::test]
 async fn a_non_ascii_progress_report_still_reaches_the_operator() {
-    let recipient =
-        mock_recipient_reporting(&["Processing 35% of bytes — 1,024 resources written"]).await;
+    let recipient = mock_recipient_reporting(&["Processing 35% — 1,024 Resources written"]).await;
     let ctx = ctx(&recipient);
     let detail_path = create_submission(&ctx).await;
 
     let (status, html) = get(&ctx, &format!("{detail_path}/status")).await;
     assert_eq!(status, StatusCode::OK);
     assert!(
-        html.contains("1,024 resources written"),
+        html.contains("1,024 Resources written"),
         "the report must survive its non-ASCII byte: {html}"
     );
     assert!(
