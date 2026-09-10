@@ -1,0 +1,33 @@
+<!--
+  `pane=form` (#843): the guided-form panel alone — hidden state plus the
+  card plus its datalists — for a host that keeps its own JSON view (View
+  Definitions' CodeMirror pane) and only wants this half re-rendered on
+  every keystroke. This fragment never renders the JSON pane, its two-column
+  grid wrapper, or the raw-edit textarea — those belong to `editor-body.html`
+  alone, and this fragment has nothing to do with them.
+
+  Same hidden-form contract as the full body (`editor-hidden-form.html`):
+  `analyze()` in editor.rs runs identically either way, so a document
+  mid-edit behaves the same regardless of which fragment renders it.
+-->
+{% include "partials/editor-hidden-form.html" %}
+
+{% if let Some(message) = parse_error %}
+<!--
+  A malformed document: the card still appears (so the panel never just
+  vanishes), but with the invalid-JSON notice in place of rows — there is
+  nothing left to anchor a row to until the text parses again.
+-->
+<section class="card editor-form{% if needs_js %} needs-js{% endif %}">
+  <div class="card-head">
+    <h3><span class="icon">{% include "icons/sliders.svg" %}</span> {{ i18n.t("editor-view-form") }}</h3>
+  </div>
+  <div class="alert" role="alert">
+    <strong>{{ i18n.t("editor-invalid-json") }}</strong>
+    <code>{{ message }}</code>
+  </div>
+</section>
+{% else %}
+{% include "partials/editor-form-pane.html" %}
+{% include "partials/editor-datalists.html" %}
+{% endif %}

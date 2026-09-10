@@ -23,11 +23,16 @@ export const ROUTES = [
   "/ui/bulk-export/new",
   "/ui/subscriptions",
   "/ui/sql/view-definitions",
+  // `?vd=new` (#843), not the bare route above: with no view selected the
+  // page renders its "nothing selected" card and neither the editor nor the
+  // guided-form grid exists at all, so the bare route never exercises either
+  // one — the starter document is the cheapest selection that does, with no
+  // seeding required.
+  "/ui/sql/view-definitions?vd=new",
   "/ui/sql/queries",
   "/ui/sql/views",
   "/ui/sql/export",
   "/ui/sql/export/new",
-  "/ui/sql/files",
 ];
 
 // The bulk-import detail page only exists with a submission behind it. Seed

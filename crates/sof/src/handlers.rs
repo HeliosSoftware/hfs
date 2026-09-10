@@ -11,6 +11,7 @@ use crate::{
     filter_resources_by_patient_and_group as sof_filter_resources_by_patient_and_group,
     filter_resources_by_since as sof_filter_resources_by_since, format_parquet_multi_file,
     get_fhir_version_string, get_newest_enabled_fhir_version,
+    lint::{Diagnostic, Severity, lint_view_definition},
     parse_view_definition_for_version as sof_parse_view_definition_for_version,
     process_view_definition, run_view_definition_with_options,
     run_view_definition_with_options_remote,
@@ -91,6 +92,32 @@ pub async fn capability_statement() -> ServerResult<impl IntoResponse> {
 /// All parameters except the subject trio, `patient`, `group`, and `resource`
 /// can be supplied on the query string.
 ///
+/// # Invalid ViewDefinition (`422`)
+///
+/// The inline subject is linted by [`helios_sof::lint::lint_view_definition`]
+/// — the same structural rules the `/ui/sql/view-definitions/lint` editor
+/// endpoint uses (#821) — against the JSON exactly as received, before any
+/// typed parse. Any error-severity diagnostic short-circuits the request
+/// with `422 Unprocessable Entity` and an `OperationOutcome` carrying **one
+/// `issue` per diagnostic**:
+/// - `severity`: always `"error"` (lint warnings never reach this response).
+/// - `code`: `structure` for a malformed document/unknown key/wrong type,
+///   `required` for a missing or empty required key, `invalid` for every
+///   other rule (duplicate column names, more than one iteration directive,
+///   an empty `select`, a FHIRPath expression that doesn't parse, or an
+///   undeclared `%constant`).
+/// - `diagnostics` and `details.text`: the lint's own message.
+/// - `details.coding[0]`: `{system, code}`, where `code` is the
+///   diagnostic's own kebab-case `DiagnosticCode` (e.g. `unknown-key`,
+///   `missing-required`, `fhirpath-syntax`).
+/// - `expression[0]`: the offending node, rendered as a FHIRPath-style path
+///   (`ViewDefinition.select[0].column[1].path`) via
+///   [`helios_sof::lint::pointer_to_fhirpath`].
+///
+/// A document the lint accepts can still fail the typed parse afterward on
+/// something the lint deliberately doesn't model — that keeps its prior
+/// single-issue `422` (see `parse_view_definition_for_version`).
+///
 /// # Returns
 /// * `Ok(Response)` - The rows in the requested format, per `_format` or the Accept header
 /// * `Err(ServerError)` - Various errors for invalid input or processing failures
@@ -161,6 +188,25 @@ pub async fn sql_run_handler(
     // come from the query string when this shape is used.
     let is_bare_view_definition =
         body.get("resourceType").and_then(|v| v.as_str()) == Some("ViewDefinition");
+
+    // #821: lint the inline ViewDefinition exactly as the client sent
+    // it, before any typed parse. `parse_parameters` below round-trips a
+    // Parameters-wrapped subject through a strict typed deserialize, which
+    // silently drops any key the generated FHIR structs don't recognize (no
+    // `deny_unknown_fields` anywhere in this codebase) — linting after that
+    // round-trip would miss `unknown-key` entirely. A structural lint error
+    // always outranks the generic `400`s the wrapper parse can raise below:
+    // an invalid subject is `422 Unprocessable Entity`, never a
+    // malformed-request `400`.
+    let inline_view_definition = if is_bare_view_definition {
+        Some(&body)
+    } else {
+        find_inline_view_definition(&body)
+    };
+    if let Some(view_definition_json) = inline_view_definition {
+        lint_inline_view_definition(view_definition_json)?;
+    }
+
     let extracted_params = if is_bare_view_definition {
         ExtractedParameters {
             subject_resource: Some(body),
@@ -797,6 +843,15 @@ fn parse_view_definition(json: serde_json::Value) -> ServerResult<SofViewDefinit
 /// default `From<SofError>` impl route `InvalidViewDefinition` through
 /// `ServerError::ProcessingError` so it surfaces as 422; the prior
 /// special-case to `BadRequest` (400) was the spec gap.
+///
+/// By the time a document reaches this typed parse, `sql_run_handler` has
+/// already run it through [`lint_inline_view_definition`] (#821) and
+/// returned early on any structural error, so a failure here means
+/// something the lint deliberately doesn't model failed instead — e.g. a
+/// `path` that isn't valid FHIRPath at the *evaluation* grammar level the
+/// typed deserializer enforces beyond the lint's own parse-only check, or a
+/// version-specific shape difference the lint's key model (R4) doesn't
+/// carry. Rare, and still a `422`.
 fn parse_view_definition_for_version(
     json: serde_json::Value,
     version: helios_fhir::FhirVersion,
@@ -804,33 +859,55 @@ fn parse_view_definition_for_version(
     sof_parse_view_definition_for_version(json, version).map_err(ServerError::from)
 }
 
+/// Finds the first `parameter[].resource` in a raw `Parameters` JSON body
+/// whose `resourceType` is `ViewDefinition` — the inline subject `$sql-run`
+/// evaluates. Shared by the pre-parse lint in [`sql_run_handler`] (#821) and
+/// by [`invalid_parameters_error`]'s "the inline ViewDefinition speaks
+/// first" fallback below.
+fn find_inline_view_definition(json: &serde_json::Value) -> Option<&serde_json::Value> {
+    json.get("parameter")?.as_array()?.iter().find_map(|param| {
+        let resource = param.get("resource")?;
+        (resource.get("resourceType").and_then(|t| t.as_str()) == Some("ViewDefinition"))
+            .then_some(resource)
+    })
+}
+
+/// Runs `helios_sof::lint` (#821) against an inline ViewDefinition JSON and,
+/// if it reports any error-severity diagnostic, short-circuits the request
+/// with a `422` carrying one `OperationOutcome.issue` per diagnostic (see
+/// `ServerError::InvalidViewDefinition`). Warnings never block `$sql-run` —
+/// the lint reports them for the UI's editor, not this endpoint.
+fn lint_inline_view_definition(json: &serde_json::Value) -> ServerResult<()> {
+    let errors: Vec<Diagnostic> = lint_view_definition(json)
+        .into_iter()
+        .filter(|diagnostic| diagnostic.severity == Severity::Error)
+        .collect();
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(ServerError::InvalidViewDefinition(errors))
+    }
+}
+
 /// Maps a strict `Parameters` deserialization failure to the right status.
 ///
 /// The whole wrapper deserializes in one pass, so a type mismatch *inside an
 /// inline ViewDefinition* also fails there — but that case is documented as
 /// `422 Unprocessable Entity` (audit item #9), not the wrapper's 400 (#670).
-/// Probe the raw JSON for inline ViewDefinitions and let the first one that
-/// fails its own parse speak, with the 422-mapped error; a wrapper that is
-/// malformed anywhere else keeps the 400.
+/// Probe the raw JSON for the inline ViewDefinition and let its own parse
+/// error speak, with the 422-mapped error; a wrapper that is malformed
+/// anywhere else keeps the 400. In practice the lint step in
+/// `sql_run_handler` already catches most of what would land here — this is
+/// the residual path for whatever it doesn't model.
 fn invalid_parameters_error(
     json: &serde_json::Value,
     version: helios_fhir::FhirVersion,
     message: String,
 ) -> ServerError {
-    for param in json
-        .get("parameter")
-        .and_then(|p| p.as_array())
-        .into_iter()
-        .flatten()
+    if let Some(resource) = find_inline_view_definition(json)
+        && let Err(error) = parse_view_definition_for_version(resource.clone(), version)
     {
-        let Some(resource) = param.get("resource") else {
-            continue;
-        };
-        if resource.get("resourceType").and_then(|t| t.as_str()) == Some("ViewDefinition")
-            && let Err(error) = parse_view_definition_for_version(resource.clone(), version)
-        {
-            return error;
-        }
+        return error;
     }
     ServerError::BadRequest(message)
 }

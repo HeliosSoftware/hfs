@@ -33,6 +33,9 @@ use std::{collections::HashMap, sync::Arc};
 
 use crate::i18n::{I18n, RequestLocale};
 use crate::raw_fold::RawFold;
+use crate::raw_json_fragment::{
+    PaneTarget, vs_expand_expand_url, vs_expand_extra_query, vs_expand_fragment_endpoint,
+};
 use crate::upstream::{
     ExpandParams, ExpansionResult, HTS_UI_MAX_EXPANSION_SIZE_HINT, OpFailure, OutcomeView,
     UpstreamError, ValueSetSummary, VsBrowserFilters, VsBrowserPage,
@@ -564,14 +567,33 @@ async fn expand_run(
         state.upstream.vs_expand_instance(&id, &params).await
     };
     let view = match expand_result {
-        Ok(result) => ExpandResultView {
-            raw: RawFold::new(&result.request_url, &result.request_body, &result.raw_body),
-            tree_mode,
-            threshold: params.threshold,
-            result: Some(result),
-            outcome: None,
-            degraded_reason: None,
-        },
+        Ok(result) => {
+            let mut raw = RawFold::new(&result.request_url, &result.request_body, &result.raw_body);
+            // Plan both incremental JSON panes (#898). Only possible when the
+            // canonical url resolved — the fragment endpoints pin the
+            // ValueSet via `url=<canonical>`.
+            if !canonical.is_empty() {
+                let req =
+                    vs_expand_extra_query(&canonical, &params, tree_mode, PaneTarget::Request);
+                let resp =
+                    vs_expand_extra_query(&canonical, &params, tree_mode, PaneTarget::Response);
+                raw.plan_panes(
+                    vs_expand_fragment_endpoint(state.fhir_version, &req),
+                    vs_expand_expand_url(&req),
+                    vs_expand_fragment_endpoint(state.fhir_version, &resp),
+                    vs_expand_expand_url(&resp),
+                    &chrome.i18n,
+                );
+            }
+            ExpandResultView {
+                raw,
+                tree_mode,
+                threshold: params.threshold,
+                result: Some(result),
+                outcome: None,
+                degraded_reason: None,
+            }
+        }
         Err(err) => {
             let mut v = ExpandResultView::from_error(&err);
             v.tree_mode = tree_mode;

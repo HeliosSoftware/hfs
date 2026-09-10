@@ -118,7 +118,7 @@ impl SearchResult {
             bundle = bundle.with_entry(
                 BundleEntry::match_entry(
                     format!("{}/{}", base_url, url),
-                    resource.content().clone(),
+                    resource.content_with_meta(),
                 )
                 .with_score(score),
             );
@@ -127,7 +127,7 @@ impl SearchResult {
         for resource in &self.included {
             bundle = bundle.with_entry(BundleEntry::include_entry(
                 format!("{}/{}", base_url, resource.url()),
-                resource.content().clone(),
+                resource.content_with_meta(),
             ));
         }
 
@@ -158,8 +158,11 @@ impl SearchResult {
             let url = resource.url();
             let score = scores.get(&url).copied();
             bundle = bundle.with_entry(
-                BundleEntry::match_entry(format!("{}/{}", base_url, url), resource.into_content())
-                    .with_score(score),
+                BundleEntry::match_entry(
+                    format!("{}/{}", base_url, url),
+                    resource.into_content_with_meta(),
+                )
+                .with_score(score),
             );
         }
 
@@ -167,7 +170,7 @@ impl SearchResult {
             let url = resource.url();
             bundle = bundle.with_entry(BundleEntry::include_entry(
                 format!("{}/{}", base_url, url),
-                resource.into_content(),
+                resource.into_content_with_meta(),
             ));
         }
 

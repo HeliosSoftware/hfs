@@ -441,7 +441,15 @@ async fn respond(
         fhir_version: state.fhir_version,
         version: state.version,
     };
-    let view = load(state, form, panel).await;
+    let mut view = load(state, form, panel).await;
+
+    // Highlight raw JSON payloads for the "Raw response" disclosures (#897).
+    if let Some(Ok(identity)) = &mut view.identity {
+        identity.highlight(&chrome.i18n);
+    }
+    if let Some(Ok(mappings)) = &mut view.mappings {
+        mappings.highlight(&chrome.i18n);
+    }
 
     if is_htmx {
         return match panel {

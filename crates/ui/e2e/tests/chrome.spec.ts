@@ -51,12 +51,14 @@ test("the Batch & Data section lists Import and Export", async ({ page, chrome }
   await expect(chrome.navLink("/ui/bulk-export")).toBeVisible();
 });
 
-test("SQL on FHIR is its own section with five navigable children", async ({
+test("SQL on FHIR is its own section with four navigable children", async ({
   page,
   chrome,
 }) => {
   // #649: the former coming-soon placeholder inside Batch & Data became a
-  // top-level section whose every child is a real route.
+  // top-level section whose every child is a real route. The job-id lookup
+  // form that used to round the section out to five is retired (#835): its
+  // nav entry is gone and `/ui/sql/files` now just redirects to the list.
   await page.goto("/ui", { waitUntil: "networkidle" });
   await chrome.sidebar.hover();
   for (const href of [
@@ -64,11 +66,11 @@ test("SQL on FHIR is its own section with five navigable children", async ({
     "/ui/sql/queries",
     "/ui/sql/views",
     "/ui/sql/export",
-    "/ui/sql/files",
   ]) {
     await expect(chrome.navLink(href)).toBeVisible();
   }
   await expect(page.locator(".nav-item--soon")).toHaveCount(0);
+  await expect(chrome.navLink("/ui/sql/files")).toHaveCount(0);
 });
 
 // The account menu (#725). Until #799 it had NO coverage in this project at

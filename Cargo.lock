@@ -3482,12 +3482,14 @@ dependencies = [
  "helios-sof",
  "helios-subscriptions",
  "helios-ui",
+ "http-body-util",
  "openssl",
  "parking_lot",
  "reqwest",
  "serde_json",
  "sqlparser",
  "tokio",
+ "tower",
  "tracing",
 ]
 
@@ -3676,6 +3678,7 @@ dependencies = [
  "rand 0.8.6",
  "regex",
  "reqwest",
+ "rusqlite",
  "serde",
  "serde_json",
  "serde_urlencoded",

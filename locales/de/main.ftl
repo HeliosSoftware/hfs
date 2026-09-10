@@ -84,6 +84,13 @@ error-not-found = Die angeforderte Ressource wurde nicht gefunden.
 error-unauthorized = Sie sind nicht berechtigt, diese Aktion auszuführen.
 error-generic = Etwas ist schiefgelaufen. Versuchen Sie es erneut.
 
+## Generische "Nicht gefunden"-Seite (#835): ein vollständiger 404 innerhalb
+## des Shells, getrennt von error-not-found (OperationOutcome-Text für
+## API-Antworten).
+
+not-found-title = Nicht gefunden
+not-found-text = Diese Seite existiert nicht oder ist für Sie nicht verfügbar.
+
 ## Dashboard-Gerüst (Figma "Dashboard V1.1")
 
 nav-section-work = Arbeit
@@ -104,7 +111,6 @@ nav-sql-view-definitions = View-Definitionen
 nav-sql-queries = SQL-Abfragen
 nav-sql-views = SQL-Views
 nav-sql-export = SQL-Export
-nav-sql-files = Dateien
 nav-capability-conformance = Capability & Konformität
 nav-search-parameters = Suchparameter
 nav-subscriptions = Abonnements
@@ -171,7 +177,13 @@ chart-pick-heading = Dargestellte Ressourcentypen
 chart-pick-all = Alle Ressourcentypen anzeigen
 chart-pick-filter = Typen filtern
 chart-empty = Noch nichts darzustellen — gespeicherte Ressourcen erscheinen hier, sobald sie angelegt werden.
-chart-sample-note = Beispieldaten: in diesem Build ist kein Live-Metrikanbieter registriert.
+# Nur für einen Build ganz ohne Metrikanbieter. Ein Anbieter, der lediglich zu
+# langsam war, bekommt chart-pending-note — beides nie verwechseln (#956).
+chart-sample-note = Beispieldaten: dieser Build hat keinen Live-Metrikanbieter, das Diagramm unten ist also ein Platzhalter und keine Messung.
+chart-pending-note = Die Live-Zahlen für dieses Zeitfenster werden noch erhoben. Bis sie eintreffen wird nichts dargestellt — es werden keine Platzhalterzahlen gezeigt.
+chart-pending-empty = Warten auf die Live-Zahlen…
+chart-pending-retry = Jetzt erneut versuchen
+chart-partial-note = Einige Zahlen konnten nicht aus dem Speicher gelesen werden und werden als Null angezeigt. Zum erneuten Versuch neu laden.
 chart-table-toggle = Als Tabelle anzeigen
 chart-table-when = Zeitpunkt
 chart-focus-series = Diese Serie fokussieren
@@ -422,7 +434,7 @@ queries-results = Ergebnisse
 queries-results-total = { $count } Ergebnisse
 queries-results-included = { $count } eingeschlossen
 queries-results-empty = Keine Ergebnisse.
-queries-open-tab = In neuem Tab öffnen
+queries-searching = Suche läuft…
 queries-col-updated = Aktualisiert
 queries-prev = Zurück
 queries-next = Weiter
@@ -481,6 +493,10 @@ editor-must-support-badge = MS
 editor-binding-hint = An ein Value Set gebunden — Codes stammen daraus; Stärke angezeigt
 editor-legend-live = Beim Tippen geprüft: Struktur, Kardinalität, erforderliche Bindings
 editor-legend-save = Beim Speichern geprüft: Constraints und Terminologie
+vd-form-legend-live = Beim Tippen geprüft: Struktur, Kardinalität, erforderliche Bindings sowie FHIRPath-Syntax / SQL-on-FHIR-Regeln
+vd-form-invalid-chip = Ungültiges JSON
+lib-form-legend-live = Beim Tippen geprüft: Struktur, Kardinalität, erforderliche Bindings
+lib-form-legend-save = Beim Speichern geprüft: SQL-on-FHIR-Library-Typ und das SQL-Attachment
 editor-deferred-badge = beim Speichern
 editor-deferred-hint = Codes werden beim Speichern gegen das Value Set geprüft (und live im Picker, wenn ein Terminologieserver konfiguriert ist)
 editor-must-support-hint = Must-support: Konsumenten dieses Profils müssen dieses Element verarbeiten können
@@ -717,6 +733,10 @@ bulk-export-since-month = Letzte 4 Wochen
 bulk-export-since-custom = Benutzerdefiniert
 bulk-export-field-since-custom = Benutzerdefinierter Zeitpunkt
 bulk-export-since-invalid = Geben Sie einen gültigen FHIR-Zeitpunkt ein, zum Beispiel 2026-08-01T00:00:00Z.
+bulk-export-field-until = Bis
+bulk-export-field-until-hint = Optionale Obergrenze. RFC 3339, z. B. 2026-08-01T00:00:00Z.
+bulk-export-window-since = Seit
+bulk-export-window-until = Bis
 bulk-export-start = Export starten
 bulk-export-running = laufend
 bulk-export-clear = Leeren
@@ -778,7 +798,21 @@ cap-json-path-too-deep = maximale Aufklapptiefe erreicht
 cap-json-pagination-label = JSON-Elemente
 cap-json-page-prev = Zurück
 cap-json-page-next = Weiter
+cap-json-collapse-all = Alle einklappen
+cap-json-expand-all = Alle ausklappen
+cap-json-expanding = Sichtbares JSON wird ausgeklappt…
+cap-json-expand-complete = Das gesamte JSON ist ausgeklappt.
+cap-json-expand-partial = Die aktuellen Seiten wurden bis zum sicheren Limit ausgeklappt. Die übrigen Knoten bleiben eingeklappt.
+cap-json-limit-reached = Das Anzeigelimit für JSON wurde erreicht. Klappen Sie einen anderen Zweig ein, bevor Sie weitere Daten laden.
+cap-json-expand-error = Der JSON-Baum konnte nicht ausgeklappt werden. Die aktuelle Ansicht wurde beibehalten; versuchen Sie es erneut.
 cap-unavailable = Das CapabilityStatement konnte nicht vom Server geladen werden — der Selbstaufruf benötigt bei aktivierter Authentifizierung eventuell ein Ausgangs-Token.
+
+## Generische JSON-Fold-Labels (#898) — verwendet von Raw-Response-Folds in HTS-UI.
+## Die cap-*-Keys oben bleiben spezifisch für CapabilityStatement.
+json-fold-loading = JSON wird geladen…
+json-fold-load-error = Dieser JSON-Abschnitt konnte nicht geladen werden. Zuklappen und erneut öffnen, um es zu wiederholen.
+json-fold-open-plain = Rohes JSON öffnen
+json-fold-plain = Roh-JSON-Fallback. Hervorhebung wird inkrementell geladen, wenn JavaScript verfügbar ist.
 
 ## Stubs der SQL-on-FHIR-Sektion (#649)
 
@@ -787,17 +821,14 @@ sql-vd-title = View-Definitionen
 sql-vd-lede = Erstelle und verwalte die ViewDefinitions, mit denen SQL on FHIR Ressourcen abflacht.
 
 sql-queries-title = SQL-Abfragen
-sql-queries-lede = Führe SQL-on-FHIR-Abfragen gegen diesen Server aus.
+sql-queries-lede = Ad-hoc-SQL über die flachen Tabellen, die deine View-Definitionen erzeugen. Die Ergebnisse aktualisieren sich während der Eingabe.
 
 sql-views-title = SQL-Views
-sql-views-lede = Wiederverwendbare SQL-Views auf Basis von ViewDefinitions.
+sql-views-lede = Benannte Views, aus denen andere Abfragen und Exporte auswählen. Definiere das SQL einmal; die erzeugten Spalten werden zu einer Tabelle, die alle nutzen können.
 
 sql-export-title = SQL-Export
-sql-export-lede = Langlaufende SQL-on-FHIR-Exportaufträge.
+sql-export-lede = Führt gespeicherte ViewDefinitions, SQL-Abfragen und SQL-Views als langlaufenden $sql-export-Auftrag aus und lädt die Ausgabedateien herunter.
 sql-export-active-title = SQL-Exporte
-
-sql-files-title = Dateien
-sql-files-lede = Manifeste und Ausgabedateien der SQL-Exporte.
 
 ## View-Definitionen-Arbeitsbereich (#649)
 
@@ -811,7 +842,6 @@ vd-none = Noch keine View-Definitionen.
 vd-empty-lede = Lege mit „Neu erstellen" die erste ViewDefinition an.
 vd-degraded = Die Liste der View-Definitionen konnte nicht geladen werden.
 vd-saved = Gespeichert.
-vd-run = Ausführen
 vd-run-failed = Die View konnte nicht ausgeführt werden.
 vd-save = Speichern
 vd-duplicate = Duplizieren
@@ -828,28 +858,217 @@ vd-pagination-label = View-Definitionsseiten
 vd-page-prev = Zurück
 vd-page-next = Weiter
 
-## SQL-Abfragen- / SQL-Views-Arbeitsbereiche (#649)
+## ViewDefinition-Lint-Meldungen und -Fixes (#821): eigene Lokalisierung des
+## `/lint`-Handlers für `helios_sof::lint::Diagnostic` — code + args, niemals
+## `Diagnostic.message` selbst (immer Englisch, nicht lokalisiert). Die
+## Schlüssel `vd-lint-*` tragen den Kebab-Case-Namen von `DiagnosticCode`; ein
+## `missing-required`/`wrong-type`-Diagnosewert aus der value[x]-Auswahl einer
+## Konstante trägt `$variant` ("missing"/"multiple") statt der generischen
+## `$key`/`$expected`+`$found`, unten ausgewählt. Jeder `vd-fix-*`-Schlüssel
+## beschriftet einen `Fix`, neben dem Diagnosewert als Ein-Klick-Aktion
+## angezeigt.
+vd-lint-not-a-view-definition = Kein ViewDefinition: gefunden { $found }
+vd-lint-unknown-key = Unbekannter Schlüssel "{ $key }"
+vd-lint-missing-required = { $variant ->
+    [missing] Eine Konstante muss genau einen Wert setzen
+   *[other] Erforderlicher Schlüssel "{ $key }" fehlt
+}
+vd-lint-wrong-type = { $variant ->
+    [multiple] Eine Konstante darf nur einen Wert setzen
+   *[other] Erwartet { $expected }, gefunden { $found }
+}
+vd-lint-empty-required = Der erforderliche Schlüssel "{ $key }" darf nicht leer sein
+vd-lint-duplicate-column-name = Doppelter Spaltenname "{ $name }"
+vd-lint-multiple-iteration-directives = Ein select darf höchstens eines von forEach, forEachOrNull, repeat setzen (gefunden { $keys })
+vd-lint-select-without-output = Ein select muss mindestens eines von column, select oder unionAll enthalten
+vd-lint-fhirpath-syntax = FHIRPath-Syntax: { $detail }
+vd-lint-undeclared-constant = Nicht deklarierte Konstante "%{ $name }"
+vd-fix-rename-key = Umbenennen zu "{ $to }"
+vd-fix-remove-key = "{ $key }" entfernen
+vd-fix-set-string = Auf "{ $value }" setzen
+
+## ViewDefinition-Vervollständigung (#821): `vd-editor.js` liest dies einmal
+## aus `data-msg-required` von `#vd-editor-grid` — die Markierung, die das
+## Vervollständigungselement eines erforderlichen strukturellen Schlüssels
+## trägt, clientseitig an seinen `detail`-Text angehängt (`/complete` sendet
+## sie nie selbst, da der Endpunkt nicht lokalisiert).
+vd-complete-required = erforderlich
+
+## Speichern-mit-Fehlern-Bestätigung des ViewDefinition-Editors (#821):
+## `vd-editor.js` wählt eine dieser beiden Renderings von
+## `data-msg-save-errors-one`/`-other` von `#vd-editor-grid` und ersetzt den
+## literalen Platzhalter `{count}` (den Wert, den `$count` erhielt) durch die
+## tatsächliche Anzahl — der Text von `window.confirm` hat keine eigene
+## Lokalisierung, das ist der einzige Weg, ihn zu übersetzen. Erscheint nur
+## beim Absenden als Save (nicht Duplicate), solange der zuletzt
+## abgeschlossene Lint-Durchlauf noch mindestens einen Fehler hat.
+vd-save-with-errors-one = Diese View-Definition hat noch { $count } Fehler. Trotzdem speichern?
+vd-save-with-errors-other = Diese View-Definition hat noch { $count } Fehler. Trotzdem speichern?
+
+## $sql-run-Ergebnispartial (#752): gemeinsam genutzt von den Playgrounds
+## View-Definitionen, SQL-Abfragen und SQL-Views (#839).
+
+sql-run-export = Als Dateien exportieren
+
+## SQL-Abfragen- / SQL-Views-Arbeitsbereiche (#649, editor-first-Layout #839)
 
 sql-queries-new-title = Neue SQL-Abfrage
 sql-views-new-title = Neue SQL-View
 sql-queries-rail-all-heading = Alle SQL-Abfragen
 sql-views-rail-all-heading = Alle SQL-Views
-lib-filter = Bibliotheken filtern
-lib-none = Noch keine Bibliotheken.
-lib-empty-lede = Lege mit „Neu erstellen" die erste Bibliothek an.
+sql-queries-chip = SQL-Abfrage
+sql-views-chip = SQL-View
+sql-queries-filter = Abfragen filtern
+sql-views-filter = Views filtern
+sql-queries-rail-empty = Noch keine Abfragen.
+sql-views-rail-empty = Noch keine Views.
+sql-queries-empty-title = Noch keine SQL-Abfragen
+sql-views-empty-title = Noch keine SQL-Views
+sql-queries-empty-lede = Lege mit „Neu erstellen" deine erste Abfrage an. Sie läuft gegen die flachen Tabellen jeder aktiven View-Definition.
+sql-views-empty-lede = Lege mit „Neu erstellen" deinen ersten View an. Seine Spalten werden zu einer Tabelle, aus der andere Abfragen und Exporte auswählen können.
+sql-queries-editor-heading = SQL
+sql-views-editor-heading = View-Definition (SQL)
+sql-queries-results-heading = Ergebnisse
+sql-views-results-heading = Vorschau
+sql-queries-run-failed = Die Abfrage konnte nicht ausgeführt werden.
+sql-views-run-failed = Die View konnte nicht ausgeführt werden.
 lib-degraded = Die Bibliotheksliste konnte nicht geladen werden.
-lib-sql-heading = SQL
+lib-run-hint = Läuft während der Eingabe – die Ergebnisse folgen dem aktuellen SQL, gespeichert oder nicht
 lib-delete-confirm = „{ $name }" löschen? Das kann nicht rückgängig gemacht werden.
 lib-delete-failed = Die Bibliothek konnte nicht gelöscht werden.
+lib-details-heading = Details
+lib-details-json-heading = Library (JSON)
+lib-details-json-note = Das SQL-Attachment wird in der SQL-Karte unten bearbeitet und ist nicht Teil dieser Ansicht.
+lib-details-new-lede = Benennen Sie sie um und lassen Sie relatedArtifact[0] auf eine vorhandene ViewDefinition verweisen.
+lib-save-wrong-kind = Der SQL-on-FHIR-Library-Typ muss „{ $code }" sein, um sie hier zu speichern.
+lib-save-view-parameters = Ein SQL View kann keine Parameter deklarieren (SQLView-Profil, Library.parameter 0..0). Entfernen Sie parameter[] in Details.
 
-## SQL-Export- und Dateien-Seiten (#649, #833)
+## Parameters-Karte (#841, nur SQL Query)
+
+lib-params-heading = Parameters
+lib-params-meta = auf der Library deklariert · die Werte unten gelten nur für diesen Lauf
+lib-params-empty = Keine Parameter deklariert. Fügen Sie hier oder in Details einen hinzu.
+lib-params-hint = :{ $name } wird im SQL verwendet, ist aber auf der Library nicht deklariert.
+lib-params-declare = :{ $name } deklarieren
+lib-params-add-toggle = Parameter hinzufügen
+lib-params-add-name-label = Name
+lib-params-add-type-label = Typ
+lib-params-add-submit = Hinzufügen
+lib-params-add-invalid-name = Parameternamen müssen ^[A-Za-z][A-Za-z0-9_]*$ entsprechen
+lib-params-add-duplicate = Ein Parameter namens { $name } ist bereits deklariert
+lib-params-add-unknown-type = Unbekannter Parametertyp
+lib-run-waiting = Warten auf einen Wert für { $names } – die Ergebnisse unten stammen vom letzten erfolgreichen Lauf.
+lib-run-unknown-table = Unbekannte Tabelle { $name } – Zeile { $line }. Deklarieren Sie sie unter Reads from oder korrigieren Sie den Namen. Ihre SQL-Abfrage ist unverändert; die Ergebnisse unten stammen vom letzten erfolgreichen Lauf.
+lib-run-unknown-table-more = Unbekannte Tabelle { $name } – Zeile { $line }.
+
+## Tabellenbereich (#842, beide Arten) — Reads from / Used by / Columns
+
+lib-tables-heading = Liest von
+lib-tables-col-alias = Alias
+lib-tables-col-target = Liest von
+lib-tables-no-alias = (kein Label)
+lib-tables-empty = Noch keine Tabellen deklariert.
+lib-tables-note = Jede Tabelle, die die SQL-Abfrage liest, als relatedArtifact-depends-on-Einträge: Alias links, die ViewDefinition oder SQL View, zu der es aufgelöst wird, rechts.
+lib-tables-remove = Entfernen
+lib-tables-kind-view-definition = ViewDefinition
+lib-tables-target-not-found = Nicht gefunden
+lib-tables-target-not-found-detail = Keine ViewDefinition oder SQL View entspricht { $resource }. Korrigieren Sie den kanonischen Wert in Details oder entfernen Sie die Zeile.
+lib-tables-target-not-a-table = Keine Tabelle
+lib-tables-target-not-a-table-detail = Es kann nur eine ViewDefinition oder eine SQL View gelesen werden.
+lib-tables-add-toggle = Tabelle hinzufügen
+lib-tables-add-table-label = Tabelle
+lib-tables-add-table-placeholder = View Definitions und SQL Views durchsuchen
+lib-tables-add-table-hint = Zum Suchen nach Namen tippen oder aus der Liste wählen.
+lib-tables-add-table-fallback-placeholder = ViewDefinition/{"{"}id{"}"} oder Library/{"{"}id{"}"}
+lib-tables-add-table-fallback-hint = Geben Sie eine ViewDefinition- oder SQL-View-Referenz ein.
+lib-tables-alias-label = Alias
+lib-tables-alias-hint = Standardmäßig der Name des Artefakts
+lib-tables-add-submit = Hinzufügen
+lib-tables-add-error-required = Wählen Sie eine ViewDefinition oder eine SQL View
+lib-tables-add-error-alias-required = Alias ist erforderlich
+lib-tables-add-error-alias-invalid = Der Alias muss ^[A-Za-z][A-Za-z0-9_]*$ entsprechen
+lib-tables-add-error-alias-duplicate = Der Alias { $alias } ist bereits deklariert
+lib-tables-options-empty = Keine Treffer.
+lib-tables-unknown = Unbekannte Tabelle
+lib-tables-unknown-detail = Wird in der SQL-Abfrage verwendet, ist aber nicht deklariert. Wählen Sie eine ViewDefinition oder SQL View, oder korrigieren Sie den Namen.
+lib-tables-declare = { $name } deklarieren
+
+lib-used-by-heading = Verwendet von
+lib-used-by-empty = Wird noch von nichts verwendet.
+lib-used-by-export-kind = SQL-Export
+
+lib-columns-heading = Spalten
+lib-columns-meta-query = was die Abfrage liefert
+lib-columns-meta-view = was die View liefert
+lib-columns-empty-query = Führen Sie die Abfrage aus, um ihre Spalten zu sehen.
+lib-columns-empty-view = Führen Sie die View aus, um ihre Spalten zu sehen.
+lib-columns-col-name = Spalte
+lib-columns-col-type = Typ
+lib-columns-col-from = Von
+
+## SQL-Export-Seiten (#649, #833)
 
 export-start-failed = Der Export konnte nicht gestartet werden.
-export-job-id = Auftrags-ID
-export-new-heading = Neuer Export
-export-no-subjects = Noch nichts zu exportieren — lege zuerst eine ViewDefinition an.
 export-format = Ausgabeformat
 export-start = Export starten
+
+## Erstellungsformular des SQL-Export-Generators (#834)
+
+sql-export-name-placeholder = Monatliche Patienten-Flachdateien
+sql-export-subjects-legend = Was möchten Sie exportieren?
+sql-export-subjects-heading = Elemente
+sql-export-filter-all = Alle
+sql-export-filter-view-definitions = ViewDefinitions
+sql-export-filter-queries = Abfragen
+sql-export-filter-views = Views
+sql-export-filter-subjects = Elemente filtern
+sql-export-select-all = Alle auswählen
+sql-export-col-subject = Element
+sql-export-col-kind = Typ
+sql-export-col-status = Status
+sql-export-selected-count = { $selected } von { $total } ausgewählt
+sql-export-format-ndjson-hint = Ein JSON-Objekt pro Zeile. Läuft gut in Pipelines.
+sql-export-format-csv-hint = Kopfzeile plus eine Zeile pro Datensatz. Öffnet sich in jeder Tabellenkalkulation.
+sql-export-format-json-hint = Ein einzelnes JSON-Array pro Ausgabe. Am einfachsten von Hand zu prüfen.
+sql-export-format-parquet-hint = Spaltenorientiert und typisiert. Am besten für Analyse-Engines geeignet.
+sql-export-empty-heading = Noch nichts zu exportieren
+sql-export-empty-body = Jede gespeicherte ViewDefinition, SQL-Abfrage und SQL-View erscheint hier als exportierbares Element. Legen Sie zuerst eines an.
+sql-export-filter-empty = Keine Elemente gefunden
+
+## SQL-Export-Generator — „Eingrenzen" und „Erweitert" (#836)
+
+sql-export-narrow-title = Eingrenzen
+sql-export-narrow-meta = optional — leer lassen, um alles zu exportieren
+sql-export-field-patients = Patienten
+sql-export-field-patients-placeholder = Patienten suchen
+sql-export-field-patients-hint = Suchen Sie nach Vorname, Nachname oder exaktem Identifier. Leer lassen, um alle Patienten zu exportieren.
+sql-export-field-patients-fallback-placeholder = FHIR-IDs der Patienten
+sql-export-field-patients-fallback-hint = Geben Sie exakte logische FHIR-IDs durch Kommas oder Zeilenumbrüche getrennt ein. Leer lassen, um alle Patienten zu exportieren.
+sql-export-field-patients-id-only-hint = Suchen Sie nach einer exakten FHIR-ID. Leer lassen, um alle Patienten zu exportieren.
+sql-export-field-groups = Gruppen
+sql-export-field-groups-placeholder = Gruppen suchen
+sql-export-field-groups-hint-r4 = Suchen Sie nach exakter FHIR-ID oder Identifier.
+sql-export-field-groups-hint-r5 = Suchen Sie nach Namen, exakter FHIR-ID oder Identifier.
+sql-export-field-groups-fallback-placeholder = FHIR-IDs der Gruppen
+sql-export-field-groups-fallback-hint = Geben Sie exakte FHIR-IDs oder Identifier durch Kommas oder Zeilenumbrüche getrennt ein.
+sql-export-group-options-empty = Keine passenden Gruppen gefunden.
+sql-export-field-since = Seit
+sql-export-since-all = Gesamter Zeitraum
+sql-export-since-day = Letzter Tag
+sql-export-since-week = Letzte 7 Tage
+sql-export-since-month = Letzte 4 Wochen
+sql-export-since-custom = Benutzerdefiniert
+sql-export-field-since-custom = Benutzerdefinierter Zeitpunkt
+sql-export-since-invalid = Geben Sie einen gültigen FHIR-Zeitpunkt ein, zum Beispiel 2026-08-01T00:00:00Z.
+sql-export-patient-invalid = Geben Sie nur gültige logische Patient-IDs ein, getrennt durch Kommas oder Zeilenumbrüche.
+sql-export-group-invalid = Geben Sie nur gültige logische Group-IDs ein, getrennt durch Kommas oder Zeilenumbrüche.
+sql-export-advanced = Erweitert
+sql-export-advanced-meta = Tracking-ID · CSV-Kopfzeile
+sql-export-field-tracking-id = Tracking-ID
+sql-export-field-tracking-id-hint = Wird im Abschlussmanifest als clientTrackingId wiedergegeben.
+sql-export-tracking-id-too-long = Die Tracking-ID darf höchstens 200 Zeichen lang sein.
+sql-export-field-header = Kopfzeile einschließen
+sql-export-field-header-hint = (nur CSV — wird für andere Formate ignoriert)
 
 ## Liste der aktiven SQL-Exporte und Auftragskarten (#833)
 
@@ -875,6 +1094,11 @@ sql-export-more-actions = Weitere Aktionen
 sql-export-copy-job-id = Auftrags-ID kopieren
 sql-export-copied = Kopiert
 sql-export-progress-waiting = Warten auf den ersten Statusbericht …
+sql-export-writing = Schreibt { $name }
+sql-export-subjects-progress = { $total ->
+    [one] { $done } von { $total } Element
+   *[other] { $done } von { $total } Elementen
+}
 sql-export-started = gestartet
 sql-export-finished-in = fertig in
 sql-export-cancelled-at = abgebrochen um
@@ -903,14 +1127,46 @@ sql-export-files-count = { $count ->
     [one] { $count } Datei
    *[other] { $count } Dateien
 }
-files-job-heading = Exportauftrag
-files-load = Manifest laden
-files-error = Das Manifest konnte nicht geladen werden.
-files-outputs-heading = Ausgaben
-files-col-output = Ausgabe
-files-col-downloads = Downloads
-files-shard = Datei { $n }
-files-empty = Der Auftrag hat keine Ausgabedateien erzeugt.
+
+## Auftrags-Detailseite (#835)
+
+sql-export-detail-finished = Abgeschlossen
+sql-export-detail-failed = Fehlgeschlagen
+sql-export-detail-cancelled = Abgebrochen
+sql-export-detail-started = Gestartet
+sql-export-detail-after = nach
+sql-export-failure-subject = Der Export stoppte beim Element
+sql-export-failure-generic = Der Export ist fehlgeschlagen:
+sql-export-detail-job-heading = Auftrag
+sql-export-detail-field-job-id = Auftrags-ID
+sql-export-detail-field-format = Format
+sql-export-detail-field-started = Gestartet
+sql-export-detail-field-duration = Dauer
+sql-export-detail-field-subjects = Elemente
+sql-export-detail-header-included = mit Kopfzeile
+sql-export-detail-header-omitted = ohne Kopfzeile
+sql-export-detail-outputs-heading = Ausgabedateien
+sql-export-detail-col-output = Ausgabe
+sql-export-detail-col-subject = Element
+sql-export-detail-col-files = Dateien
+sql-export-detail-outputs-empty = Der Auftrag hat keine Ausgabedateien erzeugt.
+sql-export-file-fallback = Datei { $n }
+
+## #837: Parameterwerte je SQL-Query im SQL-Export-Formular
+sql-export-param-count = { $count ->
+    [one] { $count } Parameter
+   *[other] { $count } Parameter
+}
+sql-export-param-required = Dieser Wert ist erforderlich.
+sql-export-param-type-mismatch = Erwartet wurde ein Wert vom Typ { $type }.
+sql-export-param-required-chip = erforderlich
+sql-export-toggle-values = Werte ein- oder ausblenden
+sql-export-values-missing-one = { $count } Wert fehlt
+sql-export-values-missing-other = { $count } Werte fehlen
+
+## partials/sql_parameter_fields.html (#837) — gemeinsam mit dem
+## Parameterformular der SQL-Query-Seite
+sql-param-default = Standardwert
 
 ## Administrative HTS-UI (crates/hts-ui) — Phase-1-Stubs
 ##
@@ -1370,6 +1626,12 @@ hts-import-step-source = Quelle waehlen
 hts-import-step-review = Pruefen
 hts-import-step-result = Ergebnis
 hts-import-file-hint = Nur JSON. Die Datei wird im Browser gelesen und in das Bundle-Feld unten kopiert; gesendet wird erst beim Absenden.
+hts-import-drop-hint = Bundle-JSON-Datei hier ablegen
+hts-import-drop-browse = oder klicken zum Durchsuchen
+hts-import-reading = Datei wird gelesen…
+hts-import-read-failed = Die Datei konnte nicht gelesen werden.
+hts-import-file-too-large = Datei ueberschreitet das Limit von ~7,5 MiB fuer URL-kodierte Uebermittlung.
+hts-import-file-loaded = Datei geladen: {"{name}"}
 hts-import-bundle-hint = Das Bundle wird an POST /import auf dem Terminologieserver gesendet. Vorhandene Ressourcen werden ueber url + version zugeordnet.
 hts-import-review-target = Zielserver
 hts-import-review-request = Anfrage

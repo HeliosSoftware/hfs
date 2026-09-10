@@ -154,8 +154,8 @@ impl SpQuery {
     /// Serializes the state to an href, with `page` and `sel` reset unless
     /// explicitly carried over.
     ///
-    /// RF2: `base` always renders as a `base=` marker, empty when `None` —
-    /// never simply omitted. A link this page generates for "All types" must
+    /// `base` always renders as a `base=` marker, empty when `None` — never
+    /// simply omitted. A link this page generates for "All types" must
     /// keep that state reachable in one click even when a real type is
     /// remembered (`rails.searchParameters.last`): an omitted `base` would
     /// resolve through that stored `last` instead of staying on "All types".
@@ -366,10 +366,10 @@ pub(crate) struct SpView {
     pub detail: Option<SpDetail>,
     pub spec_loaded: bool,
     /// Hidden inputs so the rail's search form round-trips the other filters
-    /// (RF2: `base` is always present, empty for "All types" — see
+    /// (`base` is always present, empty for "All types" — see
     /// `SpQuery::href_with`'s doc).
     pub hidden_fields: Vec<(String, String)>,
-    /// The "Recently used" group's rows (RF6), server-rendered by
+    /// The "Recently used" group's rows, server-rendered by
     /// `partials/rail_recent.html`.
     pub recent: Vec<rail_state::ResolvedRailEntry>,
     /// `rails.searchParameters`, carried to the template so
@@ -463,12 +463,12 @@ pub(crate) fn build_view(
         current: query.base.is_none(),
     };
 
-    // RF6: the "Recently used" group, resolved against every base with at
-    // least one parameter — unfiltered by the search box's `needle`, since a
+    // The "Recently used" group, resolved against every base with at least
+    // one parameter — unfiltered by the search box's `needle`, since a
     // recent must stay visible even while the box hides it from the
     // scrollable list. Every surviving base is also a valid live entry, so
     // `resolve_recents`'s snapshot fallback never triggers here: type rails
-    // never store one (only the SQL rails do, from ticket 03 on).
+    // never store one (only the SQL rails do).
     let recent_live: HashMap<String, rail_state::LiveRailItem> = base_counts
         .iter()
         .map(|(name, count)| {
@@ -710,7 +710,7 @@ pub(crate) fn build_view(
     if let Some(v) = &query.version {
         hidden_fields.push(("version".into(), v.clone()));
     }
-    // RF2: always present, empty for "All types" — see `href_with`'s doc.
+    // Always present, empty for "All types" — see `href_with`'s doc.
     hidden_fields.push(("base".into(), query.base.clone().unwrap_or_default()));
     if let Some(t) = &query.ptype {
         hidden_fields.push(("type".into(), t.clone()));
@@ -782,10 +782,9 @@ fn page_links(page: usize, page_count: usize) -> Vec<usize> {
 mod tests {
     use super::*;
 
-    /// The never-selected rail state: what every test not exercising RF6
-    /// itself passes to `build_view`, since it renders identically to
-    /// `main`'s behavior before this ticket (empty "Recently used" group,
-    /// no stored `base`).
+    /// The never-selected rail state: what every test not exercising the
+    /// rail resolution itself passes to `build_view` (empty "Recently used"
+    /// group, no stored `base`).
     fn no_rail() -> rail_state::RailState {
         rail_state::RailState::default()
     }

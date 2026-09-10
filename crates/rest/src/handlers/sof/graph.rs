@@ -45,9 +45,10 @@ use helios_persistence::core::sof_runner::{RowStream, SofRunner, ViewFilters};
 use helios_persistence::tenant::TenantContext;
 use helios_sof::sqlquery::engine::ColumnSchema;
 use helios_sof::sqlquery::{
-    BoundParam, DependsOnView, InMemorySqlEngine, QueryResult, TableSchema,
+    BoundParam, DependsOnView, InMemorySqlEngine, QueryResult, SqlQueryError, TableSchema,
 };
 use serde_json::{Value, json};
+use tracing::{debug, warn};
 
 use super::references::{canonical_matches, resolve_resource_canonical_or_relative};
 use super::sqlquery::{sqlquery_err_to_rest, validate_select_only};
@@ -616,6 +617,13 @@ pub(crate) struct ExecLimits {
 /// once; each label is a physical copy of that one result, so it is
 /// addressable at every point where a consumer's SQL selects from it. Phase
 /// 1 guarantees every label maps to exactly one node.
+///
+/// Returns a typed [`SqlQueryError`]. In particular, a
+/// [`SqlQueryError::SourceStream`] means the *source* failed — a storage
+/// error, a backend statement timeout, or a lost connection while streaming
+/// a leaf ViewDefinition's rows — never that the Library or its
+/// ViewDefinitions were malformed; callers must not treat it as a client
+/// error.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn execute_plan(
     mut engine: InMemorySqlEngine,
@@ -626,7 +634,7 @@ pub(crate) async fn execute_plan(
     subject_sql: &str,
     subject_bindings: &[BoundParam],
     limits: ExecLimits,
-) -> Result<(QueryResult, Vec<TableSchema>), String> {
+) -> Result<(QueryResult, Vec<TableSchema>), SqlQueryError> {
     let labels_by_target = labels_by_target(plan);
     let mut leaf_schemas: Vec<TableSchema> = Vec::new();
 
@@ -637,15 +645,26 @@ pub(crate) async fn execute_plan(
                 view,
             } => {
                 let schema = TableSchema::from_view_definition(view);
-                engine
-                    .create_table(internal_name, &schema)
-                    .map_err(|e| e.to_string())?;
-                let row_stream = runner
-                    .run_view(tenant, view.clone(), filters.clone())
-                    .await
-                    .map_err(|e| format!("dependency failed to materialize: {e}"))?;
+                engine.create_table(internal_name, &schema)?;
+                let view_label = leaf_view_label(view, internal_name);
+                let start = std::time::Instant::now();
+                let row_stream = match runner.run_view(tenant, view.clone(), filters.clone()).await
+                {
+                    Ok(s) => s,
+                    Err(e) => {
+                        warn!(
+                            table = %internal_name,
+                            view = %view_label,
+                            error = %e,
+                            "SQL query dependency failed to materialize"
+                        );
+                        return Err(SqlQueryError::SourceStream(format!(
+                            "dependency failed to materialize: {e}"
+                        )));
+                    }
+                };
                 let row_stream = adapt_row_stream(row_stream);
-                engine
+                let (returned_engine, inserted) = match engine
                     .insert_rows(
                         internal_name,
                         &schema,
@@ -653,7 +672,27 @@ pub(crate) async fn execute_plan(
                         limits.max_source_rows_per_vd,
                     )
                     .await
-                    .map_err(|e| e.to_string())?;
+                {
+                    Ok(v) => v,
+                    Err(e) => {
+                        warn!(
+                            table = %internal_name,
+                            view = %view_label,
+                            error = %e,
+                            "SQL query dependency failed to materialize"
+                        );
+                        return Err(e);
+                    }
+                };
+                engine = returned_engine;
+                let elapsed_ms = start.elapsed().as_millis();
+                debug!(
+                    table = %internal_name,
+                    view = %view_label,
+                    rows = inserted,
+                    elapsed_ms,
+                    "materialized SQL query dependency"
+                );
                 leaf_schemas.push(schema);
                 engine = materialize_labels(
                     engine,
@@ -666,6 +705,7 @@ pub(crate) async fn execute_plan(
             PlanNode::SqlView {
                 internal_name, sql, ..
             } => {
+                let start = std::time::Instant::now();
                 let (returned_engine, result) = run_select_with_timeout(
                     engine,
                     sql.clone(),
@@ -676,12 +716,19 @@ pub(crate) async fn execute_plan(
                 .await?;
                 engine = returned_engine;
                 if result.rows.len() > limits.max_source_rows_per_vd {
-                    return Err(format!(
-                        "SQLView result exceeds the {}-row source limit",
-                        limits.max_source_rows_per_vd
-                    ));
+                    return Err(SqlQueryError::RowCapExceeded {
+                        max: limits.max_source_rows_per_vd,
+                    });
                 }
+                let rows = result.rows.len();
                 engine = materialize_query_result(engine, internal_name, &result).await?;
+                let elapsed_ms = start.elapsed().as_millis();
+                debug!(
+                    table = %internal_name,
+                    rows,
+                    elapsed_ms,
+                    "materialized SQL view node"
+                );
                 engine = materialize_labels(
                     engine,
                     internal_name,
@@ -703,6 +750,17 @@ pub(crate) async fn execute_plan(
     .await?;
 
     Ok((result, leaf_schemas))
+}
+
+/// Picks a human-readable label for a leaf ViewDefinition's log lines:
+/// `view.name` if it is a string, else `view.url` if it is a string, else
+/// `internal_name` (the plan's internal table name), which is always
+/// present.
+fn leaf_view_label<'a>(view: &'a Value, internal_name: &'a str) -> &'a str {
+    view.get("name")
+        .and_then(|v| v.as_str())
+        .or_else(|| view.get("url").and_then(|v| v.as_str()))
+        .unwrap_or(internal_name)
 }
 
 /// Groups every distinct label used anywhere in the plan by the internal
@@ -746,15 +804,13 @@ async fn materialize_labels(
     internal_name: &str,
     labels_by_target: &HashMap<String, Vec<String>>,
     max_rows: usize,
-) -> Result<InMemorySqlEngine, String> {
+) -> Result<InMemorySqlEngine, SqlQueryError> {
     let Some(labels) = labels_by_target.get(internal_name) else {
         return Ok(engine);
     };
     for label in labels {
         let copy_sql = format!("SELECT * FROM \"{internal_name}\"");
-        let result = engine
-            .execute_select(&copy_sql, &[], max_rows.saturating_add(1))
-            .map_err(|e| e.to_string())?;
+        let result = engine.execute_select(&copy_sql, &[], max_rows.saturating_add(1))?;
         engine = materialize_query_result(engine, label, &result).await?;
     }
     Ok(engine)
@@ -780,14 +836,12 @@ fn schema_from_query_result(result: &QueryResult) -> TableSchema {
 /// Materializes a [`QueryResult`] into a fresh physical table named
 /// `table_name`.
 async fn materialize_query_result(
-    mut engine: InMemorySqlEngine,
+    engine: InMemorySqlEngine,
     table_name: &str,
     result: &QueryResult,
-) -> Result<InMemorySqlEngine, String> {
+) -> Result<InMemorySqlEngine, SqlQueryError> {
     let schema = schema_from_query_result(result);
-    engine
-        .create_table(table_name, &schema)
-        .map_err(|e| e.to_string())?;
+    engine.create_table(table_name, &schema)?;
     let rows: Vec<Result<Value, String>> = result
         .rows
         .iter()
@@ -802,11 +856,10 @@ async fn materialize_query_result(
         .collect();
     let cap = result.rows.len();
     let stream = futures::stream::iter(rows);
-    engine
+    let (returned_engine, _inserted) = engine
         .insert_rows(table_name, &schema, Box::pin(stream), cap)
-        .await
-        .map_err(|e| e.to_string())?;
-    Ok(engine)
+        .await?;
+    Ok(returned_engine)
 }
 
 /// Runs one SELECT statement on a blocking thread under a watchdog timeout
@@ -819,7 +872,7 @@ async fn run_select_with_timeout(
     bindings: Vec<BoundParam>,
     max_rows: usize,
     timeout_secs: u64,
-) -> Result<(InMemorySqlEngine, QueryResult), String> {
+) -> Result<(InMemorySqlEngine, QueryResult), SqlQueryError> {
     let interrupt = engine.interrupt_handle();
     let watchdog = tokio::spawn(async move {
         tokio::time::sleep(Duration::from_secs(timeout_secs)).await;
@@ -830,14 +883,14 @@ async fn run_select_with_timeout(
         (engine, r)
     })
     .await
-    .map_err(|e| format!("sqlquery worker panicked: {e}"))?;
+    .map_err(|e| SqlQueryError::Internal(format!("sqlquery worker panicked: {e}")))?;
     watchdog.abort();
     match exec_result {
         Ok(r) => Ok((engine, r)),
         Err(e) if e.to_string().contains("interrupted") => {
-            Err(format!("query exceeded {timeout_secs}s timeout"))
+            Err(SqlQueryError::Timeout { secs: timeout_secs })
         }
-        Err(e) => Err(e.to_string()),
+        Err(e) => Err(e),
     }
 }
 

@@ -80,4 +80,20 @@ for (const theme of THEMES) {
       ).toEqual([]);
     });
   }
+
+  test(`expanded HTS CapabilityStatement JSON is accessible — ${theme}`, async ({ page }) => {
+    test.setTimeout(120_000);
+    await page.addInitScript((t) => {
+      try {
+        localStorage.setItem("hfs-theme", t as string);
+      } catch {}
+    }, theme);
+    await page.goto("/ui/hts/capability-statement", { waitUntil: "networkidle" });
+    const region = page.locator("#capability-json-body");
+    await page.locator("[data-capability-json-expand-all]").click();
+    await expect(region).not.toHaveAttribute("aria-busy", "true");
+    await expect(page.locator("[data-capability-json-tree] > [data-expansion-state]")).toBeVisible();
+    const { violations } = await new AxeBuilder({ page }).withTags(WCAG).analyze();
+    expect(violations).toEqual([]);
+  });
 }

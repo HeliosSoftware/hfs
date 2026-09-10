@@ -268,10 +268,17 @@ where
     // Scope the registry read guard tightly so it doesn't span any await —
     // parking_lot guards aren't Send by default, which would make this async fn
     // !Send.
-    let ignored_params = {
+    let (ignored_params, sort_warnings) = {
         let reg = state.storage().search_param_registry(tenant.context());
         let registry = reg.read();
-        unknown_search_params(resource_type, &search_params, &registry)
+        (
+            unknown_search_params(resource_type, &search_params, &registry),
+            crate::extractors::search_query_builder::unsortable_sort_warnings(
+                resource_type,
+                &search_params,
+                &registry,
+            ),
+        )
     };
     if !ignored_params.is_empty() {
         if strict {
@@ -469,6 +476,13 @@ where
     if !ignored_params.is_empty() && summary_mode != Some(SummaryMode::Count) {
         append_ignored_params_outcome(&mut bundle_json, &ignored_params);
     }
+    // An unsortable `_sort` silently degrades to an id sort in the backends;
+    // report the degradation the same way ignored parameters are (#958).
+    if summary_mode != Some(SummaryMode::Count) {
+        for warning in &sort_warnings {
+            append_warning_outcome(&mut bundle_json, warning);
+        }
+    }
 
     Ok(bundle_json)
 }
@@ -479,13 +493,21 @@ where
 /// FHIR allows an unsupported parameter to be ignored only if the server says
 /// so; the self link already omits it, and this outcome names it explicitly.
 fn append_ignored_params_outcome(bundle_json: &mut serde_json::Value, ignored: &[String]) {
+    append_warning_outcome(
+        bundle_json,
+        &format!(
+            "search parameter(s) not supported by this server and ignored: {}",
+            ignored.join(", ")
+        ),
+    );
+}
+
+/// Appends one `search.mode = outcome` warning entry to the searchset.
+fn append_warning_outcome(bundle_json: &mut serde_json::Value, message: &str) {
     let outcome = crate::responses::OperationOutcomeBuilder::new()
         .warning(
             crate::responses::operation_outcome::IssueType::NotSupported,
-            format!(
-                "search parameter(s) not supported by this server and ignored: {}",
-                ignored.join(", ")
-            ),
+            message.to_string(),
         )
         .build();
     let entry = serde_json::json!({

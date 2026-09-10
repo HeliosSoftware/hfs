@@ -651,6 +651,18 @@ where
                 }
             }
 
+            // Announce each committed write to subscribers (#1023). The batch
+            // arm emits per-entry as it writes; the transaction path commits
+            // atomically in the persistence layer and returns results, so its
+            // emission happens here, once the bundle has committed, against
+            // those results. `indexed_entries` and `bundle_result.entries`
+            // share an order (the writes, sorted the same way).
+            #[cfg(feature = "subscriptions")]
+            for ((_, entry, _), result) in indexed_entries.iter().zip(bundle_result.entries.iter())
+            {
+                emit_transaction_entry_event(state, &tenant, fhir_version, entry, result);
+            }
+
             // GET searches run against the committed state (see above). A
             // failure here cannot roll the transaction back, so it surfaces
             // as that entry's own error outcome rather than a misleading
@@ -804,6 +816,137 @@ where
     };
 
     bundle_if_match_gate(if_match, current.as_ref().map(|r| r.version_id()))
+}
+
+/// Emits a create/update subscription event for a Bundle-driven write, the
+/// same announcement the single-resource handlers make (#1023). A write
+/// performed through a batch or transaction Bundle must reach subscribers just
+/// as a direct `POST`/`PUT` does; this is the seam the batch arms call so a
+/// Bundle write is never silent.
+#[cfg(feature = "subscriptions")]
+fn emit_bundle_write_event<S>(
+    state: &AppState<S>,
+    tenant: &TenantExtractor,
+    fhir_version: FhirVersion,
+    stored: &helios_persistence::types::StoredResource,
+    event_type: helios_subscriptions::ResourceEventType,
+) where
+    S: ResourceStorage,
+{
+    if let Some(engine) = state.subscription_engine() {
+        super::subscription_event::emit_subscription_event(
+            engine,
+            tenant.context(),
+            stored,
+            fhir_version,
+            event_type,
+        );
+    }
+}
+
+/// Emits a delete subscription event for a Bundle-driven delete (#1023).
+#[cfg(feature = "subscriptions")]
+fn emit_bundle_delete_event<S>(
+    state: &AppState<S>,
+    tenant: &TenantExtractor,
+    fhir_version: FhirVersion,
+    resource_type: &str,
+    resource_id: &str,
+    previous_resource: Option<serde_json::Value>,
+) where
+    S: ResourceStorage,
+{
+    if let Some(engine) = state.subscription_engine() {
+        super::subscription_event::emit_delete_event(
+            engine,
+            tenant.context(),
+            resource_type,
+            resource_id,
+            fhir_version,
+            previous_resource,
+        );
+    }
+}
+
+/// The create/update event a committed transaction write announces, or `None`
+/// when the entry is not an announcing write (a non-2xx result, or a method
+/// other than POST/PUT). A create answers 201, an update — a conditional PUT
+/// that matched an existing resource — answers 200. DELETE is handled apart
+/// from this: it carries no body, so its event is built from the URL instead.
+#[cfg(feature = "subscriptions")]
+fn transaction_write_event_type(
+    method: BundleMethod,
+    status: u16,
+) -> Option<helios_subscriptions::ResourceEventType> {
+    use helios_subscriptions::ResourceEventType;
+    if !(200..300).contains(&status) {
+        return None;
+    }
+    match method {
+        BundleMethod::Post | BundleMethod::Put => Some(if status == 201 {
+            ResourceEventType::Create
+        } else {
+            ResourceEventType::Update
+        }),
+        _ => None,
+    }
+}
+
+/// Emits a subscription event for one committed transaction entry (#1023).
+///
+/// The atomic transaction path returns `BundleEntryResult`s rather than
+/// `StoredResource`s, so the event is built from the entry's method and the
+/// result's stored JSON instead of going through the `StoredResource` helpers
+/// the batch arm uses. Only 2xx write entries announce; a POST or a PUT that
+/// created answers 201 (Create), an update answers 200 (Update).
+#[cfg(feature = "subscriptions")]
+fn emit_transaction_entry_event<S>(
+    state: &AppState<S>,
+    tenant: &TenantExtractor,
+    fhir_version: FhirVersion,
+    entry: &BundleEntry,
+    result: &BundleEntryResult,
+) where
+    S: ResourceStorage,
+{
+    let Some(engine) = state.subscription_engine() else {
+        return;
+    };
+    match entry.method {
+        BundleMethod::Post | BundleMethod::Put => {
+            let (Some(event_type), Some(resource)) = (
+                transaction_write_event_type(entry.method, result.status),
+                &result.resource,
+            ) else {
+                return;
+            };
+            super::subscription_event::emit_subscription_event_from_json(
+                engine,
+                tenant.context(),
+                resource,
+                fhir_version,
+                event_type,
+            );
+        }
+        BundleMethod::Delete if (200..300).contains(&result.status) => {
+            // A 2xx delete carries no body; take type/id from the entry URL.
+            // A conditional delete that resolved to no id has nothing to
+            // announce.
+            if let Ok((resource_type, id)) = parse_request_url(&entry.url)
+                && !id.is_empty()
+            {
+                super::subscription_event::emit_delete_event(
+                    engine,
+                    tenant.context(),
+                    &resource_type,
+                    &id,
+                    fhir_version,
+                    None,
+                );
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Processes a single batch entry, returning a structured BundleEntryResult.
@@ -1038,6 +1181,14 @@ where
             {
                 Ok(stored) => {
                     record_stored_profile(state, tenant, fhir_version, &stored);
+                    #[cfg(feature = "subscriptions")]
+                    emit_bundle_write_event(
+                        state,
+                        tenant,
+                        fhir_version,
+                        &stored,
+                        helios_subscriptions::ResourceEventType::Create,
+                    );
                     BundleEntryResult::created(stored)
                 }
                 Err(e) => {
@@ -1158,6 +1309,18 @@ where
             {
                 Ok((stored, created)) => {
                     record_stored_profile(state, tenant, fhir_version, &stored);
+                    #[cfg(feature = "subscriptions")]
+                    emit_bundle_write_event(
+                        state,
+                        tenant,
+                        fhir_version,
+                        &stored,
+                        if created {
+                            helios_subscriptions::ResourceEventType::Create
+                        } else {
+                            helios_subscriptions::ResourceEventType::Update
+                        },
+                    );
                     if created {
                         BundleEntryResult::created(stored)
                     } else {
@@ -1229,7 +1392,18 @@ where
                 .delete(tenant.context(), &resource_type, &id)
                 .await
             {
-                Ok(()) => BundleEntryResult::deleted(),
+                Ok(()) => {
+                    #[cfg(feature = "subscriptions")]
+                    emit_bundle_delete_event(
+                        state,
+                        tenant,
+                        fhir_version,
+                        &resource_type,
+                        &id,
+                        None,
+                    );
+                    BundleEntryResult::deleted()
+                }
                 Err(e) => {
                     let (status, message) = entry_error(e);
                     create_error_result(status, &message)
@@ -3407,6 +3581,39 @@ mod tests {
         for url in ["", "/", "?identifier=x"] {
             assert!(parse_request_url(url).is_err(), "url: {url}");
         }
+    }
+
+    /// The event a committed transaction write announces (#1023). A POST or a
+    /// PUT that created answers 201 (Create); a PUT that matched answers 200
+    /// (Update). DELETE and non-2xx entries announce nothing here — DELETE is
+    /// emitted from its URL, and a failed entry never committed.
+    #[cfg(feature = "subscriptions")]
+    #[test]
+    fn transaction_write_event_type_maps_status_to_the_right_event() {
+        use helios_subscriptions::ResourceEventType;
+        assert_eq!(
+            transaction_write_event_type(BundleMethod::Post, 201),
+            Some(ResourceEventType::Create)
+        );
+        assert_eq!(
+            transaction_write_event_type(BundleMethod::Put, 201),
+            Some(ResourceEventType::Create)
+        );
+        // A conditional PUT that matched an existing resource updates it.
+        assert_eq!(
+            transaction_write_event_type(BundleMethod::Put, 200),
+            Some(ResourceEventType::Update)
+        );
+        // DELETE carries no body; its event is built from the URL, not here.
+        assert_eq!(
+            transaction_write_event_type(BundleMethod::Delete, 200),
+            None
+        );
+        // A GET entry is a read, never an announcing write.
+        assert_eq!(transaction_write_event_type(BundleMethod::Get, 200), None);
+        // A non-2xx entry never committed, so it announces nothing.
+        assert_eq!(transaction_write_event_type(BundleMethod::Post, 409), None);
+        assert_eq!(transaction_write_event_type(BundleMethod::Put, 412), None);
     }
 
     #[test]

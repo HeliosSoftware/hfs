@@ -1,4 +1,4 @@
-<div class="capability-json-outline" data-capability-json-page data-item-count="{{ outline.rows.len() }}">
+<div class="capability-json-outline" data-capability-json-page data-path="{{ outline.pointer }}" data-offset="{{ outline.offset }}" data-limit="{{ outline.limit }}" data-item-count="{{ outline.rows.len() }}">
   <div class="capability-json-bracket"><span class="jt--punct">{{ outline.opening }}</span></div>
   <div class="capability-json-rows">
     {% for row in outline.rows %}

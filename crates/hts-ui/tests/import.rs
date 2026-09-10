@@ -290,8 +290,8 @@ async fn import_page_renders_full_shell_with_upload_form() {
         "hard nav must render a full HTML page",
     );
     assert!(
-        html.contains(">Import terminology<"),
-        "shell heading must be Fluent-resolved (en value: Import terminology)",
+        html.contains(">Import Terminology<"),
+        "shell heading must be Fluent-resolved (en value: Import Terminology)",
     );
     assert!(
         html.contains(r#"id="hts-import-bundle""#),

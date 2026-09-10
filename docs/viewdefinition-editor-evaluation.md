@@ -272,6 +272,12 @@ changed and why:
 
 ## 7. Risks & open questions
 
+**Status (2026-09-03, #821): closed.** The `lezer-fhirpath` license risk is resolved (below);
+the compile-time and bundle-size risks were accepted, not further mitigated, since neither
+changed materially across #821's own work; the remaining bullet (manual screen-reader
+coverage) stays open by design — it was always the gate's optional item, not something a
+Playwright/axe suite can close.
+
 - **`lezer-fhirpath`'s license is not declared.** Its `package.json` has no `license` field
   and its published tarball ships no `LICENSE` file (`npm view` falls back to labeling it
   "Proprietary" — npm's own placeholder for "unspecified", not a license anyone granted). This
@@ -282,6 +288,12 @@ changed and why:
   HL7's own [FHIRPath `.g4`](https://github.com/HL7/FHIRPath/blob/master/spec/N1/fhirpath.g4)
   — or drop to CodeMirror's `StreamLanguage` (a simpler, non-tree tokenizer API) for FHIRPath
   highlighting alone, at the cost of the clean `parseMixed` injection.
+
+  **Status (2026-09-03, #821): resolved.** `lezer-fhirpath@1.2.0`'s published npm tarball
+  declares MIT in its `README.md` § License (`package.json` still has no `license` field, and
+  the upstream GitHub repository 404s) — see the vendoring ritual's
+  [README](../crates/ui/vendor/codemirror/README.md) for the full citation. The bundle's license
+  banner and package table now cite that source instead of "not declared".
 - **Bundle upgrade discipline.** The ritual is manual by design (§4); nothing enforces that a
   version bump actually gets run, verified, and re-measured. The implementation issue should
   decide whether a periodic manual check is enough or whether this needs a tracked reminder.
@@ -324,6 +336,11 @@ same mount pattern later, unconditionally minus the FHIRPath injection where it 
   applies verbatim); its `json-editor--short` SQL textarea is a **third** language this
   epic does not touch — a future SQL grammar is out of scope here.
 
+**Status (2026-09-03, #821): one of two closed.** SQL Library mounts `code-editor.js`/
+`sql-editor.js` today (landed separately, #839/#914) — nothing left to generalize there. The
+Resource Editor's raw pane is still a plain `<textarea>`; it stays out of #821's own scope and
+is tracked as its own follow-up issue instead of being folded in here.
+
 **Relationship to #752** (live-run): orthogonal. #752 is about running $sql-run continuously as
 the user types; this epic is about what the editor shows while they type. If both land, this
 epic's architecture — not #752's — is what should decide highlighting/completion/diagnostics;
@@ -348,18 +365,62 @@ What the POC branch already has:
 
 What is missing (all of it, deliberately, per the epic's own scoping):
 
-- Completion of ViewDefinition JSON keys from the server's own model.
-- Completion of FHIR resource elements (`Patient.name.` → `given`, `family`, …) via
-  `SchemaResolver`, context-aware of `resource`/`forEach`/the configured FHIR version.
-- Completion of `%constant` names and FHIRPath/SQL-on-FHIR functions.
-- `DiagnosticCode::UndeclaredConstant` — the enum variant exists; the rule does not (needs a
-  span for `Term::ExternalConstant` usages, which requires wiring into a different, spanned
-  parser entry point than the one ticket 03 added).
-- Reusing `helios_sof::lint` from `$sql-run` itself for its 422 responses (today it still uses
-  the private, first-error-only `validate_view_definition`).
-- New Rust + Playwright tests for the editor and the endpoint (`chromium`, `nojs`, `no-cdn`,
-  axe) beyond what already incidentally passed against the POC.
-- i18n: no new user-visible strings exist yet (lint messages are English-only from
-  `helios-sof`); a decision on whether/how to localize them.
-- Generalization to the Resource Editor's raw pane and SQL Library (§8).
+- ~~Completion of ViewDefinition JSON keys from the server's own model.~~ **Done** (#821):
+  `POST /ui/sql/view-definitions/complete` (`kind: "key"`) answers from
+  `helios_sof::lint::node_keys`, the same key model `/lint`'s `unknown-key` check is built on.
+- ~~Completion of FHIR resource elements (`Patient.name.` → `given`, `family`, …) via
+  `SchemaResolver`, context-aware of `resource`/`forEach`/the configured FHIR version.~~ **Done**
+  (#821): the same endpoint's `kind: "fhirpath"` shape resolves a partial expression's type with a
+  heuristic chain walk (root type from `resource`, narrowed by ancestor `select`
+  `forEach`/`forEachOrNull`/`repeat`) against `helios_fhir_validator::editor::element_children`, a
+  new model-only sibling of `addable`/`present_children` that collapses a choice group (`value[x]`)
+  into one `value` entry carrying every arm's type.
+- ~~Completion of `%constant` names and FHIRPath/SQL-on-FHIR functions.~~ **Done** (#821): the same
+  endpoint's response also carries `constant` (from `document.constant[]`), `variable`
+  (`helios_fhirpath::environment_variables`), and `function`
+  (`helios_fhirpath::builtin_functions`) candidates, re-exported through `helios_sof::lint` so
+  `helios-ui` reaches them over the `helios-sof` edge it already has rather than taking a direct
+  `helios-fhirpath` dependency of its own.
+- ~~`DiagnosticCode::UndeclaredConstant` — the enum variant exists; the rule does not~~
+  **Done** (#821): `helios_fhirpath::external_constants` walks `helios_fhirpath::parser::spanned_parser`'s
+  AST to locate every `%name` reference, and `helios_sof::lint` reports one whose name is
+  neither in `constant[]` nor a FHIRPath environment variable.
+- ~~Reusing `helios_sof::lint` from `$sql-run` itself for its 422 responses (today it still uses
+  the private, first-error-only `validate_view_definition`).~~ **Done** (#821): `$sql-run` lints
+  the inline ViewDefinition JSON as received, before any typed parse, and responds `422` with one
+  `OperationOutcome.issue` per lint error; the library's own `validate_view_definition` now
+  delegates to the same lint, so `sof-cli` and `pysof` see identical rules and messages.
+- ~~New Rust + Playwright tests for the editor and the endpoint (`chromium`, `nojs`, `no-cdn`,
+  axe) beyond what already incidentally passed against the POC.~~ **Done** (#821):
+  `vd-editor-lint.spec.ts` and `vd-editor-completion.spec.ts` cover the lint UI (gutter, tooltip,
+  quick fixes, Ctrl+., Ctrl+Z, the save-with-errors confirmation) and the completion popup
+  (structural keys, FHIRPath elements/constants/functions, `forEach` context) end to end;
+  `a11y.spec.ts` gains three targeted WCAG 2.2 AA states (popup, tooltip, panel open, both
+  themes); `no-cdn.spec.ts` and `nojs/sql-view-definitions.spec.ts` each gain a case of their
+  own. `crates/ui/tests/router_http.rs` closes the two diagnostic codes (`duplicate-column-name`'s
+  `set-string` fix, `undeclared-constant`'s message/span) the earlier tickets' own translation
+  tests hadn't exercised at the HTTP layer.
+- ~~i18n: no new user-visible strings exist yet (lint messages are English-only from
+  `helios-sof`); a decision on whether/how to localize them.~~ **Done** (#821):
+  `helios_sof::lint::Diagnostic` stays English-only (`$sql-run`, `sof-cli`, and `pysof` all use
+  `message` verbatim) but now also carries `args` (the values `message` interpolates) and `fixes`
+  (structural, pointer-addressed edits — rename/remove a key, set a string value). The
+  `/ui/sql/view-definitions/lint` handler renders its own JSON response's `message`/`fixes[].label`
+  from `code` + `args` against a `vd-lint-*`/`vd-fix-*` Fluent catalog (`locales/{en,es,de}/main.ftl`),
+  negotiated the same way as every page (`?lang=` → `hfs_lang` cookie → `Accept-Language` → `en`).
+- ~~Diagnostics that only show a problem, never a resolution.~~ **Done** (#821):
+  `vd-editor.js` turns each `fixes` entry into a `Diagnostic.action` (a button in the hover
+  tooltip and the bottom lint panel alike), resolving its RFC 6901 `pointer` against the browser's
+  own live syntax tree at apply time and dispatching one undoable transaction that relaunches the
+  lint; **Ctrl+.** applies the single fix under the cursor or opens the lint panel for several,
+  with `lintKeymap`'s F8/Ctrl-Shift-M alongside it. Saving with at least one uncorrected error
+  (not Duplicate) now also asks for confirmation, plural-correct in the negotiated locale.
+- ~~Generalization to the Resource Editor's raw pane and SQL Library (§8).~~ **Half done**
+  (#821): SQL Library generalized separately (#839/#914). The Resource Editor's raw pane did
+  not — filed as its own follow-up issue after this PR merges, rather than folded in here
+  (§8).
 - Integration with #752, once/if it lands.
+
+**Status (2026-09-03, #821): closed.** Every bullet above that names this work is done; the
+two survivors (Resource Editor raw pane, #752 integration) were always explicitly out of
+#821's own scope, not gaps in it.
