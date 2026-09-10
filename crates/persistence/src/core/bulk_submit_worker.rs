@@ -27,9 +27,13 @@ use crate::core::bulk_submit::{
     ByteProgress, EntryResultPage, ImportMode, ManifestPhase, StreamingBulkSubmitProvider,
     SubmissionId, entry_result_pages,
 };
-use crate::core::bulk_submit_input::{SubmitInputFetcher, submission_output_job_id};
+use crate::core::bulk_submit_input::{RemoteFile, SubmitInputFetcher};
+use crate::core::bulk_submit_output::submit_artifact_key;
+use crate::core::bulk_submit_publication::{ManifestPublicationResult, ManifestPublicationStatus};
 use crate::error::{StorageError, StorageResult};
 use crate::tenant::TenantContext;
+
+const MANIFEST_FETCH_ERROR_PART_INDEX: u32 = 1;
 
 /// A lease over a single pending manifest, held by exactly one worker at a time.
 ///
@@ -129,7 +133,7 @@ pub struct ManifestFetchParams<'a> {
 }
 
 /// A finalized status-manifest artifact (output / error / deleted NDJSON part) to record.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubmitFileRecord {
     /// The submitted manifest this artifact relates to (for `output[].manifestUrl`).
     pub manifest_url: Option<String>,
@@ -137,7 +141,8 @@ pub struct SubmitFileRecord {
     pub file_type: String,
     /// FHIR resource type (for `output` entries).
     pub resource_type: Option<String>,
-    /// 0-based part index within (submission, file_type, resource_type).
+    /// 0-based part index within one manifest generation, file type, and
+    /// optional resource type.
     pub part_index: u32,
     /// Encoded storage key / path in the output store.
     pub file_path: String,
@@ -162,6 +167,16 @@ pub struct SubmitFileRow {
     pub part_index: u32,
     /// Fencing token of the worker that wrote it.
     pub fencing_token: u64,
+    /// Exact owning manifest when the persisted row is manifest-aware.
+    ///
+    /// Non-SQL rows that predate manifest-aware identities decode as `None`.
+    /// SQL migration may backfill `Some` for a legacy row.
+    pub manifest_id: Option<String>,
+    /// True when the row uses the legacy pre-manifest identity/location.
+    ///
+    /// SQL backends identify migrated legacy rows by their absent publication
+    /// worker; non-SQL backends identify them by an absent manifest ID.
+    pub legacy_locator: bool,
     /// Encoded storage key / path in the output store.
     pub file_path: String,
     /// Number of NDJSON lines in the artifact.
@@ -272,11 +287,32 @@ pub trait SubmitWorkerStorage: Send + Sync {
     ) -> Result<(), LeaseError>;
 
     /// Idempotent upsert of a finalized status-manifest artifact row. Fenced.
+    ///
+    /// SQL adapters stage the row and keep it hidden until publication; the
+    /// `finish`/`fail` publication transaction makes the full generation visible.
     async fn record_submit_file(
         &self,
         lease: &ManifestLease,
         file: &SubmitFileRecord,
     ) -> Result<(), LeaseError>;
+
+    /// Publishes the complete artifact set with the manifest's terminal state.
+    ///
+    /// SQL adapters perform canonical validation, full-set replacement, and the
+    /// fenced terminal-state update in one transaction. A same-token replay must
+    /// return [`ManifestPublicationResult::AlreadyPublished`] only when the exact
+    /// artifact set and terminal state match; a stale lease is `LeaseLost`.
+    ///
+    /// MongoDB and S3 retain the existing fenced, non-atomic sequencing: validate
+    /// the canonical set, record each artifact in turn, then write the terminal
+    /// state. Those adapters do not provide atomic full-set publication or
+    /// same-token replay markers.
+    async fn publish_manifest_artifacts(
+        &self,
+        lease: &ManifestLease,
+        files: &[SubmitFileRecord],
+        terminal: ManifestPublicationStatus,
+    ) -> Result<ManifestPublicationResult, LeaseError>;
 
     /// Marks the manifest `completed`. Fenced.
     async fn finish_manifest(&self, lease: &ManifestLease) -> Result<(), LeaseError>;
@@ -730,13 +766,28 @@ where
             Err(LeaseError::LeaseLost { .. }) => return Ok(()),
             Err(LeaseError::Storage(e)) => return Err(e),
         };
-        if let Err(LeaseError::Storage(e)) = self.jobs.mark_manifest_processing(&lease).await {
-            return Err(e);
+        match self.jobs.mark_manifest_processing(&lease).await {
+            Ok(()) => {}
+            Err(LeaseError::LeaseLost { .. }) => return Ok(()),
+            Err(LeaseError::Storage(e)) => return Err(e),
         }
 
         let Some(manifest_url) = view.manifest_url.clone() else {
-            // Nothing to fetch (status-only submission) — treat as done.
-            let _ = self.jobs.finish_manifest(&lease).await;
+            // Nothing to fetch (status-only submission). Publish its empty
+            // terminal generation with the live lease.
+            let keeper = LeaseKeeper::spawn(
+                Arc::new(JobStoreRenewal(Arc::clone(&self.jobs))),
+                lease.clone(),
+                ByteProgress::default(),
+            );
+            let _ = self
+                .publish_collected_artifacts(
+                    &lease,
+                    keeper,
+                    Vec::new(),
+                    ManifestPublicationStatus::Completed,
+                )
+                .await?;
             return Ok(());
         };
 
@@ -772,16 +823,25 @@ where
         {
             Ok(m) => m,
             Err(e) => {
-                self.record_manifest_error(
-                    &lease,
-                    &manifest_url,
-                    &format!("failed to fetch manifest: {e}"),
-                )
-                .await?;
-                // Stop renewing before the manifest goes terminal, so no
-                // heartbeat lands on a row this task has already failed.
-                drop(keeper);
-                let _ = self.jobs.fail_manifest(&lease, &e.to_string()).await;
+                let failure_message = e.to_string();
+                let fetch_error = self
+                    .write_manifest_error(
+                        &lease,
+                        &manifest_url,
+                        MANIFEST_FETCH_ERROR_PART_INDEX,
+                        &format!("failed to fetch manifest: {failure_message}"),
+                    )
+                    .await?;
+                let _ = self
+                    .publish_collected_artifacts(
+                        &lease,
+                        keeper,
+                        vec![fetch_error],
+                        ManifestPublicationStatus::Failed {
+                            error_message: failure_message,
+                        },
+                    )
+                    .await?;
                 return Ok(());
             }
         };
@@ -803,6 +863,27 @@ where
             .with_defer_indexing(self.defer_indexing)
             .with_byte_progress(progress.clone());
         let file_count = manifest.output.len() as u64;
+        // Reserve 0 for the aggregated entry-error artifact and 1 for the
+        // manifest-fetch failure. Per-file output/deleted indexes follow their
+        // input ordinal so concurrent completion order cannot renumber them.
+        let output_len = u64::try_from(manifest.output.len()).ok();
+        let deleted_len = u64::try_from(manifest.deleted.len()).ok();
+        let artifact_count = output_len
+            .and_then(|output| deleted_len.and_then(|deleted| output.checked_add(deleted)))
+            .and_then(|files| files.checked_add(u64::from(MANIFEST_FETCH_ERROR_PART_INDEX + 1)));
+        match artifact_count {
+            Some(count) if count <= i32::MAX as u64 => {}
+            Some(count) => {
+                return Err(internal_error(format!(
+                    "bulk submit manifest has too many artifacts: {count}"
+                )));
+            }
+            None => {
+                return Err(internal_error(
+                    "bulk submit manifest has too many artifacts".to_string(),
+                ));
+            }
+        }
         // Pre-size the byte denominator: every output file's advertised size
         // up front, so the percentage never recomputes against a partial
         // total — learned lazily per file, each newly opened file yanked the
@@ -898,6 +979,10 @@ where
         // manifest's persisted counters are cumulative across runs and belong
         // to the ingestion engine's per-batch bookkeeping (#969).
         let failed_at = AtomicU64::new(0);
+        // File-level fetch/ingest failures write their own finalized artifacts.
+        // No staged row exists; all finalized records are collected and handed
+        // to one publication call after the whole run.
+        let error_records = Arc::new(tokio::sync::Mutex::new(Vec::<SubmitFileRecord>::new()));
         // Shared borrows for the concurrent per-file futures. Iterating by
         // index keeps the map closure's argument owned (a `usize`), so the
         // future it returns can borrow `manifest.output[i]` for the manifest's
@@ -912,6 +997,7 @@ where
         let lease_ref = &lease;
         let manifest_ref = &manifest;
         let manifest_url_ref = &manifest_url;
+        let error_records_ref = &error_records;
 
         let mut ingest = futures::stream::iter(0..manifest.output.len())
             .map(|i| async move {
@@ -942,12 +1028,15 @@ where
                 {
                     Ok(s) => s,
                     Err(e) => {
-                        self.record_manifest_error(
-                            lease_ref,
-                            manifest_url_ref,
-                            &format!("failed to fetch file {}: {e}", file.url),
-                        )
-                        .await?;
+                        let file_error = self
+                            .write_manifest_error(
+                                lease_ref,
+                                manifest_url_ref,
+                                i as u32 + 2,
+                                &format!("failed to fetch file {}: {e}", file.url),
+                            )
+                            .await?;
+                        error_records_ref.lock().await.push(file_error);
                         failed_ref.fetch_add(1, Ordering::Relaxed);
                         // No batch ran for a file that never opened, so this
                         // failure is the worker's to add.
@@ -1012,12 +1101,15 @@ where
                         }
                     }
                     Err(e) => {
-                        self.record_manifest_error(
-                            lease_ref,
-                            manifest_url_ref,
-                            &format!("failed to ingest file {}: {e}", file.url),
-                        )
-                        .await?;
+                        let file_error = self
+                            .write_manifest_error(
+                                lease_ref,
+                                manifest_url_ref,
+                                i as u32 + 2,
+                                &format!("failed to ingest file {}: {e}", file.url),
+                            )
+                            .await?;
+                        error_records_ref.lock().await.push(file_error);
                         failed_ref.fetch_add(1, Ordering::Relaxed);
                         // Every entry this file did commit was already counted
                         // by its own batch; the file-level failure was not.
@@ -1076,9 +1168,13 @@ where
         }
         let failed = failed_at.load(Ordering::Relaxed);
 
-        // 2b. Process `deleted` files — transaction Bundles / resource refs to remove.
-        let mut deleted_refs: Vec<String> = Vec::new();
-        for file in &manifest.deleted {
+        // 2b. Process `deleted` files — transaction Bundles / resource refs to
+        // remove. Successful deletions across every deleted file share one
+        // part-0 receipt; a deleted-file fetch failure gets a source-ordinal
+        // error artifact and does not abort the remaining files.
+        let mut records = error_records.lock().await.clone();
+        let mut deleted_refs = Vec::new();
+        for (input_index, file) in manifest.deleted.iter().enumerate() {
             if keeper.lease_lost() {
                 return Ok(());
             }
@@ -1098,62 +1194,51 @@ where
                         .await;
                 }
                 Err(e) => {
-                    self.record_manifest_error(
-                        &lease,
-                        &manifest_url,
-                        &format!("failed to fetch deleted file {}: {e}", file.url),
-                    )
-                    .await?;
+                    let deleted_error = self
+                        .write_manifest_error(
+                            &lease,
+                            &manifest_url,
+                            manifest.output.len() as u32 + input_index as u32 + 2,
+                            &format!("failed to fetch deleted file {}: {e}", file.url),
+                        )
+                        .await?;
+                    records.push(deleted_error);
                 }
             }
         }
         if !deleted_refs.is_empty() {
-            self.write_deleted_artifact(&lease, &manifest_url, &deleted_refs)
+            let deleted_record = self
+                .write_deleted_artifact(&lease, &manifest_url, &deleted_refs)
                 .await?;
+            records.push(deleted_record);
         }
 
         // 3. Emit per-type `output` receipts and an aggregated `error` artifact.
         if keeper.lease_lost() {
             return Ok(());
         }
-        self.write_result_artifacts(&lease, &manifest_url, view.fhir_version, failed)
-            .await?;
+        records.extend(
+            self.write_result_artifacts(&lease, &manifest_url, view.fhir_version, failed)
+                .await?,
+        );
 
-        // 4. Mark the manifest complete.
-        if let Err(LeaseError::Storage(e)) = self.jobs.finish_manifest(&lease).await {
-            return Err(e);
-        }
+        // 4. Publish all finalized artifacts and the terminal state together
+        // where the storage engine supports it.
+        let published = self
+            .publish_collected_artifacts(
+                &lease,
+                keeper,
+                records,
+                ManifestPublicationStatus::Completed,
+            )
+            .await?;
 
         // 5. Fast-load (#903): the manifest ingested without search indexing —
         // rebuild the indexes for its resource types now. Fire-and-forget:
         // the manifest is already terminal, and the hook drives the same
         // machinery $reindex does.
-        if self.defer_indexing {
-            let mut types: Vec<String> = manifest
-                .output
-                .iter()
-                .filter_map(|f| f.resource_type.clone())
-                .collect();
-            types.sort();
-            types.dedup();
-            match (&self.reindex_hook, types.is_empty()) {
-                (Some(hook), false) => {
-                    tracing::info!(
-                        submission = %lease.submission_id,
-                        manifest = %lease.manifest_id,
-                        types = ?types,
-                        "bulk fast-load: rebuilding deferred search indexes"
-                    );
-                    hook.reindex_types(&lease.tenant, types).await;
-                }
-                _ => {
-                    tracing::warn!(
-                        submission = %lease.submission_id,
-                        manifest = %lease.manifest_id,
-                        "bulk fast-load ingested without indexing and no reindex \n                         hook is wired — run $reindex to make the data searchable"
-                    );
-                }
-            }
+        if published {
+            self.reindex_deferred(&lease, &manifest.output).await;
         }
         Ok(())
     }
@@ -1166,7 +1251,7 @@ where
         manifest_url: &str,
         _fhir_version: FhirVersion,
         failed_count: u64,
-    ) -> StorageResult<()> {
+    ) -> StorageResult<Vec<SubmitFileRecord>> {
         let pages = entry_result_pages(|continuation| async move {
             self.jobs
                 .get_entry_results_page(
@@ -1189,10 +1274,8 @@ where
         manifest_url: &str,
         failed_count: u64,
         pages: impl futures::Stream<Item = StorageResult<EntryResultPage>>,
-    ) -> StorageResult<()> {
+    ) -> StorageResult<Vec<SubmitFileRecord>> {
         use futures::TryStreamExt;
-        let job_id = submission_output_job_id(&lease.submission_id);
-        let tenant_id = lease.tenant.tenant_id().as_str().to_string();
         let mut all = Vec::new();
         futures::pin_mut!(pages);
         while let Some(page) = pages.try_next().await? {
@@ -1252,40 +1335,40 @@ where
             error_lines.push(oo.to_string());
         }
 
+        let mut records = Vec::new();
+
         // Write one `output` part per resource type.
         for (idx, (resource_type, lines)) in by_type.iter().enumerate() {
-            let key = ExportPartKey::output(
-                tenant_id.clone(),
-                job_id.clone(),
-                resource_type.clone(),
+            let key = submit_artifact_key(
+                &lease.tenant,
+                &lease.submission_id,
+                &lease.manifest_id,
+                "output",
+                Some(resource_type.as_str()),
                 idx as u32,
                 lease.fencing_token,
             );
             let part = self.write_part(&key, lines).await?;
-            self.jobs
-                .record_submit_file(
-                    lease,
-                    &SubmitFileRecord {
-                        manifest_url: Some(manifest_url.to_string()),
-                        file_type: "output".to_string(),
-                        resource_type: Some(resource_type.clone()),
-                        part_index: idx as u32,
-                        file_path: key.part_segment(),
-                        line_count: part.0,
-                        byte_count: part.1,
-                        count_severity: None,
-                    },
-                )
-                .await
-                .map_err(lease_err_to_storage)?;
+            records.push(SubmitFileRecord {
+                manifest_url: Some(manifest_url.to_string()),
+                file_type: "output".to_string(),
+                resource_type: Some(resource_type.clone()),
+                part_index: idx as u32,
+                file_path: key.resource_type,
+                line_count: part.0,
+                byte_count: part.1,
+                count_severity: None,
+            });
         }
 
         // Write a single aggregated `error` part (if any).
         if !error_lines.is_empty() {
-            let key = ExportPartKey::error(
-                tenant_id.clone(),
-                job_id.clone(),
-                "OperationOutcome",
+            let key = submit_artifact_key(
+                &lease.tenant,
+                &lease.submission_id,
+                &lease.manifest_id,
+                "error",
+                Some("OperationOutcome"),
                 0,
                 lease.fencing_token,
             );
@@ -1296,24 +1379,18 @@ where
                     .map(|(k, v)| (k, Value::from(v)))
                     .collect(),
             );
-            self.jobs
-                .record_submit_file(
-                    lease,
-                    &SubmitFileRecord {
-                        manifest_url: Some(manifest_url.to_string()),
-                        file_type: "error".to_string(),
-                        resource_type: Some("OperationOutcome".to_string()),
-                        part_index: 0,
-                        file_path: key.part_segment(),
-                        line_count: part.0,
-                        byte_count: part.1,
-                        count_severity: Some(count_severity),
-                    },
-                )
-                .await
-                .map_err(lease_err_to_storage)?;
+            records.push(SubmitFileRecord {
+                manifest_url: Some(manifest_url.to_string()),
+                file_type: "error".to_string(),
+                resource_type: Some("OperationOutcome".to_string()),
+                part_index: 0,
+                file_path: key.resource_type,
+                line_count: part.0,
+                byte_count: part.1,
+                count_severity: Some(count_severity),
+            });
         }
-        Ok(())
+        Ok(records)
     }
 
     /// Applies deletions from a `deleted` NDJSON stream (transaction Bundles or
@@ -1367,39 +1444,31 @@ where
         lease: &ManifestLease,
         manifest_url: &str,
         refs: &[String],
-    ) -> StorageResult<()> {
-        let job_id = submission_output_job_id(&lease.submission_id);
-        let tenant_id = lease.tenant.tenant_id().as_str().to_string();
+    ) -> StorageResult<SubmitFileRecord> {
         let lines: Vec<String> = refs
             .iter()
             .map(|r| json!({ "reference": r }).to_string())
             .collect();
-        let key = ExportPartKey {
-            tenant_id,
-            job_id,
-            resource_type: "Bundle".to_string(),
-            file_type: "deleted".to_string(),
-            part_index: 0,
-            fencing_token: lease.fencing_token,
-        };
+        let key = submit_artifact_key(
+            &lease.tenant,
+            &lease.submission_id,
+            &lease.manifest_id,
+            "deleted",
+            Some("Bundle"),
+            0,
+            lease.fencing_token,
+        );
         let (line_count, byte_count) = self.write_part(&key, &lines).await?;
-        self.jobs
-            .record_submit_file(
-                lease,
-                &SubmitFileRecord {
-                    manifest_url: Some(manifest_url.to_string()),
-                    file_type: "deleted".to_string(),
-                    resource_type: Some("Bundle".to_string()),
-                    part_index: 0,
-                    file_path: key.part_segment(),
-                    line_count,
-                    byte_count,
-                    count_severity: None,
-                },
-            )
-            .await
-            .map_err(lease_err_to_storage)?;
-        Ok(())
+        Ok(SubmitFileRecord {
+            manifest_url: Some(manifest_url.to_string()),
+            file_type: "deleted".to_string(),
+            resource_type: Some("Bundle".to_string()),
+            part_index: 0,
+            file_path: key.resource_type,
+            line_count,
+            byte_count,
+            count_severity: None,
+        })
     }
 
     /// Publishes the coarse pre-ingest phase for the status endpoint (#953).
@@ -1432,15 +1501,14 @@ where
         }
     }
 
-    /// Records a single manifest-level `error` OperationOutcome artifact.
-    async fn record_manifest_error(
+    /// Writes a single manifest-level `error` OperationOutcome artifact.
+    async fn write_manifest_error(
         &self,
         lease: &ManifestLease,
         manifest_url: &str,
+        part_index: u32,
         message: &str,
-    ) -> StorageResult<()> {
-        let job_id = submission_output_job_id(&lease.submission_id);
-        let tenant_id = lease.tenant.tenant_id().as_str().to_string();
+    ) -> StorageResult<SubmitFileRecord> {
         let oo = json!({
             "resourceType": "OperationOutcome",
             "issue": [{
@@ -1450,33 +1518,26 @@ where
             }]
         })
         .to_string();
-        // Use a high part index space for manifest-level errors to avoid clashing
-        // with per-result error parts (which use index 0).
-        let key = ExportPartKey::error(
-            tenant_id,
-            job_id,
-            "OperationOutcome",
-            1_000_000 + (manifest_url.len() as u32 % 1000),
+        let key = submit_artifact_key(
+            &lease.tenant,
+            &lease.submission_id,
+            &lease.manifest_id,
+            "error",
+            Some("OperationOutcome"),
+            part_index,
             lease.fencing_token,
         );
         let part = self.write_part(&key, std::slice::from_ref(&oo)).await?;
-        self.jobs
-            .record_submit_file(
-                lease,
-                &SubmitFileRecord {
-                    manifest_url: Some(manifest_url.to_string()),
-                    file_type: "error".to_string(),
-                    resource_type: Some("OperationOutcome".to_string()),
-                    part_index: key.part_index,
-                    file_path: key.part_segment(),
-                    line_count: part.0,
-                    byte_count: part.1,
-                    count_severity: Some(json!({"error": 1})),
-                },
-            )
-            .await
-            .map_err(lease_err_to_storage)?;
-        Ok(())
+        Ok(SubmitFileRecord {
+            manifest_url: Some(manifest_url.to_string()),
+            file_type: "error".to_string(),
+            resource_type: Some("OperationOutcome".to_string()),
+            part_index,
+            file_path: key.resource_type,
+            line_count: part.0,
+            byte_count: part.1,
+            count_severity: Some(json!({"error": 1})),
+        })
     }
 
     /// Writes NDJSON `lines` to a new output-store part, returning `(line_count, byte_count)`.
@@ -1494,18 +1555,62 @@ where
         let finalized = self.output.finalize_part(key, writer).await?;
         Ok((finalized.line_count, finalized.size_bytes))
     }
-}
 
-/// Converts a fenced [`LeaseError`] into a plain storage error for non-fatal paths.
-fn lease_err_to_storage(e: LeaseError) -> crate::error::StorageError {
-    match e {
-        LeaseError::Storage(s) => s,
-        LeaseError::LeaseLost { job_id } => {
-            crate::error::StorageError::Backend(crate::error::BackendError::Internal {
-                backend_name: "bulk-submit".to_string(),
-                message: format!("lease lost for {job_id}"),
-                source: None,
-            })
+    /// Publishes all collected finalized artifacts with the live lease.
+    ///
+    /// The keeper owns the heartbeat until publication has returned, then is
+    /// dropped before any deferred indexing. A publication already committed
+    /// by this same generation is quiet and does not trigger reindexing.
+    async fn publish_collected_artifacts(
+        &self,
+        lease: &ManifestLease,
+        keeper: LeaseKeeper,
+        files: Vec<SubmitFileRecord>,
+        terminal: ManifestPublicationStatus,
+    ) -> StorageResult<bool> {
+        let outcome = self
+            .jobs
+            .publish_manifest_artifacts(lease, &files, terminal)
+            .await;
+        drop(keeper);
+        match outcome {
+            Ok(ManifestPublicationResult::Published) => Ok(true),
+            Ok(ManifestPublicationResult::AlreadyPublished) => Ok(false),
+            Err(LeaseError::Storage(e)) => Err(e),
+            Err(LeaseError::LeaseLost { .. }) => Ok(false),
+        }
+    }
+
+    /// Rebuilds search indexes for the manifest's resource types after
+    /// deferred ingestion. Fire-and-forget: only publication storage errors
+    /// may affect the run.
+    async fn reindex_deferred(&self, lease: &ManifestLease, output_files: &[RemoteFile]) {
+        if !self.defer_indexing {
+            return;
+        }
+        let mut types: Vec<String> = output_files
+            .iter()
+            .filter_map(|file| file.resource_type.clone())
+            .collect();
+        types.sort();
+        types.dedup();
+        match (&self.reindex_hook, types.is_empty()) {
+            (Some(hook), false) => {
+                tracing::info!(
+                    submission = %lease.submission_id,
+                    manifest = %lease.manifest_id,
+                    types = ?types,
+                    "bulk fast-load: rebuilding deferred search indexes"
+                );
+                hook.reindex_types(&lease.tenant, types).await;
+            }
+            _ => {
+                tracing::warn!(
+                    submission = %lease.submission_id,
+                    manifest = %lease.manifest_id,
+                    "bulk fast-load ingested without indexing and no reindex hook is wired — run $reindex to make the data searchable"
+                );
+            }
         }
     }
 }
@@ -1523,6 +1628,14 @@ fn fenced_write_outcome(keeper: &LeaseKeeper, e: LeaseError) -> StorageResult<()
             Ok(())
         }
     }
+}
+
+fn internal_error(message: impl Into<String>) -> StorageError {
+    StorageError::Backend(crate::error::BackendError::Internal {
+        backend_name: "bulk-submit".to_string(),
+        message: message.into(),
+        source: None,
+    })
 }
 
 /// Builds a fallback OperationOutcome when an entry result lacks one.
@@ -1560,10 +1673,12 @@ mod tests {
     use super::*;
     use crate::backends::local_fs::LocalFsOutputStore;
     use crate::backends::sqlite::SqliteBackend;
+    use crate::core::ManifestStatus;
     use crate::core::bulk_submit::BulkSubmitProvider;
-    use crate::core::bulk_submit_input::{RemoteFile, RemoteManifest};
+    use crate::core::bulk_submit_input::{RemoteFile, RemoteManifest, submission_output_job_id};
     use crate::core::storage::ResourceStorage;
     use crate::tenant::{TenantContext, TenantId, TenantPermissions};
+    use rusqlite::params;
     use std::time::Duration as StdDuration;
 
     mod scripted_pages {
@@ -1605,11 +1720,20 @@ mod tests {
             WorkerId::new("scripted"),
         );
         let (pages, calls) = scripted_pages::pages();
-        worker
+        let records = worker
             .write_result_artifact_pages(&lease, "http://provider/m.json", 0, pages)
             .await
             .unwrap();
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 3);
+        assert_eq!(records.len(), 1);
+        backend
+            .publish_manifest_artifacts(
+                &lease,
+                &records,
+                crate::core::bulk_submit_publication::ManifestPublicationStatus::Completed,
+            )
+            .await
+            .unwrap();
         let rows = backend.list_submit_files(&tenant, &sub).await.unwrap();
         assert_eq!(rows.len(), 1);
         let row = &rows[0];
@@ -1617,7 +1741,7 @@ mod tests {
         let key = ExportPartKey {
             tenant_id: tenant.tenant_id().as_str().to_string(),
             job_id: submission_output_job_id(&sub),
-            resource_type: row.resource_type.clone().unwrap(),
+            resource_type: row.file_path.clone(),
             file_type: row.file_type.clone(),
             part_index: row.part_index,
             fencing_token: row.fencing_token,
@@ -1695,6 +1819,171 @@ mod tests {
             _oauth: &[String],
         ) -> StorageResult<Option<u64>> {
             Ok(self.files.get(url).map(|d| d.len() as u64))
+        }
+    }
+
+    /// The archived baseline wrapper, narrowed to the second-finalize fault.
+    struct FailSecondFinalize {
+        inner: Arc<LocalFsOutputStore>,
+        finalized: std::sync::atomic::AtomicU32,
+    }
+
+    #[async_trait]
+    impl ExportOutputStore for FailSecondFinalize {
+        async fn open_writer(
+            &self,
+            key: &ExportPartKey,
+        ) -> StorageResult<crate::core::bulk_export_output::ExportPartWriter> {
+            self.inner.open_writer(key).await
+        }
+
+        async fn finalize_part(
+            &self,
+            key: &ExportPartKey,
+            writer: crate::core::bulk_export_output::ExportPartWriter,
+        ) -> StorageResult<crate::core::bulk_export_output::FinalizedPart> {
+            let ordinal = self
+                .finalized
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if ordinal == 1 {
+                return Err(StorageError::Backend(
+                    crate::error::BackendError::Internal {
+                        backend_name: "bulk-submit-worker-test".to_string(),
+                        message: "second finalize forced failure".to_string(),
+                        source: None,
+                    },
+                ));
+            }
+            self.inner.finalize_part(key, writer).await
+        }
+
+        async fn download_url(
+            &self,
+            key: &ExportPartKey,
+            ttl: Duration,
+        ) -> StorageResult<crate::core::bulk_export_output::DownloadUrl> {
+            self.inner.download_url(key, ttl).await
+        }
+
+        async fn open_reader(
+            &self,
+            key: &ExportPartKey,
+        ) -> StorageResult<std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send>>> {
+            self.inner.open_reader(key).await
+        }
+
+        async fn delete_job_outputs(
+            &self,
+            tenant: &TenantContext,
+            job_id: &crate::core::ExportJobId,
+        ) -> StorageResult<()> {
+            self.inner.delete_job_outputs(tenant, job_id).await
+        }
+    }
+
+    /// Deliberately fails a compact set of input URLs while the manifest still
+    /// fetches normally, so source-ordinal error receipts can be checked.
+    struct SelectiveFailureFetcher {
+        inner: MockFetcher,
+        failing_urls: std::collections::BTreeSet<String>,
+    }
+
+    #[async_trait]
+    impl SubmitInputFetcher for SelectiveFailureFetcher {
+        async fn fetch_manifest(
+            &self,
+            url: &str,
+            headers: &[(String, String)],
+            oauth: &[String],
+            encryption_key: Option<&Value>,
+        ) -> StorageResult<RemoteManifest> {
+            self.inner
+                .fetch_manifest(url, headers, oauth, encryption_key)
+                .await
+        }
+
+        async fn open_file_stream(
+            &self,
+            url: &str,
+            headers: &[(String, String)],
+            requires_access_token: bool,
+            oauth: &[String],
+            encryption_key: Option<&Value>,
+        ) -> StorageResult<(Box<dyn tokio::io::AsyncBufRead + Send + Unpin>, Option<u64>)> {
+            if self.failing_urls.contains(url) {
+                return Err(StorageError::Backend(
+                    crate::error::BackendError::Internal {
+                        backend_name: "bulk-submit-worker-test".to_string(),
+                        message: "unavailable input".to_string(),
+                        source: None,
+                    },
+                ));
+            }
+            self.inner
+                .open_file_stream(url, headers, requires_access_token, oauth, encryption_key)
+                .await
+        }
+
+        async fn file_size(
+            &self,
+            url: &str,
+            headers: &[(String, String)],
+            requires_access_token: bool,
+            oauth: &[String],
+        ) -> StorageResult<Option<u64>> {
+            self.inner
+                .file_size(url, headers, requires_access_token, oauth)
+                .await
+        }
+    }
+
+    /// Slows only artifact finalization, exercising the worker's live keeper.
+    struct SlowFinalize {
+        inner: Arc<LocalFsOutputStore>,
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait]
+    impl ExportOutputStore for SlowFinalize {
+        async fn open_writer(
+            &self,
+            key: &ExportPartKey,
+        ) -> StorageResult<crate::core::bulk_export_output::ExportPartWriter> {
+            self.inner.open_writer(key).await
+        }
+
+        async fn finalize_part(
+            &self,
+            key: &ExportPartKey,
+            writer: crate::core::bulk_export_output::ExportPartWriter,
+        ) -> StorageResult<crate::core::bulk_export_output::FinalizedPart> {
+            self.entered.notify_one();
+            self.release.notified().await;
+            self.inner.finalize_part(key, writer).await
+        }
+
+        async fn download_url(
+            &self,
+            key: &ExportPartKey,
+            ttl: Duration,
+        ) -> StorageResult<crate::core::bulk_export_output::DownloadUrl> {
+            self.inner.download_url(key, ttl).await
+        }
+
+        async fn open_reader(
+            &self,
+            key: &ExportPartKey,
+        ) -> StorageResult<std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send>>> {
+            self.inner.open_reader(key).await
+        }
+
+        async fn delete_job_outputs(
+            &self,
+            tenant: &TenantContext,
+            job_id: &crate::core::ExportJobId,
+        ) -> StorageResult<()> {
+            self.inner.delete_job_outputs(tenant, job_id).await
         }
     }
 
@@ -2744,6 +3033,647 @@ mod tests {
             "the re-walked entry must add to the earlier run's total, not replace it"
         );
         assert_eq!(manifests[0].failed_entries, 7);
+    }
+
+    #[tokio::test]
+    async fn concurrent_file_errors_use_deterministic_source_indexes() {
+        use tokio::io::AsyncReadExt;
+
+        let backend = Arc::new(SqliteBackend::in_memory().unwrap());
+        backend.init_schema().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let tenant = tenant();
+        let sub_id = SubmissionId::generate("concurrent-errors");
+        backend
+            .create_submission(&tenant, &sub_id, None)
+            .await
+            .unwrap();
+        let _manifest = backend
+            .add_manifest(
+                &tenant,
+                &sub_id,
+                Some("http://provider/concurrent-errors.json"),
+                None,
+            )
+            .await
+            .unwrap();
+        let lease = backend
+            .claim_next_manifest(
+                &WorkerId::new("concurrent-errors-worker"),
+                StdDuration::from_secs(60),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        let mut failing_urls = std::collections::BTreeSet::new();
+        let mut output_files = Vec::new();
+        for index in 0..3 {
+            let url = format!("http://provider/fail-{index}.ndjson");
+            output_files.push(RemoteFile {
+                resource_type: Some("Patient".to_string()),
+                url: url.clone(),
+                count: Some(1),
+            });
+            failing_urls.insert(url);
+        }
+        let deleted_url = "http://provider/deleted.ndjson".to_string();
+        failing_urls.insert(deleted_url.clone());
+        let fetcher = Arc::new(SelectiveFailureFetcher {
+            inner: MockFetcher {
+                files: std::collections::HashMap::new(),
+                manifest: RemoteManifest {
+                    requires_access_token: false,
+                    output: output_files,
+                    deleted: vec![RemoteFile {
+                        resource_type: Some("Bundle".to_string()),
+                        url: deleted_url.clone(),
+                        count: Some(1),
+                    }],
+                },
+            },
+            failing_urls,
+        });
+        let output = Arc::new(LocalFsOutputStore::new(
+            tmp.path().join("objects"),
+            "http://localhost",
+        ));
+        let worker = DefaultSubmitWorker::new(
+            backend.clone(),
+            fetcher,
+            output.clone(),
+            WorkerId::new("concurrent-errors-worker"),
+        )
+        .with_file_concurrency(3);
+        worker.run_job(lease.clone()).await.unwrap();
+
+        let manifests = backend.list_manifests(&tenant, &sub_id).await.unwrap();
+        assert_eq!(manifests[0].status, ManifestStatus::Completed);
+        let errors = backend
+            .list_submit_files(&tenant, &sub_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .collect::<Vec<_>>();
+        assert_eq!(errors.len(), 5);
+        assert!(errors.iter().all(|row| row.file_type == "error"
+            && row.resource_type.as_deref() == Some("OperationOutcome")
+            && row.line_count == 1));
+        let part_indexes = errors
+            .iter()
+            .map(|row| row.part_index)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            part_indexes.into_iter().collect::<Vec<_>>(),
+            vec![0, 2, 3, 4, 5]
+        );
+        let locators = errors
+            .iter()
+            .map(|row| row.file_path.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(locators.len(), 5);
+
+        for row in errors {
+            let expected_url = match row.part_index {
+                0 => "",
+                2 => "http://provider/fail-0.ndjson",
+                3 => "http://provider/fail-1.ndjson",
+                4 => "http://provider/fail-2.ndjson",
+                5 => deleted_url.as_str(),
+                _ => panic!("unexpected error part {}", row.part_index),
+            };
+            assert_eq!(row.count_severity, Some(json!({"error": 1})));
+
+            let key = ExportPartKey {
+                tenant_id: tenant.tenant_id().as_str().to_string(),
+                job_id: submission_output_job_id(&sub_id),
+                resource_type: row.file_path.clone(),
+                file_type: row.file_type.clone(),
+                part_index: row.part_index,
+                fencing_token: row.fencing_token,
+            };
+            let mut reader = output.open_reader(&key).await.unwrap();
+            let mut bytes = Vec::new();
+            reader.read_to_end(&mut bytes).await.unwrap();
+            assert_eq!(row.byte_count, bytes.len() as u64);
+            let outcome: Value =
+                serde_json::from_str(std::str::from_utf8(&bytes).unwrap()).unwrap();
+            let diagnostic = outcome["issue"][0]["diagnostics"].as_str().unwrap();
+            if row.part_index == 0 {
+                assert!(diagnostic.contains("3 submitted resource(s)"));
+                assert!(diagnostic.contains("could not be parsed"));
+            } else {
+                assert!(diagnostic.contains(expected_url));
+                assert!(diagnostic.contains("unavailable input"));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn already_published_helper_replays_return_false() {
+        let backend = Arc::new(SqliteBackend::in_memory().unwrap());
+        backend.init_schema().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let tenant = tenant();
+        let _sub_id = seed(&backend, &tenant).await;
+        let lease = backend
+            .claim_next_manifest(
+                &WorkerId::new("already-published"),
+                StdDuration::from_secs(60),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let worker = DefaultSubmitWorker::new(
+            backend.clone(),
+            patient_fetcher(""),
+            Arc::new(LocalFsOutputStore::new(
+                tmp.path().to_path_buf(),
+                "http://localhost",
+            )),
+            WorkerId::new("already-published"),
+        );
+
+        let keeper = LeaseKeeper::spawn(
+            Arc::new(JobStoreRenewal(Arc::clone(&backend))),
+            lease.clone(),
+            ByteProgress::default(),
+        );
+        let first = worker
+            .publish_collected_artifacts(
+                &lease,
+                keeper,
+                Vec::new(),
+                ManifestPublicationStatus::Completed,
+            )
+            .await;
+        assert!(first.unwrap());
+
+        let keeper = LeaseKeeper::spawn(
+            Arc::new(JobStoreRenewal(Arc::clone(&backend))),
+            lease.clone(),
+            ByteProgress::default(),
+        );
+        let second = worker
+            .publish_collected_artifacts(
+                &lease,
+                keeper,
+                Vec::new(),
+                ManifestPublicationStatus::Completed,
+            )
+            .await;
+        assert!(!second.unwrap());
+    }
+
+    #[tokio::test]
+    async fn slow_finalize_keeps_lease_alive_for_reclaimer() {
+        use tokio::io::AsyncReadExt;
+
+        let backend = Arc::new(SqliteBackend::in_memory().unwrap());
+        backend.init_schema().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let tenant = tenant();
+        let sub_id = SubmissionId::generate("slow-finalize");
+        backend
+            .create_submission(&tenant, &sub_id, None)
+            .await
+            .unwrap();
+        let manifest = backend
+            .add_manifest(
+                &tenant,
+                &sub_id,
+                Some("http://provider/slow-finalize.json"),
+                None,
+            )
+            .await
+            .unwrap();
+        let lease = backend
+            .claim_next_manifest(&WorkerId::new("slow-finalize"), StdDuration::from_secs(2))
+            .await
+            .unwrap()
+            .unwrap();
+
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let output = Arc::new(SlowFinalize {
+            inner: Arc::new(LocalFsOutputStore::new(
+                tmp.path().join("objects"),
+                "http://localhost",
+            )),
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+        });
+        let worker = DefaultSubmitWorker::new(
+            backend.clone(),
+            patient_fetcher("{\"resourceType\":\"Patient\",\"id\":\"slow-finalize\"}\n"),
+            output.clone(),
+            WorkerId::new("slow-finalize"),
+        );
+        let run = {
+            let lease = lease.clone();
+            tokio::spawn(async move { worker.run_job(lease).await })
+        };
+        tokio::time::timeout(StdDuration::from_secs(10), entered.notified())
+            .await
+            .unwrap();
+        tokio::time::sleep(StdDuration::from_millis(2200)).await;
+        assert_eq!(
+            backend.list_manifests(&tenant, &sub_id).await.unwrap()[0].status,
+            ManifestStatus::Processing
+        );
+        assert!(
+            backend
+                .claim_next_manifest(
+                    &WorkerId::new("slow-finalize-reclaimer"),
+                    StdDuration::from_secs(2),
+                )
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        release.notify_one();
+
+        let result = tokio::time::timeout(StdDuration::from_secs(10), run)
+            .await
+            .unwrap()
+            .unwrap();
+        result.unwrap();
+        let manifests = backend.list_manifests(&tenant, &sub_id).await.unwrap();
+        assert_eq!(manifests[0].status, ManifestStatus::Completed);
+        let rows = backend.list_submit_files(&tenant, &sub_id).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(
+            (
+                row.file_type.as_str(),
+                row.resource_type.as_deref(),
+                row.part_index,
+                row.fencing_token
+            ),
+            ("output", Some("Patient"), 0, lease.fencing_token)
+        );
+        let expected_key = submit_artifact_key(
+            &tenant,
+            &sub_id,
+            &manifest.manifest_id,
+            "output",
+            Some("Patient"),
+            0,
+            lease.fencing_token,
+        );
+        assert_eq!(row.file_path, expected_key.resource_type);
+        let key = ExportPartKey {
+            tenant_id: tenant.tenant_id().as_str().to_string(),
+            job_id: submission_output_job_id(&sub_id),
+            resource_type: row.file_path.clone(),
+            file_type: row.file_type.clone(),
+            part_index: row.part_index,
+            fencing_token: row.fencing_token,
+        };
+        let mut reader = output.open_reader(&key).await.unwrap();
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes).await.unwrap();
+        assert_eq!(row.line_count, 1);
+        assert_eq!(row.byte_count, bytes.len() as u64);
+        assert_eq!(
+            std::str::from_utf8(&bytes).unwrap(),
+            "{\"reference\":\"Patient/slow-finalize\"}\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn second_finalize_failure_hides_the_set_until_live_recovery() {
+        use tokio::io::AsyncReadExt;
+
+        let backend = Arc::new(SqliteBackend::in_memory().unwrap());
+        backend.init_schema().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let tenant = tenant();
+        let sub_id = SubmissionId::generate("finalize-failure");
+        backend
+            .create_submission(&tenant, &sub_id, None)
+            .await
+            .unwrap();
+        let manifest = backend
+            .add_manifest(
+                &tenant,
+                &sub_id,
+                Some("http://provider/finalize-failure.json"),
+                None,
+            )
+            .await
+            .unwrap();
+        let old = backend
+            .claim_next_manifest(
+                &WorkerId::new("finalize-failure-old"),
+                StdDuration::from_secs(60),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        let mut files = std::collections::HashMap::new();
+        let mut output_files = Vec::new();
+        for resource_type in ["Condition", "Patient"] {
+            let url = format!("http://provider/{resource_type}.ndjson");
+            files.insert(
+                url.clone(),
+                format!("{{\"resourceType\":\"{resource_type}\",\"id\":\"one\"}}\n").into_bytes(),
+            );
+            output_files.push(RemoteFile {
+                resource_type: Some(resource_type.to_string()),
+                url,
+                count: Some(1),
+            });
+        }
+        let fetcher = Arc::new(MockFetcher {
+            files,
+            manifest: RemoteManifest {
+                requires_access_token: false,
+                output: output_files,
+                deleted: vec![],
+            },
+        });
+        let output = Arc::new(LocalFsOutputStore::new(
+            tmp.path().join("objects"),
+            "http://localhost",
+        ));
+        let failing_output = Arc::new(FailSecondFinalize {
+            inner: Arc::clone(&output),
+            finalized: std::sync::atomic::AtomicU32::new(0),
+        });
+        let failing_worker = DefaultSubmitWorker::new(
+            backend.clone(),
+            fetcher.clone(),
+            failing_output,
+            WorkerId::new("finalize-failure-old"),
+        );
+        let failed_result = failing_worker.run_job(old.clone()).await;
+        match failed_result {
+            Err(StorageError::Backend(crate::error::BackendError::Internal {
+                backend_name,
+                message,
+                source: None,
+            })) => {
+                assert_eq!(backend_name, "bulk-submit-worker-test");
+                assert_eq!(message, "second finalize forced failure");
+            }
+            other => panic!("expected exact second-finalize error, got {other:?}"),
+        }
+        assert!(
+            backend
+                .list_submit_files(&tenant, &sub_id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        backend
+            .get_connection()
+            .unwrap()
+            .execute(
+                "UPDATE bulk_manifests SET lease_expiry = '1970-01-01T00:00:00Z'
+                 WHERE tenant_id = ?1 AND submitter = ?2 AND submission_id = ?3
+                   AND manifest_id = ?4",
+                params![
+                    tenant.tenant_id().as_str(),
+                    sub_id.submitter,
+                    sub_id.submission_id,
+                    manifest.manifest_id,
+                ],
+            )
+            .unwrap();
+        let replacement = backend
+            .claim_next_manifest(
+                &WorkerId::new("finalize-failure-live"),
+                StdDuration::from_secs(60),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(replacement.manifest_id, manifest.manifest_id);
+        assert!(replacement.fencing_token > old.fencing_token);
+
+        let live_worker = DefaultSubmitWorker::new(
+            backend.clone(),
+            fetcher,
+            Arc::clone(&output),
+            WorkerId::new("finalize-failure-live"),
+        );
+        live_worker.run_job(replacement.clone()).await.unwrap();
+
+        let manifests = backend.list_manifests(&tenant, &sub_id).await.unwrap();
+        assert_eq!(manifests[0].status, ManifestStatus::Completed);
+        let mut outputs = backend
+            .list_submit_files(&tenant, &sub_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| {
+                (
+                    row.resource_type.clone().unwrap(),
+                    row.part_index,
+                    row.fencing_token,
+                    row.file_path,
+                    row.line_count,
+                    row.byte_count,
+                )
+            })
+            .collect::<Vec<_>>();
+        outputs.sort_by_key(|row| (row.0.clone(), row.1));
+        let expected_outputs = ["Condition", "Patient"]
+            .into_iter()
+            .enumerate()
+            .map(|(part_index, resource_type)| {
+                let key = submit_artifact_key(
+                    &tenant,
+                    &sub_id,
+                    &manifest.manifest_id,
+                    "output",
+                    Some(resource_type),
+                    part_index as u32,
+                    replacement.fencing_token,
+                );
+                (
+                    resource_type.to_string(),
+                    part_index as u32,
+                    replacement.fencing_token,
+                    key.resource_type,
+                    1,
+                    format!("{{\"reference\":\"{resource_type}/one\"}}\n").len() as u64,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(outputs, expected_outputs);
+        for (resource_type, part_index, fencing_token, file_path, line_count, byte_count) in outputs
+        {
+            let key = ExportPartKey {
+                tenant_id: tenant.tenant_id().as_str().to_string(),
+                job_id: submission_output_job_id(&sub_id),
+                resource_type: file_path,
+                file_type: "output".to_string(),
+                part_index,
+                fencing_token,
+            };
+            let mut reader = output.open_reader(&key).await.unwrap();
+            let mut bytes = Vec::new();
+            reader.read_to_end(&mut bytes).await.unwrap();
+            let expected_bytes = format!("{{\"reference\":\"{resource_type}/one\"}}\n");
+            assert_eq!(line_count, 1);
+            assert_eq!(byte_count, expected_bytes.len() as u64);
+            assert_eq!(std::str::from_utf8(&bytes).unwrap(), expected_bytes);
+            let references = std::str::from_utf8(&bytes)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str::<Value>(line).unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                references,
+                vec![json!({"reference": format!("{resource_type}/one")})]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn publication_takeover_is_quiet_then_original_lease_retry_reindexes() {
+        use tokio::io::AsyncReadExt;
+
+        let backend = Arc::new(SqliteBackend::in_memory().unwrap());
+        backend.init_schema().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let tenant = tenant();
+        let sub_id = SubmissionId::generate("publication-takeover");
+        backend
+            .create_submission(&tenant, &sub_id, None)
+            .await
+            .unwrap();
+        let manifest = backend
+            .add_manifest(
+                &tenant,
+                &sub_id,
+                Some("http://provider/publication-takeover.json"),
+                None,
+            )
+            .await
+            .unwrap();
+        let lease = backend
+            .claim_next_manifest(
+                &WorkerId::new("publication-takeover"),
+                StdDuration::from_secs(60),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        let hook = Arc::new(MockReindexHook {
+            calls: std::sync::Mutex::new(Vec::new()),
+        });
+        let output = Arc::new(LocalFsOutputStore::new(
+            tmp.path().join("objects"),
+            "http://localhost",
+        ));
+        let guarded_worker = DefaultSubmitWorker::new(
+            backend.clone(),
+            patient_fetcher("{\"resourceType\":\"Patient\",\"id\":\"guarded\"}\n"),
+            Arc::clone(&output),
+            WorkerId::new("publication-takeover"),
+        )
+        .with_deferred_indexing(true, Some(hook.clone()));
+
+        backend
+            .get_connection()
+            .unwrap()
+            .execute(
+                "CREATE TRIGGER lose_lease_after_output
+                 AFTER INSERT ON bulk_submit_files
+                 BEGIN
+                   UPDATE bulk_manifests
+                   SET worker_id = 'interloper', fencing_token = 999
+                   WHERE tenant_id = NEW.tenant_id
+                     AND submitter = NEW.submitter
+                     AND submission_id = NEW.submission_id
+                     AND manifest_id = NEW.manifest_id;
+                 END",
+                [],
+            )
+            .unwrap();
+        guarded_worker.run_job(lease.clone()).await.unwrap();
+        assert_eq!(
+            backend.list_manifests(&tenant, &sub_id).await.unwrap()[0].status,
+            ManifestStatus::Processing
+        );
+        assert!(
+            backend
+                .list_submit_files(&tenant, &sub_id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            hook.calls.lock().unwrap().is_empty(),
+            "lease lost publication must not fire reindex"
+        );
+
+        backend
+            .get_connection()
+            .unwrap()
+            .execute("DROP TRIGGER lose_lease_after_output", [])
+            .unwrap();
+        let retry_worker = DefaultSubmitWorker::new(
+            backend.clone(),
+            patient_fetcher("{\"resourceType\":\"Patient\",\"id\":\"guarded\"}\n"),
+            Arc::clone(&output),
+            WorkerId::new("publication-takeover"),
+        )
+        .with_deferred_indexing(true, Some(hook.clone()));
+        retry_worker.run_job(lease.clone()).await.unwrap();
+
+        let manifests = backend.list_manifests(&tenant, &sub_id).await.unwrap();
+        assert_eq!(manifests[0].status, ManifestStatus::Completed);
+        assert_eq!(
+            hook.calls.lock().unwrap().clone(),
+            vec![vec!["Patient".to_string()]]
+        );
+        let rows = backend.list_submit_files(&tenant, &sub_id).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(
+            (
+                row.file_type.as_str(),
+                row.resource_type.as_deref(),
+                row.part_index,
+                row.fencing_token
+            ),
+            ("output", Some("Patient"), 0, lease.fencing_token)
+        );
+        let expected_key = submit_artifact_key(
+            &tenant,
+            &sub_id,
+            &manifest.manifest_id,
+            "output",
+            Some("Patient"),
+            0,
+            lease.fencing_token,
+        );
+        assert_eq!(row.file_path, expected_key.resource_type);
+        let key = ExportPartKey {
+            tenant_id: tenant.tenant_id().as_str().to_string(),
+            job_id: submission_output_job_id(&sub_id),
+            resource_type: row.file_path.clone(),
+            file_type: "output".to_string(),
+            part_index: row.part_index,
+            fencing_token: row.fencing_token,
+        };
+        let mut reader = output.open_reader(&key).await.unwrap();
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes).await.unwrap();
+        assert_eq!(row.line_count, 1);
+        assert_eq!(row.byte_count, bytes.len() as u64);
+        assert_eq!(
+            std::str::from_utf8(&bytes).unwrap(),
+            "{\"reference\":\"Patient/guarded\"}\n"
+        );
     }
 
     /// How a stubbed heartbeat behaves, for the [`LeaseKeeper`] tests.
