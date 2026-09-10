@@ -106,6 +106,7 @@ Longer-term ideas we are exploring. These are not yet committed and may evolve s
 
 - **SMART on FHIR** — Full launch framework (standalone launch, EHR launch) and fine-grained scoped access
 - **GraphQL API** — [FHIR GraphQL](https://hl7.org/fhir/graphql.html) support for resource retrieval, search, and graph traversal as an alternative to the REST API
+- **`Patient/$everything` operation** ([#966](https://github.com/HeliosSoftware/hfs/issues/966)) — [FHIR `$everything`](https://hl7.org/fhir/operation-patient-everything.html) on `Patient/{id}` (and optionally at the type level), returning the patient record as a `searchset` Bundle with `_since`, `_type`, `_count`, and `start` / `end` support. The building blocks exist today: compartment search (`GET /Patient/{id}/{type}`, driven by `CompartmentDefinition`) and `Patient/$export`; `$everything` would compose the compartment machinery into a single paged operation. 👍 the issue to signal interest.
 
 ### SQL-on-FHIR & FHIRPath
 
@@ -213,7 +214,7 @@ No outstanding critical gaps. Profile validation on write, flagged as critical i
 
 | Gap | Book Reference | Current Status |
 |-----|---------------|----------------|
-| **No `$everything` operation** | Ch. 6 — FHIR-native systems where "all queries are FHIR requests" expect standard patient-centric retrieval. Partial substitutes exist: compartment search (`GET /Patient/{id}/Observation`) and `Patient/$export`. | Not planned |
+| **No `$everything` operation** | Ch. 6 — FHIR-native systems where "all queries are FHIR requests" expect standard patient-centric retrieval. Partial substitutes exist: compartment search (`GET /Patient/{id}/Observation`) and `Patient/$export`. | 🔭 Later ([#966](https://github.com/HeliosSoftware/hfs/issues/966)) |
 | **No interceptor/hook framework** | Ch. 1 "Platform Illusion," Appendix I "Proxy/intercept layer" — organizations need to inject business validation, governance rules, and custom logic into the CRUD pipeline. HFS has internal Axum middleware and configurable write-path validation, but no pluggable extension point; reacting to writes is possible out-of-band via Subscriptions, and CDS Hooks types are provided as a library only. | Not planned |
 | **No Provenance tracking** | Appendix I "Provenance tracking" — important for audit, trust, and multi-source systems. `Provenance` resources can be stored and searched like any other resource, but the server does not generate them; AuditEvent (who did what) is not the same as Provenance (where data came from). | Not planned |
 | **No general rate limiting** | Ch. 3 Q5 "Data consumers" — external consumers with SLAs require throttling and burst protection. Only `$nl-search` is rate-limited (per user/tenant window plus a daily cap); the FHIR REST surface has no throttling and relies on an upstream gateway. | Not planned |
