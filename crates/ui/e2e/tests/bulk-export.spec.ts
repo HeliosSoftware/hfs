@@ -612,7 +612,7 @@ test("Patient combobox supports keyboard selection, dedupe, removal, and scope s
   bulkExport,
 }) => {
   const queries: string[] = [];
-  await page.route("**/ui/bulk-export/patient-options", (route) => {
+  await page.route("**/ui/lookup/patient-options*", (route) => {
     queries.push(new URLSearchParams(route.request().postData() ?? "").get("q") ?? "");
     return route.fulfill({ status: 200, contentType: "text/html", body: patientOptions });
   });
@@ -707,7 +707,7 @@ test("Patient combobox closes on Tab and Clear removes selected patients", async
   page,
   bulkExport,
 }) => {
-  await page.route("**/ui/bulk-export/patient-options", (route) =>
+  await page.route("**/ui/lookup/patient-options*", (route) =>
     route.fulfill({ status: 200, contentType: "text/html", body: patientOptions }),
   );
   await bulkExport.goto();
@@ -731,7 +731,7 @@ test("open Patient combobox has no automated accessibility violations", async ({
   page,
   bulkExport,
 }) => {
-  await page.route("**/ui/bulk-export/patient-options", (route) =>
+  await page.route("**/ui/lookup/patient-options*", (route) =>
     route.fulfill({ status: 200, contentType: "text/html", body: patientOptions }),
   );
   await bulkExport.goto();
@@ -749,7 +749,7 @@ test("Patient combobox shows empty and error messages and persists a runtime ID-
   page,
   bulkExport,
 }) => {
-  await page.route("**/ui/bulk-export/patient-options", (route) => {
+  await page.route("**/ui/lookup/patient-options*", (route) => {
     const query = new URLSearchParams(route.request().postData() ?? "").get("q");
     if (query === "transport") {
       return route.fulfill({ status: 500, contentType: "text/plain", body: "server error" });

@@ -247,9 +247,16 @@ fn assert_back_link(source: &str, page: &str, href: &str, key: &str) {
     let back_link_position = source
         .find("class=\"back-link\"")
         .expect("back link marker was located above");
-    let copy_position = source.find("class=\"page-head__copy\"").unwrap_or_else(|| {
-        panic!("{page}'s header children must live inside `<div class=\"page-head__copy\">` (#801)")
-    });
+    // Match `class="page-head__copy"` or `class="page-head__copy page-head__copy--*"`
+    // (the detail pages use the `--spaced` modifier for vertical rhythm #900).
+    let copy_position = source
+        .find("class=\"page-head__copy\"")
+        .or_else(|| source.find("class=\"page-head__copy "))
+        .unwrap_or_else(|| {
+            panic!(
+                "{page}'s header children must live inside `<div class=\"page-head__copy\">` (#801)"
+            )
+        });
     assert!(
         back_link_position < copy_position,
         "{page}'s back link must precede `.page-head__copy` inside the header",
@@ -848,14 +855,14 @@ async fn capability_page_loads_the_raw_fold_scripts() {
     // — but its *behavior* is two vanilla-JS files that each page has to
     // include itself:
     //
-    //   * `capability-json.js` listens for the native `toggle` event on
-    //     `details[data-capability-json-node]` and fires the htmx GET at
-    //     `data-fragment-url`, so opening the fold shows the tree;
+    //   * `capability-json.js` enhances the server-rendered first level,
+    //     coordinates the aggregate HTML POST, and keeps native nested
+    //     `details[data-capability-json-node]` incremental;
     //   * `json-view.js` binds the per-node fold arrows inside the
     //     fragment that swap brings back.
     //
-    // HTS adopted the shared card while loading neither, so the fold opened
-    // onto the server-rendered "Load JSON" fallback and simply sat there.
+    // HTS adopted the shared card while loading neither, so the controls and
+    // nested levels remained inert.
     // Nothing failed to compile and no template error surfaced — a missing
     // `<script>` degrades in total silence, which is exactly why this
     // assertion has to exist.

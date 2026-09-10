@@ -47,22 +47,21 @@ cargo run --bin hts
 ## Admin UI
 
 The HTS administrative UI (`crates/hts-ui`) is mounted on `hts` itself at
-`/ui/hts` — it is **off by default** (an API-only deployment behind a
-gateway may not want an HTML surface listening at all) and requires
-`HTS_UI_ENABLED=true` to opt in:
+`/ui/hts` — it is **on by default**, matching HFS's always-on UI. Operators
+who deploy behind an API gateway and don't want an HTML surface listening
+at all can opt out with `HTS_UI_ENABLED=false`:
 
 ```bash
-HTS_BOOTSTRAP_DIR=./crates/hts/terminology-data HTS_UI_ENABLED=true cargo run --bin hts
+HTS_BOOTSTRAP_DIR=./crates/hts/terminology-data cargo run --bin hts
 ```
 
 ```powershell
 $env:HTS_BOOTSTRAP_DIR = ".\crates\hts\terminology-data"
-$env:HTS_UI_ENABLED    = "1"
 cargo run --bin hts
 ```
 
-Once enabled, `http://localhost:8090/ui/hts` serves the dashboard; the bare
-root `/` redirects there too.
+`http://localhost:8090/ui/hts` serves the dashboard; the bare root `/`
+redirects there too.
 
 This gives you ICD-10-CM, ICD-9-CM, NCI Thesaurus, MeSH (via NCI Thesaurus
 FLAT), NDC, HL7 THO, HL7 v2 tables, UCUM, and NUCC out of the box. Each

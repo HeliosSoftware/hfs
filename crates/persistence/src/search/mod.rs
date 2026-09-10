@@ -88,8 +88,8 @@ pub use registry::{
     SearchParameterStatus, fallback_param_type, resolve_param_targets, resolve_param_type,
 };
 pub use reindex::{
-    ReindexOperation, ReindexProgress, ReindexRequest, ReindexSource, ReindexStatus, ReindexTarget,
-    ReindexableStorage, ResourcePage,
+    ReindexOnFinish, ReindexOperation, ReindexProgress, ReindexRequest, ReindexSource,
+    ReindexStatus, ReindexTarget, ReindexableStorage, ResourcePage,
 };
 pub use seeder::{
     SeedOutcome, seed_spec_compartment_definitions, seed_spec_search_parameters,

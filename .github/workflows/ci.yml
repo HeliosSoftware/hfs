@@ -1344,7 +1344,7 @@ jobs:
                   ? `  ${t.group}/${t.name}: FAILED - ${t.msg}`
                   : `  ${t.group}/${t.name}: DID NOT EXECUTE (no recorded result)`).join('\n');
                 const txNote = remaining.some(t => t.mode === 'tx')
-                  ? `\n\nThe HTS pre-flight probe was healthy (3/3), so terminology infrastructure is NOT the cause of the tx test(s) above -- this is the evaluator.`
+                  ? `\n\nThe HTS pre-flight probe was healthy (3/3), but this does not rule out a later terminology outage. Check the errors above for HTS/proxy failures as well as evaluator regressions.`
                   : '';
                 core.error(`[COVERAGE-LOST] ${remaining.length} test(s) declared in tests-fhir-r5.xml did not pass and are not listed in known-test-failures.json:\n${detail}${txNote}\n\nA test marked DID NOT EXECUTE was downgraded to inconclusive by the runner, or never ran at all; neither affects the runner's exit code, which is the silent skip this gate exists to catch. Fix the defect, or add an entry to known-test-failures.json with a reason and a linked issue. Do not delete the test to get green.`);
                 codes.push('COVERAGE-LOST');

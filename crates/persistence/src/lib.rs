@@ -180,6 +180,7 @@ pub mod backends;
 pub mod composite;
 pub mod core;
 pub mod error;
+pub mod perf;
 pub mod search;
 pub mod sof;
 pub mod tenant;

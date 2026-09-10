@@ -240,7 +240,13 @@ fn apply_element_content(element: &mut Node, ed: &Ed, warnings: &mut Vec<String>
         }
         1 => {
             let t = &ed.types[0];
-            element.schema.type_ = Some(t.effective_code());
+            // `Element.id`-derived elements are `string`, not the `id` the
+            // (inconsistent) fhir-type extension may claim (#424).
+            element.schema.type_ = Some(
+                ed.value_type_override()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| t.effective_code()),
+            );
             if !t.target_profile.is_empty() {
                 element.schema.refers = Some(t.target_profile.clone());
             }
@@ -251,7 +257,11 @@ fn apply_element_content(element: &mut Node, ed: &Ed, warnings: &mut Vec<String>
                 "{}: multiple types without [x]; using the first",
                 ed.path
             ));
-            element.schema.type_ = Some(ed.types[0].effective_code());
+            element.schema.type_ = Some(
+                ed.value_type_override()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| ed.types[0].effective_code()),
+            );
         }
     }
     apply_value_keywords(&mut element.schema, ed, warnings);

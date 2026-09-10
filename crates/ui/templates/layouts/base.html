@@ -117,10 +117,6 @@
         <span class="icon">{% include "icons/export.svg" %}</span>
         <span class="nav-item__label">{{ i18n.t("nav-sql-export") }}</span>
       </a>
-      <a class="nav-item" href="/ui/sql/files"{% if active_page == "sql-files" %} aria-current="page"{% endif %} title="{{ i18n.t("nav-sql-files") }}">
-        <span class="icon">{% include "icons/copy.svg" %}</span>
-        <span class="nav-item__label">{{ i18n.t("nav-sql-files") }}</span>
-      </a>
 
       <div class="nav__section">{{ i18n.t("nav-section-server") }}</div>
       <a class="nav-item" href="/ui/tenants"{% if active_page == "tenants" %} aria-current="page"{% endif %} title="{{ i18n.t("nav-tenants") }}">

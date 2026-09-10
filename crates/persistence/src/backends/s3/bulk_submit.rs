@@ -15,9 +15,10 @@ use crate::core::ResourceStorage;
 use crate::core::VersionedStorage;
 use crate::core::bulk_submit::{
     BulkEntryOutcome, BulkEntryResult, BulkProcessingOptions, BulkSubmitProvider,
-    BulkSubmitRollbackProvider, ChangeType, EntryCountSummary, ManifestStatus, NdjsonEntry,
-    StreamProcessingResult, StreamingBulkSubmitProvider, SubmissionChange, SubmissionId,
-    SubmissionManifest, SubmissionStatus, SubmissionSummary,
+    BulkSubmitRollbackProvider, ChangeType, EntryCountSummary, EntryResultContinuation,
+    EntryResultPage, ManifestStatus, NdjsonEntry, PagedEntryResult, StreamProcessingResult,
+    StreamingBulkSubmitProvider, SubmissionChange, SubmissionId, SubmissionManifest,
+    SubmissionStatus, SubmissionSummary, invalid_entry_result_page,
 };
 use crate::error::{BulkSubmitError, ResourceError, StorageError, StorageResult};
 use crate::tenant::TenantContext;
@@ -403,9 +404,15 @@ impl BulkSubmitProvider for S3Backend {
             .filter(|r| r.outcome == BulkEntryOutcome::Skipped)
             .count() as u64;
 
+        // Cumulative across every run of this manifest — the counters the
+        // status endpoint reports, and the worker's own deltas use the same
+        // semantics (#969). `processed_entries` means resources written to the
+        // store, so skips are excluded and surface through their receipts
+        // (#954); `last_processed_line` is a line cursor and counts them.
         manifest_state.manifest.total_entries += results.len() as u64;
-        manifest_state.manifest.processed_entries += results.len() as u64;
+        manifest_state.manifest.processed_entries += success_count;
         manifest_state.manifest.failed_entries += failed_count;
+        manifest_state.last_processed_line += results.len() as u64;
         // A leased manifest's terminal status belongs to the worker, which calls
         // this once per manifest output file and only then decides. Settling it
         // here would take the manifest out of `processing` mid-run, so a worker
@@ -434,15 +441,29 @@ impl BulkSubmitProvider for S3Backend {
         Ok(results)
     }
 
-    async fn get_entry_results(
+    async fn get_entry_results_page(
         &self,
         tenant: &TenantContext,
         submission_id: &SubmissionId,
         manifest_id: &str,
         outcome_filter: Option<BulkEntryOutcome>,
         limit: u32,
-        offset: u32,
-    ) -> StorageResult<Vec<BulkEntryResult>> {
+        continuation: Option<&EntryResultContinuation>,
+    ) -> StorageResult<EntryResultPage> {
+        if limit == 0 {
+            return Err(invalid_entry_result_page(
+                "Receipt page limit must be greater than zero",
+            ));
+        }
+        let offset = match continuation {
+            None => 0,
+            Some(EntryResultContinuation::Offset(offset)) => *offset,
+            Some(EntryResultContinuation::Keyset(_)) => {
+                return Err(invalid_entry_result_page(
+                    "s3 receipt pages require an offset continuation",
+                ));
+            }
+        };
         let location = self.tenant_location(tenant)?;
         let mut results = self
             .load_entry_results(&location, submission_id, manifest_id)
@@ -456,7 +477,27 @@ impl BulkSubmitProvider for S3Backend {
 
         let start = (offset as usize).min(results.len());
         let end = start.saturating_add(limit as usize).min(results.len());
-        Ok(results[start..end].to_vec())
+        let page = &results[start..end];
+        let next = if page.len() == limit as usize {
+            Some(EntryResultContinuation::Offset(
+                offset
+                    .checked_add(limit)
+                    .ok_or_else(|| invalid_entry_result_page("Receipt offset exceeds u32 range"))?,
+            ))
+        } else {
+            None
+        };
+        Ok(EntryResultPage {
+            entries: page
+                .iter()
+                .cloned()
+                .map(|result| PagedEntryResult {
+                    result,
+                    stored_identity: None,
+                })
+                .collect(),
+            next,
+        })
     }
 
     async fn get_entry_counts(
@@ -518,7 +559,10 @@ impl StreamingBulkSubmitProvider for S3Backend {
             match NdjsonEntry::parse(line_number, line) {
                 Ok(entry) => {
                     if entry.resource_type != resource_type {
+                        // Rejected here, so no batch will charge it to the
+                        // manifest's counters; the worker adds it (#969).
                         result.counts.increment(BulkEntryOutcome::ValidationError);
+                        result.unbatched_errors += 1;
                         if !options.continue_on_error
                             && (options.max_errors == 0
                                 || result.counts.error_count() >= options.max_errors as u64)
@@ -531,6 +575,7 @@ impl StreamingBulkSubmitProvider for S3Backend {
                 }
                 Err(parse_err) => {
                     result.counts.increment(BulkEntryOutcome::ValidationError);
+                    result.unbatched_errors += 1;
                     if !options.continue_on_error
                         && (options.max_errors == 0
                             || result.counts.error_count() >= options.max_errors as u64)

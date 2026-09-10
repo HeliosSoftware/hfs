@@ -294,11 +294,10 @@ fn build_create_response(
         }
         _ => {
             // Default: return=representation
-            format_resource_response(status, header_map, stored.content(), format).map_err(|_| {
-                RestError::InternalError {
+            format_resource_response(status, header_map, &stored.content_with_meta(), format)
+                .map_err(|_| RestError::InternalError {
                     message: "Failed to serialize response".to_string(),
-                }
-            })
+                })
         }
     }
 }
@@ -314,9 +313,14 @@ fn build_existing_response(
 
     match prefer.return_preference() {
         Some("minimal") => Ok((StatusCode::OK, header_map).into_response()),
-        _ => format_resource_response(StatusCode::OK, header_map, stored.content(), format)
-            .map_err(|_| RestError::InternalError {
-                message: "Failed to serialize response".to_string(),
-            }),
+        _ => format_resource_response(
+            StatusCode::OK,
+            header_map,
+            &stored.content_with_meta(),
+            format,
+        )
+        .map_err(|_| RestError::InternalError {
+            message: "Failed to serialize response".to_string(),
+        }),
     }
 }

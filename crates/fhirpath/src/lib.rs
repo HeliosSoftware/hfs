@@ -280,7 +280,9 @@ mod datetime_impl;
 pub mod debug_trace;
 mod distinct_functions;
 mod extension_function;
+// Curated catalog of built-in functions; re-exported below.
 mod fhir_type_hierarchy;
+mod functions;
 mod long_conversion;
 mod not_function;
 mod polymorphic_access;
@@ -311,6 +313,7 @@ pub mod parser;
 
 // Public API exports - this is what users of the fhirpath crate should use
 pub use evaluator::EvaluationContext;
+pub use functions::{FunctionCategory, FunctionInfo, builtin_functions};
 pub use helios_fhirpath_support::EvaluationResult;
 
 /// Evaluates a FHIRPath expression against a given context.
@@ -460,4 +463,304 @@ pub fn parse_expression_diagnostics(
 fn byte_to_char_offset(s: &str, byte_offset: usize) -> usize {
     s.get(..byte_offset)
         .map_or_else(|| s.chars().count(), |prefix| prefix.chars().count())
+}
+
+/// Parses `expression` into a [`parser::SpannedExpression`] — the same AST
+/// as [`parse_expression`], but with every node annotated with its
+/// [`parser::ExprSpan`] (a byte `position`/`length` pair into `expression`).
+///
+/// Uses [`parser::spanned_parser`] under the hood; on failure, returns the
+/// same diagnostics [`parse_expression_diagnostics`] would (span converted
+/// to Unicode char offsets — see [`ParseDiagnostic`]).
+///
+/// This is a third, purely additive entry point: [`parse_expression`] and
+/// [`parse_expression_diagnostics`] keep their existing signatures and
+/// behavior unchanged, and this function does not affect the debug tracer
+/// (`FHIRPATH_DEBUG_TRACE=1`), which already calls [`parser::spanned_parser`]
+/// directly. It exists for callers that need to locate *where* a specific
+/// construct (e.g. an external constant reference) sits in the source text —
+/// [`external_constants`] is one such caller.
+///
+/// Never evaluates the expression and never touches a FHIR resource or a
+/// terminology server.
+///
+/// # Examples
+///
+/// ```
+/// use helios_fhirpath::parse_expression_spanned;
+///
+/// let spanned = parse_expression_spanned("Patient.name.family").unwrap();
+/// assert_eq!(spanned.span.position, 0);
+///
+/// let errors = parse_expression_spanned("Patient.name.").unwrap_err();
+/// assert!(!errors.is_empty());
+/// ```
+pub fn parse_expression_spanned(
+    expression: &str,
+) -> Result<parser::SpannedExpression, Vec<ParseDiagnostic>> {
+    use chumsky::Parser;
+
+    parser::spanned_parser()
+        .parse(expression)
+        .into_result()
+        .map_err(|errors| {
+            errors
+                .iter()
+                .map(|error| {
+                    let span = error.span();
+                    ParseDiagnostic {
+                        span: (
+                            byte_to_char_offset(expression, span.start),
+                            byte_to_char_offset(expression, span.end),
+                        ),
+                        message: error.to_string(),
+                    }
+                })
+                .collect()
+        })
+}
+
+/// Converts a byte-offset [`parser::ExprSpan`] (as produced by
+/// [`parser::spanned_parser`] / [`parse_expression_spanned`]) into a
+/// `(start, end)` pair of Unicode char offsets into `expression`, with the
+/// same semantics as [`ParseDiagnostic::span`].
+///
+/// `ExprSpan` stores a byte `position`/`length` because that is what
+/// chumsky's `&str` input tracks internally (see [`parser::ExprSpan`] and
+/// [`debug_trace`], its only other consumer today). A caller indexing into
+/// `expression` by character — a browser editor counting Unicode code
+/// points, or a diagnostic span meant to be sliced with `.chars()` — would
+/// silently miscount on any expression containing a multi-byte character
+/// before the span, so this conversion exists once here rather than being
+/// every such caller's problem.
+///
+/// # Examples
+///
+/// ```
+/// use helios_fhirpath::{expr_span_to_char_offsets, parse_expression_spanned};
+///
+/// // "café" is 4 chars / 5 bytes (é is a 2-byte UTF-8 sequence).
+/// let spanned = parse_expression_spanned("'café' & %foo").unwrap();
+/// // The whole expression's span covers the full source in bytes...
+/// assert_eq!(spanned.span.position + spanned.span.length, 14);
+/// // ...but converted to chars, it covers the 13-char source instead.
+/// let (_, end) = expr_span_to_char_offsets("'café' & %foo", &spanned.span);
+/// assert_eq!(end, 13);
+/// ```
+pub fn expr_span_to_char_offsets(expression: &str, span: &parser::ExprSpan) -> (usize, usize) {
+    (
+        byte_to_char_offset(expression, span.position),
+        byte_to_char_offset(expression, span.position + span.length),
+    )
+}
+
+/// A reference to an external constant (`%name`) found by [`external_constants`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternalConstantRef {
+    /// The constant's name, without the leading `%` and with any
+    /// `` `backtick` `` or `'single-quote'` delimiters stripped (escape
+    /// sequences inside a delimited name are already decoded, matching what
+    /// [`Term::ExternalConstant`](parser::Term::ExternalConstant) stores).
+    pub name: String,
+    /// The **byte** span of the full token, from the `%` through the end of
+    /// the name — including its delimiters in the two quoted lexical forms.
+    /// Convert to char offsets with [`expr_span_to_char_offsets`].
+    pub span: parser::ExprSpan,
+}
+
+/// Walks every node of `expr` and returns a reference for each external
+/// constant (`%name`, `` %`quoted name` ``, or `%'quoted name'``) found
+/// anywhere in the tree — as an operand, a function argument, inside a
+/// lambda, an indexer, a union, or the operand of `is`/`as`.
+///
+/// `source` must be the exact expression string `expr` was parsed from
+/// ([`parse_expression_spanned`] or [`parser::spanned_parser`] directly);
+/// it is needed to correct a quirk of [`parser::spanned_parser`]'s spans.
+/// Every lexical token in that grammar is built from combinators ending in
+/// `.padded()`, so the recorded `ExprSpan` for an external constant also
+/// swallows any whitespace/comments immediately following the token —
+/// harmless for [`debug_trace`], the only existing consumer of those spans,
+/// but wrong for a diagnostic span meant to underline just the `%name`
+/// token. This walker recovers the exact end offset from `source` itself
+/// rather than trusting the parser's (over-wide) span, so every
+/// [`ExternalConstantRef::span`] this returns covers precisely the token.
+///
+/// # Examples
+///
+/// ```
+/// use helios_fhirpath::{external_constants, parse_expression_spanned};
+///
+/// let source = "name.where(system = %ucum)";
+/// let spanned = parse_expression_spanned(source).unwrap();
+/// let refs = external_constants(&spanned, source);
+/// assert_eq!(refs.len(), 1);
+/// assert_eq!(refs[0].name, "ucum");
+/// assert_eq!(&source[refs[0].span.position..refs[0].span.position + refs[0].span.length], "%ucum");
+/// ```
+pub fn external_constants(
+    expr: &parser::SpannedExpression,
+    source: &str,
+) -> Vec<ExternalConstantRef> {
+    let mut refs = Vec::new();
+    collect_external_constants(expr, source, &mut refs);
+    refs
+}
+
+fn collect_external_constants(
+    expr: &parser::SpannedExpression,
+    source: &str,
+    out: &mut Vec<ExternalConstantRef>,
+) {
+    use parser::{SpannedExprKind, SpannedTerm};
+
+    match &expr.kind {
+        SpannedExprKind::Term(term) => match term {
+            SpannedTerm::ExternalConstant(name) => out.push(ExternalConstantRef {
+                name: name.clone(),
+                span: exact_external_constant_span(source, &expr.span),
+            }),
+            SpannedTerm::Invocation(invocation) => {
+                collect_external_constants_in_invocation(invocation, source, out)
+            }
+            SpannedTerm::Parenthesized(inner) => collect_external_constants(inner, source, out),
+            SpannedTerm::Literal(_) => {}
+        },
+        SpannedExprKind::Invocation(base, invocation) => {
+            collect_external_constants(base, source, out);
+            collect_external_constants_in_invocation(invocation, source, out);
+        }
+        SpannedExprKind::Indexer(base, index) => {
+            collect_external_constants(base, source, out);
+            collect_external_constants(index, source, out);
+        }
+        SpannedExprKind::Polarity(_, inner) => collect_external_constants(inner, source, out),
+        SpannedExprKind::Multiplicative(left, _, right)
+        | SpannedExprKind::Additive(left, _, right)
+        | SpannedExprKind::Inequality(left, _, right)
+        | SpannedExprKind::Equality(left, _, right)
+        | SpannedExprKind::Membership(left, _, right)
+        | SpannedExprKind::Or(left, _, right)
+        | SpannedExprKind::Union(left, right)
+        | SpannedExprKind::And(left, right)
+        | SpannedExprKind::Implies(left, right) => {
+            collect_external_constants(left, source, out);
+            collect_external_constants(right, source, out);
+        }
+        SpannedExprKind::Type(inner, _, _) => collect_external_constants(inner, source, out),
+        SpannedExprKind::Lambda(_, inner) => collect_external_constants(inner, source, out),
+        SpannedExprKind::InstanceSelector(_, fields) => {
+            for (_, field_expr) in fields {
+                collect_external_constants(field_expr, source, out);
+            }
+        }
+    }
+}
+
+fn collect_external_constants_in_invocation(
+    invocation: &parser::SpannedInvocation,
+    source: &str,
+    out: &mut Vec<ExternalConstantRef>,
+) {
+    if let parser::SpannedInvocation::Function(_, args) = invocation {
+        for arg in args {
+            collect_external_constants(arg, source, out);
+        }
+    }
+}
+
+/// Recomputes the exact `(position, length)` of an external-constant token
+/// from `source`, discarding any trailing whitespace [`parser::spanned_parser`]
+/// folded into `padded_span` (see [`external_constants`]'s doc comment).
+///
+/// Falls back to `padded_span` unchanged if `source` doesn't start a valid
+/// external constant at that position — which should never happen for a
+/// span the parser itself produced, but a silent fallback is safer for a
+/// diagnostics helper than panicking on an unexpected drift between this
+/// and the grammar.
+fn exact_external_constant_span(source: &str, padded_span: &parser::ExprSpan) -> parser::ExprSpan {
+    let tail = source.get(padded_span.position..).unwrap_or("");
+    match external_constant_token_len(tail) {
+        Some(length) => parser::ExprSpan {
+            position: padded_span.position,
+            length,
+        },
+        None => padded_span.clone(),
+    }
+}
+
+/// Given `source` starting exactly at the `%` of an external constant,
+/// returns the byte length of the token itself — `%` plus the bare
+/// identifier, or plus a `` `delimited` `` / `'quoted'` name including its
+/// closing delimiter. Returns `None` if `source` doesn't start with `%`
+/// followed by a syntactically valid external-constant name.
+///
+/// Delimited/quoted forms may contain `\`-escaped characters (matching the
+/// `esc` rule [`parser::parser`] and [`parser::spanned_parser`] both use for
+/// these tokens); this only needs to skip over them without decoding them,
+/// since the decoded name is already available from the parsed AST.
+fn external_constant_token_len(source: &str) -> Option<usize> {
+    if !source.starts_with('%') {
+        return None;
+    }
+    let after_percent = '%'.len_utf8();
+    let rest = &source[after_percent..];
+    let mut chars = rest.char_indices();
+    match chars.next() {
+        Some((_, delimiter @ ('`' | '\''))) => {
+            let mut escaped = false;
+            for (i, c) in chars {
+                if escaped {
+                    escaped = false;
+                    continue;
+                }
+                match c {
+                    '\\' => escaped = true,
+                    c if c == delimiter => return Some(after_percent + i + c.len_utf8()),
+                    _ => {}
+                }
+            }
+            None // Unterminated — shouldn't happen for a node the parser accepted.
+        }
+        Some((_, first)) if first.is_ascii_alphabetic() || first == '_' => {
+            let mut end = after_percent + first.len_utf8();
+            for (i, c) in chars {
+                if c.is_ascii_alphanumeric() || c == '_' {
+                    end = after_percent + i + c.len_utf8();
+                } else {
+                    break;
+                }
+            }
+            Some(end)
+        }
+        _ => None,
+    }
+}
+
+/// The environment variables [`evaluator`] resolves as special cases when
+/// evaluating `%name` — the fixed subset of the [FHIRPath environment
+/// variables](https://hl7.org/fhirpath/2025Jan/#environment-variables) that
+/// have a single literal name. Excludes the `%vs-[name]`/`%ext-[name]`
+/// families, which are patterns rather than enumerable names, and
+/// `%terminologies`, which is a namespace object rather than a value.
+///
+/// Kept in sync with [`evaluator`]'s handling of these names by a test
+/// (`each_environment_variable_evaluates_without_an_undefined_variable_error`)
+/// that evaluates `%<name>` for each entry against a minimal context and
+/// asserts it does not produce the "undefined variable" error an unknown
+/// name like `%definitelyUnknown` does.
+pub fn environment_variables() -> &'static [&'static str] {
+    &[
+        "context",
+        "resource",
+        "rootResource",
+        "ucum",
+        "sct",
+        "loinc",
+    ]
+}
+
+/// Returns `true` if `name` (without the leading `%`) is one of
+/// [`environment_variables`].
+pub fn is_environment_variable(name: &str) -> bool {
+    environment_variables().contains(&name)
 }

@@ -157,8 +157,8 @@ const ROUTES: &[Route] = &[
     // walk; the POST arm is exercised by `tests/import.rs`.
     Route {
         path: "/ui/hts/import",
-        // Fluent en value for `hts-import-heading` is "Import terminology".
-        expect: ">Import terminology<",
+        // Fluent en value for `hts-import-heading` is "Import Terminology".
+        expect: ">Import Terminology<",
     },
     // Capability & Conformance. One entry — the page mirrors HFS's own
     // capability page (stacked `.card` sections, no tab strip), so there is

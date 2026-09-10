@@ -62,9 +62,11 @@ status-only kick-off (no `manifestUrl`) they have nothing to attach to and are i
 | `HFS_BULK_SUBMIT_S3_BUCKET` | none | S3 bucket, required when output backend is s3 |
 | `HFS_BULK_SUBMIT_REQUIRES_ACCESS_TOKEN` | `auto` | Manifest posture; false is invalid with local-fs |
 | `HFS_BULK_SUBMIT_WORKER_CONCURRENCY` | `2` | In-process submit worker count |
+| `HFS_BULK_SUBMIT_FILE_CONCURRENCY` | `1` | Files of one manifest ingested at once (fan-out); always `1` on SQLite, where fan-out is not supported |
 | `HFS_BULK_SUBMIT_DISABLE_LOCAL_WORKER` | `false` | Disable in-pod workers |
 | `HFS_BULK_SUBMIT_MAX_CONCURRENT_PER_TENANT` | `4` | Per-tenant active submission cap; returns `429` |
 | `HFS_BULK_SUBMIT_BATCH_SIZE` | `1000` | Ingestion batch size |
+| `HFS_BULK_SUBMIT_DEFER_INDEXING` | `true` | Bulk fast-load (#903): ingest without search-index/FTS writes, then rebuild with an automatic per-type reindex when each manifest finishes. Default since #946 — ~1.2x faster end to end. Honoured on MongoDB only since #1000, where it was silently inert. A restart before that rebuild lands leaves the data stored but unsearchable; set `false` to close that window |
 | `HFS_BULK_SUBMIT_LEASE_DURATION` | `60` | Manifest lease length in seconds; must exceed heartbeat |
 | `HFS_BULK_SUBMIT_HEARTBEAT_INTERVAL` | `20` | Worker heartbeat cadence in seconds |
 | `HFS_BULK_SUBMIT_CLEANUP_INTERVAL` | `300` | Cleanup scan interval in seconds |
@@ -103,4 +105,8 @@ The backend capability splits into `BulkSubmitIngest` (the synchronous `BulkSubm
   `{relation: next, url: .../bulk-submit-status/{token}?page=N}` entry; every other manifest field repeats
   identically on each page. Fetch pages from the status URL with `?page=N` (1-based) — out of range is `404`,
   malformed is `400`. Page size `0` disables pagination and yields one manifest with an empty `link`.
+- File fan-out is backend-aware. `HFS_BULK_SUBMIT_FILE_CONCURRENCY` is honoured as configured on the concurrent-writer backends (PostgreSQL, MongoDB, S3), but file fan-out is **not supported on SQLite**: `effective_file_concurrency` returns `1` there whatever the operator configured, and a `WARN` at startup names the configured and effective values. SQLite serialises writers, so any fan-out above one queues each batch's writes behind a single exclusive lock until they outlast `busy_timeout` and abort the manifest outright. Any file fan-out at all requires PostgreSQL.
+- The manifest bookkeeping and resource writes retry with bounded exponential backoff when SQLite reports the database busy or locked, instead of failing the ingest. The retry budget is an elapsed-time deadline bounded by the manifest lease, so a retrying write can never outlive the lease it holds. Every other error still surfaces on the first attempt.
+- With `HFS_BULK_SUBMIT_DEFER_INDEXING=true` (bulk fast-load, #903 — **the default since #946**) ingestion skips the search-index and FTS writes and an automatic per-type reindex rebuilds them when each manifest finishes. Reads and history are complete throughout; search sees a manifest's resources once its reindex lands. That rebuild is started *after* the manifest is already terminal and is fire-and-forget, so `$bulk-submit-status` answers `200` while search is still incomplete, and the job lives only in an in-memory map — nothing records that indexing is outstanding and nothing re-fires it at startup. A restart in that window is not recoverable on its own.
+- MongoDB ingests a batch, not an entry (#1000): one `find` resolves which ids already exist, then one `insert`/`update` command per collection. The per-entry path it replaced cost ~9 round trips per resource and ran at ~60–76 resources/s with the server two-thirds idle; batched it reaches ~720, and ~3 100 with indexing deferred. The flush is ordered commands, not one transaction — the per-entry path was not atomic across a batch either, and a batch-wide transaction would widen #1001 from one lost entry to a whole batch.
 - Cleanup periodically removes status artifacts for submissions whose `updated_at` exceeds `HFS_BULK_SUBMIT_OUTPUT_TTL`.

@@ -186,3 +186,94 @@ pub trait ExportOutputStore: Send + Sync {
         job_id: &ExportJobId,
     ) -> StorageResult<()>;
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io;
+    use std::pin::Pin;
+    use std::sync::{Arc, Mutex};
+    use std::task::{Context, Poll};
+
+    struct ShortWriter {
+        bytes: Arc<Mutex<Vec<u8>>>,
+        fail_after: Option<usize>,
+    }
+
+    impl AsyncWrite for ShortWriter {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            input: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            let mut bytes = self.bytes.lock().unwrap();
+            let remaining = self
+                .fail_after
+                .map(|limit| limit.saturating_sub(bytes.len()))
+                .unwrap_or(usize::MAX);
+            if remaining == 0 {
+                return Poll::Ready(Err(io::Error::other("injected write failure")));
+            }
+            let accepted = input.len().min(2).min(remaining);
+            bytes.extend_from_slice(&input[..accepted]);
+            Poll::Ready(Ok(accepted))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn test_short_writes_complete_lines_and_count_bytes() {
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let mut writer = ExportPartWriter::new(Box::pin(ShortWriter {
+            bytes: bytes.clone(),
+            fail_after: None,
+        }));
+        assert_eq!(writer.line_count, 0);
+        assert_eq!(writer.byte_count, 0);
+        writer.write_line(r#"{"id":"é"}"#).await.unwrap();
+        assert_eq!(writer.line_count, 1);
+        assert_eq!(writer.byte_count, "{\"id\":\"é\"}\n".len() as u64);
+        writer.write_line(r#"{"id":"2"}"#).await.unwrap();
+        let expected = "{\"id\":\"é\"}\n{\"id\":\"2\"}\n";
+        assert_eq!(writer.line_count, 2);
+        assert_eq!(writer.byte_count, expected.len() as u64);
+        assert_eq!(*bytes.lock().unwrap(), expected.as_bytes());
+    }
+
+    async fn assert_failed_line_preserves_counts(accepted_payload_bytes: usize) {
+        let first = r#"{"id":"1"}"#;
+        let failed = r#"{"id":"2"}"#;
+        let prefix = format!("{first}\n");
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let mut writer = ExportPartWriter::new(Box::pin(ShortWriter {
+            bytes: bytes.clone(),
+            fail_after: Some(prefix.len() + accepted_payload_bytes),
+        }));
+        writer.write_line(first).await.unwrap();
+        let error = writer.write_line(failed).await.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert_eq!(error.to_string(), "injected write failure");
+        assert_eq!(writer.line_count, 1);
+        assert_eq!(writer.byte_count, prefix.len() as u64);
+        let mut expected = prefix.into_bytes();
+        expected.extend_from_slice(&failed.as_bytes()[..accepted_payload_bytes]);
+        assert_eq!(*bytes.lock().unwrap(), expected);
+    }
+
+    #[tokio::test]
+    async fn test_payload_failure_preserves_counts() {
+        assert_failed_line_preserves_counts(3).await;
+    }
+
+    #[tokio::test]
+    async fn test_newline_failure_preserves_counts() {
+        assert_failed_line_preserves_counts(r#"{"id":"2"}"#.len()).await;
+    }
+}

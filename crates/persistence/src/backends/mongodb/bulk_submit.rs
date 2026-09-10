@@ -46,9 +46,13 @@ use crate::core::bulk_export::ExportJobId;
 use crate::core::bulk_export_worker::{LeaseError, WorkerId};
 use crate::core::bulk_submit::{
     BulkEntryOutcome, BulkEntryResult, BulkProcessingOptions, BulkSubmitProvider,
-    BulkSubmitRollbackProvider, ChangeType, EntryCountSummary, ManifestStatus, NdjsonEntry,
+    BulkSubmitRollbackProvider, ChangeType, EntryCountSummary, EntryResultContinuation,
+    EntryResultPage, ManifestPhase, ManifestStatus, NdjsonEntry, PagedEntryResult,
     StreamProcessingResult, StreamingBulkSubmitProvider, SubmissionChange, SubmissionId,
-    SubmissionManifest, SubmissionStatus, SubmissionSummary,
+    SubmissionManifest, SubmissionStatus, SubmissionSummary, invalid_entry_result_page,
+};
+use crate::core::bulk_submit_publication::{
+    ManifestPublicationResult, ManifestPublicationStatus, canonical_publication_files,
 };
 use crate::core::bulk_submit_worker::{
     ManifestFetchParams, ManifestLease, ManifestWorkerView, PollTokenTarget, SubmitClaimStrategy,
@@ -58,6 +62,7 @@ use crate::error::{BackendError, BulkSubmitError, ResourceError, StorageError, S
 use crate::tenant::{TenantContext, TenantId, TenantPermissions};
 
 use super::MongoBackend;
+use super::bulk_ingest::BatchOutcome;
 
 /// Submissions: one document per `(tenant, submitter, submission_id)`.
 pub(crate) const SUBMISSIONS_COLLECTION: &str = "bulk_submissions";
@@ -204,6 +209,12 @@ fn decode_manifest(doc: &Document) -> StorageResult<SubmissionManifest> {
         failed_entries: doc.get_i64("failed_entries").unwrap_or(0).max(0) as u64,
         bytes_processed: doc.get_i64("bytes_processed").unwrap_or(0).max(0) as u64,
         bytes_total: doc.get_i64("bytes_total").unwrap_or(0).max(0) as u64,
+        // Absent on documents written before #953, and an unrecognized value
+        // from a newer writer degrades to `None` rather than failing the read —
+        // the phase is cosmetic, so it must never break a status poll.
+        phase: opt_str(doc, "phase").and_then(|s| s.parse::<ManifestPhase>().ok()),
+        files_done: doc.get_i64("files_done").unwrap_or(0).max(0) as u64,
+        files_total: doc.get_i64("files_total").unwrap_or(0).max(0) as u64,
     })
 }
 
@@ -354,111 +365,50 @@ impl MongoBackend {
         Ok(summary)
     }
 
-    /// Ingests one NDJSON entry: upserts the resource per the import mode and
-    /// records a rollback change.
-    async fn process_single_entry(
+    /// The rollback-log document for one change.
+    ///
+    /// Shared with the batched ingest (#1000), which writes a whole batch's
+    /// changes in one `insert` instead of one per entry, so both paths record a
+    /// change identically by construction.
+    pub(super) fn change_document(
         &self,
         tenant: &TenantContext,
         submission_id: &SubmissionId,
-        manifest_id: &str,
-        entry: &NdjsonEntry,
-        options: &BulkProcessingOptions,
-    ) -> StorageResult<BulkEntryResult> {
-        if let Some(resource_type) = entry.resource.get("resourceType").and_then(|v| v.as_str())
-            && resource_type != entry.resource_type
-        {
-            return Ok(BulkEntryResult::validation_error(
-                entry.line_number,
-                &entry.resource_type,
-                serde_json::json!({
-                    "resourceType": "OperationOutcome",
-                    "issue": [{
-                        "severity": "error",
-                        "code": "invalid",
-                        "diagnostics": format!(
-                            "resourceType mismatch: entry={}, payload={}",
-                            entry.resource_type, resource_type
-                        )
-                    }]
-                }),
-            ));
-        }
-
-        let existing = match entry.resource_id.as_deref() {
-            Some(id) => match self.read(tenant, &entry.resource_type, id).await {
-                Ok(found) => found,
-                // A tombstoned resource is a create target, not an error.
-                Err(StorageError::Resource(ResourceError::Gone { .. })) => None,
-                Err(e) => return Err(e),
-            },
+        change: &SubmissionChange,
+    ) -> StorageResult<Document> {
+        let previous_content = match &change.previous_content {
+            Some(v) => Some(json_string(v)?),
             None => None,
         };
-
-        if let Some(current) = existing {
-            if !options.allow_updates {
-                return Ok(BulkEntryResult::skipped(
-                    entry.line_number,
-                    &entry.resource_type,
-                    "updates not allowed",
-                ));
-            }
-            let content = options.content_for_update(current.content(), &entry.resource);
-            let updated = self.update(tenant, &current, content).await?;
-            let change = SubmissionChange::update(
-                manifest_id,
-                &entry.resource_type,
-                updated.id(),
-                current.version_id(),
-                updated.version_id(),
-                current.content().clone(),
-            );
-            self.record_change(tenant, submission_id, &change).await?;
-            return Ok(BulkEntryResult::success(
-                entry.line_number,
-                &entry.resource_type,
-                updated.id(),
-                false,
-            ));
-        }
-
-        let created = self
-            .create(
-                tenant,
-                &entry.resource_type,
-                entry.resource.clone(),
-                FhirVersion::default_enabled(),
-            )
-            .await?;
-        let change = SubmissionChange::create(
-            manifest_id,
-            &entry.resource_type,
-            created.id(),
-            created.version_id(),
-        );
-        self.record_change(tenant, submission_id, &change).await?;
-        Ok(BulkEntryResult::success(
-            entry.line_number,
-            &entry.resource_type,
-            created.id(),
-            true,
-        ))
+        let mut document = submission_filter(tenant, submission_id);
+        document.insert("change_id", &change.change_id);
+        document.insert("manifest_id", &change.manifest_id);
+        document.insert("change_type", change.change_type.to_string());
+        document.insert("resource_type", &change.resource_type);
+        document.insert("resource_id", &change.resource_id);
+        document.insert("previous_version", change.previous_version.as_deref());
+        document.insert("new_version", &change.new_version);
+        document.insert("previous_content", previous_content);
+        document.insert("changed_at", to_bson_time(change.changed_at));
+        Ok(document)
     }
 
-    /// Upserts one entry result.
+    /// One receipt as an `update` statement (`q`/`u`/`upsert`), so a batch sends
+    /// them all in one command.
     ///
     /// Keyed by `(manifest, file_url, line_number)`: line numbers restart in
     /// every manifest output file, so without the file every file after the
     /// first collides with the first (#457). The upsert is what makes a worker
     /// re-fetching a whole file after a transient failure overwrite its own
     /// earlier rows instead of duplicating them.
-    async fn store_entry_result(
+    pub(super) fn entry_result_statement(
         &self,
         tenant: &TenantContext,
         submission_id: &SubmissionId,
         manifest_id: &str,
         file_url: &str,
         result: &BulkEntryResult,
-    ) -> StorageResult<()> {
+    ) -> StorageResult<Document> {
         let mut key = manifest_filter(tenant, submission_id, manifest_id);
         key.insert("file_url", file_url);
         key.insert("line_number", result.line_number as i64);
@@ -478,13 +428,12 @@ impl MongoBackend {
             "$setOnInsert": key.clone(),
         };
 
-        self.entry_results()
-            .await?
-            .update_one(key, update)
-            .upsert(true)
-            .await
-            .map_err(|e| internal_error(format!("store entry result: {e}")))?;
-        Ok(())
+        Ok(doc! {
+            "q": key,
+            "u": update,
+            "upsert": true,
+            "multi": false,
+        })
     }
 
     /// Applies a fenced `$set`/`$inc` to the leased manifest, reporting
@@ -773,6 +722,9 @@ impl BulkSubmitProvider for MongoBackend {
             lease_expiry: None,
             bytes_processed: 0,
             bytes_total: 0,
+            phase: None,
+            files_done: 0,
+            files_total: 0,
         };
 
         let mut document = manifest_filter(tenant, submission_id, &manifest.manifest_id);
@@ -790,6 +742,9 @@ impl BulkSubmitProvider for MongoBackend {
         document.insert("last_processed_line", 0_i64);
         document.insert("bytes_processed", 0_i64);
         document.insert("bytes_total", 0_i64);
+        // `phase` is deliberately left absent until a worker claims the manifest.
+        document.insert("files_done", 0_i64);
+        document.insert("files_total", 0_i64);
 
         self.manifests()
             .await?
@@ -864,57 +819,25 @@ impl BulkSubmitProvider for MongoBackend {
             .await
             .map_err(|e| internal_error(format!("mark manifest processing: {e}")))?;
 
-        let file_url = options.file_url.as_deref().unwrap_or("");
-        let mut results = Vec::new();
-        let mut error_count = 0u32;
-
-        for entry in entries {
-            if options.max_errors > 0 && error_count >= options.max_errors {
-                if !options.continue_on_error {
-                    return Err(StorageError::BulkSubmit(
-                        BulkSubmitError::MaxErrorsExceeded {
-                            submission_id: submission_id.submission_id.clone(),
-                            max_errors: options.max_errors,
-                        },
-                    ));
-                }
-                let skipped = BulkEntryResult::skipped(
-                    entry.line_number,
-                    &entry.resource_type,
-                    "max errors exceeded",
-                );
-                self.store_entry_result(tenant, submission_id, manifest_id, file_url, &skipped)
-                    .await?;
-                results.push(skipped);
-                continue;
-            }
-
-            let result = match self
-                .process_single_entry(tenant, submission_id, manifest_id, &entry, options)
-                .await
-            {
-                Ok(result) => result,
-                Err(e) => BulkEntryResult::processing_error(
-                    entry.line_number,
-                    &entry.resource_type,
-                    serde_json::json!({
-                        "resourceType": "OperationOutcome",
-                        "issue": [{
-                            "severity": "error",
-                            "code": "exception",
-                            "diagnostics": e.to_string()
-                        }]
-                    }),
-                ),
-            };
-            if result.is_error() {
-                error_count += 1;
-            }
-
-            self.store_entry_result(tenant, submission_id, manifest_id, file_url, &result)
-                .await?;
-            results.push(result);
+        // One batch, a fixed number of commands (#1000). The per-entry pipeline
+        // this replaces made ~9 round trips per resource, which held ingest at
+        // ~60 resources/s with the server 68 % idle.
+        let outcome = self
+            .ingest_batch(tenant, submission_id, manifest_id, &entries, options)
+            .await?;
+        if outcome.aborted_on_max_errors {
+            return Err(StorageError::BulkSubmit(
+                BulkSubmitError::MaxErrorsExceeded {
+                    submission_id: submission_id.submission_id.clone(),
+                    max_errors: options.max_errors,
+                },
+            ));
         }
+        let BatchOutcome {
+            results,
+            error_count,
+            ..
+        } = outcome;
 
         manifests
             .update_one(
@@ -923,6 +846,7 @@ impl BulkSubmitProvider for MongoBackend {
                     "total_entries": results.len() as i64,
                     "processed_entries": results.iter().filter(|r| r.is_success()).count() as i64,
                     "failed_entries": error_count as i64,
+                    "last_processed_line": results.len() as i64,
                 }},
             )
             .await
@@ -932,15 +856,29 @@ impl BulkSubmitProvider for MongoBackend {
         Ok(results)
     }
 
-    async fn get_entry_results(
+    async fn get_entry_results_page(
         &self,
         tenant: &TenantContext,
         submission_id: &SubmissionId,
         manifest_id: &str,
         outcome_filter: Option<BulkEntryOutcome>,
         limit: u32,
-        offset: u32,
-    ) -> StorageResult<Vec<BulkEntryResult>> {
+        continuation: Option<&EntryResultContinuation>,
+    ) -> StorageResult<EntryResultPage> {
+        if limit == 0 {
+            return Err(invalid_entry_result_page(
+                "Receipt page limit must be greater than zero",
+            ));
+        }
+        let offset = match continuation {
+            None => 0,
+            Some(EntryResultContinuation::Offset(offset)) => *offset,
+            Some(EntryResultContinuation::Keyset(_)) => {
+                return Err(invalid_entry_result_page(
+                    "mongodb receipt pages require an offset continuation",
+                ));
+            }
+        };
         let mut filter = manifest_filter(tenant, submission_id, manifest_id);
         if let Some(outcome) = outcome_filter {
             filter.insert("outcome", outcome.to_string());
@@ -957,11 +895,30 @@ impl BulkSubmitProvider for MongoBackend {
             .with_options(options)
             .await
             .map_err(|e| internal_error(format!("query entry results: {e}")))?;
-        Ok(collect(cursor)
+        let results: Vec<_> = collect(cursor)
             .await?
             .iter()
             .map(decode_entry_result)
-            .collect())
+            .collect();
+        let next = if results.len() == limit as usize {
+            Some(EntryResultContinuation::Offset(
+                offset
+                    .checked_add(limit)
+                    .ok_or_else(|| invalid_entry_result_page("Receipt offset exceeds u32 range"))?,
+            ))
+        } else {
+            None
+        };
+        Ok(EntryResultPage {
+            entries: results
+                .into_iter()
+                .map(|result| PagedEntryResult {
+                    result,
+                    stored_identity: None,
+                })
+                .collect(),
+            next,
+        })
     }
 
     async fn get_entry_counts(
@@ -1012,7 +969,10 @@ impl StreamingBulkSubmitProvider for MongoBackend {
             match NdjsonEntry::parse(line_number, line) {
                 Ok(entry) => {
                     if entry.resource_type != resource_type {
+                        // Rejected here, so no batch will charge it to the
+                        // manifest's counters; the worker adds it (#969).
                         result.counts.increment(BulkEntryOutcome::ValidationError);
+                        result.unbatched_errors += 1;
                         if !options.continue_on_error
                             && (options.max_errors == 0
                                 || result.counts.error_count() >= options.max_errors as u64)
@@ -1025,6 +985,7 @@ impl StreamingBulkSubmitProvider for MongoBackend {
                 }
                 Err(parse_err) => {
                     result.counts.increment(BulkEntryOutcome::ValidationError);
+                    result.unbatched_errors += 1;
                     if !options.continue_on_error
                         && (options.max_errors == 0
                             || result.counts.error_count() >= options.max_errors as u64)
@@ -1077,21 +1038,7 @@ impl BulkSubmitRollbackProvider for MongoBackend {
         submission_id: &SubmissionId,
         change: &SubmissionChange,
     ) -> StorageResult<()> {
-        let previous_content = match &change.previous_content {
-            Some(v) => Some(json_string(v)?),
-            None => None,
-        };
-        let mut document = submission_filter(tenant, submission_id);
-        document.insert("change_id", &change.change_id);
-        document.insert("manifest_id", &change.manifest_id);
-        document.insert("change_type", change.change_type.to_string());
-        document.insert("resource_type", &change.resource_type);
-        document.insert("resource_id", &change.resource_id);
-        document.insert("previous_version", change.previous_version.as_deref());
-        document.insert("new_version", &change.new_version);
-        document.insert("previous_content", previous_content);
-        document.insert("changed_at", to_bson_time(change.changed_at));
-
+        let document = self.change_document(tenant, submission_id, change)?;
         self.submission_changes()
             .await?
             .insert_one(document)
@@ -1335,19 +1282,19 @@ impl SubmitWorkerStorage for MongoBackend {
         .await
     }
 
-    async fn update_manifest_progress(
+    async fn add_manifest_progress(
         &self,
         lease: &ManifestLease,
-        processed_entries: u64,
-        failed_entries: u64,
-        last_processed_line: u64,
+        processed_delta: u64,
+        failed_delta: u64,
+        lines_delta: u64,
     ) -> Result<(), LeaseError> {
         self.fenced_update(
             lease,
-            doc! { "$set": {
-                "processed_entries": processed_entries as i64,
-                "failed_entries": failed_entries as i64,
-                "last_processed_line": last_processed_line as i64,
+            doc! { "$inc": {
+                "processed_entries": processed_delta as i64,
+                "failed_entries": failed_delta as i64,
+                "last_processed_line": lines_delta as i64,
             }},
         )
         .await
@@ -1364,6 +1311,27 @@ impl SubmitWorkerStorage for MongoBackend {
             doc! { "$max": {
                 "bytes_processed": bytes_processed as i64,
                 "bytes_total": bytes_total as i64,
+            }},
+        )
+        .await
+    }
+
+    async fn update_manifest_phase(
+        &self,
+        lease: &ManifestLease,
+        phase: ManifestPhase,
+        files_done: u64,
+        files_total: u64,
+    ) -> Result<(), LeaseError> {
+        // `$set`, not `$max`: the counters restart at zero when the worker moves
+        // from `sizing` to `downloading`, so a monotonic update would pin
+        // `files_done` at the previous phase's total.
+        self.fenced_update(
+            lease,
+            doc! { "$set": {
+                "phase": phase.to_string(),
+                "files_done": files_done as i64,
+                "files_total": files_total as i64,
             }},
         )
         .await
@@ -1392,6 +1360,7 @@ impl SubmitWorkerStorage for MongoBackend {
         // token, so a retried write replaces its own row rather than adding a
         // duplicate entry to the status manifest.
         let mut key = submission_filter(&lease.tenant, &lease.submission_id);
+        key.insert("manifest_id", &lease.manifest_id);
         key.insert("file_type", &file.file_type);
         key.insert("resource_type", file.resource_type.as_deref());
         key.insert("part_index", file.part_index as i64);
@@ -1416,6 +1385,28 @@ impl SubmitWorkerStorage for MongoBackend {
             .await
             .map_err(|e| LeaseError::Storage(internal_error(format!("record submit file: {e}"))))?;
         Ok(())
+    }
+
+    /// Publishes by canonical validation, then fenced per-row writes and the
+    /// fenced terminal update. Mongo provides no atomic full-set publication;
+    /// this intentionally preserves the existing non-atomic backend behavior.
+    async fn publish_manifest_artifacts(
+        &self,
+        lease: &ManifestLease,
+        files: &[SubmitFileRecord],
+        terminal: ManifestPublicationStatus,
+    ) -> Result<ManifestPublicationResult, LeaseError> {
+        let canonical = canonical_publication_files(files).map_err(LeaseError::Storage)?;
+        for file in &canonical {
+            self.record_submit_file(lease, file).await?;
+        }
+        match terminal {
+            ManifestPublicationStatus::Completed => self.finish_manifest(lease).await?,
+            ManifestPublicationStatus::Failed { error_message } => {
+                self.fail_manifest(lease, &error_message).await?
+            }
+        }
+        Ok(ManifestPublicationResult::Published)
     }
 
     async fn finish_manifest(&self, lease: &ManifestLease) -> Result<(), LeaseError> {
@@ -1648,6 +1639,8 @@ impl SubmitWorkerStorage for MongoBackend {
                 resource_type: opt_str(d, "resource_type"),
                 part_index: d.get_i64("part_index").unwrap_or(0).max(0) as u32,
                 fencing_token: d.get_i64("fencing_token").unwrap_or(0).max(0) as u64,
+                manifest_id: opt_str(d, "manifest_id"),
+                legacy_locator: opt_str(d, "manifest_id").is_none(),
                 file_path: d.get_str("file_path").unwrap_or_default().to_string(),
                 line_count: d.get_i64("line_count").unwrap_or(0).max(0) as u64,
                 byte_count: d.get_i64("byte_count").unwrap_or(0).max(0) as u64,

@@ -28,7 +28,11 @@ R6 = ["helios-fhir/R6", "helios-rest/R6", "helios-audit/R6", "helios-ui?/R6"]
 # Build options
 skip-r6-download = []
 ui = ["dep:helios-ui"]
-headless = []
+# NOTE: headless operation is a *runtime* switch (`HFS_UI_ENABLED=false`), not a
+# feature. The former `headless` feature was gated as `not(feature = "headless")`
+# and so was enabled — turning the UI off — by `--all-features`, the selection
+# `ci.yml` uses to build the uploaded release artifacts (#975). Never add a
+# negative feature here: `--all-features` cannot express mutual exclusion.
 
 # Database backends
 sqlite = ["helios-rest/sqlite"]
@@ -91,6 +95,12 @@ async-trait = "0.1"
 # Time (used by the bulk-export cleanup task)
 chrono = "0.4"
 serde_json = "1"
+
+[dev-dependencies]
+# Drive the assembled router end-to-end (`oneshot`) so the UI-mount tests
+# assert what the binary actually serves, not what a `cfg` says.
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
 
 # Vendor OpenSSL when cross-compiling for Linux ARM64 (the macOS runner
 # doesn't have target-platform OpenSSL dev libs).  Cargo feature unification

@@ -55,12 +55,12 @@
 //! 2. **Mutate**: [`RailState::select`], [`RailState::select_all`], and
 //!    [`RailState::prune`] are pure functions that return `Some(new_state)`
 //!    only when something actually changed, so a handler writes only when it
-//!    must (RNF2).
+//!    must.
 //! 3. **Persist**: when a mutation returned `Some`, [`persist`] writes it back
 //!    as a tenant-scoped merge patch, best-effort.
 //! 4. **Render**: [`RailState::resolve_recents`] turns the stored `recent`
 //!    list into render-ready rows against the page's *live* rail, applying the
-//!    live-vs-snapshot rule and an optional validity filter (RF6).
+//!    live-vs-snapshot rule and an optional validity filter.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -90,7 +90,7 @@ pub(crate) enum RailPage {
     /// [`RailState::select_all`]'s `last: ""` "All types" state.
     SearchParameters,
     /// The Compartment viewer's definition rail (#237). Remembers `last` only;
-    /// its template does not render a "Recently used" group (see the epic).
+    /// its template does not render a "Recently used" group.
     Compartments,
     /// The SQL on FHIR View Definitions rail (#649, server-paged since #741).
     ViewDefinitions,
@@ -117,7 +117,7 @@ impl RailPage {
 }
 
 /// One entry of `rails.<page>.recent`: an id plus the optional snapshot the
-/// SQL rails write (RF1).
+/// SQL rails write.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct RailEntry {
     pub(crate) id: String,
@@ -171,7 +171,7 @@ pub(crate) struct RailState {
 
 impl RailState {
     /// Reads and sanitizes one page's already tenant-projected `rails.<page>`
-    /// value (RF3). Tolerates any malformed shape without panicking:
+    /// value. Tolerates any malformed shape without panicking:
     ///
     /// - missing or non-object input yields the empty (never-selected) state;
     /// - a `recent` entry with no string `id` is dropped;
@@ -218,8 +218,8 @@ impl RailState {
         Self { last, recent }
     }
 
-    /// RF4 `select`: moves (or inserts) `entry` to the front of `recent`,
-    /// capped at [`MAX_RECENT`], and sets `last` to its id.
+    /// Moves (or inserts) `entry` to the front of `recent`, capped at
+    /// [`MAX_RECENT`], and sets `last` to its id.
     ///
     /// If `entry.id` was already present in `recent`, its old position is
     /// dropped and its snapshot is replaced by `entry`'s — a re-selection
@@ -249,9 +249,9 @@ impl RailState {
         })
     }
 
-    /// RF4 `select_all`: sets `last` to `Some("")` ("explicitly all"),
-    /// leaving `recent` untouched — Search Parameters' only user of this
-    /// method. Returns `None` when `last` was already `""`.
+    /// Sets `last` to `Some("")` ("explicitly all"), leaving `recent`
+    /// untouched — Search Parameters' only user of this method. Returns
+    /// `None` when `last` was already `""`.
     pub(crate) fn select_all(&self) -> Option<Self> {
         if self.last.as_deref() == Some("") {
             return None;
@@ -262,17 +262,16 @@ impl RailState {
         })
     }
 
-    /// RF4 `prune`: removes `id` from `recent`, and clears `last` when it
-    /// named `id` (without promoting a new `recent[0]` — the page's normal
-    /// resolution order takes over from an absent `last`). Returns `None` when
-    /// `id` was neither in `recent` nor `last`, the no-op case a caller can
-    /// skip writing for.
+    /// Removes `id` from `recent`, and clears `last` when it named `id`
+    /// (without promoting a new `recent[0]` — the page's normal resolution
+    /// order takes over from an absent `last`). Returns `None` when `id` was
+    /// neither in `recent` nor `last`, the no-op case a caller can skip
+    /// writing for.
     ///
     /// The type rails never call this: a stale type is simply hidden by
-    /// [`Self::resolve_recents`]'s `is_valid` filter (RF6 of ticket 02),
-    /// never written away, since RF1 already lets a stale `last` fall back
-    /// to the page default in silence. The SQL rails (this ticket) prune on
-    /// a stale explicit selection's click ("poda en el click" in the epic).
+    /// [`Self::resolve_recents`]'s `is_valid` filter, never written away,
+    /// since a stale `last` already falls back to the page default in
+    /// silence. The SQL rails prune on a stale explicit selection's click.
     pub(crate) fn prune(&self, id: &str) -> Option<Self> {
         let in_recent = self.recent.iter().any(|e| e.id == id);
         let is_last = self.last.as_deref() == Some(id);
@@ -289,7 +288,7 @@ impl RailState {
         })
     }
 
-    /// RF6: resolves `recent`, in order, against a rail's currently-live items
+    /// Resolves `recent`, in order, against a rail's currently-live items
     /// into render-ready rows — the "Recently used" group.
     ///
     /// For each recent entry: if its id is a key of `live`, the live item's
@@ -301,8 +300,8 @@ impl RailState {
     ///
     /// `is_valid`, when given, hides an entry whose id it rejects (e.g. a
     /// resource type no longer in the active FHIR version) — filtered before
-    /// resolution, so a hidden id costs nothing and, per RF6, is never pruned
-    /// from the stored state just because a render skipped it.
+    /// resolution, so a hidden id costs nothing and is never pruned from the
+    /// stored state just because a render skipped it.
     pub(crate) fn resolve_recents(
         &self,
         live: &HashMap<String, LiveRailItem>,
@@ -335,7 +334,7 @@ impl RailState {
 }
 
 /// Render-ready data for one item currently present in a rail — the "live"
-/// half of [`RailState::resolve_recents`]'s resolution (RF6). Built by the
+/// half of [`RailState::resolve_recents`]'s resolution. Built by the
 /// caller from whatever already renders that page's primary list (e.g. the
 /// shared type rail's entries, or a View Definition search hit); `current`
 /// carries whatever the caller already computed for "is this the selection
@@ -349,8 +348,8 @@ pub(crate) struct LiveRailItem {
     pub(crate) current: bool,
 }
 
-/// One resolved "Recently used" row, ready to render (RF6): whichever of the
-/// live rail's current data or the stored snapshot applied.
+/// One resolved "Recently used" row, ready to render: whichever of the live
+/// rail's current data or the stored snapshot applied.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ResolvedRailEntry {
     pub(crate) id: String,
@@ -363,8 +362,7 @@ pub(crate) struct ResolvedRailEntry {
 
 /// The per-user settings document [`crate::resolve_prefs`] already fetched for
 /// this request, stamped into request extensions so every subsequent handler
-/// can read a rail's state without another [`SettingsStore`] round trip
-/// (RF3, RNF1).
+/// can read a rail's state without another [`SettingsStore`] round trip.
 ///
 /// Carries the resolved settings key, the raw stored document (`None` when no
 /// settings store is configured, the user has never stored anything, or the
@@ -434,7 +432,7 @@ where
 }
 
 /// Writes `state`'s `rails.<page>` slice, scoped to `tenant`, as a JSON merge
-/// patch (RF5). Best-effort: a store error is logged at `warn` and otherwise
+/// patch. Best-effort: a store error is logged at `warn` and otherwise
 /// swallowed — this never surfaces to the caller or the HTTP response, the
 /// same pattern `set_version`/`set_tenant` already use for preference writes.
 ///
@@ -487,7 +485,7 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    // ── RF3: reading and sanitizing ──────────────────────────────────────
+    // ── Reading and sanitizing ────────────────────────────────────────────
 
     #[test]
     fn absent_document_reads_as_the_empty_state() {
@@ -641,7 +639,7 @@ mod tests {
         assert_eq!(RailState::from_raw(None), RailState::default());
     }
 
-    // ── RF4: pure mutations ──────────────────────────────────────────────
+    // ── Pure mutations ────────────────────────────────────────────────────
 
     #[test]
     fn select_inserts_at_the_front() {
@@ -780,7 +778,7 @@ mod tests {
         assert_eq!(state.prune("Patient"), None);
     }
 
-    // ── RF6: resolving recents against the live rail ────────────────────
+    // ── Resolving recents against the live rail ──────────────────────────
 
     #[test]
     fn resolve_recents_prefers_live_data_over_the_snapshot() {
@@ -848,7 +846,7 @@ mod tests {
         assert_eq!(state.recent.len(), 2);
     }
 
-    // ── RF5: persistence ──────────────────────────────────────────────────
+    // ── Persistence ────────────────────────────────────────────────────────
 
     #[tokio::test]
     async fn persist_is_a_silent_no_op_with_no_settings_store() {
@@ -906,7 +904,7 @@ mod tests {
         persist(&settings, "l2:", "acme", RailPage::Resources, &state).await;
     }
 
-    // ── RF3 middleware wiring: exactly one read, and a handler can extract
+    // ── Middleware wiring: exactly one read, and a handler can extract
     //    RequestSettings ────────────────────────────────────────────────
 
     #[tokio::test]
@@ -987,10 +985,10 @@ mod tests {
 
     /// A tiny in-memory [`SettingsStore`] double, local to this module's unit
     /// tests. A separate, `pub` sibling reusable from integration tests
-    /// (`crates/ui/tests/support/mod.rs`) exists for tickets 02-04's
-    /// handler-level HTTP tests — integration tests compile as their own
-    /// crate and cannot reach this module's `pub(crate)` items, so the two
-    /// cannot be shared despite the near-identical implementation.
+    /// (`crates/ui/tests/support/mod.rs`) exists for the handler-level HTTP
+    /// tests — integration tests compile as their own crate and cannot
+    /// reach this module's `pub(crate)` items, so the two cannot be shared
+    /// despite the near-identical implementation.
     mod mock_store {
         use super::*;
         use async_trait::async_trait;
