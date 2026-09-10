@@ -27,6 +27,11 @@
 //! multi-node deployment, poll the node you kicked off against. (Persisting job
 //! state across the cluster is tracked separately.)
 //!
+//! Terminal status is available for up to 24 hours, subject to a limit of the
+//! most recent 1024 statuses whose tasks have exited. Expiration is swept once
+//! per minute. Evicted statuses return 404; tasks still executing (including
+//! cancellation in progress) are protected from eviction.
+//!
 //! # Composite deployments
 //!
 //! The reindex driver writes to *every* search index — the primary's own index

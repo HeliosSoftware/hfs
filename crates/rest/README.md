@@ -132,6 +132,11 @@ the background and is polled via `/$reindex-status/[job_id]`.
 - Job state is held **in memory on the node that accepted the kick-off**, so
   `/$reindex-status/[job_id]` returns `404` from any other node. In a multi-node
   deployment, poll the node you kicked off against.
+- Terminal status is retained for up to **24 hours**, subject to a limit of the
+  **most recent 1024 statuses** whose tasks have exited. Expiration is swept once
+  per minute. Under high job volume, the count limit can evict a status earlier;
+  an evicted status returns `404`. Tasks still executing, including cancellation
+  in progress, are protected. Cancellation channels are released when tasks exit.
 - The `s3` backend standalone has no search index of any kind, so `$reindex`
   there returns `501`. Every other backend and composite supports it.
 - The same applies after a **server upgrade that adds a parameter to the
