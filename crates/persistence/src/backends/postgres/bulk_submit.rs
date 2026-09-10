@@ -14,9 +14,10 @@ use crate::core::bulk_export_worker::{LeaseError, WorkerId};
 use crate::core::bulk_submit::{
     BulkEntryOutcome, BulkEntryResult, BulkProcessingOptions, BulkSubmitProvider,
     BulkSubmitRollbackProvider, CANCELLED_ABORT_REASON, ChangeType, EntryCountSummary,
-    ManifestPhase, ManifestStatus, NdjsonEntry, StreamProcessingResult,
-    StreamingBulkSubmitProvider, SubmissionChange, SubmissionId, SubmissionManifest,
-    SubmissionStatus, SubmissionSummary,
+    EntryResultContinuation, EntryResultCursor, EntryResultPage, ManifestPhase, ManifestStatus,
+    NdjsonEntry, PagedEntryResult, StreamProcessingResult, StreamingBulkSubmitProvider,
+    SubmissionChange, SubmissionId, SubmissionManifest, SubmissionStatus, SubmissionSummary,
+    invalid_entry_result_page,
 };
 use crate::core::bulk_submit_worker::{
     ManifestFetchParams, ManifestLease, ManifestWorkerView, PollTokenTarget, SubmitClaimStrategy,
@@ -828,77 +829,115 @@ impl BulkSubmitProvider for PostgresBackend {
         Ok(results)
     }
 
-    async fn get_entry_results(
+    async fn get_entry_results_page(
         &self,
         tenant: &TenantContext,
         submission_id: &SubmissionId,
         manifest_id: &str,
         outcome_filter: Option<BulkEntryOutcome>,
         limit: u32,
-        offset: u32,
-    ) -> StorageResult<Vec<BulkEntryResult>> {
+        continuation: Option<&EntryResultContinuation>,
+    ) -> StorageResult<EntryResultPage> {
+        if limit == 0 {
+            return Err(invalid_entry_result_page(
+                "Receipt page limit must be greater than zero",
+            ));
+        }
+        let after = match continuation {
+            None => None,
+            Some(EntryResultContinuation::Keyset(cursor)) => Some((
+                cursor.file_url.as_str(),
+                i32::try_from(cursor.line_number).map_err(|_| {
+                    invalid_entry_result_page(
+                        "Receipt cursor line exceeds PostgreSQL INTEGER range",
+                    )
+                })?,
+            )),
+            Some(EntryResultContinuation::Offset(_)) => {
+                return Err(invalid_entry_result_page(
+                    "PostgreSQL receipt pages require a keyset continuation",
+                ));
+            }
+        };
         let client = self.get_client().await?;
-        let tenant_id = tenant.tenant_id().as_str();
-
-        let mut sql =
-            "SELECT line_number, resource_type, resource_id, created, outcome, operation_outcome
+        let mut sql = "SELECT file_url, line_number, resource_type, resource_id, created, outcome, operation_outcome
              FROM bulk_entry_results
-             WHERE tenant_id = $1 AND submitter = $2 AND submission_id = $3 AND manifest_id = $4"
-                .to_string();
-
+             WHERE tenant_id = $1 AND submitter = $2 AND submission_id = $3 AND manifest_id = $4".to_string();
         let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = vec![
-            Box::new(tenant_id.to_string()),
+            Box::new(tenant.tenant_id().as_str().to_string()),
             Box::new(submission_id.submitter.clone()),
             Box::new(submission_id.submission_id.clone()),
             Box::new(manifest_id.to_string()),
         ];
-
         if let Some(outcome) = outcome_filter {
-            sql.push_str(" AND outcome = $5");
+            sql.push_str(&format!(" AND outcome = ${}", params.len() + 1));
             params.push(Box::new(outcome.to_string()));
         }
-
+        if let Some((file, line)) = after {
+            sql.push_str(&format!(
+                " AND (file_url, line_number) > (${}, ${})",
+                params.len() + 1,
+                params.len() + 2
+            ));
+            params.push(Box::new(file.to_string()));
+            params.push(Box::new(line));
+        }
         sql.push_str(&format!(
-            " ORDER BY line_number LIMIT {} OFFSET {}",
-            limit, offset
+            " ORDER BY file_url, line_number LIMIT ${}",
+            params.len() + 1
         ));
-
+        params.push(Box::new(i64::from(limit)));
         let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = params
             .iter()
             .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
             .collect();
-
         let rows = client
             .query(&sql, &param_refs)
             .await
-            .map_err(|e| internal_error(format!("Failed to query results: {}", e)))?;
-
-        let results: Vec<BulkEntryResult> = rows
+            .map_err(|e| internal_error(format!("Failed to query receipt page: {e}")))?;
+        let entries: Vec<PagedEntryResult> = rows
             .iter()
-            .map(|row| {
-                let line_number: i32 = row.get(0);
-                let resource_type: String = row.get(1);
-                let resource_id: Option<String> = row.get(2);
-                let created: Option<bool> = row.get(3);
-                let outcome_str: String = row.get(4);
-                let operation_outcome: Option<Value> = row.get(5);
-
-                let outcome: BulkEntryOutcome = outcome_str
+            .map(|row| -> StorageResult<_> {
+                let decode = |e| internal_error(format!("Failed to decode receipt page: {e}"));
+                let file_url: String = row.try_get(0).map_err(decode)?;
+                let line: i32 = row.try_get(1).map_err(decode)?;
+                let line_number = u64::try_from(line).map_err(|_| {
+                    internal_error("Negative stored receipt line number".to_string())
+                })?;
+                let resource_type = row.try_get(2).map_err(decode)?;
+                let resource_id = row.try_get(3).map_err(decode)?;
+                let created: Option<bool> = row.try_get(4).map_err(decode)?;
+                let outcome_str: String = row.try_get(5).map_err(decode)?;
+                let operation_outcome = row.try_get(6).map_err(decode)?;
+                // Preserve the existing interpretation of unknown outcome labels.
+                let outcome = outcome_str
                     .parse()
                     .unwrap_or(BulkEntryOutcome::ProcessingError);
-
-                BulkEntryResult {
-                    line_number: line_number as u64,
-                    resource_type,
-                    resource_id,
-                    created: created.unwrap_or(false),
-                    outcome,
-                    operation_outcome,
-                }
+                Ok(PagedEntryResult {
+                    stored_identity: Some(EntryResultCursor {
+                        file_url,
+                        line_number,
+                    }),
+                    result: BulkEntryResult {
+                        line_number,
+                        resource_type,
+                        resource_id,
+                        created: created.unwrap_or(false),
+                        outcome,
+                        operation_outcome,
+                    },
+                })
             })
-            .collect();
-
-        Ok(results)
+            .collect::<StorageResult<_>>()?;
+        let next = if entries.len() == limit as usize {
+            entries
+                .last()
+                .and_then(|entry| entry.stored_identity.clone())
+                .map(EntryResultContinuation::Keyset)
+        } else {
+            None
+        };
+        Ok(EntryResultPage { entries, next })
     }
 
     async fn get_entry_counts(

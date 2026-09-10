@@ -94,6 +94,29 @@ database. Useful flags: `--limit` (resources per file), `--batch`, `--defer-inde
 (the `HFS_BULK_SUBMIT_DEFER_INDEXING` path), `--no-phases`, `--keep` (leave the
 database for `dbstat`), `--data-dir`.
 
+`bulk_submit_mongo_bench` is its MongoDB twin (#1000), and needs a live server —
+that ingest path is round-trip-bound, which no in-process fake reproduces. Same
+flags minus the SQLite-only ones, plus `--uri` (or `HFS_MONGO_URI`) and `--db`.
+It drops and recreates its database on every run, so the rate is a cold-index
+rate and two runs compare. It also prints documents-per-resource per collection,
+which is the write-volume half of a MongoDB ingest number:
+
+```bash
+docker run -d --name bench-mongo -p 27018:27018 mongo:7.0 \
+    --port 27018 --replSet rs --bind_ip_all
+docker exec bench-mongo mongosh --port 27018 --quiet \
+    --eval 'rs.initiate({_id:"rs",members:[{_id:0,host:"localhost:27018"}]})'
+
+cargo run --release -p helios-persistence --features mongodb \
+    --example bulk_submit_mongo_bench -- \
+    --uri "mongodb://localhost:27018/?replicaSet=rs" --limit 5000 \
+    /path/to/Condition.ndjson /path/to/Patient.ndjson
+```
+
+Give the container a `--wiredTigerCacheSizeGB` you can actually exceed if you are
+measuring index-pressure decay rather than round trips: the two regimes have
+different fixes, and a run that fits in cache never shows the second one.
+
 ### Benchmarking discipline
 
 Two traps, both of which have produced wrong numbers here:

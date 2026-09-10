@@ -16,9 +16,10 @@ use crate::core::bulk_export_worker::{LeaseError, WorkerId};
 use crate::core::bulk_submit::{
     BulkEntryOutcome, BulkEntryResult, BulkProcessingOptions, BulkSubmitProvider,
     BulkSubmitRollbackProvider, CANCELLED_ABORT_REASON, ChangeType, EntryCountSummary,
-    ManifestPhase, ManifestStatus, NdjsonEntry, StreamProcessingResult,
-    StreamingBulkSubmitProvider, SubmissionChange, SubmissionId, SubmissionManifest,
-    SubmissionStatus, SubmissionSummary,
+    EntryResultContinuation, EntryResultCursor, EntryResultPage, ManifestPhase, ManifestStatus,
+    NdjsonEntry, PagedEntryResult, StreamProcessingResult, StreamingBulkSubmitProvider,
+    SubmissionChange, SubmissionId, SubmissionManifest, SubmissionStatus, SubmissionSummary,
+    invalid_entry_result_page,
 };
 use crate::core::bulk_submit_worker::{
     ManifestFetchParams, ManifestLease, ManifestWorkerView, PollTokenTarget, SubmitClaimStrategy,
@@ -938,76 +939,100 @@ impl BulkSubmitProvider for SqliteBackend {
         Ok(results)
     }
 
-    async fn get_entry_results(
+    async fn get_entry_results_page(
         &self,
         tenant: &TenantContext,
         submission_id: &SubmissionId,
         manifest_id: &str,
         outcome_filter: Option<BulkEntryOutcome>,
         limit: u32,
-        offset: u32,
-    ) -> StorageResult<Vec<BulkEntryResult>> {
+        continuation: Option<&EntryResultContinuation>,
+    ) -> StorageResult<EntryResultPage> {
+        if limit == 0 {
+            return Err(invalid_entry_result_page(
+                "Receipt page limit must be greater than zero",
+            ));
+        }
+        let after = match continuation {
+            None => None,
+            Some(EntryResultContinuation::Keyset(cursor)) => Some((
+                cursor.file_url.as_str(),
+                i64::try_from(cursor.line_number).map_err(|_| {
+                    invalid_entry_result_page("Receipt cursor line exceeds SQLite INTEGER range")
+                })?,
+            )),
+            Some(EntryResultContinuation::Offset(_)) => {
+                return Err(invalid_entry_result_page(
+                    "SQLite receipt pages require a keyset continuation",
+                ));
+            }
+        };
         let conn = self.get_connection()?;
-        let tenant_id = tenant.tenant_id().as_str();
-
-        let mut query =
-            "SELECT line_number, resource_type, resource_id, created, outcome, operation_outcome
+        let mut query = "SELECT file_url, line_number, resource_type, resource_id, created, outcome, operation_outcome
              FROM bulk_entry_results
-             WHERE tenant_id = ?1 AND submitter = ?2 AND submission_id = ?3 AND manifest_id = ?4"
-                .to_string();
-
+             WHERE tenant_id = ? AND submitter = ? AND submission_id = ? AND manifest_id = ?".to_string();
         let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = vec![
-            Box::new(tenant_id.to_string()),
+            Box::new(tenant.tenant_id().as_str().to_string()),
             Box::new(submission_id.submitter.clone()),
             Box::new(submission_id.submission_id.clone()),
             Box::new(manifest_id.to_string()),
         ];
-
         if let Some(outcome) = outcome_filter {
             query.push_str(" AND outcome = ?");
             params_vec.push(Box::new(outcome.to_string()));
         }
-
-        query.push_str(" ORDER BY line_number");
-        query.push_str(&format!(" LIMIT {} OFFSET {}", limit, offset));
-
+        if let Some((file, line)) = after {
+            query.push_str(" AND (file_url, line_number) > (?, ?)");
+            params_vec.push(Box::new(file.to_string()));
+            params_vec.push(Box::new(line));
+        }
+        query.push_str(" ORDER BY file_url, line_number LIMIT ?");
+        params_vec.push(Box::new(i64::from(limit)));
         let params_slice: Vec<&dyn rusqlite::ToSql> =
             params_vec.iter().map(|p| p.as_ref()).collect();
-
-        let mut stmt = conn
-            .prepare(&query)
-            .map_err(|e| internal_error(format!("Failed to prepare results query: {}", e)))?;
-
-        let results: Vec<BulkEntryResult> = stmt
-            .query_map(params_slice.as_slice(), |row| {
-                let line_number: i64 = row.get(0)?;
-                let resource_type: String = row.get(1)?;
-                let resource_id: Option<String> = row.get(2)?;
-                let created: Option<i32> = row.get(3)?;
-                let outcome_str: String = row.get(4)?;
-                let operation_outcome_bytes: Option<Vec<u8>> = row.get(5)?;
-
-                let outcome: BulkEntryOutcome = outcome_str
-                    .parse()
-                    .unwrap_or(BulkEntryOutcome::ProcessingError);
-
-                let operation_outcome =
-                    operation_outcome_bytes.and_then(|b| serde_json::from_slice(&b).ok());
-
-                Ok(BulkEntryResult {
-                    line_number: line_number as u64,
+        let mut stmt = conn.prepare(&query)?;
+        let mut rows = stmt.query(params_slice.as_slice())?;
+        let mut entries = Vec::new();
+        while let Some(row) = rows.next()? {
+            let file_url: String = row.get(0)?;
+            let line: i64 = row.get(1)?;
+            let line_number = u64::try_from(line)
+                .map_err(|_| internal_error("Negative stored receipt line number".to_string()))?;
+            let resource_type = row.get(2)?;
+            let resource_id = row.get(3)?;
+            let created: Option<i32> = row.get(4)?;
+            let outcome_str: String = row.get(5)?;
+            let operation_outcome_bytes: Option<Vec<u8>> = row.get(6)?;
+            let operation_outcome = operation_outcome_bytes
+                .map(|b| serde_json::from_slice(&b))
+                .transpose()?;
+            let outcome = outcome_str
+                .parse()
+                .unwrap_or(BulkEntryOutcome::ProcessingError);
+            entries.push(PagedEntryResult {
+                stored_identity: Some(EntryResultCursor {
+                    file_url,
+                    line_number,
+                }),
+                result: BulkEntryResult {
+                    line_number,
                     resource_type,
                     resource_id,
-                    created: created.map(|c| c != 0).unwrap_or(false),
+                    created: created.is_some_and(|value| value != 0),
                     outcome,
                     operation_outcome,
-                })
-            })
-            .map_err(|e| internal_error(format!("Failed to query results: {}", e)))?
-            .filter_map(|r| r.ok())
-            .collect();
-
-        Ok(results)
+                },
+            });
+        }
+        let next = if entries.len() == limit as usize {
+            entries
+                .last()
+                .and_then(|entry| entry.stored_identity.clone())
+                .map(EntryResultContinuation::Keyset)
+        } else {
+            None
+        };
+        Ok(EntryResultPage { entries, next })
     }
 
     async fn get_entry_counts(
@@ -1994,6 +2019,25 @@ impl SubmitWorkerStorage for SqliteBackend {
         Ok(())
     }
 
+    async fn checkpoint_after_file(&self) {
+        // Fold the WAL back into the database at a file boundary (#978). The
+        // passive auto-checkpoint yields to the back-to-back batch writers and
+        // lets the WAL grow into the multi-gigabyte range over a long ingest,
+        // which slows every read and doubles disk use; a TRUNCATE checkpoint
+        // between files reclaims it while no batch holds the write lock. A
+        // busy return (a reader still in a WAL frame) is fine — the next file
+        // boundary tries again — so this is best-effort and never fails the
+        // ingest. Runs on a blocking thread so the checkpoint's I/O does not
+        // stall an async worker.
+        let backend = self.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            if let Ok(conn) = backend.get_connection() {
+                let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
+            }
+        })
+        .await;
+    }
+
     async fn finish_manifest(&self, lease: &ManifestLease) -> Result<(), LeaseError> {
         // Losing this write to a busy would leave a fully ingested manifest
         // stuck in 'processing' until its lease expires and a worker redoes it
@@ -2392,6 +2436,114 @@ mod tests {
     use crate::core::bulk_submit::CancelToken;
     use crate::tenant::{TenantId, TenantPermissions};
     use serde_json::json;
+
+    mod paging_contract {
+        use crate as persistence;
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/bulk_submit/paging_contract.rs"
+        ));
+    }
+
+    mod consumer_contract {
+        use crate as persistence;
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/bulk_submit/consumer_contract.rs"
+        ));
+    }
+
+    #[tokio::test]
+    async fn bulk_submit_worker_exact_artifacts_across_pages() {
+        consumer_contract::worker_receipts(
+            std::sync::Arc::new(create_test_backend()),
+            &create_test_tenant(),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn bulk_submit_composite_deduplicates_all_pages_on_finish_and_failure() {
+        for (fail, secondary_failure) in
+            [(false, false), (true, false), (false, true), (true, true)]
+        {
+            consumer_contract::composite_receipts(
+                std::sync::Arc::new(create_test_backend()),
+                &create_test_tenant(),
+                crate::core::BackendKind::Sqlite,
+                fail,
+                secondary_failure,
+            )
+            .await;
+        }
+    }
+
+    #[async_trait]
+    impl paging_contract::ReceiptFixture for SqliteBackend {
+        async fn seed_receipts(
+            &self,
+            tenant: &TenantContext,
+            submission: &SubmissionId,
+            manifest: &str,
+            rows: &[paging_contract::ReceiptRow],
+        ) {
+            let conn = self.get_connection().unwrap();
+            let tid = tenant.tenant_id().as_str();
+            conn.execute("INSERT OR IGNORE INTO bulk_submissions (tenant_id,submitter,submission_id,status,created_at,updated_at) VALUES (?1,?2,?3,'complete',datetime('now'),datetime('now'))", params![tid, submission.submitter, submission.submission_id]).unwrap();
+            conn.execute("INSERT OR IGNORE INTO bulk_manifests (tenant_id,submitter,submission_id,manifest_id,status,added_at) VALUES (?1,?2,?3,?4,'completed',datetime('now'))", params![tid, submission.submitter, submission.submission_id, manifest]).unwrap();
+            for row in rows {
+                conn.execute("INSERT INTO bulk_entry_results (tenant_id,submitter,submission_id,manifest_id,file_url,line_number,resource_type,resource_id,outcome) VALUES (?1,?2,?3,?4,?5,?6,'Patient',?7,?8)", params![tid, submission.submitter, submission.submission_id, manifest, row.file, row.line, row.id, row.outcome]).unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn bulk_submit_exact_keyset_pages() {
+        paging_contract::exact_sql_pages(&create_test_backend(), &create_test_tenant(), i64::MAX)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn bulk_submit_corrupt_receipt_is_an_error_not_a_short_page() {
+        use paging_contract::ReceiptFixture;
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+        let sub = SubmissionId::generate("corrupt-receipt");
+        backend
+            .seed_receipts(
+                &tenant,
+                &sub,
+                "manifest",
+                &[paging_contract::ReceiptRow {
+                    file: String::new(),
+                    line: 0,
+                    id: "p".to_string(),
+                    outcome: "processing-error",
+                }],
+            )
+            .await;
+        backend
+            .get_connection()
+            .unwrap()
+            .execute(
+                "UPDATE bulk_entry_results SET operation_outcome = ?1",
+                params![b"not-json".to_vec()],
+            )
+            .unwrap();
+        assert!(
+            backend
+                .get_entry_results_page(&tenant, &sub, "manifest", None, 10, None)
+                .await
+                .is_err()
+        );
+        backend.get_connection().unwrap().execute("UPDATE bulk_entry_results SET operation_outcome = NULL, line_number = 'not-a-number'", []).unwrap();
+        assert!(
+            backend
+                .get_entry_results_page(&tenant, &sub, "manifest", None, 10, None)
+                .await
+                .is_err()
+        );
+    }
 
     fn create_test_backend() -> SqliteBackend {
         let backend = SqliteBackend::in_memory().unwrap();
@@ -3426,5 +3578,47 @@ mod tests {
             Err(StorageError::Backend(BackendError::Internal { .. }))
         ));
         assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// #978: `checkpoint_after_file` truncates the WAL back into the database.
+    /// A file-backed WAL grows with each write until a checkpoint folds it in;
+    /// after the call the `-wal` file is reclaimed (0 bytes on TRUNCATE).
+    #[tokio::test]
+    async fn checkpoint_after_file_truncates_the_wal() {
+        use crate::core::bulk_submit_worker::SubmitWorkerStorage;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("wal-test.db");
+        let backend = SqliteBackend::open(&db_path).unwrap();
+        backend.init_schema().unwrap();
+        let tenant = create_test_tenant();
+
+        // Write enough resources to grow the WAL past its initial size.
+        for i in 0..500 {
+            backend
+                .create(
+                    &tenant,
+                    "Patient",
+                    json!({"resourceType": "Patient", "id": format!("wal-{i}")}),
+                    FhirVersion::default_enabled(),
+                )
+                .await
+                .unwrap();
+        }
+
+        let wal_path = db_path.with_extension("db-wal");
+        let before = std::fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0);
+        assert!(
+            before > 0,
+            "the WAL should have grown before the checkpoint"
+        );
+
+        backend.checkpoint_after_file().await;
+
+        let after = std::fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0);
+        assert!(
+            after < before,
+            "TRUNCATE checkpoint should reclaim the WAL: before={before} after={after}"
+        );
     }
 }

@@ -66,7 +66,7 @@ status-only kick-off (no `manifestUrl`) they have nothing to attach to and are i
 | `HFS_BULK_SUBMIT_DISABLE_LOCAL_WORKER` | `false` | Disable in-pod workers |
 | `HFS_BULK_SUBMIT_MAX_CONCURRENT_PER_TENANT` | `4` | Per-tenant active submission cap; returns `429` |
 | `HFS_BULK_SUBMIT_BATCH_SIZE` | `1000` | Ingestion batch size |
-| `HFS_BULK_SUBMIT_DEFER_INDEXING` | `true` | Bulk fast-load (#903): ingest without search-index/FTS writes, then rebuild with an automatic per-type reindex when each manifest finishes. Default since #946. A restart before that rebuild lands leaves the data stored but unsearchable; set `false` to close that window — see Ingest performance |
+| `HFS_BULK_SUBMIT_DEFER_INDEXING` | `true` | Bulk fast-load (#903): ingest without search-index/FTS writes, then rebuild with an automatic per-type reindex when each manifest finishes. Default since #946; honoured on MongoDB only since #1000, where it was silently inert. A restart before that rebuild lands leaves the data stored but unsearchable; set `false` to close that window — see Ingest performance |
 | `HFS_BULK_SUBMIT_LEASE_DURATION` | `60` | Manifest lease length in seconds; must exceed heartbeat |
 | `HFS_BULK_SUBMIT_HEARTBEAT_INTERVAL` | `20` | Worker heartbeat cadence in seconds |
 | `HFS_BULK_SUBMIT_CLEANUP_INTERVAL` | `300` | Cleanup scan interval in seconds |
@@ -113,12 +113,19 @@ The backend capability splits into `BulkSubmitIngest` (the synchronous `BulkSubm
 - File fan-out is backend-aware. `HFS_BULK_SUBMIT_FILE_CONCURRENCY` is honoured as configured on the concurrent-writer backends (PostgreSQL, MongoDB, S3), but file fan-out is **not supported on SQLite**: `effective_file_concurrency` returns `1` there whatever the operator configured, and a `WARN` at startup names the configured and effective values. SQLite serialises writers, so any fan-out above one queues each batch's writes behind a single exclusive lock until they outlast `busy_timeout` and abort the manifest outright. Any file fan-out at all requires PostgreSQL.
 - The manifest bookkeeping and resource writes retry with bounded exponential backoff when SQLite reports the database busy or locked, instead of failing the ingest. The retry budget is an elapsed-time deadline bounded by the manifest lease, so a retrying write can never outlive the lease it holds. Every other error still surfaces on the first attempt.
 - With `HFS_BULK_SUBMIT_DEFER_INDEXING=true` (bulk fast-load, #903 — **the default since #946**) ingestion skips the search-index and FTS writes and an automatic per-type reindex rebuilds them when each manifest finishes. Reads and history are complete throughout; search sees a manifest's resources once its reindex lands. That rebuild is started *after* the manifest is already terminal and is fire-and-forget (`bulk_submit_worker.rs` → `reindex.rs`, `tokio::spawn`), so `$bulk-submit-status` answers `200` while search is still incomplete, and the job lives only in an in-memory map — no column on `bulk_manifests` records that indexing is outstanding and nothing re-fires it at startup. A restart in that window is not recoverable on its own.
+- MongoDB ingests a batch, not an entry: one `find` resolves which of the batch's ids already exist, then one `insert` or `update` command per collection writes the whole batch (`backends/mongodb/bulk_ingest.rs`). Before #1000 each entry cost ~9 round trips of its own — a `read`, `create`'s second existence probe, the resource and history inserts, a search-index delete and insert, a transaction commit, the rollback record and the receipt — which pinned ingest at ~60–76 resources/s with `mongod` two-thirds idle. The batch flush is a sequence of commands rather than one transaction, on purpose: the per-entry path was not atomic across a batch either, and a batch-wide transaction would turn one transient error into a whole batch of lost entries (#1001). Commands are ordered resources → history → search index → rollback log → receipts, so an interrupted batch is re-processed rather than falsely reported done.
 - Cleanup periodically removes status artifacts for submissions whose `updated_at` exceeds `HFS_BULK_SUBMIT_OUTPUT_TTL`.
 - Abort (`submissionStatus=stopped`) means **stop soon** — neither "stop this instant" nor "stop after the current file". It marks the submission `aborted`, moves its `pending`/`processing` manifests to `failed`, and bars further claims. A manifest already being ingested is stopped cooperatively: the lease keeper re-reads the submission's status on its flush cadence (a few seconds) and trips a cancel token the streaming engine checks between persisted batches, so the worst case is one keeper tick plus one batch, never mid-transaction (#968).
 - A manifest stopped that way keeps the counts it had already recorded — the entries it ingested are **not** rolled back. It writes no `output`/`error` receipts and does not restate its own status, since the abort already owns the outcome.
 - Once an abort has settled a manifest at `failed`, nothing an in-flight worker does may move it back. Three writes enforce that: `finish_manifest` and `fail_manifest` are guarded on `status = 'processing'` (a late verdict returns `LeaseLost` and is a no-op), and both `mark_manifest_processing` and the per-batch status stamp inside the ingest are guarded on `status IN ('pending','processing')` so they only ever *promote* a manifest. Without the last of those the very next batch after an abort silently reset `failed` to `processing` and the abort read as if it had never happened.
 
 ## Ingest performance
+
+The lever depends on the backend, and the two are not interchangeable. On SQLite
+and PostgreSQL the write path was already batched and the lever is
+`HFS_BULK_SUBMIT_DEFER_INDEXING`. On MongoDB the binding constraint until #1000
+was round trips, not work — see *MongoDB* below before quoting any of the SQLite
+numbers at a MongoDB deployment.
 
 `HFS_BULK_SUBMIT_DEFER_INDEXING=true` relocates search indexing to a post-ingest
 reindex and is by far the biggest lever on ingestion alone; the stored resources,
@@ -172,6 +179,51 @@ restart window that operators live with unless they set
 `HFS_BULK_SUBMIT_DEFER_INDEXING=false`. Making the rebuild durable — persisted
 on `bulk_manifests`, re-fired at startup, surfaced in `$bulk-submit-status` —
 would close the window without giving up the speed, and is not done.
+
+### MongoDB
+
+MongoDB was a different problem, and the SQLite numbers above never applied to
+it. Its ingest made ~9 round trips per resource, so it ran at a rate set by
+network latency rather than by how much work the server had to do — #1000
+measured ~60 resources/s with `mongod` at 32 % CPU and HFS idle. #1000 batches
+the whole path: one `find` to resolve existing ids, then one command per
+collection.
+
+Measured on a MongoDB 7.0 single-node replica set, 4 GB WiredTiger cache, 3 000
+Synthea `Condition` + 3 000 `Patient`, release build, batch 1 000:
+
+| | resources/s | vs. before |
+|---|---|---|
+| before #1000 | 76 | — |
+| batched | 720 | 9.5x |
+| batched + `DEFER_INDEXING=true` | 3 137 | 41x |
+
+Document counts per resource are identical before and after (1 `resources`, 1
+`resource_history`, ~21 `search_index`, 1 receipt, 1 rollback record): the win is
+entirely round trips removed, not work skipped. The third row is the one that
+skips work, and it is the row that only exists after #1000 — the switch reached
+`create`/`update`, which have no way to be told to skip indexing, so on MongoDB
+it did nothing. A MongoDB deployment on the default `true` was therefore indexing
+inline *and* rebuilding the same index in the post-manifest reindex: the index
+work twice, for a switch whose whole point is to do it once.
+
+Two things do **not** follow from those numbers:
+
+- **The decay is a separate problem.** #1000 also measured throughput falling
+  with corpus size — 300 resources/s at 2.5 M, 96 at 11 M — because 21
+  `search_index` documents times 11 non-sparse indexes is ~230 index-key
+  insertions per resource, and the resulting index set outgrows the WiredTiger
+  cache (50.7 GB of `search_index` indexes against a 7 GB cache at 8.5 M
+  resources). Batching does not touch that; it is a write-volume problem, and the
+  fix is a narrower index set (`partialFilterExpression` on the value indexes —
+  `value_number` is populated on 0 % of documents, `value_date` on 7 %,
+  `value_uri` on 4 %; two of the eleven, `idx_search_composite` and
+  `idx_search_identifier_type`, index fields the MongoDB search implementation
+  never queries at all). That is a schema migration that rebuilds indexes on the
+  largest collection in the deployment, so it is not in #1000.
+- **`DEFER_INDEXING=true` buys less end to end than 41x**, for the same reason it
+  does on SQLite: the rebuild still has to run. Quote the ingest number as an
+  ingest number.
 
 To find out where the rest of the time goes, profile the write path with the
 phase counters in `helios_persistence::perf` and the `bulk_submit_bench`
