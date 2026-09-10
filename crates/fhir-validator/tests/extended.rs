@@ -53,3 +53,8 @@ fn extended_element_reference() {
 fn extended_primitives() {
     run_extended("primitives.json");
 }
+
+#[test]
+fn extended_content_reference_cardinality() {
+    run_extended("content_reference_cardinality.json");
+}

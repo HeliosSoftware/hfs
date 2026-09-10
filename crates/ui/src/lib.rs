@@ -95,7 +95,8 @@ use axum_embed::ServeEmbed;
 use axum_htmx::{AutoVaryLayer, HxRequest};
 use chrono::{DateTime, Datelike, Duration, Utc};
 use helios_observability::dashboard::{
-    DashboardPoint, DashboardSeries, DashboardSnapshot, DashboardWindow, ExportJobCounts, TypeCount,
+    DashboardPoint, DashboardSeries, DashboardSnapshot, DashboardWindow, ExportJobCounts,
+    SnapshotState, TypeCount,
 };
 use helios_persistence::core::{BulkProviderStore, ResourceStorage, SettingsStore};
 use rust_embed::RustEmbed;
@@ -540,8 +541,11 @@ impl Status {
 /// process uptime from `helios_observability::uptime` (#540); in a cluster it
 /// describes only the node that served this request.
 struct DashboardMetrics {
-    resource_types: String,
-    stored_resources: String,
+    /// `None` while the snapshot is still being computed (#956): there is no
+    /// figure yet, and a zero would be read as one.
+    resource_types: Option<String>,
+    /// `None` under the same condition as [`Self::resource_types`].
+    stored_resources: Option<String>,
     /// Bulk-export jobs for the tenant; `None` renders the unavailable state.
     export_jobs: Option<ExportJobCounts>,
     /// Active bulk-submit (import) jobs for the tenant; `None` renders the
@@ -550,7 +554,8 @@ struct DashboardMetrics {
     /// Formatted process uptime; `None` renders the unavailable state (the
     /// uptime tracker was never initialized).
     uptime: Option<String>,
-    chart_total: String,
+    /// `None` under the same condition as [`Self::resource_types`].
+    chart_total: Option<String>,
 }
 
 /// Process uptime as a short human duration ("3d 4h", "5h 12m", "42m", "18s"),
@@ -664,6 +669,47 @@ struct WindowEntry {
     active: bool,
 }
 
+/// Why the dashboard is showing something other than a complete live reading
+/// — and therefore which notice the page carries (#956).
+///
+/// The three degraded cases used to collapse into one "sample data" banner,
+/// which made a merely-slow window claim the build had no metrics at all and
+/// put invented clinical volumes on screen. They are distinct states with
+/// distinct pages.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum DashboardNotice {
+    /// A complete live snapshot: nothing to say.
+    None,
+    /// A provider is registered but this window's snapshot is still being
+    /// computed. Nothing is charted and no headline figure is shown — waiting
+    /// is rendered as waiting.
+    Pending,
+    /// A live snapshot in which some query failed and was filled in with a
+    /// zero or an empty series (see [`DashboardSnapshot::partial`]).
+    Partial,
+    /// This build has no metrics provider at all, so the placeholder snapshot
+    /// is rendered — and labelled as invented.
+    Sample,
+}
+
+impl DashboardNotice {
+    /// The i18n key of the notice line, or `None` when the page carries none.
+    fn key(self) -> Option<&'static str> {
+        match self {
+            DashboardNotice::None => None,
+            DashboardNotice::Pending => Some("chart-pending-note"),
+            DashboardNotice::Partial => Some("chart-partial-note"),
+            DashboardNotice::Sample => Some("chart-sample-note"),
+        }
+    }
+
+    /// Whether the page is waiting on a snapshot — the chart renders its
+    /// waiting state and the notice offers a retry.
+    fn is_pending(self) -> bool {
+        matches!(self, DashboardNotice::Pending)
+    }
+}
+
 #[derive(Template)]
 #[template(path = "pages/index.html")]
 struct IndexPage {
@@ -679,9 +725,17 @@ struct IndexPage {
     all_types: bool,
     /// Link that flips the "View all resources" toggle.
     all_types_href: String,
-    /// True when no provider answered and the placeholder snapshot is shown â€”
-    /// rendered with an explicit "sample data" notice, never silently (#555).
-    sample_data: bool,
+    /// Which degraded state, if any, this render is in — and so which notice
+    /// the page carries (#555, #956). Never silent.
+    notice: DashboardNotice,
+    /// The same view, re-requested. Rendered as a "retry now" link in the
+    /// pending notice so the page is recoverable without JavaScript.
+    retry_href: String,
+    /// [`Self::retry_href`] with one more attempt spent, or `None` once the
+    /// budget is exhausted. Drives the htmx auto-refresh: the page polls a
+    /// bounded number of times and then leaves the manual link, so a server
+    /// already too busy to answer is not also asked to serve an endless poll.
+    auto_retry_href: Option<String>,
     i18n: I18n,
     /// Which sidebar entry carries `aria-current="page"` (see base.html).
     active_page: &'static str,
@@ -1708,9 +1762,16 @@ async fn index(
     // validation against the actually-plotted set happens in build_dashboard.
     let focus = query_value(query.as_deref(), "focus")
         .filter(|f| !f.is_empty() && f.chars().all(|c| c.is_ascii_alphanumeric()));
+    // `?retry=N` counts the auto-refreshes already spent waiting for a slow
+    // snapshot (#956). Clamped, so a hand-written or looping value can never
+    // buy more than the budget below.
+    let retry = query_value(query.as_deref(), "retry")
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(0)
+        .min(DASH_PENDING_RETRIES);
     render(
         build_index_page(
-            &state, locale, types, window, all_types, spec_types, focus, rv.0, &rt,
+            &state, locale, types, window, all_types, spec_types, focus, retry, rv.0, &rt,
         )
         .await,
     )
@@ -7272,6 +7333,7 @@ async fn status(
                 false,
                 Vec::new(),
                 None,
+                0,
                 rv.0,
                 &rt,
             )
@@ -7349,9 +7411,30 @@ async fn history_diff(locale: RequestLocale, axum::Form(form): axum::Form<DiffFo
     })
 }
 
-/// Assembles the landing page from the live dashboard snapshot, or from
-/// placeholder data when no provider is registered â€” in which case the page
-/// says so explicitly rather than presenting invented numbers as real (#555).
+/// How many times the pending dashboard re-requests itself before it stops and
+/// leaves only the manual retry link (#956).
+///
+/// The wait exists because the machine is busy — typically an import saturating
+/// the same storage the snapshot queries — so the poll has to be bounded: an
+/// unbounded one would keep adding load to exactly the condition it is waiting
+/// out.
+const DASH_PENDING_RETRIES: u32 = 3;
+
+/// Assembles the landing page from the live dashboard snapshot.
+///
+/// Three outcomes, three pages (#956):
+///
+/// - [`SnapshotState::Ready`] renders the figures, flagged as incomplete when
+///   the provider had to fill part of the snapshot in
+///   ([`DashboardSnapshot::partial`]).
+/// - [`SnapshotState::Pending`] — a provider is registered, this window's
+///   snapshot is still computing — renders an explicit waiting state: no
+///   chart, no headline figures, and a retry. Every window switch is a cold
+///   cache key, so this is an ordinary path, not an error.
+/// - [`SnapshotState::NoProvider`] — the build genuinely has no metrics —
+///   renders the placeholder snapshot, labelled as invented (#555).
+///
+/// Only the last of those may show numbers nobody measured, and it says so.
 #[allow(clippy::too_many_arguments)]
 async fn build_index_page(
     state: &WebState,
@@ -7361,16 +7444,52 @@ async fn build_index_page(
     all_types: bool,
     spec_types: Vec<String>,
     focus: Option<String>,
+    retry: u32,
     fhir_version: helios_fhir::FhirVersion,
     tenant: &RequestTenant,
 ) -> IndexPage {
     let status = current_status(state, fhir_version, tenant);
     let i18n = I18n::new(locale);
     let live =
-        helios_observability::dashboard::snapshot(window, &tenant.id, &types, all_types).await;
-    let sample_data = live.is_none();
-    let snapshot = live.unwrap_or_else(|| sample_snapshot(window));
-    let dash = build_dashboard(&snapshot, all_types, &spec_types, focus.as_deref());
+        helios_observability::dashboard::snapshot_state(window, &tenant.id, &types, all_types)
+            .await;
+
+    let (notice, snapshot) = match live {
+        SnapshotState::Ready(s) if s.partial => (DashboardNotice::Partial, s),
+        SnapshotState::Ready(s) => (DashboardNotice::None, s),
+        // Nothing measured yet: an empty snapshot, so every figure renders as
+        // unknown rather than as a number.
+        SnapshotState::Pending => (
+            DashboardNotice::Pending,
+            DashboardSnapshot {
+                window,
+                ..Default::default()
+            },
+        ),
+        SnapshotState::NoProvider => (DashboardNotice::Sample, sample_snapshot(window)),
+    };
+
+    let mut dash = build_dashboard(&snapshot, all_types, &spec_types, focus.as_deref());
+    if notice.is_pending() {
+        // The pending snapshot plots nothing, so the selectors it derived
+        // point at an empty charted set. Rebuild the two that must survive
+        // the wait from what was actually requested, or the retry would come
+        // back with the user's type selection silently dropped.
+        dash.windows = window_entries(&types, window, all_types, focus.as_deref());
+        dash.all_types_href = dash_href(&types, window, !all_types, focus.as_deref());
+        // No figure is known yet, and a zero here reads as a measurement.
+        dash.metrics.resource_types = None;
+        dash.metrics.stored_resources = None;
+        dash.metrics.chart_total = None;
+    }
+
+    // The same view again, one attempt further in. Built from the requested
+    // types rather than the plotted ones: while pending there are none.
+    let retry_base = dash_href(&types, window, all_types, focus.as_deref());
+    let retry_href = format!("{retry_base}&retry={}", retry.saturating_add(1));
+    let auto_retry_href =
+        (notice.is_pending() && retry < DASH_PENDING_RETRIES).then(|| retry_href.clone());
+
     IndexPage {
         status,
         metrics: dash.metrics,
@@ -7380,7 +7499,9 @@ async fn build_index_page(
         windows: dash.windows,
         all_types: dash.all_types,
         all_types_href: dash.all_types_href,
-        sample_data,
+        notice,
+        retry_href,
+        auto_retry_href,
         i18n,
         active_page: "home",
     }
@@ -7420,6 +7541,28 @@ fn dash_href(
         href.push_str(&format!("&focus={f}"));
     }
     href
+}
+
+/// The `1h` / `24h` / `30d` selector, over a given charted set.
+///
+/// Separate from `build_dashboard` because the waiting page needs it too
+/// (#956): its snapshot plots nothing, so the selector has to be rebuilt from
+/// the *requested* types rather than the plotted ones — otherwise switching
+/// window while waiting would quietly drop the user's selection.
+fn window_entries(
+    types: &[String],
+    active: DashboardWindow,
+    all_types: bool,
+    focus: Option<&str>,
+) -> Vec<WindowEntry> {
+    DashboardWindow::ALL
+        .into_iter()
+        .map(|w| WindowEntry {
+            label: w.as_str().to_string(),
+            href: dash_href(types, w, all_types, focus),
+            active: w == active,
+        })
+        .collect()
 }
 
 /// Projects a [`DashboardSnapshot`] into the headline metrics, chart geometry,
@@ -7548,24 +7691,17 @@ fn build_dashboard(
         })
         .collect();
 
-    let windows = DashboardWindow::ALL
-        .into_iter()
-        .map(|w| WindowEntry {
-            label: w.as_str().to_string(),
-            href: dash_href(&charted, w, all_types, focus),
-            active: w == snapshot.window,
-        })
-        .collect();
+    let windows = window_entries(&charted, snapshot.window, all_types, focus);
 
     let metrics = DashboardMetrics {
-        resource_types: snapshot.distinct_types.to_string(),
-        stored_resources: compact_count(snapshot.total_resources),
+        resource_types: Some(snapshot.distinct_types.to_string()),
+        stored_resources: Some(compact_count(snapshot.total_resources)),
         export_jobs: snapshot.export_jobs,
         import_jobs: snapshot.import_jobs_active,
         uptime: format_uptime(helios_observability::uptime::uptime_seconds()),
         chart_total: {
             let sum: u64 = snapshot.series.iter().map(|s| s.total).sum();
-            grouped(sum)
+            Some(grouped(sum))
         },
     };
 
@@ -7895,6 +8031,9 @@ fn sample_snapshot(window: DashboardWindow) -> DashboardSnapshot {
         available,
         export_jobs: None,
         import_jobs_active: None,
+        // Wholly invented rather than partly missing: the page says so with
+        // the sample-data notice, which `partial` must not water down (#956).
+        partial: false,
     }
 }
 
@@ -8052,7 +8191,9 @@ mod tests {
             windows: dash.windows,
             all_types: dash.all_types,
             all_types_href: dash.all_types_href,
-            sample_data: true,
+            notice: DashboardNotice::Sample,
+            retry_href: "/ui?types=&window=30d&retry=1".to_string(),
+            auto_retry_href: None,
             i18n,
             active_page: "home",
         }
@@ -8576,7 +8717,7 @@ mod tests {
         assert!(!patient.href.contains("types=Patient"));
         assert!(patient.href.contains("Observation"));
 
-        assert_eq!(dash.metrics.resource_types, "142");
+        assert_eq!(dash.metrics.resource_types.as_deref(), Some("142"));
     }
 
     /// The window selector offers every window, marks the snapshot's own as
@@ -8677,13 +8818,16 @@ mod tests {
             available: Vec::new(),
             export_jobs: None,
             import_jobs_active: None,
+            partial: false,
         };
         let dash = build_dashboard(&empty, false, &[], None);
         assert!(!dash.chart.has_data);
         assert!(dash.chart.series.is_empty());
         assert!(dash.legend.is_empty());
         assert!(dash.picker.is_empty());
-        assert_eq!(dash.metrics.chart_total, "0");
+        // A measured zero, not an unknown: an empty server has a real "0" to
+        // show, unlike a snapshot still being computed (#956).
+        assert_eq!(dash.metrics.chart_total.as_deref(), Some("0"));
         // The window selector still renders, so an empty server is not a dead end.
         assert_eq!(dash.windows.len(), DashboardWindow::ALL.len());
     }
@@ -8721,6 +8865,7 @@ mod tests {
             }],
             export_jobs: None,
             import_jobs_active: None,
+            partial: false,
         };
         let spec_types = vec![
             "Observation".to_string(),

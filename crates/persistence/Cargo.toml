@@ -26,7 +26,7 @@ cassandra = ["dep:cdrs-tokio", "dep:cdrs-tokio-helpers-derive"]
 mongodb = ["dep:mongodb"]
 neo4j = ["dep:neo4rs"]
 elasticsearch = ["dep:elasticsearch"]
-s3 = ["dep:aws-sdk-s3", "dep:aws-config", "dep:aws-credential-types", "dep:sha2"]
+s3 = ["dep:aws-sdk-s3", "dep:aws-config", "dep:aws-credential-types"]
 
 # Configuration advisor binary
 advisor = ["dep:axum", "dep:tower-http", "dep:tracing-subscriber"]
@@ -96,8 +96,8 @@ elasticsearch = { version = "8.15.0-alpha.1", optional = true }
 aws-sdk-s3 = { version = "1", optional = true, default-features = false, features = ["sigv4a", "default-https-client", "rt-tokio"] }
 aws-config = { version = "1", optional = true }
 aws-credential-types = { version = "1", optional = true }
-# Hashes the per-user settings key into an opaque, fixed-length S3 object name.
-sha2 = { version = "0.10", optional = true }
+# Hashes opaque keys and submit artifact scopes into fixed-length safe names.
+sha2 = { version = "0.10" }
 
 # Audit event integration.
 #
@@ -152,6 +152,10 @@ required-features = ["advisor"]
 [[example]]
 name = "bulk_submit_bench"
 required-features = ["sqlite"]
+
+[[example]]
+name = "bulk_submit_mongo_bench"
+required-features = ["mongodb"]
 
 # Benchmarks will be added later
 # [[bench]]
