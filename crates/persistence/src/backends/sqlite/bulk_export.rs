@@ -142,15 +142,16 @@ impl BulkExportStorage for SqliteBackend {
         let conn = self.get_connection()?;
         let tenant_id = tenant.tenant_id().as_str();
 
-        let (status_str, level_str, group_id, transaction_time, started_at, completed_at, error_message, current_type):
-            (String, String, Option<String>, String, Option<String>, Option<String>, Option<String>, Option<String>) = conn
+        let (status_str, level_str, group_id, transaction_time, started_at, completed_at, error_message, current_type, types_done, types_total):
+            (String, String, Option<String>, String, Option<String>, Option<String>, Option<String>, Option<String>, i64, i64) = conn
             .query_row(
-                "SELECT status, level, group_id, transaction_time, started_at, completed_at, error_message, current_type
+                "SELECT status, level, group_id, transaction_time, started_at, completed_at, error_message, current_type, types_done, types_total
                  FROM bulk_export_jobs
                  WHERE id = ?1 AND tenant_id = ?2",
                 params![job_id.as_str(), tenant_id],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?,
-                          row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?)),
+                          row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?,
+                          row.get(8)?, row.get(9)?)),
             )
             .map_err(|e| {
                 if matches!(e, rusqlite::Error::QueryReturnedNoRows) {
@@ -228,6 +229,8 @@ impl BulkExportStorage for SqliteBackend {
             completed_at,
             type_progress,
             current_type,
+            types_done: types_done as u32,
+            types_total: types_total as u32,
             error_message,
         })
     }
@@ -940,6 +943,44 @@ impl ExportWorkerStorage for SqliteBackend {
         }
     }
 
+    async fn set_export_current_type(
+        &self,
+        tenant: &TenantContext,
+        job_id: &ExportJobId,
+        worker_id: &WorkerId,
+        fencing_token: u64,
+        current_type: Option<&str>,
+        types_done: u32,
+        types_total: u32,
+    ) -> Result<(), LeaseError> {
+        let conn = self.get_connection().map_err(LeaseError::Storage)?;
+        let affected = conn
+            .execute(
+                "UPDATE bulk_export_jobs
+                 SET current_type = ?1, types_done = ?2, types_total = ?3
+                 WHERE id = ?4 AND tenant_id = ?5 AND worker_id = ?6 AND fencing_token = ?7",
+                params![
+                    current_type,
+                    types_done as i64,
+                    types_total as i64,
+                    job_id.as_str(),
+                    tenant.tenant_id().as_str(),
+                    worker_id.as_str(),
+                    fencing_token as i64
+                ],
+            )
+            .map_err(|e| {
+                LeaseError::Storage(internal_error(format!("set_export_current_type: {e}")))
+            })?;
+        if affected == 0 {
+            Err(LeaseError::LeaseLost {
+                job_id: job_id.clone(),
+            })
+        } else {
+            Ok(())
+        }
+    }
+
     async fn record_export_file(
         &self,
         tenant: &TenantContext,
@@ -1002,7 +1043,7 @@ impl ExportWorkerStorage for SqliteBackend {
         let affected = conn
             .execute(
                 "UPDATE bulk_export_jobs
-                 SET status = 'complete', completed_at = ?1
+                 SET status = 'complete', completed_at = ?1, current_type = NULL
                  WHERE id = ?2 AND tenant_id = ?3 AND worker_id = ?4 AND fencing_token = ?5",
                 params![
                     now,
@@ -1035,7 +1076,7 @@ impl ExportWorkerStorage for SqliteBackend {
         let affected = conn
             .execute(
                 "UPDATE bulk_export_jobs
-                 SET status = 'error', error_message = ?1, completed_at = ?2
+                 SET status = 'error', error_message = ?1, completed_at = ?2, current_type = NULL
                  WHERE id = ?3 AND tenant_id = ?4 AND worker_id = ?5 AND fencing_token = ?6",
                 params![
                     error_message,
@@ -1884,6 +1925,129 @@ mod tests {
             .finish_export_job(&tenant, &job_id, &worker_b, lease_b.fencing_token)
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_set_export_current_type_persists_and_clears() {
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+
+        let job_id = backend
+            .start_export(&tenant, test_input(ExportRequest::system()))
+            .await
+            .unwrap();
+        let worker = WorkerId::new("worker-1");
+        let lease = backend
+            .claim_next(&worker, StdDuration::from_secs(60))
+            .await
+            .unwrap()
+            .expect("job claimable");
+
+        backend
+            .set_export_current_type(
+                &tenant,
+                &job_id,
+                &worker,
+                lease.fencing_token,
+                Some("Patient"),
+                1,
+                3,
+            )
+            .await
+            .unwrap();
+
+        let progress = backend.get_export_status(&tenant, &job_id).await.unwrap();
+        assert_eq!(progress.current_type, Some("Patient".to_string()));
+        assert_eq!(progress.types_done, 1);
+        assert_eq!(progress.types_total, 3);
+
+        // The terminal update clears the marker but keeps the counters — they
+        // describe how much of the job ran, which stays true after it ends.
+        backend
+            .finish_export_job(&tenant, &job_id, &worker, lease.fencing_token)
+            .await
+            .unwrap();
+        let progress = backend.get_export_status(&tenant, &job_id).await.unwrap();
+        assert_eq!(progress.current_type, None);
+        assert_eq!(progress.types_done, 1);
+        assert_eq!(progress.types_total, 3);
+    }
+
+    #[tokio::test]
+    async fn test_set_export_current_type_is_fenced() {
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+
+        let job_id = backend
+            .start_export(&tenant, test_input(ExportRequest::system()))
+            .await
+            .unwrap();
+        let worker = WorkerId::new("worker-1");
+        let lease = backend
+            .claim_next(&worker, StdDuration::from_secs(60))
+            .await
+            .unwrap()
+            .expect("job claimable");
+
+        let stale_token = lease.fencing_token + 1;
+        assert!(matches!(
+            backend
+                .set_export_current_type(
+                    &tenant,
+                    &job_id,
+                    &worker,
+                    stale_token,
+                    Some("Patient"),
+                    1,
+                    3,
+                )
+                .await,
+            Err(LeaseError::LeaseLost { .. })
+        ));
+
+        // The status is unchanged by the rejected mutation.
+        let progress = backend.get_export_status(&tenant, &job_id).await.unwrap();
+        assert_eq!(progress.current_type, None);
+        assert_eq!(progress.types_done, 0);
+        assert_eq!(progress.types_total, 0);
+    }
+
+    #[tokio::test]
+    async fn test_fail_export_job_clears_current_type() {
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+
+        let job_id = backend
+            .start_export(&tenant, test_input(ExportRequest::system()))
+            .await
+            .unwrap();
+        let worker = WorkerId::new("worker-1");
+        let lease = backend
+            .claim_next(&worker, StdDuration::from_secs(60))
+            .await
+            .unwrap()
+            .expect("job claimable");
+
+        backend
+            .set_export_current_type(
+                &tenant,
+                &job_id,
+                &worker,
+                lease.fencing_token,
+                Some("Patient"),
+                0,
+                1,
+            )
+            .await
+            .unwrap();
+        backend
+            .fail_export_job(&tenant, &job_id, &worker, lease.fencing_token, "boom")
+            .await
+            .unwrap();
+
+        let progress = backend.get_export_status(&tenant, &job_id).await.unwrap();
+        assert_eq!(progress.current_type, None);
+        assert_eq!(progress.error_message, Some("boom".to_string()));
     }
 
     #[tokio::test]

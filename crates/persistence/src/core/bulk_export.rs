@@ -567,6 +567,12 @@ pub struct ExportProgress {
     /// Current type being processed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub current_type: Option<String>,
+    /// Resource types fully written so far; 0 before the worker starts.
+    #[serde(default)]
+    pub types_done: u32,
+    /// Resource types to write in total; 0 before the worker starts.
+    #[serde(default)]
+    pub types_total: u32,
     /// Error message if status is Error.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_message: Option<String>,
@@ -588,6 +594,8 @@ impl ExportProgress {
             completed_at: None,
             type_progress: Vec::new(),
             current_type: None,
+            types_done: 0,
+            types_total: 0,
             error_message: None,
         }
     }

@@ -10,7 +10,7 @@ use crate::core::bulk_submit_legacy::{
 use crate::error::StorageResult;
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 26;
+pub const SCHEMA_VERSION: i32 = 27;
 
 /// Initialize the database schema.
 pub fn initialize_schema(conn: &Connection) -> StorageResult<()> {
@@ -327,6 +327,7 @@ fn migrate_schema(conn: &Connection, from_version: i32) -> StorageResult<()> {
             23 => migrate_v23_to_v24(conn)?,
             24 => migrate_v24_to_v25(conn)?,
             25 => migrate_v25_to_v26(conn)?,
+            26 => migrate_v26_to_v27(conn)?,
             _ => {
                 return Err(crate::error::StorageError::Backend(
                     crate::error::BackendError::Internal {
@@ -2040,6 +2041,44 @@ fn create_publication_partial_indexes(conn: &Connection) -> StorageResult<()> {
     Ok(())
 }
 
+/// v26 -> v27: types_done/types_total on bulk_export_jobs (#961).
+///
+/// The `current_type` column existed since v6 but nothing wrote it, so a
+/// status poll could never name the resource type an export was currently
+/// writing. `types_done`/`types_total` accompany it so the poll can also show
+/// how far through the type list the worker is — both are `0` on a job the
+/// worker has not yet started.
+fn migrate_v26_to_v27(conn: &Connection) -> StorageResult<()> {
+    let job_columns: Vec<String> = {
+        let mut stmt = conn
+            .prepare("PRAGMA table_info(bulk_export_jobs)")
+            .map_err(|e| migration_err(format!("pragma bulk_export_jobs: {e}")))?;
+        let cols: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .map_err(|e| migration_err(format!("pragma rows: {e}")))?
+            .filter_map(|r| r.ok())
+            .collect();
+        cols
+    };
+    let adds = [
+        (
+            "types_done",
+            "ALTER TABLE bulk_export_jobs ADD COLUMN types_done INTEGER NOT NULL DEFAULT 0",
+        ),
+        (
+            "types_total",
+            "ALTER TABLE bulk_export_jobs ADD COLUMN types_total INTEGER NOT NULL DEFAULT 0",
+        ),
+    ];
+    for (col, sql) in &adds {
+        if !job_columns.iter().any(|c| c == col) {
+            conn.execute(sql, [])
+                .map_err(|e| migration_err(format!("add {col}: {e}")))?;
+        }
+    }
+    Ok(())
+}
+
 /// Drop all tables (for testing).
 #[cfg(test)]
 #[allow(dead_code)]
@@ -3544,5 +3583,28 @@ mod tests {
             )
             .unwrap();
         assert_eq!(has_worker_id, 1);
+    }
+
+    #[test]
+    fn test_initialize_schema_adds_types_done_and_types_total_to_bulk_export_jobs() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+
+        let columns: Vec<String> = conn
+            .prepare("PRAGMA table_info(bulk_export_jobs)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+
+        assert!(
+            columns.iter().any(|c| c == "types_done"),
+            "bulk_export_jobs must have a types_done column"
+        );
+        assert!(
+            columns.iter().any(|c| c == "types_total"),
+            "bulk_export_jobs must have a types_total column"
+        );
     }
 }

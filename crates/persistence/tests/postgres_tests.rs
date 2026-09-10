@@ -6660,6 +6660,69 @@ mod postgres_integration {
     }
 
     #[tokio::test]
+    async fn postgres_integration_export_set_current_type_persists_and_is_fenced() {
+        let _guard = BULK_EXPORT_TEST_LOCK.lock().await;
+        let backend = create_backend().await;
+        let tenant = create_tenant("export-current-type");
+
+        let job_id = backend
+            .start_export(&tenant, export_input(ExportRequest::system()))
+            .await
+            .unwrap();
+
+        let worker = WorkerId::new(format!("pg-current-type-{}", uuid::Uuid::new_v4()));
+        let lease = claim_specific(&backend, &worker, &job_id, StdDuration::from_secs(60)).await;
+
+        backend
+            .set_export_current_type(
+                &tenant,
+                &job_id,
+                &worker,
+                lease.fencing_token,
+                Some("Patient"),
+                1,
+                3,
+            )
+            .await
+            .unwrap();
+
+        let progress = backend.get_export_status(&tenant, &job_id).await.unwrap();
+        assert_eq!(progress.current_type, Some("Patient".to_string()));
+        assert_eq!(progress.types_done, 1);
+        assert_eq!(progress.types_total, 3);
+
+        // A stale fencing token is rejected and leaves the status unchanged.
+        let stale_token = lease.fencing_token + 1000;
+        assert!(matches!(
+            backend
+                .set_export_current_type(
+                    &tenant,
+                    &job_id,
+                    &worker,
+                    stale_token,
+                    Some("Observation"),
+                    2,
+                    3,
+                )
+                .await,
+            Err(LeaseError::LeaseLost { .. })
+        ));
+        let progress = backend.get_export_status(&tenant, &job_id).await.unwrap();
+        assert_eq!(progress.current_type, Some("Patient".to_string()));
+        assert_eq!(progress.types_done, 1);
+
+        // The terminal update clears the marker but keeps the counters.
+        backend
+            .finish_export_job(&tenant, &job_id, &worker, lease.fencing_token)
+            .await
+            .unwrap();
+        let progress = backend.get_export_status(&tenant, &job_id).await.unwrap();
+        assert_eq!(progress.current_type, None);
+        assert_eq!(progress.types_done, 1);
+        assert_eq!(progress.types_total, 3);
+    }
+
+    #[tokio::test]
     async fn postgres_integration_export_count_active_and_expire() {
         let _guard = BULK_EXPORT_TEST_LOCK.lock().await;
         let backend = create_backend().await;

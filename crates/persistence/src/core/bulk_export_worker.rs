@@ -185,6 +185,21 @@ pub trait ExportWorkerStorage: Send + Sync {
         progress: &TypeExportProgress,
     ) -> Result<(), LeaseError>;
 
+    /// Records which resource type the worker is about to write and how far
+    /// through the type list it is. `current_type = None` clears the marker
+    /// (the worker calls it that way once every type is done). Fenced.
+    #[allow(clippy::too_many_arguments)]
+    async fn set_export_current_type(
+        &self,
+        tenant: &TenantContext,
+        job_id: &ExportJobId,
+        worker_id: &WorkerId,
+        fencing_token: u64,
+        current_type: Option<&str>,
+        types_done: u32,
+        types_total: u32,
+    ) -> Result<(), LeaseError>;
+
     /// Idempotent upsert of a finalized output/error file row. Fenced.
     async fn record_export_file(
         &self,
@@ -497,8 +512,21 @@ where
         };
 
         let batch_size = request.batch_size.max(1);
+        let types_total = types.len() as u32;
 
-        for resource_type in &types {
+        for (type_index, resource_type) in types.iter().enumerate() {
+            self.jobs
+                .set_export_current_type(
+                    tenant,
+                    job_id,
+                    wid,
+                    token,
+                    Some(resource_type.as_str()),
+                    type_index as u32,
+                    types_total,
+                )
+                .await?;
+
             // Resume from any persisted cursor for this type.
             let mut cursor: Option<String> = view
                 .type_progress
@@ -649,6 +677,9 @@ where
             }
         }
 
+        self.jobs
+            .set_export_current_type(tenant, job_id, wid, token, None, types_total, types_total)
+            .await?;
         self.jobs
             .finish_export_job(tenant, job_id, wid, token)
             .await?;
@@ -915,10 +946,170 @@ mod tests {
 
             let progress = backend.get_export_status(&tenant, &job_id).await.unwrap();
             assert_eq!(progress.status, ExportStatus::Complete);
+            // The worker clears the in-flight marker on completion and leaves
+            // the counters showing every type as done (#961).
+            assert_eq!(progress.current_type, None);
+            assert_eq!(progress.types_total, 1);
+            assert_eq!(progress.types_done, progress.types_total);
 
             let manifest = backend.get_export_manifest(&tenant, &job_id).await.unwrap();
             let total: u64 = manifest.output.iter().map(|e| e.count).sum();
             assert_eq!(total, 3);
+        }
+
+        /// Wraps [`LocalFsOutputStore`], recording the export status the worker
+        /// sees when it opens the writer for the export's second resource type.
+        ///
+        /// (#961) `BulkExportJobStore` composes three traits
+        /// (`BulkExportStorage + ExportWorkerStorage + ExportClaimStrategy`);
+        /// wrapping it just to spy on `set_export_current_type` calls would mean
+        /// delegating every method of all three to the inner SQLite backend.
+        /// Wrapping `ExportOutputStore` instead (five methods) and reading
+        /// `get_export_status` from inside `open_writer` is far cheaper and
+        /// still proves the worker marks a type as current *before* it starts
+        /// writing it.
+        struct SecondTypeObserver {
+            inner: Arc<LocalFsOutputStore>,
+            backend: Arc<SqliteBackend>,
+            tenant: TenantContext,
+            second_type: String,
+            observed: std::sync::Mutex<Option<(Option<String>, u32)>>,
+        }
+
+        #[async_trait::async_trait]
+        impl ExportOutputStore for SecondTypeObserver {
+            async fn open_writer(
+                &self,
+                key: &ExportPartKey,
+            ) -> StorageResult<crate::core::bulk_export_output::ExportPartWriter> {
+                if key.resource_type == self.second_type {
+                    let already_observed = self.observed.lock().unwrap().is_some();
+                    if !already_observed {
+                        let status = self
+                            .backend
+                            .get_export_status(&self.tenant, &key.job_id)
+                            .await?;
+                        *self.observed.lock().unwrap() =
+                            Some((status.current_type, status.types_done));
+                    }
+                }
+                self.inner.open_writer(key).await
+            }
+
+            async fn finalize_part(
+                &self,
+                key: &ExportPartKey,
+                writer: crate::core::bulk_export_output::ExportPartWriter,
+            ) -> StorageResult<FinalizedPart> {
+                self.inner.finalize_part(key, writer).await
+            }
+
+            async fn download_url(
+                &self,
+                key: &ExportPartKey,
+                ttl: Duration,
+            ) -> StorageResult<crate::core::bulk_export_output::DownloadUrl> {
+                self.inner.download_url(key, ttl).await
+            }
+
+            async fn open_reader(
+                &self,
+                key: &ExportPartKey,
+            ) -> StorageResult<std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send>>> {
+                self.inner.open_reader(key).await
+            }
+
+            async fn delete_job_outputs(
+                &self,
+                tenant: &TenantContext,
+                job_id: &ExportJobId,
+            ) -> StorageResult<()> {
+                self.inner.delete_job_outputs(tenant, job_id).await
+            }
+        }
+
+        /// The worker marks a type as current, with `types_done` reflecting how
+        /// many types are already finished, before it writes the first line of
+        /// that type — not after. See [`SecondTypeObserver`] for why this test
+        /// observes the output store rather than the job store.
+        #[tokio::test]
+        async fn test_run_job_marks_each_type_in_order() {
+            let backend = Arc::new(SqliteBackend::in_memory().unwrap());
+            backend.init_schema().unwrap();
+            let tenant = tenant();
+
+            backend
+                .create(
+                    &tenant,
+                    "Patient",
+                    serde_json::json!({"resourceType": "Patient", "id": "p1"}),
+                    helios_fhir::FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+            backend
+                .create(
+                    &tenant,
+                    "Observation",
+                    serde_json::json!({"resourceType": "Observation", "id": "o1"}),
+                    helios_fhir::FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+
+            let tmp = tempfile::tempdir().unwrap();
+            let inner = Arc::new(LocalFsOutputStore::new(tmp.path(), "http://localhost:8080"));
+            let output = Arc::new(SecondTypeObserver {
+                inner,
+                backend: Arc::clone(&backend),
+                tenant: tenant.clone(),
+                second_type: "Observation".to_string(),
+                observed: std::sync::Mutex::new(None),
+            });
+
+            let job_id = backend
+                .start_export(
+                    &tenant,
+                    StartExportInput {
+                        request: ExportRequest::system()
+                            .with_types(vec!["Patient".to_string(), "Observation".to_string()]),
+                        transaction_time: Utc::now(),
+                        request_url: "http://localhost/$export".to_string(),
+                        owner_subject: Some("sub".to_string()),
+                        fhir_version: helios_fhir::FhirVersion::default(),
+                    },
+                )
+                .await
+                .unwrap();
+
+            let worker_id = WorkerId::new("w-order");
+            let worker = DefaultExportWorker::new(
+                Arc::clone(&backend),
+                Arc::clone(&backend),
+                Arc::clone(&output),
+                worker_id.clone(),
+            );
+
+            let lease = backend
+                .claim_next(&worker_id, Duration::from_secs(60))
+                .await
+                .unwrap()
+                .expect("job claimable");
+
+            worker.run_job(lease).await.unwrap();
+
+            let observed = output.observed.lock().unwrap().clone();
+            assert_eq!(
+                observed,
+                Some((Some("Observation".to_string()), 1)),
+                "the job must already show Observation as current, with 1 type \
+                 done, by the time its writer opens"
+            );
+
+            let progress = backend.get_export_status(&tenant, &job_id).await.unwrap();
+            assert_eq!(progress.current_type, None);
+            assert_eq!(progress.types_done, 2);
+            assert_eq!(progress.types_total, 2);
         }
 
         /// The REST layer audits the kick-off, but only the worker knows how a
