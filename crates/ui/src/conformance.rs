@@ -1061,7 +1061,10 @@ impl HttpConformanceSource {
 /// integer parameters [`HttpConformanceSource::export_status`] reads this
 /// way. `None` when the name is absent or its value isn't a `valueInteger`
 /// that fits a `u32` (the server never sends a negative subject count).
-fn parameter_integer(params: &[Value], name: &str) -> Option<u32> {
+///
+/// `pub(crate)`: `crate::bulk_export::poll_job` reuses this to read the
+/// `$export` status poll's own `typesDone`/`typesTotal` parameters (#961).
+pub(crate) fn parameter_integer(params: &[Value], name: &str) -> Option<u32> {
     params
         .iter()
         .find(|p| p.get("name").and_then(Value::as_str) == Some(name))
@@ -1073,7 +1076,10 @@ fn parameter_integer(params: &[Value], name: &str) -> Option<u32> {
 /// One `valueString` parameter of a `Parameters` resource's `parameter`
 /// array, by name (#853) — `currentSubject` is the only string parameter
 /// [`HttpConformanceSource::export_status`] reads this way.
-fn parameter_string(params: &[Value], name: &str) -> Option<String> {
+///
+/// `pub(crate)`: `crate::bulk_export::poll_job` reuses this to read the
+/// `$export` status poll's own `currentType` parameter (#961).
+pub(crate) fn parameter_string(params: &[Value], name: &str) -> Option<String> {
     params
         .iter()
         .find(|p| p.get("name").and_then(Value::as_str) == Some(name))

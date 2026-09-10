@@ -36,6 +36,7 @@ use serde_json::{Value, json};
 use std::sync::atomic::Ordering;
 use tokio::io::AsyncReadExt;
 
+use crate::conformance::{parameter_integer, parameter_string};
 use crate::i18n::{I18n, RequestLocale};
 use crate::{RequestTenant, RequestVersion, WebState, current_status, render, settings_user_key};
 
@@ -86,6 +87,23 @@ pub struct ExportJob {
     remote_job_id: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub progress: String,
+    /// Resource types fully written as of the last poll (#961); `None`
+    /// before the first poll, against a server that sends no `Parameters`
+    /// body, or in any terminal state — see [`ExportJob::progress`] for the
+    /// same lifecycle. A record persisted before #961 deserializes with
+    /// this `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub types_done: Option<u32>,
+    /// The total resource types in the job as of the last poll (#961); see
+    /// [`ExportJob::types_done`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub types_total: Option<u32>,
+    /// The resource type the last poll reported as currently being written
+    /// (#961, `currentType`). Empty when no type is in flight, the server
+    /// doesn't report it, or in any terminal state; see
+    /// [`ExportJob::progress`].
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub current_type: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub error: String,
     #[serde(default)]
@@ -95,6 +113,19 @@ pub struct ExportJob {
     /// Completion-manifest `output` entries (`{type, url, count?}`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub files: Vec<Value>,
+}
+
+impl ExportJob {
+    /// Clears `types_done`/`types_total`/`current_type` (#961) — called
+    /// alongside `progress` clearing on every transition into a terminal
+    /// state and on every poll failure, so a finished or failed job never
+    /// carries a stale type count from the last poll before it stopped
+    /// reporting progress.
+    fn clear_types_progress(&mut self) {
+        self.types_done = None;
+        self.types_total = None;
+        self.current_type.clear();
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -199,6 +230,9 @@ fn job_merge_value(job: &ExportJob) -> Value {
         },
         "remoteJobId": optional_string(&job.remote_job_id),
         "progress": optional_string(&job.progress),
+        "typesDone": job.types_done,
+        "typesTotal": job.types_total,
+        "currentType": optional_string(&job.current_type),
         "error": optional_string(&job.error),
         "startedAt": job.started_at,
         "finishedAt": optional_string(&job.finished_at),
@@ -520,10 +554,13 @@ struct JobCard {
     name: String,
     status: String,
     status_label: String,
-    progress: String,
     /// `0`–`100` for the progress track (#735): terminal states fill the bar,
     /// in-progress parses the percentage out of the recipient's X-Progress.
     progress_pct: String,
+    /// The in-progress meta line's text (#961): "Writing Observation · 1 of
+    /// 3 types" when the last poll reported type counts, else `progress` or
+    /// the localized waiting message — see [`progress_label`].
+    progress_label: String,
     error: String,
     file_count: usize,
     files: Vec<(String, String)>,
@@ -548,6 +585,40 @@ fn progress_pct(status: &str, progress: &str) -> String {
         .collect();
     let pct: String = digits.chars().rev().collect();
     if pct.is_empty() { "0".to_string() } else { pct }
+}
+
+/// The in-progress meta line's text (#961). With type counts from the last
+/// poll's `Parameters` body, this is `"Writing <type> · <done> of <total>
+/// types"` (the leading "Writing <type>" clause omitted when no type is
+/// currently in flight) — the percentage is already the progress bar's job.
+/// Without counts (a pre-#961 server, or before the first poll), this falls
+/// back to today's raw `progress` string, or the localized waiting message
+/// before the first status report.
+fn progress_label(i18n: &I18n, job: &ExportJob) -> String {
+    let Some(total) = job.types_total else {
+        return if job.progress.is_empty() {
+            i18n.t("bulk-export-progress-waiting")
+        } else {
+            job.progress.clone()
+        };
+    };
+    let done = job.types_done.unwrap_or(0);
+    let writing = if job.current_type.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "{} · ",
+            i18n.t_arg("bulk-export-writing", "name", job.current_type.clone())
+        )
+    };
+    let done_of_total = i18n.t_arg2(
+        "bulk-export-types-progress",
+        "done",
+        done as i64,
+        "total",
+        total as i64,
+    );
+    format!("{writing}{done_of_total}")
 }
 
 fn status_label(i18n: &I18n, status: &str) -> String {
@@ -582,7 +653,7 @@ fn job_card(i18n: &I18n, id: &str, job: &ExportJob, state: &WebState, tenant: &s
         status_label: status_label(i18n, &job.status),
         status: job.status.clone(),
         progress_pct: progress_pct(&job.status, &job.progress),
-        progress: job.progress.clone(),
+        progress_label: progress_label(i18n, job),
         error: job.error.clone(),
         file_count: job.files.len(),
         files: job
@@ -1210,21 +1281,30 @@ pub async fn card(
     render(JobCardFragment { i18n, card })
 }
 
-/// One poll of the export status endpoint.
+/// One poll of the export status endpoint. A `202`'s body is read as the
+/// `typesDone`/`typesTotal`/`currentType` parameters
+/// `crates/rest/src/handlers/sof/export.rs` publishes (#961): a missing
+/// body, one that isn't valid JSON, or a `Parameters` resource without those
+/// parameters simply clears them — never an error, since `X-Progress` alone
+/// is still a perfectly good answer from a server that predates this
+/// extension.
 async fn poll_job(state: &WebState, job: &mut ExportJob, headers: &HeaderMap, tenant: &str) {
     let RemoteJobIdentity::Known(remote_id) = remote_job_identity(job, state, tenant) else {
         job.status = "failed".to_string();
         job.error = "status poll unavailable: remote job identity is unknown".to_string();
+        job.clear_types_progress();
         return;
     };
     let Ok(url) = status_url(state, tenant, &remote_id) else {
         job.status = "failed".to_string();
         job.error = "status poll unavailable: invalid HFS base URL".to_string();
+        job.clear_types_progress();
         return;
     };
     let Ok(client) = no_redirect_client() else {
         job.status = "failed".to_string();
         job.error = "status poll unavailable: HTTP client setup failed".to_string();
+        job.clear_types_progress();
         return;
     };
     let media = crate::lookup::fhir_json(job.fhir_version.unwrap_or(state.fhir_version));
@@ -1241,6 +1321,7 @@ async fn poll_job(state: &WebState, job: &mut ExportJob, headers: &HeaderMap, te
         Err(e) => {
             job.status = "failed".to_string();
             job.error = format!("status poll failed: {e}");
+            job.clear_types_progress();
             return;
         }
     };
@@ -1252,6 +1333,20 @@ async fn poll_job(state: &WebState, job: &mut ExportJob, headers: &HeaderMap, te
                 .and_then(|v| v.to_str().ok())
                 .unwrap_or("in progress")
                 .to_string();
+            let body = response.text().await.unwrap_or_default();
+            let params = serde_json::from_str::<Value>(&body).ok().and_then(|value| {
+                (value.get("resourceType").and_then(Value::as_str) == Some("Parameters"))
+                    .then(|| value.get("parameter").and_then(Value::as_array).cloned())
+                    .flatten()
+            });
+            match params {
+                Some(params) => {
+                    job.types_done = parameter_integer(&params, "typesDone");
+                    job.types_total = parameter_integer(&params, "typesTotal");
+                    job.current_type = parameter_string(&params, "currentType").unwrap_or_default();
+                }
+                None => job.clear_types_progress(),
+            }
         }
         200 => {
             let manifest: Value = response.json().await.unwrap_or(Value::Null);
@@ -1259,11 +1354,13 @@ async fn poll_job(state: &WebState, job: &mut ExportJob, headers: &HeaderMap, te
             job.status = "complete".to_string();
             job.finished_at = now_stamp();
             job.progress = String::new();
+            job.clear_types_progress();
         }
         code => {
             let body = response.text().await.unwrap_or_default();
             job.status = "failed".to_string();
             job.error = format!("{code}: {}", response_diagnostics(&body));
+            job.clear_types_progress();
         }
     }
 }
@@ -1296,6 +1393,7 @@ pub async fn cancel(
         job.status = "cancelled".to_string();
         job.finished_at = now_stamp();
         job.progress = String::new();
+        job.clear_types_progress();
         let _ = store_job_conditionally(
             &state,
             &user_key,
@@ -1325,6 +1423,7 @@ pub async fn retry(
         job.status = "in-progress".to_string();
         job.error = String::new();
         job.progress = String::new();
+        job.clear_types_progress();
         job.files = Vec::new();
         job.poll_url = String::new();
         job.finished_at = String::new();
@@ -1787,5 +1886,48 @@ mod tests {
         };
         let value = serde_json::to_value(&job).unwrap();
         assert!(value.get("until").is_none(), "{value}");
+    }
+
+    /// #961: `typesDone`/`typesTotal`/`currentType` round-trip through JSON
+    /// unchanged, and a job persisted before this field existed still
+    /// deserializes with them at their empty default.
+    #[test]
+    fn test_job_types_progress_round_trips_and_legacy_json_defaults() {
+        let job = ExportJob {
+            name: "Everything".to_string(),
+            scope: "system".to_string(),
+            status: "in-progress".to_string(),
+            types_done: Some(1),
+            types_total: Some(3),
+            current_type: "Observation".to_string(),
+            ..Default::default()
+        };
+
+        let value = serde_json::to_value(&job).expect("job serializes");
+        assert_eq!(value["typesDone"], 1);
+        assert_eq!(value["typesTotal"], 3);
+        assert_eq!(value["currentType"], "Observation");
+        let round_tripped: ExportJob =
+            serde_json::from_value(value).expect("job deserializes back");
+        assert_eq!(round_tripped.types_done, Some(1));
+        assert_eq!(round_tripped.types_total, Some(3));
+        assert_eq!(round_tripped.current_type, "Observation");
+
+        // The settings merge patch carries the same three values verbatim.
+        let merge_value = job_merge_value(&job);
+        assert_eq!(merge_value["typesDone"], 1);
+        assert_eq!(merge_value["typesTotal"], 3);
+        assert_eq!(merge_value["currentType"], "Observation");
+
+        let legacy = json!({
+            "name": "Legacy job",
+            "scope": "system",
+            "status": "in-progress",
+            "startedAt": "2026-01-01T00:00:00Z"
+        });
+        let legacy_job = parse_job(&legacy);
+        assert_eq!(legacy_job.types_done, None);
+        assert_eq!(legacy_job.types_total, None);
+        assert!(legacy_job.current_type.is_empty());
     }
 }
