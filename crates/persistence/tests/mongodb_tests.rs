@@ -3374,6 +3374,85 @@ async fn mongodb_integration_search_offloaded_prevents_search_index_writes() {
     );
 }
 
+/// Schema v8 replaces `idx_resources_type_deleted` with a longer index that also
+/// carries the `$reindex` page order (#1021). The old index is that index's
+/// strict prefix, so keeping both would cost a second B-tree on every write for
+/// no reader — the migration has to actually drop it, on a deployment that
+/// already has it.
+#[tokio::test]
+async fn mongodb_integration_schema_v8_swaps_in_the_reindex_scan_index() {
+    let Some(backend) = create_backend("schema_v8_index_swap").await else {
+        eprintln!(
+            "Skipping mongodb_integration_schema_v8_swaps_in_the_reindex_scan_index (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+
+    let client = raw_test_client(&backend.config().connection_string)
+        .await
+        .expect("failed to connect MongoDB client for index assertions");
+    let database = client.database(&backend.config().database_name);
+    let resources = database.collection::<Document>("resources");
+
+    async fn index_names(collection: &mongodb::Collection<Document>) -> Vec<String> {
+        use futures::stream::TryStreamExt;
+        collection
+            .list_indexes()
+            .await
+            .expect("list indexes")
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("collect indexes")
+            .into_iter()
+            .filter_map(|i| i.options.and_then(|o| o.name))
+            .collect()
+    }
+
+    // Put the collection back into its v7 shape: the superseded index present,
+    // the new one absent, as an upgraded deployment finds it.
+    let _ = resources.drop_index("idx_resources_type_scan").await;
+    resources
+        .create_index(
+            mongodb::IndexModel::builder()
+                .keys(doc! { "tenant_id": 1_i32, "resource_type": 1_i32, "is_deleted": 1_i32 })
+                .options(Some(
+                    mongodb::options::IndexOptions::builder()
+                        .name(Some("idx_resources_type_deleted".to_string()))
+                        .build(),
+                ))
+                .build(),
+        )
+        .await
+        .expect("recreate the v7 index");
+    assert!(
+        index_names(&resources)
+            .await
+            .contains(&"idx_resources_type_deleted".to_string())
+    );
+
+    backend.init_schema().await.expect("re-run schema init");
+
+    let names = index_names(&resources).await;
+    assert!(
+        names.contains(&"idx_resources_type_scan".to_string()),
+        "the reindex page order must be indexed, got {names:?}"
+    );
+    assert!(
+        !names.contains(&"idx_resources_type_deleted".to_string()),
+        "the superseded prefix must be dropped, not kept beside it, got {names:?}"
+    );
+
+    // Idempotent: the second run finds nothing to drop, which is also the
+    // fresh-deployment path.
+    backend
+        .init_schema()
+        .await
+        .expect("schema init is idempotent");
+    let names = index_names(&resources).await;
+    assert!(names.contains(&"idx_resources_type_scan".to_string()));
+    assert!(!names.contains(&"idx_resources_type_deleted".to_string()));
+}
+
 #[tokio::test]
 async fn mongodb_integration_standalone_search_writes_search_index() {
     let Some(backend) = create_backend("search_index_written_standalone").await else {

@@ -159,14 +159,34 @@ async fn drop_index_if_present(collection: &Collection<Document>, name: &str) ->
             tracing::info!(index = name, "dropped superseded MongoDB index");
             Ok(())
         }
-        // `IndexNotFound` (27) is the expected answer on a fresh deployment.
-        Err(e) if e.to_string().contains("index not found") => Ok(()),
+        // `IndexNotFound` (27) is the expected answer on a fresh deployment, and
+        // `NamespaceNotFound` (26) is what a collection that has never been
+        // written answers. Both mean "nothing to drop".
+        //
+        // Matched on the numeric code, not the message: server text is not a
+        // stable interface, and a version that reworded it would turn a no-op
+        // into a startup failure. The message is only a fallback for an error
+        // shape that carries no code.
+        Err(e) if is_missing_index_error(&e) => Ok(()),
         Err(e) => Err(StorageError::Backend(BackendError::Internal {
             backend_name: "mongodb".to_string(),
             message: format!("Failed to drop index {name}: {e}"),
             source: None,
         })),
     }
+}
+
+/// Whether a `dropIndexes` failure means the index (or its collection) was
+/// simply not there.
+fn is_missing_index_error(error: &mongodb::error::Error) -> bool {
+    const NAMESPACE_NOT_FOUND: i32 = 26;
+    const INDEX_NOT_FOUND: i32 = 27;
+
+    if let mongodb::error::ErrorKind::Command(command) = error.kind.as_ref() {
+        return command.code == NAMESPACE_NOT_FOUND || command.code == INDEX_NOT_FOUND;
+    }
+    let message = error.to_string();
+    message.contains("index not found") || message.contains("ns not found")
 }
 
 async fn ensure_history_indexes(database: &Database) -> StorageResult<()> {

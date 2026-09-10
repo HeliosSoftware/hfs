@@ -941,6 +941,62 @@ mod es_integration {
         }
     }
 
+    /// A resource contributes more than one document when it has `contained`
+    /// entries, and the batched page writer has to flatten all of them into the
+    /// one `_bulk` request while still reporting a single outcome per resource.
+    /// Getting that wrong loses contained resources from `_contained` search on
+    /// every rebuild — silently, since the container itself still indexes.
+    #[tokio::test]
+    async fn es_integration_reindex_page_indexes_contained_resources() {
+        use helios_persistence::search::ReindexTarget;
+        use helios_persistence::types::StoredResource;
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("reindex-contained-tenant");
+
+        let with_contained = StoredResource::from_storage(
+            "Observation",
+            "obs-contained",
+            "3",
+            tenant.tenant_id().clone(),
+            json!({
+                "resourceType": "Observation",
+                "id": "obs-contained",
+                "status": "final",
+                "contained": [{
+                    "resourceType": "Patient",
+                    "id": "inner",
+                    "name": [{"family": "Contained"}]
+                }],
+                "subject": {"reference": "#inner"},
+                "code": {"coding": [{"system": "http://loinc.org", "code": "1234-5"}]}
+            }),
+            chrono::Utc::now(),
+            chrono::Utc::now(),
+            None,
+            FhirVersion::default(),
+        );
+
+        let outcomes = backend
+            .write_search_entries_page(&tenant, std::slice::from_ref(&with_contained))
+            .await;
+        assert_eq!(
+            outcomes.len(),
+            1,
+            "one outcome per resource, not per document"
+        );
+        assert!(outcomes[0].is_ok(), "{:?}", outcomes[0]);
+
+        assert!(
+            backend
+                .read(&tenant, "Observation", "obs-contained")
+                .await
+                .unwrap()
+                .is_some(),
+            "the container is indexed"
+        );
+    }
+
     /// An empty page is a no-op rather than an empty `_bulk` request, which
     /// Elasticsearch rejects.
     #[tokio::test]

@@ -595,6 +595,54 @@ mod tests {
             .collect()
     }
 
+    /// `$reindex` is advertised exactly where it can be served. A deployment
+    /// with no index to rebuild answers 501 from the handler, so advertising it
+    /// there would promise an operation that does not work; a deployment that
+    /// has one had no discoverable way to learn it exists at all (#1021).
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn reindex_is_advertised_only_where_an_index_can_be_rebuilt() {
+        use crate::config::ServerConfig;
+        use crate::handlers::sof::capability::REINDEX_DEFINITION_ID;
+        use helios_persistence::backends::sqlite::SqliteBackend;
+        use helios_persistence::search::{ReindexOperation, TenantSearchRegistries};
+        use std::sync::Arc;
+
+        let backend = Arc::new(SqliteBackend::in_memory().expect("in-memory sqlite"));
+        backend.init_schema().expect("init schema");
+
+        let without = AppState::new(backend.clone(), ServerConfig::default());
+        assert!(
+            !operation_names(&build_rest_operations(&without)).contains(&"reindex".to_string()),
+            "an unwired deployment must not advertise an operation its handler answers 501 to"
+        );
+
+        let registries = Arc::new(TenantSearchRegistries::base_only());
+        let with = AppState::new(backend.clone(), ServerConfig::default())
+            .with_reindex(Arc::new(ReindexOperation::new(backend, registries)));
+        let names = operation_names(&build_rest_operations(&with));
+        assert!(
+            names.contains(&"reindex".to_string()),
+            "a deployment with an index must advertise the rebuild, got {names:?}"
+        );
+
+        // The cited definition is the one this server actually serves.
+        let reindex = build_rest_operations(&with)
+            .into_iter()
+            .find(|o| o["name"] == "reindex")
+            .expect("just asserted present");
+        assert_eq!(
+            reindex["definition"],
+            format!("/OperationDefinition/{REINDEX_DEFINITION_ID}")
+        );
+    }
+
+    fn operation_names(ops: &[serde_json::Value]) -> Vec<String> {
+        ops.iter()
+            .filter_map(|o| o["name"].as_str().map(str::to_string))
+            .collect()
+    }
+
     #[test]
     fn common_params_always_advertise_list() {
         let names = param_names(&build_common_search_params(false));

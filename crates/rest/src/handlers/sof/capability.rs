@@ -232,6 +232,43 @@ mod tests {
             .collect()
     }
 
+    /// The advertised `definition` URL has to resolve, or the citation is a dead
+    /// link — and it must 404 where the operation is not served, matching the
+    /// CapabilityStatement gating.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn reindex_definition_is_served_only_where_reindex_is_wired() {
+        use crate::config::ServerConfig;
+        use crate::state::AppState;
+        use helios_persistence::backends::sqlite::SqliteBackend;
+        use helios_persistence::search::{ReindexOperation, TenantSearchRegistries};
+        use std::sync::Arc;
+
+        let backend = Arc::new(SqliteBackend::in_memory().expect("in-memory sqlite"));
+        backend.init_schema().expect("init schema");
+
+        let unwired = AppState::new(backend.clone(), ServerConfig::default());
+        assert!(
+            sof_operation_definition_handler(
+                State(unwired),
+                Path(REINDEX_DEFINITION_ID.to_string())
+            )
+            .await
+            .is_err(),
+            "not served where $reindex answers 501"
+        );
+
+        let registries = Arc::new(TenantSearchRegistries::base_only());
+        let wired = AppState::new(backend.clone(), ServerConfig::default())
+            .with_reindex(Arc::new(ReindexOperation::new(backend, registries)));
+        let response =
+            sof_operation_definition_handler(State(wired), Path(REINDEX_DEFINITION_ID.to_string()))
+                .await
+                .expect("served where $reindex is wired")
+                .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
     /// `$reindex` is the documented recovery for a search index that has fallen
     /// behind its primary, and it was invisible: absent from
     /// `CapabilityStatement.rest.operation`, so an operator had no discoverable
