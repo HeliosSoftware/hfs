@@ -1908,18 +1908,19 @@ mod tests {
             WorkerId::new("lazy-receipts"),
         );
 
-        let oversized_id = "p".repeat(SPOOL_BUFFER_BYTES + 4096);
+        let oversized_id = "p".repeat(3 * SPOOL_BUFFER_BYTES + 4096);
         let oversized = json!({"reference": format!("Patient/{oversized_id}")}).to_string();
         let after = json!({"reference": "Patient/after-oversized"}).to_string();
         let spool_dir = tempfile::tempdir().unwrap();
         let spool_path = spool_dir.path().to_path_buf();
-        // A row past the writer's buffer cannot be accepted without a full
-        // buffer's worth of bytes having gone through to the file, and that
-        // lower bound is what the next fetch may insist on. The row's trailing
-        // newline can still be sitting in the `BufWriter`, and the file's own
-        // staging buffer is free to hold the tail, so requiring the whole row
-        // would be a race — and flushing per page just to observe it would
-        // change the production buffering to suit a test.
+        // Both `BufWriter` and Tokio's file staging can retain a full buffer.
+        // File::write_all may return while its blocking write is still pending,
+        // so a row just larger than one buffer need not be visible on disk yet.
+        // This row exceeds both buffers by more than another full buffer: at
+        // least that much must have finished writing before the next fetch.
+        // The tail and newline can still be buffered. Requiring the whole row
+        // or flushing per page would change the production buffering to suit
+        // the test.
         let expected_on_disk = SPOOL_BUFFER_BYTES as u64;
         let spooled_id = oversized_id.clone();
         let directory = spool_path.clone();
