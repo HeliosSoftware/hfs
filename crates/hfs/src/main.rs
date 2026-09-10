@@ -2570,14 +2570,25 @@ async fn start_mongodb_elasticsearch(
         mongo.tenant_registries().clone(),
         audit_state.as_ref(),
     );
-    // Bulk submit runs against the MongoDB primary, which hosts its own job
-    // state. Ingestion deliberately goes to `mongo` rather than the composite:
-    // the composite's search half is fed by the primary's own indexing hooks.
     let reindex_hook = ops.reindex.clone().map(|op| {
         Arc::new(helios_persistence::search::ReindexOnFinish::new(op))
             as Arc<dyn helios_persistence::core::DeferredReindexHook>
     });
-    let submit_bundle = build_bulk_submit(&config, mongo.clone(), reindex_hook).await?;
+    // Bulk submit runs against the MongoDB primary, which hosts its own job
+    // state, but wrapped like sqlite-es and pg-es so finished manifests sync
+    // their resources into Elasticsearch (#882). The comment this replaces said
+    // the composite's search half was "fed by the primary's own indexing
+    // hooks" — on this backend those hooks are exactly what is turned off
+    // (`search_offloaded`, logged above as "MongoDB search indexing disabled"),
+    // so nothing indexed the bulk-loaded data anywhere and 99.9 % of an import
+    // was readable by id and invisible to every search (#1021).
+    let submit_jobs = composite_submit_jobs(
+        mongo.clone(),
+        composite.clone(),
+        config.bulk_submit.defer_indexing,
+        reindex_hook.is_some(),
+    );
+    let submit_bundle = build_bulk_submit(&config, submit_jobs, reindex_hook).await?;
     let app = create_app_with_auth_bulk_settings_and_ops(
         composite.clone(),
         config.clone(),
@@ -2991,18 +3002,24 @@ async fn start_s3_elasticsearch(
         }
     };
     // Bulk submit needs no sidecar here either: the S3 primary hosts its own
-    // job state. Ingestion goes to `s3` rather than the composite because the
-    // composite's Elasticsearch half is fed by the primary's indexing hooks.
+    // job state. It is wrapped like every other composite (#882): S3 maintains
+    // no search index of its own — Elasticsearch is the only one in this
+    // deployment, as the `ops` comment above says — so the primary has no
+    // indexing hooks for the composite's search half to be "fed by", which is
+    // what the comment this replaces claimed. Without the wrapper a completed
+    // `$bulk-submit` here leaves its resources searchable nowhere (#1021).
+    let reindex_hook = ops.reindex.clone().map(|op| {
+        Arc::new(helios_persistence::search::ReindexOnFinish::new(op))
+            as Arc<dyn helios_persistence::core::DeferredReindexHook>
+    });
     let bulk_submit = if s3.supports_bulk_submit_worker() {
-        build_bulk_submit(
-            &config,
+        let submit_jobs = composite_submit_jobs(
             s3.clone(),
-            ops.reindex.clone().map(|op| {
-                Arc::new(helios_persistence::search::ReindexOnFinish::new(op))
-                    as Arc<dyn helios_persistence::core::DeferredReindexHook>
-            }),
-        )
-        .await?
+            composite.clone(),
+            config.bulk_submit.defer_indexing,
+            reindex_hook.is_some(),
+        );
+        build_bulk_submit(&config, submit_jobs, reindex_hook).await?
     } else {
         tracing::warn!(
             "S3 is configured bucket-per-tenant with no default system bucket; \

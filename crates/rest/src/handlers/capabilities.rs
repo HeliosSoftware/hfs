@@ -276,7 +276,9 @@ where
 fn build_rest_operations<S: ResourceStorage + Send + Sync + 'static>(
     state: &AppState<S>,
 ) -> Vec<serde_json::Value> {
-    use crate::handlers::sof::capability::{SQL_EXPORT_DEFINITION_ID, SQL_RUN_DEFINITION_ID};
+    use crate::handlers::sof::capability::{
+        REINDEX_DEFINITION_ID, SQL_EXPORT_DEFINITION_ID, SQL_RUN_DEFINITION_ID,
+    };
 
     let mut ops = vec![
         serde_json::json!({
@@ -297,6 +299,24 @@ fn build_rest_operations<S: ResourceStorage + Send + Sync + 'static>(
         ops.push(serde_json::json!({
             "name": "sql-export",
             "definition": format!("/OperationDefinition/{SQL_EXPORT_DEFINITION_ID}")
+        }));
+    }
+
+    // `$reindex`, when this deployment has an index to rebuild. It is the
+    // documented recovery for a search index that has fallen behind its
+    // primary, and an operator who cannot find out it exists cannot use it —
+    // which is how a composite deployment whose bulk-loaded data never reached
+    // Elasticsearch had no discoverable way back (#1021). Declared only when
+    // wired: on an S3 primary with no secondary there is no index at all and
+    // the handler answers 501, so advertising it there would be a lie.
+    //
+    // `definition` names this server's own OperationDefinition, like the SQL on
+    // FHIR operations above: `$reindex` is a HFS administrative operation with
+    // no HL7 counterpart to cite.
+    if state.reindex().is_some() {
+        ops.push(serde_json::json!({
+            "name": "reindex",
+            "definition": format!("/OperationDefinition/{REINDEX_DEFINITION_ID}")
         }));
     }
 
@@ -572,6 +592,54 @@ mod tests {
         params
             .iter()
             .filter_map(|p| p["name"].as_str().map(str::to_string))
+            .collect()
+    }
+
+    /// `$reindex` is advertised exactly where it can be served. A deployment
+    /// with no index to rebuild answers 501 from the handler, so advertising it
+    /// there would promise an operation that does not work; a deployment that
+    /// has one had no discoverable way to learn it exists at all (#1021).
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn reindex_is_advertised_only_where_an_index_can_be_rebuilt() {
+        use crate::config::ServerConfig;
+        use crate::handlers::sof::capability::REINDEX_DEFINITION_ID;
+        use helios_persistence::backends::sqlite::SqliteBackend;
+        use helios_persistence::search::{ReindexOperation, TenantSearchRegistries};
+        use std::sync::Arc;
+
+        let backend = Arc::new(SqliteBackend::in_memory().expect("in-memory sqlite"));
+        backend.init_schema().expect("init schema");
+
+        let without = AppState::new(backend.clone(), ServerConfig::default());
+        assert!(
+            !operation_names(&build_rest_operations(&without)).contains(&"reindex".to_string()),
+            "an unwired deployment must not advertise an operation its handler answers 501 to"
+        );
+
+        let registries = Arc::new(TenantSearchRegistries::base_only());
+        let with = AppState::new(backend.clone(), ServerConfig::default())
+            .with_reindex(Arc::new(ReindexOperation::new(backend, registries)));
+        let names = operation_names(&build_rest_operations(&with));
+        assert!(
+            names.contains(&"reindex".to_string()),
+            "a deployment with an index must advertise the rebuild, got {names:?}"
+        );
+
+        // The cited definition is the one this server actually serves.
+        let reindex = build_rest_operations(&with)
+            .into_iter()
+            .find(|o| o["name"] == "reindex")
+            .expect("just asserted present");
+        assert_eq!(
+            reindex["definition"],
+            format!("/OperationDefinition/{REINDEX_DEFINITION_ID}")
+        );
+    }
+
+    fn operation_names(ops: &[serde_json::Value]) -> Vec<String> {
+        ops.iter()
+            .filter_map(|o| o["name"].as_str().map(str::to_string))
             .collect()
     }
 
