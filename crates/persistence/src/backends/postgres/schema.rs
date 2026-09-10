@@ -4846,7 +4846,9 @@ mod postgres_integration_v37_migration {
             .get(0);
         assert_eq!(malformed, "{broken");
 
-        assert_eq!(get_schema_version(&client).await.unwrap(), 37);
+        // `initialize_schema` runs every migration after v37 as well, so the
+        // database lands on the current version, not on v37 itself.
+        assert_eq!(get_schema_version(&client).await.unwrap(), SCHEMA_VERSION);
         assert_eq!(index_count(&client).await, 2);
         assert_eq!(
             column_type(&client, "bulk_manifests", "published_token").await,
@@ -5059,7 +5061,7 @@ mod postgres_integration_v37_migration {
         initialize_schema(&mut migration_client)
             .await
             .expect("retry v37");
-        assert_eq!(get_schema_version(&client).await.unwrap(), 37);
+        assert_eq!(get_schema_version(&client).await.unwrap(), SCHEMA_VERSION);
         assert_eq!(
             classification(&client, output).await,
             (Some("manifest-rollback".to_string()), None)
