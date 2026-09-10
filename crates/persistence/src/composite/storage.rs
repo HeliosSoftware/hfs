@@ -411,6 +411,35 @@ impl CompositeStorage {
         &self.secondaries
     }
 
+    /// Reports whether a secondary's search results become consistent with
+    /// the primary as soon as a sync call returns, rather than at some later
+    /// point after an async queue drains.
+    ///
+    /// This is `true` for [`SyncMode::Synchronous`], and for
+    /// [`SyncMode::Hybrid`] when `sync_for_search` is set — the same
+    /// derivation `SyncManager::sync_creates` (see [`SyncManager`]) uses to
+    /// decide whether a write waits on the secondary. It is `false` for
+    /// [`SyncMode::Asynchronous`] and whenever there is no [`SyncManager`]
+    /// at all (no secondaries configured).
+    ///
+    /// Callers use this to gate any post-sync check that reads a secondary's
+    /// state immediately: under asynchronous sync, a `count()` taken right
+    /// after a sync call reflects whatever had already drained from the
+    /// queue, not what was just synced, so such a check would be comparing
+    /// against a moving target rather than a real discrepancy.
+    pub fn syncs_search_synchronously(&self) -> bool {
+        if self.sync_manager.is_none() {
+            return false;
+        }
+        matches!(
+            self.config.sync_config.mode,
+            SyncMode::Synchronous
+                | SyncMode::Hybrid {
+                    sync_for_search: true
+                }
+        )
+    }
+
     /// Returns the health status for a backend.
     pub fn backend_health(&self, id: &str) -> Option<BackendHealth> {
         self.health_status.read().get(id).cloned()

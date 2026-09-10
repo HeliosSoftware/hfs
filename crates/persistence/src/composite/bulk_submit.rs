@@ -30,6 +30,21 @@
 //! resources become searchable just before its receipt is written, not while
 //! it streams — the status endpoint's percentage is the progress signal
 //! during ingestion.
+//!
+//! After the sync, [`SubmitWorkerStorage::sync_ingested`] also runs a
+//! best-effort **index drift check** (#1007): for every resource type the
+//! manifest ingested, it compares the primary's tenant-wide
+//! [`ResourceStorage::count`] against each secondary's. The check only runs
+//! when [`CompositeStorage::syncs_search_synchronously`] is `true` — under
+//! asynchronous sync a secondary's count reflects whatever had already
+//! drained from its queue, not this manifest's sync, so the comparison would
+//! be against a moving target rather than a real discrepancy; the check is
+//! skipped entirely in that case. It never retries: a `count` failure or a
+//! transient mismatch is logged and left for `$reindex`, the same repair the
+//! rejected-resource path above already points operators to. A count
+//! disagreement does not fail the manifest or any entry — it is surfaced as
+//! a `warning` in the receipt's `error` artifact (see
+//! [`crate::core::bulk_submit_worker::DefaultSubmitWorker`]).
 
 use std::sync::Arc;
 
@@ -49,8 +64,9 @@ use crate::core::bulk_submit::{
     SubmissionStatus, SubmissionSummary, UnindexedEntry, entry_result_pages,
 };
 use crate::core::bulk_submit_worker::{
-    BulkSubmitJobStore, IngestSyncReport, ManifestFetchParams, ManifestLease, ManifestWorkerView,
-    PollTokenTarget, SubmitClaimStrategy, SubmitFileRecord, SubmitFileRow, SubmitWorkerStorage,
+    BulkSubmitJobStore, IndexDrift, IngestSyncReport, ManifestFetchParams, ManifestLease,
+    ManifestWorkerView, PollTokenTarget, SubmitClaimStrategy, SubmitFileRecord, SubmitFileRow,
+    SubmitWorkerStorage,
 };
 use crate::core::storage::ResourceStorage;
 use crate::core::{ActivityCell, DailyResourceCount, ResourceCountDelta, SofRunner, TenantRecord};
@@ -108,6 +124,10 @@ impl CompositeSubmitJobs {
         // backend's rejection was seen first.
         let mut rejected: std::collections::HashMap<(String, String), (String, String)> =
             std::collections::HashMap::new();
+        // Every resource type with at least one `success` receipt in this
+        // manifest, for the post-sync drift check below. Collected here so
+        // the check does not have to re-read the manifest.
+        let mut types_seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
         futures::pin_mut!(pages);
         while let Some(page) = pages.next().await {
             let page = page.map_err(LeaseError::Storage)?;
@@ -117,6 +137,7 @@ impl CompositeSubmitJobs {
             // that is one refresh wait per page instead of per resource.
             let mut by_type: Vec<SyncGroup> = Vec::new();
             for entry in page.entries.into_iter().map(|entry| entry.result) {
+                types_seen.insert(entry.resource_type.clone());
                 let Some(resource_id) = entry.resource_id else {
                     continue;
                 };
@@ -203,9 +224,78 @@ impl CompositeSubmitJobs {
                 .map_err(LeaseError::Storage)?;
         }
 
+        // Post-sync drift check (#1007): compare each ingested type's
+        // tenant-wide count on the primary against every secondary's. Only
+        // meaningful when the sync above was synchronous — otherwise a
+        // secondary's count reflects whatever had already drained from its
+        // queue, not this manifest's sync, and the comparison would be
+        // against a moving target rather than a real discrepancy. Skipped
+        // entirely in that case, with no retry: a transient miss here is the
+        // same miss `$reindex` repairs, and this check must not slow down or
+        // fail closing the manifest.
+        let mut drift = Vec::new();
+        if !self.composite.syncs_search_synchronously() {
+            tracing::info!(
+                submission = %lease.submission_id,
+                manifest = %lease.manifest_id,
+                "index drift check skipped: secondary sync is asynchronous"
+            );
+        } else {
+            for resource_type in &types_seen {
+                let primary_count = match self
+                    .composite
+                    .primary()
+                    .count(&lease.tenant, Some(resource_type.as_str()))
+                    .await
+                {
+                    Ok(count) => count,
+                    Err(e) => {
+                        warn!(
+                            submission = %lease.submission_id,
+                            manifest = %lease.manifest_id,
+                            resource_type,
+                            error = %e,
+                            "bulk-submit: could not read the primary's count for the index \
+                             drift check; skipping this type"
+                        );
+                        continue;
+                    }
+                };
+                for (backend_id, secondary) in self.composite.secondaries() {
+                    let search_count = match secondary
+                        .count(&lease.tenant, Some(resource_type.as_str()))
+                        .await
+                    {
+                        Ok(count) => count,
+                        Err(e) => {
+                            warn!(
+                                submission = %lease.submission_id,
+                                manifest = %lease.manifest_id,
+                                resource_type,
+                                backend_id,
+                                error = %e,
+                                "bulk-submit: could not read a secondary's count for the \
+                                 index drift check; skipping this pair"
+                            );
+                            continue;
+                        }
+                    };
+                    if primary_count != search_count {
+                        drift.push(IndexDrift {
+                            resource_type: resource_type.clone(),
+                            backend_id: backend_id.clone(),
+                            primary_count,
+                            search_count,
+                        });
+                    }
+                }
+            }
+        }
+
         Ok(IngestSyncReport {
             synced: attempted.saturating_sub(unindexed),
             unindexed,
+            drift,
         })
     }
 
@@ -903,9 +993,20 @@ mod tests {
     /// rejects `create`/`create_many` for any id in `reject` — the shape of a
     /// secondary search index that could not accept a bulk-submitted resource
     /// (mapping conflict, timeout, …) even after retries.
+    ///
+    /// `received` tracks every distinct id `create`/`create_or_update` was
+    /// called with, by resource type, whether or not it was accepted —
+    /// `count` reports its size unless `count_override` is set. This keeps a
+    /// rejection test's own drift check honest: the primary really does hold
+    /// a rejected resource (only its *search* indexing failed), so a
+    /// realistic "index" double must say it heard about it too, or the new
+    /// drift check would misreport the very rejection `mark_entries_unindexed`
+    /// already names.
     struct SpySecondary {
         events: Arc<Mutex<Vec<String>>>,
         reject: std::collections::HashSet<String>,
+        received: Arc<Mutex<HashMap<String, HashSet<String>>>>,
+        count_override: Option<u64>,
     }
 
     #[async_trait]
@@ -926,6 +1027,11 @@ mod tests {
                 .and_then(|v| v.as_str())
                 .unwrap_or("?")
                 .to_string();
+            self.received
+                .lock()
+                .entry(resource_type.to_string())
+                .or_default()
+                .insert(id.clone());
             if self.reject.contains(&id) {
                 return Err(crate::error::StorageError::Backend(
                     crate::error::BackendError::Internal {
@@ -955,6 +1061,11 @@ mod tests {
             resource: Value,
             fhir_version: FhirVersion,
         ) -> StorageResult<(StoredResource, bool)> {
+            self.received
+                .lock()
+                .entry(resource_type.to_string())
+                .or_default()
+                .insert(id.to_string());
             self.events
                 .lock()
                 .push(format!("upsert {resource_type}/{id}"));
@@ -1014,9 +1125,18 @@ mod tests {
         async fn count(
             &self,
             _tenant: &TenantContext,
-            _resource_type: Option<&str>,
+            resource_type: Option<&str>,
         ) -> StorageResult<u64> {
-            Ok(0)
+            if let Some(n) = self.count_override {
+                return Ok(n);
+            }
+            let ty = resource_type.unwrap_or("");
+            Ok(self
+                .received
+                .lock()
+                .get(ty)
+                .map(|ids| ids.len())
+                .unwrap_or(0) as u64)
         }
     }
 
@@ -1026,9 +1146,29 @@ mod tests {
 
     /// Builds a primary + composite + spy-secondary harness. `reject` names
     /// the ids the spy secondary refuses, for the rejection-handling tests;
-    /// pass an empty set for the happy path.
+    /// pass an empty set for the happy path. Synchronous sync mode, so no
+    /// background worker is needed and events apply before the call returns.
     fn harness(
         reject: std::collections::HashSet<String>,
+    ) -> (
+        Arc<SqliteBackend>,
+        CompositeSubmitJobs,
+        Arc<Mutex<Vec<String>>>,
+    ) {
+        harness_with(
+            reject,
+            None,
+            crate::composite::config::SyncMode::Synchronous,
+        )
+    }
+
+    /// Like [`harness`], with the secondary's `count` overridable (for the
+    /// index-drift tests) and the sync mode chosen by the caller (for the
+    /// asynchronous-mode skip test).
+    fn harness_with(
+        reject: std::collections::HashSet<String>,
+        count_override: Option<u64>,
+        sync_mode: crate::composite::config::SyncMode,
     ) -> (
         Arc<SqliteBackend>,
         CompositeSubmitJobs,
@@ -1040,9 +1180,7 @@ mod tests {
         let config = CompositeConfig::builder()
             .primary("sqlite", BackendKind::Sqlite)
             .search_backend("es", BackendKind::Elasticsearch)
-            // Synchronous: no background worker runs in a unit test, and the
-            // assertions need events applied before the call returns.
-            .sync_mode(crate::composite::config::SyncMode::Synchronous)
+            .sync_mode(sync_mode)
             .build()
             .unwrap();
         let mut backends = HashMap::new();
@@ -1052,6 +1190,8 @@ mod tests {
             Arc::new(SpySecondary {
                 events: events.clone(),
                 reject,
+                received: Arc::new(Mutex::new(HashMap::new())),
+                count_override,
             }) as DynStorage,
         );
         // No sync worker started: events apply synchronously, which is what
@@ -1167,7 +1307,8 @@ mod tests {
             report,
             IngestSyncReport {
                 synced: 2,
-                unindexed: 0
+                unindexed: 0,
+                drift: Vec::new(),
             }
         );
 
@@ -1246,7 +1387,8 @@ mod tests {
             report,
             IngestSyncReport {
                 synced: 1,
-                unindexed: 1
+                unindexed: 1,
+                drift: Vec::new(),
             }
         );
 
@@ -1281,6 +1423,144 @@ mod tests {
             .unwrap();
         assert_eq!(counts.success, 1);
         assert_eq!(counts.processing_error, 1);
+    }
+
+    /// #1007: a tenant-wide count mismatch between the primary and a
+    /// secondary, discovered right after this manifest's sync, is reported
+    /// per resource type. With the spy's real received count (no override),
+    /// the same sync reports no drift — the spy genuinely holds what the
+    /// primary holds.
+    #[tokio::test]
+    async fn sync_ingested_reports_count_drift_per_type() {
+        async fn ingest_two_patients(
+            sqlite: &SqliteBackend,
+            tenant: &TenantContext,
+            sub: &SubmissionId,
+        ) -> ManifestLease {
+            sqlite.create_submission(tenant, sub, None).await.unwrap();
+            sqlite
+                .add_manifest(tenant, sub, Some("http://provider/m.json"), None)
+                .await
+                .unwrap();
+            let lease = sqlite
+                .claim_next_manifest(
+                    &WorkerId::new("w-drift"),
+                    std::time::Duration::from_secs(60),
+                )
+                .await
+                .unwrap()
+                .expect("claimable manifest");
+            sqlite
+                .process_entries(
+                    tenant,
+                    sub,
+                    &lease.manifest_id,
+                    vec![
+                        NdjsonEntry::new(
+                            1,
+                            "Patient",
+                            json!({"resourceType": "Patient", "id": "p-drift-1"}),
+                        ),
+                        NdjsonEntry::new(
+                            2,
+                            "Patient",
+                            json!({"resourceType": "Patient", "id": "p-drift-2"}),
+                        ),
+                    ],
+                    &BulkProcessingOptions::new(),
+                )
+                .await
+                .unwrap();
+            lease
+        }
+
+        // Overridden: the secondary claims only 1 Patient, disagreeing with
+        // the primary's real count of 2.
+        let (sqlite, jobs, _events) = harness_with(
+            HashSet::new(),
+            Some(1),
+            crate::composite::config::SyncMode::Synchronous,
+        );
+        let tenant = tenant();
+        let sub = SubmissionId::generate("drift-override");
+        let lease = ingest_two_patients(&sqlite, &tenant, &sub).await;
+        let report = jobs.sync_ingested(&lease).await.unwrap();
+        assert_eq!(
+            report.drift,
+            vec![IndexDrift {
+                resource_type: "Patient".to_string(),
+                backend_id: "es".to_string(),
+                primary_count: 2,
+                search_count: 1,
+            }]
+        );
+
+        // No override: the spy reports the ids it actually received, which
+        // matches the primary — no drift.
+        let (sqlite, jobs, _events) = harness_with(
+            HashSet::new(),
+            None,
+            crate::composite::config::SyncMode::Synchronous,
+        );
+        let sub = SubmissionId::generate("drift-clean");
+        let lease = ingest_two_patients(&sqlite, &tenant, &sub).await;
+        let report = jobs.sync_ingested(&lease).await.unwrap();
+        assert!(
+            report.drift.is_empty(),
+            "a secondary that truly received every ingested resource must not report drift, \
+             got {:?}",
+            report.drift
+        );
+    }
+
+    /// #1007: under asynchronous sync, a secondary's count taken right after
+    /// `sync_ingested` reflects whatever had already drained from the async
+    /// queue, not this manifest's sync — so the drift check must not run at
+    /// all, even when the secondary's (overridden) count would otherwise
+    /// disagree with the primary's.
+    #[tokio::test]
+    async fn drift_check_is_skipped_when_sync_is_asynchronous() {
+        let (sqlite, jobs, _events) = harness_with(
+            HashSet::new(),
+            Some(0),
+            crate::composite::config::SyncMode::Asynchronous,
+        );
+        let tenant = tenant();
+        let sub = SubmissionId::generate("drift-async");
+        sqlite.create_submission(&tenant, &sub, None).await.unwrap();
+        sqlite
+            .add_manifest(&tenant, &sub, Some("http://provider/m.json"), None)
+            .await
+            .unwrap();
+        let lease = sqlite
+            .claim_next_manifest(
+                &WorkerId::new("w-drift-async"),
+                std::time::Duration::from_secs(60),
+            )
+            .await
+            .unwrap()
+            .expect("claimable manifest");
+        sqlite
+            .process_entries(
+                &tenant,
+                &sub,
+                &lease.manifest_id,
+                vec![NdjsonEntry::new(
+                    1,
+                    "Patient",
+                    json!({"resourceType": "Patient", "id": "p-async-1"}),
+                )],
+                &BulkProcessingOptions::new(),
+            )
+            .await
+            .unwrap();
+
+        let report = jobs.sync_ingested(&lease).await.unwrap();
+        assert!(
+            report.drift.is_empty(),
+            "asynchronous sync must skip the drift check entirely, got {:?}",
+            report.drift
+        );
     }
 
     /// A rolled-back create is deleted from the secondary too.

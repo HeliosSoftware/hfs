@@ -40,6 +40,32 @@ pub struct IngestSyncReport {
     /// Resources a secondary rejected after retries; their entry results
     /// are now `processing-error`.
     pub unindexed: u64,
+    /// Resource types the manifest ingested whose tenant-wide count on the
+    /// primary disagrees with a secondary's, checked right after the sync
+    /// above. Always empty when secondaries are synced asynchronously (a
+    /// count taken then would not reflect this manifest's sync) or when a
+    /// backend's `count` call itself failed.
+    pub drift: Vec<IndexDrift>,
+}
+
+/// A resource type whose tenant-wide count on the primary and on a
+/// secondary search backend disagree after a manifest's sync.
+///
+/// This is a signal, not a fault attributable to any single entry: the
+/// counts are tenant-wide, so a mismatch can also come from resources
+/// outside this manifest (a concurrent write, a prior gap). It names a
+/// backend and the two counts so an operator can decide whether to run
+/// `$reindex`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexDrift {
+    /// The resource type whose counts disagree.
+    pub resource_type: String,
+    /// The secondary backend whose count disagreed with the primary's.
+    pub backend_id: String,
+    /// The primary's tenant-wide count for `resource_type`.
+    pub primary_count: u64,
+    /// The secondary's tenant-wide count for `resource_type`.
+    pub search_count: u64,
 }
 
 /// A lease over a single pending manifest, held by exactly one worker at a time.
@@ -1183,13 +1209,30 @@ where
             }
         }
         failed += sync.unindexed;
+        for d in &sync.drift {
+            tracing::warn!(
+                submission = %lease.submission_id,
+                manifest = %lease.manifest_id,
+                resource_type = %d.resource_type,
+                backend_id = %d.backend_id,
+                primary_count = d.primary_count,
+                search_count = d.search_count,
+                "bulk-submit: primary and search index disagree on this resource type's count"
+            );
+        }
 
         // 3. Emit per-type `output` receipts and an aggregated `error` artifact.
         if keeper.lease_lost() {
             return Ok(());
         }
-        self.write_result_artifacts(&lease, &manifest_url, view.fhir_version, failed)
-            .await?;
+        self.write_result_artifacts(
+            &lease,
+            &manifest_url,
+            view.fhir_version,
+            failed,
+            &sync.drift,
+        )
+        .await?;
 
         // 4. Mark the manifest complete.
         if let Err(LeaseError::Storage(e)) = self.jobs.finish_manifest(&lease).await {
@@ -1232,12 +1275,18 @@ where
 
     /// Reads back this manifest's entry results and writes `output` receipts
     /// (grouped by resource type) plus a single aggregated `error` artifact.
+    ///
+    /// `drift` adds one `warning` OperationOutcome per [`IndexDrift`] to the
+    /// `error` artifact, naming the `$reindex` repair. A drift is a tenant-wide
+    /// count disagreement, not a failed entry: it does not affect
+    /// `failed_count` or any `output` line.
     async fn write_result_artifacts(
         &self,
         lease: &ManifestLease,
         manifest_url: &str,
         _fhir_version: FhirVersion,
         failed_count: u64,
+        drift: &[IndexDrift],
     ) -> StorageResult<()> {
         let pages = entry_result_pages(|continuation| async move {
             self.jobs
@@ -1251,7 +1300,7 @@ where
                 )
                 .await
         });
-        self.write_result_artifact_pages(lease, manifest_url, failed_count, pages)
+        self.write_result_artifact_pages(lease, manifest_url, failed_count, drift, pages)
             .await
     }
 
@@ -1260,6 +1309,7 @@ where
         lease: &ManifestLease,
         manifest_url: &str,
         failed_count: u64,
+        drift: &[IndexDrift],
         pages: impl futures::Stream<Item = StorageResult<EntryResultPage>>,
     ) -> StorageResult<()> {
         use futures::TryStreamExt;
@@ -1317,6 +1367,32 @@ where
                     "diagnostics": format!(
                         "{uncaptured} submitted resource(s) could not be parsed or did not \
                          match the declared resource type"
+                    )
+                }]
+            });
+            tally_severity(&oo, &mut severity);
+            error_lines.push(oo.to_string());
+        }
+
+        // One `warning` OperationOutcome per index drift (#1007): a tenant-wide
+        // count disagreement, not a failed entry, so it neither touches
+        // `failed_count` nor removes anything already collected in `by_type`.
+        for d in drift {
+            let oo = json!({
+                "resourceType": "OperationOutcome",
+                "issue": [{
+                    "severity": "warning",
+                    "code": "incomplete",
+                    "diagnostics": format!(
+                        "Search index drift for {rt} (tenant-wide, not only this manifest): \
+                         primary holds {pc} resources, {backend} holds {sc}. Run \
+                         POST /{rt}/$reindex to rebuild. Without Elasticsearch \
+                         refresh=wait_for a small difference can be writes not yet visible; \
+                         confirm with GET /{rt}?_summary=count.",
+                        rt = d.resource_type,
+                        pc = d.primary_count,
+                        backend = d.backend_id,
+                        sc = d.search_count,
                     )
                 }]
             });
@@ -1678,7 +1754,7 @@ mod tests {
         );
         let (pages, calls) = scripted_pages::pages();
         worker
-            .write_result_artifact_pages(&lease, "http://provider/m.json", 0, pages)
+            .write_result_artifact_pages(&lease, "http://provider/m.json", 0, &[], pages)
             .await
             .unwrap();
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 3);
@@ -2153,9 +2229,43 @@ mod tests {
 
     /// A minimal secondary that rejects `create`/`create_many` for one
     /// hard-coded id, and accepts everything else — the composite-sync half
-    /// of the worker test below.
+    /// of the worker tests below.
+    ///
+    /// `received` tracks every id `create`/`create_or_update` was called
+    /// with, by resource type, whether or not it was accepted — the
+    /// primary really does hold a rejected resource (only its *search*
+    /// indexing failed), so `count` reporting what was received, not just
+    /// what was accepted, keeps the rejection test's own index-drift check
+    /// from misreporting the rejection `mark_entries_unindexed` already
+    /// names. `count_override`, when set, replaces that with a fixed value —
+    /// for forcing a drift scenario deterministically.
     struct RejectingSecondary {
         reject_id: &'static str,
+        received:
+            std::sync::Mutex<std::collections::HashMap<String, std::collections::HashSet<String>>>,
+        count_override: Option<u64>,
+    }
+
+    impl RejectingSecondary {
+        /// A secondary that only rejects `reject_id` and otherwise reports
+        /// its real received count.
+        fn new(reject_id: &'static str) -> Self {
+            Self {
+                reject_id,
+                received: std::sync::Mutex::new(std::collections::HashMap::new()),
+                count_override: None,
+            }
+        }
+
+        /// A secondary that accepts everything but always reports
+        /// `count_override`, to force an index-drift scenario.
+        fn with_count_override(count_override: u64) -> Self {
+            Self {
+                reject_id: "",
+                received: std::sync::Mutex::new(std::collections::HashMap::new()),
+                count_override: Some(count_override),
+            }
+        }
     }
 
     #[async_trait]
@@ -2176,6 +2286,12 @@ mod tests {
                 .and_then(|v| v.as_str())
                 .unwrap_or("?")
                 .to_string();
+            self.received
+                .lock()
+                .unwrap()
+                .entry(resource_type.to_string())
+                .or_default()
+                .insert(id.clone());
             if id == self.reject_id {
                 return Err(crate::error::StorageError::Backend(
                     crate::error::BackendError::Internal {
@@ -2202,6 +2318,12 @@ mod tests {
             resource: Value,
             fhir_version: FhirVersion,
         ) -> StorageResult<(crate::types::StoredResource, bool)> {
+            self.received
+                .lock()
+                .unwrap()
+                .entry(resource_type.to_string())
+                .or_default()
+                .insert(id.to_string());
             Ok((
                 crate::types::StoredResource::new(
                     resource_type,
@@ -2250,9 +2372,19 @@ mod tests {
         async fn count(
             &self,
             _tenant: &TenantContext,
-            _resource_type: Option<&str>,
+            resource_type: Option<&str>,
         ) -> StorageResult<u64> {
-            Ok(0)
+            if let Some(n) = self.count_override {
+                return Ok(n);
+            }
+            let ty = resource_type.unwrap_or("");
+            Ok(self
+                .received
+                .lock()
+                .unwrap()
+                .get(ty)
+                .map(|ids| ids.len())
+                .unwrap_or(0) as u64)
         }
     }
 
@@ -2308,9 +2440,7 @@ mod tests {
         );
         backends.insert(
             "es".to_string(),
-            Arc::new(RejectingSecondary {
-                reject_id: "reject-1",
-            }) as crate::composite::DynStorage,
+            Arc::new(RejectingSecondary::new("reject-1")) as crate::composite::DynStorage,
         );
         let composite = Arc::new(CompositeStorage::new(config, backends).unwrap());
         let jobs = Arc::new(CompositeSubmitJobs::new(
@@ -2431,6 +2561,144 @@ mod tests {
             .find(|r| r.resource_id.as_deref() == Some("reject-1"))
             .expect("rejected entry present");
         assert_eq!(rejected.outcome, BulkEntryOutcome::ProcessingError);
+    }
+
+    /// #1007: a tenant-wide count mismatch between the primary and a
+    /// secondary search index, discovered right after a manifest's sync, is
+    /// written to the receipt as a `warning` OperationOutcome naming the
+    /// `$reindex` repair — it must not be mistaken for a failed entry: every
+    /// ingested resource still reads `success`, and the manifest's
+    /// `failed_entries` does not grow.
+    #[tokio::test]
+    async fn test_worker_writes_drift_as_a_warning_outcome() {
+        use crate::composite::{CompositeConfig, CompositeStorage, CompositeSubmitJobs};
+        use crate::core::BackendKind;
+        use crate::core::bulk_submit_worker::BulkSubmitJobStore;
+
+        let sqlite = Arc::new(SqliteBackend::in_memory().unwrap());
+        sqlite.init_schema().unwrap();
+        let config = CompositeConfig::builder()
+            .primary("sqlite", BackendKind::Sqlite)
+            .search_backend("es", BackendKind::Elasticsearch)
+            .sync_mode(crate::composite::config::SyncMode::Synchronous)
+            .build()
+            .unwrap();
+        let mut backends: std::collections::HashMap<String, crate::composite::DynStorage> =
+            std::collections::HashMap::new();
+        backends.insert(
+            "sqlite".to_string(),
+            sqlite.clone() as crate::composite::DynStorage,
+        );
+        // Accepts everything but always reports a count of 1, disagreeing
+        // with the primary's real count of 2 — forces drift deterministically.
+        backends.insert(
+            "es".to_string(),
+            Arc::new(RejectingSecondary::with_count_override(1)) as crate::composite::DynStorage,
+        );
+        let composite = Arc::new(CompositeStorage::new(config, backends).unwrap());
+        let jobs = Arc::new(CompositeSubmitJobs::new(
+            sqlite.clone() as Arc<dyn BulkSubmitJobStore>,
+            composite,
+        ));
+
+        let tmp = tempfile::tempdir().unwrap();
+        let output = Arc::new(LocalFsOutputStore::new(
+            tmp.path().to_path_buf(),
+            "http://localhost:8080",
+        ));
+
+        let tenant = tenant();
+        let sub_id = SubmissionId::generate("drift-worker");
+        jobs.create_submission(&tenant, &sub_id, None)
+            .await
+            .unwrap();
+        jobs.add_manifest(
+            &tenant,
+            &sub_id,
+            Some("http://provider/manifest.json"),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let ndjson = concat!(
+            "{\"resourceType\":\"Patient\",\"id\":\"d-1\"}\n",
+            "{\"resourceType\":\"Patient\",\"id\":\"d-2\"}\n"
+        );
+        let mut files = std::collections::HashMap::new();
+        files.insert(
+            "http://provider/patient.ndjson".to_string(),
+            ndjson.as_bytes().to_vec(),
+        );
+        let fetcher = Arc::new(MockFetcher {
+            files,
+            manifest: RemoteManifest {
+                requires_access_token: false,
+                output: vec![RemoteFile {
+                    resource_type: Some("Patient".to_string()),
+                    url: "http://provider/patient.ndjson".to_string(),
+                    count: Some(2),
+                }],
+                deleted: vec![],
+            },
+        });
+
+        let worker =
+            DefaultSubmitWorker::new(jobs.clone(), fetcher, output, WorkerId::new("drift-worker"));
+        let lease = jobs
+            .claim_next_manifest(&WorkerId::new("drift-worker"), StdDuration::from_secs(60))
+            .await
+            .unwrap()
+            .expect("claimable manifest");
+        worker.run_job(lease).await.unwrap();
+
+        let manifests = jobs.list_manifests(&tenant, &sub_id).await.unwrap();
+        assert!(manifests[0].status.is_terminal());
+        assert_eq!(
+            manifests[0].failed_entries, 0,
+            "a drift is a warning, not a failed entry"
+        );
+
+        let job_id = submission_output_job_id(&sub_id);
+        let tenant_id = tenant.tenant_id().as_str();
+        let submit_files = jobs.list_submit_files(&tenant, &sub_id).await.unwrap();
+
+        let output_row = submit_files
+            .iter()
+            .find(|f| f.file_type == "output" && f.resource_type.as_deref() == Some("Patient"))
+            .expect("output receipt for Patient");
+        let output_lines =
+            read_submit_file_lines(tmp.path(), tenant_id, job_id.as_str(), output_row);
+        assert_eq!(
+            output_lines.len(),
+            2,
+            "a drift warning does not remove anything from the receipt"
+        );
+
+        let error_row = submit_files
+            .iter()
+            .find(|f| f.file_type == "error")
+            .expect("error artifact carrying the drift warning");
+        let error_lines = read_submit_file_lines(tmp.path(), tenant_id, job_id.as_str(), error_row);
+        assert_eq!(error_lines.len(), 1, "exactly one drift warning");
+        let oo: Value = serde_json::from_str(&error_lines[0]).unwrap();
+        assert_eq!(oo["issue"][0]["severity"], "warning");
+        assert_eq!(oo["issue"][0]["code"], "incomplete");
+        let diagnostics = oo["issue"][0]["diagnostics"].as_str().unwrap();
+        assert!(diagnostics.contains("Patient"));
+        assert!(diagnostics.contains("primary holds 2"));
+        assert!(diagnostics.contains("$reindex"));
+        assert_eq!(
+            error_row.count_severity,
+            Some(serde_json::json!({"warning": 1}))
+        );
+
+        let counts = jobs
+            .get_entry_counts(&tenant, &sub_id, &manifests[0].manifest_id)
+            .await
+            .unwrap();
+        assert_eq!(counts.success, 2);
+        assert_eq!(counts.processing_error, 0);
     }
 
     /// #903 fast-load: deferred ingestion stores readable resources that are

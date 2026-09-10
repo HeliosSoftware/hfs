@@ -135,7 +135,7 @@ pub use bulk_submit_input::{
     FileTokenProvider, RemoteFile, RemoteManifest, SubmitInputFetcher, submission_output_job_id,
 };
 pub use bulk_submit_worker::{
-    BulkSubmitJobStore, DefaultSubmitWorker, DeferredReindexHook, IngestSyncReport,
+    BulkSubmitJobStore, DefaultSubmitWorker, DeferredReindexHook, IndexDrift, IngestSyncReport,
     ManifestFetchParams, ManifestLease, ManifestWorkerView, PollTokenTarget, SubmitClaimStrategy,
     SubmitFileRecord, SubmitFileRow, SubmitWorkerStorage,
 };
