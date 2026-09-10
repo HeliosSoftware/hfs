@@ -262,21 +262,23 @@ test.describe("HTS backlink on detail pages (§14.5 Cat C)", () => {
 });
 
 test.describe("HTS Import file upload (§14.6 Batch-style)", () => {
-  test("file radio hides textarea and shows file input", async ({ page }) => {
+  test("file radio hides textarea and shows drop zone", async ({ page }) => {
     await page.goto("/ui/hts/import");
     const textarea = page.locator("#hts-import-bundle");
-    const fileInput = page.locator("#hts-import-file");
+    const dropZone = page.locator("#hts-import-drop");
+    const fileField = page.locator("#hts-import-file-field");
     // Paste is the default landing mode.
     await expect(textarea).toBeVisible();
-    // Switch to file mode.
+    // Switch to file mode — drop zone becomes visible, not the raw input.
     await page.getByRole("radio", { name: /file/i }).check();
-    await expect(fileInput).toBeVisible();
+    await expect(dropZone).toBeVisible();
+    await expect(fileField).toBeVisible();
     // Paste field's .field wrapper is `hidden`.
     await expect(page.locator(".field", { has: textarea })).toBeHidden();
     // Switch back to paste.
     await page.getByRole("radio", { name: /paste/i }).check();
     await expect(textarea).toBeVisible();
-    await expect(page.locator(".field", { has: fileInput })).toBeHidden();
+    await expect(fileField).toBeHidden();
   });
 
   test("picking a file fills the paste textarea via FileReader", async ({ page }) => {

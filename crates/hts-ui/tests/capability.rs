@@ -435,10 +435,9 @@ async fn capability_page_mirrors_hfs_and_declares_terminology_capabilities() {
         &closure_row[..closure_row.len().min(60)],
     );
 
-    // ── Raw CapabilityStatement, the same htmx-lazy fold HFS renders ────
-    // (#808 follow-up to #798). The default view never inlines the
-    // statement — it holds a "Load JSON" link against this server's own
-    // fragment endpoint, not HFS's.
+    // ── Raw CapabilityStatement, the same bounded tree HFS renders ──────
+    // The root outline is part of the first page response; deeper nodes use
+    // HTS's own incremental endpoint and Expand all uses one HTML POST.
     assert!(
         html.contains(r#"id="capability-json-fold""#),
         "the raw fold should use HFS's shared shell",
@@ -447,6 +446,9 @@ async fn capability_page_mirrors_hfs_and_declares_terminology_capabilities() {
         html.contains(r#"data-fragment-url="/ui/hts/capability-statement/json-fragment"#),
         "the fold should lazy-load from HTS's own fragment endpoint, not HFS's",
     );
+    assert!(html.contains(r#"data-expand-url="/ui/hts/capability-statement/json-expand""#));
+    assert!(html.contains(r#"data-capability-json-page data-path="""#));
+    assert!(html.contains(r#"data-capability-json-actions hidden"#));
     assert!(
         !html.contains(r#"<pre class="detail__code">"#),
         "the default view must not inline the statement any more",
@@ -652,6 +654,39 @@ async fn interactions_appear_when_declared_and_one_failure_degrades_only_its_car
     // rule the root page just proved.
     assert_eq!(extension_html.matches("{ 2 }").count(), 100);
 
+    let expanded = app
+        .clone()
+        .oneshot(
+            axum::http::Request::post("/ui/hts/capability-statement/json-expand")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from(
+                    "path=&offset=0&limit=100&path=%2Fextension&offset=100&limit=100",
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(expanded.status(), StatusCode::OK);
+    let expanded_html = body_text(expanded).await;
+    assert!(expanded_html.len() <= 1024 * 1024);
+    assert!(expanded_html.contains(r#"data-expansion-state="partial""#));
+    assert!(expanded_html.contains(r#"data-path="/extension""#));
+    assert!(expanded_html.contains(r#"data-offset="100""#));
+    assert!(expanded_html.contains("101–200 / 400"));
+    assert!(!expanded_html.contains("201–300 / 400"));
+
+    let invalid = app
+        .clone()
+        .oneshot(
+            axum::http::Request::post("/ui/hts/capability-statement/json-expand")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from("path=%2Fextension&offset=0"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+
     // Drilling one level further reaches the actual padding value.
     let item_html = body_text(
         app.clone()
@@ -667,6 +702,20 @@ async fn interactions_appear_when_declared_and_one_failure_degrades_only_its_car
     )
     .await;
     assert!(item_html.contains("padding-0"));
+
+    state
+        .set_capability(StatusCode::SERVICE_UNAVAILABLE, None)
+        .await;
+    let unavailable = app
+        .oneshot(
+            axum::http::Request::post("/ui/hts/capability-statement/json-expand")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from("path=&offset=0&limit=100"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unavailable.status(), StatusCode::SERVICE_UNAVAILABLE);
 }
 
 /// Guard: the page adds **no** CSS. Every class it names must already have

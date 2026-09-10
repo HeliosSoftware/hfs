@@ -38,6 +38,50 @@ Use this when working in `helios-sof`, `sof-cli`, `sof-server`, or ViewDefinitio
 
 Parameter precedence is request body, then query params, then Accept header.
 
+## Structural Validation (Lint) — the Single Source of Truth (#821)
+
+`helios_sof::lint::lint_view_definition` is the one engine that answers "is
+this JSON document a well-formed ViewDefinition": it walks a raw
+`serde_json::Value` (never a typed `helios_fhir` resource — a document being
+edited is often not valid enough to deserialize) and returns every problem it
+finds, located by RFC 6901 JSON pointer — unknown/missing/wrong-typed/empty
+keys, a `select` with no output or more than one iteration directive,
+duplicate column names, FHIRPath syntax errors, and undeclared `%constant`
+references. It is deliberately structural and syntactic only; it never
+evaluates FHIRPath, resolves terminology, or touches storage.
+
+Every `Diagnostic` carries `args` (the values its English `message`
+interpolates — `message` itself is always English, never localized here) and
+`fixes` (structural, pointer-addressed edits a client believes resolve it —
+`rename-key`/`remove-key`/`set-string`; never a text position, since this
+module never sees source text). `node_keys` exposes the same key model these
+checks are built on, for anything that wants "what keys are valid here" (the
+`helios-ui` completion endpoint, below).
+
+`$sql-run` lints the inline ViewDefinition JSON as received, before any typed
+parse — a round-trip through the typed `Parameters`/`ViewDefinition` structs
+would silently drop unknown keys, since no generated struct denies them, so
+linting *after* that parse would never catch `unknown-key` at all. A lint
+failure responds `422` with one `OperationOutcome.issue` per diagnostic,
+`issue.expression` carrying the pointer and `issue.details.coding` a code
+under `http://heliossoftware.com/fhir/CodeSystem/view-definition-lint`
+matching `Diagnostic::code`. The crate's own `validate_view_definition`
+delegates to the same lint (serializing the typed struct back to JSON first),
+so `sof-cli` and `pysof` see identical rules and messages — one engine, not
+three. A few checks that depend on evaluation context rather than structure
+(`collection: false` outside `forEach`, cross-branch column consistency in
+`unionAll`) stay as `validate_view_definition`'s own residual checks; the
+lint does not model them.
+
+The ViewDefinition editor's own `POST /ui/sql/view-definitions/lint` and
+`POST /ui/sql/view-definitions/complete` endpoints (`helios-ui`, see
+`/work-with-ui`) build directly on this module — `/lint` translates `code` +
+`args` into the negotiated locale and adds a translated `label` to each fix;
+`/complete` answers "what fits here" from the same key model plus
+`helios_fhirpath`'s function/constant/variable catalogs, re-exported through
+`helios_sof::lint` so `helios-ui` never takes a direct `helios-fhirpath`
+dependency of its own.
+
 ## Parquet Export
 
 ```bash

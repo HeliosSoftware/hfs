@@ -74,8 +74,9 @@ pub mod terminology;
 pub mod fhirpath_effects;
 
 pub use editor::{
-    Addable, AddableKind, Path, Present, Step, add_element, add_extension, addable, choose_type,
-    node_at, path_from_string, path_to_string, present_children, remove_at, schema_at, set_value,
+    Addable, AddableKind, ElementChild, Path, Present, Step, add_element, add_extension, addable,
+    choose_type, element_children, node_at, path_from_string, path_to_string, present_children,
+    remove_at, schema_at, set_value,
 };
 pub use effects::{
     CodedValue, ConstraintEvaluator, ConstraintOutcome, Deferred, DeferredConstraint,

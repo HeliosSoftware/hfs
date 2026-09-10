@@ -40,7 +40,23 @@
 //! reports polling machinery; the job's outcome is served from a separate
 //! result URL (`GET /export/{job-id}/result`):
 //!
-//! - `202 Accepted` + `X-Progress: running` while the job is running
+//! - `202 Accepted` while the job is running, with `X-Progress: {n}%`
+//!   (`n = floor(subjectsDone × 100 / subjectsTotal)`, capped at 99 until the
+//!   result is available) and `Retry-After: 5`. The body is a `Parameters`
+//!   resource:
+//!
+//!   | Parameter | Type | Present when |
+//!   |-----------|------|--------------|
+//!   | `exportId` | `valueString` | always |
+//!   | `status` | `valueCode` (`in-progress`) | always |
+//!   | `subjectsTotal` | `valueInteger` | always — total subjects in the job |
+//!   | `subjectsDone` | `valueInteger` | always — subjects fully finished |
+//!   | `currentSubject` | `valueString` | a subject is being written; absent before the first one starts or after the last one finishes. Equal to the `output.name` that subject will carry in the completion manifest |
+//!   | `estimatedTimeRemaining` | `valueInteger` (seconds) | progress is between 0 and 100% |
+//!
+//!   `subjectsTotal`/`subjectsDone`/`currentSubject` are this server's own
+//!   extension of the spec's allowance for implementation-defined interim
+//!   content; a client that only reads `X-Progress` notices nothing (#853).
 //! - `303 See Other` with a `Location` header carrying the result URL and an
 //!   empty body once the job has finished — whether it succeeded or failed
 //! - `404 Not Found` if the job ID is unknown or was cancelled
@@ -715,10 +731,22 @@ where
         )
             .into_response()),
 
-        Some(JobStatus::Running {
-            percent,
-            submitted_at,
-        }) => {
+        Some(status @ JobStatus::Running { .. }) => {
+            // `percent()` is the single place the completion percentage is
+            // derived from `subjects_done`/`subjects_total` (#853), so
+            // `X-Progress` and the body's `subjectsDone`/`subjectsTotal`
+            // parameters below always agree.
+            let percent = status.percent().unwrap_or(0);
+            let JobStatus::Running {
+                subjects_done,
+                subjects_total,
+                current_subject,
+                submitted_at,
+            } = status
+            else {
+                unreachable!("guarded by the match arm pattern")
+            };
+
             let mut headers = HeaderMap::new();
             // Spec: `X-Progress` carries a completion percentage (e.g. `65%`).
             let progress_value = format!("{percent}%");
@@ -727,13 +755,20 @@ where
             }
             // Spec SHOULD: include Retry-After during polling.
             headers.insert(header::RETRY_AFTER, HeaderValue::from_static("5"));
-            // Spec: in-progress body is an optional `Parameters` resource
-            // carrying spec-defined params only (no custom `progress` part —
-            // that channel is the `X-Progress` header).
+            // Spec: in-progress body is an optional `Parameters` resource.
+            // `subjectsTotal`/`subjectsDone`/`currentSubject` are this
+            // server's own extension of that allowance (#853) — always
+            // present while the job runs, except `currentSubject`, which is
+            // absent when no subject is currently being written.
             let mut params = vec![
                 json!({"name": "exportId", "valueString": job_id}),
                 json!({"name": "status", "valueCode": "in-progress"}),
+                json!({"name": "subjectsTotal", "valueInteger": subjects_total}),
+                json!({"name": "subjectsDone", "valueInteger": subjects_done}),
             ];
+            if let Some(name) = current_subject {
+                params.push(json!({"name": "currentSubject", "valueString": name}));
+            }
             // Optional `estimatedTimeRemaining` (integer seconds).
             // Only meaningful once the job has reported >0% progress; before
             // then we can't compute a defensible estimate. Derived from

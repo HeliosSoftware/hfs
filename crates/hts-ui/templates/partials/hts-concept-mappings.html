@@ -127,7 +127,7 @@
 
     <details>
       <summary>{{ chrome.i18n.t("hts-concept-raw-response") }}</summary>
-      <pre class="detail__code">{{ mappings.raw_body }}</pre>
+      {% if !mappings.raw_body_json.is_empty() %}{{ mappings.raw_body_json|safe }}{% else %}<pre class="detail__code" tabindex="0">{{ mappings.raw_body }}</pre>{% endif %}
     </details>
   {% endif %}
 </section>

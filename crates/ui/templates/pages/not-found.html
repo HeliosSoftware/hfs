@@ -1,0 +1,21 @@
+{% extends "layouts/base.html" %}
+
+{#
+  The generic "not found" page (#835): a route naming something this request
+  cannot see — an unknown id, or one belonging to another user/tenant —
+  renders this instead of a bare status code, so the sidebar and shell stay
+  intact and the visitor gets a way back. Deliberately reveals nothing about
+  which of "unknown" or "not yours" applies, nor the id itself.
+#}
+
+{% block title %}{{ i18n.t("not-found-title") }} — {{ i18n.t("app-title") }}{% endblock %}
+
+{% block breadcrumb %}{% endblock %}
+
+{% block content %}
+<header class="page-head">
+  <h1 class="page-head__title">{{ i18n.t("not-found-title") }}</h1>
+</header>
+<div class="card notice">{{ i18n.t("not-found-text") }}</div>
+<a class="btn" href="{{ back_href }}">{{ back_label }}</a>
+{% endblock %}

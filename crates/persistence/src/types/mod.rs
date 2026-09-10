@@ -131,6 +131,12 @@ pub use search_capabilities::{
 /// comes back and fills it. That is a few percent of footprint against a third
 /// of the write cost.
 ///
+/// The measurements above are PostgreSQL's, where `idx_search_resource` is
+/// still the index every row enters. SQLite dropped it in schema v21 (#947):
+/// there it was a strict leftmost prefix of `idx_search_composite`, which
+/// leads with the same three columns and now carries that role — and the same
+/// argument for ordered ids.
+///
 /// # What this changes for a client
 ///
 /// A version 7 UUID embeds the millisecond it was minted, so the *creation

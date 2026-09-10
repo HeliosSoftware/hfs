@@ -614,6 +614,45 @@ pub struct BulkSubmitConfig {
     pub output_ttl_secs: u64,
     /// Maximum manifests this pod ingests concurrently.
     pub worker_concurrency: u32,
+    /// How many of a single manifest's `output` files a worker ingests at once
+    /// (fan-out). `1` keeps the historical sequential behavior. Higher values
+    /// overlap per-file fetch, parse, and write, which a concurrent-writer
+    /// backend (PostgreSQL) turns into near-linear throughput. Set with
+    /// `HFS_BULK_SUBMIT_FILE_CONCURRENCY`.
+    ///
+    /// This is the *configured* value. SQLite ignores it and always ingests one
+    /// file at a time — see [`Self::effective_file_concurrency`].
+    pub file_concurrency: u32,
+    /// Bulk fast-load (#903): ingest without search-index/FTS writes and
+    /// rebuild them with an automatic per-type reindex when each manifest
+    /// finishes. Reads and history are complete throughout; search sees a
+    /// manifest's resources once its reindex lands.
+    ///
+    /// Defaults to `true` for import speed (#946), which trades away the
+    /// durability property below. Both are measured, and both are reproducible
+    /// from `crates/hfs/tests/bulk_submit/run_defer_indexing_benchmark.sh` and
+    /// `run_defer_indexing_crash_check.sh`:
+    ///
+    /// - Speed: end to end — kick-off until search returns every resource —
+    ///   `true` measured ~1.2x faster, winning all 15 interleaved rounds on an
+    ///   idle machine. Stopping the clock at the `200` instead gives 3.3x, but
+    ///   that instant is before search works. The ~6.7x sometimes quoted comes
+    ///   from `bulk_submit_bench`, which runs no reindex and so measures
+    ///   ingestion with the indexing work removed.
+    /// - Durability: the rebuild starts only after the manifest is already
+    ///   terminal and is fire-and-forget, so `$bulk-submit-status` reports
+    ///   `200` while search is still incomplete; the job exists only in an
+    ///   in-memory map, no column records that indexing is outstanding, and
+    ///   nothing re-fires it at startup. That window is the gap between the
+    ///   two clocks above — a median of 14.0s under `true` against 0.4s under
+    ///   `false`, at 10 000 resources, and it widens with volume. A restart
+    ///   inside it leaves resources stored and readable by id but absent from
+    ///   search until an operator runs `$reindex` by hand — measured at 16k of
+    ///   20k resources.
+    ///
+    /// Set `HFS_BULK_SUBMIT_DEFER_INDEXING=false` to give up the speed and
+    /// close that window.
+    pub defer_indexing: bool,
     /// When `true`, this pod does not run in-process submit workers.
     pub disable_local_worker: bool,
     /// Cap on simultaneous in-flight submissions per tenant.
@@ -668,7 +707,9 @@ impl Default for BulkSubmitConfig {
             file_url_ttl_secs: 3600,
             output_ttl_secs: 86400,
             worker_concurrency: 2,
+            file_concurrency: 1,
             disable_local_worker: false,
+            defer_indexing: true,
             max_concurrent_per_tenant: 4,
             batch_size: 1000,
             lease_duration_secs: 60,
@@ -692,6 +733,24 @@ impl Default for BulkSubmitConfig {
 }
 
 impl BulkSubmitConfig {
+    /// Returns the file fan-out this pod should actually use on `backend`.
+    ///
+    /// The configured [`Self::file_concurrency`] is honoured on every
+    /// concurrent-writer backend. On SQLite file fan-out is not supported and
+    /// the value is ignored: a manifest's batch writes queue behind one
+    /// exclusive write lock, and past a single in-flight file the queued
+    /// writers outlast `busy_timeout` and abort the ingest (#942). That is a
+    /// correctness guard, not a tuning preference — an operator who asks for 8
+    /// gets a slower import rather than a failed one.
+    ///
+    /// The result is always at least `1`, so a configured `0` still ingests.
+    pub fn effective_file_concurrency(&self, backend: BackendKind) -> u32 {
+        match backend {
+            BackendKind::Sqlite => 1,
+            _ => self.file_concurrency.max(1),
+        }
+    }
+
     /// Loads bulk-submit configuration from `HFS_BULK_SUBMIT_*` env vars.
     pub fn from_env() -> Self {
         fn env_bool(key: &str, default: bool) -> bool {
@@ -726,6 +785,8 @@ impl BulkSubmitConfig {
             file_url_ttl_secs: env_u64("HFS_BULK_SUBMIT_FILE_URL_TTL", d.file_url_ttl_secs),
             output_ttl_secs: env_u64("HFS_BULK_SUBMIT_OUTPUT_TTL", d.output_ttl_secs),
             worker_concurrency: env_u32("HFS_BULK_SUBMIT_WORKER_CONCURRENCY", d.worker_concurrency),
+            file_concurrency: env_u32("HFS_BULK_SUBMIT_FILE_CONCURRENCY", d.file_concurrency),
+            defer_indexing: env_bool("HFS_BULK_SUBMIT_DEFER_INDEXING", d.defer_indexing),
             disable_local_worker: env_bool(
                 "HFS_BULK_SUBMIT_DISABLE_LOCAL_WORKER",
                 d.disable_local_worker,
@@ -1025,6 +1086,21 @@ pub struct ServerConfig {
     #[arg(long, env = "HFS_SOF_ENABLED", default_value = "true")]
     pub sof_enabled: bool,
 
+    /// Mount the web UI at `/ui`.
+    ///
+    /// On by default. Headless deployments (behind an API gateway, or anywhere
+    /// an HTML surface should not listen at all) opt out with
+    /// `HFS_UI_ENABLED=false`; `/ui` and everything under it then answer
+    /// `404` + OperationOutcome rather than falling through to the FHIR
+    /// router. This replaces the former `headless` *build* feature, which was
+    /// a negative Cargo feature and so was tripped accidentally by
+    /// `--all-features` (see issue #975).
+    ///
+    /// Has no effect on a binary built without the `ui` feature — there the UI
+    /// is not compiled in at all and `/ui` always answers `404`.
+    #[arg(long, env = "HFS_UI_ENABLED", default_value = "true")]
+    pub ui_enabled: bool,
+
     /// Natural-language search master switch. When false the feature is
     /// completely off: the endpoint 404s and the UI renders nothing.
     #[arg(long, env = "HFS_NL_SEARCH_ENABLED", default_value = "true")]
@@ -1240,6 +1316,7 @@ impl Default for ServerConfig {
             elasticsearch_refresh_interval: "1s".to_string(),
             elasticsearch_write_refresh: "false".to_string(),
             sof_enabled: true,
+            ui_enabled: true,
             nl_search_enabled: true,
             nl_search_api_key: None,
             nl_search_model: "claude-opus-4-8".to_string(),
@@ -1462,6 +1539,7 @@ impl ServerConfig {
             elasticsearch_refresh_interval: "1s".to_string(),
             elasticsearch_write_refresh: "false".to_string(),
             sof_enabled: true,
+            ui_enabled: true,
             nl_search_enabled: true,
             nl_search_api_key: None,
             nl_search_model: "claude-opus-4-8".to_string(),
@@ -2384,5 +2462,31 @@ mod tests {
             assert_eq!(variant.to_string(), expected);
             assert_eq!(expected.parse::<StorageBackendMode>().unwrap(), variant);
         }
+    }
+
+    // ── bulk submit file fan-out (#942) ───────────────────────────
+
+    #[test]
+    fn sqlite_ignores_the_configured_file_concurrency() {
+        let cfg = BulkSubmitConfig {
+            file_concurrency: 8,
+            ..Default::default()
+        };
+        // File fan-out is not supported on the single-writer backend.
+        assert_eq!(cfg.effective_file_concurrency(BackendKind::Sqlite), 1);
+        // Concurrent-writer backends keep the operator's value.
+        assert_eq!(cfg.effective_file_concurrency(BackendKind::Postgres), 8);
+        assert_eq!(cfg.effective_file_concurrency(BackendKind::MongoDB), 8);
+        assert_eq!(cfg.effective_file_concurrency(BackendKind::S3), 8);
+    }
+
+    #[test]
+    fn effective_file_concurrency_never_drops_below_one() {
+        let cfg = BulkSubmitConfig {
+            file_concurrency: 0,
+            ..Default::default()
+        };
+        assert_eq!(cfg.effective_file_concurrency(BackendKind::Sqlite), 1);
+        assert_eq!(cfg.effective_file_concurrency(BackendKind::Postgres), 1);
     }
 }
