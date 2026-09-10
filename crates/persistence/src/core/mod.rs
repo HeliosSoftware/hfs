@@ -96,6 +96,10 @@ pub mod bulk_export_worker;
 pub mod bulk_provider;
 pub mod bulk_submit;
 pub mod bulk_submit_input;
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
+pub(crate) mod bulk_submit_legacy;
+pub mod bulk_submit_output;
+pub mod bulk_submit_publication;
 pub mod bulk_submit_worker;
 pub mod bundle_conditionals;
 pub mod capabilities;
@@ -126,14 +130,17 @@ pub use bulk_export_worker::{
 pub use bulk_provider::{BulkProviderStore, StoredProviderSubmission};
 pub use bulk_submit::{
     BulkEntryOutcome, BulkEntryResult, BulkProcessingOptions, BulkSubmitProvider,
-    BulkSubmitRollbackProvider, ChangeType, EntryCountSummary, IMPORT_MODE_PARAMETER_URL,
-    ImportMode, ManifestStatus, NdjsonEntry, StreamProcessingResult, StreamingBulkSubmitProvider,
-    SubmissionChange, SubmissionId, SubmissionManifest, SubmissionStatus, SubmissionSummary,
-    merge_resource,
+    BulkSubmitRollbackProvider, ChangeType, EntryCountSummary, EntryResultContinuation,
+    EntryResultCursor, EntryResultPage, IMPORT_MODE_PARAMETER_URL, ImportMode, ManifestPhase,
+    ManifestStatus, NdjsonEntry, PagedEntryResult, StreamProcessingResult,
+    StreamingBulkSubmitProvider, SubmissionChange, SubmissionId, SubmissionManifest,
+    SubmissionStatus, SubmissionSummary, merge_resource,
 };
 pub use bulk_submit_input::{
     FileTokenProvider, RemoteFile, RemoteManifest, SubmitInputFetcher, submission_output_job_id,
 };
+pub use bulk_submit_output::{submit_artifact_key, submit_artifact_locator};
+pub use bulk_submit_publication::{ManifestPublicationResult, ManifestPublicationStatus};
 pub use bulk_submit_worker::{
     BulkSubmitJobStore, DefaultSubmitWorker, DeferredReindexHook, ManifestFetchParams,
     ManifestLease, ManifestWorkerView, PollTokenTarget, SubmitClaimStrategy, SubmitFileRecord,

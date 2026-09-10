@@ -13,8 +13,9 @@ use super::backend::MongoBackendConfig;
 
 /// Current MongoDB schema version.
 ///
-/// v7 adds the Bulk Data Submit collections and their indexes.
-pub const SCHEMA_VERSION: i32 = 7;
+/// v7 adds the Bulk Data Submit collections and their indexes. v8 moves the
+/// artifact identity under its owning manifest.
+pub const SCHEMA_VERSION: i32 = 8;
 
 /// Initialize MongoDB collections/indexes required by the backend.
 ///
@@ -392,13 +393,35 @@ async fn ensure_bulk_submit_indexes(database: &Database) -> StorageResult<()> {
 
     let files = database.collection::<Document>(SUBMIT_FILES_COLLECTION);
     let mut file_key = submission_key;
+    file_key.insert("manifest_id", 1_i32);
     file_key.insert("file_type", 1_i32);
     file_key.insert("resource_type", 1_i32);
     file_key.insert("part_index", 1_i32);
     file_key.insert("fencing_token", 1_i32);
-    create_index(&files, file_key, "idx_bulk_submit_files_part", true).await?;
+    create_index(&files, file_key, "idx_bulk_submit_files_manifest", true).await?;
+    drop_bulk_submit_file_legacy_index(&files).await?;
 
     Ok(())
+}
+
+/// Removes the pre-v8 submit-file identity index.
+///
+/// Reinitializing an already-updated database does not fail on its absence;
+/// command error 27 is the MongoDB server's documented `IndexNotFound`.
+async fn drop_bulk_submit_file_legacy_index(files: &Collection<Document>) -> StorageResult<()> {
+    use mongodb::error::ErrorKind;
+
+    match files.drop_index("idx_bulk_submit_files_part").await {
+        Ok(()) => Ok(()),
+        Err(error) if matches!(&*error.kind, ErrorKind::Command(command) if command.code == 27) => {
+            Ok(())
+        }
+        Err(error) => Err(StorageError::Backend(BackendError::Internal {
+            backend_name: "mongodb".to_string(),
+            message: format!("drop legacy submit-file index: {error}"),
+            source: None,
+        })),
+    }
 }
 
 async fn create_index(

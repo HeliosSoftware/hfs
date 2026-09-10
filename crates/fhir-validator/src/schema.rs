@@ -179,6 +179,21 @@ impl FhirSchema {
     pub fn is_primitive(&self) -> bool {
         self.kind.as_deref() == Some(kind::PRIMITIVE_TYPE)
     }
+
+    /// Return a clone with all cardinality fields cleared.
+    ///
+    /// Used when merging an `elementReference` target into a schema set: the
+    /// target contributes structure (elements, type, constraints) but never
+    /// its own array/min/max, which belong to the referring element.
+    pub fn without_cardinality(&self) -> Self {
+        Self {
+            array: None,
+            scalar: None,
+            min: None,
+            max: None,
+            ..self.clone()
+        }
+    }
 }
 
 /// Terminology binding: the ValueSet a coded value must belong to.

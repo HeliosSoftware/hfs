@@ -378,12 +378,35 @@ fn public_api_url<'a>(
     )
 }
 
+/// The shared client for every UI call back into the FHIR API: the Bulk Export
+/// start/poll/retry/delete/download paths and the patient and Group lookups.
+///
+/// Built once. A per-call `Client::builder().build()` rebuilds the connection
+/// pool, the resolver and the TLS trust store every time, and that work does
+/// not scale across threads — measured here at 18.8ms on an idle machine
+/// against 716ms mean (781ms worst) with 32 builds in flight, a 38x
+/// degradation (#1019). Every card poll and every combobox keystroke paid it,
+/// and paid a fresh TCP connect on top because nothing was ever kept alive.
+///
+/// This is [`crate::bulk_import`]'s `http_client()` lesson (#957) applied to
+/// the paths that did not get it. Sharing is safe because the configuration
+/// below is the same at all ten call sites; the per-request timeouts that
+/// differ between them are set on the `RequestBuilder`, not here.
+///
+/// The `Result` is kept — rather than unwrapping into the `OnceLock` — so a
+/// build failure still degrades the page instead of taking the process down.
 pub(crate) fn no_redirect_client() -> Result<reqwest::Client, String> {
-    reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .connect_timeout(std::time::Duration::from_secs(15))
-        .build()
-        .map_err(|e| e.to_string())
+    static CLIENT: std::sync::OnceLock<Result<reqwest::Client, String>> =
+        std::sync::OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .connect_timeout(std::time::Duration::from_secs(15))
+                .build()
+                .map_err(|e| e.to_string())
+        })
+        .clone()
 }
 
 fn parse_url_without_credentials(raw: &str) -> Option<reqwest::Url> {

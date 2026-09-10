@@ -4031,10 +4031,10 @@ mod bulk_submit {
 
     use helios_persistence::core::{
         BulkProcessingOptions, BulkSubmitProvider, BulkSubmitRollbackProvider, ChangeType,
-        DefaultSubmitWorker, IMPORT_MODE_PARAMETER_URL, ManifestFetchParams, ManifestStatus,
-        NdjsonEntry, RemoteFile, RemoteManifest, StreamingBulkSubmitProvider, SubmissionId,
-        SubmissionStatus, SubmitClaimStrategy, SubmitFileRecord, SubmitInputFetcher,
-        SubmitWorkerStorage, WorkerId,
+        DefaultSubmitWorker, IMPORT_MODE_PARAMETER_URL, ManifestFetchParams,
+        ManifestPublicationStatus, ManifestStatus, NdjsonEntry, RemoteFile, RemoteManifest,
+        StreamingBulkSubmitProvider, SubmissionId, SubmissionStatus, SubmitClaimStrategy,
+        SubmitFileRecord, SubmitInputFetcher, SubmitWorkerStorage, WorkerId,
     };
     use helios_persistence::error::StorageResult;
     use std::collections::HashMap;
@@ -4168,6 +4168,605 @@ mod bulk_submit {
         );
     }
 
+    /// `HFS_BULK_SUBMIT_DEFER_INDEXING` (#903) was a no-op on this backend: the
+    /// per-entry path reached the search index through `create`/`update`, which
+    /// have no way to be told to skip it, so a "fast load" still wrote ~21
+    /// `search_index` documents per resource (#1000). The batched ingest owns
+    /// the index write, so the switch now actually defers it — and the resource,
+    /// its history and its receipt still land, because deferring is only ever
+    /// about the derived index.
+    #[tokio::test]
+    async fn test_defer_indexing_skips_the_search_index_but_stores_everything_else() {
+        let Some(backend) = create_backend("submit_defer_indexing").await else {
+            return;
+        };
+        let tenant = create_tenant("submit-tenant");
+        let (id, manifest_id) = seed(&backend, &tenant).await;
+
+        let results = backend
+            .process_entries(
+                &tenant,
+                &id,
+                &manifest_id,
+                vec![NdjsonEntry::new(
+                    1,
+                    "Patient",
+                    json!({
+                        "resourceType": "Patient",
+                        "id": "deferred",
+                        "name": [{"family": "Deferred"}]
+                    }),
+                )],
+                &BulkProcessingOptions::new().with_defer_indexing(true),
+            )
+            .await
+            .unwrap();
+        assert!(results[0].is_success());
+
+        assert_eq!(
+            search_index_entry_count(&backend, &tenant, "Patient", "deferred").await,
+            0,
+            "deferred indexing must not write search_index documents"
+        );
+        assert!(
+            backend
+                .read(&tenant, "Patient", "deferred")
+                .await
+                .unwrap()
+                .is_some(),
+            "the resource itself is stored either way"
+        );
+        assert_eq!(
+            backend
+                .list_versions(&tenant, "Patient", "deferred")
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "history is stored either way"
+        );
+
+        // The default still indexes, so the switch is what makes the difference.
+        backend
+            .process_entries(
+                &tenant,
+                &id,
+                &manifest_id,
+                vec![NdjsonEntry::new(
+                    2,
+                    "Patient",
+                    json!({
+                        "resourceType": "Patient",
+                        "id": "indexed",
+                        "name": [{"family": "Indexed"}]
+                    }),
+                )],
+                &BulkProcessingOptions::new(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            search_index_entry_count(&backend, &tenant, "Patient", "indexed").await > 0,
+            "without the switch the batch still indexes inline"
+        );
+    }
+
+    /// A batch is planned against an overlay of its own staged writes, so an id
+    /// repeated inside one batch versions forward exactly as it did when every
+    /// entry was its own round trip: one history row per entry, the last
+    /// entry's content stored, and one rollback record per entry.
+    #[tokio::test]
+    async fn test_repeated_id_in_one_batch_versions_forward() {
+        let Some(backend) = create_backend("submit_repeated_id").await else {
+            return;
+        };
+        let tenant = create_tenant("submit-tenant");
+        let (id, manifest_id) = seed(&backend, &tenant).await;
+
+        let entries = (1..=3)
+            .map(|n| {
+                NdjsonEntry::new(
+                    n,
+                    "Patient",
+                    json!({
+                        "resourceType": "Patient",
+                        "id": "repeated",
+                        "gender": if n == 3 { "male" } else { "female" },
+                    }),
+                )
+            })
+            .collect();
+        let results = backend
+            .process_entries(
+                &tenant,
+                &id,
+                &manifest_id,
+                entries,
+                &BulkProcessingOptions::new(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(results.len(), 3);
+        assert!(results.iter().all(|r| r.is_success()));
+        assert!(
+            results[0].created && !results[1].created && !results[2].created,
+            "only the first entry creates, got {results:?}"
+        );
+
+        let stored = backend
+            .read(&tenant, "Patient", "repeated")
+            .await
+            .unwrap()
+            .expect("the repeated id is stored once");
+        assert_eq!(stored.version_id(), "3");
+        assert_eq!(stored.content()["gender"], json!("male"));
+
+        let mut versions = backend
+            .list_versions(&tenant, "Patient", "repeated")
+            .await
+            .unwrap();
+        versions.sort();
+        assert_eq!(
+            versions,
+            vec!["1".to_string(), "2".to_string(), "3".to_string()],
+            "every entry contributes its own history version"
+        );
+
+        let changes = backend.list_changes(&tenant, &id, 100, 0).await.unwrap();
+        assert_eq!(
+            changes.len(),
+            3,
+            "the rollback log records one change per entry, got {changes:?}"
+        );
+        assert_eq!(
+            changes
+                .iter()
+                .filter(|c| c.change_type == ChangeType::Create)
+                .count(),
+            1
+        );
+
+        // The index reflects the final version only, not one row set per entry.
+        let indexed = search_index_entry_count(&backend, &tenant, "Patient", "repeated").await;
+        backend
+            .process_entries(
+                &tenant,
+                &id,
+                &manifest_id,
+                vec![NdjsonEntry::new(
+                    4,
+                    "Patient",
+                    json!({"resourceType": "Patient", "id": "single", "gender": "male"}),
+                )],
+                &BulkProcessingOptions::new().with_file_url("second.ndjson"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            indexed,
+            search_index_entry_count(&backend, &tenant, "Patient", "single").await,
+            "three entries for one id leave the same index rows as one entry would"
+        );
+    }
+
+    /// One bad entry must not take the rest of its batch down with it, and every
+    /// entry — success, validation error or skip — still gets a receipt at its
+    /// own line number.
+    #[tokio::test]
+    async fn test_a_mixed_batch_keeps_results_aligned_to_lines() {
+        let Some(backend) = create_backend("submit_mixed_batch").await else {
+            return;
+        };
+        let tenant = create_tenant("submit-tenant");
+        let (id, manifest_id) = seed(&backend, &tenant).await;
+
+        let results = backend
+            .process_entries(
+                &tenant,
+                &id,
+                &manifest_id,
+                vec![
+                    NdjsonEntry::new(
+                        1,
+                        "Patient",
+                        json!({"resourceType": "Patient", "id": "ok-1"}),
+                    ),
+                    // Payload disagrees with the file's declared type.
+                    NdjsonEntry::new(
+                        2,
+                        "Patient",
+                        json!({"resourceType": "Observation", "id": "wrong"}),
+                    ),
+                    NdjsonEntry::new(
+                        3,
+                        "Patient",
+                        json!({"resourceType": "Patient", "id": "ok-2"}),
+                    ),
+                ],
+                &BulkProcessingOptions::new(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(results.len(), 3);
+        assert_eq!(
+            results.iter().map(|r| r.line_number).collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        assert!(results[0].is_success() && results[2].is_success());
+        assert!(results[1].is_error(), "line 2 is a validation error");
+        assert!(
+            backend
+                .read(&tenant, "Patient", "ok-2")
+                .await
+                .unwrap()
+                .is_some(),
+            "an entry after the bad one still lands"
+        );
+
+        let counts = backend
+            .get_entry_counts(&tenant, &id, &manifest_id)
+            .await
+            .unwrap();
+        assert_eq!(counts.total, 3);
+        assert_eq!(counts.success, 2);
+        assert_eq!(counts.validation_error, 1);
+    }
+
+    /// With `allow_updates` off, an id that already exists is skipped rather
+    /// than versioned — and the pre-existing row keeps its content.
+    #[tokio::test]
+    async fn test_create_only_skips_existing_ids() {
+        let Some(backend) = create_backend("submit_create_only").await else {
+            return;
+        };
+        let tenant = create_tenant("submit-tenant");
+        let (id, manifest_id) = seed(&backend, &tenant).await;
+
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType": "Patient", "id": "existing", "gender": "female"}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+
+        let results = backend
+            .process_entries(
+                &tenant,
+                &id,
+                &manifest_id,
+                vec![
+                    NdjsonEntry::new(
+                        1,
+                        "Patient",
+                        json!({"resourceType": "Patient", "id": "existing", "gender": "male"}),
+                    ),
+                    NdjsonEntry::new(
+                        2,
+                        "Patient",
+                        json!({"resourceType": "Patient", "id": "fresh"}),
+                    ),
+                ],
+                &BulkProcessingOptions::create_only(),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            !results[0].is_success() && !results[0].is_error(),
+            "skipped"
+        );
+        assert!(results[1].is_success() && results[1].created);
+        let stored = backend
+            .read(&tenant, "Patient", "existing")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.version_id(), "1");
+        assert_eq!(stored.content()["gender"], json!("female"));
+    }
+
+    /// A tombstoned id is not an update target, and `create` refuses it too —
+    /// its existence probe does not filter `is_deleted`, so it reports
+    /// `AlreadyExists`. That is a pre-existing defect in the resource layer, not
+    /// in the ingest; this pins the behaviour so the batched path is known to
+    /// reproduce it rather than to have quietly changed it.
+    #[tokio::test]
+    async fn test_reimporting_a_deleted_resource_reports_already_exists() {
+        let Some(backend) = create_backend("submit_deleted_reimport").await else {
+            return;
+        };
+        let tenant = create_tenant("submit-tenant");
+        let (id, manifest_id) = seed(&backend, &tenant).await;
+
+        let created = backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType": "Patient", "id": "tombstoned"}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        backend
+            .delete(&tenant, "Patient", created.id())
+            .await
+            .unwrap();
+
+        let results = backend
+            .process_entries(
+                &tenant,
+                &id,
+                &manifest_id,
+                vec![NdjsonEntry::new(
+                    1,
+                    "Patient",
+                    json!({"resourceType": "Patient", "id": "tombstoned"}),
+                )],
+                &BulkProcessingOptions::new(),
+            )
+            .await
+            .unwrap();
+
+        assert!(results[0].is_error());
+        let diagnostics = results[0].operation_outcome.as_ref().unwrap()["issue"][0]["diagnostics"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            diagnostics.contains("already exists"),
+            "expected an already-exists diagnostic, got {diagnostics}"
+        );
+    }
+
+    /// A tenant that may not write the type gets a per-entry processing error,
+    /// not a failed batch — the permission check is per entry, as it was when
+    /// each entry called `create`/`update` for itself.
+    #[tokio::test]
+    async fn test_entries_the_tenant_may_not_write_fail_individually() {
+        let Some(backend) = create_backend("submit_permission_denied").await else {
+            return;
+        };
+        let writer = create_tenant("submit-tenant");
+        let (id, manifest_id) = seed(&backend, &writer).await;
+        let reader = TenantContext::new(writer.tenant_id().clone(), TenantPermissions::read_only());
+
+        let results = backend
+            .process_entries(
+                &reader,
+                &id,
+                &manifest_id,
+                vec![NdjsonEntry::new(
+                    1,
+                    "Patient",
+                    json!({"resourceType": "Patient", "id": "forbidden"}),
+                )],
+                &BulkProcessingOptions::new(),
+            )
+            .await
+            .unwrap();
+
+        assert!(results[0].is_error(), "a read-only tenant cannot create");
+        assert!(
+            backend
+                .read(&writer, "Patient", "forbidden")
+                .await
+                .unwrap()
+                .is_none(),
+            "and nothing was written"
+        );
+    }
+
+    /// `max_errors` with `continue_on_error` off aborts the batch — but the
+    /// entries processed before the abort keep their receipts, which is what the
+    /// per-entry path left behind and what a re-fetch relies on.
+    #[tokio::test]
+    async fn test_max_errors_aborts_the_batch_but_keeps_earlier_receipts() {
+        let Some(backend) = create_backend("submit_max_errors_abort").await else {
+            return;
+        };
+        let tenant = create_tenant("submit-tenant");
+        let (id, manifest_id) = seed(&backend, &tenant).await;
+
+        let outcome = backend
+            .process_entries(
+                &tenant,
+                &id,
+                &manifest_id,
+                vec![
+                    NdjsonEntry::new(
+                        1,
+                        "Patient",
+                        json!({"resourceType": "Observation", "id": "wrong"}),
+                    ),
+                    NdjsonEntry::new(
+                        2,
+                        "Patient",
+                        json!({"resourceType": "Patient", "id": "never-reached"}),
+                    ),
+                ],
+                &BulkProcessingOptions::strict(),
+            )
+            .await;
+        assert!(
+            matches!(
+                outcome,
+                Err(StorageError::BulkSubmit(
+                    helios_persistence::error::BulkSubmitError::MaxErrorsExceeded { .. }
+                ))
+            ),
+            "expected MaxErrorsExceeded, got {outcome:?}"
+        );
+
+        let counts = backend
+            .get_entry_counts(&tenant, &id, &manifest_id)
+            .await
+            .unwrap();
+        assert_eq!(counts.total, 1, "only the entry that ran has a receipt");
+        assert_eq!(counts.validation_error, 1);
+        assert!(
+            backend
+                .read(&tenant, "Patient", "never-reached")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// With `continue_on_error` on, everything past `max_errors` is recorded as
+    /// skipped rather than attempted.
+    #[tokio::test]
+    async fn test_max_errors_with_continue_on_error_skips_the_rest() {
+        let Some(backend) = create_backend("submit_max_errors_skip").await else {
+            return;
+        };
+        let tenant = create_tenant("submit-tenant");
+        let (id, manifest_id) = seed(&backend, &tenant).await;
+
+        let results = backend
+            .process_entries(
+                &tenant,
+                &id,
+                &manifest_id,
+                vec![
+                    NdjsonEntry::new(
+                        1,
+                        "Patient",
+                        json!({"resourceType": "Observation", "id": "wrong"}),
+                    ),
+                    NdjsonEntry::new(2, "Patient", json!({"resourceType": "Patient", "id": "a"})),
+                    NdjsonEntry::new(3, "Patient", json!({"resourceType": "Patient", "id": "b"})),
+                ],
+                &BulkProcessingOptions::new()
+                    .with_max_errors(1)
+                    .with_continue_on_error(true),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(results.len(), 3);
+        assert!(results[0].is_error());
+        assert!(
+            results[1..]
+                .iter()
+                .all(|r| !r.is_success() && !r.is_error()),
+            "entries past max_errors are skipped, got {results:?}"
+        );
+        assert!(
+            backend
+                .read(&tenant, "Patient", "a")
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        let counts = backend
+            .get_entry_counts(&tenant, &id, &manifest_id)
+            .await
+            .unwrap();
+        assert_eq!(counts.skipped, 2);
+    }
+
+    /// Two batches ingesting the same ids at once — the shape
+    /// `HFS_BULK_SUBMIT_FILE_CONCURRENCY > 1` produces when two of a manifest's
+    /// files carry the same resource. Whichever loses the race must lose it
+    /// cleanly: no failed call, no duplicated row, no receipt lost.
+    ///
+    /// Half the ids exist beforehand and half do not, so both collision paths
+    /// are in play: two concurrent inserts of a new id (one loses on the unique
+    /// index) and two concurrent updates of an existing one (one loses the
+    /// version guard, which the batch resolves by re-reading).
+    ///
+    /// The assertions are invariants rather than an expected winner, so the test
+    /// does not depend on how the two interleave.
+    #[tokio::test]
+    async fn test_two_batches_racing_for_the_same_ids_stay_consistent() {
+        let Some(backend) = create_backend("submit_concurrent_same_ids").await else {
+            return;
+        };
+        let backend = std::sync::Arc::new(backend);
+        let tenant = create_tenant("submit-tenant");
+        let (id, manifest_id) = seed(backend.as_ref(), &tenant).await;
+
+        const IDS: usize = 60;
+        for n in (0..IDS).step_by(2) {
+            backend
+                .create(
+                    &tenant,
+                    "Patient",
+                    json!({"resourceType": "Patient", "id": format!("racer-{n}")}),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+
+        let entries = || {
+            (0..IDS)
+                .map(|n| {
+                    NdjsonEntry::new(
+                        n as u64 + 1,
+                        "Patient",
+                        json!({"resourceType": "Patient", "id": format!("racer-{n}")}),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let mut handles = Vec::new();
+        for file in ["race-a.ndjson", "race-b.ndjson"] {
+            let backend = backend.clone();
+            let tenant = tenant.clone();
+            let id = id.clone();
+            let manifest_id = manifest_id.clone();
+            let entries = entries();
+            handles.push(tokio::spawn(async move {
+                backend
+                    .process_entries(
+                        &tenant,
+                        &id,
+                        &manifest_id,
+                        entries,
+                        &BulkProcessingOptions::new().with_file_url(file),
+                    )
+                    .await
+            }));
+        }
+        for handle in handles {
+            let results = handle.await.unwrap().expect("a losing batch still returns");
+            assert_eq!(results.len(), IDS);
+        }
+
+        for n in 0..IDS {
+            let stored = backend
+                .read(&tenant, "Patient", &format!("racer-{n}"))
+                .await
+                .unwrap()
+                .unwrap_or_else(|| panic!("racer-{n} must exist exactly once"));
+            // Pre-existing ids start at 1 and can be bumped once or twice
+            // depending on how the two batches interleaved; new ids start at 1.
+            assert!(
+                ["1", "2", "3"].contains(&stored.version_id()),
+                "racer-{n} landed at version {}",
+                stored.version_id()
+            );
+        }
+
+        let counts = backend
+            .get_entry_counts(&tenant, &id, &manifest_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            counts.total,
+            (IDS * 2) as u64,
+            "every line of both files keeps its own receipt"
+        );
+    }
+
     /// Line numbers restart in every manifest output file, so the file is part
     /// of an entry result's identity (#457). Without it the second file's line 1
     /// overwrites the first file's.
@@ -4203,6 +4802,158 @@ mod bulk_submit {
         assert_eq!(
             counts.total, 2,
             "both files' line 1 must survive as separate results"
+        );
+        let mut next = None;
+        let mut ids = Vec::new();
+        for page_index in 0..3 {
+            let page = backend
+                .get_entry_results_page(&tenant, &id, &manifest_id, None, 1, next.as_ref())
+                .await
+                .unwrap();
+            assert!(
+                page.entries
+                    .iter()
+                    .all(|entry| entry.stored_identity.is_none())
+            );
+            ids.extend(
+                page.entries
+                    .into_iter()
+                    .map(|entry| entry.result.resource_id.unwrap()),
+            );
+            next = page.next;
+            if page_index < 2 {
+                assert_eq!(
+                    next,
+                    Some(helios_persistence::core::EntryResultContinuation::Offset(
+                        page_index + 1
+                    ))
+                );
+            } else {
+                assert!(next.is_none(), "exact multiple must terminate");
+            }
+        }
+        assert_eq!(ids, ["pa", "pb"]);
+        assert!(
+            backend
+                .get_entry_results_page(&tenant, &id, &manifest_id, None, 0, None)
+                .await
+                .is_err()
+        );
+        assert!(
+            backend
+                .get_entry_results_page(
+                    &tenant,
+                    &id,
+                    &manifest_id,
+                    None,
+                    1,
+                    Some(&helios_persistence::core::EntryResultContinuation::Keyset(
+                        helios_persistence::core::EntryResultCursor {
+                            file_url: String::new(),
+                            line_number: 0,
+                        }
+                    ))
+                )
+                .await
+                .is_err()
+        );
+        let primary = Arc::new(backend);
+        let config = helios_persistence::composite::config::CompositeConfig::builder()
+            .primary("mongo", BackendKind::MongoDB)
+            .build()
+            .unwrap();
+        let storage = Arc::new(
+            helios_persistence::composite::storage::CompositeStorage::new(
+                config,
+                std::collections::HashMap::from([(
+                    "mongo".to_string(),
+                    primary.clone() as helios_persistence::composite::storage::DynStorage,
+                )]),
+            )
+            .unwrap(),
+        );
+        let jobs =
+            helios_persistence::composite::bulk_submit::CompositeSubmitJobs::new(primary, storage);
+        let delegated = jobs
+            .get_entry_results_page(&tenant, &id, &manifest_id, None, 1, None)
+            .await
+            .unwrap();
+        assert!(delegated.entries[0].stored_identity.is_none());
+        assert_eq!(
+            delegated.next,
+            Some(helios_persistence::core::EntryResultContinuation::Offset(1))
+        );
+        eprintln!("Verified MongoDB bulk-submit receipt pagination and Composite delegation");
+    }
+
+    /// The manifest counters are cumulative across every run of a manifest, so
+    /// both writers into them — the worker's `add_manifest_progress` and the
+    /// ingestion engine's per-batch bookkeeping — must add rather than assign.
+    /// Assigning would stomp the other writer and walk the status endpoint's
+    /// numbers backwards on resume (#969). The SQLite backend pins the same
+    /// invariant in `test_progress_counters_only_move_forward`; this is its
+    /// MongoDB twin, guarding the `$inc` documents.
+    #[tokio::test]
+    async fn test_progress_counters_only_move_forward() {
+        let Some(backend) = create_backend("submit_progress_accumulates").await else {
+            return;
+        };
+        let tenant = create_tenant("submit-tenant");
+        let (id, manifest_id) = seed(&backend, &tenant).await;
+
+        let lease = backend
+            .claim_next_manifest(&WorkerId::new("worker-1"), lease_duration())
+            .await
+            .unwrap()
+            .expect("the seeded manifest is claimable");
+
+        // The worker's own contributions accumulate across calls...
+        backend
+            .add_manifest_progress(&lease, 5, 1, 6)
+            .await
+            .unwrap();
+        backend
+            .add_manifest_progress(&lease, 2, 0, 2)
+            .await
+            .unwrap();
+        assert_eq!(
+            backend
+                .get_manifest_for_worker(&lease)
+                .await
+                .unwrap()
+                .last_processed_line,
+            8
+        );
+
+        // ...and the ingestion engine's per-batch bookkeeping adds on top of
+        // them instead of replacing them.
+        backend
+            .process_entries(
+                &tenant,
+                &id,
+                &manifest_id,
+                vec![
+                    NdjsonEntry::new(1, "Patient", json!({"resourceType": "Patient"})),
+                    NdjsonEntry::new(2, "Patient", json!({"resourceType": "Patient"})),
+                ],
+                &BulkProcessingOptions::new(),
+            )
+            .await
+            .unwrap();
+
+        let manifests = backend.list_manifests(&tenant, &id).await.unwrap();
+        assert_eq!(manifests[0].processed_entries, 9);
+        assert_eq!(manifests[0].failed_entries, 1);
+        // `add_manifest_progress` never touches `total_entries`, so only the two
+        // batched entries are counted here.
+        assert_eq!(manifests[0].total_entries, 2);
+        assert_eq!(
+            backend
+                .get_manifest_for_worker(&lease)
+                .await
+                .unwrap()
+                .last_processed_line,
+            10
         );
     }
 
@@ -4281,7 +5032,7 @@ mod bulk_submit {
                 .err()
                 .map(|e| format!("{e:?}")),
             backend
-                .update_manifest_progress(&stale, 1, 0, 1)
+                .add_manifest_progress(&stale, 1, 0, 1)
                 .await
                 .err()
                 .map(|e| format!("{e:?}")),
@@ -4625,6 +5376,268 @@ mod bulk_submit {
                 .is_none(),
             "a line of the wrong type must not be stored"
         );
+    }
+
+    /// Reconstructs the pre-v8 Mongo artifact shape, migrates it through the
+    /// public backend migration, and verifies manifest-aware v8 identity for
+    /// two generations under one submission.
+    #[tokio::test]
+    async fn test_v7_to_v8_manifest_aware_submit_file_identity() {
+        use futures::TryStreamExt;
+
+        let Some(backend) = create_backend("submit_v7_to_v8_manifest_identity").await else {
+            eprintln!("skipping: no MongoDB container available");
+            return;
+        };
+        let tenant = create_tenant("submit-v7");
+        let submission_id = SubmissionId::new("v7-provider", "legacy-generation");
+        let db = backend.get_database().await.unwrap();
+        let files = db.collection::<Document>("bulk_submit_files");
+
+        files
+            .drop_index("idx_bulk_submit_files_manifest")
+            .await
+            .unwrap();
+        files
+            .create_index(
+                mongodb::IndexModel::builder()
+                    .keys(doc! {
+                        "tenant_id": 1_i32,
+                        "submitter": 1_i32,
+                        "submission_id": 1_i32,
+                        "file_type": 1_i32,
+                        "resource_type": 1_i32,
+                        "part_index": 1_i32,
+                        "fencing_token": 1_i32,
+                    })
+                    .options(
+                        mongodb::options::IndexOptions::builder()
+                            .name(Some("idx_bulk_submit_files_part".to_string()))
+                            .unique(Some(true))
+                            .build(),
+                    )
+                    .build(),
+            )
+            .await
+            .unwrap();
+        db.collection::<Document>("schema_version")
+            .update_one(
+                doc! { "_id": "schema_version" },
+                doc! { "$set": { "version": 7_i32 } },
+            )
+            .await
+            .unwrap();
+        files
+            .insert_one(doc! {
+                "tenant_id": tenant.tenant_id().as_str(),
+                "submitter": &submission_id.submitter,
+                "submission_id": &submission_id.submission_id,
+                "manifest_url": "https://provider.example/legacy.json",
+                "file_type": "output",
+                "resource_type": "Patient",
+                "part_index": 0_i64,
+                "fencing_token": 1_i64,
+                "file_path": "legacy/output/Patient-0.ndjson",
+                "line_count": 2_i64,
+                "byte_count": 19_i64,
+                "created_at": mongodb::bson::DateTime::from_millis(
+                    chrono::Utc::now().timestamp_millis(),
+                ),
+            })
+            .await
+            .unwrap();
+
+        backend.migrate().await.unwrap();
+        let schema_version = db
+            .collection::<Document>("schema_version")
+            .find_one(doc! { "_id": "schema_version" })
+            .await
+            .unwrap()
+            .expect("schema version document");
+        assert_eq!(schema_version.get_i32("version").unwrap(), 8_i32);
+
+        let indexes = files
+            .list_indexes()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let manifest_index = indexes
+            .iter()
+            .find(|index| {
+                index
+                    .options
+                    .as_ref()
+                    .and_then(|options| options.name.as_deref())
+                    == Some("idx_bulk_submit_files_manifest")
+            })
+            .expect("v8 submit-file identity index");
+        assert_eq!(
+            manifest_index.keys,
+            doc! {
+                "tenant_id": 1_i32,
+                "submitter": 1_i32,
+                "submission_id": 1_i32,
+                "manifest_id": 1_i32,
+                "file_type": 1_i32,
+                "resource_type": 1_i32,
+                "part_index": 1_i32,
+                "fencing_token": 1_i32,
+            }
+        );
+        assert_eq!(manifest_index.options.as_ref().unwrap().unique, Some(true));
+        assert!(
+            indexes.iter().all(|index| index
+                .options
+                .as_ref()
+                .and_then(|options| options.name.as_deref())
+                != Some("idx_bulk_submit_files_part")),
+            "legacy submit-file index must be dropped, got {indexes:?}"
+        );
+
+        // A second pass on the already-migrated database is a no-op.
+        backend.migrate().await.unwrap();
+        let legacy_rows = backend
+            .list_submit_files(&tenant, &submission_id)
+            .await
+            .unwrap();
+        assert_eq!(legacy_rows.len(), 1);
+        assert!(legacy_rows[0].manifest_id.is_none());
+        assert!(legacy_rows[0].legacy_locator);
+        assert_eq!(legacy_rows[0].line_count, 2);
+        assert_eq!(legacy_rows[0].byte_count, 19);
+
+        let new_submission_id = SubmissionId::new("v8-provider", "manifest-aware-generation");
+        backend
+            .create_submission(&tenant, &new_submission_id, None)
+            .await
+            .unwrap();
+        let first = backend
+            .add_manifest(
+                &tenant,
+                &new_submission_id,
+                Some("https://provider.example/first.json"),
+                None,
+            )
+            .await
+            .unwrap();
+        let second = backend
+            .add_manifest(
+                &tenant,
+                &new_submission_id,
+                Some("https://provider.example/second.json"),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_ne!(first.manifest_id, second.manifest_id);
+
+        let worker_id = WorkerId::new("v8-identity-worker");
+        let first_lease = backend
+            .claim_next_manifest(&worker_id, lease_duration())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first_lease.submission_id, new_submission_id);
+        assert_eq!(first_lease.manifest_id, first.manifest_id);
+        assert_eq!(first_lease.fencing_token, 1);
+        let record = SubmitFileRecord {
+            manifest_url: Some("https://provider.example/first.json".to_string()),
+            file_type: "output".to_string(),
+            resource_type: Some("Patient".to_string()),
+            part_index: 0,
+            file_path: "legacy/output/Patient-0.ndjson".to_string(),
+            line_count: 2,
+            byte_count: 19,
+            count_severity: None,
+        };
+        backend
+            .record_submit_file(&first_lease, &record)
+            .await
+            .unwrap();
+        backend
+            .record_submit_file(&first_lease, &record)
+            .await
+            .unwrap();
+        backend
+            .publish_manifest_artifacts(
+                &first_lease,
+                std::slice::from_ref(&record),
+                ManifestPublicationStatus::Completed,
+            )
+            .await
+            .unwrap();
+
+        let second_lease = backend
+            .claim_next_manifest(&worker_id, lease_duration())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(second_lease.submission_id, new_submission_id);
+        assert_eq!(second_lease.manifest_id, second.manifest_id);
+        assert_eq!(second_lease.fencing_token, 1);
+        let second_record = SubmitFileRecord {
+            manifest_url: Some("https://provider.example/second.json".to_string()),
+            ..record.clone()
+        };
+        backend
+            .record_submit_file(&second_lease, &second_record)
+            .await
+            .unwrap();
+        backend
+            .publish_manifest_artifacts(
+                &second_lease,
+                &[second_record],
+                ManifestPublicationStatus::Completed,
+            )
+            .await
+            .unwrap();
+
+        let rows = backend
+            .list_submit_files(&tenant, &new_submission_id)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|row| !row.legacy_locator));
+        let mut actual_manifest_ids: Vec<_> = rows
+            .iter()
+            .map(|row| row.manifest_id.as_deref().unwrap())
+            .collect();
+        actual_manifest_ids.sort_unstable();
+        let mut expected_manifest_ids =
+            vec![first.manifest_id.as_str(), second.manifest_id.as_str()];
+        expected_manifest_ids.sort_unstable();
+        assert_eq!(actual_manifest_ids, expected_manifest_ids);
+        assert!(rows.iter().all(|row| row.file_type == "output"));
+        assert!(
+            rows.iter()
+                .all(|row| row.resource_type.as_deref() == Some("Patient"))
+        );
+        assert!(rows.iter().all(|row| row.part_index == 0));
+        assert!(rows.iter().all(|row| row.line_count == 2));
+        assert!(rows.iter().all(|row| row.byte_count == 19));
+        assert!(
+            rows.iter()
+                .all(|row| row.file_path == "legacy/output/Patient-0.ndjson")
+        );
+        let manifests = backend
+            .list_manifests(&tenant, &new_submission_id)
+            .await
+            .unwrap();
+        assert_eq!(manifests.len(), 2);
+        assert_ne!(manifests[0].manifest_id, manifests[1].manifest_id);
+        assert!(manifests.iter().all(|manifest| {
+            manifest.manifest_id == first.manifest_id || manifest.manifest_id == second.manifest_id
+        }));
+
+        let preserved_legacy_rows = backend
+            .list_submit_files(&tenant, &submission_id)
+            .await
+            .unwrap();
+        assert_eq!(preserved_legacy_rows.len(), 1);
+        assert!(preserved_legacy_rows[0].manifest_id.is_none());
+        assert!(preserved_legacy_rows[0].legacy_locator);
     }
 }
 

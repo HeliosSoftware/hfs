@@ -998,10 +998,125 @@ async fn bulk_submit_entry_results_are_keyed_by_their_output_file() {
     assert_eq!(counts.success, 2, "one stored entry result per file");
 
     let stored = backend
-        .get_entry_results(&tenant, &submission_id, &manifest.manifest_id, None, 10, 0)
+        .get_entry_results_page(
+            &tenant,
+            &submission_id,
+            &manifest.manifest_id,
+            None,
+            10,
+            None,
+        )
         .await
         .unwrap();
-    assert_eq!(stored.len(), 2, "both files' line 1 must survive");
+    assert_eq!(stored.entries.len(), 2, "both files' line 1 must survive");
+    let mut expected: Vec<_> = stored
+        .entries
+        .iter()
+        .map(|entry| entry.result.resource_id.clone())
+        .collect();
+    expected.sort();
+    let mut next = None;
+    let mut actual = Vec::new();
+    for page_index in 0..3 {
+        let page = backend
+            .get_entry_results_page(
+                &tenant,
+                &submission_id,
+                &manifest.manifest_id,
+                None,
+                1,
+                next.as_ref(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            page.entries
+                .iter()
+                .all(|entry| entry.stored_identity.is_none())
+        );
+        actual.extend(
+            page.entries
+                .into_iter()
+                .map(|entry| entry.result.resource_id),
+        );
+        next = page.next;
+        if page_index < 2 {
+            assert_eq!(
+                next,
+                Some(crate::core::EntryResultContinuation::Offset(page_index + 1))
+            );
+        } else {
+            assert!(
+                next.is_none(),
+                "exact multiple terminates with an empty final page"
+            );
+        }
+    }
+    actual.sort();
+    assert_eq!(actual, expected);
+    assert!(
+        backend
+            .get_entry_results_page(
+                &tenant,
+                &submission_id,
+                &manifest.manifest_id,
+                None,
+                0,
+                None
+            )
+            .await
+            .is_err()
+    );
+    assert!(
+        backend
+            .get_entry_results_page(
+                &tenant,
+                &submission_id,
+                &manifest.manifest_id,
+                None,
+                1,
+                Some(&crate::core::EntryResultContinuation::Keyset(
+                    crate::core::EntryResultCursor {
+                        file_url: String::new(),
+                        line_number: 0,
+                    }
+                ))
+            )
+            .await
+            .is_err()
+    );
+    let primary = Arc::new(backend);
+    let config = crate::composite::config::CompositeConfig::builder()
+        .primary("s3", crate::core::BackendKind::S3)
+        .build()
+        .unwrap();
+    let storage = Arc::new(
+        crate::composite::storage::CompositeStorage::new(
+            config,
+            std::collections::HashMap::from([(
+                "s3".to_string(),
+                primary.clone() as crate::composite::storage::DynStorage,
+            )]),
+        )
+        .unwrap(),
+    );
+    let jobs = crate::composite::bulk_submit::CompositeSubmitJobs::new(primary, storage);
+    let delegated = jobs
+        .get_entry_results_page(
+            &tenant,
+            &submission_id,
+            &manifest.manifest_id,
+            None,
+            1,
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(delegated.entries[0].stored_identity.is_none());
+    assert_eq!(
+        delegated.next,
+        Some(crate::core::EntryResultContinuation::Offset(1))
+    );
 
     // The raw NDJSON archive is discriminated too, so the auditable copy of the
     // first file's payload is not replaced by the second's.
@@ -2991,7 +3106,7 @@ mod bulk_submit_worker {
                 .err()
                 .map(|e| format!("{e:?}")),
             backend
-                .update_manifest_progress(&stale, 5, 0, 5)
+                .add_manifest_progress(&stale, 5, 0, 5)
                 .await
                 .err()
                 .map(|e| format!("{e:?}")),
