@@ -236,7 +236,7 @@ pub async fn worker_receipts<B: BulkSubmitJobStore + 'static>(
         let key = ExportPartKey {
             tenant_id: tenant.tenant_id().as_str().to_string(),
             job_id: submission_output_job_id(&submission),
-            resource_type: row.resource_type.clone().unwrap(),
+            resource_type: row.file_path.clone(),
             file_type: row.file_type.clone(),
             part_index: row.part_index,
             fencing_token: row.fencing_token,

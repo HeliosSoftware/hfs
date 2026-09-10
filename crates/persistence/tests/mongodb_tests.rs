@@ -4013,10 +4013,10 @@ mod bulk_submit {
 
     use helios_persistence::core::{
         BulkProcessingOptions, BulkSubmitProvider, BulkSubmitRollbackProvider, ChangeType,
-        DefaultSubmitWorker, IMPORT_MODE_PARAMETER_URL, ManifestFetchParams, ManifestStatus,
-        NdjsonEntry, RemoteFile, RemoteManifest, StreamingBulkSubmitProvider, SubmissionId,
-        SubmissionStatus, SubmitClaimStrategy, SubmitFileRecord, SubmitInputFetcher,
-        SubmitWorkerStorage, WorkerId,
+        DefaultSubmitWorker, IMPORT_MODE_PARAMETER_URL, ManifestFetchParams,
+        ManifestPublicationStatus, ManifestStatus, NdjsonEntry, RemoteFile, RemoteManifest,
+        StreamingBulkSubmitProvider, SubmissionId, SubmissionStatus, SubmitClaimStrategy,
+        SubmitFileRecord, SubmitInputFetcher, SubmitWorkerStorage, WorkerId,
     };
     use helios_persistence::error::StorageResult;
     use std::collections::HashMap;
@@ -5358,6 +5358,268 @@ mod bulk_submit {
                 .is_none(),
             "a line of the wrong type must not be stored"
         );
+    }
+
+    /// Reconstructs the pre-v8 Mongo artifact shape, migrates it through the
+    /// public backend migration, and verifies manifest-aware v8 identity for
+    /// two generations under one submission.
+    #[tokio::test]
+    async fn test_v7_to_v8_manifest_aware_submit_file_identity() {
+        use futures::TryStreamExt;
+
+        let Some(backend) = create_backend("submit_v7_to_v8_manifest_identity").await else {
+            eprintln!("skipping: no MongoDB container available");
+            return;
+        };
+        let tenant = create_tenant("submit-v7");
+        let submission_id = SubmissionId::new("v7-provider", "legacy-generation");
+        let db = backend.get_database().await.unwrap();
+        let files = db.collection::<Document>("bulk_submit_files");
+
+        files
+            .drop_index("idx_bulk_submit_files_manifest")
+            .await
+            .unwrap();
+        files
+            .create_index(
+                mongodb::IndexModel::builder()
+                    .keys(doc! {
+                        "tenant_id": 1_i32,
+                        "submitter": 1_i32,
+                        "submission_id": 1_i32,
+                        "file_type": 1_i32,
+                        "resource_type": 1_i32,
+                        "part_index": 1_i32,
+                        "fencing_token": 1_i32,
+                    })
+                    .options(
+                        mongodb::options::IndexOptions::builder()
+                            .name(Some("idx_bulk_submit_files_part".to_string()))
+                            .unique(Some(true))
+                            .build(),
+                    )
+                    .build(),
+            )
+            .await
+            .unwrap();
+        db.collection::<Document>("schema_version")
+            .update_one(
+                doc! { "_id": "schema_version" },
+                doc! { "$set": { "version": 7_i32 } },
+            )
+            .await
+            .unwrap();
+        files
+            .insert_one(doc! {
+                "tenant_id": tenant.tenant_id().as_str(),
+                "submitter": &submission_id.submitter,
+                "submission_id": &submission_id.submission_id,
+                "manifest_url": "https://provider.example/legacy.json",
+                "file_type": "output",
+                "resource_type": "Patient",
+                "part_index": 0_i64,
+                "fencing_token": 1_i64,
+                "file_path": "legacy/output/Patient-0.ndjson",
+                "line_count": 2_i64,
+                "byte_count": 19_i64,
+                "created_at": mongodb::bson::DateTime::from_millis(
+                    chrono::Utc::now().timestamp_millis(),
+                ),
+            })
+            .await
+            .unwrap();
+
+        backend.migrate().await.unwrap();
+        let schema_version = db
+            .collection::<Document>("schema_version")
+            .find_one(doc! { "_id": "schema_version" })
+            .await
+            .unwrap()
+            .expect("schema version document");
+        assert_eq!(schema_version.get_i32("version").unwrap(), 8_i32);
+
+        let indexes = files
+            .list_indexes()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let manifest_index = indexes
+            .iter()
+            .find(|index| {
+                index
+                    .options
+                    .as_ref()
+                    .and_then(|options| options.name.as_deref())
+                    == Some("idx_bulk_submit_files_manifest")
+            })
+            .expect("v8 submit-file identity index");
+        assert_eq!(
+            manifest_index.keys,
+            doc! {
+                "tenant_id": 1_i32,
+                "submitter": 1_i32,
+                "submission_id": 1_i32,
+                "manifest_id": 1_i32,
+                "file_type": 1_i32,
+                "resource_type": 1_i32,
+                "part_index": 1_i32,
+                "fencing_token": 1_i32,
+            }
+        );
+        assert_eq!(manifest_index.options.as_ref().unwrap().unique, Some(true));
+        assert!(
+            indexes.iter().all(|index| index
+                .options
+                .as_ref()
+                .and_then(|options| options.name.as_deref())
+                != Some("idx_bulk_submit_files_part")),
+            "legacy submit-file index must be dropped, got {indexes:?}"
+        );
+
+        // A second pass on the already-migrated database is a no-op.
+        backend.migrate().await.unwrap();
+        let legacy_rows = backend
+            .list_submit_files(&tenant, &submission_id)
+            .await
+            .unwrap();
+        assert_eq!(legacy_rows.len(), 1);
+        assert!(legacy_rows[0].manifest_id.is_none());
+        assert!(legacy_rows[0].legacy_locator);
+        assert_eq!(legacy_rows[0].line_count, 2);
+        assert_eq!(legacy_rows[0].byte_count, 19);
+
+        let new_submission_id = SubmissionId::new("v8-provider", "manifest-aware-generation");
+        backend
+            .create_submission(&tenant, &new_submission_id, None)
+            .await
+            .unwrap();
+        let first = backend
+            .add_manifest(
+                &tenant,
+                &new_submission_id,
+                Some("https://provider.example/first.json"),
+                None,
+            )
+            .await
+            .unwrap();
+        let second = backend
+            .add_manifest(
+                &tenant,
+                &new_submission_id,
+                Some("https://provider.example/second.json"),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_ne!(first.manifest_id, second.manifest_id);
+
+        let worker_id = WorkerId::new("v8-identity-worker");
+        let first_lease = backend
+            .claim_next_manifest(&worker_id, lease_duration())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first_lease.submission_id, new_submission_id);
+        assert_eq!(first_lease.manifest_id, first.manifest_id);
+        assert_eq!(first_lease.fencing_token, 1);
+        let record = SubmitFileRecord {
+            manifest_url: Some("https://provider.example/first.json".to_string()),
+            file_type: "output".to_string(),
+            resource_type: Some("Patient".to_string()),
+            part_index: 0,
+            file_path: "legacy/output/Patient-0.ndjson".to_string(),
+            line_count: 2,
+            byte_count: 19,
+            count_severity: None,
+        };
+        backend
+            .record_submit_file(&first_lease, &record)
+            .await
+            .unwrap();
+        backend
+            .record_submit_file(&first_lease, &record)
+            .await
+            .unwrap();
+        backend
+            .publish_manifest_artifacts(
+                &first_lease,
+                std::slice::from_ref(&record),
+                ManifestPublicationStatus::Completed,
+            )
+            .await
+            .unwrap();
+
+        let second_lease = backend
+            .claim_next_manifest(&worker_id, lease_duration())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(second_lease.submission_id, new_submission_id);
+        assert_eq!(second_lease.manifest_id, second.manifest_id);
+        assert_eq!(second_lease.fencing_token, 1);
+        let second_record = SubmitFileRecord {
+            manifest_url: Some("https://provider.example/second.json".to_string()),
+            ..record.clone()
+        };
+        backend
+            .record_submit_file(&second_lease, &second_record)
+            .await
+            .unwrap();
+        backend
+            .publish_manifest_artifacts(
+                &second_lease,
+                &[second_record],
+                ManifestPublicationStatus::Completed,
+            )
+            .await
+            .unwrap();
+
+        let rows = backend
+            .list_submit_files(&tenant, &new_submission_id)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|row| !row.legacy_locator));
+        let mut actual_manifest_ids: Vec<_> = rows
+            .iter()
+            .map(|row| row.manifest_id.as_deref().unwrap())
+            .collect();
+        actual_manifest_ids.sort_unstable();
+        let mut expected_manifest_ids =
+            vec![first.manifest_id.as_str(), second.manifest_id.as_str()];
+        expected_manifest_ids.sort_unstable();
+        assert_eq!(actual_manifest_ids, expected_manifest_ids);
+        assert!(rows.iter().all(|row| row.file_type == "output"));
+        assert!(
+            rows.iter()
+                .all(|row| row.resource_type.as_deref() == Some("Patient"))
+        );
+        assert!(rows.iter().all(|row| row.part_index == 0));
+        assert!(rows.iter().all(|row| row.line_count == 2));
+        assert!(rows.iter().all(|row| row.byte_count == 19));
+        assert!(
+            rows.iter()
+                .all(|row| row.file_path == "legacy/output/Patient-0.ndjson")
+        );
+        let manifests = backend
+            .list_manifests(&tenant, &new_submission_id)
+            .await
+            .unwrap();
+        assert_eq!(manifests.len(), 2);
+        assert_ne!(manifests[0].manifest_id, manifests[1].manifest_id);
+        assert!(manifests.iter().all(|manifest| {
+            manifest.manifest_id == first.manifest_id || manifest.manifest_id == second.manifest_id
+        }));
+
+        let preserved_legacy_rows = backend
+            .list_submit_files(&tenant, &submission_id)
+            .await
+            .unwrap();
+        assert_eq!(preserved_legacy_rows.len(), 1);
+        assert!(preserved_legacy_rows[0].manifest_id.is_none());
+        assert!(preserved_legacy_rows[0].legacy_locator);
     }
 }
 
