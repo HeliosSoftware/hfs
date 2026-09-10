@@ -19,6 +19,9 @@ use crate::core::bulk_submit::{
     SubmissionChange, SubmissionId, SubmissionManifest, SubmissionStatus, SubmissionSummary,
     invalid_entry_result_page,
 };
+use crate::core::bulk_submit_publication::{
+    ManifestPublicationResult, ManifestPublicationStatus, canonical_publication_files,
+};
 use crate::core::bulk_submit_worker::{
     ManifestFetchParams, ManifestLease, ManifestWorkerView, PollTokenTarget, SubmitClaimStrategy,
     SubmitFileRecord, SubmitFileRow, SubmitWorkerStorage,
@@ -41,6 +44,18 @@ fn lease_lost(lease: &ManifestLease) -> LeaseError {
     LeaseError::LeaseLost {
         job_id: ExportJobId::from_string(format!("{}/{}", lease.submission_id, lease.manifest_id)),
     }
+}
+
+#[derive(Debug)]
+struct ManifestPublicationState {
+    manifest_url: Option<String>,
+    status: String,
+    fencing_token: i64,
+    worker_id: Option<String>,
+    published_token: Option<i64>,
+    publication_status: Option<String>,
+    publication_error_message: Option<String>,
+    publication_worker_id: Option<String>,
 }
 
 /// Derives the ingest FHIR version from a stored `outputFormat` MIME string.
@@ -1537,7 +1552,8 @@ impl SubmitClaimStrategy for PostgresBackend {
             .execute(
                 "UPDATE bulk_manifests SET lease_expiry = $1
                  WHERE tenant_id = $2 AND submitter = $3 AND submission_id = $4
-                   AND manifest_id = $5 AND worker_id = $6 AND fencing_token = $7",
+                   AND manifest_id = $5 AND status = 'processing'
+                   AND worker_id = $6 AND fencing_token = $7",
                 &[
                     &new_expiry,
                     &lease.tenant.tenant_id().as_str(),
@@ -1593,9 +1609,10 @@ impl SubmitWorkerStorage for PostgresBackend {
                 "SELECT manifest_url, fhir_base_url, output_format, file_request_headers,
                         oauth_metadata_urls, file_encryption_key, last_processed_line,
                         import_directives, submission_metadata
-                 FROM bulk_manifests
-                 WHERE tenant_id = $1 AND submitter = $2 AND submission_id = $3
-                   AND manifest_id = $4 AND worker_id = $5 AND fencing_token = $6",
+                FROM bulk_manifests
+                WHERE tenant_id = $1 AND submitter = $2 AND submission_id = $3
+                  AND manifest_id = $4 AND status = 'processing'
+                  AND worker_id = $5 AND fencing_token = $6",
                 &[
                     &lease.tenant.tenant_id().as_str(),
                     &lease.submission_id.submitter,
@@ -1665,8 +1682,8 @@ impl SubmitWorkerStorage for PostgresBackend {
             .execute(
                 "UPDATE bulk_manifests SET status = 'processing'
                  WHERE tenant_id = $1 AND submitter = $2 AND submission_id = $3
-                   AND manifest_id = $4 AND worker_id = $5 AND fencing_token = $6
-                   AND status IN ('pending', 'processing')",
+                   AND manifest_id = $4 AND status = 'processing'
+                   AND worker_id = $5 AND fencing_token = $6",
                 &[
                     &lease.tenant.tenant_id().as_str(),
                     &lease.submission_id.submitter,
@@ -1802,124 +1819,88 @@ impl SubmitWorkerStorage for PostgresBackend {
         lease: &ManifestLease,
         file: &SubmitFileRecord,
     ) -> Result<(), LeaseError> {
-        let client = self.get_client().await.map_err(LeaseError::Storage)?;
-        // Fence: only record if we still hold the lease.
-        let holds = client
-            .query(
-                "SELECT 1 FROM bulk_manifests
-                 WHERE tenant_id = $1 AND submitter = $2 AND submission_id = $3
-                   AND manifest_id = $4 AND worker_id = $5 AND fencing_token = $6",
-                &[
-                    &lease.tenant.tenant_id().as_str(),
-                    &lease.submission_id.submitter,
-                    &lease.submission_id.submission_id,
-                    &lease.manifest_id,
-                    &lease.worker_id.as_str(),
-                    &(lease.fencing_token as i64),
-                ],
-            )
+        let mut client = self.get_client().await.map_err(LeaseError::Storage)?;
+        let tx = client
+            .transaction()
             .await
-            .map_err(|e| LeaseError::Storage(internal_error(format!("fence check: {e}"))))?;
-        if holds.is_empty() {
+            .map_err(|e| LeaseError::Storage(internal_error(format!("begin staging: {e}"))))?;
+        let lease_token = i64::try_from(lease.fencing_token).map_err(|_| {
+            LeaseError::Storage(internal_error(
+                "lease fencing_token does not fit i64".to_string(),
+            ))
+        })?;
+        let Some(state) = manifest_publication_state(&tx, lease).await? else {
+            return Err(lease_lost(lease));
+        };
+        if state.status != "processing"
+            || state.fencing_token != lease_token
+            || state.worker_id.as_deref() != Some(lease.worker_id.as_str())
+        {
             return Err(lease_lost(lease));
         }
 
-        let count_severity = file
-            .count_severity
-            .as_ref()
-            .and_then(|v| serde_json::to_string(v).ok());
-        client
-            .execute(
-                "INSERT INTO bulk_submit_files
-                 (tenant_id, submitter, submission_id, manifest_url, file_type, resource_type,
-                  part_index, fencing_token, file_path, line_count, byte_count, count_severity,
-                  created_at)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
-                &[
-                    &lease.tenant.tenant_id().as_str(),
-                    &lease.submission_id.submitter,
-                    &lease.submission_id.submission_id,
-                    &file.manifest_url,
-                    &file.file_type,
-                    &file.resource_type,
-                    &(file.part_index as i32),
-                    &(lease.fencing_token as i64),
-                    &file.file_path,
-                    &(file.line_count as i64),
-                    &(file.byte_count as i64),
-                    &count_severity,
-                    &Utc::now(),
-                ],
+        let canonical =
+            canonical_publication_files(std::slice::from_ref(file)).map_err(LeaseError::Storage)?;
+        validate_publication_records(state.manifest_url.as_deref(), &canonical)
+            .map_err(LeaseError::Storage)?;
+        let staged = read_manifest_generation_records(&tx, lease, lease_token).await?;
+        let identity = |record: &SubmitFileRecord| {
+            (
+                record.file_type.clone(),
+                record.resource_type.clone(),
+                record.part_index,
             )
+        };
+        if let Some(existing) = staged
+            .iter()
+            .find(|record| identity(record) == identity(file))
+        {
+            if existing != file {
+                return Err(LeaseError::Storage(publication_conflict(
+                    "staged artifact identity has conflicting content",
+                )));
+            }
+        } else {
+            insert_publication_files(&tx, lease, lease_token, &canonical).await?;
+        }
+        tx.commit()
             .await
-            .map_err(|e| LeaseError::Storage(internal_error(format!("record submit file: {e}"))))?;
+            .map_err(|e| LeaseError::Storage(internal_error(format!("commit staging: {e}"))))?;
         Ok(())
     }
 
+    async fn publish_manifest_artifacts(
+        &self,
+        lease: &ManifestLease,
+        files: &[SubmitFileRecord],
+        terminal: ManifestPublicationStatus,
+    ) -> Result<ManifestPublicationResult, LeaseError> {
+        PostgresBackend::publish_manifest_artifacts(self, lease, files, terminal).await
+    }
+
     async fn finish_manifest(&self, lease: &ManifestLease) -> Result<(), LeaseError> {
-        let client = self.get_client().await.map_err(LeaseError::Storage)?;
-        // `status = 'processing'` is part of the fence, not decoration:
-        // `abort_submission` moves in-flight manifests to `'failed'` without
-        // clearing `worker_id`/`fencing_token`, so without this guard a worker
-        // that finishes just after an abort silently rewrites `'failed'` back to
-        // `'completed'`. Guarded, the write is a no-op and the caller sees
-        // `LeaseLost`, which callers already read as "someone else owns the
-        // outcome" (#968).
-        let affected = client
-            .execute(
-                "UPDATE bulk_manifests SET status = 'completed', worker_id = NULL, lease_expiry = NULL
-                 WHERE tenant_id = $1 AND submitter = $2 AND submission_id = $3
-                   AND manifest_id = $4 AND worker_id = $5 AND fencing_token = $6
-                   AND status = 'processing'",
-                &[
-                    &lease.tenant.tenant_id().as_str(),
-                    &lease.submission_id.submitter,
-                    &lease.submission_id.submission_id,
-                    &lease.manifest_id,
-                    &lease.worker_id.as_str(),
-                    &(lease.fencing_token as i64),
-                ],
-            )
+        // The helper's fence (`status = 'processing'` plus this lease's worker
+        // and fencing token) is what makes a finish that lands after
+        // `abort_submission` moved the manifest to `'failed'` a `LeaseLost`
+        // no-op instead of a silent rewrite back to `'completed'` (#968).
+        self.publish_current_manifest_generation(lease, ManifestPublicationStatus::Completed)
             .await
-            .map_err(|e| LeaseError::Storage(internal_error(format!("finish manifest: {e}"))))?;
-        if affected == 0 {
-            Err(lease_lost(lease))
-        } else {
-            Ok(())
-        }
     }
 
     async fn fail_manifest(
         &self,
         lease: &ManifestLease,
-        _error_message: &str,
+        error_message: &str,
     ) -> Result<(), LeaseError> {
-        let client = self.get_client().await.map_err(LeaseError::Storage)?;
-        // Same `status = 'processing'` fence as `finish_manifest`: an aborted
-        // manifest's outcome belongs to the abort, so a late worker verdict must
-        // not overwrite it — it gets `LeaseLost` instead (#968).
-        let affected = client
-            .execute(
-                "UPDATE bulk_manifests SET status = 'failed', worker_id = NULL, lease_expiry = NULL
-                 WHERE tenant_id = $1 AND submitter = $2 AND submission_id = $3
-                   AND manifest_id = $4 AND worker_id = $5 AND fencing_token = $6
-                   AND status = 'processing'",
-                &[
-                    &lease.tenant.tenant_id().as_str(),
-                    &lease.submission_id.submitter,
-                    &lease.submission_id.submission_id,
-                    &lease.manifest_id,
-                    &lease.worker_id.as_str(),
-                    &(lease.fencing_token as i64),
-                ],
-            )
-            .await
-            .map_err(|e| LeaseError::Storage(internal_error(format!("fail manifest: {e}"))))?;
-        if affected == 0 {
-            Err(lease_lost(lease))
-        } else {
-            Ok(())
-        }
+        // Same fence as `finish_manifest`: an aborted manifest's outcome belongs
+        // to the abort, so a late worker verdict gets `LeaseLost` instead (#968).
+        self.publish_current_manifest_generation(
+            lease,
+            ManifestPublicationStatus::Failed {
+                error_message: error_message.to_string(),
+            },
+        )
+        .await
     }
 
     async fn set_manifest_fetch_params(
@@ -2143,11 +2124,25 @@ impl SubmitWorkerStorage for PostgresBackend {
         let client = self.get_client().await?;
         let rows = client
             .query(
-                "SELECT manifest_url, file_type, resource_type, part_index, fencing_token,
-                        file_path, line_count, byte_count, count_severity
-                 FROM bulk_submit_files
-                 WHERE tenant_id = $1 AND submitter = $2 AND submission_id = $3
-                 ORDER BY id",
+                "SELECT f.manifest_url, f.file_type, f.resource_type, f.part_index,
+                        f.fencing_token,
+                        file_path, line_count, byte_count, count_severity,
+                        f.manifest_id, m.publication_worker_id
+                 FROM bulk_submit_files AS f
+                 INNER JOIN bulk_manifests AS m
+                   ON m.tenant_id = f.tenant_id
+                      AND m.submitter = f.submitter
+                      AND m.submission_id = f.submission_id
+                      AND m.manifest_id = f.manifest_id
+                      AND m.published_token = f.fencing_token
+                 WHERE f.manifest_id IS NOT NULL
+                   AND f.tenant_id = $1
+                   AND f.submitter = $2
+                   AND f.submission_id = $3
+                   AND f.publication_excluded_reason IS NULL
+                   AND m.published_token IS NOT NULL
+                   AND m.publication_status IN ('completed', 'failed')
+                 ORDER BY f.id",
                 &[
                     &tenant.tenant_id().as_str(),
                     &id.submitter,
@@ -2156,25 +2151,34 @@ impl SubmitWorkerStorage for PostgresBackend {
             )
             .await
             .map_err(|e| internal_error(format!("list submit files: {e}")))?;
-        Ok(rows
-            .iter()
+        rows.iter()
             .map(|row| {
+                let manifest_url: Option<String> = row.get(0);
+                let file_type: String = row.get(1);
+                let resource_type: Option<String> = row.get(2);
+                let part_index: i32 = row.get(3);
+                let fencing_token: i64 = row.get(4);
+                let file_path: String = row.get(5);
+                let line_count: i64 = row.get(6);
+                let byte_count: i64 = row.get(7);
                 let count_severity: Option<String> = row.get(8);
-                SubmitFileRow {
-                    manifest_url: row.get(0),
-                    file_type: row.get(1),
-                    resource_type: row.get(2),
-                    part_index: row.get::<_, i32>(3) as u32,
-                    fencing_token: row.get::<_, i64>(4) as u64,
-                    file_path: row.get(5),
-                    line_count: row.get::<_, i64>(6) as u64,
-                    byte_count: row.get::<_, i64>(7) as u64,
-                    count_severity: count_severity
-                        .as_deref()
-                        .and_then(|s| serde_json::from_str(s).ok()),
-                }
+                let manifest_id: Option<String> = row.get(9);
+                let publication_worker_id: Option<String> = row.get(10);
+                publication_row_from_parts(
+                    manifest_url,
+                    file_type,
+                    resource_type,
+                    part_index,
+                    fencing_token,
+                    file_path,
+                    line_count,
+                    byte_count,
+                    count_severity,
+                    manifest_id,
+                    publication_worker_id.is_none(),
+                )
             })
-            .collect())
+            .collect::<StorageResult<Vec<_>>>()
     }
 
     async fn delete_submission_artifacts(
@@ -2182,19 +2186,51 @@ impl SubmitWorkerStorage for PostgresBackend {
         tenant: &TenantContext,
         id: &SubmissionId,
     ) -> StorageResult<()> {
-        let client = self.get_client().await?;
-        client
-            .execute(
-                "DELETE FROM bulk_submit_files
-                 WHERE tenant_id = $1 AND submitter = $2 AND submission_id = $3",
-                &[
-                    &tenant.tenant_id().as_str(),
-                    &id.submitter,
-                    &id.submission_id,
-                ],
-            )
+        let mut client = self.get_client().await?;
+        let tx = client
+            .transaction()
             .await
-            .map_err(|e| internal_error(format!("delete artifacts: {e}")))?;
+            .map_err(|e| internal_error(format!("begin artifact cleanup: {e}")))?;
+        tx.query(
+            "SELECT manifest_id FROM bulk_manifests
+             WHERE tenant_id = $1 AND submitter = $2 AND submission_id = $3
+             ORDER BY added_at, manifest_id
+             FOR UPDATE",
+            &[
+                &tenant.tenant_id().as_str(),
+                &id.submitter,
+                &id.submission_id,
+            ],
+        )
+        .await
+        .map_err(|e| internal_error(format!("lock manifest rows: {e}")))?;
+        tx.execute(
+            "DELETE FROM bulk_submit_files
+                 WHERE tenant_id = $1 AND submitter = $2 AND submission_id = $3",
+            &[
+                &tenant.tenant_id().as_str(),
+                &id.submitter,
+                &id.submission_id,
+            ],
+        )
+        .await
+        .map_err(|e| internal_error(format!("delete artifacts: {e}")))?;
+        tx.execute(
+            "UPDATE bulk_manifests
+                 SET published_token = NULL, publication_status = NULL,
+                     publication_error_message = NULL, publication_worker_id = NULL
+                 WHERE tenant_id = $1 AND submitter = $2 AND submission_id = $3",
+            &[
+                &tenant.tenant_id().as_str(),
+                &id.submitter,
+                &id.submission_id,
+            ],
+        )
+        .await
+        .map_err(|e| internal_error(format!("clear publication markers: {e}")))?;
+        tx.commit()
+            .await
+            .map_err(|e| internal_error(format!("commit artifact cleanup: {e}")))?;
         Ok(())
     }
 
@@ -2253,4 +2289,459 @@ impl SubmitWorkerStorage for PostgresBackend {
             .map_err(|e| internal_error(format!("set transaction_time: {e}")))?;
         Ok(now)
     }
+}
+
+impl PostgresBackend {
+    /// Atomically replaces and publishes the complete artifact set for a lease.
+    ///
+    /// State selection, staged-row replacement, and the terminal fencing update
+    /// all run on one locked manifest row. A successful commit is the only point
+    /// at which the generation becomes visible to publication queries.
+    pub async fn publish_manifest_artifacts(
+        &self,
+        lease: &ManifestLease,
+        files: &[SubmitFileRecord],
+        terminal: ManifestPublicationStatus,
+    ) -> Result<ManifestPublicationResult, LeaseError> {
+        let canonical = canonical_publication_files(files).map_err(LeaseError::Storage)?;
+        let mut client = self.get_client().await.map_err(LeaseError::Storage)?;
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|e| LeaseError::Storage(internal_error(format!("begin publication: {e}"))))?;
+        let Some(outcome) =
+            publish_manifest_artifacts_in_tx(&tx, lease, &canonical, &terminal).await?
+        else {
+            return Err(lease_lost(lease));
+        };
+        tx.commit()
+            .await
+            .map_err(|e| LeaseError::Storage(internal_error(format!("commit publication: {e}"))))?;
+        Ok(outcome)
+    }
+
+    /// Publishes the generation already staged for `lease`. Terminal finish and
+    /// failure read the staged set inside the publication transaction, so a
+    /// concurrent staging write cannot be omitted from the atomic commit.
+    async fn publish_current_manifest_generation(
+        &self,
+        lease: &ManifestLease,
+        terminal: ManifestPublicationStatus,
+    ) -> Result<(), LeaseError> {
+        let mut client = self.get_client().await.map_err(LeaseError::Storage)?;
+        let tx = client.transaction().await.map_err(|e| {
+            LeaseError::Storage(internal_error(format!("begin finish publication: {e}")))
+        })?;
+        let lease_token = i64::try_from(lease.fencing_token).map_err(|_| {
+            LeaseError::Storage(internal_error(
+                "lease fencing_token does not fit i64".to_string(),
+            ))
+        })?;
+        let Some(state) = manifest_publication_state(&tx, lease).await? else {
+            return Err(lease_lost(lease));
+        };
+        if state.status == "replaced" || state.fencing_token != lease_token {
+            return Err(lease_lost(lease));
+        }
+
+        let staged = if state.status == "processing" {
+            if state.worker_id.as_deref() != Some(lease.worker_id.as_str()) {
+                return Err(lease_lost(lease));
+            }
+            read_manifest_generation_records(&tx, lease, lease_token).await?
+        } else {
+            let published_token_matches = state.published_token == Some(lease_token);
+            let publisher_matches =
+                state.publication_worker_id.as_deref() == Some(lease.worker_id.as_str());
+            if !published_token_matches || !publisher_matches {
+                return Err(lease_lost(lease));
+            }
+            let (terminal_status, terminal_error) = publication_status_parts(&terminal);
+            if state.status != terminal_status
+                || state.publication_status.as_deref() != Some(terminal_status)
+                || state.publication_error_message != terminal_error.map(str::to_string)
+            {
+                return Err(LeaseError::Storage(publication_conflict(
+                    "terminal state changed for the same publication",
+                )));
+            }
+            read_manifest_generation_records(&tx, lease, lease_token).await?
+        };
+        let staged = canonical_publication_files(&staged).map_err(LeaseError::Storage)?;
+        let Some(outcome) =
+            publish_manifest_artifacts_in_tx(&tx, lease, &staged, &terminal).await?
+        else {
+            return Err(lease_lost(lease));
+        };
+        let _ = outcome;
+        tx.commit().await.map_err(|e| {
+            LeaseError::Storage(internal_error(format!("commit finish publication: {e}")))
+        })?;
+        Ok(())
+    }
+}
+
+/// Reads the publication state with its manifest row locked. A missing identity
+/// means lease loss; every query error is a storage error.
+async fn manifest_publication_state(
+    tx: &tokio_postgres::Transaction<'_>,
+    lease: &ManifestLease,
+) -> StorageResult<Option<ManifestPublicationState>> {
+    let row = tx
+        .query_opt(
+            "SELECT manifest_url, status, fencing_token, worker_id,
+                    published_token, publication_status, publication_error_message,
+                    publication_worker_id
+             FROM bulk_manifests
+             WHERE tenant_id = $1 AND submitter = $2 AND submission_id = $3
+               AND manifest_id = $4
+             FOR UPDATE",
+            &[
+                &lease.tenant.tenant_id().as_str(),
+                &lease.submission_id.submitter,
+                &lease.submission_id.submission_id,
+                &lease.manifest_id,
+            ],
+        )
+        .await
+        .map_err(|e| internal_error(format!("read publication state: {e}")))?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let manifest_url: Option<String> = row.get(0);
+    let status: String = row.get(1);
+    let fencing_token: i64 = row.get(2);
+    let worker_id: Option<String> = row.get(3);
+    let published_token: Option<i64> = row.get(4);
+    let publication_status: Option<String> = row.get(5);
+    let publication_error_message: Option<String> = row.get(6);
+    let publication_worker_id: Option<String> = row.get(7);
+    Ok(Some(ManifestPublicationState {
+        manifest_url,
+        status,
+        fencing_token,
+        worker_id,
+        published_token,
+        publication_status,
+        publication_error_message,
+        publication_worker_id,
+    }))
+}
+
+fn publication_conflict(message: impl Into<String>) -> StorageError {
+    internal_error(format!("manifest publication conflict: {}", message.into()))
+}
+
+fn publication_status_parts(terminal: &ManifestPublicationStatus) -> (&'static str, Option<&str>) {
+    match terminal {
+        ManifestPublicationStatus::Completed => ("completed", None),
+        ManifestPublicationStatus::Failed { error_message } => {
+            ("failed", Some(error_message.as_str()))
+        }
+    }
+}
+
+async fn read_manifest_generation_records(
+    tx: &tokio_postgres::Transaction<'_>,
+    lease: &ManifestLease,
+    fencing_token: i64,
+) -> StorageResult<Vec<SubmitFileRecord>> {
+    let rows = tx
+        .query(
+            "SELECT manifest_url, file_type, resource_type, part_index, file_path,
+                    line_count, byte_count, count_severity
+             FROM bulk_submit_files
+             WHERE tenant_id = $1 AND submitter = $2 AND submission_id = $3
+               AND manifest_id = $4 AND fencing_token = $5
+               AND publication_excluded_reason IS NULL
+             ORDER BY id",
+            &[
+                &lease.tenant.tenant_id().as_str(),
+                &lease.submission_id.submitter,
+                &lease.submission_id.submission_id,
+                &lease.manifest_id,
+                &fencing_token,
+            ],
+        )
+        .await
+        .map_err(|e| internal_error(format!("read publication rows: {e}")))?;
+    let mut records = Vec::new();
+    for row in rows {
+        let manifest_url: Option<String> = row.get(0);
+        let file_type: String = row.get(1);
+        let resource_type: Option<String> = row.get(2);
+        let part_index: i32 = row.get(3);
+        let file_path: String = row.get(4);
+        let line_count: i64 = row.get(5);
+        let byte_count: i64 = row.get(6);
+        let count_severity: Option<String> = row.get(7);
+        records.push(publication_record_from_parts(
+            manifest_url,
+            file_type,
+            resource_type,
+            part_index,
+            fencing_token,
+            file_path,
+            line_count,
+            byte_count,
+            count_severity,
+        )?);
+    }
+    Ok(records)
+}
+
+fn validate_publication_records(
+    manifest_url: Option<&str>,
+    records: &[SubmitFileRecord],
+) -> StorageResult<()> {
+    for file in records {
+        if !matches!(file.file_type.as_str(), "output" | "error" | "deleted") {
+            return Err(publication_conflict(format!(
+                "invalid file_type: {}",
+                file.file_type
+            )));
+        }
+        match (&file.manifest_url, manifest_url) {
+            (Some(file_url), Some(manifest_url)) if file_url == manifest_url => {}
+            _ => {
+                return Err(publication_conflict(
+                    "artifact manifest_url does not match the leased manifest",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn publication_record_from_parts(
+    manifest_url: Option<String>,
+    file_type: String,
+    resource_type: Option<String>,
+    part_index: i32,
+    fencing_token: i64,
+    file_path: String,
+    line_count: i64,
+    byte_count: i64,
+    count_severity: Option<String>,
+) -> StorageResult<SubmitFileRecord> {
+    let count_severity = match count_severity {
+        Some(text) => Some(serde_json::from_str::<Value>(&text).map_err(|error| {
+            internal_error(format!("decode published count_severity: {error}"))
+        })?),
+        None => None,
+    };
+    let part_index = u32::try_from(part_index)
+        .map_err(|_| internal_error("published part_index is negative".to_string()))?;
+    if fencing_token < 0 {
+        return Err(internal_error(
+            "published fencing_token is negative".to_string(),
+        ));
+    }
+    let line_count = u64::try_from(line_count)
+        .map_err(|_| internal_error("published line_count is negative".to_string()))?;
+    let byte_count = u64::try_from(byte_count)
+        .map_err(|_| internal_error("published byte_count is negative".to_string()))?;
+    Ok(SubmitFileRecord {
+        manifest_url,
+        file_type,
+        resource_type,
+        part_index,
+        file_path,
+        line_count,
+        byte_count,
+        count_severity,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn publication_row_from_parts(
+    manifest_url: Option<String>,
+    file_type: String,
+    resource_type: Option<String>,
+    part_index: i32,
+    fencing_token: i64,
+    file_path: String,
+    line_count: i64,
+    byte_count: i64,
+    count_severity: Option<String>,
+    manifest_id: Option<String>,
+    legacy_locator: bool,
+) -> StorageResult<SubmitFileRow> {
+    let record = publication_record_from_parts(
+        manifest_url,
+        file_type,
+        resource_type,
+        part_index,
+        fencing_token,
+        file_path,
+        line_count,
+        byte_count,
+        count_severity,
+    )?;
+    Ok(SubmitFileRow {
+        manifest_url: record.manifest_url,
+        file_type: record.file_type,
+        resource_type: record.resource_type,
+        part_index: record.part_index,
+        fencing_token: fencing_token as u64,
+        manifest_id,
+        legacy_locator,
+        file_path: record.file_path,
+        line_count: record.line_count,
+        byte_count: record.byte_count,
+        count_severity: record.count_severity,
+    })
+}
+
+/// Returns `None` for lease loss and `Some` for a committed publication. All
+/// writes remain protected by the transaction's rollback-on-drop behavior.
+async fn publish_manifest_artifacts_in_tx(
+    tx: &tokio_postgres::Transaction<'_>,
+    lease: &ManifestLease,
+    canonical: &[SubmitFileRecord],
+    terminal: &ManifestPublicationStatus,
+) -> StorageResult<Option<ManifestPublicationResult>> {
+    let lease_token = i64::try_from(lease.fencing_token)
+        .map_err(|_| internal_error("lease fencing_token does not fit i64".to_string()))?;
+    let Some(state) = manifest_publication_state(tx, lease).await? else {
+        return Ok(None);
+    };
+    if state.status == "replaced" || state.fencing_token != lease_token {
+        return Ok(None);
+    }
+
+    let published_token_matches = state.published_token == Some(lease_token);
+    let publisher_matches =
+        state.publication_worker_id.as_deref() == Some(lease.worker_id.as_str());
+    if published_token_matches {
+        if !publisher_matches {
+            return Ok(None);
+        }
+        let (terminal_status, terminal_error) = publication_status_parts(terminal);
+        if state.publication_status.as_deref() != Some(terminal_status)
+            || state.status != terminal_status
+            || state.publication_error_message != terminal_error.map(str::to_string)
+        {
+            return Err(publication_conflict(
+                "terminal state changed for the same publication",
+            ));
+        }
+
+        let persisted = read_manifest_generation_records(tx, lease, lease_token).await?;
+        let persisted = canonical_publication_files(&persisted)?;
+        if persisted != canonical {
+            return Err(publication_conflict(
+                "artifact payload changed for the same publication",
+            ));
+        }
+        return Ok(Some(ManifestPublicationResult::AlreadyPublished));
+    }
+
+    // Fresh work must still be owned by this exact lease. An older publication
+    // marker is allowed and remains selected until this transaction replaces it.
+    if state.status != "processing" || state.worker_id.as_deref() != Some(lease.worker_id.as_str())
+    {
+        return Ok(None);
+    }
+
+    validate_publication_records(state.manifest_url.as_deref(), canonical)?;
+    delete_staged_publication_files(tx, lease, lease_token).await?;
+    insert_publication_files(tx, lease, lease_token, canonical).await?;
+
+    let (terminal_status, terminal_error) = publication_status_parts(terminal);
+    let affected = tx
+        .execute(
+            "UPDATE bulk_manifests
+             SET status = $5, published_token = $6, publication_status = $7,
+                 publication_error_message = $8, publication_worker_id = $9,
+                 worker_id = NULL, lease_expiry = NULL
+             WHERE tenant_id = $1 AND submitter = $2 AND submission_id = $3
+               AND manifest_id = $4 AND status = 'processing'
+               AND worker_id = $10 AND fencing_token = $11",
+            &[
+                &lease.tenant.tenant_id().as_str(),
+                &lease.submission_id.submitter,
+                &lease.submission_id.submission_id,
+                &lease.manifest_id,
+                &terminal_status,
+                &lease_token,
+                &terminal_status,
+                &terminal_error,
+                &lease.worker_id.as_str(),
+                &lease.worker_id.as_str(),
+                &lease_token,
+            ],
+        )
+        .await
+        .map_err(|e| internal_error(format!("publish manifest: {e}")))?;
+    if affected != 1 {
+        return Ok(None);
+    }
+    Ok(Some(ManifestPublicationResult::Published))
+}
+
+async fn delete_staged_publication_files(
+    tx: &tokio_postgres::Transaction<'_>,
+    lease: &ManifestLease,
+    fencing_token: i64,
+) -> StorageResult<()> {
+    tx.execute(
+        "DELETE FROM bulk_submit_files
+         WHERE tenant_id = $1 AND submitter = $2 AND submission_id = $3
+           AND manifest_id = $4 AND fencing_token = $5",
+        &[
+            &lease.tenant.tenant_id().as_str(),
+            &lease.submission_id.submitter,
+            &lease.submission_id.submission_id,
+            &lease.manifest_id,
+            &fencing_token,
+        ],
+    )
+    .await
+    .map_err(|e| internal_error(format!("delete staged files: {e}")))?;
+    Ok(())
+}
+
+async fn insert_publication_files(
+    tx: &tokio_postgres::Transaction<'_>,
+    lease: &ManifestLease,
+    fencing_token: i64,
+    files: &[SubmitFileRecord],
+) -> StorageResult<()> {
+    for file in files {
+        let count_severity = match &file.count_severity {
+            Some(value) => Some(
+                serde_json::to_string(value)
+                    .map_err(|error| internal_error(format!("encode count_severity: {error}")))?,
+            ),
+            None => None,
+        };
+        tx.execute(
+            "INSERT INTO bulk_submit_files
+             (tenant_id, submitter, submission_id, manifest_id, manifest_url, file_type,
+              resource_type, part_index, fencing_token, file_path, line_count, byte_count,
+              count_severity, created_at, publication_excluded_reason)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, NULL)",
+            &[
+                &lease.tenant.tenant_id().as_str(),
+                &lease.submission_id.submitter,
+                &lease.submission_id.submission_id,
+                &lease.manifest_id,
+                &file.manifest_url,
+                &file.file_type,
+                &file.resource_type,
+                &(file.part_index as i32),
+                &fencing_token,
+                &file.file_path,
+                &(file.line_count as i64),
+                &(file.byte_count as i64),
+                &count_severity,
+                &Utc::now(),
+            ],
+        )
+        .await
+        .map_err(|e| internal_error(format!("insert publication file: {e}")))?;
+    }
+    Ok(())
 }

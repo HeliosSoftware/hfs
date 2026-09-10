@@ -41,6 +41,7 @@ use crate::core::bulk_submit::{
     StreamingBulkSubmitProvider, SubmissionChange, SubmissionId, SubmissionManifest,
     SubmissionStatus, SubmissionSummary, entry_result_pages,
 };
+use crate::core::bulk_submit_publication::{ManifestPublicationResult, ManifestPublicationStatus};
 use crate::core::bulk_submit_worker::{
     BulkSubmitJobStore, ManifestFetchParams, ManifestLease, ManifestWorkerView, PollTokenTarget,
     SubmitClaimStrategy, SubmitFileRecord, SubmitFileRow, SubmitWorkerStorage,
@@ -69,6 +70,22 @@ impl CompositeSubmitJobs {
     /// Wraps the primary's job store with the composite's secondary sync.
     pub fn new(primary: Arc<dyn BulkSubmitJobStore>, composite: Arc<CompositeStorage>) -> Self {
         Self { primary, composite }
+    }
+
+    /// Preflights the primary lease before terminal publication.
+    ///
+    /// Sync is best-effort only for a lease the primary still authorizes. If the
+    /// lease has been lost, publication still delegates to the primary so it can
+    /// distinguish an already-committed replay from a stale token.
+    async fn preflight_for_publication(&self, lease: &ManifestLease) -> Result<(), LeaseError> {
+        match self.primary.get_manifest_for_worker(lease).await {
+            Ok(_) => {
+                self.sync_ingested(lease).await;
+                Ok(())
+            }
+            Err(LeaseError::LeaseLost { .. }) => Ok(()),
+            Err(LeaseError::Storage(error)) => Err(LeaseError::Storage(error)),
+        }
     }
 
     /// Pushes every successfully ingested entry of the leased manifest
@@ -694,11 +711,20 @@ impl SubmitWorkerStorage for CompositeSubmitJobs {
         self.primary.record_submit_file(lease, file).await
     }
 
+    async fn publish_manifest_artifacts(
+        &self,
+        lease: &ManifestLease,
+        files: &[SubmitFileRecord],
+        terminal: ManifestPublicationStatus,
+    ) -> Result<ManifestPublicationResult, LeaseError> {
+        self.preflight_for_publication(lease).await?;
+        self.primary
+            .publish_manifest_artifacts(lease, files, terminal)
+            .await
+    }
+
     async fn finish_manifest(&self, lease: &ManifestLease) -> Result<(), LeaseError> {
-        // Sync before finishing: once the manifest is terminal the lease is
-        // gone, and syncing under the live lease keeps a reclaim from racing
-        // a half-finished sweep with a second ingestion of the same files.
-        self.sync_ingested(lease).await;
+        self.preflight_for_publication(lease).await?;
         self.primary.finish_manifest(lease).await
     }
 
@@ -707,9 +733,7 @@ impl SubmitWorkerStorage for CompositeSubmitJobs {
         lease: &ManifestLease,
         error_message: &str,
     ) -> Result<(), LeaseError> {
-        // A failed manifest still committed its successful entries on the
-        // primary — search must agree with what reads will return.
-        self.sync_ingested(lease).await;
+        self.preflight_for_publication(lease).await?;
         self.primary.fail_manifest(lease, error_message).await
     }
 
