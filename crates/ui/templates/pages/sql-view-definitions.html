@@ -49,7 +49,12 @@
   canonical form actually changed, re-requests the panel alone. Without
   JavaScript (or before `theme.js` marks `<html class="js">`) the card stays
   hidden (`needs-js`) and the grid collapses to the editor alone — the page
-  already works without it, unchanged from #752.
+  already works without it, unchanged from #752. This pairing itself — the
+  sync in both directions, the validity chip, the row↔editor cross-highlight
+  — lives in the shared `editor-pair.js` (#840), not this page's own
+  `vd-editor.js`; the editor form (`#vd-editor-form`) carries the shared
+  `editor__doc` class so it gets the same "grow together, cap at 70vh,
+  scroll inside" height as the guided-form card beside it.
 #}
 
 {% block title %}{{ i18n.t("sql-vd-title") }} — {{ i18n.t("app-title") }}{% endblock %}
@@ -146,8 +151,26 @@
          textarea below (`form_pane`, built by `render_vd_form_pane`); it
          carries `needs-js` (`editor-form-pane.html`) so the grid collapses
          to the editor alone until `theme.js` marks `<html class="js">` and
-         `vd-editor.js` wires it up. -->
-    <div class="editor__grid editor__grid--stretch" id="vd-editor-grid">
+         `vd-editor.js` wires it up.
+
+         `data-msg-required` (#821): the translated marker `vd-editor.js`
+         appends to a required structural key's completion item — read once,
+         directly off this grid (already looked up by id at mount time), so
+         nothing English ever needs to be baked into the completion source
+         itself.
+
+         `data-msg-save-errors-one`/`-other` (#821): the two plural forms of
+         the Save-with-errors confirmation text, each rendered here with the
+         literal placeholder `{count}` standing in for `$count` — the same
+         trick `search-results.html`'s own `data-msg-total` uses — since the
+         real error count is known only client-side, once a lint pass has
+         actually completed. `vd-editor.js` substitutes it and picks the
+         singular/plural form itself before handing the result to
+         `window.confirm`. -->
+    <div class="editor__grid editor__grid--stretch" id="vd-editor-grid"
+         data-msg-required="{{ i18n.t("vd-complete-required") }}"
+         data-msg-save-errors-one="{{ i18n.t_arg("vd-save-with-errors-one", "count", "{count}".to_string()) }}"
+         data-msg-save-errors-other="{{ i18n.t_arg("vd-save-with-errors-other", "count", "{count}".to_string()) }}">
       <!-- The editor card (#752): always open, no fold — the definition
            lives in one place and the results below follow it live. The
            textarea itself carries the live-preview wiring: htmx reposts it
@@ -164,7 +187,7 @@
             </p>
           </div>
         </div>
-        <form method="post" action="/ui/sql/view-definitions" id="vd-editor-form" class="card__body">
+        <form method="post" action="/ui/sql/view-definitions" id="vd-editor-form" class="card__body editor__doc">
           <input type="hidden" name="id" value="{{ sel.id }}">
           <textarea class="json-editor" name="json" spellcheck="false"
                     hx-post="/ui/sql/view-definitions/run"
@@ -209,16 +232,19 @@
 <script src="/ui/assets/resource-filter.js" defer></script>
 <script src="/ui/assets/conformance-crud.js" defer></script>
 <!-- The ViewDefinition editor (#753, its mount helper generalized for
-     #838; the guided form wired on in #843): the vendored CodeMirror 6
-     bundle must load before the shared mount helper, which must load before
-     the guided form's shared loop, which must load before this page's own
-     editor script — each reads globals (window.HfsCodeMirror,
-     window.HfsCodeEditor, window.HfsEditorForm) at the top of its IIFE.
-     editor-form.js is loaded here, not from base.html, the same as the
-     other three: nothing outside this page drives the guided form through
-     it yet. Loaded only on this page. -->
+     #838; the guided-form pairing wired on in #843, extracted onto
+     editor-pair.js in #840): the vendored CodeMirror 6 bundle must load
+     before the shared mount helper, which must load before the guided
+     form's shared loop, which must load before the shared editor/form
+     pairing, which must load before this page's own editor script — each
+     reads globals (window.HfsCodeMirror, window.HfsCodeEditor,
+     window.HfsEditorForm, window.HfsEditorPair) at the top of its IIFE.
+     editor-form.js and editor-pair.js are loaded here, not from base.html,
+     the same as the other two: nothing outside this page drives the
+     guided-form pairing through them yet. Loaded only on this page. -->
 <script src="/ui/assets/vendor/codemirror.bundle.js" defer></script>
 <script src="/ui/assets/code-editor.js" defer></script>
 <script src="/ui/assets/editor-form.js" defer></script>
+<script src="/ui/assets/editor-pair.js" defer></script>
 <script src="/ui/assets/vd-editor.js" defer></script>
 {% endblock %}

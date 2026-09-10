@@ -44,6 +44,12 @@ const MAX_DISPLAY_STRING_CHARS: usize = 256;
 pub struct FragmentEndpoint<'a> {
     pub base_path: &'a str,
     pub version: &'a str,
+    /// Extra, already-percent-encoded query parameters appended to every
+    /// fragment URL (e.g. `system=…&code=…&target=response` for an HTS
+    /// workbench that must re-issue the operation on each fragment GET).
+    /// Empty for endpoints that need no context beyond the path itself,
+    /// like the CapabilityStatement page.
+    pub extra_query: &'a str,
 }
 
 pub enum View {
@@ -846,7 +852,16 @@ fn fragment_url(endpoint: FragmentEndpoint, pointer: &str, offset: usize, limit:
     query.append_pair("path", pointer);
     query.append_pair("offset", &offset.to_string());
     query.append_pair("limit", &limit.to_string());
-    format!("{}?{}", endpoint.base_path, query.finish())
+    if endpoint.extra_query.is_empty() {
+        format!("{}?{}", endpoint.base_path, query.finish())
+    } else {
+        format!(
+            "{}?{}&{}",
+            endpoint.base_path,
+            query.finish(),
+            endpoint.extra_query
+        )
+    }
 }
 
 pub fn root_fragment_url(endpoint: FragmentEndpoint) -> String {
@@ -971,6 +986,7 @@ mod tests {
     const ENDPOINT: FragmentEndpoint<'static> = FragmentEndpoint {
         base_path: "/ui/capability-statement/json-fragment",
         version: "R4",
+        extra_query: "",
     };
 
     struct Labels;
@@ -1110,6 +1126,7 @@ mod tests {
         let hts_endpoint = FragmentEndpoint {
             base_path: "/ui/hts/capability-statement/json-fragment",
             version: "R4",
+            extra_query: "",
         };
         let url = root_fragment_url(hts_endpoint);
         assert!(url.starts_with("/ui/hts/capability-statement/json-fragment?"));

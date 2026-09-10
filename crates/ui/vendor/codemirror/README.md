@@ -89,7 +89,14 @@ assuming the change is intentional.
 | `@codemirror/lang-sql` | 6.10.0 | MIT |
 | `@lezer/common` | 1.5.2 | MIT |
 | `@lezer/highlight` | 1.2.3 | MIT |
-| `lezer-fhirpath` | 1.2.0 | **not declared in package metadata — to be confirmed before adoption** |
+| `lezer-fhirpath` | 1.2.0 | MIT [^lezer-fhirpath-license] |
+
+[^lezer-fhirpath-license]: Declared in `README.md` § License of the tarball published on npm
+    (`lezer-fhirpath@1.2.0`,
+    <https://registry.npmjs.org/lezer-fhirpath/-/lezer-fhirpath-1.2.0.tgz>, published
+    2025-12-08), verified 2026-09-03. `package.json` in that tarball has no `license` field, and
+    the upstream repository (<https://github.com/HealthSamurai/lezer-fhirpath>) returned 404 on
+    that date.
 
 The first thirteen are all published by the CodeMirror/Lezer project (Marijn
 Haverbeke and others) under the MIT license; the bundle's banner comment
@@ -104,12 +111,13 @@ never imports from it directly, exactly as with `@lezer/lr` under
 declares no `license` field in its `package.json` and ships no `LICENSE` file
 in its published tarball — `npm view lezer-fhirpath` falls back to labeling
 it "Proprietary", which is npm's own placeholder for "unspecified", not a
-license anyone has actually granted. This is a known, accepted risk for this
-evaluation proof-of-concept: it is used here anyway because writing a
-replacement grammar now would mean implementing before the evaluation has
-concluded. The bundle has been merged since #820 (issue #753); "confirm the
-license or replace the grammar" remains an open follow-up, tracked
-separately — not a condition of any further merge into this bundle.
+license anyone has actually granted. This was a known, accepted risk for the
+evaluation proof-of-concept #753 shipped it in: writing a replacement grammar
+then would have meant implementing before the evaluation had concluded. The
+risk is now closed — the package's published README does declare MIT (see
+the table footnote above) — with the one reservation that the declaration
+lives in that README rather than a `package.json` `license` field or a
+`LICENSE` file in the tarball.
 
 `rollup`, `@rollup/plugin-node-resolve`, and `@rollup/plugin-terser` are
 `devDependencies` (build-time only; nothing about them ships in the output).
@@ -142,25 +150,38 @@ executes on SQLite (rusqlite), so only that dialect (plus `StandardSQL` and
 the `SQLDialect` class, kept in case a future dialect swap needs them) is
 re-exported.
 
+`@codemirror/autocomplete` and `@codemirror/lint` each gained more of their
+own API surface (#821), beyond the editor-wiring names bundled since #753:
+`snippetCompletion`, `snippet`, `startCompletion`, `closeCompletion`,
+`acceptCompletion`, `completionStatus`, `currentCompletions`, and
+`insertCompletionText` build and drive individual completions;
+`forEachDiagnostic`, `openLintPanel`, `closeLintPanel`, `nextDiagnostic`,
+`previousDiagnostic`, and `diagnosticCount` inspect and navigate the lint
+panel's diagnostics. `@codemirror/view` adds `hoverTooltip` and
+`showTooltip`, the primitives a hover tooltip is built from. None of these
+change how an editor mounts — they are building blocks the ViewDefinition
+editor's completion and quick-fix UI consumes directly off the global.
+
 See `src/entry.js` for the full, explicit list of re-exported names — it is
-the single source of truth tickets 02 and 03 build against.
+the single source of truth the ViewDefinition editor's completion and
+diagnostics code builds against.
 
 ## Measured sizes
 
-Measured against the bundle committed with this ticket (`node -e` using
+Measured against the bundle committed with this regeneration (`node -e` using
 `zlib.gzipSync`/`brotliCompressSync` at max quality):
 
-| Encoding | Bytes | Delta vs. pre-`lang-sql` |
+| Encoding | Bytes | Delta vs. #838 |
 |---|---|---|
-| raw (uncompressed) | 441 447 | +14 822 |
-| gzip | 143 157 | +5 806 |
-| brotli | 121 482 | +4 824 |
+| raw (uncompressed) | 446 874 | +5 427 |
+| gzip | 145 146 | +1 989 |
+| brotli | 123 117 | +1 635 |
 
-"Pre-`lang-sql`" is the bundle committed by #753 (426 625 / 137 351 /
-116 658), before #838 added `@codemirror/lang-sql`.
+"#838" is the bundle committed there (441 447 / 143 157 / 121 482), before
+#821 added the `@codemirror/autocomplete`, `@codemirror/lint`, and
+`@codemirror/view` exports listed above.
 
-Budget (ticket 01, RF6): raw bundle must stay **≤ 500 000 bytes**. Current
-margin: ≈ 57 KB.
+Budget: raw bundle must stay **≤ 500 000 bytes**. Current margin: ≈ 52 KB.
 
 The gzip/brotli figures are informational — what compressing this exact
 artifact yields — not what today's server response carries. See

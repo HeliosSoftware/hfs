@@ -1,11 +1,16 @@
 //! SQLite schema definitions and migrations.
 
-use rusqlite::Connection;
+use rusqlite::{Connection, Transaction, TransactionBehavior};
+use serde_json::Value;
 
+use crate::core::bulk_submit_legacy::{
+    LegacyArtifactMetadata, LegacyFile, LegacyManifest, LegacyPublicationAction,
+    classify_legacy_publications,
+};
 use crate::error::StorageResult;
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 19;
+pub const SCHEMA_VERSION: i32 = 26;
 
 /// Initialize the database schema.
 pub fn initialize_schema(conn: &Connection) -> StorageResult<()> {
@@ -202,25 +207,39 @@ fn create_indexes(conn: &Connection) -> StorageResult<()> {
         "CREATE INDEX IF NOT EXISTS idx_resources_type ON resources(tenant_id, resource_type)",
         "CREATE INDEX IF NOT EXISTS idx_resources_updated ON resources(tenant_id, last_updated)",
         "CREATE INDEX IF NOT EXISTS idx_resources_reindex ON resources(tenant_id, resource_type, last_updated, id)",
+        // Covering index for the live-resource counts the dashboard runs
+        // (schema v24, #959). The column order is load-bearing: `tenant_id`
+        // and `is_deleted` are both equality-matched, so they form the probed
+        // prefix, and `resource_type` then arrives already sorted *within*
+        // that prefix — the `GROUP BY` needs no sort step and every column the
+        // query mentions lives in the index, so the table is never touched.
+        // `idx_resources_type` cannot serve these: it lacks `is_deleted`, so
+        // SQLite can walk it for the tenant but must then fetch each matching
+        // row from the table just to test `is_deleted = 0` — millions of row
+        // visits on a large corpus.
+        "CREATE INDEX IF NOT EXISTS idx_resources_live_type ON resources(tenant_id, is_deleted, resource_type)",
         // History table indexes
         "CREATE INDEX IF NOT EXISTS idx_history_resource ON resource_history(tenant_id, resource_type, id)",
         "CREATE INDEX IF NOT EXISTS idx_history_updated ON resource_history(tenant_id, last_updated)",
         // Search index indexes
-        "CREATE INDEX IF NOT EXISTS idx_search_string ON search_index(tenant_id, resource_type, param_name, value_string)",
-        "CREATE INDEX IF NOT EXISTS idx_search_token ON search_index(tenant_id, resource_type, param_name, value_token_system, value_token_code)",
-        "CREATE INDEX IF NOT EXISTS idx_search_date ON search_index(tenant_id, resource_type, param_name, value_date)",
-        "CREATE INDEX IF NOT EXISTS idx_search_number ON search_index(tenant_id, resource_type, param_name, value_number)",
-        "CREATE INDEX IF NOT EXISTS idx_search_quantity ON search_index(tenant_id, resource_type, param_name, value_quantity_value, value_quantity_unit)",
-        "CREATE INDEX IF NOT EXISTS idx_search_reference ON search_index(tenant_id, resource_type, param_name, value_reference)",
-        "CREATE INDEX IF NOT EXISTS idx_search_uri ON search_index(tenant_id, resource_type, param_name, value_uri)",
-        // Index for composite parameter matching
+        "CREATE INDEX IF NOT EXISTS idx_search_string ON search_index(tenant_id, resource_type, param_name, value_string) WHERE value_string IS NOT NULL",
+        "CREATE INDEX IF NOT EXISTS idx_search_token ON search_index(tenant_id, resource_type, param_name, value_token_system, value_token_code) WHERE value_token_system IS NOT NULL OR value_token_code IS NOT NULL",
+        "CREATE INDEX IF NOT EXISTS idx_search_date ON search_index(tenant_id, resource_type, param_name, value_date) WHERE value_date IS NOT NULL",
+        "CREATE INDEX IF NOT EXISTS idx_search_number ON search_index(tenant_id, resource_type, param_name, value_number) WHERE value_number IS NOT NULL",
+        "CREATE INDEX IF NOT EXISTS idx_search_quantity ON search_index(tenant_id, resource_type, param_name, value_quantity_value, value_quantity_unit) WHERE value_quantity_value IS NOT NULL",
+        "CREATE INDEX IF NOT EXISTS idx_search_reference ON search_index(tenant_id, resource_type, param_name, value_reference) WHERE value_reference IS NOT NULL",
+        "CREATE INDEX IF NOT EXISTS idx_search_uri ON search_index(tenant_id, resource_type, param_name, value_uri) WHERE value_uri IS NOT NULL",
+        // Index for composite parameter matching, and for every lookup keyed
+        // by the owning resource. `idx_search_resource` used to sit alongside
+        // it on `(tenant_id, resource_type, resource_id)` — a strict leftmost
+        // prefix of this one, so it served no query this index cannot, while
+        // every single index row paid a second full b-tree insertion for it
+        // (schema v21).
         "CREATE INDEX IF NOT EXISTS idx_search_composite ON search_index(tenant_id, resource_type, resource_id, param_name, composite_group)",
-        // Index for resource-based lookups
-        "CREATE INDEX IF NOT EXISTS idx_search_resource ON search_index(tenant_id, resource_type, resource_id)",
         // Index for :text modifier searches (token display text)
-        "CREATE INDEX IF NOT EXISTS idx_search_token_display ON search_index(tenant_id, resource_type, param_name, value_token_display)",
+        "CREATE INDEX IF NOT EXISTS idx_search_token_display ON search_index(tenant_id, resource_type, param_name, value_token_display) WHERE value_token_display IS NOT NULL",
         // Index for :of-type modifier searches (identifier type)
-        "CREATE INDEX IF NOT EXISTS idx_search_identifier_type ON search_index(tenant_id, resource_type, param_name, value_identifier_type_system, value_identifier_type_code)",
+        "CREATE INDEX IF NOT EXISTS idx_search_identifier_type ON search_index(tenant_id, resource_type, param_name, value_identifier_type_system, value_identifier_type_code) WHERE value_identifier_type_system IS NOT NULL OR value_identifier_type_code IS NOT NULL",
     ];
 
     for index_sql in &indexes {
@@ -301,6 +320,13 @@ fn migrate_schema(conn: &Connection, from_version: i32) -> StorageResult<()> {
             16 => migrate_v16_to_v17(conn)?,
             17 => migrate_v17_to_v18(conn)?,
             18 => migrate_v18_to_v19(conn)?,
+            19 => migrate_v19_to_v20(conn)?,
+            20 => migrate_v20_to_v21(conn)?,
+            21 => migrate_v21_to_v22(conn)?,
+            22 => migrate_v22_to_v23(conn)?,
+            23 => migrate_v23_to_v24(conn)?,
+            24 => migrate_v24_to_v25(conn)?,
+            25 => migrate_v25_to_v26(conn)?,
             _ => {
                 return Err(crate::error::StorageError::Backend(
                     crate::error::BackendError::Internal {
@@ -1442,12 +1468,585 @@ fn migrate_v18_to_v19(conn: &Connection) -> StorageResult<()> {
     Ok(())
 }
 
+/// Migrate from schema version 19 to version 20.
+///
+/// Rebuilds the nine per-family `search_index` indexes as partial indexes.
+/// Every index row populates exactly one value-column family for its
+/// parameter type, but each INSERT maintained all fifteen secondary indexes —
+/// NULL columns included, so a token row still paid the date, number,
+/// quantity, string, and uri B-trees. Instrumentation on the bulk-import
+/// benchmark put those inserts at 53% of total import time; with the partial
+/// predicates each row maintains only its own family's structures, measured
+/// at 1.67x end-to-end on the same benchmark with identical row counts.
+///
+/// Search plans are unaffected: every family's query predicates compare its
+/// value column (`value_date >= ?`, `value_token_code = ?`), which implies
+/// the index's `IS NOT NULL` (or OR-of-columns) predicate. `:missing` never
+/// scans value columns for NULL — it resolves from entry presence.
+fn migrate_v19_to_v20(conn: &Connection) -> StorageResult<()> {
+    let statements = [
+        "DROP INDEX IF EXISTS idx_search_string",
+        "CREATE INDEX idx_search_string ON search_index(tenant_id, resource_type, param_name, value_string) WHERE value_string IS NOT NULL",
+        "DROP INDEX IF EXISTS idx_search_token",
+        "CREATE INDEX idx_search_token ON search_index(tenant_id, resource_type, param_name, value_token_system, value_token_code) WHERE value_token_system IS NOT NULL OR value_token_code IS NOT NULL",
+        "DROP INDEX IF EXISTS idx_search_date",
+        "CREATE INDEX idx_search_date ON search_index(tenant_id, resource_type, param_name, value_date) WHERE value_date IS NOT NULL",
+        "DROP INDEX IF EXISTS idx_search_number",
+        "CREATE INDEX idx_search_number ON search_index(tenant_id, resource_type, param_name, value_number) WHERE value_number IS NOT NULL",
+        "DROP INDEX IF EXISTS idx_search_quantity",
+        "CREATE INDEX idx_search_quantity ON search_index(tenant_id, resource_type, param_name, value_quantity_value, value_quantity_unit) WHERE value_quantity_value IS NOT NULL",
+        "DROP INDEX IF EXISTS idx_search_reference",
+        "CREATE INDEX idx_search_reference ON search_index(tenant_id, resource_type, param_name, value_reference) WHERE value_reference IS NOT NULL",
+        "DROP INDEX IF EXISTS idx_search_uri",
+        "CREATE INDEX idx_search_uri ON search_index(tenant_id, resource_type, param_name, value_uri) WHERE value_uri IS NOT NULL",
+        "DROP INDEX IF EXISTS idx_search_token_display",
+        "CREATE INDEX idx_search_token_display ON search_index(tenant_id, resource_type, param_name, value_token_display) WHERE value_token_display IS NOT NULL",
+        "DROP INDEX IF EXISTS idx_search_identifier_type",
+        "CREATE INDEX idx_search_identifier_type ON search_index(tenant_id, resource_type, param_name, value_identifier_type_system, value_identifier_type_code) WHERE value_identifier_type_system IS NOT NULL OR value_identifier_type_code IS NOT NULL",
+    ];
+    for sql in &statements {
+        conn.execute(sql, [])
+            .map_err(|e| migration_err(format!("v20 partial index rebuild: {e}")))?;
+    }
+    Ok(())
+}
+
+/// Migrate from schema version 20 to version 21.
+///
+/// Drops `idx_search_resource`. It indexed
+/// `(tenant_id, resource_type, resource_id)` — a strict leftmost prefix of
+/// `idx_search_composite`'s `(tenant_id, resource_type, resource_id,
+/// param_name, composite_group)`, which every SQLite query planner will use
+/// for the same lookups. It therefore answered no query the composite index
+/// could not, while every row written to `search_index` (about 14 per
+/// ingested resource) paid a second b-tree insertion to maintain it.
+///
+/// Measured on a 86,453-resource bulk-submit ingest of the Synthea manifest
+/// (1.18M index rows): 1,946 -> 2,106 resources/s (+8%), with the
+/// `search_index` INSERT phase falling from 0.249 ms to 0.225 ms per resource
+/// and the database 85 MB smaller (#947).
+fn migrate_v20_to_v21(conn: &Connection) -> StorageResult<()> {
+    conn.execute("DROP INDEX IF EXISTS idx_search_resource", [])
+        .map_err(|e| migration_err(format!("v21 drop idx_search_resource: {e}")))?;
+    Ok(())
+}
+
+/// Migrate from schema version 21 to version 22.
+///
+/// Rebuilds the last three `search_index` indexes that were still *full*
+/// indexes over a column almost every row leaves NULL, as partial indexes
+/// (#947). #944 did this for the v20 set and skipped these three because they
+/// were added later, by the v10 and v11 migrations.
+///
+/// A full index takes an entry for **every** row in the table, NULL or not.
+/// On a 86,453-resource ingest of the Synthea manifest — 1,182,409 index rows,
+/// of which 150,000 carry a reference display and none carry a canonical
+/// quantity or a contained flag — those three indexes held 1.18M entries each
+/// and cost 134 MB:
+///
+/// ```text
+///                                  before    after
+/// idx_search_reference_display     51.6 MB   9.8 MB
+/// idx_search_quantity_canonical    47.9 MB   0.0 MB
+/// idx_search_contained             34.0 MB   0.0 MB
+/// ```
+///
+/// Every row therefore paid three b-tree insertions it could never be found
+/// by. `idx_search_string_folded` is deliberately **not** in this list: it is
+/// also the only index leading with `(tenant_id, resource_type, param_name)`
+/// that covers every row, and the query planner falls back to it for the
+/// `LIKE`-shaped modifier searches (`:text`, `:contains`) whose predicate
+/// SQLite cannot prove implies `IS NOT NULL`. Making it partial pushed those
+/// onto `idx_search_composite`'s `(tenant_id, resource_type)` prefix, and
+/// replacing it with a narrow `(tenant_id, resource_type, param_name)` index
+/// made the planner prefer that for token searches too — a selective
+/// `code=…` lookup went from 2.9 ms to 22.1 ms because the value could no
+/// longer be filtered inside the index.
+///
+/// `EXPLAIN QUERY PLAN` over 15 representative search shapes (token, token
+/// `:text`, reference, reference `:text`, string prefix and exact, quantity
+/// raw and canonical, date, uri, identifier `:of-type`, `_contained`,
+/// composite, delete-by-resource) is byte-identical before and after this
+/// migration. Ingest of the same manifest went 2,238 -> 2,543 resources/s
+/// (+14%) with the database 124 MB (11%) smaller.
+fn migrate_v21_to_v22(conn: &Connection) -> StorageResult<()> {
+    let statements = [
+        "DROP INDEX IF EXISTS idx_search_reference_display",
+        "CREATE INDEX idx_search_reference_display
+         ON search_index(tenant_id, resource_type, param_name, value_reference_display)
+         WHERE value_reference_display IS NOT NULL",
+        "DROP INDEX IF EXISTS idx_search_quantity_canonical",
+        "CREATE INDEX idx_search_quantity_canonical
+         ON search_index(tenant_id, resource_type, param_name, value_quantity_canonical_unit, value_quantity_canonical_value)
+         WHERE value_quantity_canonical_value IS NOT NULL",
+        "DROP INDEX IF EXISTS idx_search_contained",
+        "CREATE INDEX idx_search_contained
+         ON search_index(tenant_id, contained_type, is_contained, param_name)
+         WHERE is_contained = 1",
+    ];
+    for sql in &statements {
+        conn.execute(sql, [])
+            .map_err(|e| migration_err(format!("v22 partial index rebuild: {e}")))?;
+    }
+    Ok(())
+}
+
+/// Migrate from schema version 22 to version 23.
+///
+/// Adds `resource_fts_map`, which records the `rowid` FTS5 assigned to each
+/// resource's `resource_fts` row, and backfills it from the rows already there
+/// (#967).
+///
+/// `resource_fts` is an FTS5 virtual table whose plain columns are
+/// `UNINDEXED`, so
+///
+/// ```text
+/// DELETE FROM resource_fts WHERE tenant_id = ? AND resource_type = ? AND resource_id = ?
+/// ```
+///
+/// cannot seek: it scans the whole table. That delete runs once per resource
+/// on every re-index — an update, a re-import, `$reindex` — which makes those
+/// operations quadratic in corpus size. Measured on a 104 GB database holding
+/// 6,036,052 FTS documents (3.02 GB of `resource_fts_data`): a resumed bulk
+/// import advanced 16,700 entries in 20 hours, one core at 100%, 835,000 page
+/// reads per second and no writes. #949 guarded the *create* path (a resource
+/// with no `search_index` rows was never FTS-indexed); every other path still
+/// paid the scan.
+///
+/// FTS5 does index `rowid`, so with the mapping the delete becomes a b-tree
+/// lookup. The backfill is one scan of the FTS table — the cost of a single
+/// delete under the old scheme.
+fn migrate_v22_to_v23(conn: &Connection) -> StorageResult<()> {
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS resource_fts_map (
+            tenant_id TEXT NOT NULL,
+            resource_type TEXT NOT NULL,
+            resource_id TEXT NOT NULL,
+            fts_rowid INTEGER NOT NULL,
+            PRIMARY KEY (tenant_id, resource_type, resource_id, fts_rowid)
+        ) WITHOUT ROWID",
+        [],
+    )
+    .map_err(|e| migration_err(format!("v23 create resource_fts_map: {e}")))?;
+
+    // The FTS table is optional: a build without FTS5 never created it, and
+    // there is then nothing to map.
+    let fts_exists: bool = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='resource_fts'",
+            [],
+            |_| Ok(true),
+        )
+        .unwrap_or(false);
+    if fts_exists {
+        // `OR IGNORE`: the primary key includes the rowid, so a resource that
+        // somehow has two FTS rows keeps both mappings and both get deleted.
+        conn.execute(
+            "INSERT OR IGNORE INTO resource_fts_map (tenant_id, resource_type, resource_id, fts_rowid)
+             SELECT tenant_id, resource_type, resource_id, rowid FROM resource_fts",
+            [],
+        )
+        .map_err(|e| migration_err(format!("v23 backfill resource_fts_map: {e}")))?;
+    }
+    Ok(())
+}
+
+/// Migrate from schema version 23 to version 24.
+///
+/// Adds `idx_resources_live_type` on
+/// `(tenant_id, is_deleted, resource_type)`, the covering index for the
+/// live-resource counts the Home/Dashboard page runs on every load (#959).
+///
+/// Two query shapes, both hit once per dashboard render:
+///
+/// ```text
+/// SELECT resource_type, COUNT(*) FROM resources
+///  WHERE tenant_id = ?1 AND is_deleted = 0
+///  GROUP BY resource_type
+///
+/// SELECT COUNT(*) FROM resources
+///  WHERE tenant_id = ?1 AND is_deleted = 0
+/// ```
+///
+/// plus `count_by_types`, which is the first with an extra
+/// `AND resource_type IN (...)` — the same access path, narrowed.
+///
+/// Before this index the only candidate was `idx_resources_type` on
+/// `(tenant_id, resource_type)`, which does **not** contain `is_deleted`.
+/// SQLite can walk it for the tenant, but `is_deleted = 0` is not answerable
+/// from the index, so it must fetch every matching row out of the table just
+/// to evaluate that one predicate. On a 6,000,000-resource database that is
+/// six million random row visits per count — the dashboard took about 30
+/// seconds to load.
+///
+/// The column order is the whole point. `tenant_id` and `is_deleted` are both
+/// equality-matched, so they form the probed prefix; `resource_type` then
+/// arrives already sorted *within* that prefix, which means the `GROUP BY`
+/// needs no sort step and the aggregate is answered from the index alone,
+/// without touching the table. Any other order loses one of those two
+/// properties: leading with `resource_type` breaks the equality prefix, and
+/// putting `is_deleted` last leaves it unusable as a seek key.
+///
+/// Honest note on the cost of this migration: the index has to be built once,
+/// at the startup that performs the upgrade. On a multi-million-row database
+/// that means a full scan of `resources` plus a b-tree build, and it takes a
+/// noticeable amount of time (and transient disk for the sort) before the
+/// server begins serving. It is a one-off cost — subsequent startups find the
+/// index already there and skip this migration entirely.
+fn migrate_v23_to_v24(conn: &Connection) -> StorageResult<()> {
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_resources_live_type
+         ON resources(tenant_id, is_deleted, resource_type)",
+        [],
+    )
+    .map_err(|e| migration_err(format!("v24 create idx_resources_live_type: {e}")))?;
+    Ok(())
+}
+
+/// Migrate from schema version 24 to version 25: the coarse pre-ingest phase
+/// on manifests (#953).
+///
+/// `ManifestStatus::Processing` covers a worker's whole run, so the window
+/// before the first NDJSON byte lands — fetching the remote Bulk Export
+/// Manifest, HEAD-ing its output files to pre-size the byte denominator —
+/// reported a flat `0%`, indistinguishable at the status endpoint from a
+/// wedged job. `phase` is the kebab-case `ManifestPhase` the claiming worker
+/// last reported (NULL before any worker claims it, and for databases
+/// migrated from earlier versions); `files_done`/`files_total` are that
+/// phase's file counters.
+fn migrate_v24_to_v25(conn: &Connection) -> StorageResult<()> {
+    // SQLite has no `ADD COLUMN IF NOT EXISTS` and a duplicate column is a hard
+    // error, so gate each ALTER on PRAGMA table_info the way the earlier
+    // bulk-submit migrations do. A fresh database reaches this migration too
+    // (v1 is created, then every migration runs), and the guard also keeps the
+    // step re-runnable against a database a pre-release build already stamped.
+    let manifest_columns: Vec<String> = {
+        let mut stmt = conn
+            .prepare("PRAGMA table_info(bulk_manifests)")
+            .map_err(|e| migration_err(format!("pragma bulk_manifests: {e}")))?;
+        let cols: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .map_err(|e| migration_err(format!("pragma rows: {e}")))?
+            .filter_map(|r| r.ok())
+            .collect();
+        cols
+    };
+    let adds = [
+        ("phase", "ALTER TABLE bulk_manifests ADD COLUMN phase TEXT"),
+        (
+            "files_done",
+            "ALTER TABLE bulk_manifests ADD COLUMN files_done INTEGER NOT NULL DEFAULT 0",
+        ),
+        (
+            "files_total",
+            "ALTER TABLE bulk_manifests ADD COLUMN files_total INTEGER NOT NULL DEFAULT 0",
+        ),
+    ];
+    for (col, sql) in &adds {
+        if !manifest_columns.iter().any(|c| c == col) {
+            conn.execute(sql, [])
+                .map_err(|e| migration_err(format!("add manifest phase columns: {e}")))?;
+        }
+    }
+    Ok(())
+}
+
+fn table_columns(conn: &Connection, table: &str) -> StorageResult<Vec<String>> {
+    let mut stmt = conn
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .map_err(|e| migration_err(format!("pragma {table}: {e}")))?;
+    let rows = stmt
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(|e| migration_err(format!("pragma {table} rows: {e}")))?;
+    let mut columns = Vec::new();
+    for row in rows {
+        columns.push(row?);
+    }
+    Ok(columns)
+}
+
+fn add_column_if_missing(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+    sql: &str,
+) -> StorageResult<()> {
+    if !table_columns(conn, table)?
+        .iter()
+        .any(|existing| existing == column)
+    {
+        conn.execute(sql, [])
+            .map_err(|e| migration_err(format!("add {table}.{column}: {e}")))?;
+    }
+    Ok(())
+}
+
+/// Migrate from schema version 25 to version 26: manifest-scoped publication.
+///
+/// Existing artifact rows predate manifest identity and idempotent publication.
+/// The upgrade classifies every legacy row without deleting it, then adds two
+/// partial unique indexes so future SQLite publication can distinguish `None`
+/// from `Some("")` resource types.
+fn migrate_v25_to_v26(conn: &Connection) -> StorageResult<()> {
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
+        .map_err(|e| migration_err(format!("begin v26 migration: {e}")))?;
+    let result = migrate_v25_to_v26_in_transaction(&tx);
+
+    match result {
+        Ok(()) => tx
+            .commit()
+            .map_err(|e| migration_err(format!("commit v26 migration: {e}"))),
+        Err(error) => Err(error),
+    }
+}
+
+fn migrate_v25_to_v26_in_transaction(tx: &Connection) -> StorageResult<()> {
+    let manifest_columns = table_columns(tx, "bulk_manifests")?;
+    let file_columns = table_columns(tx, "bulk_submit_files")?;
+    if manifest_columns.is_empty() || file_columns.is_empty() {
+        return Err(migration_err(
+            "bulk_manifests and bulk_submit_files must exist before v26".to_string(),
+        ));
+    }
+
+    // Capture this before any ALTER. A prior interrupted run may have committed
+    // all DDL and classification but failed before stamping v26. In that state
+    // legacy classification must not run again or overwrite generation markers.
+    let new_columns = [
+        ("bulk_manifests", "published_token"),
+        ("bulk_manifests", "publication_status"),
+        ("bulk_manifests", "publication_error_message"),
+        ("bulk_manifests", "publication_worker_id"),
+        ("bulk_submit_files", "manifest_id"),
+        ("bulk_submit_files", "publication_excluded_reason"),
+    ];
+    let classification_already_complete = new_columns.iter().all(|(table, column)| {
+        let columns = match *table {
+            "bulk_manifests" => &manifest_columns,
+            _ => &file_columns,
+        };
+        columns.iter().any(|existing| existing == column)
+    });
+
+    add_column_if_missing(
+        tx,
+        "bulk_manifests",
+        "published_token",
+        "ALTER TABLE bulk_manifests ADD COLUMN published_token INTEGER",
+    )?;
+    add_column_if_missing(
+        tx,
+        "bulk_manifests",
+        "publication_status",
+        "ALTER TABLE bulk_manifests ADD COLUMN publication_status TEXT",
+    )?;
+    add_column_if_missing(
+        tx,
+        "bulk_manifests",
+        "publication_error_message",
+        "ALTER TABLE bulk_manifests ADD COLUMN publication_error_message TEXT",
+    )?;
+    add_column_if_missing(
+        tx,
+        "bulk_manifests",
+        "publication_worker_id",
+        "ALTER TABLE bulk_manifests ADD COLUMN publication_worker_id TEXT",
+    )?;
+    add_column_if_missing(
+        tx,
+        "bulk_submit_files",
+        "manifest_id",
+        "ALTER TABLE bulk_submit_files ADD COLUMN manifest_id TEXT",
+    )?;
+    add_column_if_missing(
+        tx,
+        "bulk_submit_files",
+        "publication_excluded_reason",
+        "ALTER TABLE bulk_submit_files ADD COLUMN publication_excluded_reason TEXT",
+    )?;
+
+    if !classification_already_complete {
+        let manifests = load_legacy_manifests(tx)?;
+        let files = load_legacy_files(tx)?;
+        for action in classify_legacy_publications(&manifests, &files) {
+            match action {
+                LegacyPublicationAction::Exclude { id, reason } => {
+                    set_row_reason(tx, id, reason)?;
+                }
+                LegacyPublicationAction::Assign { id, manifest_id } => {
+                    set_manifest_file_identity(tx, id, &manifest_id)?;
+                }
+                LegacyPublicationAction::Publish { manifest } => {
+                    mark_manifest_publication(tx, &manifest)?;
+                }
+            }
+        }
+    }
+    create_publication_partial_indexes(tx)?;
+    Ok(())
+}
+
+fn load_legacy_manifests(conn: &Connection) -> StorageResult<Vec<LegacyManifest>> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT tenant_id, submitter, submission_id, manifest_id, manifest_url,
+                    status, fencing_token
+             FROM bulk_manifests
+             ORDER BY tenant_id, submitter, submission_id, added_at, manifest_id",
+        )
+        .map_err(|e| migration_err(format!("read legacy manifests: {e}")))?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok(LegacyManifest {
+                tenant_id: row.get(0)?,
+                submitter: row.get(1)?,
+                submission_id: row.get(2)?,
+                manifest_id: row.get(3)?,
+                manifest_url: row.get(4)?,
+                status: row.get(5)?,
+                fencing_token: row.get(6)?,
+            })
+        })
+        .map_err(|e| migration_err(format!("read legacy manifests: {e}")))?;
+    let mut manifests = Vec::new();
+    for row in rows {
+        manifests.push(row.map_err(|e| migration_err(format!("read legacy manifests: {e}")))?);
+    }
+    Ok(manifests)
+}
+
+fn load_legacy_files(conn: &Connection) -> StorageResult<Vec<LegacyFile>> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, tenant_id, submitter, submission_id, manifest_url, file_type,
+                    resource_type, part_index, fencing_token, file_path, line_count,
+                    byte_count, count_severity
+             FROM bulk_submit_files
+             WHERE manifest_id IS NULL AND publication_excluded_reason IS NULL
+             ORDER BY id",
+        )
+        .map_err(|e| migration_err(format!("read legacy artifacts: {e}")))?;
+    let rows = stmt
+        .query_map([], |row| {
+            let count_severity: Option<String> = row.get(12)?;
+            let (count_severity, count_severity_invalid) = match count_severity {
+                Some(text) => match serde_json::from_str::<Value>(&text) {
+                    Ok(value) => (Some(value), false),
+                    Err(_) => (Some(Value::String(text)), true),
+                },
+                None => (None, false),
+            };
+            Ok(LegacyFile {
+                id: row.get(0)?,
+                tenant_id: row.get(1)?,
+                submitter: row.get(2)?,
+                submission_id: row.get(3)?,
+                metadata: LegacyArtifactMetadata {
+                    manifest_url: row.get(4)?,
+                    file_type: row.get(5)?,
+                    resource_type: row.get(6)?,
+                    part_index: row.get(7)?,
+                    file_path: row.get(9)?,
+                    line_count: row.get(10)?,
+                    byte_count: row.get(11)?,
+                    count_severity,
+                    count_severity_invalid,
+                },
+                fencing_token: row.get(8)?,
+            })
+        })
+        .map_err(|e| migration_err(format!("read legacy artifacts: {e}")))?;
+    let mut files = Vec::new();
+    for row in rows {
+        files.push(row.map_err(|e| migration_err(format!("read legacy artifacts: {e}")))?);
+    }
+    Ok(files)
+}
+
+fn set_row_reason(conn: &Connection, id: i64, reason: &str) -> StorageResult<()> {
+    conn.execute(
+        "UPDATE bulk_submit_files
+         SET manifest_id = NULL, publication_excluded_reason = ?2
+         WHERE id = ?1",
+        rusqlite::params![id, reason],
+    )
+    .map_err(|e| migration_err(format!("classify artifact {id}: {e}")))?;
+    Ok(())
+}
+
+fn set_manifest_file_identity(conn: &Connection, id: i64, manifest_id: &str) -> StorageResult<()> {
+    conn.execute(
+        "UPDATE bulk_submit_files
+         SET manifest_id = ?2, publication_excluded_reason = NULL
+         WHERE id = ?1",
+        rusqlite::params![id, manifest_id],
+    )
+    .map_err(|e| migration_err(format!("assign artifact {id}: {e}")))?;
+    Ok(())
+}
+
+fn mark_manifest_publication(conn: &Connection, manifest: &LegacyManifest) -> StorageResult<()> {
+    // Failed legacy messages are unknowable, so publication_status is retained
+    // without inventing publication_error_message. The NULL worker leaves the
+    // marker unable to authorize a fresh publication replay.
+    conn.execute(
+        "UPDATE bulk_manifests
+         SET published_token = ?5,
+             publication_status = ?6,
+             publication_error_message = NULL,
+             publication_worker_id = NULL
+         WHERE tenant_id = ?1 AND submitter = ?2 AND submission_id = ?3
+           AND manifest_id = ?4
+           AND published_token IS NULL
+           AND publication_status IS NULL
+           AND publication_error_message IS NULL
+           AND publication_worker_id IS NULL",
+        rusqlite::params![
+            manifest.tenant_id,
+            manifest.submitter,
+            manifest.submission_id,
+            manifest.manifest_id,
+            manifest.fencing_token,
+            manifest.status,
+        ],
+    )
+    .map_err(|e| migration_err(format!("mark legacy publication: {e}")))?;
+    Ok(())
+}
+
+fn create_publication_partial_indexes(conn: &Connection) -> StorageResult<()> {
+    let indexes = [
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_bulk_submit_files_artifact_null
+         ON bulk_submit_files(
+             tenant_id, submitter, submission_id, manifest_id, file_type,
+             part_index, fencing_token
+         )
+         WHERE manifest_id IS NOT NULL
+           AND publication_excluded_reason IS NULL
+           AND resource_type IS NULL",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_bulk_submit_files_artifact_not_null
+         ON bulk_submit_files(
+             tenant_id, submitter, submission_id, manifest_id, file_type,
+             resource_type, part_index, fencing_token
+         )
+         WHERE manifest_id IS NOT NULL
+           AND publication_excluded_reason IS NULL
+           AND resource_type IS NOT NULL",
+    ];
+    for index in indexes {
+        conn.execute(index, [])
+            .map_err(|e| migration_err(format!("create publication artifact index: {e}")))?;
+    }
+    Ok(())
+}
+
 /// Drop all tables (for testing).
 #[cfg(test)]
 #[allow(dead_code)]
 pub fn drop_all_tables(conn: &Connection) -> StorageResult<()> {
     // Drop FTS5 table first (if exists)
     let _ = conn.execute("DROP TABLE IF EXISTS resource_fts", []);
+    let _ = conn.execute("DROP TABLE IF EXISTS resource_fts_map", []);
     let _ = conn.execute("DROP TABLE IF EXISTS search_index_fts", []);
 
     // Drop bulk tables (order matters due to foreign keys)
@@ -1497,6 +2096,242 @@ pub fn drop_all_tables(conn: &Connection) -> StorageResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::bulk_submit_legacy::{
+        LEGACY_REASON_AMBIGUOUS_URL, LEGACY_REASON_CONFLICTING_DUPLICATE,
+        LEGACY_REASON_EXACT_DUPLICATE, LEGACY_REASON_INCOMPLETE_GENERATION,
+        LEGACY_REASON_INVALID_DOMAIN, LEGACY_REASON_NONTERMINAL, LEGACY_REASON_NULL_URL,
+        LEGACY_REASON_TOKEN_MISMATCH,
+    };
+    use rusqlite::OptionalExtension;
+
+    /// Builds a genuine v25 database by walking every real migration once. This
+    /// avoids initializing to v26 and pretending to remove columns afterward.
+    fn migrate_through_v25(conn: &Connection) {
+        create_schema_v1(conn).unwrap();
+        let _ = get_schema_version(conn).unwrap();
+        migrate_v1_to_v2(conn).unwrap();
+        migrate_v2_to_v3(conn).unwrap();
+        migrate_v3_to_v4(conn).unwrap();
+        migrate_v4_to_v5(conn).unwrap();
+        migrate_v5_to_v6(conn).unwrap();
+        migrate_v6_to_v7(conn).unwrap();
+        migrate_v7_to_v8(conn).unwrap();
+        migrate_v8_to_v9(conn).unwrap();
+        migrate_v9_to_v10(conn).unwrap();
+        migrate_v10_to_v11(conn).unwrap();
+        migrate_v11_to_v12(conn).unwrap();
+        migrate_v12_to_v13(conn).unwrap();
+        migrate_v13_to_v14(conn).unwrap();
+        migrate_v14_to_v15(conn).unwrap();
+        migrate_v15_to_v16(conn).unwrap();
+        migrate_v16_to_v17(conn).unwrap();
+        migrate_v17_to_v18(conn).unwrap();
+        migrate_v18_to_v19(conn).unwrap();
+        migrate_v19_to_v20(conn).unwrap();
+        migrate_v20_to_v21(conn).unwrap();
+        migrate_v21_to_v22(conn).unwrap();
+        migrate_v22_to_v23(conn).unwrap();
+        migrate_v23_to_v24(conn).unwrap();
+        migrate_v24_to_v25(conn).unwrap();
+        set_schema_version(conn, 25).unwrap();
+    }
+
+    fn seed_v25_submission(conn: &Connection, tenant: &str, submitter: &str, submission: &str) {
+        conn.execute(
+            "INSERT INTO bulk_submissions
+             (tenant_id, submitter, submission_id, status, created_at, updated_at)
+             VALUES (?1, ?2, ?3, 'in-progress', '2026-01-01T00:00:00Z',
+                     '2026-01-01T00:00:00Z')",
+            rusqlite::params![tenant, submitter, submission],
+        )
+        .unwrap();
+    }
+
+    #[allow(clippy::too_many_arguments)] // Explicit legacy-schema fixture columns.
+    fn seed_v25_manifest(
+        conn: &Connection,
+        tenant: &str,
+        submitter: &str,
+        submission: &str,
+        manifest: &str,
+        url: Option<&str>,
+        status: &str,
+        fencing_token: i64,
+    ) {
+        conn.execute(
+            "INSERT INTO bulk_manifests
+             (tenant_id, submitter, submission_id, manifest_id, manifest_url, status,
+              added_at, fencing_token)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, '2026-01-01T00:00:00Z', ?7)",
+            rusqlite::params![
+                tenant,
+                submitter,
+                submission,
+                manifest,
+                url,
+                status,
+                fencing_token
+            ],
+        )
+        .unwrap();
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn seed_v25_artifact(
+        conn: &Connection,
+        tenant: &str,
+        submitter: &str,
+        submission: &str,
+        url: Option<&str>,
+        file_type: &str,
+        resource_type: Option<&str>,
+        part_index: i64,
+        fencing_token: i64,
+        file_path: &str,
+        line_count: i64,
+        byte_count: i64,
+        count_severity: Option<&str>,
+    ) -> i64 {
+        conn.execute(
+            "INSERT INTO bulk_submit_files
+             (tenant_id, submitter, submission_id, manifest_url, file_type, resource_type,
+              part_index, fencing_token, file_path, line_count, byte_count, count_severity,
+              created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
+                     '2026-01-01T00:00:00Z')",
+            rusqlite::params![
+                tenant,
+                submitter,
+                submission,
+                url,
+                file_type,
+                resource_type,
+                part_index,
+                fencing_token,
+                file_path,
+                line_count,
+                byte_count,
+                count_severity,
+            ],
+        )
+        .unwrap();
+        conn.last_insert_rowid()
+    }
+
+    fn artifact_classification(conn: &Connection, id: i64) -> (Option<String>, Option<String>) {
+        conn.query_row(
+            "SELECT manifest_id, publication_excluded_reason
+             FROM bulk_submit_files WHERE id = ?1",
+            [id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap()
+    }
+
+    #[allow(clippy::type_complexity)] // Exact persisted columns for migration assertions.
+    fn publication_marker(
+        conn: &Connection,
+        tenant: &str,
+        submitter: &str,
+        submission: &str,
+        manifest: &str,
+    ) -> Option<(Option<i64>, Option<String>, Option<String>, Option<String>)> {
+        conn.query_row(
+            "SELECT published_token, publication_status, publication_error_message,
+                    publication_worker_id
+             FROM bulk_manifests
+             WHERE tenant_id = ?1 AND submitter = ?2 AND submission_id = ?3
+               AND manifest_id = ?4",
+            rusqlite::params![tenant, submitter, submission, manifest],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()
+        .unwrap()
+    }
+
+    fn v26_column_names(conn: &Connection, table: &str) -> Vec<String> {
+        let wanted: &[&str] = if table == "bulk_manifests" {
+            &[
+                "published_token",
+                "publication_status",
+                "publication_error_message",
+                "publication_worker_id",
+            ]
+        } else {
+            &["manifest_id", "publication_excluded_reason"]
+        };
+        let existing = table_columns(conn, table).unwrap();
+        wanted
+            .iter()
+            .filter(|column| existing.iter().any(|name| name == *column))
+            .map(|column| (*column).to_string())
+            .collect()
+    }
+
+    fn publication_index_names(conn: &Connection) -> Vec<String> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT name FROM sqlite_master
+                 WHERE type='index' AND tbl_name='bulk_submit_files'
+                   AND name LIKE 'idx_bulk_submit_files_artifact_%'
+                 ORDER BY name",
+            )
+            .unwrap();
+        stmt.query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct ArtifactSnapshotRow {
+        id: i64,
+        tenant_id: String,
+        submitter: String,
+        submission_id: String,
+        manifest_url: Option<String>,
+        file_type: String,
+        resource_type: Option<String>,
+        part_index: i64,
+        fencing_token: i64,
+        file_path: String,
+        line_count: i64,
+        byte_count: i64,
+        count_severity: Option<String>,
+    }
+
+    type ArtifactSnapshot = Vec<ArtifactSnapshotRow>;
+
+    fn artifact_snapshot(conn: &Connection) -> ArtifactSnapshot {
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, tenant_id, submitter, submission_id, manifest_url, file_type,
+                        resource_type, part_index, fencing_token, file_path, line_count,
+                        byte_count, count_severity
+                 FROM bulk_submit_files ORDER BY id",
+            )
+            .unwrap();
+        stmt.query_map([], |row| {
+            Ok(ArtifactSnapshotRow {
+                id: row.get(0)?,
+                tenant_id: row.get(1)?,
+                submitter: row.get(2)?,
+                submission_id: row.get(3)?,
+                manifest_url: row.get(4)?,
+                file_type: row.get(5)?,
+                resource_type: row.get(6)?,
+                part_index: row.get(7)?,
+                fencing_token: row.get(8)?,
+                file_path: row.get(9)?,
+                line_count: row.get(10)?,
+                byte_count: row.get(11)?,
+                count_severity: row.get(12)?,
+            })
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
+    }
 
     #[test]
     fn test_schema_initialization() {
@@ -1612,11 +2447,886 @@ mod tests {
         assert_eq!(version, SCHEMA_VERSION);
     }
 
-    /// Migrations must be re-runnable: a database already carrying the latest
-    /// columns can be replayed from any earlier recorded version (tests do this,
-    /// and so does a build that stamped a version before finishing its work).
-    /// SQLite has no `ADD COLUMN IF NOT EXISTS`, so every `ALTER TABLE ... ADD
-    /// COLUMN` step has to guard against the column already being there.
+    /// The index layout the write path pays for on every `search_index` row
+    /// (#947). Two properties, both load-bearing:
+    ///
+    /// * `idx_search_resource` is gone (v21). It was a strict leftmost prefix
+    ///   of `idx_search_composite`, so it answered no query that index cannot
+    ///   while charging every row a second b-tree insertion.
+    /// * The three indexes rebuilt in v22 are partial. A full index over a
+    ///   column almost every row leaves NULL takes an entry per row for
+    ///   nothing.
+    ///
+    /// `idx_search_string_folded` is asserted to be *non*-partial on purpose:
+    /// it is also the only full index leading with
+    /// `(tenant_id, resource_type, param_name)`, and the planner falls back to
+    /// it for the `LIKE`-shaped modifier searches whose predicate SQLite
+    /// cannot prove implies `IS NOT NULL`. Making it partial silently pushes
+    /// `:text` and `:contains` onto a `(tenant_id, resource_type)` scan.
+    #[test]
+    fn search_index_carries_no_redundant_or_full_value_indexes() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+
+        let index_sql = |name: &str| -> Option<String> {
+            conn.query_row(
+                "SELECT sql FROM sqlite_master WHERE type='index' AND name=?1",
+                [name],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .ok()
+            .flatten()
+        };
+
+        assert!(
+            index_sql("idx_search_resource").is_none(),
+            "idx_search_resource is a prefix of idx_search_composite and must not be recreated"
+        );
+        assert!(
+            index_sql("idx_search_composite")
+                .expect("composite index")
+                .contains("resource_id"),
+            "idx_search_composite must still lead with the resource key"
+        );
+
+        for (name, predicate) in [
+            (
+                "idx_search_reference_display",
+                "value_reference_display IS NOT NULL",
+            ),
+            (
+                "idx_search_quantity_canonical",
+                "value_quantity_canonical_value IS NOT NULL",
+            ),
+            ("idx_search_contained", "is_contained = 1"),
+        ] {
+            let sql = index_sql(name).unwrap_or_else(|| panic!("{name} must exist"));
+            assert!(
+                sql.contains(predicate),
+                "{name} must be partial on `{predicate}`, got: {sql}"
+            );
+        }
+
+        let folded = index_sql("idx_search_string_folded").expect("folded index");
+        assert!(
+            !folded.to_ascii_uppercase().contains("WHERE"),
+            "idx_search_string_folded must stay full: it is the fallback index for \
+             LIKE-shaped modifier searches. Got: {folded}"
+        );
+    }
+
+    /// A database upgraded through the ladder must end up with exactly the
+    /// index set a fresh one gets — otherwise a long-lived server keeps paying
+    /// for indexes new installs no longer create.
+    #[test]
+    fn upgraded_database_has_the_same_search_index_indexes_as_a_fresh_one() {
+        let index_set = |conn: &Connection| -> Vec<(String, Option<String>)> {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT name, sql FROM sqlite_master
+                     WHERE type='index' AND tbl_name='search_index' ORDER BY name",
+                )
+                .unwrap();
+            let rows: Vec<(String, Option<String>)> = stmt
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap()
+                .filter_map(|r| r.ok())
+                .collect();
+            rows
+        };
+
+        let fresh = Connection::open_in_memory().unwrap();
+        initialize_schema(&fresh).unwrap();
+
+        let upgraded = Connection::open_in_memory().unwrap();
+        create_schema_v1(&upgraded).unwrap();
+        // Creates the version table, as `initialize_schema` would.
+        let _ = get_schema_version(&upgraded).unwrap();
+        set_schema_version(&upgraded, 1).unwrap();
+        initialize_schema(&upgraded).unwrap();
+
+        assert_eq!(index_set(&fresh), index_set(&upgraded));
+    }
+
+    /// #959: the dashboard's live-resource counts must be answerable from an
+    /// index alone. `idx_resources_type` on `(tenant_id, resource_type)` has no
+    /// `is_deleted`, so SQLite had to visit every matching table row just to
+    /// test `is_deleted = 0` — ~30 s to render `/ui` over 6M resources.
+    ///
+    /// The column order of the v24 index is the whole point, so it is asserted
+    /// exactly: `tenant_id` and `is_deleted` are equality-matched and form the
+    /// probed prefix, after which `resource_type` is already sorted within that
+    /// prefix and the `GROUP BY` needs no sort. Reordering the columns compiles
+    /// and passes every functional test while quietly restoring the 30 s load.
+    #[test]
+    fn resources_carries_the_live_type_covering_index_in_order() {
+        let resources_index_set = |conn: &Connection| -> Vec<(String, Option<String>)> {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT name, sql FROM sqlite_master
+                     WHERE type='index' AND tbl_name='resources' ORDER BY name",
+                )
+                .unwrap();
+            let rows: Vec<(String, Option<String>)> = stmt
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap()
+                .filter_map(|r| r.ok())
+                .collect();
+            rows
+        };
+        // `PRAGMA index_info` returns one row per indexed column, in index
+        // order (seqno, cid, name) — exactly what we need to pin down.
+        let index_columns = |conn: &Connection, name: &str| -> Vec<String> {
+            let mut stmt = conn
+                .prepare(&format!("PRAGMA index_info({name})"))
+                .unwrap_or_else(|e| panic!("index_info({name}): {e}"));
+            stmt.query_map([], |row| row.get::<_, String>(2))
+                .unwrap()
+                .filter_map(|r| r.ok())
+                .collect()
+        };
+        let has_index = |conn: &Connection, name: &str| -> bool {
+            conn.query_row(
+                "SELECT 1 FROM sqlite_master WHERE type='index' AND name=?1",
+                [name],
+                |_| Ok(true),
+            )
+            .unwrap_or(false)
+        };
+
+        // A fresh database gets the index from `create_indexes`.
+        let fresh = Connection::open_in_memory().unwrap();
+        initialize_schema(&fresh).unwrap();
+        assert!(
+            has_index(&fresh, "idx_resources_live_type"),
+            "a fresh database must carry idx_resources_live_type"
+        );
+        assert_eq!(
+            index_columns(&fresh, "idx_resources_live_type"),
+            vec![
+                "tenant_id".to_string(),
+                "is_deleted".to_string(),
+                "resource_type".to_string()
+            ],
+            "the equality-matched columns must come first, resource_type last, \
+             or the GROUP BY loses both its seek prefix and its free ordering"
+        );
+
+        // A database walked up the whole ladder must match a fresh one, or a
+        // long-lived server never gets the index new installs are created with.
+        let upgraded = Connection::open_in_memory().unwrap();
+        create_schema_v1(&upgraded).unwrap();
+        let _ = get_schema_version(&upgraded).unwrap();
+        set_schema_version(&upgraded, 1).unwrap();
+        initialize_schema(&upgraded).unwrap();
+        assert_eq!(resources_index_set(&fresh), resources_index_set(&upgraded));
+
+        // A genuine v23-era database: everything current except the v24 index.
+        let v23 = Connection::open_in_memory().unwrap();
+        initialize_schema(&v23).unwrap();
+        v23.execute("DROP INDEX idx_resources_live_type", [])
+            .unwrap();
+        set_schema_version(&v23, 23).unwrap();
+        assert!(!has_index(&v23, "idx_resources_live_type"));
+
+        // The same entry point the server uses on an existing database.
+        initialize_schema(&v23).unwrap();
+        assert_eq!(get_schema_version(&v23).unwrap(), SCHEMA_VERSION);
+        assert!(
+            has_index(&v23, "idx_resources_live_type"),
+            "the v23 -> v24 migration must create idx_resources_live_type"
+        );
+        assert_eq!(
+            index_columns(&v23, "idx_resources_live_type"),
+            index_columns(&fresh, "idx_resources_live_type"),
+            "the migrated index must match the one a fresh database creates"
+        );
+    }
+
+    /// #967: the v23 mapping must exist and be backfilled from whatever FTS
+    /// rows a pre-v23 database already had, or those rows could never be
+    /// deleted by rowid and would linger as stale `_text`/`_content` matches.
+    #[test]
+    fn v23_backfills_the_fts_rowid_mapping_from_existing_rows() {
+        let conn = Connection::open_in_memory().unwrap();
+        // A database at v22, with FTS content written the pre-v23 way.
+        create_schema_v1(&conn).unwrap();
+        let _ = get_schema_version(&conn).unwrap();
+        set_schema_version(&conn, 1).unwrap();
+        migrate_schema(&conn, 1).unwrap();
+        conn.execute("DROP TABLE IF EXISTS resource_fts_map", [])
+            .unwrap();
+        set_schema_version(&conn, 22).unwrap();
+
+        let fts_exists: bool = conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='resource_fts'",
+                [],
+                |_| Ok(true),
+            )
+            .unwrap_or(false);
+        if !fts_exists {
+            return; // built without FTS5; nothing to map
+        }
+        for (id, text) in [("a", "alpha"), ("b", "beta")] {
+            conn.execute(
+                "INSERT INTO resource_fts (resource_id, resource_type, tenant_id, narrative_text, full_content)
+                 VALUES (?1, 'Patient', 't', ?2, ?2)",
+                rusqlite::params![id, text],
+            )
+            .unwrap();
+        }
+
+        initialize_schema(&conn).unwrap();
+        assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
+
+        let mapped: Vec<(String, i64)> = conn
+            .prepare("SELECT resource_id, fts_rowid FROM resource_fts_map ORDER BY resource_id")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        assert_eq!(mapped.len(), 2, "both pre-existing FTS rows must be mapped");
+
+        // Every mapping must point at the row it claims to.
+        for (resource_id, rowid) in mapped {
+            let found: String = conn
+                .query_row(
+                    "SELECT resource_id FROM resource_fts WHERE rowid = ?1",
+                    [rowid],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(found, resource_id);
+        }
+    }
+
+    #[test]
+    fn publication_migration_preserves_clean_and_exact_duplicate_artifacts() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate_through_v25(&conn);
+        seed_v25_submission(&conn, "tenant-a", "alice", "submission-1");
+        seed_v25_manifest(
+            &conn,
+            "tenant-a",
+            "alice",
+            "submission-1",
+            "manifest-clean",
+            Some("http://provider/clean.json"),
+            "completed",
+            7,
+        );
+        seed_v25_manifest(
+            &conn,
+            "tenant-a",
+            "alice",
+            "submission-1",
+            "manifest-failed",
+            Some("http://provider/failed.json"),
+            "failed",
+            8,
+        );
+        let output = seed_v25_artifact(
+            &conn,
+            "tenant-a",
+            "alice",
+            "submission-1",
+            Some("http://provider/clean.json"),
+            "output",
+            Some("Patient"),
+            0,
+            7,
+            "tenant/submit/output-0.ndjson",
+            3,
+            120,
+            None,
+        );
+        let failed_error = seed_v25_artifact(
+            &conn,
+            "tenant-a",
+            "alice",
+            "submission-1",
+            Some("http://provider/failed.json"),
+            "error",
+            Some("OperationOutcome"),
+            0,
+            8,
+            "tenant/submit/error-0.ndjson",
+            2,
+            88,
+            Some(r#"{"warning":1,"error":2}"#),
+        );
+        let duplicate = seed_v25_artifact(
+            &conn,
+            "tenant-a",
+            "alice",
+            "submission-1",
+            Some("http://provider/clean.json"),
+            "output",
+            Some("Patient"),
+            0,
+            7,
+            "tenant/submit/output-0.ndjson",
+            3,
+            120,
+            None,
+        );
+
+        initialize_schema(&conn).unwrap();
+        assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
+        assert_eq!(
+            artifact_classification(&conn, output),
+            (Some("manifest-clean".to_string()), None)
+        );
+        assert_eq!(
+            artifact_classification(&conn, failed_error),
+            (Some("manifest-failed".to_string()), None)
+        );
+        assert_eq!(
+            artifact_classification(&conn, duplicate),
+            (None, Some(LEGACY_REASON_EXACT_DUPLICATE.to_string()))
+        );
+        assert_eq!(
+            publication_marker(&conn, "tenant-a", "alice", "submission-1", "manifest-clean",),
+            Some((Some(7), Some("completed".to_string()), None, None))
+        );
+        assert_eq!(
+            publication_marker(
+                &conn,
+                "tenant-a",
+                "alice",
+                "submission-1",
+                "manifest-failed",
+            ),
+            Some((Some(8), Some("failed".to_string()), None, None))
+        );
+        assert_eq!(publication_index_names(&conn).len(), 2);
+    }
+
+    #[test]
+    fn publication_migration_quarantines_conflicting_or_incomplete_generations() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate_through_v25(&conn);
+        seed_v25_submission(&conn, "tenant-a", "alice", "submission-conflicts");
+        seed_v25_manifest(
+            &conn,
+            "tenant-a",
+            "alice",
+            "submission-conflicts",
+            "manifest-conflicts",
+            Some("http://provider/conflicts.json"),
+            "completed",
+            9,
+        );
+        seed_v25_manifest(
+            &conn,
+            "tenant-a",
+            "alice",
+            "submission-conflicts",
+            "manifest-incomplete",
+            Some("http://provider/incomplete.json"),
+            "completed",
+            10,
+        );
+        let conflicting_first = seed_v25_artifact(
+            &conn,
+            "tenant-a",
+            "alice",
+            "submission-conflicts",
+            Some("http://provider/conflicts.json"),
+            "output",
+            Some("Patient"),
+            0,
+            9,
+            "tenant/submit/first.ndjson",
+            1,
+            10,
+            None,
+        );
+        let conflicting_second = seed_v25_artifact(
+            &conn,
+            "tenant-a",
+            "alice",
+            "submission-conflicts",
+            Some("http://provider/conflicts.json"),
+            "output",
+            Some("Patient"),
+            0,
+            9,
+            "tenant/submit/second.ndjson",
+            2,
+            20,
+            None,
+        );
+        let unique_conflict_member = seed_v25_artifact(
+            &conn,
+            "tenant-a",
+            "alice",
+            "submission-conflicts",
+            Some("http://provider/conflicts.json"),
+            "output",
+            Some("Observation"),
+            0,
+            9,
+            "tenant/submit/observation.ndjson",
+            1,
+            11,
+            None,
+        );
+        let recognized_with_null = seed_v25_artifact(
+            &conn,
+            "tenant-a",
+            "alice",
+            "submission-conflicts",
+            Some("http://provider/incomplete.json"),
+            "output",
+            Some("Patient"),
+            0,
+            10,
+            "tenant/submit/recognized.ndjson",
+            1,
+            12,
+            None,
+        );
+        let null_url = seed_v25_artifact(
+            &conn,
+            "tenant-a",
+            "alice",
+            "submission-conflicts",
+            None,
+            "output",
+            Some("Patient"),
+            1,
+            10,
+            "tenant/submit/null-url.ndjson",
+            1,
+            13,
+            None,
+        );
+
+        initialize_schema(&conn).unwrap();
+        for id in [
+            conflicting_first,
+            conflicting_second,
+            unique_conflict_member,
+        ] {
+            assert_eq!(
+                artifact_classification(&conn, id),
+                (None, Some(LEGACY_REASON_CONFLICTING_DUPLICATE.to_string()))
+            );
+        }
+        assert_eq!(
+            artifact_classification(&conn, recognized_with_null),
+            (None, Some(LEGACY_REASON_INCOMPLETE_GENERATION.to_string()))
+        );
+        assert_eq!(
+            artifact_classification(&conn, null_url),
+            (None, Some(LEGACY_REASON_NULL_URL.to_string()))
+        );
+        assert_eq!(
+            publication_marker(
+                &conn,
+                "tenant-a",
+                "alice",
+                "submission-conflicts",
+                "manifest-conflicts",
+            ),
+            Some((None, None, None, None))
+        );
+        assert_eq!(
+            publication_marker(
+                &conn,
+                "tenant-a",
+                "alice",
+                "submission-conflicts",
+                "manifest-incomplete",
+            ),
+            Some((None, None, None, None))
+        );
+    }
+
+    #[test]
+    fn publication_unique_indexes_distinguish_none_and_empty_resource_type() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate_through_v25(&conn);
+        seed_v25_submission(&conn, "tenant-a", "alice", "submission-types");
+        seed_v25_manifest(
+            &conn,
+            "tenant-a",
+            "alice",
+            "submission-types",
+            "manifest-types",
+            Some("http://provider/types.json"),
+            "completed",
+            3,
+        );
+        seed_v25_artifact(
+            &conn,
+            "tenant-a",
+            "alice",
+            "submission-types",
+            Some("http://provider/types.json"),
+            "output",
+            None,
+            0,
+            3,
+            "tenant/submit/none.ndjson",
+            1,
+            10,
+            None,
+        );
+        seed_v25_artifact(
+            &conn,
+            "tenant-a",
+            "alice",
+            "submission-types",
+            Some("http://provider/types.json"),
+            "output",
+            Some(""),
+            0,
+            3,
+            "tenant/submit/empty.ndjson",
+            1,
+            11,
+            None,
+        );
+
+        initialize_schema(&conn).unwrap();
+        initialize_schema(&conn).unwrap();
+        let count = |resource: Option<&str>| -> i64 {
+            conn.query_row(
+                "SELECT COUNT(*) FROM bulk_submit_files
+                 WHERE manifest_id = 'manifest-types'
+                   AND publication_excluded_reason IS NULL
+                   AND resource_type IS ?1",
+                rusqlite::params![resource],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(count(None), 1);
+        assert_eq!(count(Some("")), 1);
+
+        let duplicate = |resource: Option<&str>| {
+            conn.execute(
+                "INSERT INTO bulk_submit_files
+                 (tenant_id, submitter, submission_id, manifest_id, manifest_url, file_type,
+                  resource_type, part_index, fencing_token, file_path, line_count, byte_count,
+                  created_at)
+                 VALUES ('tenant-a', 'alice', 'submission-types', 'manifest-types',
+                         'http://provider/types.json', 'output', ?1, 0, 3,
+                         'tenant/submit/duplicate.ndjson', 1, 10,
+                         '2026-01-01T00:00:00Z')",
+                rusqlite::params![resource],
+            )
+        };
+        for resource in [None, Some("")] {
+            let error = duplicate(resource).unwrap_err();
+            assert_eq!(
+                error.sqlite_error().unwrap().extended_code,
+                rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE
+            );
+        }
+    }
+
+    #[test]
+    fn publication_migration_rolls_back_trigger_failure_and_replays() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate_through_v25(&conn);
+        seed_v25_submission(&conn, "tenant-a", "alice", "submission-rollback");
+        seed_v25_manifest(
+            &conn,
+            "tenant-a",
+            "alice",
+            "submission-rollback",
+            "manifest-rollback",
+            Some("http://provider/rollback.json"),
+            "completed",
+            5,
+        );
+        let output = seed_v25_artifact(
+            &conn,
+            "tenant-a",
+            "alice",
+            "submission-rollback",
+            Some("http://provider/rollback.json"),
+            "output",
+            Some("Patient"),
+            0,
+            5,
+            "tenant/submit/output.ndjson",
+            1,
+            10,
+            None,
+        );
+        let before = artifact_snapshot(&conn);
+        conn.execute(
+            &format!(
+                "CREATE TRIGGER fail_v26_publication BEFORE UPDATE ON bulk_submit_files
+                 WHEN old.id = {output}
+                 BEGIN SELECT RAISE(ABORT, 'injected v26 publication failure'); END"
+            ),
+            [],
+        )
+        .unwrap();
+
+        let error = initialize_schema(&conn).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("injected v26 publication failure")
+        );
+        assert_eq!(get_schema_version(&conn).unwrap(), 25);
+        assert!(v26_column_names(&conn, "bulk_manifests").is_empty());
+        assert!(v26_column_names(&conn, "bulk_submit_files").is_empty());
+        assert!(publication_index_names(&conn).is_empty());
+        assert_eq!(artifact_snapshot(&conn), before);
+
+        conn.execute("DROP TRIGGER fail_v26_publication", [])
+            .unwrap();
+        initialize_schema(&conn).unwrap();
+        assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
+        assert_eq!(
+            artifact_classification(&conn, output),
+            (Some("manifest-rollback".to_string()), None)
+        );
+        assert_eq!(
+            publication_marker(
+                &conn,
+                "tenant-a",
+                "alice",
+                "submission-rollback",
+                "manifest-rollback",
+            ),
+            Some((Some(5), Some("completed".to_string()), None, None))
+        );
+
+        // Simulate a crash after the committed classification but before the
+        // version stamp. Replay must preserve the marker and classifications.
+        let classified = artifact_classification(&conn, output);
+        let marker = publication_marker(
+            &conn,
+            "tenant-a",
+            "alice",
+            "submission-rollback",
+            "manifest-rollback",
+        );
+        set_schema_version(&conn, 25).unwrap();
+        initialize_schema(&conn).unwrap();
+        assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
+        assert_eq!(artifact_classification(&conn, output), classified);
+        assert_eq!(
+            publication_marker(
+                &conn,
+                "tenant-a",
+                "alice",
+                "submission-rollback",
+                "manifest-rollback",
+            ),
+            marker
+        );
+    }
+
+    #[test]
+    fn publication_migration_excludes_ambiguous_stale_and_malformed_rows() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate_through_v25(&conn);
+        let cases = [
+            (
+                "ambiguous",
+                "completed",
+                7,
+                1,
+                None,
+                LEGACY_REASON_AMBIGUOUS_URL,
+            ),
+            (
+                "stale",
+                "completed",
+                6,
+                1,
+                None,
+                LEGACY_REASON_TOKEN_MISMATCH,
+            ),
+            (
+                "future",
+                "completed",
+                99,
+                1,
+                None,
+                LEGACY_REASON_TOKEN_MISMATCH,
+            ),
+            (
+                "processing",
+                "processing",
+                7,
+                1,
+                None,
+                LEGACY_REASON_NONTERMINAL,
+            ),
+            (
+                "replaced",
+                "replaced",
+                7,
+                1,
+                None,
+                LEGACY_REASON_NONTERMINAL,
+            ),
+            (
+                "negative",
+                "completed",
+                7,
+                -1,
+                None,
+                LEGACY_REASON_INVALID_DOMAIN,
+            ),
+            (
+                "invalid-json",
+                "completed",
+                7,
+                1,
+                Some("{"),
+                LEGACY_REASON_INVALID_DOMAIN,
+            ),
+            (
+                "scalar",
+                "completed",
+                7,
+                1,
+                Some("[]"),
+                LEGACY_REASON_INVALID_DOMAIN,
+            ),
+            (
+                "negative-severity",
+                "completed",
+                7,
+                1,
+                Some(r#"{"error":-1}"#),
+                LEGACY_REASON_INVALID_DOMAIN,
+            ),
+        ];
+        let mut expected = Vec::new();
+        for (submission, status, token, lines, severity, reason) in cases {
+            seed_v25_submission(&conn, "tenant-a", "alice", submission);
+            seed_v25_manifest(
+                &conn,
+                "tenant-a",
+                "alice",
+                submission,
+                "m",
+                Some("url"),
+                status,
+                7,
+            );
+            if submission == "ambiguous" {
+                seed_v25_manifest(
+                    &conn,
+                    "tenant-a",
+                    "alice",
+                    submission,
+                    "other",
+                    Some("url"),
+                    status,
+                    7,
+                );
+            }
+            let row = seed_v25_artifact(
+                &conn,
+                "tenant-a",
+                "alice",
+                submission,
+                Some("url"),
+                "error",
+                Some("OperationOutcome"),
+                0,
+                token,
+                "preserved-path",
+                lines,
+                10,
+                severity,
+            );
+            expected.push((row, reason));
+            if reason == LEGACY_REASON_INVALID_DOMAIN {
+                let sibling = seed_v25_artifact(
+                    &conn,
+                    "tenant-a",
+                    "alice",
+                    submission,
+                    Some("url"),
+                    "output",
+                    Some("Patient"),
+                    0,
+                    7,
+                    "valid-sibling",
+                    1,
+                    10,
+                    None,
+                );
+                expected.push((sibling, reason));
+            }
+        }
+        let before = artifact_snapshot(&conn);
+        initialize_schema(&conn).unwrap();
+        for (row, reason) in expected {
+            assert_eq!(
+                artifact_classification(&conn, row),
+                (None, Some(reason.to_string()))
+            );
+        }
+        assert_eq!(artifact_snapshot(&conn), before);
+    }
+
+    #[test]
+    fn publication_migration_associates_urls_within_the_complete_submission_scope() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate_through_v25(&conn);
+        let scopes = [
+            ("a", "alice", "one"),
+            ("b", "alice", "one"),
+            ("a", "bob", "one"),
+            ("a", "alice", "two"),
+        ];
+        let mut rows = Vec::new();
+        for (tenant, submitter, submission) in scopes {
+            seed_v25_submission(&conn, tenant, submitter, submission);
+            seed_v25_manifest(
+                &conn,
+                tenant,
+                submitter,
+                submission,
+                "shared-id",
+                Some("shared-url"),
+                "completed",
+                7,
+            );
+            rows.push(seed_v25_artifact(
+                &conn,
+                tenant,
+                submitter,
+                submission,
+                Some("shared-url"),
+                "output",
+                Some("Patient"),
+                0,
+                7,
+                "preserved-path",
+                1,
+                10,
+                None,
+            ));
+        }
+        initialize_schema(&conn).unwrap();
+        for row in rows {
+            assert_eq!(
+                artifact_classification(&conn, row),
+                (Some("shared-id".to_string()), None)
+            );
+        }
+    }
+
+    /// Replay migrations against an already current database, including a
+    /// retry after the schema transaction committed before its version stamp.
     #[test]
     fn test_migration_ladder_replays_on_a_current_database() {
         for from in 1..SCHEMA_VERSION {

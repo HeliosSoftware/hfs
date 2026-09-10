@@ -98,6 +98,38 @@
   margin: 0 0 10px;
 }
 
+/* One incremental JSON pane inside the HTS workbench raw fold (#898):
+   a labelled data-capability-json-root with its own expand/collapse
+   controls, stacked twice (request body, response body). */
+.capability-json-pane {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  min-width: 0;
+}
+
+.capability-json-pane + .capability-json-pane {
+  margin-top: 14px;
+}
+
+/* Like `.capability-raw-card > .card-head`: label and controls sit together,
+   left-aligned. */
+.capability-json-pane__head {
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.capability-json-pane__head > span {
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.6px;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
 @media (max-width: 520px) {
   .cap-resource-card > .card-head {
     flex-direction: column;
@@ -1674,16 +1706,19 @@ select.field__input {
   color: var(--muted);
 }
 
-/* The Raw CapabilityStatement has one keyboard-focusable scroll owner. Every
-   nested outline and shared JSON fragment remains overflow-visible inside it. */
-#capability-json-body {
+/* The Raw CapabilityStatement — and each HTS workbench pane body (#898) —
+   has one keyboard-focusable scroll owner. Every nested outline and shared
+   JSON fragment remains overflow-visible inside it. */
+#capability-json-body,
+.capability-json-pane__body {
   max-height: 70vh;
   overflow: auto;
   scrollbar-gutter: stable;
   outline: none;
 }
 
-#capability-json-body:focus-visible {
+#capability-json-body:focus-visible,
+.capability-json-pane__body:focus-visible {
   border-radius: 8px;
   box-shadow: 0 0 0 3px var(--accent-soft);
 }
@@ -1695,7 +1730,8 @@ select.field__input {
   line-height: 1.6;
 }
 
-#capability-json-body .capability-json-outline {
+#capability-json-body .capability-json-outline,
+.capability-json-pane__body .capability-json-outline {
   max-height: none;
   overflow: visible;
 }
@@ -3124,7 +3160,7 @@ details.json-fold[open] > summary .icon {
      element in this file already uses (.chip, .tab, .nav-item,
      .filter-rail__item), so a selected row paints like everything else.
    They touch different selectors in the same list; both are kept. */
-.data-table tbody tr:not(.data-table__empty):hover td,
+.data-table tbody tr:not(.data-table__empty):not(.row--params):hover td,
 .data-table tbody tr[aria-selected="true"] td,
 .data-table tbody tr[aria-current="true"] td {
   background: var(--accent-soft);
@@ -3286,6 +3322,114 @@ details.json-fold[open] > summary .icon {
 /* A failing row carries the frame's red left edge. */
 .data-table tr.row--alert > td:first-child {
   box-shadow: inset 3px 0 0 var(--danger);
+}
+
+/* #837: the SQL Export builder's parameter values row, right under a
+   parameterized SQL Query subject's own `<tr>` — the "client's notebook" of
+   values the checked row needs before it can run. Shaded off the plain row
+   background so the boundary between "picking a subject" and "filling in
+   its values" reads at a glance, without the weight of a border. */
+.row--params {
+  background: var(--input-bg);
+}
+
+.row--params td {
+  padding: 10px 14px 12px;
+}
+
+/* Field grid inside a values row (#837): plain `.field` voice, three per
+   row, no icon. `.field` already carries its own bottom margin for stacked
+   forms; inside this grid every field sits in its own column instead, so
+   that margin only adds uneven whitespace. */
+.param-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 14px;
+  max-width: 720px;
+}
+
+.row--params .field {
+  margin: 0;
+}
+
+/* The values row's expand/collapse chevron (#837), in the Subject cell of a
+   parameterized SQL Query — sql-export-form.js reveals it (server-rendered
+   `hidden`) only once its row is checked, then toggles `aria-expanded` on
+   click. The icon itself rotates purely off that attribute, matching
+   `.json-line__arrow`'s own collapsed-state rotation. */
+.row-toggle {
+  display: inline-grid;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  vertical-align: middle;
+}
+
+.row-toggle:hover {
+  color: var(--text);
+}
+
+.row-toggle .icon {
+  display: inline-flex;
+  transition: transform 0.15s ease;
+}
+
+.row-toggle[aria-expanded="false"] .icon {
+  transform: rotate(-90deg);
+}
+
+/* The folded values row's own chip summary (#837), next to the chevron:
+   `sql-export-form.js` fills it with one `.tag--param`/`.tag--danger` chip
+   per parameter while the row is collapsed, and empties/hides it again on
+   expand. */
+.param-summary {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  vertical-align: middle;
+}
+
+/* One undeclared-placeholder hint (#841's Parameters card, `.lib-params-
+   hint`): the ":name is used but not declared" text and its own one-click
+   *Declare* button, side by side — an informational row, not a `.notice`
+   (this is expected while a query is still being written, never an error),
+   so it gets its own quieter surface instead of `.notice--warn`'s. */
+.lib-params-hint {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 12px;
+  margin: 0 0 8px;
+  font-size: 13px;
+  color: var(--text);
+  background: var(--bg-content);
+  border: 1px solid var(--surface-border);
+  border-radius: 8px;
+}
+
+.lib-params-hint:last-of-type {
+  margin-bottom: 0;
+}
+
+/* The `Add parameter` panel's own name/type row (#841) — plain `.field`s
+   side by side, unlike `.param-grid`'s fixed three-up layout (built for a
+   *values* row that can hold many, not this always-exactly-two form). */
+.lib-params-add__fields {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 14px;
+}
+
+.lib-params-add__fields .field {
+  flex: 1 1 160px;
+  margin-bottom: 0;
 }
 
 /* The Last 24 hrs sparkline (#782): the engine's half-hour delivery series,
@@ -4535,7 +4679,12 @@ details.json-fold[open] > summary .icon {
   overflow: hidden;
 }
 
-/* The editor card's own scrolling area is whichever of the two the browser
+/* `.editor__doc` (#840, generalized off View Definitions' own `#vd-editor-
+   form`): the flex-column container of a JSON editor pane inside a stretch
+   pairing — on View Definitions, the `<form id="vd-editor-form">` around
+   the editor itself carries this class; any future `.editor__grid--stretch`
+   consumer's own editor container does the same to get identical sizing.
+   The editor card's own scrolling area is whichever of the two the browser
    actually mounted: CodeMirror's wrapper (`.code-editor`) normally, or the
    plain `<textarea>` it replaces when the bundle never mounted.
    Only `flex` lives here for the CodeMirror wrapper: the matching
@@ -4551,7 +4700,7 @@ details.json-fold[open] > summary .icon {
    lives in) — with nothing here it would otherwise need to beat, `flex`
    loses nothing by living unlayered alongside `max-height: none` instead of
    splitting the one selector across two blocks. */
-.editor__grid--stretch #vd-editor-form {
+.editor__grid--stretch .editor__doc {
   display: flex;
   flex: 1;
   flex-direction: column;
@@ -4600,6 +4749,19 @@ details.json-fold[open] > summary .icon {
   color: var(--text-strong);
 }
 
+/* A `<details class="card">` whose `<summary>` is itself a `.card-head`
+   (SQL Export's "Advanced" disclosure, #836): a card that opens and closes
+   like every other native disclosure in this file, without a second markup
+   language for "collapsible card" versus "collapsible section". */
+details.card > summary.card-head {
+  list-style: none;
+  cursor: pointer;
+}
+
+details.card > summary.card-head::-webkit-details-marker {
+  display: none;
+}
+
 .card-head__tools {
   display: flex;
   gap: 6px;
@@ -4641,9 +4803,11 @@ details.json-fold[open] > summary .icon {
   line-height: 1.6;
 }
 
-/* The CapabilityStatement owns the only scroll container for its incremental
-   tree. Keep bounded scalar fragments from creating nested 70vh scrollers. */
-#capability-json-body .json-view {
+/* The CapabilityStatement — and each HTS workbench pane (#898) — owns the
+   only scroll container for its incremental tree. Keep bounded scalar
+   fragments from creating nested 70vh scrollers. */
+#capability-json-body .json-view,
+.capability-json-pane__body .json-view {
   max-height: none;
   overflow: visible;
 }
@@ -5433,6 +5597,43 @@ details.json-fold[open] > summary .icon {
 
 .builder-row__modchip[aria-pressed="true"] strong {
   color: var(--accent);
+}
+
+/* Running-query indicator (#958): visible whenever a search is in flight,
+   because a slow search must be distinguishable from a click that did not
+   register. */
+.query-results__busy {
+  display: inline-flex;
+  gap: 6px;
+  align-items: center;
+  color: var(--muted);
+  font-size: 12.5px;
+}
+
+.query-results__busy::before {
+  content: "";
+  width: 12px;
+  height: 12px;
+  border: 2px solid var(--surface-border);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: query-busy-spin 0.8s linear infinite;
+}
+
+@keyframes query-busy-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .query-results__busy::before {
+    animation: none;
+  }
+}
+
+.query-results.is-busy .data-table {
+  opacity: 0.55;
 }
 
 /* Results sort (#416). */
@@ -6356,6 +6557,10 @@ details.json-fold[open] > summary .icon {
   background: var(--accent);
 }
 
+.progress--in-progress .progress__bar {
+  background: var(--accent);
+}
+
 .progress--complete .progress__bar {
   background: var(--ok);
 }
@@ -6371,6 +6576,10 @@ details.json-fold[open] > summary .icon {
 .job-card__meta {
   margin: 0;
   font-size: 13px;
+  color: var(--muted);
+}
+
+.job-card__window {
   color: var(--muted);
 }
 
@@ -6512,12 +6721,27 @@ body.app-shell .pane {
    textarea) is ordinary layout, but it lives in this same unlayered block
    for one clear read.
 
-   What is deliberately NOT here: sizing (min/max-height) and token colors.
-   Those are per editor — `.vd-editor` below sets its own heights and
-   `.cmt-json-*`/`.cmt-fp-*` colors; `.sql-editor` does the
-   same for its own tokens — because different editors in this crate need
-   different heights and color palettes even though they share every other
-   rule below. */
+   What is deliberately NOT here: sizing (min/max-height) and non-JSON token
+   colors. Sizing is per editor — `.editor__doc` (shared JSON editor panes)
+   and `.sql-editor` further down each set their own heights, because
+   different editors in this crate need different footprints even though
+   they share every other rule below. The JSON token palette (`.cmt-json-*`,
+   right below) IS here, generalized off View Definitions' own original
+   copy (#840): every editor in this crate that shows outer JSON — View
+   Definitions today, the Library Details editor next (#840) — reads the
+   same five classes, so one shared rule set beats a per-editor copy. A
+   language injected into JSON's own string values (`.cmt-fp-*`, FHIRPath)
+   is not shared the same way and stays scoped to the editor that injects
+   it (`.vd-editor`, further down). */
+
+/* JSON token colors — the same variables the Resource Editor's raw JSON
+   view (.jt--key et al.) already uses, so a JSON document's outer shape
+   reads identically wherever it appears in the UI. */
+.code-editor .cmt-json-key { color: var(--json-key); }
+.code-editor .cmt-json-string { color: var(--json-string); }
+.code-editor .cmt-json-number { color: var(--json-number); }
+.code-editor .cmt-json-literal { color: var(--json-literal); font-weight: 600; }
+.code-editor .cmt-json-punct { color: var(--muted); }
 
 .code-editor {
   width: 100%;
@@ -6557,6 +6781,17 @@ body.app-shell .pane {
 .code-editor .cm-activeLine,
 .code-editor .cm-activeLineGutter {
   background: var(--accent-soft);
+}
+
+/* #821: `.cm-gutters`' own `color: var(--muted)` above, over the active
+   line's `--accent-soft` wash, measures 4.44:1 in the light theme — just
+   under WCAG AA's 4.5:1 (axe-caught: `a11y.spec.ts`'s targeted lint-panel/
+   tooltip states are the first scan to ever exercise a focused, active-line
+   editor). The active line's own content already renders full-strength
+   (`.cm-content`'s `color: var(--text)`, never dimmed) rather than muted;
+   its gutter number matching that is the same fix, not a one-off color. */
+.code-editor .cm-activeLineGutter {
+  color: var(--text);
 }
 
 .code-editor .cm-selectionBackground {
@@ -6617,10 +6852,13 @@ body.app-shell .pane {
    matches neither surface in light. Recolored here as an ordinary app
    popover instead: the same surface/border/radius/shadow recipe
    `.menu__panel` already uses, so it reads as this UI's own chrome, not a
-   library default. (The bottom `cm-panel-lint` diagnostics panel is left
-   alone: nothing in the ViewDefinition editor's keymap can open it — no
-   `lintKeymap` is wired in `vd-editor.js` — so it is unreachable, not just
-   unstyled.) */
+   library default. Reachable — and, since #821, also *actionable* — three
+   ways: hovering the underline, resting the cursor inside it (both native
+   `@codemirror/lint` behavior, left at its default `hoverTime`), or
+   Ctrl+. (`vd-editor.js`'s own `Mod-.` binding); Ctrl-Shift-M opens the
+   bottom `cm-panel-lint` list of every diagnostic at once (`lintKeymap`,
+   also wired in `vd-editor.js`), styled together with this tooltip further
+   down since both render the identical `.cm-diagnostic` markup. */
 .code-editor .cm-tooltip {
   background: var(--surface);
   color: var(--text);
@@ -6648,6 +6886,51 @@ body.app-shell .pane {
    keeps the bar fully inside the rounded box instead of flush with its edge. */
 .code-editor .cm-diagnostic {
   margin-left: 0;
+}
+
+/* Quick-fix action buttons (#821): one per `Fix` the diagnostic
+   carries, rendered by @codemirror/lint itself inside `.cm-diagnostic` (the
+   tooltip) and each `<li>` of `.cm-panel-lint` alike. CM6's own baseTheme
+   hardcodes a dark `#444` pill with white text, unthemed and out of step
+   with everything else in this popover - recolored here as this app's own
+   secondary-button recipe (`.btn`'s own surface/border/radius, scaled down
+   to the tooltip's own type size) instead. */
+.code-editor .cm-diagnosticAction {
+  font: inherit;
+  font-size: 11px;
+  font-weight: 500;
+  padding: 3px 8px;
+  margin-left: 8px;
+  color: var(--text);
+  background: var(--surface);
+  border: 1px solid var(--surface-border);
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.code-editor .cm-diagnosticAction:hover {
+  background: var(--accent-soft);
+  border-color: var(--accent);
+}
+
+/* The app's own focus indicator (#682, same recipe as `.btn:focus-visible`
+   above) - these buttons are reached by Tab while the tooltip/panel has
+   focus, not just by mouse. */
+.code-editor .cm-diagnosticAction:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+/* The diagnostic's own `source` (#821: the lint's `code`, e.g.
+   "unknown-key") - an intentionally untranslated technical tag, so it reads
+   as secondary/reference text rather than part of the message itself. CM6's
+   own baseTheme already dims it (`opacity: .7`); recolored to `--muted` so
+   both themes keep AA contrast against `--surface` rather than an
+   arbitrary opacity over whatever `--text` happens to be. */
+.code-editor .cm-diagnosticSource {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  color: var(--muted);
+  opacity: 1;
 }
 
 /* Server lint presentation (#753): the underline, gutter
@@ -6708,6 +6991,132 @@ body.app-shell .pane {
   border-bottom-color: var(--warn);
 }
 
+/* The bottom lint panel (#821: opened by Ctrl-Shift-M or Ctrl+.
+   with more than one fix under the cursor) - CM6 appends it as a sibling
+   of `.cm-scroller` inside `.cm-editor`'s own flex column, so it only ever
+   eats into the scroller's share of `.cm-editor`'s fixed height (`app.css`'s
+   own "ViewDefinition editor" section further down sets that height, min
+   320px/max 70vh or 100% inside the guided-form stretch pairing); the
+   editor itself never grows or shrinks to make room, so opening it causes
+   no layout shift outside the card. Every diagnostic renders as the exact
+   same `.cm-diagnostic`/`.cm-diagnosticAction`/`.cm-diagnosticSource`
+   markup the hover tooltip above uses, one per `<li>` - already themed by
+   those same rules; only the panel's own chrome (surface, the scrollable
+   list CM6 caps at 100px tall by default, the selected row, and the close
+   button) needs its own recoloring here. */
+.code-editor .cm-panel.cm-panel-lint {
+  background: var(--surface);
+  color: var(--text);
+  border-top: 1px solid var(--surface-border);
+}
+
+.code-editor .cm-panel.cm-panel-lint ul {
+  background: var(--surface);
+}
+
+.code-editor .cm-panel.cm-panel-lint ul li {
+  border-bottom: 1px solid var(--surface-border);
+}
+
+/* #821: the panel's own `<li>` no longer carries `[aria-selected]` at all
+   (`vd-editor.js`'s own update listener strips it, alongside `role="option"`,
+   for the `nested-interactive` fix below — mirroring its true/false onto
+   this plain `[data-selected]` attribute first) so this selector never
+   fights `@codemirror/lint`'s own baseTheme rules for the same attribute —
+   including its `ul:focus [aria-selected]` variant, which swapped in the
+   OS `Highlight`/`HighlightText` system colors the moment the panel
+   actually had keyboard focus (`openLintPanel` focuses it on open) and
+   measured a 2.05:1 contrast ratio against `.cm-diagnosticSource`'s own
+   `--muted` text in axe's own reported environment; `data-selected` simply
+   has no such competing rule to lose to. */
+.code-editor .cm-panel.cm-panel-lint ul li[data-selected="true"] {
+  background: var(--accent-soft);
+  color: var(--text);
+}
+
+/* #821 (axe `target-size`, WCAG 2.2 AA): CM6's own baseTheme sizes this
+   purely from its `font-size`/line-height/padding, landing at 28.7x18px —
+   under the 24x24 minimum. Fixed to the same `.icon-button` recipe (above)
+   every other icon-only control in this crate already uses, rather than a
+   one-off size just for this button. */
+.code-editor .cm-panel.cm-panel-lint button[name="close"] {
+  display: inline-grid;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  color: var(--muted);
+  background: none;
+  border: none;
+  padding: 0;
+  font-size: 14px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.code-editor .cm-panel.cm-panel-lint button[name="close"]:hover {
+  color: var(--text);
+}
+
+.code-editor .cm-panel.cm-panel-lint button[name="close"]:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+/* Completion popup chrome (#821, code-editor.js's `completion` option):
+   `.cm-tooltip-autocomplete` is itself a `.cm-tooltip` (recolored as an app
+   popover above — surface/border/radius/shadow, the same recipe
+   `.menu__panel` uses), so only what is specific to the option list itself
+   needs its own rules here: each row's layout, the label/matched-substring/
+   detail text, its kind icon, and the selected row. `@codemirror/
+   autocomplete`'s own baseTheme hardcodes the selected row
+   (`&light .../li[aria-selected]{background:"#17c",color:"white"}`, the
+   same always-`&light` gap the lint tooltip comment above explains) and the
+   kind icons (a plain glyph per `Completion.type` via `content` — already
+   text, never an image) — recolored below rather than turned off
+   (`icons: false`), so each kind stays visually distinct. */
+.code-editor .cm-tooltip-autocomplete ul {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+}
+
+.code-editor .cm-tooltip-autocomplete ul li {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.code-editor .cm-tooltip-autocomplete ul li[aria-selected] {
+  background: var(--accent-soft);
+  color: var(--text);
+}
+
+.code-editor .cm-completionIcon {
+  opacity: 0.7;
+}
+
+.code-editor .cm-completionIcon-property::after { color: var(--json-key); }
+.code-editor .cm-completionIcon-function::after,
+.code-editor .cm-completionIcon-method::after { color: var(--fp-function); }
+.code-editor .cm-completionIcon-variable::after { color: var(--fp-constant); }
+
+.code-editor .cm-completionLabel {
+  color: var(--text);
+}
+
+.code-editor .cm-completionMatchedText {
+  text-decoration: none;
+  color: var(--accent-text);
+  font-weight: 600;
+}
+
+.code-editor .cm-completionDetail {
+  margin-left: auto;
+  padding-left: 8px;
+  font-style: normal;
+  color: var(--muted);
+  white-space: nowrap;
+}
+
 /* The textarea code-editor.js mounts over: present for the form (its
    `name` attribute still submits), hidden from sight and the accessibility
    tree so it does not shadow the editor's own role="textbox" (CM6's
@@ -6717,27 +7126,28 @@ body.app-shell .pane {
 }
 
 /* ---------------------------------------------------------------------------
-   ViewDefinition editor (#753, generalized in #838): only what is specific to
-   this editor now lives here — its heights and its two token palettes
-   (JSON, FHIRPath). Everything CodeMirror-generic moved to `.code-editor`
-   above.
+   Shared JSON editor pane sizing (#753, generalized off View Definitions'
+   own original copy in #840): `.editor__doc` marks a JSON editor's
+   container inside a stretch pairing (`.editor__grid--stretch` further up
+   this file, in the layered `pages` section, #843) — on View Definitions
+   the `<form id="vd-editor-form">` around the editor carries it; any future
+   consumer's own container does the same to get the identical "min 320px,
+   max ~70vh, scrolls internally" footprint below.
 
-   Sizing is on `.cm-editor` itself, not the `.vd-editor` wrapper: CodeMirror
-   already makes it a flex column with no explicit height, so a plain
-   min-height/max-height there is enough for `.cm-scroller`'s `height: 100%`
-   to resolve once content forces the max-height clamp, giving the
-   "min 320px, max ~70vh, scrolls internally" shape (#753) without
-   measuring anything in JS.
+   Sizing is on `.cm-editor` itself, not the `.editor__doc` wrapper:
+   CodeMirror already makes it a flex column with no explicit height, so a
+   plain min-height/max-height there is enough for `.cm-scroller`'s
+   `height: 100%` to resolve once content forces the max-height clamp,
+   without measuring anything in JS.
    --------------------------------------------------------------------------- */
 
-.vd-editor .cm-editor {
+.editor__doc .cm-editor {
   min-height: 320px;
   max-height: 70vh;
 }
 
-/* Inside the guided-form pairing (#843, `.editor__grid--stretch` further up
-   this file, in the layered `pages` section): the row itself already caps
-   total height at 70vh and stretches both cards to match, so `.cm-editor`
+/* Inside the guided-form pairing (#843): the row itself already caps total
+   height at 70vh and stretches both cards to match, so `.cm-editor`
    becomes its wrapper's `flex: 1` scrolling area — `height: 100%` of
    whatever the stretch pairing gives it — instead of clamping itself
    independently. The 320px floor above is untouched — that minimum applies
@@ -6754,11 +7164,11 @@ body.app-shell .pane {
 /* #752: the plain `<textarea>` fallback's own height — the same
    "min 320px, max ~70vh, scroll internally" shape `.cm-editor` gets above,
    so nojs and the pre-mount flash match the mounted editor's footprint
-   instead of a fixed `rows` count. Scoped to this page's form rather than
+   instead of a fixed `rows` count. Scoped to `.editor__doc` rather than
    `.json-editor` itself, which every other page keeps its own sizing for —
    the Library-backed SQL pane below gets the identical treatment, scoped to
    its own smaller editor's dimensions (#839). */
-#vd-editor-form textarea.json-editor {
+.editor__doc textarea.json-editor {
   min-height: 320px;
   max-height: 70vh;
   overflow-y: auto;
@@ -6769,19 +7179,17 @@ body.app-shell .pane {
    yields — its 320px floor does not. `flex: 1` rides along here too (moved
    down from beside `.code-editor`'s own copy, further up this file) so the
    selector is not declared a second time. */
-.editor__grid--stretch #vd-editor-form textarea.json-editor {
+.editor__grid--stretch .editor__doc textarea.json-editor {
   flex: 1;
   max-height: none;
 }
 
-/* JSON token colors — the same variables the Resource Editor's raw JSON
-   view (.jt--key et al.) already uses, so a ViewDefinition's outer shape
-   reads identically wherever it appears in the UI. */
-.vd-editor .cmt-json-key { color: var(--json-key); }
-.vd-editor .cmt-json-string { color: var(--json-string); }
-.vd-editor .cmt-json-number { color: var(--json-number); }
-.vd-editor .cmt-json-literal { color: var(--json-literal); font-weight: 600; }
-.vd-editor .cmt-json-punct { color: var(--muted); }
+/* ---------------------------------------------------------------------------
+   ViewDefinition editor (#753, generalized in #838; its JSON sizing and
+   token colors generalized off this section in #840): only what is
+   specific to this editor now lives here — the FHIRPath palette for the
+   grammar its own script injects into the outer JSON.
+   --------------------------------------------------------------------------- */
 
 /* FHIRPath token colors — the injected grammar, scoped separately in
    vd-editor.js so these never bleed onto the outer JSON's own tokens even
@@ -6798,9 +7206,11 @@ body.app-shell .pane {
 /* ---------------------------------------------------------------------------
    SQL editor (#838, sql-editor.js): mounted over the SQL pane's
    `<textarea name="sql">` on /ui/sql/queries and /ui/sql/views. Same
-   min-height-grows / max-height-scrolls shape as .vd-editor above, just
-   shorter — the SQL pane is a single query, not a full ViewDefinition
-   document — and one token palette instead of two (no injected language). */
+   min-height-grows / max-height-scrolls shape as `.editor__doc .cm-editor`
+   above, just shorter — the SQL pane is a single query, not a full
+   ViewDefinition document — and one token palette instead of two (no
+   injected language). Not `.editor__doc` itself: the SQL pane is not part
+   of a `.editor__grid--stretch` pairing. */
 
 .sql-editor .cm-editor {
   min-height: 180px;
@@ -6809,8 +7219,8 @@ body.app-shell .pane {
 
 /* #839: the SQL pane's plain `<textarea>` fallback matches the mounted
    CodeMirror editor's own min-height/max-height above — the same
-   "nojs footprint equals the mounted one" contract `#vd-editor-form
-   textarea.json-editor` gives the ViewDefinition editor, scoped here to
+   "nojs footprint equals the mounted one" contract `.editor__doc
+   textarea.json-editor` gives a JSON editor pane, scoped here to
    `#lib-editor-form` instead since `.json-editor` itself keeps its generic
    sizing for every other page. */
 #lib-editor-form textarea.json-editor {

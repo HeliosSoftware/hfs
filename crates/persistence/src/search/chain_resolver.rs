@@ -135,6 +135,17 @@ fn intersect(mut sets: Vec<HashSet<String>>) -> HashSet<String> {
 /// drains every page.
 const RESOLVER_PAGE: u32 = 1000;
 
+/// Maximum number of reference values passed to a single intermediate hop
+/// search. A backend expands a multi-value reference param into an OR of one
+/// condition per value; the SQLite builder folds them with a helper that
+/// parenthesizes both operands (`(X) OR (Y)`), and SQLite counts each
+/// parenthesized expression as its own tree node, so every term adds ~2 to the
+/// parse-tree depth — a chain wide enough to reach depth 1000 fails to prepare
+/// ("Expression tree is too large", #943). 250 keeps a hop's tree near ~500
+/// deep with comfortable margin, no matter how wide the intermediate set is;
+/// correctness never depends on the size — the chunks' matches are unioned.
+const CHAIN_VALUE_CHUNK: usize = 250;
+
 /// Every match of `query`, across every page. The resolver's intermediate
 /// searches feed id rewrites, so letting a backend apply its default page
 /// size silently truncated every hop of every chain at 100 matches — both
@@ -263,25 +274,38 @@ where
     // refs, across every candidate parent type.
     for i in (0..hops.len()).rev() {
         let ref_param = &hops[i].reference_param;
-        let values: Vec<SearchValue> = current_refs.iter().map(SearchValue::eq).collect();
+        // Search the refs in chunks. A backend renders a multi-value reference
+        // param as an OR of one condition per value, which nests one level per
+        // term; past ~1000 terms SQLite refuses to prepare the statement
+        // ("Expression tree is too large", #943). Chunking bounds the per-query
+        // term count regardless of how wide the intermediate set is; the union
+        // of the chunks is the same parent set. Dedup between chunks so a parent
+        // referencing refs in two chunks does not inflate the next hop.
+        let mut seen: HashSet<String> = HashSet::new();
         let mut next_refs: Vec<String> = Vec::new();
         for parent_type in &parent_types_per_hop[i] {
-            let query = SearchQuery::new(parent_type).with_parameter(SearchParameter {
-                name: ref_param.clone(),
-                param_type: SearchParamType::Reference,
-                modifier: None,
-                values: values.clone(),
-                chain: vec![],
-                components: vec![],
-            });
-            let items = search_all_pages(storage, tenant, query).await?;
-            next_refs.extend(items.into_iter().map(|res| {
-                if i == 0 {
-                    res.id().to_string()
-                } else {
-                    format!("{}/{}", res.resource_type(), res.id())
+            for chunk in current_refs.chunks(CHAIN_VALUE_CHUNK) {
+                let values: Vec<SearchValue> = chunk.iter().map(SearchValue::eq).collect();
+                let query = SearchQuery::new(parent_type).with_parameter(SearchParameter {
+                    name: ref_param.clone(),
+                    param_type: SearchParamType::Reference,
+                    modifier: None,
+                    values,
+                    chain: vec![],
+                    components: vec![],
+                });
+                let items = search_all_pages(storage, tenant, query).await?;
+                for res in items {
+                    let r = if i == 0 {
+                        res.id().to_string()
+                    } else {
+                        format!("{}/{}", res.resource_type(), res.id())
+                    };
+                    if seen.insert(r.clone()) {
+                        next_refs.push(r);
+                    }
                 }
-            }));
+            }
         }
         current_refs = next_refs;
         if current_refs.is_empty() {
@@ -610,6 +634,91 @@ mod tests {
         let rewritten = resolve_chains(&b, &t, &query).await.unwrap();
         let result = b.search(&t, &rewritten).await.unwrap();
         assert!(result.resources.items.is_empty(), "no patient named Nobody");
+    }
+
+    /// A two-level chain over a wide intermediate set used to 500 with
+    /// "Expression tree is too large (maximum depth 1000)" (#943): each hop
+    /// searched one query carrying every intermediate reference as an OR of
+    /// equals, and the final rewrite injected every matched id as an `_id` OR,
+    /// both of which nest one level per value and trip SQLite's parse-depth
+    /// limit past ~1000 terms. The resolver now chunks the reference hops and
+    /// the `_id` filter is a flat `IN (...)`, so a wide chain resolves.
+    #[tokio::test]
+    async fn two_level_chain_over_wide_intermediate_set() {
+        let b = backend();
+        let t = tenant();
+
+        // Comfortably past the depth-1000 limit so the un-chunked path fails.
+        const N: usize = 1200;
+        for i in 0..N {
+            let pid = format!("p{i}");
+            let eid = format!("e{i}");
+            let oid = format!("o{i}");
+            b.create(
+                &t,
+                "Patient",
+                json!({ "resourceType": "Patient", "id": pid, "gender": "female" }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+            b.create(
+                &t,
+                "Encounter",
+                json!({ "resourceType": "Encounter", "id": eid, "status": "finished",
+                        "subject": { "reference": format!("Patient/{pid}") } }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+            b.create(
+                &t,
+                "Observation",
+                json!({ "resourceType": "Observation", "id": oid, "status": "final",
+                        "encounter": { "reference": format!("Encounter/{eid}") } }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        }
+
+        // Observation?encounter.subject.gender=female (a two-hop forward chain;
+        // `subject` is the reference param the sibling tests exercise).
+        let query = SearchQuery::new("Observation").with_parameter(SearchParameter {
+            name: "encounter".to_string(),
+            param_type: SearchParamType::Reference,
+            modifier: None,
+            values: vec![SearchValue::eq("female")],
+            chain: vec![
+                ChainedParameter {
+                    reference_param: "encounter".to_string(),
+                    target_type: Some("Encounter".to_string()),
+                    target_param: "subject".to_string(),
+                },
+                ChainedParameter {
+                    reference_param: "subject".to_string(),
+                    target_type: Some("Patient".to_string()),
+                    target_param: "gender".to_string(),
+                },
+            ],
+            components: vec![],
+        });
+
+        let mut rewritten = resolve_chains(&b, &t, &query)
+            .await
+            .expect("wide chain resolves without a depth-1000 failure");
+        // One page big enough to hold every match, so the assertion sees the
+        // full result rather than a default-capped page.
+        rewritten.count = Some((N + 10) as u32);
+        let result = b
+            .search(&t, &rewritten)
+            .await
+            .expect("the rewritten _id filter prepares as a flat IN list");
+        assert_eq!(
+            result.resources.items.len(),
+            N,
+            "every observation whose encounter's patient is female matches"
+        );
     }
 }
 

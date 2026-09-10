@@ -250,6 +250,29 @@ struct LogLine {
     message: String,
 }
 
+/// The submission's log as `partials/bulk_import_log.html` wants it:
+/// newest-first, so the detail page's first paint and the status fragment's
+/// out-of-band refresh agree on the order (#955).
+fn log_lines(submission: &Submission) -> Vec<LogLine> {
+    submission
+        .log
+        .iter()
+        .rev()
+        .map(|entry| LogLine {
+            at: entry
+                .get("at")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            message: entry
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+        })
+        .collect()
+}
+
 fn status_label(i18n: &I18n, status: &str) -> String {
     match status {
         "in-progress" => i18n.t("bulk-import-status-in-progress"),
@@ -288,6 +311,8 @@ struct BulkImportDetailPage {
     client_id: String,
     token_url: String,
     log: Vec<LogLine>,
+    /// The page paints the log in place, never out-of-band.
+    log_oob: bool,
     error: Option<String>,
     edit_open: bool,
 }
@@ -414,7 +439,7 @@ pub async fn create(
         mid.clone(),
         serde_json::to_value(&manifest).unwrap_or(Value::Null),
     );
-    submit_one_with_id(&mut submission, &id, &mid).await;
+    submit_one_with_id(&mut submission, &id, &mid, &rt.id).await;
     match save(&state, &rt, &id, &submission, Some(0)).await {
         Ok(_) => Redirect::to(&format!("/ui/bulk-import/{id}")).into_response(),
         Err(e) => (StatusCode::BAD_GATEWAY, e).into_response(),
@@ -458,24 +483,7 @@ fn render_detail_page(
         .unwrap_or("")
         .to_string();
 
-    let log: Vec<LogLine> = s
-        .log
-        .iter()
-        .rev()
-        .map(|entry| LogLine {
-            at: entry
-                .get("at")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string(),
-            message: entry
-                .get("message")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string(),
-        })
-        .collect();
-
+    let log = log_lines(&s);
     let label = status_label(&i18n, &s.status);
     render(BulkImportDetailPage {
         status,
@@ -504,6 +512,7 @@ fn render_detail_page(
         client_id: s.client_id,
         token_url: s.token_url,
         log,
+        log_oob: false,
         error,
         edit_open,
     })
@@ -718,7 +727,7 @@ async fn backend_services_token(client_id: &str, token_url: &str) -> Result<Stri
     header.kid = signing_kid(&pem, &alg);
     let assertion = encode(&header, &claims, &key).map_err(|e| e.to_string())?;
 
-    let response = reqwest::Client::new()
+    let response = http_client()
         .post(token_url)
         .form(&[
             ("grant_type", "client_credentials"),
@@ -757,14 +766,18 @@ fn kickoff_target(submission: &Submission) -> String {
 async fn post_kickoff(
     submission: &Submission,
     parameters: &Value,
+    tenant: &str,
 ) -> Result<(u16, String, String), String> {
     let target = kickoff_target(submission);
-    let mut request = reqwest::Client::new()
-        .post(&target)
-        .header("Content-Type", "application/fhir+json")
-        .header("Accept", "application/fhir+json")
-        .timeout(std::time::Duration::from_secs(15))
-        .json(parameters);
+    let mut request = with_tenant(
+        http_client()
+            .post(&target)
+            .header("Content-Type", "application/fhir+json")
+            .header("Accept", "application/fhir+json")
+            .timeout(std::time::Duration::from_secs(15))
+            .json(parameters),
+        tenant,
+    );
     if submission.auth == "backend-services" {
         let token = backend_services_token(&submission.client_id, &submission.token_url).await?;
         request = request.bearer_auth(token);
@@ -824,7 +837,7 @@ fn summarize_error_body(content_type: &str, body: &str) -> String {
 /// Kicks off recipient-side status tracking: `POST $bulk-submit-status`
 /// (submitter + submissionId, `Prefer: respond-async`), returning the poll
 /// URL the recipient hands back in `Content-Location`.
-async fn status_kickoff(submission: &Submission, id: &str) -> Result<String, String> {
+async fn status_kickoff(submission: &Submission, id: &str, tenant: &str) -> Result<String, String> {
     let target = public_url_with_segments(&submission.recipient_base_url, ["$bulk-submit-status"]);
     // Only the identifying parameters ride the status kick-off.
     let parameters = kickoff_parameters(submission, id, "", None);
@@ -837,12 +850,15 @@ async fn status_kickoff(submission: &Submission, id: &str) -> Result<String, Str
         .collect();
     let body = json!({ "resourceType": "Parameters", "parameter": identifying });
 
-    let mut request = reqwest::Client::new()
-        .post(&target)
-        .header("Content-Type", "application/fhir+json")
-        .header("Prefer", "respond-async")
-        .timeout(std::time::Duration::from_secs(15))
-        .json(&body);
+    let mut request = with_tenant(
+        http_client()
+            .post(&target)
+            .header("Content-Type", "application/fhir+json")
+            .header("Prefer", "respond-async")
+            .timeout(std::time::Duration::from_secs(15))
+            .json(&body),
+        tenant,
+    );
     if submission.auth == "backend-services" {
         let token = backend_services_token(&submission.client_id, &submission.token_url).await?;
         request = request.bearer_auth(token);
@@ -855,6 +871,58 @@ async fn status_kickoff(submission: &Submission, id: &str) -> Result<String, Str
         .and_then(|v| v.to_str().ok())
         .map(String::from)
         .ok_or_else(|| format!("status kick-off answered {status} without Content-Location"))
+}
+
+/// How long a status poll may take before it is abandoned. During a heavy
+/// ingest the recipient's status handler contends with the writers and is
+/// legitimately slow — measured at 8-13s against a local recipient under a
+/// bulk load, past the previous 10s cap — so the cap is generous rather
+/// than snappy: a slow status is expected under load, not an outage. A poll
+/// that still times out logs its cause and backs off instead of hammering
+/// (#957).
+const STATUS_POLL_TIMEOUT_SECS: u64 = 30;
+
+/// How long to hold polls after a transport failure. The error branch used to
+/// leave `next_poll_at` in the past, so every subsequent 5s htmx tick fired
+/// another poll — the exact hammering the recipient's rate limit (#790)
+/// rejects (#957).
+const STATUS_POLL_FAILURE_BACKOFF_SECS: u64 = 30;
+
+/// Shared HTTP client. A per-request `reqwest::Client::new()` rebuilds the
+/// connection pool and resolver every call, so every poll paid a fresh TCP
+/// connect and nothing was ever kept alive (#957).
+fn http_client() -> &'static reqwest::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    CLIENT.get_or_init(reqwest::Client::new)
+}
+
+/// Stamps the selected tenant onto a self-call. The recipient is this HFS
+/// process (#689): under header routing the tenant travels only here, and
+/// under `both` the URL prefix already agrees with it. `Authorization` is
+/// deliberately not forwarded — `/ui` sits outside the auth layer (#320)
+/// and backend-services kick-offs mint their own bearer (#1006).
+fn with_tenant(request: reqwest::RequestBuilder, tenant: &str) -> reqwest::RequestBuilder {
+    request.header("X-Tenant-ID", tenant)
+}
+
+/// Renders a poll transport failure with its cause. `reqwest::Error`'s
+/// `Display` stops at the URL and hides the reason in `source()`, which made
+/// a timeout, a refused connection, and a reset log byte-identically (#957).
+fn poll_failure_detail(e: &reqwest::Error) -> String {
+    if e.is_timeout() {
+        return format!(
+            "timed out after {STATUS_POLL_TIMEOUT_SECS}s — the recipient's status \
+             endpoint can be slow while it is ingesting"
+        );
+    }
+    let mut detail = e.to_string();
+    let mut src = std::error::Error::source(e);
+    while let Some(cause) = src {
+        detail.push_str(": ");
+        detail.push_str(&cause.to_string());
+        src = cause.source();
+    }
+    detail
 }
 
 /// Whether the recipient asked us to hold off: a stored `next_poll_at` still
@@ -885,30 +953,47 @@ fn retry_after_seconds(response: &reqwest::Response) -> Option<u64> {
 /// logged and polling stops (the poll URL is cleared). `202` and `429` carry
 /// `Retry-After`; both push `next_poll_at` out so the card's refresh cadence
 /// never turns into a poll the recipient would reject (#790).
-async fn poll_status(submission: &mut Submission) {
+async fn poll_status(submission: &mut Submission, tenant: &str) {
     let poll_url = submission.poll_url.clone();
-    let response = match reqwest::Client::new()
-        .get(&poll_url)
-        .header("Accept", "application/json")
-        .timeout(std::time::Duration::from_secs(10))
-        .send()
-        .await
+    let response = match with_tenant(
+        http_client()
+            .get(&poll_url)
+            .header("Accept", "application/json")
+            .timeout(std::time::Duration::from_secs(STATUS_POLL_TIMEOUT_SECS)),
+        tenant,
+    )
+    .send()
+    .await
     {
         Ok(r) => r,
         Err(e) => {
-            push_log(submission, format!("Status poll failed: {e}"));
+            push_log(
+                submission,
+                format!("Status poll failed: {}", poll_failure_detail(&e)),
+            );
+            // A failed poll honors a backoff too — without this,
+            // `next_poll_at` stays in the past and every 5s tick re-polls,
+            // sailing through the recipient's rate limit (#957).
+            hold_polls_for(submission, STATUS_POLL_FAILURE_BACKOFF_SECS);
             return;
         }
     };
     match response.status().as_u16() {
         202 => {
             let retry_after = retry_after_seconds(&response);
+            // Decoded from the raw bytes, not through `to_str()`: that
+            // accessor refuses any value outside visible US-ASCII, so a
+            // recipient whose progress sentence carries a dash, an accent or a
+            // non-Latin script would be reported here as a bare "in progress"
+            // — losing the byte percentage and the resource count for the whole
+            // ingest. `X-Progress` is free-form prose meant for a human, so
+            // display whatever arrived and let the fallback mean what it says:
+            // the recipient sent no progress at all.
             let progress = response
                 .headers()
                 .get("x-progress")
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("in progress")
-                .to_string();
+                .map(|v| String::from_utf8_lossy(v.as_bytes()).into_owned())
+                .unwrap_or_else(|| "in progress".to_string());
             if submission.progress != progress {
                 push_log(submission, format!("Status: {progress}"));
             }
@@ -1001,7 +1086,7 @@ async fn poll_status(submission: &mut Submission) {
 
 /// Fires the kick-off for one manifest and records the outcome on the
 /// submission (status, log, poll URL).
-async fn submit_one_with_id(submission: &mut Submission, id: &str, mid: &str) {
+async fn submit_one_with_id(submission: &mut Submission, id: &str, mid: &str, tenant: &str) {
     let Some(m) = submission
         .manifests
         .get(mid)
@@ -1014,7 +1099,7 @@ async fn submit_one_with_id(submission: &mut Submission, id: &str, mid: &str) {
         format!("Submitting manifest \"{}\"...", m.manifest_url),
     );
     let parameters = kickoff_parameters(submission, id, "in-progress", Some(&m));
-    match post_kickoff(submission, &parameters).await {
+    match post_kickoff(submission, &parameters, tenant).await {
         Ok((status, _, _)) if (200..300).contains(&status) => {
             push_log(
                 submission,
@@ -1027,7 +1112,7 @@ async fn submit_one_with_id(submission: &mut Submission, id: &str, mid: &str) {
             // Start recipient-side status tracking on the first accepted
             // manifest; later submissions reuse the same poll URL.
             if submission.poll_url.is_empty() {
-                match status_kickoff(submission, id).await {
+                match status_kickoff(submission, id, tenant).await {
                     Ok(poll_url) => {
                         push_log(submission, "Bulk status kick-off request".to_string());
                         submission.poll_url = poll_url;
@@ -1104,7 +1189,7 @@ async fn set_status(
     }
     push_log(&mut s, format!("Marking submission {status}..."));
     let parameters = kickoff_parameters(&s, &id, status, None);
-    match post_kickoff(&s, &parameters).await {
+    match post_kickoff(&s, &parameters, &rt.id).await {
         Ok((code, _, _)) if (200..300).contains(&code) => {
             push_log(&mut s, format!("Recipient acknowledged ({code})."));
             s.status = status.to_string();
@@ -1145,6 +1230,10 @@ struct StatusCard {
     completed_at: String,
     /// Rides out-of-band into the summary card's STATUS cell.
     status_label: String,
+    /// Rides out-of-band into the Submission Log section, whose lines this
+    /// poll may have just written (#955).
+    log: Vec<LogLine>,
+    log_oob: bool,
 }
 
 /// `GET /ui/bulk-import/{id}/status` — at most one recipient poll, then the
@@ -1164,7 +1253,7 @@ pub async fn status_fragment(
         return StatusCode::NOT_FOUND.into_response();
     };
     if !s.poll_url.is_empty() && poll_due(&s) {
-        poll_status(&mut s).await;
+        poll_status(&mut s, &rt.id).await;
         save_or_warn(&state, &rt, &id, &s, Some(sv)).await;
     }
     let label = status_label(&i18n, &s.status);
@@ -1178,6 +1267,8 @@ pub async fn status_fragment(
         errors: s.result["errors"].as_u64().unwrap_or(0),
         completed_at: s.result["completedAt"].as_str().unwrap_or("").to_string(),
         status_label: label,
+        log: log_lines(&s),
+        log_oob: true,
         i18n,
     })
 }
@@ -1186,8 +1277,27 @@ pub async fn status_fragment(
 /// one. `0%` counts: HFS reports byte-level progress, so an early zero is a
 /// bar about to fill, not a percentage that never moves — the indeterminate
 /// sweep is reserved for recipients that report no percentage at all.
+///
+/// Pre-ingest phase reports (#953) — `waiting for a worker`, `reading
+/// manifest`, `sizing {done} of {total} files`, `downloading file {done} of
+/// {total}` — deliberately fall through to `None`: there is no meaningful
+/// share-of-the-whole to draw yet, so the card pairs the phase text with the
+/// indeterminate sweep. #827 is the rule being honoured here — a determinate
+/// reading must never be shown beside an indeterminate bar, so "phase text +
+/// sweep" and "percentage + fill" are the only two shapes this card has.
+///
+/// The contract that keeps that true: **a phase string must never begin with
+/// the literal `processing ` prefix**, or its embedded counts (`sizing 37 of
+/// 412 files`) would be mis-parsed as a percentage. The recipient owns the
+/// vocabulary; this parser only claims the one prefix.
 fn progress_percent(progress: &str) -> Option<u8> {
-    let rest = progress.strip_prefix("processing ")?;
+    // Case-insensitive: HFS capitalizes the line ("Processing 3% of bytes -
+    // …", #954), older HFS versions and foreign recipients may send lowercase
+    // "processing 3% complete …". Either way the digits follow the prefix.
+    let rest = progress
+        .get(..11)
+        .filter(|p| p.eq_ignore_ascii_case("processing "))
+        .and_then(|_| progress.get(11..))?;
     let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
     let pct: u8 = digits.parse().ok().filter(|p| *p <= 100)?;
     Some(pct)
@@ -1243,6 +1353,31 @@ mod tests {
     use super::*;
 
     #[test]
+    fn progress_percent_reads_both_hfs_wordings_and_foreign_case() {
+        // Current HFS wording (#954, ASCII-only since the sentence travels in
+        // a header).
+        assert_eq!(
+            progress_percent("Processing 3% of bytes - 609,191 resources written"),
+            Some(3)
+        );
+        assert_eq!(progress_percent("Processing 0% of bytes"), Some(0));
+        // A recipient that does use non-ASCII still gets its percentage read:
+        // the header is decoded from bytes, so the sentence arrives intact.
+        assert_eq!(
+            progress_percent("Processing 3% of bytes — 609,191 resources written"),
+            Some(3)
+        );
+        // Pre-#954 HFS and lowercase foreign recipients.
+        assert_eq!(
+            progress_percent("processing 10% complete (5 entries ingested)"),
+            Some(10)
+        );
+        // Non-matching recipients keep the indeterminate sweep.
+        assert_eq!(progress_percent("halfway there"), None);
+        assert_eq!(progress_percent("processing lots"), None);
+    }
+
+    #[test]
     fn recipient_base_preserves_prefix_and_adds_path_tenant() {
         assert_eq!(
             recipient_base_url_value("https://public.example/fhir", true, "acme"),
@@ -1264,5 +1399,63 @@ mod tests {
             recipient_base_url_value("https://public.example/fhir", true, "north clinic"),
             "https://public.example/fhir/north%20clinic"
         );
+    }
+
+    /// #953: the pre-ingest phases carry no share-of-the-whole, so every one
+    /// of them reads as `None` and the card draws the indeterminate sweep
+    /// beside the phase text. The counts inside `sizing …` / `downloading
+    /// file …` are the trap this guards: they must never be mistaken for a
+    /// percentage (#827 — never a determinate reading on an indeterminate
+    /// bar).
+    #[test]
+    fn pre_ingest_phases_report_no_percentage() {
+        for phase in [
+            "waiting for a worker",
+            "reading manifest",
+            "sizing 37 of 412 files",
+            "downloading file 1 of 412",
+        ] {
+            assert_eq!(progress_percent(phase), None, "phase: {phase}");
+            assert!(
+                !phase.starts_with("processing "),
+                "a phase string that starts with the parsed prefix would be \
+                 mis-read as a percentage: {phase}"
+            );
+        }
+    }
+
+    /// The ingest-phase vocabulary is unchanged by #953: `processing N%` is
+    /// still the one shape that yields a determinate bar, with or without the
+    /// entry-count suffix.
+    #[test]
+    fn processing_percentages_still_read_as_determinate() {
+        assert_eq!(progress_percent("processing 35% complete"), Some(35));
+        assert_eq!(
+            progress_percent("processing 35% complete (120 entries ingested)"),
+            Some(35)
+        );
+        assert_eq!(progress_percent("processing 0% complete"), Some(0));
+        assert_eq!(progress_percent("processing 100% complete"), Some(100));
+    }
+
+    /// A stalled report keeps its current behaviour: it does not carry the
+    /// `processing ` prefix, so its `40%` is never lifted into the bar — the
+    /// operator gets the sweep plus the full explanatory sentence.
+    #[test]
+    fn a_stalled_report_stays_indeterminate() {
+        assert_eq!(
+            progress_percent("stalled at 40% - a worker stopped without handoff; see server logs"),
+            None
+        );
+    }
+
+    /// Out-of-range and malformed percentages fall back to the sweep rather
+    /// than clamping to something the recipient never said.
+    #[test]
+    fn unparseable_percentages_fall_back_to_the_sweep() {
+        assert_eq!(progress_percent("processing 101% complete"), None);
+        assert_eq!(progress_percent("processing complete"), None);
+        assert_eq!(progress_percent(""), None);
+        assert_eq!(progress_percent("in progress"), None);
     }
 }

@@ -19,6 +19,9 @@ use serde_json::Value;
 use std::sync::Arc;
 use tower::ServiceExt;
 
+mod support;
+use support::InMemorySettingsStore;
+
 struct NoSettingsAccess;
 
 #[async_trait::async_trait]
@@ -273,6 +276,35 @@ async fn dashboard_renders_job_cards_with_unavailable_state_when_no_provider() {
     // binary, because the tracker is process-global.
     assert!(!html.contains("99.98"));
     assert!(!html.contains("since process start"));
+}
+
+#[tokio::test]
+async fn a_build_with_no_provider_names_that_reason_and_offers_no_retry() {
+    // The other half of #956. Sample data is honest here and nowhere else, so
+    // this router, which registers no provider, is the one page allowed to
+    // carry it, and it has to say why. tests/dashboard_pending_http.rs asserts
+    // the same boundary from the other side; on its own that file only proves
+    // the slow and partial cases stay away from this wording, which would still
+    // hold if the sample branch were deleted or silently relabelled.
+    let response = app()
+        .oneshot(Request::get("/ui").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains("this build has no live metrics provider"));
+    assert!(html.contains("placeholder, not measurements"));
+
+    // A slow provider and a half-answered one keep their own wording and their
+    // own remedy; neither may be confused with a build that has none at all.
+    assert!(!html.contains("Still gathering the live figures"));
+    assert!(!html.contains("could not be read from storage"));
+
+    // There is nothing to wait for, so nothing polls and nothing invites a
+    // retry: re-asking a provider-less build would only redraw the same page.
+    assert!(!html.contains(r#"hx-trigger="load delay:1200ms""#));
+    assert!(!html.contains("Retry now"));
 }
 
 #[tokio::test]
@@ -1141,7 +1173,7 @@ async fn queries_param_catalog_is_a_registry_fed_fragment() {
 
     assert_eq!(response.status(), StatusCode::OK);
     let html = body_text(response).await;
-    assert!(html.contains(r#"<datalist id="param-options">"#));
+    assert!(html.contains(r#"<datalist id="param-options" data-columns="#));
     // Real registry data: Patient's own params plus Resource-level ones.
     assert!(html.contains(r#"value="birthdate""#));
     assert!(html.contains(r#"value="_id""#));
@@ -1735,6 +1767,59 @@ async fn editor_pane_form_keeps_the_users_text_when_the_json_is_broken() {
     assert!(!html.contains(r#"class="editor__grid""#));
 }
 
+/* `hidden` and `legend` (#840): the engine two hosts (SQL Query and SQL
+ * View's own Details panel) will build on — a `hidden` first-level element
+ * neither renders nor mutates, and a host-chosen `legend` independent of
+ * `resourceType`. Same endpoint, same `apply()`/`analyze()` pass as every
+ * other `pane=form` test above. */
+
+/// `hidden=content` on a `Library` with two `content[]` attachments (#840)
+/// drops every row under `content` and its own "+ Add" option, while
+/// `#editor-doc` still carries both attachments untouched.
+#[tokio::test]
+async fn editor_pane_form_hidden_content_drops_its_rows_and_add_option_but_keeps_the_document() {
+    let doc = serde_json::json!({
+        "resourceType": "Library",
+        "status": "draft",
+        "content": [
+            { "contentType": "application/sql", "data": "U0VMRUNUIDE=" },
+            { "contentType": "text/plain", "data": "aGVsbG8=" }
+        ]
+    });
+    let html = edit(&form_pane_body(&doc, &[("hidden", "content")])).await;
+
+    assert!(!html.contains(r#"data-path="content""#));
+    assert!(!html.contains(r#"data-path="content.0""#));
+    assert!(!html.contains(r#"data-path="content.0.contentType""#));
+    assert!(!html.contains(r#"data-name="content""#));
+    // Other top-level elements are still offered.
+    assert!(html.contains(r#"data-name="name""#));
+
+    // #editor-doc carries the whole document, both attachments included,
+    // HTML-escaped by Askama.
+    let doc_start = html.find(r#"id="editor-doc""#).expect("#editor-doc");
+    let doc_field = &html[doc_start..];
+    assert!(doc_field.contains("application/sql"));
+    assert!(doc_field.contains("U0VMRUNUIDE="));
+    assert!(doc_field.contains("text/plain"));
+    assert!(doc_field.contains("aGVsbG8="));
+}
+
+/// `legend=sql-library` (#840) swaps in the SQL Query/SQL View pair of
+/// legend lines — neither the Resource Editor's generic "constraints and
+/// terminology" line nor View Definitions' single line.
+#[tokio::test]
+async fn editor_pane_form_sql_library_legend_shows_its_own_two_lines() {
+    let doc = serde_json::json!({ "resourceType": "Library", "status": "draft" });
+    let html = edit(&form_pane_body(&doc, &[("legend", "sql-library")])).await;
+
+    assert!(html.contains("editor-legend__live"));
+    assert!(html.contains("editor-legend__save"));
+    assert!(html.contains("SQL on FHIR Library type"));
+    assert!(!html.contains("constraints and terminology"));
+    assert!(!html.contains("FHIRPath syntax"));
+}
+
 /* History & Versions (#236). The diff is computed server-side; these post two
  * versions the way the browser does after fetching them from _history. */
 
@@ -1840,7 +1925,7 @@ async fn resources_page_has_the_filter_search_and_create_button() {
     // Patient, and the builder's URL is pre-filled so the no-JS form already
     // shows the query the client also runs on load.
     assert!(html.contains("Create new Patient"));
-    assert!(html.contains(r#"value="GET /Patient""#));
+    assert!(html.contains(r#"value="GET /Patient?_summary=true""#));
     // The client-side template for the label update on rail clicks (#605):
     // the literal `{type}` placeholder, not the interpolated per-request value.
     assert!(html.contains(r#"data-msg-create="Create new {type}""#));
@@ -1903,7 +1988,7 @@ async fn resources_deep_links_focus_the_selected_type() {
     assert!(html.contains(r#"class="filter-rail" id="resources""#));
     // Create and the builder prefill both follow the deep-linked type.
     assert!(html.contains("Create new Observation"));
-    assert!(html.contains(r#"value="GET /Observation""#));
+    assert!(html.contains(r#"value="GET /Observation?_summary=true""#));
 }
 
 #[tokio::test]
@@ -2610,8 +2695,17 @@ async fn sql_library_workspaces_split_kinds_and_roundtrip_sql() {
     assert!(html.contains("flat_patients"));
     assert!(!html.contains("patient_counts"));
 
-    // Save re-embeds the SQL pane and redirects to the stored library.
-    let body = "id=&action=save&sql=SELECT%202&json=%7B%22resourceType%22%3A%22Library%22%2C%22name%22%3A%22x%22%7D";
+    // Save re-embeds the SQL pane and redirects to the stored library. The
+    // posted `json` carries this page's own `sql-query` coding — #840's
+    // gate rejects anything else (exercised separately below).
+    let new_query = serde_json::json!({"resourceType": "Library", "name": "x",
+        "type": {"coding": [{"system": system, "code": "sql-query"}]}});
+    let body = form_urlencoded::Serializer::new(String::new())
+        .append_pair("id", "")
+        .append_pair("action", "save")
+        .append_pair("sql", "SELECT 2")
+        .append_pair("json", &new_query.to_string())
+        .finish();
     let response = app
         .clone()
         .oneshot(
@@ -2664,11 +2758,11 @@ fn title_row_html(html: &str) -> String {
 /// head's own plural collection title) and `.tag--{status}` naming the
 /// resource's own FHIR `status` verbatim — render for both a saved
 /// selection and the `?lib=new` starter, whose chips read the starter's own
-/// fixed `draft` status. The secondary "Edit as JSON" link only appears for
-/// a saved Library, and its `href` names that Library's own `_id`. There is
-/// exactly one `<h1>` per page.
+/// fixed `draft` status. There is exactly one `<h1>` per page. #840 retires
+/// the title row's "Edit as JSON" link — the Details card below replaces it
+/// — so it never appears, saved or not.
 #[tokio::test]
-async fn sql_library_title_row_carries_kind_chips_and_the_edit_as_json_link() {
+async fn sql_library_title_row_carries_kind_chips_and_no_edit_as_json_link() {
     let system = "http://hl7.org/fhir/uv/sql-on-fhir/CodeSystem/LibraryTypesCodes";
     let libs = vec![
         serde_json::json!({"resourceType": "Library", "id": "q1", "name": "patient_counts",
@@ -2700,7 +2794,8 @@ async fn sql_library_title_row_carries_kind_chips_and_the_edit_as_json_link() {
     assert!(title_row.contains(r#"class="tag tag--type">SQL Query<"#));
     assert!(title_row.contains(r#"class="tag tag--active">active<"#));
     assert!(title_row.contains("patient_counts"));
-    assert!(html.contains(r#"href="/ui/resources?url=Library%3F_id%3Dq1""#));
+    assert!(!html.contains("Edit as JSON"));
+    assert!(!html.contains(r#"href="/ui/resources?url=Library%3F_id%3Dq1""#));
 
     let response = app
         .clone()
@@ -2715,10 +2810,11 @@ async fn sql_library_title_row_carries_kind_chips_and_the_edit_as_json_link() {
     let title_row = title_row_html(&html);
     assert!(title_row.contains(r#"class="tag tag--type">SQL View<"#));
     assert!(title_row.contains(r#"class="tag tag--retired">retired<"#));
-    assert!(html.contains(r#"href="/ui/resources?url=Library%3F_id%3Dv1""#));
+    assert!(!html.contains("Edit as JSON"));
+    assert!(!html.contains(r#"href="/ui/resources?url=Library%3F_id%3Dv1""#));
 
     // `?lib=new`: the starter's own fixed `draft` status: no stored id, so
-    // no "Edit as JSON" link and no CRUD actions at all.
+    // no CRUD actions at all.
     let response = app
         .oneshot(
             Request::get("/ui/sql/queries?lib=new")
@@ -2814,8 +2910,9 @@ async fn sql_library_editor_results_and_failure_copy_differ_by_kind() {
 /// `sql_queries_run_previews_posted_content_and_offers_export_with_an_id`),
 /// present only for SQL Queries and only once the Library is saved — never
 /// for `?lib=new`'s unsaved starter, and never for SQL Views at all. The
-/// JSON fold, its `<details>`, and `?run=1` are gone; the resource travels
-/// as a hidden `name="json"` field instead of a visible textarea.
+/// JSON fold, its `<details>`, and `?run=1` are gone; the resource — its
+/// own SQL attachment stripped out — travels as the Details card's own
+/// visible `name="json"` textarea (#840), not a hidden field.
 #[tokio::test]
 async fn sql_library_page_offers_export_only_for_a_saved_query_and_drops_the_json_fold() {
     let system = "http://hl7.org/fhir/uv/sql-on-fhir/CodeSystem/LibraryTypesCodes";
@@ -2844,9 +2941,12 @@ async fn sql_library_page_offers_export_only_for_a_saved_query_and_drops_the_jso
     // this checks the fold's own class rather than every `<details>`.
     assert!(!html.contains("json-fold"));
     assert!(!html.contains("run=1"));
-    assert!(!html.contains(r#"<textarea class="json-editor" name="json""#));
-    assert!(html.contains(r#"<input type="hidden" name="json" value="#));
+    assert!(html.contains(r#"<textarea class="json-editor" name="json" form="lib-editor-form""#));
+    assert!(!html.contains(r#"<input type="hidden" name="json""#));
     assert!(html_unescape(&html).contains(r#""resourceType": "Library""#));
+    // The SQL attachment is stripped out of the Details document — it lives
+    // only in the SQL card's own textarea, decoded (#840).
+    assert!(!html_unescape(&html).contains("application/sql"));
 
     // `?lib=new`: the starter is never saved, so Export never appears even
     // though the kind offers it.
@@ -2910,6 +3010,279 @@ async fn sql_library_empty_state_uses_the_routes_own_kind_copy() {
     assert!(html.contains("No views yet."));
     assert!(!html.contains("No SQL queries yet"));
     assert!(html.contains(r#"href="/ui/sql/views?lib=new""#));
+}
+
+/// The exact text between the Details JSON pane's `<textarea name="json"
+/// ...>` open tag and its `</textarea>` close tag, HTML-unescaped — the same
+/// shape as [`sql_textarea_value`] for the SQL pane below it. `name="json"`
+/// occurs exactly once on this page (the hidden guided-form state names its
+/// own fields `doc`/`op`/`path`/…, never `json`).
+fn lib_json_textarea_value(html: &str) -> String {
+    let open_tag_end = html
+        .find(r#"name="json""#)
+        .and_then(|from| html[from..].find('>').map(|to| from + to + 1))
+        .expect("a <textarea name=\"json\"> open tag");
+    let close = html[open_tag_end..]
+        .find("</textarea>")
+        .expect("a matching </textarea>");
+    html_unescape(&html[open_tag_end..open_tag_end + close])
+}
+
+/// #840: the Details JSON pane shows the Library minus its SQL attachment —
+/// a second, non-SQL attachment survives untouched — the guided form beside
+/// it never shows or offers to mutate `content`, its own legend names what
+/// Save actually gates, and the retired "Edit as JSON" link is gone.
+#[tokio::test]
+async fn sql_library_details_strips_the_sql_attachment_and_hides_content() {
+    let system = "http://hl7.org/fhir/uv/sql-on-fhir/CodeSystem/LibraryTypesCodes";
+    let lib = serde_json::json!({"resourceType": "Library", "id": "q1", "name": "patient_counts",
+    "status": "active",
+    "type": {"coding": [{"system": system, "code": "sql-query"}]},
+    "content": [
+        {"contentType": "application/sql", "data": BASE64.encode("SELECT 1")},
+        {"contentType": "text/plain", "data": BASE64.encode("a note")},
+    ]});
+    let source = helios_ui::StaticConformanceSource::empty().with(
+        "Library",
+        helios_fhir::FhirVersion::R4,
+        vec![lib],
+    );
+    let app = library_app(source);
+
+    let response = app
+        .oneshot(
+            Request::get("/ui/sql/queries?lib=q1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+
+    assert!(html.contains(r#"class="card editor-form needs-js""#));
+    assert!(html.contains(r#"id="lib-details-grid""#));
+    let json_field = lib_json_textarea_value(&html);
+    assert!(json_field.contains("text/plain"), "{json_field}");
+    assert!(!json_field.contains("application/sql"), "{json_field}");
+    assert!(!html.contains(r#"data-path="content""#));
+    assert!(html.contains("Checked on save: SQL on FHIR"));
+    assert!(!html.contains("Edit as JSON"));
+}
+
+/// #840: the Details lede only shows for `?lib=new` — the hint that closes
+/// the #839 follow-up about the starter's `change-me` placeholder — and is
+/// absent for a saved selection.
+#[tokio::test]
+async fn sql_library_details_new_lede_shows_only_for_the_starter() {
+    let system = "http://hl7.org/fhir/uv/sql-on-fhir/CodeSystem/LibraryTypesCodes";
+    let lib = serde_json::json!({"resourceType": "Library", "id": "q1", "name": "patient_counts",
+        "status": "active",
+        "type": {"coding": [{"system": system, "code": "sql-query"}]}});
+    let source = helios_ui::StaticConformanceSource::empty().with(
+        "Library",
+        helios_fhir::FhirVersion::R4,
+        vec![lib],
+    );
+    let app = library_app(source);
+
+    let html = body_text(
+        app.clone()
+            .oneshot(
+                Request::get("/ui/sql/queries?lib=new")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert!(html.contains("Rename it and point relatedArtifact[0]"));
+
+    let html = body_text(
+        app.oneshot(
+            Request::get("/ui/sql/queries?lib=q1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap(),
+    )
+    .await;
+    assert!(!html.contains("Rename it and point relatedArtifact[0]"));
+}
+
+/// #840: Save fuses the posted Details document (no SQL attachment, a
+/// non-SQL one kept) with the posted SQL pane into one Library —
+/// `sql_libraries::embed_sql` appends the `application/sql` attachment
+/// alongside the surviving `text/plain` one — and redirects to it.
+/// `StaticConformanceSource::save_resource` does not persist (see
+/// `sql_editor_save_roundtrips_special_characters_byte_for_byte`'s own doc
+/// comment), so the merged document is read back off
+/// [`helios_ui::StaticConformanceSource::saved_resources`] instead of a
+/// follow-up fetch.
+#[tokio::test]
+async fn sql_library_save_merges_details_and_sql_into_one_library() {
+    let system = "http://hl7.org/fhir/uv/sql-on-fhir/CodeSystem/LibraryTypesCodes";
+    let details = serde_json::json!({"resourceType": "Library", "id": "q1", "name": "new_title",
+        "status": "active",
+        "type": {"coding": [{"system": system, "code": "sql-query"}]},
+        "content": [{"contentType": "text/plain", "data": BASE64.encode("a note")}]});
+    let source = helios_ui::StaticConformanceSource::empty();
+    let app = library_app(source.clone());
+
+    let body = form_urlencoded::Serializer::new(String::new())
+        .append_pair("id", "q1")
+        .append_pair("action", "save")
+        .append_pair("json", &details.to_string())
+        .append_pair("sql", "SELECT 2")
+        .finish();
+    let response = app
+        .oneshot(
+            Request::post("/ui/sql/queries")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        response.headers()["location"],
+        "/ui/sql/queries?lib=q1&saved=1"
+    );
+
+    let saved = source.saved_resources();
+    assert_eq!(saved.len(), 1);
+    let saved = &saved[0];
+    assert_eq!(saved["name"], "new_title");
+    let content = saved["content"].as_array().expect("content array");
+    assert_eq!(content.len(), 2);
+    assert!(
+        content
+            .iter()
+            .any(|a| a["contentType"] == "text/plain" && a["data"] == BASE64.encode("a note"))
+    );
+    assert!(
+        content.iter().any(
+            |a| a["contentType"] == "application/sql" && a["data"] == BASE64.encode("SELECT 2")
+        )
+    );
+}
+
+/// #840: saving a `sql-view`-coded document from SQL Queries (and the
+/// reverse, from SQL Views) is rejected with the route's own expected code
+/// named in a warning notice — nothing is saved.
+#[tokio::test]
+async fn sql_library_save_rejects_the_other_kinds_coding() {
+    let system = "http://hl7.org/fhir/uv/sql-on-fhir/CodeSystem/LibraryTypesCodes";
+    let cases = [
+        ("/ui/sql/queries", "sql-view", "sql-query"),
+        ("/ui/sql/views", "sql-query", "sql-view"),
+    ];
+    for (route, wrong_code, expected_code) in cases {
+        let wrong_kind = serde_json::json!({"resourceType": "Library", "name": "x",
+            "status": "active",
+            "type": {"coding": [{"system": system, "code": wrong_code}]}});
+        let source = helios_ui::StaticConformanceSource::empty();
+        let app = library_app(source.clone());
+
+        let body = form_urlencoded::Serializer::new(String::new())
+            .append_pair("id", "")
+            .append_pair("action", "save")
+            .append_pair("json", &wrong_kind.to_string())
+            .append_pair("sql", "SELECT 1")
+            .finish();
+        let response = app
+            .oneshot(
+                Request::post(route)
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{route}");
+        let html = body_text(response).await;
+        assert!(html.contains("notice--warn"), "{route}: {html}");
+        assert!(html.contains(expected_code), "{route}: {html}");
+        assert!(source.saved_resources().is_empty(), "{route}");
+    }
+}
+
+/// #840: invalid Details JSON re-renders with the guided-form card showing
+/// the invalid-JSON notice in place of rows — the same shape View
+/// Definitions' own Save-error path already proves — and both textareas
+/// keep exactly what was submitted.
+#[tokio::test]
+async fn sql_library_save_invalid_json_shows_the_invalid_form_card() {
+    let source = helios_ui::StaticConformanceSource::empty();
+    let app = library_app(source);
+
+    let body = form_urlencoded::Serializer::new(String::new())
+        .append_pair("id", "")
+        .append_pair("action", "save")
+        .append_pair("json", "{nope")
+        .append_pair("sql", "SELECT 3")
+        .finish();
+    let response = app
+        .oneshot(
+            Request::post("/ui/sql/queries")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains("invalid JSON"));
+    // The guided-form card itself, in its own invalid-JSON state
+    // (`partials/editor-form-fragment.html`'s `parse_error` branch) —
+    // distinct from the page-level `.notice--warn` the "invalid JSON"
+    // assertion above already covers.
+    assert!(html.contains(r#"<div class="alert" role="alert">"#));
+    assert_eq!(lib_json_textarea_value(&html), "{nope");
+    assert_eq!(sql_textarea_value(&html), "SELECT 3");
+}
+
+/// #840: `POST …/run` embeds the posted SQL into the posted (content-less)
+/// Details document exactly as Save does, before handing it to `$sql-run` —
+/// the same `sql_libraries::embed_sql` merge, proven here against the live
+/// preview endpoint rather than Save's redirect.
+#[tokio::test]
+async fn sql_queries_run_embeds_the_sql_into_the_content_less_document() {
+    let source = helios_ui::StaticConformanceSource::empty()
+        .with_sql_run(Ok(vec![serde_json::json!({"n": 1})]));
+    let app = library_app(source.clone());
+    let details = serde_json::json!({
+        "resourceType": "Library", "name": "unsaved_query", "status": "draft",
+        "relatedArtifact": [{"type": "depends-on", "label": "v", "resource": "http://example.org/ViewDefinition/v"}],
+    });
+
+    let response = app
+        .oneshot(post_run(
+            "/ui/sql/queries/run",
+            library_run_body("lib1", &details, "SELECT COUNT(*) AS n FROM v"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let calls = source.sql_run_calls();
+    assert_eq!(calls.len(), 1);
+    let content = calls[0]["content"].as_array().expect("content array");
+    let sql_attachment = content
+        .iter()
+        .find(|a| a["contentType"] == "application/sql")
+        .expect("an application/sql attachment");
+    let decoded = BASE64
+        .decode(sql_attachment["data"].as_str().unwrap())
+        .unwrap();
+    assert_eq!(
+        String::from_utf8(decoded).unwrap(),
+        "SELECT COUNT(*) AS n FROM v"
+    );
 }
 
 /// `application/x-www-form-urlencoded`-encodes `s`, byte by byte, so tests
@@ -3064,8 +3437,10 @@ async fn sql_queries_run_previews_posted_content_and_offers_export_with_an_id() 
     let source = helios_ui::StaticConformanceSource::empty()
         .with_sql_run(Ok(vec![serde_json::json!({"n": 3})]));
     let app = library_app(source);
-    let library =
-        serde_json::json!({"resourceType": "Library", "name": "unsaved_query", "status": "draft"});
+    let library = serde_json::json!({
+        "resourceType": "Library", "name": "unsaved_query", "status": "draft",
+        "relatedArtifact": [{"type": "depends-on", "label": "v", "resource": "http://example.org/ViewDefinition/v"}],
+    });
 
     let response = app
         .clone()
@@ -3173,7 +3548,10 @@ async fn library_run_failure_carries_the_error_line_only_when_the_message_names_
     let source = helios_ui::StaticConformanceSource::empty()
         .with_sql_run(Err("sql parser error: … at Line: 2, Column: 8".into()));
     let app = library_app(source);
-    let library = serde_json::json!({"resourceType": "Library", "status": "draft"});
+    let library = serde_json::json!({
+        "resourceType": "Library", "status": "draft",
+        "relatedArtifact": [{"type": "depends-on", "label": "v", "resource": "http://example.org/ViewDefinition/v"}],
+    });
 
     let response = app
         .oneshot(post_run(
@@ -3247,13 +3625,17 @@ async fn library_run_rejects_a_non_library_resource_type() {
     assert!(!html.contains("<td>p1</td>"));
 }
 
-/// #839: a body with no `json` field is the one case either `/run`
-/// endpoint answers with a genuine error status — axum's own `Form`
-/// rejection (`422 Unprocessable Entity`), not this endpoint's `2xx`
-/// fragment contract. See `view_definitions_run_without_a_json_field_is_
-/// unprocessable`'s own doc comment for why `422`, not `400`.
+/// #839, revised by #841: unlike View Definitions' own `/run` (still an
+/// `axum::Form<T>` extraction, which genuinely rejects a body missing a
+/// required field — `view_definitions_run_without_a_json_field_is_
+/// unprocessable`), the Library-backed `/run` fragment parses the raw body
+/// by hand (`parse_lib_run_form`, needed for its own `param:{name}` fields)
+/// and never fails to extract: a body with no `json` field simply parses an
+/// empty string as JSON, which fails the same way any other invalid JSON
+/// does — a `200` fragment carrying `RunResultsState::Failure`, not a
+/// genuine error status.
 #[tokio::test]
-async fn library_run_without_a_json_field_is_unprocessable() {
+async fn library_run_without_a_json_field_reports_invalid_json_instead_of_rejecting() {
     let app = library_app(helios_ui::StaticConformanceSource::empty());
 
     let response = app
@@ -3261,7 +3643,9 @@ async fn library_run_without_a_json_field_is_unprocessable() {
         .await
         .unwrap();
 
-    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains("invalid JSON"), "{html}");
 }
 
 /// #839: `?lib=<id>&saved=1` (Save's own redirect) renders the
@@ -3307,7 +3691,10 @@ async fn sql_queries_page_saved_redirect_runs_the_stored_library_others_stay_emp
         .await
         .unwrap();
     let html = body_text(response).await;
-    assert!(!html.contains("table-card"));
+    // No results table has run yet: `#run-results` is still the classless
+    // placeholder (#842's own Columns skeleton also carries `.table-card`,
+    // so that class alone no longer distinguishes "a results table
+    // rendered" — this element id/shape does).
     assert!(html.contains(r#"<div id="run-results"></div>"#));
     assert!(html.contains(r#"hx-post="/ui/sql/queries/run""#));
     assert!(html.contains(r#"hx-trigger="load""#));
@@ -3353,7 +3740,11 @@ async fn sql_queries_page_drops_the_run_link_and_wires_the_textarea_to_htmx() {
         .await
         .unwrap();
     let html = body_text(response).await;
-    assert!(!html.contains("table-card"));
+    // No results table has run yet: `#run-results` is still the classless
+    // placeholder (#842's own Columns skeleton also carries `.table-card`,
+    // so that class alone no longer distinguishes "a results table
+    // rendered" — this element id/shape does).
+    assert!(html.contains(r#"<div id="run-results"></div>"#));
 }
 
 /// #649: the View Definitions workspace lists stored views in the rail
@@ -3511,6 +3902,103 @@ async fn view_definitions_page_renders_the_stretch_grid_and_the_guided_form_inli
     assert!(
         form_pos < vd_pos,
         "editor-form.js must load before vd-editor.js"
+    );
+}
+
+/// #821: `vd-editor.js` reads the completion popup's translated "required"
+/// marker straight off `#vd-editor-grid`'s own `data-msg-required` — this
+/// negotiates exactly like every other page (`?lang=`/cookie/
+/// `Accept-Language` → `en`), not through the `/complete` endpoint (which is
+/// not locale-aware at all: see its own tests).
+#[tokio::test]
+async fn view_definitions_page_carries_the_required_completion_marker_translated() {
+    let source = helios_ui::StaticConformanceSource::empty().with(
+        "ViewDefinition",
+        helios_fhir::FhirVersion::R4,
+        Vec::new(),
+    );
+    let app = view_definitions_app(source);
+
+    let en = body_text(
+        app.clone()
+            .oneshot(
+                Request::get("/ui/sql/view-definitions?vd=new")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert!(en.contains(r#"data-msg-required="required""#), "{en}");
+
+    let es = body_text(
+        app.oneshot(
+            Request::get("/ui/sql/view-definitions?vd=new&lang=es")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap(),
+    )
+    .await;
+    assert!(es.contains(r#"data-msg-required="obligatorio""#), "{es}");
+}
+
+/// #821: the two plural forms of the Save-with-errors confirmation
+/// text, negotiated exactly like `data-msg-required` above — rendered with
+/// the literal `{count}` marker `vd-editor.js` substitutes client-side once
+/// it knows the real error count, never a real number baked in server-side.
+#[tokio::test]
+async fn view_definitions_page_carries_the_save_with_errors_confirmation_translated() {
+    let source = helios_ui::StaticConformanceSource::empty().with(
+        "ViewDefinition",
+        helios_fhir::FhirVersion::R4,
+        Vec::new(),
+    );
+    let app = view_definitions_app(source);
+
+    let en = body_text(
+        app.clone()
+            .oneshot(
+                Request::get("/ui/sql/view-definitions?vd=new")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert!(
+        en.contains(r#"data-msg-save-errors-one="This view definition still has {count} error. Save it anyway?""#),
+        "{en}"
+    );
+    assert!(
+        en.contains(r#"data-msg-save-errors-other="This view definition still has {count} errors. Save it anyway?""#),
+        "{en}"
+    );
+
+    let es = body_text(
+        app.oneshot(
+            Request::get("/ui/sql/view-definitions?vd=new&lang=es")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap(),
+    )
+    .await;
+    assert!(
+        es.contains(
+            r#"data-msg-save-errors-one="Esta definición de vista aún tiene {count} error. ¿Guardar de todas formas?""#
+        ),
+        "{es}"
+    );
+    assert!(
+        es.contains(
+            r#"data-msg-save-errors-other="Esta definición de vista aún tiene {count} errores. ¿Guardar de todas formas?""#
+        ),
+        "{es}"
     );
 }
 
@@ -3991,6 +4479,19 @@ async fn view_definitions_lint_returns_diagnostics_for_an_invalid_document() {
     assert_eq!(unknown_key["pointer"], "/notAField");
     assert_eq!(unknown_key["severity"], "error");
     assert!(unknown_key["span"].is_null());
+    // #821: args/fixes ride along on every diagnostic, and — with nothing
+    // close enough to suggest for `notAField` — the only fix offered is
+    // dropping the key.
+    assert_eq!(unknown_key["args"]["key"], "notAField");
+    assert!(unknown_key["args"]["suggestion"].is_null());
+    assert_eq!(
+        unknown_key["fixes"],
+        serde_json::json!([{
+            "kind": "remove-key",
+            "pointer": "/notAField",
+            "label": r#"Remove "notAField""#
+        }])
+    );
 
     let syntax = diagnostics
         .iter()
@@ -4001,6 +4502,255 @@ async fn view_definitions_lint_returns_diagnostics_for_an_invalid_document() {
     assert!(syntax["span"].is_object());
     assert!(syntax["span"]["start"].is_u64());
     assert!(syntax["span"]["end"].is_u64());
+    assert!(syntax["args"]["detail"].is_string());
+    assert_eq!(syntax["fixes"], serde_json::json!([]));
+}
+
+/// #821: the generic `missing-required` diagnostic never sets `args.variant`
+/// (only the constant `value[x]` ones do) — it must still translate, not
+/// degrade to the raw catalog key, exercising the handler's own workaround
+/// for `fluent-templates` failing a selector lookup outright when the
+/// selector variable is completely absent (see
+/// `translate_diagnostic_message` in `crates/ui/src/lib.rs`).
+#[tokio::test]
+async fn view_definitions_lint_translates_a_generic_missing_required_diagnostic() {
+    let doc = serde_json::json!({ "resourceType": "ViewDefinition" });
+    let response = app()
+        .oneshot(
+            Request::post("/ui/sql/view-definitions/lint")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(doc.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = serde_json::from_str(&body_text(response).await).unwrap();
+    let diagnostics = body["diagnostics"].as_array().expect("diagnostics array");
+    let select_missing = diagnostics
+        .iter()
+        .find(|d| d["code"] == "missing-required" && d["args"]["key"] == "select")
+        .expect("a missing-required diagnostic for select");
+    assert_eq!(
+        select_missing["message"],
+        r#"Missing required key "select""#
+    );
+}
+
+/// #821: `message` is the negotiated-locale rendering of `code` + `args`
+/// against the `vd-lint-*` catalog — `?lang=es` (the same negotiation every
+/// page uses) renders it in Spanish while `code` stays the literal wire
+/// value the browser matches on either way.
+#[tokio::test]
+async fn view_definitions_lint_translates_message_with_lang_query() {
+    let doc = serde_json::json!({
+        "resourceType": "ViewDefinition",
+        "status": "active",
+        "resource": "Patient",
+        "select": [{ "column": [{ "name": "id", "path": "getResourceKey()" }] }],
+        "notAField": "oops"
+    });
+    let response = app()
+        .oneshot(
+            Request::post("/ui/sql/view-definitions/lint?lang=es")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(doc.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = serde_json::from_str(&body_text(response).await).unwrap();
+    let diagnostics = body["diagnostics"].as_array().expect("diagnostics array");
+    let unknown_key = diagnostics
+        .iter()
+        .find(|d| d["code"] == "unknown-key")
+        .expect("an unknown-key diagnostic for notAField");
+    assert_eq!(unknown_key["code"], "unknown-key");
+    assert_eq!(unknown_key["message"], r#"Clave desconocida "notAField""#);
+}
+
+/// `?lang=en` and no `?lang=`/cookie/`Accept-Language` at all both render
+/// English — the default and an explicit choice must agree.
+#[tokio::test]
+async fn view_definitions_lint_defaults_to_english_message() {
+    let doc = serde_json::json!({
+        "resourceType": "ViewDefinition",
+        "status": "active",
+        "resource": "Patient",
+        "select": [{ "column": [{ "name": "id", "path": "getResourceKey()" }] }],
+        "notAField": "oops"
+    });
+    for target in [
+        "/ui/sql/view-definitions/lint",
+        "/ui/sql/view-definitions/lint?lang=en",
+    ] {
+        let response = app()
+            .oneshot(
+                Request::post(target)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(doc.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_str(&body_text(response).await).unwrap();
+        let diagnostics = body["diagnostics"].as_array().expect("diagnostics array");
+        let unknown_key = diagnostics
+            .iter()
+            .find(|d| d["code"] == "unknown-key")
+            .unwrap_or_else(|| panic!("an unknown-key diagnostic for {target}"));
+        assert_eq!(unknown_key["message"], r#"Unknown key "notAField""#);
+    }
+}
+
+/// The `hfs_lang` cookie (the language switcher's persisted choice) drives
+/// negotiation exactly like `?lang=` does — set via the `Cookie` header
+/// here, the way a returning browser would send it back on every request.
+#[tokio::test]
+async fn view_definitions_lint_translates_message_with_lang_cookie() {
+    let doc = serde_json::json!({
+        "resourceType": "ViewDefinition",
+        "status": "active",
+        "resource": "Patient",
+        "select": [{ "column": [{ "name": "id", "path": "getResourceKey()" }] }],
+        "notAField": "oops"
+    });
+    let response = app()
+        .oneshot(
+            Request::post("/ui/sql/view-definitions/lint")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::COOKIE, "hfs_lang=es")
+                .body(Body::from(doc.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = serde_json::from_str(&body_text(response).await).unwrap();
+    let diagnostics = body["diagnostics"].as_array().expect("diagnostics array");
+    let unknown_key = diagnostics
+        .iter()
+        .find(|d| d["code"] == "unknown-key")
+        .expect("an unknown-key diagnostic for notAField");
+    assert_eq!(unknown_key["message"], r#"Clave desconocida "notAField""#);
+}
+
+/// The one fix `unknown-key` offers when there's a typo suggestion
+/// (`rename-key`) gets its own translated `label`, distinct from
+/// `message` — and it interpolates the fix's own literal suggestion, not a
+/// translated word, since `to` is a JSON key name.
+#[tokio::test]
+async fn view_definitions_lint_fix_label_is_translated_and_carries_the_suggestion() {
+    let doc = serde_json::json!({
+        "resourceType": "ViewDefinition",
+        "status": "active",
+        "resource": "Patient",
+        "select": [{ "columns": [{ "name": "id", "path": "getResourceKey()" }] }]
+    });
+    let response = app()
+        .oneshot(
+            Request::post("/ui/sql/view-definitions/lint?lang=es")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(doc.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = serde_json::from_str(&body_text(response).await).unwrap();
+    let diagnostics = body["diagnostics"].as_array().expect("diagnostics array");
+    let unknown_key = diagnostics
+        .iter()
+        .find(|d| d["code"] == "unknown-key")
+        .expect("an unknown-key diagnostic for columns");
+    let fixes = unknown_key["fixes"].as_array().expect("fixes array");
+    let rename = fixes
+        .iter()
+        .find(|f| f["kind"] == "rename-key")
+        .expect("a rename-key fix");
+    assert_eq!(rename["to"], "column");
+    let label = rename["label"].as_str().expect("a translated label");
+    assert!(label.contains("column"), "{label}");
+    assert_eq!(label, r#"Renombrar a "column""#);
+}
+
+/// `duplicate-column-name`'s own `set-string` fix — not exercised by any
+/// other translation test in this file, which only covers `unknown-key`'s
+/// `rename-key`/`remove-key` — gets a translated `label` too, distinct from
+/// `message`, and both interpolate the diagnostic's own column name.
+#[tokio::test]
+async fn view_definitions_lint_translates_a_duplicate_column_name_diagnostic_and_its_set_string_fix()
+ {
+    let doc = serde_json::json!({
+        "resourceType": "ViewDefinition",
+        "status": "active",
+        "resource": "Patient",
+        "select": [{ "column": [
+            { "name": "id", "path": "getResourceKey()" },
+            { "name": "id", "path": "name.family" }
+        ] }]
+    });
+    let response = app()
+        .oneshot(
+            Request::post("/ui/sql/view-definitions/lint")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(doc.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = serde_json::from_str(&body_text(response).await).unwrap();
+    let diagnostics = body["diagnostics"].as_array().expect("diagnostics array");
+    let duplicate = diagnostics
+        .iter()
+        .find(|d| d["code"] == "duplicate-column-name")
+        .expect("a duplicate-column-name diagnostic for the second \"id\"");
+    assert_eq!(duplicate["pointer"], "/select/0/column/1/name");
+    assert_eq!(duplicate["message"], r#"Duplicate column name "id""#);
+    let fixes = duplicate["fixes"].as_array().expect("fixes array");
+    assert_eq!(fixes.len(), 1);
+    assert_eq!(fixes[0]["kind"], "set-string");
+    assert_eq!(fixes[0]["value"], "id_2");
+    assert_eq!(fixes[0]["label"], r#"Set to "id_2""#);
+}
+
+/// `undeclared-constant`'s message and `span` — the diagnostic
+/// `vd-editor-lint.spec.ts` relies on to underline exactly the `%name`
+/// token, not the whole expression.
+#[tokio::test]
+async fn view_definitions_lint_translates_an_undeclared_constant_diagnostic() {
+    let doc = serde_json::json!({
+        "resourceType": "ViewDefinition",
+        "status": "active",
+        "resource": "Patient",
+        "select": [{ "column": [{ "name": "computed", "path": "%bogus + 1" }] }]
+    });
+    let response = app()
+        .oneshot(
+            Request::post("/ui/sql/view-definitions/lint?lang=es")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(doc.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = serde_json::from_str(&body_text(response).await).unwrap();
+    let diagnostics = body["diagnostics"].as_array().expect("diagnostics array");
+    let undeclared = diagnostics
+        .iter()
+        .find(|d| d["code"] == "undeclared-constant")
+        .expect("an undeclared-constant diagnostic for %bogus");
+    assert_eq!(undeclared["pointer"], "/select/0/column/0/path");
+    assert_eq!(undeclared["message"], r#"Constante no declarada "%bogus""#);
+    assert_eq!(
+        undeclared["span"],
+        serde_json::json!({ "start": 0, "end": 6 })
+    );
+    assert_eq!(undeclared["fixes"], serde_json::json!([]));
 }
 
 #[tokio::test]
@@ -4044,6 +4794,338 @@ async fn view_definitions_lint_rejects_a_non_json_body() {
     let body: serde_json::Value = serde_json::from_str(&body_text(response).await).unwrap();
     let error = body["error"].as_str().expect("error message");
     assert!(error.starts_with("invalid JSON: "), "{error}");
+}
+
+// ---------------------------------------------------------------------------
+// POST /ui/sql/view-definitions/complete (#821)
+// ---------------------------------------------------------------------------
+
+async fn complete(body: Value) -> (StatusCode, Value) {
+    let response = app()
+        .oneshot(
+            Request::post("/ui/sql/view-definitions/complete")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let body: Value = serde_json::from_str(&body_text(response).await).unwrap();
+    (status, body)
+}
+
+fn item_labels<'a>(body: &'a Value, kind: &str) -> Vec<&'a str> {
+    body["items"]
+        .as_array()
+        .expect("items array")
+        .iter()
+        .filter(|item| item["kind"] == kind)
+        .map(|item| item["label"].as_str().expect("label"))
+        .collect()
+}
+
+/// A minimal, `/lint`-clean ViewDefinition on `Patient` — the base document
+/// most `fhirpath`-kind tests below start from.
+fn patient_view_definition() -> Value {
+    serde_json::json!({
+        "resourceType": "ViewDefinition",
+        "status": "active",
+        "resource": "Patient",
+        "select": [{ "column": [{ "name": "id", "path": "getResourceKey()" }] }]
+    })
+}
+
+/// `present` excludes keys already on the node, and `key` items carry
+/// `detail`/`required` from the key model — `path` is required on a column,
+/// `name` is not (both offered) unless already present.
+#[tokio::test]
+async fn view_definitions_complete_key_excludes_present_and_reports_required() {
+    let (status, body) = complete(serde_json::json!({
+        "kind": "key",
+        "pointer": "/select/0/column/1",
+        "present": ["name"]
+    }))
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["from"], 0);
+    let items = body["items"].as_array().expect("items array");
+    assert!(
+        !items.iter().any(|i| i["label"] == "name"),
+        "present key excluded: {items:?}"
+    );
+    let path = items
+        .iter()
+        .find(|i| i["label"] == "path")
+        .expect("path key offered");
+    assert_eq!(path["kind"], "key");
+    assert_eq!(path["detail"], "string");
+    assert_eq!(path["required"], true);
+}
+
+/// The document root offers `resource`, `select`, and friends.
+#[tokio::test]
+async fn view_definitions_complete_key_at_root() {
+    let (status, body) = complete(serde_json::json!({ "kind": "key", "pointer": "" })).await;
+    assert_eq!(status, StatusCode::OK);
+    let labels = item_labels(&body, "key");
+    assert!(labels.contains(&"resource"), "{labels:?}");
+    assert!(labels.contains(&"select"), "{labels:?}");
+}
+
+/// A pointer the key model does not recognize answers with no candidates,
+/// not an error.
+#[tokio::test]
+async fn view_definitions_complete_key_at_an_unmodeled_pointer_is_empty() {
+    let (status, body) = complete(serde_json::json!({
+        "kind": "key",
+        "pointer": "/select/0/column/0/path"
+    }))
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["items"], serde_json::json!([]));
+}
+
+/// Right after a `.`, offers the resolved type's children plus every
+/// function — `Patient.name.` resolves `name` to `HumanName` off the root
+/// type (`Patient`, the first segment, is recognized and skipped).
+#[tokio::test]
+async fn view_definitions_complete_fhirpath_after_dot_offers_children_and_functions() {
+    let expression = "Patient.name.";
+    let (status, body) = complete(serde_json::json!({
+        "kind": "fhirpath",
+        "pointer": "/select/0/column/0/path",
+        "document": patient_view_definition(),
+        "expression": expression,
+        "cursor": expression.chars().count()
+    }))
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["from"], 13);
+    let elements = item_labels(&body, "element");
+    assert!(elements.contains(&"given"), "{elements:?}");
+    assert!(elements.contains(&"family"), "{elements:?}");
+    assert!(
+        item_labels(&body, "function").contains(&"where"),
+        "functions always ride along in member mode"
+    );
+}
+
+/// A function call chained mid-expression (`where(...)`, in the
+/// type-preserving list) doesn't disturb the resolved type — completion
+/// after it still resolves against `HumanName`.
+#[tokio::test]
+async fn view_definitions_complete_fhirpath_resolves_through_a_type_preserving_function() {
+    let expression = "name.where(use = 'official').giv";
+    let (status, body) = complete(serde_json::json!({
+        "kind": "fhirpath",
+        "pointer": "/select/0/column/0/path",
+        "document": patient_view_definition(),
+        "expression": expression,
+        "cursor": expression.chars().count()
+    }))
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["from"],
+        expression.chars().count() - 3,
+        "start of \"giv\""
+    );
+    let elements = item_labels(&body, "element");
+    assert!(elements.contains(&"given"), "{elements:?}");
+}
+
+/// A `select`'s own `forEach` narrows `%context` for everything under it —
+/// root-mode completion (no dot before the cursor) against a `forEach:
+/// "name"` select resolves straight to `HumanName`'s children.
+#[tokio::test]
+async fn view_definitions_complete_fhirpath_root_mode_uses_the_ancestor_foreach_context() {
+    let mut document = patient_view_definition();
+    document["select"][0]["forEach"] = serde_json::json!("name");
+    let (status, body) = complete(serde_json::json!({
+        "kind": "fhirpath",
+        "pointer": "/select/0/column/0/path",
+        "document": document,
+        "expression": "giv",
+        "cursor": 3
+    }))
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["from"], 0);
+    assert!(item_labels(&body, "element").contains(&"given"), "{body:?}");
+}
+
+/// `where[].path` is not nested under any `select`, so it always resolves
+/// against the root type regardless of ancestor `select`s.
+#[tokio::test]
+async fn view_definitions_complete_fhirpath_where_path_uses_root_context() {
+    let mut document = patient_view_definition();
+    document["where"] = serde_json::json!([{ "path": "x" }]);
+    let (status, body) = complete(serde_json::json!({
+        "kind": "fhirpath",
+        "pointer": "/where/0/path",
+        "document": document,
+        "expression": "act",
+        "cursor": 3
+    }))
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        item_labels(&body, "element").contains(&"active"),
+        "{body:?}"
+    );
+}
+
+/// `%` alone puts the cursor in constant mode — declared `constant[]`
+/// entries and the FHIRPath environment variables, nothing else, and `from`
+/// points at the `%` itself.
+#[tokio::test]
+async fn view_definitions_complete_fhirpath_percent_offers_constants_and_variables() {
+    let mut document = patient_view_definition();
+    document["constant"] = serde_json::json!([{ "name": "official", "valueString": "official" }]);
+    let (status, body) = complete(serde_json::json!({
+        "kind": "fhirpath",
+        "pointer": "/select/0/column/0/path",
+        "document": document,
+        "expression": "%",
+        "cursor": 1
+    }))
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["from"], 0);
+    let constants = item_labels(&body, "constant");
+    assert!(constants.contains(&"%official"), "{constants:?}");
+    let official = body["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["label"] == "%official")
+        .unwrap();
+    assert_eq!(official["detail"], "string");
+    let variables = item_labels(&body, "variable");
+    assert!(variables.contains(&"%resource"), "{variables:?}");
+    assert!(
+        item_labels(&body, "element").is_empty(),
+        "constant mode offers no elements"
+    );
+}
+
+/// `resolve()` is not in the type-preserving list, so a chain through it
+/// resolves to an unknown type — `element` is empty, but `function`
+/// candidates are still offered.
+#[tokio::test]
+async fn view_definitions_complete_fhirpath_unknown_type_still_offers_functions() {
+    let expression = "id.resolve().";
+    let (status, body) = complete(serde_json::json!({
+        "kind": "fhirpath",
+        "pointer": "/select/0/column/0/path",
+        "document": patient_view_definition(),
+        "expression": expression,
+        "cursor": expression.chars().count()
+    }))
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(item_labels(&body, "element").is_empty(), "{body:?}");
+    assert!(!item_labels(&body, "function").is_empty());
+}
+
+/// A cursor inside an unterminated `'...'` string literal never completes
+/// anything.
+#[tokio::test]
+async fn view_definitions_complete_fhirpath_inside_a_string_literal_is_empty() {
+    let expression = "name.where(use = 'offic";
+    let (status, body) = complete(serde_json::json!({
+        "kind": "fhirpath",
+        "pointer": "/select/0/column/0/path",
+        "document": patient_view_definition(),
+        "expression": expression,
+        "cursor": expression.chars().count()
+    }))
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["items"], serde_json::json!([]));
+}
+
+/// A `resource` the registry cannot resolve degrades to an unknown root
+/// type — no `element` candidates, never an error.
+#[tokio::test]
+async fn view_definitions_complete_fhirpath_unresolvable_resource_offers_no_elements() {
+    let mut document = patient_view_definition();
+    document["resource"] = serde_json::json!("Nope");
+    let (status, body) = complete(serde_json::json!({
+        "kind": "fhirpath",
+        "pointer": "/select/0/column/0/path",
+        "document": document,
+        "expression": "act",
+        "cursor": 3
+    }))
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(item_labels(&body, "element").is_empty(), "{body:?}");
+}
+
+/// A bare choice-group segment (`value[x]`, with nothing narrowing it)
+/// resolves to an unknown type.
+#[tokio::test]
+async fn view_definitions_complete_fhirpath_bare_choice_element_is_unknown() {
+    let mut document = patient_view_definition();
+    document["resource"] = serde_json::json!("Observation");
+    let expression = "Observation.value.";
+    let (status, body) = complete(serde_json::json!({
+        "kind": "fhirpath",
+        "pointer": "/select/0/column/0/path",
+        "document": document,
+        "expression": expression,
+        "cursor": expression.chars().count()
+    }))
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(item_labels(&body, "element").is_empty(), "{body:?}");
+}
+
+/// `ofType(T)` narrows a choice group to `T` regardless of the ambiguity
+/// `value` alone would carry.
+#[tokio::test]
+async fn view_definitions_complete_fhirpath_of_type_narrows_a_choice_element() {
+    let mut document = patient_view_definition();
+    document["resource"] = serde_json::json!("Observation");
+    let expression = "Observation.value.ofType(Quantity).";
+    let (status, body) = complete(serde_json::json!({
+        "kind": "fhirpath",
+        "pointer": "/select/0/column/0/path",
+        "document": document,
+        "expression": expression,
+        "cursor": expression.chars().count()
+    }))
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let elements = item_labels(&body, "element");
+    assert!(elements.contains(&"value"), "{elements:?}");
+    assert!(elements.contains(&"unit"), "{elements:?}");
+    assert!(elements.contains(&"system"), "{elements:?}");
+}
+
+#[tokio::test]
+async fn view_definitions_complete_rejects_an_unknown_kind() {
+    let (status, body) = complete(serde_json::json!({ "kind": "bogus", "pointer": "/" })).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body["error"].as_str().is_some(), "{body:?}");
+}
+
+#[tokio::test]
+async fn view_definitions_complete_rejects_a_non_json_body() {
+    let response = app()
+        .oneshot(
+            Request::post("/ui/sql/view-definitions/complete")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from("not json"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: Value = serde_json::from_str(&body_text(response).await).unwrap();
+    assert!(body["error"].as_str().is_some());
 }
 
 /// #649: Save is a plain form post — a valid document redirects to the stored
@@ -4139,6 +5221,1312 @@ fn library_app(source: helios_ui::StaticConformanceSource) -> Router {
         "http://localhost:8080".to_string(),
         None,
     )
+}
+
+/// [`library_app`] with a settings store attached (#842) — the Tables
+/// panel's own *Used by* card is the only Library-backed surface that reads
+/// one (`sql_export::jobs_for_used_by`), so this stays a separate helper
+/// rather than growing `library_app`'s own signature for every other test.
+fn library_app_with_settings(
+    source: helios_ui::StaticConformanceSource,
+    settings: Arc<InMemorySettingsStore>,
+) -> Router {
+    helios_ui::mount_with_conformance_source(
+        Router::new(),
+        "9.9.9",
+        Some(std::path::PathBuf::from("../../data")),
+        nl(true, true),
+        None,
+        Some(settings),
+        "default".to_string(),
+        std::sync::Arc::new(source),
+        helios_fhir::FhirVersion::R4,
+        None,
+        "http://localhost:8080".to_string(),
+        None,
+    )
+}
+
+// -----------------------------------------------------------------------
+// Parameters card (#841, SQL Query only)
+// -----------------------------------------------------------------------
+
+const LIBRARY_TYPES_SYSTEM: &str =
+    "http://hl7.org/fhir/uv/sql-on-fhir/CodeSystem/LibraryTypesCodes";
+
+/// #841: the page's own render shows `#lib-params` with one form-associated
+/// `param:{name}` field per declared `use=in` parameter, and the
+/// `params_sig` hidden field carries the declared `name:type` signature.
+#[tokio::test]
+async fn sql_query_page_shows_the_parameters_card_with_form_associated_fields() {
+    let lib = serde_json::json!({
+        "resourceType": "Library", "id": "q1", "name": "by_ward", "status": "active",
+        "type": {"coding": [{"system": LIBRARY_TYPES_SYSTEM, "code": "sql-query"}]},
+        "content": [{"contentType": "application/sql", "data": BASE64.encode("SELECT * FROM v WHERE ward = :ward")}],
+        "parameter": [{"name": "ward", "use": "in", "type": "string"}],
+    });
+    let source = helios_ui::StaticConformanceSource::empty()
+        .with("Library", helios_fhir::FhirVersion::R4, vec![lib])
+        .with_sql_run(Ok(Vec::new()));
+    let app = library_app(source);
+
+    let response = app
+        .oneshot(
+            Request::get("/ui/sql/queries?lib=q1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains(r#"id="lib-params""#));
+    assert!(html.contains(r#"name="param:ward" value="" form="lib-editor-form""#));
+    assert!(html.contains(r#"name="params_sig" form="lib-editor-form" value="ward:string""#));
+}
+
+/// #841: the same JSON, on the SQL View route, never shows `#lib-params` —
+/// `LibraryKind::declares_parameters` is `false` there, whatever
+/// `parameter[]` the stored document happens to carry.
+#[tokio::test]
+async fn sql_view_page_never_shows_the_parameters_card() {
+    let lib = serde_json::json!({
+        "resourceType": "Library", "id": "v1", "name": "flat", "status": "active",
+        "type": {"coding": [{"system": LIBRARY_TYPES_SYSTEM, "code": "sql-view"}]},
+        "content": [{"contentType": "application/sql", "data": BASE64.encode("SELECT 1")}],
+    });
+    let source = helios_ui::StaticConformanceSource::empty()
+        .with("Library", helios_fhir::FhirVersion::R4, vec![lib])
+        .with_sql_run(Ok(Vec::new()));
+    let app = library_app(source);
+
+    let response = app
+        .oneshot(
+            Request::get("/ui/sql/views?lib=v1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let html = body_text(response).await;
+    assert!(!html.contains(r#"id="lib-params""#));
+}
+
+/// #841: the `/run` fragment reads `param:{name}` off the raw form body and
+/// supplies it to `$sql-run` as a typed binding (asserted against
+/// `sql_run_bindings_calls`) — never as part of the document itself.
+#[tokio::test]
+async fn sql_query_run_supplies_bindings_and_never_embeds_them_in_the_document() {
+    let source = helios_ui::StaticConformanceSource::empty()
+        .with_sql_run(Ok(vec![serde_json::json!({"n": 1})]));
+    let app = library_app(source.clone());
+    let library = serde_json::json!({
+        "resourceType": "Library", "name": "by_ward", "status": "draft",
+        "parameter": [{"name": "ward", "use": "in", "type": "string"}],
+        "relatedArtifact": [{"type": "depends-on", "label": "v", "resource": "http://example.org/ViewDefinition/v"}],
+    });
+    let body = form_urlencoded::Serializer::new(String::new())
+        .append_pair("id", "lib1")
+        .append_pair("json", &library.to_string())
+        .append_pair("sql", "SELECT * FROM v WHERE ward = :ward")
+        .append_pair("params_sig", "ward:string")
+        .append_pair("param:ward", "3B")
+        .finish();
+    let response = app
+        .oneshot(post_run("/ui/sql/queries/run", body))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let bindings = source.sql_run_bindings_calls();
+    assert_eq!(bindings.len(), 1);
+    assert_eq!(
+        bindings[0],
+        vec![helios_ui::SqlExportParameter {
+            name: "ward".to_string(),
+            type_code: "string".to_string(),
+            value: "3B".to_string(),
+        }]
+    );
+
+    let calls = source.sql_run_calls();
+    assert_eq!(calls.len(), 1);
+    assert!(!calls[0].to_string().contains("3B"), "{}", calls[0]);
+}
+
+/// #841: a declared, default-less parameter with no submitted value
+/// blocks the run — no `$sql-run` call, an informational (non-`--warn`)
+/// "waiting" notice, and no `#run-results` in the response (the client's
+/// previous table, if any, is left alone).
+#[tokio::test]
+async fn sql_query_run_without_a_required_value_waits_instead_of_running() {
+    let source = helios_ui::StaticConformanceSource::empty()
+        .with_sql_run(Ok(vec![serde_json::json!({"n": 1})]));
+    let app = library_app(source.clone());
+    let library = serde_json::json!({
+        "resourceType": "Library", "name": "by_ward", "status": "draft",
+        "parameter": [{"name": "ward", "use": "in", "type": "string"}],
+        "relatedArtifact": [{"type": "depends-on", "label": "v", "resource": "http://example.org/ViewDefinition/v"}],
+    });
+    let body = form_urlencoded::Serializer::new(String::new())
+        .append_pair("id", "lib1")
+        .append_pair("json", &library.to_string())
+        .append_pair("sql", "SELECT * FROM v WHERE ward = :ward")
+        .append_pair("params_sig", "ward:string")
+        .finish();
+    let response = app
+        .oneshot(post_run("/ui/sql/queries/run", body))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains("Waiting for a value for :ward"));
+    assert!(!html.contains(r#"id="run-results""#));
+    assert!(html.contains(r#"<p class="notice">"#));
+    assert!(source.sql_run_calls().is_empty());
+}
+
+/// #841: `#lib-params` rides the `/run` response as its own
+/// `hx-swap-oob` companion only when the freshly computed signature differs
+/// from the posted `params_sig` — a stale/absent one re-attaches the card,
+/// a matching one (even with different, freshly typed values) never does.
+#[tokio::test]
+async fn sql_query_run_reattaches_the_parameters_card_only_when_the_signature_changed() {
+    let source = helios_ui::StaticConformanceSource::empty()
+        .with_sql_run(Ok(vec![serde_json::json!({"n": 1})]));
+    let app = library_app(source);
+    let library = serde_json::json!({
+        "resourceType": "Library", "name": "by_ward", "status": "draft",
+        "parameter": [{"name": "ward", "use": "in", "type": "string"}],
+        "relatedArtifact": [{"type": "depends-on", "label": "v", "resource": "http://example.org/ViewDefinition/v"}],
+    });
+
+    let stale_sig_body = form_urlencoded::Serializer::new(String::new())
+        .append_pair("id", "lib1")
+        .append_pair("json", &library.to_string())
+        .append_pair("sql", "SELECT * FROM v WHERE ward = :ward")
+        .append_pair("params_sig", "")
+        .append_pair("param:ward", "3B")
+        .finish();
+    let response = app
+        .clone()
+        .oneshot(post_run("/ui/sql/queries/run", stale_sig_body))
+        .await
+        .unwrap();
+    let html = body_text(response).await;
+    assert!(html.contains(r#"id="lib-params" hx-swap-oob="outerHTML""#));
+
+    let matching_sig_body = form_urlencoded::Serializer::new(String::new())
+        .append_pair("id", "lib1")
+        .append_pair("json", &library.to_string())
+        .append_pair("sql", "SELECT * FROM v WHERE ward = :ward")
+        .append_pair("params_sig", "ward:string")
+        .append_pair("param:ward", "3C")
+        .finish();
+    let response = app
+        .oneshot(post_run("/ui/sql/queries/run", matching_sig_body))
+        .await
+        .unwrap();
+    let html = body_text(response).await;
+    assert!(!html.contains(r#"id="lib-params""#));
+}
+
+/// #841: a `:name` placeholder the SQL uses but `Library.parameter`
+/// does not declare shows as a hint (not an error — the run still goes
+/// through) with its own *Declare :name* button.
+#[tokio::test]
+async fn sql_query_run_shows_a_hint_for_an_undeclared_placeholder() {
+    let source = helios_ui::StaticConformanceSource::empty()
+        .with_sql_run(Ok(vec![serde_json::json!({"n": 1})]));
+    let app = library_app(source);
+    let library = serde_json::json!({
+        "resourceType": "Library", "name": "by_extra", "status": "draft",
+        "relatedArtifact": [{"type": "depends-on", "label": "v", "resource": "http://example.org/ViewDefinition/v"}],
+    });
+    let body = form_urlencoded::Serializer::new(String::new())
+        .append_pair("id", "lib1")
+        .append_pair("json", &library.to_string())
+        .append_pair("sql", "SELECT * FROM v WHERE x = :extra")
+        .append_pair("params_sig", "")
+        .finish();
+    let response = app
+        .oneshot(post_run("/ui/sql/queries/run", body))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains(":extra is used in the SQL but not declared on the Library."));
+    assert!(html.contains(r#"name="declare_param" value="extra""#));
+    assert!(html.contains("Declare :extra"));
+}
+
+/// #841: a SQL View's own profile fixes `Library.parameter` to
+/// `0..0` — a document that carries one anyway is rejected the same way a
+/// parse failure is, before `$sql-run` ever runs.
+#[tokio::test]
+async fn sql_view_run_rejects_a_non_empty_parameter_array_without_calling_sql_run() {
+    let source = helios_ui::StaticConformanceSource::empty()
+        .with_sql_run(Ok(vec![serde_json::json!({"n": 1})]));
+    let app = library_app(source.clone());
+    let library = serde_json::json!({
+        "resourceType": "Library", "name": "v", "status": "draft",
+        "parameter": [{"name": "ward", "use": "in", "type": "string"}],
+    });
+    let response = app
+        .oneshot(post_run(
+            "/ui/sql/views/run",
+            library_run_body("lib1", &library, "SELECT 1"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains("A SQL View cannot declare parameters"));
+    assert!(source.sql_run_calls().is_empty());
+}
+
+/// #841: Save (and Duplicate) rejects a SQL View document with a
+/// non-empty `parameter[]` — the same message the `/run` gate uses — and
+/// nothing is saved.
+#[tokio::test]
+async fn sql_view_save_rejects_a_non_empty_parameter_array() {
+    let doc = serde_json::json!({
+        "resourceType": "Library", "name": "v", "status": "active",
+        "type": {"coding": [{"system": LIBRARY_TYPES_SYSTEM, "code": "sql-view"}]},
+        "parameter": [{"name": "ward", "use": "in", "type": "string"}],
+    });
+    let source = helios_ui::StaticConformanceSource::empty();
+    let app = library_app(source.clone());
+    let body = form_urlencoded::Serializer::new(String::new())
+        .append_pair("id", "")
+        .append_pair("action", "save")
+        .append_pair("json", &doc.to_string())
+        .append_pair("sql", "SELECT 1")
+        .finish();
+    let response = app
+        .oneshot(
+            Request::post("/ui/sql/views")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains("notice--warn"));
+    assert!(html.contains("A SQL View cannot declare parameters"));
+    assert!(source.saved_resources().is_empty());
+}
+
+/// #841: `POST /ui/sql/queries/document op=add-parameter` with
+/// `HX-Request` returns the Parameters card alone, its root carrying
+/// `data-document` with the updated (unsaved) Library JSON — the new
+/// `{name, use: "in", type}` entry appended to `parameter[]`.
+#[tokio::test]
+async fn document_add_parameter_with_hx_request_returns_the_card_with_data_document() {
+    let source = helios_ui::StaticConformanceSource::empty();
+    let app = library_app(source.clone());
+    let library = serde_json::json!({"resourceType": "Library", "name": "q", "status": "draft"});
+    let body = form_urlencoded::Serializer::new(String::new())
+        .append_pair("id", "lib1")
+        .append_pair("json", &library.to_string())
+        .append_pair("sql", "SELECT * FROM v WHERE ward = :ward")
+        .append_pair("params_sig", "")
+        .append_pair("op", "add-parameter")
+        .append_pair("param_name", "ward")
+        .append_pair("param_type", "string")
+        .finish();
+    let response = app
+        .oneshot(
+            Request::post("/ui/sql/queries/document")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .header("HX-Request", "true")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains(r#"id="lib-params""#));
+    let raw_document = text_between(&html, "data-document=\"", "\"");
+    let document: serde_json::Value = serde_json::from_str(&html_unescape(raw_document)).unwrap();
+    let params = document["parameter"].as_array().expect("parameter array");
+    assert_eq!(params.len(), 1);
+    assert_eq!(params[0]["name"], "ward");
+    assert_eq!(params[0]["use"], "in");
+    assert_eq!(params[0]["type"], "string");
+    assert!(source.saved_resources().is_empty());
+}
+
+/// #841: without `HX-Request`, the same submission re-renders the
+/// whole page with the updated JSON in the Details textarea and the posted
+/// SQL in its own — never saved.
+#[tokio::test]
+async fn document_add_parameter_without_hx_request_rerenders_the_page_unsaved() {
+    let source = helios_ui::StaticConformanceSource::empty();
+    let app = library_app(source.clone());
+    let library = serde_json::json!({"resourceType": "Library", "name": "q", "status": "draft"});
+    let body = form_urlencoded::Serializer::new(String::new())
+        .append_pair("id", "lib1")
+        .append_pair("json", &library.to_string())
+        .append_pair("sql", "SELECT * FROM v WHERE ward = :ward")
+        .append_pair("params_sig", "")
+        .append_pair("op", "add-parameter")
+        .append_pair("param_name", "ward")
+        .append_pair("param_type", "string")
+        .finish();
+    let response = app
+        .oneshot(
+            Request::post("/ui/sql/queries/document")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    let json_field = lib_json_textarea_value(&html);
+    assert!(json_field.contains(r#""name": "ward""#), "{json_field}");
+    assert!(json_field.contains(r#""use": "in""#), "{json_field}");
+    assert_eq!(
+        sql_textarea_value(&html),
+        "SELECT * FROM v WHERE ward = :ward"
+    );
+    assert!(source.saved_resources().is_empty());
+}
+
+/// #841: a duplicate or invalid parameter name is rejected with a
+/// message in the `Add parameter` panel's own field, the panel left open,
+/// and no `data-document` — nothing about the declared parameters changes.
+#[tokio::test]
+async fn document_add_parameter_rejects_a_duplicate_and_an_invalid_name() {
+    let library_with_ward = serde_json::json!({
+        "resourceType": "Library", "name": "q", "status": "draft",
+        "parameter": [{"name": "ward", "use": "in", "type": "string"}],
+    });
+
+    let cases = [
+        ("ward", "integer", "already declared"),
+        ("2bad", "string", "must match"),
+    ];
+    for (name, type_code, expected) in cases {
+        let source = helios_ui::StaticConformanceSource::empty();
+        let app = library_app(source.clone());
+        let body = form_urlencoded::Serializer::new(String::new())
+            .append_pair("id", "lib1")
+            .append_pair("json", &library_with_ward.to_string())
+            .append_pair("sql", "SELECT * FROM v WHERE ward = :ward")
+            .append_pair("params_sig", "ward:string")
+            .append_pair("op", "add-parameter")
+            .append_pair("param_name", name)
+            .append_pair("param_type", type_code)
+            .finish();
+        let response = app
+            .oneshot(
+                Request::post("/ui/sql/queries/document")
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .header("HX-Request", "true")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{name}");
+        let html = body_text(response).await;
+        assert!(!html.contains("data-document="), "{name}: {html}");
+        assert!(html.contains(expected), "{name}: {html}");
+        assert!(
+            html.contains("<details class=\"editor-add\" open>"),
+            "{name}: {html}"
+        );
+        assert!(source.saved_resources().is_empty(), "{name}");
+    }
+}
+
+/// The `document` endpoint's own `HX-Request` fragment never touches the
+/// `$sql-export` body — a regression guard alongside #834/#836's own
+/// `sql_export_http` tests, which stay untouched by this ticket.
+#[tokio::test]
+async fn document_endpoint_never_calls_sql_export() {
+    let source = helios_ui::StaticConformanceSource::empty();
+    let app = library_app(source.clone());
+    let library = serde_json::json!({"resourceType": "Library", "name": "q", "status": "draft"});
+    let body = form_urlencoded::Serializer::new(String::new())
+        .append_pair("id", "lib1")
+        .append_pair("json", &library.to_string())
+        .append_pair("sql", "SELECT 1")
+        .append_pair("params_sig", "")
+        .append_pair("op", "add-parameter")
+        .append_pair("param_name", "ward")
+        .append_pair("param_type", "string")
+        .finish();
+    let _ = app
+        .oneshot(
+            Request::post("/ui/sql/queries/document")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .header("HX-Request", "true")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(source.export_calls().is_empty());
+}
+
+// -----------------------------------------------------------------------
+// Tables panel (#842, both kinds) — Reads from / Used by / Add table /
+// Remove / table-options
+// -----------------------------------------------------------------------
+
+fn tables_view_definition() -> Value {
+    serde_json::json!({
+        "resourceType": "ViewDefinition", "id": "vd1", "name": "patients_flat",
+        "status": "active", "resource": "Patient",
+        "url": "http://example.org/ViewDefinition/patients_flat",
+        "select": [{"column": [{"name": "id", "path": "getResourceKey()"}]}],
+    })
+}
+
+/// A `sql-view` Library depending on [`tables_view_definition`] (resolved)
+/// and on a canonical nothing answers to (unresolved) — the two *Reads
+/// from* row states #842 exercises together.
+fn tables_sql_view() -> Value {
+    serde_json::json!({
+        "resourceType": "Library", "id": "v1", "name": "flat_view", "status": "active",
+        "url": "http://example.org/Library/flat_view",
+        "type": {"coding": [{"system": LIBRARY_TYPES_SYSTEM, "code": "sql-view"}]},
+        "content": [{"contentType": "application/sql", "data": BASE64.encode("SELECT * FROM v")}],
+        "relatedArtifact": [
+            {"type": "depends-on", "label": "v", "resource": "http://example.org/ViewDefinition/patients_flat"},
+            {"type": "depends-on", "label": "missing", "resource": "http://example.org/ViewDefinition/nope"},
+        ],
+    })
+}
+
+/// A `sql-query` Library depending on [`tables_sql_view`] by its own `url`
+/// — the *Used by* artifact #842 expects the SQL View's own page to
+/// list.
+fn tables_sql_query() -> Value {
+    serde_json::json!({
+        "resourceType": "Library", "id": "q1", "name": "by_ward", "status": "active",
+        "type": {"coding": [{"system": LIBRARY_TYPES_SYSTEM, "code": "sql-query"}]},
+        "content": [{"contentType": "application/sql", "data": BASE64.encode("SELECT * FROM flat")}],
+        "relatedArtifact": [
+            {"type": "depends-on", "label": "flat", "resource": "http://example.org/Library/flat_view"},
+        ],
+    })
+}
+
+/// The completed `$sql-export` job [`seed_export_job`] stores, referencing
+/// [`tables_sql_view`] — the *Used by* export row #842 expects on both
+/// the SQL View's own page and, via a job referencing the SQL Query
+/// instead, the SQL Query's own page.
+fn seed_export_job_value(name: &str, reference: &str) -> Value {
+    serde_json::json!({
+        "jobId": "job-a",
+        "name": name,
+        "subjects": [{"name": "export_subject", "reference": reference, "kind": "sql-view"}],
+        "format": "ndjson",
+        "status": "complete",
+        "startedAt": "2026-09-01T09:00:00Z",
+    })
+}
+
+async fn seed_export_job(store: &InMemorySettingsStore, job_id: &str, job: Value) {
+    store
+        .patch_settings(
+            "l2:",
+            serde_json::json!({ "byTenant": { "default": { "sqlExport": { "jobs": { job_id: job } } } } }),
+            None,
+        )
+        .await
+        .expect("seed sql export job");
+}
+
+/// #842: the SQL View's own page resolves *Reads from* (one row to
+/// the stored ViewDefinition by canonical URL, one to nothing) and lists
+/// *Used by* — the SQL Query depending on it by `url`, and the export job
+/// referencing it — in that order (artifacts before exports).
+#[tokio::test]
+async fn sql_view_page_resolves_reads_from_and_lists_used_by() {
+    let store = Arc::new(InMemorySettingsStore::new());
+    seed_export_job(
+        &store,
+        "job-a",
+        seed_export_job_value("Nightly extract", "Library/v1"),
+    )
+    .await;
+    let source = helios_ui::StaticConformanceSource::empty()
+        .with(
+            "ViewDefinition",
+            helios_fhir::FhirVersion::R4,
+            vec![tables_view_definition()],
+        )
+        .with(
+            "Library",
+            helios_fhir::FhirVersion::R4,
+            vec![tables_sql_view(), tables_sql_query()],
+        );
+    let app = library_app_with_settings(source, store.clone());
+
+    let response = app
+        .oneshot(
+            Request::get("/ui/sql/views?lib=v1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains(r#"id="lib-tables""#));
+    // #842/NF1: exactly two settings reads for the whole render — the rail's
+    // own `RequestSettings` extraction, and one `jobs_for_used_by` call for
+    // the *Used by* card — never one per Library or per *Used by* row.
+    assert_eq!(store.get_settings_calls(), 2);
+
+    // Reads from: resolved row.
+    let reads_from = text_between(&html, r#"id="lib-tables""#, r#"id="lib-tables-add-table""#);
+    assert!(reads_from.contains("<code>v</code>"), "{reads_from}");
+    assert!(
+        reads_from.contains(r#"href="/ui/sql/view-definitions?vd=vd1""#),
+        "{reads_from}"
+    );
+    assert!(reads_from.contains("patients_flat"), "{reads_from}");
+    // Reads from: unresolved row, tinted with the shared failing-row class.
+    assert!(reads_from.contains("row--alert"), "{reads_from}");
+    assert!(reads_from.contains("Not found"), "{reads_from}");
+
+    // Used by: the SQL Query (by url) and the export job, both linked.
+    assert!(html.contains(r#"href="/ui/sql/queries?lib=q1""#), "{html}");
+    assert!(html.contains("by_ward"), "{html}");
+    assert!(html.contains(r#"href="/ui/sql/export/job-a""#), "{html}");
+    assert!(html.contains("Nightly extract"), "{html}");
+}
+
+/// #842: the SQL Query's own *Used by* never lists an artifact — the
+/// graph forbids depending on a SQL Query — only the export job whose
+/// subject references it.
+#[tokio::test]
+async fn sql_query_page_used_by_lists_only_the_export_job() {
+    let store = Arc::new(InMemorySettingsStore::new());
+    seed_export_job(
+        &store,
+        "job-a",
+        seed_export_job_value("Ward extract", "Library/q1"),
+    )
+    .await;
+    // Seeding landed exactly as `seed_export_job_value` built it — the base
+    // this test's own assertions below rely on.
+    assert_eq!(
+        store.peek("l2:").expect("job seeded")["byTenant"]["default"]["sqlExport"]["jobs"]["job-a"]
+            ["subjects"][0]["reference"],
+        "Library/q1"
+    );
+    let source = helios_ui::StaticConformanceSource::empty().with(
+        "Library",
+        helios_fhir::FhirVersion::R4,
+        vec![tables_sql_query()],
+    );
+    let app = library_app_with_settings(source, store);
+
+    let response = app
+        .oneshot(
+            Request::get("/ui/sql/queries?lib=q1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    // Scoped to `#lib-tables`'s own *Used by* section (the rail above it
+    // legitimately links `?lib=q1` at the selected artifact itself).
+    let used_by = text_between(&html, "Used by", "</section>");
+    assert!(
+        used_by.contains(r#"href="/ui/sql/export/job-a""#),
+        "{used_by}"
+    );
+    assert!(used_by.contains("Ward extract"), "{used_by}");
+    assert!(
+        !used_by.contains(r#"href="/ui/sql/queries?lib="#),
+        "{used_by}"
+    );
+    assert!(
+        !used_by.contains(r#"href="/ui/sql/views?lib="#),
+        "{used_by}"
+    );
+}
+
+/// #842: `table-options` answers ViewDefinitions and `sql-view`
+/// Libraries whose name contains `q`, excludes `exclude`, and never offers
+/// a `sql-query` Library.
+#[tokio::test]
+async fn table_options_lists_view_definitions_and_sql_views_excluding_exclude_and_queries() {
+    let source = helios_ui::StaticConformanceSource::empty()
+        .with(
+            "ViewDefinition",
+            helios_fhir::FhirVersion::R4,
+            vec![tables_view_definition()],
+        )
+        .with(
+            "Library",
+            helios_fhir::FhirVersion::R4,
+            vec![tables_sql_view(), tables_sql_query()],
+        );
+    let app = library_app(source);
+
+    let body = form_urlencoded::Serializer::new(String::new())
+        .append_pair("q", "")
+        .finish();
+    let response = app
+        .oneshot(
+            Request::post("/ui/lookup/table-options?target=lib-tables&exclude=Library%2Fv1")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .header("HX-Request", "true")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(
+        html.contains(r#"data-value="ViewDefinition/vd1""#),
+        "{html}"
+    );
+    assert!(html.contains(r#"data-name="patients_flat""#), "{html}");
+    // `v1` is `exclude`d, `q1` is a sql-query — neither is ever offered.
+    assert!(!html.contains(r#"data-value="Library/v1""#), "{html}");
+    assert!(!html.contains(r#"data-value="Library/q1""#), "{html}");
+}
+
+/// #842: an unrecognized `target` is a bare `400`, the same closed-list
+/// guard the Patient/Group combobox endpoints already enforce.
+#[tokio::test]
+async fn table_options_rejects_an_unknown_target() {
+    let app = library_app(helios_ui::StaticConformanceSource::empty());
+    let response = app
+        .oneshot(
+            Request::post("/ui/lookup/table-options?target=bogus")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .header("HX-Request", "true")
+                .body(Body::from(
+                    form_urlencoded::Serializer::new(String::new())
+                        .append_pair("q", "")
+                        .finish(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+/// #842: `add-table` writes a `depends-on` entry with the target's own
+/// `url`, defaulting the alias to the target's own `name` when
+/// `table_alias` is blank.
+#[tokio::test]
+async fn document_add_table_writes_the_targets_url_and_defaults_the_alias() {
+    let source = helios_ui::StaticConformanceSource::empty().with(
+        "ViewDefinition",
+        helios_fhir::FhirVersion::R4,
+        vec![tables_view_definition()],
+    );
+    let app = library_app(source.clone());
+    let library = serde_json::json!({"resourceType": "Library", "name": "q", "status": "draft"});
+    let body = form_urlencoded::Serializer::new(String::new())
+        .append_pair("id", "lib1")
+        .append_pair("json", &library.to_string())
+        .append_pair("sql", "SELECT * FROM patients_flat")
+        .append_pair("op", "add-table")
+        .append_pair("table", "ViewDefinition/vd1")
+        .append_pair("table_alias", "")
+        .finish();
+    let response = app
+        .oneshot(
+            Request::post("/ui/sql/queries/document")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .header("HX-Request", "true")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains(r#"id="lib-tables""#));
+    let raw_document = text_between(&html, "data-document=\"", "\"");
+    let document: serde_json::Value = serde_json::from_str(&html_unescape(raw_document)).unwrap();
+    let deps = document["relatedArtifact"]
+        .as_array()
+        .expect("relatedArtifact");
+    assert_eq!(deps.len(), 1);
+    assert_eq!(deps[0]["type"], "depends-on");
+    assert_eq!(deps[0]["label"], "patients_flat");
+    assert_eq!(
+        deps[0]["resource"],
+        "http://example.org/ViewDefinition/patients_flat"
+    );
+    assert!(source.saved_resources().is_empty());
+}
+
+/// #842: a target with no `url` of its own writes `Type/id` instead.
+#[tokio::test]
+async fn document_add_table_falls_back_to_type_id_without_a_url() {
+    let no_url_vd = serde_json::json!({
+        "resourceType": "ViewDefinition", "id": "vd2", "name": "no_url_vd",
+        "status": "draft", "resource": "Patient",
+    });
+    let source = helios_ui::StaticConformanceSource::empty().with(
+        "ViewDefinition",
+        helios_fhir::FhirVersion::R4,
+        vec![no_url_vd],
+    );
+    let app = library_app(source);
+    let library = serde_json::json!({"resourceType": "Library", "name": "q", "status": "draft"});
+    let body = form_urlencoded::Serializer::new(String::new())
+        .append_pair("id", "lib1")
+        .append_pair("json", &library.to_string())
+        .append_pair("sql", "SELECT 1")
+        .append_pair("op", "add-table")
+        .append_pair("table", "ViewDefinition/vd2")
+        .append_pair("table_alias", "")
+        .finish();
+    let response = app
+        .oneshot(
+            Request::post("/ui/sql/queries/document")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .header("HX-Request", "true")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let html = body_text(response).await;
+    let raw_document = text_between(&html, "data-document=\"", "\"");
+    let document: serde_json::Value = serde_json::from_str(&html_unescape(raw_document)).unwrap();
+    assert_eq!(
+        document["relatedArtifact"][0]["resource"],
+        "ViewDefinition/vd2"
+    );
+    assert_eq!(document["relatedArtifact"][0]["label"], "no_url_vd");
+}
+
+/// #842: `add-table`'s own validation, in order — no target,
+/// an invalid alias, a case-insensitive duplicate, and a reference to a
+/// `sql-query` Library, which the graph itself would reject as a table.
+#[tokio::test]
+async fn document_add_table_rejects_a_missing_invalid_duplicate_or_sql_query_target() {
+    let library_with_v = serde_json::json!({
+        "resourceType": "Library", "name": "q", "status": "draft",
+        "relatedArtifact": [
+            {"type": "depends-on", "label": "v", "resource": "http://example.org/ViewDefinition/patients_flat"},
+        ],
+    });
+    let cases: [(&str, &str, &str); 4] = [
+        ("", "", "Pick a view definition or SQL view"),
+        ("ViewDefinition/vd1", "2bad", "must match"),
+        ("ViewDefinition/vd1", "V", "already declared"),
+        ("Library/q1", "byward", "Pick a view definition or SQL view"),
+    ];
+    for (table, alias, expected) in cases {
+        let source = helios_ui::StaticConformanceSource::empty()
+            .with(
+                "ViewDefinition",
+                helios_fhir::FhirVersion::R4,
+                vec![tables_view_definition()],
+            )
+            .with(
+                "Library",
+                helios_fhir::FhirVersion::R4,
+                vec![tables_sql_query()],
+            );
+        let app = library_app(source.clone());
+        let body = form_urlencoded::Serializer::new(String::new())
+            .append_pair("id", "lib1")
+            .append_pair("json", &library_with_v.to_string())
+            .append_pair("sql", "SELECT * FROM v")
+            .append_pair("op", "add-table")
+            .append_pair("table", table)
+            .append_pair("table_alias", alias)
+            .finish();
+        let response = app
+            .oneshot(
+                Request::post("/ui/sql/queries/document")
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .header("HX-Request", "true")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{table:?}/{alias:?}");
+        let html = body_text(response).await;
+        assert!(!html.contains("data-document="), "{table:?}: {html}");
+        assert!(html.contains(expected), "{table:?}/{alias:?}: {html}");
+        assert!(source.saved_resources().is_empty());
+    }
+}
+
+/// #842: `remove-table` removes the row with the exact matching
+/// label, leaving the rest of the document untouched.
+#[tokio::test]
+async fn document_remove_table_removes_the_matching_row() {
+    let library_with_two = serde_json::json!({
+        "resourceType": "Library", "name": "q", "status": "draft",
+        "relatedArtifact": [
+            {"type": "depends-on", "label": "v", "resource": "http://example.org/ViewDefinition/patients_flat"},
+            {"type": "depends-on", "label": "w", "resource": "Library/w1"},
+        ],
+    });
+    let source = helios_ui::StaticConformanceSource::empty();
+    let app = library_app(source.clone());
+    let body = form_urlencoded::Serializer::new(String::new())
+        .append_pair("id", "lib1")
+        .append_pair("json", &library_with_two.to_string())
+        .append_pair("sql", "SELECT * FROM v JOIN w")
+        .append_pair("table_label", "v")
+        .finish();
+    let response = app
+        .oneshot(
+            Request::post("/ui/sql/queries/document")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .header("HX-Request", "true")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    let raw_document = text_between(&html, "data-document=\"", "\"");
+    let document: serde_json::Value = serde_json::from_str(&html_unescape(raw_document)).unwrap();
+    let deps = document["relatedArtifact"]
+        .as_array()
+        .expect("relatedArtifact");
+    assert_eq!(deps.len(), 1);
+    assert_eq!(deps[0]["label"], "w");
+    assert!(source.saved_resources().is_empty());
+}
+
+/// #842: the `/run` fragment includes `#lib-tables` `hx-swap-oob` only
+/// when the posted `tables_sig` differs from the one it freshly computes —
+/// unchanged, it is left out entirely.
+#[tokio::test]
+async fn sql_query_run_reattaches_the_tables_card_only_when_the_signature_changed() {
+    let source = helios_ui::StaticConformanceSource::empty()
+        .with(
+            "ViewDefinition",
+            helios_fhir::FhirVersion::R4,
+            vec![tables_view_definition()],
+        )
+        .with_sql_run(Ok(Vec::new()));
+    let app = library_app(source);
+    let library = serde_json::json!({
+        "resourceType": "Library", "name": "q", "status": "draft",
+        "type": {"coding": [{"system": LIBRARY_TYPES_SYSTEM, "code": "sql-query"}]},
+        "relatedArtifact": [
+            {"type": "depends-on", "label": "v", "resource": "http://example.org/ViewDefinition/patients_flat"},
+        ],
+    });
+
+    let run = |tables_sig: &'static str| {
+        let body = form_urlencoded::Serializer::new(String::new())
+            .append_pair("id", "")
+            .append_pair("json", &library.to_string())
+            .append_pair("sql", "SELECT * FROM v")
+            .append_pair("params_sig", "")
+            .append_pair("tables_sig", tables_sig)
+            .finish();
+        Request::post("/ui/sql/queries/run")
+            .header("content-type", "application/x-www-form-urlencoded")
+            .body(Body::from(body))
+            .unwrap()
+    };
+
+    let stale = app.clone().oneshot(run("")).await.unwrap();
+    assert_eq!(stale.status(), StatusCode::OK);
+    let html = body_text(stale).await;
+    assert!(html.contains(r#"id="lib-tables""#), "{html}");
+    assert!(html.contains(r#"hx-swap-oob="outerHTML""#), "{html}");
+
+    let matched = app
+        .clone()
+        .oneshot(run("v=http://example.org/ViewDefinition/patients_flat"))
+        .await
+        .unwrap();
+    let html = body_text(matched).await;
+    assert!(!html.contains(r#"id="lib-tables""#), "{html}");
+}
+
+// -----------------------------------------------------------------------
+// Unknown-table lint and Columns (#842/04)
+// -----------------------------------------------------------------------
+
+/// A SQL Query declaring one dependency, `v` — resolving it is never the
+/// point of these tests (a `NotFound` row never blocks `$sql-run`, #842's
+/// own "imitates, does not replace" rule), only that `v` itself is a
+/// declared label the unknown-table lint recognizes.
+fn library_declaring_v() -> Value {
+    serde_json::json!({
+        "resourceType": "Library", "name": "q", "status": "draft",
+        "relatedArtifact": [
+            {"type": "depends-on", "label": "v", "resource": "http://example.org/ViewDefinition/v"},
+        ],
+    })
+}
+
+/// The `data-diagnostics` attribute's own JSON array, HTML-unescaped and
+/// parsed — `sql-editor.js`'s own `setDiagnostics` input.
+fn diagnostics(html: &str) -> Vec<Value> {
+    let raw = html_unescape(text_between(html, r#"data-diagnostics=""#, "\">"));
+    serde_json::from_str(&raw).expect("data-diagnostics is a JSON array")
+}
+
+/// The unknown-table lint (#842/04): a table the SQL reads that no declared
+/// label names never reaches `$sql-run` at all — the notice carries the full sentence,
+/// `data-error-line` at the table's own line, `data-diagnostics` locating
+/// it in the posted SQL by character offset, the results/Columns meta both
+/// relabel to "last successful run", and *Reads from* gains its own
+/// `.tag--failed` "Unknown table" row with a *Declare* button.
+#[tokio::test]
+async fn sql_query_run_unknown_table_never_calls_sql_run() {
+    let source = helios_ui::StaticConformanceSource::empty().with_sql_run(Ok(Vec::new()));
+    let app = library_app(source.clone());
+
+    let response = app
+        .oneshot(post_run(
+            "/ui/sql/queries/run",
+            library_run_body("lib1", &library_declaring_v(), "SELECT * FROM vv"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(source.sql_run_calls().is_empty());
+
+    let html = body_text(response).await;
+    assert!(
+        html.contains(
+            "Unknown table vv — line 1. Declare it under Reads from or fix the name. \
+             Your SQL is unchanged; the results below are from the last successful run."
+        ),
+        "{html}"
+    );
+    assert!(html.contains(r#"data-error-line="1""#), "{html}");
+    let found = diagnostics(&html);
+    assert_eq!(found.len(), 1);
+    // "SELECT * FROM vv" — "vv" starts at char offset 14, length 2.
+    assert_eq!(found[0]["from"], 14);
+    assert_eq!(found[0]["to"], 16);
+    assert_eq!(found[0]["table"], "vv");
+    assert_eq!(found[0]["message"], "Unknown table vv — line 1.");
+
+    assert!(
+        html.contains(r#"id="run-results-meta" class="card-head__meta" hx-swap-oob="outerHTML">last successful run"#),
+        "{html}"
+    );
+    assert!(
+        html.contains(r#"id="lib-columns-meta" class="card-head__meta" hx-swap-oob="outerHTML">last successful run"#),
+        "{html}"
+    );
+    assert!(!html.contains(r#"id="lib-columns" hx-swap-oob"#), "{html}");
+
+    assert!(
+        html.contains(r#"id="lib-tables" hx-swap-oob="outerHTML""#),
+        "{html}"
+    );
+    let unknown_row = text_between(&html, "<code>vv</code>", "</tr>");
+    assert!(
+        unknown_row.contains(r#"tag tag--failed">Unknown table"#),
+        "{unknown_row}"
+    );
+    assert!(
+        unknown_row.contains(
+            "Used in the SQL but not declared. Pick a view definition or SQL view, or fix the name."
+        ),
+        "{unknown_row}"
+    );
+    assert!(
+        unknown_row.contains(r#"data-declare-table="vv">"#) && unknown_row.contains("Declare vv"),
+        "{unknown_row}"
+    );
+    // The `/run` fragment's own OOB companion never auto-opens the panel —
+    // only the JS *Declare* click does (`sql-library-panels.js`); a no-JS
+    // page-level render is the one that pre-opens it (see the `document`
+    // endpoint test below).
+    assert!(
+        !html.contains(r#"<details class="editor-add" open>"#),
+        "{html}"
+    );
+}
+
+/// *Declare*'s own no-JS affordance (#842/04): `?…&saved=1`'s own page-level render (Save's
+/// own redirect, so this is exactly what a no-JS Save of a SQL with an
+/// unknown table shows) opens *Add table* on its own, with the alias
+/// already the unknown table's own name — the only way a visitor without
+/// JavaScript can reach the panel at all.
+#[tokio::test]
+async fn sql_queries_page_saved_redirect_opens_add_table_for_an_unknown_table() {
+    let system = "http://hl7.org/fhir/uv/sql-on-fhir/CodeSystem/LibraryTypesCodes";
+    let lib = serde_json::json!({
+        "resourceType": "Library", "id": "q1", "name": "q", "status": "active",
+        "type": {"coding": [{"system": system, "code": "sql-query"}]},
+        "content": [{"contentType": "application/sql", "data": BASE64.encode("SELECT * FROM vv")}],
+        "relatedArtifact": [{"type": "depends-on", "label": "v", "resource": "http://example.org/ViewDefinition/v"}],
+    });
+    let source = helios_ui::StaticConformanceSource::empty().with(
+        "Library",
+        helios_fhir::FhirVersion::R4,
+        vec![lib],
+    );
+    let app = library_app(source);
+
+    let response = app
+        .oneshot(
+            Request::get("/ui/sql/queries?lib=q1&saved=1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains("Unknown table vv"), "{html}");
+    let unknown_row = text_between(&html, "<code>vv</code>", "</tr>");
+    assert!(
+        unknown_row.contains(r#"tag tag--failed">Unknown table"#),
+        "{unknown_row}"
+    );
+    assert!(
+        html.contains(r#"<details class="editor-add" open>"#),
+        "{html}"
+    );
+    assert!(html.contains(r#"name="table_alias""#), "{html}");
+    let alias_field = text_between(&html, r#"name="table_alias""#, ">");
+    assert!(alias_field.contains(r#"value="vv""#), "{alias_field}");
+}
+
+/// A multi-line SQL statement's own unknown table is still located by its
+/// own real line, not line 1.
+#[tokio::test]
+async fn sql_query_run_unknown_table_multiline_sql_reports_the_correct_line() {
+    let source = helios_ui::StaticConformanceSource::empty().with_sql_run(Ok(Vec::new()));
+    let app = library_app(source);
+
+    let response = app
+        .oneshot(post_run(
+            "/ui/sql/queries/run",
+            library_run_body("lib1", &library_declaring_v(), "SELECT *\nFROM vv"),
+        ))
+        .await
+        .unwrap();
+    let html = body_text(response).await;
+    assert!(html.contains(r#"data-error-line="2""#), "{html}");
+    assert!(html.contains("Unknown table vv — line 2."), "{html}");
+}
+
+/// Two unknown tables produce two `data-diagnostics` entries and two
+/// sentences — the first the long form, the second the short one.
+#[tokio::test]
+async fn sql_query_run_two_unknown_tables_report_two_diagnostics_and_sentences() {
+    let source = helios_ui::StaticConformanceSource::empty().with_sql_run(Ok(Vec::new()));
+    let app = library_app(source);
+
+    let response = app
+        .oneshot(post_run(
+            "/ui/sql/queries/run",
+            library_run_body("lib1", &library_declaring_v(), "SELECT * FROM aa, bb"),
+        ))
+        .await
+        .unwrap();
+    let html = body_text(response).await;
+    assert!(
+        html.contains(
+            "Unknown table aa — line 1. Declare it under Reads from or fix the name. \
+             Your SQL is unchanged; the results below are from the last successful run. \
+             Unknown table bb — line 1."
+        ),
+        "{html}"
+    );
+    let found = diagnostics(&html);
+    assert_eq!(found.len(), 2);
+    assert_eq!(found[0]["table"], "aa");
+    assert_eq!(found[1]["table"], "bb");
+}
+
+/// A CTE reading only a declared table never trips the lint — the CTE's
+/// own name is never itself reported (#842/01's own scanner contract), and
+/// `v` is declared.
+#[tokio::test]
+async fn sql_query_run_cte_over_a_declared_table_runs_without_a_notice() {
+    let source = helios_ui::StaticConformanceSource::empty()
+        .with_sql_run(Ok(vec![serde_json::json!({"n": 1})]));
+    let app = library_app(source.clone());
+
+    let response = app
+        .oneshot(post_run(
+            "/ui/sql/queries/run",
+            library_run_body(
+                "lib1",
+                &library_declaring_v(),
+                "WITH cte AS (SELECT * FROM v) SELECT * FROM cte",
+            ),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(source.sql_run_calls().len(), 1);
+    let html = body_text(response).await;
+    assert!(!html.contains("Unknown table"), "{html}");
+}
+
+/// One `<td>{name}</td><td>{type}</td><td>{origin}</td>` row's own inner
+/// text, located by its `<code>{name}</code>` cell (#842/04).
+fn column_row<'a>(html: &'a str, name: &str) -> &'a str {
+    text_between(html, &format!("<code>{name}</code>"), "</tr>")
+}
+
+/// The Columns card (#842/04): a good run's own — a column whose name exists in
+/// exactly one resolved ViewDefinition dependency gets that dependency's
+/// own type and an `{label}.{column}` origin; anything else falls back to
+/// the row values' own JSON shape, with no origin.
+#[tokio::test]
+async fn sql_query_run_good_run_fills_the_columns_card() {
+    let vd = serde_json::json!({
+        "resourceType": "ViewDefinition", "id": "vd1", "name": "patients_flat",
+        "status": "active", "resource": "Patient",
+        "url": "http://example.org/ViewDefinition/v",
+        "select": [{"column": [
+            {"name": "id", "path": "getResourceKey()"},
+            {"name": "family", "path": "name.family"},
+        ]}],
+    });
+    let source = helios_ui::StaticConformanceSource::empty()
+        .with("ViewDefinition", helios_fhir::FhirVersion::R4, vec![vd])
+        .with_sql_run(Ok(vec![
+            serde_json::json!({"id": "p1", "family": "Garcia", "n": 3, "ok": true}),
+        ]));
+    let app = library_app(source);
+
+    let response = app
+        .oneshot(post_run(
+            "/ui/sql/queries/run",
+            library_run_body("lib1", &library_declaring_v(), "SELECT * FROM v"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(
+        html.contains(r#"id="lib-columns" hx-swap-oob="outerHTML""#),
+        "{html}"
+    );
+    assert!(!html.contains(r#"id="lib-columns-meta" class="card-head__meta" hx-swap-oob"#));
+
+    let id_row = column_row(&html, "id");
+    assert!(id_row.contains("<td>string</td>"), "{id_row}");
+    assert!(id_row.contains("<td>v.id</td>"), "{id_row}");
+    let family_row = column_row(&html, "family");
+    assert!(family_row.contains("<td>string</td>"), "{family_row}");
+    assert!(family_row.contains("<td>v.family</td>"), "{family_row}");
+    let n_row = column_row(&html, "n");
+    assert!(n_row.contains("<td>integer</td>"), "{n_row}");
+    assert!(n_row.contains("<td>—</td>"), "{n_row}");
+    let ok_row = column_row(&html, "ok");
+    assert!(ok_row.contains("<td>boolean</td>"), "{ok_row}");
+    assert!(ok_row.contains("<td>—</td>"), "{ok_row}");
+}
+
+/// #842/04's own NF1: once a run has succeeded, a *later* run that fails
+/// (a lint gate, or `$sql-run` itself) never re-sends the whole Columns card — only
+/// its own meta relabels to "last successful run", the same OOB shape
+/// `#run-results-meta` already uses.
+#[tokio::test]
+async fn sql_query_run_failure_only_relabels_the_columns_meta() {
+    let source =
+        helios_ui::StaticConformanceSource::empty().with_sql_run(Err("no such table: v".into()));
+    let app = library_app(source);
+
+    let response = app
+        .oneshot(post_run(
+            "/ui/sql/queries/run",
+            library_run_body("lib1", &library_declaring_v(), "SELECT * FROM v"),
+        ))
+        .await
+        .unwrap();
+    let html = body_text(response).await;
+    assert!(
+        html.contains(r#"id="lib-columns-meta" class="card-head__meta" hx-swap-oob="outerHTML">last successful run"#),
+        "{html}"
+    );
+    assert!(!html.contains(r#"id="lib-columns" hx-swap-oob"#), "{html}");
+}
+
+/// #842/04's own scope: View Definitions has no SQL of its own to scan for
+/// tables, and never carries a Columns card at all.
+#[tokio::test]
+async fn view_definitions_run_never_emits_a_columns_card() {
+    let source = helios_ui::StaticConformanceSource::empty()
+        .with_sql_run(Ok(vec![serde_json::json!({"n": 1})]));
+    let app = library_app(source);
+    let vd = serde_json::json!({
+        "resourceType": "ViewDefinition", "name": "v", "status": "draft", "resource": "Patient",
+        "select": [{"column": [{"name": "n", "path": "1"}]}],
+    });
+    let body = urlencoded_json_body(&vd);
+    let response = app
+        .oneshot(post_run("/ui/sql/view-definitions/run", body))
+        .await
+        .unwrap();
+    let html = body_text(response).await;
+    assert!(!html.contains("lib-columns"), "{html}");
+}
+
+/// #842/04: `?…&saved=1`'s own server-side run fills the Columns card in
+/// page mode too — inline (`oob: false`), not as an `hx-swap-oob`
+/// companion, since a hard navigation has nothing to swap into.
+#[tokio::test]
+async fn sql_queries_page_saved_redirect_fills_the_columns_card() {
+    let system = "http://hl7.org/fhir/uv/sql-on-fhir/CodeSystem/LibraryTypesCodes";
+    let vd = serde_json::json!({
+        "resourceType": "ViewDefinition", "id": "vd1", "name": "patients_flat",
+        "status": "active", "resource": "Patient",
+        "url": "http://example.org/ViewDefinition/v",
+        "select": [{"column": [{"name": "id", "path": "getResourceKey()"}]}],
+    });
+    let lib = serde_json::json!({
+        "resourceType": "Library", "id": "q1", "name": "patient_counts", "status": "active",
+        "type": {"coding": [{"system": system, "code": "sql-query"}]},
+        "content": [{"contentType": "application/sql", "data": BASE64.encode("SELECT * FROM v")}],
+        "relatedArtifact": [
+            {"type": "depends-on", "label": "v", "resource": "http://example.org/ViewDefinition/v"},
+        ],
+    });
+    let source = helios_ui::StaticConformanceSource::empty()
+        .with("Library", helios_fhir::FhirVersion::R4, vec![lib])
+        .with("ViewDefinition", helios_fhir::FhirVersion::R4, vec![vd])
+        .with_sql_run(Ok(vec![serde_json::json!({"id": "p1"})]));
+    let app = library_app(source);
+
+    let response = app
+        .oneshot(
+            Request::get("/ui/sql/queries?lib=q1&saved=1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains(r#"id="lib-columns""#), "{html}");
+    assert!(!html.contains(r#"id="lib-columns" hx-swap-oob"#), "{html}");
+    let id_row = column_row(&html, "id");
+    assert!(id_row.contains("<td>string</td>"), "{id_row}");
+    assert!(id_row.contains("<td>v.id</td>"), "{id_row}");
 }
 
 /// The `id="vd-rail-list"` (or `id="lib-rail-list"`) scrollable list's own

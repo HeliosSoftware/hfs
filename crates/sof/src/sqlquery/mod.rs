@@ -13,12 +13,16 @@ pub mod engine;
 pub mod library;
 pub mod output;
 pub mod params;
+pub mod scan;
 
-pub use bind::{BoundParam, bind_supplied_params};
+pub use bind::{BINDABLE_PARAMETER_TYPES, BoundParam, bind_supplied_params};
 pub use engine::{ColumnFhirType, InMemorySqlEngine, QueryResult, TableSchema};
 pub use library::{DependsOnView, LibraryParameter, SqlQueryLibrary, parse_sqlquery_library};
 pub use output::format_fhir_parameters;
 pub use params::{SqlQueryRunParams, extract_sqlquery_params_from_json};
+pub use scan::{
+    Placeholder, ScanError, ScanResult, SourcePosition, TableRef, scan_sql, undeclared_tables,
+};
 
 use thiserror::Error;
 
@@ -60,4 +64,21 @@ pub enum SqlQueryError {
 
     #[error("composite SQL value for column '{0}' cannot be represented as a FHIR scalar")]
     UnsupportedFhirValue(String),
+
+    /// The `SofRunner` stream feeding a `depends-on` dependency table
+    /// yielded an error — a storage failure, a backend statement timeout,
+    /// or a lost connection. The dependency was not materialized. This is
+    /// never the client's fault (the Library and its ViewDefinitions may be
+    /// perfectly well-formed) and must be surfaced as a server error, not
+    /// folded into [`SqlQueryError::MalformedLibrary`].
+    #[error("dependency source failed: {0}")]
+    SourceStream(String),
+
+    /// A failure in the server's own execution machinery rather than in the
+    /// client's request — e.g. the blocking worker that materializes a
+    /// depends-on ViewDefinition's row stream panicked. This is never
+    /// caused by malformed client input and should be surfaced as a 500,
+    /// not as a validation error.
+    #[error("internal error: {0}")]
+    Internal(String),
 }

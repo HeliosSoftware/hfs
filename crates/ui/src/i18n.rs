@@ -20,7 +20,7 @@ use axum::{
 };
 use fluent_templates::{Loader, fluent_bundle::FluentValue};
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::convert::Infallible;
 use unic_langid::{LanguageIdentifier, langid};
 
@@ -167,10 +167,8 @@ fn match_supported(tag: &str) -> Option<&'static LanguageIdentifier> {
         {
             return Some(locale);
         }
-        match range.rfind('-') {
-            Some(idx) => range = &range[..idx],
-            None => return None,
-        }
+        let idx = range.rfind('-')?;
+        range = &range[..idx];
     }
 }
 
@@ -237,6 +235,31 @@ impl I18n {
             (Cow::Owned(name1.to_owned()), value1.into()),
             (Cow::Owned(name2.to_owned()), value2.into()),
         ]);
+        LOCALES
+            .try_lookup_with_args(self.locale, key, &args)
+            .unwrap_or_else(|| key.to_owned())
+    }
+
+    /// Look up a message with an arbitrary, named-at-runtime set of string
+    /// placeables — `t_arg`/`t_arg2` above cover the fixed 1- and 2-argument
+    /// call sites everywhere else in this crate, but the ViewDefinition lint
+    /// catalog (`vd-lint-*`) interpolates a different argument set per
+    /// `helios_sof::lint::DiagnosticCode`, carried as exactly this shape
+    /// (`Diagnostic::args`) by the lint itself. Every value is interpolated
+    /// as a Fluent string placeable, matching the lint's own args contract:
+    /// technical values (keys, expressions, FHIRPath detail) are never
+    /// further localized, only spliced into the surrounding sentence
+    /// `main.ftl` provides.
+    pub fn t_args(&self, key: &str, args: &BTreeMap<String, String>) -> String {
+        let args: HashMap<Cow<'static, str>, FluentValue<'static>> = args
+            .iter()
+            .map(|(name, value)| {
+                (
+                    Cow::Owned(name.clone()),
+                    FluentValue::String(Cow::Owned(value.clone())),
+                )
+            })
+            .collect();
         LOCALES
             .try_lookup_with_args(self.locale, key, &args)
             .unwrap_or_else(|| key.to_owned())
@@ -351,6 +374,116 @@ mod tests {
             de.t_arg("health-uptime", "duration", "3d"),
             "Betriebszeit: 3d"
         );
+    }
+
+    #[test]
+    fn t_args_interpolates_a_variable_named_argument_set() {
+        let en = I18n { locale: &EN };
+        let mut args = BTreeMap::new();
+        args.insert("key".to_string(), "columns".to_string());
+        assert_eq!(
+            en.t_args("vd-lint-unknown-key", &args),
+            r#"Unknown key "columns""#
+        );
+    }
+
+    #[test]
+    fn t_args_selector_falls_back_only_when_the_variable_is_present_but_unmatched() {
+        // `fluent-templates`' selector lookup behaves differently depending
+        // on *how* `$variant` is missing: entirely absent from the args map
+        // fails the whole lookup (falls back to the raw key, same as an
+        // unknown key), but present with a value that matches no declared
+        // variant renders the `*[other]` arm normally. `sql_view_definitions_lint`
+        // in `crates/ui/src/lib.rs` relies on exactly this: it always adds
+        // an empty `variant` before rendering `vd-lint-missing-required`/
+        // `vd-lint-wrong-type` for a diagnostic whose own `args` (the
+        // generic `key`/`expected`+`found` shape) never sets one.
+        let mut absent = BTreeMap::new();
+        absent.insert("key".to_string(), "select".to_string());
+        let en = I18n { locale: &EN };
+        assert_eq!(
+            en.t_args("vd-lint-missing-required", &absent),
+            "vd-lint-missing-required",
+            "an entirely absent selector variable degrades to the raw key"
+        );
+
+        let mut present_but_unmatched = absent.clone();
+        present_but_unmatched.insert("variant".to_string(), String::new());
+        assert_eq!(
+            en.t_args("vd-lint-missing-required", &present_but_unmatched),
+            r#"Missing required key "select""#
+        );
+    }
+
+    #[test]
+    fn t_args_selects_on_variant_per_locale() {
+        let mut args = BTreeMap::new();
+        args.insert("variant".to_string(), "missing".to_string());
+        let en = I18n { locale: &EN };
+        assert_eq!(
+            en.t_args("vd-lint-missing-required", &args),
+            "A constant must set exactly one value"
+        );
+        let es = I18n { locale: &ES };
+        assert_eq!(
+            es.t_args("vd-lint-missing-required", &args),
+            "Una constante debe establecer exactamente un valor"
+        );
+    }
+
+    /// #821: every `helios_sof::lint::DiagnosticCode` variant must have a
+    /// matching `vd-lint-<code>` key in `en` (the same test in
+    /// `helios-sof`'s own `lint::tests` pins the wire strings this list
+    /// mirrors; `catalogs_share_the_same_key_set` above already proves
+    /// `es`/`de` carry the same key set as `en`).
+    #[test]
+    fn every_diagnostic_code_has_a_vd_lint_catalog_key_in_en() {
+        use helios_sof::lint::DiagnosticCode;
+        let codes = [
+            DiagnosticCode::NotAViewDefinition,
+            DiagnosticCode::UnknownKey,
+            DiagnosticCode::MissingRequired,
+            DiagnosticCode::WrongType,
+            DiagnosticCode::EmptyRequired,
+            DiagnosticCode::DuplicateColumnName,
+            DiagnosticCode::MultipleIterationDirectives,
+            DiagnosticCode::SelectWithoutOutput,
+            DiagnosticCode::FhirPathSyntax,
+            DiagnosticCode::UndeclaredConstant,
+        ];
+        // A stand-in value for every placeable any `vd-lint-*` message might
+        // interpolate — `t_args`, not the argument-free `t`, since most of
+        // these messages have no rendering at all without their args (a
+        // selector on a variable that isn't there fails the lookup
+        // entirely, rather than falling back to a partial string): this
+        // test only wants to know the key exists and produces *some*
+        // rendered sentence, not what any specific argument set says.
+        let placeholder_args: BTreeMap<String, String> = [
+            "found",
+            "key",
+            "suggestion",
+            "expected",
+            "name",
+            "variant",
+            "keys",
+            "detail",
+        ]
+        .into_iter()
+        .map(|arg| (arg.to_string(), "x".to_string()))
+        .collect();
+        let en = I18n { locale: &EN };
+        for code in codes {
+            let wire = match serde_json::to_value(code).unwrap() {
+                serde_json::Value::String(wire) => wire,
+                other => panic!("{code:?} did not serialize to a string: {other:?}"),
+            };
+            let key = format!("vd-lint-{wire}");
+            assert_ne!(
+                en.t_args(&key, &placeholder_args),
+                key,
+                "missing catalog key `{key}`"
+            );
+        }
     }
 
     #[test]

@@ -816,6 +816,1086 @@ mod postgres_integration {
     use testcontainers_modules::postgres::Postgres;
     use tokio::sync::{Mutex, OnceCell};
 
+    #[tokio::test]
+    async fn postgres_publication_exact_contract() {
+        use helios_persistence::core::{
+            BulkSubmitProvider, LeaseError, ManifestPublicationResult, ManifestPublicationStatus,
+            ManifestStatus, SubmissionId, SubmitFileRecord, SubmitWorkerStorage,
+        };
+
+        let _guard = BULK_SUBMIT_TEST_LOCK.lock().await;
+        let backend = create_backend().await;
+        let tenant = create_tenant("publication-exact-contract");
+        let submission = SubmissionId::generate("publication-exact-contract");
+        let manifest_url = "https://provider/publication-exact-contract.json";
+        backend
+            .create_submission(&tenant, &submission, None)
+            .await
+            .unwrap();
+        let manifest = backend
+            .add_manifest(&tenant, &submission, Some(manifest_url), None)
+            .await
+            .unwrap();
+        let lease = claim_specific_manifest(
+            &backend,
+            &helios_persistence::core::WorkerId::new(format!(
+                "publication-contract-worker-{}",
+                uuid::Uuid::new_v4().simple()
+            )),
+            &submission,
+            &manifest.manifest_id,
+            std::time::Duration::from_secs(60),
+        )
+        .await;
+        let output = SubmitFileRecord {
+            manifest_url: Some(manifest_url.to_string()),
+            file_type: "output".to_string(),
+            resource_type: Some("Patient".to_string()),
+            part_index: 0,
+            file_path: "output/patient-0.ndjson".to_string(),
+            line_count: 3,
+            byte_count: 128,
+            count_severity: None,
+        };
+        let error = SubmitFileRecord {
+            manifest_url: Some(manifest_url.to_string()),
+            file_type: "error".to_string(),
+            resource_type: Some("OperationOutcome".to_string()),
+            part_index: 0,
+            file_path: "error/outcome-0.ndjson".to_string(),
+            line_count: 1,
+            byte_count: 96,
+            count_severity: Some(serde_json::json!({"error": 2})),
+        };
+
+        backend.record_submit_file(&lease, &output).await.unwrap();
+        backend.record_submit_file(&lease, &output).await.unwrap();
+        assert!(
+            backend
+                .list_submit_files(&tenant, &submission)
+                .await
+                .unwrap()
+                .is_empty(),
+            "staged artifacts are not publication-visible"
+        );
+
+        let mut conflicting = output.clone();
+        conflicting.byte_count = 127;
+        assert!(
+            matches!(
+                backend.record_submit_file(&lease, &conflicting).await,
+                Err(LeaseError::Storage(_))
+            ),
+            "the same artifact identity cannot change staged byte_count"
+        );
+
+        assert_eq!(
+            backend
+                .publish_manifest_artifacts(
+                    &lease,
+                    &[output.clone(), error.clone()],
+                    ManifestPublicationStatus::Completed,
+                )
+                .await
+                .unwrap(),
+            ManifestPublicationResult::Published
+        );
+        let manifest = backend
+            .get_manifest(&tenant, &submission, &lease.manifest_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(manifest.status, ManifestStatus::Completed);
+        let rows = backend
+            .list_submit_files(&tenant, &submission)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        let row = rows
+            .iter()
+            .find(|row| row.file_type == "output")
+            .expect("published output row");
+        assert_eq!(row.manifest_url.as_deref(), Some(manifest_url));
+        assert_eq!(row.resource_type.as_deref(), Some("Patient"));
+        assert_eq!(row.part_index, 0);
+        assert_eq!(row.fencing_token, lease.fencing_token);
+        assert_eq!(row.file_path, "output/patient-0.ndjson");
+        assert_eq!(row.line_count, 3);
+        assert_eq!(row.byte_count, 128);
+        assert_eq!(row.count_severity, None);
+        let row = rows
+            .iter()
+            .find(|row| row.file_type == "error")
+            .expect("published error row");
+        assert_eq!(row.manifest_url.as_deref(), Some(manifest_url));
+        assert_eq!(row.resource_type.as_deref(), Some("OperationOutcome"));
+        assert_eq!(row.part_index, 0);
+        assert_eq!(row.fencing_token, lease.fencing_token);
+        assert_eq!(row.file_path, "error/outcome-0.ndjson");
+        assert_eq!(row.line_count, 1);
+        assert_eq!(row.byte_count, 96);
+        assert_eq!(row.count_severity, Some(serde_json::json!({"error": 2})));
+
+        assert_eq!(
+            backend
+                .publish_manifest_artifacts(
+                    &lease,
+                    &[error.clone(), output.clone()],
+                    ManifestPublicationStatus::Completed,
+                )
+                .await
+                .unwrap(),
+            ManifestPublicationResult::AlreadyPublished
+        );
+
+        let mut altered = output.clone();
+        altered.byte_count = 127;
+        assert!(
+            matches!(
+                backend
+                    .publish_manifest_artifacts(
+                        &lease,
+                        &[altered, error.clone()],
+                        ManifestPublicationStatus::Completed,
+                    )
+                    .await,
+                Err(LeaseError::Storage(_))
+            ),
+            "published byte_count cannot change on replay"
+        );
+        assert!(
+            matches!(
+                backend
+                    .publish_manifest_artifacts(
+                        &lease,
+                        &[output.clone(), error.clone()],
+                        ManifestPublicationStatus::Failed {
+                            error_message: "changed terminal".to_string(),
+                        },
+                    )
+                    .await,
+                Err(LeaseError::Storage(_))
+            ),
+            "published terminal status cannot change on replay"
+        );
+
+        assert!(
+            matches!(
+                backend
+                    .publish_manifest_artifacts(
+                        &helios_persistence::core::ManifestLease {
+                            worker_id: helios_persistence::core::WorkerId::new(
+                                "interloper".to_string()
+                            ),
+                            ..lease.clone()
+                        },
+                        &[output.clone(), error.clone()],
+                        ManifestPublicationStatus::Completed,
+                    )
+                    .await,
+                Err(LeaseError::LeaseLost { .. })
+            ),
+            "the same publication cannot be replayed by another worker"
+        );
+
+        assert_eq!(
+            backend
+                .publish_manifest_artifacts(
+                    &lease,
+                    &[output.clone(), error.clone()],
+                    ManifestPublicationStatus::Completed,
+                )
+                .await
+                .unwrap(),
+            ManifestPublicationResult::AlreadyPublished
+        );
+        assert_eq!(
+            backend
+                .list_submit_files(&tenant, &submission)
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn postgres_publication_fault_rollback_and_retry() {
+        use helios_persistence::core::{
+            BulkSubmitProvider, LeaseError, ManifestPublicationResult, ManifestPublicationStatus,
+            ManifestStatus, SubmissionId, SubmitFileRecord, SubmitWorkerStorage,
+        };
+
+        let _guard = BULK_SUBMIT_TEST_LOCK.lock().await;
+        let backend = create_backend().await;
+        let tenant = create_tenant("publication-fault-rollback");
+        let submission = SubmissionId::generate("publication-fault-rollback");
+        let manifest_url = "https://provider/publication-fault-rollback.json";
+        backend
+            .create_submission(&tenant, &submission, None)
+            .await
+            .unwrap();
+        let manifest = backend
+            .add_manifest(&tenant, &submission, Some(manifest_url), None)
+            .await
+            .unwrap();
+        let lease = claim_specific_manifest(
+            &backend,
+            &helios_persistence::core::WorkerId::new(format!(
+                "publication-fault-worker-{}",
+                uuid::Uuid::new_v4().simple()
+            )),
+            &submission,
+            &manifest.manifest_id,
+            std::time::Duration::from_secs(60),
+        )
+        .await;
+        let output = SubmitFileRecord {
+            manifest_url: Some(manifest_url.to_string()),
+            file_type: "output".to_string(),
+            resource_type: Some("Patient".to_string()),
+            part_index: 0,
+            file_path: "output/patient-0.ndjson".to_string(),
+            line_count: 3,
+            byte_count: 128,
+            count_severity: None,
+        };
+        let error = SubmitFileRecord {
+            manifest_url: Some(manifest_url.to_string()),
+            file_type: "error".to_string(),
+            resource_type: Some("OperationOutcome".to_string()),
+            part_index: 0,
+            file_path: "error/outcome-0.ndjson".to_string(),
+            line_count: 1,
+            byte_count: 96,
+            count_severity: Some(serde_json::json!({"error": 2})),
+        };
+
+        let client = backend.get_client().await.unwrap();
+        let identity_where = "tenant_id = $1 AND submitter = $2 AND submission_id = $3 \
+                              AND manifest_id = $4";
+        let tenant_id = lease.tenant.tenant_id().as_str();
+        let identity: [&(dyn tokio_postgres::types::ToSql + Sync); 4] = [
+            &tenant_id,
+            &lease.submission_id.submitter,
+            &lease.submission_id.submission_id,
+            &lease.manifest_id,
+        ];
+        let fault_worker = format!("publication-fault-{}", uuid::Uuid::new_v4().simple());
+        let insert_fn = format!(
+            "publication_fault_insert_fn_{}",
+            uuid::Uuid::new_v4().simple()
+        );
+        let insert_trigger = format!(
+            "publication_fault_insert_trigger_{}",
+            uuid::Uuid::new_v4().simple()
+        );
+        client
+            .batch_execute(&format!(
+                r#"
+                CREATE FUNCTION public.{insert_fn}() RETURNS trigger LANGUAGE plpgsql AS $body$
+                BEGIN
+                    UPDATE bulk_manifests
+                    SET worker_id = '{fault_worker}', fencing_token = fencing_token + 1
+                    WHERE tenant_id = NEW.tenant_id AND submitter = NEW.submitter
+                      AND submission_id = NEW.submission_id AND manifest_id = NEW.manifest_id;
+                    RETURN NEW;
+                END;
+                $body$;
+                CREATE TRIGGER {insert_trigger} AFTER INSERT ON bulk_submit_files
+                FOR EACH ROW
+                WHEN (NEW.tenant_id = '{tenant}' AND NEW.submitter = '{submitter}'
+                      AND NEW.submission_id = '{submission}' AND NEW.manifest_id = '{manifest_id}')
+                EXECUTE FUNCTION public.{insert_fn}();
+                "#,
+                tenant = lease.tenant.tenant_id(),
+                submitter = lease.submission_id.submitter,
+                submission = lease.submission_id.submission_id,
+                manifest_id = lease.manifest_id,
+            ))
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(
+                backend
+                    .publish_manifest_artifacts(
+                        &lease,
+                        &[output.clone(), error.clone()],
+                        ManifestPublicationStatus::Completed,
+                    )
+                    .await,
+                Err(LeaseError::LeaseLost { .. })
+            ),
+            "the active lease must no longer match the injected worker/token"
+        );
+        let raw_count = client
+            .query_one(
+                &format!("SELECT count(*) FROM bulk_submit_files WHERE {identity_where}"),
+                &identity,
+            )
+            .await
+            .unwrap()
+            .get::<_, i64>(0);
+        assert_eq!(raw_count, 0);
+        let marker = client
+            .query_one(
+                &format!(
+                    "SELECT worker_id, fencing_token, published_token, publication_status, \
+                     publication_error_message FROM bulk_manifests WHERE {identity_where}"
+                ),
+                &identity,
+            )
+            .await
+            .unwrap();
+        assert_eq!(marker.get::<_, String>(0), lease.worker_id.as_str());
+        assert_eq!(marker.get::<_, i64>(1), lease.fencing_token as i64);
+        assert_eq!(marker.get::<_, Option<i64>>(2), None);
+        assert_eq!(marker.get::<_, Option<String>>(3), None);
+        assert_eq!(marker.get::<_, Option<String>>(4), None);
+        client
+            .batch_execute(&format!(
+                "DROP TRIGGER IF EXISTS {insert_trigger} ON bulk_submit_files; \
+                 DROP FUNCTION IF EXISTS public.{insert_fn}();"
+            ))
+            .await
+            .unwrap();
+
+        let update_fn = format!(
+            "publication_fault_update_fn_{}",
+            uuid::Uuid::new_v4().simple()
+        );
+        let update_trigger = format!(
+            "publication_fault_update_trigger_{}",
+            uuid::Uuid::new_v4().simple()
+        );
+        client
+            .batch_execute(&format!(
+                r#"
+                CREATE FUNCTION public.{update_fn}() RETURNS trigger LANGUAGE plpgsql AS $body$
+                BEGIN
+                    IF NEW.published_token IS NOT NULL AND NEW.tenant_id = '{tenant}'
+                       AND NEW.submitter = '{submitter}' AND NEW.submission_id = '{submission}'
+                       AND NEW.manifest_id = '{manifest_id}' THEN
+                        RAISE EXCEPTION 'publication injected terminal failure';
+                    END IF;
+                    RETURN NEW;
+                END;
+                $body$;
+                CREATE TRIGGER {update_trigger} BEFORE UPDATE ON bulk_manifests
+                FOR EACH ROW EXECUTE FUNCTION public.{update_fn}();
+                "#,
+                tenant = lease.tenant.tenant_id(),
+                submitter = lease.submission_id.submitter,
+                submission = lease.submission_id.submission_id,
+                manifest_id = lease.manifest_id,
+            ))
+            .await
+            .unwrap();
+        let Err(LeaseError::Storage(storage_error)) = backend
+            .publish_manifest_artifacts(
+                &lease,
+                &[output.clone(), error.clone()],
+                ManifestPublicationStatus::Completed,
+            )
+            .await
+        else {
+            panic!("the BEFORE UPDATE fault must surface as a storage error");
+        };
+        assert!(matches!(
+            storage_error,
+            helios_persistence::error::StorageError::Backend(
+                helios_persistence::error::BackendError::Internal { .. }
+            )
+        ));
+        assert!(storage_error.to_string().contains("publish manifest:"));
+        let raw_count = client
+            .query_one(
+                &format!("SELECT count(*) FROM bulk_submit_files WHERE {identity_where}"),
+                &identity,
+            )
+            .await
+            .unwrap()
+            .get::<_, i64>(0);
+        assert_eq!(raw_count, 0);
+        let marker = client
+            .query_one(
+                &format!(
+                    "SELECT worker_id, fencing_token, published_token, publication_status, \
+                     publication_error_message FROM bulk_manifests WHERE {identity_where}"
+                ),
+                &identity,
+            )
+            .await
+            .unwrap();
+        assert_eq!(marker.get::<_, String>(0), lease.worker_id.as_str());
+        assert_eq!(marker.get::<_, i64>(1), lease.fencing_token as i64);
+        assert_eq!(marker.get::<_, Option<i64>>(2), None);
+        assert_eq!(marker.get::<_, Option<String>>(3), None);
+        assert_eq!(marker.get::<_, Option<String>>(4), None);
+        client
+            .batch_execute(&format!(
+                "DROP TRIGGER IF EXISTS {update_trigger} ON bulk_manifests; \
+                 DROP FUNCTION IF EXISTS public.{update_fn}();"
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            backend
+                .publish_manifest_artifacts(
+                    &lease,
+                    &[output.clone(), error.clone()],
+                    ManifestPublicationStatus::Completed,
+                )
+                .await
+                .unwrap(),
+            ManifestPublicationResult::Published
+        );
+        let rows = backend
+            .list_submit_files(&tenant, &submission)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        for expected in [&output, &error] {
+            let row = rows
+                .iter()
+                .find(|row| row.file_type == expected.file_type)
+                .expect("published row");
+            assert_eq!(row.file_path, expected.file_path);
+            assert_eq!(row.fencing_token, lease.fencing_token);
+        }
+        let manifest = backend
+            .get_manifest(&tenant, &submission, &lease.manifest_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(manifest.status, ManifestStatus::Completed);
+        assert_eq!(
+            backend
+                .publish_manifest_artifacts(
+                    &lease,
+                    &[error.clone(), output],
+                    ManifestPublicationStatus::Completed,
+                )
+                .await
+                .unwrap(),
+            ManifestPublicationResult::AlreadyPublished
+        );
+    }
+
+    #[tokio::test]
+    async fn postgres_publication_expiry_reclaim_scope_and_replay() {
+        use helios_persistence::core::{
+            BulkSubmitProvider, LeaseError, ManifestPublicationResult, ManifestPublicationStatus,
+            ManifestStatus, SubmissionId, SubmitFileRecord, SubmitWorkerStorage,
+        };
+
+        let _guard = BULK_SUBMIT_TEST_LOCK.lock().await;
+        let backend = create_backend().await;
+        let tenant = create_tenant("publication-expiry-scope");
+        let submission = SubmissionId::generate("publication-expiry-scope");
+        backend
+            .create_submission(&tenant, &submission, None)
+            .await
+            .unwrap();
+        let manifest = backend
+            .add_manifest(
+                &tenant,
+                &submission,
+                Some("https://provider/publication-expiry-scope.json"),
+                None,
+            )
+            .await
+            .unwrap();
+        let expired_unreclaimed = claim_specific_manifest(
+            &backend,
+            &helios_persistence::core::WorkerId::new(format!(
+                "publication-expiry-worker-{}",
+                uuid::Uuid::new_v4().simple()
+            )),
+            &submission,
+            &manifest.manifest_id,
+            std::time::Duration::from_secs(60),
+        )
+        .await;
+        let client = backend.get_client().await.unwrap();
+        let expired_tenant_id = expired_unreclaimed.tenant.tenant_id().as_str();
+        client
+            .execute(
+                "UPDATE bulk_manifests SET lease_expiry = NOW() - INTERVAL '1 second' \
+                 WHERE tenant_id = $1 AND submitter = $2 AND submission_id = $3 \
+                   AND manifest_id = $4",
+                &[
+                    &expired_tenant_id as &(dyn tokio_postgres::types::ToSql + Sync),
+                    &expired_unreclaimed.submission_id.submitter,
+                    &expired_unreclaimed.submission_id.submission_id,
+                    &expired_unreclaimed.manifest_id,
+                ],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            backend
+                .publish_manifest_artifacts(
+                    &expired_unreclaimed,
+                    &[],
+                    ManifestPublicationStatus::Completed,
+                )
+                .await
+                .unwrap(),
+            ManifestPublicationResult::Published,
+            "expiry alone does not fence an unreclaimed live lease"
+        );
+
+        let stale_url = "https://provider/publication-expiry-scope-stale.json";
+        let reclaim_seed = backend
+            .add_manifest(&tenant, &submission, Some(stale_url), None)
+            .await
+            .unwrap();
+        let stale = claim_specific_manifest(
+            &backend,
+            &helios_persistence::core::WorkerId::new(format!(
+                "publication-stale-worker-{}",
+                uuid::Uuid::new_v4().simple()
+            )),
+            &submission,
+            &reclaim_seed.manifest_id,
+            std::time::Duration::from_secs(60),
+        )
+        .await;
+        let stale_tenant_id = stale.tenant.tenant_id().as_str();
+        client
+            .execute(
+                "UPDATE bulk_manifests SET lease_expiry = NOW() - INTERVAL '1 second' \
+                 WHERE tenant_id = $1 AND submitter = $2 AND submission_id = $3 \
+                   AND manifest_id = $4",
+                &[
+                    &stale_tenant_id as &(dyn tokio_postgres::types::ToSql + Sync),
+                    &stale.submission_id.submitter,
+                    &stale.submission_id.submission_id,
+                    &stale.manifest_id,
+                ],
+            )
+            .await
+            .unwrap();
+        let lease = claim_specific_manifest(
+            &backend,
+            &helios_persistence::core::WorkerId::new(format!(
+                "publication-live-worker-{}",
+                uuid::Uuid::new_v4().simple()
+            )),
+            &submission,
+            &reclaim_seed.manifest_id,
+            std::time::Duration::from_secs(60),
+        )
+        .await;
+        assert!(lease.fencing_token > stale.fencing_token);
+        let error = SubmitFileRecord {
+            manifest_url: Some(stale_url.to_string()),
+            file_type: "error".to_string(),
+            resource_type: Some("OperationOutcome".to_string()),
+            part_index: 0,
+            file_path: format!("error/{}.ndjson", lease.manifest_id),
+            line_count: 2,
+            byte_count: 128,
+            count_severity: Some(serde_json::json!({"error": 2})),
+        };
+        let failure_message = format!("reclaimed publication {}", lease.fencing_token);
+        assert!(matches!(
+            backend
+                .publish_manifest_artifacts(
+                    &stale,
+                    std::slice::from_ref(&error),
+                    ManifestPublicationStatus::Failed {
+                        error_message: failure_message.clone(),
+                    },
+                )
+                .await,
+            Err(LeaseError::LeaseLost { .. })
+        ));
+        assert!(
+            backend
+                .list_submit_files(&tenant, &submission)
+                .await
+                .unwrap()
+                .is_empty(),
+            "the stale publication must not expose its rejected set"
+        );
+        assert_eq!(
+            backend
+                .publish_manifest_artifacts(
+                    &lease,
+                    std::slice::from_ref(&error),
+                    ManifestPublicationStatus::Failed {
+                        error_message: failure_message.clone(),
+                    },
+                )
+                .await
+                .unwrap(),
+            ManifestPublicationResult::Published
+        );
+        let live_manifest = backend
+            .get_manifest(&tenant, &submission, &lease.manifest_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(live_manifest.status, ManifestStatus::Failed);
+        let rows = backend
+            .list_submit_files(&tenant, &submission)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row.file_type, "error");
+        assert_eq!(row.resource_type.as_deref(), Some("OperationOutcome"));
+        assert_eq!(row.part_index, 0);
+        assert_eq!(row.fencing_token, lease.fencing_token);
+        assert_eq!(row.file_path, error.file_path);
+        assert_eq!(row.line_count, 2);
+        assert_eq!(row.byte_count, 128);
+        assert_eq!(row.count_severity, Some(serde_json::json!({"error": 2})));
+        assert_eq!(
+            backend
+                .publish_manifest_artifacts(
+                    &lease,
+                    std::slice::from_ref(&error),
+                    ManifestPublicationStatus::Failed {
+                        error_message: failure_message.clone(),
+                    },
+                )
+                .await
+                .unwrap(),
+            ManifestPublicationResult::AlreadyPublished
+        );
+        assert!(matches!(
+            backend
+                .publish_manifest_artifacts(
+                    &lease,
+                    std::slice::from_ref(&error),
+                    ManifestPublicationStatus::Failed {
+                        error_message: "different terminal message".to_string(),
+                    },
+                )
+                .await,
+            Err(LeaseError::Storage(_))
+        ));
+
+        let coexist_url = "https://provider/publication-expiry-scope-coexist.json";
+        let coexist_manifest = backend
+            .add_manifest(&tenant, &submission, Some(coexist_url), None)
+            .await
+            .unwrap();
+        let coexist_lease = claim_specific_manifest(
+            &backend,
+            &helios_persistence::core::WorkerId::new(format!(
+                "publication-coexist-worker-{}",
+                uuid::Uuid::new_v4().simple()
+            )),
+            &submission,
+            &coexist_manifest.manifest_id,
+            std::time::Duration::from_secs(60),
+        )
+        .await;
+        let mut coexist_lease = coexist_lease;
+        coexist_lease.fencing_token = lease.fencing_token;
+        client
+            .execute(
+                "UPDATE bulk_manifests SET fencing_token = $1 \
+                 WHERE tenant_id = $2 AND submitter = $3 AND submission_id = $4 \
+                   AND manifest_id = $5",
+                &[
+                    &(coexist_lease.fencing_token as i64),
+                    &coexist_lease.tenant.tenant_id().as_str(),
+                    &coexist_lease.submission_id.submitter,
+                    &coexist_lease.submission_id.submission_id,
+                    &coexist_lease.manifest_id,
+                ],
+            )
+            .await
+            .unwrap();
+        let coexist = SubmitFileRecord {
+            manifest_url: Some(coexist_url.to_string()),
+            file_path: format!("error/{}.ndjson", coexist_lease.manifest_id),
+            ..error.clone()
+        };
+        backend
+            .record_submit_file(&coexist_lease, &coexist)
+            .await
+            .unwrap();
+        assert_eq!(
+            backend
+                .publish_manifest_artifacts(
+                    &coexist_lease,
+                    std::slice::from_ref(&coexist),
+                    ManifestPublicationStatus::Completed,
+                )
+                .await
+                .unwrap(),
+            ManifestPublicationResult::Published
+        );
+        let rows = backend
+            .list_submit_files(&tenant, &submission)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|row| row.file_type == "error"
+            && row.resource_type.as_deref() == Some("OperationOutcome")
+            && row.part_index == 0
+            && row.fencing_token == lease.fencing_token));
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.manifest_id.as_deref())
+                .collect::<Vec<_>>(),
+            vec![
+                Some(lease.manifest_id.as_str()),
+                Some(coexist_lease.manifest_id.as_str())
+            ]
+        );
+        let other_tenant = create_tenant("publication-scope-other");
+        assert!(
+            backend
+                .list_submit_files(&other_tenant, &submission)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            backend
+                .list_submit_files(&tenant, &SubmissionId::generate("publication-scope-other"))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let _ = client;
+    }
+
+    #[tokio::test]
+    async fn postgres_publication_concurrency_and_cleanup_rollback() {
+        use helios_persistence::core::{
+            BulkSubmitProvider, LeaseError, ManifestPublicationResult, ManifestPublicationStatus,
+            SubmissionId, SubmitFileRecord, SubmitWorkerStorage,
+        };
+
+        let _guard = BULK_SUBMIT_TEST_LOCK.lock().await;
+        let backend = create_backend().await;
+        let tenant = create_tenant("publication-cleanup");
+        let submission = SubmissionId::generate("publication-cleanup");
+        let manifest_url = "https://provider/publication-cleanup.json";
+        backend
+            .create_submission(&tenant, &submission, None)
+            .await
+            .unwrap();
+        let manifest = backend
+            .add_manifest(&tenant, &submission, Some(manifest_url), None)
+            .await
+            .unwrap();
+        let lease = claim_specific_manifest(
+            &backend,
+            &helios_persistence::core::WorkerId::new(format!(
+                "publication-cleanup-worker-{}",
+                uuid::Uuid::new_v4().simple()
+            )),
+            &submission,
+            &manifest.manifest_id,
+            std::time::Duration::from_secs(60),
+        )
+        .await;
+        let output = SubmitFileRecord {
+            manifest_url: Some(manifest_url.to_string()),
+            file_type: "output".to_string(),
+            resource_type: Some("Patient".to_string()),
+            part_index: 0,
+            file_path: "output/patient-0.ndjson".to_string(),
+            line_count: 3,
+            byte_count: 128,
+            count_severity: None,
+        };
+        let error = SubmitFileRecord {
+            manifest_url: Some(manifest_url.to_string()),
+            file_type: "error".to_string(),
+            resource_type: Some("OperationOutcome".to_string()),
+            part_index: 0,
+            file_path: "error/outcome-0.ndjson".to_string(),
+            line_count: 1,
+            byte_count: 96,
+            count_severity: Some(serde_json::json!({"error": 2})),
+        };
+        backend.record_submit_file(&lease, &output).await.unwrap();
+        backend.record_submit_file(&lease, &error).await.unwrap();
+        let set = [output.clone(), error.clone()];
+        let (first, second) = tokio::join!(
+            backend.publish_manifest_artifacts(&lease, &set, ManifestPublicationStatus::Completed,),
+            backend.publish_manifest_artifacts(&lease, &set, ManifestPublicationStatus::Completed,),
+        );
+        let results = [first.unwrap(), second.unwrap()];
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| **result == ManifestPublicationResult::Published)
+                .count(),
+            1
+        );
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| **result == ManifestPublicationResult::AlreadyPublished)
+                .count(),
+            1
+        );
+
+        let client = backend.get_client().await.unwrap();
+        let tenant_id = lease.tenant.tenant_id().as_str();
+        let where_clause = "tenant_id = $1 AND submitter = $2 AND submission_id = $3";
+        let identity: [&(dyn tokio_postgres::types::ToSql + Sync); 3] = [
+            &tenant_id,
+            &lease.submission_id.submitter,
+            &lease.submission_id.submission_id,
+        ];
+        let cleanup_fn = format!("publication_cleanup_fn_{}", uuid::Uuid::new_v4().simple());
+        let cleanup_trigger = format!(
+            "publication_cleanup_trigger_{}",
+            uuid::Uuid::new_v4().simple()
+        );
+        client
+            .batch_execute(&format!(
+                r#"
+                CREATE FUNCTION public.{cleanup_fn}() RETURNS trigger LANGUAGE plpgsql AS $body$
+                BEGIN
+                    RAISE EXCEPTION 'cleanup injected terminal failure';
+                END;
+                $body$;
+                CREATE TRIGGER {cleanup_trigger} BEFORE UPDATE OF published_token ON bulk_manifests
+                FOR EACH ROW
+                WHEN (OLD.published_token IS NOT NULL AND NEW.published_token IS NULL
+                      AND NEW.tenant_id = '{tenant_id}'
+                      AND NEW.submitter = '{submitter}'
+                      AND NEW.submission_id = '{submission_id}')
+                EXECUTE FUNCTION public.{cleanup_fn}();
+                "#,
+                tenant_id = lease.tenant.tenant_id(),
+                submitter = lease.submission_id.submitter,
+                submission_id = lease.submission_id.submission_id,
+            ))
+            .await
+            .unwrap();
+        let Err(storage_error) = backend
+            .delete_submission_artifacts(&tenant, &submission)
+            .await
+        else {
+            panic!("cleanup marker reset must fail while the trigger is installed");
+        };
+        assert!(
+            storage_error
+                .to_string()
+                .contains("clear publication markers:"),
+            "PG Display must retain the backend stage context, got {storage_error}"
+        );
+        let raw_count = client
+            .query_one(
+                &format!("SELECT count(*) FROM bulk_submit_files WHERE {where_clause}"),
+                &identity,
+            )
+            .await
+            .unwrap()
+            .get::<_, i64>(0);
+        assert_eq!(raw_count, 2);
+        let marker = client
+            .query_one(
+                &format!(
+                    "SELECT published_token, publication_status, publication_error_message, \
+                     publication_worker_id FROM bulk_manifests WHERE {where_clause}"
+                ),
+                &identity,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            marker.get::<_, Option<i64>>(0),
+            Some(lease.fencing_token as i64)
+        );
+        assert_eq!(
+            marker.get::<_, Option<String>>(1),
+            Some("completed".to_string())
+        );
+        assert_eq!(marker.get::<_, Option<String>>(2), None);
+        assert_eq!(
+            marker.get::<_, Option<String>>(3),
+            Some(lease.worker_id.as_str().to_string())
+        );
+        client
+            .batch_execute(&format!(
+                "DROP TRIGGER IF EXISTS {cleanup_trigger} ON bulk_manifests; \
+                 DROP FUNCTION IF EXISTS public.{cleanup_fn}();"
+            ))
+            .await
+            .unwrap();
+        backend
+            .delete_submission_artifacts(&tenant, &submission)
+            .await
+            .unwrap();
+        let raw_count = client
+            .query_one(
+                &format!("SELECT count(*) FROM bulk_submit_files WHERE {where_clause}"),
+                &identity,
+            )
+            .await
+            .unwrap()
+            .get::<_, i64>(0);
+        assert_eq!(raw_count, 0);
+        assert!(matches!(
+            backend
+                .publish_manifest_artifacts(
+                    &lease,
+                    &[output, error],
+                    ManifestPublicationStatus::Completed,
+                )
+                .await,
+            Err(LeaseError::LeaseLost { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn postgres_replaced_manifest_process_entries_does_not_revive_publication() {
+        use helios_persistence::core::LeaseError;
+        use helios_persistence::core::{
+            BulkSubmitProvider, ManifestPublicationStatus, ManifestStatus, SubmissionId,
+            SubmitWorkerStorage,
+        };
+
+        let _guard = BULK_SUBMIT_TEST_LOCK.lock().await;
+        let backend = create_backend().await;
+        let tenant = create_tenant("replacement-guard");
+        let submission = SubmissionId::generate("replacement-guard");
+        let manifest_url = "https://provider/replacement-guard.json";
+        backend
+            .create_submission(&tenant, &submission, None)
+            .await
+            .unwrap();
+        let manifest = backend
+            .add_manifest(&tenant, &submission, Some(manifest_url), None)
+            .await
+            .unwrap();
+        let lease = claim_specific_manifest(
+            &backend,
+            &helios_persistence::core::WorkerId::new(format!(
+                "replacement-guard-worker-{}",
+                uuid::Uuid::new_v4().simple()
+            )),
+            &submission,
+            &manifest.manifest_id,
+            std::time::Duration::from_secs(60),
+        )
+        .await;
+        backend
+            .replace_manifest_by_url(&tenant, &submission, manifest_url)
+            .await
+            .unwrap();
+
+        backend
+            .process_entries(
+                &tenant,
+                &submission,
+                &manifest.manifest_id,
+                Vec::new(),
+                &helios_persistence::core::BulkProcessingOptions::new(),
+            )
+            .await
+            .unwrap();
+        let manifest = backend
+            .get_manifest(&tenant, &submission, &manifest.manifest_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            manifest.status,
+            ManifestStatus::Replaced,
+            "an empty ingest must not revive a replaced manifest"
+        );
+        assert!(
+            matches!(
+                backend
+                    .publish_manifest_artifacts(&lease, &[], ManifestPublicationStatus::Completed,)
+                    .await,
+                Err(LeaseError::LeaseLost { .. })
+            ),
+            "the old lease must lose publication after replacement"
+        );
+    }
+
+    mod receipt_paging_contract {
+        use helios_persistence as persistence;
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/bulk_submit/paging_contract.rs"
+        ));
+    }
+
+    mod receipt_consumer_contract {
+        use helios_persistence as persistence;
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/bulk_submit/consumer_contract.rs"
+        ));
+    }
+
+    #[tokio::test]
+    async fn postgres_bulk_submit_worker_exact_artifacts_across_pages() {
+        let _guard = BULK_SUBMIT_TEST_LOCK.lock().await;
+        receipt_consumer_contract::worker_receipts(
+            std::sync::Arc::new(create_backend().await),
+            &create_tenant("receipt-worker"),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn postgres_bulk_submit_composite_deduplicates_all_pages_on_finish_and_failure() {
+        let _guard = BULK_SUBMIT_TEST_LOCK.lock().await;
+        for (fail, secondary_failure) in
+            [(false, false), (true, false), (false, true), (true, true)]
+        {
+            receipt_consumer_contract::composite_receipts(
+                std::sync::Arc::new(create_backend().await),
+                &create_tenant("receipt-composite"),
+                BackendKind::Postgres,
+                fail,
+                secondary_failure,
+            )
+            .await;
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl receipt_paging_contract::ReceiptFixture for PostgresBackend {
+        async fn seed_receipts(
+            &self,
+            tenant: &TenantContext,
+            submission: &helios_persistence::core::SubmissionId,
+            manifest: &str,
+            rows: &[receipt_paging_contract::ReceiptRow],
+        ) {
+            let client = self.get_client().await.unwrap();
+            let tid = tenant.tenant_id().as_str();
+            client.execute("INSERT INTO bulk_submissions (tenant_id,submitter,submission_id,status,created_at,updated_at) VALUES ($1,$2,$3,'complete',NOW(),NOW()) ON CONFLICT DO NOTHING", &[&tid, &submission.submitter, &submission.submission_id]).await.unwrap();
+            client.execute("INSERT INTO bulk_manifests (tenant_id,submitter,submission_id,manifest_id,status,added_at) VALUES ($1,$2,$3,$4,'completed',NOW()) ON CONFLICT DO NOTHING", &[&tid, &submission.submitter, &submission.submission_id, &manifest]).await.unwrap();
+            for row in rows {
+                let line = i32::try_from(row.line).unwrap();
+                client.execute("INSERT INTO bulk_entry_results (tenant_id,submitter,submission_id,manifest_id,file_url,line_number,resource_type,resource_id,outcome) VALUES ($1,$2,$3,$4,$5,$6,'Patient',$7,$8)", &[&tid, &submission.submitter, &submission.submission_id, &manifest, &row.file, &line, &row.id, &row.outcome]).await.unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn postgres_bulk_submit_exact_keyset_pages() {
+        receipt_paging_contract::exact_sql_pages(
+            &create_backend().await,
+            &create_tenant("receipt-pages"),
+            i64::from(i32::MAX),
+        )
+        .await;
+    }
+
     /// Shared PostgreSQL container reused across all tests in this module.
     struct SharedPg {
         host: String,
@@ -5691,6 +6771,167 @@ mod postgres_integration {
             .await
             .unwrap();
         assert_eq!(ok.version, 2);
+    }
+
+    /// A dedicated backend with one physical connection per writer, so a
+    /// concurrency test can put every racer in flight at once instead of
+    /// queuing behind `create_backend`'s shared 5-connection pool. Mirrors
+    /// `postgres_integration_concurrent_pool_connections_all_carry_statement_timeout`'s
+    /// pattern of building a bespoke config against the shared container.
+    async fn create_backend_with_pool_size(pool_size: usize) -> PostgresBackend {
+        let pg = shared_pg().await;
+        let data_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .map(|p| p.join("data"))
+            .unwrap_or_else(|| PathBuf::from("data"));
+        let config = PostgresConfig {
+            host: pg.host.clone(),
+            port: pg.port,
+            dbname: "postgres".to_string(),
+            user: "postgres".to_string(),
+            password: Some("postgres".to_string()),
+            max_connections: pool_size,
+            data_dir: Some(data_dir),
+            ..Default::default()
+        };
+        PostgresBackend::new(config)
+            .await
+            .expect("Failed to create PostgresBackend")
+    }
+
+    /// Forces `count` physical connections into existence and back into the
+    /// idle pool before a race starts.
+    ///
+    /// deadpool creates connections lazily, and establishing a fresh one
+    /// (TCP handshake + PostgreSQL startup/auth) can take longer than the
+    /// whole read-modify-write these concurrency tests race — so on a cold
+    /// pool, a barrier-released batch can end up serialized by connection
+    /// setup alone: writer 1 finishes its entire transaction while writer 2
+    /// is still waiting for its connection, which defeats the test. Holding
+    /// `count` clients at once (forcing that many distinct connections) and
+    /// then dropping them back into the pool removes that confound.
+    async fn warm_pool(backend: &PostgresBackend, count: usize) {
+        let mut clients = Vec::with_capacity(count);
+        for _ in 0..count {
+            clients.push(backend.get_client().await.expect("warm connection"));
+        }
+        drop(clients);
+    }
+
+    /// A user's very first write is the case `SELECT … FOR UPDATE` cannot
+    /// protect on its own: with no row yet, there is nothing for the lock to
+    /// block on, so racing writers must instead serialize on
+    /// `write_settings`'s `pg_advisory_xact_lock`. Without it, every racer
+    /// reads `None`, computes `new_version = 1` from an empty document, and
+    /// the `INSERT … ON CONFLICT DO UPDATE` losers silently overwrite the
+    /// winner — a lost update on creation. Firing many unconditional
+    /// single-key patches at a brand-new user key and requiring every key to
+    /// survive, with the version landing on exactly the writer count, is the
+    /// same shape as `mongodb_integration_settings_concurrent_patches_serialize`.
+    ///
+    /// Runs on a multi-thread runtime with a dedicated pool sized to the
+    /// writer count and a [`tokio::sync::Barrier`] releasing every task at
+    /// once — a single-threaded runtime, or a shared pool a racer might queue
+    /// behind, can make the whole batch execute close enough to sequentially
+    /// that even the unfixed code never actually hits the race.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn postgres_integration_settings_concurrent_first_writes_never_lose_an_update() {
+        use std::sync::Arc;
+
+        const WRITERS: usize = 8;
+        let backend = Arc::new(create_backend_with_pool_size(WRITERS).await);
+        warm_pool(&backend, WRITERS).await;
+        let user = unique_user_key("concurrent-first-write");
+        let barrier = Arc::new(tokio::sync::Barrier::new(WRITERS));
+
+        let mut handles = Vec::with_capacity(WRITERS);
+        for i in 0..WRITERS {
+            let backend = backend.clone();
+            let user = user.clone();
+            let barrier = barrier.clone();
+            handles.push(tokio::spawn(async move {
+                barrier.wait().await;
+                backend
+                    .patch_settings(&user, json!({ format!("k{i}"): i }), None)
+                    .await
+            }));
+        }
+        for h in handles {
+            h.await
+                .expect("patch task panicked")
+                .expect("patch_settings failed");
+        }
+
+        let final_doc = backend
+            .get_settings(&user)
+            .await
+            .unwrap()
+            .expect("settings document missing after concurrent first writes");
+        let obj = final_doc.document.as_object().unwrap();
+        for i in 0..WRITERS {
+            assert_eq!(
+                obj.get(&format!("k{i}")),
+                Some(&json!(i)),
+                "key k{i} was lost to a read-modify-write race on the user's first write"
+            );
+        }
+        // WRITERS patches, each a distinct successful write from version 0 upward.
+        assert_eq!(final_doc.version, WRITERS as i64);
+    }
+
+    /// The `if_match_version = Some(0)` half of the same race: every racer
+    /// asserts "this user does not exist yet", so exactly one `put_settings`
+    /// call may succeed and the rest must observe the loser's own creation as
+    /// an optimistic-lock conflict — never a raw backend error, and never a
+    /// second silent `Ok`. Uses the same error shape as
+    /// `postgres_integration_settings_optimistic_lock`.
+    ///
+    /// Same multi-thread + dedicated-pool + barrier setup as
+    /// `postgres_integration_settings_concurrent_first_writes_never_lose_an_update`,
+    /// for the same reason: this must exercise real concurrent creates, not a
+    /// batch that happens to run one at a time.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn postgres_integration_settings_concurrent_creates_have_a_single_winner() {
+        use std::sync::Arc;
+
+        const WRITERS: usize = 8;
+        let backend = Arc::new(create_backend_with_pool_size(WRITERS).await);
+        warm_pool(&backend, WRITERS).await;
+        let user = unique_user_key("concurrent-create");
+        let barrier = Arc::new(tokio::sync::Barrier::new(WRITERS));
+
+        let mut handles = Vec::with_capacity(WRITERS);
+        for i in 0..WRITERS {
+            let backend = backend.clone();
+            let user = user.clone();
+            let barrier = barrier.clone();
+            handles.push(tokio::spawn(async move {
+                barrier.wait().await;
+                backend
+                    .put_settings(&user, json!({"createdBy": i}), Some(0))
+                    .await
+            }));
+        }
+
+        let mut ok_count = 0;
+        let mut conflict_count = 0;
+        for h in handles {
+            match h.await.expect("put task panicked") {
+                Ok(stored) => {
+                    ok_count += 1;
+                    assert_eq!(stored.version, 1);
+                }
+                Err(StorageError::Concurrency(ConcurrencyError::OptimisticLockFailure {
+                    ..
+                })) => {
+                    conflict_count += 1;
+                }
+                Err(other) => panic!("expected an optimistic-lock conflict, got {other:?}"),
+            }
+        }
+        assert_eq!(ok_count, 1, "exactly one create should win the race");
+        assert_eq!(conflict_count, WRITERS - 1);
     }
 
     /// Issue #313: a tenant purge must reach the PHI-derived query strings a

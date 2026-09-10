@@ -41,14 +41,26 @@ pub struct SeedOutcome {
     pub failed: usize,
 }
 
-/// Writes every resource of `resource_type` for `tenant`, fanning creates out
-/// at the backend's [`bulk_write_concurrency`] so latency-bound backends (one
-/// PUT per resource on S3, one round trip per row on networked databases) pay
-/// round-trips-divided-by-fanout rather than their sum. `AlreadyExists` counts
-/// as already-seeded. Any other error is retried twice with a short backoff —
+/// How many resources go into one [`create_many`] call. Large enough that a
+/// backend with a native batch write sees the seed as a handful of requests
+/// (and, under Elasticsearch `refresh=wait_for`, a handful of refresh waits);
+/// small enough that a failed batch's individual retries stay cheap.
+///
+/// [`create_many`]: ResourceStorage::create_many
+const SEED_BATCH_SIZE: usize = 256;
+
+/// Writes every resource of `resource_type` for `tenant` in
+/// [`SEED_BATCH_SIZE`] batches through [`create_many`], whose default fans
+/// creates out at the backend's [`bulk_write_concurrency`] so latency-bound
+/// backends (one PUT per resource on S3, one round trip per row on networked
+/// databases) pay round-trips-divided-by-fanout rather than their sum, and
+/// whose overrides (Elasticsearch, and a composite feeding it) make each batch
+/// one request. `AlreadyExists` counts as already-seeded. Any other error is
+/// retried resource-by-resource, twice each with a short backoff —
 /// shared-cache SQLite surfaces reader/writer overlap as an immediate `table
 /// is locked` error rather than waiting — before counting as failed.
 ///
+/// [`create_many`]: ResourceStorage::create_many
 /// [`bulk_write_concurrency`]: ResourceStorage::bulk_write_concurrency
 async fn create_all<S>(
     storage: &S,
@@ -61,10 +73,19 @@ where
     S: ResourceStorage + ?Sized,
 {
     let concurrency = storage.bulk_write_concurrency().clamp(1, 32);
-    write_all(
+    write_batched(
+        SEED_BATCH_SIZE,
         concurrency,
         resource_type,
         resources,
+        |batch| async move {
+            storage
+                .create_many(tenant, resource_type, batch, fhir_version)
+                .await
+                .into_iter()
+                .map(|result| result.map(|_| ()))
+                .collect()
+        },
         |resource| async move {
             storage
                 .create(tenant, resource_type, resource, fhir_version)
@@ -73,6 +94,61 @@ where
         },
     )
     .await
+}
+
+/// The batching core of [`create_all`], parameterized over the batch write
+/// and the single write so it can be exercised without a storage backend.
+///
+/// Each batch of `batch_size` goes through `create_many`, which answers one
+/// result per resource in order. Resources it created or found existing are
+/// settled; the rest — a transient error, or a short answer from a backend
+/// that dropped part of the batch — fall through to [`write_all`], which
+/// retries them one at a time.
+async fn write_batched<M, MFut, F, Fut>(
+    batch_size: usize,
+    concurrency: usize,
+    resource_type: &'static str,
+    resources: Vec<Value>,
+    create_many: M,
+    create: F,
+) -> SeedOutcome
+where
+    M: Fn(Vec<Value>) -> MFut,
+    MFut: Future<Output = Vec<StorageResult<()>>>,
+    F: Fn(Value) -> Fut,
+    Fut: Future<Output = StorageResult<()>>,
+{
+    let mut outcome = SeedOutcome {
+        created: 0,
+        existing: 0,
+        failed: 0,
+    };
+    let mut retry = Vec::new();
+    for batch in resources.chunks(batch_size.max(1)) {
+        let mut results = create_many(batch.to_vec()).await.into_iter();
+        for resource in batch {
+            match results.next() {
+                Some(Ok(())) => outcome.created += 1,
+                Some(Err(StorageError::Resource(ResourceError::AlreadyExists { .. }))) => {
+                    outcome.existing += 1;
+                }
+                Some(Err(e)) => {
+                    tracing::debug!(
+                        "{resource_type} seeding: batch write failed, retrying individually: {e}"
+                    );
+                    retry.push(resource.clone());
+                }
+                None => retry.push(resource.clone()),
+            }
+        }
+    }
+    if !retry.is_empty() {
+        let retried = write_all(concurrency, resource_type, retry, create).await;
+        outcome.created += retried.created;
+        outcome.existing += retried.existing;
+        outcome.failed += retried.failed;
+    }
+    outcome
 }
 
 /// The fanout/retry core of [`create_all`], parameterized over the write so it
@@ -418,5 +494,94 @@ mod tests {
     async fn zero_concurrency_is_clamped_not_deadlocked() {
         let outcome = write_all(0, "SearchParameter", resources(3), |_| async { Ok(()) }).await;
         assert_eq!(outcome.created, 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn batches_settle_through_create_many_and_only_rejects_fall_back() {
+        let batch_calls = AtomicUsize::new(0);
+        let single_calls = AtomicUsize::new(0);
+        let outcome = write_batched(
+            2,
+            1,
+            "SearchParameter",
+            resources(5),
+            |batch| {
+                batch_calls.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    batch
+                        .into_iter()
+                        .map(|resource| match resource["id"].as_str() {
+                            Some("r0") => {
+                                Err(StorageError::Resource(ResourceError::AlreadyExists {
+                                    resource_type: "SearchParameter".to_string(),
+                                    id: "r0".to_string(),
+                                }))
+                            }
+                            Some("r3") => Err(transient()),
+                            _ => Ok(()),
+                        })
+                        .collect()
+                }
+            },
+            |resource| {
+                single_calls.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    assert_eq!(resource["id"], json!("r3"), "only the reject is retried");
+                    Ok(())
+                }
+            },
+        )
+        .await;
+        assert_eq!(
+            batch_calls.load(Ordering::SeqCst),
+            3,
+            "5 resources, 2 per batch"
+        );
+        assert_eq!(single_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            outcome,
+            SeedOutcome {
+                created: 4,
+                existing: 1,
+                failed: 0
+            }
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_short_batch_answer_retries_the_unanswered_resources() {
+        // A backend that answers for fewer resources than it was given must
+        // not lose the rest: they go through the single-write path.
+        let single_calls = AtomicUsize::new(0);
+        let outcome = write_batched(
+            4,
+            2,
+            "CompartmentDefinition",
+            resources(3),
+            |_| async move { vec![Ok(())] },
+            |_| {
+                single_calls.fetch_add(1, Ordering::SeqCst);
+                async move { Ok(()) }
+            },
+        )
+        .await;
+        assert_eq!(single_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(outcome.created, 3);
+        assert_eq!(outcome.failed, 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn batch_rejects_that_keep_failing_count_as_failed() {
+        let outcome = write_batched(
+            8,
+            1,
+            "SearchParameter",
+            resources(2),
+            |batch| async move { batch.iter().map(|_| Err(transient())).collect() },
+            |_| async move { Err(transient()) },
+        )
+        .await;
+        assert_eq!(outcome.created, 0);
+        assert_eq!(outcome.failed, 2);
     }
 }

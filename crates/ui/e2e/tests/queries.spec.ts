@@ -265,7 +265,6 @@ test.describe("query builder", () => {
       "href",
       `${paginationOrigin}/public/fhir/acme/Patient/patient-page-two`,
     );
-    await expect(queries.results.openTab).toHaveAttribute("href", paginationUrl);
     await expect(queries.results.prev).toBeVisible();
     await expect(queries.results.error).toBeHidden();
 
@@ -2119,9 +2118,9 @@ test.describe("query builder", () => {
 
     const sort = queries.page.locator("#query-results-sort");
     await sort.selectOption("-_lastUpdated");
-    await expect(queries.page.locator("#query-results-open")).toHaveAttribute(
-      "href",
-      "/Patient?name=Sortable&_sort=-_lastUpdated",
+    // Picking a sort rewrites the visible query and re-runs (#958).
+    await expect(queries.builder.url).toHaveValue(
+      "GET /Patient?name=Sortable&_sort=-_lastUpdated",
     );
   });
 

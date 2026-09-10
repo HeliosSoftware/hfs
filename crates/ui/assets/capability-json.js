@@ -12,7 +12,10 @@
   }
 
   function regionFor(root) {
-    return root && root.querySelector("#capability-json-body");
+    return (
+      root &&
+      root.querySelector("[data-capability-json-region], #capability-json-body")
+    );
   }
 
   function treeFor(root) {
@@ -172,7 +175,8 @@
     var hasExpandable = !!tree.querySelector(
       "details[data-capability-json-node] [data-capability-json-body]",
     );
-    expand.disabled = busy || state === "complete" || !hasExpandable;
+    expand.disabled =
+      busy || state === "complete" || !hasExpandable || !root.dataset.expandUrl;
     collapse.disabled = busy ? false : tree.innerHTML === root.capabilityJsonInitialMarkup;
   }
 
@@ -303,7 +307,10 @@
   function expandAll(root) {
     var tree = treeFor(root);
     var region = regionFor(root);
-    if (!tree || !region || root.capabilityJsonAggregateController) return;
+    // Never fetch("") — an empty expand URL would POST to the current page
+    // and inject the whole document into the tree.
+    if (!tree || !region || !root.dataset.expandUrl) return;
+    if (root.capabilityJsonAggregateController) return;
     var body = collectPages(tree);
     if (!body) {
       setStatus(root, text(root, "limitText"));

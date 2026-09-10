@@ -180,7 +180,13 @@ chart-pick-heading = Charted Resource Types
 chart-pick-all = View all resource types
 chart-pick-filter = Filter types
 chart-empty = Nothing to chart yet — stored resources appear here as they are created.
-chart-sample-note = Sample data: no live metrics provider is registered on this build.
+# Only for a build with no metrics provider at all. A provider that was merely
+# slow gets chart-pending-note instead — the two must never be confused (#956).
+chart-sample-note = Sample data: this build has no live metrics provider, so the chart below is a placeholder, not measurements.
+chart-pending-note = Still gathering the live figures for this window. Nothing is charted until they arrive — no placeholder numbers are shown.
+chart-pending-empty = Waiting for the live figures…
+chart-pending-retry = Retry now
+chart-partial-note = Some figures could not be read from storage and are shown as zero. Reload to try again.
 chart-table-toggle = View as Table
 chart-table-when = Time
 chart-focus-series = Focus this series
@@ -431,7 +437,7 @@ queries-results = Results
 queries-results-total = { $count } results
 queries-results-included = { $count } included
 queries-results-empty = No results.
-queries-open-tab = Open in New Tab
+queries-searching = Searching…
 queries-col-updated = Updated
 queries-prev = Previous
 queries-next = Next
@@ -501,6 +507,12 @@ vd-form-legend-live = Checked as you type: structure, cardinality, required bind
 # states ("No issues.", "3 issues"), never the longer editor-invalid-json
 # sentence.
 vd-form-invalid-chip = Invalid JSON
+# SQL Query / SQL View's own two-line legend (#840): Save there gates the
+# SQL on FHIR Library type and the SQL attachment, not the generic
+# constraints/terminology promise `editor-legend-save` makes — a promise
+# `HFS_VALIDATION_MODE` off (the default) would make false.
+lib-form-legend-live = Checked as you type: structure, cardinality, required bindings
+lib-form-legend-save = Checked on save: SQL on FHIR Library type and the SQL attachment
 editor-deferred-badge = on save
 editor-deferred-hint = Codes are verified against the value set when you save (and live in the picker where a terminology server is configured)
 editor-must-support-hint = Must-support: consumers of this profile are expected to handle this element
@@ -810,6 +822,13 @@ cap-json-limit-reached = The JSON display limit was reached. Collapse another br
 cap-json-expand-error = The JSON tree could not be expanded. The current view was kept; try again.
 cap-unavailable = The CapabilityStatement could not be fetched from the server — the self-call may need an outbound token when authentication is enabled.
 
+## Generic JSON fold labels (#898) — used by raw response folds in HTS-UI.
+## The cap-* keys above are kept for CapabilityStatement specifically.
+json-fold-loading = Loading JSON…
+json-fold-load-error = This JSON section could not be loaded. Collapse and reopen it to retry.
+json-fold-open-plain = Open plain JSON
+json-fold-plain = Plain JSON fallback. Highlighting is loaded incrementally when JavaScript is available.
+
 ## SQL on FHIR section stubs (#649)
 
 
@@ -858,6 +877,50 @@ vd-pagination-label = View definition pages
 vd-page-prev = Previous
 vd-page-next = Next
 
+## ViewDefinition lint messages and fixes (#821): the `/lint` handler's own
+## localization of `helios_sof::lint::Diagnostic` — code + args here, never
+## `Diagnostic.message` (English-only, unlocalized) itself. `vd-lint-*` keys
+## are named after `DiagnosticCode`'s own kebab-case wire form; a
+## `missing-required`/`wrong-type` diagnostic from a constant's value[x]
+## choice carries `$variant` ("missing"/"multiple") instead of the generic
+## `$key`/`$expected`+`$found` args, selected on below. `vd-fix-*` keys label
+## one `Fix` each, shown next to the diagnostic as a one-click action.
+vd-lint-not-a-view-definition = Not a ViewDefinition: found { $found }
+vd-lint-unknown-key = Unknown key "{ $key }"
+vd-lint-missing-required = { $variant ->
+    [missing] A constant must set exactly one value
+   *[other] Missing required key "{ $key }"
+}
+vd-lint-wrong-type = { $variant ->
+    [multiple] A constant may set only one value
+   *[other] Expected { $expected }, found { $found }
+}
+vd-lint-empty-required = Required key "{ $key }" must not be empty
+vd-lint-duplicate-column-name = Duplicate column name "{ $name }"
+vd-lint-multiple-iteration-directives = A select may set at most one of forEach, forEachOrNull, repeat (found { $keys })
+vd-lint-select-without-output = A select must have at least one of column, select, or unionAll
+vd-lint-fhirpath-syntax = FHIRPath syntax: { $detail }
+vd-lint-undeclared-constant = Undeclared constant "%{ $name }"
+vd-fix-rename-key = Rename to "{ $to }"
+vd-fix-remove-key = Remove "{ $key }"
+vd-fix-set-string = Set to "{ $value }"
+
+## ViewDefinition completion (#821): `vd-editor.js` reads this once off
+## `#vd-editor-grid`'s own `data-msg-required` — the marker a required
+## structural key's completion item carries, appended to its `detail` text
+## client-side (never sent by `/complete` itself, which is not locale-aware).
+vd-complete-required = required
+
+## ViewDefinition editor save-with-errors confirmation (#821): `vd-editor.js`
+## picks whichever of these renders `#vd-editor-grid`'s own
+## `data-msg-save-errors-one`/`-other` and substitutes the real count for the
+## literal `{count}` marker below, itself the value `$count` was given —
+## `window.confirm`'s own text has no locale of its own, so this is the only
+## way to translate it. Shown only when submitting as Save (not Duplicate)
+## while the most recently completed lint pass still has at least one error.
+vd-save-with-errors-one = This view definition still has { $count } error. Save it anyway?
+vd-save-with-errors-other = This view definition still has { $count } errors. Save it anyway?
+
 ## $sql-run results partial (#752): shared by the View Definitions, SQL
 ## Queries, and SQL Views playgrounds (#839).
 
@@ -891,11 +954,119 @@ lib-degraded = The library list could not be loaded.
 # The SQL card's "runs as you type" legend (#839) — shared verbatim by SQL
 # Queries and SQL Views, unlike the headings/failure prefix above.
 lib-run-hint = Runs as you type — results follow the current SQL, saved or not
-# The title row's secondary link to the full resource (#839; #840 replaces
-# this with a Details card).
-lib-edit-json = Edit as JSON
 lib-delete-confirm = Delete "{ $name }"? This cannot be undone.
 lib-delete-failed = Could not delete the library.
+# Details section (#840): the Library minus its SQL attachment, edited as
+# JSON (left) and through the guided form (right).
+lib-details-heading = Details
+lib-details-json-heading = Library (JSON)
+lib-details-json-note = The SQL attachment is edited in the SQL card below and is not part of this view.
+# Shown only for `?lib=new`, under the Details heading — closes the #839
+# follow-up asking for a hint about the starter's `change-me` placeholder.
+lib-details-new-lede = Rename it and point relatedArtifact[0] at a ViewDefinition that exists.
+# The Save gate (#840): rejects a document whose `type.coding` names the
+# other kind's code (a sql-view saved from SQL Queries, or the reverse),
+# which would otherwise silently vanish it from the rail it was just edited
+# on. `$code` is the route's own expected code ("sql-query"/"sql-view").
+lib-save-wrong-kind = The Library's SQL on FHIR type must be "{ $code }" to save it here.
+# The Save gate's SQL View counterpart (#841): the SQLView profile
+# fixes `Library.parameter` to 0..0, so a non-empty declaration is rejected
+# the same way the wrong `type.coding` above is. The identical text also
+# backs the `/run` fragment's own pre-`$sql-run` check for the same case —
+# one message, two call sites.
+lib-save-view-parameters = A SQL View cannot declare parameters (SQLView profile, Library.parameter 0..0). Remove parameter[] in Details.
+
+## Parameters card (#841, SQL Query only)
+
+lib-params-heading = Parameters
+lib-params-meta = declared on the Library · values below are for this run only
+lib-params-empty = No parameters declared. Add one here or in Details.
+# `$name` is the bare placeholder name, without its leading `:` — both
+# messages below add it themselves so a translation can place it anywhere
+# in the sentence.
+lib-params-hint = :{ $name } is used in the SQL but not declared on the Library.
+lib-params-declare = Declare :{ $name }
+lib-params-add-toggle = Add parameter
+lib-params-add-name-label = Name
+lib-params-add-type-label = Type
+lib-params-add-submit = Add
+# `add-parameter`'s own validation messages (#841) — type codes
+# (`string`, `integer`, …) are never translated.
+lib-params-add-invalid-name = Parameter names must match ^[A-Za-z][A-Za-z0-9_]*$
+lib-params-add-duplicate = A parameter named { $name } is already declared
+lib-params-add-unknown-type = Unknown parameter type
+# The live-run "waiting for a value" notice (#841): `$names` is
+# already comma-joined with each name's own leading `:` by the caller (one
+# name, or several), since a Fluent list can't format an arbitrary-length
+# collection on its own.
+lib-run-waiting = Waiting for a value for { $names } — the results below are from the last successful run.
+
+# The unknown-table lint's own live-run notice (#842/04): the SQL reads a
+# table no declared `relatedArtifact[depends-on]` label names, so `$sql-run`
+# is never called. `lib-run-unknown-table` is the *first* unknown table's
+# own full sentence (the notice's own banner text when there is only one);
+# `lib-run-unknown-table-more` is the short form every additional table
+# (and every table's own hover tooltip in the editor) uses instead. `$line`
+# is the table's own 1-based line number.
+lib-run-unknown-table = Unknown table { $name } — line { $line }. Declare it under Reads from or fix the name. Your SQL is unchanged; the results below are from the last successful run.
+lib-run-unknown-table-more = Unknown table { $name } — line { $line }.
+
+## Tables panel (#842, both kinds) — Reads from / Used by / Columns
+
+lib-tables-heading = Reads from
+lib-tables-col-alias = Alias
+lib-tables-col-target = Reads from
+# The `<code>` cell's own placeholder for a `relatedArtifact[depends-on]`
+# entry with no `label` at all — a malformed document, most commonly one
+# hand-edited in Details.
+lib-tables-no-alias = (no label)
+lib-tables-empty = No tables declared yet.
+lib-tables-note = Every table the SQL reads, as relatedArtifact depends-on entries: alias on the left, the view definition or SQL view it resolves to on the right.
+lib-tables-remove = Remove
+# The resolved-target chip text. "SQL View" reuses `sql-views-chip` — the
+# same chip the title row and *Used by* already show for that kind.
+lib-tables-kind-view-definition = ViewDefinition
+lib-tables-target-not-found = Not found
+lib-tables-target-not-found-detail = No ViewDefinition or SQL View answers to { $resource }. Fix the canonical in Details or remove the row.
+lib-tables-target-not-a-table = Not a table
+lib-tables-target-not-a-table-detail = Only a ViewDefinition or a SQL View can be read.
+lib-tables-add-toggle = Add table
+lib-tables-add-table-label = Table
+lib-tables-add-table-placeholder = Search view definitions and SQL views
+lib-tables-add-table-hint = Type to search by name, or pick from the list.
+lib-tables-add-table-fallback-placeholder = ViewDefinition/{"{"}id{"}"} or Library/{"{"}id{"}"}
+lib-tables-add-table-fallback-hint = Enter a ViewDefinition or SQL View reference.
+lib-tables-alias-label = Alias
+lib-tables-alias-hint = Defaults to the artifact's name
+lib-tables-add-submit = Add
+# `add-table`'s own validation messages (#842), in the order they are
+# checked.
+lib-tables-add-error-required = Pick a view definition or SQL view
+lib-tables-add-error-alias-required = Alias is required
+lib-tables-add-error-alias-invalid = Alias must match ^[A-Za-z][A-Za-z0-9_]*$
+lib-tables-add-error-alias-duplicate = Alias { $alias } is already declared
+# The *Add table* combobox's own "no matches" result message
+# (`partials/lookup_options.html`), mirroring `bulk-export-patient-options-
+# empty`/`sql-export-group-options-empty` for the two existing pickers.
+lib-tables-options-empty = No matches.
+# The unknown-table lint's own row (#842/04): a table the SQL reads that no
+# dependency declares, appended after every resolved row.
+lib-tables-unknown = Unknown table
+lib-tables-unknown-detail = Used in the SQL but not declared. Pick a view definition or SQL view, or fix the name.
+lib-tables-declare = Declare { $name }
+
+lib-used-by-heading = Used by
+lib-used-by-empty = Nothing uses this yet.
+lib-used-by-export-kind = SQL Export
+
+lib-columns-heading = Columns
+lib-columns-meta-query = what the query produces
+lib-columns-meta-view = what the view produces
+lib-columns-empty-query = Run the query to see its columns.
+lib-columns-empty-view = Run the view to see its columns.
+lib-columns-col-name = Column
+lib-columns-col-type = Type
+lib-columns-col-from = From
 
 ## SQL Export pages (#649, #833)
 
@@ -926,6 +1097,41 @@ sql-export-empty-heading = Nothing to export yet
 sql-export-empty-body = Every stored view definition, SQL query and SQL view shows up here as an export subject. Create one first.
 sql-export-filter-empty = No subjects match
 
+## SQL Export builder — "Narrow it down" and "Advanced" (#836)
+
+sql-export-narrow-title = Narrow it down
+sql-export-narrow-meta = optional — leave empty to export everything
+sql-export-field-patients = Patients
+sql-export-field-patients-placeholder = Search patients
+sql-export-field-patients-hint = Search by name, surname or exact identifier. Leave empty to export every patient.
+sql-export-field-patients-fallback-placeholder = Patient FHIR IDs
+sql-export-field-patients-fallback-hint = Enter exact logical FHIR IDs separated by commas or new lines. Leave empty to export every patient.
+sql-export-field-patients-id-only-hint = Search by exact FHIR ID. Leave empty to export every patient.
+sql-export-field-groups = Groups
+sql-export-field-groups-placeholder = Search groups
+sql-export-field-groups-hint-r4 = Search by exact FHIR ID or identifier.
+sql-export-field-groups-hint-r5 = Search by name, exact FHIR ID or identifier.
+sql-export-field-groups-fallback-placeholder = Group FHIR IDs
+sql-export-field-groups-fallback-hint = Enter exact FHIR IDs or identifiers separated by commas or new lines.
+sql-export-group-options-empty = No matching groups found.
+sql-export-field-since = Since
+sql-export-since-all = All time
+sql-export-since-day = Last day
+sql-export-since-week = Last 7 days
+sql-export-since-month = Last 4 weeks
+sql-export-since-custom = Custom
+sql-export-field-since-custom = Custom instant
+sql-export-since-invalid = Enter a valid FHIR instant, such as 2026-08-01T00:00:00Z.
+sql-export-patient-invalid = Enter only valid logical Patient IDs, separated by commas or new lines.
+sql-export-group-invalid = Enter only valid logical Group IDs, separated by commas or new lines.
+sql-export-advanced = Advanced
+sql-export-advanced-meta = tracking id · CSV header
+sql-export-field-tracking-id = Tracking id
+sql-export-field-tracking-id-hint = Echoed in the completion manifest as clientTrackingId.
+sql-export-tracking-id-too-long = Tracking id must be 200 characters or fewer.
+sql-export-field-header = Include a header row
+sql-export-field-header-hint = (CSV only — ignored for other formats)
+
 ## Active SQL Exports list and job cards (#833)
 
 sql-export-new = New SQL Export
@@ -950,6 +1156,11 @@ sql-export-more-actions = More actions
 sql-export-copy-job-id = Copy job id
 sql-export-copied = Copied
 sql-export-progress-waiting = Waiting for the first status report…
+sql-export-writing = Writing { $name }
+sql-export-subjects-progress = { $total ->
+    [one] { $done } of { $total } subject
+   *[other] { $done } of { $total } subjects
+}
 sql-export-started = started
 sql-export-finished-in = finished in
 sql-export-cancelled-at = cancelled at
@@ -994,12 +1205,30 @@ sql-export-detail-field-format = Format
 sql-export-detail-field-started = Started
 sql-export-detail-field-duration = Duration
 sql-export-detail-field-subjects = Subjects
+sql-export-detail-header-included = with header row
+sql-export-detail-header-omitted = no header row
 sql-export-detail-outputs-heading = Output files
 sql-export-detail-col-output = Output
 sql-export-detail-col-subject = Subject
 sql-export-detail-col-files = Files
 sql-export-detail-outputs-empty = The job produced no output files.
 sql-export-file-fallback = File { $n }
+
+## #837: per-SQL-Query parameter values on the SQL Export builder
+sql-export-param-count = { $count ->
+    [one] { $count } parameter
+   *[other] { $count } parameters
+}
+sql-export-param-required = This value is required.
+sql-export-param-type-mismatch = Expected a { $type } value.
+sql-export-param-required-chip = required
+sql-export-toggle-values = Show or hide values
+sql-export-values-missing-one = { $count } value missing
+sql-export-values-missing-other = { $count } values missing
+
+## partials/sql_parameter_fields.html (#837) — shared with the SQL Query
+## page's own parameter form
+sql-param-default = default
 
 ## HTS administrative UI (crates/hts-ui) — Phase 1 scaffold stubs
 ##

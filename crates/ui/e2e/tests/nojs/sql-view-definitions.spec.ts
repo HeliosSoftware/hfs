@@ -65,3 +65,52 @@ test("with JavaScript disabled, the guided-form card stays hidden and the editor
   await expect(page.locator("section.editor-form")).toBeHidden();
   await expect(page.locator("textarea[name='json']")).toBeVisible();
 });
+
+// #821: the lint UI (gutter markers, the tooltip, the save-with-errors
+// confirmation) is CodeMirror's own — with no bundle mounted there is no
+// editor pane at all, so there is nothing to warn about and nothing to
+// block Save. A document with lint errors must still save exactly like a
+// clean one always has, with no dialog (`window.confirm` never runs — the
+// save handler in `vd-editor.js` lives entirely inside its own `if
+// (CodeEditor && CM)` branch, never wired at all when that branch didn't
+// run) and no `.cm-editor` ever appearing on the page.
+test("with JavaScript disabled, a document with lint errors saves through Save with no dialog and no editor pane", async ({
+  page,
+  request,
+}) => {
+  const vdId = await createResource(request, "ViewDefinition", {
+    name: "e2e_nojs_lint_errors",
+    status: "active",
+    resource: "Patient",
+    select: [{ column: [{ name: "id", path: "getResourceKey()" }] }],
+  });
+  await waitSearchable(request, "ViewDefinition", vdId);
+
+  await page.goto(`/ui/sql/view-definitions?vd=${vdId}`);
+  const editor = page.locator("textarea[name='json']");
+  await expect(editor).toBeVisible();
+  await expect(page.locator(".cm-editor")).toHaveCount(0);
+
+  // An unrecognized key ("columns", not "column") — the same shape
+  // `vd-editor-lint.spec.ts` lints server-side — typed straight into the
+  // plain textarea, no CodeMirror concept involved.
+  const withLintErrors = JSON.stringify({
+    resourceType: "ViewDefinition",
+    id: vdId,
+    name: "e2e_nojs_lint_errors",
+    status: "active",
+    resource: "Patient",
+    select: [{ columns: [{ name: "id", path: "getResourceKey()" }] }],
+  });
+  await editor.fill(withLintErrors);
+
+  let dialogFired = false;
+  page.on("dialog", (dialog) => {
+    dialogFired = true;
+    dialog.dismiss();
+  });
+  await page.locator("#vd-editor-form button[name='action'][value='save']").click();
+  await expect(page).toHaveURL(new RegExp(`vd=${vdId}&saved=1`));
+  expect(dialogFired).toBe(false);
+  await expect(page.locator(".cm-editor")).toHaveCount(0);
+});

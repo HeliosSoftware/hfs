@@ -1273,6 +1273,7 @@ mod tests {
             crate::capability_json::FragmentEndpoint {
                 base_path: "/ui/capability-statement/json-fragment",
                 version: "R4",
+                extra_query: "",
             },
         )
         .unwrap()

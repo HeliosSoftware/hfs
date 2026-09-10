@@ -46,6 +46,9 @@ use std::{collections::HashMap, sync::Arc};
 
 use crate::i18n::{I18n, RequestLocale};
 use crate::raw_fold::RawFold;
+use crate::raw_json_fragment::{
+    PaneTarget, cm_translate_expand_url, cm_translate_extra_query, cm_translate_fragment_endpoint,
+};
 use crate::upstream::{
     CmBrowserFilters, CmBrowserPage, ConceptMapSummary, OpFailure, OutcomeView, TranslateDirection,
     TranslateParams, TranslateResult, UpstreamError,
@@ -574,13 +577,30 @@ async fn translate_run(
         state.upstream.cm_translate_instance(&id, &params).await
     };
     let view = match translate_result {
-        Ok(result) => TranslateResultView {
-            raw: RawFold::new(&result.request_url, &result.request_body, &result.raw_body),
-            direction,
-            result: Some(result),
-            outcome: None,
-            degraded_reason: None,
-        },
+        Ok(result) => {
+            let mut raw = RawFold::new(&result.request_url, &result.request_body, &result.raw_body);
+            // Plan both incremental JSON panes (#898). Only possible when the
+            // canonical url resolved — the fragment endpoints pin the
+            // ConceptMap via `url=<canonical>`.
+            if !canonical.is_empty() {
+                let req = cm_translate_extra_query(&canonical, &params, PaneTarget::Request);
+                let resp = cm_translate_extra_query(&canonical, &params, PaneTarget::Response);
+                raw.plan_panes(
+                    cm_translate_fragment_endpoint(state.fhir_version, &req),
+                    cm_translate_expand_url(&req),
+                    cm_translate_fragment_endpoint(state.fhir_version, &resp),
+                    cm_translate_expand_url(&resp),
+                    &chrome.i18n,
+                );
+            }
+            TranslateResultView {
+                raw,
+                direction,
+                result: Some(result),
+                outcome: None,
+                degraded_reason: None,
+            }
+        }
         Err(err) => TranslateResultView::from_error(direction, &err),
     };
     respond_workbench(&state, chrome, id, view, is_htmx).await

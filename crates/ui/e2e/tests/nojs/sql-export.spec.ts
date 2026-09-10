@@ -227,6 +227,156 @@ test("a completed job's detail page lists its outputs and download pills without
   await expect(row.locator(".job-card__files a")).toHaveCount(1);
 });
 
+// #836: without sql-export-form.js, the CSV header switch never hides
+// itself and the Patients/Groups comboboxes never enhance past their plain
+// fallback textareas — both still have to work, and their values still have
+// to reach the job and its detail page. `<details>` is a native element, so
+// opening "Advanced" needs no script either.
+test("the CSV header switch is visible without JavaScript, and the Patients/Groups fallback textareas submit references shown in the detail", async ({
+  page,
+  request,
+  sqlExport,
+}) => {
+  const vdName = `nojs_sql_export_filters_${Date.now()}`;
+  const vdId = await createResource(request, "ViewDefinition", {
+    name: vdName,
+    status: "active",
+    resource: "Patient",
+    select: [{ column: [{ name: "id", path: "getResourceKey()" }] }],
+  });
+  seededViewDefinitionIds.push(vdId);
+  await waitSearchable(request, "ViewDefinition", vdId);
+
+  // `$sql-export` itself validates every patient/group reference against
+  // real resources before it will even start the job
+  // (`validate_patient_group_refs` in crates/rest/src/handlers/sof/
+  // export.rs — a direct read, not a search, so no indexing delay to wait
+  // out), so the fallback textareas need real ids too for this job to
+  // reach `complete` rather than `failed`.
+  const patientAId = await createResource(request, "Patient", {
+    name: [{ family: "NojsSqlExportFiltersA" }],
+  });
+  const patientBId = await createResource(request, "Patient", {
+    name: [{ family: "NojsSqlExportFiltersB" }],
+  });
+  const groupId = await createResource(request, "Group", {
+    type: "person",
+    actual: true,
+    name: "Nojs cohort",
+  });
+
+  await sqlExport.gotoNew();
+  await sqlExport.openAdvanced();
+  await expect(sqlExport.headerLabel).toBeVisible();
+  await expect(sqlExport.headerCheckbox).toBeEnabled();
+  await expect(sqlExport.headerCheckbox).toBeChecked();
+
+  await sqlExport.patientFallback.fill(`Patient/${patientAId}, Patient/${patientBId}`);
+  await sqlExport.groupFallback.fill(groupId);
+  await sqlExport.subjectCheckbox(`ViewDefinition/${vdId}`).check();
+  await sqlExport.startButton.click();
+  await expect(page).toHaveURL(/\/ui\/sql\/export$/);
+
+  // No htmx here: the card only catches up on a fresh reload.
+  let card = sqlExport.card(vdName);
+  await expect
+    .poll(
+      async () => {
+        await page.reload();
+        card = sqlExport.card(vdName);
+        return card.locator(".tag").innerText();
+      },
+      { timeout: 15_000, intervals: [250, 500, 1_000] },
+    )
+    .toBe("Complete");
+
+  await card.getByRole("link", { name: vdName }).click();
+  await expect(page).toHaveURL(/\/ui\/sql\/export\/[^/]+$/);
+  await expect(sqlExport.detailPatients).toHaveCount(2);
+  await expect(sqlExport.detailPatients).toContainText([
+    `Patient/${patientAId}`,
+    `Patient/${patientBId}`,
+  ]);
+  await expect(sqlExport.detailGroups).toHaveCount(1);
+  await expect(sqlExport.detailGroups).toHaveText(`Group/${groupId}`);
+});
+
+// #837: without sql-export-form.js, every values row renders visible and
+// the row-toggle chevron never does — there is no fold/collapse concept at
+// all, matching the design's own "no-JavaScript renders every values row
+// open" rule. A missing required value is caught by the server, not the
+// browser: the field's `required` attribute is itself server-rendered only
+// for a subject the *previous* render already knew was checked
+// (`SubjectRow::checked`), so a box checked by a real click, with no script
+// to resync it, submits a plain empty value the server has to reject.
+test("every values row renders open with no chevron, and a missing required value round-trips through the server", async ({
+  page,
+  request,
+  sqlExport,
+}) => {
+  const stamp = Date.now();
+  const canonical = `http://example.org/ViewDefinition/nojs-sql-export-params-${stamp}`;
+  const vdId = await createResource(request, "ViewDefinition", {
+    name: `nojs_sql_export_params_vd_${stamp}`,
+    url: canonical,
+    status: "active",
+    resource: "Patient",
+    select: [{ column: [{ name: "id", path: "getResourceKey()" }] }],
+  });
+  seededViewDefinitionIds.push(vdId);
+
+  const queryName = `nojs_sql_export_params_query_${stamp}`;
+  const libId = await createSqlQueryLibrary(request, queryName, canonical, undefined, [
+    { name: "ward", use: "in", type: "string" },
+  ]);
+  seededLibraryIds.push(libId);
+  await waitSearchable(request, "ViewDefinition", vdId);
+  await waitSearchable(request, "Library", libId);
+
+  const reference = `Library/${libId}`;
+
+  await sqlExport.gotoNew();
+  await expect(sqlExport.paramsRow(reference)).toBeVisible();
+  await expect(sqlExport.rowToggle(reference)).toBeHidden();
+
+  // Checked, left empty, submitted: no client-side block possible here, so
+  // the request reaches the server, which rejects it and re-renders the
+  // builder directly at the form's own POST target (`/ui/sql/export`,
+  // never a redirect to `/new` — this URL alone cannot distinguish a
+  // rejected submission from a successful one, only the content can) — no
+  // new job appears in the list.
+  await sqlExport.subjectCheckbox(reference).check();
+  await sqlExport.startButton.click();
+  await expect(page).toHaveURL(/\/ui\/sql\/export$/);
+  await expect(sqlExport.paramField(reference, "ward")).toHaveAttribute("aria-invalid", "true");
+  await expect(sqlExport.paramsRow(reference)).toContainText("This value is required.");
+  await sqlExport.goto();
+  await expect(sqlExport.card(queryName)).toHaveCount(0);
+
+  // Filled in and resubmitted, the job starts and the detail shows the chip.
+  await sqlExport.gotoNew();
+  await sqlExport.subjectCheckbox(reference).check();
+  await sqlExport.paramField(reference, "ward").fill("W1");
+  await sqlExport.startButton.click();
+  await expect(page).toHaveURL(/\/ui\/sql\/export$/);
+
+  let card = sqlExport.card(queryName);
+  await expect
+    .poll(
+      async () => {
+        await page.reload();
+        card = sqlExport.card(queryName);
+        return card.locator(".tag").innerText();
+      },
+      { timeout: 15_000, intervals: [250, 500, 1_000] },
+    )
+    .toBe("Complete");
+
+  await card.getByRole("link", { name: queryName }).click();
+  await expect(page).toHaveURL(/\/ui\/sql\/export\/[^/]+$/);
+  await expect(page.locator(".job-detail__subjects")).toContainText(":ward = W1");
+});
+
 test("Retry on a failed job's detail page works without JavaScript", async ({
   page,
   request,

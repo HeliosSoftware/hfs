@@ -80,6 +80,7 @@ fn fragment_endpoint(state: &HtsUiState) -> FragmentEndpoint<'_> {
     FragmentEndpoint {
         base_path: JSON_FRAGMENT_URL,
         version: state.fhir_version,
+        extra_query: "",
     }
 }
 

@@ -358,6 +358,72 @@ fn r4_pack_validates_known_good_and_bad_resources() {
     );
 }
 
+/// Regression for issue #424: a StructureDefinition whose `element.id`s carry a
+/// choice suffix (`[x]`) or a slice qualifier (`:`) must NOT trip a
+/// primitive-value error. Before the converter fix, R4B/R5 typed
+/// `ElementDefinition.id` as the constrained `id` primitive, whose regex
+/// `[A-Za-z0-9\-\.]{1,64}` rejects exactly these ids — so the spec's own
+/// profiles failed validation. R4 was always clean (typed `string`), so it
+/// serves as the control that the assertion is meaningful.
+///
+/// Version-gated behind R4B/R5 (that is where the bug lived), so it runs in
+/// CI's `cargo test --workspace --all-features` but not in the coverage job,
+/// which builds default features (R4 only).
+#[cfg(any(feature = "R4B", feature = "R5"))]
+#[test]
+fn structuredefinition_element_ids_with_choice_or_slice_are_not_rejected() {
+    // A trimmed but structurally-valid StructureDefinition whose element ids
+    // include a choice base (`Observation.value[x]`) and a named slice
+    // (`Observation.category:vital-signs`). These are the exact shapes the `id`
+    // regex rejected.
+    let sd = json!({
+        "resourceType": "StructureDefinition",
+        "url": "http://example.org/StructureDefinition/choice-and-slice",
+        "name": "ChoiceAndSlice",
+        "status": "active",
+        "kind": "resource",
+        "abstract": false,
+        "type": "Observation",
+        "baseDefinition": "http://hl7.org/fhir/StructureDefinition/Observation",
+        "derivation": "constraint",
+        "differential": { "element": [
+            { "id": "Observation.value[x]", "path": "Observation.value[x]", "min": 0, "max": "1" },
+            {
+                "id": "Observation.category:vital-signs",
+                "path": "Observation.category",
+                "sliceName": "vital-signs",
+                "min": 0, "max": "1"
+            }
+        ]}
+    });
+
+    let versions = [
+        #[cfg(feature = "R4B")]
+        FhirVersion::R4B,
+        #[cfg(feature = "R5")]
+        FhirVersion::R5,
+    ];
+    for version in versions {
+        let validator = Validator::new(core_registry(version));
+        let outcome = validator.validate_sync(&sd, &ValidationOptions::default());
+
+        // The precise #424 failure: a primitive-value error on an element id.
+        let id_value_errors: Vec<_> = outcome
+            .errors
+            .iter()
+            .filter(|e| {
+                e.kind == helios_fhir_validator::ErrorKind::PrimitiveValue
+                    && e.path.ends_with(".id")
+            })
+            .collect();
+        assert!(
+            id_value_errors.is_empty(),
+            "{version:?}: element ids with [x]/: must not fail primitive-value validation, got: {}",
+            serde_json::to_string_pretty(&id_value_errors).unwrap()
+        );
+    }
+}
+
 /// U+00A0 in a `string` or a `code` must survive validation against the real
 /// packs, on every enabled version (issue #425).
 ///

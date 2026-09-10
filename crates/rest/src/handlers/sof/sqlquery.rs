@@ -55,8 +55,9 @@ use helios_persistence::core::search::SearchProvider;
 use helios_persistence::core::sof_runner::ViewFilters;
 use helios_sof::sqlquery::SqlQueryError;
 use helios_sof::{
-    ColumnFhirType, ContentType, InMemorySqlEngine, QueryResult, bind_supplied_params,
-    extract_sqlquery_params_from_json, format_fhir_parameters, parse_sqlquery_library,
+    ColumnFhirType, ContentType, InMemorySqlEngine, QueryResult, TableRef, bind_supplied_params,
+    extract_sqlquery_params_from_json, format_fhir_parameters, parse_sqlquery_library, scan_sql,
+    undeclared_tables,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -141,6 +142,23 @@ where
     // SELECT-only validation of the subject's own SQL.
     validate_select_only(&library.sql)?;
 
+    // #841/#842: reject a subject that reads a table no `relatedArtifact
+    // [depends-on]` label declares, before spending any work resolving or
+    // materializing the dependency graph. Only the top-level subject is
+    // checked here — `$sql-export` and interior SQLView nodes of the graph
+    // are unchanged (see `graph.rs`). When the scanner itself can't
+    // tokenize the SQL, this check is silently skipped: the SQL engine's
+    // own error path (further below) reports the problem instead, exactly
+    // as it did before this check existed.
+    if let Ok(scan) = scan_sql(&library.sql) {
+        let declared_labels: Vec<String> =
+            library.depends_on.iter().map(|d| d.label.clone()).collect();
+        let unknown = undeclared_tables(&scan, &declared_labels);
+        if !unknown.is_empty() {
+            return Err(unknown_table_error(&unknown));
+        }
+    }
+
     let runner = state
         .sof_runner()
         .ok_or_else(|| RestError::NotImplemented {
@@ -198,7 +216,7 @@ where
         limits,
     )
     .await
-    .map_err(|e| RestError::UnprocessableEntity { message: e })?;
+    .map_err(sqlquery_err_to_rest)?;
 
     // SoF v2 PR #353: apply caller-supplied `_limit` as a soft cap on the
     // final result set, AFTER SQL evaluation (including any in-query LIMIT).
@@ -431,6 +449,38 @@ fn build_response(ct: &'static str, body: Vec<u8>) -> Response {
     (StatusCode::OK, [(header::CONTENT_TYPE, ct)], body).into_response()
 }
 
+/// Builds the `422` this handler returns when the subject's own SQL reads a
+/// table no `relatedArtifact[depends-on]` label declares (#841/#842).
+///
+/// One `OperationOutcome.issue` per undeclared table, in the order
+/// [`undeclared_tables`] returned them (first-occurrence order in the SQL),
+/// each carrying a `Line: N, Column: M` marker in `diagnostics` — the exact
+/// wording [`sqlparser`]'s own parse errors already use, so a client that
+/// already scrapes that marker out of a `$sql-run` `422` keeps working
+/// unchanged. Uses [`RestError::ValidationFailed`], not
+/// `RestError::MultiIssue`, because this response must be `422 Unprocessable
+/// Entity` (the SQL parsed fine; it names a table the server can't resolve)
+/// and `MultiIssue` is pinned to `400 Bad Request`.
+fn unknown_table_error(tables: &[&TableRef]) -> RestError {
+    let issues: Vec<Value> = tables
+        .iter()
+        .map(|t| {
+            serde_json::json!({
+                "severity": "error",
+                "code": "processing",
+                "diagnostics": format!(
+                    "unknown table '{}' at Line: {}, Column: {}; declare it as a \
+                     relatedArtifact depends-on label or fix the name",
+                    t.name, t.position.line, t.position.column,
+                ),
+            })
+        })
+        .collect();
+    RestError::ValidationFailed {
+        outcome: serde_json::json!({ "resourceType": "OperationOutcome", "issue": issues }),
+    }
+}
+
 pub(crate) fn sqlquery_err_to_rest(e: SqlQueryError) -> RestError {
     match e {
         SqlQueryError::MalformedLibrary(msg) => RestError::UnprocessableEntity { message: msg },
@@ -474,5 +524,37 @@ pub(crate) fn sqlquery_err_to_rest(e: SqlQueryError) -> RestError {
                 message: format!("SQLite error: {err}"),
             }
         }
+        SqlQueryError::Internal(message) => RestError::InternalError { message },
+        SqlQueryError::SourceStream(msg) => RestError::InternalError {
+            message: format!("dependency source failed: {msg}"),
+        },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn source_stream_and_internal_errors_map_to_500() {
+        let source_stream = sqlquery_err_to_rest(SqlQueryError::SourceStream("x".into()));
+        assert_eq!(
+            source_stream.client_response().0,
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+
+        let internal = sqlquery_err_to_rest(SqlQueryError::Internal("y".into()));
+        assert_eq!(
+            internal.client_response().0,
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+
+        // A source failure must never be reported as if the client sent a
+        // malformed request: row-cap violations still answer 422.
+        let row_cap = sqlquery_err_to_rest(SqlQueryError::RowCapExceeded { max: 5 });
+        assert_eq!(
+            row_cap.client_response().0,
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
     }
 }

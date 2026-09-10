@@ -233,7 +233,10 @@ pub(super) fn add_schemas_to_set(
     if let Some(segments) = schema.element_reference.clone() {
         let ref_key = segments.join(".");
         match resolve_element_reference(ctx.resolver, &segments) {
-            Some(target) => add_schemas_to_set(ctx, set, target, &ref_key),
+            Some(target) => {
+                let stripped = Arc::new(target.without_cardinality());
+                add_schemas_to_set(ctx, set, stripped, &ref_key);
+            }
             None => ctx.error(
                 ErrorKind::UnknownSchema,
                 errors::msg_unknown_schema(&ref_key),

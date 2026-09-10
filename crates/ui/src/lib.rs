@@ -46,6 +46,7 @@ mod conformance;
 mod editor;
 mod history;
 mod i18n;
+mod lookup;
 mod rail_state;
 mod search_params;
 mod sql_export;
@@ -61,10 +62,12 @@ mod sql_libraries;
 mod sql_views;
 mod subscriptions;
 mod tenants;
+mod vd_complete;
 
 #[doc(hidden)]
 pub use conformance::{
-    Caller, ConformanceSource, RecordedExportCall, SqlExportStatus, StaticConformanceSource,
+    Caller, ConformanceSource, RecordedExportCall, SqlExportParameter, SqlExportRequest,
+    SqlExportStatus, SqlExportSubject, StaticConformanceSource, sql_export_parameters_body,
 };
 
 /// The locale plumbing, re-exported out of the private `i18n` module.
@@ -92,7 +95,8 @@ use axum_embed::ServeEmbed;
 use axum_htmx::{AutoVaryLayer, HxRequest};
 use chrono::{DateTime, Datelike, Duration, Utc};
 use helios_observability::dashboard::{
-    DashboardPoint, DashboardSeries, DashboardSnapshot, DashboardWindow, ExportJobCounts, TypeCount,
+    DashboardPoint, DashboardSeries, DashboardSnapshot, DashboardWindow, ExportJobCounts,
+    SnapshotState, TypeCount,
 };
 use helios_persistence::core::{BulkProviderStore, ResourceStorage, SettingsStore};
 use rust_embed::RustEmbed;
@@ -537,8 +541,11 @@ impl Status {
 /// process uptime from `helios_observability::uptime` (#540); in a cluster it
 /// describes only the node that served this request.
 struct DashboardMetrics {
-    resource_types: String,
-    stored_resources: String,
+    /// `None` while the snapshot is still being computed (#956): there is no
+    /// figure yet, and a zero would be read as one.
+    resource_types: Option<String>,
+    /// `None` under the same condition as [`Self::resource_types`].
+    stored_resources: Option<String>,
     /// Bulk-export jobs for the tenant; `None` renders the unavailable state.
     export_jobs: Option<ExportJobCounts>,
     /// Active bulk-submit (import) jobs for the tenant; `None` renders the
@@ -547,7 +554,8 @@ struct DashboardMetrics {
     /// Formatted process uptime; `None` renders the unavailable state (the
     /// uptime tracker was never initialized).
     uptime: Option<String>,
-    chart_total: String,
+    /// `None` under the same condition as [`Self::resource_types`].
+    chart_total: Option<String>,
 }
 
 /// Process uptime as a short human duration ("3d 4h", "5h 12m", "42m", "18s"),
@@ -661,6 +669,47 @@ struct WindowEntry {
     active: bool,
 }
 
+/// Why the dashboard is showing something other than a complete live reading
+/// — and therefore which notice the page carries (#956).
+///
+/// The three degraded cases used to collapse into one "sample data" banner,
+/// which made a merely-slow window claim the build had no metrics at all and
+/// put invented clinical volumes on screen. They are distinct states with
+/// distinct pages.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum DashboardNotice {
+    /// A complete live snapshot: nothing to say.
+    None,
+    /// A provider is registered but this window's snapshot is still being
+    /// computed. Nothing is charted and no headline figure is shown — waiting
+    /// is rendered as waiting.
+    Pending,
+    /// A live snapshot in which some query failed and was filled in with a
+    /// zero or an empty series (see [`DashboardSnapshot::partial`]).
+    Partial,
+    /// This build has no metrics provider at all, so the placeholder snapshot
+    /// is rendered — and labelled as invented.
+    Sample,
+}
+
+impl DashboardNotice {
+    /// The i18n key of the notice line, or `None` when the page carries none.
+    fn key(self) -> Option<&'static str> {
+        match self {
+            DashboardNotice::None => None,
+            DashboardNotice::Pending => Some("chart-pending-note"),
+            DashboardNotice::Partial => Some("chart-partial-note"),
+            DashboardNotice::Sample => Some("chart-sample-note"),
+        }
+    }
+
+    /// Whether the page is waiting on a snapshot — the chart renders its
+    /// waiting state and the notice offers a retry.
+    fn is_pending(self) -> bool {
+        matches!(self, DashboardNotice::Pending)
+    }
+}
+
 #[derive(Template)]
 #[template(path = "pages/index.html")]
 struct IndexPage {
@@ -676,9 +725,17 @@ struct IndexPage {
     all_types: bool,
     /// Link that flips the "View all resources" toggle.
     all_types_href: String,
-    /// True when no provider answered and the placeholder snapshot is shown â€”
-    /// rendered with an explicit "sample data" notice, never silently (#555).
-    sample_data: bool,
+    /// Which degraded state, if any, this render is in — and so which notice
+    /// the page carries (#555, #956). Never silent.
+    notice: DashboardNotice,
+    /// The same view, re-requested. Rendered as a "retry now" link in the
+    /// pending notice so the page is recoverable without JavaScript.
+    retry_href: String,
+    /// [`Self::retry_href`] with one more attempt spent, or `None` once the
+    /// budget is exhausted. Drives the htmx auto-refresh: the page polls a
+    /// bounded number of times and then leaves the manual link, so a server
+    /// already too busy to answer is not also asked to serve an endless poll.
+    auto_retry_href: Option<String>,
     i18n: I18n,
     /// Which sidebar entry carries `aria-current="page"` (see base.html).
     active_page: &'static str,
@@ -885,6 +942,8 @@ struct ParamOption {
 #[template(path = "partials/param-options.html")]
 struct ParamOptionsPartial {
     params: Vec<ParamOption>,
+    /// Comma-joined default column hint for the selected type (#958).
+    columns: String,
 }
 
 /// History & Versions screen (#236, Figma "History & Versions"): the version
@@ -1241,6 +1300,12 @@ pub fn mount_with_conformance_source_and_runtime(
             "/ui/sql/view-definitions/lint",
             axum::routing::post(sql_view_definitions_lint),
         )
+        // #821: the editor's context-completion endpoint — "where is the
+        // cursor" from the browser, "what fits there" back from the server.
+        .route(
+            "/ui/sql/view-definitions/complete",
+            axum::routing::post(vd_complete::complete),
+        )
         // The playground's live preview fragment (#752, generalized to all
         // three SQL on FHIR pages in #839).
         .route(
@@ -1252,8 +1317,16 @@ pub fn mount_with_conformance_source_and_runtime(
             get(sql_queries_page).post(sql_queries_save),
         )
         .route("/ui/sql/queries/run", axum::routing::post(sql_queries_run))
+        .route(
+            "/ui/sql/queries/document",
+            axum::routing::post(sql_queries_document),
+        )
         .route("/ui/sql/views", get(sql_views_page).post(sql_views_save))
         .route("/ui/sql/views/run", axum::routing::post(sql_views_run))
+        .route(
+            "/ui/sql/views/document",
+            axum::routing::post(sql_views_document),
+        )
         // Active SQL Exports (#833): list-first, mirroring Bulk Export's
         // `/ui/bulk-export` + `/ui/bulk-export/new` shape.
         .route(
@@ -1261,6 +1334,23 @@ pub fn mount_with_conformance_source_and_runtime(
             get(sql_export::list).post(sql_export::start),
         )
         .route("/ui/sql/export/new", get(sql_export::new_page))
+        // Shared Patient/Group combobox search endpoints (#836): Bulk Export's
+        // own Patients field and SQL Export's "Narrow it down" Patients/Groups
+        // fields all post here, distinguished by `?target=`.
+        .route(
+            "/ui/lookup/patient-options",
+            axum::routing::post(lookup::patient_options),
+        )
+        .route(
+            "/ui/lookup/group-options",
+            axum::routing::post(lookup::group_options),
+        )
+        // The SQL Query/SQL View *Add table* combobox's own search endpoint
+        // (#842): ViewDefinitions and `sql-view` Libraries by name.
+        .route(
+            "/ui/lookup/table-options",
+            axum::routing::post(lookup::table_options),
+        )
         // The job detail permalink (#835). `new` above is a literal segment,
         // matched ahead of the `{id}` param at the same depth regardless of
         // route registration order — axum's router always prefers a static
@@ -1329,10 +1419,6 @@ pub fn mount_with_conformance_source_and_runtime(
             get(bulk_export::active).post(bulk_export::start),
         )
         .route("/ui/bulk-export/new", get(bulk_export::page))
-        .route(
-            "/ui/bulk-export/patient-options",
-            axum::routing::post(bulk_export::patient_options),
-        )
         .route("/ui/bulk-export/active", get(bulk_export::active_redirect))
         .route("/ui/bulk-export/active/{id}/card", get(bulk_export::card))
         .route(
@@ -1676,9 +1762,16 @@ async fn index(
     // validation against the actually-plotted set happens in build_dashboard.
     let focus = query_value(query.as_deref(), "focus")
         .filter(|f| !f.is_empty() && f.chars().all(|c| c.is_ascii_alphanumeric()));
+    // `?retry=N` counts the auto-refreshes already spent waiting for a slow
+    // snapshot (#956). Clamped, so a hand-written or looping value can never
+    // buy more than the budget below.
+    let retry = query_value(query.as_deref(), "retry")
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(0)
+        .min(DASH_PENDING_RETRIES);
     render(
         build_index_page(
-            &state, locale, types, window, all_types, spec_types, focus, rv.0, &rt,
+            &state, locale, types, window, all_types, spec_types, focus, retry, rv.0, &rt,
         )
         .await,
     )
@@ -1993,7 +2086,10 @@ async fn resources(
     .await;
     let selected_type = explicit_type
         .unwrap_or_else(|| resolve_stored_type(rail.last.as_deref(), &resource_types, "Patient"));
-    let builder_url = url_from_query.or_else(|| Some(format!("/{selected_type}")));
+    // First open seeds `_summary=true` (#958): a fresh query returns summary
+    // elements — matching the table's default columns — instead of every
+    // attribute of every resource. Deleting it from the editable URL opts out.
+    let builder_url = url_from_query.or_else(|| Some(format!("/{selected_type}?_summary=true")));
     let targets = match state.conformance.metadata(rv.0, &rt.id).await {
         Ok(statement) => {
             match capability::CreateTargets::from_statement(&resource_types, &statement, rv.0) {
@@ -2190,7 +2286,64 @@ async fn query_params_catalog(
         .collect();
     params.sort_by(|a, b| a.code.cmp(&b.code));
     params.dedup_by(|a, b| a.code == b.code);
-    render(ParamOptionsPartial { params })
+    render(ParamOptionsPartial {
+        params,
+        columns: default_result_columns(rv.0, &resource_type).join(","),
+    })
+}
+
+/// Default result-table columns for a resource type (#958): its summary
+/// elements minus resource infrastructure, capped so the table stays
+/// scannable. Replaces the six-type hardcoded map in the browser — every
+/// type the spec defines summary elements for now gets real columns.
+fn default_result_columns(version: helios_fhir::FhirVersion, resource_type: &str) -> Vec<String> {
+    let summary_fields: &[&str] = match version {
+        #[cfg(feature = "R4")]
+        helios_fhir::FhirVersion::R4 => helios_fhir::r4::get_summary_fields(resource_type),
+        #[cfg(feature = "R4B")]
+        helios_fhir::FhirVersion::R4B => helios_fhir::r4b::get_summary_fields(resource_type),
+        #[cfg(feature = "R5")]
+        helios_fhir::FhirVersion::R5 => helios_fhir::r5::get_summary_fields(resource_type),
+        #[cfg(feature = "R6")]
+        helios_fhir::FhirVersion::R6 => helios_fhir::r6::get_summary_fields(resource_type),
+        #[allow(unreachable_patterns)]
+        _ => &[],
+    };
+    const INFRASTRUCTURE: [&str; 9] = [
+        "resourceType",
+        "id",
+        "meta",
+        "implicitRules",
+        "language",
+        "text",
+        "contained",
+        "extension",
+        "modifierExtension",
+    ];
+    summary_fields
+        .iter()
+        .map(|f| snake_to_camel(f))
+        .filter(|f| !INFRASTRUCTURE.contains(&f.as_str()))
+        .take(5)
+        .collect()
+}
+
+/// `get_summary_fields` returns Rust field names; resources carry camelCase
+/// JSON keys, which is what the results table indexes by.
+fn snake_to_camel(field: &str) -> String {
+    let mut out = String::with_capacity(field.len());
+    let mut upper_next = false;
+    for c in field.chars() {
+        if c == '_' {
+            upper_next = true;
+        } else if upper_next {
+            out.extend(c.to_uppercase());
+            upper_next = false;
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// Query string for the SearchParameter viewer. Every filter is a link and
@@ -2480,6 +2633,13 @@ enum RunResultsState {
     /// sqlparser's own `Line: N` marker — the 1-based line number the
     /// editor tints (#839, [`sql_views::extract_error_line`]).
     Failure(String, Option<u32>),
+    /// A SQL Query with a declared, required parameter this run has no
+    /// value for (#841): `$sql-run` is never called, and the previous
+    /// table (if any) is left in place — the same OOB shape as `Failure`
+    /// (the stale-meta relabel, no `#run-results` swap) but rendered as a
+    /// plain, non-`--warn` notice naming which `:name`(s) are missing,
+    /// since this is an expected pause, not an error.
+    Waiting(String),
     /// The page's own render before anything has run server-side — no
     /// `?saved=1`/`?lib=…&saved=1`, or the current selection has no preview
     /// yet. Renders the notice region's own client-driven initial-load
@@ -2573,9 +2733,9 @@ fn shape_vd(vd: &serde_json::Value) -> (String, String, String) {
 /// `pane=form` branch performs over HTTP (`editor::build_form_pane`), called
 /// directly instead: the page's own render (and the Save-error re-render)
 /// need the panel in place on first paint, not fetched after the fact.
-/// `document`'s own `resourceType` decides
-/// [`editor::EditorFormPane::is_view_definition`] exactly as `render_body`
-/// would, falling back to `"ViewDefinition"` — every caller on this page
+/// `document`'s own `resourceType` decides [`editor::EditorFormPane::legend`]
+/// exactly as `render_body` would (an empty legend override derives it), and
+/// falls back to `"ViewDefinition"` — every caller on this page
 /// hands it a `ViewDefinition`, valid or not, except the one Save-error path
 /// where the submitted document parses but carries some other type; letting
 /// the schema registry decide what that renders as (or fails to) is exactly
@@ -2595,14 +2755,36 @@ fn render_vd_form_pane(
     // render, not the shared HTTP endpoint - the card needs `needs-js` so it
     // stays hidden until `theme.js` marks `<html class="js">` and
     // `vd-editor.js` wires it up.
-    editor::build_form_pane(i18n, registry, version, resource_type, document, None, true)
+    // #840: nothing hidden and the legend derived, exactly as before that
+    // parameter pair existed.
+    editor::build_form_pane(
+        i18n,
+        registry,
+        version,
+        resource_type,
+        document,
+        None,
+        true,
+        &[],
+        "",
+    )
 }
 
-/// The guided-form panel for text that failed to parse as JSON (#843) — the
+/// The guided-form panel for text that failed to parse as JSON (#843,
+/// generalized off its original View-Definitions-only copy in #840) — the
 /// Save-error path's counterpart to `editor::render_body`'s own malformed-
-/// document branch: the card still appears, with the invalid-JSON notice in
-/// place of rows, and the user's exact text untouched.
-fn invalid_vd_form_pane(i18n: I18n, text: String, parse_error: String) -> editor::EditorFormPane {
+/// document branch, shared by View Definitions and the SQL Query/SQL View
+/// Details panel: the card still appears, with the invalid-JSON notice in
+/// place of rows, and the user's exact text untouched. `legend` is the
+/// caller's own choice ([`editor::Legend`]) rather than derived — text that
+/// never parsed carries no `resourceType` for [`editor::Legend::resolve`] to
+/// read.
+fn invalid_form_pane(
+    i18n: I18n,
+    text: String,
+    parse_error: String,
+    legend: editor::Legend,
+) -> editor::EditorFormPane {
     editor::EditorFormPane {
         i18n,
         rows: Vec::new(),
@@ -2613,8 +2795,11 @@ fn invalid_vd_form_pane(i18n: I18n, text: String, parse_error: String) -> editor
         parse_error: Some(parse_error),
         focus_path: String::new(),
         auto_open_add: false,
-        is_view_definition: false,
-        needs_js: true, // #843: the page's own inline render, always needs-js
+        // Unread while `parse_error` is `Some` (the pane's own template
+        // renders the invalid-JSON notice instead of the legend), but kept
+        // faithful to the caller's own host nonetheless.
+        legend,
+        needs_js: true, // #843: every caller's own inline render, always needs-js
     }
 }
 
@@ -2853,8 +3038,8 @@ async fn sql_view_definitions_page(
     // pages in #839).
     let i18n = I18n::new(locale);
     let run_state = match (&selected_value, query.saved.as_deref() == Some("1")) {
-        (Some(vd), true) => match run_sql_preview(&state, vd, rv.0, &rt.id).await {
-            Ok((table, ms)) => RunResultsState::Success(table, ms),
+        (Some(vd), true) => match run_sql_preview(&state, vd, &[], rv.0, &rt.id).await {
+            Ok((table, _rows, ms)) => RunResultsState::Success(table, ms),
             Err(error) => {
                 let line = sql_views::extract_error_line(&error);
                 RunResultsState::Failure(error, line)
@@ -2907,21 +3092,37 @@ async fn sql_view_definitions_page(
 /// (see `build_table`'s own doc comment). NF2: never logs `resource` itself
 /// — a ViewDefinition's `constant[]` or a Library's embedded SQL can carry
 /// PHI.
+///
+/// `bindings` (#841) supplies this run's values for a SQL Query's
+/// `Library.parameter` declarations; every caller in this ticket passes an
+/// empty slice — a ViewDefinition or an unparameterized Library has none to
+/// supply, and the Parameters card that fills this in for a parameterized
+/// SQL Query lands separately.
+///
+/// Returns the raw JSON rows alongside the stringified [`sql_views::
+/// RunTable`] (#842/04): the Columns card's own type inference
+/// ([`sql_libraries::analyze_columns`]) needs a column's *values*, not
+/// their rendered cell text, to tell a JSON number from a JSON string —
+/// distinctions [`sql_views::build_table`]'s own `cell_text` already
+/// erases. Every caller that has no use for them (View Definitions) simply
+/// ignores the second element.
 async fn run_sql_preview(
     state: &WebState,
     resource: &serde_json::Value,
+    bindings: &[SqlExportParameter],
     version: helios_fhir::FhirVersion,
     tenant: &str,
-) -> Result<(sql_views::RunTable, u64), String> {
+) -> Result<(sql_views::RunTable, Vec<serde_json::Value>, u64), String> {
     let start = std::time::Instant::now();
     let rows = state
         .conformance
-        .sql_run(resource, sql_views::RUN_LIMIT, version, tenant)
+        .sql_run(resource, bindings, sql_views::RUN_LIMIT, version, tenant)
         .await?;
     // `Instant::elapsed` millis fits `u64` for anything short of 584 million
     // years; `unwrap_or(u64::MAX)` is just a total function, never reachable.
     let ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
-    Ok((sql_views::build_table(resource, &rows), ms))
+    let table = sql_views::build_table(resource, &rows);
+    Ok((table, rows, ms))
 }
 
 #[derive(Deserialize)]
@@ -2955,9 +3156,12 @@ async fn sql_view_definitions_save(
         // own malformed-document branch renders.
         let form_pane = match serde_json::from_str::<serde_json::Value>(&json) {
             Ok(document) => render_vd_form_pane(I18n::new(locale), rv.0, document),
-            Err(parse_error) => {
-                invalid_vd_form_pane(I18n::new(locale), json.clone(), parse_error.to_string())
-            }
+            Err(parse_error) => invalid_form_pane(
+                I18n::new(locale),
+                json.clone(),
+                parse_error.to_string(),
+                editor::Legend::ViewDefinition,
+            ),
         };
         SqlViewDefinitionsPage {
             status: current_status(&state, rv.0, &rt),
@@ -3122,8 +3326,8 @@ async fn sql_view_definitions_run(
         }
     };
 
-    let run_state = match run_sql_preview(&state, &view_definition, rv.0, &rt.id).await {
-        Ok((table, ms)) => {
+    let run_state = match run_sql_preview(&state, &view_definition, &[], rv.0, &rt.id).await {
+        Ok((table, _rows, ms)) => {
             tracing::debug!(rows = table.rows.len(), ms, "ran a ViewDefinition preview");
             RunResultsState::Success(table, ms)
         }
@@ -3135,11 +3339,130 @@ async fn sql_view_definitions_run(
     respond(run_state)
 }
 
-/// #753 (evaluation POC, not merged upstream): structural +
-/// FHIRPath-syntax lint for the ViewDefinition editor's async CodeMirror 6
-/// linter (`vd-editor.js`). Delegates entirely to
-/// [`helios_sof::lint::lint_view_definition`] — this handler only decodes
-/// the request body and shapes the response; it never touches storage, the
+/// One [`helios_sof::lint::Fix`], translated (#821): the fix's own JSON
+/// shape (`kind`, `pointer`, and whichever of `to`/`value` that `kind`
+/// carries — [`helios_sof::lint::Fix`]'s own `#[serde(tag = "kind")]`
+/// representation, flattened in here unchanged) plus a `label` rendered from
+/// the matching `vd-fix-*` catalog key, ready for a button or menu item that
+/// offers this fix with no further lookup on the browser's part.
+#[derive(serde::Serialize)]
+struct LintFixDto {
+    #[serde(flatten)]
+    fix: helios_sof::lint::Fix,
+    label: String,
+}
+
+/// One [`helios_sof::lint::Diagnostic`], translated (#821): every field
+/// except `message` passes through unchanged (`args` included — a client
+/// that wants the raw value behind a translated sentence, e.g. `args.name`
+/// for `undeclared-constant`, still has it). `message` here is **not**
+/// [`helios_sof::lint::Diagnostic::message`] (that field is always English —
+/// `$sql-run`, `sof-cli`, and `pysof` all use it verbatim); it is the
+/// negotiated-locale rendering of `code` + `args` against the `vd-lint-*`
+/// catalog, matching #821's split: `helios_sof` never localizes, only this
+/// handler does.
+#[derive(serde::Serialize)]
+struct LintDiagnosticDto {
+    pointer: String,
+    message: String,
+    severity: helios_sof::lint::Severity,
+    code: helios_sof::lint::DiagnosticCode,
+    span: Option<helios_sof::lint::Span>,
+    args: std::collections::BTreeMap<String, String>,
+    fixes: Vec<LintFixDto>,
+}
+
+/// The kebab-case wire string [`helios_sof::lint::DiagnosticCode`] already
+/// serializes as (`fhirpath-syntax`, `unknown-key`, ...) — read back through
+/// `serde_json` rather than hand-duplicating the mapping, so the `vd-lint-*`
+/// catalog key this builds can never drift from the lint's own JSON `code`.
+/// `crates/sof/src/error.rs` carries the identical trick for
+/// `$sql-run`'s `422` coding, one crate over and with no code to share it
+/// through.
+fn diagnostic_catalog_key(code: helios_sof::lint::DiagnosticCode) -> String {
+    match serde_json::to_value(code) {
+        Ok(serde_json::Value::String(wire)) => format!("vd-lint-{wire}"),
+        _ => unreachable!("DiagnosticCode serializes to a JSON string"),
+    }
+}
+
+/// The translated `message` for one diagnostic (#821): `code` + `args`
+/// against the matching `vd-lint-*` catalog key.
+///
+/// `vd-lint-missing-required` and `vd-lint-wrong-type` select their wording
+/// on `$variant` — set only by the two diagnostics `check_constant_value`
+/// reports for a constant's `value[x]` choice, never by the generic
+/// `missing-required`/`wrong-type` diagnostics (a plain missing/wrong-typed
+/// key), whose own `args` (per `helios_sof::lint`'s contract) has no
+/// `variant` at all. `fluent-templates`' selector lookup fails the *entire*
+/// message when the selector variable is completely absent from the args
+/// map — unlike a present-but-unmatched value, which falls to `*[other]`
+/// normally (see `t_args_selector_falls_back_only_when_the_variable_is_present_but_unmatched`
+/// in `i18n.rs`) — so an empty `variant` is added here before rendering
+/// those two codes specifically, for the lookup only: the diagnostic's own
+/// `args` in the JSON response (`LintDiagnosticDto::args`) is untouched.
+fn translate_diagnostic_message(
+    i18n: I18n,
+    code: helios_sof::lint::DiagnosticCode,
+    args: &std::collections::BTreeMap<String, String>,
+) -> String {
+    use helios_sof::lint::DiagnosticCode;
+    let key = diagnostic_catalog_key(code);
+    if matches!(
+        code,
+        DiagnosticCode::MissingRequired | DiagnosticCode::WrongType
+    ) && !args.contains_key("variant")
+    {
+        let mut with_variant = args.clone();
+        with_variant.insert("variant".to_string(), String::new());
+        i18n.t_args(&key, &with_variant)
+    } else {
+        i18n.t_args(&key, args)
+    }
+}
+
+/// The last segment of an RFC 6901 pointer, unescaped (`~1` → `/` before
+/// `~0` → `~`, undoing the encoding's own order) — what `vd-fix-remove-key`'s
+/// `$key` names: the property being removed, not its full path.
+fn pointer_last_segment(pointer: &str) -> String {
+    pointer
+        .rsplit('/')
+        .next()
+        .unwrap_or_default()
+        .replace("~1", "/")
+        .replace("~0", "~")
+}
+
+/// The translated label for one fix, from its matching `vd-fix-*` catalog
+/// key — see the module-level `## ViewDefinition lint messages and fixes`
+/// section of `main.ftl` for the exact wording and argument per kind.
+fn fix_label(i18n: I18n, fix: &helios_sof::lint::Fix) -> String {
+    use helios_sof::lint::Fix;
+    match fix {
+        Fix::RenameKey { to, .. } => i18n.t_arg("vd-fix-rename-key", "to", to.clone()),
+        Fix::RemoveKey { pointer } => {
+            i18n.t_arg("vd-fix-remove-key", "key", pointer_last_segment(pointer))
+        }
+        Fix::SetString { value, .. } => i18n.t_arg("vd-fix-set-string", "value", value.clone()),
+        // `Fix` is `#[non_exhaustive]`: a variant this crate doesn't know a
+        // `vd-fix-*` key for yet must not crash the handler. Fall back to
+        // the fix's own `kind` tag rather than a hand-picked English
+        // sentence, so a `helios-sof` upgrade alone still renders
+        // *something* until this match (and the catalog) catch up.
+        _ => serde_json::to_value(fix)
+            .ok()
+            .and_then(|value| value.get("kind")?.as_str().map(str::to_owned))
+            .unwrap_or_default(),
+    }
+}
+
+/// Structural + FHIRPath-syntax lint for the ViewDefinition editor's async
+/// CodeMirror 6 linter (`vd-editor.js`) (#753, #820, #821). Delegates
+/// entirely to [`helios_sof::lint::lint_view_definition`] for the checks
+/// themselves — this handler only decodes the request body, translates each
+/// diagnostic and fix into the negotiated locale (`?lang=` / `hfs_lang`
+/// cookie / `Accept-Language`, same policy as every other page — see
+/// [`i18n`]), and shapes the response; it never touches storage, the
 /// tenant, or the configured FHIR version, because the lint itself is
 /// purely structural and version-agnostic.
 ///
@@ -3149,7 +3472,8 @@ async fn sql_view_definitions_run(
 /// The body is read as raw bytes (not the `Json` extractor) so a malformed
 /// body reports the lint's exact `{"error": "..."}` shape instead of axum's
 /// generic rejection body.
-async fn sql_view_definitions_lint(body: Bytes) -> Response {
+async fn sql_view_definitions_lint(locale: RequestLocale, body: Bytes) -> Response {
+    let i18n = I18n::new(locale);
     let doc: serde_json::Value = match serde_json::from_slice(&body) {
         Ok(doc) => doc,
         Err(error) => {
@@ -3161,7 +3485,25 @@ async fn sql_view_definitions_lint(body: Bytes) -> Response {
         }
     };
 
-    let diagnostics = helios_sof::lint::lint_view_definition(&doc);
+    let diagnostics: Vec<LintDiagnosticDto> = helios_sof::lint::lint_view_definition(&doc)
+        .into_iter()
+        .map(|diagnostic| LintDiagnosticDto {
+            message: translate_diagnostic_message(i18n, diagnostic.code, &diagnostic.args),
+            fixes: diagnostic
+                .fixes
+                .into_iter()
+                .map(|fix| LintFixDto {
+                    label: fix_label(i18n, &fix),
+                    fix,
+                })
+                .collect(),
+            pointer: diagnostic.pointer,
+            severity: diagnostic.severity,
+            code: diagnostic.code,
+            span: diagnostic.span,
+            args: diagnostic.args,
+        })
+        .collect();
     // NF2: never log the document itself — a ViewDefinition's `constant[]`
     // can carry PHI — only how many diagnostics it produced.
     tracing::debug!(
@@ -3228,6 +3570,27 @@ struct LibraryKind {
     /// (SQL Queries only — a SQL View has no `subject=Library/{id}` export
     /// shape of its own).
     offers_export: bool,
+    /// Whether this kind's Library declares `Library.parameter[]` at all
+    /// (#841): `true` for SQL Query, `false` for SQL View, whose SQLView
+    /// profile fixes `Library.parameter` to `0..0`. The page renders the
+    /// Parameters card (and gates Save on an empty `parameter[]`) from this
+    /// field alone — never an `if` comparing `code` against a string,
+    /// matching [`LibraryKind`]'s own NF5 rule.
+    declares_parameters: bool,
+    /// This kind's document-mutation endpoint (`POST …/document`, #841/#842):
+    /// the Parameters card's *Add parameter*/*Declare* controls' own, and
+    /// (#842) the Tables panel's *Add table*/*Remove* controls' own,
+    /// `hx-post`/`formaction` target.
+    document_href: &'static str,
+    /// The Columns skeleton card's own meta line (#842) — "what the query
+    /// produces" / "what the view produces". #842/03 only lays out the
+    /// skeleton (heading, a fixed `0` count, this meta line, and
+    /// `columns_empty_key`'s own empty-state body); a follow-up fills the
+    /// card itself in with the last good run's columns.
+    columns_meta_key: &'static str,
+    /// The Columns skeleton's own empty-state body (#842) — "Run the query
+    /// to see its columns." / "Run the view to see its columns."
+    columns_empty_key: &'static str,
 }
 
 const SQL_QUERY_KIND: LibraryKind = LibraryKind {
@@ -3250,6 +3613,10 @@ const SQL_QUERY_KIND: LibraryKind = LibraryKind {
     icon_svg: include_str!("../templates/icons/code.svg"),
     run_href: "/ui/sql/queries/run",
     offers_export: true,
+    declares_parameters: true,
+    document_href: "/ui/sql/queries/document",
+    columns_meta_key: "lib-columns-meta-query",
+    columns_empty_key: "lib-columns-empty-query",
 };
 
 const SQL_VIEW_KIND: LibraryKind = LibraryKind {
@@ -3272,6 +3639,10 @@ const SQL_VIEW_KIND: LibraryKind = LibraryKind {
     icon_svg: include_str!("../templates/icons/layers-platforms.svg"),
     run_href: "/ui/sql/views/run",
     offers_export: false,
+    declares_parameters: false,
+    document_href: "/ui/sql/views/document",
+    columns_meta_key: "lib-columns-meta-view",
+    columns_empty_key: "lib-columns-empty-view",
 };
 
 /// The Library-backed pages' one editable form's id — matches
@@ -3302,6 +3673,940 @@ fn status_tag_class(status: &str) -> &'static str {
         "retired" => "retired",
         _ => "unknown",
     }
+}
+
+// ---------------------------------------------------------------------
+// Parameters card (#841): a SQL Query's declared `Library.parameter[use=in]`
+// values for the live run, the placeholders the SQL uses but does not
+// declare, and the `Add parameter`/`Declare` mutations that write a new
+// declaration into the Details document via `POST …/document`.
+// ---------------------------------------------------------------------
+
+/// One declared parameter's live-run value, shaped to match
+/// `partials/sql_parameter_fields.html`'s own field access
+/// (#837/#841) — the same field names [`crate::sql_export`]'s own
+/// `ParamFieldView` exposes, duplicated here rather than shared because the
+/// two live in different modules and Askama's macro call resolves fields
+/// structurally, not through a trait. `error` is always `None`: unlike SQL
+/// Export's own job-creation validation, a value that fails to bind its
+/// declared type is left to `$sql-run`'s own error message (#841),
+/// never flagged on the field itself. `required` is likewise always
+/// `false` — see [`analyze_params`]'s own doc comment for why the HTML5
+/// attribute must stay off even for a parameter with no default.
+struct LibParamFieldView {
+    name: String,
+    type_code: String,
+    default: Option<String>,
+    value: String,
+    required: bool,
+    error: Option<String>,
+}
+
+/// [`analyze_params`]'s pure result: everything the Parameters card, the
+/// `/run` fragment, and the `document` endpoint each need from one
+/// (document, SQL, submitted values) triple, computed exactly once so none
+/// of them can disagree about the signature, the bindings, or which
+/// required parameters are still unfilled (the architecture note's "una
+/// sola función").
+struct ParamsAnalysis {
+    fields: Vec<LibParamFieldView>,
+    /// `:name` placeholders the SQL uses that `fields` does not declare
+    /// (#841), in scanner order — see
+    /// [`sql_libraries::undeclared_placeholder_names`].
+    hints: Vec<String>,
+    /// The card's own signature (#841) — see [`sql_libraries::params_signature`].
+    signature: String,
+    /// One binding per declared parameter with a non-empty submitted value
+    /// (#841) — a blank value on a defaulted parameter is omitted
+    /// so `$sql-run` applies its own default, never sent as an empty string.
+    bindings: Vec<SqlExportParameter>,
+    /// The declared, default-less parameters with no non-empty submitted
+    /// value (#841) — non-empty exactly when the run this render
+    /// backs must show the "waiting" notice instead of calling `$sql-run`.
+    missing_required: Vec<String>,
+}
+
+/// Analyzes one `document`/`sql`/submitted-`values` triple for the
+/// Parameters card (#841): reads `document`'s declared `use=in` parameters
+/// ([`sql_libraries::parameters`]), scans `sql` for placeholders it does not
+/// declare ([`sql_libraries::undeclared_placeholder_names`]), and resolves
+/// each declared field's live-run value — a `values` entry when present
+/// (even blank, echoing a deliberate clear rather than snapping back to the
+/// default — the same rule [`crate::sql_export::ParamFieldView`]'s own doc
+/// comment states), the declared default otherwise.
+///
+/// Every field's `required` attribute is deliberately left `false`
+/// (`LibParamFieldView::required`) even for a parameter with no default:
+/// these inputs are `form="lib-editor-form"`, the *same* form Save submits,
+/// and Save must always succeed regardless of what the Parameters card
+/// holds (#841 — values are session-only and never block Save). The
+/// "waiting" notice this analysis's own `missing_required` drives is what
+/// actually enforces the requirement, entirely server-side, never through
+/// HTML5's native `required` validation.
+fn analyze_params(
+    document: &serde_json::Value,
+    sql: &str,
+    values: &std::collections::HashMap<String, String>,
+) -> ParamsAnalysis {
+    let declared = sql_libraries::parameters(document);
+    let hints = sql_libraries::undeclared_placeholder_names(sql, &declared);
+    let signature = sql_libraries::params_signature(&declared, &hints);
+
+    let mut fields = Vec::with_capacity(declared.len());
+    let mut bindings = Vec::new();
+    let mut missing_required = Vec::new();
+    for p in &declared {
+        let submitted = values.get(&p.name).map(String::as_str);
+        let value = submitted
+            .unwrap_or_else(|| p.default.as_deref().unwrap_or(""))
+            .to_string();
+        match submitted.map(str::trim) {
+            Some(trimmed) if !trimmed.is_empty() => bindings.push(SqlExportParameter {
+                name: p.name.clone(),
+                type_code: p.type_code.clone(),
+                value: trimmed.to_string(),
+            }),
+            _ if p.default.is_none() => missing_required.push(p.name.clone()),
+            // Empty (or never submitted) with a default: the server applies
+            // it by omission, so nothing is sent and nothing is missing.
+            _ => {}
+        }
+        fields.push(LibParamFieldView {
+            name: p.name.clone(),
+            type_code: p.type_code.clone(),
+            default: p.default.clone(),
+            value,
+            required: false,
+            error: None,
+        });
+    }
+    ParamsAnalysis {
+        fields,
+        hints,
+        signature,
+        bindings,
+        missing_required,
+    }
+}
+
+/// The "waiting" notice's own text (#841): every missing required
+/// parameter's name, `:`-prefixed and comma-joined ("`:ward`" or "`:ward,
+/// :city`"), interpolated into the `lib-run-waiting` catalog message.
+/// `missing_required` must be non-empty — every caller only reaches this
+/// once it has confirmed that itself.
+fn waiting_message(i18n: &I18n, missing_required: &[String]) -> String {
+    let names = missing_required
+        .iter()
+        .map(|name| format!(":{name}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    i18n.t_arg("lib-run-waiting", "names", names)
+}
+
+/// The Parameters card's own re-submitted `Add parameter` state (#841): the
+/// text/select values [`sql_library_document`] echoes back into the
+/// `<details>` on a rejected `add-parameter`, and the validation message
+/// alongside them. `Default` is every other render's own state — closed,
+/// empty, no error.
+#[derive(Default)]
+struct AddParamFormState {
+    name: String,
+    type_code: String,
+    open: bool,
+    error: Option<String>,
+}
+
+/// [`build_params_card`]'s presentation-only options — everything about a
+/// render that [`analyze_params`] itself has no opinion on, grouped so the
+/// function's own signature does not grow a parameter per caller. `Default`
+/// is the page's own inline render: no OOB swap, no `data-document`, the
+/// `Add parameter` panel closed and clean.
+#[derive(Default)]
+struct ParamsCardOptions {
+    add: AddParamFormState,
+    /// `true` only for the `/run` fragment's own OOB companion (#841) — the
+    /// one context where this card rides alongside another element's direct
+    /// target swap rather than being the response (or part of the page)
+    /// itself. See `partials/sql_parameters_card.html`'s own header comment.
+    oob: bool,
+    /// The `document` endpoint's own `HX-Request` success response carries
+    /// the updated Details document here (#841) — `host.setDoc`
+    /// (`sql-library-panels.js`) applies it as one undoable transaction.
+    /// `None` everywhere else, including a rejected `add-parameter`.
+    data_document: Option<String>,
+}
+
+/// Builds the Parameters card (#841) from an already-computed
+/// [`ParamsAnalysis`] plus `options`' presentation state — a caller that
+/// also needs `analysis.bindings`/`analysis.missing_required` (the `/run`
+/// fragment, the `document` endpoint) computes it once with
+/// [`analyze_params`] and passes it in here; a caller that only needs the
+/// card itself (the page's own render) may do the same and simply ignore
+/// the rest. `kind` supplies the card's static wiring
+/// (`run_href`/`document_href`); `kind.declares_parameters` is the caller's
+/// own gate for whether to build this at all — this function itself always
+/// builds one, trusting the caller already checked.
+fn build_params_card(
+    i18n: I18n,
+    kind: &LibraryKind,
+    analysis: ParamsAnalysis,
+    options: ParamsCardOptions,
+) -> LibParamsCard {
+    LibParamsCard {
+        i18n,
+        run_href: kind.run_href,
+        document_href: kind.document_href,
+        fields: analysis.fields,
+        hints: analysis.hints,
+        type_options: helios_sof::sqlquery::BINDABLE_PARAMETER_TYPES,
+        signature: analysis.signature,
+        add_name: options.add.name,
+        add_type: options.add.type_code,
+        add_open: options.add.open,
+        add_error: options.add.error,
+        oob: options.oob,
+        data_document: options.data_document,
+    }
+}
+
+/// `partials/sql_parameters_card.html`'s render surface (#841): the live-run
+/// values row (`sql_parameter_fields.html`, one `.field` per declared
+/// `Library.parameter[use=in]`), the undeclared-placeholder hints, the
+/// `params_sig` signature, and the `Add parameter` panel — built once by
+/// [`build_params_card`] and shared by the page's own first paint, the
+/// `/run` fragment's OOB companion, and the `document` endpoint's own
+/// response.
+#[derive(Template)]
+#[template(path = "partials/sql_parameters_card.html")]
+struct LibParamsCard {
+    i18n: I18n,
+    /// This kind's `POST …/run` fragment endpoint (#841) — the card's own
+    /// `hx-post`, fired 500ms after the last keystroke in any of its value
+    /// fields (they bubble `input` up to this element).
+    run_href: &'static str,
+    /// This kind's `POST …/document` endpoint (#841) — the `Add parameter`/
+    /// `Declare` controls' own `hx-post`/`formaction`.
+    document_href: &'static str,
+    fields: Vec<LibParamFieldView>,
+    /// Undeclared placeholder hints, in scanner order (#841).
+    hints: Vec<String>,
+    /// `Library.parameter[use=in]`'s own type picker options
+    /// (`helios_sof::sqlquery::BINDABLE_PARAMETER_TYPES`), for the `Add
+    /// parameter` `<select>`.
+    type_options: &'static [&'static str],
+    /// The `params_sig` hidden field's own value (#841).
+    signature: String,
+    add_name: String,
+    add_type: String,
+    add_open: bool,
+    add_error: Option<String>,
+    /// `true` only for the `/run` fragment's own OOB companion — see
+    /// [`ParamsCardOptions::oob`].
+    oob: bool,
+    /// The updated Details document, present only on the `document`
+    /// endpoint's own successful `HX-Request` response — see
+    /// [`ParamsCardOptions::data_document`].
+    data_document: Option<String>,
+}
+
+// ---------------------------------------------------------------------
+// Tables panel (#842): *Reads from* (a SQL Query/SQL View's declared
+// `relatedArtifact[depends-on]` table dependencies, resolved the same way
+// `$sql-run`'s own graph walk resolves them) and *Used by* (which other
+// Libraries and SQL Export jobs depend on this one). The pure half of this
+// — reading declarations, matching a reference against an already-fetched
+// candidate, and the `Add table`/`Remove` document mutations — lives in
+// `sql_libraries`; everything here is the I/O half (`ConformanceSource::
+// read_resource`/`search_page`/`fetch`, `sql_export::jobs_for_used_by`) plus
+// the presentation shaping `sql_libraries` itself never does (this module
+// never localizes, matching every other card's own split).
+// ---------------------------------------------------------------------
+
+/// Resolves one `relatedArtifact[depends-on].resource` reference against
+/// storage, mirroring `crates/rest/.../graph.rs`'s own `StorageArtifactFetcher::fetch`
+/// (#842's own resolution imitates, never replaces, the server's own):
+/// a `Type/id` reference reads that resource
+/// directly; an absolute canonical URL is searched for among stored
+/// ViewDefinitions first (`search_page("ViewDefinition", url=…)`, tried
+/// first since it is the more common dependency, exactly as the server's
+/// own fetcher tries it first), then — only if that finds nothing — among
+/// `libraries` (the rail's own already-fetched Library list, reused rather
+/// than fetched again, #842/NF1). A search or read failure degrades to
+/// [`sql_libraries::TableTarget::NotFound`] — the same "nothing answers to
+/// this" row a genuine 404 gets, since neither the API nor this card has
+/// anywhere else to explain the difference.
+///
+/// Also returns the resolved artifact's own raw JSON alongside its
+/// [`sql_libraries::TableTarget`] classification (#842/04) — `None` only
+/// for `TableTarget::NotFound`, since nothing was ever fetched. *Reads
+/// from* only needs the classification; the Columns card's own origin
+/// lookup ([`resolve_view_definition_dependencies`]) is what needs the
+/// document itself, to read its `select[].column[]` list.
+async fn resolve_table_reference(
+    state: &WebState,
+    version: helios_fhir::FhirVersion,
+    tenant: &str,
+    reference: &str,
+    libraries: &[serde_json::Value],
+) -> (sql_libraries::TableTarget, Option<serde_json::Value>) {
+    use sql_libraries::{DependencyLookup, TableTarget};
+    match sql_libraries::dependency_lookup(reference) {
+        DependencyLookup::TypeId { resource_type, id } => {
+            match state
+                .conformance
+                .read_resource(resource_type, &id, version, tenant)
+                .await
+            {
+                Ok(artifact) => {
+                    let target = sql_libraries::classify_table_artifact(resource_type, &artifact);
+                    (target, Some(artifact))
+                }
+                Err(_) => (TableTarget::NotFound, None),
+            }
+        }
+        DependencyLookup::Canonical { canonical, .. } => {
+            let params = vec![("url".to_string(), canonical)];
+            if let Ok(page) = state
+                .conformance
+                .search_page(
+                    "ViewDefinition",
+                    &params,
+                    sql_views::PAGE_SIZE,
+                    0,
+                    version,
+                    tenant,
+                )
+                .await
+                && let Some(vd) = page
+                    .resources
+                    .iter()
+                    .find(|vd| sql_libraries::matches_reference(reference, "ViewDefinition", vd))
+            {
+                let target = sql_libraries::classify_table_artifact("ViewDefinition", vd);
+                return (target, Some(vd.clone()));
+            }
+            match libraries
+                .iter()
+                .find(|lib| sql_libraries::matches_reference(reference, "Library", lib))
+            {
+                Some(lib) => {
+                    let target = sql_libraries::classify_table_artifact("Library", lib);
+                    (target, Some(lib.clone()))
+                }
+                None => (TableTarget::NotFound, None),
+            }
+        }
+    }
+}
+
+/// Resolves every dependency in `deps` via [`resolve_table_reference`],
+/// memoizing by `resource` so a dependency repeated under two labels — or
+/// two dependencies naming the same canonical URL — is only ever resolved
+/// once per render (#842's own "no redundant requests"). Returns each
+/// dependency's own [`sql_libraries::TableRow`] paired with the resolved
+/// artifact's raw JSON (#842/04) — *Reads from*'s own render only needs the
+/// former; [`resolve_view_definition_dependencies`] filters the latter down
+/// to the ViewDefinitions the Columns card needs.
+async fn resolve_table_rows(
+    state: &WebState,
+    version: helios_fhir::FhirVersion,
+    tenant: &str,
+    deps: &[sql_libraries::TableDependency],
+    libraries: &[serde_json::Value],
+) -> Vec<(sql_libraries::TableRow, Option<serde_json::Value>)> {
+    let mut cache: std::collections::HashMap<
+        String,
+        (sql_libraries::TableTarget, Option<serde_json::Value>),
+    > = std::collections::HashMap::new();
+    let mut rows = Vec::with_capacity(deps.len());
+    for dep in deps {
+        if !cache.contains_key(&dep.resource) {
+            let resolved =
+                resolve_table_reference(state, version, tenant, &dep.resource, libraries).await;
+            cache.insert(dep.resource.clone(), resolved);
+        }
+        let (target, doc) = cache
+            .get(&dep.resource)
+            .cloned()
+            .unwrap_or((sql_libraries::TableTarget::NotFound, None));
+        rows.push((
+            sql_libraries::TableRow {
+                label: dep.label.clone(),
+                resource: dep.resource.clone(),
+                target,
+            },
+            doc,
+        ));
+    }
+    rows
+}
+
+/// Resolves every dependency in `deps` down to the ViewDefinitions among
+/// them — the Columns card's own origin lookup (#842/04): `(label,
+/// resolved document)` for each dependency [`resolve_table_rows`] resolved
+/// to a `TableTarget::ViewDefinition`, in declaration order. A dependency
+/// that fails to resolve, or resolves to a SQL View or anything else, is
+/// simply absent — SQL Views never contribute a column origin (#842's own
+/// "out of scope" rule).
+///
+/// Only ever called after a successful `$sql-run` (#842/04's own NF1): this
+/// performs the identical fetch [`resolve_table_rows`] does for the Tables
+/// panel, so it is deliberately never invoked when a run failed or never
+/// ran at all — a good run's own dependency resolution "happens once per
+/// dependency", not once per keystroke that leaves the run unable to
+/// happen.
+async fn resolve_view_definition_dependencies(
+    state: &WebState,
+    version: helios_fhir::FhirVersion,
+    tenant: &str,
+    deps: &[sql_libraries::TableDependency],
+    libraries: &[serde_json::Value],
+) -> Vec<(String, serde_json::Value)> {
+    resolve_table_rows(state, version, tenant, deps, libraries)
+        .await
+        .into_iter()
+        .filter_map(|(row, doc)| match (row.target, doc) {
+            (sql_libraries::TableTarget::ViewDefinition { .. }, Some(doc)) => {
+                Some((row.label, doc))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// [`analyze_tables`]'s pure result: everything the Tables panel needs from
+/// one (document, already-fetched Library list, already-loaded job list)
+/// triple, computed once so *Reads from*'s signature and *Used by*'s rows
+/// can never disagree about what the document currently declares.
+struct TablesAnalysis {
+    rows: Vec<sql_libraries::TableRow>,
+    /// Every table the SQL reads that no declared label names (#842/04),
+    /// in first-occurrence-in-SQL order — [`sql_libraries::unknown_tables`]'s
+    /// own findings, appended as their own rows after `rows`.
+    unknown: Vec<String>,
+    /// The card's own signature (#842, extended for #842/04) — see
+    /// [`sql_libraries::tables_signature_with_unknown`].
+    signature: String,
+    used_by_artifacts: Vec<sql_libraries::UsedByArtifact>,
+    used_by_exports: Vec<sql_libraries::UsedByExport>,
+}
+
+/// Analyzes one document/dependency-list/job-list triple for the Tables
+/// panel (#842): resolves every declared dependency
+/// ([`resolve_table_rows`]), and finds every *Used by* peer — other
+/// Libraries depending on this one ([`sql_libraries::used_by_artifacts`])
+/// and SQL Export jobs whose subjects reference it
+/// ([`sql_libraries::used_by_exports`]). `deps` is the caller's own already-
+/// computed [`sql_libraries::table_dependencies`] (every caller needs it a
+/// moment earlier anyway, to decide whether to call this at all — see
+/// `sql_library_run`'s own signature comparison, #842/NF1). `unknown_tables`
+/// (#842/04) is the caller's own already-scanned
+/// [`sql_libraries::unknown_tables`] result — a pure, I/O-free computation
+/// every caller has to run anyway to decide whether `$sql-run` can even be
+/// attempted, so it is never repeated here.
+#[allow(clippy::too_many_arguments)]
+async fn analyze_tables(
+    state: &WebState,
+    version: helios_fhir::FhirVersion,
+    tenant: &str,
+    document: &serde_json::Value,
+    deps: &[sql_libraries::TableDependency],
+    unknown_tables: &[helios_sof::sqlquery::TableRef],
+    libraries: &[serde_json::Value],
+    jobs: &[(String, sql_export::ExportJob)],
+) -> TablesAnalysis {
+    let unknown: Vec<String> = unknown_tables.iter().map(|t| t.name.clone()).collect();
+    let signature = sql_libraries::tables_signature_with_unknown(deps, &unknown);
+    let rows = resolve_table_rows(state, version, tenant, deps, libraries)
+        .await
+        .into_iter()
+        .map(|(row, _doc)| row)
+        .collect();
+    let used_by_artifacts = sql_libraries::used_by_artifacts(libraries, document);
+    let library_id = document
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let used_by_exports = sql_libraries::used_by_exports(jobs, library_id);
+    TablesAnalysis {
+        rows,
+        unknown,
+        signature,
+        used_by_artifacts,
+        used_by_exports,
+    }
+}
+
+/// Fetches the tenant's whole Library list and job history, then runs
+/// [`analyze_tables`] — the "I have nothing already fetched" path every
+/// caller but the page's own render needs (`render_lib_document_page`,
+/// `apply_add_table`, `apply_remove_table`'s own `HX-Request` responses):
+/// unlike the page's own render, which already fetched a Library list for
+/// the rail (#842/NF1 — reused there, never fetched twice), these callers
+/// have no rail context of their own and fetch exactly once per response.
+/// `deps`/`unknown_tables` (#842/04) are the caller's own already-computed
+/// [`sql_libraries::table_dependencies`]/[`sql_libraries::unknown_tables`] —
+/// every caller parses `document` and scans the editor's own current SQL
+/// text a moment earlier anyway, to decide the run/notice gate this
+/// analysis is no substitute for.
+async fn full_tables_analysis(
+    state: &WebState,
+    version: helios_fhir::FhirVersion,
+    tenant: &str,
+    user_key: &str,
+    document: &serde_json::Value,
+    deps: &[sql_libraries::TableDependency],
+    unknown_tables: &[helios_sof::sqlquery::TableRef],
+) -> TablesAnalysis {
+    let libraries = state
+        .conformance
+        .fetch("Library", version, tenant)
+        .await
+        .unwrap_or_default();
+    let jobs = sql_export::jobs_for_used_by(state, user_key, tenant).await;
+    analyze_tables(
+        state,
+        version,
+        tenant,
+        document,
+        deps,
+        unknown_tables,
+        &libraries,
+        &jobs,
+    )
+    .await
+}
+
+/// The *Add table* combobox's own search endpoint href for a Library `id`
+/// (empty for `?lib=new`, per #842 — nothing to exclude when nothing
+/// is open yet).
+fn table_options_href(id: &str) -> String {
+    if id.is_empty() {
+        "/ui/lookup/table-options?target=lib-tables".to_string()
+    } else {
+        format!("/ui/lookup/table-options?target=lib-tables&exclude=Library/{id}")
+    }
+}
+
+/// One *Reads from* row, shaped for `partials/sql_tables_card.html`
+/// (#842) — [`sql_libraries::TableRow`] plus this module's own
+/// localization of its target, built by [`table_row_view`].
+struct TableRowView {
+    label: String,
+    chip: String,
+    /// `"type"` for a resolved target (`.tag--type`), `"failed"` for
+    /// `NotFound`/`NotATable` (`.tag--failed`) — the class suffix
+    /// `sql_tables_card.html` appends to `tag--`.
+    chip_class: &'static str,
+    link_href: Option<String>,
+    link_label: Option<String>,
+    /// The failure detail line under a `NotFound`/`NotATable` row's own
+    /// chip (#842); `None` for a resolved row.
+    detail: Option<String>,
+}
+
+/// Localizes one resolved [`sql_libraries::TableRow`] into a
+/// [`TableRowView`] (#842) — the chip text/class, the resolved
+/// target's own link, and, for an unresolved row, the failure detail
+/// message. `sql_libraries` itself never localizes (matching every other
+/// pure-model/view split in this module), so this is the one place a
+/// [`sql_libraries::TableTarget`] variant becomes catalog text.
+fn table_row_view(i18n: &I18n, row: sql_libraries::TableRow) -> TableRowView {
+    match row.target {
+        sql_libraries::TableTarget::ViewDefinition { id, name } => TableRowView {
+            label: row.label,
+            chip: i18n.t("lib-tables-kind-view-definition"),
+            chip_class: "type",
+            link_href: Some(format!("/ui/sql/view-definitions?vd={id}")),
+            link_label: Some(name),
+            detail: None,
+        },
+        sql_libraries::TableTarget::SqlView { id, name } => TableRowView {
+            label: row.label,
+            chip: i18n.t("sql-views-chip"),
+            chip_class: "type",
+            link_href: Some(format!("/ui/sql/views?lib={id}")),
+            link_label: Some(name),
+            detail: None,
+        },
+        sql_libraries::TableTarget::NotFound => TableRowView {
+            chip: i18n.t("lib-tables-target-not-found"),
+            chip_class: "failed",
+            link_href: None,
+            link_label: None,
+            detail: Some(i18n.t_arg(
+                "lib-tables-target-not-found-detail",
+                "resource",
+                row.resource,
+            )),
+            label: row.label,
+        },
+        sql_libraries::TableTarget::NotATable => TableRowView {
+            chip: i18n.t("lib-tables-target-not-a-table"),
+            chip_class: "failed",
+            link_href: None,
+            link_label: None,
+            detail: Some(i18n.t("lib-tables-target-not-a-table-detail")),
+            label: row.label,
+        },
+    }
+}
+
+/// One *Reads from* row for a table the SQL reads but no dependency
+/// declares (#842/04) — rendered after every resolved [`TableRowView`],
+/// with its own chip and *Declare* action rather than reusing
+/// [`sql_libraries::TableTarget::NotFound`]'s shape: unlike a declared
+/// dependency whose target fails to resolve, this table names no
+/// `relatedArtifact.resource` to resolve, or fail to resolve, at all.
+struct UnknownTableRowView {
+    /// The table name exactly as the SQL spells it — both the row's own
+    /// `<code>` text and the *Declare* button's own prefill value.
+    name: String,
+}
+
+/// One *Used by* row, shaped for `partials/sql_tables_card.html`
+/// (#842) — an artifact or an export, already indistinguishable by the
+/// time the card renders them (both are just a chip, a link and a label).
+struct UsedByRowView {
+    chip: String,
+    href: String,
+    label: String,
+}
+
+/// Localizes [`TablesAnalysis::used_by_artifacts`]/`used_by_exports` into
+/// the card's own row order (#842: artifacts first, then exports —
+/// each group already sorted by its own producer, name for artifacts
+/// ([`sql_libraries::used_by_artifacts`]), most-recently-started for
+/// exports ([`sql_export::jobs_for_used_by`])).
+fn used_by_view(i18n: &I18n, analysis: &TablesAnalysis) -> Vec<UsedByRowView> {
+    let mut rows: Vec<UsedByRowView> = analysis
+        .used_by_artifacts
+        .iter()
+        .map(|artifact| {
+            let (chip_key, base_href) = match artifact.kind {
+                sql_libraries::LibraryArtifactKind::SqlQuery => {
+                    ("sql-queries-chip", "/ui/sql/queries")
+                }
+                sql_libraries::LibraryArtifactKind::SqlView => ("sql-views-chip", "/ui/sql/views"),
+            };
+            UsedByRowView {
+                chip: i18n.t(chip_key),
+                href: format!("{base_href}?lib={}", artifact.id),
+                label: artifact.name.clone(),
+            }
+        })
+        .collect();
+    rows.extend(analysis.used_by_exports.iter().map(|export| UsedByRowView {
+        chip: i18n.t("lib-used-by-export-kind"),
+        href: format!("/ui/sql/export/{}", export.job_id),
+        label: export.label.clone(),
+    }));
+    rows
+}
+
+/// The *Add table* panel's own re-submitted state (#842): the `table`/
+/// `alias` text [`sql_library_document`] echoes back into the `<details>`
+/// on a rejected `add-table`, and the validation message alongside them.
+/// `Default` is every other render's own state — closed, empty, no error.
+#[derive(Default)]
+struct AddTableFormState {
+    table: String,
+    alias: String,
+    open: bool,
+    error: Option<String>,
+}
+
+/// [`build_tables_card`]'s presentation-only options — mirrors
+/// [`ParamsCardOptions`] for the Tables panel: `Default` is the page's own
+/// inline render (no OOB swap, no `data_document`, the *Add table* panel
+/// closed and clean).
+#[derive(Default)]
+struct TablesCardOptions {
+    add: AddTableFormState,
+    /// `true` only for the `/run` fragment's own OOB companion (#842) — see
+    /// [`ParamsCardOptions::oob`]'s identical role for the Parameters card.
+    oob: bool,
+    /// The `document` endpoint's own `HX-Request` success response carries
+    /// the updated Details document here (#842) — `host.setDoc`
+    /// (`sql-library-panels.js`) applies it exactly as it already does for
+    /// `#lib-params`.
+    data_document: Option<String>,
+}
+
+/// Builds the Tables panel's left-hand card (#842) from an already-computed
+/// [`TablesAnalysis`] plus `options`' presentation state — mirrors
+/// [`build_params_card`]'s own role for the Parameters card.
+///
+/// #842/04: on a page-level render (`!options.oob` — the page's own first
+/// paint, the `document` endpoint's own no-JS echo, or a validation-error
+/// re-render; never the `/run` fragment's own OOB companion) whose SQL
+/// reads at least one unknown table, the panel opens itself with the
+/// *first* one's own name already in the alias field whenever
+/// `options.add` is still its own untouched default (closed, empty, no
+/// error — never the case after a rejected *Add table* submission, which
+/// always sets at least one of those) — the no-JS half of *Declare*'s own
+/// contract: a no-JS visitor has no other way to reach the panel at
+/// all. With JavaScript, the live `/run` fragment never auto-opens it —
+/// only clicking a specific row's own *Declare {name}* button
+/// (`sql-library-panels.js`) does, so introducing a typo while typing
+/// never yanks focus into a panel the visitor did not ask for.
+fn build_tables_card(
+    i18n: I18n,
+    kind: &LibraryKind,
+    analysis: TablesAnalysis,
+    table_options_href: String,
+    options: TablesCardOptions,
+) -> LibTablesCard {
+    let used_by = used_by_view(&i18n, &analysis);
+    let rows = analysis
+        .rows
+        .into_iter()
+        .map(|row| table_row_view(&i18n, row))
+        .collect();
+    let unknown_rows: Vec<UnknownTableRowView> = analysis
+        .unknown
+        .into_iter()
+        .map(|name| UnknownTableRowView { name })
+        .collect();
+    let add_is_default = !options.oob
+        && options.add.table.is_empty()
+        && options.add.alias.is_empty()
+        && !options.add.open
+        && options.add.error.is_none();
+    let (add_alias, add_open) = if add_is_default && let Some(first) = unknown_rows.first() {
+        (first.name.clone(), true)
+    } else {
+        (options.add.alias, options.add.open)
+    };
+    LibTablesCard {
+        i18n,
+        document_href: kind.document_href,
+        table_options_href,
+        rows,
+        unknown_rows,
+        used_by,
+        signature: analysis.signature,
+        add_table: options.add.table,
+        add_alias,
+        add_open,
+        add_error: options.add.error,
+        oob: options.oob,
+        data_document: options.data_document,
+    }
+}
+
+/// `partials/sql_tables_card.html`'s render surface (#842): the resolved
+/// *Reads from* rows, the *Used by* rows, the `tables_sig` signature, and
+/// the *Add table* panel — built once by [`build_tables_card`] and shared
+/// by the page's own first paint, the `/run` fragment's OOB companion, and
+/// the `document` endpoint's own response, exactly like [`LibParamsCard`].
+#[derive(Template)]
+#[template(path = "partials/sql_tables_card.html")]
+struct LibTablesCard {
+    i18n: I18n,
+    /// This kind's `POST …/document` endpoint (#842) — the *Add table*/
+    /// *Remove* controls' own `hx-post`/`formaction`.
+    document_href: &'static str,
+    /// The *Add table* combobox's own search endpoint (#842).
+    table_options_href: String,
+    rows: Vec<TableRowView>,
+    /// Tables the SQL reads that no dependency declares (#842/04),
+    /// rendered as their own rows after `rows` — never counted in the
+    /// card head's own `.toolbar__count`, which still names only the
+    /// *declared* dependencies.
+    unknown_rows: Vec<UnknownTableRowView>,
+    used_by: Vec<UsedByRowView>,
+    /// The `tables_sig` hidden field's own value (#842).
+    signature: String,
+    add_table: String,
+    add_alias: String,
+    add_open: bool,
+    add_error: Option<String>,
+    /// `true` only for the `/run` fragment's own OOB companion — see
+    /// [`TablesCardOptions::oob`].
+    oob: bool,
+    /// The updated Details document, present only on the `document`
+    /// endpoint's own successful `HX-Request` response — see
+    /// [`TablesCardOptions::data_document`].
+    data_document: Option<String>,
+}
+
+/// One *Columns* row, shaped for `partials/sql_columns_card.html`
+/// (#842/04) — a [`sql_libraries::ColumnInfo`] with its type/origin already
+/// rendered to display text, `"—"` standing in for either `None`
+/// (`crate::column_rows`, the one place a [`sql_libraries::ColumnInfo`]
+/// becomes catalog-free display text — there is no i18n key for it, this
+/// placeholder is the same in every locale).
+struct ColumnRowView {
+    name: String,
+    type_text: String,
+    /// `"{label}.{column}"` when [`sql_libraries::ColumnInfo::origin`] is
+    /// `Some`, `"—"` otherwise.
+    origin_text: String,
+}
+
+/// The Tables panel's right-hand card (#842, filled in for #842/04):
+/// *Columns* — the last good run's own column list, or, with `rows` empty,
+/// the same skeleton #842/03 rendered (a fixed `0` count and
+/// `empty_key`'s own "run it to see its columns" body). One struct/template
+/// covers both: the skeleton is simply this card with nothing to show yet,
+/// never a separate render path.
+///
+/// Rendered two ways:
+///   - The page's own inline render (`oob: false`) — skeleton on every
+///     render but a successful `?…&saved=1` (`crate::sql_library_page`),
+///     which fills `rows` in instead.
+///   - The `/run` fragment's own OOB companion (`oob: true`) — only on a
+///     successful run; a failure of any kind relabels `#lib-columns-meta`
+///     on its own instead of sending this card at all (#842/04's own
+///     `ColumnsFragment::Stale`), so `rows` is never empty when this
+///     variant travels.
+#[derive(Template)]
+#[template(path = "partials/sql_columns_card.html")]
+struct LibColumnsCard {
+    i18n: I18n,
+    /// "what the query produces" / "what the view produces"
+    /// (`kind.columns_meta_key`) — never the "last successful run" stale
+    /// text, which only ever travels as `ColumnsFragment::Stale`'s own
+    /// meta-only OOB update, never through this card.
+    meta: String,
+    rows: Vec<ColumnRowView>,
+    /// The skeleton's own empty-state body (`kind.columns_empty_key`) —
+    /// read only when `rows` is empty.
+    empty_key: &'static str,
+    /// `true` only for the `/run` fragment's own OOB companion — see this
+    /// struct's own doc comment.
+    oob: bool,
+}
+
+/// Builds the Columns card (#842/04) — the skeleton (`rows: Vec::new()`,
+/// every render but a good run) or the last good run's own column list,
+/// localizing each [`sql_libraries::ColumnInfo`] [`sql_libraries::
+/// analyze_columns`] returns into a [`ColumnRowView`].
+fn build_columns_card(
+    i18n: I18n,
+    kind: &LibraryKind,
+    rows: Vec<sql_libraries::ColumnInfo>,
+    oob: bool,
+) -> LibColumnsCard {
+    let rows = rows
+        .into_iter()
+        .map(|c| ColumnRowView {
+            name: c.name,
+            type_text: c.type_code.unwrap_or_else(|| "—".to_string()),
+            origin_text: c
+                .origin
+                .map(|(label, column)| format!("{label}.{column}"))
+                .unwrap_or_else(|| "—".to_string()),
+        })
+        .collect();
+    LibColumnsCard {
+        i18n,
+        meta: i18n.t(kind.columns_meta_key),
+        rows,
+        empty_key: kind.columns_empty_key,
+        oob,
+    }
+}
+
+/// The unknown-table lint's own `#run-notice` (#842/04) — rendered in
+/// place of [`RunResultsPartial`]'s own `Failure` arm because this notice
+/// needs a `data-diagnostics` attribute `partials/sql_run_results.html` has
+/// no reason to carry for every page that shares it (View Definitions has
+/// no SQL to scan tables out of at all, and that partial's own doc comment
+/// asks that it stay exactly as it is). Otherwise the identical OOB shape
+/// as that partial's own `Failure` arm: the previous `#run-results` table
+/// (if any) is left untouched, and only its meta is relabelled "last
+/// successful run" — see [`unknown_tables_notice`] for how its own fields
+/// are built.
+#[derive(Template)]
+#[template(path = "partials/lib_run_unknown_tables.html")]
+struct UnknownTablesNotice {
+    i18n: I18n,
+    fragment: bool,
+    /// The *first* unknown table's own 1-based line — `data-error-line`,
+    /// the same attribute [`sql_views::extract_error_line`]'s own findings
+    /// already tint via `sql-editor.js`.
+    first_line: usize,
+    /// The whole notice's own text — the first table's own long sentence,
+    /// then one short sentence per additional table.
+    message: String,
+    /// `{ "from", "to", "message", "table" }` objects, one per unknown
+    /// table, JSON-encoded (`data-diagnostics`) — `sql-editor.js`'s own
+    /// `setDiagnostics` input.
+    diagnostics_json: String,
+}
+
+/// Builds [`UnknownTablesNotice`]'s own text and diagnostics from the
+/// scanner's own findings (#842/04) — shared by every surface that gates
+/// `$sql-run` on it the same way: the `/run` fragment, `?…&saved=1`'s own
+/// server-side run, and the `document` endpoint's own no-JS echo. `tables` must be
+/// non-empty; every caller only reaches here once
+/// [`sql_libraries::unknown_tables`] returned something.
+///
+/// Every diagnostic's own `"message"` is the *short* per-table sentence
+/// (`lib-run-unknown-table-more`), even the first one — the long "declare
+/// it under Reads from" sentence only ever appears once, in the notice's
+/// own banner text, never repeated in each position's own hover tooltip.
+fn unknown_tables_notice(
+    i18n: I18n,
+    fragment: bool,
+    tables: &[helios_sof::sqlquery::TableRef],
+) -> UnknownTablesNotice {
+    let mut message = String::new();
+    let mut diagnostics = Vec::with_capacity(tables.len());
+    for (index, table) in tables.iter().enumerate() {
+        let line = table.position.line.to_string();
+        let short = i18n.t_arg2(
+            "lib-run-unknown-table-more",
+            "name",
+            table.name.clone(),
+            "line",
+            line.clone(),
+        );
+        if index == 0 {
+            message.push_str(&i18n.t_arg2(
+                "lib-run-unknown-table",
+                "name",
+                table.name.clone(),
+                "line",
+                line,
+            ));
+        } else {
+            message.push(' ');
+            message.push_str(&short);
+        }
+        diagnostics.push(serde_json::json!({
+            "from": table.position.offset,
+            "to": table.position.offset + table.position.length,
+            "message": short,
+            "table": table.name,
+        }));
+    }
+    UnknownTablesNotice {
+        i18n,
+        fragment,
+        first_line: tables[0].position.line,
+        message,
+        diagnostics_json: serde_json::to_string(&diagnostics).unwrap_or_default(),
+    }
+}
+
+/// The Library-backed pages' own `#run-notice` region (#842/04) — either
+/// the shared [`RunResultsPartial`] every SQL on FHIR playground uses, or
+/// the unknown-table lint's own [`UnknownTablesNotice`] taking its place: a
+/// SQL View with declared parameters, a required parameter
+/// with no value, and an actual `$sql-run` failure all render as
+/// [`Self::Standard`]; only "the SQL reads a table no dependency declares"
+/// renders as [`Self::UnknownTables`], since only that case needs
+/// `data-diagnostics`. Used both by the `/run` fragment
+/// ([`LibRunFragment::run_results`]) and by every full-page render
+/// ([`SqlLibraryPage::run_results`]) that must show the identical notice
+/// in place of results (`?…&saved=1`, the `document` endpoint's own no-JS
+/// echo).
+enum LibRunNotice {
+    Standard(RunResultsPartial),
+    UnknownTables(UnknownTablesNotice),
 }
 
 /// The SQL Queries / SQL Views workspace (#649): the same shape as View
@@ -3341,11 +4646,36 @@ struct SqlLibraryPage {
     degraded: Option<String>,
     selected: Option<SelectedLib>,
     is_new: bool,
-    /// The `$sql-run` preview card and its failure notice, nested as its own
-    /// template (#839) so `partials/sql_run_results.html`'s markup — shared
-    /// with View Definitions — stays in exactly one place. `fragment: false`
-    /// here — the page's own render has nothing to swap into.
-    run_results: RunResultsPartial,
+    /// The Details card's guided-form panel (#840), alongside its own JSON
+    /// editor — the same shape View Definitions' `form_pane` is, built
+    /// inline from the document `selected.json` already shows so the page's
+    /// first paint never flashes full-width before shrinking to make room
+    /// for it. `None` only alongside `selected: None`.
+    details: Option<editor::EditorFormPane>,
+    /// Whether this kind declares `Library.parameter[]` at all
+    /// (`kind.declares_parameters`, #841) — the template's own gate for
+    /// rendering `params_card`, never an `if` on `code`.
+    declares_parameters: bool,
+    /// The Parameters card (#841), `Some` only alongside
+    /// `declares_parameters` and a selection — `None` for SQL Views and for
+    /// the "no Library yet" empty state.
+    params_card: Option<LibParamsCard>,
+    /// The Tables panel's left-hand card (#842, both kinds): *Reads from*
+    /// and *Used by*. `Some` whenever a Library is selected — including
+    /// `?lib=new` — `None` only for the "no Library yet" empty state.
+    tables_card: Option<LibTablesCard>,
+    /// The Tables panel's right-hand card (#842, filled in for #842/04):
+    /// *Columns* — the skeleton on every render but a successful
+    /// `?…&saved=1`, gated the same way as `tables_card` (present only
+    /// alongside a selection, so this needs no further gate of its own in
+    /// the template).
+    columns_card: Option<LibColumnsCard>,
+    /// The `$sql-run` preview card and its failure notice — either the
+    /// shared `partials/sql_run_results.html` markup or the unknown-table
+    /// lint's own notice (#842/04, [`LibRunNotice`]). `fragment: false` on
+    /// the `Standard` arm here — the page's own render has nothing to
+    /// swap into.
+    run_results: LibRunNotice,
     save_error: Option<String>,
     saved: bool,
     /// The "Recently used" group's own rows.
@@ -3383,7 +4713,11 @@ struct SqlLibQuery {
 }
 
 /// Shapes a stored `Library` resource into the editor's `(id, name, json,
-/// sql)` quadruple, decoding the SQL pane out of its base64 attachment.
+/// sql)` quadruple: `sql` decoded out of the base64 `application/sql`
+/// attachment for the SQL card, `json` the Details card's own document —
+/// `lib` with that same attachment stripped back out (#840,
+/// [`sql_libraries::strip_sql_attachment`]) — so the two cards never show
+/// the SQL text twice.
 fn shape_lib(lib: &serde_json::Value) -> (String, String, String, String) {
     let id = lib
         .get("id")
@@ -3396,8 +4730,73 @@ fn shape_lib(lib: &serde_json::Value) -> (String, String, String, String) {
         .unwrap_or(&id)
         .to_string();
     let sql = sql_libraries::extract_sql(lib);
-    let json = serde_json::to_string_pretty(lib).unwrap_or_default();
+    let json =
+        serde_json::to_string_pretty(&sql_libraries::strip_sql_attachment(lib)).unwrap_or_default();
     (id, name, json, sql)
+}
+
+/// Builds SQL Query/SQL View's Details guided-form panel (#840) against an
+/// already-parsed document — the same analysis `editor::render_body`'s
+/// `pane=form` branch performs over HTTP (`editor::build_form_pane`) with
+/// `hidden=["content"]` and `legend=sql-library`, called directly instead:
+/// the page's own render (and the Save-error re-render) need the panel in
+/// place on first paint, not fetched after the fact. Mirrors
+/// [`render_vd_form_pane`]; `document`'s own `resourceType` decides the
+/// fallback resource type when absent, falling back to `"Library"` — every
+/// caller on this page hands it a `Library` (its SQL attachment already
+/// stripped by the caller), except the one Save-error path where the
+/// submitted document parses but carries some other type.
+fn render_lib_details_pane(
+    i18n: I18n,
+    version: helios_fhir::FhirVersion,
+    document: serde_json::Value,
+) -> editor::EditorFormPane {
+    let registry = helios_fhir_validator::packs::core_registry(version);
+    let resource_type = document
+        .get("resourceType")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("Library")
+        .to_string();
+    // #840: the SQL attachment lives in its own card below, never in the
+    // Details form — hidden from both its rows and its own "+ Add" list —
+    // and the two-line legend names what Save actually gates on this page
+    // (the Library type coding and the SQL attachment), not the generic
+    // constraints/terminology promise `Legend::Resource` makes.
+    editor::build_form_pane(
+        i18n,
+        registry,
+        version,
+        resource_type,
+        document,
+        None,
+        true,
+        &[String::from("content")],
+        "sql-library",
+    )
+}
+
+/// The Details panel for whichever document this render selected (#840):
+/// the stored library — its SQL attachment stripped — or `?lib=new`'s
+/// starter document (which carries none to begin with), mirroring
+/// [`vd_form_pane_for_selection`]. `None` only alongside `selected: None`.
+fn lib_details_pane_for_selection(
+    i18n: I18n,
+    version: helios_fhir::FhirVersion,
+    kind: &LibraryKind,
+    is_new: bool,
+    selected_value: Option<&serde_json::Value>,
+) -> Option<editor::EditorFormPane> {
+    if is_new {
+        Some(render_lib_details_pane(
+            i18n,
+            version,
+            sql_libraries::starter_library_value(kind.code),
+        ))
+    } else {
+        selected_value.map(|lib| {
+            render_lib_details_pane(i18n, version, sql_libraries::strip_sql_attachment(lib))
+        })
+    }
 }
 
 /// Resolves one candidate Library id, requiring it to carry `code`: a stored
@@ -3450,6 +4849,7 @@ fn resolve_lib_recents(
     rail.resolve_recents(&live, |id| format!("{base_href}?lib={id}"), None)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn sql_library_page(
     state: WebState,
     locale: RequestLocale,
@@ -3458,6 +4858,7 @@ async fn sql_library_page(
     query: SqlLibQuery,
     kind: &LibraryKind,
     settings: rail_state::RequestSettings,
+    user_key: String,
 ) -> Response {
     let filter = query.filter.unwrap_or_default();
     let (mut libraries, degraded) = match state.conformance.fetch("Library", rv.0, &rt.id).await {
@@ -3593,16 +4994,184 @@ async fn sql_library_page(
     // Owned, not borrowed: `selected` itself moves into the response below,
     // in the same expression that still needs this id for `export_href`.
     let selected_id = selected.as_ref().map(|s| s.id.clone()).unwrap_or_default();
-    let run_state = match (&selected_value, query.saved.as_deref() == Some("1")) {
-        (Some(lib), true) => match run_sql_preview(&state, lib, rv.0, &rt.id).await {
-            Ok((table, ms)) => RunResultsState::Success(table, ms),
-            Err(error) => {
-                let line = sql_views::extract_error_line(&error);
-                RunResultsState::Failure(error, line)
-            }
-        },
-        _ => RunResultsState::Empty,
+
+    // #842: the Tables panel, for whichever document this render selected —
+    // the stored library, or `?lib=new`'s starter document (which still
+    // declares one dependency, `change-me`, unresolved). Reuses the
+    // very `libraries` fetch the rail above already made (NF1): by this
+    // point the selected library's own entry has already been removed from
+    // it (`swap_remove`, above), so it never lists itself as a dependency
+    // target nor as a *Used by* peer.
+    let tables_document: Option<serde_json::Value> = if is_new {
+        Some(sql_libraries::starter_library_value(kind.code))
+    } else {
+        selected_value.clone()
     };
+    // #842/04: the unknown-table lint applies to `?…&saved=1`'s own
+    // server-side run exactly as it does to the `/run` fragment — computed
+    // once here (pure, no I/O) and reused both to gate the run below and to
+    // feed *Reads from*'s own unknown rows. `selected.sql` (never
+    // `tables_document`'s own, possibly stale, embedded attachment) is the
+    // editor's current text — for `?lib=new` that is the starter SQL, which
+    // its own declared `v` dependency already covers.
+    let deps = tables_document
+        .as_ref()
+        .map(sql_libraries::table_dependencies)
+        .unwrap_or_default();
+    let unknown_tables = selected
+        .as_ref()
+        .map(|s| sql_libraries::unknown_tables(&s.sql, &deps))
+        .unwrap_or_default();
+    let tables_card = match &tables_document {
+        Some(document) => {
+            let jobs = sql_export::jobs_for_used_by(&state, &user_key, &rt.id).await;
+            let analysis = analyze_tables(
+                &state,
+                rv.0,
+                &rt.id,
+                document,
+                &deps,
+                &unknown_tables,
+                &libraries,
+                &jobs,
+            )
+            .await;
+            Some(build_tables_card(
+                i18n,
+                kind,
+                analysis,
+                table_options_href(&selected_id),
+                TablesCardOptions::default(),
+            ))
+        }
+        None => None,
+    };
+
+    // #841: this render never has any submitted parameter values — a fresh
+    // navigation has nothing to echo, and `?…&saved=1`'s own POST body is
+    // lost to Save's redirect — so the analysis and
+    // the card it feeds are always built off an empty map. A SQL Query with
+    // a declared, required parameter therefore always needs a value typed
+    // in before `?…&saved=1` can show a table; until then this render's own
+    // `run_results` below shows the same "waiting" notice the `/run`
+    // fragment would.
+    let no_values = std::collections::HashMap::new();
+    let analysis = kind
+        .declares_parameters
+        .then_some(selected_value.as_ref())
+        .flatten()
+        .map(|lib| {
+            let sql = selected
+                .as_ref()
+                .map(|s| s.sql.as_str())
+                .unwrap_or_default();
+            analyze_params(lib, sql, &no_values)
+        });
+    // #842/04: a SQL View's own non-empty `parameter[]` — the same gate
+    // `sql_library_run` checks first, against the *submitted* document
+    // rather than an `analyze_params`-style analysis, since it never even
+    // reaches SQL Views. `?…&saved=1` only ever shows a *stored* Library,
+    // which Save's own gate (#841/#842) already keeps from carrying one —
+    // this exists only for a document a raw API write put here instead.
+    let view_has_parameters = !kind.declares_parameters
+        && selected_value
+            .as_ref()
+            .and_then(|lib| lib.get("parameter"))
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|params| !params.is_empty());
+    let export_href_val = export_href(kind, &selected_id);
+    let standard_notice = |state: RunResultsState| {
+        LibRunNotice::Standard(RunResultsPartial {
+            i18n,
+            fragment: false,
+            run_href: kind.run_href,
+            form_id: LIB_EDITOR_FORM_ID,
+            heading_key: kind.results_heading_key,
+            failed_key: kind.failed_key,
+            export_href: export_href_val.clone(),
+            state,
+        })
+    };
+    let (run_results, columns_rows) = match (&selected_value, query.saved.as_deref() == Some("1")) {
+        (Some(_), true) if view_has_parameters => (
+            standard_notice(RunResultsState::Failure(
+                i18n.t("lib-save-view-parameters"),
+                None,
+            )),
+            Vec::new(),
+        ),
+        (Some(_), true) if !unknown_tables.is_empty() => (
+            LibRunNotice::UnknownTables(unknown_tables_notice(i18n, false, &unknown_tables)),
+            Vec::new(),
+        ),
+        (Some(_), true)
+            if analysis
+                .as_ref()
+                .is_some_and(|a| !a.missing_required.is_empty()) =>
+        {
+            (
+                standard_notice(RunResultsState::Waiting(waiting_message(
+                    &i18n,
+                    &analysis.as_ref().expect("checked above").missing_required,
+                ))),
+                Vec::new(),
+            )
+        }
+        (Some(lib), true) => {
+            let bindings = analysis
+                .as_ref()
+                .map(|a| a.bindings.as_slice())
+                .unwrap_or(&[]);
+            match run_sql_preview(&state, lib, bindings, rv.0, &rt.id).await {
+                Ok((table, raw_rows, ms)) => {
+                    // #842/04's own NF1: the Columns card's origin lookup
+                    // resolves dependencies to ViewDefinitions only after a
+                    // run has actually succeeded — and only the ones the
+                    // SQL actually reads (`dependencies_used_by_sql`), so a
+                    // stale, no-longer-queried label never manufactures a
+                    // false "ambiguous origin".
+                    let run_sql = selected
+                        .as_ref()
+                        .map(|s| s.sql.as_str())
+                        .unwrap_or_default();
+                    let used_deps = sql_libraries::dependencies_used_by_sql(run_sql, &deps);
+                    let view_definitions = resolve_view_definition_dependencies(
+                        &state, rv.0, &rt.id, &used_deps, &libraries,
+                    )
+                    .await;
+                    let columns = sql_libraries::analyze_columns(
+                        &table.columns,
+                        &raw_rows,
+                        &view_definitions,
+                    );
+                    (
+                        standard_notice(RunResultsState::Success(table, ms)),
+                        columns,
+                    )
+                }
+                Err(error) => {
+                    let line = sql_views::extract_error_line(&error);
+                    (
+                        standard_notice(RunResultsState::Failure(error, line)),
+                        Vec::new(),
+                    )
+                }
+            }
+        }
+        _ => (standard_notice(RunResultsState::Empty), Vec::new()),
+    };
+    let params_card = analysis
+        .map(|analysis| build_params_card(i18n, kind, analysis, ParamsCardOptions::default()));
+    // #842/04: the skeleton on every render but a good `?…&saved=1` run,
+    // gated identically to `tables_card` — `Some` alongside any selection,
+    // `None` only for the "no Library yet" empty state.
+    let columns_card = tables_card
+        .is_some()
+        .then(|| build_columns_card(i18n, kind, columns_rows, false));
+    // #840: the Details card's guided-form panel, built inline from the same
+    // document `selected.json` already shows — `selected_value` is still
+    // borrowed here, ahead of `selected` itself moving into the response.
+    let details = lib_details_pane_for_selection(i18n, rv.0, kind, is_new, selected_value.as_ref());
 
     render(SqlLibraryPage {
         status: current_status(&state, rv.0, &rt),
@@ -3626,16 +5195,12 @@ async fn sql_library_page(
         degraded,
         selected,
         is_new,
-        run_results: RunResultsPartial {
-            i18n,
-            fragment: false,
-            run_href: kind.run_href,
-            form_id: LIB_EDITOR_FORM_ID,
-            heading_key: kind.results_heading_key,
-            failed_key: kind.failed_key,
-            export_href: export_href(kind, &selected_id),
-            state: run_state,
-        },
+        details,
+        declares_parameters: kind.declares_parameters,
+        params_card,
+        tables_card,
+        columns_card,
+        run_results,
         save_error: None,
         saved: query.saved.as_deref() == Some("1"),
         recent_entries,
@@ -3644,16 +5209,257 @@ async fn sql_library_page(
     })
 }
 
-#[derive(Deserialize)]
+#[derive(Default)]
 struct SqlLibSaveForm {
-    #[serde(default)]
     id: String,
     json: String,
     /// The decoded SQL pane; re-embedded as the base64 attachment on save.
-    #[serde(default)]
     sql: String,
-    #[serde(default)]
     action: String,
+    /// Every submitted `param:{name}` value (#841) — Save reads these only
+    /// to echo the Parameters card back exactly as the user had it on a
+    /// rejected submission; [`sql_libraries::add_parameter`] is the only
+    /// writer of `Library.parameter[]`, so nothing here ever reaches a
+    /// saved resource.
+    values: std::collections::HashMap<String, String>,
+}
+
+/// Parses `SqlLibSaveForm`'s fields out of a raw urlencoded body (#841): the
+/// dynamic `param:{name}` values a `#[derive(Deserialize)]` struct cannot
+/// express, alongside the fixed `id`/`json`/`sql`/`action` fields — the same
+/// by-hand parse `sql_export::start` uses for its own `param:{reference}:
+/// {name}` fields.
+fn parse_lib_save_form(body: &[u8]) -> SqlLibSaveForm {
+    let mut form = SqlLibSaveForm::default();
+    for (key, value) in form_urlencoded::parse(body) {
+        if let Some(name) = key.strip_prefix("param:") {
+            form.values.insert(name.to_string(), value.into_owned());
+            continue;
+        }
+        match key.as_ref() {
+            "id" => form.id = value.into_owned(),
+            "json" => form.json = value.into_owned(),
+            "sql" => form.sql = value.into_owned(),
+            "action" => form.action = value.into_owned(),
+            _ => {}
+        }
+    }
+    form
+}
+
+/// Builds the Details guided-form panel and the Parameters card together
+/// from one submitted JSON string (#840/#841): the panel from the parsed
+/// document, with the same document feeding [`analyze_params`] for the
+/// card when `kind.declares_parameters`; the invalid-JSON notice in the
+/// panel's place, and no card at all, when `json` does not parse — there is
+/// no document left to read declarations from either. Shared by Save's own
+/// validation-error re-render and the `document` endpoint's own no-JS
+/// response ([`render_lib_document_page`]), the two places that reconstruct
+/// this pairing from raw submitted text rather than an already-resolved
+/// document.
+fn lib_details_and_params(
+    i18n: I18n,
+    version: helios_fhir::FhirVersion,
+    kind: &LibraryKind,
+    json: &str,
+    sql: &str,
+    values: &std::collections::HashMap<String, String>,
+    add: AddParamFormState,
+) -> (editor::EditorFormPane, Option<LibParamsCard>) {
+    match serde_json::from_str::<serde_json::Value>(json) {
+        Ok(document) => {
+            let details = render_lib_details_pane(i18n, version, document.clone());
+            let params_card = kind.declares_parameters.then(|| {
+                let analysis = analyze_params(&document, sql, values);
+                build_params_card(
+                    i18n,
+                    kind,
+                    analysis,
+                    ParamsCardOptions {
+                        add,
+                        ..Default::default()
+                    },
+                )
+            });
+            (details, params_card)
+        }
+        Err(parse_error) => {
+            let details = invalid_form_pane(
+                i18n,
+                json.to_string(),
+                parse_error.to_string(),
+                editor::Legend::SqlLibrary,
+            );
+            (details, None)
+        }
+    }
+}
+
+/// Re-renders the whole SQL Query/SQL View workspace around a submitted —
+/// not necessarily saved — document (#840, extended for #841): Save's own
+/// validation-error path and the `document` endpoint's own no-JS response
+/// both land here. Neither writes anything to storage; both show exactly
+/// the `json`/`sql`/parameter `values` the request carried (for the
+/// `document` endpoint's own success case, `json` is the document
+/// [`sql_libraries::add_parameter`] just produced, pretty-printed — not
+/// what was submitted); neither ever calls `$sql-run` — the submitted text
+/// is what the live-preview wiring runs once the page opens, once
+/// JavaScript re-fires it — so the results region is always either empty
+/// (`RunResultsState::Empty`, the same "nothing has run server-side yet"
+/// shell every render with no `?…&saved=1` uses) or, when the SQL reads an
+/// undeclared table, the unknown-table lint's own notice in its place
+/// (#842/04 — free to compute, no I/O involved).
+///
+/// `save_error` is the page-level `.notice--warn` banner: `Some` for Save's
+/// own rejections and the `document` endpoint's whole-document failures (an
+/// invalid JSON body, or the wrong `resourceType` — #841/#842), `None`
+/// otherwise, including the `document` endpoint's own success and its
+/// own `add-parameter`/`add-table`-specific validation failures, which
+/// surface through the Parameters/Tables cards' own `add` panels instead
+/// ([`AddParamFormState`]/[`AddTableFormState`]).
+///
+/// #842: the Tables panel renders here too — built from `json` the same way
+/// [`lib_details_and_params`] builds `params_card`, `None` alongside it
+/// when `json` fails to parse (there is no document to resolve
+/// dependencies from either), `Some` otherwise via [`full_tables_analysis`]
+/// (this function has no rail-fetched Library list of its own to reuse,
+/// unlike [`sql_library_page`]'s own render).
+#[allow(clippy::too_many_arguments)]
+async fn render_lib_document_page(
+    state: &WebState,
+    locale: RequestLocale,
+    version: helios_fhir::FhirVersion,
+    rt: &RequestTenant,
+    kind: &LibraryKind,
+    user_key: &str,
+    json: String,
+    sql: String,
+    is_new: bool,
+    id: String,
+    status: String,
+    // Owned, not borrowed: every caller but `sql_library_document`'s own
+    // `apply_*` handlers reaches this from a plain (non-`async`) closure
+    // whose own by-value parameter would otherwise not outlive the `Future`
+    // this `async fn` returns (see `sql_library_save`'s own `error_page`).
+    values: std::collections::HashMap<String, String>,
+    save_error: Option<String>,
+    add: AddParamFormState,
+    add_table: AddTableFormState,
+) -> SqlLibraryPage {
+    // Computed before `id` moves into `SelectedLib` below.
+    let export_href = export_href(kind, &id);
+    let status_class = status_tag_class(&status);
+    let i18n = I18n::new(locale);
+    let (details, params_card) =
+        lib_details_and_params(i18n, version, kind, &json, &sql, &values, add);
+    // #842/04: the unknown-table lint applies to this endpoint's own
+    // no-JS re-render too — a document mutation never itself calls
+    // `$sql-run` (the submitted text is what the live-preview wiring runs
+    // once the page opens, per this function's own doc comment above), but
+    // detecting an unknown table is pure and free, so there is no reason
+    // not to show the same notice a `/run` fragment would have.
+    let (tables_card, run_results) = match serde_json::from_str::<serde_json::Value>(json.trim()) {
+        Ok(document) => {
+            let deps = sql_libraries::table_dependencies(&document);
+            let unknown_tables = sql_libraries::unknown_tables(&sql, &deps);
+            let analysis = full_tables_analysis(
+                state,
+                version,
+                &rt.id,
+                user_key,
+                &document,
+                &deps,
+                &unknown_tables,
+            )
+            .await;
+            let tables_card = Some(build_tables_card(
+                i18n,
+                kind,
+                analysis,
+                table_options_href(&id),
+                TablesCardOptions {
+                    add: add_table,
+                    ..Default::default()
+                },
+            ));
+            let run_results = if unknown_tables.is_empty() {
+                LibRunNotice::Standard(RunResultsPartial {
+                    i18n,
+                    fragment: false,
+                    run_href: kind.run_href,
+                    form_id: LIB_EDITOR_FORM_ID,
+                    heading_key: kind.results_heading_key,
+                    failed_key: kind.failed_key,
+                    export_href: export_href.clone(),
+                    state: RunResultsState::Empty,
+                })
+            } else {
+                LibRunNotice::UnknownTables(unknown_tables_notice(i18n, false, &unknown_tables))
+            };
+            (tables_card, run_results)
+        }
+        Err(_) => (
+            None,
+            LibRunNotice::Standard(RunResultsPartial {
+                i18n,
+                fragment: false,
+                run_href: kind.run_href,
+                form_id: LIB_EDITOR_FORM_ID,
+                heading_key: kind.results_heading_key,
+                failed_key: kind.failed_key,
+                export_href: export_href.clone(),
+                state: RunResultsState::Empty,
+            }),
+        ),
+    };
+    // #842/04: this endpoint never runs `$sql-run`, so Columns is always
+    // its own empty skeleton — gated identically to `tables_card`.
+    let columns_card = tables_card
+        .is_some()
+        .then(|| build_columns_card(i18n, kind, Vec::new(), false));
+    SqlLibraryPage {
+        status: current_status(state, version, rt),
+        i18n,
+        active_page: kind.active_page,
+        base_href: kind.base_href,
+        run_href: kind.run_href,
+        title_key: kind.title_key,
+        lede_key: kind.lede_key,
+        new_title_key: kind.new_title_key,
+        all_heading_key: kind.all_heading_key,
+        filter_placeholder_key: kind.filter_placeholder_key,
+        rail_empty_key: kind.rail_empty_key,
+        editor_heading_key: kind.editor_heading_key,
+        empty_title_key: kind.empty_title_key,
+        empty_lede_key: kind.empty_lede_key,
+        chip_key: kind.chip_key,
+        icon_svg: kind.icon_svg,
+        rail: Vec::new(),
+        filter: String::new(),
+        degraded: None,
+        selected: Some(SelectedLib {
+            name: if is_new { String::new() } else { id.clone() },
+            id,
+            json,
+            sql,
+            status,
+            status_class,
+        }),
+        is_new,
+        details: Some(details),
+        declares_parameters: kind.declares_parameters,
+        params_card,
+        tables_card,
+        columns_card,
+        run_results,
+        save_error,
+        saved: false,
+        // Neither a save nor a navigation — there is nothing new to record
+        // and no rail to repaint.
+        recent_entries: Vec::new(),
+        rail_page: kind.page.key(),
+        max_recent: rail_state::MAX_RECENT,
+    }
 }
 
 async fn sql_library_save(
@@ -3661,72 +5467,43 @@ async fn sql_library_save(
     locale: RequestLocale,
     rv: RequestVersion,
     rt: RequestTenant,
+    user_key: String,
     form: SqlLibSaveForm,
     kind: &LibraryKind,
 ) -> Response {
+    // A form-validation error re-renders in place: nothing has run
+    // server-side, no rail to repaint, and the submitted text is kept
+    // rather than lost — [`render_lib_document_page`]'s own shape, shared
+    // with the `document` endpoint's no-JS response (#841/#842). A plain
+    // (not `async`) closure: calling `render_lib_document_page` here only
+    // builds its `Future`, so every call site below still has to `.await`
+    // it — the closure itself stays a bare `Fn`, callable more than once,
+    // which an `async` closure capturing `&state`/`&rt` by move could not
+    // be.
     let error_page = |save_error: String,
                       json: String,
                       sql: String,
                       is_new: bool,
                       id: String,
-                      status: String| {
-        // Computed before `id` moves into `SelectedLib` below.
-        let export_href = export_href(kind, &id);
-        let status_class = status_tag_class(&status);
-        let i18n = I18n::new(locale);
-        SqlLibraryPage {
-            status: current_status(&state, rv.0, &rt),
-            i18n,
-            active_page: kind.active_page,
-            base_href: kind.base_href,
-            run_href: kind.run_href,
-            title_key: kind.title_key,
-            lede_key: kind.lede_key,
-            new_title_key: kind.new_title_key,
-            all_heading_key: kind.all_heading_key,
-            filter_placeholder_key: kind.filter_placeholder_key,
-            rail_empty_key: kind.rail_empty_key,
-            editor_heading_key: kind.editor_heading_key,
-            empty_title_key: kind.empty_title_key,
-            empty_lede_key: kind.empty_lede_key,
-            chip_key: kind.chip_key,
-            icon_svg: kind.icon_svg,
-            rail: Vec::new(),
-            filter: String::new(),
-            degraded: None,
-            selected: Some(SelectedLib {
-                name: if is_new { String::new() } else { id.clone() },
-                id,
-                json,
-                sql,
-                status,
-                status_class,
-            }),
+                      status: String,
+                      values: std::collections::HashMap<String, String>| {
+        render_lib_document_page(
+            &state,
+            locale,
+            rv.0,
+            &rt,
+            kind,
+            &user_key,
+            json,
+            sql,
             is_new,
-            // A form-validation error re-renders in place: nothing has run
-            // server-side, so this render's own results are `Empty` — same
-            // as any other render with no `?saved=1`. The submitted text is
-            // still whatever the user typed (kept, not lost), so the
-            // `Empty` arm's own load trigger runs that same text through the
-            // live preview once the page opens.
-            run_results: RunResultsPartial {
-                i18n,
-                fragment: false,
-                run_href: kind.run_href,
-                form_id: LIB_EDITOR_FORM_ID,
-                heading_key: kind.results_heading_key,
-                failed_key: kind.failed_key,
-                export_href,
-                state: RunResultsState::Empty,
-            },
-            save_error: Some(save_error),
-            saved: false,
-            // A form-validation error re-renders in place, not a navigation —
-            // there is nothing new to record and no rail to repaint.
-            recent_entries: Vec::new(),
-            rail_page: kind.page.key(),
-            max_recent: rail_state::MAX_RECENT,
-        }
+            id,
+            status,
+            values,
+            Some(save_error),
+            AddParamFormState::default(),
+            AddTableFormState::default(),
+        )
     };
 
     let duplicate = form.action == "duplicate";
@@ -3735,14 +5512,18 @@ async fn sql_library_save(
         Err(e) => {
             // No parsed resource to read a status off of — the JSON itself
             // never parsed, so the re-rendered chip is empty (`unknown`).
-            return render(error_page(
-                format!("invalid JSON: {e}"),
-                form.json,
-                form.sql,
-                form.id.is_empty(),
-                form.id,
-                String::new(),
-            ));
+            return render(
+                error_page(
+                    format!("invalid JSON: {e}"),
+                    form.json,
+                    form.sql,
+                    form.id.is_empty(),
+                    form.id,
+                    String::new(),
+                    form.values,
+                )
+                .await,
+            );
         }
     };
     if resource
@@ -3751,14 +5532,63 @@ async fn sql_library_save(
         != Some("Library")
     {
         let status = sql_libraries::extract_status(&resource);
-        return render(error_page(
-            "the document must have resourceType \"Library\"".to_string(),
-            form.json,
-            form.sql,
-            form.id.is_empty(),
-            form.id,
-            status,
-        ));
+        return render(
+            error_page(
+                "the document must have resourceType \"Library\"".to_string(),
+                form.json,
+                form.sql,
+                form.id.is_empty(),
+                form.id,
+                status,
+                form.values,
+            )
+            .await,
+        );
+    }
+    // #840: this page only ever shows and saves Libraries of its own kind —
+    // saving a `sql-view` from SQL Queries (or the reverse) would silently
+    // vanish it from the rail it was just edited on. Checked ahead of
+    // `embed_sql` below, against the resource exactly as submitted, so a
+    // rejected Save changes nothing about what the user typed.
+    if !sql_libraries::has_library_code(&resource, kind.code) {
+        let status = sql_libraries::extract_status(&resource);
+        return render(
+            error_page(
+                I18n::new(locale).t_arg("lib-save-wrong-kind", "code", kind.code.to_string()),
+                form.json,
+                form.sql,
+                form.id.is_empty(),
+                form.id,
+                status,
+                form.values,
+            )
+            .await,
+        );
+    }
+    // #841: a SQL View's own profile fixes `Library.parameter` to
+    // `0..0` — reject a save (or Duplicate) that would persist a non-empty
+    // one rather than silently keeping declarations the page never lets the
+    // user act on. Checked after #840's own type gate above, against the
+    // resource exactly as submitted (before `embed_sql`), same as it is.
+    if !kind.declares_parameters
+        && resource
+            .get("parameter")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|params| !params.is_empty())
+    {
+        let status = sql_libraries::extract_status(&resource);
+        return render(
+            error_page(
+                I18n::new(locale).t("lib-save-view-parameters"),
+                form.json,
+                form.sql,
+                form.id.is_empty(),
+                form.id,
+                status,
+                form.values,
+            )
+            .await,
+        );
     }
     sql_libraries::embed_sql(&mut resource, &form.sql);
     // Read before `resource` moves into `save_resource` below — only the
@@ -3794,24 +5624,27 @@ async fn sql_library_save(
             axum::response::Redirect::to(&format!("{}?lib={stored_id}&saved=1", kind.base_href))
                 .into_response()
         }
-        Err(error) => render(error_page(
-            error,
-            form.json,
-            form.sql,
-            id.is_none(),
-            form.id,
-            status,
-        )),
+        Err(error) => render(
+            error_page(
+                error,
+                form.json,
+                form.sql,
+                id.is_none(),
+                form.id,
+                status,
+                form.values,
+            )
+            .await,
+        ),
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Default)]
 struct SqlLibRunForm {
     /// The Library id the posted document was opened from, empty for an
     /// unsaved one — only ever used to gate the Export action's `href`
     /// (#839); a stored Library is never read back through it, so a
     /// mismatched or nonexistent id changes nothing about what runs.
-    #[serde(default)]
     id: String,
     /// The editor's full text, exactly as posted — never reformatted or
     /// re-serialized before either parsing it or embedding `sql` into it.
@@ -3819,30 +5652,158 @@ struct SqlLibRunForm {
     /// The SQL pane's exact posted text, embedded into `json`'s
     /// `application/sql` attachment the same way Save does
     /// ([`sql_libraries::embed_sql`]).
-    #[serde(default)]
     sql: String,
+    /// Every submitted `param:{name}` value (#841), keyed by name.
+    values: std::collections::HashMap<String, String>,
+    /// The `params_sig` hidden field's own value (#841) — the browser's own
+    /// record of what the Parameters card last declared.
+    params_sig: String,
+    /// The `tables_sig` hidden field's own value (#842) — the browser's own
+    /// record of what the Tables panel's *Reads from* card last declared.
+    tables_sig: String,
 }
 
-/// `POST /ui/sql/queries/run` and `POST /ui/sql/views/run` (#839): the
-/// Library-backed playgrounds' live preview fragment, the same shape
-/// [`sql_view_definitions_run`] gives View Definitions. Always runs the
-/// *posted* `json`/`sql` — saved or not, and never a lookup of `id` against
-/// storage — through `$sql-run`, embedding `sql` into `json` first
-/// exactly as Save does. Renders `partials/sql_run_results.html` in
-/// fragment mode; see that endpoint's own doc comment for the shared `200`-
-/// except-for-a-malformed-body contract.
+/// Parses `SqlLibRunForm`'s fields out of a raw urlencoded body (#841): the
+/// dynamic `param:{name}` values a `#[derive(Deserialize)]` struct cannot
+/// express, alongside the fixed `id`/`json`/`sql`/`params_sig`/`tables_sig`
+/// fields — the same by-hand parse [`parse_lib_save_form`] uses for its own
+/// `values`.
+fn parse_lib_run_form(body: &[u8]) -> SqlLibRunForm {
+    let mut form = SqlLibRunForm::default();
+    for (key, value) in form_urlencoded::parse(body) {
+        if let Some(name) = key.strip_prefix("param:") {
+            form.values.insert(name.to_string(), value.into_owned());
+            continue;
+        }
+        match key.as_ref() {
+            "id" => form.id = value.into_owned(),
+            "json" => form.json = value.into_owned(),
+            "sql" => form.sql = value.into_owned(),
+            "params_sig" => form.params_sig = value.into_owned(),
+            "tables_sig" => form.tables_sig = value.into_owned(),
+            _ => {}
+        }
+    }
+    form
+}
+
+/// The `/run` fragment's own Columns-card companion (#842/04) — mirrors
+/// `params_card`/`tables_card`'s own `Option` shape, but *always* carries
+/// something: unlike those two cards (silent when their own signature
+/// hasn't changed), every fragment response says *something* new about
+/// Columns — the full card, replaced wholesale, on a good run,
+/// or just its own meta relabelled "last successful run" on any failure
+/// (a JSON parse failure, the wrong `resourceType`, a SQL View's own
+/// `parameter[]`, an unknown table, a required parameter with no value, or
+/// an actual `$sql-run` failure — every arm but a genuine success).
+enum ColumnsFragment {
+    Filled(LibColumnsCard),
+    Stale(String),
+}
+
+/// The `/run` fragment's whole response (#841, extended for #842/#842-04):
+/// the results notice (targeted directly by the request that triggered
+/// it) plus, only when the freshly computed signature differs from what
+/// the browser posted, the Parameters and/or Tables cards riding along as
+/// their own `hx-swap-oob` companions, and — always — the Columns card's
+/// own update — one Askama template nesting all of them, the same way
+/// every other multi-part response in this crate nests one `Template`'s
+/// render inside another's rather than concatenating strings by hand.
+/// `params_card` is always `None` for SQL Views (the card never shows
+/// there) and for a SQL Query render whose signature matched (the card
+/// never travels just because a value changed); `tables_card` is `None`
+/// whenever the (unknown-table-extended) signature matched, for both
+/// kinds.
+#[derive(Template)]
+#[template(path = "partials/lib_run_fragment.html")]
+struct LibRunFragment {
+    run_results: LibRunNotice,
+    params_card: Option<LibParamsCard>,
+    tables_card: Option<LibTablesCard>,
+    columns: ColumnsFragment,
+}
+
+/// `POST /ui/sql/queries/run` and `POST /ui/sql/views/run` (#839, extended
+/// for #841): the Library-backed playgrounds' live preview fragment, the
+/// same shape [`sql_view_definitions_run`] gives View Definitions. Always
+/// runs the *posted* `json`/`sql` — saved or not, and never a lookup of `id`
+/// against storage — through `$sql-run`, embedding `sql` into `json` first
+/// exactly as Save does. Renders [`LibRunFragment`] (`partials/sql_run_
+/// results.html` plus, when it changed, the Parameters card's own OOB
+/// companion).
+///
+/// Unlike [`sql_view_definitions_run`], this always answers `200`: `form`
+/// comes from [`parse_lib_run_form`]'s own by-hand parse (`param:{name}`
+/// needs one, #841), which — like [`sql_export::start`]'s identical
+/// `RawForm` parse — never fails to extract, so a missing `json`/`sql`
+/// simply parses (or fails to parse, `RunResultsState::Failure`) as the
+/// empty string, itself already a normal fragment response; there is no
+/// "malformed body" case left for this endpoint to 4xx on.
+///
+/// Builds the `/run` fragment's own Columns update for a *successful* run
+/// (#842/04, NF1): fetches the tenant's Library list, resolves whichever of
+/// `deps` the SQL actually reads down to their ViewDefinitions
+/// (`sql_libraries::dependencies_used_by_sql`,
+/// [`resolve_view_definition_dependencies`]), and analyzes `table`/
+/// `raw_rows` against them ([`sql_libraries::analyze_columns`]). A SQL
+/// Query and a SQL View share this identical "good run" shape, differing
+/// only in whether declared parameters were involved getting here — called
+/// from both of [`sql_library_run`]'s own branches, never from a failure
+/// path (see [`ColumnsFragment::Stale`] for those).
+#[allow(clippy::too_many_arguments)]
+async fn columns_fragment_for_success(
+    state: &WebState,
+    version: helios_fhir::FhirVersion,
+    tenant: &str,
+    i18n: I18n,
+    kind: &LibraryKind,
+    table: &sql_views::RunTable,
+    raw_rows: &[serde_json::Value],
+    sql: &str,
+    deps: &[sql_libraries::TableDependency],
+) -> ColumnsFragment {
+    let used_deps = sql_libraries::dependencies_used_by_sql(sql, deps);
+    let libraries = state
+        .conformance
+        .fetch("Library", version, tenant)
+        .await
+        .unwrap_or_default();
+    let view_definitions =
+        resolve_view_definition_dependencies(state, version, tenant, &used_deps, &libraries).await;
+    let columns_rows = sql_libraries::analyze_columns(&table.columns, raw_rows, &view_definitions);
+    ColumnsFragment::Filled(build_columns_card(i18n, kind, columns_rows, true))
+}
+
+/// #841's own decision order ahead of `$sql-run`, extended by #842/04's own
+/// unknown-table lint — one clock, one source of truth, rather than a
+/// separate check running on its own schedule:
+///
+/// 1. A SQL View with a non-empty `parameter[]` never runs (its own
+///    profile forbids the declaration at all).
+/// 2. The SQL reading a table no declared label names never runs either —
+///    the unknown-table lint's own notice, [`LibRunNotice::UnknownTables`].
+/// 3. A SQL Query with an unfilled required parameter never runs either
+///    (the "waiting" notice, [`RunResultsState::Waiting`]).
+/// 4. Only once every check above passes does this call `$sql-run`, with
+///    that render's own bindings.
+///
+/// The Columns card ([`ColumnsFragment`]) rides every response: `Filled`
+/// only for step 4's own success, `Stale` for every other outcome
+/// (#842/04's own NF1 — its dependency resolution never runs on a request
+/// that stops at step 1, 2, or 3, or that reaches step 4 and fails).
 async fn sql_library_run(
     state: WebState,
     locale: RequestLocale,
     rv: RequestVersion,
     rt: RequestTenant,
+    user_key: String,
     form: SqlLibRunForm,
     kind: &LibraryKind,
 ) -> Response {
     let i18n = I18n::new(locale);
     let export_href = export_href(kind, &form.id);
-    let respond = |run_state: RunResultsState| {
-        render(RunResultsPartial {
+    let standard = |state: RunResultsState| {
+        LibRunNotice::Standard(RunResultsPartial {
             i18n,
             fragment: true,
             run_href: kind.run_href,
@@ -3850,20 +5811,37 @@ async fn sql_library_run(
             heading_key: kind.results_heading_key,
             failed_key: kind.failed_key,
             export_href: export_href.clone(),
-            state: run_state,
+            state,
+        })
+    };
+    let stale_columns = || ColumnsFragment::Stale(i18n.t("vd-results-stale"));
+    let respond = |run_results: LibRunNotice,
+                   params_card: Option<LibParamsCard>,
+                   tables_card: Option<LibTablesCard>,
+                   columns: ColumnsFragment| {
+        render(LibRunFragment {
+            run_results,
+            params_card,
+            tables_card,
+            columns,
         })
     };
 
     // A JSON parse failure never reaches $sql-run. NF1: never log
-    // `form.json`/`form.sql` themselves — a Library's embedded SQL or JSON
-    // body can carry PHI.
+    // `form.json`/`form.sql`/`form.values` themselves — a Library's
+    // embedded SQL, JSON body, or parameter values can carry PHI.
     let mut resource: serde_json::Value = match serde_json::from_str(form.json.trim()) {
         Ok(value) => value,
         Err(error) => {
-            return respond(RunResultsState::Failure(
-                format!("invalid JSON: {error}"),
+            return respond(
+                standard(RunResultsState::Failure(
+                    format!("invalid JSON: {error}"),
+                    None,
+                )),
                 None,
-            ));
+                None,
+                stale_columns(),
+            );
         }
     };
     if resource
@@ -3871,29 +5849,881 @@ async fn sql_library_run(
         .and_then(serde_json::Value::as_str)
         != Some("Library")
     {
-        return respond(RunResultsState::Failure(
-            "the document must have resourceType \"Library\"".to_string(),
+        return respond(
+            standard(RunResultsState::Failure(
+                "the document must have resourceType \"Library\"".to_string(),
+                None,
+            )),
             None,
-        ));
+            None,
+            stale_columns(),
+        );
     }
-    sql_libraries::embed_sql(&mut resource, &form.sql);
 
-    let run_state = match run_sql_preview(&state, &resource, rv.0, &rt.id).await {
-        Ok((table, ms)) => {
-            tracing::debug!(
-                rows = table.rows.len(),
-                ms,
-                kind = kind.code,
-                "ran a Library preview"
-            );
-            RunResultsState::Success(table, ms)
-        }
-        Err(error) => {
-            let line = sql_views::extract_error_line(&error);
-            RunResultsState::Failure(error, line)
+    // #841: a SQL View's own profile fixes `Library.parameter` to
+    // `0..0` — this kind never declares parameters, so it never builds the
+    // Parameters card (`kind.declares_parameters` gates that below) and
+    // never calls `$sql-run` for a document that carries a declaration
+    // anyway (however it got there — Details, most likely).
+    if !kind.declares_parameters
+        && resource
+            .get("parameter")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|params| !params.is_empty())
+    {
+        return respond(
+            standard(RunResultsState::Failure(
+                i18n.t("lib-save-view-parameters"),
+                None,
+            )),
+            None,
+            None,
+            stale_columns(),
+        );
+    }
+
+    // #842: the Tables panel resolves identically for both kinds, ahead of
+    // the SQL Query/SQL View branches below — but only when the freshly
+    // computed (unknown-table-extended, #842/04) signature differs from
+    // what the browser posted (NF1): a keystroke that changes only a
+    // value, or only the SQL text in a way that doesn't add or remove an
+    // unknown table, never touches this signature, so most `/run` requests
+    // skip this fetch entirely. The unknown-table scan itself is pure and
+    // always runs — the run/notice gate below needs its result regardless
+    // of whether the card travels.
+    let deps = sql_libraries::table_dependencies(&resource);
+    let unknown_tables = sql_libraries::unknown_tables(&form.sql, &deps);
+    let unknown_names: Vec<String> = unknown_tables.iter().map(|t| t.name.clone()).collect();
+    let tables_signature = sql_libraries::tables_signature_with_unknown(&deps, &unknown_names);
+    let tables_card = if tables_signature != form.tables_sig {
+        let libraries = state
+            .conformance
+            .fetch("Library", rv.0, &rt.id)
+            .await
+            .unwrap_or_default();
+        let jobs = sql_export::jobs_for_used_by(&state, &user_key, &rt.id).await;
+        let analysis = analyze_tables(
+            &state,
+            rv.0,
+            &rt.id,
+            &resource,
+            &deps,
+            &unknown_tables,
+            &libraries,
+            &jobs,
+        )
+        .await;
+        Some(build_tables_card(
+            i18n,
+            kind,
+            analysis,
+            table_options_href(&form.id),
+            TablesCardOptions {
+                oob: true,
+                ..Default::default()
+            },
+        ))
+    } else {
+        None
+    };
+
+    // #842/04: the SQL reads a table no declared label names —
+    // never call `$sql-run` at all, so a stray table name never
+    // materializes an in-memory database for nothing. The previous good
+    // table (if any) is left untouched (`RunResultsPartial`'s own OOB
+    // shape for a failure, mirrored here) and Columns' own meta relabels
+    // to "last successful run".
+    if !unknown_tables.is_empty() {
+        return respond(
+            LibRunNotice::UnknownTables(unknown_tables_notice(i18n, true, &unknown_tables)),
+            None,
+            tables_card,
+            stale_columns(),
+        );
+    }
+
+    if !kind.declares_parameters {
+        sql_libraries::embed_sql(&mut resource, &form.sql);
+        let (run_results, columns) =
+            match run_sql_preview(&state, &resource, &[], rv.0, &rt.id).await {
+                Ok((table, raw_rows, ms)) => {
+                    tracing::debug!(
+                        rows = table.rows.len(),
+                        ms,
+                        kind = kind.code,
+                        "ran a Library preview"
+                    );
+                    let columns = columns_fragment_for_success(
+                        &state, rv.0, &rt.id, i18n, kind, &table, &raw_rows, &form.sql, &deps,
+                    )
+                    .await;
+                    (standard(RunResultsState::Success(table, ms)), columns)
+                }
+                Err(error) => {
+                    let line = sql_views::extract_error_line(&error);
+                    (
+                        standard(RunResultsState::Failure(error, line)),
+                        stale_columns(),
+                    )
+                }
+            };
+        return respond(run_results, None, tables_card, columns);
+    }
+
+    // #841: SQL Query — declared parameters, undeclared-placeholder hints,
+    // and the values/bindings this run supplies, all from one analysis so
+    // the signature comparison below and the run itself never disagree.
+    let analysis = analyze_params(&resource, &form.sql, &form.values);
+    let oob = analysis.signature != form.params_sig;
+
+    let (run_results, columns) = if !analysis.missing_required.is_empty() {
+        (
+            standard(RunResultsState::Waiting(waiting_message(
+                &i18n,
+                &analysis.missing_required,
+            ))),
+            stale_columns(),
+        )
+    } else {
+        sql_libraries::embed_sql(&mut resource, &form.sql);
+        // Borrowed across the `await`, not cloned: `analysis` itself is
+        // untouched until after this call returns, so its own `bindings`
+        // stay valid for the whole request.
+        match run_sql_preview(&state, &resource, &analysis.bindings, rv.0, &rt.id).await {
+            Ok((table, raw_rows, ms)) => {
+                tracing::debug!(
+                    rows = table.rows.len(),
+                    ms,
+                    kind = kind.code,
+                    "ran a Library preview"
+                );
+                let columns = columns_fragment_for_success(
+                    &state, rv.0, &rt.id, i18n, kind, &table, &raw_rows, &form.sql, &deps,
+                )
+                .await;
+                (standard(RunResultsState::Success(table, ms)), columns)
+            }
+            Err(error) => {
+                let line = sql_views::extract_error_line(&error);
+                (
+                    standard(RunResultsState::Failure(error, line)),
+                    stale_columns(),
+                )
+            }
         }
     };
-    respond(run_state)
+    let params_card = oob.then(|| {
+        build_params_card(
+            i18n,
+            kind,
+            analysis,
+            ParamsCardOptions {
+                oob: true,
+                ..Default::default()
+            },
+        )
+    });
+    respond(run_results, params_card, tables_card, columns)
+}
+
+#[derive(Default)]
+struct SqlLibDocumentForm {
+    id: String,
+    json: String,
+    sql: String,
+    /// Every submitted `param:{name}` value (#841) — echoed back into the
+    /// Parameters card's own fields on every response this endpoint
+    /// produces, exactly as `/run` does.
+    values: std::collections::HashMap<String, String>,
+    params_sig: String,
+    /// `add-parameter`/`add-table` (#841/#842) — *Remove* has no `op` value
+    /// of its own; see [`Self::table_label`]. Ignored when
+    /// [`Self::declare_param`]/[`Self::table_label`] is `Some`.
+    op: String,
+    param_name: String,
+    param_type: String,
+    /// The `declare_param` field a *Declare :name* button submits as its
+    /// own name/value pair (#841) — present only when that button,
+    /// not the `Add parameter` panel's own submit, triggered this request;
+    /// its value is the placeholder name to declare, type `string`.
+    declare_param: Option<String>,
+    /// `op=add-table`'s own `table` field (#842) — the reference the *Add
+    /// table* combobox (or its no-JS fallback textarea) submits.
+    table: String,
+    /// `op=add-table`'s own `table_alias` field (#842).
+    table_alias: String,
+    /// One row's own *Remove* button's own name/value pair (#842) — the
+    /// exact `relatedArtifact.label` of the dependency it removes, present
+    /// only when that specific button (not the *Add table* panel's own
+    /// submit) triggered this request. Mirrors [`Self::declare_param`]'s own
+    /// "the field's presence is the operation" shape: with several *Remove*
+    /// buttons sharing one `<form>`, only the one actually clicked
+    /// contributes its name/value pair at all — there is no single shared
+    /// `op=remove-table` value every row's button could carry alongside its
+    /// own label without a second name/value pair, which a plain HTML
+    /// `<button>` cannot have.
+    table_label: Option<String>,
+}
+
+/// Parses `SqlLibDocumentForm`'s fields out of a raw urlencoded body
+/// (#841/#842) — the same by-hand parse [`parse_lib_run_form`]/
+/// [`parse_lib_save_form`] use for their own `values`.
+fn parse_lib_document_form(body: &[u8]) -> SqlLibDocumentForm {
+    let mut form = SqlLibDocumentForm::default();
+    for (key, value) in form_urlencoded::parse(body) {
+        if let Some(name) = key.strip_prefix("param:") {
+            form.values.insert(name.to_string(), value.into_owned());
+            continue;
+        }
+        match key.as_ref() {
+            "id" => form.id = value.into_owned(),
+            "json" => form.json = value.into_owned(),
+            "sql" => form.sql = value.into_owned(),
+            "params_sig" => form.params_sig = value.into_owned(),
+            "op" => form.op = value.into_owned(),
+            "param_name" => form.param_name = value.into_owned(),
+            "param_type" => form.param_type = value.into_owned(),
+            "declare_param" => form.declare_param = Some(value.into_owned()),
+            "table" => form.table = value.into_owned(),
+            "table_alias" => form.table_alias = value.into_owned(),
+            "table_label" => form.table_label = Some(value.into_owned()),
+            _ => {}
+        }
+    }
+    form
+}
+
+/// Translates one [`sql_libraries::AddParameterError`] into its
+/// `lib-params-add-*` catalog message (#841) — this module's own split
+/// from `sql_libraries`, which never localizes (matching
+/// [`sql_libraries::parameters`]'s own convention).
+fn add_parameter_error_message(i18n: &I18n, error: sql_libraries::AddParameterError) -> String {
+    match error {
+        sql_libraries::AddParameterError::InvalidName => i18n.t("lib-params-add-invalid-name"),
+        sql_libraries::AddParameterError::DuplicateName(name) => {
+            i18n.t_arg("lib-params-add-duplicate", "name", name)
+        }
+        sql_libraries::AddParameterError::UnknownType => i18n.t("lib-params-add-unknown-type"),
+    }
+}
+
+/// One mutation `POST …/document` can apply (#841/#842) — [`SqlLibDocumentForm`]'s
+/// own submission, parsed into the shape each `apply_*` function below
+/// actually needs. [`parse_doc_mutation`] is the only place that reads
+/// `form.op`/`form.declare_param` directly; everything downstream matches on
+/// this enum instead.
+enum DocMutation {
+    AddParameter { name: String, type_code: String },
+    AddTable { table: String, alias: String },
+    RemoveTable { label: String },
+}
+
+/// Reads `form`'s own `op` (or `declare_param`/`table_label`, a single
+/// button's own shorthand for a mutation `op` cannot itself carry a second
+/// field for, #841/#842) into a [`DocMutation`] — `None` for anything else,
+/// which [`sql_library_document`] answers with a bare `400` rather than
+/// silently doing nothing.
+fn parse_doc_mutation(form: &SqlLibDocumentForm) -> Option<DocMutation> {
+    if let Some(name) = &form.declare_param {
+        return Some(DocMutation::AddParameter {
+            name: name.trim().to_string(),
+            type_code: "string".to_string(),
+        });
+    }
+    if let Some(label) = &form.table_label {
+        return Some(DocMutation::RemoveTable {
+            label: label.clone(),
+        });
+    }
+    match form.op.as_str() {
+        "add-parameter" => Some(DocMutation::AddParameter {
+            name: form.param_name.trim().to_string(),
+            type_code: form.param_type.clone(),
+        }),
+        "add-table" => Some(DocMutation::AddTable {
+            table: form.table.trim().to_string(),
+            alias: form.table_alias.trim().to_string(),
+        }),
+        _ => None,
+    }
+}
+
+/// A whole-document failure (invalid JSON, or the wrong `resourceType`) is
+/// treated the same as `/run`'s own check (#841/#842) — identical message
+/// text, no mutation attempted — surfaced through whichever card's own
+/// *Add* error slot `mutation` belongs to on the `HX-Request` path (there is
+/// no other notice a card-only response can show it in) and the page-level
+/// `.notice--warn` banner on the no-JS path (matching Save's own shape for
+/// the same failure — both cards' own `add` state resets to
+/// [`AddParamFormState::default`]/[`AddTableFormState::default`] there,
+/// since the whole document failed to parse and there is nothing of either
+/// panel's own submission left worth re-showing next to the banner).
+#[allow(clippy::too_many_arguments)]
+async fn document_whole_error_response(
+    state: &WebState,
+    locale: RequestLocale,
+    version: helios_fhir::FhirVersion,
+    rt: &RequestTenant,
+    kind: &LibraryKind,
+    user_key: &str,
+    is_htmx: bool,
+    form: &SqlLibDocumentForm,
+    mutation: &DocMutation,
+    message: String,
+) -> Response {
+    let i18n = I18n::new(locale);
+    if is_htmx {
+        match mutation {
+            DocMutation::AddParameter { name, type_code } => render(LibParamsCard {
+                i18n,
+                run_href: kind.run_href,
+                document_href: kind.document_href,
+                fields: Vec::new(),
+                hints: Vec::new(),
+                type_options: helios_sof::sqlquery::BINDABLE_PARAMETER_TYPES,
+                signature: String::new(),
+                add_name: name.clone(),
+                add_type: type_code.clone(),
+                add_open: true,
+                add_error: Some(message),
+                oob: false,
+                data_document: None,
+            }),
+            DocMutation::AddTable { .. } | DocMutation::RemoveTable { .. } => {
+                render(LibTablesCard {
+                    i18n,
+                    document_href: kind.document_href,
+                    table_options_href: table_options_href(&form.id),
+                    rows: Vec::new(),
+                    unknown_rows: Vec::new(),
+                    used_by: Vec::new(),
+                    signature: String::new(),
+                    add_table: form.table.clone(),
+                    add_alias: form.table_alias.clone(),
+                    add_open: true,
+                    add_error: Some(message),
+                    oob: false,
+                    data_document: None,
+                })
+            }
+        }
+    } else {
+        render(
+            render_lib_document_page(
+                state,
+                locale,
+                version,
+                rt,
+                kind,
+                user_key,
+                form.json.clone(),
+                form.sql.clone(),
+                form.id.is_empty(),
+                form.id.clone(),
+                String::new(),
+                form.values.clone(),
+                Some(message),
+                AddParamFormState::default(),
+                AddTableFormState::default(),
+            )
+            .await,
+        )
+    }
+}
+
+/// [`DocMutation::AddParameter`]'s own handler (#841) — unchanged behavior
+/// from before #842's own `op` dispatch grew a `match`, just moved into its
+/// own function alongside [`apply_add_table`]/[`apply_remove_table`].
+#[allow(clippy::too_many_arguments)]
+async fn apply_add_parameter(
+    state: &WebState,
+    locale: RequestLocale,
+    version: helios_fhir::FhirVersion,
+    rt: &RequestTenant,
+    kind: &LibraryKind,
+    user_key: &str,
+    is_htmx: bool,
+    form: SqlLibDocumentForm,
+    document: serde_json::Value,
+    name: String,
+    type_code: String,
+) -> Response {
+    let i18n = I18n::new(locale);
+    let mut updated = document.clone();
+    match sql_libraries::add_parameter(&mut updated, &name, &type_code) {
+        Ok(()) => {
+            // The updated document, pretty-printed exactly as Details
+            // itself always shows it — never the SQL-embedded form
+            // `/run`/Save build; this endpoint never touches `content`.
+            let updated_pretty = serde_json::to_string_pretty(&updated).unwrap_or_default();
+            if is_htmx {
+                let analysis = analyze_params(&updated, &form.sql, &form.values);
+                render(build_params_card(
+                    i18n,
+                    kind,
+                    analysis,
+                    ParamsCardOptions {
+                        // Closed again after a successful add (#841) — with
+                        // JS this also happens implicitly, since
+                        // `host.setDoc` swaps in this same server-rendered
+                        // (closed) card once it strips `data-document` off.
+                        add: AddParamFormState::default(),
+                        oob: false,
+                        data_document: Some(updated_pretty),
+                    },
+                ))
+            } else {
+                let status = sql_libraries::extract_status(&updated);
+                render(
+                    render_lib_document_page(
+                        state,
+                        locale,
+                        version,
+                        rt,
+                        kind,
+                        user_key,
+                        updated_pretty,
+                        form.sql,
+                        form.id.is_empty(),
+                        form.id,
+                        status,
+                        form.values.clone(),
+                        None,
+                        AddParamFormState::default(),
+                        AddTableFormState::default(),
+                    )
+                    .await,
+                )
+            }
+        }
+        Err(error) => {
+            let message = add_parameter_error_message(&i18n, error);
+            let add = AddParamFormState {
+                name,
+                type_code,
+                open: true,
+                error: Some(message),
+            };
+            if is_htmx {
+                let analysis = analyze_params(&document, &form.sql, &form.values);
+                render(build_params_card(
+                    i18n,
+                    kind,
+                    analysis,
+                    ParamsCardOptions {
+                        add,
+                        oob: false,
+                        data_document: None,
+                    },
+                ))
+            } else {
+                let status = sql_libraries::extract_status(&document);
+                render(
+                    render_lib_document_page(
+                        state,
+                        locale,
+                        version,
+                        rt,
+                        kind,
+                        user_key,
+                        form.json,
+                        form.sql,
+                        form.id.is_empty(),
+                        form.id,
+                        status,
+                        form.values.clone(),
+                        None,
+                        add,
+                        AddTableFormState::default(),
+                    )
+                    .await,
+                )
+            }
+        }
+    }
+}
+
+/// Resolves `table_ref` — an *Add table* submission, always the relative
+/// `ViewDefinition/{id}`/`Library/{id}` shape the combobox's own `value` (or
+/// the fallback textarea's documented hint) uses, never a canonical URL —
+/// into the artifact it names, once [`sql_libraries::AddTableError`]'s own
+/// gate (#842) is satisfied: it must actually resolve, resolve to a
+/// ViewDefinition or a `sql-view` Library, and — for a Library — not be
+/// `own_id` (`Type/id` alone cannot rule out a self-canonical reference,
+/// which is why this check lives here rather than in
+/// [`sql_libraries::dependency_lookup`]). `None` for anything else,
+/// including a bare canonical URL — #842's own *Add table* never offers
+/// one, and accepting it here would let a hand-edited fallback submission
+/// bypass the "distinct from the artifact itself" rule for a Library
+/// matched by `url` rather than `id`.
+async fn resolve_table_target(
+    state: &WebState,
+    version: helios_fhir::FhirVersion,
+    tenant: &str,
+    table_ref: &str,
+    own_id: &str,
+) -> Option<serde_json::Value> {
+    let sql_libraries::DependencyLookup::TypeId { resource_type, id } =
+        sql_libraries::dependency_lookup(table_ref)
+    else {
+        return None;
+    };
+    if resource_type != "ViewDefinition" && resource_type != "Library" {
+        return None;
+    }
+    let artifact = state
+        .conformance
+        .read_resource(resource_type, &id, version, tenant)
+        .await
+        .ok()?;
+    let valid = match resource_type {
+        "ViewDefinition" => true,
+        "Library" => {
+            sql_libraries::has_library_code(&artifact, "sql-view")
+                && (own_id.is_empty() || id != own_id)
+        }
+        _ => false,
+    };
+    valid.then_some(artifact)
+}
+
+/// [`DocMutation::AddTable`]'s own handler (#842): resolves `table`,
+/// then validates the alias in the order the spec documents — target
+/// present and resolvable, alias present (falling back to the target's own
+/// `name`), alias shape, alias uniqueness (case-insensitive) — appending
+/// `{"type": "depends-on", "label": alias, "resource": R}` on success, `R`
+/// the target's own `url` when it has one, else its `Type/id`
+/// (#842's own "no version pin" rule).
+#[allow(clippy::too_many_arguments)]
+async fn apply_add_table(
+    state: &WebState,
+    locale: RequestLocale,
+    version: helios_fhir::FhirVersion,
+    rt: &RequestTenant,
+    kind: &LibraryKind,
+    user_key: &str,
+    is_htmx: bool,
+    form: SqlLibDocumentForm,
+    document: serde_json::Value,
+    table: String,
+    alias_input: String,
+) -> Response {
+    let i18n = I18n::new(locale);
+    let own_id = document
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+
+    let target = resolve_table_target(state, version, &rt.id, &table, &own_id).await;
+    let outcome = match &target {
+        None => Err(i18n.t("lib-tables-add-error-required")),
+        Some(artifact) => {
+            let default_alias = artifact
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string);
+            let alias = if alias_input.is_empty() {
+                default_alias
+            } else {
+                Some(alias_input.clone())
+            };
+            match alias {
+                None => Err(i18n.t("lib-tables-add-error-alias-required")),
+                Some(alias) if !sql_libraries::is_valid_parameter_name(&alias) => {
+                    Err(i18n.t("lib-tables-add-error-alias-invalid"))
+                }
+                Some(alias) if sql_libraries::label_declared(&document, &alias) => {
+                    Err(i18n.t_arg("lib-tables-add-error-alias-duplicate", "alias", alias))
+                }
+                Some(alias) => {
+                    let resource_type = artifact
+                        .get("resourceType")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default();
+                    let id = artifact
+                        .get("id")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default();
+                    let resource_ref = artifact
+                        .get("url")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string)
+                        .unwrap_or_else(|| format!("{resource_type}/{id}"));
+                    Ok((alias, resource_ref))
+                }
+            }
+        }
+    };
+
+    match outcome {
+        Ok((alias, resource_ref)) => {
+            let mut updated = document.clone();
+            sql_libraries::add_table(&mut updated, &alias, &resource_ref);
+            let updated_pretty = serde_json::to_string_pretty(&updated).unwrap_or_default();
+            if is_htmx {
+                let deps = sql_libraries::table_dependencies(&updated);
+                let unknown_tables = sql_libraries::unknown_tables(&form.sql, &deps);
+                let analysis = full_tables_analysis(
+                    state,
+                    version,
+                    &rt.id,
+                    user_key,
+                    &updated,
+                    &deps,
+                    &unknown_tables,
+                )
+                .await;
+                render(build_tables_card(
+                    i18n,
+                    kind,
+                    analysis,
+                    table_options_href(&form.id),
+                    TablesCardOptions {
+                        // Closed again after a successful add (#842) —
+                        // mirrors `apply_add_parameter`'s own rule.
+                        add: AddTableFormState::default(),
+                        oob: false,
+                        data_document: Some(updated_pretty),
+                    },
+                ))
+            } else {
+                let status = sql_libraries::extract_status(&updated);
+                render(
+                    render_lib_document_page(
+                        state,
+                        locale,
+                        version,
+                        rt,
+                        kind,
+                        user_key,
+                        updated_pretty,
+                        form.sql,
+                        form.id.is_empty(),
+                        form.id,
+                        status,
+                        form.values.clone(),
+                        None,
+                        AddParamFormState::default(),
+                        AddTableFormState::default(),
+                    )
+                    .await,
+                )
+            }
+        }
+        Err(message) => {
+            let add = AddTableFormState {
+                table,
+                alias: alias_input,
+                open: true,
+                error: Some(message),
+            };
+            if is_htmx {
+                let deps = sql_libraries::table_dependencies(&document);
+                let unknown_tables = sql_libraries::unknown_tables(&form.sql, &deps);
+                let analysis = full_tables_analysis(
+                    state,
+                    version,
+                    &rt.id,
+                    user_key,
+                    &document,
+                    &deps,
+                    &unknown_tables,
+                )
+                .await;
+                render(build_tables_card(
+                    i18n,
+                    kind,
+                    analysis,
+                    table_options_href(&form.id),
+                    TablesCardOptions {
+                        add,
+                        oob: false,
+                        data_document: None,
+                    },
+                ))
+            } else {
+                let status = sql_libraries::extract_status(&document);
+                render(
+                    render_lib_document_page(
+                        state,
+                        locale,
+                        version,
+                        rt,
+                        kind,
+                        user_key,
+                        form.json,
+                        form.sql,
+                        form.id.is_empty(),
+                        form.id,
+                        status,
+                        form.values.clone(),
+                        None,
+                        AddParamFormState::default(),
+                        add,
+                    )
+                    .await,
+                )
+            }
+        }
+    }
+}
+
+/// [`DocMutation::RemoveTable`]'s own handler (#842) — always
+/// "succeeds": a `label` matching no `depends-on` entry leaves the document
+/// untouched (`sql_libraries::remove_table`'s own contract) rather than
+/// erroring, so this never has a failure branch to render.
+#[allow(clippy::too_many_arguments)]
+async fn apply_remove_table(
+    state: &WebState,
+    locale: RequestLocale,
+    version: helios_fhir::FhirVersion,
+    rt: &RequestTenant,
+    kind: &LibraryKind,
+    user_key: &str,
+    is_htmx: bool,
+    form: SqlLibDocumentForm,
+    document: serde_json::Value,
+    label: String,
+) -> Response {
+    let i18n = I18n::new(locale);
+    let mut updated = document.clone();
+    sql_libraries::remove_table(&mut updated, &label);
+    let updated_pretty = serde_json::to_string_pretty(&updated).unwrap_or_default();
+    if is_htmx {
+        let deps = sql_libraries::table_dependencies(&updated);
+        let unknown_tables = sql_libraries::unknown_tables(&form.sql, &deps);
+        let analysis = full_tables_analysis(
+            state,
+            version,
+            &rt.id,
+            user_key,
+            &updated,
+            &deps,
+            &unknown_tables,
+        )
+        .await;
+        render(build_tables_card(
+            i18n,
+            kind,
+            analysis,
+            table_options_href(&form.id),
+            TablesCardOptions {
+                data_document: Some(updated_pretty),
+                ..Default::default()
+            },
+        ))
+    } else {
+        let status = sql_libraries::extract_status(&updated);
+        render(
+            render_lib_document_page(
+                state,
+                locale,
+                version,
+                rt,
+                kind,
+                user_key,
+                updated_pretty,
+                form.sql,
+                form.id.is_empty(),
+                form.id,
+                status,
+                form.values.clone(),
+                None,
+                AddParamFormState::default(),
+                AddTableFormState::default(),
+            )
+            .await,
+        )
+    }
+}
+
+/// `POST /ui/sql/queries/document` and `POST /ui/sql/views/document`
+/// (#841, extended for #842): the Parameters card's *Add parameter*/
+/// *Declare* mutations and the Tables panel's *Add table*/*Remove*
+/// mutations, all applied to the *submitted* Details document — never a
+/// stored resource — and handed back unsaved, the same "never touches
+/// storage" contract Save's own validation-error path already keeps
+/// ([`render_lib_document_page`]). [`parse_doc_mutation`] decides which of
+/// [`apply_add_parameter`]/[`apply_add_table`]/[`apply_remove_table`]
+/// handles the request; an unrecognized submission answers a bare `400`
+/// rather than silently doing nothing.
+#[allow(clippy::too_many_arguments)]
+async fn sql_library_document(
+    state: WebState,
+    locale: RequestLocale,
+    rv: RequestVersion,
+    rt: RequestTenant,
+    user_key: String,
+    is_htmx: bool,
+    form: SqlLibDocumentForm,
+    kind: &LibraryKind,
+) -> Response {
+    let Some(mutation) = parse_doc_mutation(&form) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+
+    // NF1: never log `form.json`/`form.sql`/`form.values` — a Library's
+    // embedded SQL, JSON body, or parameter values can carry PHI.
+    let document: serde_json::Value = match serde_json::from_str(form.json.trim()) {
+        Ok(value) => value,
+        Err(error) => {
+            return document_whole_error_response(
+                &state,
+                locale,
+                rv.0,
+                &rt,
+                kind,
+                &user_key,
+                is_htmx,
+                &form,
+                &mutation,
+                format!("invalid JSON: {error}"),
+            )
+            .await;
+        }
+    };
+    if document
+        .get("resourceType")
+        .and_then(serde_json::Value::as_str)
+        != Some("Library")
+    {
+        return document_whole_error_response(
+            &state,
+            locale,
+            rv.0,
+            &rt,
+            kind,
+            &user_key,
+            is_htmx,
+            &form,
+            &mutation,
+            "the document must have resourceType \"Library\"".to_string(),
+        )
+        .await;
+    }
+
+    match mutation {
+        DocMutation::AddParameter { name, type_code } => {
+            apply_add_parameter(
+                &state, locale, rv.0, &rt, kind, &user_key, is_htmx, form, document, name,
+                type_code,
+            )
+            .await
+        }
+        DocMutation::AddTable { table, alias } => {
+            apply_add_table(
+                &state, locale, rv.0, &rt, kind, &user_key, is_htmx, form, document, table, alias,
+            )
+            .await
+        }
+        DocMutation::RemoveTable { label } => {
+            apply_remove_table(
+                &state, locale, rv.0, &rt, kind, &user_key, is_htmx, form, document, label,
+            )
+            .await
+        }
+    }
 }
 
 async fn sql_queries_page(
@@ -3901,10 +6731,22 @@ async fn sql_queries_page(
     locale: RequestLocale,
     rv: RequestVersion,
     rt: RequestTenant,
+    principal: Option<axum::Extension<helios_auth::Principal>>,
     Query(query): Query<SqlLibQuery>,
     settings: rail_state::RequestSettings,
 ) -> Response {
-    sql_library_page(state, locale, rv, rt, query, &SQL_QUERY_KIND, settings).await
+    let user_key = settings_user_key(principal.as_deref());
+    sql_library_page(
+        state,
+        locale,
+        rv,
+        rt,
+        query,
+        &SQL_QUERY_KIND,
+        settings,
+        user_key,
+    )
+    .await
 }
 
 async fn sql_queries_save(
@@ -3912,9 +6754,20 @@ async fn sql_queries_save(
     locale: RequestLocale,
     rv: RequestVersion,
     rt: RequestTenant,
-    axum::Form(form): axum::Form<SqlLibSaveForm>,
+    principal: Option<axum::Extension<helios_auth::Principal>>,
+    axum::extract::RawForm(body): axum::extract::RawForm,
 ) -> Response {
-    sql_library_save(state, locale, rv, rt, form, &SQL_QUERY_KIND).await
+    let user_key = settings_user_key(principal.as_deref());
+    sql_library_save(
+        state,
+        locale,
+        rv,
+        rt,
+        user_key,
+        parse_lib_save_form(&body),
+        &SQL_QUERY_KIND,
+    )
+    .await
 }
 
 async fn sql_queries_run(
@@ -3922,9 +6775,43 @@ async fn sql_queries_run(
     locale: RequestLocale,
     rv: RequestVersion,
     rt: RequestTenant,
-    axum::Form(form): axum::Form<SqlLibRunForm>,
+    principal: Option<axum::Extension<helios_auth::Principal>>,
+    axum::extract::RawForm(body): axum::extract::RawForm,
 ) -> Response {
-    sql_library_run(state, locale, rv, rt, form, &SQL_QUERY_KIND).await
+    let user_key = settings_user_key(principal.as_deref());
+    sql_library_run(
+        state,
+        locale,
+        rv,
+        rt,
+        user_key,
+        parse_lib_run_form(&body),
+        &SQL_QUERY_KIND,
+    )
+    .await
+}
+
+async fn sql_queries_document(
+    State(state): State<WebState>,
+    locale: RequestLocale,
+    rv: RequestVersion,
+    rt: RequestTenant,
+    principal: Option<axum::Extension<helios_auth::Principal>>,
+    HxRequest(is_htmx): HxRequest,
+    axum::extract::RawForm(body): axum::extract::RawForm,
+) -> Response {
+    let user_key = settings_user_key(principal.as_deref());
+    sql_library_document(
+        state,
+        locale,
+        rv,
+        rt,
+        user_key,
+        is_htmx,
+        parse_lib_document_form(&body),
+        &SQL_QUERY_KIND,
+    )
+    .await
 }
 
 async fn sql_views_page(
@@ -3932,10 +6819,22 @@ async fn sql_views_page(
     locale: RequestLocale,
     rv: RequestVersion,
     rt: RequestTenant,
+    principal: Option<axum::Extension<helios_auth::Principal>>,
     Query(query): Query<SqlLibQuery>,
     settings: rail_state::RequestSettings,
 ) -> Response {
-    sql_library_page(state, locale, rv, rt, query, &SQL_VIEW_KIND, settings).await
+    let user_key = settings_user_key(principal.as_deref());
+    sql_library_page(
+        state,
+        locale,
+        rv,
+        rt,
+        query,
+        &SQL_VIEW_KIND,
+        settings,
+        user_key,
+    )
+    .await
 }
 
 async fn sql_views_save(
@@ -3943,9 +6842,20 @@ async fn sql_views_save(
     locale: RequestLocale,
     rv: RequestVersion,
     rt: RequestTenant,
-    axum::Form(form): axum::Form<SqlLibSaveForm>,
+    principal: Option<axum::Extension<helios_auth::Principal>>,
+    axum::extract::RawForm(body): axum::extract::RawForm,
 ) -> Response {
-    sql_library_save(state, locale, rv, rt, form, &SQL_VIEW_KIND).await
+    let user_key = settings_user_key(principal.as_deref());
+    sql_library_save(
+        state,
+        locale,
+        rv,
+        rt,
+        user_key,
+        parse_lib_save_form(&body),
+        &SQL_VIEW_KIND,
+    )
+    .await
 }
 
 async fn sql_views_run(
@@ -3953,9 +6863,43 @@ async fn sql_views_run(
     locale: RequestLocale,
     rv: RequestVersion,
     rt: RequestTenant,
-    axum::Form(form): axum::Form<SqlLibRunForm>,
+    principal: Option<axum::Extension<helios_auth::Principal>>,
+    axum::extract::RawForm(body): axum::extract::RawForm,
 ) -> Response {
-    sql_library_run(state, locale, rv, rt, form, &SQL_VIEW_KIND).await
+    let user_key = settings_user_key(principal.as_deref());
+    sql_library_run(
+        state,
+        locale,
+        rv,
+        rt,
+        user_key,
+        parse_lib_run_form(&body),
+        &SQL_VIEW_KIND,
+    )
+    .await
+}
+
+async fn sql_views_document(
+    State(state): State<WebState>,
+    locale: RequestLocale,
+    rv: RequestVersion,
+    rt: RequestTenant,
+    principal: Option<axum::Extension<helios_auth::Principal>>,
+    HxRequest(is_htmx): HxRequest,
+    axum::extract::RawForm(body): axum::extract::RawForm,
+) -> Response {
+    let user_key = settings_user_key(principal.as_deref());
+    sql_library_document(
+        state,
+        locale,
+        rv,
+        rt,
+        user_key,
+        is_htmx,
+        parse_lib_document_form(&body),
+        &SQL_VIEW_KIND,
+    )
+    .await
 }
 
 /// The shared cards, already HTML.
@@ -4085,6 +7029,7 @@ fn capability_json_fragment_endpoint(
     capability_json::FragmentEndpoint {
         base_path: "/ui/capability-statement/json-fragment",
         version: version.as_str(),
+        extra_query: "",
     }
 }
 
@@ -4388,6 +7333,7 @@ async fn status(
                 false,
                 Vec::new(),
                 None,
+                0,
                 rv.0,
                 &rt,
             )
@@ -4465,9 +7411,30 @@ async fn history_diff(locale: RequestLocale, axum::Form(form): axum::Form<DiffFo
     })
 }
 
-/// Assembles the landing page from the live dashboard snapshot, or from
-/// placeholder data when no provider is registered â€” in which case the page
-/// says so explicitly rather than presenting invented numbers as real (#555).
+/// How many times the pending dashboard re-requests itself before it stops and
+/// leaves only the manual retry link (#956).
+///
+/// The wait exists because the machine is busy — typically an import saturating
+/// the same storage the snapshot queries — so the poll has to be bounded: an
+/// unbounded one would keep adding load to exactly the condition it is waiting
+/// out.
+const DASH_PENDING_RETRIES: u32 = 3;
+
+/// Assembles the landing page from the live dashboard snapshot.
+///
+/// Three outcomes, three pages (#956):
+///
+/// - [`SnapshotState::Ready`] renders the figures, flagged as incomplete when
+///   the provider had to fill part of the snapshot in
+///   ([`DashboardSnapshot::partial`]).
+/// - [`SnapshotState::Pending`] — a provider is registered, this window's
+///   snapshot is still computing — renders an explicit waiting state: no
+///   chart, no headline figures, and a retry. Every window switch is a cold
+///   cache key, so this is an ordinary path, not an error.
+/// - [`SnapshotState::NoProvider`] — the build genuinely has no metrics —
+///   renders the placeholder snapshot, labelled as invented (#555).
+///
+/// Only the last of those may show numbers nobody measured, and it says so.
 #[allow(clippy::too_many_arguments)]
 async fn build_index_page(
     state: &WebState,
@@ -4477,16 +7444,52 @@ async fn build_index_page(
     all_types: bool,
     spec_types: Vec<String>,
     focus: Option<String>,
+    retry: u32,
     fhir_version: helios_fhir::FhirVersion,
     tenant: &RequestTenant,
 ) -> IndexPage {
     let status = current_status(state, fhir_version, tenant);
     let i18n = I18n::new(locale);
     let live =
-        helios_observability::dashboard::snapshot(window, &tenant.id, &types, all_types).await;
-    let sample_data = live.is_none();
-    let snapshot = live.unwrap_or_else(|| sample_snapshot(window));
-    let dash = build_dashboard(&snapshot, all_types, &spec_types, focus.as_deref());
+        helios_observability::dashboard::snapshot_state(window, &tenant.id, &types, all_types)
+            .await;
+
+    let (notice, snapshot) = match live {
+        SnapshotState::Ready(s) if s.partial => (DashboardNotice::Partial, s),
+        SnapshotState::Ready(s) => (DashboardNotice::None, s),
+        // Nothing measured yet: an empty snapshot, so every figure renders as
+        // unknown rather than as a number.
+        SnapshotState::Pending => (
+            DashboardNotice::Pending,
+            DashboardSnapshot {
+                window,
+                ..Default::default()
+            },
+        ),
+        SnapshotState::NoProvider => (DashboardNotice::Sample, sample_snapshot(window)),
+    };
+
+    let mut dash = build_dashboard(&snapshot, all_types, &spec_types, focus.as_deref());
+    if notice.is_pending() {
+        // The pending snapshot plots nothing, so the selectors it derived
+        // point at an empty charted set. Rebuild the two that must survive
+        // the wait from what was actually requested, or the retry would come
+        // back with the user's type selection silently dropped.
+        dash.windows = window_entries(&types, window, all_types, focus.as_deref());
+        dash.all_types_href = dash_href(&types, window, !all_types, focus.as_deref());
+        // No figure is known yet, and a zero here reads as a measurement.
+        dash.metrics.resource_types = None;
+        dash.metrics.stored_resources = None;
+        dash.metrics.chart_total = None;
+    }
+
+    // The same view again, one attempt further in. Built from the requested
+    // types rather than the plotted ones: while pending there are none.
+    let retry_base = dash_href(&types, window, all_types, focus.as_deref());
+    let retry_href = format!("{retry_base}&retry={}", retry.saturating_add(1));
+    let auto_retry_href =
+        (notice.is_pending() && retry < DASH_PENDING_RETRIES).then(|| retry_href.clone());
+
     IndexPage {
         status,
         metrics: dash.metrics,
@@ -4496,7 +7499,9 @@ async fn build_index_page(
         windows: dash.windows,
         all_types: dash.all_types,
         all_types_href: dash.all_types_href,
-        sample_data,
+        notice,
+        retry_href,
+        auto_retry_href,
         i18n,
         active_page: "home",
     }
@@ -4536,6 +7541,28 @@ fn dash_href(
         href.push_str(&format!("&focus={f}"));
     }
     href
+}
+
+/// The `1h` / `24h` / `30d` selector, over a given charted set.
+///
+/// Separate from `build_dashboard` because the waiting page needs it too
+/// (#956): its snapshot plots nothing, so the selector has to be rebuilt from
+/// the *requested* types rather than the plotted ones — otherwise switching
+/// window while waiting would quietly drop the user's selection.
+fn window_entries(
+    types: &[String],
+    active: DashboardWindow,
+    all_types: bool,
+    focus: Option<&str>,
+) -> Vec<WindowEntry> {
+    DashboardWindow::ALL
+        .into_iter()
+        .map(|w| WindowEntry {
+            label: w.as_str().to_string(),
+            href: dash_href(types, w, all_types, focus),
+            active: w == active,
+        })
+        .collect()
 }
 
 /// Projects a [`DashboardSnapshot`] into the headline metrics, chart geometry,
@@ -4664,24 +7691,17 @@ fn build_dashboard(
         })
         .collect();
 
-    let windows = DashboardWindow::ALL
-        .into_iter()
-        .map(|w| WindowEntry {
-            label: w.as_str().to_string(),
-            href: dash_href(&charted, w, all_types, focus),
-            active: w == snapshot.window,
-        })
-        .collect();
+    let windows = window_entries(&charted, snapshot.window, all_types, focus);
 
     let metrics = DashboardMetrics {
-        resource_types: snapshot.distinct_types.to_string(),
-        stored_resources: compact_count(snapshot.total_resources),
+        resource_types: Some(snapshot.distinct_types.to_string()),
+        stored_resources: Some(compact_count(snapshot.total_resources)),
         export_jobs: snapshot.export_jobs,
         import_jobs: snapshot.import_jobs_active,
         uptime: format_uptime(helios_observability::uptime::uptime_seconds()),
         chart_total: {
             let sum: u64 = snapshot.series.iter().map(|s| s.total).sum();
-            grouped(sum)
+            Some(grouped(sum))
         },
     };
 
@@ -5011,6 +8031,9 @@ fn sample_snapshot(window: DashboardWindow) -> DashboardSnapshot {
         available,
         export_jobs: None,
         import_jobs_active: None,
+        // Wholly invented rather than partly missing: the page says so with
+        // the sample-data notice, which `partial` must not water down (#956).
+        partial: false,
     }
 }
 
@@ -5168,7 +8191,9 @@ mod tests {
             windows: dash.windows,
             all_types: dash.all_types,
             all_types_href: dash.all_types_href,
-            sample_data: true,
+            notice: DashboardNotice::Sample,
+            retry_href: "/ui?types=&window=30d&retry=1".to_string(),
+            auto_retry_href: None,
             i18n,
             active_page: "home",
         }
@@ -5392,6 +8417,57 @@ mod tests {
         );
     }
 
+    /// #821: the vendoring ritual's raw-size budget (`crates/ui/vendor/codemirror/README.md`
+    /// § "Measured sizes") — a regeneration that pulls in an unexpectedly heavy
+    /// package should fail a test, not just a number nobody re-checks in the README.
+    #[test]
+    fn codemirror_vendor_bundle_stays_within_its_raw_size_budget() {
+        let file = Assets::get("vendor/codemirror.bundle.js").expect("CodeMirror bundle embedded");
+        const RAW_SIZE_BUDGET_BYTES: usize = 500_000;
+        assert!(
+            file.data.len() <= RAW_SIZE_BUDGET_BYTES,
+            "codemirror.bundle.js is {} bytes, over the {}-byte raw budget",
+            file.data.len(),
+            RAW_SIZE_BUDGET_BYTES
+        );
+    }
+
+    /// #821: `lezer-fhirpath`'s license is MIT, declared only in its published
+    /// README (no `license` field, no `LICENSE` file — see the vendor README's
+    /// citation) — the banner records that via `rollup.config.js`'s license
+    /// override map and must no longer show the old "not declared" placeholder.
+    #[test]
+    fn codemirror_vendor_bundle_banner_documents_lezer_fhirpath_license() {
+        let file = Assets::get("vendor/codemirror.bundle.js").expect("CodeMirror bundle embedded");
+        let source = std::str::from_utf8(&file.data).expect("bundle is UTF-8");
+        assert!(
+            source.contains("lezer-fhirpath") && source.contains("MIT"),
+            "banner must document lezer-fhirpath's MIT license"
+        );
+        assert!(
+            !source.contains("not declared in package metadata"),
+            "banner must no longer show the unresolved-license placeholder"
+        );
+    }
+
+    /// #821: the vendoring ritual's README documents `eval`/`new Function`/
+    /// `document.write` as a hard constraint on this bundle, checked by hand
+    /// on every regeneration — this makes that check automatic.
+    #[test]
+    fn codemirror_vendor_bundle_has_no_eval_or_dynamic_code() {
+        let file = Assets::get("vendor/codemirror.bundle.js").expect("CodeMirror bundle embedded");
+        let source = std::str::from_utf8(&file.data).expect("bundle is UTF-8");
+        assert!(!source.contains("eval("), "bundle must not call eval(...)");
+        assert!(
+            !source.contains("new Function("),
+            "bundle must not construct dynamic functions"
+        );
+        assert!(
+            !source.contains("document.write("),
+            "bundle must not call document.write(...)"
+        );
+    }
+
     /// #753: vd-editor.js — the hand-written mount script that
     /// progressively enhances the ViewDefinition textarea with the vendored
     /// bundle — is embedded like every other page script.
@@ -5568,11 +8644,14 @@ mod tests {
                     targets: "Organization,Practitioner".into(),
                 },
             ],
+            columns: "name,gender,birthDate".into(),
         }
         .render()
         .expect("partial renders");
 
-        assert!(html.contains(r#"<datalist id="param-options">"#));
+        assert!(
+            html.contains(r#"<datalist id="param-options" data-columns="name,gender,birthDate">"#)
+        );
         assert!(html.contains(r#"value="birthdate""#));
         assert!(html.contains(r#"data-type="date""#));
         assert!(html.contains(r#"data-targets="Organization,Practitioner""#));
@@ -5638,7 +8717,7 @@ mod tests {
         assert!(!patient.href.contains("types=Patient"));
         assert!(patient.href.contains("Observation"));
 
-        assert_eq!(dash.metrics.resource_types, "142");
+        assert_eq!(dash.metrics.resource_types.as_deref(), Some("142"));
     }
 
     /// The window selector offers every window, marks the snapshot's own as
@@ -5739,13 +8818,16 @@ mod tests {
             available: Vec::new(),
             export_jobs: None,
             import_jobs_active: None,
+            partial: false,
         };
         let dash = build_dashboard(&empty, false, &[], None);
         assert!(!dash.chart.has_data);
         assert!(dash.chart.series.is_empty());
         assert!(dash.legend.is_empty());
         assert!(dash.picker.is_empty());
-        assert_eq!(dash.metrics.chart_total, "0");
+        // A measured zero, not an unknown: an empty server has a real "0" to
+        // show, unlike a snapshot still being computed (#956).
+        assert_eq!(dash.metrics.chart_total.as_deref(), Some("0"));
         // The window selector still renders, so an empty server is not a dead end.
         assert_eq!(dash.windows.len(), DashboardWindow::ALL.len());
     }
@@ -5783,6 +8865,7 @@ mod tests {
             }],
             export_jobs: None,
             import_jobs_active: None,
+            partial: false,
         };
         let spec_types = vec![
             "Observation".to_string(),

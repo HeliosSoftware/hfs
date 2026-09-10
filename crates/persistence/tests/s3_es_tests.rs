@@ -131,6 +131,18 @@ async fn shared_minio() -> &'static SharedMinio {
 /// on its own.
 const ES_STARTUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
+/// Elasticsearch image tag for the shared test container.
+///
+/// `testcontainers-modules` defaults to 7.16.1, whose bundled JDK 17.0.1
+/// crashes at startup on cgroup v2 hosts without a mounted controller
+/// (Docker Desktop's linuxkit VM): `NullPointerException: Cannot invoke
+/// "jdk.internal.platform.CgroupInfo.getMountPoint()" because "anyController"
+/// is null` (JDK-8272124, fixed in 17.0.2). Every 7.16.x tag ships the broken
+/// JDK, so pin the latest 7.17 release; it keeps the 7.x API surface and the
+/// `[YELLOW] to [GREEN]` ready message the module waits on (8.x does not log
+/// that line, so a plain tag bump to 8.15.0 would hang the startup wait).
+const ES_IMAGE_TAG: &str = "7.17.29";
+
 /// How many times to try starting the ES container before giving up.
 const ES_START_ATTEMPTS: usize = 2;
 
@@ -146,6 +158,7 @@ async fn start_es_container() -> testcontainers::ContainerAsync<ElasticSearch> {
     let mut last_err = None;
     for attempt in 1..=ES_START_ATTEMPTS {
         match ElasticSearch::default()
+            .with_tag(ES_IMAGE_TAG)
             .with_env_var("ES_JAVA_OPTS", "-Xms256m -Xmx256m")
             .with_label("github.run_id", &run_id)
             .with_startup_timeout(ES_STARTUP_TIMEOUT)

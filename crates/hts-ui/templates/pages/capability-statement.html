@@ -108,16 +108,5 @@
 {% if let Some(raw_card) = view.raw_card %}
 {{ raw_card|safe }}
 {% endif %}
-{#-
-  The tree enhancer, exactly as HFS wires it on its own page: it reveals the
-  aggregate controls, sends one HTML POST for Expand all, and keeps native
-  `details[data-capability-json-node]` incremental. Without it the first level
-  and plain-JSON link still work, while deeper controls remain inert; see the
-  regression tests in `tests/chrome_parity.rs`.
-
-  Kept outside the `{% if %}` above to mirror HFS, whose tag likewise sits
-  after its own conditional. The per-node arrow toggles come from
-  `json-view.js`, loaded globally by `layouts/base.html`.
--#}
-<script src="/ui/hts/assets/capability-json.js" defer></script>
+{#- capability-json.js is now loaded globally by layouts/base.html (#898) -#}
 {% endblock %}

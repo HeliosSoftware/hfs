@@ -523,30 +523,33 @@ impl QueryBuilder {
     ) -> Option<SqlFragment> {
         match param.name.as_str() {
             "_id" => {
-                // _id searches directly on the resources table
-                let mut conditions = Vec::new();
-                for (i, value) in param.values.iter().enumerate() {
-                    conditions.push(SqlFragment::with_params(
-                        format!("id = ?{}", param_offset + i + 1),
-                        vec![SqlParam::string(&value.value)],
-                    ));
-                }
-
-                if conditions.is_empty() {
+                // _id searches directly on the resources table. Build a flat
+                // `id IN (?, ?, ...)` rather than a chain of `id = ? OR id = ?`:
+                // a nested OR of N terms parses to a tree of depth N, and SQLite
+                // refuses to prepare past depth 1000, so a chained/`_has`
+                // resolution that injects thousands of ids as an `_id` filter
+                // used to 500 (#943). An `IN` list is a single node of any
+                // length.
+                if param.values.is_empty() {
                     return None;
                 }
-
-                let mut combined = conditions.remove(0);
-                for cond in conditions {
-                    combined = combined.or(cond);
-                }
+                let mut params = Vec::with_capacity(param.values.len());
+                let placeholders: Vec<String> = param
+                    .values
+                    .iter()
+                    .enumerate()
+                    .map(|(i, value)| {
+                        params.push(SqlParam::string(&value.value));
+                        format!("?{}", param_offset + i + 1)
+                    })
+                    .collect();
 
                 Some(SqlFragment::with_params(
                     format!(
-                        "resource_id IN (SELECT id FROM resources WHERE tenant_id = ?1 AND resource_type = ?2 AND ({}))",
-                        combined.sql
+                        "resource_id IN (SELECT id FROM resources WHERE tenant_id = ?1 AND resource_type = ?2 AND id IN ({}))",
+                        placeholders.join(", ")
                     ),
-                    combined.params,
+                    params,
                 ))
             }
             "_lastUpdated" => {

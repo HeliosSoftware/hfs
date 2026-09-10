@@ -36,10 +36,12 @@ use tracing::warn;
 use crate::core::bulk_export_worker::{LeaseError, WorkerId};
 use crate::core::bulk_submit::{
     BulkEntryOutcome, BulkEntryResult, BulkProcessingOptions, BulkSubmitProvider,
-    BulkSubmitRollbackProvider, ChangeType, EntryCountSummary, NdjsonEntry, StreamProcessingResult,
+    BulkSubmitRollbackProvider, ChangeType, EntryCountSummary, EntryResultContinuation,
+    EntryResultPage, ManifestPhase, NdjsonEntry, StreamProcessingResult,
     StreamingBulkSubmitProvider, SubmissionChange, SubmissionId, SubmissionManifest,
-    SubmissionStatus, SubmissionSummary,
+    SubmissionStatus, SubmissionSummary, entry_result_pages,
 };
+use crate::core::bulk_submit_publication::{ManifestPublicationResult, ManifestPublicationStatus};
 use crate::core::bulk_submit_worker::{
     BulkSubmitJobStore, ManifestFetchParams, ManifestLease, ManifestWorkerView, PollTokenTarget,
     SubmitClaimStrategy, SubmitFileRecord, SubmitFileRow, SubmitWorkerStorage,
@@ -52,6 +54,10 @@ use crate::types::StoredResource;
 
 use super::storage::CompositeStorage;
 use super::sync::SyncEvent;
+
+/// One batch of ingested resources bound for the secondaries: the resource
+/// type and FHIR version they share, and their `(id, content)` pairs.
+type SyncGroup = ((String, FhirVersion), Vec<(String, Value)>);
 
 /// The composite's `$bulk-submit` job store: the primary's engine for all
 /// state and ingestion, plus secondary-index sync at manifest boundaries.
@@ -66,6 +72,22 @@ impl CompositeSubmitJobs {
         Self { primary, composite }
     }
 
+    /// Preflights the primary lease before terminal publication.
+    ///
+    /// Sync is best-effort only for a lease the primary still authorizes. If the
+    /// lease has been lost, publication still delegates to the primary so it can
+    /// distinguish an already-committed replay from a stale token.
+    async fn preflight_for_publication(&self, lease: &ManifestLease) -> Result<(), LeaseError> {
+        match self.primary.get_manifest_for_worker(lease).await {
+            Ok(_) => {
+                self.sync_ingested(lease).await;
+                Ok(())
+            }
+            Err(LeaseError::LeaseLost { .. }) => Ok(()),
+            Err(LeaseError::Storage(error)) => Err(LeaseError::Storage(error)),
+        }
+    }
+
     /// Pushes every successfully ingested entry of the leased manifest
     /// through the composite's secondary sync.
     ///
@@ -75,23 +97,32 @@ impl CompositeSubmitJobs {
     /// not be blocked by a search-index hiccup. Distinct resources are
     /// synced once even when a manifest touched them on several lines.
     async fn sync_ingested(&self, lease: &ManifestLease) {
-        let mut seen: std::collections::HashSet<(String, String)> =
-            std::collections::HashSet::new();
-        let limit = 1000u32;
-        let mut offset = 0u32;
-        loop {
-            let batch = match self
-                .primary
-                .get_entry_results(
+        let pages = entry_result_pages(|continuation| async move {
+            self.primary
+                .get_entry_results_page(
                     &lease.tenant,
                     &lease.submission_id,
                     &lease.manifest_id,
                     Some(BulkEntryOutcome::Success),
-                    limit,
-                    offset,
+                    1000,
+                    continuation.as_ref(),
                 )
                 .await
-            {
+        });
+        self.sync_ingested_pages(lease, pages).await;
+    }
+
+    async fn sync_ingested_pages(
+        &self,
+        lease: &ManifestLease,
+        pages: impl futures::Stream<Item = StorageResult<EntryResultPage>>,
+    ) {
+        use futures::StreamExt;
+        let mut seen: std::collections::HashSet<(String, String)> =
+            std::collections::HashSet::new();
+        futures::pin_mut!(pages);
+        while let Some(page) = pages.next().await {
+            let page = match page {
                 Ok(b) => b,
                 Err(e) => {
                     warn!(
@@ -104,33 +135,62 @@ impl CompositeSubmitJobs {
                     return;
                 }
             };
-            let n = batch.len() as u32;
-            for entry in batch {
+            // One batch per (type, FHIR version) per page, so the secondary
+            // takes a page of ingested resources as one write rather than one
+            // synchronous event each — under Elasticsearch `refresh=wait_for`
+            // that is one refresh wait per page instead of per resource.
+            let mut by_type: Vec<SyncGroup> = Vec::new();
+            for entry in page.entries.into_iter().map(|entry| entry.result) {
                 let Some(resource_id) = entry.resource_id else {
                     continue;
                 };
                 if !seen.insert((entry.resource_type.clone(), resource_id.clone())) {
                     continue;
                 }
-                self.sync_one(lease, &entry.resource_type, &resource_id)
+                let Some(stored) = self
+                    .read_ingested(lease, &entry.resource_type, &resource_id)
+                    .await
+                else {
+                    continue;
+                };
+                let key = (entry.resource_type.clone(), stored.fhir_version());
+                let group = match by_type.iter_mut().find(|(k, _)| *k == key) {
+                    Some(group) => group,
+                    None => {
+                        by_type.push((key, Vec::new()));
+                        by_type.last_mut().expect("just pushed")
+                    }
+                };
+                group.1.push((resource_id, stored.content().clone()));
+            }
+            for ((resource_type, fhir_version), resources) in by_type {
+                self.composite
+                    .sync_creates_to_secondaries(
+                        &lease.tenant,
+                        &resource_type,
+                        fhir_version,
+                        resources,
+                    )
                     .await;
             }
-            if n < limit {
-                return;
-            }
-            offset += limit;
         }
     }
 
-    /// Reads one resource from the primary and emits the matching sync event.
-    async fn sync_one(&self, lease: &ManifestLease, resource_type: &str, resource_id: &str) {
-        let stored = match self
+    /// Reads one ingested resource back from the primary for syncing. A
+    /// resource deleted (or rolled back) since ingestion is reflected as a
+    /// delete on the secondaries instead, and `None` is returned.
+    async fn read_ingested(
+        &self,
+        lease: &ManifestLease,
+        resource_type: &str,
+        resource_id: &str,
+    ) -> Option<StoredResource> {
+        match self
             .primary
             .read(&lease.tenant, resource_type, resource_id)
             .await
         {
-            Ok(Some(stored)) => stored,
-            // Deleted (or rolled back) since ingestion — reflect that instead.
+            Ok(Some(stored)) => Some(stored),
             Ok(None) | Err(_) => {
                 let _ = self
                     .composite
@@ -140,26 +200,8 @@ impl CompositeSubmitJobs {
                         tenant_id: lease.tenant.tenant_id().clone(),
                     })
                     .await;
-                return;
+                None
             }
-        };
-        if let Err(e) = self
-            .composite
-            .sync_to_secondaries(SyncEvent::Create {
-                resource_type: resource_type.to_string(),
-                resource_id: resource_id.to_string(),
-                content: stored.content().clone(),
-                tenant_id: lease.tenant.tenant_id().clone(),
-                fhir_version: stored.fhir_version(),
-            })
-            .await
-        {
-            warn!(
-                resource_type,
-                resource_id,
-                error = %e,
-                "secondary sync of an ingested resource failed; repair via $reindex"
-            );
         }
     }
 }
@@ -192,6 +234,18 @@ impl ResourceStorage for CompositeSubmitJobs {
     ) -> StorageResult<StoredResource> {
         self.composite
             .create(tenant, resource_type, resource, fhir_version)
+            .await
+    }
+
+    async fn create_many(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        resources: Vec<Value>,
+        fhir_version: FhirVersion,
+    ) -> Vec<StorageResult<StoredResource>> {
+        self.composite
+            .create_many(tenant, resource_type, resources, fhir_version)
             .await
     }
 
@@ -446,23 +500,23 @@ impl BulkSubmitProvider for CompositeSubmitJobs {
             .await
     }
 
-    async fn get_entry_results(
+    async fn get_entry_results_page(
         &self,
         tenant: &TenantContext,
         submission_id: &SubmissionId,
         manifest_id: &str,
         outcome_filter: Option<BulkEntryOutcome>,
         limit: u32,
-        offset: u32,
-    ) -> StorageResult<Vec<BulkEntryResult>> {
+        continuation: Option<&EntryResultContinuation>,
+    ) -> StorageResult<EntryResultPage> {
         self.primary
-            .get_entry_results(
+            .get_entry_results_page(
                 tenant,
                 submission_id,
                 manifest_id,
                 outcome_filter,
                 limit,
-                offset,
+                continuation,
             )
             .await
     }
@@ -614,20 +668,15 @@ impl SubmitWorkerStorage for CompositeSubmitJobs {
         self.primary.mark_manifest_processing(lease).await
     }
 
-    async fn update_manifest_progress(
+    async fn add_manifest_progress(
         &self,
         lease: &ManifestLease,
-        processed_entries: u64,
-        failed_entries: u64,
-        last_processed_line: u64,
+        processed_delta: u64,
+        failed_delta: u64,
+        lines_delta: u64,
     ) -> Result<(), LeaseError> {
         self.primary
-            .update_manifest_progress(
-                lease,
-                processed_entries,
-                failed_entries,
-                last_processed_line,
-            )
+            .add_manifest_progress(lease, processed_delta, failed_delta, lines_delta)
             .await
     }
 
@@ -642,6 +691,18 @@ impl SubmitWorkerStorage for CompositeSubmitJobs {
             .await
     }
 
+    async fn update_manifest_phase(
+        &self,
+        lease: &ManifestLease,
+        phase: ManifestPhase,
+        files_done: u64,
+        files_total: u64,
+    ) -> Result<(), LeaseError> {
+        self.primary
+            .update_manifest_phase(lease, phase, files_done, files_total)
+            .await
+    }
+
     async fn record_submit_file(
         &self,
         lease: &ManifestLease,
@@ -650,11 +711,20 @@ impl SubmitWorkerStorage for CompositeSubmitJobs {
         self.primary.record_submit_file(lease, file).await
     }
 
+    async fn publish_manifest_artifacts(
+        &self,
+        lease: &ManifestLease,
+        files: &[SubmitFileRecord],
+        terminal: ManifestPublicationStatus,
+    ) -> Result<ManifestPublicationResult, LeaseError> {
+        self.preflight_for_publication(lease).await?;
+        self.primary
+            .publish_manifest_artifacts(lease, files, terminal)
+            .await
+    }
+
     async fn finish_manifest(&self, lease: &ManifestLease) -> Result<(), LeaseError> {
-        // Sync before finishing: once the manifest is terminal the lease is
-        // gone, and syncing under the live lease keeps a reclaim from racing
-        // a half-finished sweep with a second ingestion of the same files.
-        self.sync_ingested(lease).await;
+        self.preflight_for_publication(lease).await?;
         self.primary.finish_manifest(lease).await
     }
 
@@ -663,9 +733,7 @@ impl SubmitWorkerStorage for CompositeSubmitJobs {
         lease: &ManifestLease,
         error_message: &str,
     ) -> Result<(), LeaseError> {
-        // A failed manifest still committed its successful entries on the
-        // primary — search must agree with what reads will return.
-        self.sync_ingested(lease).await;
+        self.preflight_for_publication(lease).await?;
         self.primary.fail_manifest(lease, error_message).await
     }
 
@@ -923,6 +991,56 @@ mod tests {
         let jobs =
             CompositeSubmitJobs::new(sqlite.clone() as Arc<dyn BulkSubmitJobStore>, composite);
         (sqlite, jobs, events)
+    }
+
+    mod scripted_pages {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/bulk_submit/scripted_pages.rs"
+        ));
+    }
+
+    #[tokio::test]
+    async fn sync_consumer_reads_beyond_an_empty_page_with_continuation() {
+        let (sqlite, jobs, events) = harness();
+        let tenant = tenant();
+        let sub = SubmissionId::generate("scripted-sync");
+        sqlite.create_submission(&tenant, &sub, None).await.unwrap();
+        sqlite
+            .add_manifest(&tenant, &sub, Some("http://provider/m.json"), None)
+            .await
+            .unwrap();
+        let lease = sqlite
+            .claim_next_manifest(
+                &WorkerId::new("scripted"),
+                std::time::Duration::from_secs(60),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        for id in ["after-empty", "exclusive-late"] {
+            sqlite
+                .create(
+                    &tenant,
+                    "Patient",
+                    json!({"resourceType":"Patient", "id":id}),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+        let (pages, calls) = scripted_pages::pages();
+        jobs.sync_ingested_pages(&lease, pages).await;
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 3);
+        let mut actual = events.lock().clone();
+        actual.sort();
+        assert_eq!(
+            actual,
+            vec![
+                "create Patient/after-empty",
+                "create Patient/exclusive-late"
+            ]
+        );
     }
 
     /// #882: a finished manifest pushes every ingested resource into the

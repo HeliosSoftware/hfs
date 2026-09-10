@@ -1306,50 +1306,73 @@ fn cm_detail_page_uses_the_v3_compact_header_shape() {
     );
 }
 
-/// #806 regression guard: a `<summary>` carrying `.field__label` is
+/// #806 / #898 regression guard: a `<summary>` carrying `.field__label` is
 /// `display: block`, so the browser draws no disclosure marker, and the
-/// rule sets no `cursor` — the fold looked like an inert grey label. The
-/// ConceptMap templates must keep using the shared `.disclosure` pattern
-/// and must never reintroduce that summary class.
+/// rule sets no `cursor` — the fold looked like an inert grey label.
+///
+/// There are two fold types in the ConceptMap surface:
+/// - Fact-set folds (`.disclosure` pattern) for collapsing ConceptMap metadata
+/// - Raw JSON folds (`.card .json-fold` pattern, #898) for raw response payloads
+///
+/// Both must ship an explicit chevron. The raw fold template must use the
+/// card-shaped json-fold pattern.
 #[test]
 fn cm_detail_folds_never_reintroduce_the_markerless_field_label_summary() {
-    // (template, carries a fold of its own). The translate result includes
-    // the raw fold from `partials/hts-raw-fold.html` (#803), so the shape
-    // is asserted on the partial rather than on the includer.
-    let templates = [
+    // (template, fold type). The translate result includes the raw fold
+    // from `partials/hts-raw-fold.html` (#803), so the shape is asserted on
+    // the partial rather than on the includer.
+    //
+    // Fold types: "disclosure" = fact-set, "json-fold" = raw JSON (#898)
+    let templates: &[(&str, &str, Option<&str>)] = &[
         (
             "pages/cm-detail.html",
             include_str!("../templates/pages/cm-detail.html"),
-            true,
+            Some("disclosure"), // fact-set fold, not raw JSON
         ),
         (
             "partials/hts-cm-translate-result.html",
             include_str!("../templates/partials/hts-cm-translate-result.html"),
-            false,
+            None, // includes hts-raw-fold.html, does not define its own fold
         ),
         (
             "partials/hts-raw-fold.html",
             include_str!("../templates/partials/hts-raw-fold.html"),
-            true,
+            Some("json-fold"), // raw JSON fold, must use card pattern (#898)
         ),
     ];
 
-    for (name, template, carries_fold) in templates {
+    for (name, template, fold_type) in templates {
         let body = strip_template_comments(template);
         assert!(
             !body.contains(r#"<summary class="field__label""#),
             "{name} must not pin a `.field__label` summary: it kills the \
              native disclosure marker and leaves no pointer cursor (#806)",
         );
-        if !carries_fold {
-            continue;
+        match *fold_type {
+            Some("disclosure") => {
+                // Fact-set fold: expects `.disclosure` pattern with chevron
+                assert!(
+                    body.contains(r#"<details class="disclosure">"#)
+                        && body.contains(r#"<summary class="disclosure__summary">"#)
+                        && body.contains(r#"class="icon disclosure__chevron""#),
+                    "{name} must use the shared `.disclosure` fold shape",
+                );
+            }
+            Some("json-fold") => {
+                // Raw JSON fold: expects card `.json-fold` pattern (#898)
+                assert!(
+                    body.contains(r#"<summary class="card-head">"#),
+                    "{name} must render the card-head summary for the json-fold",
+                );
+                assert!(
+                    body.contains(r#"class="icon">"#),
+                    "{name}'s fold must render the chevron icon",
+                );
+            }
+            _ => {
+                // No fold of its own — just checking it doesn't use field__label
+            }
         }
-        assert!(
-            body.contains(r#"<details class="disclosure">"#)
-                && body.contains(r#"<summary class="disclosure__summary">"#)
-                && body.contains(r#"class="icon disclosure__chevron""#),
-            "{name} must use the shared `.disclosure` fold shape",
-        );
     }
 }
 
