@@ -42,11 +42,13 @@ use crate::state::AppState;
 pub const SQL_RUN_DEFINITION_ID: &str = "hfs-sql-run";
 /// Path id for the `$sql-export` definition this server publishes.
 pub const SQL_EXPORT_DEFINITION_ID: &str = "hfs-sql-export";
+/// Path id for the `$reindex` definition this server publishes.
+pub const REINDEX_DEFINITION_ID: &str = "hfs-reindex";
 
 /// `GET [base]/OperationDefinition/{id}`
 ///
-/// Serves the two definitions above. Any other id is a 404 — this route does
-/// not read arbitrary OperationDefinitions out of storage.
+/// Serves the definitions above. Any other id is a 404 — this route does not
+/// read arbitrary OperationDefinitions out of storage.
 pub async fn sof_operation_definition_handler<S>(
     State(state): State<AppState<S>>,
     Path(id): Path<String>,
@@ -55,9 +57,11 @@ where
     S: ResourceStorage + Send + Sync + 'static,
 {
     let export_available = state.export_controller().is_some();
+    let reindex_available = state.reindex().is_some();
     let definition = match id.as_str() {
         SQL_RUN_DEFINITION_ID => sql_run_definition(),
         SQL_EXPORT_DEFINITION_ID if export_available => sql_export_definition(),
+        REINDEX_DEFINITION_ID if reindex_available => reindex_definition(),
         _ => {
             return Err(RestError::NotFound {
                 resource_type: "OperationDefinition".to_string(),
@@ -66,6 +70,45 @@ where
         }
     };
     Ok((StatusCode::OK, axum::Json(definition)))
+}
+
+/// The `$reindex` operation this server publishes.
+///
+/// `base` is absent on purpose: `$reindex` is an HFS administrative operation
+/// with no HL7 counterpart to derive from, unlike the SQL on FHIR pair below.
+/// It is advertised in `CapabilityStatement.rest.operation` only where an index
+/// exists to rebuild, which is what makes it discoverable to an operator whose
+/// search index has fallen behind its primary (#1021).
+pub(crate) fn reindex_definition() -> Value {
+    json!({
+        "resourceType": "OperationDefinition",
+        "id": REINDEX_DEFINITION_ID,
+        "url": format!("/OperationDefinition/{REINDEX_DEFINITION_ID}"),
+        "name": "Reindex",
+        "title": "Rebuild the search index from stored resources",
+        "status": "active",
+        "kind": "operation",
+        "code": "reindex",
+        "affectsState": true,
+        "system": true,
+        "type": true,
+        "instance": false,
+        "description": "Re-extracts search parameters from every stored resource and rewrites every search index the deployment maintains, including an Elasticsearch secondary. Runs in the background: the kick-off returns 202 with a job id, polled at GET [base]/$reindex-status/{id} and cancelled with DELETE on the same path. Job state is held in memory on the node that accepted the kick-off, so poll the node you kicked off against. Requires the system/reindex operation scope.",
+        "parameter": [
+            {
+                "name": "clearExisting", "use": "in", "min": 0, "max": "1", "type": "boolean",
+                "documentation": "Clear each index before rebuilding it. Defaults to false, which overwrites entries in place; a resource deleted from the primary since the last index keeps its stale entry unless this is set."
+            },
+            {
+                "name": "batchSize", "use": "in", "min": 0, "max": "1", "type": "integer",
+                "documentation": "Resources read and rewritten per page. Defaults to 100."
+            },
+            {
+                "name": "jobId", "use": "out", "min": 1, "max": "1", "type": "string",
+                "documentation": "Identifier to poll at [base]/$reindex-status/{jobId}."
+            }
+        ]
+    })
 }
 
 /// The `$sql-run` subset this server supports.
@@ -187,6 +230,72 @@ mod tests {
             .iter()
             .map(|p| p["name"].as_str().unwrap())
             .collect()
+    }
+
+    /// The advertised `definition` URL has to resolve, or the citation is a dead
+    /// link — and it must 404 where the operation is not served, matching the
+    /// CapabilityStatement gating.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn reindex_definition_is_served_only_where_reindex_is_wired() {
+        use crate::config::ServerConfig;
+        use crate::state::AppState;
+        use helios_persistence::backends::sqlite::SqliteBackend;
+        use helios_persistence::search::{ReindexOperation, TenantSearchRegistries};
+        use std::sync::Arc;
+
+        let backend = Arc::new(SqliteBackend::in_memory().expect("in-memory sqlite"));
+        backend.init_schema().expect("init schema");
+
+        let unwired = AppState::new(backend.clone(), ServerConfig::default());
+        assert!(
+            sof_operation_definition_handler(
+                State(unwired),
+                Path(REINDEX_DEFINITION_ID.to_string())
+            )
+            .await
+            .is_err(),
+            "not served where $reindex answers 501"
+        );
+
+        let registries = Arc::new(TenantSearchRegistries::base_only());
+        let wired = AppState::new(backend.clone(), ServerConfig::default())
+            .with_reindex(Arc::new(ReindexOperation::new(backend, registries)));
+        let response =
+            sof_operation_definition_handler(State(wired), Path(REINDEX_DEFINITION_ID.to_string()))
+                .await
+                .expect("served where $reindex is wired")
+                .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// `$reindex` is the documented recovery for a search index that has fallen
+    /// behind its primary, and it was invisible: absent from
+    /// `CapabilityStatement.rest.operation`, so an operator had no discoverable
+    /// way to learn it exists (#1021). This pins the definition it now cites.
+    #[test]
+    fn reindex_definition_describes_the_operation_the_handler_accepts() {
+        let d = reindex_definition();
+        assert_eq!(d["code"], "reindex");
+        assert_eq!(d["id"], REINDEX_DEFINITION_ID);
+        assert_eq!(
+            d["affectsState"], true,
+            "a reindex rewrites the search index"
+        );
+        assert_eq!(d["system"], true, "POST [base]/$reindex");
+        assert_eq!(d["type"], true, "POST [base]/{{type}}/$reindex");
+        assert!(
+            d.get("base").is_none(),
+            "no HL7 counterpart to subset — unlike the SQL on FHIR pair"
+        );
+
+        // The in-parameters are exactly the two the kick-off handler reads; an
+        // OperationDefinition that named others would advertise support that
+        // does not exist.
+        let names = param_names(&d);
+        assert!(names.contains(&"clearExisting"));
+        assert!(names.contains(&"batchSize"));
+        assert!(names.contains(&"jobId"));
     }
 
     #[test]

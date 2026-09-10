@@ -56,6 +56,9 @@ use crate::core::bulk_submit::{
     BulkSubmitProvider, ManifestPhase, ManifestStatus, SubmissionId, SubmissionManifest,
     SubmissionStatus,
 };
+use crate::core::bulk_submit_publication::{
+    ManifestPublicationResult, ManifestPublicationStatus, canonical_publication_files,
+};
 use crate::core::bulk_submit_worker::{
     ManifestFetchParams, ManifestLease, ManifestWorkerView, PollTokenTarget, SubmitClaimStrategy,
     SubmitFileRecord, SubmitFileRow, SubmitWorkerStorage,
@@ -384,6 +387,26 @@ impl S3Backend {
     where
         F: Fn(&mut SubmissionManifestState),
     {
+        self.fenced_mutate_if(lease, |_| true, mutate).await
+    }
+
+    /// [`Self::fenced_mutate`] with an extra `precondition` on the stored state,
+    /// failing with `LeaseLost` when it does not hold.
+    ///
+    /// The two writes that settle a manifest's outcome require it to still be
+    /// `processing`: `abort_submission` moves in-flight manifests to `failed`,
+    /// and a worker that finishes just afterwards must not rewrite that verdict
+    /// (#968).
+    async fn fenced_mutate_if<P, F>(
+        &self,
+        lease: &ManifestLease,
+        precondition: P,
+        mutate: F,
+    ) -> Result<(), LeaseError>
+    where
+        P: Fn(&SubmissionManifestState) -> bool,
+        F: Fn(&mut SubmissionManifestState),
+    {
         let location = self
             .tenant_location(&lease.tenant)
             .map_err(LeaseError::Storage)?;
@@ -396,7 +419,7 @@ impl S3Backend {
             let Some((mut state, etag)) = loaded else {
                 return Err(lease_lost(lease));
             };
-            if !holds_lease(&state, lease) {
+            if !holds_lease(&state, lease) || !precondition(&state) {
                 return Err(lease_lost(lease));
             }
 
@@ -481,6 +504,12 @@ impl S3Backend {
 fn holds_lease(state: &SubmissionManifestState, lease: &ManifestLease) -> bool {
     state.worker_id.as_deref() == Some(lease.worker_id.as_str())
         && state.fencing_token == lease.fencing_token
+}
+
+/// Whether the manifest is still in flight — the precondition on the writes that
+/// settle its outcome, so an abort's verdict is not overwritten (#968).
+fn is_processing(state: &SubmissionManifestState) -> bool {
+    state.manifest.status == ManifestStatus::Processing
 }
 
 #[async_trait]
@@ -725,6 +754,8 @@ impl SubmitWorkerStorage for S3Backend {
             resource_type: file.resource_type.clone(),
             part_index: file.part_index,
             fencing_token: lease.fencing_token,
+            manifest_id: Some(lease.manifest_id.clone()),
+            legacy_locator: false,
             file_path: file.file_path.clone(),
             line_count: file.line_count,
             byte_count: file.byte_count,
@@ -733,6 +764,7 @@ impl SubmitWorkerStorage for S3Backend {
         let key = location.keyspace.submit_file_key(
             &lease.submission_id.submitter,
             &lease.submission_id.submission_id,
+            &lease.manifest_id,
             &file.file_type,
             file.resource_type.as_deref(),
             file.part_index,
@@ -749,8 +781,32 @@ impl SubmitWorkerStorage for S3Backend {
         Ok(())
     }
 
+    /// Publishes by canonical validation, then fenced per-row writes and the
+    /// fenced terminal update. S3 provides no cross-object transaction; this
+    /// intentionally preserves the existing non-atomic backend behavior.
+    async fn publish_manifest_artifacts(
+        &self,
+        lease: &ManifestLease,
+        files: &[SubmitFileRecord],
+        terminal: ManifestPublicationStatus,
+    ) -> Result<ManifestPublicationResult, LeaseError> {
+        let canonical = canonical_publication_files(files).map_err(LeaseError::Storage)?;
+        for file in &canonical {
+            self.record_submit_file(lease, file).await?;
+        }
+        match terminal {
+            ManifestPublicationStatus::Completed => self.finish_manifest(lease).await?,
+            ManifestPublicationStatus::Failed { error_message } => {
+                self.fail_manifest(lease, &error_message).await?
+            }
+        }
+        Ok(ManifestPublicationResult::Published)
+    }
+
     async fn finish_manifest(&self, lease: &ManifestLease) -> Result<(), LeaseError> {
-        self.fenced_mutate(lease, |state| {
+        // Guarded on `processing` so a worker finishing just after an abort
+        // cannot rewrite the abort's `failed` verdict back to `completed` (#968).
+        self.fenced_mutate_if(lease, is_processing, |state| {
             state.manifest.status = ManifestStatus::Completed;
             state.worker_id = None;
             state.lease_expiry = None;
@@ -767,7 +823,8 @@ impl SubmitWorkerStorage for S3Backend {
         error_message: &str,
     ) -> Result<(), LeaseError> {
         let message = error_message.to_string();
-        self.fenced_mutate(lease, move |state| {
+        // Same `processing` guard as `finish_manifest` (#968).
+        self.fenced_mutate_if(lease, is_processing, move |state| {
             state.manifest.status = ManifestStatus::Failed;
             state.error_message = Some(message.clone());
             state.worker_id = None;
@@ -1145,6 +1202,8 @@ struct SubmitFileRowRecord {
     resource_type: Option<String>,
     part_index: u32,
     fencing_token: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    manifest_id: Option<String>,
     file_path: String,
     line_count: u64,
     byte_count: u64,
@@ -1159,6 +1218,7 @@ impl From<&SubmitFileRow> for SubmitFileRowRecord {
             resource_type: row.resource_type.clone(),
             part_index: row.part_index,
             fencing_token: row.fencing_token,
+            manifest_id: row.manifest_id.clone(),
             file_path: row.file_path.clone(),
             line_count: row.line_count,
             byte_count: row.byte_count,
@@ -1169,16 +1229,46 @@ impl From<&SubmitFileRow> for SubmitFileRowRecord {
 
 impl From<SubmitFileRowRecord> for SubmitFileRow {
     fn from(record: SubmitFileRowRecord) -> Self {
+        let legacy_locator = record.manifest_id.is_none();
         Self {
             manifest_url: record.manifest_url,
             file_type: record.file_type,
             resource_type: record.resource_type,
             part_index: record.part_index,
             fencing_token: record.fencing_token,
+            manifest_id: record.manifest_id,
+            legacy_locator,
             file_path: record.file_path,
             line_count: record.line_count,
             byte_count: record.byte_count,
             count_severity: record.count_severity,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_record_without_manifest_id_is_legacy_locator() {
+        let record: SubmitFileRowRecord = serde_json::from_str(
+            r#"{
+                "manifest_url": "http://provider/manifest.json",
+                "file_type": "output",
+                "resource_type": "Patient",
+                "part_index": 0,
+                "fencing_token": 1,
+                "file_path": "output.ndjson",
+                "line_count": 1,
+                "byte_count": 16,
+                "count_severity": null
+            }"#,
+        )
+        .unwrap();
+        let row = SubmitFileRow::from(record);
+
+        assert_eq!(row.manifest_id, None);
+        assert!(row.legacy_locator);
     }
 }

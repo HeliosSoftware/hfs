@@ -832,6 +832,39 @@ pub struct ByteProgress {
     pub total: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
+/// The [`StreamProcessingResult::abort_reason`] a stream carries when it
+/// stopped because its [`CancelToken`] was tripped rather than because the
+/// data was bad.
+pub const CANCELLED_ABORT_REASON: &str = "cancelled";
+
+/// Cooperative cancellation for a manifest ingest in flight.
+///
+/// Aborting a submission only stopped *future* claims: a manifest already
+/// claimed ran to completion whatever the submission status said, so Abort
+/// could not interrupt a large manifest (#968). The lease keeper trips this
+/// token when the submission leaves an ingestable status, and the ingest
+/// loops check it between batches — cancellation is therefore "stop soon",
+/// bounded by one heartbeat interval plus one batch, never mid-transaction.
+#[derive(Debug, Clone, Default)]
+pub struct CancelToken(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl CancelToken {
+    /// Creates a token that has not been tripped.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Asks every holder to stop at its next check point.
+    pub fn cancel(&self) {
+        self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Returns whether cancellation has been requested.
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
 /// Options for bulk processing.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BulkProcessingOptions {
@@ -868,6 +901,11 @@ pub struct BulkProcessingOptions {
     /// transactions on SQLite.
     #[serde(skip)]
     pub byte_progress: Option<ByteProgress>,
+    /// Cooperative cancellation for the ingest in flight, when the caller
+    /// offers one. Checked between batches so an aborted submission stops the
+    /// manifest it already claimed instead of running it to the end (#968).
+    #[serde(skip)]
+    pub cancel: Option<CancelToken>,
 }
 
 fn default_submit_batch_size() -> u32 {
@@ -900,6 +938,7 @@ impl BulkProcessingOptions {
             file_url: None,
             defer_indexing: false,
             byte_progress: None,
+            cancel: None,
         }
     }
 
@@ -919,6 +958,18 @@ impl BulkProcessingOptions {
     pub fn with_byte_progress(mut self, byte_progress: ByteProgress) -> Self {
         self.byte_progress = Some(byte_progress);
         self
+    }
+
+    /// Attaches the token that lets the caller stop this ingest (#968).
+    pub fn with_cancel(mut self, cancel: CancelToken) -> Self {
+        self.cancel = Some(cancel);
+        self
+    }
+
+    /// Returns whether the caller has asked this ingest to stop. Ingest loops
+    /// call it at a batch boundary, never mid-transaction (#968).
+    pub fn is_cancelled(&self) -> bool {
+        self.cancel.as_ref().is_some_and(CancelToken::is_cancelled)
     }
 
     /// Sets the batch size.

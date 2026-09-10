@@ -739,8 +739,8 @@ impl PostgresBackend {
 
     /// Initialize the database schema.
     pub async fn init_schema(&self) -> StorageResult<()> {
-        let client = self.get_client().await?;
-        super::schema::initialize_schema(&client).await?;
+        let mut client = self.get_client().await?;
+        super::schema::initialize_schema(&mut client).await?;
         let _ = self
             .index_layout
             .set(super::schema::read_index_layout(&client).await);

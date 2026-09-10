@@ -501,8 +501,9 @@ test("a patient-only server rejection starts reactive field validation", async (
   page,
   bulkExport,
 }) => {
+  const exportName = "Patient-only rejection";
   await bulkExport.goto();
-  await bulkExport.nameInput.fill("Patient-only rejection");
+  await bulkExport.nameInput.fill(exportName);
   await bulkExport.scopeRadio("patient").check();
   await bulkExport.sincePreset.selectOption("custom");
   await bulkExport.sinceCustom.fill("2026-08-01T00:00:00Z");
@@ -524,6 +525,13 @@ test("a patient-only server rejection starts reactive field validation", async (
 
   await expect(bulkExport.form).toHaveAttribute("data-validation-started", "true");
   await expect(page.locator(".notice")).toContainText("valid logical Patient IDs");
+  // The attribute only arms the reactive validation; the deferred
+  // bulk-export.js is what acts on it, and everything asserted above is server
+  // markup that is already there while the scripts are still loading. Wait for
+  // the enhancement itself: the server renders the static page title in the
+  // heading, and the name reaches it in the same synchronous pass that binds
+  // the input listeners the edits below depend on.
+  await expect(bulkExport.nameHeading).toHaveText(exportName);
   await expect(bulkExport.nameError).toBeHidden();
   await expect(bulkExport.sinceCustomError).toBeHidden();
 

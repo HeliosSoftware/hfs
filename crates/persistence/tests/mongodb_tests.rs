@@ -3374,6 +3374,85 @@ async fn mongodb_integration_search_offloaded_prevents_search_index_writes() {
     );
 }
 
+/// Schema v9 replaces `idx_resources_type_deleted` with a longer index that also
+/// carries the `$reindex` page order (#1021). The old index is that index's
+/// strict prefix, so keeping both would cost a second B-tree on every write for
+/// no reader — the migration has to actually drop it, on a deployment that
+/// already has it.
+#[tokio::test]
+async fn mongodb_integration_schema_v9_swaps_in_the_reindex_scan_index() {
+    let Some(backend) = create_backend("schema_v9_index_swap").await else {
+        eprintln!(
+            "Skipping mongodb_integration_schema_v9_swaps_in_the_reindex_scan_index (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+
+    let client = raw_test_client(&backend.config().connection_string)
+        .await
+        .expect("failed to connect MongoDB client for index assertions");
+    let database = client.database(&backend.config().database_name);
+    let resources = database.collection::<Document>("resources");
+
+    async fn index_names(collection: &mongodb::Collection<Document>) -> Vec<String> {
+        use futures::stream::TryStreamExt;
+        collection
+            .list_indexes()
+            .await
+            .expect("list indexes")
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("collect indexes")
+            .into_iter()
+            .filter_map(|i| i.options.and_then(|o| o.name))
+            .collect()
+    }
+
+    // Put the collection back into its v8 shape: the superseded index present,
+    // the new one absent, as an upgraded deployment finds it.
+    let _ = resources.drop_index("idx_resources_type_scan").await;
+    resources
+        .create_index(
+            mongodb::IndexModel::builder()
+                .keys(doc! { "tenant_id": 1_i32, "resource_type": 1_i32, "is_deleted": 1_i32 })
+                .options(Some(
+                    mongodb::options::IndexOptions::builder()
+                        .name(Some("idx_resources_type_deleted".to_string()))
+                        .build(),
+                ))
+                .build(),
+        )
+        .await
+        .expect("recreate the v7 index");
+    assert!(
+        index_names(&resources)
+            .await
+            .contains(&"idx_resources_type_deleted".to_string())
+    );
+
+    backend.init_schema().await.expect("re-run schema init");
+
+    let names = index_names(&resources).await;
+    assert!(
+        names.contains(&"idx_resources_type_scan".to_string()),
+        "the reindex page order must be indexed, got {names:?}"
+    );
+    assert!(
+        !names.contains(&"idx_resources_type_deleted".to_string()),
+        "the superseded prefix must be dropped, not kept beside it, got {names:?}"
+    );
+
+    // Idempotent: the second run finds nothing to drop, which is also the
+    // fresh-deployment path.
+    backend
+        .init_schema()
+        .await
+        .expect("schema init is idempotent");
+    let names = index_names(&resources).await;
+    assert!(names.contains(&"idx_resources_type_scan".to_string()));
+    assert!(!names.contains(&"idx_resources_type_deleted".to_string()));
+}
+
 #[tokio::test]
 async fn mongodb_integration_standalone_search_writes_search_index() {
     let Some(backend) = create_backend("search_index_written_standalone").await else {
@@ -4011,12 +4090,13 @@ async fn mongodb_integration_purging_one_tenant_leaves_the_look_alikes_intact() 
 mod bulk_submit {
     use super::*;
 
+    use helios_persistence::core::bulk_submit::{CANCELLED_ABORT_REASON, CancelToken};
     use helios_persistence::core::{
         BulkProcessingOptions, BulkSubmitProvider, BulkSubmitRollbackProvider, ChangeType,
-        DefaultSubmitWorker, IMPORT_MODE_PARAMETER_URL, ManifestFetchParams, ManifestStatus,
-        NdjsonEntry, RemoteFile, RemoteManifest, StreamingBulkSubmitProvider, SubmissionId,
-        SubmissionStatus, SubmitClaimStrategy, SubmitFileRecord, SubmitInputFetcher,
-        SubmitWorkerStorage, WorkerId,
+        DefaultSubmitWorker, IMPORT_MODE_PARAMETER_URL, LeaseError, ManifestFetchParams,
+        ManifestPublicationStatus, ManifestStatus, NdjsonEntry, RemoteFile, RemoteManifest,
+        StreamingBulkSubmitProvider, SubmissionId, SubmissionStatus, SubmitClaimStrategy,
+        SubmitFileRecord, SubmitInputFetcher, SubmitWorkerStorage, WorkerId,
     };
     use helios_persistence::error::StorageResult;
     use std::collections::HashMap;
@@ -5448,6 +5528,420 @@ mod bulk_submit {
                 .is_none(),
             "a line of the wrong type must not be stored"
         );
+    }
+
+    /// Wraps a reader so that `token` is tripped the first time the ingest
+    /// actually reads from the stream.
+    struct CancelOnFirstRead<R> {
+        inner: R,
+        token: CancelToken,
+        tripped: bool,
+    }
+
+    impl<R: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for CancelOnFirstRead<R> {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            let this = self.get_mut();
+            if !this.tripped {
+                this.tripped = true;
+                this.token.cancel();
+            }
+            std::pin::Pin::new(&mut this.inner).poll_read(cx, buf)
+        }
+    }
+
+    /// Six one-per-line Patients, enough for three batches of two.
+    fn six_patient_lines() -> Vec<u8> {
+        (1..=6)
+            .map(|i| format!("{{\"resourceType\":\"Patient\",\"id\":\"cancel-{i}\"}}\n"))
+            .collect::<String>()
+            .into_bytes()
+    }
+
+    /// #968, MongoDB: cancelling mid-manifest stops at the next batch boundary,
+    /// keeping the batches already committed and skipping the rest. Mongo has no
+    /// enclosing transaction around the manifest, so "durable partial progress"
+    /// is a property of the backend, not of a rollback that never happened.
+    #[tokio::test]
+    async fn cancelled_mid_stream_keeps_committed_batches_and_stops() {
+        let Some(backend) = create_backend("submit_cancel_mid_stream").await else {
+            return;
+        };
+        let tenant = create_tenant("submit-tenant");
+        let (sub_id, manifest_id) = seed(&backend, &tenant).await;
+
+        let cancel = CancelToken::new();
+        let options = BulkProcessingOptions::new()
+            .with_batch_size(2)
+            .with_cancel(cancel.clone());
+
+        let reader = Box::new(tokio::io::BufReader::new(CancelOnFirstRead {
+            inner: std::io::Cursor::new(six_patient_lines()),
+            token: cancel,
+            tripped: false,
+        }));
+        let result = backend
+            .process_ndjson_stream(&tenant, &sub_id, &manifest_id, "Patient", reader, &options)
+            .await
+            .unwrap();
+
+        assert!(result.aborted);
+        assert_eq!(result.abort_reason.as_deref(), Some(CANCELLED_ABORT_REASON));
+        assert_eq!(
+            result.counts.success, 2,
+            "the batch already committed when the token tripped is kept"
+        );
+        assert_eq!(
+            result.lines_processed, 2,
+            "the remaining four lines were never read"
+        );
+
+        let counts = backend
+            .get_entry_counts(&tenant, &sub_id, &manifest_id)
+            .await
+            .unwrap();
+        assert_eq!(counts.total, 2, "the partial counts are durable");
+        assert!(
+            backend
+                .read(&tenant, "Patient", "cancel-2")
+                .await
+                .unwrap()
+                .is_some(),
+            "the first batch really landed"
+        );
+        assert!(
+            backend
+                .read(&tenant, "Patient", "cancel-3")
+                .await
+                .unwrap()
+                .is_none(),
+            "nothing after the cancellation point was ingested"
+        );
+    }
+
+    /// #968, MongoDB: `abort_submission` fails in-flight manifests without
+    /// clearing the lease, so the worker's late verdict must lose rather than
+    /// resurrect the manifest as `completed`. Mongo enforces this with a
+    /// `status: processing` clause added to the fenced-write filter, so this
+    /// also pins that the status is spelled the way the filter expects.
+    #[tokio::test]
+    async fn abort_beats_a_late_finish_manifest() {
+        let Some(backend) = create_backend("submit_abort_beats_finish").await else {
+            return;
+        };
+        let tenant = create_tenant("submit-tenant");
+        let (sub_id, _manifest_id) = seed(&backend, &tenant).await;
+
+        let lease = backend
+            .claim_next_manifest(&WorkerId::new("w1"), lease_duration())
+            .await
+            .unwrap()
+            .expect("a manifest should be claimable");
+        backend.mark_manifest_processing(&lease).await.unwrap();
+
+        // The submitter aborts while the worker still holds a valid lease.
+        backend
+            .abort_submission(&tenant, &sub_id, "user cancelled")
+            .await
+            .unwrap();
+
+        // The worker's verdicts arrive too late and change nothing.
+        assert!(
+            matches!(
+                backend.finish_manifest(&lease).await,
+                Err(LeaseError::LeaseLost { .. })
+            ),
+            "a finish after an abort must not win"
+        );
+        let stored = backend
+            .get_manifest(&tenant, &sub_id, &lease.manifest_id)
+            .await
+            .unwrap()
+            .expect("manifest");
+        assert_eq!(
+            stored.status,
+            ManifestStatus::Failed,
+            "the abort's verdict stands"
+        );
+
+        assert!(
+            matches!(
+                backend.fail_manifest(&lease, "worker gave up").await,
+                Err(LeaseError::LeaseLost { .. })
+            ),
+            "a late failure verdict is equally a no-op"
+        );
+        let stored = backend
+            .get_manifest(&tenant, &sub_id, &lease.manifest_id)
+            .await
+            .unwrap()
+            .expect("manifest");
+        assert_eq!(stored.status, ManifestStatus::Failed);
+    }
+
+    /// Reconstructs the pre-v8 Mongo artifact shape, migrates it through the
+    /// public backend migration, and verifies manifest-aware v8 identity for
+    /// two generations under one submission.
+    #[tokio::test]
+    async fn test_v7_to_v8_manifest_aware_submit_file_identity() {
+        use futures::TryStreamExt;
+
+        let Some(backend) = create_backend("submit_v7_to_v8_manifest_identity").await else {
+            eprintln!("skipping: no MongoDB container available");
+            return;
+        };
+        let tenant = create_tenant("submit-v7");
+        let submission_id = SubmissionId::new("v7-provider", "legacy-generation");
+        let db = backend.get_database().await.unwrap();
+        let files = db.collection::<Document>("bulk_submit_files");
+
+        files
+            .drop_index("idx_bulk_submit_files_manifest")
+            .await
+            .unwrap();
+        files
+            .create_index(
+                mongodb::IndexModel::builder()
+                    .keys(doc! {
+                        "tenant_id": 1_i32,
+                        "submitter": 1_i32,
+                        "submission_id": 1_i32,
+                        "file_type": 1_i32,
+                        "resource_type": 1_i32,
+                        "part_index": 1_i32,
+                        "fencing_token": 1_i32,
+                    })
+                    .options(
+                        mongodb::options::IndexOptions::builder()
+                            .name(Some("idx_bulk_submit_files_part".to_string()))
+                            .unique(Some(true))
+                            .build(),
+                    )
+                    .build(),
+            )
+            .await
+            .unwrap();
+        db.collection::<Document>("schema_version")
+            .update_one(
+                doc! { "_id": "schema_version" },
+                doc! { "$set": { "version": 7_i32 } },
+            )
+            .await
+            .unwrap();
+        files
+            .insert_one(doc! {
+                "tenant_id": tenant.tenant_id().as_str(),
+                "submitter": &submission_id.submitter,
+                "submission_id": &submission_id.submission_id,
+                "manifest_url": "https://provider.example/legacy.json",
+                "file_type": "output",
+                "resource_type": "Patient",
+                "part_index": 0_i64,
+                "fencing_token": 1_i64,
+                "file_path": "legacy/output/Patient-0.ndjson",
+                "line_count": 2_i64,
+                "byte_count": 19_i64,
+                "created_at": mongodb::bson::DateTime::from_millis(
+                    chrono::Utc::now().timestamp_millis(),
+                ),
+            })
+            .await
+            .unwrap();
+
+        backend.migrate().await.unwrap();
+        let schema_version = db
+            .collection::<Document>("schema_version")
+            .find_one(doc! { "_id": "schema_version" })
+            .await
+            .unwrap()
+            .expect("schema version document");
+        assert_eq!(schema_version.get_i32("version").unwrap(), 9_i32);
+
+        let indexes = files
+            .list_indexes()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let manifest_index = indexes
+            .iter()
+            .find(|index| {
+                index
+                    .options
+                    .as_ref()
+                    .and_then(|options| options.name.as_deref())
+                    == Some("idx_bulk_submit_files_manifest")
+            })
+            .expect("v8 submit-file identity index");
+        assert_eq!(
+            manifest_index.keys,
+            doc! {
+                "tenant_id": 1_i32,
+                "submitter": 1_i32,
+                "submission_id": 1_i32,
+                "manifest_id": 1_i32,
+                "file_type": 1_i32,
+                "resource_type": 1_i32,
+                "part_index": 1_i32,
+                "fencing_token": 1_i32,
+            }
+        );
+        assert_eq!(manifest_index.options.as_ref().unwrap().unique, Some(true));
+        assert!(
+            indexes.iter().all(|index| index
+                .options
+                .as_ref()
+                .and_then(|options| options.name.as_deref())
+                != Some("idx_bulk_submit_files_part")),
+            "legacy submit-file index must be dropped, got {indexes:?}"
+        );
+
+        // A second pass on the already-migrated database is a no-op.
+        backend.migrate().await.unwrap();
+        let legacy_rows = backend
+            .list_submit_files(&tenant, &submission_id)
+            .await
+            .unwrap();
+        assert_eq!(legacy_rows.len(), 1);
+        assert!(legacy_rows[0].manifest_id.is_none());
+        assert!(legacy_rows[0].legacy_locator);
+        assert_eq!(legacy_rows[0].line_count, 2);
+        assert_eq!(legacy_rows[0].byte_count, 19);
+
+        let new_submission_id = SubmissionId::new("v8-provider", "manifest-aware-generation");
+        backend
+            .create_submission(&tenant, &new_submission_id, None)
+            .await
+            .unwrap();
+        let first = backend
+            .add_manifest(
+                &tenant,
+                &new_submission_id,
+                Some("https://provider.example/first.json"),
+                None,
+            )
+            .await
+            .unwrap();
+        let second = backend
+            .add_manifest(
+                &tenant,
+                &new_submission_id,
+                Some("https://provider.example/second.json"),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_ne!(first.manifest_id, second.manifest_id);
+
+        let worker_id = WorkerId::new("v8-identity-worker");
+        let first_lease = backend
+            .claim_next_manifest(&worker_id, lease_duration())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first_lease.submission_id, new_submission_id);
+        assert_eq!(first_lease.manifest_id, first.manifest_id);
+        assert_eq!(first_lease.fencing_token, 1);
+        let record = SubmitFileRecord {
+            manifest_url: Some("https://provider.example/first.json".to_string()),
+            file_type: "output".to_string(),
+            resource_type: Some("Patient".to_string()),
+            part_index: 0,
+            file_path: "legacy/output/Patient-0.ndjson".to_string(),
+            line_count: 2,
+            byte_count: 19,
+            count_severity: None,
+        };
+        backend
+            .record_submit_file(&first_lease, &record)
+            .await
+            .unwrap();
+        backend
+            .record_submit_file(&first_lease, &record)
+            .await
+            .unwrap();
+        backend
+            .publish_manifest_artifacts(
+                &first_lease,
+                std::slice::from_ref(&record),
+                ManifestPublicationStatus::Completed,
+            )
+            .await
+            .unwrap();
+
+        let second_lease = backend
+            .claim_next_manifest(&worker_id, lease_duration())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(second_lease.submission_id, new_submission_id);
+        assert_eq!(second_lease.manifest_id, second.manifest_id);
+        assert_eq!(second_lease.fencing_token, 1);
+        let second_record = SubmitFileRecord {
+            manifest_url: Some("https://provider.example/second.json".to_string()),
+            ..record.clone()
+        };
+        backend
+            .record_submit_file(&second_lease, &second_record)
+            .await
+            .unwrap();
+        backend
+            .publish_manifest_artifacts(
+                &second_lease,
+                &[second_record],
+                ManifestPublicationStatus::Completed,
+            )
+            .await
+            .unwrap();
+
+        let rows = backend
+            .list_submit_files(&tenant, &new_submission_id)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|row| !row.legacy_locator));
+        let mut actual_manifest_ids: Vec<_> = rows
+            .iter()
+            .map(|row| row.manifest_id.as_deref().unwrap())
+            .collect();
+        actual_manifest_ids.sort_unstable();
+        let mut expected_manifest_ids =
+            vec![first.manifest_id.as_str(), second.manifest_id.as_str()];
+        expected_manifest_ids.sort_unstable();
+        assert_eq!(actual_manifest_ids, expected_manifest_ids);
+        assert!(rows.iter().all(|row| row.file_type == "output"));
+        assert!(
+            rows.iter()
+                .all(|row| row.resource_type.as_deref() == Some("Patient"))
+        );
+        assert!(rows.iter().all(|row| row.part_index == 0));
+        assert!(rows.iter().all(|row| row.line_count == 2));
+        assert!(rows.iter().all(|row| row.byte_count == 19));
+        assert!(
+            rows.iter()
+                .all(|row| row.file_path == "legacy/output/Patient-0.ndjson")
+        );
+        let manifests = backend
+            .list_manifests(&tenant, &new_submission_id)
+            .await
+            .unwrap();
+        assert_eq!(manifests.len(), 2);
+        assert_ne!(manifests[0].manifest_id, manifests[1].manifest_id);
+        assert!(manifests.iter().all(|manifest| {
+            manifest.manifest_id == first.manifest_id || manifest.manifest_id == second.manifest_id
+        }));
+
+        let preserved_legacy_rows = backend
+            .list_submit_files(&tenant, &submission_id)
+            .await
+            .unwrap();
+        assert_eq!(preserved_legacy_rows.len(), 1);
+        assert!(preserved_legacy_rows[0].manifest_id.is_none());
+        assert!(preserved_legacy_rows[0].legacy_locator);
     }
 }
 

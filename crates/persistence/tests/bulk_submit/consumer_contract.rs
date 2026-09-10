@@ -236,7 +236,7 @@ pub async fn worker_receipts<B: BulkSubmitJobStore + 'static>(
         let key = ExportPartKey {
             tenant_id: tenant.tenant_id().as_str().to_string(),
             job_id: submission_output_job_id(&submission),
-            resource_type: row.resource_type.clone().unwrap(),
+            resource_type: row.file_path.clone(),
             file_type: row.file_type.clone(),
             part_index: row.part_index,
             fencing_token: row.fencing_token,
@@ -270,6 +270,97 @@ pub async fn worker_receipts<B: BulkSubmitJobStore + 'static>(
     errors.sort_by_key(Value::to_string);
     expected_errors.sort_by_key(Value::to_string);
     assert_eq!(errors, expected_errors);
+
+    // A manifest whose only entries fail to parse has no successful results at
+    // all: it must publish the aggregated `error` part alone, still counted and
+    // byte-exact, without an empty `output` part standing in for the types it
+    // never stored.
+    let error_only = SubmissionId::generate("worker-receipt-contract-error-only");
+    backend
+        .create_submission(tenant, &error_only, None)
+        .await
+        .unwrap();
+    let error_manifest = backend
+        .add_manifest(
+            tenant,
+            &error_only,
+            Some("http://provider/error-only.json"),
+            None,
+        )
+        .await
+        .unwrap();
+    let error_url = "http://provider/error-only.ndjson".to_string();
+    let mut error_files = HashMap::new();
+    error_files.insert(error_url.clone(), b"not-json\n".to_vec());
+    let error_fetcher = Arc::new(MemoryFetcher {
+        files: error_files,
+        manifest: RemoteManifest {
+            requires_access_token: false,
+            output: vec![RemoteFile {
+                resource_type: Some("Patient".to_string()),
+                url: error_url,
+                count: Some(1),
+            }],
+            deleted: Vec::new(),
+        },
+    });
+    let error_lease = claim(backend.as_ref(), &error_only, &error_manifest.manifest_id).await;
+    let error_worker = DefaultSubmitWorker::new(
+        backend.clone(),
+        error_fetcher,
+        output.clone(),
+        error_lease.worker_id.clone(),
+    );
+    error_worker.run_job(error_lease).await.unwrap();
+
+    let current = backend
+        .list_manifests(tenant, &error_only)
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(current.status, ManifestStatus::Completed);
+    let rows = backend
+        .list_submit_files(tenant, &error_only)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1, "an error-only run publishes one artifact");
+    let row = &rows[0];
+    assert_eq!(
+        (
+            row.file_type.as_str(),
+            row.resource_type.as_deref(),
+            row.part_index,
+            row.line_count
+        ),
+        ("error", Some("OperationOutcome"), 0, 1)
+    );
+    assert_eq!(row.count_severity, Some(json!({"error": 1})));
+    let key = ExportPartKey {
+        tenant_id: tenant.tenant_id().as_str().to_string(),
+        job_id: submission_output_job_id(&error_only),
+        resource_type: row.file_path.clone(),
+        file_type: row.file_type.clone(),
+        part_index: row.part_index,
+        fencing_token: row.fencing_token,
+    };
+    let mut reader = output.open_reader(&key).await.unwrap();
+    let mut bytes = Vec::new();
+    reader.read_to_end(&mut bytes).await.unwrap();
+    assert_eq!(row.byte_count, bytes.len() as u64);
+    let rows: Vec<Value> = std::str::from_utf8(&bytes)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(
+        rows,
+        vec![json!({"resourceType": "OperationOutcome", "issue": [{
+            "severity": "error",
+            "code": "processing",
+            "diagnostics": "1 submitted resource(s) could not be parsed or did not match the declared resource type"
+        }]})]
+    );
 }
 
 struct RecordingSecondary {

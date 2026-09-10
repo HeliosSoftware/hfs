@@ -26,7 +26,7 @@ cassandra = ["dep:cdrs-tokio", "dep:cdrs-tokio-helpers-derive"]
 mongodb = ["dep:mongodb"]
 neo4j = ["dep:neo4rs"]
 elasticsearch = ["dep:elasticsearch"]
-s3 = ["dep:aws-sdk-s3", "dep:aws-config", "dep:aws-credential-types", "dep:sha2"]
+s3 = ["dep:aws-sdk-s3", "dep:aws-config", "dep:aws-credential-types"]
 
 # Configuration advisor binary
 advisor = ["dep:axum", "dep:tower-http", "dep:tracing-subscriber"]
@@ -65,6 +65,9 @@ json-patch = "3"
 humantime = "2"
 futures = "0.3"
 unicode-normalization = "0.1"
+# Bulk-submit result receipts spool to a per-run temp directory (#982) instead
+# of accumulating in memory. Uses the platform temp dir, so `TMPDIR` isolates it.
+tempfile = "3"
 
 # SQLite backend
 rusqlite = { version = "0.33", features = ["bundled", "serde_json", "functions"], optional = true }
@@ -96,8 +99,8 @@ elasticsearch = { version = "8.15.0-alpha.1", optional = true }
 aws-sdk-s3 = { version = "1", optional = true, default-features = false, features = ["sigv4a", "default-https-client", "rt-tokio"] }
 aws-config = { version = "1", optional = true }
 aws-credential-types = { version = "1", optional = true }
-# Hashes the per-user settings key into an opaque, fixed-length S3 object name.
-sha2 = { version = "0.10", optional = true }
+# Hashes opaque keys and submit artifact scopes into fixed-length safe names.
+sha2 = { version = "0.10" }
 
 # Audit event integration.
 #
@@ -128,7 +131,6 @@ rustdoc-args = ["--cfg", "docsrs"]
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
 tokio-test = "0.4"
-tempfile = "3"
 criterion = { version = "0.5", features = ["async_tokio"] }
 testcontainers-modules = { version = "0.15", features = ["postgres", "elastic_search", "minio", "mongo"] }
 paste = "1.0"

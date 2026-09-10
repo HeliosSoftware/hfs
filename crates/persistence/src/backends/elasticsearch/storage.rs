@@ -725,83 +725,7 @@ impl ResourceStorage for ElasticsearchBackend {
                     .map(move |(index, doc_id, doc)| (i, index.as_str(), doc_id.as_str(), doc))
             })
             .collect();
-        let mut failures: Vec<Option<String>> = vec![None; prepared.len()];
-        fn fail_chunk(
-            failures: &mut [Option<String>],
-            chunk: &[(usize, &str, &str, &Value)],
-            message: String,
-        ) {
-            for (i, ..) in chunk {
-                failures[*i].get_or_insert_with(|| message.clone());
-            }
-        }
-        for chunk in ops.chunks(BULK_OPS_PER_REQUEST) {
-            let body: Vec<BulkOperation<Value>> = chunk
-                .iter()
-                .map(|(_, index, doc_id, doc)| {
-                    BulkOperation::index((*doc).clone())
-                        .index(*index)
-                        .id(*doc_id)
-                        .into()
-                })
-                .collect();
-            let mut request = self.client().bulk(BulkParts::None).body(body);
-            if let Some(refresh) = self.write_refresh_param() {
-                request = request.refresh(refresh);
-            }
-            let response = match request.send().await {
-                Ok(response) => response,
-                Err(e) => {
-                    fail_chunk(
-                        &mut failures,
-                        chunk,
-                        format!("Failed to send bulk index request: {e}"),
-                    );
-                    continue;
-                }
-            };
-            let status = response.status_code();
-            let payload: Value = match response.json().await {
-                Ok(payload) if status.is_success() => payload,
-                Ok(payload) => {
-                    fail_chunk(
-                        &mut failures,
-                        chunk,
-                        format!("Bulk index request failed (status {status}): {payload}"),
-                    );
-                    continue;
-                }
-                Err(e) => {
-                    fail_chunk(
-                        &mut failures,
-                        chunk,
-                        format!("Failed to read bulk index response: {e}"),
-                    );
-                    continue;
-                }
-            };
-            let items = payload
-                .get("items")
-                .and_then(|v| v.as_array())
-                .cloned()
-                .unwrap_or_default();
-            for (position, (i, ..)) in chunk.iter().enumerate() {
-                let item = items.get(position).and_then(|item| item.get("index"));
-                let item_status = item
-                    .and_then(|v| v.get("status"))
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0);
-                if !(200..300).contains(&item_status) {
-                    let error = item
-                        .and_then(|v| v.get("error"))
-                        .map(|v| v.to_string())
-                        .unwrap_or_else(|| "no item in bulk response".to_string());
-                    failures[*i].get_or_insert_with(|| {
-                        format!("Failed to index document (status {item_status}): {error}")
-                    });
-                }
-            }
-        }
+        let failures = self.send_bulk_index(&ops, prepared.len()).await;
 
         let now = Utc::now();
         prepared
@@ -1395,6 +1319,106 @@ impl PurgableStorage for ElasticsearchBackend {
 // two write methods behave differently from a SQL backend's — see each below.
 // ============================================================================
 
+impl ElasticsearchBackend {
+    /// Sends `ops` as chunked `_bulk` requests and reports, per owner, the
+    /// first failure among the operations it contributed.
+    ///
+    /// `ops` is `(owner index, ES index, document id, document)`. Owners are
+    /// positions in the caller's own list — a resource usually contributes more
+    /// than one document (its own plus one per `contained` entry), and one bad
+    /// document fails the resource that produced it and nothing else.
+    ///
+    /// Shared by [`ResourceStorage::create_many`] and
+    /// [`ReindexTarget::write_search_entries_page`] so a rebuild and a bulk
+    /// create put the same documents on the wire the same way — one request per
+    /// [`BULK_OPS_PER_REQUEST`] operations, and one write-refresh wait per
+    /// request rather than per document.
+    async fn send_bulk_index(
+        &self,
+        ops: &[(usize, &str, &str, &Value)],
+        owners: usize,
+    ) -> Vec<Option<String>> {
+        let mut failures: Vec<Option<String>> = vec![None; owners];
+        fn fail_chunk(
+            failures: &mut [Option<String>],
+            chunk: &[(usize, &str, &str, &Value)],
+            message: String,
+        ) {
+            for (i, ..) in chunk {
+                failures[*i].get_or_insert_with(|| message.clone());
+            }
+        }
+        for chunk in ops.chunks(BULK_OPS_PER_REQUEST) {
+            let body: Vec<BulkOperation<Value>> = chunk
+                .iter()
+                .map(|(_, index, doc_id, doc)| {
+                    BulkOperation::index((*doc).clone())
+                        .index(*index)
+                        .id(*doc_id)
+                        .into()
+                })
+                .collect();
+            let mut request = self.client().bulk(BulkParts::None).body(body);
+            if let Some(refresh) = self.write_refresh_param() {
+                request = request.refresh(refresh);
+            }
+            let response = match request.send().await {
+                Ok(response) => response,
+                Err(e) => {
+                    fail_chunk(
+                        &mut failures,
+                        chunk,
+                        format!("Failed to send bulk index request: {e}"),
+                    );
+                    continue;
+                }
+            };
+            let status = response.status_code();
+            let payload: Value = match response.json().await {
+                Ok(payload) if status.is_success() => payload,
+                Ok(payload) => {
+                    fail_chunk(
+                        &mut failures,
+                        chunk,
+                        format!("Bulk index request failed (status {status}): {payload}"),
+                    );
+                    continue;
+                }
+                Err(e) => {
+                    fail_chunk(
+                        &mut failures,
+                        chunk,
+                        format!("Failed to read bulk index response: {e}"),
+                    );
+                    continue;
+                }
+            };
+            let items = payload
+                .get("items")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+            for (position, (i, ..)) in chunk.iter().enumerate() {
+                let item = items.get(position).and_then(|item| item.get("index"));
+                let item_status = item
+                    .and_then(|v| v.get("status"))
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                if !(200..300).contains(&item_status) {
+                    let error = item
+                        .and_then(|v| v.get("error"))
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|| "no item in bulk response".to_string());
+                    failures[*i].get_or_insert_with(|| {
+                        format!("Failed to index document (status {item_status}): {error}")
+                    });
+                }
+            }
+        }
+        failures
+    }
+}
+
 #[async_trait]
 impl ReindexTarget for ElasticsearchBackend {
     /// A no-op, deliberately.
@@ -1413,6 +1437,134 @@ impl ReindexTarget for ElasticsearchBackend {
         _resource_id: &str,
     ) -> StorageResult<u64> {
         Ok(0)
+    }
+
+    /// Rebuilds a page of resources in one `_bulk` request per
+    /// [`BULK_OPS_PER_REQUEST`] documents.
+    ///
+    /// The default trait implementation walks the page one resource at a time,
+    /// which against Elasticsearch is one HTTP round trip each and held
+    /// `$reindex` to ~160 resources/s however fast the source read was — at
+    /// which a corpus-sized rebuild cannot finish, so the deferred-indexing
+    /// fast-load path had no usable recovery (#1021). SQLite already overrode
+    /// this for the same reason, batching a page into one transaction; this is
+    /// its Elasticsearch counterpart.
+    ///
+    /// Under `refresh=wait_for` the saving is larger still: that policy blocks
+    /// each write until the next scheduled refresh, so per-document writes cost
+    /// one refresh wait each while a bulk request costs one for the page.
+    async fn write_search_entries_page(
+        &self,
+        tenant: &TenantContext,
+        resources: &[StoredResource],
+    ) -> Vec<StorageResult<usize>> {
+        if resources.is_empty() {
+            return Vec::new();
+        }
+        let tenant_id = tenant.tenant_id().as_str();
+        let extractor = self.tenant_extractor(tenant_id);
+
+        // Every document each resource contributes, plus the value count its
+        // successful outcome reports.
+        struct Prepared {
+            values: usize,
+            docs: Vec<(String, String, Value)>,
+            failure: Option<String>,
+        }
+        let mut types_touched: Vec<String> = Vec::new();
+        let prepared: Vec<Prepared> = resources
+            .iter()
+            .map(|resource| {
+                let resource_type = resource.resource_type();
+                let id = resource.id();
+                let content = resource.content();
+                let fhir_version = resource.fhir_version();
+                let extracted_values = match extractor.extract(content, resource_type) {
+                    Ok(values) => values,
+                    Err(e) => {
+                        return Prepared {
+                            values: 0,
+                            docs: Vec::new(),
+                            failure: Some(format!("Search parameter extraction failed: {e}")),
+                        };
+                    }
+                };
+                types_touched.push(resource_type.to_string());
+                let mut docs = vec![(
+                    self.index_name(tenant_id, resource_type),
+                    Self::document_id(resource_type, id),
+                    build_es_document(
+                        tenant_id,
+                        resource_type,
+                        id,
+                        resource.version_id(),
+                        content,
+                        fhir_version,
+                        &extracted_values,
+                    ),
+                )];
+                for contained in extractor.extract_contained(content) {
+                    types_touched.push(contained.contained_type.clone());
+                    docs.push((
+                        self.index_name(tenant_id, &contained.contained_type),
+                        Self::document_id(
+                            &contained.contained_type,
+                            &contained_resource_id(id, &contained.local_id),
+                        ),
+                        build_es_contained_document(
+                            tenant_id,
+                            resource_type,
+                            id,
+                            &contained.contained_type,
+                            &contained.local_id,
+                            &contained.content,
+                            resource.version_id(),
+                            fhir_version,
+                            &contained.values,
+                        ),
+                    ));
+                }
+                Prepared {
+                    values: extracted_values.len(),
+                    docs,
+                    failure: None,
+                }
+            })
+            .collect();
+
+        // Ensure every index touched exists, once each — not once per resource.
+        let mut ensured = std::collections::HashSet::new();
+        for ty in types_touched {
+            if ensured.insert(ty.clone())
+                && let Err(e) = schema::ensure_index(self, tenant_id, &ty).await
+            {
+                let message = e.to_string();
+                return resources
+                    .iter()
+                    .map(|_| Err(internal_error(message.clone())))
+                    .collect();
+            }
+        }
+
+        let ops: Vec<(usize, &str, &str, &Value)> = prepared
+            .iter()
+            .enumerate()
+            .flat_map(|(i, p)| {
+                p.docs
+                    .iter()
+                    .map(move |(index, doc_id, doc)| (i, index.as_str(), doc_id.as_str(), doc))
+            })
+            .collect();
+        let failures = self.send_bulk_index(&ops, prepared.len()).await;
+
+        prepared
+            .into_iter()
+            .zip(failures)
+            .map(|(p, failure)| match p.failure.or(failure) {
+                Some(message) => Err(internal_error(message)),
+                None => Ok(p.values),
+            })
+            .collect()
     }
 
     async fn write_search_entries(

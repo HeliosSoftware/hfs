@@ -13,8 +13,11 @@ use super::backend::MongoBackendConfig;
 
 /// Current MongoDB schema version.
 ///
-/// v7 adds the Bulk Data Submit collections and their indexes.
-pub const SCHEMA_VERSION: i32 = 7;
+/// v7 adds the Bulk Data Submit collections and their indexes. v8 moves the
+/// artifact identity under its owning manifest. v9 replaces
+/// `idx_resources_type_deleted` with a longer index that also carries the
+/// `$reindex` page order (#1021).
+pub const SCHEMA_VERSION: i32 = 9;
 
 /// Initialize MongoDB collections/indexes required by the backend.
 ///
@@ -102,10 +105,33 @@ async fn ensure_resources_indexes(database: &Database) -> StorageResult<()> {
     )
     .await?;
 
+    // Equality on (tenant, type, is_deleted), then the `(last_updated, id)` the
+    // `$reindex` source both range-filters and sorts on — so a page is an
+    // ordered index walk of exactly `limit` keys.
+    //
+    // Without the trailing two fields the planner can satisfy the filter but not
+    // the sort, so it fetched **every** live resource of the type and sorted it
+    // in memory to return 500 rows, once per page: quadratic in corpus size.
+    // That is what held `$reindex` to 58 resources/s with mongod at 660 % CPU
+    // and Elasticsearch idle, and why running six type-jobs in parallel was
+    // *slower* than one — they contended on the same full scans (#1021).
+    // Measured at 300 000 resources: first page 676 ms examining 300 000
+    // documents, against 2 ms examining 500 with this index.
+    //
+    // `idx_resources_type_deleted` was exactly this index's leading prefix, so
+    // it is dropped rather than kept beside it: every query it served is served
+    // here, and carrying both would cost a second B-tree on every write for no
+    // reader. `migrate_schema_async` drops it on an existing deployment.
     create_index(
         &resources,
-        doc! { "tenant_id": 1_i32, "resource_type": 1_i32, "is_deleted": 1_i32 },
-        "idx_resources_type_deleted",
+        doc! {
+            "tenant_id": 1_i32,
+            "resource_type": 1_i32,
+            "is_deleted": 1_i32,
+            "last_updated": 1_i32,
+            "id": 1_i32,
+        },
+        "idx_resources_type_scan",
         false,
     )
     .await?;
@@ -118,7 +144,50 @@ async fn ensure_resources_indexes(database: &Database) -> StorageResult<()> {
     )
     .await?;
 
+    drop_index_if_present(&resources, "idx_resources_type_deleted").await?;
+
     Ok(())
+}
+
+/// Drops `name` if the collection has it, treating "no such index" as success.
+///
+/// Used for indexes a later schema version supersedes: a fresh deployment never
+/// created them, and an upgraded one must not keep paying for them on every
+/// write.
+async fn drop_index_if_present(collection: &Collection<Document>, name: &str) -> StorageResult<()> {
+    match collection.drop_index(name).await {
+        Ok(()) => {
+            tracing::info!(index = name, "dropped superseded MongoDB index");
+            Ok(())
+        }
+        // `IndexNotFound` (27) is the expected answer on a fresh deployment, and
+        // `NamespaceNotFound` (26) is what a collection that has never been
+        // written answers. Both mean "nothing to drop".
+        //
+        // Matched on the numeric code, not the message: server text is not a
+        // stable interface, and a version that reworded it would turn a no-op
+        // into a startup failure. The message is only a fallback for an error
+        // shape that carries no code.
+        Err(e) if is_missing_index_error(&e) => Ok(()),
+        Err(e) => Err(StorageError::Backend(BackendError::Internal {
+            backend_name: "mongodb".to_string(),
+            message: format!("Failed to drop index {name}: {e}"),
+            source: None,
+        })),
+    }
+}
+
+/// Whether a `dropIndexes` failure means the index (or its collection) was
+/// simply not there.
+fn is_missing_index_error(error: &mongodb::error::Error) -> bool {
+    const NAMESPACE_NOT_FOUND: i32 = 26;
+    const INDEX_NOT_FOUND: i32 = 27;
+
+    if let mongodb::error::ErrorKind::Command(command) = error.kind.as_ref() {
+        return command.code == NAMESPACE_NOT_FOUND || command.code == INDEX_NOT_FOUND;
+    }
+    let message = error.to_string();
+    message.contains("index not found") || message.contains("ns not found")
 }
 
 async fn ensure_history_indexes(database: &Database) -> StorageResult<()> {
@@ -392,13 +461,35 @@ async fn ensure_bulk_submit_indexes(database: &Database) -> StorageResult<()> {
 
     let files = database.collection::<Document>(SUBMIT_FILES_COLLECTION);
     let mut file_key = submission_key;
+    file_key.insert("manifest_id", 1_i32);
     file_key.insert("file_type", 1_i32);
     file_key.insert("resource_type", 1_i32);
     file_key.insert("part_index", 1_i32);
     file_key.insert("fencing_token", 1_i32);
-    create_index(&files, file_key, "idx_bulk_submit_files_part", true).await?;
+    create_index(&files, file_key, "idx_bulk_submit_files_manifest", true).await?;
+    drop_bulk_submit_file_legacy_index(&files).await?;
 
     Ok(())
+}
+
+/// Removes the pre-v8 submit-file identity index.
+///
+/// Reinitializing an already-updated database does not fail on its absence;
+/// command error 27 is the MongoDB server's documented `IndexNotFound`.
+async fn drop_bulk_submit_file_legacy_index(files: &Collection<Document>) -> StorageResult<()> {
+    use mongodb::error::ErrorKind;
+
+    match files.drop_index("idx_bulk_submit_files_part").await {
+        Ok(()) => Ok(()),
+        Err(error) if matches!(&*error.kind, ErrorKind::Command(command) if command.code == 27) => {
+            Ok(())
+        }
+        Err(error) => Err(StorageError::Backend(BackendError::Internal {
+            backend_name: "mongodb".to_string(),
+            message: format!("drop legacy submit-file index: {error}"),
+            source: None,
+        })),
+    }
 }
 
 async fn create_index(

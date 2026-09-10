@@ -196,14 +196,60 @@ impl InMemorySqlEngine {
         Ok(())
     }
 
-    /// Stream `rows` into `label`. Each row is a flat JSON object whose keys
-    /// match column names; missing or null keys become SQL NULL.
+    /// Streams `rows` into `label` on a dedicated blocking thread, then
+    /// hands the engine back to the caller.
+    ///
+    /// The engine (and the `rusqlite::Statement` the insert loop prepares)
+    /// is not `Send` across an `.await` point, and the row stream is
+    /// typically a `tokio::sync::mpsc` channel whose `recv` spends the
+    /// polling task's cooperative budget on every item — draining more than
+    /// 128 rows in an ordinary async task therefore starves the waker and
+    /// hangs forever. Moving the whole operation into
+    /// `tokio::task::spawn_blocking` sidesteps both problems: the engine
+    /// crosses into a blocking-pool thread by value, the stream is driven
+    /// with `Handle::block_on` (which resets the cooperative budget on every
+    /// poll and is safe to use exactly because there is no scheduler to
+    /// starve on that thread), and the engine is returned to the caller once
+    /// the whole insert has completed.
+    ///
+    /// Returns `Ok((engine, n))` on success, where `n` is the number of rows
+    /// inserted and the transaction has been committed. On `Err`, the
+    /// transaction has already been rolled back and the engine is dropped;
+    /// callers are expected to abort the current plan rather than keep using
+    /// a half-populated database.
     pub async fn insert_rows<S>(
+        self,
+        label: &str,
+        schema: &TableSchema,
+        rows: Pin<Box<S>>,
+        max_rows: usize,
+    ) -> Result<(Self, usize), SqlQueryError>
+    where
+        S: Stream<Item = Result<Value, String>> + Send + 'static + ?Sized,
+    {
+        let label = label.to_string();
+        let schema = schema.clone();
+        tokio::task::spawn_blocking(move || {
+            let handle = tokio::runtime::Handle::current();
+            let mut engine = self;
+            let inserted = engine.insert_rows_blocking(&label, &schema, rows, max_rows, &handle)?;
+            Ok((engine, inserted))
+        })
+        .await
+        .map_err(|e| SqlQueryError::Internal(format!("sqlquery worker panicked: {e}")))?
+    }
+
+    /// Synchronous body of [`Self::insert_rows`]. Runs entirely on the
+    /// blocking thread `insert_rows` spawned; every `rows.next()` call
+    /// (including the no-columns fast path) goes through `handle.block_on`
+    /// instead of `.await`, since this function is not itself async.
+    fn insert_rows_blocking<S>(
         &mut self,
         label: &str,
         schema: &TableSchema,
         mut rows: Pin<Box<S>>,
         max_rows: usize,
+        handle: &tokio::runtime::Handle,
     ) -> Result<usize, SqlQueryError>
     where
         S: Stream<Item = Result<Value, String>> + Send + ?Sized,
@@ -215,8 +261,8 @@ impl InMemorySqlEngine {
         if schema.columns.is_empty() {
             // Drain the stream without inserting; nothing to persist.
             let mut n = 0usize;
-            while let Some(item) = rows.next().await {
-                item.map_err(SqlQueryError::MalformedLibrary)?;
+            while let Some(item) = handle.block_on(rows.next()) {
+                item.map_err(SqlQueryError::SourceStream)?;
                 n += 1;
                 if n > max_rows {
                     return Err(SqlQueryError::RowCapExceeded { max: max_rows });
@@ -240,8 +286,8 @@ impl InMemorySqlEngine {
         let mut inserted = 0usize;
         let result: Result<usize, SqlQueryError> = (|| {
             let mut stmt = self.conn.prepare(&insert_sql)?;
-            while let Some(item) = futures::executor::block_on(rows.next()) {
-                let row = item.map_err(SqlQueryError::MalformedLibrary)?;
+            while let Some(item) = handle.block_on(rows.next()) {
+                let row = item.map_err(SqlQueryError::SourceStream)?;
                 inserted += 1;
                 if inserted > max_rows {
                     return Err(SqlQueryError::RowCapExceeded { max: max_rows });
@@ -416,7 +462,7 @@ mod tests {
 
     #[tokio::test]
     async fn round_trip_basic() {
-        let mut engine = InMemorySqlEngine::open().unwrap();
+        let engine = InMemorySqlEngine::open().unwrap();
         let s = schema(&[
             ("id", ColumnFhirType::String("id".into())),
             ("n", ColumnFhirType::Integer),
@@ -426,7 +472,7 @@ mod tests {
             Ok(json!({"id": "a", "n": 1})),
             Ok(json!({"id": "b", "n": 2})),
         ]);
-        let inserted = engine
+        let (engine, inserted) = engine
             .insert_rows("patients", &s, Box::pin(rows), 10)
             .await
             .unwrap();
@@ -442,14 +488,14 @@ mod tests {
 
     #[tokio::test]
     async fn null_handling() {
-        let mut engine = InMemorySqlEngine::open().unwrap();
+        let engine = InMemorySqlEngine::open().unwrap();
         let s = schema(&[
             ("id", ColumnFhirType::String("id".into())),
             ("age", ColumnFhirType::Integer),
         ]);
         engine.create_table("t", &s).unwrap();
         let rows = stream::iter(vec![Ok(json!({"id": "a"}))]); // age missing
-        engine
+        let (engine, _inserted) = engine
             .insert_rows("t", &s, Box::pin(rows), 10)
             .await
             .unwrap();
@@ -461,26 +507,59 @@ mod tests {
 
     #[tokio::test]
     async fn row_cap_exceeded() {
-        let mut engine = InMemorySqlEngine::open().unwrap();
+        let engine = InMemorySqlEngine::open().unwrap();
         let s = schema(&[("n", ColumnFhirType::Integer)]);
         engine.create_table("t", &s).unwrap();
         let rows = stream::iter((0..10).map(|i| Ok(json!({"n": i}))));
-        let err = engine
-            .insert_rows("t", &s, Box::pin(rows), 3)
-            .await
-            .unwrap_err();
+        // `Result<(InMemorySqlEngine, usize), _>` doesn't implement `Debug`
+        // (the engine wraps a `rusqlite::Connection`, which doesn't), so
+        // `unwrap_err()` isn't available here; match instead.
+        let err = match engine.insert_rows("t", &s, Box::pin(rows), 3).await {
+            Ok(_) => panic!("expected RowCapExceeded"),
+            Err(e) => e,
+        };
         assert!(matches!(err, SqlQueryError::RowCapExceeded { max: 3 }));
+    }
+
+    #[tokio::test]
+    async fn insert_rows_reports_stream_error_as_source_stream() {
+        // A `SofRunner`'s row stream fails mid-materialization (storage
+        // error, backend statement timeout, lost connection). This must be
+        // reported as `SourceStream`, not folded into `MalformedLibrary` —
+        // the Library and its ViewDefinitions are perfectly well-formed.
+        let engine = InMemorySqlEngine::open().unwrap();
+        let s = schema(&[("id", ColumnFhirType::String("id".into()))]);
+        engine.create_table("t", &s).unwrap();
+        let ok_rows = (0..200).map(|i| Ok(json!({"id": format!("p{i}")})));
+        let rows = stream::iter(
+            ok_rows.chain(std::iter::once(Err("connection reset by peer".to_string()))),
+        );
+        let err = match engine.insert_rows("t", &s, Box::pin(rows), 10_000).await {
+            Ok(_) => panic!("expected SourceStream"),
+            Err(e) => e,
+        };
+        let SqlQueryError::SourceStream(msg) = &err else {
+            panic!("expected SourceStream, got {err:?}");
+        };
+        assert!(
+            msg.contains("connection reset by peer"),
+            "unexpected message: {msg}"
+        );
+        assert!(
+            format!("{err}").starts_with("dependency source failed: "),
+            "unexpected display: {err}"
+        );
     }
 
     #[tokio::test]
     async fn execute_select_silently_truncates_at_max_rows() {
         // SoF v2 PR #353: the server's hard cap silently truncates the
         // result set; it must not error.
-        let mut engine = InMemorySqlEngine::open().unwrap();
+        let engine = InMemorySqlEngine::open().unwrap();
         let s = schema(&[("n", ColumnFhirType::Integer)]);
         engine.create_table("t", &s).unwrap();
         let rows = stream::iter((1..=10).map(|i| Ok(json!({"n": i}))));
-        engine
+        let (engine, _inserted) = engine
             .insert_rows("t", &s, Box::pin(rows), 100)
             .await
             .unwrap();
@@ -502,11 +581,11 @@ mod tests {
 
     #[tokio::test]
     async fn named_bindings_filter() {
-        let mut engine = InMemorySqlEngine::open().unwrap();
+        let engine = InMemorySqlEngine::open().unwrap();
         let s = schema(&[("n", ColumnFhirType::Integer)]);
         engine.create_table("t", &s).unwrap();
         let rows = stream::iter((1..=5).map(|i| Ok(json!({"n": i}))));
-        engine
+        let (engine, _inserted) = engine
             .insert_rows("t", &s, Box::pin(rows), 100)
             .await
             .unwrap();
@@ -518,6 +597,62 @@ mod tests {
             .execute_select("SELECT n FROM t WHERE n >= :min ORDER BY n", &bindings, 100)
             .unwrap();
         assert_eq!(result.rows.len(), 3);
+    }
+
+    /// Regression test for the hang this ticket fixes. A real runner (see
+    /// `crates/persistence/src/sof/sqlite.rs`) feeds `insert_rows` through a
+    /// `tokio::sync::mpsc` channel from a `spawn_blocking` producer. Each
+    /// `recv` on that channel spends one unit of the polling task's
+    /// cooperative budget (128 per poll, tokio's `coop` module); once it ran
+    /// out at row 129, the old executor-blocking implementation (draining
+    /// the stream via the `futures` crate's synchronous executor) never woke
+    /// up again. 1,000 rows is comfortably past
+    /// that threshold — `futures::stream::iter` would not reproduce this,
+    /// since it never touches the cooperative budget.
+    ///
+    /// The consumer runs inside `tokio::spawn` (not directly `.await`ed) and
+    /// the `JoinHandle` is wrapped in `tokio::time::timeout`: on a
+    /// single-threaded runtime (`main`, the pre-fix binary) this test would
+    /// otherwise hang forever instead of failing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn insert_rows_drains_tokio_mpsc_stream_past_coop_budget() {
+        const ROW_COUNT: i64 = 1000;
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<Value, String>>(256);
+
+        tokio::task::spawn_blocking(move || {
+            for i in 0..ROW_COUNT {
+                let row = json!({"id": format!("p{i}"), "n": i});
+                if tx.blocking_send(Ok(row)).is_err() {
+                    break;
+                }
+            }
+        });
+
+        let consumer = tokio::spawn(async move {
+            let engine = InMemorySqlEngine::open().unwrap();
+            let s = schema(&[
+                ("id", ColumnFhirType::String("id".into())),
+                ("n", ColumnFhirType::Integer),
+            ]);
+            engine.create_table("t", &s).unwrap();
+            let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+            let (engine, inserted) = engine
+                .insert_rows("t", &s, Box::pin(stream), 10_000)
+                .await
+                .unwrap();
+            let count = engine
+                .execute_select("SELECT COUNT(*) AS c FROM t", &[], 10)
+                .unwrap();
+            (inserted, count)
+        });
+
+        let (inserted, count) = tokio::time::timeout(std::time::Duration::from_secs(10), consumer)
+            .await
+            .expect("insert_rows must not hang past the cooperative budget")
+            .expect("consumer task must not panic");
+
+        assert_eq!(inserted, ROW_COUNT as usize);
+        assert_eq!(count.rows[0][0], Some(Value::Number(ROW_COUNT.into())));
     }
 
     #[test]

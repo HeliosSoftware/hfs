@@ -111,23 +111,26 @@ impl ReferenceHandler {
         let base = strip_reference_version(ref_value);
 
         if base.contains('/') {
-            // Type/id (or absolute URL): match the base reference and any
-            // `_history`-versioned form of it, as a single **indexable range**
-            // rather than `= ? OR value_reference LIKE '…/_history/%'`. The OR
-            // and the leading-anchored LIKE both defeat the index, so the old
-            // form scanned every reference row of the type; a plain range uses
-            // `idx_search_reference` (#1017).
+            // Type/id (or absolute URL): match the base reference exactly, plus
+            // any `_history`-versioned form of it as an **indexable range**,
+            // rather than `= ? OR value_reference LIKE '…/_history/%'`. The
+            // leading-anchored LIKE defeats the index, so the old form scanned
+            // every reference row of the type; an equality plus a plain range
+            // on the same column lets the planner take two `idx_search_reference`
+            // probes (MULTI-INDEX OR) instead (#1017).
             //
-            // `[base, base || '0')` is exactly `<base>` plus `<base>/_history/…`:
-            // a stored reference is either `<base>` itself or `<base>/_history/<v>`
-            // (`strip_reference_version` removed any version from `base`), and
-            // `'/'` (0x2F) sorts just below `'0'` (0x30), so `<base>/…` falls
-            // inside the range while a different id that merely shares the
-            // prefix (`<base>4`, `<base>0`) sorts at or above the `'0'` bound and
-            // is excluded.
+            // The range `[base || '/_history/', base || '/_history0')` is exactly
+            // `<base>/_history/<anything>`: `'/'` (0x2F) is immediately below
+            // `'0'` (0x30). It must be anchored on the `/_history/` suffix rather
+            // than on `<base>` alone: FHIR ids may contain `-` (0x2D) and `.`
+            // (0x2E), which sort *below* `'/'`, so a bare `[base, base || '0')`
+            // range would also capture a different resource whose id merely
+            // extends this one (`<base>-4`, `<base>.5`) (#1030 review).
             SqlFragment::with_params(
                 format!(
-                    "(value_reference >= ?{p} AND value_reference < ?{p} || '0')",
+                    "(value_reference = ?{p} \
+                      OR (value_reference >= ?{p} || '/_history/' \
+                          AND value_reference < ?{p} || '/_history0'))",
                     p = param_num
                 ),
                 vec![SqlParam::string(base)],
@@ -257,10 +260,11 @@ mod tests {
         let value = SearchValue::new(SearchPrefix::Eq, "Patient/123");
         let frag = ReferenceHandler::build_sql(&value, None, 0);
 
-        // Version-agnostic via a single indexable range (#1017): the base and
-        // any `_history` version, bound once as `?1`.
-        assert!(frag.sql.contains("value_reference >= ?1"));
-        assert!(frag.sql.contains("value_reference < ?1 || '0'"));
+        // Version-agnostic via an equality plus an indexable `_history` range
+        // (#1017), bound once as `?1`.
+        assert!(frag.sql.contains("value_reference = ?1"));
+        assert!(frag.sql.contains("value_reference >= ?1 || '/_history/'"));
+        assert!(frag.sql.contains("value_reference < ?1 || '/_history0'"));
         assert!(
             !frag.sql.contains("LIKE"),
             "the range must not fall back to LIKE"
@@ -282,20 +286,32 @@ mod tests {
 
     #[test]
     fn test_reference_range_bounds_match_base_and_versions_only() {
-        // The `[base, base||'0')` range must include the base and every
-        // `_history` version, and exclude a different id that merely shares the
-        // prefix. `'/'` (0x2F) < `'0'` (0x30) is what makes this hold (#1017).
+        // The predicate is `= base OR [base/_history/, base/_history0)`. It
+        // must include the base and every `_history` version, and exclude a
+        // different id that merely extends this one — including with `-` and
+        // `.`, which are legal FHIR id characters that sort *below* `'/'` and
+        // `'0'` (#1030 review). Mirrors SQLite's BINARY (bytewise) collation.
         let base = "Patient/123";
-        let upper = format!("{base}0");
+        let lower = format!("{base}/_history/");
+        let upper = format!("{base}/_history0");
+        let matches = |s: &str| s == base || (s >= lower.as_str() && s < upper.as_str());
+
         // included:
-        assert!(base >= base && base < upper.as_str());
-        let versioned = "Patient/123/_history/2";
-        assert!(versioned >= base && versioned < upper.as_str());
-        // excluded (a different id sharing the "123" prefix):
-        let sibling = "Patient/1234";
-        assert!(!(sibling < upper.as_str()));
-        let sibling0 = "Patient/1230";
-        assert!(!(sibling0 < upper.as_str()));
+        assert!(matches("Patient/123"));
+        assert!(matches("Patient/123/_history/1"));
+        assert!(matches("Patient/123/_history/27"));
+        assert!(matches("Patient/123/_history/abc-1.2"));
+
+        // excluded (a different resource whose id extends "123"):
+        assert!(!matches("Patient/1234"));
+        assert!(!matches("Patient/1230"));
+        assert!(!matches("Patient/123-4"));
+        assert!(!matches("Patient/123.5"));
+        assert!(!matches("Patient/123-4/_history/1"));
+        assert!(!matches("Patient/123.5/_history/1"));
+        // excluded (a shorter id, or a different type):
+        assert!(!matches("Patient/12"));
+        assert!(!matches("Group/123"));
     }
 
     #[test]
@@ -328,9 +344,10 @@ mod tests {
         );
 
         // `:Patient` normalizes the bare id to `Patient/123`, which then uses
-        // the indexable range like any Type/id reference (#1017).
-        assert!(frag.sql.contains("value_reference >= ?1"));
-        assert!(frag.sql.contains("value_reference < ?1 || '0'"));
+        // the equality + `_history` range like any Type/id reference (#1017).
+        assert!(frag.sql.contains("value_reference = ?1"));
+        assert!(frag.sql.contains("value_reference >= ?1 || '/_history/'"));
+        assert!(frag.sql.contains("value_reference < ?1 || '/_history0'"));
         let dbg = format!("{:?}", frag.params);
         assert!(dbg.contains("Patient/123"));
     }

@@ -63,6 +63,7 @@ use crate::core::bulk_submit::{
     StreamingBulkSubmitProvider, SubmissionChange, SubmissionId, SubmissionManifest,
     SubmissionStatus, SubmissionSummary, UnindexedEntry, entry_result_pages,
 };
+use crate::core::bulk_submit_publication::{ManifestPublicationResult, ManifestPublicationStatus};
 use crate::core::bulk_submit_worker::{
     BulkSubmitJobStore, IndexDrift, IngestSyncReport, ManifestFetchParams, ManifestLease,
     ManifestWorkerView, PollTokenTarget, SubmitClaimStrategy, SubmitFileRecord, SubmitFileRow,
@@ -846,9 +847,21 @@ impl SubmitWorkerStorage for CompositeSubmitJobs {
         self.primary.record_submit_file(lease, file).await
     }
 
-    async fn finish_manifest(&self, lease: &ManifestLease) -> Result<(), LeaseError> {
+    async fn publish_manifest_artifacts(
+        &self,
+        lease: &ManifestLease,
+        files: &[SubmitFileRecord],
+        terminal: ManifestPublicationStatus,
+    ) -> Result<ManifestPublicationResult, LeaseError> {
         // The worker calls `sync_ingested` itself, as an explicit step before
-        // the receipt (#1007) — nothing left to do here but delegate.
+        // the receipt is built (#1007) — nothing left to do here but delegate.
+        self.primary
+            .publish_manifest_artifacts(lease, files, terminal)
+            .await
+    }
+
+    async fn finish_manifest(&self, lease: &ManifestLease) -> Result<(), LeaseError> {
+        // Ditto: nothing left to do here but delegate.
         self.primary.finish_manifest(lease).await
     }
 

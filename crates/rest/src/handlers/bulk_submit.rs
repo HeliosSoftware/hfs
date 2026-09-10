@@ -9,6 +9,7 @@
 //! Implements the FHIR Bulk Data Access **Submit** operation:
 //! <https://build.fhir.org/ig/HL7/bulk-data/en/submit.html>.
 
+use std::collections::HashSet;
 use std::net::IpAddr;
 use std::time::Duration;
 
@@ -19,10 +20,11 @@ use axum::{
     response::Response,
 };
 use helios_auth::Principal;
+use helios_persistence::TenantContext;
 use helios_persistence::core::{
     DownloadUrl, ExportPartKey, IMPORT_MODE_PARAMETER_URL, ImportMode, ManifestFetchParams,
-    ManifestPhase, ManifestStatus, ResourceStorage, SubmissionId, SubmissionStatus,
-    submission_output_job_id,
+    ManifestPhase, ManifestStatus, ResourceStorage, SubmissionId, SubmissionStatus, SubmitFileRow,
+    submission_output_job_id, submit_artifact_key,
 };
 use serde_json::{Value, json};
 
@@ -79,6 +81,123 @@ fn bad_request(msg: impl Into<String>) -> RestError {
     RestError::BadRequest {
         message: msg.into(),
     }
+}
+
+/// One artifact resolved to the exact output-store key and REST route part.
+#[derive(Debug)]
+struct ResolvedSubmitArtifact<'a> {
+    key: ExportPartKey,
+    route_part: String,
+    row: &'a SubmitFileRow,
+}
+
+/// Reconstructs a legacy artifact's resource-part route and key.
+///
+/// Only `SubmitFileRow::legacy_locator == true` authorizes this fallback. The
+/// flag itself, rather than the shape of `file_path`, is the compatibility
+/// decision, so a malformed new row can never be silently treated as legacy.
+fn legacy_submit_artifact_route_part(row: &SubmitFileRow) -> String {
+    let resource_type = row
+        .resource_type
+        .clone()
+        .unwrap_or_else(|| "OperationOutcome".into());
+    format!("{resource_type}-{}", row.part_index)
+}
+
+/// Resolves one recorded artifact to its exact key and route.
+///
+/// New rows must carry an owning manifest ID and their exact v1 locator.
+/// Legacy rows use the pre-manifest resource-part route only because their
+/// explicit flag says so. Callers that expose the whole set must first reject
+/// duplicate route parts.
+fn resolve_submit_artifacts<'a>(
+    tenant: &TenantContext,
+    submission_id: &SubmissionId,
+    files: &'a [SubmitFileRow],
+) -> RestResult<Vec<ResolvedSubmitArtifact<'a>>> {
+    files
+        .iter()
+        .map(|row| {
+            if row.legacy_locator {
+                let resource_type = row
+                    .resource_type
+                    .clone()
+                    .unwrap_or_else(|| "OperationOutcome".into());
+                let route_part = legacy_submit_artifact_route_part(row);
+                let key = ExportPartKey {
+                    tenant_id: tenant.tenant_id().as_str().to_string(),
+                    job_id: submission_output_job_id(submission_id),
+                    resource_type,
+                    file_type: row.file_type.clone(),
+                    part_index: row.part_index,
+                    fencing_token: row.fencing_token,
+                };
+                return Ok(ResolvedSubmitArtifact {
+                    key,
+                    route_part,
+                    row,
+                });
+            }
+
+            let manifest_id =
+                row.manifest_id
+                    .as_deref()
+                    .ok_or_else(|| RestError::InternalError {
+                        message: format!(
+                            "manifest-aware bulk-submit artifact is missing manifest_id: {}",
+                            row.file_path
+                        ),
+                    })?;
+            let key = submit_artifact_key(
+                tenant,
+                submission_id,
+                manifest_id,
+                &row.file_type,
+                row.resource_type.as_deref(),
+                row.part_index,
+                row.fencing_token,
+            );
+            if row.file_path != key.resource_type {
+                return Err(RestError::InternalError {
+                    message: format!(
+                        "stored submit artifact locator does not match its manifest identity: {}",
+                        row.file_path
+                    ),
+                });
+            }
+            Ok(ResolvedSubmitArtifact {
+                route_part: key.resource_type.clone(),
+                key,
+                row,
+            })
+        })
+        .collect()
+}
+
+/// Resolves the complete visible artifact set and rejects ambiguous routes.
+///
+/// A legacy collision across `file_type` or manifest generations yields the
+/// same REST route for two artifacts. Rejecting before slicing keeps every
+/// page deterministic and prevents a valid-looking route from silently
+/// selecting the first collision.
+fn resolve_visible_submit_artifacts<'a>(
+    tenant: &TenantContext,
+    submission_id: &SubmissionId,
+    files: &'a [SubmitFileRow],
+) -> RestResult<Vec<ResolvedSubmitArtifact<'a>>> {
+    let resolved_files = resolve_submit_artifacts(tenant, submission_id, files)?;
+    let mut route_parts = HashSet::with_capacity(resolved_files.len());
+    for artifact in &resolved_files {
+        if !route_parts.insert(artifact.route_part.as_str()) {
+            return Err(RestError::InternalError {
+                message: format!(
+                    "ambiguous bulk-submit artifact route: {}",
+                    artifact.route_part
+                ),
+            });
+        }
+    }
+    Ok(resolved_files)
 }
 
 /// Enforces the `system/bulk-submit` operation scope when auth is enabled.
@@ -858,11 +977,11 @@ where
             // the number #969 exists to show was invisible exactly when it had
             // something to say.
             format!(
-                "Processing {pct}% of bytes - {} resources written",
+                "Processing {pct}% - {} Resources written",
                 group_thousands(entries)
             )
         } else if pct > 0 {
-            format!("Processing {pct}% of bytes")
+            format!("Processing {pct}%")
         } else if !manifests.is_empty()
             && manifests
                 .iter()
@@ -871,7 +990,17 @@ where
             // Nothing claimed yet: the submission is queued, not slow. (The
             // emptiness guard is belt-and-braces — an empty manifest list is
             // vacuously `all_terminal` and never reaches this branch.)
-            "waiting for a worker".to_string()
+            //
+            // With the in-process pool running, an idle worker claims within
+            // its two-second idle sleep, so this reads as a moment in a queue
+            // rather than a wait on something scarce. With the pool disabled
+            // nothing in this process will ever claim it, and the operator
+            // needs to hear that an external worker is the missing piece.
+            if cfg.disable_local_worker {
+                "Queued - waiting for an external worker".to_string()
+            } else {
+                "Queued - starting shortly".to_string()
+            }
         } else {
             // A worker holds a manifest but has not produced a countable byte.
             // The first non-terminal manifest carrying a phase speaks for the
@@ -896,12 +1025,25 @@ where
                     )),
                     _ => None,
                 })
-                .unwrap_or_else(|| format!("Processing {pct}% of bytes"))
+                .unwrap_or_else(|| format!("Processing {pct}%"))
+        };
+        // Poll cadence follows the phase. The pre-ingest phases each last
+        // seconds, so a client honouring the ingest cadence (two minutes by
+        // default) would sleep through every one of them and the #953 reports
+        // would never reach a screen — the Import page showed the queued text
+        // for the whole first window. Advertise the short cadence until the
+        // first byte or entry is counted, then fall back to the long one.
+        // A stall keeps the long cadence: nothing is about to change.
+        let pre_ingest = !stalled && entries == 0 && pct == 0;
+        let retry_after = if pre_ingest {
+            cfg.effective_pre_ingest_retry_after_secs()
+        } else {
+            cfg.retry_after_secs
         };
         return Response::builder()
             .status(StatusCode::ACCEPTED)
             .header("X-Progress", progress)
-            .header("Retry-After", cfg.retry_after_secs.to_string())
+            .header("Retry-After", retry_after.to_string())
             .body(Body::empty())
             .map_err(|e| RestError::InternalError {
                 message: e.to_string(),
@@ -917,8 +1059,11 @@ where
         .list_submit_files(ctx, sub_id)
         .await
         .map_err(RestError::from)?;
-    let job_id = submission_output_job_id(sub_id);
     let ttl = Duration::from_secs(cfg.file_url_ttl_secs);
+
+    // Resolve and validate the complete visible set before slicing so a route
+    // collision cannot make pagination non-deterministic.
+    let resolved_files = resolve_visible_submit_artifacts(ctx, sub_id, &files)?;
 
     // Slice the artifact rows into the requested page. Backends return them in a
     // stable order (`ORDER BY id`) and rows are append-only until the whole
@@ -935,11 +1080,15 @@ where
             id: format!("{token}?{PAGE_PARAM}={page}"),
         });
     }
-    let page_files = if page_size == 0 {
-        &files[..]
+    let start = if page_size == 0 {
+        0
     } else {
-        let start = (page - 1) * page_size;
-        &files[start..(start + page_size).min(files.len())]
+        (page - 1) * page_size
+    };
+    let page_artifacts = if page_size == 0 {
+        &resolved_files[..]
+    } else {
+        &resolved_files[start..(start + page_size).min(resolved_files.len())]
     };
 
     let mut output_arr = Vec::new();
@@ -952,21 +1101,10 @@ where
     // stays identical on every page even though each page sees a different slice.
     let mut requires_token = cfg.requires_access_token == "true";
 
-    for f in page_files {
-        let resource_type = f
-            .resource_type
-            .clone()
-            .unwrap_or_else(|| "OperationOutcome".into());
-        let key = ExportPartKey {
-            tenant_id: ctx.tenant_id().as_str().to_string(),
-            job_id: job_id.clone(),
-            resource_type: resource_type.clone(),
-            file_type: f.file_type.clone(),
-            part_index: f.part_index,
-            fencing_token: f.fencing_token,
-        };
+    for artifact in page_artifacts {
+        let f = artifact.row;
         let dl = output
-            .download_url(&key, ttl)
+            .download_url(&artifact.key, ttl)
             .await
             .map_err(RestError::from)?;
         // HFS-served artifacts (local-fs) MUST be advertised on the
@@ -975,10 +1113,13 @@ where
         // Pre-signed URLs (S3) are capability URLs and are used as-is.
         requires_token |= dl.requires_access_token;
         let url = advertised_download_url(&dl, || {
-            let part = format!("{resource_type}-{}", f.part_index);
             state.public_url_for_request(
                 &tenant,
-                ["bulk-submit-file", token.as_str(), part.as_str()],
+                [
+                    "bulk-submit-file",
+                    token.as_str(),
+                    artifact.route_part.as_str(),
+                ],
             )
         });
         let url = serde_json::Value::String(url);
@@ -1184,36 +1325,31 @@ where
     let ctx = &target.tenant;
     let sub_id = &target.submission_id;
 
-    // Resolve the part to a recorded artifact (part = "{resource_type}-{part_index}").
+    // Resolve the requested route exactly once. A duplicate route is an
+    // ambiguous stored artifact, so it is reported as missing rather than
+    // allowing first-row ordering to choose a file.
     let files = jobs
         .list_submit_files(ctx, sub_id)
         .await
         .map_err(RestError::from)?;
-    let job_id = submission_output_job_id(sub_id);
-    let matched = files.into_iter().find(|f| {
-        let rt = f
-            .resource_type
-            .clone()
-            .unwrap_or_else(|| "OperationOutcome".into());
-        format!("{}-{}", rt, f.part_index) == part
-    });
-    let f = matched.ok_or_else(|| RestError::NotFound {
+    let resolved_files = resolve_submit_artifacts(ctx, sub_id, &files)?;
+    let mut matches = resolved_files
+        .into_iter()
+        .filter(|artifact| artifact.route_part == part);
+    let matched = matches.next().ok_or_else(|| RestError::NotFound {
         resource_type: "bulk-submit-file".to_string(),
         id: format!("{token}/{part}"),
     })?;
-    let key = ExportPartKey {
-        tenant_id: ctx.tenant_id().as_str().to_string(),
-        job_id,
-        resource_type: f
-            .resource_type
-            .clone()
-            .unwrap_or_else(|| "OperationOutcome".into()),
-        file_type: f.file_type.clone(),
-        part_index: f.part_index,
-        fencing_token: f.fencing_token,
-    };
-
-    let mut reader = output.open_reader(&key).await.map_err(RestError::from)?;
+    if matches.next().is_some() {
+        return Err(RestError::NotFound {
+            resource_type: "bulk-submit-file".to_string(),
+            id: format!("{token}/{part}"),
+        });
+    }
+    let mut reader = output
+        .open_reader(&matched.key)
+        .await
+        .map_err(RestError::from)?;
     let mut bytes = Vec::new();
     tokio::io::AsyncReadExt::read_to_end(&mut reader, &mut bytes)
         .await
@@ -1233,6 +1369,98 @@ where
 mod tests {
     use super::*;
     use serde_json::json;
+
+    use helios_persistence::tenant::{TenantId, TenantPermissions};
+
+    fn submit_file_row(
+        file_type: &str,
+        resource_type: Option<&str>,
+        manifest_id: Option<&str>,
+        legacy_locator: bool,
+        file_path: &str,
+    ) -> SubmitFileRow {
+        SubmitFileRow {
+            manifest_url: Some("https://provider/manifest.json".to_string()),
+            file_type: file_type.to_string(),
+            resource_type: resource_type.map(str::to_string),
+            part_index: 0,
+            fencing_token: 1,
+            manifest_id: manifest_id.map(str::to_string),
+            legacy_locator,
+            file_path: file_path.to_string(),
+            line_count: 1,
+            byte_count: 1,
+            count_severity: None,
+        }
+    }
+
+    fn test_tenant() -> TenantContext {
+        TenantContext::new(
+            TenantId::new("test-tenant"),
+            TenantPermissions::full_access(),
+        )
+    }
+
+    #[test]
+    fn legacy_routes_reject_ambiguous_resource_parts() {
+        let tenant = test_tenant();
+        let submission_id = SubmissionId::new("http://ehr|ehr-1", "it-1");
+        let rows = vec![
+            submit_file_row(
+                "output",
+                Some("OperationOutcome"),
+                None,
+                true,
+                "legacy-output",
+            ),
+            submit_file_row(
+                "error",
+                Some("OperationOutcome"),
+                None,
+                true,
+                "legacy-error",
+            ),
+        ];
+        let result = resolve_visible_submit_artifacts(&tenant, &submission_id, &rows);
+        assert!(matches!(result, Err(RestError::InternalError { .. })));
+    }
+
+    #[test]
+    fn one_unambiguous_legacy_row_resolves_to_the_legacy_route() {
+        let tenant = test_tenant();
+        let submission_id = SubmissionId::new("http://ehr|ehr-1", "it-1");
+        let rows = vec![submit_file_row(
+            "output",
+            Some("OperationOutcome"),
+            None,
+            true,
+            "legacy-output",
+        )];
+
+        let resolved = resolve_visible_submit_artifacts(&tenant, &submission_id, &rows)
+            .expect("unambiguous legacy row");
+
+        assert_eq!(resolved[0].route_part, "OperationOutcome-0");
+        assert_eq!(
+            resolved[0].key.job_id.as_str(),
+            submission_output_job_id(&submission_id).as_str()
+        );
+    }
+
+    #[test]
+    fn malformed_new_rows_do_not_use_legacy_fallback() {
+        let tenant = test_tenant();
+        let submission_id = SubmissionId::new("http://ehr|ehr-1", "it-1");
+        let rows = vec![submit_file_row(
+            "output",
+            Some("OperationOutcome"),
+            Some("manifest-a"),
+            false,
+            "not-a-submit-v1-locator",
+        )];
+        let result = resolve_submit_artifacts(&tenant, &submission_id, &rows);
+        assert!(matches!(result, Err(RestError::InternalError { .. })));
+    }
 
     #[test]
     fn group_thousands_groups_digits_from_the_right() {
