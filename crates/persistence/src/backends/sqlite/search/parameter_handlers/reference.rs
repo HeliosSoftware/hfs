@@ -293,9 +293,9 @@ mod tests {
         assert!(versioned >= base && versioned < upper.as_str());
         // excluded (a different id sharing the "123" prefix):
         let sibling = "Patient/1234";
-        assert!(!(sibling < upper.as_str()));
+        assert!(sibling >= upper.as_str());
         let sibling0 = "Patient/1230";
-        assert!(!(sibling0 < upper.as_str()));
+        assert!(sibling0 >= upper.as_str());
     }
 
     #[test]
