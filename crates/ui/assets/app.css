@@ -6557,6 +6557,10 @@ details.card > summary.card-head::-webkit-details-marker {
   background: var(--accent);
 }
 
+.progress--in-progress .progress__bar {
+  background: var(--accent);
+}
+
 .progress--complete .progress__bar {
   background: var(--ok);
 }
