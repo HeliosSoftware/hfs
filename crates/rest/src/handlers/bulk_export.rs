@@ -517,6 +517,23 @@ where
 }
 
 /// `GET /export-status/{job_id}` — poll status / fetch manifest.
+///
+/// While the job is `accepted` or `in-progress`, the poll returns `202
+/// Accepted` with `X-Progress: {n}%` (`n = floor(typesDone × 100 /
+/// typesTotal)`, capped at 99, or `0` before the worker has reported any
+/// progress) and `Retry-After: 120`. The body is a `Parameters` resource:
+///
+/// | Parameter | Type | Present when |
+/// |-----------|------|--------------|
+/// | `exportId` | `valueString` | always |
+/// | `status` | `valueCode` (`in-progress`) | always |
+/// | `typesTotal` | `valueInteger` | always — total resource types in the job |
+/// | `typesDone` | `valueInteger` | always — resource types fully written |
+/// | `currentType` | `valueString` | a resource type is being written; absent before the worker starts or between types |
+///
+/// `typesTotal`/`typesDone`/`currentType` are this server's own extension of
+/// the Bulk Data Access allowance for a `202` body, mirroring `$sql-export`
+/// (#853).
 pub async fn export_status_handler<S>(
     State(state): State<AppState<S>>,
     Path(job_id): Path<String>,
@@ -561,15 +578,35 @@ where
                 .get_export_status(tenant.context(), &job_id)
                 .await
                 .map_err(map_storage_err)?;
-            let x_progress = progress
-                .current_type
-                .clone()
-                .unwrap_or_else(|| format!("{:.0}%", progress.overall_progress() * 100.0));
+            let percent: u32 = progress
+                .types_done
+                .saturating_mul(100)
+                .checked_div(progress.types_total)
+                .unwrap_or(0)
+                .min(99);
+            let mut params = vec![
+                serde_json::json!({"name": "exportId", "valueString": job_id.as_str()}),
+                serde_json::json!({"name": "status", "valueCode": "in-progress"}),
+                serde_json::json!({"name": "typesTotal", "valueInteger": progress.types_total}),
+                serde_json::json!({"name": "typesDone", "valueInteger": progress.types_done}),
+            ];
+            if let Some(current_type) = &progress.current_type {
+                params
+                    .push(serde_json::json!({"name": "currentType", "valueString": current_type}));
+            }
+            let body = serde_json::json!({
+                "resourceType": "Parameters",
+                "parameter": params,
+            });
+            let body = serde_json::to_vec(&body).map_err(|e| RestError::InternalError {
+                message: e.to_string(),
+            })?;
             Response::builder()
                 .status(StatusCode::ACCEPTED)
-                .header("X-Progress", x_progress)
+                .header("X-Progress", format!("{percent}%"))
                 .header("Retry-After", "120")
-                .body(Body::empty())
+                .header("Content-Type", "application/fhir+json")
+                .body(Body::from(body))
                 .map_err(|e| RestError::InternalError {
                     message: e.to_string(),
                 })

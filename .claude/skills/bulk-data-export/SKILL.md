@@ -84,3 +84,4 @@ The full local stack is in `docker/bulk-export/docker-compose.yml`: HFS, Postgre
 - Group export `_since` late membership uses `include` by default, returning pre-`_since` resources for patients added after `_since`.
 - `exclude` is reserved for a follow-up that requires group-membership-history tracking.
 - Group export flattens nested `Group/` members iteratively with a visited-set cycle guard.
+- Status poll `202`: `X-Progress` is the percentage of resource types fully written; the body is a `Parameters` with `typesTotal`, `typesDone` and `currentType` (the type in flight), like `$sql-export`.

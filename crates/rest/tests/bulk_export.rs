@@ -358,6 +358,218 @@ async fn test_system_export_full_lifecycle() {
 }
 
 #[tokio::test]
+async fn test_status_poll_reports_types_progress_while_in_flight() {
+    let (server, backend, _output, _tmp) = create_bulk_export_server().await;
+    let tenant = test_tenant();
+    seed_patients(&backend, 1).await;
+    backend
+        .create(
+            &tenant,
+            "Observation",
+            json!({
+                "resourceType": "Observation",
+                "id": "o1",
+                "status": "final",
+                "code": {"text": "test"},
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .expect("seed observation");
+    backend
+        .create(
+            &tenant,
+            "Condition",
+            json!({"resourceType": "Condition", "id": "c1"}),
+            FhirVersion::default(),
+        )
+        .await
+        .expect("seed condition");
+
+    let kickoff = server
+        .get("/$export")
+        .add_header("x-tenant-id", "test-tenant")
+        .add_header("prefer", "respond-async")
+        .add_query_param("_type", "Patient,Observation,Condition")
+        .await;
+    assert_eq!(kickoff.status_code(), StatusCode::ACCEPTED);
+    let status_url = kickoff
+        .headers()
+        .get("content-location")
+        .expect("Content-Location header")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let status_path = status_url.strip_prefix("http://localhost:8080").unwrap();
+    let job_id = status_path.rsplit('/').next().unwrap().to_string();
+
+    // Put the job in flight without running the real worker: claim it, mark
+    // it in-progress, and record that one of the three types is done.
+    let worker_id = WorkerId::new("t");
+    let lease = backend
+        .claim_next(&worker_id, Duration::from_secs(60))
+        .await
+        .expect("claim_next")
+        .expect("a job is claimable right after kick-off");
+    backend
+        .mark_export_in_progress(&tenant, &lease.job_id, &worker_id, lease.fencing_token)
+        .await
+        .expect("mark_export_in_progress");
+    backend
+        .set_export_current_type(
+            &tenant,
+            &lease.job_id,
+            &worker_id,
+            lease.fencing_token,
+            Some("Observation"),
+            1,
+            3,
+        )
+        .await
+        .expect("set_export_current_type");
+
+    let polling = server
+        .get(status_path)
+        .add_header("x-tenant-id", "test-tenant")
+        .await;
+    assert_eq!(polling.status_code(), StatusCode::ACCEPTED);
+    assert_eq!(
+        polling
+            .headers()
+            .get("x-progress")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "33%"
+    );
+    assert!(
+        polling
+            .headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .contains("application/fhir+json")
+    );
+    let body: Value = polling.json();
+    assert_eq!(body["resourceType"], "Parameters");
+    let params = body["parameter"].as_array().expect("parameter array");
+    let find = |name: &str| params.iter().find(|p| p["name"] == name);
+    assert_eq!(find("exportId").unwrap()["valueString"], job_id);
+    assert_eq!(find("status").unwrap()["valueCode"], "in-progress");
+    assert_eq!(find("typesTotal").unwrap()["valueInteger"], 3);
+    assert_eq!(find("typesDone").unwrap()["valueInteger"], 1);
+    assert_eq!(find("currentType").unwrap()["valueString"], "Observation");
+}
+
+#[tokio::test]
+async fn test_status_poll_before_worker_starts_reports_zero_without_current_type() {
+    let (server, backend, _output, _tmp) = create_bulk_export_server().await;
+    seed_patients(&backend, 1).await;
+
+    let kickoff = server
+        .get("/$export")
+        .add_header("x-tenant-id", "test-tenant")
+        .add_header("prefer", "respond-async")
+        .add_query_param("_type", "Patient")
+        .await;
+    assert_eq!(kickoff.status_code(), StatusCode::ACCEPTED);
+    let status_url = kickoff
+        .headers()
+        .get("content-location")
+        .expect("Content-Location header")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let status_path = status_url.strip_prefix("http://localhost:8080").unwrap();
+
+    let polling = server
+        .get(status_path)
+        .add_header("x-tenant-id", "test-tenant")
+        .await;
+    assert_eq!(polling.status_code(), StatusCode::ACCEPTED);
+    assert_eq!(
+        polling
+            .headers()
+            .get("x-progress")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "0%"
+    );
+    let body: Value = polling.json();
+    let params = body["parameter"].as_array().expect("parameter array");
+    let find = |name: &str| params.iter().find(|p| p["name"] == name);
+    assert_eq!(find("typesTotal").unwrap()["valueInteger"], 0);
+    assert_eq!(find("typesDone").unwrap()["valueInteger"], 0);
+    assert!(find("currentType").is_none());
+}
+
+#[tokio::test]
+async fn test_status_poll_percent_is_capped_at_99_while_running() {
+    let (server, backend, _output, _tmp) = create_bulk_export_server().await;
+    let tenant = test_tenant();
+    seed_patients(&backend, 1).await;
+
+    let kickoff = server
+        .get("/$export")
+        .add_header("x-tenant-id", "test-tenant")
+        .add_header("prefer", "respond-async")
+        .add_query_param("_type", "Patient")
+        .await;
+    assert_eq!(kickoff.status_code(), StatusCode::ACCEPTED);
+    let status_url = kickoff
+        .headers()
+        .get("content-location")
+        .expect("Content-Location header")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let status_path = status_url.strip_prefix("http://localhost:8080").unwrap();
+
+    let worker_id = WorkerId::new("t");
+    let lease = backend
+        .claim_next(&worker_id, Duration::from_secs(60))
+        .await
+        .expect("claim_next")
+        .expect("a job is claimable right after kick-off");
+    backend
+        .mark_export_in_progress(&tenant, &lease.job_id, &worker_id, lease.fencing_token)
+        .await
+        .expect("mark_export_in_progress");
+    // Every type reported done, but the job has not yet transitioned to
+    // `complete` — a real, if transitory, state while the worker finalizes
+    // output files and the manifest.
+    backend
+        .set_export_current_type(
+            &tenant,
+            &lease.job_id,
+            &worker_id,
+            lease.fencing_token,
+            Some("Patient"),
+            3,
+            3,
+        )
+        .await
+        .expect("set_export_current_type");
+
+    let polling = server
+        .get(status_path)
+        .add_header("x-tenant-id", "test-tenant")
+        .await;
+    assert_eq!(polling.status_code(), StatusCode::ACCEPTED);
+    assert_eq!(
+        polling
+            .headers()
+            .get("x-progress")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "99%"
+    );
+}
+
+#[tokio::test]
 async fn test_patient_and_group_export_levels() {
     let (server, backend, output, _tmp) = create_bulk_export_server().await;
     seed_patients(&backend, 2).await;
