@@ -1980,6 +1980,87 @@ async fn test_search_reference_subject() {
     assert!(ids.contains(&"obs-2"));
 }
 
+/// A `Type/id` reference search must not match a *different* resource whose
+/// id merely extends the searched id. FHIR ids may contain `-` and `.`, which
+/// sort below `'/'` and `'0'` in SQLite's BINARY collation, so a naive
+/// `[base, base || '0')` index range (PR #1030) wrongly captured `Patient/123-4`
+/// and `Patient/123.5` for `subject=Patient/123`. The predicate must still be
+/// version-agnostic (match `Patient/123/_history/<v>`).
+#[tokio::test]
+async fn test_search_by_reference_does_not_match_extended_sibling_ids() {
+    let backend = create_backend();
+    let tenant = create_tenant("test-tenant");
+
+    // Every stored reference shares the "Patient/123" prefix; only the first
+    // two are the same resource.
+    let refs = [
+        ("obs-base", "Patient/123"),
+        ("obs-versioned", "Patient/123/_history/2"),
+        ("obs-dash", "Patient/123-4"),
+        ("obs-dot", "Patient/123.5"),
+        ("obs-digit", "Patient/1234"),
+        ("obs-zero", "Patient/1230"),
+        ("obs-dash-versioned", "Patient/123-4/_history/1"),
+        ("obs-short", "Patient/12"),
+    ];
+    for (id, reference) in refs {
+        backend
+            .create(
+                &tenant,
+                "Observation",
+                json!({
+                    "resourceType": "Observation",
+                    "id": id,
+                    "status": "final",
+                    "subject": {"reference": reference},
+                    "code": {"coding": [{"code": "8867-4"}]}
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+    }
+
+    let search = |value: &str| {
+        SearchQuery::new("Observation").with_parameter(SearchParameter {
+            name: "subject".to_string(),
+            param_type: SearchParamType::Reference,
+            modifier: None,
+            values: vec![SearchValue::eq(value)],
+            chain: vec![],
+            components: vec![],
+        })
+    };
+
+    let result = backend
+        .search(&tenant, &search("Patient/123"))
+        .await
+        .unwrap();
+    let mut ids: Vec<&str> = result.resources.items.iter().map(|r| r.id()).collect();
+    ids.sort_unstable();
+    assert_eq!(
+        ids,
+        vec!["obs-base", "obs-versioned"],
+        "subject=Patient/123 must match only Patient/123 and its _history versions"
+    );
+
+    // The siblings are themselves searchable, exactly.
+    let result = backend
+        .search(&tenant, &search("Patient/123-4"))
+        .await
+        .unwrap();
+    let mut ids: Vec<&str> = result.resources.items.iter().map(|r| r.id()).collect();
+    ids.sort_unstable();
+    assert_eq!(ids, vec!["obs-dash", "obs-dash-versioned"]);
+
+    let result = backend
+        .search(&tenant, &search("Patient/123.5"))
+        .await
+        .unwrap();
+    let ids: Vec<&str> = result.resources.items.iter().map(|r| r.id()).collect();
+    assert_eq!(ids, vec!["obs-dot"]);
+}
+
 #[tokio::test]
 async fn test_patient_compartment_export_observation_without_since() {
     let backend = create_backend();
