@@ -6579,6 +6579,10 @@ details.card > summary.card-head::-webkit-details-marker {
   color: var(--muted);
 }
 
+.job-card__window {
+  color: var(--muted);
+}
+
 .job-card__files {
   display: flex;
   flex-wrap: wrap;
