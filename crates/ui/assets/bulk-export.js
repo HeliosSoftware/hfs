@@ -1,6 +1,8 @@
-/* Progressive enhancement for the Bulk Export builder (#792, #793). The
-   server-rendered form remains usable without JavaScript: individual resource
-   types and Custom instant stay enabled for native narrowing. */
+/* Progressive enhancement for the Bulk Export builder (#792, #793, #1016).
+   The server-rendered form remains usable without JavaScript: individual
+   resource types and Custom instant stay enabled for native narrowing, and
+   the Patients scope is rejected server-side when no patient was chosen.
+   With JavaScript that same check also runs inline before submit. */
 (function () {
   "use strict";
 
@@ -18,6 +20,7 @@
   var sinceCustomError = form.querySelector("#bulk-export-since-custom-error");
   var scopeRadios = Array.prototype.slice.call(form.querySelectorAll('input[name="scope"]'));
   var patientCombobox = form.querySelector(".combobox--scope-patient");
+  var patientsError = form.querySelector("#bulk-export-patients-error");
   var validationStarted = form.getAttribute("data-validation-started") === "true";
 
   function setFieldError(input, error, invalid) {
@@ -158,16 +161,47 @@
     sinceCustom.disabled = sincePreset.value !== "custom";
   }
 
+  function patientScopeSelected() {
+    var patientScope = form.querySelector('input[name="scope"][value="patient"]');
+    return Boolean(patientScope && patientScope.checked);
+  }
+
   function synchronizePatientScope() {
     if (!patientCombobox) return;
-    var patientScope = form.querySelector('input[name="scope"][value="patient"]');
-    var active = Boolean(patientScope && patientScope.checked);
+    var active = patientScopeSelected();
     var input = patientCombobox.querySelector('[role="combobox"]');
     if (input) input.disabled = !active;
     patientCombobox.querySelectorAll("[data-combobox-selected-input]").forEach(function (selected) {
       selected.disabled = !active;
     });
     if (!active) patientCombobox.dispatchEvent(new CustomEvent("hfs:combobox-close"));
+  }
+
+  function patientField() {
+    if (!patientCombobox) return null;
+    var enhancement = patientCombobox.querySelector("[data-combobox-enhancement]");
+    if (enhancement && !enhancement.hidden) {
+      return patientCombobox.querySelector('[role="combobox"]');
+    }
+    return patientCombobox.querySelector('textarea[name="patient"]');
+  }
+
+  function hasPatientSelection() {
+    if (!patientCombobox) return false;
+    var enhancement = patientCombobox.querySelector("[data-combobox-enhancement]");
+    if (enhancement && !enhancement.hidden) {
+      return patientCombobox.querySelectorAll("[data-combobox-selected-input]").length > 0;
+    }
+    var fallback = patientCombobox.querySelector('textarea[name="patient"]');
+    return Boolean(fallback && /[^\s,]/.test(fallback.value));
+  }
+
+  function validatePatients() {
+    var invalid = Boolean(
+      patientCombobox && patientsError && patientScopeSelected() && !hasPatientSelection(),
+    );
+    setFieldError(patientField(), patientsError, invalid);
+    return !invalid;
   }
 
   // Browser-restored forms may come back with All Resources unchecked. Keep
@@ -202,22 +236,32 @@
     });
   }
   scopeRadios.forEach(function (scope) {
-    scope.addEventListener("change", synchronizePatientScope);
+    scope.addEventListener("change", function () {
+      synchronizePatientScope();
+      if (validationStarted) validatePatients();
+    });
   });
   if (patientCombobox) {
-    patientCombobox.addEventListener("hfs:combobox-change", synchronizePatientScope);
+    patientCombobox.addEventListener("hfs:combobox-change", function () {
+      synchronizePatientScope();
+      if (validationStarted) validatePatients();
+    });
   }
 
   form.addEventListener("submit", function (event) {
     validationStarted = true;
     var nameValid = validateName();
     var sinceValid = validateSince();
-    if (!nameValid || !sinceValid) {
+    var patientsValid = validatePatients();
+    if (!nameValid || !sinceValid || !patientsValid) {
       event.preventDefault();
       if (!nameValid && nameInput) {
         nameInput.focus();
       } else if (!sinceValid && sinceCustom) {
         sinceCustom.focus();
+      } else if (!patientsValid) {
+        var field = patientField();
+        if (field) field.focus();
       }
       return;
     }
