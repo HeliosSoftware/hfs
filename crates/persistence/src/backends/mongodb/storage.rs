@@ -300,7 +300,7 @@ fn system_history_cursor_or(params: &HistoryParams) -> Option<Vec<Document>> {
     let bson_ts = chrono_to_bson(ts);
     Some(vec![
         doc! { "last_updated": { "$lt": bson_ts } },
-        doc! { "last_updated": bson_ts.clone(), "resource_type": { "$lt": &resource_type } },
+        doc! { "last_updated": bson_ts, "resource_type": { "$lt": &resource_type } },
         doc! {
             "last_updated": bson_ts,
             "resource_type": &resource_type,
@@ -4286,8 +4286,7 @@ mod history_query_tests {
             "system",
         );
 
-        let or_branches =
-            system_history_cursor_or(&params).expect("expected a cursor predicate");
+        let or_branches = system_history_cursor_or(&params).expect("expected a cursor predicate");
         let expected_ts = chrono_to_bson(ts);
         assert_eq!(
             or_branches,
@@ -4393,7 +4392,10 @@ mod history_query_tests {
     #[test]
     fn sorts_match_the_serving_index_key_order() {
         // idx_history_type_updated = {tenant_id, resource_type, last_updated: -1, id: -1}
-        assert_eq!(type_history_sort(), doc! { "last_updated": -1_i32, "id": -1_i32 });
+        assert_eq!(
+            type_history_sort(),
+            doc! { "last_updated": -1_i32, "id": -1_i32 }
+        );
         // idx_history_system_updated = {tenant_id, last_updated: -1, resource_type: -1, id: -1}
         assert_eq!(
             system_history_sort(),

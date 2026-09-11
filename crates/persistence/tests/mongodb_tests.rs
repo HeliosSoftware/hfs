@@ -2090,8 +2090,8 @@ async fn mongodb_integration_history_providers() {
 // ---------------------------------------------------------------------------
 // #1053: history_type / history_system must page via a server-side sort +
 // limit + cursor predicate rather than draining the whole history corpus into
-// memory before sorting/paging in Rust. See mongodb storage.rs history_type /
-// history_system and the module-level doc comment there.
+// memory before sorting/paging in Rust. See the inline comments in
+// history_type / history_system in mongodb/storage.rs.
 // ---------------------------------------------------------------------------
 
 use mongodb::Collection;
@@ -2259,7 +2259,12 @@ async fn mongodb_history_type_does_not_read_rows_outside_the_page() {
     let page1_keys: Vec<(String, String)> = page1
         .items
         .iter()
-        .map(|e| (e.resource.id().to_string(), e.resource.version_id().to_string()))
+        .map(|e| {
+            (
+                e.resource.id().to_string(),
+                e.resource.version_id().to_string(),
+            )
+        })
         .collect();
     assert_eq!(page1_keys, expected[0..10]);
     assert!(page1.page_info.has_next);
@@ -2280,12 +2285,20 @@ async fn mongodb_history_type_does_not_read_rows_outside_the_page() {
     let page2_keys: Vec<(String, String)> = page2
         .items
         .iter()
-        .map(|e| (e.resource.id().to_string(), e.resource.version_id().to_string()))
+        .map(|e| {
+            (
+                e.resource.id().to_string(),
+                e.resource.version_id().to_string(),
+            )
+        })
         .collect();
     assert_eq!(page2_keys, expected[10..20]);
     // Disjoint from page 1, contiguous with it.
     for key in &page2_keys {
-        assert!(!page1_keys.contains(key), "page 2 repeated a page 1 row: {key:?}");
+        assert!(
+            !page1_keys.contains(key),
+            "page 2 repeated a page 1 row: {key:?}"
+        );
     }
 
     // --- Assertion (3): CANARY PREMISE ---
@@ -2393,8 +2406,11 @@ async fn mongodb_history_type_paging_is_ordered_and_complete() {
     // version_id (the Rust-side tie-break).
     let mut expected = expected_by_k;
     expected.sort_by(|a, b| {
-        b.0.cmp(&a.0)
-            .then_with(|| b.2.parse::<i64>().unwrap().cmp(&a.2.parse::<i64>().unwrap()))
+        b.0.cmp(&a.0).then_with(|| {
+            b.2.parse::<i64>()
+                .unwrap()
+                .cmp(&a.2.parse::<i64>().unwrap())
+        })
     });
     let expected: Vec<(String, String)> = expected.into_iter().map(|(_, id, v)| (id, v)).collect();
     assert_eq!(expected.len(), 26);
@@ -2413,12 +2429,20 @@ async fn mongodb_history_type_paging_is_ordered_and_complete() {
         let keys: Vec<(String, String)> = page
             .items
             .iter()
-            .map(|e| (e.resource.id().to_string(), e.resource.version_id().to_string()))
+            .map(|e| {
+                (
+                    e.resource.id().to_string(),
+                    e.resource.version_id().to_string(),
+                )
+            })
             .collect();
         all_rows.extend(keys);
 
         if page.page_info.has_next {
-            let cursor = page.page_info.next_cursor.expect("has_next implies a cursor");
+            let cursor = page
+                .page_info
+                .next_cursor
+                .expect("has_next implies a cursor");
             params = HistoryParams::new().count(5).include_deleted(true);
             params.pagination = helios_persistence::types::Pagination::with_cursor(5, cursor);
         } else {
@@ -2431,7 +2455,11 @@ async fn mongodb_history_type_paging_is_ordered_and_complete() {
     let mut dedup_check = all_rows.clone();
     dedup_check.sort();
     dedup_check.dedup();
-    assert_eq!(dedup_check.len(), all_rows.len(), "found duplicate rows across pages");
+    assert_eq!(
+        dedup_check.len(),
+        all_rows.len(),
+        "found duplicate rows across pages"
+    );
 }
 
 /// Mirror of the pin test for `history_system`: sentinel row of a resource
@@ -2494,8 +2522,15 @@ async fn mongodb_history_system_does_not_read_rows_outside_the_page() {
     for i in 0..5usize {
         for v in 1..=3usize {
             let id = format!("sys-pat-{i}");
-            stamp_history_last_updated(&history, &tenant, "Patient", &id, &v.to_string(), history_ts(base_millis, k))
-                .await;
+            stamp_history_last_updated(
+                &history,
+                &tenant,
+                "Patient",
+                &id,
+                &v.to_string(),
+                history_ts(base_millis, k),
+            )
+            .await;
             expected.push(("Patient".to_string(), id, v.to_string()));
             k += 1;
         }
@@ -2503,8 +2538,15 @@ async fn mongodb_history_system_does_not_read_rows_outside_the_page() {
     for i in 0..5usize {
         for v in 1..=3usize {
             let id = format!("hist-obs-{i}");
-            stamp_history_last_updated(&history, &tenant, "Observation", &id, &v.to_string(), history_ts(base_millis, k))
-                .await;
+            stamp_history_last_updated(
+                &history,
+                &tenant,
+                "Observation",
+                &id,
+                &v.to_string(),
+                history_ts(base_millis, k),
+            )
+            .await;
             expected.push(("Observation".to_string(), id, v.to_string()));
             k += 1;
         }
@@ -2613,12 +2655,22 @@ async fn mongodb_history_type_plan_is_a_bounded_index_walk() {
         .await
         .expect("failed to query system.profile");
 
-    let mut entry: Option<Document> = None;
-    while cursor.advance().await.expect("failed to advance profile cursor") {
-        let doc = cursor.deserialize_current().expect("failed to deserialize profile entry");
-        entry = Some(doc);
-        break;
-    }
+    // Only the newest matching entry is of interest, so advance once rather
+    // than looping (a `while` with an unconditional `break` trips
+    // `clippy::never_loop`, which CI denies).
+    let entry: Option<Document> = if cursor
+        .advance()
+        .await
+        .expect("failed to advance profile cursor")
+    {
+        Some(
+            cursor
+                .deserialize_current()
+                .expect("failed to deserialize profile entry"),
+        )
+    } else {
+        None
+    };
     let entry = entry.expect("expected a profiled find on resource_history");
 
     let command = entry
@@ -2638,19 +2690,35 @@ async fn mongodb_history_type_plan_is_a_bounded_index_walk() {
     // On MongoDB 5.0 `hasSortStage` is simply absent when there is no sort
     // stage — must not unwrap a missing field as an error.
     let has_sort_stage = entry.get_bool("hasSortStage").unwrap_or(false);
-    assert!(!has_sort_stage, "expected no blocking sort stage on the first page");
+    assert!(
+        !has_sort_stage,
+        "expected no blocking sort stage on the first page"
+    );
 
-    let docs_examined = entry.get_i64("docsExamined").or_else(|_| entry.get_i32("docsExamined").map(i64::from));
-    let keys_examined = entry.get_i64("keysExamined").or_else(|_| entry.get_i32("keysExamined").map(i64::from));
+    let docs_examined = entry
+        .get_i64("docsExamined")
+        .or_else(|_| entry.get_i32("docsExamined").map(i64::from));
+    let keys_examined = entry
+        .get_i64("keysExamined")
+        .or_else(|_| entry.get_i32("keysExamined").map(i64::from));
     if let Ok(d) = docs_examined {
-        assert!(d <= 11, "docsExamined {d} exceeds count+1 (11) on the first page");
+        assert!(
+            d <= 11,
+            "docsExamined {d} exceeds count+1 (11) on the first page"
+        );
     }
     if let Ok(k) = keys_examined {
-        assert!(k <= 11, "keysExamined {k} exceeds count+1 (11) on the first page");
+        assert!(
+            k <= 11,
+            "keysExamined {k} exceeds count+1 (11) on the first page"
+        );
     }
 
     let plan_summary = entry.get_str("planSummary").unwrap_or_default();
-    assert!(plan_summary.contains("IXSCAN"), "expected an IXSCAN plan, got: {plan_summary}");
+    assert!(
+        plan_summary.contains("IXSCAN"),
+        "expected an IXSCAN plan, got: {plan_summary}"
+    );
 
     // Rebuild the inner find command from exactly what the server recorded
     // (command also carries $db/lsid/$readPreference, which explain rejects).
@@ -2668,10 +2736,22 @@ async fn mongodb_history_type_plan_is_a_bounded_index_walk() {
     let stats = explain
         .get_document("executionStats")
         .expect("explain missing executionStats");
-    let total_keys = stats.get_i64("totalKeysExamined").or_else(|_| stats.get_i32("totalKeysExamined").map(i64::from)).unwrap();
-    let total_docs = stats.get_i64("totalDocsExamined").or_else(|_| stats.get_i32("totalDocsExamined").map(i64::from)).unwrap();
-    assert!(total_keys <= 11, "explain totalKeysExamined {total_keys} exceeds 11");
-    assert!(total_docs <= 11, "explain totalDocsExamined {total_docs} exceeds 11");
+    let total_keys = stats
+        .get_i64("totalKeysExamined")
+        .or_else(|_| stats.get_i32("totalKeysExamined").map(i64::from))
+        .unwrap();
+    let total_docs = stats
+        .get_i64("totalDocsExamined")
+        .or_else(|_| stats.get_i32("totalDocsExamined").map(i64::from))
+        .unwrap();
+    assert!(
+        total_keys <= 11,
+        "explain totalKeysExamined {total_keys} exceeds 11"
+    );
+    assert!(
+        total_docs <= 11,
+        "explain totalDocsExamined {total_docs} exceeds 11"
+    );
 
     // Only the *winning* plan matters here. `explain` also carries
     // `queryPlanner.rejectedPlans` — other candidates the multi-planner
