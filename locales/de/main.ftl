@@ -184,6 +184,15 @@ chart-pending-note = Die Live-Zahlen für dieses Zeitfenster werden noch erhoben
 chart-pending-empty = Warten auf die Live-Zahlen…
 chart-pending-retry = Jetzt erneut versuchen
 chart-partial-note = Einige Zahlen konnten nicht aus dem Speicher gelesen werden und werden als Null angezeigt. Zum erneuten Versuch neu laden.
+# #1078: die Zählungen des Tenants sind bekannt, die Serien dieses Zeitfensters
+# noch nicht — die Karten zeigen echte Zahlen, nur das Diagramm wartet.
+chart-series-pending-note = Das Diagramm für dieses Zeitfenster wird noch geladen. Die angezeigten Zählungen sind echt und stammen aus der letzten Erhebung; dargestellt wird erst, wenn die Zahlen für dieses Zeitfenster eintreffen.
+# #1078: gemessen, aber aus Schreibzählern im Speicher statt aus einem exakten
+# Speicherlesevorgang gezählt. Eine Kennzeichnung, keine Warnung.
+chart-approximate-note = Näherungswert: aus den jüngsten Schreibvorgängen gezählt und noch nicht mit dem Speicher abgeglichen.
+# #1078: wann die Zahlen auf der Seite gelesen wurden. $time ist eine UTC-Uhrzeit,
+# mit vorangestelltem Datum, wenn sie nicht von heute ist (z. B. "14:02:31 UTC").
+chart-as-of = Stand: { $time }.
 chart-table-toggle = Als Tabelle anzeigen
 chart-table-when = Zeitpunkt
 chart-focus-series = Diese Serie fokussieren

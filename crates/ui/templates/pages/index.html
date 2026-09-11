@@ -7,10 +7,12 @@
 
 {#
   Everything derived from the dashboard snapshot lives in one swappable
-  region (#956). While the snapshot is still being computed the page renders
-  a waiting state and — with JavaScript — re-requests just this region a
-  bounded number of times, so the figures appear without a manual reload and
-  without ever standing in for them with invented ones.
+  region (#956). While the chart is still waiting — nothing known yet, or
+  (#1078) the tenant's figures known but this window's series not — the page
+  renders a waiting state and, with JavaScript, re-requests just this region
+  a bounded number of times, so the figures appear without a manual reload
+  and without ever standing in for them with invented ones. The stat cards
+  render whenever a figure is known; only the chart area waits.
 #}
 <div id="dash-live"
   {% if let Some(href) = auto_retry_href %}
@@ -150,22 +152,28 @@
   </header>
 
   {#
-    Whatever is short of a complete live reading is named here, and named
-    precisely: waiting is not "no provider", and a half-failed snapshot is
-    not a measurement (#956). `aria-live` so the swap announces itself.
+    Whatever is short of a complete, exact live reading is named here, and
+    named precisely: waiting is not "no provider", a half-failed snapshot is
+    not a measurement (#956), and a figure counted from recent writes is not
+    an exact storage read (#1078). One line per fact, in the precedence
+    `DashboardNotice` documents; the first line of a live render says when
+    its figures were read. `aria-live` so the swap announces itself.
   #}
-  {% if let Some(key) = notice.key() %}
-  <p class="notice notice--warn" aria-live="polite">
-    {{ i18n.t(key) }}
-    {% if notice.is_pending() %}
+  {% for line in notices %}
+  <p class="notice{% if line.kind.is_warning() %} notice--warn{% endif %}" aria-live="polite" data-dash-notice="{{ line.kind.slug() }}">
+    {% if let Some(key) = line.kind.key() %}{{ i18n.t(key) }}{% endif %}
+    {% if let Some(as_of) = line.as_of %}
+    <time datetime="{{ as_of.datetime }}">{{ i18n.t_arg("chart-as-of", "time", as_of.label.clone()) }}</time>
+    {% endif %}
+    {% if line.kind.is_waiting() %}
     {# Always present, auto-refresh or not: the page stays recoverable
        without JavaScript, and after the poll budget it is the only way on. #}
     <a href="{{ retry_href }}">{{ i18n.t("chart-pending-retry") }}</a>
     {% endif %}
   </p>
-  {% endif %}
+  {% endfor %}
 
-  {% if notice.is_pending() %}
+  {% if chart_waiting %}
   <div class="chart-empty">{{ i18n.t("chart-pending-empty") }}</div>
   {% else if !chart.has_data %}
   <div class="chart-empty">{{ i18n.t("chart-empty") }}</div>

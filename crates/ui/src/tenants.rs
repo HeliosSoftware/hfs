@@ -677,11 +677,17 @@ pub async fn delete(
     // every resource. `purge_tenant_data` is transactional on the SQL backends,
     // so on failure nothing was removed and a retry is safe.
     let purge_error = if query.purge {
-        storage
-            .purge_tenant_data(&id)
-            .await
-            .err()
-            .map(|e| format!("Tenant '{id}' was deregistered but its data was NOT purged: {e}"))
+        match storage.purge_tenant_data(&id).await {
+            Ok(_) => {
+                // The tenant's data is gone; so must be its dashboard live
+                // counters, or the Home chart would keep showing it (#1078).
+                helios_observability::dashboard_counters::invalidate_tenant(&id);
+                None
+            }
+            Err(e) => Some(format!(
+                "Tenant '{id}' was deregistered but its data was NOT purged: {e}"
+            )),
+        }
     } else {
         None
     };

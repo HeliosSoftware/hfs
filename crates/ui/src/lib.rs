@@ -669,45 +669,175 @@ struct WindowEntry {
     active: bool,
 }
 
-/// Why the dashboard is showing something other than a complete live reading
-/// — and therefore which notice the page carries (#956).
+/// One fact the dashboard states about the figures it shows — short of, or
+/// qualifying, a complete live reading (#956, #1078). Each renders as one
+/// notice line.
 ///
-/// The three degraded cases used to collapse into one "sample data" banner,
-/// which made a merely-slow window claim the build had no metrics at all and
-/// put invented clinical volumes on screen. They are distinct states with
-/// distinct pages.
+/// The degraded cases used to collapse into one "sample data" banner, which
+/// made a merely-slow window claim the build had no metrics at all and put
+/// invented clinical volumes on screen. They are distinct facts with distinct
+/// lines, and the qualifiers a live snapshot can carry are never folded into
+/// one another either.
+///
+/// Which lines a render carries, in order ([`dashboard_notices`]):
+///
+/// - [`Self::Sample`] alone — no provider, so nothing else applies.
+/// - [`Self::Pending`] alone — a truly cold tenant: no figure is known, so
+///   there is nothing to qualify and no reading to date.
+/// - Otherwise (a live [`SnapshotState::Ready`]), every qualifier that holds,
+///   strongest first: [`Self::SeriesPending`] (it decides what the chart area
+///   shows and carries the retry), then [`Self::Partial`] (figures filled in
+///   with zeros — a defect), then [`Self::Approximate`] (measured, just not
+///   reconciled). Flags that combine all show: `partial` + `approximate`
+///   reads as both facts, never the weaker one hiding the stronger or the
+///   other way round. With no qualifier at all the render carries
+///   [`Self::Live`].
+///
+/// The snapshot's "as of" time rides on the first line of a live render,
+/// whichever that is, so a figure served stale — while a refresh overruns
+/// under an import, say — always says when it was read.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum DashboardNotice {
-    /// A complete live snapshot: nothing to say.
-    None,
-    /// A provider is registered but this window's snapshot is still being
-    /// computed. Nothing is charted and no headline figure is shown — waiting
-    /// is rendered as waiting.
+    /// A complete, exact live snapshot. Its line carries only the "as of"
+    /// time, and is omitted when that is unknown.
+    Live,
+    /// A provider is registered but nothing is cached for the tenant yet.
+    /// Nothing is charted and no headline figure is shown — waiting is
+    /// rendered as waiting.
     Pending,
+    /// The tenant's totals, type list and job counts are known, but this
+    /// window's series are not ([`DashboardSnapshot::series_pending`]): the
+    /// cards and picker render, the chart area alone waits, and the page
+    /// retries like [`Self::Pending`].
+    SeriesPending,
     /// A live snapshot in which some query failed and was filled in with a
     /// zero or an empty series (see [`DashboardSnapshot::partial`]).
     Partial,
+    /// A live snapshot whose figures are measured but not reconciled with
+    /// storage ([`DashboardSnapshot::approximate`]).
+    Approximate,
     /// This build has no metrics provider at all, so the placeholder snapshot
     /// is rendered — and labelled as invented.
     Sample,
 }
 
 impl DashboardNotice {
-    /// The i18n key of the notice line, or `None` when the page carries none.
+    /// The i18n key of the line's text, or `None` for [`Self::Live`], whose
+    /// line is only its "as of" time.
     fn key(self) -> Option<&'static str> {
         match self {
-            DashboardNotice::None => None,
+            DashboardNotice::Live => None,
             DashboardNotice::Pending => Some("chart-pending-note"),
+            DashboardNotice::SeriesPending => Some("chart-series-pending-note"),
             DashboardNotice::Partial => Some("chart-partial-note"),
+            DashboardNotice::Approximate => Some("chart-approximate-note"),
             DashboardNotice::Sample => Some("chart-sample-note"),
         }
     }
 
-    /// Whether the page is waiting on a snapshot — the chart renders its
-    /// waiting state and the notice offers a retry.
-    fn is_pending(self) -> bool {
-        matches!(self, DashboardNotice::Pending)
+    /// A stable hook for the line (`data-dash-notice`), independent of the
+    /// locale's wording.
+    fn slug(self) -> &'static str {
+        match self {
+            DashboardNotice::Live => "live",
+            DashboardNotice::Pending => "pending",
+            DashboardNotice::SeriesPending => "series-pending",
+            DashboardNotice::Partial => "partial",
+            DashboardNotice::Approximate => "approximate",
+            DashboardNotice::Sample => "sample",
+        }
     }
+
+    /// Whether the line is a warning (`.notice--warn`) rather than a plain
+    /// label: something is missing or invented. Approximate and live figures
+    /// are real readings, so they are labelled, not flagged.
+    fn is_warning(self) -> bool {
+        !matches!(self, DashboardNotice::Live | DashboardNotice::Approximate)
+    }
+
+    /// Whether the chart is still waiting on this window's series — the
+    /// chart area renders its waiting state and the line offers a retry.
+    fn is_waiting(self) -> bool {
+        matches!(
+            self,
+            DashboardNotice::Pending | DashboardNotice::SeriesPending
+        )
+    }
+}
+
+/// When a snapshot's figures were read, rendered as a `<time>` (#1078).
+struct AsOf {
+    /// RFC 3339, for the `datetime` attribute.
+    datetime: String,
+    /// The visible fallback: `HH:MM:SS UTC` on the current UTC day, with the
+    /// date in front otherwise — UTC like the chart's own axis labels.
+    label: String,
+}
+
+impl AsOf {
+    fn new(read_at: DateTime<Utc>, now: DateTime<Utc>) -> Self {
+        let label = if read_at.date_naive() == now.date_naive() {
+            read_at.format("%H:%M:%S UTC")
+        } else {
+            read_at.format("%Y-%m-%d %H:%M:%S UTC")
+        };
+        AsOf {
+            datetime: read_at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            label: label.to_string(),
+        }
+    }
+}
+
+/// One rendered notice line: the fact, and the "as of" time when this is the
+/// line that carries it.
+struct NoticeLine {
+    kind: DashboardNotice,
+    as_of: Option<AsOf>,
+}
+
+/// The notice lines a dashboard render carries, in the order and under the
+/// precedence documented on [`DashboardNotice`].
+fn dashboard_notices(state: &SnapshotState, now: DateTime<Utc>) -> Vec<NoticeLine> {
+    let snapshot = match state {
+        SnapshotState::NoProvider => {
+            return vec![NoticeLine {
+                kind: DashboardNotice::Sample,
+                as_of: None,
+            }];
+        }
+        SnapshotState::Pending => {
+            return vec![NoticeLine {
+                kind: DashboardNotice::Pending,
+                as_of: None,
+            }];
+        }
+        SnapshotState::Ready(snapshot) => snapshot,
+    };
+
+    let mut kinds: Vec<DashboardNotice> = [
+        (snapshot.series_pending, DashboardNotice::SeriesPending),
+        (snapshot.partial, DashboardNotice::Partial),
+        (snapshot.approximate, DashboardNotice::Approximate),
+    ]
+    .into_iter()
+    .filter_map(|(holds, kind)| holds.then_some(kind))
+    .collect();
+    if kinds.is_empty() {
+        // Nothing to qualify — but a live line with no time says nothing.
+        if snapshot.generated_at.is_none() {
+            return Vec::new();
+        }
+        kinds.push(DashboardNotice::Live);
+    }
+
+    let mut as_of = snapshot.generated_at.map(|read_at| AsOf::new(read_at, now));
+    kinds
+        .into_iter()
+        .map(|kind| NoticeLine {
+            kind,
+            as_of: as_of.take(),
+        })
+        .collect()
 }
 
 #[derive(Template)]
@@ -725,11 +855,15 @@ struct IndexPage {
     all_types: bool,
     /// Link that flips the "View all resources" toggle.
     all_types_href: String,
-    /// Which degraded state, if any, this render is in — and so which notice
-    /// the page carries (#555, #956). Never silent.
-    notice: DashboardNotice,
+    /// What this render has to say about its figures — degraded states,
+    /// qualifiers, and when the figures were read (#555, #956, #1078). Never
+    /// silent; see [`DashboardNotice`] for which lines appear together.
+    notices: Vec<NoticeLine>,
+    /// Whether the chart area renders its waiting state: nothing is known
+    /// yet, or this window's series are still loading (#1078).
+    chart_waiting: bool,
     /// The same view, re-requested. Rendered as a "retry now" link in the
-    /// pending notice so the page is recoverable without JavaScript.
+    /// waiting notice so the page is recoverable without JavaScript.
     retry_href: String,
     /// [`Self::retry_href`] with one more attempt spent, or `None` once the
     /// budget is exhausted. Drives the htmx auto-refresh: the page polls a
@@ -7424,13 +7558,17 @@ const DASH_PENDING_RETRIES: u32 = 3;
 ///
 /// Three outcomes, three pages (#956):
 ///
-/// - [`SnapshotState::Ready`] renders the figures, flagged as incomplete when
-///   the provider had to fill part of the snapshot in
-///   ([`DashboardSnapshot::partial`]).
-/// - [`SnapshotState::Pending`] — a provider is registered, this window's
-///   snapshot is still computing — renders an explicit waiting state: no
-///   chart, no headline figures, and a retry. Every window switch is a cold
-///   cache key, so this is an ordinary path, not an error.
+/// - [`SnapshotState::Ready`] renders the figures, dated by their "as of"
+///   time and labelled with every qualifier that holds (#1078): incomplete
+///   when the provider had to fill part of the snapshot in
+///   ([`DashboardSnapshot::partial`]), approximate when the figures are not
+///   reconciled with storage ([`DashboardSnapshot::approximate`]). When only
+///   this window's series are missing ([`DashboardSnapshot::series_pending`],
+///   a warm tenant switching to a slow window) the cards and the type picker
+///   render from the snapshot while the chart area alone waits and retries.
+/// - [`SnapshotState::Pending`] — a provider is registered, nothing is cached
+///   for the tenant yet — renders an explicit waiting state: no chart, no
+///   headline figures, and a retry.
 /// - [`SnapshotState::NoProvider`] — the build genuinely has no metrics —
 ///   renders the placeholder snapshot, labelled as invented (#555).
 ///
@@ -7454,41 +7592,59 @@ async fn build_index_page(
         helios_observability::dashboard::snapshot_state(window, &tenant.id, &types, all_types)
             .await;
 
-    let (notice, snapshot) = match live {
-        SnapshotState::Ready(s) if s.partial => (DashboardNotice::Partial, s),
-        SnapshotState::Ready(s) => (DashboardNotice::None, s),
+    let notices = dashboard_notices(&live, Utc::now());
+    let cold = matches!(live, SnapshotState::Pending);
+    let chart_waiting = notices.iter().any(|line| line.kind.is_waiting());
+
+    let snapshot = match live {
+        SnapshotState::Ready(mut s) => {
+            if s.series_pending {
+                // Never chart series the snapshot says are not this window's.
+                s.series.clear();
+            }
+            s
+        }
         // Nothing measured yet: an empty snapshot, so every figure renders as
         // unknown rather than as a number.
-        SnapshotState::Pending => (
-            DashboardNotice::Pending,
-            DashboardSnapshot {
-                window,
-                ..Default::default()
-            },
-        ),
-        SnapshotState::NoProvider => (DashboardNotice::Sample, sample_snapshot(window)),
+        SnapshotState::Pending => DashboardSnapshot {
+            window,
+            ..Default::default()
+        },
+        SnapshotState::NoProvider => sample_snapshot(window),
     };
 
     let mut dash = build_dashboard(&snapshot, all_types, &spec_types, focus.as_deref());
-    if notice.is_pending() {
-        // The pending snapshot plots nothing, so the selectors it derived
-        // point at an empty charted set. Rebuild the two that must survive
+    if chart_waiting {
+        // The waiting snapshot plots nothing, so the selectors it derived
+        // point at an empty charted set. Rebuild the ones that must survive
         // the wait from what was actually requested, or the retry would come
         // back with the user's type selection silently dropped.
         dash.windows = window_entries(&types, window, all_types, focus.as_deref());
         dash.all_types_href = dash_href(&types, window, !all_types, focus.as_deref());
-        // No figure is known yet, and a zero here reads as a measurement.
+        dash.picker = picker_entries(
+            &snapshot.available,
+            all_types,
+            &spec_types,
+            &types,
+            window,
+            focus.as_deref(),
+        );
+        // Nothing is charted yet, so there is no charted total — and a zero
+        // here reads as a measurement.
+        dash.metrics.chart_total = None;
+    }
+    if cold {
+        // No figure is known yet at all.
         dash.metrics.resource_types = None;
         dash.metrics.stored_resources = None;
-        dash.metrics.chart_total = None;
     }
 
     // The same view again, one attempt further in. Built from the requested
-    // types rather than the plotted ones: while pending there are none.
+    // types rather than the plotted ones: while waiting there are none.
     let retry_base = dash_href(&types, window, all_types, focus.as_deref());
     let retry_href = format!("{retry_base}&retry={}", retry.saturating_add(1));
     let auto_retry_href =
-        (notice.is_pending() && retry < DASH_PENDING_RETRIES).then(|| retry_href.clone());
+        (chart_waiting && retry < DASH_PENDING_RETRIES).then(|| retry_href.clone());
 
     IndexPage {
         status,
@@ -7499,7 +7655,8 @@ async fn build_index_page(
         windows: dash.windows,
         all_types: dash.all_types,
         all_types_href: dash.all_types_href,
-        notice,
+        notices,
+        chart_waiting,
         retry_href,
         auto_retry_href,
         i18n,
@@ -7611,58 +7768,14 @@ fn build_dashboard(
         }
     }
 
-    // The picker's option list: the tenant's stored types (largest first,
-    // from the provider), plus â€” with `all_types` â€” every other type of the
-    // active FHIR version, at 0, alphabetically after (never duplicating a
-    // type the provider already listed).
-    let mut options: Vec<TypeCount> = snapshot.available.clone();
-    if all_types {
-        let stored: std::collections::HashSet<&str> =
-            options.iter().map(|t| t.resource_type.as_str()).collect();
-        let mut empties: Vec<TypeCount> = spec_types
-            .iter()
-            .filter(|name| !stored.contains(name.as_str()))
-            .map(|name| TypeCount {
-                resource_type: name.clone(),
-                total: 0,
-            })
-            .collect();
-        empties.sort_by(|a, b| a.resource_type.cmp(&b.resource_type));
-        options.extend(empties);
-    }
-
-    // Each option toggles membership.
-    let picker = options
-        .iter()
-        .map(|t| {
-            let selected = charted.contains(&t.resource_type);
-            let toggled: Vec<String> = if selected {
-                charted
-                    .iter()
-                    .filter(|c| **c != t.resource_type)
-                    .cloned()
-                    .collect()
-            } else {
-                // Selecting past the cap swaps the oldest series out
-                // (mirrors the provider's MAX_CHARTED_TYPES).
-                let mut set: Vec<String> = charted
-                    .iter()
-                    .skip(charted.len().saturating_sub(CHART_MAX_SERIES - 1))
-                    .cloned()
-                    .collect();
-                set.push(t.resource_type.clone());
-                set
-            };
-            PickerEntry {
-                resource_type: t.resource_type.clone(),
-                total: grouped(t.total),
-                // dash_href drops the focus itself if this toggle removes
-                // the focused type.
-                href: dash_href(&toggled, snapshot.window, all_types, focus),
-                selected,
-            }
-        })
-        .collect();
+    let picker = picker_entries(
+        &snapshot.available,
+        all_types,
+        spec_types,
+        &charted,
+        snapshot.window,
+        focus,
+    );
 
     // The legend names each plotted series; while more than one is plotted,
     // an entry links to focusing that series â€” or back out of the focus when
@@ -7714,6 +7827,75 @@ fn build_dashboard(
         all_types,
         all_types_href: dash_href(&charted, snapshot.window, !all_types, focus),
     }
+}
+
+/// The chart's type picker: one toggle per option, checked for the types in
+/// `charted`.
+///
+/// Separate from `build_dashboard` for the same reason as [`window_entries`]:
+/// while the chart waits (#956, #1078) nothing is plotted, so the checked
+/// state and every toggle link have to come from the *requested* types, or
+/// picking a type while waiting would drop the rest of the selection.
+fn picker_entries(
+    available: &[TypeCount],
+    all_types: bool,
+    spec_types: &[String],
+    charted: &[String],
+    window: DashboardWindow,
+    focus: Option<&str>,
+) -> Vec<PickerEntry> {
+    // The picker's option list: the tenant's stored types (largest first,
+    // from the provider), plus â€” with `all_types` â€” every other type of the
+    // active FHIR version, at 0, alphabetically after (never duplicating a
+    // type the provider already listed).
+    let mut options: Vec<TypeCount> = available.to_vec();
+    if all_types {
+        let stored: std::collections::HashSet<&str> =
+            options.iter().map(|t| t.resource_type.as_str()).collect();
+        let mut empties: Vec<TypeCount> = spec_types
+            .iter()
+            .filter(|name| !stored.contains(name.as_str()))
+            .map(|name| TypeCount {
+                resource_type: name.clone(),
+                total: 0,
+            })
+            .collect();
+        empties.sort_by(|a, b| a.resource_type.cmp(&b.resource_type));
+        options.extend(empties);
+    }
+
+    // Each option toggles membership.
+    options
+        .iter()
+        .map(|t| {
+            let selected = charted.contains(&t.resource_type);
+            let toggled: Vec<String> = if selected {
+                charted
+                    .iter()
+                    .filter(|c| **c != t.resource_type)
+                    .cloned()
+                    .collect()
+            } else {
+                // Selecting past the cap swaps the oldest series out
+                // (mirrors the provider's MAX_CHARTED_TYPES).
+                let mut set: Vec<String> = charted
+                    .iter()
+                    .skip(charted.len().saturating_sub(CHART_MAX_SERIES - 1))
+                    .cloned()
+                    .collect();
+                set.push(t.resource_type.clone());
+                set
+            };
+            PickerEntry {
+                resource_type: t.resource_type.clone(),
+                total: grouped(t.total),
+                // dash_href drops the focus itself if this toggle removes
+                // the focused type.
+                href: dash_href(&toggled, window, all_types, focus),
+                selected,
+            }
+        })
+        .collect()
 }
 
 // Chart plot area within the `0 0 1060 H` viewBox: the value axis occupies the
@@ -8034,6 +8216,9 @@ fn sample_snapshot(window: DashboardWindow) -> DashboardSnapshot {
         // Wholly invented rather than partly missing: the page says so with
         // the sample-data notice, which `partial` must not water down (#956).
         partial: false,
+        generated_at: None,
+        approximate: false,
+        series_pending: false,
     }
 }
 
@@ -8191,7 +8376,8 @@ mod tests {
             windows: dash.windows,
             all_types: dash.all_types,
             all_types_href: dash.all_types_href,
-            notice: DashboardNotice::Sample,
+            notices: dashboard_notices(&SnapshotState::NoProvider, Utc::now()),
+            chart_waiting: false,
             retry_href: "/ui?types=&window=30d&retry=1".to_string(),
             auto_retry_href: None,
             i18n,
@@ -8819,6 +9005,9 @@ mod tests {
             export_jobs: None,
             import_jobs_active: None,
             partial: false,
+            generated_at: None,
+            approximate: false,
+            series_pending: false,
         };
         let dash = build_dashboard(&empty, false, &[], None);
         assert!(!dash.chart.has_data);
@@ -8866,6 +9055,9 @@ mod tests {
             export_jobs: None,
             import_jobs_active: None,
             partial: false,
+            generated_at: None,
+            approximate: false,
+            series_pending: false,
         };
         let spec_types = vec![
             "Observation".to_string(),
@@ -8977,6 +9169,179 @@ mod tests {
         assert_eq!(axis_time_label(at, DashboardWindow::LastHour), "14:30");
         assert_eq!(axis_time_label(at, DashboardWindow::LastDay), "14:30");
         assert_eq!(axis_time_label(at, DashboardWindow::LastMonth), "JUL 14");
+    }
+
+    /// #1078: every qualifier a live snapshot carries gets its own line, in
+    /// the documented precedence, and only the first line carries the "as
+    /// of" time. The two ways of having no snapshot stay single, undated
+    /// lines (#956).
+    #[test]
+    fn dashboard_notices_keep_every_qualifier_in_precedence_order() {
+        let read_at = DateTime::from_timestamp(1_752_503_400, 0).expect("valid instant");
+        let now = read_at + Duration::seconds(30);
+        let kinds = |lines: &[NoticeLine]| lines.iter().map(|l| l.kind).collect::<Vec<_>>();
+        let dated = |lines: &[NoticeLine]| {
+            lines
+                .iter()
+                .map(|l| l.as_of.as_ref().map(|a| a.datetime.clone()))
+                .collect::<Vec<_>>()
+        };
+
+        let sample = dashboard_notices(&SnapshotState::NoProvider, now);
+        assert_eq!(kinds(&sample), [DashboardNotice::Sample]);
+        assert_eq!(dated(&sample), [None]);
+
+        let cold = dashboard_notices(&SnapshotState::Pending, now);
+        assert_eq!(kinds(&cold), [DashboardNotice::Pending]);
+        assert_eq!(dated(&cold), [None]);
+        assert!(cold[0].kind.is_waiting() && cold[0].kind.is_warning());
+
+        let ready = |edit: fn(&mut DashboardSnapshot)| {
+            let mut snapshot = DashboardSnapshot {
+                generated_at: Some(read_at),
+                ..Default::default()
+            };
+            edit(&mut snapshot);
+            SnapshotState::Ready(snapshot)
+        };
+
+        // An undated complete snapshot has nothing to say at all.
+        let undated = dashboard_notices(&ready(|s| s.generated_at = None), now);
+        assert!(undated.is_empty());
+
+        // A dated complete one says only when it was read, as a plain label.
+        let live = dashboard_notices(&ready(|_| {}), now);
+        assert_eq!(kinds(&live), [DashboardNotice::Live]);
+        assert_eq!(dated(&live), [Some("2025-07-14T14:30:00Z".to_string())]);
+        assert!(!live[0].kind.is_warning() && !live[0].kind.is_waiting());
+
+        let approximate = dashboard_notices(&ready(|s| s.approximate = true), now);
+        assert_eq!(kinds(&approximate), [DashboardNotice::Approximate]);
+        assert!(approximate[0].as_of.is_some());
+        assert!(!approximate[0].kind.is_warning() && !approximate[0].kind.is_waiting());
+
+        let series_pending = dashboard_notices(&ready(|s| s.series_pending = true), now);
+        assert_eq!(kinds(&series_pending), [DashboardNotice::SeriesPending]);
+        assert!(series_pending[0].as_of.is_some());
+        assert!(series_pending[0].kind.is_waiting() && series_pending[0].kind.is_warning());
+
+        // Combined flags keep every fact, strongest first, dated once.
+        let all = dashboard_notices(
+            &ready(|s| {
+                s.series_pending = true;
+                s.partial = true;
+                s.approximate = true;
+            }),
+            now,
+        );
+        assert_eq!(
+            kinds(&all),
+            [
+                DashboardNotice::SeriesPending,
+                DashboardNotice::Partial,
+                DashboardNotice::Approximate
+            ]
+        );
+        assert_eq!(
+            dated(&all),
+            [Some("2025-07-14T14:30:00Z".to_string()), None, None]
+        );
+        let partial_approximate = dashboard_notices(
+            &ready(|s| {
+                s.partial = true;
+                s.approximate = true;
+            }),
+            now,
+        );
+        assert_eq!(
+            kinds(&partial_approximate),
+            [DashboardNotice::Partial, DashboardNotice::Approximate]
+        );
+    }
+
+    /// The "as of" fallback text is UTC, like the chart axis, and names the
+    /// date only when the reading is not from the current UTC day.
+    #[test]
+    fn as_of_label_is_utc_with_the_date_only_when_not_today() {
+        let read_at = DateTime::from_timestamp(1_752_503_431, 0).expect("valid instant");
+        let same_day = AsOf::new(read_at, read_at + Duration::minutes(5));
+        assert_eq!(same_day.label, "14:30:31 UTC");
+        assert_eq!(same_day.datetime, "2025-07-14T14:30:31Z");
+
+        let next_day = AsOf::new(read_at, read_at + Duration::days(1));
+        assert_eq!(next_day.label, "2025-07-14 14:30:31 UTC");
+    }
+
+    /// #1078: while the chart waits, the picker is rebuilt from the requested
+    /// types — checked state and toggle links — so picking a type keeps the
+    /// rest of the selection instead of starting from an empty one.
+    #[test]
+    fn picker_entries_follow_the_requested_types_while_waiting() {
+        let available = vec![
+            TypeCount {
+                resource_type: "Observation".to_string(),
+                total: 1_200,
+            },
+            TypeCount {
+                resource_type: "Patient".to_string(),
+                total: 40,
+            },
+        ];
+        let requested = vec!["Patient".to_string()];
+        let picker = picker_entries(
+            &available,
+            false,
+            &[],
+            &requested,
+            DashboardWindow::LastHour,
+            None,
+        );
+
+        assert_eq!(picker.len(), 2);
+        let observation = &picker[0];
+        assert!(!observation.selected);
+        assert_eq!(observation.total, "1,200", "real counts from the snapshot");
+        assert_eq!(observation.href, "/ui?types=Patient,Observation&window=1h");
+        let patient = &picker[1];
+        assert!(patient.selected);
+        assert_eq!(patient.href, "/ui?types=&window=1h");
+    }
+
+    /// The notice lines render as documented: a warning per missing or
+    /// invented fact, a plain label for approximate figures, the "as of" time
+    /// as a machine-readable `<time>`, and the retry link only on the waiting
+    /// line.
+    #[test]
+    fn index_page_renders_dated_notice_lines() {
+        let read_at = DateTime::from_timestamp(1_752_503_431, 0).expect("valid instant");
+        let mut page = sample_index_page("1.2.3", 42, i18n("en"));
+        page.notices = dashboard_notices(
+            &SnapshotState::Ready(DashboardSnapshot {
+                generated_at: Some(read_at),
+                series_pending: true,
+                approximate: true,
+                ..Default::default()
+            }),
+            read_at,
+        );
+        page.chart_waiting = true;
+        let html = page.render().expect("index renders");
+
+        assert!(html.contains(
+            r#"<p class="notice notice--warn" aria-live="polite" data-dash-notice="series-pending">"#
+        ));
+        assert!(
+            html.contains(
+                r#"<p class="notice" aria-live="polite" data-dash-notice="approximate">"#
+            )
+        );
+        assert!(
+            html.contains(r#"<time datetime="2025-07-14T14:30:31Z">As of 14:30:31 UTC.</time>"#)
+        );
+        assert_eq!(html.matches("<time ").count(), 1, "dated once");
+        assert_eq!(html.matches("Retry now").count(), 1);
+        assert!(html.contains("Waiting for the live figures"));
+        assert!(!html.contains(r#"<svg class="chart""#));
     }
 
     #[test]

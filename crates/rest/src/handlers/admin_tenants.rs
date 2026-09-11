@@ -304,7 +304,10 @@ where
 
     let deregistered = state.storage().deregister_tenant(&id).await?;
     let resources_removed = if query.purge {
-        Some(state.storage().purge_tenant_data(&id).await?)
+        let removed = state.storage().purge_tenant_data(&id).await?;
+        // The tenant's data is gone; so must be its dashboard counters (#1078).
+        super::dashboard_counts::invalidated(&id);
+        Some(removed)
     } else {
         None
     };

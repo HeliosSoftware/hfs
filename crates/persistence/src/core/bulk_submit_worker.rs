@@ -518,6 +518,40 @@ pub trait DeferredReindexHook: Send + Sync {
     async fn reindex_types(&self, tenant: &TenantContext, resource_types: Vec<String>);
 }
 
+/// Told about the resources a manifest committed, so live resource counts kept
+/// outside storage — the server's Home dashboard counters (#1078) — can follow
+/// a bulk import without waiting on storage aggregates that a big import keeps
+/// from finishing. Implemented by the server wiring; this crate only reports.
+///
+/// Called synchronously from the ingest loop, once per `output` file whose
+/// ingest returned (including a cooperatively aborted one: the batches it
+/// committed stay committed) and once per resource type with successful
+/// deletions after each `deleted` file. Implementations must be cheap and must
+/// not block. A file whose ingest failed outright, or a run abandoned because
+/// its lease was lost, reports nothing — any batches it did commit are left to
+/// the implementation's own reconciliation with storage.
+pub trait ImportedResourcesHook: Send + Sync {
+    /// `created` / `updated` entries of `resource_type` were committed for the
+    /// tenant.
+    ///
+    /// The ingestion engine's per-file result only carries a combined success
+    /// count, not the created/updated split of each entry, so the worker
+    /// reports every successful entry as `created` and `updated` as 0. A
+    /// re-import over ids that already exist therefore over-reports creates;
+    /// consumers must treat the figure as approximate and reconcile it.
+    fn resources_imported(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        created: u64,
+        updated: u64,
+    );
+
+    /// `deleted` live resources of `resource_type` were removed for the tenant
+    /// by a manifest's `deleted` files.
+    fn resources_deleted(&self, _tenant: &TenantContext, _resource_type: &str, _deleted: u64) {}
+}
+
 /// The default in-process submit worker.
 ///
 /// Binds a [`BulkSubmitJobStore`] (job state + claim + worker storage + ingestion
@@ -538,6 +572,8 @@ pub struct DefaultSubmitWorker<Js: ?Sized, Fetcher: ?Sized, Os: ?Sized> {
     /// Rebuilds the deferred indexes after each finished manifest. Without a
     /// hook, deferred mode still ingests and logs that $reindex is owed.
     reindex_hook: Option<Arc<dyn DeferredReindexHook>>,
+    /// Told what each ingested file committed (dashboard live counts, #1078).
+    imported_hook: Option<Arc<dyn ImportedResourcesHook>>,
     /// How many of a manifest's `output` files to ingest at once (#fan-out).
     /// `1` keeps the historical sequential behavior. Higher values overlap
     /// per-file fetch, parse, and write, which a concurrent-writer backend
@@ -902,6 +938,7 @@ where
             worker_id,
             defer_indexing: false,
             reindex_hook: None,
+            imported_hook: None,
             file_concurrency: 1,
         }
     }
@@ -922,6 +959,16 @@ where
     ) -> Self {
         self.defer_indexing = defer;
         self.reindex_hook = hook;
+        self
+    }
+
+    /// Sets the hook told about the resources each file committed (see
+    /// [`ImportedResourcesHook`]).
+    pub fn with_imported_resources_hook(
+        mut self,
+        hook: Option<Arc<dyn ImportedResourcesHook>>,
+    ) -> Self {
+        self.imported_hook = hook;
         self
     }
 
@@ -1280,6 +1327,16 @@ where
                 {
                     Ok(result) => {
                         failed_ref.fetch_add(result.counts.error_count(), Ordering::Relaxed);
+                        // Every `success` was committed by its batch — also on a
+                        // cooperative abort, which stops between batches.
+                        if let Some(hook) = &self.imported_hook {
+                            hook.resources_imported(
+                                &lease_ref.tenant,
+                                &resource_type,
+                                result.counts.success,
+                                0,
+                            );
+                        }
                         // Every entry a batch committed was counted by that
                         // batch. The lines the stream threw out before they
                         // reached one — unparseable, or carrying the wrong
@@ -1776,6 +1833,7 @@ where
         refs: &mut Vec<String>,
     ) {
         use tokio::io::AsyncBufReadExt;
+        let refs_before = refs.len();
         let mut lines = reader.lines();
         while let Ok(Some(line)) = lines.next_line().await {
             let line = line.trim();
@@ -1808,6 +1866,20 @@ where
                 if self.jobs.delete(&lease.tenant, ty, id).await.is_ok() {
                     refs.push(format!("{ty}/{id}"));
                 }
+            }
+        }
+
+        // `delete` only succeeds against a live resource, so every reference
+        // pushed above removed one. Reported per type, once per file.
+        if let Some(hook) = &self.imported_hook {
+            let mut per_type = std::collections::BTreeMap::<&str, u64>::new();
+            for reference in &refs[refs_before..] {
+                if let Some((ty, _)) = reference.split_once('/') {
+                    *per_type.entry(ty).or_default() += 1;
+                }
+            }
+            for (ty, deleted) in per_type {
+                hook.resources_deleted(&lease.tenant, ty, deleted);
             }
         }
     }
@@ -3814,6 +3886,151 @@ mod tests {
         // Byte progress reached the file's full advertised size.
         assert_eq!(manifests[0].bytes_total, ndjson.len() as u64);
         assert_eq!(manifests[0].bytes_processed, ndjson.len() as u64);
+    }
+
+    /// Captures the imported/deleted callbacks the worker fires (#1078).
+    #[derive(Default)]
+    struct MockImportedHook {
+        imported: std::sync::Mutex<Vec<(String, String, u64, u64)>>,
+        deleted: std::sync::Mutex<Vec<(String, String, u64)>>,
+    }
+
+    impl ImportedResourcesHook for MockImportedHook {
+        fn resources_imported(
+            &self,
+            tenant: &TenantContext,
+            resource_type: &str,
+            created: u64,
+            updated: u64,
+        ) {
+            self.imported.lock().unwrap().push((
+                tenant.tenant_id().as_str().to_string(),
+                resource_type.to_string(),
+                created,
+                updated,
+            ));
+        }
+
+        fn resources_deleted(&self, tenant: &TenantContext, resource_type: &str, deleted: u64) {
+            self.deleted.lock().unwrap().push((
+                tenant.tenant_id().as_str().to_string(),
+                resource_type.to_string(),
+                deleted,
+            ));
+        }
+    }
+
+    /// #1078: the worker reports each ingested file's committed successes, per
+    /// tenant and type, and each `deleted` file's removals — so the dashboard's
+    /// live counts follow a bulk import without storage aggregates.
+    #[tokio::test]
+    async fn test_worker_reports_imported_and_deleted_resources_to_the_hook() {
+        let backend = Arc::new(SqliteBackend::in_memory().unwrap());
+        backend.init_schema().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let output = Arc::new(LocalFsOutputStore::new(
+            tmp.path().to_path_buf(),
+            "http://localhost:8080",
+        ));
+
+        let tenant = tenant();
+        let sub_id = SubmissionId::generate("mock-system");
+        backend
+            .create_submission(&tenant, &sub_id, None)
+            .await
+            .unwrap();
+        backend
+            .add_manifest(
+                &tenant,
+                &sub_id,
+                Some("http://provider/manifest.json"),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let patients = concat!(
+            "{\"resourceType\":\"Patient\",\"id\":\"p1\"}\n",
+            "{\"resourceType\":\"Patient\",\"id\":\"p2\"}\n",
+            "{\"resourceType\":\"Patient\",\"id\":\"p3\"}\n",
+            // Rejected by the stream (wrong type): not a success.
+            "{\"resourceType\":\"Observation\",\"id\":\"o-wrong\"}\n"
+        );
+        let observations = "{\"resourceType\":\"Observation\",\"id\":\"o1\",\"status\":\"final\",\"code\":{\"text\":\"x\"}}\n";
+        let deleted = concat!(
+            "{\"resourceType\":\"Patient\",\"id\":\"p1\"}\n",
+            "{\"resourceType\":\"Patient\",\"id\":\"p2\"}\n",
+            // Never existed: its delete fails and is not reported.
+            "{\"resourceType\":\"Patient\",\"id\":\"missing\"}\n"
+        );
+        let mut files = std::collections::HashMap::new();
+        files.insert(
+            "http://provider/patient.ndjson".to_string(),
+            patients.as_bytes().to_vec(),
+        );
+        files.insert(
+            "http://provider/observation.ndjson".to_string(),
+            observations.as_bytes().to_vec(),
+        );
+        files.insert(
+            "http://provider/deleted.ndjson".to_string(),
+            deleted.as_bytes().to_vec(),
+        );
+        let fetcher = Arc::new(MockFetcher {
+            files,
+            manifest: RemoteManifest {
+                requires_access_token: false,
+                output: vec![
+                    RemoteFile {
+                        resource_type: Some("Patient".to_string()),
+                        url: "http://provider/patient.ndjson".to_string(),
+                        count: Some(4),
+                    },
+                    RemoteFile {
+                        resource_type: Some("Observation".to_string()),
+                        url: "http://provider/observation.ndjson".to_string(),
+                        count: Some(1),
+                    },
+                ],
+                deleted: vec![RemoteFile {
+                    resource_type: None,
+                    url: "http://provider/deleted.ndjson".to_string(),
+                    count: None,
+                }],
+            },
+        });
+
+        let hook = Arc::new(MockImportedHook::default());
+        let worker = DefaultSubmitWorker::new(
+            backend.clone(),
+            fetcher,
+            output,
+            WorkerId::new("test-worker"),
+        )
+        .with_imported_resources_hook(Some(hook.clone()));
+
+        let lease = backend
+            .claim_next_manifest(&WorkerId::new("test-worker"), StdDuration::from_secs(60))
+            .await
+            .unwrap()
+            .expect("claimable manifest");
+        worker.run_job(lease).await.unwrap();
+
+        let mut imported = hook.imported.lock().unwrap().clone();
+        imported.sort();
+        assert_eq!(
+            imported,
+            vec![
+                ("t1".to_string(), "Observation".to_string(), 1, 0),
+                ("t1".to_string(), "Patient".to_string(), 3, 0),
+            ],
+            "one call per file, with that file's committed successes"
+        );
+        assert_eq!(
+            *hook.deleted.lock().unwrap(),
+            vec![("t1".to_string(), "Patient".to_string(), 2)],
+            "only deletions that removed a live resource are reported"
+        );
     }
 
     /// A minimal secondary that rejects `create`/`create_many` for one

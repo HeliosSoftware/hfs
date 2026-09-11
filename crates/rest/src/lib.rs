@@ -596,13 +596,22 @@ where
     // and bulk-submit job counts when those subsystems are wired, without
     // depending on the persistence layer. Storage-agnostic consumers read it
     // via `helios_observability::dashboard::snapshot()`.
-    helios_observability::dashboard::set_provider(Arc::new(
+    let dashboard_provider = Arc::new(
         dashboard::StorageDashboardProvider::new(Arc::clone(&storage_arc), &config)
             .with_job_stores(
                 bulk_export.as_ref().map(|b| Arc::clone(&b.jobs)),
                 bulk_submit.as_ref().map(|b| Arc::clone(&b.jobs)),
             ),
-    ));
+    );
+    helios_observability::dashboard::set_provider(dashboard_provider.clone());
+    // The provider serves seeded tenants from the in-memory write counters
+    // (#1078); this background task seeds the default tenant at startup and
+    // periodically reconciles the counters with storage, backing off while a
+    // bulk submit is active. It holds only a weak reference, so it stops once
+    // a later `build_app` replaces this provider (see
+    // `dashboard::spawn_reconcile_loop`). Skipped outside a Tokio runtime.
+    let _ = dashboard::spawn_reconcile_loop(&dashboard_provider);
+    drop(dashboard_provider);
 
     let (app_audit_sink, app_audit_source_observer) = audit_state
         .as_ref()

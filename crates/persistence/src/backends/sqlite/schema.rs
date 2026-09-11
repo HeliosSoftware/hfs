@@ -10,7 +10,7 @@ use crate::core::bulk_submit_legacy::{
 use crate::error::StorageResult;
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 27;
+pub const SCHEMA_VERSION: i32 = 28;
 
 /// Initialize the database schema.
 pub fn initialize_schema(conn: &Connection) -> StorageResult<()> {
@@ -220,7 +220,21 @@ fn create_indexes(conn: &Connection) -> StorageResult<()> {
         "CREATE INDEX IF NOT EXISTS idx_resources_live_type ON resources(tenant_id, is_deleted, resource_type)",
         // History table indexes
         "CREATE INDEX IF NOT EXISTS idx_history_resource ON resource_history(tenant_id, resource_type, id)",
+        // `idx_history_updated` serves the tenant-wide `last_updated` range
+        // scans (system `_history` `_since`/`_at`, the activity histogram);
+        // those never filter on `resource_type`, so it stays.
         "CREATE INDEX IF NOT EXISTS idx_history_updated ON resource_history(tenant_id, last_updated)",
+        // Covering index for the dashboard's per-type delta query
+        // (`count_deltas_by_bucket`, schema v28, #1078). With only
+        // `idx_history_updated` available, each per-type query walked every
+        // history row in the window across *all* types and fetched each one
+        // from the table to test `resource_type` — millions of row visits per
+        // type during an import. Here `tenant_id` and `resource_type` are
+        // equality-matched, `last_updated` is the range bound (and the input
+        // to the bucket `strftime`), and `is_deleted`/`version_id` are the
+        // only other columns the delta `CASE` reads, so the query is answered
+        // from the index alone.
+        "CREATE INDEX IF NOT EXISTS idx_history_type_updated ON resource_history(tenant_id, resource_type, last_updated, is_deleted, version_id)",
         // Search index indexes
         "CREATE INDEX IF NOT EXISTS idx_search_string ON search_index(tenant_id, resource_type, param_name, value_string) WHERE value_string IS NOT NULL",
         "CREATE INDEX IF NOT EXISTS idx_search_token ON search_index(tenant_id, resource_type, param_name, value_token_system, value_token_code) WHERE value_token_system IS NOT NULL OR value_token_code IS NOT NULL",
@@ -328,6 +342,7 @@ fn migrate_schema(conn: &Connection, from_version: i32) -> StorageResult<()> {
             24 => migrate_v24_to_v25(conn)?,
             25 => migrate_v25_to_v26(conn)?,
             26 => migrate_v26_to_v27(conn)?,
+            27 => migrate_v27_to_v28(conn)?,
             _ => {
                 return Err(crate::error::StorageError::Backend(
                     crate::error::BackendError::Internal {
@@ -2079,6 +2094,37 @@ fn migrate_v26_to_v27(conn: &Connection) -> StorageResult<()> {
     Ok(())
 }
 
+/// v27 -> v28: covering index for the dashboard's per-type history deltas
+/// (#1078).
+///
+/// `count_deltas_by_bucket` filters `resource_history` on
+/// `tenant_id = ? AND resource_type = ? AND last_updated >= ?` and reads only
+/// `last_updated`, `is_deleted` and `version_id`. The sole range index,
+/// `idx_history_updated (tenant_id, last_updated)`, has no `resource_type`, so
+/// every per-type query walked the whole window's history across all types and
+/// visited each row in the table — millions of rows per type while an import
+/// is running, which made the dashboard's 1h FHIR-resources panel crawl.
+/// `idx_history_type_updated` puts both equality columns first, then the range
+/// column, then the two columns the delta `CASE` reads, so the query is a
+/// bounded seek over a covering index. `idx_history_updated` is kept: system
+/// history and the activity histogram range over `last_updated` without a
+/// `resource_type`.
+///
+/// Honest note on the cost of this migration: the index is built once, at the
+/// startup that performs the upgrade, which means a full scan of
+/// `resource_history` plus a b-tree build (and transient disk for the sort).
+/// On a very large database that can take a while before the server begins
+/// serving. It is a one-off cost — subsequent startups skip this migration.
+fn migrate_v27_to_v28(conn: &Connection) -> StorageResult<()> {
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_history_type_updated
+         ON resource_history(tenant_id, resource_type, last_updated, is_deleted, version_id)",
+        [],
+    )
+    .map_err(|e| migration_err(format!("v28 create idx_history_type_updated: {e}")))?;
+    Ok(())
+}
+
 /// Drop all tables (for testing).
 #[cfg(test)]
 #[allow(dead_code)]
@@ -2680,6 +2726,192 @@ mod tests {
             index_columns(&fresh, "idx_resources_live_type"),
             "the migrated index must match the one a fresh database creates"
         );
+    }
+
+    /// `PRAGMA index_info` returns one row per indexed column, in index order
+    /// (seqno, cid, name).
+    fn index_columns_of(conn: &Connection, name: &str) -> Vec<String> {
+        let mut stmt = conn
+            .prepare(&format!("PRAGMA index_info({name})"))
+            .unwrap_or_else(|e| panic!("index_info({name}): {e}"));
+        stmt.query_map([], |row| row.get::<_, String>(2))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect()
+    }
+
+    fn index_exists(conn: &Connection, name: &str) -> bool {
+        conn.query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='index' AND name=?1",
+            [name],
+            |_| Ok(true),
+        )
+        .unwrap_or(false)
+    }
+
+    /// #1078: the dashboard's per-type history deltas must seek on
+    /// `(tenant_id, resource_type)` and be answered from the index alone.
+    /// `idx_history_updated (tenant_id, last_updated)` has no `resource_type`,
+    /// so each per-type query walked every history row of the window across
+    /// all types. The column order is asserted exactly: equality columns
+    /// first, then the range column, then the columns the delta `CASE` reads.
+    #[test]
+    fn resource_history_carries_the_type_updated_covering_index_in_order() {
+        let expected: Vec<String> = [
+            "tenant_id",
+            "resource_type",
+            "last_updated",
+            "is_deleted",
+            "version_id",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+
+        // A fresh database gets the index from `create_indexes`.
+        let fresh = Connection::open_in_memory().unwrap();
+        initialize_schema(&fresh).unwrap();
+        assert!(get_schema_version(&fresh).unwrap() >= 28);
+        assert!(
+            index_exists(&fresh, "idx_history_type_updated"),
+            "a fresh database must carry idx_history_type_updated"
+        );
+        assert_eq!(
+            index_columns_of(&fresh, "idx_history_type_updated"),
+            expected,
+            "equality columns, then the range column, then the CASE inputs"
+        );
+        // The tenant-wide range index still serves system history.
+        assert!(index_exists(&fresh, "idx_history_updated"));
+
+        // A genuine v27-era database: everything current except the v28 index.
+        let v27 = Connection::open_in_memory().unwrap();
+        initialize_schema(&v27).unwrap();
+        v27.execute("DROP INDEX idx_history_type_updated", [])
+            .unwrap();
+        set_schema_version(&v27, 27).unwrap();
+        assert!(!index_exists(&v27, "idx_history_type_updated"));
+
+        // The same entry point the server uses on an existing database.
+        initialize_schema(&v27).unwrap();
+        assert_eq!(get_schema_version(&v27).unwrap(), SCHEMA_VERSION);
+        assert!(
+            index_exists(&v27, "idx_history_type_updated"),
+            "the v27 -> v28 migration must create idx_history_type_updated"
+        );
+        assert_eq!(
+            index_columns_of(&v27, "idx_history_type_updated"),
+            expected,
+            "the migrated index must match the one a fresh database creates"
+        );
+
+        // Idempotent: re-running the step (a pre-release build may already
+        // have stamped the index) and re-initializing are both no-ops.
+        migrate_v27_to_v28(&v27).unwrap();
+        set_schema_version(&v27, 27).unwrap();
+        initialize_schema(&v27).unwrap();
+        initialize_schema(&v27).unwrap();
+        assert_eq!(get_schema_version(&v27).unwrap(), SCHEMA_VERSION);
+        let count: i64 = v27
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type='index' AND name='idx_history_type_updated'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(index_columns_of(&v27, "idx_history_type_updated"), expected);
+    }
+
+    /// #1078: the planner must actually pick the covering index for the exact
+    /// SQL shape `SqliteBackend::count_deltas_by_bucket` runs — an index that
+    /// exists but loses to `idx_history_updated` (or the primary key) would
+    /// pass every functional test while leaving the dashboard slow. Checked
+    /// both with SQLite's default heuristics (the server never runs ANALYZE)
+    /// and after ANALYZE over a mixed-type corpus.
+    #[test]
+    fn count_deltas_by_bucket_query_uses_the_covering_history_index() {
+        // Keep in sync with `count_deltas_by_bucket` in `storage.rs`.
+        const DELTA_SQL: &str = "SELECT (CAST(strftime('%s', last_updated) AS INTEGER) / ?4) * ?4 AS bucket, \
+                    SUM(CASE WHEN is_deleted = 1 THEN -1 \
+                             WHEN version_id = '1' THEN 1 \
+                             ELSE 0 END) AS delta \
+             FROM resource_history \
+             WHERE tenant_id = ?1 AND resource_type = ?2 AND last_updated >= ?3 \
+             GROUP BY bucket HAVING delta != 0 ORDER BY bucket";
+
+        let plan = |conn: &Connection| -> Vec<String> {
+            let mut stmt = conn
+                .prepare(&format!("EXPLAIN QUERY PLAN {DELTA_SQL}"))
+                .unwrap();
+            stmt.query_map(
+                rusqlite::params!["t1", "Patient", "2026-01-01T00:00:00+00:00", 60],
+                |row| row.get::<_, String>(3),
+            )
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect()
+        };
+        let assert_covering = |details: &[String], when: &str| {
+            assert!(
+                details.iter().any(|d| d.contains("idx_history_type_updated")
+                    && d.contains("COVERING INDEX")),
+                "{when}: count_deltas_by_bucket must search resource_history using \
+                 COVERING INDEX idx_history_type_updated, got plan {details:?}"
+            );
+        };
+
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+        assert_covering(&plan(&conn), "empty table, default heuristics");
+
+        // A mixed corpus: several tenants and types, creations, updates and
+        // deletes spread over a few days.
+        {
+            let tx = conn.unchecked_transaction().unwrap();
+            let mut insert = tx
+                .prepare(
+                    "INSERT INTO resource_history
+                     (tenant_id, resource_type, id, version_id, data, last_updated, is_deleted)
+                     VALUES (?1, ?2, ?3, ?4, x'7b7d', ?5, ?6)",
+                )
+                .unwrap();
+            for tenant in ["t1", "t2"] {
+                for (t, rtype) in ["Patient", "Observation", "Encounter", "Condition"]
+                    .iter()
+                    .enumerate()
+                {
+                    for i in 0..200 {
+                        for version in 1..=((i % 3) + 1) {
+                            let ts = format!(
+                                "2026-01-{:02}T{:02}:{:02}:00+00:00",
+                                1 + (i % 5),
+                                (i + t) % 24,
+                                (i * 7 + version) % 60
+                            );
+                            let deleted = i % 3 == 2 && version == 3;
+                            insert
+                                .execute(rusqlite::params![
+                                    tenant,
+                                    rtype,
+                                    format!("{rtype}-{i}"),
+                                    version.to_string(),
+                                    ts,
+                                    deleted as i64
+                                ])
+                                .unwrap();
+                        }
+                    }
+                }
+            }
+            drop(insert);
+            tx.commit().unwrap();
+        }
+        assert_covering(&plan(&conn), "populated table, default heuristics");
+
+        conn.execute_batch("ANALYZE").unwrap();
+        assert_covering(&plan(&conn), "populated table after ANALYZE");
     }
 
     /// #967: the v23 mapping must exist and be backfilled from whatever FTS

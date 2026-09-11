@@ -257,6 +257,9 @@ where
             )
             .await?
     };
+    // A create — including the restore of a deleted resource, which storage
+    // reports as created — adds a live resource; a plain update does not.
+    super::dashboard_counts::upserted(tenant.context(), &resource_type, created);
 
     // Stored StructureDefinitions feed the tenant's profile registry.
     if resource_type == "StructureDefinition" {
@@ -423,6 +426,7 @@ where
             })
         }
         ConditionalUpdateResult::Created(stored) => {
+            super::dashboard_counts::created(tenant.context(), &resource_type);
             let headers = ResourceHeaders::from_stored(&stored, &state);
             let location =
                 state.public_url_for_request(&tenant, [stored.resource_type(), stored.id()]);
