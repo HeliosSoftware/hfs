@@ -349,7 +349,7 @@ async fn mongodb_comma_separated_date_values_are_ored() {
             .expect("seed patient");
     }
 
-    // One `birthdate` SearchParameter, `values.len() == values.len()`
+    // One `birthdate` SearchParameter carrying all the values
     // (a comma list), as opposed to `repeated_birthdate_query` below which
     // builds one SearchParameter per value.
     fn comma_birthdate_query(values: &[&str]) -> SearchQuery {
