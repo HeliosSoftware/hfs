@@ -3549,7 +3549,11 @@ async fn mongodb_integration_reindex_page_batches_index_writes() {
     let mut before_counts = Vec::with_capacity(page.len());
     for resource in &page {
         let count = search_index_entry_count(&backend, &tenant, "Patient", resource.id()).await;
-        assert!(count > 0, "resource {} should already be indexed", resource.id());
+        assert!(
+            count > 0,
+            "resource {} should already be indexed",
+            resource.id()
+        );
         before_counts.push(count);
     }
     let untouched_before =
@@ -3691,7 +3695,11 @@ async fn mongodb_integration_reindex_page_counts_contained_entries() {
     let outcomes = backend
         .write_search_entries_page(&tenant, std::slice::from_ref(&with_contained))
         .await;
-    assert_eq!(outcomes.len(), 1, "one outcome per resource, not per document");
+    assert_eq!(
+        outcomes.len(),
+        1,
+        "one outcome per resource, not per document"
+    );
     let reported = outcomes[0]
         .as_ref()
         .unwrap_or_else(|e| panic!("reindex failed: {e:?}"));
@@ -3733,8 +3741,7 @@ async fn mongodb_integration_reindex_page_is_a_no_op_when_search_offloaded() {
     use helios_persistence::search::ReindexTarget;
     use helios_persistence::types::StoredResource;
 
-    let Some(backend) =
-        create_backend_with_search_offloaded("reindex_page_offloaded", true).await
+    let Some(backend) = create_backend_with_search_offloaded("reindex_page_offloaded", true).await
     else {
         eprintln!(
             "Skipping mongodb_integration_reindex_page_is_a_no_op_when_search_offloaded (requires Docker or HFS_TEST_MONGODB_URL)"

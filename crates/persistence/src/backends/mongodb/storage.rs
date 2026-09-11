@@ -4259,7 +4259,8 @@ impl ReindexTarget for MongoBackend {
         // SEARCH_INDEX_INSERT_CHUNK, tracking which resource each document
         // belongs to so an unordered write error attributes back to just
         // that resource instead of failing the whole page.
-        let mut owners: Vec<usize> = Vec::with_capacity(prepared.iter().map(|p| p.docs.len()).sum());
+        let mut owners: Vec<usize> =
+            Vec::with_capacity(prepared.iter().map(|p| p.docs.len()).sum());
         let mut all_docs: Vec<Document> = Vec::with_capacity(owners.capacity());
         for (i, p) in prepared.iter().enumerate() {
             for d in &p.docs {
