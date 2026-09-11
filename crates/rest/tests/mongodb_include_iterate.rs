@@ -41,7 +41,9 @@ mod mongodb_include_iterate_tests {
 
     struct SharedMongo {
         connection_string: String,
-        _container: testcontainers::ContainerAsync<Mongo>,
+        /// `None` when `HFS_TEST_MONGODB_URL` pointed us at an instance we do
+        /// not own, so there is nothing to tear down.
+        _container: Option<testcontainers::ContainerAsync<Mongo>>,
     }
 
     static SHARED_MONGO: OnceCell<Option<SharedMongo>> = OnceCell::const_new();
@@ -49,6 +51,20 @@ mod mongodb_include_iterate_tests {
     async fn shared_mongo() -> Option<&'static SharedMongo> {
         SHARED_MONGO
             .get_or_init(|| async {
+                // Prefer an instance the caller already has, matching the
+                // contract the persistence suite documents. Starting a
+                // container per test binary is how this machine accumulated
+                // orphaned mongo containers; honouring the variable lets a
+                // developer or CI lane point every suite at one server.
+                if let Ok(url) = std::env::var("HFS_TEST_MONGODB_URL") {
+                    if !url.trim().is_empty() {
+                        return Some(SharedMongo {
+                            connection_string: url,
+                            _container: None,
+                        });
+                    }
+                }
+
                 let run_id = std::env::var("GITHUB_RUN_ID").unwrap_or_default();
                 let container = Mongo::default()
                     .with_label("github.run_id", &run_id)
@@ -60,7 +76,7 @@ mod mongodb_include_iterate_tests {
                 let host = container.get_host().await.ok()?.to_string();
                 Some(SharedMongo {
                     connection_string: format!("mongodb://{host}:{port}"),
-                    _container: container,
+                    _container: Some(container),
                 })
             })
             .await

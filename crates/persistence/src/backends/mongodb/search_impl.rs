@@ -1946,6 +1946,7 @@ impl IncludeProvider for MongoBackend {
                     .unwrap_or_else(FhirVersion::default_enabled),
                 limit,
                 &truncated_labels.join(","),
+                "increase HFS_MONGODB_MAX_INCLUDED_RESOURCES to raise the limit",
             ));
         }
 
@@ -2062,6 +2063,7 @@ impl RevincludeProvider for MongoBackend {
                     .unwrap_or_else(FhirVersion::default_enabled),
                 limit,
                 &truncated_labels.join(","),
+                "increase HFS_MONGODB_MAX_INCLUDED_RESOURCES to raise the limit",
             ));
         }
 

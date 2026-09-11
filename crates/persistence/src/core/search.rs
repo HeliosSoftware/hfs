@@ -43,11 +43,19 @@ pub const INCLUDE_TRUNCATION_OUTCOME_ID: &str = "hfs-include-truncated";
 /// `directive_label` should name the directive that was truncated (e.g.
 /// `"_revinclude=Observation:subject"`) so the diagnostics text is
 /// actionable; `limit` is the resource-count cap that was hit.
+///
+/// `remedy` names what the operator can actually do about it, and is supplied
+/// by the caller because the cap has more than one source: a backend's own
+/// configurable limit, or the fixed [`MAX_ITERATE_INCLUDED`] bound on the
+/// `:iterate` continuation, which applies to every backend. Naming one
+/// backend's environment variable here would misdirect callers of the other
+/// path.
 pub fn include_truncation_outcome(
     tenant: &TenantContext,
     fhir_version: FhirVersion,
     limit: usize,
     directive_label: &str,
+    remedy: &str,
 ) -> StoredResource {
     let now = chrono::Utc::now();
     let content = serde_json::json!({
@@ -57,7 +65,7 @@ pub fn include_truncation_outcome(
             "code": "incomplete",
             "diagnostics": format!(
                 "included resources for '{directive_label}' were truncated at {limit} \
-                 resources; increase HFS_MONGODB_MAX_INCLUDED_RESOURCES to raise the limit"
+                 resources; {remedy}"
             ),
         }]
     });
@@ -760,6 +768,7 @@ where
             fhir_version,
             max_included,
             &label,
+            "the _include:iterate expansion limit is fixed and not configurable",
         ));
     }
 
@@ -1134,6 +1143,7 @@ mod tests {
             FhirVersion::default(),
             5,
             "_revinclude=Observation:subject",
+            "increase the limit",
         );
         assert!(is_include_truncation_marker(&marker));
         assert!(!is_include_truncation_marker(&patient));
