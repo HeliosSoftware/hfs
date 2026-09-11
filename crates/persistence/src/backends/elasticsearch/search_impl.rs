@@ -16,8 +16,8 @@ use crate::core::search::{
 use crate::error::{BackendError, StorageResult};
 use crate::tenant::TenantContext;
 use crate::types::{
-    CursorValue, IncludeDirective, Page, PageCursor, PageInfo, Pagination, SearchQuery,
-    StoredResource,
+    CursorDirection, CursorValue, IncludeDirective, Page, PageCursor, PageInfo, Pagination,
+    SearchQuery, StoredResource,
 };
 
 use super::backend::ElasticsearchBackend;
@@ -206,6 +206,50 @@ async fn send_search_with_retry(
     )
 }
 
+/// Converts an Elasticsearch hit's `sort` array into cursor values, dropping
+/// the trailing tie-breaker (the resource id the query builder appends to
+/// every sort for deterministic ordering). The remaining values are mapped
+/// to the matching [`CursorValue`] variant so the cursor can be replayed
+/// against a future search without re-deriving them from the stored
+/// resource.
+fn cursor_values_from_sort(sort_values: &[Value]) -> Vec<CursorValue> {
+    sort_values
+        .iter()
+        .take(sort_values.len().saturating_sub(1))
+        .map(|v| {
+            if let Some(s) = v.as_str() {
+                CursorValue::String(s.to_string())
+            } else if let Some(n) = v.as_i64() {
+                CursorValue::Number(n)
+            } else if let Some(b) = v.as_bool() {
+                CursorValue::Boolean(b)
+            } else if v.is_null() {
+                CursorValue::Null
+            } else {
+                CursorValue::String(v.to_string())
+            }
+        })
+        .collect()
+}
+
+/// Builds an opaque page cursor pointing at `resource`, or `None` if the hit
+/// carried no `sort` values (e.g. the query had no explicit or default sort
+/// applied to it). `direction` selects whether the cursor should be replayed
+/// as `Next` (walk forward from this resource) or `Previous` (walk backward
+/// from this resource).
+fn page_cursor_for(
+    resource: &StoredResource,
+    sort_values: Option<&Vec<Value>>,
+    direction: CursorDirection,
+) -> Option<String> {
+    let values = cursor_values_from_sort(sort_values?);
+    let cursor = match direction {
+        CursorDirection::Next => PageCursor::new(values, resource.id()),
+        CursorDirection::Previous => PageCursor::previous(values, resource.id()),
+    };
+    Some(cursor.encode())
+}
+
 #[async_trait]
 impl SearchProvider for ElasticsearchBackend {
     async fn search(
@@ -250,10 +294,8 @@ impl SearchProvider for ElasticsearchBackend {
 
         let count = query.count.unwrap_or(20) as usize;
 
-        let mut resources = Vec::new();
+        let mut hits_with_sort: Vec<(StoredResource, Option<Vec<Value>>)> = Vec::new();
         let mut scores: HashMap<String, f64> = HashMap::new();
-        let mut last_sort: Option<Vec<Value>> = None;
-        let mut last_resource_id = String::new();
 
         for hit in &hits {
             let source = match hit.get("_source") {
@@ -277,52 +319,85 @@ impl SearchProvider for ElasticsearchBackend {
                 if let Some(score) = hit.get("_score").and_then(|s| s.as_f64()) {
                     scores.insert(stored.url(), score);
                 }
-                last_resource_id = stored.id().to_string();
-                resources.push(stored);
-            }
-
-            // Track sort values for cursor
-            if let Some(sort) = hit.get("sort") {
-                last_sort = sort.as_array().cloned();
+                let sort_values = hit.get("sort").and_then(Value::as_array).cloned();
+                hits_with_sort.push((stored, sort_values));
             }
         }
 
-        // Determine pagination
-        let has_next = resources.len() >= count;
-        let next_cursor = if has_next {
-            last_sort.as_ref().map(|sort_values| {
-                let cursor_values: Vec<CursorValue> = sort_values
-                    .iter()
-                    .take(sort_values.len().saturating_sub(1)) // exclude tie-breaker
-                    .map(|v| {
-                        if let Some(s) = v.as_str() {
-                            CursorValue::String(s.to_string())
-                        } else if let Some(n) = v.as_i64() {
-                            CursorValue::Number(n)
-                        } else if let Some(b) = v.as_bool() {
-                            CursorValue::Boolean(b)
-                        } else if v.is_null() {
-                            CursorValue::Null
-                        } else {
-                            CursorValue::String(v.to_string())
-                        }
+        // A `Previous` cursor asks the query builder for the reversed sort order
+        // (T1) plus one extra hit (`count + 1`), so `hits_with_sort` here arrives
+        // in reverse result order and may be one item longer than the requested
+        // page. That extra hit is the farthest one from the cursor — it belongs
+        // to the page *before* the one we return, not to this page — so it must
+        // be dropped with `truncate` before we `reverse()` back into normal
+        // query order. See #1015.
+        let backward = query
+            .cursor
+            .as_deref()
+            .and_then(|c| PageCursor::decode(c).ok())
+            .is_some_and(|c| c.direction() == CursorDirection::Previous);
+
+        let page_info = if backward {
+            let has_previous = hits_with_sort.len() > count;
+            if has_previous {
+                hits_with_sort.truncate(count);
+            }
+            hits_with_sort.reverse();
+
+            if hits_with_sort.is_empty() {
+                PageInfo {
+                    next_cursor: None,
+                    previous_cursor: None,
+                    total,
+                    has_next: false,
+                    has_previous: false,
+                }
+            } else {
+                let next_cursor = hits_with_sort
+                    .last()
+                    .and_then(|(r, s)| page_cursor_for(r, s.as_ref(), CursorDirection::Next));
+                let previous_cursor = if has_previous {
+                    hits_with_sort.first().and_then(|(r, s)| {
+                        page_cursor_for(r, s.as_ref(), CursorDirection::Previous)
                     })
-                    .collect();
-
-                PageCursor::new(cursor_values, &last_resource_id).encode()
-            })
+                } else {
+                    None
+                };
+                PageInfo {
+                    next_cursor,
+                    previous_cursor,
+                    total,
+                    has_next: true,
+                    has_previous,
+                }
+            }
         } else {
-            None
+            let has_next = hits_with_sort.len() >= count;
+            let has_previous = query.cursor.is_some() || query.offset.unwrap_or(0) > 0;
+            let next_cursor = if has_next {
+                hits_with_sort
+                    .last()
+                    .and_then(|(r, s)| page_cursor_for(r, s.as_ref(), CursorDirection::Next))
+            } else {
+                None
+            };
+            let previous_cursor = if has_previous {
+                hits_with_sort
+                    .first()
+                    .and_then(|(r, s)| page_cursor_for(r, s.as_ref(), CursorDirection::Previous))
+            } else {
+                None
+            };
+            PageInfo {
+                next_cursor,
+                previous_cursor,
+                total,
+                has_next,
+                has_previous,
+            }
         };
 
-        let page_info = PageInfo {
-            next_cursor,
-            previous_cursor: None,
-            total,
-            has_next,
-            has_previous: query.cursor.is_some() || query.offset.unwrap_or(0) > 0,
-        };
-
+        let resources: Vec<StoredResource> = hits_with_sort.into_iter().map(|(r, _)| r).collect();
         let page = Page::new(resources, page_info);
         let mut result = SearchResult::new(page);
 
@@ -775,5 +850,24 @@ mod tests {
             r#"{"error":{"type":"illegal_argument_exception"}}"#
         ));
         assert!(!is_transient_es_error(404, "index_not_found_exception"));
+    }
+
+    #[test]
+    fn cursor_values_from_sort_drops_tie_breaker_and_maps_types() {
+        let sort_values = vec![
+            json!(1700),
+            json!("x"),
+            json!(true),
+            Value::Null,
+            json!("p-1"),
+        ];
+
+        let cursor_values = cursor_values_from_sort(&sort_values);
+
+        assert_eq!(cursor_values.len(), 4);
+        assert!(matches!(cursor_values[0], CursorValue::Number(1700)));
+        assert!(matches!(&cursor_values[1], CursorValue::String(s) if s == "x"));
+        assert!(matches!(cursor_values[2], CursorValue::Boolean(true)));
+        assert!(matches!(cursor_values[3], CursorValue::Null));
     }
 }

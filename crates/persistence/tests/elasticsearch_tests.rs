@@ -3974,6 +3974,215 @@ mod es_integration {
     }
 
     // ========================================================================
+    // Cursor Pagination Tests (#1015)
+    // ========================================================================
+
+    /// Creates Patients `cp-1..cp-n` (inclusive) in the given tenant.
+    async fn create_cursor_paging_patients(
+        backend: &ElasticsearchBackend,
+        tenant: &TenantContext,
+        n: u32,
+    ) {
+        for i in 1..=n {
+            backend
+                .create(
+                    tenant,
+                    "Patient",
+                    json!({
+                        "resourceType": "Patient",
+                        "id": format!("cp-{i}"),
+                        "name": [{"family": "CursorPaging"}]
+                    }),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+    }
+
+    /// Collects the resource ids of a search result's page, in page order.
+    fn page_ids(result: &helios_persistence::core::SearchResult) -> Vec<String> {
+        result
+            .resources
+            .items
+            .iter()
+            .map(|r| r.id().to_string())
+            .collect()
+    }
+
+    /// Walks forward through 7 Patients 3 at a time (no explicit `_sort`),
+    /// then walks all the way back via `previous_cursor` and confirms every
+    /// page is reproduced exactly, including the page-3-to-page-2 hop that a
+    /// naive truncate-after-reverse implementation gets wrong (#1015).
+    #[tokio::test]
+    async fn es_integration_cursor_paging_round_trip_previous() {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::types::SearchQuery;
+
+        let backend = create_backend_with("1ms", WriteRefreshPolicy::WaitFor).await;
+        let tenant = create_tenant("cursor-prev");
+        create_cursor_paging_patients(&backend, &tenant, 7).await;
+
+        let query = SearchQuery::new("Patient").with_count(3);
+
+        let page1 = backend.search(&tenant, &query).await.unwrap();
+        assert_eq!(page1.resources.items.len(), 3);
+        assert!(!page1.resources.page_info.has_previous);
+        assert!(page1.resources.page_info.previous_cursor.is_none());
+        assert!(page1.resources.page_info.has_next);
+        assert!(page1.resources.page_info.next_cursor.is_some());
+
+        let page2 = backend
+            .search(
+                &tenant,
+                &query
+                    .clone()
+                    .with_cursor(page1.resources.page_info.next_cursor.clone().unwrap()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(page2.resources.items.len(), 3);
+        assert!(page2.resources.page_info.has_previous);
+        assert!(page2.resources.page_info.previous_cursor.is_some());
+        assert!(page2.resources.page_info.has_next);
+
+        let page3 = backend
+            .search(
+                &tenant,
+                &query
+                    .clone()
+                    .with_cursor(page2.resources.page_info.next_cursor.clone().unwrap()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(page3.resources.items.len(), 1);
+        assert!(!page3.resources.page_info.has_next);
+        assert!(page3.resources.page_info.next_cursor.is_none());
+        assert!(page3.resources.page_info.previous_cursor.is_some());
+
+        let page1_ids = page_ids(&page1);
+        let page2_ids = page_ids(&page2);
+        let page3_ids = page_ids(&page3);
+        let mut all_ids = page1_ids.clone();
+        all_ids.extend(page2_ids.clone());
+        all_ids.extend(page3_ids.clone());
+        let mut unique_ids = all_ids.clone();
+        unique_ids.sort();
+        unique_ids.dedup();
+        assert_eq!(unique_ids.len(), 7, "all 7 ids must be distinct");
+
+        // Walk back: page 3 -> page 2 must be exact, including order. This is
+        // the case a naive truncate-after-reverse gets wrong: it drops the
+        // nearest hit instead of the farthest one.
+        let back2 = backend
+            .search(
+                &tenant,
+                &query
+                    .clone()
+                    .with_cursor(page3.resources.page_info.previous_cursor.clone().unwrap()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(page_ids(&back2), page2_ids);
+        assert!(back2.resources.page_info.has_previous);
+        assert!(back2.resources.page_info.has_next);
+        assert!(back2.resources.page_info.next_cursor.is_some());
+
+        let back1 = backend
+            .search(
+                &tenant,
+                &query
+                    .clone()
+                    .with_cursor(back2.resources.page_info.previous_cursor.clone().unwrap()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(page_ids(&back1), page1_ids);
+        assert!(!back1.resources.page_info.has_previous);
+        assert!(back1.resources.page_info.previous_cursor.is_none());
+        assert!(back1.resources.page_info.has_next);
+
+        let again2 = backend
+            .search(
+                &tenant,
+                &query
+                    .clone()
+                    .with_cursor(back1.resources.page_info.next_cursor.clone().unwrap()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(page_ids(&again2), page2_ids);
+    }
+
+    /// Same round trip, but with an explicit `_sort=_id` ascending so the
+    /// exact page contents (not just their distinctness) can be asserted.
+    #[tokio::test]
+    async fn es_integration_cursor_paging_round_trip_previous_with_sort() {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::types::{SearchQuery, SortDirection, SortDirective};
+
+        let backend = create_backend_with("1ms", WriteRefreshPolicy::WaitFor).await;
+        let tenant = create_tenant("cursor-prev-sort");
+        create_cursor_paging_patients(&backend, &tenant, 7).await;
+
+        let query = SearchQuery::new("Patient")
+            .with_count(3)
+            .with_sort(SortDirective {
+                parameter: "_id".to_string(),
+                direction: SortDirection::Ascending,
+                param_type: None,
+            });
+
+        let page1 = backend.search(&tenant, &query).await.unwrap();
+        assert_eq!(page_ids(&page1), vec!["cp-1", "cp-2", "cp-3"]);
+
+        let page2 = backend
+            .search(
+                &tenant,
+                &query
+                    .clone()
+                    .with_cursor(page1.resources.page_info.next_cursor.clone().unwrap()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(page_ids(&page2), vec!["cp-4", "cp-5", "cp-6"]);
+
+        let page3 = backend
+            .search(
+                &tenant,
+                &query
+                    .clone()
+                    .with_cursor(page2.resources.page_info.next_cursor.clone().unwrap()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(page_ids(&page3), vec!["cp-7"]);
+
+        let back2 = backend
+            .search(
+                &tenant,
+                &query
+                    .clone()
+                    .with_cursor(page3.resources.page_info.previous_cursor.clone().unwrap()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(page_ids(&back2), vec!["cp-4", "cp-5", "cp-6"]);
+
+        let back1 = backend
+            .search(
+                &tenant,
+                &query
+                    .clone()
+                    .with_cursor(back2.resources.page_info.previous_cursor.clone().unwrap()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(page_ids(&back1), vec!["cp-1", "cp-2", "cp-3"]);
+        assert!(back1.resources.page_info.previous_cursor.is_none());
+    }
+
+    // ========================================================================
     // Backend Info Tests
     // ========================================================================
 

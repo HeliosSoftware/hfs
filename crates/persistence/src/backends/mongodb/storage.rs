@@ -8,7 +8,7 @@ use helios_fhir::FhirVersion;
 use mongodb::{
     ClientSession, Collection, Cursor, SessionCursor,
     bson::{self, Bson, DateTime as BsonDateTime, Document, doc},
-    error::Error as MongoError,
+    error::{Error as MongoError, ErrorKind as MongoErrorKind},
     options::FindOptions,
 };
 use serde_json::Value;
@@ -1895,16 +1895,44 @@ impl MongoBackend {
         resource_id: &str,
         resource: &Value,
     ) -> Vec<Document> {
-        let mut index_docs = match self
+        self.search_index_documents_checked(tenant_id, resource_type, resource_id, resource)
+            .0
+    }
+
+    /// [`Self::search_index_documents`], plus the extraction failure message
+    /// (if any) that made this resource fall back to minimal index rows.
+    ///
+    /// Used by [`ReindexTarget::write_search_entries_page`] so a page can
+    /// still write every resource's fallback rows (matching what
+    /// [`Self::index_resource`] already does for a single resource) while
+    /// still reporting that resource as failed — the way the old, per-resource
+    /// `write_search_entries` always did — instead of a batched rewrite
+    /// silently turning a corrupt resource into a quiet `Ok`.
+    pub(super) fn search_index_documents_checked(
+        &self,
+        tenant_id: &str,
+        resource_type: &str,
+        resource_id: &str,
+        resource: &Value,
+    ) -> (Vec<Document>, Option<String>) {
+        let (mut index_docs, failure) = match self
             .tenant_extractor(tenant_id)
             .extract(resource, resource_type)
         {
-            Ok(values) => values
-                .iter()
-                .filter_map(|value| {
-                    self.build_search_index_document(tenant_id, resource_type, resource_id, value)
-                })
-                .collect::<Vec<_>>(),
+            Ok(values) => (
+                values
+                    .iter()
+                    .filter_map(|value| {
+                        self.build_search_index_document(
+                            tenant_id,
+                            resource_type,
+                            resource_id,
+                            value,
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+                None,
+            ),
             Err(e) => {
                 tracing::warn!(
                     "Search extraction failed for {}/{}: {}. Using minimal fallback index values.",
@@ -1912,11 +1940,14 @@ impl MongoBackend {
                     resource_id,
                     e
                 );
-                self.index_minimal_fallback_documents(
-                    tenant_id,
-                    resource_type,
-                    resource_id,
-                    resource,
+                (
+                    self.index_minimal_fallback_documents(
+                        tenant_id,
+                        resource_type,
+                        resource_id,
+                        resource,
+                    ),
+                    Some(format!("Search parameter extraction failed: {e}")),
                 )
             }
         };
@@ -1941,7 +1972,7 @@ impl MongoBackend {
             }
         }
 
-        index_docs
+        (index_docs, failure)
     }
 
     pub(crate) async fn index_resource(
@@ -4078,31 +4109,15 @@ impl ReindexTarget for MongoBackend {
         tenant: &TenantContext,
         resource: &StoredResource,
     ) -> StorageResult<usize> {
-        if self.is_search_offloaded() {
-            return Ok(0);
-        }
-
-        let db = self.get_database().await?;
-        let mut no_session: Option<ClientSession> = None;
-
-        // Reuses the CRUD indexing path, so contained resources are indexed the
-        // same way here as they are on create/update.
-        self.index_resource(
-            &db,
-            tenant.tenant_id().as_str(),
-            resource.resource_type(),
-            resource.id(),
-            resource.content(),
-            &mut no_session,
-        )
-        .await?;
-
-        let values = self
-            .tenant_extractor(tenant.tenant_id().as_str())
-            .extract(resource.content(), resource.resource_type())
-            .map_err(|e| internal_error(format!("Search parameter extraction failed: {e}")))?;
-
-        Ok(values.len())
+        // Delegates to the page method (a slice of one) so the single-resource
+        // and batched-reindex paths write and count identically by
+        // construction, and so this no longer pays a redundant second
+        // `extract()` purely to compute a count (#1064) — a count that also
+        // omitted any `_contained` rows the write itself inserted.
+        self.write_search_entries_page(tenant, std::slice::from_ref(resource))
+            .await
+            .pop()
+            .unwrap_or(Ok(0))
     }
 
     async fn clear_search_index(&self, tenant: &TenantContext) -> StorageResult<u64> {
@@ -4119,7 +4134,197 @@ impl ReindexTarget for MongoBackend {
 
         Ok(result.deleted_count)
     }
+
+    /// Rebuilds a whole page in one `delete_many` plus one (possibly chunked)
+    /// `insert_many`, instead of the default's two `delete_many` plus one
+    /// `insert_many` PER RESOURCE — `delete_search_entries` above, then
+    /// `write_search_entries` -> `index_resource`'s own delete-then-insert
+    /// (#1064). For a 100-resource page that was 300 sequential round trips;
+    /// this is two (three only if a page mixes resource types, which no
+    /// production caller does — see the precondition below).
+    ///
+    /// Building every resource's documents through
+    /// [`Self::search_index_documents_checked`] keeps a rebuild and the CRUD
+    /// path (`index_resource`) indexing identically by construction, and
+    /// lets one resource's bad content fall back to minimal rows (as
+    /// `index_resource` already does) while still reporting that resource as
+    /// failed — mirroring what the old, per-resource `write_search_entries`
+    /// did, and what SQLite's `write_search_entries_on` and Elasticsearch's
+    /// override still do for the same case.
+    ///
+    /// The count each `Ok` reports is the number of documents actually
+    /// written for that resource, which — unlike the old
+    /// `write_search_entries`'s `extract(..).len()` — includes any
+    /// `_contained` rows. `$reindex-status.entries_created` will read higher
+    /// for corpora with `contained` resources as a result; this is a more
+    /// truthful count of what was written, and matches SQLite's
+    /// `write_search_entries_on` (which also adds `index_contained_resources`'
+    /// count).
+    ///
+    /// Precondition: `resources` must hold each `(resource_type, id)` at most
+    /// once. The one production caller, `fetch_resources_page`, reads the
+    /// current-resources collection keyset-ordered by `(last_updated, id)`
+    /// and cannot produce a duplicate; unlike Elasticsearch's `_id`-keyed
+    /// upsert, a repeated id here would double-insert, because the delete for
+    /// the whole page runs once, up front, rather than once per resource.
+    ///
+    /// A page-level failure — getting the database handle, the grouped
+    /// delete, or an insert error the driver does not attribute to a specific
+    /// document — fans out to every resource as the same `Err`, because in
+    /// that case nothing was written for anybody (mirroring SQLite's
+    /// BEGIN/COMMIT fan-out and Elasticsearch's `ensure_index` fan-out for the
+    /// same reason). An unordered `insert_many` write error IS attributed to
+    /// just the document(s) it names, via the same per-op index mapping the
+    /// batched bulk-submit ingest uses (`bulk_ingest.rs`'s create-batch path)
+    /// and that Elasticsearch's `send_bulk_index` uses for the same purpose.
+    async fn write_search_entries_page(
+        &self,
+        tenant: &TenantContext,
+        resources: &[StoredResource],
+    ) -> Vec<StorageResult<usize>> {
+        if resources.is_empty() {
+            return Vec::new();
+        }
+
+        // Honors `is_search_offloaded()`, matching the guards in
+        // `delete_search_entries` and `write_search_entries`/`clear_search_index`
+        // above: a search-offloaded backend keeps no index of its own and must
+        // issue no commands here.
+        if self.is_search_offloaded() {
+            return resources.iter().map(|_| Ok(0)).collect();
+        }
+
+        let db = match self.get_database().await {
+            Ok(db) => db,
+            Err(e) => {
+                let msg = e.to_string();
+                return resources
+                    .iter()
+                    .map(|_| Err(internal_error(msg.clone())))
+                    .collect();
+            }
+        };
+
+        let tenant_id = tenant.tenant_id().as_str();
+
+        struct Prepared {
+            docs: Vec<Document>,
+            failure: Option<String>,
+        }
+        let prepared: Vec<Prepared> = resources
+            .iter()
+            .map(|resource| {
+                let (docs, failure) = self.search_index_documents_checked(
+                    tenant_id,
+                    resource.resource_type(),
+                    resource.id(),
+                    resource.content(),
+                );
+                Prepared { docs, failure }
+            })
+            .collect();
+
+        let collection = db.collection::<Document>(MongoBackend::SEARCH_INDEX_COLLECTION);
+
+        // ONE delete per distinct resource_type in the page (a production
+        // page is single-type — `fetch_resources_page` filters on one type —
+        // so this is one command; grouping keeps a hypothetical
+        // heterogeneous slice correct too). A failure here means stale rows
+        // may remain for the whole page, so it fans out to every resource.
+        let mut ids_by_type: HashMap<&str, Vec<Bson>> = HashMap::new();
+        for resource in resources {
+            ids_by_type
+                .entry(resource.resource_type())
+                .or_default()
+                .push(Bson::from(resource.id()));
+        }
+        for (resource_type, ids) in ids_by_type {
+            if let Err(e) = collection
+                .delete_many(doc! {
+                    "tenant_id": tenant_id,
+                    "resource_type": resource_type,
+                    "resource_id": { "$in": ids },
+                })
+                .await
+            {
+                let msg = format!("Failed to delete search entries: {e}");
+                return resources
+                    .iter()
+                    .map(|_| Err(internal_error(msg.clone())))
+                    .collect();
+            }
+        }
+
+        // Flatten every resource's documents into one insert, chunked at
+        // SEARCH_INDEX_INSERT_CHUNK, tracking which resource each document
+        // belongs to so an unordered write error attributes back to just
+        // that resource instead of failing the whole page.
+        let mut owners: Vec<usize> =
+            Vec::with_capacity(prepared.iter().map(|p| p.docs.len()).sum());
+        let mut all_docs: Vec<Document> = Vec::with_capacity(owners.capacity());
+        for (i, p) in prepared.iter().enumerate() {
+            for d in &p.docs {
+                owners.push(i);
+                all_docs.push(d.clone());
+            }
+        }
+
+        let mut insert_failures: HashMap<usize, String> = HashMap::new();
+        let mut offset = 0usize;
+        for chunk in all_docs.chunks(SEARCH_INDEX_INSERT_CHUNK) {
+            match collection.insert_many(chunk).ordered(false).await {
+                Ok(_) => {}
+                Err(e) => match e.kind.as_ref() {
+                    MongoErrorKind::InsertMany(insert_many) => {
+                        let Some(write_errors) = insert_many.write_errors.as_ref() else {
+                            let msg = format!("Failed to insert search index entries: {e}");
+                            return resources
+                                .iter()
+                                .map(|_| Err(internal_error(msg.clone())))
+                                .collect();
+                        };
+                        for write_error in write_errors {
+                            let owner = owners[offset + write_error.index];
+                            insert_failures
+                                .entry(owner)
+                                .or_insert_with(|| write_error.message.clone());
+                        }
+                    }
+                    _ => {
+                        let msg = format!("Failed to insert search index entries: {e}");
+                        return resources
+                            .iter()
+                            .map(|_| Err(internal_error(msg.clone())))
+                            .collect();
+                    }
+                },
+            }
+            offset += chunk.len();
+        }
+
+        prepared
+            .into_iter()
+            .enumerate()
+            .map(|(i, p)| match p.failure {
+                Some(msg) => Err(internal_error(msg)),
+                None => match insert_failures.remove(&i) {
+                    Some(msg) => Err(internal_error(format!(
+                        "Failed to insert search index entries: {msg}"
+                    ))),
+                    None => Ok(p.docs.len()),
+                },
+            })
+            .collect()
+    }
 }
+
+/// Documents per `insert_many` when [`MongoBackend`]'s
+/// [`ReindexTarget::write_search_entries_page`] flattens a page's index
+/// documents into one insert. Mirrors `bulk_ingest.rs`'s
+/// `INSERT_DOCS_PER_COMMAND` (same value, same rationale: bound how much the
+/// driver serializes per command) without depending on that module, since a
+/// page's `search_index` documents are built the same way a batch's are.
+const SEARCH_INDEX_INSERT_CHUNK: usize = 5_000;
 
 /// Parses a `{rfc3339}|{id}` keyset-pagination cursor for the reindex source.
 fn parse_reindex_cursor(cursor: &str) -> Option<(DateTime<Utc>, String)> {

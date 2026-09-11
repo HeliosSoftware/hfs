@@ -1304,6 +1304,88 @@ fn spawn_s3_search_param_refresh(
     });
 }
 
+/// Registers the shared base SearchParameters — embedded fallback, the FHIR
+/// spec file, and every custom file in `data_dir` (e.g. the SQL-on-FHIR
+/// `ViewDefinition` params in `sql-on-fhir-search-parameters.json`) — into
+/// `registry`.
+///
+/// This is the same three-tier load the SQLite, PostgreSQL, and MongoDB
+/// backends perform when they build their own registries. A primary with no
+/// `data_dir` of its own (S3) needs a starter to do it instead; skipping the
+/// custom tier left Elasticsearch unaware of params such as `ViewDefinition`
+/// `name`, so `name:contains` was silently dropped from searches (#1070).
+#[cfg(all(feature = "s3", feature = "elasticsearch"))]
+fn populate_base_search_registry(
+    registry: &mut helios_persistence::search::SearchParameterRegistry,
+    fhir_version: helios_fhir::FhirVersion,
+    data_dir: &std::path::Path,
+) {
+    use helios_persistence::search::SearchParameterLoader;
+
+    let loader = SearchParameterLoader::new(fhir_version);
+    let mut fallback_count = 0;
+    let mut spec_count = 0;
+    let mut custom_count = 0;
+    let mut custom_files: Vec<String> = Vec::new();
+
+    match loader.load_embedded() {
+        Ok(params) => {
+            for p in params {
+                if registry.register(p).is_ok() {
+                    fallback_count += 1;
+                }
+            }
+        }
+        Err(e) => warn!("Failed to load embedded SearchParameters: {e}"),
+    }
+
+    let spec_path = data_dir.join(loader.spec_filename());
+    match loader.load_from_spec_file(data_dir) {
+        Ok(params) => {
+            for p in params {
+                if registry.register(p).is_ok() {
+                    spec_count += 1;
+                }
+            }
+        }
+        Err(e) => warn!(
+            "Could not load spec SearchParameters from {}: {e}. Using minimal fallback.",
+            spec_path.display()
+        ),
+    }
+
+    match loader.load_custom_from_directory_with_files(data_dir) {
+        Ok((params, files)) => {
+            for p in params {
+                if registry.register(p).is_ok() {
+                    custom_count += 1;
+                }
+            }
+            custom_files = files;
+        }
+        Err(e) => warn!(
+            "Error loading custom SearchParameters from {}: {e}",
+            data_dir.display()
+        ),
+    }
+
+    let custom_info = if custom_files.is_empty() {
+        String::new()
+    } else {
+        format!(" [{}]", custom_files.join(", "))
+    };
+    info!(
+        "SearchParameter registry initialized: {} total ({} spec from {}, {} fallback, {} custom{}) covering {} resource types",
+        registry.len(),
+        spec_count,
+        spec_path.display(),
+        fallback_count,
+        custom_count,
+        custom_info,
+        registry.resource_types().len()
+    );
+}
+
 /// Starts the server with SQLite-only backend.
 #[cfg(feature = "sqlite")]
 async fn start_sqlite(
@@ -2894,32 +2976,26 @@ async fn start_s3_elasticsearch(
     );
 
     // Populate S3's own per-tenant registry container with the shared base
-    // (embedded + spec) — S3 has no `data_dir`/FHIR version of its own to load
-    // these from, so a composite starter does it once here, the same params
-    // `build_search_registry` used to load into a standalone container. Unlike
+    // (embedded + spec + custom, e.g. the SQL-on-FHIR `ViewDefinition` params) —
+    // S3 has no `data_dir`/FHIR version of its own to load these from, so a
+    // composite starter does it once here, the same three tiers the SQLite,
+    // PostgreSQL, and MongoDB primaries load into theirs. Omitting the custom
+    // tier left ES blind to `ViewDefinition?name:contains=…` (#1070). Unlike
     // before, this container is *S3's real registries* (`s3.tenant_registries()`),
     // not a throwaway one: S3's own create/update/delete hooks now keep each
     // tenant's stored SearchParameter overlay on it current (#787), so sharing
     // it with Elasticsearch below gives ES the same live overlay every other
     // composite's search backend already gets from its primary.
     {
-        use helios_persistence::search::SearchParameterLoader;
-        let loader = SearchParameterLoader::new(config.default_fhir_version);
-        let mut base = s3.tenant_registries().base().write();
-        if let Ok(params) = loader.load_embedded() {
-            for p in params {
-                let _ = base.register(p);
-            }
-        }
         let data_dir = config
             .data_dir
             .clone()
             .unwrap_or_else(|| std::path::PathBuf::from("./data"));
-        if let Ok(params) = loader.load_from_spec_file(&data_dir) {
-            for p in params {
-                let _ = base.register(p);
-            }
-        }
+        populate_base_search_registry(
+            &mut s3.tenant_registries().base().write(),
+            config.default_fhir_version,
+            &data_dir,
+        );
     }
     let es = Arc::new(ElasticsearchBackend::with_shared_registry(
         es_config,

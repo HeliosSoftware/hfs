@@ -29,7 +29,9 @@ use helios_persistence::core::{Backend, BackendKind, ResourceStorage};
 use helios_persistence::error::{ResourceError, StorageError};
 use helios_persistence::search::{SearchParameterLoader, TenantSearchRegistries};
 use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
-use helios_persistence::types::{SearchParamType, SearchParameter, SearchQuery, SearchValue};
+use helios_persistence::types::{
+    SearchModifier, SearchParamType, SearchParameter, SearchQuery, SearchValue, SortDirective,
+};
 
 use aws_config::{BehaviorVersion, Region};
 use aws_sdk_s3::Client;
@@ -269,6 +271,14 @@ fn build_search_registry() -> Arc<TenantSearchRegistries> {
                 let _ = registry.register(p);
             }
         }
+        // Custom files (e.g. the SQL-on-FHIR `ViewDefinition` params), the
+        // third tier `start_s3_elasticsearch` loads too — without it ES never
+        // indexes `ViewDefinition.name` (#1070).
+        if let Ok((params, _files)) = loader.load_custom_from_directory_with_files(&data_dir) {
+            for p in params {
+                let _ = registry.register(p);
+            }
+        }
     }
     registries
 }
@@ -393,6 +403,75 @@ where
 // ============================================================================
 // Tests
 // ============================================================================
+
+/// `ViewDefinition?_sort=name&name:contains=view` — the web UI's SQL-views rail
+/// and Add-table combobox query — returns only the case-insensitive substring
+/// matches, in name order (#1070). The `name` param comes from the custom
+/// `sql-on-fhir-search-parameters.json` file, so this fails if the search
+/// registry skips the custom tier: ES never indexes `ViewDefinition.name`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn s3_es_test_view_definition_name_contains_sorted() {
+    if skip_if_disabled("s3_es_test_view_definition_name_contains_sorted") {
+        return;
+    }
+
+    let harness = make_harness("vd-name-contains").await;
+    let tenant = tenant("s3-es-tenant");
+
+    // Created out of name order so the sort is observable. Names start
+    // lowercase so the expected order is the same whether the backend's
+    // string sort is case-sensitive or not.
+    let mut ids_by_name = HashMap::new();
+    for name in ["beta_VIEW_x", "gamma", "alpha_view"] {
+        let created = harness
+            .composite
+            .create(
+                &tenant,
+                "ViewDefinition",
+                json!({
+                    "resourceType": "ViewDefinition",
+                    "url": format!("http://example.org/ViewDefinition/{name}"),
+                    "name": name,
+                    "status": "active",
+                    "resource": "Patient",
+                    "select": [{"column": [{"path": "id", "name": "id"}]}]
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .expect("create ViewDefinition should succeed");
+        ids_by_name.insert(name, created.id().to_string());
+    }
+
+    let query = SearchQuery::new("ViewDefinition")
+        .with_parameter(SearchParameter {
+            name: "name".to_string(),
+            param_type: SearchParamType::String,
+            modifier: Some(SearchModifier::Contains),
+            values: vec![SearchValue::eq("view")],
+            chain: vec![],
+            components: vec![],
+        })
+        .with_sort(SortDirective::parse("name").with_param_type(Some(SearchParamType::String)));
+
+    let expected = vec![
+        ids_by_name["alpha_view"].clone(),
+        ids_by_name["beta_VIEW_x"].clone(),
+    ];
+    let ids = |r: &SearchResult| -> Vec<String> {
+        r.resources
+            .items
+            .iter()
+            .map(|res| res.id().to_string())
+            .collect()
+    };
+    let results = search_until(&harness, &tenant, &query, |r| ids(r) == expected).await;
+    assert_eq!(
+        ids(&results),
+        expected,
+        "name:contains=view must return only alpha_view and beta_VIEW_x, sorted by name"
+    );
+}
 
 /// Write a Patient to S3, then verify it appears in ES search by name.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
