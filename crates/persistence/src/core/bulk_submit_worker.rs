@@ -2244,9 +2244,12 @@ mod tests {
                 // A continuation means a previous page was consumed, and its
                 // receipts have to be on disk by now.
                 Some(_) => {
+                    // `fs::metadata` on the path, not `DirEntry::metadata`: on
+                    // Windows the listing's size can lag a file still open for
+                    // writing and read 0 despite the bytes being on disk.
                     let spooled: u64 = std::fs::read_dir(&directory)
                         .expect("the spool directory exists while receipts are building")
-                        .map(|entry| entry.unwrap().metadata().unwrap().len())
+                        .map(|entry| std::fs::metadata(entry.unwrap().path()).unwrap().len())
                         .sum();
                     if spooled < expected_on_disk {
                         Err(internal_error(format!(

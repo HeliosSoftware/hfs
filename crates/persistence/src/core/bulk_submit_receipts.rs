@@ -348,11 +348,16 @@ mod tests {
         names
     }
 
+    /// Bytes on disk across the spool directory. Sizes come from
+    /// `fs::metadata` on each path, not `DirEntry::metadata`: on Windows the
+    /// latter is the directory listing's copy, which NTFS may leave stale while
+    /// a writer still holds the file open, so a spool with bytes on disk can
+    /// read 0.
     fn spool_bytes(path: &std::path::Path) -> u64 {
         std::fs::read_dir(path)
             .map(|entries| {
                 entries
-                    .map(|entry| entry.unwrap().metadata().unwrap().len())
+                    .map(|entry| std::fs::metadata(entry.unwrap().path()).unwrap().len())
                     .sum()
             })
             .unwrap_or(0)
