@@ -2097,6 +2097,27 @@ mod chaining {
 mod includes {
     use super::*;
 
+    /// Sorted `(resourceType, id)` pairs for bundle entries tagged
+    /// `search.mode == "include"`, for exact-set assertions independent of
+    /// fetch order.
+    fn include_entries(body: &Value) -> Vec<(String, String)> {
+        let mut pairs: Vec<(String, String)> = get_bundle_entries(body)
+            .iter()
+            .filter(|e| e["search"]["mode"] == "include")
+            .map(|e| {
+                (
+                    e["resource"]["resourceType"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string(),
+                    e["resource"]["id"].as_str().unwrap_or_default().to_string(),
+                )
+            })
+            .collect();
+        pairs.sort();
+        pairs
+    }
+
     #[tokio::test]
     async fn test_include_subject() {
         let (server, backend) = create_test_server().await;
@@ -2336,6 +2357,121 @@ mod includes {
                 );
             }
         }
+    }
+
+    #[tokio::test]
+    async fn test_include_service_provider_conditional_reference_yields_no_includes() {
+        let (server, backend) = create_test_server().await;
+        seed_search_test_data(&backend).await;
+
+        let tenant = test_tenant();
+        let encounter = json!({
+            "resourceType": "Encounter",
+            "id": "enc-cond",
+            "status": "finished",
+            "class": {"system": "http://terminology.hl7.org/CodeSystem/v3-ActCode", "code": "AMB"},
+            "subject": {"reference": "Patient/patient-1"},
+            "serviceProvider": {
+                "reference": "Organization?identifier=http://example.org/org|dept-9"
+            }
+        });
+        backend
+            .create(&tenant, "Encounter", encounter, FhirVersion::R4)
+            .await
+            .unwrap();
+
+        let response = server
+            .get("/Encounter?_id=enc-cond&_include=Encounter:service-provider")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+
+        response.assert_status_ok();
+        let body: Value = response.json();
+        let entries = get_bundle_entries(&body);
+
+        let match_entries: Vec<&&Value> = entries
+            .iter()
+            .filter(|e| e["search"]["mode"] == "match")
+            .collect();
+        assert_eq!(match_entries.len(), 1);
+        assert_eq!(match_entries[0]["resource"]["resourceType"], "Encounter");
+
+        assert!(
+            include_entries(&body).is_empty(),
+            "a conditional serviceProvider reference must not produce an include"
+        );
+        assert!(
+            !entries
+                .iter()
+                .any(|e| e["resource"]["resourceType"] == "Patient"),
+            "the conditional serviceProvider reference must not pull in the subject Patient either"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_include_service_provider_returns_only_the_organization() {
+        let (server, backend) = create_test_server().await;
+        seed_search_test_data(&backend).await;
+
+        let tenant = test_tenant();
+        let encounter = json!({
+            "resourceType": "Encounter",
+            "id": "enc-sp",
+            "status": "finished",
+            "class": {"system": "http://terminology.hl7.org/CodeSystem/v3-ActCode", "code": "AMB"},
+            "subject": {"reference": "Patient/patient-1"},
+            "serviceProvider": {"reference": "Organization/org-2"}
+        });
+        backend
+            .create(&tenant, "Encounter", encounter, FhirVersion::R4)
+            .await
+            .unwrap();
+
+        let expected = vec![("Organization".to_string(), "org-2".to_string())];
+
+        for query in [
+            "/Encounter?_id=enc-sp&_include=Encounter:service-provider",
+            "/Encounter?_id=enc-sp&_include=Encounter:service-provider:Organization",
+        ] {
+            let response = server
+                .get(query)
+                .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+                .await;
+
+            response.assert_status_ok();
+            let body: Value = response.json();
+            assert_eq!(include_entries(&body), expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_include_subject_returns_only_the_patient() {
+        let (server, backend) = create_test_server().await;
+        seed_search_test_data(&backend).await;
+
+        let tenant = test_tenant();
+        let encounter = json!({
+            "resourceType": "Encounter",
+            "id": "enc-sp",
+            "status": "finished",
+            "class": {"system": "http://terminology.hl7.org/CodeSystem/v3-ActCode", "code": "AMB"},
+            "subject": {"reference": "Patient/patient-1"},
+            "serviceProvider": {"reference": "Organization/org-2"}
+        });
+        backend
+            .create(&tenant, "Encounter", encounter, FhirVersion::R4)
+            .await
+            .unwrap();
+
+        let response = server
+            .get("/Encounter?_id=enc-sp&_include=Encounter:subject")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+
+        response.assert_status_ok();
+        let body: Value = response.json();
+        let expected = vec![("Patient".to_string(), "patient-1".to_string())];
+        assert_eq!(include_entries(&body), expected);
     }
 }
 
