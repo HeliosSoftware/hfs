@@ -58,9 +58,7 @@
   </div>
 
   {% if card.status == "in-progress" %}
-  <p class="job-card__meta">
-    {% if !card.progress.is_empty() %}{{ card.progress }}{% else %}{{ i18n.t("bulk-export-progress-waiting") }}{% endif %}
-  </p>
+  <p class="job-card__meta">{{ card.progress_label }}</p>
   {% endif %}
 
   {% if card.status == "complete" %}

@@ -808,7 +808,9 @@ mod postgres_integration {
     use helios_persistence::core::SettingsStore;
     use helios_persistence::core::history::{HistoryParams, InstanceHistoryProvider};
     use helios_persistence::core::{Backend, BackendCapability, BackendKind, ResourceStorage};
-    use helios_persistence::error::{BackendError, ConcurrencyError, ResourceError, StorageError};
+    use helios_persistence::error::{
+        BackendError, BulkExportError, ConcurrencyError, ResourceError, StorageError,
+    };
     use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
 
     use testcontainers::ImageExt;
@@ -6274,8 +6276,8 @@ mod postgres_integration {
 
     use chrono::{DateTime, Utc};
     use helios_persistence::core::bulk_export::{
-        BulkExportStorage, ExportDataProvider, ExportRequest, ExportStatus, PatientExportProvider,
-        StartExportInput, TypeExportProgress,
+        BulkExportStorage, ExportDataProvider, ExportRequest, ExportStatus, GroupExportProvider,
+        PatientExportProvider, StartExportInput, TypeExportProgress,
     };
     use helios_persistence::core::bulk_export_worker::{
         ExportClaimStrategy, ExportWorkerStorage, LeaseError, WorkerId,
@@ -6363,6 +6365,34 @@ mod postgres_integration {
 
         let progress = backend.get_export_status(&tenant, &job_id).await.unwrap();
         assert_eq!(progress.status, ExportStatus::Complete);
+    }
+
+    #[tokio::test]
+    async fn postgres_integration_export_missing_group_is_group_not_found() {
+        let backend = create_backend().await;
+        let tenant = create_tenant("export-missing-group");
+
+        let members_err = backend
+            .get_group_members(&tenant, "nope")
+            .await
+            .expect_err("a nonexistent group must not resolve to an empty member list");
+        match members_err {
+            StorageError::BulkExport(BulkExportError::GroupNotFound { group_id }) => {
+                assert_eq!(group_id, "nope");
+            }
+            other => panic!("expected GroupNotFound, got: {other:?}"),
+        }
+
+        let patients_err = backend
+            .resolve_group_patient_ids(&tenant, "nope")
+            .await
+            .expect_err("resolving patients for a nonexistent group must fail");
+        match patients_err {
+            StorageError::BulkExport(BulkExportError::GroupNotFound { group_id }) => {
+                assert_eq!(group_id, "nope");
+            }
+            other => panic!("expected GroupNotFound, got: {other:?}"),
+        }
     }
 
     /// Pins a stored resource's `last_updated` so a window test does not depend
@@ -6627,6 +6657,69 @@ mod postgres_integration {
             .finish_export_job(&tenant, &job_id, &worker_b, lease_b.fencing_token)
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn postgres_integration_export_set_current_type_persists_and_is_fenced() {
+        let _guard = BULK_EXPORT_TEST_LOCK.lock().await;
+        let backend = create_backend().await;
+        let tenant = create_tenant("export-current-type");
+
+        let job_id = backend
+            .start_export(&tenant, export_input(ExportRequest::system()))
+            .await
+            .unwrap();
+
+        let worker = WorkerId::new(format!("pg-current-type-{}", uuid::Uuid::new_v4()));
+        let lease = claim_specific(&backend, &worker, &job_id, StdDuration::from_secs(60)).await;
+
+        backend
+            .set_export_current_type(
+                &tenant,
+                &job_id,
+                &worker,
+                lease.fencing_token,
+                Some("Patient"),
+                1,
+                3,
+            )
+            .await
+            .unwrap();
+
+        let progress = backend.get_export_status(&tenant, &job_id).await.unwrap();
+        assert_eq!(progress.current_type, Some("Patient".to_string()));
+        assert_eq!(progress.types_done, 1);
+        assert_eq!(progress.types_total, 3);
+
+        // A stale fencing token is rejected and leaves the status unchanged.
+        let stale_token = lease.fencing_token + 1000;
+        assert!(matches!(
+            backend
+                .set_export_current_type(
+                    &tenant,
+                    &job_id,
+                    &worker,
+                    stale_token,
+                    Some("Observation"),
+                    2,
+                    3,
+                )
+                .await,
+            Err(LeaseError::LeaseLost { .. })
+        ));
+        let progress = backend.get_export_status(&tenant, &job_id).await.unwrap();
+        assert_eq!(progress.current_type, Some("Patient".to_string()));
+        assert_eq!(progress.types_done, 1);
+
+        // The terminal update clears the marker but keeps the counters.
+        backend
+            .finish_export_job(&tenant, &job_id, &worker, lease.fencing_token)
+            .await
+            .unwrap();
+        let progress = backend.get_export_status(&tenant, &job_id).await.unwrap();
+        assert_eq!(progress.current_type, None);
+        assert_eq!(progress.types_done, 1);
+        assert_eq!(progress.types_total, 3);
     }
 
     #[tokio::test]

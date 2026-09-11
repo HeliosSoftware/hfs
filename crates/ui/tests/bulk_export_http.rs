@@ -124,6 +124,13 @@ struct MockExport {
     group_identifier_results: Arc<Mutex<Vec<serde_json::Value>>>,
     /// What `POST /Group/_search?name=` answers (R5+ only — #836).
     group_name_results: Arc<Mutex<Vec<serde_json::Value>>>,
+    /// When set, status polls answer 500 with this body instead of the
+    /// default 202-then-manifest sequence.
+    status_failure_body: Arc<Mutex<Option<String>>>,
+    /// When set, the first status poll answers `202` with this `Parameters`
+    /// body (and `x-progress: 33%`) instead of the default bare `18%
+    /// complete` header with no body (#961).
+    status_progress_body: Arc<Mutex<Option<String>>>,
 }
 
 impl Default for MockExport {
@@ -170,6 +177,8 @@ impl Default for MockExport {
             groups: Default::default(),
             group_identifier_results: Default::default(),
             group_name_results: Default::default(),
+            status_failure_body: Default::default(),
+            status_progress_body: Default::default(),
         }
     }
 }
@@ -239,9 +248,28 @@ fn mock_fhir_app(state: MockExport) -> Router {
                 .and_then(|value| value.to_str().ok())
                 .map(str::to_string),
         ));
+        if let Some(body) = s.status_failure_body.lock().unwrap().clone() {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                [("content-type", "application/fhir+json")],
+                body,
+            )
+                .into_response();
+        }
         let mut polls = s.polls.lock().unwrap();
         *polls += 1;
         if *polls == 1 {
+            if let Some(body) = s.status_progress_body.lock().unwrap().clone() {
+                return (
+                    StatusCode::ACCEPTED,
+                    [
+                        ("x-progress", "33%"),
+                        ("content-type", "application/fhir+json"),
+                    ],
+                    body,
+                )
+                    .into_response();
+            }
             (StatusCode::ACCEPTED, [("x-progress", "18% complete")], "").into_response()
         } else {
             let advertised_base = s.advertised_base.lock().unwrap().clone();
@@ -1324,6 +1352,137 @@ async fn starting_a_system_export_kicks_off_and_tracks_the_job() {
     assert!(!html.contains("every 5s"));
 }
 
+/// #961: a `202` whose body is a `Parameters` resource carrying
+/// `typesTotal`/`typesDone`/`currentType` drives "Writing Observation · 1 of
+/// 3 types" on the card, the bar still reads the `X-Progress` percentage,
+/// and the counts persist on the job record.
+#[tokio::test]
+async fn an_in_progress_card_shows_the_type_in_flight_and_types_progress() {
+    let (base, mock, backend) = serve().await;
+    *mock.status_progress_body.lock().unwrap() = Some(
+        serde_json::json!({
+            "resourceType": "Parameters",
+            "parameter": [
+                {"name": "typesTotal", "valueInteger": 3},
+                {"name": "typesDone", "valueInteger": 1},
+                {"name": "currentType", "valueString": "Observation"}
+            ]
+        })
+        .to_string(),
+    );
+
+    post_form(
+        &base,
+        "/ui/bulk-export",
+        &[("name", "Everything"), ("scope", "system")],
+    )
+    .await;
+    let (_, html) = get_text(&base, "/ui/bulk-export").await;
+    let card_path = html
+        .split("hx-get=\"")
+        .map(|s| s.split('"').next().unwrap_or(""))
+        .find(|s| s.starts_with("/ui/bulk-export/active/"))
+        .expect("card poll url")
+        .to_string();
+    let id = card_path
+        .trim_end_matches("/card")
+        .rsplit('/')
+        .next()
+        .unwrap()
+        .to_string();
+
+    let (_, html) = get_text(&base, &card_path).await;
+    assert!(html.contains("Writing Observation"), "{html}");
+    assert!(html.contains("1 of 3 types"), "{html}");
+    assert!(html.contains(r#"aria-valuenow="33""#), "{html}");
+    assert!(html.contains("every 5s"), "{html}");
+
+    let current = backend.get_settings("l2:").await.unwrap().unwrap();
+    let jobs = current.document["byTenant"]["default"]["bulkExport"]["jobs"]
+        .as_object()
+        .unwrap();
+    assert_eq!(jobs[&id]["typesDone"], 1);
+    assert_eq!(jobs[&id]["typesTotal"], 3);
+    assert_eq!(jobs[&id]["currentType"], "Observation");
+}
+
+/// #961: against a server that answers `202` with no body (or one that
+/// isn't a `Parameters` resource), the card keeps showing the raw
+/// `X-Progress` text and never claims a type count it was never given.
+#[tokio::test]
+async fn an_in_progress_card_without_a_parameters_body_keeps_the_raw_progress() {
+    let (base, _mock, _backend) = serve().await;
+    post_form(
+        &base,
+        "/ui/bulk-export",
+        &[("name", "Everything"), ("scope", "system")],
+    )
+    .await;
+    let (_, html) = get_text(&base, "/ui/bulk-export").await;
+    let card_path = html
+        .split("hx-get=\"")
+        .map(|s| s.split('"').next().unwrap_or(""))
+        .find(|s| s.starts_with("/ui/bulk-export/active/"))
+        .expect("card poll url")
+        .to_string();
+
+    let (_, html) = get_text(&base, &card_path).await;
+    assert!(html.contains("18% complete"), "{html}");
+    assert!(!html.contains("types"), "{html}");
+}
+
+/// #961: once a job completes, the stale type counts from the last
+/// in-progress poll must not linger on the persisted record.
+#[tokio::test]
+async fn a_completed_card_clears_the_types_progress() {
+    let (base, mock, backend) = serve().await;
+    *mock.status_progress_body.lock().unwrap() = Some(
+        serde_json::json!({
+            "resourceType": "Parameters",
+            "parameter": [
+                {"name": "typesTotal", "valueInteger": 3},
+                {"name": "typesDone", "valueInteger": 1},
+                {"name": "currentType", "valueString": "Observation"}
+            ]
+        })
+        .to_string(),
+    );
+    post_form(
+        &base,
+        "/ui/bulk-export",
+        &[("name", "Everything"), ("scope", "system")],
+    )
+    .await;
+    let (_, html) = get_text(&base, "/ui/bulk-export").await;
+    let card_path = html
+        .split("hx-get=\"")
+        .map(|s| s.split('"').next().unwrap_or(""))
+        .find(|s| s.starts_with("/ui/bulk-export/active/"))
+        .expect("card poll url")
+        .to_string();
+    let id = card_path
+        .trim_end_matches("/card")
+        .rsplit('/')
+        .next()
+        .unwrap()
+        .to_string();
+
+    // First fetch: 202 with type counts.
+    get_text(&base, &card_path).await;
+    // Second: the mock flips to 200 -> complete.
+    let (_, html) = get_text(&base, &card_path).await;
+    assert!(html.contains("Complete"), "{html}");
+
+    let current = backend.get_settings("l2:").await.unwrap().unwrap();
+    let jobs = current.document["byTenant"]["default"]["bulkExport"]["jobs"]
+        .as_object()
+        .unwrap();
+    let job = &jobs[&id];
+    assert!(job.get("typesDone").is_none(), "{job}");
+    assert!(job.get("typesTotal").is_none(), "{job}");
+    assert!(job.get("currentType").is_none(), "{job}");
+}
+
 #[tokio::test]
 async fn invalid_start_fields_return_one_400_without_a_job_or_kickoff() {
     let (base, mock, backend) = serve().await;
@@ -1772,6 +1931,67 @@ async fn a_rejected_kickoff_lands_as_failed_and_retry_reruns_it() {
             "retry should preserve the empty all-resources type list: {query}"
         );
     }
+}
+
+#[tokio::test]
+async fn a_failed_status_poll_shows_the_operation_outcome_diagnostics() {
+    let (base, mock, _) = serve().await;
+    post_form(
+        &base,
+        "/ui/bulk-export",
+        &[("name", "Diabetes registry 2024"), ("scope", "system")],
+    )
+    .await;
+
+    let (_, html) = get_text(&base, "/ui/bulk-export").await;
+    let card_path = html
+        .split("hx-get=\"")
+        .map(|s| s.split('"').next().unwrap_or(""))
+        .find(|s| s.starts_with("/ui/bulk-export/active/"))
+        .expect("card poll url")
+        .to_string();
+
+    *mock.status_failure_body.lock().unwrap() = Some(
+        serde_json::json!({
+            "resourceType": "OperationOutcome",
+            "issue": [{
+                "severity": "error",
+                "code": "not-found",
+                "diagnostics": "Group/no-such-group not found"
+            }]
+        })
+        .to_string(),
+    );
+
+    let (_, html) = get_text(&base, &card_path).await;
+    assert!(html.contains("Group/no-such-group not found"), "{html}");
+    assert!(html.contains("500:"), "{html}");
+    assert!(!html.contains("\"resourceType\""), "{html}");
+    assert!(html.contains("Retry"), "{html}");
+}
+
+#[tokio::test]
+async fn a_failed_status_poll_without_operation_outcome_keeps_the_raw_body() {
+    let (base, mock, _) = serve().await;
+    post_form(
+        &base,
+        "/ui/bulk-export",
+        &[("name", "Diabetes registry 2024"), ("scope", "system")],
+    )
+    .await;
+
+    let (_, html) = get_text(&base, "/ui/bulk-export").await;
+    let card_path = html
+        .split("hx-get=\"")
+        .map(|s| s.split('"').next().unwrap_or(""))
+        .find(|s| s.starts_with("/ui/bulk-export/active/"))
+        .expect("card poll url")
+        .to_string();
+
+    *mock.status_failure_body.lock().unwrap() = Some("boom".to_string());
+
+    let (_, html) = get_text(&base, &card_path).await;
+    assert!(html.contains("500: boom"), "{html}");
 }
 
 #[tokio::test]

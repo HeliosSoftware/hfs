@@ -142,7 +142,7 @@ impl BulkExportStorage for PostgresBackend {
 
         let rows = client
             .query(
-                "SELECT status, level, group_id, transaction_time, started_at, completed_at, error_message, current_type
+                "SELECT status, level, group_id, transaction_time, started_at, completed_at, error_message, current_type, types_done, types_total
                  FROM bulk_export_jobs
                  WHERE id = $1 AND tenant_id = $2",
                 &[&job_id.as_str(), &tenant_id],
@@ -165,6 +165,8 @@ impl BulkExportStorage for PostgresBackend {
         let completed_at: Option<chrono::DateTime<Utc>> = row.get(5);
         let error_message: Option<String> = row.get(6);
         let current_type: Option<String> = row.get(7);
+        let types_done: i32 = row.get(8);
+        let types_total: i32 = row.get(9);
 
         let status: ExportStatus = status_str
             .parse()
@@ -215,6 +217,8 @@ impl BulkExportStorage for PostgresBackend {
             completed_at,
             type_progress,
             current_type,
+            types_done: types_done as u32,
+            types_total: types_total as u32,
             error_message,
         })
     }
@@ -860,6 +864,45 @@ impl ExportWorkerStorage for PostgresBackend {
         }
     }
 
+    async fn set_export_current_type(
+        &self,
+        tenant: &TenantContext,
+        job_id: &ExportJobId,
+        worker_id: &WorkerId,
+        fencing_token: u64,
+        current_type: Option<&str>,
+        types_done: u32,
+        types_total: u32,
+    ) -> Result<(), LeaseError> {
+        let client = self.get_client().await.map_err(LeaseError::Storage)?;
+        let affected = client
+            .execute(
+                "UPDATE bulk_export_jobs
+                 SET current_type = $1, types_done = $2, types_total = $3
+                 WHERE id = $4 AND tenant_id = $5 AND worker_id = $6 AND fencing_token = $7",
+                &[
+                    &current_type,
+                    &(types_done as i32),
+                    &(types_total as i32),
+                    &job_id.as_str(),
+                    &tenant.tenant_id().as_str(),
+                    &worker_id.as_str(),
+                    &(fencing_token as i64),
+                ],
+            )
+            .await
+            .map_err(|e| {
+                LeaseError::Storage(internal_error(format!("set_export_current_type: {e}")))
+            })?;
+        if affected == 0 {
+            Err(LeaseError::LeaseLost {
+                job_id: job_id.clone(),
+            })
+        } else {
+            Ok(())
+        }
+    }
+
     async fn record_export_file(
         &self,
         tenant: &TenantContext,
@@ -923,7 +966,7 @@ impl ExportWorkerStorage for PostgresBackend {
         let affected = client
             .execute(
                 "UPDATE bulk_export_jobs
-                 SET status = 'complete', completed_at = $1
+                 SET status = 'complete', completed_at = $1, current_type = NULL
                  WHERE id = $2 AND tenant_id = $3 AND worker_id = $4 AND fencing_token = $5",
                 &[
                     &now,
@@ -957,7 +1000,7 @@ impl ExportWorkerStorage for PostgresBackend {
         let affected = client
             .execute(
                 "UPDATE bulk_export_jobs
-                 SET status = 'error', error_message = $1, completed_at = $2
+                 SET status = 'error', error_message = $1, completed_at = $2, current_type = NULL
                  WHERE id = $3 AND tenant_id = $4 AND worker_id = $5 AND fencing_token = $6",
                 &[
                     &error_message,
@@ -1385,7 +1428,9 @@ impl GroupExportProvider for PostgresBackend {
             .map_err(|e| internal_error(format!("Failed to fetch group: {}", e)))?;
 
         if rows.is_empty() {
-            return Ok(Vec::new());
+            return Err(StorageError::BulkExport(BulkExportError::GroupNotFound {
+                group_id: group_id.to_string(),
+            }));
         }
 
         let data: Value = rows[0].get(0);

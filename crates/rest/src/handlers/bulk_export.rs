@@ -18,23 +18,30 @@ use helios_persistence::core::ExportDataProvider;
 use helios_persistence::core::{
     DownloadUrl, ExportJobId, ExportLevel, ExportManifest, ExportOutputFile, ExportOutputStore,
     ExportRequest, ExportStatus, GroupExportProvider, PatientExportProvider, RawManifestEntry,
-    ResourceStorage, StartExportInput, TypeFilter,
+    ResourceStorage, SearchProvider, StartExportInput, TypeFilter,
 };
-use helios_persistence::error::{BulkExportError, StorageError};
+use helios_persistence::error::{BulkExportError, ResourceError, StorageError};
 use tokio::io::AsyncRead;
 use tokio_util::io::ReaderStream;
 
 use crate::error::{RestError, RestResult};
-use crate::extractors::{FhirVersionExtractor, TenantExtractor};
+use crate::extractors::{
+    FhirVersionExtractor, SearchParams, TenantExtractor, build_search_query_from_pairs,
+    unknown_search_params,
+};
 use crate::state::AppState;
 
 /// Trait bound shared by all bulk-export handlers (the resource-store side).
 pub trait ExportResourceStore:
-    ResourceStorage + ExportDataProvider + PatientExportProvider + GroupExportProvider
+    ResourceStorage + ExportDataProvider + PatientExportProvider + GroupExportProvider + SearchProvider
 {
 }
 impl<S> ExportResourceStore for S where
-    S: ResourceStorage + ExportDataProvider + PatientExportProvider + GroupExportProvider
+    S: ResourceStorage
+        + ExportDataProvider
+        + PatientExportProvider
+        + GroupExportProvider
+        + SearchProvider
 {
 }
 
@@ -184,7 +191,51 @@ where
                 )));
             }
         }
-        type_filters.push(TypeFilter::new(rt, query));
+        // Compile the filter against the search parameter registry so the
+        // worker (T5) executes exactly what was validated here, without
+        // re-interpreting text. This is always strict: the Bulk Data Access
+        // spec requires unsupported `_typeFilter` parameters to be rejected
+        // at kick-off, so `Prefer: handling=lenient` does not relax it.
+        let filter_pairs: Vec<(String, String)> = url::form_urlencoded::parse(query.as_bytes())
+            .into_owned()
+            .collect();
+        let compiled = {
+            let reg = state.storage().search_param_registry(tenant.context());
+            let registry = reg.read();
+            let params = SearchParams::from_pairs(filter_pairs.clone());
+            let unknown = unknown_search_params(rt, &params, &registry);
+            if !unknown.is_empty() {
+                return Err(bad_request(format!(
+                    "_typeFilter '{raw}': unknown search parameter(s) for {rt}: {}",
+                    unknown.join(", ")
+                )));
+            }
+            build_search_query_from_pairs(rt, &filter_pairs, &registry)
+                .map_err(|e| bad_request(format!("_typeFilter '{raw}': {e}")))?
+        };
+        type_filters.push(TypeFilter::new(rt, query).with_compiled(compiled));
+    }
+
+    // Group existence — a `Group/{id}/$export` for a Group that does not exist (or is
+    // deleted) must be rejected with 404 before any job is created. `read` reports
+    // "missing" as `Ok(None)` but a soft-deleted resource as `Err(Resource(Gone))`;
+    // both mean the same thing for export purposes, so both map to 404 here.
+    if let ExportLevel::Group { group_id } = &level {
+        let group_missing = match state
+            .storage()
+            .read(tenant.context(), "Group", group_id)
+            .await
+        {
+            Ok(found) => found.is_none(),
+            Err(StorageError::Resource(ResourceError::Gone { .. })) => true,
+            Err(e) => return Err(map_storage_err(e)),
+        };
+        if group_missing {
+            return Err(RestError::NotFound {
+                resource_type: "Group".to_string(),
+                id: group_id.clone(),
+            });
+        }
     }
 
     // patient (POST only)
@@ -343,6 +394,12 @@ fn map_storage_err(e: StorageError) -> RestError {
             resource_type: "export-job".to_string(),
             id: job_id,
         },
+        StorageError::BulkExport(BulkExportError::GroupNotFound { group_id }) => {
+            RestError::NotFound {
+                resource_type: "Group".to_string(),
+                id: group_id,
+            }
+        }
         StorageError::Backend(helios_persistence::error::BackendError::UnsupportedCapability {
             ..
         }) => RestError::NotImplemented {
@@ -460,6 +517,23 @@ where
 }
 
 /// `GET /export-status/{job_id}` — poll status / fetch manifest.
+///
+/// While the job is `accepted` or `in-progress`, the poll returns `202
+/// Accepted` with `X-Progress: {n}%` (`n = floor(typesDone × 100 /
+/// typesTotal)`, capped at 99, or `0` before the worker has reported any
+/// progress) and `Retry-After: 120`. The body is a `Parameters` resource:
+///
+/// | Parameter | Type | Present when |
+/// |-----------|------|--------------|
+/// | `exportId` | `valueString` | always |
+/// | `status` | `valueCode` (`in-progress`) | always |
+/// | `typesTotal` | `valueInteger` | always — total resource types in the job |
+/// | `typesDone` | `valueInteger` | always — resource types fully written |
+/// | `currentType` | `valueString` | a resource type is being written; absent before the worker starts or between types |
+///
+/// `typesTotal`/`typesDone`/`currentType` are this server's own extension of
+/// the Bulk Data Access allowance for a `202` body, mirroring `$sql-export`
+/// (#853).
 pub async fn export_status_handler<S>(
     State(state): State<AppState<S>>,
     Path(job_id): Path<String>,
@@ -504,15 +578,35 @@ where
                 .get_export_status(tenant.context(), &job_id)
                 .await
                 .map_err(map_storage_err)?;
-            let x_progress = progress
-                .current_type
-                .clone()
-                .unwrap_or_else(|| format!("{:.0}%", progress.overall_progress() * 100.0));
+            let percent: u32 = progress
+                .types_done
+                .saturating_mul(100)
+                .checked_div(progress.types_total)
+                .unwrap_or(0)
+                .min(99);
+            let mut params = vec![
+                serde_json::json!({"name": "exportId", "valueString": job_id.as_str()}),
+                serde_json::json!({"name": "status", "valueCode": "in-progress"}),
+                serde_json::json!({"name": "typesTotal", "valueInteger": progress.types_total}),
+                serde_json::json!({"name": "typesDone", "valueInteger": progress.types_done}),
+            ];
+            if let Some(current_type) = &progress.current_type {
+                params
+                    .push(serde_json::json!({"name": "currentType", "valueString": current_type}));
+            }
+            let body = serde_json::json!({
+                "resourceType": "Parameters",
+                "parameter": params,
+            });
+            let body = serde_json::to_vec(&body).map_err(|e| RestError::InternalError {
+                message: e.to_string(),
+            })?;
             Response::builder()
                 .status(StatusCode::ACCEPTED)
-                .header("X-Progress", x_progress)
+                .header("X-Progress", format!("{percent}%"))
                 .header("Retry-After", "120")
-                .body(Body::empty())
+                .header("Content-Type", "application/fhir+json")
+                .body(Body::from(body))
                 .map_err(|e| RestError::InternalError {
                     message: e.to_string(),
                 })
@@ -566,9 +660,33 @@ where
                     message: e.to_string(),
                 })
         }
-        ExportStatus::Error => Err(RestError::InternalError {
-            message: "export job failed".to_string(),
-        }),
+        ExportStatus::Error => {
+            let progress = jobs
+                .get_export_status(tenant.context(), &job_id)
+                .await
+                .map_err(map_storage_err)?;
+            let diagnostics = progress
+                .error_message
+                .unwrap_or_else(|| "export job failed".to_string());
+            let body = serde_json::json!({
+                "resourceType": "OperationOutcome",
+                "issue": [{
+                    "severity": "error",
+                    "code": "processing",
+                    "diagnostics": diagnostics,
+                }],
+            });
+            let body = serde_json::to_vec(&body).map_err(|e| RestError::InternalError {
+                message: e.to_string(),
+            })?;
+            Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .header("Content-Type", "application/fhir+json")
+                .body(Body::from(body))
+                .map_err(|e| RestError::InternalError {
+                    message: e.to_string(),
+                })
+        }
         ExportStatus::Cancelled => Err(RestError::NotFound {
             resource_type: "export-job".to_string(),
             id: job_id.to_string(),

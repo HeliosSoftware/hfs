@@ -77,10 +77,11 @@ The full local stack is in `docker/bulk-export/docker-compose.yml`: HFS, Postgre
 
 ## Behavior Notes
 
-- `_typeFilter` is parsed and applied.
+- `_typeFilter` is validated against the search parameter registry at kick-off (unknown parameters or invalid values → `400`, regardless of `Prefer: handling`) and applied by the worker per batch.
 - Unsupported result-control params inside `_typeFilter` are rejected with `400` regardless of `Prefer: handling`: `_sort`, `_include`, `_revinclude`, `_count`, `_elements`.
 - `_elements` is implemented: subset to listed paths plus `id`, `resourceType`, and `meta`, with a `SUBSETTED` `meta.tag` added.
 - Unsupported parameters `includeAssociatedData`, `organizeOutputBy`, and `allowPartialManifests` return `400` when `Prefer: handling=strict` is set. Without strict handling, or with lenient handling, they are ignored and a warning is logged.
 - Group export `_since` late membership uses `include` by default, returning pre-`_since` resources for patients added after `_since`.
 - `exclude` is reserved for a follow-up that requires group-membership-history tracking.
 - Group export flattens nested `Group/` members iteratively with a visited-set cycle guard.
+- Status poll `202`: `X-Progress` is the percentage of resource types fully written; the body is a `Parameters` with `typesTotal`, `typesDone` and `currentType` (the type in flight), like `$sql-export`.

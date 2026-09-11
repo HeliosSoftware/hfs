@@ -47,6 +47,8 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+use crate::types::SearchQuery;
 use uuid::Uuid;
 
 /// Audit event helpers for bulk export operations.
@@ -319,12 +321,18 @@ impl std::fmt::Display for ExportLevel {
 ///
 /// Type filters allow specifying FHIR search parameters that should be applied
 /// when exporting a specific resource type.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TypeFilter {
     /// The resource type this filter applies to.
     pub resource_type: String,
     /// The search query parameters.
     pub query: String,
+    /// The filter compiled against the search parameter registry at kick-off.
+    ///
+    /// `None` only for jobs persisted before the filter was compiled; the
+    /// worker refuses to run those rather than exporting an unfiltered set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compiled: Option<SearchQuery>,
 }
 
 impl TypeFilter {
@@ -333,7 +341,15 @@ impl TypeFilter {
         Self {
             resource_type: resource_type.into(),
             query: query.into(),
+            compiled: None,
         }
+    }
+
+    /// Attaches the compiled search query that the worker should execute for
+    /// this filter, replacing text re-parsing at run time.
+    pub fn with_compiled(mut self, query: SearchQuery) -> Self {
+        self.compiled = Some(query);
+        self
     }
 }
 
@@ -551,6 +567,12 @@ pub struct ExportProgress {
     /// Current type being processed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub current_type: Option<String>,
+    /// Resource types fully written so far; 0 before the worker starts.
+    #[serde(default)]
+    pub types_done: u32,
+    /// Resource types to write in total; 0 before the worker starts.
+    #[serde(default)]
+    pub types_total: u32,
     /// Error message if status is Error.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_message: Option<String>,
@@ -572,6 +594,8 @@ impl ExportProgress {
             completed_at: None,
             type_progress: Vec::new(),
             current_type: None,
+            types_done: 0,
+            types_total: 0,
             error_message: None,
         }
     }
@@ -1256,6 +1280,25 @@ mod tests {
         assert_eq!(request.resource_types, vec!["Patient", "Observation"]);
         assert_eq!(request.batch_size, 500);
         assert_eq!(request.type_filters.len(), 1);
+    }
+
+    #[test]
+    fn test_type_filter_legacy_json_without_compiled_deserializes_to_none() {
+        let json = r#"{"resource_type":"Patient","query":"active=true"}"#;
+        let filter: TypeFilter = serde_json::from_str(json).unwrap();
+        assert_eq!(filter.resource_type, "Patient");
+        assert_eq!(filter.query, "active=true");
+        assert!(filter.compiled.is_none());
+    }
+
+    #[test]
+    fn test_type_filter_compiled_round_trips() {
+        let filter =
+            TypeFilter::new("Patient", "active=true").with_compiled(SearchQuery::new("Patient"));
+        let json = serde_json::to_string(&filter).unwrap();
+        let round_tripped: TypeFilter = serde_json::from_str(&json).unwrap();
+        let compiled = round_tripped.compiled.expect("compiled query preserved");
+        assert_eq!(compiled.resource_type, "Patient");
     }
 
     #[test]

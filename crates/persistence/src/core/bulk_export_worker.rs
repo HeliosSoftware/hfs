@@ -6,6 +6,7 @@
 //!
 //! [`BulkExportStorage`]: crate::core::bulk_export::BulkExportStorage
 
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -17,8 +18,10 @@ use crate::core::bulk_export::{
     GroupExportProvider, PatientExportProvider, TypeExportProgress,
 };
 use crate::core::bulk_export_output::{ExportOutputStore, ExportPartKey, FinalizedPart};
-use crate::error::{StorageError, StorageResult};
+use crate::core::search::SearchProvider;
+use crate::error::{BulkExportError, StorageError, StorageResult};
 use crate::tenant::TenantContext;
+use crate::types::{SearchParamType, SearchParameter, SearchQuery, SearchValue};
 
 /// Identifier for an export worker instance.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -182,6 +185,21 @@ pub trait ExportWorkerStorage: Send + Sync {
         progress: &TypeExportProgress,
     ) -> Result<(), LeaseError>;
 
+    /// Records which resource type the worker is about to write and how far
+    /// through the type list it is. `current_type = None` clears the marker
+    /// (the worker calls it that way once every type is done). Fenced.
+    #[allow(clippy::too_many_arguments)]
+    async fn set_export_current_type(
+        &self,
+        tenant: &TenantContext,
+        job_id: &ExportJobId,
+        worker_id: &WorkerId,
+        fencing_token: u64,
+        current_type: Option<&str>,
+        types_done: u32,
+        types_total: u32,
+    ) -> Result<(), LeaseError>;
+
     /// Idempotent upsert of a finalized output/error file row. Fenced.
     async fn record_export_file(
         &self,
@@ -229,13 +247,19 @@ impl<T> BulkExportJobStore for T where
 }
 
 /// Marker trait for a resource-store that can feed every export level.
+///
+/// The `SearchProvider` bound lets the worker intersect each fetched batch
+/// with a compiled `_typeFilter` through the same search path a normal FHIR
+/// search uses (see [`DefaultExportWorker::filter_batch_lines`]), so
+/// composite deployments filter through whichever backend actually indexes
+/// search (e.g. Elasticsearch) rather than the primary store alone.
 pub trait ExportResourceProvider:
-    ExportDataProvider + PatientExportProvider + GroupExportProvider
+    ExportDataProvider + PatientExportProvider + GroupExportProvider + SearchProvider
 {
 }
 
 impl<T> ExportResourceProvider for T where
-    T: ExportDataProvider + PatientExportProvider + GroupExportProvider
+    T: ExportDataProvider + PatientExportProvider + GroupExportProvider + SearchProvider
 {
 }
 
@@ -371,6 +395,8 @@ where
             }
             Err(LeaseError::Storage(e)) => {
                 // Best-effort: mark the job failed (also fenced).
+                tracing::error!(job_id = %lease.job_id, error = %e, "export job failed");
+                let public = public_failure_message(&e);
                 let _ = self
                     .jobs
                     .fail_export_job(
@@ -378,7 +404,7 @@ where
                         &lease.job_id,
                         &lease.worker_id,
                         lease.fencing_token,
-                        &e.to_string(),
+                        &public,
                     )
                     .await;
                 self.emit_audit(
@@ -426,6 +452,27 @@ where
             .await
             .map_err(LeaseError::Storage)?;
 
+        // Every `_typeFilter` must carry the query compiled against the search
+        // parameter registry at kick-off (T4). A filter persisted before that
+        // compilation existed has no query to run, so the job fails here
+        // rather than silently exporting an unfiltered set. When two filters
+        // target the same resource type, the first one wins — the kick-off
+        // path does not combine multiple filters for one type today.
+        let mut filters: HashMap<&str, &SearchQuery> = HashMap::new();
+        for tf in &request.type_filters {
+            let Some(compiled) = tf.compiled.as_ref() else {
+                return Err(LeaseError::Storage(StorageError::BulkExport(
+                    BulkExportError::InvalidTypeFilter {
+                        resource_type: tf.resource_type.clone(),
+                        message: "the filter was stored without a compiled query; \
+                                  re-submit the export"
+                            .to_string(),
+                    },
+                )));
+            };
+            filters.entry(tf.resource_type.as_str()).or_insert(compiled);
+        }
+
         // For Group exports, resolve the member patient IDs once.
         // When `exclude_since_newly_added` is set AND `_since` is provided,
         // filter out patients whose `Group.member.period.start` is *after*
@@ -465,8 +512,21 @@ where
         };
 
         let batch_size = request.batch_size.max(1);
+        let types_total = types.len() as u32;
 
-        for resource_type in &types {
+        for (type_index, resource_type) in types.iter().enumerate() {
+            self.jobs
+                .set_export_current_type(
+                    tenant,
+                    job_id,
+                    wid,
+                    token,
+                    Some(resource_type.as_str()),
+                    type_index as u32,
+                    types_total,
+                )
+                .await?;
+
             // Resume from any persisted cursor for this type.
             let mut cursor: Option<String> = view
                 .type_progress
@@ -551,7 +611,19 @@ where
                         .map_err(LeaseError::Storage)?,
                 };
 
-                if !batch.lines.is_empty() {
+                // Intersect the batch with the compiled `_typeFilter` for this
+                // type, if any. `cursor`, `is_last`, progress and the
+                // heartbeat below all keep coming from `batch` — the traversal
+                // itself is unaffected by filtering; only what gets written is.
+                let lines = match filters.get(resource_type.as_str()) {
+                    Some(filter) => self
+                        .filter_batch_lines(tenant, resource_type, filter, batch.lines.clone())
+                        .await
+                        .map_err(LeaseError::Storage)?,
+                    None => batch.lines.clone(),
+                };
+
+                if !lines.is_empty() {
                     let key = ExportPartKey::output(
                         tenant.tenant_id().as_str(),
                         job_id.clone(),
@@ -564,7 +636,7 @@ where
                         .open_writer(&key)
                         .await
                         .map_err(LeaseError::Storage)?;
-                    for line in &batch.lines {
+                    for line in &lines {
                         let out_line = apply_elements(line, &request.elements);
                         writer.write_line(&out_line).await.map_err(|e| {
                             LeaseError::Storage(StorageError::Backend(
@@ -606,9 +678,79 @@ where
         }
 
         self.jobs
+            .set_export_current_type(tenant, job_id, wid, token, None, types_total, types_total)
+            .await?;
+        self.jobs
             .finish_export_job(tenant, job_id, wid, token)
             .await?;
         Ok(JobOutcome::Completed)
+    }
+
+    /// Keeps only the lines of `batch` whose resource matches `filter`.
+    ///
+    /// Runs `filter` with an `_id` OR-list of the batch's ids through the
+    /// search provider, paging with the result cursor until every page is
+    /// read, and drops the lines the search did not return. A line whose JSON
+    /// has no `id` field cannot be matched at all and is dropped with a
+    /// warning rather than kept unconditionally.
+    async fn filter_batch_lines(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        filter: &SearchQuery,
+        lines: Vec<String>,
+    ) -> StorageResult<Vec<String>> {
+        let ids_by_line: Vec<Option<String>> = lines
+            .iter()
+            .map(|line| {
+                let id = serde_json::from_str::<serde_json::Value>(line)
+                    .ok()
+                    .and_then(|v| v.get("id").and_then(|id| id.as_str()).map(str::to_string));
+                if id.is_none() {
+                    tracing::warn!(
+                        resource_type,
+                        "export batch line has no id; dropping it from the type-filter check"
+                    );
+                }
+                id
+            })
+            .collect();
+        let ids: Vec<String> = ids_by_line.iter().flatten().cloned().collect();
+
+        let mut query = filter.clone();
+        query.resource_type = resource_type.to_string();
+        query.parameters.push(SearchParameter {
+            name: "_id".to_string(),
+            param_type: SearchParamType::Token,
+            modifier: None,
+            values: ids.iter().map(|id| SearchValue::eq(id.clone())).collect(),
+            chain: Vec::new(),
+            components: Vec::new(),
+        });
+        query.count = Some(lines.len() as u32);
+        query.cursor = None;
+        query.total = None;
+        query.summary = None;
+        query.elements.clear();
+        query.sort.clear();
+        query.includes.clear();
+
+        let mut matched: HashSet<String> = HashSet::new();
+        loop {
+            let result = self.data.search(tenant, &query).await?;
+            matched.extend(result.resources.items.iter().map(|r| r.id().to_string()));
+            match result.resources.page_info.next_cursor {
+                Some(next) => query.cursor = Some(next),
+                None => break,
+            }
+        }
+
+        Ok(lines
+            .into_iter()
+            .zip(ids_by_line)
+            .filter(|(_, id)| id.as_deref().is_some_and(|id| matched.contains(id)))
+            .map(|(line, _)| line)
+            .collect())
     }
 }
 
@@ -623,6 +765,19 @@ enum JobOutcome {
     Completed,
     /// A cooperative cancellation check saw the job cancelled and stopped.
     Cancelled,
+}
+
+/// The failure text stored on the job and shown to the export's owner.
+///
+/// Domain errors (`BulkExportError`) describe the export itself and are
+/// stored verbatim; anything else may carry backend detail (SQL, table
+/// names, connection strings) and is replaced by a generic message, with
+/// the full error kept in the server log by the caller.
+fn public_failure_message(e: &StorageError) -> String {
+    match e {
+        StorageError::BulkExport(inner) => inner.to_string(),
+        _ => "export failed: internal storage error".to_string(),
+    }
 }
 
 /// Applies `_elements` projection to an NDJSON line.
@@ -692,13 +847,41 @@ mod tests {
         assert_eq!(v["meta"]["tag"][0]["code"], "SUBSETTED");
     }
 
+    #[test]
+    fn test_public_failure_message_keeps_domain_errors() {
+        use crate::error::BulkExportError;
+
+        let err = StorageError::BulkExport(BulkExportError::GroupNotFound {
+            group_id: "g1".to_string(),
+        });
+        let message = public_failure_message(&err);
+        assert!(
+            message.contains("g1"),
+            "domain errors should be stored verbatim, got: {message}"
+        );
+    }
+
+    #[test]
+    fn test_public_failure_message_masks_backend_errors() {
+        use crate::error::BackendError;
+
+        let err = StorageError::Backend(BackendError::Internal {
+            backend_name: "sqlite".to_string(),
+            message: "SELECT * FROM secret".to_string(),
+            source: None,
+        });
+        let message = public_failure_message(&err);
+        assert_eq!(message, "export failed: internal storage error");
+        assert!(!message.contains("SELECT"));
+    }
+
     #[cfg(feature = "sqlite")]
     mod worker_integration {
         use super::*;
         use crate::backends::local_fs::LocalFsOutputStore;
         use crate::backends::sqlite::SqliteBackend;
         use crate::core::ResourceStorage;
-        use crate::core::bulk_export::{ExportRequest, StartExportInput};
+        use crate::core::bulk_export::{ExportRequest, StartExportInput, TypeFilter};
         use crate::tenant::{TenantContext, TenantId, TenantPermissions};
         use chrono::Utc;
         use std::sync::Arc;
@@ -763,10 +946,170 @@ mod tests {
 
             let progress = backend.get_export_status(&tenant, &job_id).await.unwrap();
             assert_eq!(progress.status, ExportStatus::Complete);
+            // The worker clears the in-flight marker on completion and leaves
+            // the counters showing every type as done (#961).
+            assert_eq!(progress.current_type, None);
+            assert_eq!(progress.types_total, 1);
+            assert_eq!(progress.types_done, progress.types_total);
 
             let manifest = backend.get_export_manifest(&tenant, &job_id).await.unwrap();
             let total: u64 = manifest.output.iter().map(|e| e.count).sum();
             assert_eq!(total, 3);
+        }
+
+        /// Wraps [`LocalFsOutputStore`], recording the export status the worker
+        /// sees when it opens the writer for the export's second resource type.
+        ///
+        /// (#961) `BulkExportJobStore` composes three traits
+        /// (`BulkExportStorage + ExportWorkerStorage + ExportClaimStrategy`);
+        /// wrapping it just to spy on `set_export_current_type` calls would mean
+        /// delegating every method of all three to the inner SQLite backend.
+        /// Wrapping `ExportOutputStore` instead (five methods) and reading
+        /// `get_export_status` from inside `open_writer` is far cheaper and
+        /// still proves the worker marks a type as current *before* it starts
+        /// writing it.
+        struct SecondTypeObserver {
+            inner: Arc<LocalFsOutputStore>,
+            backend: Arc<SqliteBackend>,
+            tenant: TenantContext,
+            second_type: String,
+            observed: std::sync::Mutex<Option<(Option<String>, u32)>>,
+        }
+
+        #[async_trait::async_trait]
+        impl ExportOutputStore for SecondTypeObserver {
+            async fn open_writer(
+                &self,
+                key: &ExportPartKey,
+            ) -> StorageResult<crate::core::bulk_export_output::ExportPartWriter> {
+                if key.resource_type == self.second_type {
+                    let already_observed = self.observed.lock().unwrap().is_some();
+                    if !already_observed {
+                        let status = self
+                            .backend
+                            .get_export_status(&self.tenant, &key.job_id)
+                            .await?;
+                        *self.observed.lock().unwrap() =
+                            Some((status.current_type, status.types_done));
+                    }
+                }
+                self.inner.open_writer(key).await
+            }
+
+            async fn finalize_part(
+                &self,
+                key: &ExportPartKey,
+                writer: crate::core::bulk_export_output::ExportPartWriter,
+            ) -> StorageResult<FinalizedPart> {
+                self.inner.finalize_part(key, writer).await
+            }
+
+            async fn download_url(
+                &self,
+                key: &ExportPartKey,
+                ttl: Duration,
+            ) -> StorageResult<crate::core::bulk_export_output::DownloadUrl> {
+                self.inner.download_url(key, ttl).await
+            }
+
+            async fn open_reader(
+                &self,
+                key: &ExportPartKey,
+            ) -> StorageResult<std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send>>> {
+                self.inner.open_reader(key).await
+            }
+
+            async fn delete_job_outputs(
+                &self,
+                tenant: &TenantContext,
+                job_id: &ExportJobId,
+            ) -> StorageResult<()> {
+                self.inner.delete_job_outputs(tenant, job_id).await
+            }
+        }
+
+        /// The worker marks a type as current, with `types_done` reflecting how
+        /// many types are already finished, before it writes the first line of
+        /// that type — not after. See [`SecondTypeObserver`] for why this test
+        /// observes the output store rather than the job store.
+        #[tokio::test]
+        async fn test_run_job_marks_each_type_in_order() {
+            let backend = Arc::new(SqliteBackend::in_memory().unwrap());
+            backend.init_schema().unwrap();
+            let tenant = tenant();
+
+            backend
+                .create(
+                    &tenant,
+                    "Patient",
+                    serde_json::json!({"resourceType": "Patient", "id": "p1"}),
+                    helios_fhir::FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+            backend
+                .create(
+                    &tenant,
+                    "Observation",
+                    serde_json::json!({"resourceType": "Observation", "id": "o1"}),
+                    helios_fhir::FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+
+            let tmp = tempfile::tempdir().unwrap();
+            let inner = Arc::new(LocalFsOutputStore::new(tmp.path(), "http://localhost:8080"));
+            let output = Arc::new(SecondTypeObserver {
+                inner,
+                backend: Arc::clone(&backend),
+                tenant: tenant.clone(),
+                second_type: "Observation".to_string(),
+                observed: std::sync::Mutex::new(None),
+            });
+
+            let job_id = backend
+                .start_export(
+                    &tenant,
+                    StartExportInput {
+                        request: ExportRequest::system()
+                            .with_types(vec!["Patient".to_string(), "Observation".to_string()]),
+                        transaction_time: Utc::now(),
+                        request_url: "http://localhost/$export".to_string(),
+                        owner_subject: Some("sub".to_string()),
+                        fhir_version: helios_fhir::FhirVersion::default(),
+                    },
+                )
+                .await
+                .unwrap();
+
+            let worker_id = WorkerId::new("w-order");
+            let worker = DefaultExportWorker::new(
+                Arc::clone(&backend),
+                Arc::clone(&backend),
+                Arc::clone(&output),
+                worker_id.clone(),
+            );
+
+            let lease = backend
+                .claim_next(&worker_id, Duration::from_secs(60))
+                .await
+                .unwrap()
+                .expect("job claimable");
+
+            worker.run_job(lease).await.unwrap();
+
+            let observed = output.observed.lock().unwrap().clone();
+            assert_eq!(
+                observed,
+                Some((Some("Observation".to_string()), 1)),
+                "the job must already show Observation as current, with 1 type \
+                 done, by the time its writer opens"
+            );
+
+            let progress = backend.get_export_status(&tenant, &job_id).await.unwrap();
+            assert_eq!(progress.current_type, None);
+            assert_eq!(progress.types_done, 2);
+            assert_eq!(progress.types_total, 2);
         }
 
         /// The REST layer audits the kick-off, but only the worker knows how a
@@ -852,6 +1195,223 @@ mod tests {
                     .and_then(|w| w.reference.as_ref())
                     .and_then(|r| r.value.as_deref()),
                 Some("Practitioner/dr-1")
+            );
+        }
+
+        #[tokio::test]
+        async fn test_run_job_stores_public_message_on_failure() {
+            let backend = Arc::new(SqliteBackend::in_memory().unwrap());
+            backend.init_schema().unwrap();
+            let tenant = tenant();
+
+            let tmp = tempfile::tempdir().unwrap();
+            let output = Arc::new(LocalFsOutputStore::new(tmp.path(), "http://localhost:8080"));
+
+            // No `Group/g-missing` was ever created, so resolving its members
+            // during the run fails with a domain `GroupNotFound` error.
+            let job_id = backend
+                .start_export(
+                    &tenant,
+                    StartExportInput {
+                        request: ExportRequest::group("g-missing")
+                            .with_types(vec!["Patient".to_string()]),
+                        transaction_time: Utc::now(),
+                        request_url: "http://localhost/Group/g-missing/$export".to_string(),
+                        owner_subject: Some("sub".to_string()),
+                        fhir_version: helios_fhir::FhirVersion::default(),
+                    },
+                )
+                .await
+                .unwrap();
+
+            let worker_id = WorkerId::new("w-fail");
+            let worker = DefaultExportWorker::new(
+                Arc::clone(&backend),
+                Arc::clone(&backend),
+                Arc::clone(&output),
+                worker_id.clone(),
+            );
+
+            let lease = backend
+                .claim_next(&worker_id, Duration::from_secs(60))
+                .await
+                .unwrap()
+                .expect("job claimable");
+
+            let result = worker.run_job(lease).await;
+            assert!(result.is_err(), "run_job should surface the failure");
+
+            let progress = backend.get_export_status(&tenant, &job_id).await.unwrap();
+            assert_eq!(progress.status, ExportStatus::Error);
+            let error_message = progress
+                .error_message
+                .expect("failed job should carry an error message");
+            assert!(
+                error_message.contains("g-missing"),
+                "error message should name the missing group, got: {error_message}"
+            );
+        }
+
+        /// A `_typeFilter` persisted before compiled queries existed (T4) has
+        /// no query for the worker to run. `run_job` must refuse it outright
+        /// rather than fall back to exporting the type unfiltered.
+        #[tokio::test]
+        async fn test_run_job_fails_before_writing_when_type_filter_is_not_compiled() {
+            let backend = Arc::new(SqliteBackend::in_memory().unwrap());
+            backend.init_schema().unwrap();
+            let tenant = tenant();
+
+            backend
+                .create(
+                    &tenant,
+                    "Patient",
+                    serde_json::json!({"resourceType": "Patient", "id": "p1", "active": true}),
+                    helios_fhir::FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+
+            let tmp = tempfile::tempdir().unwrap();
+            let output = Arc::new(LocalFsOutputStore::new(tmp.path(), "http://localhost:8080"));
+
+            // `TypeFilter::new` alone (without `.with_compiled`) mimics a job
+            // that was persisted before the compiled-query field existed.
+            let job_id = backend
+                .start_export(
+                    &tenant,
+                    StartExportInput {
+                        request: ExportRequest::system()
+                            .with_types(vec!["Patient".to_string()])
+                            .with_type_filter(TypeFilter::new("Patient", "active=true")),
+                        transaction_time: Utc::now(),
+                        request_url: "http://localhost/$export".to_string(),
+                        owner_subject: Some("sub".to_string()),
+                        fhir_version: helios_fhir::FhirVersion::default(),
+                    },
+                )
+                .await
+                .unwrap();
+
+            let worker_id = WorkerId::new("w-uncompiled-filter");
+            let worker = DefaultExportWorker::new(
+                Arc::clone(&backend),
+                Arc::clone(&backend),
+                Arc::clone(&output),
+                worker_id.clone(),
+            );
+
+            let lease = backend
+                .claim_next(&worker_id, Duration::from_secs(60))
+                .await
+                .unwrap()
+                .expect("job claimable");
+
+            let result = worker.run_job(lease).await;
+            assert!(
+                result.is_err(),
+                "run_job should refuse a filter without a compiled query"
+            );
+
+            let progress = backend.get_export_status(&tenant, &job_id).await.unwrap();
+            assert_eq!(progress.status, ExportStatus::Error);
+            let error_message = progress
+                .error_message
+                .expect("failed job should carry an error message");
+            assert!(
+                error_message.contains("re-submit"),
+                "error message should tell the client to re-submit, got: {error_message}"
+            );
+
+            let manifest = backend.get_export_manifest(&tenant, &job_id).await.unwrap();
+            assert!(
+                manifest.output.is_empty(),
+                "no output files should be recorded when the filter check fails before writing"
+            );
+        }
+
+        /// `filter_batch_lines` should keep exactly the lines the search
+        /// provider confirms match, in the batch's original order, paging
+        /// through the search result until it is exhausted.
+        #[tokio::test]
+        async fn test_filter_batch_lines_pages_through_the_search_result() {
+            // Point at the workspace's data directory so the search-parameter
+            // registry loads the full FHIR spec — the minimal embedded set
+            // used by `SqliteBackend::in_memory()` does not include `active`.
+            let data_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("..")
+                .join("..")
+                .join("data");
+            let config = crate::backends::sqlite::SqliteBackendConfig {
+                data_dir: Some(data_dir),
+                ..Default::default()
+            };
+            let backend = Arc::new(SqliteBackend::with_config(":memory:", config).unwrap());
+            backend.init_schema().unwrap();
+            let tenant = tenant();
+
+            let mut lines = Vec::new();
+            for i in 0..3 {
+                let id = format!("p-active-{i}");
+                let resource = serde_json::json!({
+                    "resourceType": "Patient",
+                    "id": id,
+                    "active": true,
+                });
+                backend
+                    .create(
+                        &tenant,
+                        "Patient",
+                        resource.clone(),
+                        helios_fhir::FhirVersion::default(),
+                    )
+                    .await
+                    .unwrap();
+                lines.push(resource.to_string());
+            }
+            let inactive = serde_json::json!({
+                "resourceType": "Patient",
+                "id": "p-inactive",
+                "active": false,
+            });
+            backend
+                .create(
+                    &tenant,
+                    "Patient",
+                    inactive.clone(),
+                    helios_fhir::FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+            lines.push(inactive.to_string());
+
+            let tmp = tempfile::tempdir().unwrap();
+            let output = Arc::new(LocalFsOutputStore::new(tmp.path(), "http://localhost:8080"));
+            let worker = DefaultExportWorker::new(
+                Arc::clone(&backend),
+                Arc::clone(&backend),
+                Arc::clone(&output),
+                WorkerId::new("w-filter-pages"),
+            );
+
+            let mut filter = SearchQuery::new("Patient");
+            filter.parameters.push(SearchParameter {
+                name: "active".to_string(),
+                param_type: SearchParamType::Token,
+                modifier: None,
+                values: vec![SearchValue::boolean(true)],
+                chain: Vec::new(),
+                components: Vec::new(),
+            });
+
+            let filtered = worker
+                .filter_batch_lines(&tenant, "Patient", &filter, lines.clone())
+                .await
+                .expect("filter_batch_lines");
+
+            assert_eq!(
+                filtered,
+                lines[..3],
+                "the 3 active lines, original order kept"
             );
         }
     }

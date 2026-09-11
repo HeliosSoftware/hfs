@@ -9,7 +9,7 @@ use crate::core::bulk_submit_legacy::{
 use crate::error::{BackendError, StorageResult};
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 37;
+pub const SCHEMA_VERSION: i32 = 38;
 
 /// Advisory-lock key serializing schema migration across HFS instances sharing
 /// one database. Arbitrary but must stay stable across releases.
@@ -372,6 +372,7 @@ async fn migrate_schema(
                 version += 1;
                 continue;
             }
+            37 => migrate_v37_to_v38(client).await?,
             _ => {
                 return Err(pg_error(format!("Unknown schema version: {}", version)));
             }
@@ -3623,6 +3624,29 @@ async fn mark_manifest_publication(
     Ok(())
 }
 
+/// v37 -> v38: types_done/types_total on bulk_export_jobs (#961).
+///
+/// The `current_type` column existed since v6 but nothing wrote it, so a
+/// status poll could never name the resource type an export was currently
+/// writing. `types_done`/`types_total` accompany it so the poll can also show
+/// how far through the type list the worker is — both are `0` on a job the
+/// worker has not yet started.
+async fn migrate_v37_to_v38(client: &deadpool_postgres::Client) -> StorageResult<()> {
+    let stmts = [
+        "ALTER TABLE bulk_export_jobs ADD COLUMN IF NOT EXISTS types_done INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE bulk_export_jobs ADD COLUMN IF NOT EXISTS types_total INTEGER NOT NULL DEFAULT 0",
+    ];
+
+    for sql in stmts {
+        client
+            .execute(sql, &[])
+            .await
+            .map_err(|e| pg_error(format!("Migration v37->v38 failed: {}", e)))?;
+    }
+
+    Ok(())
+}
+
 /// v23 -> v24: drop `fk_search_resource`.
 ///
 /// `search_index` carried a composite FK to `resources` with `ON DELETE
@@ -4822,7 +4846,9 @@ mod postgres_integration_v37_migration {
             .get(0);
         assert_eq!(malformed, "{broken");
 
-        assert_eq!(get_schema_version(&client).await.unwrap(), 37);
+        // `initialize_schema` runs every migration after v37 as well, so the
+        // database lands on the current version, not on v37 itself.
+        assert_eq!(get_schema_version(&client).await.unwrap(), SCHEMA_VERSION);
         assert_eq!(index_count(&client).await, 2);
         assert_eq!(
             column_type(&client, "bulk_manifests", "published_token").await,
@@ -5035,7 +5061,7 @@ mod postgres_integration_v37_migration {
         initialize_schema(&mut migration_client)
             .await
             .expect("retry v37");
-        assert_eq!(get_schema_version(&client).await.unwrap(), 37);
+        assert_eq!(get_schema_version(&client).await.unwrap(), SCHEMA_VERSION);
         assert_eq!(
             classification(&client, output).await,
             (Some("manifest-rollback".to_string()), None)
