@@ -423,27 +423,64 @@ impl QueryBuilder {
             return self.build_composite_parameter_condition(param, param_offset);
         }
 
-        // Multiple values are ORed together
-        let mut or_conditions = Vec::new();
-        let mut total_params = 0usize;
+        // A plain multi-value reference search (all `Type/id`, no modifier)
+        // collapses to a single index-friendly `value_reference IN (...)`
+        // instead of ORing one `(= OR range)` branch per value (#1052). The
+        // OR-of-branches did two `idx_search_reference` probes per value and
+        // nested one level per term — ~18 ms/value (250 refs ≈ 4.6 s) and the
+        // parse-depth blow-up behind #943; a flat `IN` is a single indexed
+        // lookup of any length at ~1 node. Version-stripped bases are matched
+        // exactly, which covers every unversioned stored reference (references
+        // are stored unversioned in practice); the single-value path below
+        // keeps the full `_history` range match for the rare versioned case.
+        let is_plain_multi_reference = matches!(param.param_type, SearchParamType::Reference)
+            && param.modifier.is_none()
+            && param.values.len() >= 2
+            && param
+                .values
+                .iter()
+                .all(|v| strip_reference_version(&v.value).contains('/'));
 
-        for value in &param.values {
-            let condition = self.build_value_condition(param, value, param_offset + total_params);
-            if let Some(cond) = condition {
-                total_params += cond.params.len();
-                or_conditions.push(cond);
+        let combined = if is_plain_multi_reference {
+            let mut params = Vec::with_capacity(param.values.len());
+            let placeholders: Vec<String> = param
+                .values
+                .iter()
+                .enumerate()
+                .map(|(i, v)| {
+                    params.push(SqlParam::string(strip_reference_version(&v.value)));
+                    format!("?{}", param_offset + i + 1)
+                })
+                .collect();
+            SqlFragment::with_params(
+                format!("value_reference IN ({})", placeholders.join(", ")),
+                params,
+            )
+        } else {
+            // Multiple values are ORed together
+            let mut or_conditions = Vec::new();
+            let mut total_params = 0usize;
+
+            for value in &param.values {
+                let condition =
+                    self.build_value_condition(param, value, param_offset + total_params);
+                if let Some(cond) = condition {
+                    total_params += cond.params.len();
+                    or_conditions.push(cond);
+                }
             }
-        }
 
-        if or_conditions.is_empty() {
-            return None;
-        }
+            if or_conditions.is_empty() {
+                return None;
+            }
 
-        // Combine with OR
-        let mut combined = or_conditions.remove(0);
-        for cond in or_conditions {
-            combined = combined.or(cond);
-        }
+            // Combine with OR
+            let mut combined = or_conditions.remove(0);
+            for cond in or_conditions {
+                combined = combined.or(cond);
+            }
+            combined
+        };
 
         // Wrap in subquery to ensure proper AND/OR semantics. `:not` negates
         // HERE, at the resource level, not inside the row predicate (#473):
@@ -1226,5 +1263,112 @@ mod tests {
         }
         // tenant, resource_type, + 3 per ID-only ref × 2 values
         assert_eq!(fragment.params.len(), 8);
+    }
+
+    #[test]
+    fn test_multi_value_typed_reference_uses_flat_in() {
+        // A plain multi-value `Type/id` reference collapses to one flat
+        // `value_reference IN (...)` — a single indexed lookup, not an OR of
+        // per-value range branches (#1052).
+        let builder = QueryBuilder::new("default", "Observation");
+        let mut query = SearchQuery::new("Observation");
+        query.parameters.push(SearchParameter {
+            name: "subject".to_string(),
+            param_type: SearchParamType::Reference,
+            modifier: None,
+            values: vec![
+                SearchValue::eq("Patient/a"),
+                SearchValue::eq("Patient/b"),
+                SearchValue::eq("Patient/c"),
+            ],
+            chain: vec![],
+            components: vec![],
+        });
+
+        let fragment = builder.build(&query);
+        assert!(
+            fragment.sql.contains("value_reference IN (?3, ?4, ?5)"),
+            "expected a flat IN list, got: {}",
+            fragment.sql
+        );
+        // No per-value OR branches, and no `_history` range scan.
+        assert!(
+            !fragment.sql.contains(" OR "),
+            "should not OR: {}",
+            fragment.sql
+        );
+        assert!(
+            !fragment.sql.contains("_history"),
+            "multi-value IN path is exact-base only: {}",
+            fragment.sql
+        );
+        // tenant, resource_type, + one base per value
+        assert_eq!(fragment.params.len(), 5);
+    }
+
+    #[test]
+    fn test_multi_value_typed_reference_strips_versions() {
+        // Each search value is version-stripped to its base before going into
+        // the IN list, so a versioned search value still matches the base.
+        let builder = QueryBuilder::new("default", "Observation");
+        let mut query = SearchQuery::new("Observation");
+        query.parameters.push(SearchParameter {
+            name: "subject".to_string(),
+            param_type: SearchParamType::Reference,
+            modifier: None,
+            values: vec![
+                SearchValue::eq("Patient/a/_history/2"),
+                SearchValue::eq("Patient/b"),
+            ],
+            chain: vec![],
+            components: vec![],
+        });
+
+        let fragment = builder.build(&query);
+        assert!(
+            fragment.sql.contains("value_reference IN (?3, ?4)"),
+            "{}",
+            fragment.sql
+        );
+        let bound: Vec<String> = fragment
+            .params
+            .iter()
+            .filter_map(|p| match p {
+                SqlParam::String(s) => Some(s.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            bound.contains(&"Patient/a".to_string()),
+            "version not stripped: {bound:?}"
+        );
+        assert!(bound.contains(&"Patient/b".to_string()), "bound: {bound:?}");
+    }
+
+    #[test]
+    fn test_multi_value_bare_id_reference_keeps_or_path() {
+        // Bare ids (no `Type/`) cannot use the base-equality IN — they still
+        // need the `%/id` suffix match — so they keep the generic OR path.
+        let builder = QueryBuilder::new("default", "Immunization");
+        let mut query = SearchQuery::new("Immunization");
+        query.parameters.push(SearchParameter {
+            name: "patient".to_string(),
+            param_type: SearchParamType::Reference,
+            modifier: None,
+            values: vec![SearchValue::eq("p1"), SearchValue::eq("p2")],
+            chain: vec![],
+            components: vec![],
+        });
+        let fragment = builder.build(&query);
+        assert!(
+            !fragment.sql.contains("value_reference IN (?3, ?4)"),
+            "bare ids must not take the flat-IN path: {}",
+            fragment.sql
+        );
+        assert!(
+            fragment.sql.contains(" OR "),
+            "bare-id path still ORs: {}",
+            fragment.sql
+        );
     }
 }
