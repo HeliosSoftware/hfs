@@ -132,6 +132,15 @@ Each item notes the spec basis, the fix, the files touched, and backend coverage
   Elasticsearch were already correct (OR for every type) and are
   unchanged. PostgreSQL has the same class of defect, more broadly
   (quantity included) — tracked as a follow-up below, not fixed here.
+  MongoDB was the outlier here, not an exception to a settled convention:
+  the REST extractor, SQLite, Elasticsearch, and the UI's own query
+  builder already narrate a comma-separated date range as OR (e.g.
+  `crates/ui/e2e/tests/queries.spec.ts:1186` —
+  `"birthdate is on or before “1979-12-31” or birthdate is on or
+  after “1980-01-02”"`, exercised by the `mongodb`
+  backend lane of `.github/workflows/ui-tests-matrix.yml`); those e2e
+  assertions narrate builder hydration only, not result counts, so they
+  are unaffected by this fix either way.
   Files: `crates/persistence/src/backends/mongodb/search_impl.rs`.
 
 ## Out of first cut (tracked follow-ups)
