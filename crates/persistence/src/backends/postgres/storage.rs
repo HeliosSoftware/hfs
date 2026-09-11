@@ -2643,6 +2643,12 @@ impl PurgableStorage for PostgresBackend {
 
 // Helper function to parse simple search parameters
 // Supports basic formats like: identifier=X, _id=Y, name=Z
+/// Why conditional criteria cannot be resolved inside a transaction when
+/// search is offloaded to a secondary backend (#511, #859).
+const OFFLOADED_CONDITIONAL_REFUSAL: &str = "conditional criteria cannot be resolved inside a \
+     transaction when search is offloaded to a secondary backend; submit the entry in a batch \
+     Bundle instead";
+
 fn parse_simple_search_params(params: &str) -> Vec<(String, String)> {
     params
         .split('&')
@@ -2830,6 +2836,10 @@ impl PostgresBackend {
     /// Buffered creates are flushed first, exactly as `read` does, so they are
     /// visible too; a bundle that puts `ifNoneExist` on every entry therefore
     /// forfeits create batching, which is the correct trade.
+    ///
+    /// The string form `ifNoneExist` carries is parsed here and handed to the
+    /// typed [`ConditionalTransaction::find_matching`], so both criteria
+    /// forms run one search body (#859).
     async fn find_matching_resources_in_tx(
         &self,
         tenant: &TenantContext,
@@ -2837,17 +2847,12 @@ impl PostgresBackend {
         resource_type: &str,
         search_params_str: &str,
     ) -> StorageResult<Vec<StoredResource>> {
+        use crate::core::ConditionalTransaction;
+
         let Some(query) = self.conditional_query(tenant, resource_type, search_params_str)? else {
             return Ok(Vec::new());
         };
-
-        tx.flush().await?;
-        let client = tx.client()?;
-        let result = self
-            .search_with_client(client, tenant, &query, None)
-            .await?;
-
-        Ok(result.resources.items)
+        tx.find_matching(resource_type, &query.parameters).await
     }
 
     /// Builds the search a conditional interaction's criteria describe, or
@@ -3097,6 +3102,14 @@ impl BundleProvider for PostgresBackend {
         true
     }
 
+    /// With search offloaded to a secondary backend the local index is empty
+    /// for every row, so an in-transaction search would always find nothing
+    /// and every conditional write would create the duplicate its criteria
+    /// exist to prevent.
+    fn supports_conditional_in_transaction(&self) -> bool {
+        !self.is_search_offloaded()
+    }
+
     async fn process_transaction(
         &self,
         tenant: &TenantContext,
@@ -3117,6 +3130,25 @@ impl BundleProvider for PostgresBackend {
         let mut results = Vec::with_capacity(entries.len());
         let mut error_info: Option<(usize, String)> = None;
 
+        // URL-borne conditional entries (`PUT/DELETE [type]?[criteria]`)
+        // resolve against the transaction's starting view before any entry is
+        // written, and an overlap between resolved identities and the other
+        // entries fails the bundle (R4 §3.1.0.11.2; #859). Nothing is
+        // buffered yet, so no flush precedes these searches.
+        let targets = match crate::core::resolve_conditional_targets(
+            &mut tx,
+            &entries,
+            (!self.supports_conditional_in_transaction()).then_some(OFFLOADED_CONDITIONAL_REFUSAL),
+        )
+        .await
+        {
+            Ok(targets) => targets,
+            Err(e) => {
+                let _ = Box::new(tx).rollback().await;
+                return Err(e);
+            }
+        };
+
         // `create` no longer sends its insert on the spot — the transaction
         // batches consecutive creates and flushes them together, which is what
         // takes a 1,632-entry import bundle from 3,264 statements to 26. A
@@ -3126,8 +3158,18 @@ impl BundleProvider for PostgresBackend {
         // n-th `create` call back to the entry that made it.
         let mut create_entry_index: Vec<usize> = Vec::with_capacity(entries.len());
 
-        // Build a map of fullUrl -> assigned reference for reference resolution
+        // Build a map of fullUrl -> assigned reference for reference resolution.
+        // A conditional entry that matched is known now, so `urn:uuid`
+        // references to it resolve regardless of entry order.
         let mut reference_map: HashMap<String, String> = HashMap::new();
+        for target in targets.values() {
+            if let (Some(full_url), Some(identity)) = (
+                entries[target.entry_index].full_url.as_ref(),
+                target.identity(),
+            ) {
+                reference_map.insert(full_url.clone(), identity);
+            }
+        }
 
         // Whether any entry in this transaction writes a SearchParameter that
         // affects this tenant's cached overlay (#787: transaction-bundle writes
@@ -3149,7 +3191,9 @@ impl BundleProvider for PostgresBackend {
             }
 
             let creates_before = tx.creates_seen();
-            let result = self.process_bundle_entry_tx(tenant, &mut tx, entry).await;
+            let result = self
+                .process_bundle_entry_tx(tenant, &mut tx, entry, targets.get(&idx))
+                .await;
             for _ in creates_before..tx.creates_seen() {
                 create_entry_index.push(idx);
             }
@@ -3187,17 +3231,22 @@ impl BundleProvider for PostgresBackend {
                                     }) == Some("SearchParameter")
                                 }
                                 // Deleted: the emptied result carries no resource, so
-                                // parse the type from the entry's URL instead.
-                                204 => self
-                                    .parse_url(&entry.url)
-                                    .map(|(resource_type, _)| resource_type == "SearchParameter")
+                                // take the type from the entry's URL instead.
+                                204 => crate::core::conditional_resource_type(entry)
+                                    .map(|resource_type| resource_type == "SearchParameter")
+                                    .or_else(|| {
+                                        self.parse_url(&entry.url).ok().map(|(resource_type, _)| {
+                                            resource_type == "SearchParameter"
+                                        })
+                                    })
                                     .unwrap_or(false),
                                 _ => false,
                             };
                     }
 
-                    // If this was a create (POST) and we have a fullUrl, record the mapping
-                    if entry.method == BundleMethod::Post {
+                    // A create (POST, or a conditional PUT that created) with a
+                    // fullUrl records the assigned identity for later references.
+                    if matches!(entry.method, BundleMethod::Post | BundleMethod::Put) {
                         if let Some(ref full_url) = entry.full_url {
                             if let Some(ref location) = entry_result.location {
                                 let reference = location
@@ -3292,11 +3341,16 @@ fn attribute_entry_error(
 
 impl PostgresBackend {
     /// Process a single bundle entry within a transaction.
+    ///
+    /// `target` is the pre-pass resolution of a URL-borne conditional entry
+    /// (#859): its `PUT` updates the match or creates, its `DELETE` deletes
+    /// the match or is a no-op `204`, without re-resolving the criteria.
     async fn process_bundle_entry_tx(
         &self,
         tenant: &TenantContext,
         tx: &mut super::transaction::PostgresTransaction,
         entry: &BundleEntry,
+        target: Option<&crate::core::ConditionalTarget>,
     ) -> StorageResult<BundleEntryResult> {
         use crate::core::transaction::Transaction;
 
@@ -3341,9 +3395,7 @@ impl PostgresBackend {
                     // Refuse the entry instead; the bundle rolls back (#511).
                     if self.is_search_offloaded() {
                         return Ok(crate::core::not_supported_entry(
-                            "ifNoneExist cannot be resolved inside a transaction when search \
-                             is offloaded to a secondary backend; submit the entry in a batch \
-                             Bundle instead",
+                            OFFLOADED_CONDITIONAL_REFUSAL,
                         ));
                     }
                     let matches = self
@@ -3363,6 +3415,17 @@ impl PostgresBackend {
                         field: "resource".to_string(),
                     })
                 })?;
+
+                if let Some(target) = target {
+                    return Ok(match &target.resolved {
+                        Some(existing) => crate::core::conditional_update_entry(
+                            tx.update(existing, resource).await?,
+                        ),
+                        None => BundleEntryResult::created(
+                            tx.create(&target.resource_type, resource).await?,
+                        ),
+                    });
+                }
 
                 let (resource_type, id) = self.parse_url(&entry.url)?;
 
@@ -3396,6 +3459,16 @@ impl PostgresBackend {
                 }
             }
             BundleMethod::Delete => {
+                if let Some(target) = target {
+                    return Ok(match &target.resolved {
+                        Some(existing) => {
+                            tx.delete(&target.resource_type, existing.id()).await?;
+                            crate::core::conditional_delete_entry(existing)
+                        }
+                        None => BundleEntryResult::deleted(),
+                    });
+                }
+
                 let (resource_type, id) = self.parse_url(&entry.url)?;
 
                 // Honor `ifMatch` on DELETE — previously ignored here, so a

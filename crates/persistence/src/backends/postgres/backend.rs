@@ -28,6 +28,9 @@ use crate::search::{
 type StoredByTenant = Arc<RwLock<HashMap<String, Vec<SearchParameterDefinition>>>>;
 
 /// PostgreSQL backend for FHIR resource storage.
+///
+/// Cheap to clone: a pool handle, shared registries and the config.
+#[derive(Clone)]
 pub struct PostgresBackend {
     pool: Pool,
     config: PostgresConfig,
