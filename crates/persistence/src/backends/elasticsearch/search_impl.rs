@@ -409,22 +409,6 @@ impl SearchProvider for ElasticsearchBackend {
             result = result.with_total(t);
         }
 
-        // Resolve includes if requested
-        if !query.includes.is_empty() {
-            let include_directives: Vec<IncludeDirective> = query
-                .includes
-                .iter()
-                .filter(|i| i.include_type == crate::types::IncludeType::Include)
-                .cloned()
-                .collect();
-            if !include_directives.is_empty() {
-                let included = self
-                    .resolve_includes(tenant, &result.resources.items, &include_directives)
-                    .await?;
-                result = result.with_included(included);
-            }
-        }
-
         Ok(result)
     }
 
@@ -732,45 +716,17 @@ async fn execute_text_search(
 
 #[async_trait]
 impl IncludeProvider for ElasticsearchBackend {
+    /// Delegates to the shared, registry-driven resolver so `_include` (and
+    /// `:iterate`) follows the same search-parameter definitions (with FHIRPath
+    /// expression evaluation) used to build the index, instead of a
+    /// backend-specific reference extractor that could disagree with it.
     async fn resolve_includes(
         &self,
         tenant: &TenantContext,
         resources: &[StoredResource],
         includes: &[IncludeDirective],
     ) -> StorageResult<Vec<StoredResource>> {
-        let mut included = Vec::new();
-
-        for directive in includes {
-            for resource in resources {
-                // Extract references from the resource's content
-                let content = resource.content();
-                let search_param = &directive.search_param;
-
-                // Walk the content looking for reference values
-                let references = extract_references(content, search_param);
-
-                for (ref_type, ref_id) in references {
-                    // Check target type filter
-                    if let Some(ref target_type) = directive.target_type {
-                        if ref_type != *target_type {
-                            continue;
-                        }
-                    }
-
-                    // Read the referenced resource from ES
-                    if let Some(stored) = self.read(tenant, &ref_type, &ref_id).await? {
-                        // Avoid duplicates
-                        if !included.iter().any(|r: &StoredResource| {
-                            r.resource_type() == stored.resource_type() && r.id() == stored.id()
-                        }) {
-                            included.push(stored);
-                        }
-                    }
-                }
-            }
-        }
-
-        Ok(included)
+        crate::core::resolve_includes_iterative(self, tenant, resources, includes).await
     }
 }
 
@@ -867,79 +823,6 @@ fn parse_hit_to_stored_resource(
         None,
         fhir_version,
     )))
-}
-
-/// Extracts reference values from a FHIR resource for a given search parameter.
-///
-/// Returns a list of (resource_type, resource_id) tuples.
-fn extract_references(content: &Value, param_name: &str) -> Vec<(String, String)> {
-    let mut refs = Vec::new();
-
-    // Common reference fields in FHIR resources
-    // The param name maps to a path in the resource
-    if let Some(obj) = content.as_object() {
-        // Direct field match (e.g., "subject" -> content.subject)
-        if let Some(ref_value) = obj.get(param_name) {
-            extract_reference_from_value(ref_value, &mut refs);
-        }
-
-        // Also check common FHIR reference patterns
-        for (_key, value) in obj {
-            if let Some(ref_obj) = value.as_object() {
-                if let Some(reference) = ref_obj.get("reference").and_then(|r| r.as_str()) {
-                    if let Some((rt, id)) = parse_reference_string(reference) {
-                        refs.push((rt, id));
-                    }
-                }
-            }
-            if let Some(arr) = value.as_array() {
-                for item in arr {
-                    if let Some(ref_obj) = item.as_object() {
-                        if let Some(reference) = ref_obj.get("reference").and_then(|r| r.as_str()) {
-                            if let Some((rt, id)) = parse_reference_string(reference) {
-                                refs.push((rt, id));
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    refs
-}
-
-/// Extracts a reference from a JSON value (object with "reference" field or array).
-fn extract_reference_from_value(value: &Value, refs: &mut Vec<(String, String)>) {
-    if let Some(obj) = value.as_object() {
-        if let Some(reference) = obj.get("reference").and_then(|r| r.as_str()) {
-            if let Some((rt, id)) = parse_reference_string(reference) {
-                refs.push((rt, id));
-            }
-        }
-    } else if let Some(arr) = value.as_array() {
-        for item in arr {
-            extract_reference_from_value(item, refs);
-        }
-    }
-}
-
-/// Parses a FHIR reference string "Type/id" into (type, id).
-fn parse_reference_string(reference: &str) -> Option<(String, String)> {
-    // Handle relative references: "Patient/123"
-    if let Some((type_part, id_part)) = reference.rsplit_once('/') {
-        // Avoid URL paths - just take the last two segments
-        let resource_type = type_part.rsplit('/').next().unwrap_or(type_part);
-        if resource_type
-            .chars()
-            .next()
-            .map(|c| c.is_uppercase())
-            .unwrap_or(false)
-        {
-            return Some((resource_type.to_string(), id_part.to_string()));
-        }
-    }
-    None
 }
 
 #[cfg(test)]

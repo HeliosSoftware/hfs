@@ -3726,6 +3726,254 @@ mod es_integration {
     }
 
     // ========================================================================
+    // Include Resolution Tests (#1013)
+    // ========================================================================
+
+    /// Sorted `(resource_type, id)` pairs, for exact-set assertions regardless
+    /// of the order resources were fetched in.
+    fn include_type_ids(
+        resources: &[helios_persistence::types::StoredResource],
+    ) -> Vec<(String, String)> {
+        let mut pairs: Vec<(String, String)> = resources
+            .iter()
+            .map(|r| (r.resource_type().to_string(), r.id().to_string()))
+            .collect();
+        pairs.sort();
+        pairs
+    }
+
+    /// Seeds the fixture shared by the `_include` delegation tests: `pat-1`
+    /// (managed by `org-1`), `org-1`, an Encounter with a real `serviceProvider`
+    /// reference (`enc-org`) and one with a conditional reference (`enc-cond`),
+    /// both referencing `pat-1` via `subject`.
+    async fn seed_include_fixture(backend: &ElasticsearchBackend, tenant: &TenantContext) {
+        backend
+            .create(
+                tenant,
+                "Organization",
+                json!({
+                    "resourceType": "Organization",
+                    "id": "org-1",
+                    "name": "Include Org"
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+
+        backend
+            .create(
+                tenant,
+                "Patient",
+                json!({
+                    "resourceType": "Patient",
+                    "id": "pat-1",
+                    "name": [{"family": "Include"}],
+                    "managingOrganization": {"reference": "Organization/org-1"}
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+
+        backend
+            .create(
+                tenant,
+                "Encounter",
+                json!({
+                    "resourceType": "Encounter",
+                    "id": "enc-cond",
+                    "status": "finished",
+                    "class": {"code": "AMB"},
+                    "subject": {"reference": "Patient/pat-1"},
+                    "serviceProvider": {
+                        "reference": "Organization?identifier=http://example.org/org|dept-9"
+                    }
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+
+        backend
+            .create(
+                tenant,
+                "Encounter",
+                json!({
+                    "resourceType": "Encounter",
+                    "id": "enc-org",
+                    "status": "finished",
+                    "class": {"code": "AMB"},
+                    "subject": {"reference": "Patient/pat-1"},
+                    "serviceProvider": {"reference": "Organization/org-1"}
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+
+        // Wait for index refresh so the fixture is visible to search()/read().
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+    }
+
+    /// `search()` leaves `included` empty, like SQLite and Postgres, so the
+    /// REST layer resolves `_include` for Elasticsearch through the shared
+    /// `resolve_includes_iterative` path instead of an inline extractor.
+    #[tokio::test]
+    async fn es_integration_search_does_not_resolve_includes_inline() {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::types::{IncludeDirective, IncludeType, SearchQuery};
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("include-1013-1");
+        seed_include_fixture(&backend, &tenant).await;
+
+        let query = SearchQuery::new("Encounter").with_include(IncludeDirective {
+            include_type: IncludeType::Include,
+            source_type: "Encounter".to_string(),
+            search_param: "service-provider".to_string(),
+            target_type: None,
+            iterate: false,
+        });
+
+        let result = backend.search(&tenant, &query).await.unwrap();
+
+        let mut ids: Vec<String> = result
+            .resources
+            .items
+            .iter()
+            .map(|r| r.id().to_string())
+            .collect();
+        ids.sort();
+        assert_eq!(ids, vec!["enc-cond".to_string(), "enc-org".to_string()]);
+        assert!(result.included.is_empty());
+    }
+
+    /// `IncludeProvider::resolve_includes` delegates to the shared,
+    /// registry-driven resolver: a conditional `serviceProvider` reference
+    /// never resolves to an included resource, a real one resolves to exactly
+    /// its target, and resolving the same target from two source resources
+    /// dedupes it.
+    #[tokio::test]
+    async fn es_integration_include_service_provider_returns_only_targets() {
+        use helios_persistence::core::IncludeProvider;
+        use helios_persistence::types::{IncludeDirective, IncludeType};
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("include-1013-2");
+        seed_include_fixture(&backend, &tenant).await;
+
+        let enc_cond = backend
+            .read(&tenant, "Encounter", "enc-cond")
+            .await
+            .unwrap()
+            .expect("enc-cond must exist");
+        let enc_org = backend
+            .read(&tenant, "Encounter", "enc-org")
+            .await
+            .unwrap()
+            .expect("enc-org must exist");
+
+        let service_provider = IncludeDirective {
+            include_type: IncludeType::Include,
+            source_type: "Encounter".to_string(),
+            search_param: "service-provider".to_string(),
+            target_type: None,
+            iterate: false,
+        };
+
+        let both = backend
+            .resolve_includes(
+                &tenant,
+                &[enc_cond.clone(), enc_org.clone()],
+                std::slice::from_ref(&service_provider),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            include_type_ids(&both),
+            vec![("Organization".to_string(), "org-1".to_string())]
+        );
+
+        let cond_only = backend
+            .resolve_includes(
+                &tenant,
+                std::slice::from_ref(&enc_cond),
+                std::slice::from_ref(&service_provider),
+            )
+            .await
+            .unwrap();
+        assert!(cond_only.is_empty());
+
+        let subject = IncludeDirective {
+            include_type: IncludeType::Include,
+            source_type: "Encounter".to_string(),
+            search_param: "subject".to_string(),
+            target_type: None,
+            iterate: false,
+        };
+
+        let subjects = backend
+            .resolve_includes(&tenant, &[enc_cond, enc_org], &[subject])
+            .await
+            .unwrap();
+        assert_eq!(
+            include_type_ids(&subjects),
+            vec![("Patient".to_string(), "pat-1".to_string())]
+        );
+    }
+
+    /// `:iterate` follows references transitively through the same shared
+    /// resolver: `Encounter:subject` finds the Patient on the first hop, and
+    /// `Patient:organization` (marked `iterate`) then follows that Patient to
+    /// its managing Organization.
+    #[tokio::test]
+    async fn es_integration_include_iterate_follows_included_resources() {
+        use helios_persistence::core::IncludeProvider;
+        use helios_persistence::types::{IncludeDirective, IncludeType};
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("include-1013-3");
+        seed_include_fixture(&backend, &tenant).await;
+
+        let enc_org = backend
+            .read(&tenant, "Encounter", "enc-org")
+            .await
+            .unwrap()
+            .expect("enc-org must exist");
+
+        let includes = vec![
+            IncludeDirective {
+                include_type: IncludeType::Include,
+                source_type: "Encounter".to_string(),
+                search_param: "subject".to_string(),
+                target_type: None,
+                iterate: false,
+            },
+            IncludeDirective {
+                include_type: IncludeType::Include,
+                source_type: "Patient".to_string(),
+                search_param: "organization".to_string(),
+                target_type: None,
+                iterate: true,
+            },
+        ];
+
+        let included = backend
+            .resolve_includes(&tenant, &[enc_org], &includes)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            include_type_ids(&included),
+            vec![
+                ("Organization".to_string(), "org-1".to_string()),
+                ("Patient".to_string(), "pat-1".to_string()),
+            ]
+        );
+    }
+
+    // ========================================================================
     // Cursor Pagination Tests (#1015)
     // ========================================================================
 
