@@ -411,9 +411,9 @@ where
         })?;
 
     // Resolve _include/_revinclude (with :iterate) for backends whose search()
-    // does not populate includes inline (SQLite, Postgres). Backends that
-    // resolve inline (Elasticsearch, MongoDB) return a non-empty `included` and
-    // are left as-is.
+    // does not populate includes inline (SQLite, Postgres, Elasticsearch).
+    // MongoDB is the only backend that resolves inline, returning a non-empty
+    // `included` that is left as-is.
     if !query.includes.is_empty() && result.included.is_empty() {
         let included = resolve_includes_iterative(
             state.storage(),
