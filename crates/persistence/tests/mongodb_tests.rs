@@ -317,6 +317,241 @@ async fn mongodb_day_precision_date_boundaries() {
     date_boundary_suite::day_precision_boundaries(&backend, "date-boundary-519").await;
 }
 
+/// #1062: a comma-separated value list on one `SearchParameter` is OR per
+/// FHIR (https://build.fhir.org/search.html#combining) — for date same as
+/// every other type. Drives the real `SearchProvider::search` /
+/// `search_count` path so the assertion is on behavior, not just the filter
+/// document shape (see `value_list_tests` in `search_impl.rs` for that
+/// Docker-free half of the pin).
+///
+/// This is deliberately distinct from the *repeated*-parameter form
+/// (`?birthdate=ge...&birthdate=le...`), which is two separate
+/// `SearchParameter` entries and is intersected, not OR-ed — case (d) below
+/// guards that it is untouched (MANUAL_TESTING_MATRIX row 4.3 relies on it).
+#[tokio::test]
+async fn mongodb_comma_separated_date_values_are_ored() {
+    let Some(backend) = create_backend_with_full_registry("comma_or_date").await else {
+        eprintln!("skipping: no MongoDB container available");
+        return;
+    };
+    let tenant = create_tenant("tenant-comma-or-date");
+
+    const BIRTHDATES: [&str; 3] = ["1985-05-05", "1995-10-02", "2005-01-01"];
+    for (i, birth) in BIRTHDATES.iter().enumerate() {
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"id": format!("cod-{i}"), "birthDate": birth}),
+                FhirVersion::default(),
+            )
+            .await
+            .expect("seed patient");
+    }
+
+    // One `birthdate` SearchParameter carrying all the values
+    // (a comma list), as opposed to `repeated_birthdate_query` below which
+    // builds one SearchParameter per value.
+    fn comma_birthdate_query(values: &[&str]) -> SearchQuery {
+        SearchQuery::new("Patient").with_parameter(SearchParameter {
+            name: "birthdate".to_string(),
+            param_type: SearchParamType::Date,
+            values: values.iter().map(|v| SearchValue::parse(v)).collect(),
+            ..Default::default()
+        })
+    }
+
+    fn repeated_birthdate_query(values: &[&str]) -> SearchQuery {
+        let mut query = SearchQuery::new("Patient");
+        for v in values {
+            query = query.with_parameter(SearchParameter {
+                name: "birthdate".to_string(),
+                param_type: SearchParamType::Date,
+                values: vec![SearchValue::parse(v)],
+                ..Default::default()
+            });
+        }
+        query
+    }
+
+    // Eventually-consistent search backends need the seed to land in the
+    // index first; poll on the broadest query until all 3 are visible (same
+    // idiom as `date_boundary_suite::day_precision_boundaries`).
+    let visibility_probe = comma_birthdate_query(&["ge1900-01-01"]);
+    for attempt in 0..60 {
+        let visible = backend
+            .search(&tenant, &visibility_probe)
+            .await
+            .expect("visibility probe")
+            .resources
+            .items
+            .len();
+        if visible == BIRTHDATES.len() {
+            break;
+        }
+        assert!(
+            attempt < 59,
+            "cohort never became searchable: {visible}/{} visible",
+            BIRTHDATES.len()
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+
+    // (a) Precondition: extraction really produced 3 rows, so a failure
+    // below is never blamed on extraction instead of the fix under test.
+    let precondition = backend
+        .search(&tenant, &comma_birthdate_query(&["ge1900-01-01"]))
+        .await
+        .expect("precondition search");
+    assert_eq!(
+        precondition.resources.items.len(),
+        3,
+        "precondition: birthdate=ge1900-01-01 must see all 3 patients"
+    );
+
+    // (b) Disjoint comma list -> the union, not the empty set. Before the
+    // fix the $and over one search_index row can never be satisfied by a
+    // disjoint pair, `matching_resource_ids` short-circuits to an empty
+    // set, and the whole search returns 0.
+    let disjoint = comma_birthdate_query(&["1985-05-05", "2005-01-01"]);
+    let disjoint_result = backend
+        .search(&tenant, &disjoint)
+        .await
+        .expect("disjoint comma search");
+    assert_eq!(
+        disjoint_result.resources.items.len(),
+        2,
+        "birthdate=1985-05-05,2005-01-01 must return the union (FHIR comma = OR)"
+    );
+    let disjoint_count = backend
+        .search_count(&tenant, &disjoint)
+        .await
+        .expect("disjoint comma count");
+    assert_eq!(
+        disjoint_count, 2,
+        "search_count must agree with search() on the same query"
+    );
+
+    // (c) Range-shaped comma list -> the deliberate widening. Before the
+    // fix this behaved as a closed range (1: only the 1995-10-02 patient).
+    // After, it is "any date >= 1995-01-01 OR any date <= 1995-12-31" (in
+    // FHIR terms, ge OR le), which every patient in this cohort satisfies —
+    // the widening this fix pins on purpose (see PR description / issue
+    // #1062 for the migration to the repeated form).
+    let range_shaped = comma_birthdate_query(&["ge1995-01-01", "le1995-12-31"]);
+    let range_result = backend
+        .search(&tenant, &range_shaped)
+        .await
+        .expect("range-shaped comma search");
+    assert_eq!(
+        range_result.resources.items.len(),
+        3,
+        "birthdate=ge1995-01-01,le1995-12-31 widens to OR across all 3 patients"
+    );
+
+    // (d) Guard: the repeated-parameter form is a different mechanism (two
+    // `SearchParameter` entries, intersected in `matching_resource_ids`)
+    // and must be unaffected — it stays a closed range.
+    let repeated = repeated_birthdate_query(&["ge1995-01-01", "le1995-12-31"]);
+    let repeated_result = backend
+        .search(&tenant, &repeated)
+        .await
+        .expect("repeated-parameter search");
+    assert_eq!(
+        repeated_result.resources.items.len(),
+        1,
+        "repeated birthdate parameters (ge&le) must still AND to a closed range"
+    );
+}
+
+/// #1062, Number: same defect class as the date case above. `ChargeItem`
+/// is chosen deliberately over `RiskAssessment.probability`: the latter is
+/// an uncast choice element (`RiskAssessment.prediction.probability`) that
+/// the schema-less extractor does not resolve, so a failure there would be
+/// ambiguous between "extraction didn't run" and "the fix is wrong".
+/// `ChargeItem.factorOverride` is a plain decimal path.
+#[tokio::test]
+async fn mongodb_comma_separated_number_values_are_ored() {
+    let Some(backend) = create_backend_with_full_registry("comma_or_number").await else {
+        eprintln!("skipping: no MongoDB container available");
+        return;
+    };
+    let tenant = create_tenant("tenant-comma-or-number");
+
+    const FACTORS: [f64; 3] = [0.25, 0.75, 1.5];
+    for (i, factor) in FACTORS.iter().enumerate() {
+        backend
+            .create(
+                &tenant,
+                "ChargeItem",
+                json!({
+                    "id": format!("con-{i}"),
+                    "status": "billable",
+                    "factorOverride": factor,
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .expect("seed chargeitem");
+    }
+
+    fn factor_query(values: &[&str]) -> SearchQuery {
+        SearchQuery::new("ChargeItem").with_parameter(SearchParameter {
+            name: "factor-override".to_string(),
+            param_type: SearchParamType::Number,
+            values: values.iter().map(|v| SearchValue::parse(v)).collect(),
+            ..Default::default()
+        })
+    }
+
+    let visibility_probe = factor_query(&["ge0"]);
+    for attempt in 0..60 {
+        let visible = backend
+            .search(&tenant, &visibility_probe)
+            .await
+            .expect("visibility probe")
+            .resources
+            .items
+            .len();
+        if visible == FACTORS.len() {
+            break;
+        }
+        assert!(
+            attempt < 59,
+            "cohort never became searchable: {visible}/{} visible",
+            FACTORS.len()
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+
+    // (a) Precondition: proves ChargeItem.factorOverride actually extracts
+    // into a `value_number` row, isolating that risk from the fix itself.
+    let precondition = backend
+        .search(&tenant, &visibility_probe)
+        .await
+        .expect("precondition search");
+    assert_eq!(
+        precondition.resources.items.len(),
+        3,
+        "precondition: factor-override=ge0 must see all 3 ChargeItems \
+         (a failure here means ChargeItem.factorOverride did not extract, \
+         which is unrelated to #1062 — see comma_separated_number_values_are_ored \
+         in search_impl.rs for the extraction-free pin of the same fix)"
+    );
+
+    // (b) Disjoint comma list -> the union, not the empty set.
+    let disjoint = factor_query(&["0.25", "1.5"]);
+    let disjoint_result = backend
+        .search(&tenant, &disjoint)
+        .await
+        .expect("disjoint comma search");
+    assert_eq!(
+        disjoint_result.resources.items.len(),
+        2,
+        "factor-override=0.25,1.5 must return the union (FHIR comma = OR)"
+    );
+}
+
 fn create_tenant(tenant_id: &str) -> TenantContext {
     TenantContext::new(TenantId::new(tenant_id), TenantPermissions::full_access())
 }
