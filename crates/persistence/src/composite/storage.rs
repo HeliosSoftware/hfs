@@ -489,12 +489,26 @@ impl CompositeStorage {
     }
 
     /// Routes and executes a search query.
+    ///
+    /// With a dedicated Search backend the whole query goes there; otherwise
+    /// the query is routed, split by feature across backends, and merged.
     #[instrument(skip(self, tenant, query), fields(resource_type = %query.resource_type))]
     async fn execute_routed_search(
         &self,
         tenant: &TenantContext,
         query: &SearchQuery,
     ) -> StorageResult<SearchResult> {
+        // When a dedicated Search backend is configured, the primary has its
+        // search index offloaded (`search_offloaded = true`) and thus empty.
+        // Splitting the query and intersecting with the primary's (empty)
+        // results would always return nothing and drop the `total`. The
+        // Search backend supports every query feature, including full-text,
+        // so send it the whole query instead, exactly like the no-auxiliary
+        // path below already does. See #1012.
+        if self.has_dedicated_search_backend() {
+            return self.execute_primary_search(tenant, query).await;
+        }
+
         // Route the query
         let decision = self
             .router
@@ -2623,11 +2637,13 @@ mod tests {
     use crate::error::{BackendError, StorageError, StorageResult};
     use crate::tenant::{TenantContext, TenantId, TenantPermissions};
     use crate::types::{
-        SearchParamType, SearchParameter, SearchQuery, SearchValue, StoredResource,
+        Page, PageInfo, SearchParamType, SearchParameter, SearchQuery, SearchValue, StoredResource,
+        StoredResourceBuilder,
     };
     use async_trait::async_trait;
     use helios_fhir::FhirVersion;
     use serde_json::{Value, json};
+    use std::sync::Mutex;
 
     #[derive(Debug)]
     struct FailingSearchBackend {
@@ -3363,6 +3379,340 @@ mod tests {
             .await
             .expect("composite search_count should succeed");
         assert_eq!(count, 1);
+    }
+
+    /// A fake resource storage that also acts as a search provider. It
+    /// records every `search` query it receives (so tests can assert which
+    /// backend answered, and with which parameters) and returns a fixed set
+    /// of results with the total set to the number of results.
+    struct RecordingSearchProvider {
+        name: &'static str,
+        calls: Mutex<Vec<SearchQuery>>,
+        results: Vec<StoredResource>,
+    }
+
+    impl RecordingSearchProvider {
+        fn new(name: &'static str, results: Vec<StoredResource>) -> Self {
+            Self {
+                name,
+                calls: Mutex::new(Vec::new()),
+                results,
+            }
+        }
+
+        fn call_count(&self) -> usize {
+            self.calls.lock().expect("calls mutex poisoned").len()
+        }
+    }
+
+    #[async_trait]
+    impl ResourceStorage for RecordingSearchProvider {
+        fn backend_name(&self) -> &'static str {
+            self.name
+        }
+
+        async fn create(
+            &self,
+            _tenant: &TenantContext,
+            _resource_type: &str,
+            _resource: Value,
+            _fhir_version: FhirVersion,
+        ) -> StorageResult<StoredResource> {
+            Err(StorageError::Backend(BackendError::UnsupportedCapability {
+                backend_name: self.name.to_string(),
+                capability: "create".to_string(),
+            }))
+        }
+
+        async fn create_or_update(
+            &self,
+            _tenant: &TenantContext,
+            _resource_type: &str,
+            _id: &str,
+            _resource: Value,
+            _fhir_version: FhirVersion,
+        ) -> StorageResult<(StoredResource, bool)> {
+            Err(StorageError::Backend(BackendError::UnsupportedCapability {
+                backend_name: self.name.to_string(),
+                capability: "create_or_update".to_string(),
+            }))
+        }
+
+        async fn read(
+            &self,
+            _tenant: &TenantContext,
+            _resource_type: &str,
+            _id: &str,
+        ) -> StorageResult<Option<StoredResource>> {
+            Ok(None)
+        }
+
+        async fn update(
+            &self,
+            _tenant: &TenantContext,
+            _current: &StoredResource,
+            _resource: Value,
+        ) -> StorageResult<StoredResource> {
+            Err(StorageError::Backend(BackendError::UnsupportedCapability {
+                backend_name: self.name.to_string(),
+                capability: "update".to_string(),
+            }))
+        }
+
+        async fn delete(
+            &self,
+            _tenant: &TenantContext,
+            _resource_type: &str,
+            _id: &str,
+        ) -> StorageResult<()> {
+            Err(StorageError::Backend(BackendError::UnsupportedCapability {
+                backend_name: self.name.to_string(),
+                capability: "delete".to_string(),
+            }))
+        }
+
+        async fn count(
+            &self,
+            _tenant: &TenantContext,
+            _resource_type: Option<&str>,
+        ) -> StorageResult<u64> {
+            Ok(self.results.len() as u64)
+        }
+    }
+
+    #[async_trait]
+    impl SearchProvider for RecordingSearchProvider {
+        async fn search(
+            &self,
+            _tenant: &TenantContext,
+            query: &SearchQuery,
+        ) -> StorageResult<SearchResult> {
+            self.calls
+                .lock()
+                .expect("calls mutex poisoned")
+                .push(query.clone());
+            Ok(
+                SearchResult::new(Page::new(self.results.clone(), PageInfo::end()))
+                    .with_total(self.results.len() as u64),
+            )
+        }
+
+        async fn search_count(
+            &self,
+            _tenant: &TenantContext,
+            _query: &SearchQuery,
+        ) -> StorageResult<u64> {
+            Ok(self.results.len() as u64)
+        }
+
+        fn search_param_registry(
+            &self,
+            _tenant: &TenantContext,
+        ) -> std::sync::Arc<parking_lot::RwLock<crate::search::SearchParameterRegistry>> {
+            std::sync::Arc::new(parking_lot::RwLock::new(
+                crate::search::SearchParameterRegistry::new(),
+            ))
+        }
+    }
+
+    /// Builds a fake `Patient` resource with the given id, for use as a
+    /// dedicated-search-backend fixture.
+    fn fake_patient(id: &str) -> StoredResource {
+        StoredResourceBuilder::new()
+            .resource_type("Patient")
+            .id(id)
+            .tenant_id(TenantId::new("composite-test"))
+            .content(json!({
+                "resourceType": "Patient",
+                "id": id,
+            }))
+            .build()
+    }
+
+    /// Builds a composite whose config has a primary and a dedicated
+    /// Search-role backend, backed by [`RecordingSearchProvider`] fakes so
+    /// tests can assert which backend answered a query.
+    fn make_composite_with_dedicated_search(
+        primary_results: Vec<StoredResource>,
+        search_results: Vec<StoredResource>,
+    ) -> (
+        CompositeStorage,
+        Arc<RecordingSearchProvider>,
+        Arc<RecordingSearchProvider>,
+    ) {
+        let primary = Arc::new(RecordingSearchProvider::new("primary", primary_results));
+        let search = Arc::new(RecordingSearchProvider::new("search", search_results));
+
+        let composite_config = CompositeConfig::builder()
+            .primary("primary", BackendKind::Sqlite)
+            .search_backend("search", BackendKind::Sqlite)
+            .build()
+            .expect("build composite config");
+
+        let mut backends: HashMap<String, DynStorage> = HashMap::new();
+        backends.insert("primary".to_string(), primary.clone() as DynStorage);
+        backends.insert("search".to_string(), search.clone() as DynStorage);
+
+        let mut search_providers: HashMap<String, DynSearchProvider> = HashMap::new();
+        search_providers.insert("primary".to_string(), primary.clone() as DynSearchProvider);
+        search_providers.insert("search".to_string(), search.clone() as DynSearchProvider);
+
+        let composite = CompositeStorage::new(composite_config, backends)
+            .expect("create composite storage")
+            .with_search_providers(search_providers);
+
+        (composite, primary, search)
+    }
+
+    /// Builds a composite whose config has only a primary backend (no
+    /// dedicated Search role), backed by a single [`RecordingSearchProvider`]
+    /// fake.
+    fn make_composite_no_search_backend(
+        primary_results: Vec<StoredResource>,
+    ) -> (CompositeStorage, Arc<RecordingSearchProvider>) {
+        let primary = Arc::new(RecordingSearchProvider::new("primary", primary_results));
+
+        let composite_config = CompositeConfig::builder()
+            .primary("primary", BackendKind::Sqlite)
+            .build()
+            .expect("build composite config");
+
+        let mut backends: HashMap<String, DynStorage> = HashMap::new();
+        backends.insert("primary".to_string(), primary.clone() as DynStorage);
+
+        let mut search_providers: HashMap<String, DynSearchProvider> = HashMap::new();
+        search_providers.insert("primary".to_string(), primary.clone() as DynSearchProvider);
+
+        let composite = CompositeStorage::new(composite_config, backends)
+            .expect("create composite storage")
+            .with_search_providers(search_providers);
+
+        (composite, primary)
+    }
+
+    #[tokio::test]
+    async fn test_full_text_query_is_answered_whole_by_dedicated_search_backend() {
+        let tenant = TenantContext::new(
+            TenantId::new("composite-test"),
+            TenantPermissions::full_access(),
+        );
+
+        let search_results = vec![
+            fake_patient("patient-1"),
+            fake_patient("patient-2"),
+            fake_patient("patient-3"),
+        ];
+        let (composite, primary, search) =
+            make_composite_with_dedicated_search(vec![], search_results);
+
+        let query = SearchQuery::new("Patient").with_parameter(SearchParameter {
+            name: "_content".to_string(),
+            param_type: SearchParamType::String,
+            modifier: None,
+            values: vec![SearchValue::string("everett")],
+            chain: vec![],
+            components: vec![],
+        });
+
+        let result = composite
+            .search(&tenant, &query)
+            .await
+            .expect("composite search should succeed");
+
+        assert_eq!(result.resources.len(), 3);
+        assert_eq!(result.total, Some(3));
+        assert_eq!(search.call_count(), 1);
+        assert_eq!(primary.call_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_mixed_query_reaches_dedicated_search_backend_intact() {
+        let tenant = TenantContext::new(
+            TenantId::new("composite-test"),
+            TenantPermissions::full_access(),
+        );
+
+        let search_results = vec![
+            fake_patient("patient-1"),
+            fake_patient("patient-2"),
+            fake_patient("patient-3"),
+        ];
+        let (composite, primary, search) =
+            make_composite_with_dedicated_search(vec![], search_results);
+
+        let query = SearchQuery::new("Patient")
+            .with_parameter(SearchParameter {
+                name: "_content".to_string(),
+                param_type: SearchParamType::String,
+                modifier: None,
+                values: vec![SearchValue::string("everett")],
+                chain: vec![],
+                components: vec![],
+            })
+            .with_parameter(SearchParameter {
+                name: "gender".to_string(),
+                param_type: SearchParamType::Token,
+                modifier: None,
+                values: vec![SearchValue::eq("female")],
+                chain: vec![],
+                components: vec![],
+            });
+
+        let result = composite
+            .search(&tenant, &query)
+            .await
+            .expect("composite search should succeed");
+
+        assert_eq!(result.total, Some(3));
+        assert_eq!(primary.call_count(), 0);
+        assert_eq!(search.call_count(), 1);
+
+        let recorded = search.calls.lock().expect("calls mutex poisoned");
+        let recorded_query = recorded.first().expect("search should have been called");
+        let names: Vec<&str> = recorded_query
+            .parameters
+            .iter()
+            .map(|p| p.name.as_str())
+            .collect();
+        assert!(
+            names.contains(&"_content"),
+            "recorded query should keep the _content parameter"
+        );
+        assert!(
+            names.contains(&"gender"),
+            "recorded query should keep the gender parameter"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_full_text_query_without_dedicated_search_backend_is_unchanged() {
+        // No Search-role backend is configured, so the guard added for #1012
+        // never triggers here: this exercises the pre-existing routing path
+        // (single backend, no auxiliary targets), unchanged by this fix.
+        let tenant = TenantContext::new(
+            TenantId::new("composite-test"),
+            TenantPermissions::full_access(),
+        );
+
+        let primary_results = vec![fake_patient("patient-1"), fake_patient("patient-2")];
+        let (composite, primary) = make_composite_no_search_backend(primary_results);
+
+        let query = SearchQuery::new("Patient").with_parameter(SearchParameter {
+            name: "_text".to_string(),
+            param_type: SearchParamType::String,
+            modifier: None,
+            values: vec![SearchValue::string("everett")],
+            chain: vec![],
+            components: vec![],
+        });
+
+        let result = composite
+            .search(&tenant, &query)
+            .await
+            .expect("composite search should succeed from the primary backend");
+
+        assert_eq!(result.resources.len(), 2);
+        assert_eq!(primary.call_count(), 1);
     }
 
     #[cfg(feature = "sqlite")]
