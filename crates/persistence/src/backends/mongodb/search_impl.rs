@@ -1554,11 +1554,54 @@ impl MongoBackend {
         let bounded = doc! {
             "$and": [ filter, { "resource_id": { "$in": Bson::Array(ids) } } ],
         };
-        let mut cursor = search_index
-            .find(bounded)
-            .projection(doc! { "resource_id": 1_i32, "_id": 0_i32 })
-            .await
-            .or_query_error("Failed to verify search_index candidates")?;
+
+        // The hint is load-bearing, not an optimisation. Measured with
+        // `explain("executionStats")` on an 827,985-Encounter corpus, verifying
+        // `date >= 2016` against 2,048 candidate ids, using the exact `$and`
+        // filter shape built below:
+        //
+        //   unhinted -> idx_search_string,    1,655,936 keys / 1,655,936 docs
+        //   hinted   -> idx_search_composite,     8,191 keys /     4,096 docs
+        //
+        // Keys examined is the stable figure — a ~200x difference, reproducible
+        // across runs. Wall time varied 51-80 s unhinted against 0.6-0.8 s
+        // hinted, depending on cache warmth, so treat those as indicative only.
+        //
+        // Left to itself the planner picks a value-typed index because its
+        // (tenant_id, resource_type, param_name) prefix matches, then scans the
+        // parameter's entire slice and treats the far more selective
+        // `resource_id: {$in: ...}` as a residual. `idx_search_composite` is
+        // (tenant_id, resource_type, resource_id, param_name, composite_group),
+        // whose first three keys are exactly this filter's equality/point-bound
+        // set, so it seeks the candidates directly.
+        //
+        // `ensure_search_indexes` creates that index unconditionally on every
+        // boot (schema.rs), so it is present in practice; the un-hinted retry
+        // below only guards a database whose indexes were dropped out of band,
+        // where a correct-but-slow answer beats an error.
+        let projection = doc! { "resource_id": 1_i32, "_id": 0_i32 };
+        let hinted = search_index
+            .find(bounded.clone())
+            .projection(projection.clone())
+            .hint(mongodb::options::Hint::Name(
+                "idx_search_composite".to_string(),
+            ))
+            .await;
+        let mut cursor = match hinted {
+            Ok(cursor) => cursor,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "idx_search_composite hint rejected; retrying candidate verification \
+                     unhinted (expect a full parameter-slice scan)"
+                );
+                search_index
+                    .find(bounded)
+                    .projection(projection)
+                    .await
+                    .or_query_error("Failed to verify search_index candidates")?
+            }
+        };
         let mut out = HashSet::new();
         Self::drain_resource_ids(&mut cursor, usize::MAX, &mut out).await?;
         Ok(out)
