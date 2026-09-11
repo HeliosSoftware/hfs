@@ -61,6 +61,18 @@ function progressReports(lines: string[]): { pct: number; written: number }[] {
     .map((match) => ({ pct: Number(match[1]), written: Number(match[2].replace(/,/g, "")) }));
 }
 
+// The source listens on loopback, so it is only reachable by an hfs running on
+// this host. A remote HFS_E2E_BASE_URL (the backend matrix) cannot fetch it;
+// the per-PR ui-tests.yml run, where hfs and the browser share a host, keeps
+// the coverage. Skipped here, before the test body starts the source at all.
+test.beforeEach(({ baseURL }) => {
+  const host = new URL(baseURL!).hostname;
+  test.skip(
+    host !== "127.0.0.1" && host !== "localhost" && host !== "::1",
+    "the bulk-submit source is served on loopback; a remote server cannot fetch it",
+  );
+});
+
 test("a manifest submitted from the Import page ingests, and its counters only ever climb", async ({
   page,
   chrome,

@@ -3486,6 +3486,303 @@ async fn mongodb_integration_standalone_search_writes_search_index() {
     );
 }
 
+/// #1064: `MongoBackend` had no `write_search_entries_page` override, so
+/// `$reindex` fell through to `ReindexTarget`'s default loop — per resource,
+/// one `delete_many` (`delete_search_entries`) followed by ANOTHER
+/// `delete_many` plus one `insert_many` (`write_search_entries` ->
+/// `index_resource`). An 8-resource page issued 16 deletes and 8 inserts
+/// instead of 1 and 1, strictly sequential.
+///
+/// MongoDB's per-database profiler is the seam that proves the command
+/// count: every test here gets a unique database
+/// (`build_test_database_name`), so `system.profile` is immune to the other
+/// integration tests running in parallel against the shared container — the
+/// reason a `serverStatus` counter would not work here.
+#[tokio::test]
+async fn mongodb_integration_reindex_page_batches_index_writes() {
+    use futures::stream::TryStreamExt;
+    use helios_persistence::search::ReindexTarget;
+    use helios_persistence::types::StoredResource;
+
+    let Some(backend) = create_backend("reindex_page_batches").await else {
+        eprintln!(
+            "Skipping mongodb_integration_reindex_page_batches_index_writes (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+
+    let tenant = create_tenant("reindex-page-tenant");
+
+    let make_patient = |n: usize| {
+        StoredResource::from_storage(
+            "Patient",
+            format!("page-{n}"),
+            "1",
+            tenant.tenant_id().clone(),
+            json!({
+                "resourceType": "Patient",
+                "id": format!("page-{n}"),
+                "name": [{"family": format!("Paged{n}")}]
+            }),
+            chrono::Utc::now(),
+            chrono::Utc::now(),
+            None,
+            FhirVersion::default(),
+        )
+    };
+
+    let page: Vec<StoredResource> = (0..8).map(make_patient).collect();
+    let untouched = make_patient(8);
+
+    // Seed: every resource — the page plus one that will NOT be reindexed —
+    // already has search_index rows, as a prior write or reindex would leave
+    // them. This also runs the override once before the profiled window, so
+    // that window measures only the second rebuild below.
+    let mut seed = page.clone();
+    seed.push(untouched.clone());
+    let seed_outcomes = backend.write_search_entries_page(&tenant, &seed).await;
+    assert!(
+        seed_outcomes.iter().all(|o| o.is_ok()),
+        "seeding failed: {seed_outcomes:?}"
+    );
+
+    let mut before_counts = Vec::with_capacity(page.len());
+    for resource in &page {
+        let count = search_index_entry_count(&backend, &tenant, "Patient", resource.id()).await;
+        assert!(
+            count > 0,
+            "resource {} should already be indexed",
+            resource.id()
+        );
+        before_counts.push(count);
+    }
+    let untouched_before =
+        search_index_entry_count(&backend, &tenant, "Patient", untouched.id()).await;
+    assert!(untouched_before > 0);
+
+    let db = backend.get_database().await.unwrap();
+    let profiling_enabled = db.run_command(doc! { "profile": 2_i32 }).await.is_ok();
+    if !profiling_enabled {
+        eprintln!(
+            "mongodb_integration_reindex_page_batches_index_writes: server refused \
+             {{profile: 2}} (likely a managed/shared HFS_TEST_MONGODB_URL); skipping the \
+             command-count assertions and running the contract assertions only"
+        );
+    }
+
+    let outcomes = backend.write_search_entries_page(&tenant, &page).await;
+
+    if profiling_enabled {
+        db.run_command(doc! { "profile": 0_i32 })
+            .await
+            .expect("failed to disable profiling");
+
+        let ns = format!("{}.search_index", db.name());
+        let entries: Vec<Document> = db
+            .collection::<Document>("system.profile")
+            .find(doc! { "ns": ns.as_str() })
+            .await
+            .expect("failed to read system.profile")
+            .try_collect()
+            .await
+            .expect("failed to collect system.profile");
+
+        assert!(
+            !entries.is_empty(),
+            "profiler produced no entries for {ns} — the assertions below would be vacuous"
+        );
+
+        let removes = entries
+            .iter()
+            .filter(|e| e.get_str("op").ok() == Some("remove"))
+            .count();
+        let inserts = entries
+            .iter()
+            .filter(|e| e.get_str("op").ok() == Some("insert"))
+            .count();
+
+        assert!(
+            removes <= 1,
+            "a reindex page must issue at most one delete_many, got {removes}: {entries:?}"
+        );
+        assert!(
+            inserts <= 1,
+            "a reindex page must issue at most one insert_many, got {inserts}: {entries:?}"
+        );
+        assert!(
+            entries.len() <= 2,
+            "a reindex page must issue at most 2 write commands total, got {}: {entries:?}",
+            entries.len()
+        );
+    }
+
+    // Contract, checked whether or not profiling was available: one outcome
+    // per resource, in order, each reporting the rows actually present, and
+    // the rewrite left the row count for each resource unchanged (a
+    // delete-then-rewrite of identical content).
+    assert_eq!(outcomes.len(), page.len());
+    for (i, (outcome, resource)) in outcomes.iter().zip(&page).enumerate() {
+        let count = outcome
+            .as_ref()
+            .unwrap_or_else(|e| panic!("resource {i} failed: {e:?}"));
+        let actual = search_index_entry_count(&backend, &tenant, "Patient", resource.id()).await;
+        assert_eq!(
+            *count as u64, actual,
+            "resource {i} reported count must match rows actually present"
+        );
+        assert_eq!(
+            actual, before_counts[i],
+            "resource {i} row count drifted across the rebuild"
+        );
+    }
+
+    // Scoping: the ninth Patient, not in the page, must be untouched — proves
+    // the single grouped `delete_many` is scoped by the page's resource ids
+    // and did not wipe the tenant's other rows.
+    let untouched_after =
+        search_index_entry_count(&backend, &tenant, "Patient", untouched.id()).await;
+    assert_eq!(
+        untouched_after, untouched_before,
+        "the page's delete_many must not touch resources outside the page"
+    );
+}
+
+/// #1064: `write_search_entries` used to report `extract(..).len()` — the
+/// container's own extracted values — even though `index_resource` (and,
+/// after the fix, `write_search_entries_page`) also inserts `_contained`
+/// rows for anything nested under `contained`. The reported count therefore
+/// undercounted whenever a resource has `contained` entries. Uses the full
+/// registry so both the Observation's own parameters and the contained
+/// Patient's `name` are guaranteed to extract, not just whichever handful
+/// ship in the embedded default registry.
+#[tokio::test]
+async fn mongodb_integration_reindex_page_counts_contained_entries() {
+    use helios_persistence::search::ReindexTarget;
+    use helios_persistence::types::StoredResource;
+
+    let Some(backend) = create_backend_with_full_registry("reindex_page_contained").await else {
+        eprintln!(
+            "Skipping mongodb_integration_reindex_page_counts_contained_entries (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+
+    let tenant = create_tenant("reindex-contained-tenant");
+
+    let with_contained = StoredResource::from_storage(
+        "Observation",
+        "obs-contained",
+        "1",
+        tenant.tenant_id().clone(),
+        json!({
+            "resourceType": "Observation",
+            "id": "obs-contained",
+            "status": "final",
+            "contained": [{
+                "resourceType": "Patient",
+                "id": "inner",
+                "name": [{"family": "Contained"}]
+            }],
+            "subject": {"reference": "#inner"},
+            "code": {"coding": [{"system": "http://loinc.org", "code": "1234-5"}]}
+        }),
+        chrono::Utc::now(),
+        chrono::Utc::now(),
+        None,
+        FhirVersion::default(),
+    );
+
+    let outcomes = backend
+        .write_search_entries_page(&tenant, std::slice::from_ref(&with_contained))
+        .await;
+    assert_eq!(
+        outcomes.len(),
+        1,
+        "one outcome per resource, not per document"
+    );
+    let reported = outcomes[0]
+        .as_ref()
+        .unwrap_or_else(|e| panic!("reindex failed: {e:?}"));
+
+    let actual = search_index_entry_count(&backend, &tenant, "Observation", "obs-contained").await;
+    assert_eq!(
+        *reported as u64, actual,
+        "reported entry count must match rows actually written, including _contained rows"
+    );
+
+    let client = raw_test_client(&backend.config().connection_string)
+        .await
+        .expect("failed to connect MongoDB client for search_index assertions");
+    let database = client.database(&backend.config().database_name);
+    let contained_rows = database
+        .collection::<Document>("search_index")
+        .count_documents(doc! {
+            "tenant_id": tenant.tenant_id().as_str(),
+            "resource_type": "Observation",
+            "resource_id": "obs-contained",
+            "is_contained": true,
+        })
+        .await
+        .expect("failed to count contained search_index rows");
+    assert!(
+        contained_rows > 0,
+        "the contained Patient's values must be indexed alongside the container"
+    );
+}
+
+/// Guard for the `is_search_offloaded()` short-circuit the batched override
+/// needs. The default loop honors the flag via `delete_search_entries` and
+/// `write_search_entries`'s own guards; the page override has to reproduce
+/// it directly rather than issuing commands a search-offloaded backend must
+/// never run. Passes both before and after #1064 — it pins the guard, not
+/// the defect.
+#[tokio::test]
+async fn mongodb_integration_reindex_page_is_a_no_op_when_search_offloaded() {
+    use helios_persistence::search::ReindexTarget;
+    use helios_persistence::types::StoredResource;
+
+    let Some(backend) = create_backend_with_search_offloaded("reindex_page_offloaded", true).await
+    else {
+        eprintln!(
+            "Skipping mongodb_integration_reindex_page_is_a_no_op_when_search_offloaded (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+
+    let tenant = create_tenant("reindex-offloaded-tenant");
+
+    let resources: Vec<StoredResource> = (0..2)
+        .map(|n| {
+            StoredResource::from_storage(
+                "Patient",
+                format!("offloaded-{n}"),
+                "1",
+                tenant.tenant_id().clone(),
+                json!({
+                    "resourceType": "Patient",
+                    "id": format!("offloaded-{n}"),
+                    "name": [{"family": format!("Offloaded{n}")}]
+                }),
+                chrono::Utc::now(),
+                chrono::Utc::now(),
+                None,
+                FhirVersion::default(),
+            )
+        })
+        .collect();
+
+    let outcomes = backend.write_search_entries_page(&tenant, &resources).await;
+    assert_eq!(outcomes.len(), 2);
+    for outcome in &outcomes {
+        assert_eq!(*outcome.as_ref().unwrap(), 0usize);
+    }
+
+    for resource in &resources {
+        let count = search_index_entry_count(&backend, &tenant, "Patient", resource.id()).await;
+        assert_eq!(count, 0, "search-offloaded backend must write nothing");
+    }
+}
+
 #[tokio::test]
 async fn mongodb_integration_search_parameter_registry_updates_when_offloaded() {
     let Some(backend) =
