@@ -142,6 +142,34 @@ pub struct MongoBackendConfig {
     /// When true, search indexing is offloaded to a secondary backend.
     #[serde(default)]
     pub search_offloaded: bool,
+
+    /// Row batch size for `matching_resource_ids`' probe/stream/verify steps
+    /// over `search_index` (#999).
+    ///
+    /// A probe reads at most `search_scan_chunk + 1` rows to decide whether a
+    /// predicate is exact (the cursor ended inside the bound) or saturated;
+    /// the streaming driver drains this many rows per bite; a bounded
+    /// verification's `resource_id: {$in: [...]}` splice never carries more
+    /// than this many ids. Clamped to at least 1 at every use site — test-only
+    /// values below ~64 are for exercising chunk-boundary behavior, not
+    /// representative of production cost.
+    #[serde(default = "default_search_scan_chunk")]
+    pub search_scan_chunk: usize,
+
+    /// Maximum number of resource ids `matching_resource_ids` will accumulate
+    /// before failing with `SearchError::TooManyResults` (#999) instead of
+    /// continuing to scan.
+    ///
+    /// Derived from the 16MB MongoDB command-document limit that
+    /// `build_resource_filter` splices matched ids into as `{id: {$in: […]}}`:
+    /// a 36-char UUID costs ~48 bytes as a BSON array element (type byte +
+    /// ~6-byte stringified index + 4-byte length + 36 chars + null), so
+    /// 100,000 ids splice to ~4.8MB — comfortably under a third of the limit,
+    /// leaving room for the rest of the query document and for
+    /// `count_documents`' own copy of the same filter. Raising this well
+    /// above ~300,000 risks the splice itself exceeding 16MB again.
+    #[serde(default = "default_max_matched_ids")]
+    pub max_matched_ids: usize,
 }
 
 fn default_connection_string() -> String {
@@ -164,6 +192,22 @@ fn default_server_selection_timeout_ms() -> u64 {
     15_000
 }
 
+/// See [`MongoBackendConfig::search_scan_chunk`].
+fn default_search_scan_chunk() -> usize {
+    2048
+}
+
+/// See [`MongoBackendConfig::max_matched_ids`].
+fn default_max_matched_ids() -> usize {
+    100_000
+}
+
+/// Above this, a single `{id: {$in: […]}}` splice risks the 16MB MongoDB
+/// command-document limit again (see [`MongoBackendConfig::max_matched_ids`]).
+/// Not enforced — an operator may have a reason to accept the risk — but
+/// logged once at backend construction so a misconfiguration is visible.
+const MAX_MATCHED_IDS_SAFE_CEILING: usize = 300_000;
+
 impl Default for MongoBackendConfig {
     fn default() -> Self {
         Self {
@@ -175,6 +219,8 @@ impl Default for MongoBackendConfig {
             fhir_version: FhirVersion::default_enabled(),
             data_dir: None,
             search_offloaded: false,
+            search_scan_chunk: default_search_scan_chunk(),
+            max_matched_ids: default_max_matched_ids(),
         }
     }
 }
@@ -229,6 +275,16 @@ impl MongoBackend {
     /// Creates a new MongoDB backend from the provided configuration.
     pub fn new(config: MongoBackendConfig) -> StorageResult<Self> {
         Self::validate_connection_string(&config.connection_string)?;
+
+        if config.max_matched_ids > MAX_MATCHED_IDS_SAFE_CEILING {
+            tracing::warn!(
+                max_matched_ids = config.max_matched_ids,
+                safe_ceiling = MAX_MATCHED_IDS_SAFE_CEILING,
+                "mongodb max_matched_ids exceeds the derived safe ceiling; the \
+                 {{id: {{$in: […]}}}} splice matching_resource_ids builds can approach \
+                 MongoDB's 16MB command-document limit again"
+            );
+        }
 
         let stored_by_tenant: StoredByTenant =
             Arc::new(RwLock::new(std::collections::HashMap::new()));

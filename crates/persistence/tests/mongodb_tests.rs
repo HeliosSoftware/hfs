@@ -33,7 +33,7 @@ use helios_persistence::search::SearchParameterStatus;
 use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
 use helios_persistence::types::{
     IncludeDirective, IncludeType, SearchModifier, SearchParamType, SearchParameter, SearchPrefix,
-    SearchQuery, SearchValue, SortDirective,
+    SearchQuery, SearchValue, SortDirective, TotalMode,
 };
 use mongodb::Client;
 use mongodb::bson::{Document, doc};
@@ -428,6 +428,31 @@ async fn create_backend_with_full_registry(test_name: &str) -> Option<MongoBacke
         connection_string,
         database_name: build_test_database_name(test_name),
         data_dir: Some(data_dir),
+        ..Default::default()
+    };
+    build_backend(config).await
+}
+
+/// Like [`create_backend_with_full_registry`], but with `matching_resource_ids`'
+/// (#999) probe/stream batch size and matched-id cap overridden — so a test can
+/// force multi-bite streaming and/or a small cap without needing thousands of
+/// fixture resources.
+async fn create_backend_with_scan_config(
+    test_name: &str,
+    search_scan_chunk: usize,
+    max_matched_ids: usize,
+) -> Option<MongoBackend> {
+    let connection_string = shared_mongo::connection_string().await?;
+    let data_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|p| p.parent())
+        .map(|p| p.join("data"))?;
+    let config = MongoBackendConfig {
+        connection_string,
+        database_name: build_test_database_name(test_name),
+        data_dir: Some(data_dir),
+        search_scan_chunk,
+        max_matched_ids,
         ..Default::default()
     };
     build_backend(config).await
@@ -6469,4 +6494,968 @@ async fn mongodb_integration_if_none_exist_broad_param_beyond_probe_limit() {
         (NOISE_COUNT + 1) as u64,
         "no duplicate should have been created"
     );
+}
+
+// ============================================================================
+// #999: mongodb `matching_resource_ids` bounded-probe rewrite.
+//
+// These tests exercise the new partition/probe/verify flow in
+// `crates/persistence/src/backends/mongodb/search_impl.rs`: positive
+// predicates combined with `:missing`/`:not` complements and compartment
+// membership, the multi-bite streaming driver (including a resource whose
+// index rows straddle a bite boundary), the single-parameter fast path, the
+// `max_matched_ids` cap, and the `_total=none` gates on all three mongodb
+// search entry points (`search`, `search_param_sorted`, `search_contained`).
+// ============================================================================
+
+async fn assert_missing_true_false_semantics(backend: &MongoBackend) {
+    let tenant = create_tenant("tenant-missing-scenario");
+
+    let active_with_gender = [
+        ("amg-1", "male"),
+        ("amg-2", "female"),
+        ("amg-3", "male"),
+        ("amg-4", "female"),
+        ("amg-5", "male"),
+    ];
+    let active_no_gender = ["ang-1", "ang-2", "ang-3"];
+    let inactive_with_gender = [("ivg-1", "female"), ("ivg-2", "male")];
+    let inactive_no_gender = ["ing-1", "ing-2"];
+
+    for (id, gender) in active_with_gender {
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType": "Patient", "id": id, "active": true, "gender": gender}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+    }
+    for id in active_no_gender {
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType": "Patient", "id": id, "active": true}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+    }
+    for (id, gender) in inactive_with_gender {
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType": "Patient", "id": id, "active": false, "gender": gender}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+    }
+    for id in inactive_no_gender {
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType": "Patient", "id": id, "active": false}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+    }
+
+    let active_param = || SearchParameter {
+        name: "active".to_string(),
+        param_type: SearchParamType::Token,
+        modifier: None,
+        values: vec![SearchValue::eq("true")],
+        chain: vec![],
+        components: vec![],
+    };
+    let gender_missing = |wants_missing: bool| SearchParameter {
+        name: "gender".to_string(),
+        param_type: SearchParamType::Token,
+        modifier: Some(SearchModifier::Missing),
+        values: vec![SearchValue::eq(if wants_missing {
+            "true"
+        } else {
+            "false"
+        })],
+        chain: vec![],
+        components: vec![],
+    };
+    let ids_of = |result: &helios_persistence::core::SearchResult| -> Vec<String> {
+        let mut v: Vec<String> = result
+            .resources
+            .items
+            .iter()
+            .map(|r| r.id().to_string())
+            .collect();
+        v.sort();
+        v
+    };
+    let ids_set =
+        |result: helios_persistence::core::SearchResult| -> std::collections::HashSet<String> {
+            result
+                .resources
+                .items
+                .iter()
+                .map(|r| r.id().to_string())
+                .collect()
+        };
+
+    // Independently: `active=true` alone (single-param fast path).
+    let active_only = SearchQuery::new("Patient").with_parameter(active_param());
+    let active_ids = ids_set(backend.search(&tenant, &active_only).await.unwrap());
+
+    // Independently: `gender:missing=true`/`=false` alone (complement-only,
+    // universe path — no positive predicate at all).
+    let missing_true_only = SearchQuery::new("Patient").with_parameter(gender_missing(true));
+    let missing_true_ids = ids_set(backend.search(&tenant, &missing_true_only).await.unwrap());
+
+    let missing_false_only = SearchQuery::new("Patient").with_parameter(gender_missing(false));
+    let missing_false_ids = ids_set(backend.search(&tenant, &missing_false_only).await.unwrap());
+
+    // Combined: `active=true & gender:missing=true` — must be exactly the
+    // active, no-gender patients, AND exactly the independently-computed
+    // intersection of the two single-param results.
+    let combined_true = SearchQuery::new("Patient")
+        .with_parameter(active_param())
+        .with_parameter(gender_missing(true));
+    let result_true = backend.search(&tenant, &combined_true).await.unwrap();
+    let got_true = ids_of(&result_true);
+    let mut expected_true: Vec<String> = active_no_gender.iter().map(|s| s.to_string()).collect();
+    expected_true.sort();
+    assert_eq!(got_true, expected_true, "active & gender:missing=true");
+
+    let mut expected_true_from_sets: Vec<String> = active_ids
+        .intersection(&missing_true_ids)
+        .cloned()
+        .collect();
+    expected_true_from_sets.sort();
+    assert_eq!(
+        got_true, expected_true_from_sets,
+        "combined result must equal the independently-computed intersection"
+    );
+
+    // Combined: `active=true & gender:missing=false` — everyone active with a
+    // gender value, and again equal to the independently-computed intersection.
+    let combined_false = SearchQuery::new("Patient")
+        .with_parameter(active_param())
+        .with_parameter(gender_missing(false));
+    let result_false = backend.search(&tenant, &combined_false).await.unwrap();
+    let got_false = ids_of(&result_false);
+    let mut expected_false: Vec<String> = active_with_gender
+        .iter()
+        .map(|(id, _)| id.to_string())
+        .collect();
+    expected_false.sort();
+    assert_eq!(got_false, expected_false, "active & gender:missing=false");
+
+    let mut expected_false_from_sets: Vec<String> = active_ids
+        .intersection(&missing_false_ids)
+        .cloned()
+        .collect();
+    expected_false_from_sets.sort();
+    assert_eq!(got_false, expected_false_from_sets);
+}
+
+/// A positive search parameter combined with `:missing=true` and
+/// `:missing=false` (#999). mongodb_integration_search_missing_not_and_param_sort
+/// (mongodb_tests.rs) exercises `:missing` only as the SOLE parameter of its
+/// query, so `normal` is empty there and every assertion routes through the
+/// complement-only branch — the multi-parameter bounded-complement logic this
+/// rewrite ships is otherwise untested.
+#[tokio::test]
+async fn mongodb_search_positive_param_with_missing_true_and_false() {
+    let Some(backend) = create_backend_with_full_registry("missing_true_false").await else {
+        eprintln!(
+            "Skipping mongodb_search_positive_param_with_missing_true_and_false (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    assert_missing_true_false_semantics(&backend).await;
+}
+
+/// Same as [`mongodb_search_positive_param_with_missing_true_and_false`], but
+/// with `search_scan_chunk = 3` so the `active=true` positive (8 rows)
+/// saturates and the query runs through the multi-bite STREAMING driver
+/// instead of the bounded-candidate path — exercising the per-bite complement
+/// branch of `verify_against`, not only the bounded one.
+#[tokio::test]
+async fn mongodb_search_positive_param_with_missing_true_and_false_small_chunk() {
+    let Some(backend) =
+        create_backend_with_scan_config("missing_true_false_chunk", 3, 100_000).await
+    else {
+        eprintln!(
+            "Skipping mongodb_search_positive_param_with_missing_true_and_false_small_chunk (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    assert_missing_true_false_semantics(&backend).await;
+}
+
+async fn assert_not_includes_valueless(backend: &MongoBackend) {
+    let tenant = create_tenant("tenant-not-scenario");
+
+    let fixtures: [(&str, bool, Option<&str>); 6] = [
+        ("nv-1", true, Some("male")),
+        ("nv-2", true, Some("female")),
+        ("nv-3", true, None),
+        ("nv-4", true, Some("female")),
+        ("nv-5", true, Some("male")),
+        ("nv-6", false, Some("female")),
+    ];
+    for (id, active, gender) in fixtures {
+        let mut resource = json!({"resourceType": "Patient", "id": id, "active": active});
+        if let Some(gender) = gender {
+            resource["gender"] = json!(gender);
+        }
+        backend
+            .create(&tenant, "Patient", resource, FhirVersion::default())
+            .await
+            .unwrap();
+    }
+
+    let active_param = SearchParameter {
+        name: "active".to_string(),
+        param_type: SearchParamType::Token,
+        modifier: None,
+        values: vec![SearchValue::eq("true")],
+        chain: vec![],
+        components: vec![],
+    };
+    let not_male = SearchParameter {
+        name: "gender".to_string(),
+        param_type: SearchParamType::Token,
+        modifier: Some(SearchModifier::Not),
+        values: vec![SearchValue::eq("male")],
+        chain: vec![],
+        components: vec![],
+    };
+
+    // Same two predicates, opposite URL/param order — the result must not
+    // depend on which predicate probes first.
+    let forward = SearchQuery::new("Patient")
+        .with_parameter(active_param.clone())
+        .with_parameter(not_male.clone());
+    let reverse = SearchQuery::new("Patient")
+        .with_parameter(not_male)
+        .with_parameter(active_param);
+
+    for (label, query) in [("forward", forward), ("reverse", reverse)] {
+        let result = backend.search(&tenant, &query).await.unwrap();
+        let mut ids: Vec<String> = result
+            .resources
+            .items
+            .iter()
+            .map(|r| r.id().to_string())
+            .collect();
+        ids.sort();
+        // Excludes the two active males (nv-1, nv-5) and the inactive
+        // female (nv-6, excluded by `active=true`); INCLUDES the
+        // active-no-gender patient (nv-3) per the `:not` spec semantics.
+        assert_eq!(ids, vec!["nv-2", "nv-3", "nv-4"], "order = {label}");
+    }
+}
+
+/// A positive parameter combined with `:not`, which per spec must also
+/// include resources carrying no value at all for the negated parameter
+/// (#999) — the failure mode of complementing against the positive match
+/// instead of against the candidate set.
+#[tokio::test]
+async fn mongodb_search_positive_param_with_not_includes_valueless_resources() {
+    let Some(backend) = create_backend_with_full_registry("not_valueless").await else {
+        eprintln!(
+            "Skipping mongodb_search_positive_param_with_not_includes_valueless_resources (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    assert_not_includes_valueless(&backend).await;
+}
+
+/// Same as above, but `search_scan_chunk = 3` so `active=true` (5 rows)
+/// saturates and the per-bite complement branch of `verify_against` runs.
+#[tokio::test]
+async fn mongodb_search_positive_param_with_not_includes_valueless_resources_small_chunk() {
+    let Some(backend) = create_backend_with_scan_config("not_valueless_chunk", 3, 100_000).await
+    else {
+        eprintln!(
+            "Skipping mongodb_search_positive_param_with_not_includes_valueless_resources_small_chunk (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    assert_not_includes_valueless(&backend).await;
+}
+
+/// A compartment restriction combined with a positive search parameter
+/// (#999): the compartment stops being a separate post-step and becomes a
+/// probed predicate inside the shared machinery, which
+/// mongodb_integration_compartment_search (compartment alone, no other
+/// parameter) does not exercise. Also guards the version-agnostic anchored
+/// `^{base}/_history/` regex invariant.
+#[tokio::test]
+async fn mongodb_search_compartment_combined_with_positive_param() {
+    use helios_persistence::types::CompartmentMembership;
+
+    let Some(backend) = create_backend_with_full_registry("compartment_plus_param").await else {
+        eprintln!(
+            "Skipping mongodb_search_compartment_combined_with_positive_param (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = create_tenant("tenant-compartment-plus-param");
+
+    // In the compartment via `subject`, status final — included.
+    backend
+        .create(
+            &tenant,
+            "Observation",
+            json!({
+                "resourceType": "Observation", "id": "obs-subj-final", "status": "final",
+                "code": {"text": "hr"}, "subject": {"reference": "Patient/comp-p1"}
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    // In the compartment via `performer` only, status final — included.
+    backend
+        .create(
+            &tenant,
+            "Observation",
+            json!({
+                "resourceType": "Observation", "id": "obs-perf-final", "status": "final",
+                "code": {"text": "hr"}, "subject": {"reference": "Patient/comp-p2"},
+                "performer": [{"reference": "Patient/comp-p1"}]
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    // In the compartment, but wrong status — excluded.
+    backend
+        .create(
+            &tenant,
+            "Observation",
+            json!({
+                "resourceType": "Observation", "id": "obs-subj-prelim", "status": "preliminary",
+                "code": {"text": "hr"}, "subject": {"reference": "Patient/comp-p1"}
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    // Right status, wrong (other) patient — excluded.
+    backend
+        .create(
+            &tenant,
+            "Observation",
+            json!({
+                "resourceType": "Observation", "id": "obs-other-final", "status": "final",
+                "code": {"text": "hr"}, "subject": {"reference": "Patient/comp-p2"}
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    // References the compartment patient via a `/_history/<vid>` suffix —
+    // version-agnostic matching must still include it.
+    backend
+        .create(
+            &tenant,
+            "Observation",
+            json!({
+                "resourceType": "Observation", "id": "obs-hist-final", "status": "final",
+                "code": {"text": "hr"}, "subject": {"reference": "Patient/comp-p1/_history/3"}
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+
+    let mut query = SearchQuery::new("Observation").with_parameter(SearchParameter {
+        name: "status".to_string(),
+        param_type: SearchParamType::Token,
+        modifier: None,
+        values: vec![SearchValue::eq("final")],
+        chain: vec![],
+        components: vec![],
+    });
+    query.compartment = Some(CompartmentMembership {
+        params: vec!["subject".to_string(), "performer".to_string()],
+        reference: "Patient/comp-p1".to_string(),
+    });
+
+    let result = backend.search(&tenant, &query).await.unwrap();
+    let mut ids: Vec<String> = result
+        .resources
+        .items
+        .iter()
+        .map(|r| r.id().to_string())
+        .collect();
+    ids.sort();
+    assert_eq!(
+        ids,
+        vec!["obs-hist-final", "obs-perf-final", "obs-subj-final"]
+    );
+}
+
+/// Pins the `Ok(None)` ("no restriction") vs `Ok(Some(restricted))` boundary
+/// through `compartment_filter` (#999): a compartment with empty `params` or
+/// an empty `reference` must return every resource of the type — the same
+/// as having no compartment at all — never an empty result.
+#[tokio::test]
+async fn mongodb_search_compartment_empty_is_no_restriction() {
+    use helios_persistence::types::CompartmentMembership;
+
+    let Some(backend) = create_backend_with_full_registry("compartment_none_boundary").await else {
+        eprintln!(
+            "Skipping mongodb_search_compartment_empty_is_no_restriction (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = create_tenant("tenant-compartment-none");
+
+    for (id, patient) in [("o1", "cn-p1"), ("o2", "cn-p1"), ("o3", "cn-p2")] {
+        backend
+            .create(
+                &tenant,
+                "Observation",
+                json!({
+                    "resourceType": "Observation", "id": id, "status": "final",
+                    "code": {"text": "hr"}, "subject": {"reference": format!("Patient/{patient}")}
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+    }
+
+    let ids_of = |result: &helios_persistence::core::SearchResult| -> Vec<String> {
+        let mut v: Vec<String> = result
+            .resources
+            .items
+            .iter()
+            .map(|r| r.id().to_string())
+            .collect();
+        v.sort();
+        v
+    };
+
+    // Empty `params`: no restriction — `Ok(None)` semantics, returns ALL 3.
+    let mut q_empty_params = SearchQuery::new("Observation");
+    q_empty_params.compartment = Some(CompartmentMembership {
+        params: vec![],
+        reference: "Patient/cn-p1".to_string(),
+    });
+    let r1 = backend.search(&tenant, &q_empty_params).await.unwrap();
+    assert_eq!(
+        ids_of(&r1),
+        vec!["o1", "o2", "o3"],
+        "empty params = no restriction"
+    );
+
+    // Empty `reference`: no restriction — `Ok(None)` semantics, returns ALL 3.
+    let mut q_empty_ref = SearchQuery::new("Observation");
+    q_empty_ref.compartment = Some(CompartmentMembership {
+        params: vec!["subject".to_string()],
+        reference: String::new(),
+    });
+    let r2 = backend.search(&tenant, &q_empty_ref).await.unwrap();
+    assert_eq!(
+        ids_of(&r2),
+        vec!["o1", "o2", "o3"],
+        "empty reference = no restriction"
+    );
+
+    // Control: a genuine restriction only returns the compartment's members.
+    let mut q_restricted = SearchQuery::new("Observation");
+    q_restricted.compartment = Some(CompartmentMembership {
+        params: vec!["subject".to_string()],
+        reference: "Patient/cn-p1".to_string(),
+    });
+    let r3 = backend.search(&tenant, &q_restricted).await.unwrap();
+    assert_eq!(
+        ids_of(&r3),
+        vec!["o1", "o2"],
+        "genuine restriction excludes cn-p2"
+    );
+}
+
+async fn assert_driver_stream_crosses_chunk_boundary(backend: &MongoBackend) {
+    let tenant = create_tenant("tenant-straddle");
+
+    // 10 Encounters, ALL `class=AMB` (10 class rows). 4 of them also carry a
+    // `period` {start,end} inside the `date=ge2000` range — a Period writes
+    // TWO `date` index rows per resource (converters.rs:467-474), so the
+    // date predicate's 8 rows are FEWER than class's 10, making `date` the
+    // ranked (smaller) streaming driver. The other 6 carry no period at all,
+    // contributing zero date rows.
+    let with_period = ["str-1", "str-2", "str-3", "str-4"];
+    let without_period = ["str-5", "str-6", "str-7", "str-8", "str-9", "str-10"];
+
+    for id in with_period {
+        backend
+            .create(
+                &tenant,
+                "Encounter",
+                json!({
+                    "resourceType": "Encounter",
+                    "id": id,
+                    "status": "finished",
+                    "class": {
+                        "system": "http://terminology.hl7.org/CodeSystem/v3-ActCode",
+                        "code": "AMB"
+                    },
+                    "period": {"start": "2005-01-01T00:00:00Z", "end": "2005-01-02T00:00:00Z"}
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+    }
+    for id in without_period {
+        backend
+            .create(
+                &tenant,
+                "Encounter",
+                json!({
+                    "resourceType": "Encounter",
+                    "id": id,
+                    "status": "finished",
+                    "class": {
+                        "system": "http://terminology.hl7.org/CodeSystem/v3-ActCode",
+                        "code": "AMB"
+                    }
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+    }
+
+    let query = SearchQuery::new("Encounter")
+        .with_parameter(SearchParameter {
+            name: "class".to_string(),
+            param_type: SearchParamType::Token,
+            modifier: None,
+            values: vec![SearchValue::eq("AMB")],
+            chain: vec![],
+            components: vec![],
+        })
+        .with_parameter(SearchParameter {
+            name: "date".to_string(),
+            param_type: SearchParamType::Date,
+            modifier: None,
+            values: vec![SearchValue::new(SearchPrefix::Ge, "2000-01-01")],
+            chain: vec![],
+            components: vec![],
+        });
+
+    let result = backend.search(&tenant, &query).await.unwrap();
+    let mut ids: Vec<String> = result
+        .resources
+        .items
+        .iter()
+        .map(|r| r.id().to_string())
+        .collect();
+    ids.sort();
+    let mut expected: Vec<String> = with_period.iter().map(|s| s.to_string()).collect();
+    expected.sort();
+    assert_eq!(ids, expected, "class=AMB & date=ge2000");
+}
+
+/// The multi-bite streaming driver (#999): with `search_scan_chunk = 1`, both
+/// `class` (10 rows) and `date` (8 rows) saturate the probe, `date` is picked
+/// as the (smaller, ranked) driver, and — because a `chunk` of 1 means every
+/// bite is exactly one row — a straddling resource (one of its two `date`
+/// rows in one bite, the other in the next) is *guaranteed* on every run, not
+/// merely possible. This is the shape behind #999's PR-1026 finding 6
+/// (`last_index_id` resetting the keyset cursor): a resource whose rows land
+/// in different bites must still be verified and counted exactly once.
+#[tokio::test]
+async fn mongodb_search_driver_stream_crosses_chunk_boundary_chunk_1() {
+    let Some(backend) = create_backend_with_scan_config("driver_straddle_chunk1", 1, 1000).await
+    else {
+        eprintln!(
+            "Skipping mongodb_search_driver_stream_crosses_chunk_boundary_chunk_1 (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    assert_driver_stream_crosses_chunk_boundary(&backend).await;
+}
+
+/// Same as above with `search_scan_chunk = 3`: both predicates still saturate
+/// (10 > 3, 8 > 3) and — because 8 rows do not divide evenly into 3-row
+/// bites — at least one Encounter's two `date` rows still land in different
+/// bites, this time alongside bites that do NOT straddle, exercising both
+/// cases in the same run.
+#[tokio::test]
+async fn mongodb_search_driver_stream_crosses_chunk_boundary_chunk_3() {
+    let Some(backend) = create_backend_with_scan_config("driver_straddle_chunk3", 3, 1000).await
+    else {
+        eprintln!(
+            "Skipping mongodb_search_driver_stream_crosses_chunk_boundary_chunk_3 (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    assert_driver_stream_crosses_chunk_boundary(&backend).await;
+}
+
+/// The `max_matched_ids` cap (#999): a search whose matched-id set would
+/// otherwise grow past the configured cap must fail fast with a typed error
+/// instead of continuing to scan — and the cap must be scoped to the query's
+/// own result, not to the whole collection or backend.
+#[tokio::test]
+async fn mongodb_search_matched_id_cap_returns_too_many_results() {
+    use helios_persistence::error::SearchError;
+
+    let Some(backend) = create_backend_with_scan_config("matched_id_cap", 2, 4).await else {
+        eprintln!(
+            "Skipping mongodb_search_matched_id_cap_returns_too_many_results (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+
+    let tenant_big = create_tenant("tenant-cap-big");
+    for i in 0..9 {
+        backend
+            .create(
+                &tenant_big,
+                "Patient",
+                json!({"resourceType": "Patient", "id": format!("cap-big-{i}"), "active": true}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+    }
+
+    let tenant_small = create_tenant("tenant-cap-small");
+    for i in 0..3 {
+        backend
+            .create(
+                &tenant_small,
+                "Patient",
+                json!({"resourceType": "Patient", "id": format!("cap-small-{i}"), "active": true}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+    }
+
+    let active_query = SearchQuery::new("Patient").with_parameter(SearchParameter {
+        name: "active".to_string(),
+        param_type: SearchParamType::Token,
+        modifier: None,
+        values: vec![SearchValue::eq("true")],
+        chain: vec![],
+        components: vec![],
+    });
+
+    let err = backend
+        .search(&tenant_big, &active_query)
+        .await
+        .expect_err("9 matches over a cap of 4 must fail, not truncate silently");
+    match err {
+        StorageError::Search(SearchError::TooManyResults { count, max }) => {
+            assert!(
+                count >= 5,
+                "count should reflect that scanning stopped past the cap, got {count}"
+            );
+            assert_eq!(max, 4);
+        }
+        other => panic!("expected SearchError::TooManyResults, got {other:?}"),
+    }
+
+    // A different tenant under the SAME backend/database, whose result
+    // genuinely fits under the cap, still succeeds — the cap is scoped to
+    // the query's own matched-id accumulation, not to the collection.
+    let small_result = backend
+        .search(&tenant_small, &active_query)
+        .await
+        .expect("a 3-result query under a cap of 4 must succeed");
+    assert_eq!(small_result.resources.items.len(), 3);
+}
+
+async fn assert_single_param_fast_path_matches_general_path(backend: &MongoBackend) {
+    let tenant = create_tenant("tenant-fast-path");
+
+    // 30 active (17 female, 10 male, 3 no-gender) + 10 inactive (5 female, 3
+    // male, 2 no-gender) — sized so the three computed id sets genuinely
+    // diverge (a fixture with no inactive/no-gender patients cannot tell the
+    // single-param path apart from the general one).
+    fn push(
+        fixtures: &mut Vec<(String, bool, Option<&'static str>)>,
+        prefix: &str,
+        active: bool,
+        gender: Option<&'static str>,
+        count: usize,
+    ) {
+        for i in 0..count {
+            fixtures.push((format!("fp-{prefix}-{i}"), active, gender));
+        }
+    }
+
+    let mut fixtures: Vec<(String, bool, Option<&'static str>)> = Vec::new();
+    push(&mut fixtures, "af", true, Some("female"), 17);
+    push(&mut fixtures, "am", true, Some("male"), 10);
+    push(&mut fixtures, "an", true, None, 3);
+    push(&mut fixtures, "if", false, Some("female"), 5);
+    push(&mut fixtures, "im", false, Some("male"), 3);
+    push(&mut fixtures, "in", false, None, 2);
+
+    for (id, active, gender) in &fixtures {
+        let mut resource = json!({"resourceType": "Patient", "id": id, "active": active});
+        if let Some(gender) = gender {
+            resource["gender"] = json!(gender);
+        }
+        backend
+            .create(&tenant, "Patient", resource, FhirVersion::default())
+            .await
+            .unwrap();
+    }
+
+    let param = |name: &str, value: &str, modifier: Option<SearchModifier>| SearchParameter {
+        name: name.to_string(),
+        param_type: SearchParamType::Token,
+        modifier,
+        values: vec![SearchValue::eq(value)],
+        chain: vec![],
+        components: vec![],
+    };
+    let ids_set =
+        |result: helios_persistence::core::SearchResult| -> std::collections::HashSet<String> {
+            result
+                .resources
+                .items
+                .iter()
+                .map(|r| r.id().to_string())
+                .collect()
+        };
+
+    // Path 1: the single-parameter fast path — `gender=female` alone.
+    let female_only = SearchQuery::new("Patient").with_parameter(param("gender", "female", None));
+    let female_ids = ids_set(backend.search(&tenant, &female_only).await.unwrap());
+
+    // Path 2: probe + exact-intersection — `gender=female & active=true`.
+    let female_active = SearchQuery::new("Patient")
+        .with_parameter(param("gender", "female", None))
+        .with_parameter(param("active", "true", None));
+    let female_active_ids = ids_set(backend.search(&tenant, &female_active).await.unwrap());
+
+    // Path 3: bounded complement — `active=true & gender:not=male`.
+    let active_not_male = SearchQuery::new("Patient")
+        .with_parameter(param("active", "true", None))
+        .with_parameter(param("gender", "male", Some(SearchModifier::Not)));
+    let active_not_male_ids = ids_set(backend.search(&tenant, &active_not_male).await.unwrap());
+
+    // Independent single-param baselines to check both combined paths against.
+    let active_ids = ids_set(
+        backend
+            .search(
+                &tenant,
+                &SearchQuery::new("Patient").with_parameter(param("active", "true", None)),
+            )
+            .await
+            .unwrap(),
+    );
+    let male_ids = ids_set(
+        backend
+            .search(
+                &tenant,
+                &SearchQuery::new("Patient").with_parameter(param("gender", "male", None)),
+            )
+            .await
+            .unwrap(),
+    );
+
+    assert_eq!(
+        female_ids.len(),
+        22,
+        "17 active + 5 inactive female patients"
+    );
+
+    let expected_female_active: std::collections::HashSet<String> =
+        female_ids.intersection(&active_ids).cloned().collect();
+    assert_eq!(
+        female_active_ids, expected_female_active,
+        "probe+intersect path must equal the independently-computed intersection"
+    );
+    assert_eq!(female_active_ids.len(), 17);
+
+    let expected_active_not_male: std::collections::HashSet<String> =
+        active_ids.difference(&male_ids).cloned().collect();
+    assert_eq!(
+        active_not_male_ids, expected_active_not_male,
+        "bounded-complement path must equal the independently-computed difference"
+    );
+    assert_eq!(
+        active_not_male_ids.len(),
+        20,
+        "17 active female + 3 active no-gender"
+    );
+
+    // The two-param female&active result must be a subset of the
+    // active&not-male result (every active female is active and not male) —
+    // a structural cross-check the three paths cannot satisfy by accident.
+    assert!(female_active_ids.is_subset(&active_not_male_ids));
+}
+
+/// The single-parameter fast path (#999) must agree with the general
+/// probe/verify path on the same query, computed through three different
+/// internal routes (unprobed single stream, probe+exact-intersection,
+/// bounded complement) — the commonest FHIR search shape is the one most
+/// likely to silently drift from the general path.
+#[tokio::test]
+async fn mongodb_search_single_param_fast_path_matches_general_path() {
+    let Some(backend) = create_backend_with_full_registry("fast_path_matches_general").await else {
+        eprintln!(
+            "Skipping mongodb_search_single_param_fast_path_matches_general_path (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    assert_single_param_fast_path_matches_general_path(&backend).await;
+}
+
+/// Same as above with `search_scan_chunk = 4`, so even the single-param fast
+/// path (22 female matches) streams across multiple bites.
+#[tokio::test]
+async fn mongodb_search_single_param_fast_path_matches_general_path_small_chunk() {
+    let Some(backend) =
+        create_backend_with_scan_config("fast_path_matches_general_chunk", 4, 100_000).await
+    else {
+        eprintln!(
+            "Skipping mongodb_search_single_param_fast_path_matches_general_path_small_chunk (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    assert_single_param_fast_path_matches_general_path(&backend).await;
+}
+
+/// `_total=none` must not populate `Bundle.total` on ANY of the three
+/// mongodb total gates (#999): the default `search()` path, the
+/// `search_param_sorted()` `_sort=<param>` path, and the `search_contained()`
+/// `_contained` path. `TotalMode::None` is itself a `Some` variant, so
+/// `query.total.is_some()` (what all three gates used before this fix) runs
+/// a full count for a client that explicitly declined one.
+#[tokio::test]
+async fn mongodb_search_total_none_does_not_populate_or_pay_for_total() {
+    use helios_persistence::types::{ContainedMode, ContainedReturn};
+
+    let Some(backend) = create_backend_with_full_registry("total_none_gates").await else {
+        eprintln!(
+            "Skipping mongodb_search_total_none_does_not_populate_or_pay_for_total (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = create_tenant("tenant-total-none");
+
+    for i in 0..5 {
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({
+                    "resourceType": "Patient",
+                    "id": format!("tot-{i}"),
+                    "birthDate": "1990-01-01"
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+    }
+
+    let cases = [
+        (None, true),
+        (Some(TotalMode::None), true),
+        (Some(TotalMode::Estimate), false),
+        (Some(TotalMode::Accurate), false),
+    ];
+
+    // Gate 1: default `search()`.
+    for (total, expect_none) in cases {
+        let mut query = SearchQuery::new("Patient");
+        query.total = total;
+        let result = backend.search(&tenant, &query).await.unwrap();
+        if expect_none {
+            assert!(
+                result.total.is_none(),
+                "search(): total={total:?} must not populate Bundle.total"
+            );
+        } else {
+            assert_eq!(result.total, Some(5), "search(): total={total:?}");
+        }
+    }
+
+    // Gate 2: `search_param_sorted()` (`_sort=<param>`).
+    for (total, expect_none) in cases {
+        let mut query = SearchQuery::new("Patient").with_sort(
+            SortDirective::parse("birthdate").with_param_type(Some(SearchParamType::Date)),
+        );
+        query.total = total;
+        let result = backend.search(&tenant, &query).await.unwrap();
+        if expect_none {
+            assert!(
+                result.total.is_none(),
+                "search_param_sorted(): total={total:?} must not populate Bundle.total"
+            );
+        } else {
+            assert_eq!(
+                result.total,
+                Some(5),
+                "search_param_sorted(): total={total:?}"
+            );
+        }
+    }
+
+    // Gate 3: `search_contained()` (`_contained=true`).
+    backend
+        .create(
+            &tenant,
+            "Observation",
+            json!({
+                "resourceType": "Observation",
+                "id": "tot-obs-1",
+                "status": "final",
+                "code": {"text": "hr"},
+                "subject": {"reference": "#cp1"},
+                "contained": [{
+                    "resourceType": "Patient",
+                    "id": "cp1",
+                    "name": [{"family": "TotalGate"}]
+                }]
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+
+    for (total, expect_none) in cases {
+        let mut query = SearchQuery::new("Patient");
+        query.contained = ContainedMode::On;
+        query.contained_return = ContainedReturn::Container;
+        query.parameters.push(SearchParameter {
+            name: "name".to_string(),
+            param_type: SearchParamType::String,
+            modifier: None,
+            values: vec![SearchValue::eq("TotalGate")],
+            chain: vec![],
+            components: vec![],
+        });
+        query.total = total;
+        let result = backend.search(&tenant, &query).await.unwrap();
+        if expect_none {
+            assert!(
+                result.total.is_none(),
+                "search_contained(): total={total:?} must not populate Bundle.total"
+            );
+        } else {
+            assert_eq!(result.total, Some(1), "search_contained(): total={total:?}");
+        }
+    }
 }

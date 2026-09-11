@@ -833,7 +833,12 @@ impl From<SearchError> for RestError {
                 feature: err.to_string(),
             },
             SearchError::TooManyResults { count, max } => RestError::UnprocessableEntity {
-                message: format!("Search returned {} results, maximum is {}", count, max),
+                // `count` is a lower bound: accumulation stops as soon as the
+                // cap is crossed, so the query may match more than this.
+                message: format!(
+                    "Search matched at least {} resources, which exceeds the maximum of {}",
+                    count, max
+                ),
             },
         }
     }
@@ -1151,6 +1156,40 @@ mod tests {
 
     fn status_of(err: StorageError) -> StatusCode {
         RestError::from(err).into_response().status()
+    }
+
+    // ── SearchError::TooManyResults → RestError mapping (#999) ────
+
+    /// The mongodb backend's matched-id cap (#999) must surface as a fast,
+    /// typed 422 — not the 500/timeout the server produces today when a
+    /// broad search hangs — and the message must read `count` as the lower
+    /// bound it is (accumulation stops as soon as the cap is crossed, so the
+    /// query may in fact match more than `count`).
+    #[test]
+    fn test_search_too_many_results_maps_to_422_with_lower_bound_wording() {
+        let err = StorageError::Search(SearchError::TooManyResults {
+            count: 100_001,
+            max: 100_000,
+        });
+        assert_eq!(status_of(err), StatusCode::UNPROCESSABLE_ENTITY);
+
+        let rendered = RestError::from(SearchError::TooManyResults {
+            count: 100_001,
+            max: 100_000,
+        });
+        match rendered {
+            RestError::UnprocessableEntity { message } => {
+                assert!(
+                    message.contains("at least 100001"),
+                    "message must read `count` as a lower bound, not an exact total: {message}"
+                );
+                assert!(
+                    message.contains("100000"),
+                    "message must name the max: {message}"
+                );
+            }
+            other => panic!("expected UnprocessableEntity, got {other:?}"),
+        }
     }
 
     #[test]

@@ -186,6 +186,100 @@ fn parse_simple_search_params(params: &str) -> Vec<(String, String)> {
         .collect()
 }
 
+// ---------------------------------------------------------------------------
+// `matching_resource_ids` (#999): bound parameters instead of resolving each
+// one at full cardinality. See the doc comment on `MongoBackend::
+// matching_resource_ids` for the overall design.
+// ---------------------------------------------------------------------------
+
+/// One restriction `matching_resource_ids` must satisfy: either an explicit
+/// search parameter, or the compartment membership restriction (which is just
+/// another positive predicate over `search_index`).
+enum Predicate<'q> {
+    Param(&'q SearchParameter),
+    Compartment(&'q CompartmentMembership),
+}
+
+/// The result of probing one predicate with a row-bounded `find`.
+enum Probe {
+    /// The cursor ended before the bound — this id set is complete.
+    Exact(HashSet<String>),
+    /// More than the probe bound exist; nothing about the count is learned.
+    Saturated,
+}
+
+/// Once an intersected exact candidate set is already this small, further
+/// probing cannot pay for itself — bound-verify the rest against it instead.
+const EARLY_STOP: usize = 256;
+
+/// Cap on the index-only ranking count used to choose a streaming driver
+/// among two or more saturated positives. Kept well under the historically
+/// suggested 1,000,000: real production row counts and FETCH costs for this
+/// count have not been measured on the target corpus, so this stays small
+/// enough that even a worst-case (non-covered) plan cannot make the ranking
+/// step itself cost more than the stream it exists to shrink, while still
+/// comfortably separating a `~30k`-row predicate from a `~1M`-row one.
+const TIER1_COUNT_LIMIT: u64 = 100_000;
+
+fn too_many_results(count: usize, max: usize) -> StorageError {
+    StorageError::Search(SearchError::TooManyResults { count, max })
+}
+
+/// Classifies a built `search_index` filter document by how well MongoDB can
+/// bound it, WITHOUT any knowledge of which value builder produced it — so it
+/// stays correct as the value builders evolve and is unit-testable with no
+/// live MongoDB:
+///
+/// - `2`: an unbounded `$regex` — case-insensitive (`$options` containing
+///   `i`, which MongoDB cannot use an index prefix for even when anchored:
+///   every default `:string`/`:code-text`/token-display match is
+///   case-insensitive) or not anchored with `^` (a bare-reference `$or`
+///   branch's `/X$`, `:contains`, `:text`).
+/// - `1`: an `$or` (multi-value token, the compartment's exact-base branch)
+///   or a case-SENSITIVE anchored regex (the compartment's
+///   `^{base}/_history/`).
+/// - `0`: equality/range on an indexed value field only, no regex and no
+///   `$or` anywhere.
+///
+/// The worst (highest) class found anywhere in the document wins, so an
+/// `$or` containing one bounded and one unbounded branch is still `2`.
+fn filter_cost_class(filter: &Document) -> u8 {
+    let mut class = 0u8;
+    classify_filter_into(filter, &mut class);
+    class
+}
+
+fn classify_filter_into(doc: &Document, class: &mut u8) {
+    // A "field: {$regex: ..., $options: ...}" leaf: classify and stop —
+    // nothing else inside a regex options document is a nested filter.
+    if let Ok(pattern) = doc.get_str("$regex") {
+        let case_insensitive = doc
+            .get_str("$options")
+            .map(|opts| opts.contains('i'))
+            .unwrap_or(false);
+        let anchored = pattern.starts_with('^');
+        *class = (*class).max(if anchored && !case_insensitive { 1 } else { 2 });
+        return;
+    }
+
+    for (key, value) in doc.iter() {
+        if key == "$or" {
+            *class = (*class).max(1);
+        }
+        match value {
+            Bson::Document(inner) => classify_filter_into(inner, class),
+            Bson::Array(items) => {
+                for item in items {
+                    if let Bson::Document(inner) = item {
+                        classify_filter_into(inner, class);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 #[async_trait]
 impl SearchProvider for MongoBackend {
     async fn search(
@@ -322,8 +416,16 @@ impl SearchProvider for MongoBackend {
             None
         };
 
-        let total = if query.total.is_some() {
-            Some(self.search_count(tenant, query).await?)
+        // `wants_total()` — not `query.total.is_some()` — because
+        // `TotalMode::None` (`_total=none`) is itself a `Some` variant; the
+        // client explicitly declined a total and must not pay for one.
+        // Reuses `matched_ids`, already computed above, instead of
+        // recomputing it from scratch inside `search_count` (#999).
+        let total = if query.wants_total() {
+            Some(
+                self.count_with_matched_ids(&db, tenant_id, query, matched_ids.as_ref())
+                    .await?,
+            )
         } else {
             None
         };
@@ -381,25 +483,14 @@ impl SearchProvider for MongoBackend {
         self.validate_query_support(query)?;
 
         let db = self.get_database().await?;
-        let resources = db.collection::<Document>(MongoBackend::RESOURCES_COLLECTION);
         let tenant_id = tenant.tenant_id().as_str();
 
         let matched_ids = self
             .matching_resource_ids(&db, tenant_id, &query.resource_type, query)
             .await?;
 
-        let filter = self.build_resource_filter(
-            tenant_id,
-            &query.resource_type,
-            query,
-            matched_ids.as_ref(),
-            None,
-        )?;
-
-        resources
-            .count_documents(filter)
+        self.count_with_matched_ids(&db, tenant_id, query, matched_ids.as_ref())
             .await
-            .or_query_error("Failed to count MongoDB search results")
     }
 
     fn search_param_registry(
@@ -588,7 +679,7 @@ impl MongoBackend {
 
         let count = query.count.unwrap_or(100) as usize;
         let offset = query.offset.unwrap_or(0) as usize;
-        let total = if query.total.is_some() {
+        let total = if query.wants_total() {
             Some(items.len() as u64)
         } else {
             None
@@ -780,8 +871,11 @@ impl MongoBackend {
         let resources: Vec<StoredResource> =
             page_ids.iter().filter_map(|id| by_id.remove(id)).collect();
 
-        let total = if query.total.is_some() {
-            Some(self.search_count(tenant, query).await?)
+        let total = if query.wants_total() {
+            Some(
+                self.count_with_matched_ids(db, tenant_id, query, matched_ids.as_ref())
+                    .await?,
+            )
         } else {
             None
         };
@@ -828,23 +922,15 @@ impl MongoBackend {
         })
     }
 
-    /// Distinct `resource_id`s in the search index matching `filter`.
-    async fn distinct_resource_ids(
-        &self,
-        search_index: &mongodb::Collection<Document>,
-        filter: Document,
-    ) -> StorageResult<HashSet<String>> {
-        Ok(search_index
-            .distinct("resource_id", filter)
-            .await
-            .or_query_error("Failed to query search_index")?
-            .into_iter()
-            .filter_map(|value| value.as_str().map(ToString::to_string))
-            .collect())
-    }
-
     /// Every live resource id of the type — the universe `:missing=true` and
     /// `:not` complement against (#881).
+    ///
+    /// NOT capped: also used by [`Self::param_sorted_ids`] (#881/#1040) to
+    /// append unkeyed resources for `_sort=<param>`, a path this issue does not
+    /// touch. Capping this function would make `_sort=<param>` on a type with
+    /// more than `max_matched_ids` live resources fail where it works today.
+    /// The complement-only branch of [`Self::matching_resource_ids`] uses the
+    /// separate, capped [`Self::capped_universe_ids`] instead.
     async fn all_resource_ids(
         &self,
         db: &mongodb::Database,
@@ -866,6 +952,97 @@ impl MongoBackend {
             .into_iter()
             .filter_map(|value| value.as_str().map(ToString::to_string))
             .collect())
+    }
+
+    /// Capped, streamed universe of live resource ids of the type — used ONLY
+    /// by [`Self::matching_resource_ids`]'s complement-only branch (no positive
+    /// predicate at all, e.g. `Patient?gender:not=female`), where the universe
+    /// itself is the candidate set `:missing=true`/`:not` complement against.
+    ///
+    /// Unlike [`Self::all_resource_ids`] (kept unbounded for `_sort=<param>`,
+    /// #1040 — not touched here), this is a covered scan of
+    /// `idx_resources_type_scan` (`tenant_id, resource_type, is_deleted,
+    /// last_updated, id`): `id` comes out of the index key with no per-document
+    /// fetch. Streamed and capped at `max_matched_ids` (#999) rather than
+    /// `resources.distinct("id", …)`, which shares the 16MB reply cap this
+    /// issue is about, just on a different collection.
+    async fn capped_universe_ids(
+        &self,
+        db: &mongodb::Database,
+        tenant_id: &str,
+        resource_type: &str,
+        chunk: usize,
+        cap: usize,
+    ) -> StorageResult<HashSet<String>> {
+        let resources = db.collection::<Document>(MongoBackend::RESOURCES_COLLECTION);
+        let mut cursor = resources
+            .find(doc! {
+                "tenant_id": tenant_id,
+                "resource_type": resource_type,
+                "is_deleted": false,
+            })
+            .projection(doc! { "id": 1_i32, "_id": 0_i32 })
+            .batch_size(chunk as u32)
+            .await
+            .or_query_error("Failed to enumerate resource ids")?;
+
+        let mut ids = HashSet::new();
+        loop {
+            let rows = Self::drain_field(&mut cursor, "id", chunk, &mut ids).await?;
+            if rows == 0 {
+                break;
+            }
+            if ids.len() > cap {
+                return Err(too_many_results(ids.len(), cap));
+            }
+        }
+        Ok(ids)
+    }
+
+    /// Drains at most `limit` rows from a live cursor into `out`, reading
+    /// `field` as the id. Termination is the cursor's own end-of-stream
+    /// (`advance()` returning `false`) or `limit` rows read, whichever comes
+    /// first — there is no page position or `_id` to track, so a straggling or
+    /// short batch cannot desynchronize progress the way a keyset cursor's
+    /// last-seen-`_id` can (#999 finding 6).
+    ///
+    /// A row whose `field` is missing/not-a-string is skipped but still counted
+    /// toward `rows`, matching the old `filter_map` behaviour — it cannot
+    /// affect termination, because progress is rows drained, not ids collected.
+    async fn drain_field(
+        cursor: &mut Cursor<Document>,
+        field: &str,
+        limit: usize,
+        out: &mut HashSet<String>,
+    ) -> StorageResult<usize> {
+        let mut rows = 0usize;
+        while rows < limit {
+            if !cursor
+                .advance()
+                .await
+                .or_query_error("Failed to advance MongoDB cursor")?
+            {
+                break;
+            }
+            rows += 1;
+            if let Ok(doc) = cursor.deserialize_current() {
+                let doc: Document = doc;
+                if let Ok(value) = doc.get_str(field) {
+                    out.insert(value.to_string());
+                }
+            }
+        }
+        Ok(rows)
+    }
+
+    /// [`Self::drain_field`] specialised to `resource_id`, the field every
+    /// `search_index` probe/stream/verify projection carries.
+    async fn drain_resource_ids(
+        cursor: &mut Cursor<Document>,
+        limit: usize,
+        out: &mut HashSet<String>,
+    ) -> StorageResult<usize> {
+        Self::drain_field(cursor, "resource_id", limit, out).await
     }
 
     /// Resource ids of the type ordered by an indexed search parameter's
@@ -933,6 +1110,52 @@ impl MongoBackend {
         Ok(ordered)
     }
 
+    /// Resolves every parameter restriction (positive params, `:missing`,
+    /// `:not`, and compartment membership) into a bounded set of resource
+    /// ids, without ever asking MongoDB to `distinct` an unbounded
+    /// `search_index` slice (#999).
+    ///
+    /// # Design
+    ///
+    /// Parameters partition into POSITIVES (no modifier / `:exact` /
+    /// `:contains` / `:text` / `:code-text`, plus `:missing=false` — all of
+    /// these are expressible as a single `search_index` filter whose matches
+    /// are the answer) and COMPLEMENTS (`:missing=true`, `:not` — both need a
+    /// universe to complement against). A compartment restriction is just
+    /// another positive predicate.
+    ///
+    /// Each positive is PROBED in increasing [`filter_cost_class`] order via
+    /// [`Self::probe_predicate`]: `find(filter).limit(chunk+1)`, so the answer
+    /// is either [`Probe::Exact`] (the cursor ended inside the bound — a
+    /// *complete* id set, because exactness is a property of termination, not
+    /// of a heuristic) or [`Probe::Saturated`] (more than `chunk` rows exist).
+    /// Exact sets intersect in Rust (each ≤ `chunk`, so this is free); probing
+    /// stops early once the intersection is small (`EARLY_STOP`) or a
+    /// `filter_cost_class` ≥ 2 predicate (an unbounded `$regex` scan) would be
+    /// probed only to narrow an already-small set further.
+    ///
+    /// If any predicate resolved exactly, every remaining predicate —
+    /// including one that would have been an unbounded scan — is checked with
+    /// [`Self::bounded_verify`], a `find` whose filter is bounded by
+    /// `resource_id: {$in: candidates}` (≤ `chunk` ids), served by the
+    /// existing `idx_search_composite (tenant_id, resource_type, resource_id,
+    /// param_name, composite_group)`. `:missing`/`:not` complements are the
+    /// same bounded check plus a `retain` in [`Self::verify_against`] — the
+    /// ONE implementation of the modifier logic in this file.
+    ///
+    /// Only when every positive saturates (or there were none at all) do we
+    /// fall back to a genuine scan: with two or more saturated positives, an
+    /// index-only `count_documents(filter).limit(TIER1_COUNT_LIMIT)` picks the
+    /// smallest as the driver; its `find` cursor is drained `chunk` rows
+    /// (a "bite") at a time, each bite verified independently and its
+    /// survivors folded into the accumulated result — capped at
+    /// `max_matched_ids`, past which [`SearchError::TooManyResults`] is
+    /// returned rather than continuing to scan. A single positive with no
+    /// complements skips probing entirely: the stream itself is the probe.
+    ///
+    /// No positives at all (e.g. `Patient?gender:not=female`) uses
+    /// [`Self::capped_universe_ids`] as the candidate set instead of a driver
+    /// stream, then runs the same [`Self::verify_against`].
     async fn matching_resource_ids(
         &self,
         db: &mongodb::Database,
@@ -941,119 +1164,431 @@ impl MongoBackend {
         query: &SearchQuery,
     ) -> StorageResult<Option<HashSet<String>>> {
         let search_index = db.collection::<Document>(MongoBackend::SEARCH_INDEX_COLLECTION);
-        let mut matched: Option<HashSet<String>> = None;
+        let chunk = self.config().search_scan_chunk.max(1);
+        let cap = self.config().max_matched_ids.max(1);
+
+        let mut positives: Vec<Predicate<'_>> = Vec::new();
+        let mut complements: Vec<&SearchParameter> = Vec::new();
 
         for param in &query.parameters {
             if matches!(param.name.as_str(), "_id" | "_lastUpdated") {
                 continue;
             }
-
-            // `:missing` resolves from index-entry presence alone (#881),
-            // exactly like the SQL backends: `missing=false` is the set of
-            // resources with any entry for the parameter, `missing=true` its
-            // complement over the type's live resources.
-            let ids = if matches!(param.modifier, Some(SearchModifier::Missing)) {
-                let wants_missing = param
-                    .values
-                    .first()
-                    .map(|v| v.value == "true")
-                    .unwrap_or(false);
-                let with_entry = self
-                    .distinct_resource_ids(
-                        &search_index,
-                        doc! {
-                            "tenant_id": tenant_id,
-                            "resource_type": resource_type,
-                            "param_name": &param.name,
-                        },
-                    )
-                    .await?;
-                if wants_missing {
-                    let all = self.all_resource_ids(db, tenant_id, resource_type).await?;
-                    all.difference(&with_entry).cloned().collect::<HashSet<_>>()
-                } else {
-                    with_entry
+            match &param.modifier {
+                // `:missing=false` ("has an entry for this param") IS a
+                // positive predicate — its filter is the plain presence
+                // filter (see `predicate_filter`). Only `:missing=true` needs
+                // a universe to complement against.
+                Some(SearchModifier::Missing)
+                    if param
+                        .values
+                        .first()
+                        .map(|v| v.value == "true")
+                        .unwrap_or(false) =>
+                {
+                    complements.push(param);
                 }
-            } else if matches!(param.modifier, Some(SearchModifier::Not)) {
-                // `:not` is the complement of the positive match, and per the
-                // spec it includes resources with no value for the parameter
-                // at all (#881).
-                let mut positive = param.clone();
-                positive.modifier = None;
-                let filter = self.build_search_index_filter(tenant_id, resource_type, &positive)?;
-                let matching = self.distinct_resource_ids(&search_index, filter).await?;
-                let all = self.all_resource_ids(db, tenant_id, resource_type).await?;
-                all.difference(&matching).cloned().collect::<HashSet<_>>()
-            } else {
-                let filter = self.build_search_index_filter(tenant_id, resource_type, param)?;
-                self.distinct_resource_ids(&search_index, filter).await?
-            };
-
-            if ids.is_empty() {
-                return Ok(Some(HashSet::new()));
+                Some(SearchModifier::Not) => complements.push(param),
+                _ => positives.push(Predicate::Param(param)),
             }
-
-            matched = Some(match matched {
-                Some(current) => current
-                    .intersection(&ids)
-                    .cloned()
-                    .collect::<HashSet<String>>(),
-                None => ids,
-            });
-
-            if matched.as_ref().is_some_and(|set| set.is_empty()) {
-                return Ok(matched);
+        }
+        if let Some(comp) = query.compartment.as_ref() {
+            if !comp.params.is_empty() && !comp.reference.is_empty() {
+                positives.push(Predicate::Compartment(comp));
             }
         }
 
-        // Compartment membership: a resource joins the compartment if it
-        // references the compartment via ANY of the membership params (OR),
-        // per the FHIR CompartmentDefinition. Computed as a single OR query
-        // over the search_index and intersected with the parameter matches.
-        if let Some(comp) = &query.compartment {
-            if let Some(ids) = self
-                .compartment_resource_ids(&search_index, tenant_id, resource_type, comp)
+        if positives.is_empty() && complements.is_empty() {
+            return Ok(None);
+        }
+
+        // Single positive, nothing to complement against: the stream IS the
+        // probe. One command for the common case, same as today's one
+        // `distinct` — but with no 16MB reply cap.
+        if positives.len() == 1 && complements.is_empty() {
+            let filter = self.predicate_filter(tenant_id, resource_type, &positives[0])?;
+            let ids = self
+                .stream_search_index_ids(&search_index, filter, chunk, cap)
+                .await?;
+            return Ok(Some(ids));
+        }
+
+        let filters: Vec<Document> = positives
+            .iter()
+            .map(|p| self.predicate_filter(tenant_id, resource_type, p))
+            .collect::<StorageResult<Vec<_>>>()?;
+        let classes: Vec<u8> = filters.iter().map(filter_cost_class).collect();
+
+        let mut order: Vec<usize> = (0..positives.len()).collect();
+        order.sort_by_key(|&i| (classes[i], i));
+
+        let mut candidates: Option<HashSet<String>> = None;
+        let mut unresolved: Vec<usize> = Vec::new();
+
+        for &i in &order {
+            // Rule A: once the exact intersection is already small, further
+            // probing cannot pay for itself — bound-verify the rest instead.
+            if candidates.as_ref().is_some_and(|c| c.len() <= EARLY_STOP) {
+                unresolved.push(i);
+                continue;
+            }
+            // Rule B: never pay an unbounded `$regex` scan to narrow a set we
+            // already have a real bound on.
+            if classes[i] >= 2 && candidates.is_some() {
+                unresolved.push(i);
+                continue;
+            }
+
+            match self
+                .probe_predicate(&search_index, filters[i].clone(), chunk)
                 .await?
             {
-                if ids.is_empty() {
-                    return Ok(Some(HashSet::new()));
+                Probe::Exact(ids) => {
+                    if ids.is_empty() {
+                        return Ok(Some(HashSet::new()));
+                    }
+                    candidates = Some(match candidates {
+                        Some(current) => current.intersection(&ids).cloned().collect(),
+                        None => ids,
+                    });
+                    if candidates.as_ref().is_some_and(|c| c.is_empty()) {
+                        return Ok(Some(HashSet::new()));
+                    }
                 }
-                matched = Some(match matched {
-                    Some(current) => current
-                        .intersection(&ids)
-                        .cloned()
-                        .collect::<HashSet<String>>(),
-                    None => ids,
-                });
+                Probe::Saturated => unresolved.push(i),
             }
         }
 
-        Ok(matched)
+        // Bounded case: at least one positive resolved exactly, so every
+        // remaining predicate (saturated positives + complements) is checked
+        // against a small candidate set instead of scanned.
+        if let Some(mut candidates) = candidates {
+            let rest: Vec<&Document> = unresolved.iter().map(|&i| &filters[i]).collect();
+            self.verify_against(
+                &search_index,
+                tenant_id,
+                resource_type,
+                &mut candidates,
+                &rest,
+                &complements,
+            )
+            .await?;
+            if candidates.len() > cap {
+                return Err(too_many_results(candidates.len(), cap));
+            }
+            return Ok(Some(candidates));
+        }
+
+        // No positives at all: the universe is the candidate set.
+        if positives.is_empty() {
+            let mut candidates = self
+                .capped_universe_ids(db, tenant_id, resource_type, chunk, cap)
+                .await?;
+            if candidates.is_empty() {
+                return Ok(Some(candidates));
+            }
+            self.verify_against(
+                &search_index,
+                tenant_id,
+                resource_type,
+                &mut candidates,
+                &[],
+                &complements,
+            )
+            .await?;
+            return Ok(Some(candidates));
+        }
+
+        // Every positive saturated: rank by real (bounded, index-only) row
+        // counts and stream the smallest as the driver, verifying each bite
+        // against the rest.
+        debug_assert!(
+            !unresolved.is_empty(),
+            "every positive is either exact or saturated"
+        );
+        let driver_i = if unresolved.len() > 1 {
+            let mut best: Option<(usize, u64)> = None;
+            for &i in &unresolved {
+                let n = search_index
+                    .count_documents(filters[i].clone())
+                    .limit(TIER1_COUNT_LIMIT)
+                    .await
+                    .or_query_error("Failed to rank search_index predicates")?;
+                if n == 0 {
+                    return Ok(Some(HashSet::new()));
+                }
+                if best.is_none_or(|(_, prev)| n < prev) {
+                    best = Some((i, n));
+                }
+            }
+            best.map(|(i, _)| i).unwrap_or(unresolved[0])
+        } else {
+            unresolved[0]
+        };
+        let rest: Vec<&Document> = unresolved
+            .iter()
+            .filter(|&&i| i != driver_i)
+            .map(|&i| &filters[i])
+            .collect();
+
+        let mut cursor = search_index
+            .find(filters[driver_i].clone())
+            .projection(doc! { "resource_id": 1_i32, "_id": 0_i32 })
+            .batch_size(chunk as u32)
+            .await
+            .or_query_error("Failed to scan driver predicate")?;
+
+        let mut confirmed: HashSet<String> = HashSet::new();
+        loop {
+            let mut bite: HashSet<String> = HashSet::new();
+            let rows = Self::drain_resource_ids(&mut cursor, chunk, &mut bite).await?;
+            if rows == 0 {
+                break;
+            }
+            // A resource whose rows straddle a bite boundary simply appears
+            // as a candidate in more than one bite, is verified more than
+            // once (idempotent) and inserted once (`HashSet`). Deliberately
+            // no global "seen" set: it would have to remember rejected ids
+            // too and would be unbounded again.
+            self.verify_against(
+                &search_index,
+                tenant_id,
+                resource_type,
+                &mut bite,
+                &rest,
+                &complements,
+            )
+            .await?;
+            confirmed.extend(bite);
+            if confirmed.len() > cap {
+                return Err(too_many_results(confirmed.len(), cap));
+            }
+        }
+        Ok(Some(confirmed))
     }
 
-    /// Returns the resource IDs that are members of the compartment described by
-    /// `comp`: resources that reference `comp.reference` through ANY of the
-    /// membership params (logical OR). Reference matching is version-agnostic
-    /// (mirrors the reference handler): the stored reference must equal the base
-    /// reference or carry a `/_history/<vid>` suffix.
-    ///
-    /// Returns `Ok(None)` when `comp` carries no params or no reference (no
-    /// restriction to apply), otherwise `Ok(Some(ids))` (possibly empty).
-    async fn compartment_resource_ids(
+    /// The `search_index` filter for one predicate. `:missing=false` (routed
+    /// as a positive — see `matching_resource_ids`) resolves to the bare
+    /// presence filter, exactly like the SQL backends: `missing=false` is the
+    /// set of resources with any entry for the parameter.
+    fn predicate_filter(
+        &self,
+        tenant_id: &str,
+        resource_type: &str,
+        pred: &Predicate<'_>,
+    ) -> StorageResult<Document> {
+        match pred {
+            Predicate::Param(p) if matches!(p.modifier, Some(SearchModifier::Missing)) => Ok(doc! {
+                "tenant_id": tenant_id,
+                "resource_type": resource_type,
+                "param_name": &p.name,
+            }),
+            Predicate::Param(p) => self.build_search_index_filter(tenant_id, resource_type, p),
+            Predicate::Compartment(c) => Ok(self
+                .compartment_filter(tenant_id, resource_type, c)
+                .expect("Predicate::Compartment is only constructed when comp has params and a reference")),
+        }
+    }
+
+    /// Narrows `candidates` in place by every predicate not already resolved
+    /// exactly (`rest`) and every `:missing`/`:not` complement. The ONLY
+    /// implementation of the modifier logic in this file — called once in the
+    /// bounded case, once per bite in the streaming case, and once for the
+    /// no-positives universe case.
+    async fn verify_against(
         &self,
         search_index: &mongodb::Collection<Document>,
         tenant_id: &str,
         resource_type: &str,
+        candidates: &mut HashSet<String>,
+        rest: &[&Document],
+        complements: &[&SearchParameter],
+    ) -> StorageResult<()> {
+        for filter in rest {
+            if candidates.is_empty() {
+                return Ok(());
+            }
+            let passing = self
+                .bounded_verify(search_index, (*filter).clone(), candidates)
+                .await?;
+            candidates.retain(|id| passing.contains(id));
+        }
+
+        for param in complements {
+            if candidates.is_empty() {
+                return Ok(());
+            }
+            match &param.modifier {
+                Some(SearchModifier::Missing) => {
+                    // Only `:missing=true` is ever routed here (see
+                    // `matching_resource_ids`'s partition), so this is always
+                    // the complement direction — but read the value rather
+                    // than assume it, so the function stays correct if that
+                    // routing ever changes.
+                    let wants_missing = param
+                        .values
+                        .first()
+                        .map(|v| v.value == "true")
+                        .unwrap_or(false);
+                    let presence = doc! {
+                        "tenant_id": tenant_id,
+                        "resource_type": resource_type,
+                        "param_name": &param.name,
+                    };
+                    let with_entry = self
+                        .bounded_verify(search_index, presence, candidates)
+                        .await?;
+                    if wants_missing {
+                        candidates.retain(|id| !with_entry.contains(id));
+                    } else {
+                        candidates.retain(|id| with_entry.contains(id));
+                    }
+                }
+                Some(SearchModifier::Not) => {
+                    // Complement of the positive match; per spec this KEEPS
+                    // resources with no value at all for the parameter, which
+                    // falls out of the `retain(!contains)` rather than
+                    // needing a separate union — exact (not approximate)
+                    // because `candidates` is already a subset of the type's
+                    // live resources (`delete` removes their `search_index`
+                    // rows, and the universe path filters `is_deleted: false`).
+                    let mut positive = (*param).clone();
+                    positive.modifier = None;
+                    let filter =
+                        self.build_search_index_filter(tenant_id, resource_type, &positive)?;
+                    let matching = self
+                        .bounded_verify(search_index, filter, candidates)
+                        .await?;
+                    candidates.retain(|id| !matching.contains(id));
+                }
+                _ => {
+                    // `matching_resource_ids` only ever pushes Missing/Not
+                    // parameters into `complements`.
+                    debug_assert!(
+                        false,
+                        "verify_against received a complement with modifier {:?}",
+                        param.modifier
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Probes one predicate: `find(filter).limit(chunk+1)`. Fewer than
+    /// `chunk + 1` rows means the cursor was exhausted before the bound, so
+    /// the returned id set is COMPLETE — exactness is a property of
+    /// termination, not of a heuristic — otherwise the predicate is
+    /// [`Probe::Saturated`] and nothing about its size is learned.
+    async fn probe_predicate(
+        &self,
+        search_index: &mongodb::Collection<Document>,
+        filter: Document,
+        chunk: usize,
+    ) -> StorageResult<Probe> {
+        let mut cursor = search_index
+            .find(filter)
+            .projection(doc! { "resource_id": 1_i32, "_id": 0_i32 })
+            .limit((chunk + 1) as i64)
+            .batch_size(chunk as u32)
+            .await
+            .or_query_error("Failed to probe search_index")?;
+        let mut ids = HashSet::new();
+        let rows = Self::drain_resource_ids(&mut cursor, chunk + 1, &mut ids).await?;
+        Ok(if rows <= chunk {
+            Probe::Exact(ids)
+        } else {
+            Probe::Saturated
+        })
+    }
+
+    /// Streams every matching `resource_id` for `filter`, capped at `cap`.
+    /// Used for the single-positive fast path, and reusable anywhere a whole
+    /// predicate (not just a candidate-bounded slice of one) must be read.
+    async fn stream_search_index_ids(
+        &self,
+        search_index: &mongodb::Collection<Document>,
+        filter: Document,
+        chunk: usize,
+        cap: usize,
+    ) -> StorageResult<HashSet<String>> {
+        let mut cursor = search_index
+            .find(filter)
+            .projection(doc! { "resource_id": 1_i32, "_id": 0_i32 })
+            .batch_size(chunk as u32)
+            .await
+            .or_query_error("Failed to scan search_index")?;
+        let mut ids = HashSet::new();
+        loop {
+            let rows = Self::drain_resource_ids(&mut cursor, chunk, &mut ids).await?;
+            if rows == 0 {
+                break;
+            }
+            if ids.len() > cap {
+                return Err(too_many_results(ids.len(), cap));
+            }
+        }
+        Ok(ids)
+    }
+
+    /// The ONLY place this file asks MongoDB about `search_index` rows for a
+    /// candidate set: `{$and: [filter, {resource_id: {$in: candidates}}]}`,
+    /// so an unbounded scan is not expressible at any call site (#999). Served
+    /// by `idx_search_composite (tenant_id, resource_type, resource_id,
+    /// param_name, composite_group)` — an index that already exists and whose
+    /// prefix this filter shape matches exactly. `find`, not `distinct`: the
+    /// MongoDB 5.0.6 floor this backend supports predates `distinct`'s
+    /// `hint` option (server 7.1+), so a `find` keeps a future planner-hint
+    /// escape hatch open that a `distinct` would foreclose.
+    async fn bounded_verify(
+        &self,
+        search_index: &mongodb::Collection<Document>,
+        filter: Document,
+        candidates: &HashSet<String>,
+    ) -> StorageResult<HashSet<String>> {
+        debug_assert!(
+            !candidates.is_empty(),
+            "callers must not call with empty candidates"
+        );
+        let ids: Vec<Bson> = candidates.iter().cloned().map(Bson::String).collect();
+        let bounded = doc! {
+            "$and": [ filter, { "resource_id": { "$in": Bson::Array(ids) } } ],
+        };
+        let mut cursor = search_index
+            .find(bounded)
+            .projection(doc! { "resource_id": 1_i32, "_id": 0_i32 })
+            .await
+            .or_query_error("Failed to verify search_index candidates")?;
+        let mut out = HashSet::new();
+        Self::drain_resource_ids(&mut cursor, usize::MAX, &mut out).await?;
+        Ok(out)
+    }
+
+    /// The compartment membership filter: resources that reference
+    /// `comp.reference` through ANY of `comp.params` (logical OR). Reference
+    /// matching is version-agnostic (mirrors the reference handler): the
+    /// stored reference must equal the base reference or carry a
+    /// `/_history/<vid>` suffix, matched with an ANCHORED regex so an
+    /// unrelated resource whose reference merely ends the same way cannot
+    /// join the compartment.
+    ///
+    /// Returns `None` when `comp` carries no params or no reference (no
+    /// restriction to apply — the caller must treat this the same as "no
+    /// compartment", never as "restricted to nothing").
+    fn compartment_filter(
+        &self,
+        tenant_id: &str,
+        resource_type: &str,
         comp: &CompartmentMembership,
-    ) -> StorageResult<Option<HashSet<String>>> {
+    ) -> Option<Document> {
         if comp.params.is_empty() || comp.reference.is_empty() {
-            return Ok(None);
+            return None;
         }
 
         let base = strip_reference_version(&comp.reference);
         let params: Vec<Bson> = comp.params.iter().cloned().map(Bson::String).collect();
 
-        let filter = doc! {
+        Some(doc! {
             "tenant_id": tenant_id,
             "resource_type": resource_type,
             "param_name": { "$in": Bson::Array(params) },
@@ -1061,17 +1596,7 @@ impl MongoBackend {
                 { "value_reference": &base },
                 { "value_reference": { "$regex": format!("^{}/_history/", regex_escape(base)) } },
             ],
-        };
-
-        let ids = search_index
-            .distinct("resource_id", filter)
-            .await
-            .or_query_error("Failed to query search_index")?
-            .into_iter()
-            .filter_map(|value| value.as_str().map(ToString::to_string))
-            .collect::<HashSet<_>>();
-
-        Ok(Some(ids))
+        })
     }
 
     pub(super) fn build_search_index_filter(
@@ -1438,6 +1963,36 @@ impl MongoBackend {
         }
     }
 
+    /// Counts resources matching `query`, given an already-resolved
+    /// `matched_ids` (or `None` for no parameter restriction). The count half
+    /// of what `search_count` does standalone, factored out so `search` and
+    /// `search_param_sorted` can reuse a `matching_resource_ids` they already
+    /// paid for instead of recomputing it from scratch for the total (#999).
+    async fn count_with_matched_ids(
+        &self,
+        db: &mongodb::Database,
+        tenant_id: &str,
+        query: &SearchQuery,
+        matched_ids: Option<&HashSet<String>>,
+    ) -> StorageResult<u64> {
+        let filter =
+            self.build_resource_filter(tenant_id, &query.resource_type, query, matched_ids, None)?;
+        db.collection::<Document>(MongoBackend::RESOURCES_COLLECTION)
+            .count_documents(filter)
+            .await
+            .or_query_error("Failed to count MongoDB search results")
+    }
+
+    /// Builds the `resources` collection filter for a search, splicing
+    /// `matched_ids` (when present) in as `{id: {$in: […]}}`.
+    ///
+    /// That splice has its own 16MB MongoDB command-document limit, separate
+    /// from — and the reason behind — the cap `matching_resource_ids` (#999)
+    /// enforces on `matched_ids` itself: `MongoBackendConfig::max_matched_ids`
+    /// bounds `matched_ids.len()` to a size (100,000 ids by default, ~4.8MB
+    /// spliced) that cannot reach this limit, so `matching_resource_ids`
+    /// returning `Err` is the only way this splice can be too big — it can
+    /// never silently produce one.
     pub(super) fn build_resource_filter(
         &self,
         tenant_id: &str,
@@ -2098,5 +2653,82 @@ mod query_support_tests {
                 ..
             }) if modifier == "below"
         ));
+    }
+}
+
+#[cfg(test)]
+mod cost_class_tests {
+    use super::*;
+
+    /// Token equality (`{value_token_code: "X"}`): no `$regex`, no `$or` —
+    /// index-bounded (#999).
+    #[test]
+    fn token_equality_is_class_0() {
+        let filter = doc! { "tenant_id": "t", "resource_type": "Patient", "param_name": "gender", "value_token_code": "male" };
+        assert_eq!(filter_cost_class(&filter), 0);
+    }
+
+    /// A case-SENSITIVE anchored regex (`^X`, no `$options`) — MongoDB can use
+    /// an index prefix for this, e.g. the compartment's exact-base branch or
+    /// `:code-text`'s `^{escaped}` (#999).
+    #[test]
+    fn anchored_case_sensitive_regex_is_class_1() {
+        let filter = doc! {
+            "tenant_id": "t", "resource_type": "Observation", "param_name": "code",
+            "value_token_display": { "$regex": "^Foo" }
+        };
+        assert_eq!(filter_cost_class(&filter), 1);
+    }
+
+    /// An anchored regex with `$options: "i"` gets NO index bounds on any
+    /// MongoDB version, even though it starts with `^` — this is the case the
+    /// binding review's required change flags explicitly (#999): the default
+    /// (non-`:exact`) string/token-display match is case-insensitive, so
+    /// probing it would scan the whole `(tenant, type, param_name)` range.
+    #[test]
+    fn anchored_case_insensitive_regex_is_class_2() {
+        let filter = doc! {
+            "tenant_id": "t", "resource_type": "Patient", "param_name": "name",
+            "value_string": { "$regex": "^Smith", "$options": "i" }
+        };
+        assert_eq!(filter_cost_class(&filter), 2);
+    }
+
+    /// An UNANCHORED regex (`/X$`, the bare-reference `$or` branch, or
+    /// `:contains`) has no derivable index bounds regardless of case (#999).
+    #[test]
+    fn unanchored_regex_is_class_2() {
+        let filter = doc! {
+            "tenant_id": "t", "resource_type": "Encounter", "param_name": "patient",
+            "$or": [
+                { "value_reference": "Patient/123" },
+                { "value_reference": { "$regex": "/123$" } },
+            ]
+        };
+        assert_eq!(filter_cost_class(&filter), 2);
+    }
+
+    /// The worst class anywhere in the document wins: an `$or` with one
+    /// bounded and one unbounded branch is still class 2, and a plain `$or`
+    /// with no regex at all (multi-value token) is class 1.
+    #[test]
+    fn worst_class_in_document_wins() {
+        let multi_value_or = doc! {
+            "tenant_id": "t", "resource_type": "Patient", "param_name": "identifier",
+            "$or": [
+                { "value_token_code": "A" },
+                { "value_token_code": "B" },
+            ]
+        };
+        assert_eq!(filter_cost_class(&multi_value_or), 1);
+
+        let mixed_or = doc! {
+            "tenant_id": "t", "resource_type": "Patient", "param_name": "name",
+            "$or": [
+                { "value_string": { "$regex": "^Smith", "$options": "i" } },
+                { "value_string": "Exact" },
+            ]
+        };
+        assert_eq!(filter_cost_class(&mixed_or), 2);
     }
 }
