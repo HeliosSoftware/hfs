@@ -277,6 +277,57 @@ fn parse_system_history_cursor(params: &HistoryParams) -> Option<(DateTime<Utc>,
     Some((timestamp, resource_type, id))
 }
 
+/// Server-side keyset predicate for a `history_type` cursor page: matches the
+/// same `last_updated < ts OR (last_updated == ts AND id < cursor_id)` shape
+/// already used by the Rust-side comparison here and by the SQLite/Postgres
+/// backends, but as a MongoDB `$or` so the index — not a full scan — can
+/// serve it. `None` when there is no cursor (first page), an absent/malformed
+/// cursor, or offset-mode pagination — in every such case the caller adds no
+/// `$or` and the query is simply the first page.
+fn type_history_cursor_or(params: &HistoryParams) -> Option<Vec<Document>> {
+    let (ts, id) = parse_type_history_cursor(params)?;
+    let bson_ts = chrono_to_bson(ts);
+    Some(vec![
+        doc! { "last_updated": { "$lt": bson_ts } },
+        doc! { "last_updated": bson_ts, "id": { "$lt": id } },
+    ])
+}
+
+/// Same as [`type_history_cursor_or`] but for `history_system`'s 3-key sort
+/// (`last_updated`, `resource_type`, `id`).
+fn system_history_cursor_or(params: &HistoryParams) -> Option<Vec<Document>> {
+    let (ts, resource_type, id) = parse_system_history_cursor(params)?;
+    let bson_ts = chrono_to_bson(ts);
+    Some(vec![
+        doc! { "last_updated": { "$lt": bson_ts } },
+        doc! { "last_updated": bson_ts, "resource_type": { "$lt": &resource_type } },
+        doc! {
+            "last_updated": bson_ts,
+            "resource_type": &resource_type,
+            "id": { "$lt": id },
+        },
+    ])
+}
+
+/// Sort matching `idx_history_type_updated`'s key order after its two
+/// equality-filtered prefix fields (`tenant_id`, `resource_type`).
+fn type_history_sort() -> Document {
+    doc! { "last_updated": -1_i32, "id": -1_i32 }
+}
+
+/// Sort matching `idx_history_system_updated`'s key order after its
+/// equality-filtered prefix field (`tenant_id`).
+fn system_history_sort() -> Document {
+    doc! { "last_updated": -1_i32, "resource_type": -1_i32, "id": -1_i32 }
+}
+
+/// Documents to fetch for a history page: `count + 1` so the caller can
+/// detect `has_next` by truncating back to `count`. Never 0 — MongoDB reads
+/// `limit(0)` as "unlimited", which would silently undo the bound.
+fn history_fetch_limit(count: u32) -> i64 {
+    i64::from(count.saturating_add(1))
+}
+
 #[derive(Debug, Clone)]
 struct ParsedHistoryRow {
     resource_type: String,
@@ -2475,9 +2526,25 @@ impl TypeHistoryProvider for MongoBackend {
             "resource_type": resource_type,
         };
         apply_history_params_filter(&mut filter, params);
+        if let Some(or_branches) = type_history_cursor_or(params) {
+            // A distinct top-level key from the `last_updated` range that
+            // `apply_history_params_filter` may have just inserted, so the
+            // two AND together implicitly rather than colliding.
+            filter.insert("$or", or_branches);
+        }
+
+        let opts = FindOptions::builder()
+            .sort(type_history_sort())
+            .limit(history_fetch_limit(params.pagination.count))
+            // Exclusion-style on the only two fields parse_history_row never
+            // reads: an inclusion projection risks silently substituting a
+            // default for a field it does read (e.g. fhir_version).
+            .projection(doc! { "_id": 0, "created_at": 0 })
+            .build();
 
         let cursor = history
             .find(filter)
+            .with_options(opts)
             .await
             .or_query_error("Failed to query type history")?;
 
@@ -2487,19 +2554,25 @@ impl TypeHistoryProvider for MongoBackend {
             .map(|doc| parse_history_row(doc, Some(resource_type), None))
             .collect::<StorageResult<Vec<_>>>()?;
 
+        // The server-side sort (matching idx_history_type_updated) already
+        // orders the <= count+1 fetched rows by (last_updated desc, id desc);
+        // only the version_id tie-break stays in Rust, because version_id is
+        // in neither idx_history_type_updated nor idx_history_system_updated
+        // (pushing it server-side would reintroduce a blocking SORT, and it
+        // is stored as a string, so a server-side $lt/sort on it would
+        // misorder "10" ahead of "9" anyway). When a (last_updated, id) tie
+        // group straddles the fetch-limit boundary, the server's limit() may
+        // now pick an arbitrary subset of that group before this sort runs,
+        // so which member lands on the page is no longer guaranteed to be
+        // the highest version_id — but any group member beyond the boundary
+        // was already dropped by the (ts, id)-only cursor predicate above
+        // (shared with SQLite/Postgres), so total loss is unchanged.
         rows.sort_by(|a, b| {
             b.last_updated
                 .cmp(&a.last_updated)
                 .then_with(|| b.id.cmp(&a.id))
                 .then_with(|| parse_version_id(&b.version_id).cmp(&parse_version_id(&a.version_id)))
         });
-
-        if let Some((cursor_timestamp, cursor_id)) = parse_type_history_cursor(params) {
-            rows.retain(|row| {
-                row.last_updated < cursor_timestamp
-                    || (row.last_updated == cursor_timestamp && row.id < cursor_id)
-            });
-        }
 
         let page_len = params.pagination.count as usize;
         let has_more = rows.len() > page_len;
@@ -2565,9 +2638,19 @@ impl SystemHistoryProvider for MongoBackend {
             "tenant_id": tenant_id,
         };
         apply_history_params_filter(&mut filter, params);
+        if let Some(or_branches) = system_history_cursor_or(params) {
+            filter.insert("$or", or_branches);
+        }
+
+        let opts = FindOptions::builder()
+            .sort(system_history_sort())
+            .limit(history_fetch_limit(params.pagination.count))
+            .projection(doc! { "_id": 0, "created_at": 0 })
+            .build();
 
         let cursor = history
             .find(filter)
+            .with_options(opts)
             .await
             .or_query_error("Failed to query system history")?;
 
@@ -2577,6 +2660,12 @@ impl SystemHistoryProvider for MongoBackend {
             .map(|doc| parse_history_row(doc, None, None))
             .collect::<StorageResult<Vec<_>>>()?;
 
+        // See the matching comment in history_type: the server-side sort
+        // (matching idx_history_system_updated) already orders the fetched
+        // page; only the version_id tie-break stays in Rust, and a
+        // (last_updated, resource_type, id) tie group straddling the
+        // fetch-limit boundary can show an arbitrary member without
+        // widening total loss versus today.
         rows.sort_by(|a, b| {
             b.last_updated
                 .cmp(&a.last_updated)
@@ -2584,17 +2673,6 @@ impl SystemHistoryProvider for MongoBackend {
                 .then_with(|| b.id.cmp(&a.id))
                 .then_with(|| parse_version_id(&b.version_id).cmp(&parse_version_id(&a.version_id)))
         });
-
-        if let Some((cursor_timestamp, cursor_type, cursor_id)) =
-            parse_system_history_cursor(params)
-        {
-            rows.retain(|row| {
-                row.last_updated < cursor_timestamp
-                    || (row.last_updated == cursor_timestamp
-                        && (row.resource_type < cursor_type
-                            || (row.resource_type == cursor_type && row.id < cursor_id)))
-            });
-        }
 
         let page_len = params.pagination.count as usize;
         let has_more = rows.len() > page_len;
@@ -4354,5 +4432,179 @@ fn resolve_bundle_references(value: &mut Value, reference_map: &HashMap<String, 
             }
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod history_query_tests {
+    //! Docker-free unit tests for the pure query builders behind #1053's
+    //! fix: the server-side cursor predicate, sort, and fetch-limit that
+    //! `history_type`/`history_system` now push to MongoDB instead of
+    //! draining the whole history corpus into Rust before paging.
+
+    use super::*;
+    use crate::types::Pagination;
+
+    fn cursor_params(sort_values: Vec<CursorValue>, resource_id: &str) -> HistoryParams {
+        let cursor = PageCursor::new(sort_values, resource_id);
+        HistoryParams {
+            pagination: Pagination::with_cursor(10, cursor.encode()),
+            ..HistoryParams::default()
+        }
+    }
+
+    #[test]
+    fn type_history_cursor_or_matches_expected_shape() {
+        let ts = DateTime::parse_from_rfc3339("2024-01-01T00:00:10Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let params = cursor_params(
+            vec![
+                CursorValue::String(ts.to_rfc3339()),
+                CursorValue::String("obs-5".to_string()),
+            ],
+            "Observation",
+        );
+
+        let or_branches = type_history_cursor_or(&params).expect("expected a cursor predicate");
+        let expected_ts = chrono_to_bson(ts);
+        assert_eq!(
+            or_branches,
+            vec![
+                doc! { "last_updated": { "$lt": expected_ts } },
+                doc! { "last_updated": expected_ts, "id": { "$lt": "obs-5" } },
+            ]
+        );
+    }
+
+    #[test]
+    fn system_history_cursor_or_matches_expected_3_branch_shape() {
+        let ts = DateTime::parse_from_rfc3339("2024-01-01T00:00:10Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let params = cursor_params(
+            vec![
+                CursorValue::String(ts.to_rfc3339()),
+                CursorValue::String("Observation".to_string()),
+                CursorValue::String("obs-5".to_string()),
+            ],
+            "system",
+        );
+
+        let or_branches = system_history_cursor_or(&params).expect("expected a cursor predicate");
+        let expected_ts = chrono_to_bson(ts);
+        assert_eq!(
+            or_branches,
+            vec![
+                doc! { "last_updated": { "$lt": expected_ts } },
+                doc! {
+                    "last_updated": expected_ts,
+                    "resource_type": { "$lt": "Observation" },
+                },
+                doc! {
+                    "last_updated": expected_ts,
+                    "resource_type": "Observation",
+                    "id": { "$lt": "obs-5" },
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn cursor_or_is_none_for_absent_cursor() {
+        let params = HistoryParams::default();
+        assert!(type_history_cursor_or(&params).is_none());
+        assert!(system_history_cursor_or(&params).is_none());
+    }
+
+    #[test]
+    fn cursor_or_is_none_for_malformed_cursor() {
+        // Only one sort value: type history needs 2, system needs 3.
+        let ts = Utc::now();
+        let params = cursor_params(vec![CursorValue::String(ts.to_rfc3339())], "Observation");
+        assert!(type_history_cursor_or(&params).is_none());
+        assert!(system_history_cursor_or(&params).is_none());
+
+        // Two sort values: enough for type history, not for system history.
+        let params2 = cursor_params(
+            vec![
+                CursorValue::String(ts.to_rfc3339()),
+                CursorValue::String("obs-5".to_string()),
+            ],
+            "Observation",
+        );
+        assert!(type_history_cursor_or(&params2).is_some());
+        assert!(system_history_cursor_or(&params2).is_none());
+    }
+
+    #[test]
+    fn cursor_or_is_none_for_offset_mode_pagination() {
+        let params = HistoryParams {
+            pagination: Pagination::offset(5),
+            ..HistoryParams::default()
+        };
+        assert!(type_history_cursor_or(&params).is_none());
+        assert!(system_history_cursor_or(&params).is_none());
+    }
+
+    #[test]
+    fn since_before_range_coexists_with_cursor_or_without_key_collision() {
+        let since = DateTime::parse_from_rfc3339("2024-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let before = DateTime::parse_from_rfc3339("2024-06-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let cursor_ts = DateTime::parse_from_rfc3339("2024-03-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        let mut params = cursor_params(
+            vec![
+                CursorValue::String(cursor_ts.to_rfc3339()),
+                CursorValue::String("obs-5".to_string()),
+            ],
+            "Observation",
+        );
+        params.since = Some(since);
+        params.before = Some(before);
+
+        let mut filter = doc! { "tenant_id": "tenant-1", "resource_type": "Observation" };
+        apply_history_params_filter(&mut filter, &params);
+        let or_branches = type_history_cursor_or(&params).expect("expected a cursor predicate");
+        filter.insert("$or", or_branches);
+
+        // Both the range (under "last_updated") and the cursor predicate
+        // (under the distinct top-level "$or" key) are present — they AND
+        // together implicitly rather than colliding on the same key.
+        let range = filter
+            .get_document("last_updated")
+            .expect("expected the since/before range to remain under last_updated");
+        assert_eq!(range.get("$gte"), Some(&Bson::from(chrono_to_bson(since))));
+        assert_eq!(range.get("$lt"), Some(&Bson::from(chrono_to_bson(before))));
+        assert!(filter.contains_key("$or"));
+        // include_deleted defaults to false, so the filter also carries it.
+        assert_eq!(filter.get_bool("is_deleted").ok(), Some(false));
+    }
+
+    #[test]
+    fn history_fetch_limit_is_count_plus_one_and_never_zero() {
+        assert_eq!(history_fetch_limit(10), 11);
+        assert_eq!(history_fetch_limit(0), 1);
+        assert_eq!(history_fetch_limit(99), 100);
+    }
+
+    #[test]
+    fn sorts_match_the_serving_index_key_order() {
+        // idx_history_type_updated = {tenant_id, resource_type, last_updated: -1, id: -1}
+        assert_eq!(
+            type_history_sort(),
+            doc! { "last_updated": -1_i32, "id": -1_i32 }
+        );
+        // idx_history_system_updated = {tenant_id, last_updated: -1, resource_type: -1, id: -1}
+        assert_eq!(
+            system_history_sort(),
+            doc! { "last_updated": -1_i32, "resource_type": -1_i32, "id": -1_i32 }
+        );
     }
 }
