@@ -3,6 +3,7 @@ import {
   createResource,
   createResources,
   createSqlQueryLibrary,
+  deleteByNamePrefix,
   deleteResources,
   waitSearchable,
 } from "../../pages/api";
@@ -37,6 +38,12 @@ const PADDING_SUBJECTS = 200;
 // the full mechanism).
 let seededViewDefinitionIds: string[] = [];
 
+// The per-run name prefix of every padding batch, swept by name in this
+// file's own `afterEach` on top of the ids above: a `createResources` chunk
+// whose request fails outright (a 408 on the ES composites) never reports its
+// ids while the server may still commit it (#1070).
+let seededViewDefinitionPrefixes: string[] = [];
+
 // Same reasoning as `seededViewDefinitionIds` above, for the `Library`
 // sql-query subject the failed-job detail test below seeds.
 let seededLibraryIds: string[] = [];
@@ -45,6 +52,12 @@ test.afterEach(async ({ request }) => {
   const ids = seededViewDefinitionIds;
   seededViewDefinitionIds = [];
   await deleteResources(request, "ViewDefinition", ids);
+
+  const prefixes = seededViewDefinitionPrefixes;
+  seededViewDefinitionPrefixes = [];
+  for (const prefix of prefixes) {
+    await deleteByNamePrefix(request, "ViewDefinition", prefix);
+  }
 
   const libraryIds = seededLibraryIds;
   seededLibraryIds = [];
@@ -71,6 +84,10 @@ test("SQL Export lifecycle works without JavaScript", async ({ page, request, sq
   test.setTimeout(120_000);
 
   async function startPaddedExport(name: string): Promise<void> {
+    // `name` already carries a per-run `Date.now()` stamp. Registered before
+    // the batch starts and per chunk as it lands, so a failure partway
+    // through still leaves `afterEach` able to clean up every padding row.
+    seededViewDefinitionPrefixes.push(`${name}_`);
     const ids = await createResources(
       request,
       Array.from({ length: PADDING_SUBJECTS }, (_, i) => ({
@@ -82,8 +99,9 @@ test("SQL Export lifecycle works without JavaScript", async ({ page, request, sq
           select: [{ column: [{ name: "id", path: "getResourceKey()" }] }],
         },
       })),
+      undefined,
+      (chunkIds) => seededViewDefinitionIds.push(...chunkIds),
     );
-    seededViewDefinitionIds.push(...ids);
 
     await sqlExport.gotoNew();
     const checkboxes = ids

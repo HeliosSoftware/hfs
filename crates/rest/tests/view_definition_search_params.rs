@@ -189,6 +189,54 @@ mod search_by_name {
         let body: Value = response.json();
         assert_eq!(entry_ids(&body), vec!["vd-draft".to_string()]);
     }
+
+    /// The web UI's SQL-views rail and Add-table combobox query:
+    /// `_sort=name&name:contains=<q>` returns exactly the case-insensitive
+    /// substring matches, sorted by name — never the unfiltered list (#1070).
+    #[tokio::test]
+    async fn contains_modifier_filters_case_insensitively_and_sorts_by_name() {
+        let (server, backend) = create_test_server().await;
+        seed_view_definitions(&backend).await;
+
+        // Created out of name order so the sort is observable; lowercase
+        // leading letters keep the expected order independent of whether the
+        // string sort is case-sensitive. `gamma` and the seeded `Patient*`
+        // views must be filtered out.
+        let tenant = test_tenant();
+        for (id, name) in [
+            ("vd-beta", "beta_VIEW_x"),
+            ("vd-gamma", "gamma"),
+            ("vd-alpha", "alpha_view"),
+        ] {
+            backend
+                .create(
+                    &tenant,
+                    "ViewDefinition",
+                    view_definition(
+                        id,
+                        &format!("http://example.org/ViewDefinition/{id}"),
+                        name,
+                        "active",
+                        "2024-02-01",
+                    ),
+                    FhirVersion::R4,
+                )
+                .await
+                .expect("seed ViewDefinition");
+        }
+
+        let response = server
+            .get("/ViewDefinition?_sort=name&name:contains=View")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+
+        response.assert_status_ok();
+        let body: Value = response.json();
+        assert_eq!(
+            entry_ids(&body),
+            vec!["vd-alpha".to_string(), "vd-beta".to_string()]
+        );
+    }
 }
 
 mod search_by_status {
