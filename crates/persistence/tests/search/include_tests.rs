@@ -227,6 +227,136 @@ async fn test_include_iterate() {
     // Depending on implementation, may have both Patient and Organization
 }
 
+/// #1063: pins the specific hazard option 2 (routing `:iterate` continuation
+/// through the REST guard rather than through the backend) must avoid — the
+/// first hop must never be resolved twice.
+///
+/// `resolve_includes_iterate_continuation` seeds its frontier from
+/// `already_included` (what a backend already resolved inline) instead of
+/// re-deriving it from `matches`, so calling it with hop 1's output already
+/// supplied must return ONLY the second hop — never re-return the Patient —
+/// and calling it again with the Organization already present must return
+/// nothing (idempotent, no cycle).
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn iterate_continuation_starts_at_the_second_hop() {
+    use helios_persistence::core::resolve_includes_iterate_continuation;
+
+    let backend = create_sqlite_backend();
+    let tenant = create_tenant();
+
+    backend
+        .create_or_update(
+            &tenant,
+            "Organization",
+            "org-1",
+            json!({"resourceType": "Organization", "id": "org-1", "name": "Org One"}),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    backend
+        .create_or_update(
+            &tenant,
+            "Patient",
+            "patient-1",
+            json!({
+                "resourceType": "Patient",
+                "id": "patient-1",
+                "name": [{"family": "Smith"}],
+                "managingOrganization": {"reference": "Organization/org-1"}
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    let observation = backend
+        .create(
+            &tenant,
+            "Observation",
+            json!({
+                "resourceType": "Observation",
+                "status": "final",
+                "subject": {"reference": "Patient/patient-1"},
+                "code": {"coding": [{"code": "test"}]}
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    let patient = backend
+        .read(&tenant, "Patient", "patient-1")
+        .await
+        .unwrap()
+        .expect("patient-1 exists");
+
+    let includes = vec![
+        IncludeDirective {
+            include_type: IncludeType::Include,
+            source_type: "Observation".to_string(),
+            search_param: "subject".to_string(),
+            target_type: Some("Patient".to_string()),
+            iterate: false,
+        },
+        IncludeDirective {
+            include_type: IncludeType::Include,
+            source_type: "Patient".to_string(),
+            search_param: "organization".to_string(),
+            target_type: Some("Organization".to_string()),
+            iterate: true,
+        },
+    ];
+
+    // Simulate a backend that already resolved hop 1 inline (the Patient).
+    let continuation = resolve_includes_iterate_continuation(
+        &backend,
+        &tenant,
+        std::slice::from_ref(&observation),
+        &includes,
+        std::slice::from_ref(&patient),
+    )
+    .await
+    .expect("continuation must succeed");
+
+    assert_eq!(
+        continuation.len(),
+        1,
+        "continuation should return exactly the second hop (Organization), got {:?}",
+        continuation
+            .iter()
+            .map(|r| format!("{}/{}", r.resource_type(), r.id()))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(continuation[0].resource_type(), "Organization");
+    assert_eq!(continuation[0].id(), "org-1");
+    assert!(
+        !continuation.iter().any(|r| r.resource_type() == "Patient"),
+        "hop 1 (Patient) must not be re-resolved/re-returned"
+    );
+
+    // Idempotency: call again with the Organization already present too —
+    // nothing new to add.
+    let mut already = vec![patient.clone()];
+    already.extend(continuation.clone());
+    let second_pass = resolve_includes_iterate_continuation(
+        &backend,
+        &tenant,
+        std::slice::from_ref(&observation),
+        &includes,
+        &already,
+    )
+    .await
+    .expect("second continuation call must succeed");
+    assert!(
+        second_pass.is_empty(),
+        "nothing new to resolve once the Organization is already included, got {:?}",
+        second_pass
+            .iter()
+            .map(|r| format!("{}/{}", r.resource_type(), r.id()))
+            .collect::<Vec<_>>()
+    );
+}
+
 // ============================================================================
 // _revinclude Tests
 // ============================================================================

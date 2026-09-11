@@ -194,6 +194,12 @@ where
     let server_selection_timeout_ms = env("HFS_MONGODB_SERVER_SELECTION_TIMEOUT_MS")
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(15_000);
+    // Bounds `_include`/`_revinclude` resolution per directive (#1061), so a
+    // wide reverse-reference set can't grow a searchset Bundle without limit.
+    let max_included_resources = env("HFS_MONGODB_MAX_INCLUDED_RESOURCES")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(1000)
+        .max(1);
 
     MongoBackendConfig {
         connection_string,
@@ -204,6 +210,7 @@ where
         fhir_version: config.default_fhir_version,
         data_dir: config.data_dir.clone(),
         search_offloaded,
+        max_included_resources,
     }
 }
 
@@ -423,6 +430,9 @@ async fn create_audit_mongodb_storage(
             fhir_version: server_config.default_fhir_version,
             data_dir: server_config.data_dir.clone(),
             search_offloaded: false,
+            // Audit storage doesn't resolve _include/_revinclude; the default
+            // (and any future new field) is fine here.
+            ..Default::default()
         };
         MongoBackend::new(config)?
     } else {
