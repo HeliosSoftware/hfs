@@ -3726,6 +3726,463 @@ mod es_integration {
     }
 
     // ========================================================================
+    // Include Resolution Tests (#1013)
+    // ========================================================================
+
+    /// Sorted `(resource_type, id)` pairs, for exact-set assertions regardless
+    /// of the order resources were fetched in.
+    fn include_type_ids(
+        resources: &[helios_persistence::types::StoredResource],
+    ) -> Vec<(String, String)> {
+        let mut pairs: Vec<(String, String)> = resources
+            .iter()
+            .map(|r| (r.resource_type().to_string(), r.id().to_string()))
+            .collect();
+        pairs.sort();
+        pairs
+    }
+
+    /// Seeds the fixture shared by the `_include` delegation tests: `pat-1`
+    /// (managed by `org-1`), `org-1`, an Encounter with a real `serviceProvider`
+    /// reference (`enc-org`) and one with a conditional reference (`enc-cond`),
+    /// both referencing `pat-1` via `subject`.
+    async fn seed_include_fixture(backend: &ElasticsearchBackend, tenant: &TenantContext) {
+        backend
+            .create(
+                tenant,
+                "Organization",
+                json!({
+                    "resourceType": "Organization",
+                    "id": "org-1",
+                    "name": "Include Org"
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+
+        backend
+            .create(
+                tenant,
+                "Patient",
+                json!({
+                    "resourceType": "Patient",
+                    "id": "pat-1",
+                    "name": [{"family": "Include"}],
+                    "managingOrganization": {"reference": "Organization/org-1"}
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+
+        backend
+            .create(
+                tenant,
+                "Encounter",
+                json!({
+                    "resourceType": "Encounter",
+                    "id": "enc-cond",
+                    "status": "finished",
+                    "class": {"code": "AMB"},
+                    "subject": {"reference": "Patient/pat-1"},
+                    "serviceProvider": {
+                        "reference": "Organization?identifier=http://example.org/org|dept-9"
+                    }
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+
+        backend
+            .create(
+                tenant,
+                "Encounter",
+                json!({
+                    "resourceType": "Encounter",
+                    "id": "enc-org",
+                    "status": "finished",
+                    "class": {"code": "AMB"},
+                    "subject": {"reference": "Patient/pat-1"},
+                    "serviceProvider": {"reference": "Organization/org-1"}
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+
+        // Wait for index refresh so the fixture is visible to search()/read().
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+    }
+
+    /// `search()` leaves `included` empty, like SQLite and Postgres, so the
+    /// REST layer resolves `_include` for Elasticsearch through the shared
+    /// `resolve_includes_iterative` path instead of an inline extractor.
+    #[tokio::test]
+    async fn es_integration_search_does_not_resolve_includes_inline() {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::types::{IncludeDirective, IncludeType, SearchQuery};
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("include-1013-1");
+        seed_include_fixture(&backend, &tenant).await;
+
+        let query = SearchQuery::new("Encounter").with_include(IncludeDirective {
+            include_type: IncludeType::Include,
+            source_type: "Encounter".to_string(),
+            search_param: "service-provider".to_string(),
+            target_type: None,
+            iterate: false,
+        });
+
+        let result = backend.search(&tenant, &query).await.unwrap();
+
+        let mut ids: Vec<String> = result
+            .resources
+            .items
+            .iter()
+            .map(|r| r.id().to_string())
+            .collect();
+        ids.sort();
+        assert_eq!(ids, vec!["enc-cond".to_string(), "enc-org".to_string()]);
+        assert!(result.included.is_empty());
+    }
+
+    /// `IncludeProvider::resolve_includes` delegates to the shared,
+    /// registry-driven resolver: a conditional `serviceProvider` reference
+    /// never resolves to an included resource, a real one resolves to exactly
+    /// its target, and resolving the same target from two source resources
+    /// dedupes it.
+    #[tokio::test]
+    async fn es_integration_include_service_provider_returns_only_targets() {
+        use helios_persistence::core::IncludeProvider;
+        use helios_persistence::types::{IncludeDirective, IncludeType};
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("include-1013-2");
+        seed_include_fixture(&backend, &tenant).await;
+
+        let enc_cond = backend
+            .read(&tenant, "Encounter", "enc-cond")
+            .await
+            .unwrap()
+            .expect("enc-cond must exist");
+        let enc_org = backend
+            .read(&tenant, "Encounter", "enc-org")
+            .await
+            .unwrap()
+            .expect("enc-org must exist");
+
+        let service_provider = IncludeDirective {
+            include_type: IncludeType::Include,
+            source_type: "Encounter".to_string(),
+            search_param: "service-provider".to_string(),
+            target_type: None,
+            iterate: false,
+        };
+
+        let both = backend
+            .resolve_includes(
+                &tenant,
+                &[enc_cond.clone(), enc_org.clone()],
+                std::slice::from_ref(&service_provider),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            include_type_ids(&both),
+            vec![("Organization".to_string(), "org-1".to_string())]
+        );
+
+        let cond_only = backend
+            .resolve_includes(
+                &tenant,
+                std::slice::from_ref(&enc_cond),
+                std::slice::from_ref(&service_provider),
+            )
+            .await
+            .unwrap();
+        assert!(cond_only.is_empty());
+
+        let subject = IncludeDirective {
+            include_type: IncludeType::Include,
+            source_type: "Encounter".to_string(),
+            search_param: "subject".to_string(),
+            target_type: None,
+            iterate: false,
+        };
+
+        let subjects = backend
+            .resolve_includes(&tenant, &[enc_cond, enc_org], &[subject])
+            .await
+            .unwrap();
+        assert_eq!(
+            include_type_ids(&subjects),
+            vec![("Patient".to_string(), "pat-1".to_string())]
+        );
+    }
+
+    /// `:iterate` follows references transitively through the same shared
+    /// resolver: `Encounter:subject` finds the Patient on the first hop, and
+    /// `Patient:organization` (marked `iterate`) then follows that Patient to
+    /// its managing Organization.
+    #[tokio::test]
+    async fn es_integration_include_iterate_follows_included_resources() {
+        use helios_persistence::core::IncludeProvider;
+        use helios_persistence::types::{IncludeDirective, IncludeType};
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("include-1013-3");
+        seed_include_fixture(&backend, &tenant).await;
+
+        let enc_org = backend
+            .read(&tenant, "Encounter", "enc-org")
+            .await
+            .unwrap()
+            .expect("enc-org must exist");
+
+        let includes = vec![
+            IncludeDirective {
+                include_type: IncludeType::Include,
+                source_type: "Encounter".to_string(),
+                search_param: "subject".to_string(),
+                target_type: None,
+                iterate: false,
+            },
+            IncludeDirective {
+                include_type: IncludeType::Include,
+                source_type: "Patient".to_string(),
+                search_param: "organization".to_string(),
+                target_type: None,
+                iterate: true,
+            },
+        ];
+
+        let included = backend
+            .resolve_includes(&tenant, &[enc_org], &includes)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            include_type_ids(&included),
+            vec![
+                ("Organization".to_string(), "org-1".to_string()),
+                ("Patient".to_string(), "pat-1".to_string()),
+            ]
+        );
+    }
+
+    // ========================================================================
+    // Cursor Pagination Tests (#1015)
+    // ========================================================================
+
+    /// Creates Patients `cp-1..cp-n` (inclusive) in the given tenant.
+    async fn create_cursor_paging_patients(
+        backend: &ElasticsearchBackend,
+        tenant: &TenantContext,
+        n: u32,
+    ) {
+        for i in 1..=n {
+            backend
+                .create(
+                    tenant,
+                    "Patient",
+                    json!({
+                        "resourceType": "Patient",
+                        "id": format!("cp-{i}"),
+                        "name": [{"family": "CursorPaging"}]
+                    }),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+    }
+
+    /// Collects the resource ids of a search result's page, in page order.
+    fn page_ids(result: &helios_persistence::core::SearchResult) -> Vec<String> {
+        result
+            .resources
+            .items
+            .iter()
+            .map(|r| r.id().to_string())
+            .collect()
+    }
+
+    /// Walks forward through 7 Patients 3 at a time (no explicit `_sort`),
+    /// then walks all the way back via `previous_cursor` and confirms every
+    /// page is reproduced exactly, including the page-3-to-page-2 hop that a
+    /// naive truncate-after-reverse implementation gets wrong (#1015).
+    #[tokio::test]
+    async fn es_integration_cursor_paging_round_trip_previous() {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::types::SearchQuery;
+
+        let backend = create_backend_with("1ms", WriteRefreshPolicy::WaitFor).await;
+        let tenant = create_tenant("cursor-prev");
+        create_cursor_paging_patients(&backend, &tenant, 7).await;
+
+        let query = SearchQuery::new("Patient").with_count(3);
+
+        let page1 = backend.search(&tenant, &query).await.unwrap();
+        assert_eq!(page1.resources.items.len(), 3);
+        assert!(!page1.resources.page_info.has_previous);
+        assert!(page1.resources.page_info.previous_cursor.is_none());
+        assert!(page1.resources.page_info.has_next);
+        assert!(page1.resources.page_info.next_cursor.is_some());
+
+        let page2 = backend
+            .search(
+                &tenant,
+                &query
+                    .clone()
+                    .with_cursor(page1.resources.page_info.next_cursor.clone().unwrap()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(page2.resources.items.len(), 3);
+        assert!(page2.resources.page_info.has_previous);
+        assert!(page2.resources.page_info.previous_cursor.is_some());
+        assert!(page2.resources.page_info.has_next);
+
+        let page3 = backend
+            .search(
+                &tenant,
+                &query
+                    .clone()
+                    .with_cursor(page2.resources.page_info.next_cursor.clone().unwrap()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(page3.resources.items.len(), 1);
+        assert!(!page3.resources.page_info.has_next);
+        assert!(page3.resources.page_info.next_cursor.is_none());
+        assert!(page3.resources.page_info.previous_cursor.is_some());
+
+        let page1_ids = page_ids(&page1);
+        let page2_ids = page_ids(&page2);
+        let page3_ids = page_ids(&page3);
+        let mut all_ids = page1_ids.clone();
+        all_ids.extend(page2_ids.clone());
+        all_ids.extend(page3_ids.clone());
+        let mut unique_ids = all_ids.clone();
+        unique_ids.sort();
+        unique_ids.dedup();
+        assert_eq!(unique_ids.len(), 7, "all 7 ids must be distinct");
+
+        // Walk back: page 3 -> page 2 must be exact, including order. This is
+        // the case a naive truncate-after-reverse gets wrong: it drops the
+        // nearest hit instead of the farthest one.
+        let back2 = backend
+            .search(
+                &tenant,
+                &query
+                    .clone()
+                    .with_cursor(page3.resources.page_info.previous_cursor.clone().unwrap()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(page_ids(&back2), page2_ids);
+        assert!(back2.resources.page_info.has_previous);
+        assert!(back2.resources.page_info.has_next);
+        assert!(back2.resources.page_info.next_cursor.is_some());
+
+        let back1 = backend
+            .search(
+                &tenant,
+                &query
+                    .clone()
+                    .with_cursor(back2.resources.page_info.previous_cursor.clone().unwrap()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(page_ids(&back1), page1_ids);
+        assert!(!back1.resources.page_info.has_previous);
+        assert!(back1.resources.page_info.previous_cursor.is_none());
+        assert!(back1.resources.page_info.has_next);
+
+        let again2 = backend
+            .search(
+                &tenant,
+                &query
+                    .clone()
+                    .with_cursor(back1.resources.page_info.next_cursor.clone().unwrap()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(page_ids(&again2), page2_ids);
+    }
+
+    /// Same round trip, but with an explicit `_sort=_id` ascending so the
+    /// exact page contents (not just their distinctness) can be asserted.
+    #[tokio::test]
+    async fn es_integration_cursor_paging_round_trip_previous_with_sort() {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::types::{SearchQuery, SortDirection, SortDirective};
+
+        let backend = create_backend_with("1ms", WriteRefreshPolicy::WaitFor).await;
+        let tenant = create_tenant("cursor-prev-sort");
+        create_cursor_paging_patients(&backend, &tenant, 7).await;
+
+        let query = SearchQuery::new("Patient")
+            .with_count(3)
+            .with_sort(SortDirective {
+                parameter: "_id".to_string(),
+                direction: SortDirection::Ascending,
+                param_type: None,
+            });
+
+        let page1 = backend.search(&tenant, &query).await.unwrap();
+        assert_eq!(page_ids(&page1), vec!["cp-1", "cp-2", "cp-3"]);
+
+        let page2 = backend
+            .search(
+                &tenant,
+                &query
+                    .clone()
+                    .with_cursor(page1.resources.page_info.next_cursor.clone().unwrap()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(page_ids(&page2), vec!["cp-4", "cp-5", "cp-6"]);
+
+        let page3 = backend
+            .search(
+                &tenant,
+                &query
+                    .clone()
+                    .with_cursor(page2.resources.page_info.next_cursor.clone().unwrap()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(page_ids(&page3), vec!["cp-7"]);
+
+        let back2 = backend
+            .search(
+                &tenant,
+                &query
+                    .clone()
+                    .with_cursor(page3.resources.page_info.previous_cursor.clone().unwrap()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(page_ids(&back2), vec!["cp-4", "cp-5", "cp-6"]);
+
+        let back1 = backend
+            .search(
+                &tenant,
+                &query
+                    .clone()
+                    .with_cursor(back2.resources.page_info.previous_cursor.clone().unwrap()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(page_ids(&back1), vec!["cp-1", "cp-2", "cp-3"]);
+        assert!(back1.resources.page_info.previous_cursor.is_none());
+    }
+
+    // ========================================================================
     // Backend Info Tests
     // ========================================================================
 

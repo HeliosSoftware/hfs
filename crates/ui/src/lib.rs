@@ -1819,6 +1819,19 @@ fn build_rail_entries(
         .collect()
 }
 
+/// The rail's per-type counts from a live snapshot — but only when the snapshot
+/// is whole. A `partial` snapshot is one where a query failed and was filled
+/// with a placeholder zero (e.g. the per-type count query timing out under the
+/// load of a post-import deferred index rebuild, #1065); trusting its
+/// `available` would render every type as a fabricated `0`, which reads as "the
+/// server lost my data" rather than "counts are momentarily unavailable".
+/// Returning `None` makes [`build_rail_entries`] show no count at all instead.
+fn rail_counts(live: &Option<DashboardSnapshot>) -> Option<&[TypeCount]> {
+    live.as_ref()
+        .filter(|s| !s.partial)
+        .map(|s| s.available.as_slice())
+}
+
 /// For a type rail (Resources, Search, Saved Queries): the stored `last`
 /// when it still names one of `resource_types`, else `fallback`. Only
 /// consulted when the request carried no explicit selection at all — an
@@ -1967,7 +1980,7 @@ async fn search(
     let rail_entries = build_rail_entries(
         "/ui/search",
         &resource_types,
-        live.as_ref().map(|s| s.available.as_slice()),
+        rail_counts(&live),
         Some(selected_type.as_str()),
     );
     let recent_entries = resolve_type_recents(&rail, &rail_entries, "/ui/search");
@@ -2026,7 +2039,7 @@ async fn queries(
     let rail_entries = build_rail_entries(
         "/ui/queries",
         &resource_types,
-        live.as_ref().map(|s| s.available.as_slice()),
+        rail_counts(&live),
         Some(selected_type.as_str()),
     );
     let recent_entries = resolve_type_recents(&rail, &rail_entries, "/ui/queries");
@@ -2127,7 +2140,7 @@ async fn resources(
     let rail_entries = build_rail_entries(
         "/ui/resources",
         &resource_types,
-        live.as_ref().map(|s| s.available.as_slice()),
+        rail_counts(&live),
         Some(selected_type.as_str()),
     );
     let recent_entries = resolve_type_recents(&rail, &rail_entries, "/ui/resources");
@@ -8035,6 +8048,29 @@ fn sample_snapshot(window: DashboardWindow) -> DashboardSnapshot {
         // the sample-data notice, which `partial` must not water down (#956).
         partial: false,
     }
+}
+
+#[test]
+fn rail_counts_are_dropped_when_the_snapshot_is_partial() {
+    // A whole snapshot hands its per-type counts to the rail.
+    let whole = sample_snapshot(DashboardWindow::default());
+    assert!(
+        rail_counts(&Some(whole)).is_some_and(|a| !a.is_empty()),
+        "a whole snapshot should expose its counts"
+    );
+
+    // A partial snapshot (a count query failed and was filled with zeros, e.g.
+    // under a deferred index rebuild, #1065) must NOT feed those fabricated
+    // zeros to the rail — better no count than a wrong 0.
+    let mut degraded = sample_snapshot(DashboardWindow::default());
+    degraded.partial = true;
+    assert!(
+        rail_counts(&Some(degraded)).is_none(),
+        "a partial snapshot must not surface fabricated zero counts"
+    );
+
+    // No provider at all: nothing to show.
+    assert!(rail_counts(&None).is_none());
 }
 
 /// Floors `ts` to the start of the epoch-aligned bucket containing it. Mirrors

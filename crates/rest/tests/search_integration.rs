@@ -2097,6 +2097,27 @@ mod chaining {
 mod includes {
     use super::*;
 
+    /// Sorted `(resourceType, id)` pairs for bundle entries tagged
+    /// `search.mode == "include"`, for exact-set assertions independent of
+    /// fetch order.
+    fn include_entries(body: &Value) -> Vec<(String, String)> {
+        let mut pairs: Vec<(String, String)> = get_bundle_entries(body)
+            .iter()
+            .filter(|e| e["search"]["mode"] == "include")
+            .map(|e| {
+                (
+                    e["resource"]["resourceType"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string(),
+                    e["resource"]["id"].as_str().unwrap_or_default().to_string(),
+                )
+            })
+            .collect();
+        pairs.sort();
+        pairs
+    }
+
     #[tokio::test]
     async fn test_include_subject() {
         let (server, backend) = create_test_server().await;
@@ -2337,6 +2358,121 @@ mod includes {
             }
         }
     }
+
+    #[tokio::test]
+    async fn test_include_service_provider_conditional_reference_yields_no_includes() {
+        let (server, backend) = create_test_server().await;
+        seed_search_test_data(&backend).await;
+
+        let tenant = test_tenant();
+        let encounter = json!({
+            "resourceType": "Encounter",
+            "id": "enc-cond",
+            "status": "finished",
+            "class": {"system": "http://terminology.hl7.org/CodeSystem/v3-ActCode", "code": "AMB"},
+            "subject": {"reference": "Patient/patient-1"},
+            "serviceProvider": {
+                "reference": "Organization?identifier=http://example.org/org|dept-9"
+            }
+        });
+        backend
+            .create(&tenant, "Encounter", encounter, FhirVersion::R4)
+            .await
+            .unwrap();
+
+        let response = server
+            .get("/Encounter?_id=enc-cond&_include=Encounter:service-provider")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+
+        response.assert_status_ok();
+        let body: Value = response.json();
+        let entries = get_bundle_entries(&body);
+
+        let match_entries: Vec<&&Value> = entries
+            .iter()
+            .filter(|e| e["search"]["mode"] == "match")
+            .collect();
+        assert_eq!(match_entries.len(), 1);
+        assert_eq!(match_entries[0]["resource"]["resourceType"], "Encounter");
+
+        assert!(
+            include_entries(&body).is_empty(),
+            "a conditional serviceProvider reference must not produce an include"
+        );
+        assert!(
+            !entries
+                .iter()
+                .any(|e| e["resource"]["resourceType"] == "Patient"),
+            "the conditional serviceProvider reference must not pull in the subject Patient either"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_include_service_provider_returns_only_the_organization() {
+        let (server, backend) = create_test_server().await;
+        seed_search_test_data(&backend).await;
+
+        let tenant = test_tenant();
+        let encounter = json!({
+            "resourceType": "Encounter",
+            "id": "enc-sp",
+            "status": "finished",
+            "class": {"system": "http://terminology.hl7.org/CodeSystem/v3-ActCode", "code": "AMB"},
+            "subject": {"reference": "Patient/patient-1"},
+            "serviceProvider": {"reference": "Organization/org-2"}
+        });
+        backend
+            .create(&tenant, "Encounter", encounter, FhirVersion::R4)
+            .await
+            .unwrap();
+
+        let expected = vec![("Organization".to_string(), "org-2".to_string())];
+
+        for query in [
+            "/Encounter?_id=enc-sp&_include=Encounter:service-provider",
+            "/Encounter?_id=enc-sp&_include=Encounter:service-provider:Organization",
+        ] {
+            let response = server
+                .get(query)
+                .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+                .await;
+
+            response.assert_status_ok();
+            let body: Value = response.json();
+            assert_eq!(include_entries(&body), expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_include_subject_returns_only_the_patient() {
+        let (server, backend) = create_test_server().await;
+        seed_search_test_data(&backend).await;
+
+        let tenant = test_tenant();
+        let encounter = json!({
+            "resourceType": "Encounter",
+            "id": "enc-sp",
+            "status": "finished",
+            "class": {"system": "http://terminology.hl7.org/CodeSystem/v3-ActCode", "code": "AMB"},
+            "subject": {"reference": "Patient/patient-1"},
+            "serviceProvider": {"reference": "Organization/org-2"}
+        });
+        backend
+            .create(&tenant, "Encounter", encounter, FhirVersion::R4)
+            .await
+            .unwrap();
+
+        let response = server
+            .get("/Encounter?_id=enc-sp&_include=Encounter:subject")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+
+        response.assert_status_ok();
+        let body: Value = response.json();
+        let expected = vec![("Patient".to_string(), "patient-1".to_string())];
+        assert_eq!(include_entries(&body), expected);
+    }
 }
 
 // =============================================================================
@@ -2345,6 +2481,19 @@ mod includes {
 
 mod fulltext_search {
     use super::*;
+
+    /// Extracts the `id` of every `entry[].resource` in a search Bundle.
+    ///
+    /// Used instead of raw `get_bundle_entries` closures so every full-text
+    /// test can assert both presence and absence of specific ids without
+    /// repeating the extraction logic.
+    fn entry_ids(body: &Value) -> Vec<String> {
+        get_bundle_entries(body)
+            .iter()
+            .filter_map(|e| e["resource"]["id"].as_str())
+            .map(|s| s.to_string())
+            .collect()
+    }
 
     #[tokio::test]
     async fn test_text_search() {
@@ -2357,28 +2506,22 @@ mod fulltext_search {
             .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
             .await;
 
-        // Full-text search may or may not be implemented
-        let status = response.status_code();
-        if status == StatusCode::OK {
-            let body: Value = response.json();
-            let entries = get_bundle_entries(&body);
+        assert_eq!(response.status_code(), StatusCode::OK);
+        let body: Value = response.json();
+        let ids = entry_ids(&body);
 
-            // If implemented, should find patient-1 (has "diabetes" in text)
-            if !entries.is_empty() {
-                // At least one result should mention diabetes in narrative
-                let has_diabetes_patient =
-                    entries.iter().any(|e| e["resource"]["id"] == "patient-1");
-                assert!(
-                    has_diabetes_patient,
-                    "Should find patient with diabetes in text"
-                );
-            }
-        } else {
-            // Not implemented - that's okay
-            assert_eq!(
-                status,
-                StatusCode::BAD_REQUEST,
-                "Should return 400 if not supported"
+        // patient-1's narrative mentions diabetes; the others don't.
+        assert!(
+            ids.contains(&"patient-1".to_string()),
+            "expected patient-1 in results, got {:?}",
+            ids
+        );
+        for excluded in ["patient-2", "patient-3", "patient-4"] {
+            assert!(
+                !ids.contains(&excluded.to_string()),
+                "did not expect {} in results, got {:?}",
+                excluded,
+                ids
             );
         }
     }
@@ -2394,29 +2537,21 @@ mod fulltext_search {
             .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
             .await;
 
-        let status = response.status_code();
-        if status == StatusCode::OK {
-            let body: Value = response.json();
-            let entries = get_bundle_entries(&body);
+        assert_eq!(response.status_code(), StatusCode::OK);
+        let body: Value = response.json();
+        let ids = entry_ids(&body);
 
-            // If implemented, should find condition-2 (hypertension)
-            if !entries.is_empty() {
-                let has_hypertension = entries.iter().any(|e| {
-                    e["resource"]["id"] == "condition-2"
-                        || e["resource"]["code"]["coding"]
-                            .as_array()
-                            .map(|arr| arr.iter().any(|c| c["display"] == "Hypertension"))
-                            .unwrap_or(false)
-                });
-                if has_hypertension {
-                    // Good, found the expected result
-                }
-            }
-        }
-        // Either OK or BAD_REQUEST is acceptable
+        // condition-2's display ("Hypertension") and narrative both mention
+        // it; condition-1 is about diabetes and mentions neither.
         assert!(
-            status == StatusCode::OK || status == StatusCode::BAD_REQUEST,
-            "Should return OK or 400"
+            ids.contains(&"condition-2".to_string()),
+            "expected condition-2 in results, got {:?}",
+            ids
+        );
+        assert!(
+            !ids.contains(&"condition-1".to_string()),
+            "did not expect condition-1 in results, got {:?}",
+            ids
         );
     }
 
@@ -2425,22 +2560,32 @@ mod fulltext_search {
         let (server, backend) = create_test_server().await;
         seed_search_test_data(&backend).await;
 
-        // Search for multiple words
+        // Search for multiple words; FTS5's default bareword syntax is an
+        // implicit AND across terms, so this must behave like Elasticsearch's
+        // `operator: "and"` rather than matching on either word alone.
         let response = server
             .get("/Observation?_text=heart%20rate")
             .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
             .await;
 
-        let status = response.status_code();
-        if status == StatusCode::OK {
-            let body: Value = response.json();
-            // Should find observations with "heart rate" in text
-            assert_eq!(body["resourceType"], "Bundle");
+        assert_eq!(response.status_code(), StatusCode::OK);
+        let body: Value = response.json();
+        let ids = entry_ids(&body);
+
+        // obs-1, obs-3, obs-4 mention both "heart" and "rate"; obs-2 mentions
+        // neither (its narrative is about temperature).
+        for expected in ["obs-1", "obs-3", "obs-4"] {
+            assert!(
+                ids.contains(&expected.to_string()),
+                "expected {} in results, got {:?}",
+                expected,
+                ids
+            );
         }
-        // Either OK or BAD_REQUEST is acceptable
         assert!(
-            status == StatusCode::OK || status == StatusCode::BAD_REQUEST,
-            "Should return OK or 400"
+            !ids.contains(&"obs-2".to_string()),
+            "did not expect obs-2 in results, got {:?}",
+            ids
         );
     }
 
@@ -2454,17 +2599,72 @@ mod fulltext_search {
             .get("/Patient?_text=smith")
             .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
             .await;
-
         let response_upper = server
             .get("/Patient?_text=SMITH")
             .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
             .await;
 
-        // Both should succeed or both should fail (unsupported)
+        assert_eq!(response_lower.status_code(), StatusCode::OK);
+        assert_eq!(response_upper.status_code(), StatusCode::OK);
+
+        let mut ids_lower = entry_ids(&response_lower.json::<Value>());
+        let mut ids_upper = entry_ids(&response_upper.json::<Value>());
+        ids_lower.sort();
+        ids_upper.sort();
+
+        // patient-1 and patient-2 are both named Smith; case must not change
+        // which resources are found.
+        assert!(!ids_lower.is_empty(), "expected some matches for 'smith'");
         assert_eq!(
-            response_lower.status_code(),
-            response_upper.status_code(),
-            "Case should not affect search availability"
+            ids_lower, ids_upper,
+            "case should not affect which resources are found"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_text_search_count_summary_carries_total() {
+        let (server, backend) = create_test_server().await;
+        seed_search_test_data(&backend).await;
+
+        let response = server
+            .get("/Patient?_text=smith&_summary=count")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+
+        assert_eq!(response.status_code(), StatusCode::OK);
+        let body: Value = response.json();
+
+        // patient-1 and patient-2 both match "smith"; _summary=count must
+        // carry the numeric total instead of an empty/absent Bundle field.
+        assert_eq!(body["total"].as_i64(), Some(2));
+        assert!(
+            body.get("entry").is_none(),
+            "_summary=count must not return entries, got {:?}",
+            body.get("entry")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_text_search_without_match_is_empty_200() {
+        let (server, backend) = create_test_server().await;
+        seed_search_test_data(&backend).await;
+
+        let response = server
+            .get("/Patient?_text=zzzznomatchzzzz")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+
+        // No matches is a well-formed empty result, not "unsupported".
+        assert_eq!(response.status_code(), StatusCode::OK);
+        let body: Value = response.json();
+        assert!(get_bundle_entries(&body).is_empty());
+        // `total` may be omitted or reported as zero, but never a non-zero
+        // number: that would mean the filter was silently dropped.
+        let total = body.get("total").and_then(|t| t.as_i64());
+        assert!(
+            total.is_none() || total == Some(0),
+            "expected no total or a total of 0, got {:?}",
+            total
         );
     }
 
@@ -2480,7 +2680,7 @@ mod fulltext_search {
             .await;
 
         let status = response.status_code();
-        // This is an advanced feature, may not be supported
+        // :text-advanced is out of scope for #1012; still accepts OK or 400.
         assert!(
             status == StatusCode::OK || status == StatusCode::BAD_REQUEST,
             "Should return OK or 400"
@@ -2498,20 +2698,28 @@ mod fulltext_search {
             .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
             .await;
 
-        let status = response.status_code();
-        if status == StatusCode::OK {
-            let body: Value = response.json();
-            let entries = get_bundle_entries(&body);
+        assert_eq!(response.status_code(), StatusCode::OK);
+        let body: Value = response.json();
+        let ids = entry_ids(&body);
 
-            // obs-1 has "normal sinus rhythm", obs-2 has "normal range"
-            if !entries.is_empty() {
-                // Results should include observations with "normal" in content
-            }
+        // obs-1 has "normal sinus rhythm", obs-2 has "normal range"; obs-3
+        // and obs-4 don't mention "normal" anywhere.
+        for expected in ["obs-1", "obs-2"] {
+            assert!(
+                ids.contains(&expected.to_string()),
+                "expected {} in results, got {:?}",
+                expected,
+                ids
+            );
         }
-        assert!(
-            status == StatusCode::OK || status == StatusCode::BAD_REQUEST,
-            "Should return OK or 400"
-        );
+        for excluded in ["obs-3", "obs-4"] {
+            assert!(
+                !ids.contains(&excluded.to_string()),
+                "did not expect {} in results, got {:?}",
+                excluded,
+                ids
+            );
+        }
     }
 }
 

@@ -547,7 +547,11 @@ pub const MAX_ITERATE_INCLUDED: usize = 1000;
 /// (SQLite, Postgres). References are extracted via the search-parameter
 /// registry's FHIRPath expression — so parameters whose name differs from the
 /// JSON field (e.g. Patient `organization` → `managingOrganization`) resolve
-/// correctly — and the referenced resources are fetched with `search()`.
+/// correctly — and the referenced resources are fetched with `search()`. Only
+/// references the extractor has already resolved to a `resource_type` +
+/// `resource_id` pair are followed; conditional references
+/// (`Type?param=value`), `urn:` references, and contained (`#`) references
+/// have no resolvable id and therefore never produce an included resource.
 ///
 /// Runs hop 1 (every directive) then `:iterate`-only hops, exactly as before
 /// #1063 — unbounded budget, so SQLite/Postgres see no behaviour change. For a
@@ -668,15 +672,18 @@ where
                         let Some(def) = def else { continue };
                         if let Ok(values) = extractor.extract_for_param(res.content(), &def) {
                             for v in values {
-                                if let IndexValue::Reference { reference, .. } = v.value {
-                                    if let Some((t, i)) = reference.split_once('/') {
-                                        if let Some(target) = &directive.target_type {
-                                            if t != target {
-                                                continue;
-                                            }
+                                if let IndexValue::Reference {
+                                    resource_type: Some(t),
+                                    resource_id: Some(i),
+                                    ..
+                                } = v.value
+                                {
+                                    if let Some(target) = &directive.target_type {
+                                        if &t != target {
+                                            continue;
                                         }
-                                        wanted.push((t.to_string(), i.to_string()));
                                     }
+                                    wanted.push((t, i));
                                 }
                             }
                         }

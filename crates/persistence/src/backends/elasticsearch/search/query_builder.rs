@@ -5,8 +5,9 @@
 use serde_json::{Value, json};
 
 use crate::types::{
-    CompartmentMembership, PageCursor, SearchModifier, SearchParamType, SearchParameter,
-    SearchPrefix, SearchQuery, SortDirection, SortDirective, strip_reference_version,
+    CompartmentMembership, CursorDirection, PageCursor, SearchModifier, SearchParamType,
+    SearchParameter, SearchPrefix, SearchQuery, SortDirection, SortDirective,
+    strip_reference_version,
 };
 
 use super::fts;
@@ -33,6 +34,24 @@ fn query_has_relevance(query: &SearchQuery) -> bool {
                 Some(SearchModifier::Text) | Some(SearchModifier::TextAdvanced)
             )
     })
+}
+
+/// Returns the effective Elasticsearch sort order (`"asc"`/`"desc"`) for a
+/// sort directive's `direction`, swapped when `paging` is
+/// `CursorDirection::Previous`. Paging backward means walking the result set
+/// in the opposite order, so every criterion — including `mode` and
+/// `missing`, which are derived from this order — must flip too (#1015).
+fn es_order(direction: SortDirection, paging: CursorDirection) -> &'static str {
+    let ascending = match direction {
+        SortDirection::Ascending => true,
+        SortDirection::Descending => false,
+    };
+    let ascending = if paging == CursorDirection::Previous {
+        !ascending
+    } else {
+        ascending
+    };
+    if ascending { "asc" } else { "desc" }
 }
 
 /// Builds Elasticsearch queries from FHIR search queries.
@@ -110,18 +129,36 @@ impl<'a> EsQueryBuilder<'a> {
             "query": { "bool": bool_query },
         });
 
+        // Decode the cursor once and reuse it for sort direction, size, and
+        // `search_after` — an undecodable cursor is treated as absent
+        // everywhere, matching the pre-existing `search_after` behavior.
+        let cursor = query
+            .cursor
+            .as_deref()
+            .and_then(|c| PageCursor::decode(c).ok());
+        let paging = cursor
+            .as_ref()
+            .map(PageCursor::direction)
+            .unwrap_or_default();
+
         // Add sorting
-        let sort = self.build_sort(&query.sort);
+        let sort = self.build_sort(&query.sort, paging);
         body["sort"] = sort;
 
         // Add pagination
         let count = query.count.unwrap_or(20);
-        body["size"] = json!(count);
+        // `Previous` requests one extra hit so the results layer can tell
+        // whether an earlier page exists beyond the ones returned (#1015).
+        let size = if paging == CursorDirection::Previous {
+            count + 1
+        } else {
+            count
+        };
+        body["size"] = json!(size);
 
-        if let Some(ref cursor_str) = query.cursor {
-            if let Ok(cursor) = PageCursor::decode(cursor_str) {
-                let search_after = self.build_search_after(&cursor);
-                body["search_after"] = search_after;
+        if query.cursor.is_some() {
+            if let Some(cursor) = cursor.as_ref() {
+                body["search_after"] = self.build_search_after(cursor);
             }
         } else if let Some(offset) = query.offset {
             body["from"] = json!(offset);
@@ -304,22 +341,34 @@ impl<'a> EsQueryBuilder<'a> {
     }
 
     /// Builds the sort clause.
-    fn build_sort(&self, directives: &[SortDirective]) -> Value {
+    ///
+    /// A `Previous` cursor walks the result set backward, so `paging`
+    /// reverses every criterion — including the final `resource_id`
+    /// tie-breaker — relative to the `Next` order. `search_after` then seeks
+    /// from the cursor position in that reversed order, and the results
+    /// layer restores the caller-facing order before returning the page
+    /// (#1015).
+    fn build_sort(&self, directives: &[SortDirective], paging: CursorDirection) -> Value {
         if directives.is_empty() {
-            // Default sort: _lastUpdated descending, then _id for tie-breaking
-            return json!([
-                { "last_updated": { "order": "desc" } },
-                { "resource_id": { "order": "asc" } }
-            ]);
+            // Default sort: _lastUpdated descending, then _id for
+            // tie-breaking; reversed when paging backward.
+            return if paging == CursorDirection::Previous {
+                json!([
+                    { "last_updated": { "order": "asc" } },
+                    { "resource_id": { "order": "desc" } }
+                ])
+            } else {
+                json!([
+                    { "last_updated": { "order": "desc" } },
+                    { "resource_id": { "order": "asc" } }
+                ])
+            };
         }
 
         let mut sort_clauses: Vec<Value> = Vec::new();
 
         for directive in directives {
-            let order = match directive.direction {
-                SortDirection::Ascending => "asc",
-                SortDirection::Descending => "desc",
-            };
+            let order = es_order(directive.direction, paging);
 
             match directive.parameter.as_str() {
                 "_id" => {
@@ -376,8 +425,13 @@ impl<'a> EsQueryBuilder<'a> {
             }
         }
 
-        // Always add tie-breaker
-        sort_clauses.push(json!({ "resource_id": { "order": "asc" } }));
+        // Always add tie-breaker, reversed when paging backward.
+        let tie_breaker_order = if paging == CursorDirection::Previous {
+            "desc"
+        } else {
+            "asc"
+        };
+        sort_clauses.push(json!({ "resource_id": { "order": tie_breaker_order } }));
 
         Value::Array(sort_clauses)
     }
@@ -420,7 +474,19 @@ pub fn build_count_query(tenant_id: &str, resource_type: &str, query: &SearchQue
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{SearchValue, SortDirection};
+    use crate::types::{CursorValue, SearchValue, SortDirection};
+
+    /// Encodes a `Previous` cursor at the given resource ID, used to
+    /// exercise the backward-paging path of `build`.
+    fn previous_cursor(id: &str) -> String {
+        PageCursor::previous(vec![CursorValue::Number(1_700_000_000_000)], id).encode()
+    }
+
+    /// Encodes a `Next` cursor at the given resource ID, used as the
+    /// forward-paging regression baseline.
+    fn next_cursor(id: &str) -> String {
+        PageCursor::new(vec![CursorValue::Number(1_700_000_000_000)], id).encode()
+    }
 
     #[test]
     fn test_basic_query_build() {
@@ -664,5 +730,90 @@ mod tests {
             !sort["search_params.string.value.keyword"].is_null(),
             "untyped parameters keep the string-group sort, got {sort}"
         );
+    }
+
+    /// #1015: a `Previous` cursor must reverse the default sort (including
+    /// the tie-breaker) and over-fetch by one hit so the results layer can
+    /// tell whether an earlier page exists.
+    #[test]
+    fn test_previous_cursor_reverses_default_sort_and_overfetches() {
+        let query = SearchQuery::new("Patient")
+            .with_count(5)
+            .with_cursor(previous_cursor("p-5"));
+        let builder = EsQueryBuilder::new("acme", "Patient", "hfs_acme_patient".to_string());
+        let body = builder.build(&query).body;
+
+        assert_eq!(
+            body["sort"],
+            json!([
+                { "last_updated": { "order": "asc" } },
+                { "resource_id": { "order": "desc" } }
+            ])
+        );
+        assert_eq!(body["search_after"], json!([1_700_000_000_000i64, "p-5"]));
+        assert_eq!(body["size"], json!(6));
+        assert!(body.get("from").is_none());
+    }
+
+    /// #1015: a custom sort's `mode`/`missing` are derived from the
+    /// *effective* order, so a `Previous` cursor over an ascending directive
+    /// yields `desc`/`max`/`_first` — the same derivation used for a plain
+    /// descending sort, without a second table for the reversed case.
+    #[test]
+    fn test_previous_cursor_reverses_custom_sort_mode_and_missing() {
+        let query = SearchQuery::new("Patient")
+            .with_sort(SortDirective {
+                parameter: "birthdate".to_string(),
+                direction: SortDirection::Ascending,
+                param_type: Some(SearchParamType::Date),
+            })
+            .with_cursor(previous_cursor("p-5"));
+        let builder = EsQueryBuilder::new("acme", "Patient", "hfs_acme_patient".to_string());
+        let sort = builder.build(&query).body["sort"].clone();
+        let sort = sort.as_array().expect("sort is an array");
+
+        let clause = &sort[0]["search_params.date.value"];
+        assert_eq!(clause["order"], "desc");
+        assert_eq!(clause["mode"], "max");
+        assert_eq!(clause["missing"], "_first");
+
+        let tie_breaker = sort.last().expect("tie-breaker present");
+        assert_eq!(tie_breaker, &json!({ "resource_id": { "order": "desc" } }));
+    }
+
+    /// #1015: `_sort=_score` also flips under a `Previous` cursor.
+    #[test]
+    fn test_previous_cursor_reverses_score_sort() {
+        let query = SearchQuery::new("Patient")
+            .with_sort(SortDirective {
+                parameter: "_score".to_string(),
+                direction: SortDirection::Descending,
+                param_type: None,
+            })
+            .with_cursor(previous_cursor("p-5"));
+        let builder = EsQueryBuilder::new("acme", "Patient", "hfs_acme_patient".to_string());
+        let sort = builder.build(&query).body["sort"].clone();
+
+        assert_eq!(sort[0], json!({ "_score": { "order": "asc" } }));
+    }
+
+    /// #1015 regression: a `Next` cursor leaves sort and size untouched.
+    #[test]
+    fn test_next_cursor_keeps_sort_and_size() {
+        let query = SearchQuery::new("Patient")
+            .with_count(5)
+            .with_cursor(next_cursor("p-5"));
+        let builder = EsQueryBuilder::new("acme", "Patient", "hfs_acme_patient".to_string());
+        let body = builder.build(&query).body;
+
+        assert_eq!(
+            body["sort"],
+            json!([
+                { "last_updated": { "order": "desc" } },
+                { "resource_id": { "order": "asc" } }
+            ])
+        );
+        assert_eq!(body["size"], json!(5));
+        assert_eq!(body["search_after"], json!([1_700_000_000_000i64, "p-5"]));
     }
 }

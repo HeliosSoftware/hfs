@@ -84,6 +84,7 @@
     "q",
     patient_value
   ) %}{% endcall %}
+  <span id="bulk-export-patients-error" class="field__hint field__hint--error" role="alert"{% if patients_error.is_none() %} hidden{% endif %}>{% match patients_error %}{% when Some(message) %}{{ message }}{% when None %}{{ i18n.t("bulk-export-patients-required") }}{% endmatch %}</span>
 
   <section class="card">
     <div class="card-head">

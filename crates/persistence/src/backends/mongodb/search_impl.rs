@@ -1107,13 +1107,24 @@ impl MongoBackend {
             return Ok(filter);
         }
 
-        let combine_with_and = matches!(
-            param.param_type,
-            SearchParamType::Date | SearchParamType::Number
-        );
-        let operator = if combine_with_and { "$and" } else { "$or" };
+        // #1062: FHIR comma-separated values are OR for every parameter type
+        // (https://build.fhir.org/search.html#combining) — Date and Number
+        // used to get `$and` here, which was not merely stricter but wrong
+        // in a way that emptied the whole result. This filter is evaluated
+        // against a single `search_index` document (one value of one
+        // parameter, for one resource), so a disjoint AND can never be
+        // satisfied by any row: `distinct_resource_ids` then returns
+        // nothing, and `matching_resource_ids`'s empty-set short circuit
+        // empties the *entire* search result, not just this parameter. The
+        // AND semantics callers actually want is the *repeated*-parameter
+        // form (`?date=ge2020&date=le2021`), which arrives as separate
+        // `SearchParameter`s and is intersected in `matching_resource_ids` —
+        // unaffected by this change. Behavior change: a range-shaped comma
+        // list (`?date=ge2020,le2021`) widens from "in 2020-2021" to "any
+        // date >= 2020 OR any date <= 2021"; use the repeated form above for
+        // a closed range.
         filter.insert(
-            operator,
+            "$or",
             Bson::Array(value_filters.into_iter().map(Bson::Document).collect()),
         );
 
@@ -1509,11 +1520,25 @@ impl MongoBackend {
         &self,
         param: &SearchParameter,
     ) -> StorageResult<Vec<Document>> {
-        param
+        let mut conditions = param
             .values
             .iter()
             .map(|value| self.build_date_filter(value, "last_updated"))
-            .collect()
+            .collect::<StorageResult<Vec<_>>>()?;
+
+        // #1062: comma-separated `_lastUpdated` values are OR, the same
+        // defect and fix as `build_search_index_filter` above (see the
+        // comment there). Returning a single combined document — instead of
+        // one document per value — keeps `build_resource_filter` unchanged:
+        // it still `extend`s whatever comes back into the top-level `$and`,
+        // so two *separate* `_lastUpdated` parameters (the repeated form)
+        // still AND.
+        if conditions.len() <= 1 {
+            return Ok(conditions);
+        }
+        Ok(vec![doc! {
+            "$or": Bson::Array(conditions.drain(..).map(Bson::Document).collect()),
+        }])
     }
 
     fn build_cursor_condition(&self, cursor: &PageCursor) -> StorageResult<Document> {
@@ -2216,5 +2241,200 @@ mod query_support_tests {
                 ..
             }) if modifier == "below"
         ));
+    }
+}
+
+/// #1062: comma-separated search values are OR per FHIR
+/// (https://build.fhir.org/search.html#combining), for every parameter
+/// type. These pins target the exact filter document `build_search_index_filter`
+/// sends to `distinct_resource_ids` (:832), because *where* the predicate is
+/// evaluated is what made the old `$and` catastrophic rather than merely
+/// strict: a `search_index` document holds one value of one parameter for
+/// one resource, so a disjoint `$and` can never be satisfied by any single
+/// row. `distinct` then returns empty, `matching_resource_ids`'s empty-set
+/// short circuit fires, and the *entire* search result is emptied — not
+/// just the one parameter.
+///
+/// This is unrelated to the repeated-parameter form
+/// (`?birthdate=ge1980-01-01&birthdate=lt1990-01-01`), which arrives as two
+/// separate `SearchParameter` entries and is intersected across parameters
+/// in `matching_resource_ids`; that AND is correct per spec and is guarded
+/// here too, so a change that widens the comma-list join cannot silently
+/// widen the repeated form as well.
+#[cfg(test)]
+mod value_list_tests {
+    use super::*;
+    use crate::backends::mongodb::MongoBackendConfig;
+
+    fn backend() -> MongoBackend {
+        MongoBackend::new(MongoBackendConfig::default()).unwrap()
+    }
+
+    #[test]
+    fn comma_separated_date_values_are_ored() {
+        let backend = backend();
+        let param = SearchParameter {
+            name: "birthdate".to_string(),
+            param_type: SearchParamType::Date,
+            modifier: None,
+            values: vec![SearchValue::parse("2019"), SearchValue::parse("2021")],
+            chain: vec![],
+            components: vec![],
+        };
+
+        let filter = backend
+            .build_search_index_filter("t1", "Patient", &param)
+            .expect("valid filter");
+
+        assert!(
+            filter.get("$and").is_none(),
+            "date value list must not be ANDed: {filter:?}"
+        );
+        let arms = filter.get_array("$or").expect("$or array");
+        assert_eq!(arms.len(), 2);
+        for arm in arms {
+            let doc = arm.as_document().expect("$or arm is a document");
+            assert!(
+                doc.contains_key("value_date"),
+                "each $or arm constrains value_date: {doc:?}"
+            );
+        }
+    }
+
+    /// A regression a partial fix could pass: dropping only `Date` from the
+    /// old `matches!` would leave `Number` ANDed and this test red.
+    #[test]
+    fn comma_separated_number_values_are_ored() {
+        let backend = backend();
+        let param = SearchParameter {
+            name: "factor-override".to_string(),
+            param_type: SearchParamType::Number,
+            modifier: None,
+            values: vec![SearchValue::parse("0.25"), SearchValue::parse("1.5")],
+            chain: vec![],
+            components: vec![],
+        };
+
+        let filter = backend
+            .build_search_index_filter("t1", "ChargeItem", &param)
+            .expect("valid filter");
+
+        assert!(
+            filter.get("$and").is_none(),
+            "number value list must not be ANDed: {filter:?}"
+        );
+        let arms = filter.get_array("$or").expect("$or array");
+        assert_eq!(arms.len(), 2);
+        for arm in arms {
+            let doc = arm.as_document().expect("$or arm is a document");
+            assert!(
+                doc.contains_key("value_number"),
+                "each $or arm constrains value_number: {doc:?}"
+            );
+        }
+    }
+
+    /// Quantity was never in the AND list. Confirmed here rather than
+    /// assumed, so this module pins the join for every parameter type in
+    /// one place.
+    #[test]
+    fn comma_separated_quantity_values_stay_ored() {
+        let backend = backend();
+        let param = SearchParameter {
+            name: "value-quantity".to_string(),
+            param_type: SearchParamType::Quantity,
+            modifier: None,
+            values: vec![SearchValue::parse("5"), SearchValue::parse("10")],
+            chain: vec![],
+            components: vec![],
+        };
+
+        let filter = backend
+            .build_search_index_filter("t1", "Observation", &param)
+            .expect("valid filter");
+
+        assert!(filter.get("$and").is_none());
+        assert_eq!(filter.get_array("$or").expect("$or array").len(), 2);
+    }
+
+    /// Second site, same defect, one function away:
+    /// `build_resource_last_updated_conditions` (:1508) is the `_lastUpdated`
+    /// equivalent of `build_search_index_filter`, resolved against the
+    /// resource document instead of `search_index`. A disjoint comma list
+    /// must OR into a single combined condition.
+    #[test]
+    fn comma_separated_last_updated_values_are_ored() {
+        let backend = backend();
+        let query = SearchQuery::new("Patient").with_parameter(SearchParameter {
+            name: "_lastUpdated".to_string(),
+            param_type: SearchParamType::Date,
+            modifier: None,
+            values: vec![SearchValue::parse("2019"), SearchValue::parse("2021")],
+            chain: vec![],
+            components: vec![],
+        });
+
+        let filter = backend
+            .build_resource_filter("t1", "Patient", &query, None, None)
+            .expect("valid filter");
+
+        let and_arms = filter.get_array("$and").expect("$and array");
+        assert_eq!(
+            and_arms.len(),
+            2,
+            "base document plus one combined last_updated condition: {filter:?}"
+        );
+        let combined = and_arms[1].as_document().expect("condition is a document");
+        let or_arms = combined.get_array("$or").expect("$or array");
+        assert_eq!(or_arms.len(), 2);
+        for arm in or_arms {
+            let doc = arm.as_document().expect("$or arm is a document");
+            assert!(doc.contains_key("last_updated"));
+        }
+    }
+
+    /// Guard: the repeated-parameter form is a different mechanism (two
+    /// separate `SearchParameter` entries, not one with two values) and
+    /// must keep ANDing exactly as before — MANUAL_TESTING_MATRIX row 4.3
+    /// depends on it. Must stay green before and after the fix.
+    #[test]
+    fn repeated_last_updated_parameters_still_and() {
+        let backend = backend();
+        let query = SearchQuery::new("Patient")
+            .with_parameter(SearchParameter {
+                name: "_lastUpdated".to_string(),
+                param_type: SearchParamType::Date,
+                modifier: None,
+                values: vec![SearchValue::parse("ge2019")],
+                chain: vec![],
+                components: vec![],
+            })
+            .with_parameter(SearchParameter {
+                name: "_lastUpdated".to_string(),
+                param_type: SearchParamType::Date,
+                modifier: None,
+                values: vec![SearchValue::parse("le2021")],
+                chain: vec![],
+                components: vec![],
+            });
+
+        let filter = backend
+            .build_resource_filter("t1", "Patient", &query, None, None)
+            .expect("valid filter");
+
+        let and_arms = filter.get_array("$and").expect("$and array");
+        assert_eq!(
+            and_arms.len(),
+            3,
+            "base document plus one condition per repeated parameter: {filter:?}"
+        );
+        for arm in &and_arms[1..] {
+            let doc = arm.as_document().expect("condition is a document");
+            assert!(doc.contains_key("last_updated"));
+            assert!(
+                doc.get("$or").is_none(),
+                "a single-value condition stays flat, not wrapped in $or"
+            );
+        }
     }
 }

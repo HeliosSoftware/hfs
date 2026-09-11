@@ -789,3 +789,265 @@ async fn test_include_no_references() {
     assert!(!result.resources.is_empty());
     assert!(result.included.is_empty());
 }
+
+// ============================================================================
+// Parsed Type/id Only (#1013)
+// ============================================================================
+
+/// Sorted `(resource_type, id)` pairs for a set of included resources, to
+/// allow exact-set assertions regardless of fetch order.
+#[cfg(feature = "sqlite")]
+fn included_type_ids(
+    resources: &[helios_persistence::types::StoredResource],
+) -> Vec<(String, String)> {
+    let mut pairs: Vec<(String, String)> = resources
+        .iter()
+        .map(|r| (r.resource_type().to_string(), r.id().to_string()))
+        .collect();
+    pairs.sort();
+    pairs
+}
+
+/// A conditional reference (`Type?param=value`) has no resolvable
+/// `resource_type`/`resource_id`, so `_include` must skip it entirely rather
+/// than searching against a bogus type derived from the raw string.
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn test_include_skips_conditional_reference() {
+    let backend = create_sqlite_backend();
+    let tenant = create_tenant();
+
+    let patient = json!({
+        "resourceType": "Patient",
+        "id": "patient-1",
+        "name": [{"family": "Smith"}]
+    });
+    backend
+        .create_or_update(
+            &tenant,
+            "Patient",
+            "patient-1",
+            patient,
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+
+    let encounter = json!({
+        "resourceType": "Encounter",
+        "id": "enc-cond",
+        "status": "finished",
+        "class": {"code": "AMB"},
+        "subject": {"reference": "Patient/patient-1"},
+        "serviceProvider": {
+            "reference": "Organization?identifier=http://example.org/org|dept-9"
+        }
+    });
+    backend
+        .create_or_update(
+            &tenant,
+            "Encounter",
+            "enc-cond",
+            encounter,
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+
+    let query = SearchQuery::new("Encounter")
+        .with_parameter(helios_persistence::types::SearchParameter {
+            name: "_id".to_string(),
+            param_type: helios_persistence::types::SearchParamType::Token,
+            modifier: None,
+            values: vec![helios_persistence::types::SearchValue::eq("enc-cond")],
+            chain: vec![],
+            components: vec![],
+        })
+        .with_include(IncludeDirective {
+            include_type: IncludeType::Include,
+            source_type: "Encounter".to_string(),
+            search_param: "service-provider".to_string(),
+            target_type: None,
+            iterate: false,
+        });
+
+    let result = search_with_includes(&backend, &tenant, &query.with_count(100))
+        .await
+        .unwrap();
+
+    assert_eq!(result.resources.len(), 1);
+    assert_eq!(result.resources.items[0].resource_type(), "Encounter");
+    assert!(result.included.is_empty());
+}
+
+/// A hyphenated search parameter name (`service-provider`) resolves via the
+/// registry to the referenced `Organization`, both with and without an
+/// explicit `:target_type` filter.
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn test_include_hyphenated_param_resolves_via_registry() {
+    let backend = create_sqlite_backend();
+    let tenant = create_tenant();
+
+    let patient = json!({
+        "resourceType": "Patient",
+        "id": "patient-1",
+        "name": [{"family": "Smith"}]
+    });
+    backend
+        .create_or_update(
+            &tenant,
+            "Patient",
+            "patient-1",
+            patient,
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+
+    let org = json!({
+        "resourceType": "Organization",
+        "id": "org-sp",
+        "name": "Service Provider Org"
+    });
+    backend
+        .create_or_update(
+            &tenant,
+            "Organization",
+            "org-sp",
+            org,
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+
+    let encounter = json!({
+        "resourceType": "Encounter",
+        "id": "enc-sp",
+        "status": "finished",
+        "class": {"code": "AMB"},
+        "subject": {"reference": "Patient/patient-1"},
+        "serviceProvider": {"reference": "Organization/org-sp"}
+    });
+    backend
+        .create_or_update(
+            &tenant,
+            "Encounter",
+            "enc-sp",
+            encounter,
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+
+    let expected = vec![("Organization".to_string(), "org-sp".to_string())];
+
+    for target_type in [None, Some("Organization".to_string())] {
+        let query = SearchQuery::new("Encounter")
+            .with_parameter(helios_persistence::types::SearchParameter {
+                name: "_id".to_string(),
+                param_type: helios_persistence::types::SearchParamType::Token,
+                modifier: None,
+                values: vec![helios_persistence::types::SearchValue::eq("enc-sp")],
+                chain: vec![],
+                components: vec![],
+            })
+            .with_include(IncludeDirective {
+                include_type: IncludeType::Include,
+                source_type: "Encounter".to_string(),
+                search_param: "service-provider".to_string(),
+                target_type,
+                iterate: false,
+            });
+
+        let result = search_with_includes(&backend, &tenant, &query.with_count(100))
+            .await
+            .unwrap();
+
+        assert_eq!(included_type_ids(&result.included), expected);
+    }
+}
+
+/// `_include=Encounter:subject` on the same `Encounter` returns exactly the
+/// referenced `Patient`, never the `Organization` from `serviceProvider`.
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn test_include_subject_returns_only_patient() {
+    let backend = create_sqlite_backend();
+    let tenant = create_tenant();
+
+    let patient = json!({
+        "resourceType": "Patient",
+        "id": "patient-1",
+        "name": [{"family": "Smith"}]
+    });
+    backend
+        .create_or_update(
+            &tenant,
+            "Patient",
+            "patient-1",
+            patient,
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+
+    let org = json!({
+        "resourceType": "Organization",
+        "id": "org-sp",
+        "name": "Service Provider Org"
+    });
+    backend
+        .create_or_update(
+            &tenant,
+            "Organization",
+            "org-sp",
+            org,
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+
+    let encounter = json!({
+        "resourceType": "Encounter",
+        "id": "enc-sp",
+        "status": "finished",
+        "class": {"code": "AMB"},
+        "subject": {"reference": "Patient/patient-1"},
+        "serviceProvider": {"reference": "Organization/org-sp"}
+    });
+    backend
+        .create_or_update(
+            &tenant,
+            "Encounter",
+            "enc-sp",
+            encounter,
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+
+    let query = SearchQuery::new("Encounter")
+        .with_parameter(helios_persistence::types::SearchParameter {
+            name: "_id".to_string(),
+            param_type: helios_persistence::types::SearchParamType::Token,
+            modifier: None,
+            values: vec![helios_persistence::types::SearchValue::eq("enc-sp")],
+            chain: vec![],
+            components: vec![],
+        })
+        .with_include(IncludeDirective {
+            include_type: IncludeType::Include,
+            source_type: "Encounter".to_string(),
+            search_param: "subject".to_string(),
+            target_type: None,
+            iterate: false,
+        });
+
+    let result = search_with_includes(&backend, &tenant, &query.with_count(100))
+        .await
+        .unwrap();
+
+    let expected = vec![("Patient".to_string(), "patient-1".to_string())];
+    assert_eq!(included_type_ids(&result.included), expected);
+}
