@@ -4829,6 +4829,96 @@ mod bulk_submit {
         );
     }
 
+    /// #1007: `mark_entries_unindexed` flips only the named `(type, id)`
+    /// entry results to `processing-error`, leaving the rest untouched, and
+    /// is a no-op on an empty entry list.
+    #[tokio::test]
+    async fn mark_entries_unindexed_flips_only_the_named_resources() {
+        use helios_persistence::core::{BulkEntryOutcome, UnindexedEntry};
+
+        let Some(backend) = create_backend("submit_mark_unindexed").await else {
+            return;
+        };
+        let tenant = create_tenant("submit-tenant");
+        let (id, manifest_id) = seed(&backend, &tenant).await;
+
+        let entries = vec![
+            NdjsonEntry::new(
+                1,
+                "Patient",
+                json!({"resourceType": "Patient", "id": "mongo-unidx-1"}),
+            ),
+            NdjsonEntry::new(
+                2,
+                "Patient",
+                json!({"resourceType": "Patient", "id": "mongo-unidx-2"}),
+            ),
+            NdjsonEntry::new(
+                3,
+                "Patient",
+                json!({"resourceType": "Patient", "id": "mongo-unidx-3"}),
+            ),
+        ];
+        let results = backend
+            .process_entries(
+                &tenant,
+                &id,
+                &manifest_id,
+                entries,
+                &BulkProcessingOptions::new(),
+            )
+            .await
+            .unwrap();
+        assert!(results.iter().all(|r| r.is_success()));
+
+        assert_eq!(
+            backend
+                .mark_entries_unindexed(&tenant, &id, &manifest_id, &[])
+                .await
+                .unwrap(),
+            0,
+            "an empty entry list is a no-op"
+        );
+
+        let oo = json!({
+            "resourceType": "OperationOutcome",
+            "issue": [{
+                "severity": "error",
+                "code": "incomplete",
+                "diagnostics": "Patient/mongo-unidx-2 was stored but could not be indexed for \
+                                search on es: timeout. Run POST /Patient/$reindex to repair."
+            }]
+        });
+        let changed = backend
+            .mark_entries_unindexed(
+                &tenant,
+                &id,
+                &manifest_id,
+                &[UnindexedEntry {
+                    resource_type: "Patient".to_string(),
+                    resource_id: "mongo-unidx-2".to_string(),
+                    operation_outcome: oo.clone(),
+                }],
+            )
+            .await
+            .unwrap();
+        assert_eq!(changed, 1);
+
+        let page = backend
+            .get_entry_results_page(&tenant, &id, &manifest_id, None, 10, None)
+            .await
+            .unwrap();
+        for paged in &page.entries {
+            let result = &paged.result;
+            if result.resource_id.as_deref() == Some("mongo-unidx-2") {
+                assert_eq!(result.outcome, BulkEntryOutcome::ProcessingError);
+                assert_eq!(result.operation_outcome.as_ref(), Some(&oo));
+            } else {
+                assert_eq!(result.outcome, BulkEntryOutcome::Success);
+            }
+        }
+    }
+
     /// Line numbers restart in every manifest output file, so the file is part
     /// of an entry result's identity (#457). Without it the second file's line 1
     /// overwrites the first file's.

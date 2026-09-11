@@ -62,7 +62,7 @@ use crate::types::{
 use super::config::{CompositeConfig, SyncMode};
 use super::merger::{MergeOptions, ResultMerger};
 use super::router::{QueryRouter, RoutingDecision, RoutingError};
-use super::sync::{SyncEvent, SyncManager};
+use super::sync::{SyncEvent, SyncManager, SyncStatus};
 
 /// A dynamically typed storage backend.
 pub type DynStorage = Arc<dyn ResourceStorage + Send + Sync>;
@@ -411,6 +411,35 @@ impl CompositeStorage {
         &self.secondaries
     }
 
+    /// Reports whether a secondary's search results become consistent with
+    /// the primary as soon as a sync call returns, rather than at some later
+    /// point after an async queue drains.
+    ///
+    /// This is `true` for [`SyncMode::Synchronous`], and for
+    /// [`SyncMode::Hybrid`] when `sync_for_search` is set — the same
+    /// derivation `SyncManager::sync_creates` (see [`SyncManager`]) uses to
+    /// decide whether a write waits on the secondary. It is `false` for
+    /// [`SyncMode::Asynchronous`] and whenever there is no [`SyncManager`]
+    /// at all (no secondaries configured).
+    ///
+    /// Callers use this to gate any post-sync check that reads a secondary's
+    /// state immediately: under asynchronous sync, a `count()` taken right
+    /// after a sync call reflects whatever had already drained from the
+    /// queue, not what was just synced, so such a check would be comparing
+    /// against a moving target rather than a real discrepancy.
+    pub fn syncs_search_synchronously(&self) -> bool {
+        if self.sync_manager.is_none() {
+            return false;
+        }
+        matches!(
+            self.config.sync_config.mode,
+            SyncMode::Synchronous
+                | SyncMode::Hybrid {
+                    sync_for_search: true
+                }
+        )
+    }
+
     /// Returns the health status for a backend.
     pub fn backend_health(&self, id: &str) -> Option<BackendHealth> {
         self.health_status.read().get(id).cloned()
@@ -708,7 +737,11 @@ impl CompositeStorage {
                 .push((resource_id.to_string(), resource_json.clone()));
         }
         for (resource_type, resources) in by_type {
-            self.sync_creates_to_secondaries(tenant, &resource_type, fhir_version, resources)
+            // The bundle path has no per-entry receipt to correct on a
+            // rejection; the per-backend statuses are for callers that do
+            // (bulk-submit), so this one discards them.
+            let _ = self
+                .sync_creates_to_secondaries(tenant, &resource_type, fhir_version, resources)
                 .await;
         }
     }
@@ -717,20 +750,26 @@ impl CompositeStorage {
     /// ([`SyncManager::sync_creates`]), logging rather than failing: the
     /// primary already holds them, and a secondary that missed the batch is
     /// repaired by `$reindex`.
+    ///
+    /// Returns each secondary's [`SyncStatus`] (including which ids, if any,
+    /// it rejected after retries), so a caller that must know — e.g. to mark
+    /// a bulk-submitted resource's entry result `processing-error` — can
+    /// inspect it. Empty when there are no resources, no secondaries
+    /// configured, or the batch sync itself errored (already logged here).
     pub(crate) async fn sync_creates_to_secondaries(
         &self,
         tenant: &TenantContext,
         resource_type: &str,
         fhir_version: FhirVersion,
         resources: Vec<(String, Value)>,
-    ) {
+    ) -> Vec<SyncStatus> {
         if resources.is_empty() {
-            return;
+            return Vec::new();
         }
         let Some(ref sync_manager) = self.sync_manager else {
-            return;
+            return Vec::new();
         };
-        if let Err(e) = sync_manager
+        match sync_manager
             .sync_creates(
                 tenant.tenant_id(),
                 resource_type,
@@ -740,11 +779,15 @@ impl CompositeStorage {
             )
             .await
         {
-            warn!(
-                error = %e,
-                resource_type,
-                "Failed to sync batch of resources to secondaries"
-            );
+            Ok(statuses) => statuses,
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    resource_type,
+                    "Failed to sync batch of resources to secondaries"
+                );
+                Vec::new()
+            }
         }
     }
 
@@ -878,7 +921,11 @@ impl ResourceStorage for CompositeStorage {
             .filter_map(|result| result.as_ref().ok())
             .map(|stored| (stored.id().to_string(), stored.content().clone()))
             .collect();
-        self.sync_creates_to_secondaries(tenant, resource_type, fhir_version, created)
+        // `create_many` has no per-entry receipt to correct either — that is
+        // `CompositeSubmitJobs::sync_ingested`'s job, which calls
+        // `sync_creates_to_secondaries` itself and inspects the statuses.
+        let _ = self
+            .sync_creates_to_secondaries(tenant, resource_type, fhir_version, created)
             .await;
 
         results

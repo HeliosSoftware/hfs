@@ -430,6 +430,18 @@ impl std::str::FromStr for BulkEntryOutcome {
     }
 }
 
+/// A resource the primary committed but a secondary search index rejected
+/// after retries; its entry results become `processing-error`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnindexedEntry {
+    /// The resource's FHIR type.
+    pub resource_type: String,
+    /// The resource's id.
+    pub resource_id: String,
+    /// The OperationOutcome stored on every entry result of the resource.
+    pub operation_outcome: Value,
+}
+
 /// Result of processing a single NDJSON entry.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BulkEntryResult {
@@ -1458,6 +1470,23 @@ pub trait BulkSubmitProvider: ResourceStorage {
         submission_id: &SubmissionId,
         manifest_id: &str,
     ) -> StorageResult<EntryCountSummary>;
+
+    /// Marks every entry result of `manifest_id` whose `(resource_type,
+    /// resource_id)` matches one of `entries` as `processing-error`, storing
+    /// that entry's OperationOutcome. Returns how many rows changed.
+    ///
+    /// Called before the manifest's receipt is written, for resources the
+    /// primary committed but a secondary search index rejected after
+    /// retries — the receipt must not claim `success` for a resource that is
+    /// unsearchable. An empty `entries` list is a no-op that returns `Ok(0)`
+    /// without touching storage.
+    async fn mark_entries_unindexed(
+        &self,
+        tenant: &TenantContext,
+        submission_id: &SubmissionId,
+        manifest_id: &str,
+        entries: &[UnindexedEntry],
+    ) -> StorageResult<u64>;
 }
 
 /// Provider for streaming NDJSON processing.

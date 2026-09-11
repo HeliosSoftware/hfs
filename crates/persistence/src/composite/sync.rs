@@ -146,6 +146,14 @@ pub struct SyncStatus {
 
     /// Duration of the operation.
     pub duration: Duration,
+
+    /// Ids this backend rejected after retries; empty on success.
+    ///
+    /// Only [`SyncManager::sync_creates`] populates this — a batch sync knows
+    /// which of its many resources failed. A single-event [`SyncManager::sync`]
+    /// concerns one resource already named by the event, and in asynchronous
+    /// mode the event is merely enqueued, so both leave this empty.
+    pub failed_resource_ids: Vec<String>,
 }
 
 /// Synchronization manager for secondary backends.
@@ -385,6 +393,7 @@ impl SyncManager {
                 let mut synced = 0;
                 let mut errors = 0;
                 let mut last_error = None;
+                let mut failed_resource_ids = Vec::new();
                 for ((resource_id, content), result) in resources.iter().zip(results) {
                     let Err(batch_error) = result else {
                         synced += 1;
@@ -410,6 +419,7 @@ impl SyncManager {
                         Err(e) => {
                             errors += 1;
                             last_error = Some(e.to_string());
+                            failed_resource_ids.push(resource_id.clone());
                         }
                     }
                 }
@@ -425,6 +435,7 @@ impl SyncManager {
                             retry_config.max_retries
                         },
                         duration: start.elapsed(),
+                        failed_resource_ids,
                     },
                     synced,
                     errors,
@@ -485,6 +496,7 @@ impl SyncManager {
                         error: None,
                         retry_count: 0,
                         duration: start.elapsed(),
+                        failed_resource_ids: Vec::new(),
                     },
                     Err(e) => SyncStatus {
                         backend_id,
@@ -492,6 +504,7 @@ impl SyncManager {
                         error: Some(e.to_string()),
                         retry_count: retry_config.max_retries,
                         duration: start.elapsed(),
+                        failed_resource_ids: Vec::new(),
                     },
                 }
             });
@@ -565,6 +578,8 @@ impl SyncManager {
                     error: None,
                     retry_count: 0,
                     duration: Duration::ZERO,
+                    // Queued, not rejected: nothing is known to have failed yet.
+                    failed_resource_ids: Vec::new(),
                 })
                 .collect())
         } else {

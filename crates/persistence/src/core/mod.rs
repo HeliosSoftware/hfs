@@ -134,7 +134,7 @@ pub use bulk_submit::{
     EntryResultCursor, EntryResultPage, IMPORT_MODE_PARAMETER_URL, ImportMode, ManifestPhase,
     ManifestStatus, NdjsonEntry, PagedEntryResult, StreamProcessingResult,
     StreamingBulkSubmitProvider, SubmissionChange, SubmissionId, SubmissionManifest,
-    SubmissionStatus, SubmissionSummary, merge_resource,
+    SubmissionStatus, SubmissionSummary, UnindexedEntry, merge_resource,
 };
 pub use bulk_submit_input::{
     FileTokenProvider, RemoteFile, RemoteManifest, SubmitInputFetcher, submission_output_job_id,
@@ -142,9 +142,9 @@ pub use bulk_submit_input::{
 pub use bulk_submit_output::{submit_artifact_key, submit_artifact_locator};
 pub use bulk_submit_publication::{ManifestPublicationResult, ManifestPublicationStatus};
 pub use bulk_submit_worker::{
-    BulkSubmitJobStore, DefaultSubmitWorker, DeferredReindexHook, ManifestFetchParams,
-    ManifestLease, ManifestWorkerView, PollTokenTarget, SubmitClaimStrategy, SubmitFileRecord,
-    SubmitFileRow, SubmitWorkerStorage,
+    BulkSubmitJobStore, DefaultSubmitWorker, DeferredReindexHook, IndexDrift, IngestSyncReport,
+    ManifestFetchParams, ManifestLease, ManifestWorkerView, PollTokenTarget, SubmitClaimStrategy,
+    SubmitFileRecord, SubmitFileRow, SubmitWorkerStorage,
 };
 pub use capabilities::{
     CapabilityProvider, GlobalSearchCapabilities, Interaction, ResourceCapabilities,

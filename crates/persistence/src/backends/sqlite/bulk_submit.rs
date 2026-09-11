@@ -19,7 +19,7 @@ use crate::core::bulk_submit::{
     EntryResultContinuation, EntryResultCursor, EntryResultPage, ManifestPhase, ManifestStatus,
     NdjsonEntry, PagedEntryResult, StreamProcessingResult, StreamingBulkSubmitProvider,
     SubmissionChange, SubmissionId, SubmissionManifest, SubmissionStatus, SubmissionSummary,
-    invalid_entry_result_page,
+    UnindexedEntry, invalid_entry_result_page,
 };
 use crate::core::bulk_submit_publication::{
     ManifestPublicationResult, ManifestPublicationStatus, canonical_publication_files,
@@ -1069,6 +1069,56 @@ impl BulkSubmitProvider for SqliteBackend {
             processing_error: processing_error as u64,
             skipped: skipped as u64,
         })
+    }
+
+    async fn mark_entries_unindexed(
+        &self,
+        tenant: &TenantContext,
+        submission_id: &SubmissionId,
+        manifest_id: &str,
+        entries: &[UnindexedEntry],
+    ) -> StorageResult<u64> {
+        if entries.is_empty() {
+            return Ok(0);
+        }
+        let mut conn = self.get_connection()?;
+        let tenant_id = tenant.tenant_id().as_str().to_string();
+        let tx = conn
+            .transaction()
+            .map_err(|e| internal_error(format!("Failed to begin unindexed-mark txn: {}", e)))?;
+        let mut affected = 0u64;
+        {
+            let mut stmt = tx
+                .prepare(
+                    "UPDATE bulk_entry_results
+                     SET outcome = 'processing-error', operation_outcome = ?1
+                     WHERE tenant_id = ?2 AND submitter = ?3 AND submission_id = ?4
+                       AND manifest_id = ?5 AND resource_type = ?6 AND resource_id = ?7",
+                )
+                .map_err(|e| internal_error(format!("Failed to prepare unindexed-mark: {}", e)))?;
+            for entry in entries {
+                let outcome_bytes = serde_json::to_vec(&entry.operation_outcome).map_err(|e| {
+                    internal_error(format!("Failed to serialize operation outcome: {}", e))
+                })?;
+                let n = stmt
+                    .execute(params![
+                        outcome_bytes,
+                        tenant_id,
+                        &submission_id.submitter,
+                        &submission_id.submission_id,
+                        manifest_id,
+                        &entry.resource_type,
+                        &entry.resource_id,
+                    ])
+                    .map_err(|e| {
+                        internal_error(format!("Failed to mark entry unindexed: {}", e))
+                    })?;
+                affected += n as u64;
+            }
+        }
+        tx.commit()
+            .map_err(|e| internal_error(format!("Failed to commit unindexed-mark txn: {}", e)))?;
+        Ok(affected)
     }
 }
 
@@ -5449,5 +5499,94 @@ mod tests {
             after < before,
             "TRUNCATE checkpoint should reclaim the WAL: before={before} after={after}"
         );
+    }
+
+    /// #1007: `mark_entries_unindexed` flips only the named `(type, id)`
+    /// entry results to `processing-error`, leaving the rest untouched, and
+    /// is a no-op on an empty entry list.
+    #[tokio::test]
+    async fn mark_entries_unindexed_flips_only_the_named_resources() {
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+
+        let sub_id = SubmissionId::generate("test-system");
+        backend
+            .create_submission(&tenant, &sub_id, None)
+            .await
+            .unwrap();
+        let manifest = backend
+            .add_manifest(&tenant, &sub_id, None, None)
+            .await
+            .unwrap();
+
+        let entries: Vec<NdjsonEntry> = ["sqlite-unidx-1", "sqlite-unidx-2", "sqlite-unidx-3"]
+            .iter()
+            .enumerate()
+            .map(|(i, id)| {
+                NdjsonEntry::new(
+                    (i + 1) as u64,
+                    "Patient",
+                    json!({"resourceType": "Patient", "id": id}),
+                )
+            })
+            .collect();
+        let results = backend
+            .process_entries(
+                &tenant,
+                &sub_id,
+                &manifest.manifest_id,
+                entries,
+                &BulkProcessingOptions::new(),
+            )
+            .await
+            .unwrap();
+        assert!(results.iter().all(|r| r.is_success()));
+
+        // An empty entry list touches nothing.
+        assert_eq!(
+            backend
+                .mark_entries_unindexed(&tenant, &sub_id, &manifest.manifest_id, &[])
+                .await
+                .unwrap(),
+            0
+        );
+
+        let oo = json!({
+            "resourceType": "OperationOutcome",
+            "issue": [{
+                "severity": "error",
+                "code": "incomplete",
+                "diagnostics": "Patient/sqlite-unidx-2 was stored but could not be indexed for \
+                                search on es: timeout. Run POST /Patient/$reindex to repair."
+            }]
+        });
+        let changed = backend
+            .mark_entries_unindexed(
+                &tenant,
+                &sub_id,
+                &manifest.manifest_id,
+                &[UnindexedEntry {
+                    resource_type: "Patient".to_string(),
+                    resource_id: "sqlite-unidx-2".to_string(),
+                    operation_outcome: oo.clone(),
+                }],
+            )
+            .await
+            .unwrap();
+        assert_eq!(changed, 1);
+
+        let page = backend
+            .get_entry_results_page(&tenant, &sub_id, &manifest.manifest_id, None, 10, None)
+            .await
+            .unwrap();
+        for paged in &page.entries {
+            let result = &paged.result;
+            if result.resource_id.as_deref() == Some("sqlite-unidx-2") {
+                assert_eq!(result.outcome, BulkEntryOutcome::ProcessingError);
+                assert_eq!(result.operation_outcome.as_ref(), Some(&oo));
+            } else {
+                assert_eq!(result.outcome, BulkEntryOutcome::Success);
+            }
+        }
     }
 }

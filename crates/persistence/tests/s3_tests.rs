@@ -239,6 +239,110 @@ async fn test_aws_bundle_bulk_export_and_submit() {
     assert!(results[0].is_success());
 }
 
+/// #1007: `mark_entries_unindexed` flips only the named `(type, id)` entry
+/// results to `processing-error`, leaving the rest untouched, and is a no-op
+/// on an empty entry list.
+#[tokio::test]
+async fn mark_entries_unindexed_flips_only_the_named_resources() {
+    if !run_aws_tests() {
+        eprintln!("skipping AWS test (set RUN_AWS_S3_TESTS=1)");
+        return;
+    }
+
+    use helios_persistence::core::{BulkEntryOutcome, UnindexedEntry};
+
+    let backend = make_prefix_backend(format!("integration/{}/mark-unindexed", Uuid::new_v4()));
+    let tenant = tenant("aws-tenant-unindexed");
+
+    let submission_id = SubmissionId::new("aws-client", format!("sub-{}", Uuid::new_v4()));
+    backend
+        .create_submission(&tenant, &submission_id, None)
+        .await
+        .unwrap();
+    let manifest = backend
+        .add_manifest(&tenant, &submission_id, None, None)
+        .await
+        .unwrap();
+
+    let ids = ["s3-unidx-1", "s3-unidx-2", "s3-unidx-3"];
+    let entries: Vec<NdjsonEntry> = ids
+        .iter()
+        .enumerate()
+        .map(|(i, id)| {
+            NdjsonEntry::new(
+                (i + 1) as u64,
+                "Patient",
+                json!({"resourceType": "Patient", "id": id}),
+            )
+        })
+        .collect();
+    let results = backend
+        .process_entries(
+            &tenant,
+            &submission_id,
+            &manifest.manifest_id,
+            entries,
+            &BulkProcessingOptions::new(),
+        )
+        .await
+        .unwrap();
+    assert!(results.iter().all(|r| r.is_success()));
+
+    assert_eq!(
+        backend
+            .mark_entries_unindexed(&tenant, &submission_id, &manifest.manifest_id, &[])
+            .await
+            .unwrap(),
+        0,
+        "an empty entry list is a no-op"
+    );
+
+    let oo = json!({
+        "resourceType": "OperationOutcome",
+        "issue": [{
+            "severity": "error",
+            "code": "incomplete",
+            "diagnostics": "Patient/s3-unidx-2 was stored but could not be indexed for search \
+                            on es: timeout. Run POST /Patient/$reindex to repair."
+        }]
+    });
+    let changed = backend
+        .mark_entries_unindexed(
+            &tenant,
+            &submission_id,
+            &manifest.manifest_id,
+            &[UnindexedEntry {
+                resource_type: "Patient".to_string(),
+                resource_id: "s3-unidx-2".to_string(),
+                operation_outcome: oo.clone(),
+            }],
+        )
+        .await
+        .unwrap();
+    assert_eq!(changed, 1);
+
+    let page = backend
+        .get_entry_results_page(
+            &tenant,
+            &submission_id,
+            &manifest.manifest_id,
+            None,
+            10,
+            None,
+        )
+        .await
+        .unwrap();
+    for paged in &page.entries {
+        let result = &paged.result;
+        if result.resource_id.as_deref() == Some("s3-unidx-2") {
+            assert_eq!(result.outcome, BulkEntryOutcome::ProcessingError);
+            assert_eq!(result.operation_outcome.as_ref(), Some(&oo));
+        } else {
+            assert_eq!(result.outcome, BulkEntryOutcome::Success);
+        }
+    }
+}
+
 #[tokio::test]
 async fn test_aws_bucket_per_tenant_mode_if_configured() {
     if !run_aws_tests() {

@@ -17,7 +17,7 @@ use crate::core::bulk_submit::{
     EntryResultContinuation, EntryResultCursor, EntryResultPage, ManifestPhase, ManifestStatus,
     NdjsonEntry, PagedEntryResult, StreamProcessingResult, StreamingBulkSubmitProvider,
     SubmissionChange, SubmissionId, SubmissionManifest, SubmissionStatus, SubmissionSummary,
-    invalid_entry_result_page,
+    UnindexedEntry, invalid_entry_result_page,
 };
 use crate::core::bulk_submit_publication::{
     ManifestPublicationResult, ManifestPublicationStatus, canonical_publication_files,
@@ -997,6 +997,52 @@ impl BulkSubmitProvider for PostgresBackend {
             processing_error: processing_error.unwrap_or(0) as u64,
             skipped: skipped.unwrap_or(0) as u64,
         })
+    }
+
+    async fn mark_entries_unindexed(
+        &self,
+        tenant: &TenantContext,
+        submission_id: &SubmissionId,
+        manifest_id: &str,
+        entries: &[UnindexedEntry],
+    ) -> StorageResult<u64> {
+        if entries.is_empty() {
+            return Ok(0);
+        }
+        let mut client = self.get_client().await?;
+        let tenant_id = tenant.tenant_id().as_str();
+        let txn = client
+            .transaction()
+            .await
+            .map_err(|e| internal_error(format!("Failed to begin unindexed-mark txn: {}", e)))?;
+
+        let mut affected = 0u64;
+        for entry in entries {
+            let rows = txn
+                .execute(
+                    "UPDATE bulk_entry_results
+                     SET outcome = 'processing-error', operation_outcome = $1
+                     WHERE tenant_id = $2 AND submitter = $3 AND submission_id = $4
+                       AND manifest_id = $5 AND resource_type = $6 AND resource_id = $7",
+                    &[
+                        &entry.operation_outcome,
+                        &tenant_id,
+                        &submission_id.submitter.as_str(),
+                        &submission_id.submission_id.as_str(),
+                        &manifest_id,
+                        &entry.resource_type.as_str(),
+                        &entry.resource_id.as_str(),
+                    ],
+                )
+                .await
+                .map_err(|e| internal_error(format!("Failed to mark entry unindexed: {}", e)))?;
+            affected += rows;
+        }
+
+        txn.commit()
+            .await
+            .map_err(|e| internal_error(format!("Failed to commit unindexed-mark txn: {}", e)))?;
+        Ok(affected)
     }
 }
 

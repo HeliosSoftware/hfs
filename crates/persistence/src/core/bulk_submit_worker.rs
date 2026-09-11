@@ -34,6 +34,43 @@ use crate::core::bulk_submit_receipts::{ReceiptSpools, SPOOL_BUFFER_BYTES, Spool
 use crate::error::{StorageError, StorageResult};
 use crate::tenant::TenantContext;
 
+/// What pushing a manifest's ingested resources into the deployment's
+/// secondary search indexes achieved, reported before the receipt is written.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct IngestSyncReport {
+    /// Resources every secondary accepted.
+    pub synced: u64,
+    /// Resources a secondary rejected after retries; their entry results
+    /// are now `processing-error`.
+    pub unindexed: u64,
+    /// Resource types the manifest ingested whose tenant-wide count on the
+    /// primary disagrees with a secondary's, checked right after the sync
+    /// above. Always empty when secondaries are synced asynchronously (a
+    /// count taken then would not reflect this manifest's sync) or when a
+    /// backend's `count` call itself failed.
+    pub drift: Vec<IndexDrift>,
+}
+
+/// A resource type whose tenant-wide count on the primary and on a
+/// secondary search backend disagree after a manifest's sync.
+///
+/// This is a signal, not a fault attributable to any single entry: the
+/// counts are tenant-wide, so a mismatch can also come from resources
+/// outside this manifest (a concurrent write, a prior gap). It names a
+/// backend and the two counts so an operator can decide whether to run
+/// `$reindex`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexDrift {
+    /// The resource type whose counts disagree.
+    pub resource_type: String,
+    /// The secondary backend whose count disagreed with the primary's.
+    pub backend_id: String,
+    /// The primary's tenant-wide count for `resource_type`.
+    pub primary_count: u64,
+    /// The secondary's tenant-wide count for `resource_type`.
+    pub search_count: u64,
+}
+
 const MANIFEST_FETCH_ERROR_PART_INDEX: u32 = 1;
 
 /// A lease over a single pending manifest, held by exactly one worker at a time.
@@ -335,6 +372,15 @@ pub trait SubmitWorkerStorage: Send + Sync {
         error_message: &str,
     ) -> Result<(), LeaseError>;
 
+    /// Pushes every resource this manifest ingested into the deployment's
+    /// secondary search indexes, before the receipt is written, and marks the
+    /// ones a secondary rejected as `processing-error`. Backends that index
+    /// themselves have nothing to push and report an empty sync. Fenced.
+    async fn sync_ingested(&self, lease: &ManifestLease) -> Result<IngestSyncReport, LeaseError> {
+        let _ = lease;
+        Ok(IngestSyncReport::default())
+    }
+
     // ---- REST-facing (unfenced) submission/poll-token/artifact lifecycle ----
 
     /// Persists the remote-fetch parameters for a manifest that the kickoff handler
@@ -478,7 +524,9 @@ pub trait DeferredReindexHook: Send + Sync {
 /// engine), a [`SubmitInputFetcher`] (remote manifest + NDJSON fetch), and an
 /// [`ExportOutputStore`] (where status-manifest artifacts go), and drives a claimed
 /// manifest to completion: fetch → ingest each `output` file via the existing
-/// `process_ndjson_stream` engine → emit `output`/`error` artifacts → finish.
+/// `process_ndjson_stream` engine → sync ingested resources to secondary search
+/// indexes ([`SubmitWorkerStorage::sync_ingested`], #1007) → emit `output`/`error`
+/// artifacts → finish.
 pub struct DefaultSubmitWorker<Js: ?Sized, Fetcher: ?Sized, Os: ?Sized> {
     jobs: Arc<Js>,
     fetcher: Arc<Fetcher>,
@@ -959,6 +1007,21 @@ where
             Ok(m) => m,
             Err(e) => {
                 let failure_message = e.to_string();
+                // Whatever a prior run of this manifest already ingested must
+                // stay searchable even though this run fails outright — sync
+                // it before the manifest goes terminal, while the lease (and
+                // this heartbeat) still covers the write. Best-effort: the
+                // manifest fails either way, and a miss here is repaired by
+                // $reindex.
+                if let Err(e) = self.jobs.sync_ingested(&lease).await {
+                    tracing::warn!(
+                        submission = %lease.submission_id,
+                        manifest = %lease.manifest_id,
+                        error = %e,
+                        "bulk-submit: failed to sync ingested resources before failing the \
+                         manifest on a fetch error"
+                    );
+                }
                 let fetch_error = self
                     .write_manifest_error(
                         &lease,
@@ -1302,7 +1365,7 @@ where
             );
             return Ok(());
         }
-        let failed = failed_at.load(Ordering::Relaxed);
+        let mut failed = failed_at.load(Ordering::Relaxed);
 
         // 2b. Process `deleted` files — transaction Bundles / resource refs to
         // remove. Successful deletions across every deleted file share one
@@ -1350,6 +1413,56 @@ where
             records.push(deleted_record);
         }
 
+        // 2c. Push this manifest's ingested resources into the deployment's
+        // secondary search indexes, before the receipt is written (#1007): a
+        // resource a secondary rejects after retries must not read `success`
+        // in the receipt or the status counts. Same wind-down gate as the
+        // receipt step below: a lost lease or an abort must not sync into a
+        // manifest another worker (or the abort itself) already owns.
+        if keeper.should_stop() {
+            log_wind_down(&lease, keeper.cancelled());
+            return Ok(());
+        }
+        let sync = match self.jobs.sync_ingested(&lease).await {
+            Ok(report) => report,
+            Err(LeaseError::LeaseLost { .. }) => return Ok(()),
+            Err(LeaseError::Storage(e)) => return Err(e),
+        };
+        if sync.unindexed > 0 {
+            tracing::warn!(
+                submission = %lease.submission_id,
+                manifest = %lease.manifest_id,
+                unindexed = sync.unindexed,
+                synced = sync.synced,
+                "bulk-submit: a secondary rejected ingested resources after retries; \
+                 their entry results are now processing-error"
+            );
+            // `processed_entries` is not corrected: it is cumulative across
+            // runs and over-reporting is the safe direction (see
+            // `SubmitWorkerStorage::add_manifest_progress`'s docs).
+            // `failed_entries` must still grow, so the status counts and this
+            // manifest's own receipt agree.
+            if let Err(e) = self
+                .jobs
+                .add_manifest_progress(&lease, 0, sync.unindexed, 0)
+                .await
+            {
+                return fenced_write_outcome(&keeper, e);
+            }
+        }
+        failed += sync.unindexed;
+        for d in &sync.drift {
+            tracing::warn!(
+                submission = %lease.submission_id,
+                manifest = %lease.manifest_id,
+                resource_type = %d.resource_type,
+                backend_id = %d.backend_id,
+                primary_count = d.primary_count,
+                search_count = d.search_count,
+                "bulk-submit: primary and search index disagree on this resource type's count"
+            );
+        }
+
         // 3. Emit per-type `output` receipts and an aggregated `error` artifact.
         // A wound-down job writes neither these nor a terminal manifest status:
         // the receipts would claim a manifest that never finished, and an
@@ -1369,6 +1482,7 @@ where
                 &manifest_url,
                 view.fhir_version,
                 failed,
+                &sync.drift,
             ) => Some(receipts?),
         };
         let Some(receipts) = receipts else {
@@ -1407,12 +1521,18 @@ where
     /// Reads back this manifest's entry results and writes `output` receipts
     /// (grouped by resource type) plus a single aggregated `error` artifact,
     /// spooling them to disk instead of holding the receipt set in memory (#982).
+    ///
+    /// `drift` adds one `warning` OperationOutcome per [`IndexDrift`] to the
+    /// `error` artifact, naming the `$reindex` repair. A drift is a tenant-wide
+    /// count disagreement, not a failed entry: it does not affect
+    /// `failed_count` or any `output` line.
     async fn write_result_artifacts(
         &self,
         lease: &ManifestLease,
         manifest_url: &str,
         _fhir_version: FhirVersion,
         failed_count: u64,
+        drift: &[IndexDrift],
     ) -> StorageResult<Vec<SubmitFileRecord>> {
         let pages = entry_result_pages(|continuation| async move {
             self.jobs
@@ -1427,7 +1547,7 @@ where
                 .await
         });
         let spools = ReceiptSpools::new()?;
-        self.write_result_artifact_pages(spools, lease, manifest_url, failed_count, pages)
+        self.write_result_artifact_pages(spools, lease, manifest_url, failed_count, drift, pages)
             .await
     }
 
@@ -1441,6 +1561,7 @@ where
         lease: &ManifestLease,
         manifest_url: &str,
         failed_count: u64,
+        drift: &[IndexDrift],
         pages: impl futures::Stream<Item = StorageResult<EntryResultPage>>,
     ) -> StorageResult<Vec<SubmitFileRecord>> {
         use futures::TryStreamExt;
@@ -1493,6 +1614,33 @@ where
                     "diagnostics": format!(
                         "{uncaptured} submitted resource(s) could not be parsed or did not \
                          match the declared resource type"
+                    )
+                }]
+            });
+            tally_severity(&oo, &mut severity);
+            spools.push_error(&oo.to_string()).await?;
+        }
+
+        // One `warning` OperationOutcome per index drift (#1007): a tenant-wide
+        // count disagreement, not a failed entry, so it neither touches
+        // `failed_count` nor removes anything already collected in the output
+        // spools. Pushed before the spools close, same as every other error line.
+        for d in drift {
+            let oo = json!({
+                "resourceType": "OperationOutcome",
+                "issue": [{
+                    "severity": "warning",
+                    "code": "incomplete",
+                    "diagnostics": format!(
+                        "Search index drift for {rt} (tenant-wide, not only this manifest): \
+                         primary holds {pc} resources, {backend} holds {sc}. Run \
+                         POST /{rt}/$reindex to rebuild. Without Elasticsearch \
+                         refresh=wait_for a small difference can be writes not yet visible; \
+                         confirm with GET /{rt}?_summary=count.",
+                        rt = d.resource_type,
+                        pc = d.primary_count,
+                        backend = d.backend_id,
+                        sc = d.search_count,
                     )
                 }]
             });
@@ -1962,6 +2110,7 @@ mod tests {
                 &lease,
                 "http://provider/m.json",
                 0,
+                &[],
                 pages,
             )
             .await
@@ -2118,6 +2267,7 @@ mod tests {
                 &lease,
                 "http://provider/lazy.json",
                 0,
+                &[],
                 pages,
             )
             .await
@@ -2272,6 +2422,7 @@ mod tests {
                 &lease,
                 "http://provider/mixed.json",
                 5,
+                &[],
                 pages,
             )
             .await
@@ -2557,6 +2708,7 @@ mod tests {
                 &lease,
                 "http://provider/error-only.json",
                 5,
+                &[],
                 pages,
             )
             .await
@@ -2695,6 +2847,7 @@ mod tests {
                 &lease,
                 "http://provider/vanished.json",
                 0,
+                &[],
                 pages,
             )
             .await
@@ -2891,6 +3044,7 @@ mod tests {
                     &lease,
                     "http://provider/store-failure.json",
                     0,
+                    &[],
                     pages,
                 )
                 .await
@@ -2993,6 +3147,7 @@ mod tests {
                     &lease,
                     "http://provider/dropped.json",
                     0,
+                    &[],
                     pages,
                 )
                 .await
@@ -3659,6 +3814,481 @@ mod tests {
         // Byte progress reached the file's full advertised size.
         assert_eq!(manifests[0].bytes_total, ndjson.len() as u64);
         assert_eq!(manifests[0].bytes_processed, ndjson.len() as u64);
+    }
+
+    /// A minimal secondary that rejects `create`/`create_many` for one
+    /// hard-coded id, and accepts everything else — the composite-sync half
+    /// of the worker tests below.
+    ///
+    /// `received` tracks every id `create`/`create_or_update` was called
+    /// with, by resource type, whether or not it was accepted — the
+    /// primary really does hold a rejected resource (only its *search*
+    /// indexing failed), so `count` reporting what was received, not just
+    /// what was accepted, keeps the rejection test's own index-drift check
+    /// from misreporting the rejection `mark_entries_unindexed` already
+    /// names. `count_override`, when set, replaces that with a fixed value —
+    /// for forcing a drift scenario deterministically.
+    struct RejectingSecondary {
+        reject_id: &'static str,
+        received:
+            std::sync::Mutex<std::collections::HashMap<String, std::collections::HashSet<String>>>,
+        count_override: Option<u64>,
+    }
+
+    impl RejectingSecondary {
+        /// A secondary that only rejects `reject_id` and otherwise reports
+        /// its real received count.
+        fn new(reject_id: &'static str) -> Self {
+            Self {
+                reject_id,
+                received: std::sync::Mutex::new(std::collections::HashMap::new()),
+                count_override: None,
+            }
+        }
+
+        /// A secondary that accepts everything but always reports
+        /// `count_override`, to force an index-drift scenario.
+        fn with_count_override(count_override: u64) -> Self {
+            Self {
+                reject_id: "",
+                received: std::sync::Mutex::new(std::collections::HashMap::new()),
+                count_override: Some(count_override),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ResourceStorage for RejectingSecondary {
+        fn backend_name(&self) -> &'static str {
+            "rejecting-secondary"
+        }
+
+        async fn create(
+            &self,
+            _tenant: &TenantContext,
+            resource_type: &str,
+            resource: Value,
+            fhir_version: FhirVersion,
+        ) -> StorageResult<crate::types::StoredResource> {
+            let id = resource
+                .get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?")
+                .to_string();
+            self.received
+                .lock()
+                .unwrap()
+                .entry(resource_type.to_string())
+                .or_default()
+                .insert(id.clone());
+            if id == self.reject_id {
+                return Err(crate::error::StorageError::Backend(
+                    crate::error::BackendError::Internal {
+                        backend_name: "rejecting-secondary".to_string(),
+                        message: format!("secondary rejected {resource_type}/{id}"),
+                        source: None,
+                    },
+                ));
+            }
+            Ok(crate::types::StoredResource::new(
+                resource_type,
+                id,
+                TenantId::new("t1"),
+                resource,
+                fhir_version,
+            ))
+        }
+
+        async fn create_or_update(
+            &self,
+            _tenant: &TenantContext,
+            resource_type: &str,
+            id: &str,
+            resource: Value,
+            fhir_version: FhirVersion,
+        ) -> StorageResult<(crate::types::StoredResource, bool)> {
+            self.received
+                .lock()
+                .unwrap()
+                .entry(resource_type.to_string())
+                .or_default()
+                .insert(id.to_string());
+            Ok((
+                crate::types::StoredResource::new(
+                    resource_type,
+                    id,
+                    TenantId::new("t1"),
+                    resource,
+                    fhir_version,
+                ),
+                true,
+            ))
+        }
+
+        async fn read(
+            &self,
+            _tenant: &TenantContext,
+            _resource_type: &str,
+            _id: &str,
+        ) -> StorageResult<Option<crate::types::StoredResource>> {
+            Ok(None)
+        }
+
+        async fn update(
+            &self,
+            _tenant: &TenantContext,
+            current: &crate::types::StoredResource,
+            resource: Value,
+        ) -> StorageResult<crate::types::StoredResource> {
+            Ok(crate::types::StoredResource::new(
+                current.resource_type(),
+                current.id(),
+                TenantId::new("t1"),
+                resource,
+                current.fhir_version(),
+            ))
+        }
+
+        async fn delete(
+            &self,
+            _tenant: &TenantContext,
+            _resource_type: &str,
+            _id: &str,
+        ) -> StorageResult<()> {
+            Ok(())
+        }
+
+        async fn count(
+            &self,
+            _tenant: &TenantContext,
+            resource_type: Option<&str>,
+        ) -> StorageResult<u64> {
+            if let Some(n) = self.count_override {
+                return Ok(n);
+            }
+            let ty = resource_type.unwrap_or("");
+            Ok(self
+                .received
+                .lock()
+                .unwrap()
+                .get(ty)
+                .map(|ids| ids.len())
+                .unwrap_or(0) as u64)
+        }
+    }
+
+    /// Reads back a finalized status-manifest artifact's NDJSON lines
+    /// directly from [`LocalFsOutputStore`]'s layout (mirrors
+    /// `LocalFsOutputStore::part_path`, which is private to that module).
+    fn read_submit_file_lines(
+        tmp_root: &std::path::Path,
+        tenant_id: &str,
+        job_id: &str,
+        row: &crate::core::bulk_submit_worker::SubmitFileRow,
+    ) -> Vec<String> {
+        // The on-disk name is keyed by `row.file_path`, the opaque locator
+        // `submit_artifact_key` derives from the artifact's full identity
+        // (#1045) — not the human-readable `resource_type`, which several
+        // rows of the same manifest can share.
+        let path = tmp_root.join(tenant_id).join(job_id).join(format!(
+            "{}-{}-{}-{}.ndjson",
+            row.file_type, row.file_path, row.part_index, row.fencing_token
+        ));
+        std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// #1007: a resource the primary ingests but a secondary search index
+    /// rejects (after retries) must not read `success` in the manifest's
+    /// receipt — its entry result becomes `processing-error` with an
+    /// OperationOutcome naming the resource and the `$reindex` repair, and
+    /// the manifest still reaches a terminal state.
+    #[tokio::test]
+    async fn test_worker_reports_unindexed_resources_in_the_receipt() {
+        use crate::composite::{CompositeConfig, CompositeStorage, CompositeSubmitJobs};
+        use crate::core::BackendKind;
+        use crate::core::bulk_submit::BulkEntryOutcome;
+        use crate::core::bulk_submit_worker::BulkSubmitJobStore;
+
+        let sqlite = Arc::new(SqliteBackend::in_memory().unwrap());
+        sqlite.init_schema().unwrap();
+        let config = CompositeConfig::builder()
+            .primary("sqlite", BackendKind::Sqlite)
+            .search_backend("es", BackendKind::Elasticsearch)
+            .sync_mode(crate::composite::config::SyncMode::Synchronous)
+            .build()
+            .unwrap();
+        let mut backends: std::collections::HashMap<String, crate::composite::DynStorage> =
+            std::collections::HashMap::new();
+        backends.insert(
+            "sqlite".to_string(),
+            sqlite.clone() as crate::composite::DynStorage,
+        );
+        backends.insert(
+            "es".to_string(),
+            Arc::new(RejectingSecondary::new("reject-1")) as crate::composite::DynStorage,
+        );
+        let composite = Arc::new(CompositeStorage::new(config, backends).unwrap());
+        let jobs = Arc::new(CompositeSubmitJobs::new(
+            sqlite.clone() as Arc<dyn BulkSubmitJobStore>,
+            composite,
+        ));
+
+        let tmp = tempfile::tempdir().unwrap();
+        let output = Arc::new(LocalFsOutputStore::new(
+            tmp.path().to_path_buf(),
+            "http://localhost:8080",
+        ));
+
+        let tenant = tenant();
+        let sub_id = SubmissionId::generate("mock-system");
+        jobs.create_submission(&tenant, &sub_id, None)
+            .await
+            .unwrap();
+        jobs.add_manifest(
+            &tenant,
+            &sub_id,
+            Some("http://provider/manifest.json"),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let ndjson = concat!(
+            "{\"resourceType\":\"Patient\",\"id\":\"ok-1\"}\n",
+            "{\"resourceType\":\"Patient\",\"id\":\"reject-1\"}\n"
+        );
+        let mut files = std::collections::HashMap::new();
+        files.insert(
+            "http://provider/patient.ndjson".to_string(),
+            ndjson.as_bytes().to_vec(),
+        );
+        let fetcher = Arc::new(MockFetcher {
+            files,
+            manifest: RemoteManifest {
+                requires_access_token: false,
+                output: vec![RemoteFile {
+                    resource_type: Some("Patient".to_string()),
+                    url: "http://provider/patient.ndjson".to_string(),
+                    count: Some(2),
+                }],
+                deleted: vec![],
+            },
+        });
+
+        let worker = DefaultSubmitWorker::new(
+            jobs.clone(),
+            fetcher,
+            output,
+            WorkerId::new("unindexed-worker"),
+        );
+        let lease = jobs
+            .claim_next_manifest(
+                &WorkerId::new("unindexed-worker"),
+                StdDuration::from_secs(60),
+            )
+            .await
+            .unwrap()
+            .expect("claimable manifest");
+        worker.run_job(lease).await.unwrap();
+
+        let manifests = jobs.list_manifests(&tenant, &sub_id).await.unwrap();
+        assert!(
+            manifests[0].status.is_terminal(),
+            "the manifest must still reach a terminal state"
+        );
+
+        let job_id = submission_output_job_id(&sub_id);
+        let tenant_id = tenant.tenant_id().as_str();
+        let submit_files = jobs.list_submit_files(&tenant, &sub_id).await.unwrap();
+
+        let output_row = submit_files
+            .iter()
+            .find(|f| f.file_type == "output" && f.resource_type.as_deref() == Some("Patient"))
+            .expect("output receipt for Patient");
+        let output_lines =
+            read_submit_file_lines(tmp.path(), tenant_id, job_id.as_str(), output_row);
+        assert_eq!(
+            output_lines,
+            vec![serde_json::json!({"reference": "Patient/ok-1"}).to_string()],
+            "only the accepted resource is a success receipt"
+        );
+
+        let error_row = submit_files
+            .iter()
+            .find(|f| f.file_type == "error")
+            .expect("error receipt for the rejected resource");
+        let error_lines = read_submit_file_lines(tmp.path(), tenant_id, job_id.as_str(), error_row);
+        assert_eq!(error_lines.len(), 1, "exactly one rejected resource");
+        let oo: Value = serde_json::from_str(&error_lines[0]).unwrap();
+        assert_eq!(oo["issue"][0]["code"], "incomplete");
+        let diagnostics = oo["issue"][0]["diagnostics"].as_str().unwrap();
+        assert!(diagnostics.contains("Patient/reject-1"));
+        assert!(diagnostics.contains("$reindex"));
+        assert_eq!(
+            error_row.count_severity,
+            Some(serde_json::json!({"error": 1}))
+        );
+
+        let counts = jobs
+            .get_entry_counts(&tenant, &sub_id, &manifests[0].manifest_id)
+            .await
+            .unwrap();
+        assert_eq!(counts.success, 1);
+        assert_eq!(counts.processing_error, 1);
+        let page = jobs
+            .get_entry_results_page(&tenant, &sub_id, &manifests[0].manifest_id, None, 10, None)
+            .await
+            .unwrap();
+        let rejected = page
+            .entries
+            .iter()
+            .map(|e| &e.result)
+            .find(|r| r.resource_id.as_deref() == Some("reject-1"))
+            .expect("rejected entry present");
+        assert_eq!(rejected.outcome, BulkEntryOutcome::ProcessingError);
+    }
+
+    /// #1007: a tenant-wide count mismatch between the primary and a
+    /// secondary search index, discovered right after a manifest's sync, is
+    /// written to the receipt as a `warning` OperationOutcome naming the
+    /// `$reindex` repair — it must not be mistaken for a failed entry: every
+    /// ingested resource still reads `success`, and the manifest's
+    /// `failed_entries` does not grow.
+    #[tokio::test]
+    async fn test_worker_writes_drift_as_a_warning_outcome() {
+        use crate::composite::{CompositeConfig, CompositeStorage, CompositeSubmitJobs};
+        use crate::core::BackendKind;
+        use crate::core::bulk_submit_worker::BulkSubmitJobStore;
+
+        let sqlite = Arc::new(SqliteBackend::in_memory().unwrap());
+        sqlite.init_schema().unwrap();
+        let config = CompositeConfig::builder()
+            .primary("sqlite", BackendKind::Sqlite)
+            .search_backend("es", BackendKind::Elasticsearch)
+            .sync_mode(crate::composite::config::SyncMode::Synchronous)
+            .build()
+            .unwrap();
+        let mut backends: std::collections::HashMap<String, crate::composite::DynStorage> =
+            std::collections::HashMap::new();
+        backends.insert(
+            "sqlite".to_string(),
+            sqlite.clone() as crate::composite::DynStorage,
+        );
+        // Accepts everything but always reports a count of 1, disagreeing
+        // with the primary's real count of 2 — forces drift deterministically.
+        backends.insert(
+            "es".to_string(),
+            Arc::new(RejectingSecondary::with_count_override(1)) as crate::composite::DynStorage,
+        );
+        let composite = Arc::new(CompositeStorage::new(config, backends).unwrap());
+        let jobs = Arc::new(CompositeSubmitJobs::new(
+            sqlite.clone() as Arc<dyn BulkSubmitJobStore>,
+            composite,
+        ));
+
+        let tmp = tempfile::tempdir().unwrap();
+        let output = Arc::new(LocalFsOutputStore::new(
+            tmp.path().to_path_buf(),
+            "http://localhost:8080",
+        ));
+
+        let tenant = tenant();
+        let sub_id = SubmissionId::generate("drift-worker");
+        jobs.create_submission(&tenant, &sub_id, None)
+            .await
+            .unwrap();
+        jobs.add_manifest(
+            &tenant,
+            &sub_id,
+            Some("http://provider/manifest.json"),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let ndjson = concat!(
+            "{\"resourceType\":\"Patient\",\"id\":\"d-1\"}\n",
+            "{\"resourceType\":\"Patient\",\"id\":\"d-2\"}\n"
+        );
+        let mut files = std::collections::HashMap::new();
+        files.insert(
+            "http://provider/patient.ndjson".to_string(),
+            ndjson.as_bytes().to_vec(),
+        );
+        let fetcher = Arc::new(MockFetcher {
+            files,
+            manifest: RemoteManifest {
+                requires_access_token: false,
+                output: vec![RemoteFile {
+                    resource_type: Some("Patient".to_string()),
+                    url: "http://provider/patient.ndjson".to_string(),
+                    count: Some(2),
+                }],
+                deleted: vec![],
+            },
+        });
+
+        let worker =
+            DefaultSubmitWorker::new(jobs.clone(), fetcher, output, WorkerId::new("drift-worker"));
+        let lease = jobs
+            .claim_next_manifest(&WorkerId::new("drift-worker"), StdDuration::from_secs(60))
+            .await
+            .unwrap()
+            .expect("claimable manifest");
+        worker.run_job(lease).await.unwrap();
+
+        let manifests = jobs.list_manifests(&tenant, &sub_id).await.unwrap();
+        assert!(manifests[0].status.is_terminal());
+        assert_eq!(
+            manifests[0].failed_entries, 0,
+            "a drift is a warning, not a failed entry"
+        );
+
+        let job_id = submission_output_job_id(&sub_id);
+        let tenant_id = tenant.tenant_id().as_str();
+        let submit_files = jobs.list_submit_files(&tenant, &sub_id).await.unwrap();
+
+        let output_row = submit_files
+            .iter()
+            .find(|f| f.file_type == "output" && f.resource_type.as_deref() == Some("Patient"))
+            .expect("output receipt for Patient");
+        let output_lines =
+            read_submit_file_lines(tmp.path(), tenant_id, job_id.as_str(), output_row);
+        assert_eq!(
+            output_lines.len(),
+            2,
+            "a drift warning does not remove anything from the receipt"
+        );
+
+        let error_row = submit_files
+            .iter()
+            .find(|f| f.file_type == "error")
+            .expect("error artifact carrying the drift warning");
+        let error_lines = read_submit_file_lines(tmp.path(), tenant_id, job_id.as_str(), error_row);
+        assert_eq!(error_lines.len(), 1, "exactly one drift warning");
+        let oo: Value = serde_json::from_str(&error_lines[0]).unwrap();
+        assert_eq!(oo["issue"][0]["severity"], "warning");
+        assert_eq!(oo["issue"][0]["code"], "incomplete");
+        let diagnostics = oo["issue"][0]["diagnostics"].as_str().unwrap();
+        assert!(diagnostics.contains("Patient"));
+        assert!(diagnostics.contains("primary holds 2"));
+        assert!(diagnostics.contains("$reindex"));
+        assert_eq!(
+            error_row.count_severity,
+            Some(serde_json::json!({"warning": 1}))
+        );
+
+        let counts = jobs
+            .get_entry_counts(&tenant, &sub_id, &manifests[0].manifest_id)
+            .await
+            .unwrap();
+        assert_eq!(counts.success, 2);
+        assert_eq!(counts.processing_error, 0);
     }
 
     /// #903 fast-load: deferred ingestion stores readable resources that are

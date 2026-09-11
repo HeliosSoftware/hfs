@@ -84,6 +84,8 @@ status-only kick-off (no `manifestUrl`) they have nothing to attach to and are i
 | `HFS_BULK_SUBMIT_BLOCK_CONCURRENT_SUBMISSION` | `false` | Reject a new submission while one is in-progress; returns `429` |
 | `HFS_BULK_SUBMIT_DECRYPTION_KEY` | none | P-256/P-384 private key(s) for `ECDH-ES*` `fileEncryptionKey` unwrapping — PEM (PKCS#8/SEC1) or a JWK / JWK Set |
 
+`HFS_COMPOSITE_SYNC_MODE` (documented in `/run-hfs-server`) also affects bulk submit on composite deployments: `asynchronous` (default) queues the secondary sync; the bulk-submit receipt then cannot reflect search-index failures and the drift check is skipped.
+
 Job state reuses the same backend as the FHIR resources — unlike bulk *export*, which sidecars its job store on MongoDB and S3. Every backend that runs `$bulk-submit` hosts its own: SQLite shares `./data/hfs.db`, PostgreSQL shares `HFS_DATABASE_URL`, MongoDB uses its own `bulk_*` collections, and S3 keeps the lease and artifact state in the same objects its ingestion engine already writes (compare-and-swapped against the object ETag). Bulk submit is therefore available on `sqlite`, `postgres`, `mongodb`, `s3`, and their `-elasticsearch` composites; other backends return `501`.
 
 The backend capability splits into `BulkSubmitIngest` (the synchronous `BulkSubmitProvider` ingestion engine) and `BulkSubmitRestWorker` (full `$bulk-submit` REST worker/job-store). All four advertise both, with one exception: an S3 backend in `BucketPerTenant` mode with no `default_system_bucket` has nowhere tenant-independent to keep the worker's claim queue and poll-token index, so it advertises only `BulkSubmitIngest` and `$bulk-submit` reports `501` — the same axis that gates the per-user settings store.
@@ -115,12 +117,56 @@ The backend capability splits into `BulkSubmitIngest` (the synchronous `BulkSubm
 - The manifest bookkeeping and resource writes retry with bounded exponential backoff when SQLite reports the database busy or locked, instead of failing the ingest. The retry budget is an elapsed-time deadline bounded by the manifest lease, so a retrying write can never outlive the lease it holds. Every other error still surfaces on the first attempt.
 - With `HFS_BULK_SUBMIT_DEFER_INDEXING=true` (bulk fast-load, #903 — **the default since #946**) ingestion skips the search-index and FTS writes and an automatic per-type reindex rebuilds them when each manifest finishes. Reads and history are complete throughout; search sees a manifest's resources once its reindex lands. That rebuild is started *after* the manifest is already terminal and is fire-and-forget (`bulk_submit_worker.rs` → `reindex.rs`, `tokio::spawn`), so `$bulk-submit-status` answers `200` while search is still incomplete, and the job lives only in an in-memory map — no column on `bulk_manifests` records that indexing is outstanding and nothing re-fires it at startup. A restart in that window is not recoverable on its own.
 - MongoDB ingests a batch, not an entry: one `find` resolves which of the batch's ids already exist, then one `insert` or `update` command per collection writes the whole batch (`backends/mongodb/bulk_ingest.rs`). Before #1000 each entry cost ~9 round trips of its own — a `read`, `create`'s second existence probe, the resource and history inserts, a search-index delete and insert, a transaction commit, the rollback record and the receipt — which pinned ingest at ~60–76 resources/s with `mongod` two-thirds idle. The batch flush is a sequence of commands rather than one transaction, on purpose: the per-entry path was not atomic across a batch either, and a batch-wide transaction would turn one transient error into a whole batch of lost entries (#1001). Commands are ordered resources → history → search index → rollback log → receipts, so an interrupted batch is re-processed rather than falsely reported done.
-- **On a composite deployment (primary + Elasticsearch), the ingest engine does not reach the secondary by itself.** Ingestion runs on the *primary's* engine, and the primary deliberately skips its own indexing when search is offloaded — so `main.rs` wraps the primary's job store in `CompositeSubmitJobs`, which syncs each manifest's resources into the secondary when the manifest reaches a terminal state (#882). Every composite mode must call `composite_submit_jobs(...)`; `mongo-es` and `s3-es` did not, and a completed import there was readable by id and invisible to every search — 15.27M of 15.28M resources on the reported deployment, with `GET` by id passing every smoke test (#1021). `crates/hfs/tests/bulk_submit/run_composite_es_index_check.sh` asserts the searchable count, not just readability, and is the guard against a fourth composite backend repeating it.
-- **`HFS_BULK_SUBMIT_DEFER_INDEXING` is read once, at startup, not per submission.** `spawn_submit_workers` hands the configured value to each worker, and the worker applies it to every manifest it ingests from then on; nothing about the flag is persisted on a submission or manifest record. Two consequences an operator hits: restarting with a different value changes only manifests ingested *after* the restart, and a manifest that already reached a terminal state is never re-synced — the composite sync fires once, at `finish_manifest`. Use `$reindex` to repair those, not a restart.
+- **On a composite deployment (primary + Elasticsearch), the ingest engine does not reach the secondary by itself.** Ingestion runs on the *primary's* engine, and the primary deliberately skips its own indexing when search is offloaded — so `main.rs` wraps the primary's job store in `CompositeSubmitJobs`, which syncs each manifest's ingested resources into the secondary. Every composite mode must call `composite_submit_jobs(...)`; `mongo-es` and `s3-es` did not, and a completed import there was readable by id and invisible to every search — 15.27M of 15.28M resources on the reported deployment, with `GET` by id passing every smoke test (#1021). `crates/hfs/tests/bulk_submit/run_composite_es_index_check.sh` asserts the searchable count, not just readability, and is the guard against a fourth composite backend repeating it.
+- The sync itself runs *before* the manifest's receipt is written (#1007), as an explicit worker step — not at `finish_manifest`, which no longer syncs by itself, so a manifest that already reached a terminal state is never re-synced by a restart; repair it with `$reindex`. A resource the secondary still rejects after its retries gets an entry result of `processing-error` in the receipt, carrying an OperationOutcome (`incomplete`) that names the `Type/id`, the rejecting backend, and `POST /{type}/$reindex` as the repair; the resource itself stays stored and readable by id, and the status's `failed_entries` counts it.
+- After that copy, for every resource type the manifest ingested, the worker compares the primary's tenant-wide resource count against each secondary's. A mismatch is recorded as a `warning` OperationOutcome (also `incomplete`, naming both counts) in the manifest's `error` artifact and logged on the server. This check only runs when `HFS_COMPOSITE_SYNC_MODE` is `synchronous` or `hybrid`; under the default `asynchronous` mode the secondary's count reflects whatever had already drained from its queue rather than this manifest's own sync, so the check is skipped and the receipt then guarantees only that the resources committed on the primary.
+- Without `HFS_ELASTICSEARCH_WRITE_REFRESH=wait_for`, a small count difference can be a write that has not become visible yet rather than a real gap; reconfirm with `GET /{type}?_summary=count` before treating it as drift. See "Verifying and repairing search drift" below.
+- **`HFS_BULK_SUBMIT_DEFER_INDEXING` is read once, at startup, not per submission.** `spawn_submit_workers` hands the configured value to each worker, and the worker applies it to every manifest it ingests from then on; nothing about the flag is persisted on a submission or manifest record. Restarting with a different value changes only manifests ingested *after* the restart.
 - Cleanup periodically removes status artifacts for submissions whose `updated_at` exceeds `HFS_BULK_SUBMIT_OUTPUT_TTL`.
 - Abort (`submissionStatus=stopped`) means **stop soon** — neither "stop this instant" nor "stop after the current file". It marks the submission `aborted`, moves its `pending`/`processing` manifests to `failed`, and bars further claims. A manifest already being ingested is stopped cooperatively: the lease keeper re-reads the submission's status on its flush cadence (a few seconds) and trips a cancel token the streaming engine checks between persisted batches, so the worst case is one keeper tick plus one batch, never mid-transaction (#968).
 - A manifest stopped that way keeps the counts it had already recorded — the entries it ingested are **not** rolled back. It writes no `output`/`error` receipts and does not restate its own status, since the abort already owns the outcome.
 - Once an abort has settled a manifest at `failed`, nothing an in-flight worker does may move it back. Three writes enforce that: `finish_manifest` and `fail_manifest` are guarded on `status = 'processing'` (a late verdict returns `LeaseLost` and is a no-op), and both `mark_manifest_processing` and the per-batch status stamp inside the ingest are guarded on `status IN ('pending','processing')` so they only ever *promote* a manifest. Without the last of those the very next batch after an abort silently reset `failed` to `processing` and the abort read as if it had never happened.
+
+## Verifying and repairing search drift
+
+Applies to composite deployments (`*-elasticsearch` backends) where a primary
+stores and serves resources by id while an Elasticsearch secondary serves
+search. A standalone backend has a single index, so there is nothing to drift.
+
+**Verify**: fetch the finished status manifest with `GET
+/bulk-submit-status/{poll_token}` and scan its `error` artifact for
+OperationOutcome issues coded `incomplete` — `severity: error` names a
+resource the secondary rejected (`processing-error`, still stored and
+readable by id); `severity: warning` names a resource type whose tenant-wide
+count disagrees between the primary and a secondary. Confirm the count
+directly against the secondary with `_summary=count`, scoped to the same
+tenant:
+
+```bash
+curl -H "X-Tenant-ID: clinic-a" "http://localhost:8080/Patient?_summary=count"
+```
+
+Compare that against the primary's own count for the same type and tenant
+(the dashboard in the UI, or the backend's `count`). Note this is the
+type's tenant-wide count, not just this manifest's entries — a drift can
+predate the manifest that surfaced it.
+
+**Repair**: rebuild the affected resource type's search index with
+`$reindex`, which requires the `system/reindex` scope:
+
+```bash
+curl -X POST -H "Authorization: Bearer $TOKEN" -H "X-Tenant-ID: clinic-a" \
+  http://localhost:8080/Patient/\$reindex
+# -> 202 Accepted, a Parameters resource with a "jobId" parameter
+
+curl -H "Authorization: Bearer $TOKEN" \
+  http://localhost:8080/\$reindex-status/{job_id}
+```
+
+`$reindex` rebuilds the whole resource type for the tenant, not only the
+manifest's resources, and its job state is per-process — poll the node you
+kicked it off against. See #1007 and `HFS_COMPOSITE_SYNC_MODE` above for why
+the drift check does not always run.
 
 ## Ingest performance
 
