@@ -2087,6 +2087,667 @@ async fn mongodb_integration_history_providers() {
     assert!(system_count >= 4);
 }
 
+// ---------------------------------------------------------------------------
+// #1053: history_type / history_system must page via a server-side sort +
+// limit + cursor predicate rather than draining the whole history corpus into
+// memory before sorting/paging in Rust. See mongodb storage.rs history_type /
+// history_system and the module-level doc comment there.
+// ---------------------------------------------------------------------------
+
+use mongodb::Collection;
+
+/// Seeds `obs_count` Observations with 3 versions each (create + 2 updates)
+/// and returns the (id, version_id) history keys in creation order:
+/// `hist-obs-0` v1, v2, v3, `hist-obs-1` v1, v2, v3, ...
+async fn seed_type_history_corpus(
+    backend: &MongoBackend,
+    tenant: &TenantContext,
+    obs_count: usize,
+) -> Vec<(String, String)> {
+    let mut keys = Vec::new();
+    for i in 0..obs_count {
+        let id = format!("hist-obs-{i}");
+        let v1 = backend
+            .create(
+                tenant,
+                "Observation",
+                json!({"resourceType": "Observation", "id": id, "status": "final"}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        keys.push((id.clone(), "1".to_string()));
+
+        let v2 = backend
+            .update(
+                tenant,
+                &v1,
+                json!({"resourceType": "Observation", "id": id, "status": "amended"}),
+            )
+            .await
+            .unwrap();
+        keys.push((id.clone(), "2".to_string()));
+
+        backend
+            .update(
+                tenant,
+                &v2,
+                json!({"resourceType": "Observation", "id": id, "status": "final"}),
+            )
+            .await
+            .unwrap();
+        keys.push((id.clone(), "3".to_string()));
+    }
+    keys
+}
+
+/// Overwrites `last_updated` on one `resource_history` row directly, so tests
+/// can pin a deterministic, wall-clock-independent ordering instead of
+/// trusting back-to-back millisecond-resolution writes not to tie.
+async fn stamp_history_last_updated(
+    history: &Collection<Document>,
+    tenant: &TenantContext,
+    resource_type: &str,
+    id: &str,
+    version_id: &str,
+    ts: mongodb::bson::DateTime,
+) {
+    let result = history
+        .update_one(
+            doc! {
+                "tenant_id": tenant.tenant_id().as_str(),
+                "resource_type": resource_type,
+                "id": id,
+                "version_id": version_id,
+            },
+            doc! { "$set": { "last_updated": ts } },
+        )
+        .await
+        .expect("failed to stamp resource_history.last_updated");
+    assert_eq!(
+        result.matched_count, 1,
+        "expected exactly one history row for ({resource_type}, {id}, v{version_id})"
+    );
+}
+
+fn history_ts(base_millis: i64, offset_secs: i64) -> mongodb::bson::DateTime {
+    mongodb::bson::DateTime::from_millis(base_millis + offset_secs * 1000)
+}
+
+/// Pin for #1053: `history_type` must not read rows outside the requested
+/// page. A `data`-less sentinel row sits at the *oldest* timestamp (well
+/// outside the first two pages); today's unbounded `find` drains it into
+/// `parse_history_row`, which errors on the missing payload even though the
+/// sentinel is nowhere near the page being requested. After the fix the
+/// server-side `sort + limit` means the sentinel is never fetched for a
+/// small page, and assertion (3) below proves the sentinel is still live
+/// (and still errors) once the requested window actually reaches it — so a
+/// future tolerant parse that swallowed missing-payload rows could not make
+/// this test pass vacuously.
+#[tokio::test]
+async fn mongodb_history_type_does_not_read_rows_outside_the_page() {
+    let Some(backend) = create_backend("history_page_bounds").await else {
+        eprintln!(
+            "Skipping mongodb_history_type_does_not_read_rows_outside_the_page (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = create_tenant("tenant-history-page-bounds");
+
+    // 10 Observations x 3 versions = 30 good history rows.
+    seed_type_history_corpus(&backend, &tenant, 10).await;
+
+    let client = raw_test_client(&backend.config().connection_string)
+        .await
+        .expect("failed to connect raw MongoDB client");
+    let database = client.database(&backend.config().database_name);
+    let history: Collection<Document> = database.collection("resource_history");
+
+    // Deterministic timestamps: row k (k = i*3 + (v-1)) gets base + k seconds,
+    // so descending last_updated order is exactly descending k, with no ties.
+    let base_millis = chrono::Utc::now().timestamp_millis() - 1_000_000;
+    for i in 0..10usize {
+        for v in 1..=3usize {
+            let k = (i * 3 + (v - 1)) as i64;
+            stamp_history_last_updated(
+                &history,
+                &tenant,
+                "Observation",
+                &format!("hist-obs-{i}"),
+                &v.to_string(),
+                history_ts(base_millis, k),
+            )
+            .await;
+        }
+    }
+
+    // Sentinel: oldest timestamp of all, no `data` field, unique id so the
+    // (tenant_id, resource_type, id, version_id) unique index is satisfied.
+    history
+        .insert_one(doc! {
+            "tenant_id": tenant.tenant_id().as_str(),
+            "resource_type": "Observation",
+            "id": "sentinel-1053",
+            "version_id": "1",
+            "last_updated": history_ts(base_millis, -1000),
+            "is_deleted": false,
+            "fhir_version": "R4",
+        })
+        .await
+        .expect("failed to insert sentinel history row");
+
+    // Expected global order (newest first) is descending k: 29, 28, ..., 0.
+    let expected: Vec<(String, String)> = (0..30i64)
+        .rev()
+        .map(|k| {
+            let i = k / 3;
+            let v = (k % 3) + 1;
+            (format!("hist-obs-{i}"), v.to_string())
+        })
+        .collect();
+
+    // --- Assertion (1): THE PIN ---
+    let params = HistoryParams::new().count(10).include_deleted(true);
+    let page1 = backend
+        .history_type(&tenant, "Observation", &params)
+        .await
+        .expect(
+            "history_type must not read past the requested page \
+             (a data-less sentinel far outside the page must not surface)",
+        );
+    assert_eq!(page1.items.len(), 10);
+    let page1_keys: Vec<(String, String)> = page1
+        .items
+        .iter()
+        .map(|e| (e.resource.id().to_string(), e.resource.version_id().to_string()))
+        .collect();
+    assert_eq!(page1_keys, expected[0..10]);
+    assert!(page1.page_info.has_next);
+    let next_cursor = page1
+        .page_info
+        .next_cursor
+        .clone()
+        .expect("expected a next_cursor for page 1");
+
+    // --- Assertion (2): CURSOR CONSISTENCY ---
+    let mut params2 = HistoryParams::new().count(10).include_deleted(true);
+    params2.pagination = helios_persistence::types::Pagination::with_cursor(10, next_cursor);
+    let page2 = backend
+        .history_type(&tenant, "Observation", &params2)
+        .await
+        .expect("page 2 must succeed (its fetch window does not reach the sentinel)");
+    assert_eq!(page2.items.len(), 10);
+    let page2_keys: Vec<(String, String)> = page2
+        .items
+        .iter()
+        .map(|e| (e.resource.id().to_string(), e.resource.version_id().to_string()))
+        .collect();
+    assert_eq!(page2_keys, expected[10..20]);
+    // Disjoint from page 1, contiguous with it.
+    for key in &page2_keys {
+        assert!(!page1_keys.contains(key), "page 2 repeated a page 1 row: {key:?}");
+    }
+
+    // --- Assertion (3): CANARY PREMISE ---
+    // A window wide enough to actually reach the sentinel must still error,
+    // proving the sentinel is live and matches the filter (i.e. it is only
+    // absent from assertion (1) because the page stopped short of it).
+    let wide_params = HistoryParams::new().count(100).include_deleted(true);
+    let err = backend
+        .history_type(&tenant, "Observation", &wide_params)
+        .await
+        .expect_err("a window reaching the sentinel must surface its missing payload");
+    let message = format!("{err}");
+    assert!(
+        message.contains("Missing history payload"),
+        "expected a missing-payload error, got: {message}"
+    );
+}
+
+/// Companion to the pin test: no sentinel, walks every page via `next_cursor`
+/// and checks the full corpus comes back in the right order with no
+/// duplicates or omissions. Includes one deliberate (last_updated, id) tie
+/// pair placed strictly inside page 1, to pin that the version_id tie-break
+/// (last_updated desc, id desc, version_id desc) survives in Rust once the
+/// sort/limit/cursor predicate move server-side.
+#[tokio::test]
+async fn mongodb_history_type_paging_is_ordered_and_complete() {
+    let Some(backend) = create_backend("history_paging_complete").await else {
+        eprintln!(
+            "Skipping mongodb_history_type_paging_is_ordered_and_complete (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = create_tenant("tenant-history-paging-complete");
+
+    // 8 Observations x 3 versions = 24 rows, plus 2 extra versions on
+    // "hist-obs-0" (v4, v5) sharing v3's timestamp to create a tie group that
+    // straddles nothing but sits inside page 1 (count=5).
+    seed_type_history_corpus(&backend, &tenant, 8).await;
+    let obs0_v3 = backend
+        .read(&tenant, "Observation", "hist-obs-0")
+        .await
+        .unwrap()
+        .unwrap();
+    let obs0_v4 = backend
+        .update(
+            &tenant,
+            &obs0_v3,
+            json!({"resourceType": "Observation", "id": "hist-obs-0", "status": "final"}),
+        )
+        .await
+        .unwrap();
+    backend
+        .update(
+            &tenant,
+            &obs0_v4,
+            json!({"resourceType": "Observation", "id": "hist-obs-0", "status": "final"}),
+        )
+        .await
+        .unwrap();
+
+    let client = raw_test_client(&backend.config().connection_string)
+        .await
+        .expect("failed to connect raw MongoDB client");
+    let database = client.database(&backend.config().database_name);
+    let history: Collection<Document> = database.collection("resource_history");
+
+    let base_millis = chrono::Utc::now().timestamp_millis() - 1_000_000;
+    // 26 total rows: assign distinct k = 0..25 to every (id, version) except
+    // that hist-obs-0's v4 and v5 both get k = 25 (the newest slot), forming
+    // the deliberate tie: version_id 5 must sort before version_id 4.
+    let mut k = 0i64;
+    let mut expected_by_k: Vec<(i64, String, String)> = Vec::new();
+    for i in 0..8usize {
+        for v in 1..=3usize {
+            expected_by_k.push((k, format!("hist-obs-{i}"), v.to_string()));
+            stamp_history_last_updated(
+                &history,
+                &tenant,
+                "Observation",
+                &format!("hist-obs-{i}"),
+                &v.to_string(),
+                history_ts(base_millis, k),
+            )
+            .await;
+            k += 1;
+        }
+    }
+    // Tie pair: v4 and v5 of hist-obs-0 share the *next* timestamp (k = 25).
+    let tie_k = k;
+    for v in [4usize, 5usize] {
+        stamp_history_last_updated(
+            &history,
+            &tenant,
+            "Observation",
+            "hist-obs-0",
+            &v.to_string(),
+            history_ts(base_millis, tie_k),
+        )
+        .await;
+    }
+    expected_by_k.push((tie_k, "hist-obs-0".to_string(), "5".to_string()));
+    expected_by_k.push((tie_k, "hist-obs-0".to_string(), "4".to_string()));
+
+    // Expected global order: descending k; within a k tie, descending
+    // version_id (the Rust-side tie-break).
+    let mut expected = expected_by_k;
+    expected.sort_by(|a, b| {
+        b.0.cmp(&a.0)
+            .then_with(|| b.2.parse::<i64>().unwrap().cmp(&a.2.parse::<i64>().unwrap()))
+    });
+    let expected: Vec<(String, String)> = expected.into_iter().map(|(_, id, v)| (id, v)).collect();
+    assert_eq!(expected.len(), 26);
+    // The tie pair (v5, v4) must be strictly inside page 1 (count=5): it's
+    // rank 1-2 of 26, well inside the first 5.
+    assert_eq!(expected[0], ("hist-obs-0".to_string(), "5".to_string()));
+    assert_eq!(expected[1], ("hist-obs-0".to_string(), "4".to_string()));
+
+    let mut all_rows: Vec<(String, String)> = Vec::new();
+    let mut params = HistoryParams::new().count(5).include_deleted(true);
+    loop {
+        let page = backend
+            .history_type(&tenant, "Observation", &params)
+            .await
+            .expect("paging through the full corpus must not error");
+        let keys: Vec<(String, String)> = page
+            .items
+            .iter()
+            .map(|e| (e.resource.id().to_string(), e.resource.version_id().to_string()))
+            .collect();
+        all_rows.extend(keys);
+
+        if page.page_info.has_next {
+            let cursor = page.page_info.next_cursor.expect("has_next implies a cursor");
+            params = HistoryParams::new().count(5).include_deleted(true);
+            params.pagination = helios_persistence::types::Pagination::with_cursor(5, cursor);
+        } else {
+            break;
+        }
+    }
+
+    assert_eq!(all_rows.len(), expected.len(), "row count mismatch");
+    assert_eq!(all_rows, expected, "row order mismatch");
+    let mut dedup_check = all_rows.clone();
+    dedup_check.sort();
+    dedup_check.dedup();
+    assert_eq!(dedup_check.len(), all_rows.len(), "found duplicate rows across pages");
+}
+
+/// Mirror of the pin test for `history_system`: sentinel row of a resource
+/// type that already appears in the corpus, at the oldest timestamp, no
+/// `data` field.
+#[tokio::test]
+async fn mongodb_history_system_does_not_read_rows_outside_the_page() {
+    let Some(backend) = create_backend("history_system_page_bounds").await else {
+        eprintln!(
+            "Skipping mongodb_history_system_does_not_read_rows_outside_the_page (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = create_tenant("tenant-history-system-page-bounds");
+
+    // 5 Patients + 5 Observations, 3 versions each = 30 rows.
+    for i in 0..5usize {
+        let id = format!("sys-pat-{i}");
+        let v1 = backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType": "Patient", "id": id, "name": [{"family": "X"}]}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        let v2 = backend
+            .update(
+                &tenant,
+                &v1,
+                json!({"resourceType": "Patient", "id": id, "name": [{"family": "Y"}]}),
+            )
+            .await
+            .unwrap();
+        backend
+            .update(
+                &tenant,
+                &v2,
+                json!({"resourceType": "Patient", "id": id, "name": [{"family": "Z"}]}),
+            )
+            .await
+            .unwrap();
+    }
+    seed_type_history_corpus(&backend, &tenant, 5).await;
+
+    let client = raw_test_client(&backend.config().connection_string)
+        .await
+        .expect("failed to connect raw MongoDB client");
+    let database = client.database(&backend.config().database_name);
+    let history: Collection<Document> = database.collection("resource_history");
+
+    // Deterministic, distinct timestamps across all 30 rows: Patients get
+    // k = 0..14, Observations get k = 15..29 (so ordering is unambiguous by
+    // timestamp alone; resource_type/id tie-break is covered by the type
+    // history companion test).
+    let base_millis = chrono::Utc::now().timestamp_millis() - 1_000_000;
+    let mut expected: Vec<(String, String, String)> = Vec::new();
+    let mut k = 0i64;
+    for i in 0..5usize {
+        for v in 1..=3usize {
+            let id = format!("sys-pat-{i}");
+            stamp_history_last_updated(&history, &tenant, "Patient", &id, &v.to_string(), history_ts(base_millis, k))
+                .await;
+            expected.push(("Patient".to_string(), id, v.to_string()));
+            k += 1;
+        }
+    }
+    for i in 0..5usize {
+        for v in 1..=3usize {
+            let id = format!("hist-obs-{i}");
+            stamp_history_last_updated(&history, &tenant, "Observation", &id, &v.to_string(), history_ts(base_millis, k))
+                .await;
+            expected.push(("Observation".to_string(), id, v.to_string()));
+            k += 1;
+        }
+    }
+    expected.reverse(); // newest (highest k) first
+
+    history
+        .insert_one(doc! {
+            "tenant_id": tenant.tenant_id().as_str(),
+            "resource_type": "Patient",
+            "id": "sentinel-1053-system",
+            "version_id": "1",
+            "last_updated": history_ts(base_millis, -1000),
+            "is_deleted": false,
+            "fhir_version": "R4",
+        })
+        .await
+        .expect("failed to insert sentinel history row");
+
+    let params = HistoryParams::new().count(10).include_deleted(true);
+    let page1 = backend
+        .history_system(&tenant, &params)
+        .await
+        .expect("history_system must not read past the requested page");
+    assert_eq!(page1.items.len(), 10);
+    let page1_keys: Vec<(String, String, String)> = page1
+        .items
+        .iter()
+        .map(|e| {
+            (
+                e.resource.resource_type().to_string(),
+                e.resource.id().to_string(),
+                e.resource.version_id().to_string(),
+            )
+        })
+        .collect();
+    assert_eq!(page1_keys, expected[0..10]);
+    assert!(page1.page_info.has_next);
+
+    let wide_params = HistoryParams::new().count(100).include_deleted(true);
+    let err = backend
+        .history_system(&tenant, &wide_params)
+        .await
+        .expect_err("a window reaching the sentinel must surface its missing payload");
+    assert!(
+        format!("{err}").contains("Missing history payload"),
+        "expected a missing-payload error"
+    );
+}
+
+/// Scale-free plan guard: the winning plan for the *first* (no-cursor) page
+/// must be a bounded index walk — sort and limit pushed to MongoDB, no
+/// blocking in-memory SORT stage, and keys/docs examined bounded by
+/// `_count`, not by the size of the corpus. Per code review: on a tiny
+/// corpus the cursor-page query can legitimately choose a residual-filter
+/// plan whose keysExamined scale with the cursor's rank rather than just
+/// `_count` (still O(rank + count), still non-blocking) — so this test only
+/// asserts the hard bound on the first page, where no cursor predicate is
+/// involved and the index alone must satisfy the whole query.
+#[tokio::test]
+async fn mongodb_history_type_plan_is_a_bounded_index_walk() {
+    let Some(backend) = create_backend("history_plan_guard").await else {
+        eprintln!(
+            "Skipping mongodb_history_type_plan_is_a_bounded_index_walk (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = create_tenant("tenant-history-plan-guard");
+
+    seed_type_history_corpus(&backend, &tenant, 10).await; // 30 rows
+
+    let client = raw_test_client(&backend.config().connection_string)
+        .await
+        .expect("failed to connect raw MongoDB client");
+    let db_name = backend.config().database_name.clone();
+    let database = client.database(&db_name);
+
+    if let Err(e) = database.run_command(doc! { "profile": 2_i32 }).await {
+        eprintln!(
+            "Skipping mongodb_history_type_plan_is_a_bounded_index_walk plan assertions: \
+             {{profile: 2}} was refused ({e})"
+        );
+        return;
+    }
+
+    let params = HistoryParams::new().count(10).include_deleted(true);
+    backend
+        .history_type(&tenant, "Observation", &params)
+        .await
+        .expect("history_type must succeed");
+
+    let _ = database.run_command(doc! { "profile": 0_i32 }).await;
+
+    let profile: Collection<Document> = database.collection("system.profile");
+    let opts = mongodb::options::FindOptions::builder()
+        .sort(doc! { "ts": -1_i32 })
+        .limit(20)
+        .build();
+    let mut cursor = profile
+        .find(doc! {
+            "ns": format!("{db_name}.resource_history"),
+            "op": "query",
+            "command.find": "resource_history",
+        })
+        .with_options(opts)
+        .await
+        .expect("failed to query system.profile");
+
+    let mut entry: Option<Document> = None;
+    while cursor.advance().await.expect("failed to advance profile cursor") {
+        let doc = cursor.deserialize_current().expect("failed to deserialize profile entry");
+        entry = Some(doc);
+        break;
+    }
+    let entry = entry.expect("expected a profiled find on resource_history");
+
+    let command = entry
+        .get_document("command")
+        .expect("profile entry missing command");
+    assert_eq!(
+        command.get_document("sort").ok(),
+        Some(&doc! { "last_updated": -1_i32, "id": -1_i32 })
+    );
+    let limit = command
+        .get_i32("limit")
+        .map(i64::from)
+        .or_else(|_| command.get_i64("limit"))
+        .expect("command missing limit");
+    assert_eq!(limit, 11);
+
+    // On MongoDB 5.0 `hasSortStage` is simply absent when there is no sort
+    // stage — must not unwrap a missing field as an error.
+    let has_sort_stage = entry.get_bool("hasSortStage").unwrap_or(false);
+    assert!(!has_sort_stage, "expected no blocking sort stage on the first page");
+
+    let docs_examined = entry.get_i64("docsExamined").or_else(|_| entry.get_i32("docsExamined").map(i64::from));
+    let keys_examined = entry.get_i64("keysExamined").or_else(|_| entry.get_i32("keysExamined").map(i64::from));
+    if let Ok(d) = docs_examined {
+        assert!(d <= 11, "docsExamined {d} exceeds count+1 (11) on the first page");
+    }
+    if let Ok(k) = keys_examined {
+        assert!(k <= 11, "keysExamined {k} exceeds count+1 (11) on the first page");
+    }
+
+    let plan_summary = entry.get_str("planSummary").unwrap_or_default();
+    assert!(plan_summary.contains("IXSCAN"), "expected an IXSCAN plan, got: {plan_summary}");
+
+    // Rebuild the inner find command from exactly what the server recorded
+    // (command also carries $db/lsid/$readPreference, which explain rejects).
+    let mut inner = Document::new();
+    for key in ["find", "filter", "sort", "limit", "projection"] {
+        if let Some(v) = command.get(key) {
+            inner.insert(key, v.clone());
+        }
+    }
+    let explain = database
+        .run_command(doc! { "explain": inner, "verbosity": "executionStats" })
+        .await
+        .expect("explain of the recorded find command failed");
+
+    let stats = explain
+        .get_document("executionStats")
+        .expect("explain missing executionStats");
+    let total_keys = stats.get_i64("totalKeysExamined").or_else(|_| stats.get_i32("totalKeysExamined").map(i64::from)).unwrap();
+    let total_docs = stats.get_i64("totalDocsExamined").or_else(|_| stats.get_i32("totalDocsExamined").map(i64::from)).unwrap();
+    assert!(total_keys <= 11, "explain totalKeysExamined {total_keys} exceeds 11");
+    assert!(total_docs <= 11, "explain totalDocsExamined {total_docs} exceeds 11");
+
+    // Only the *winning* plan matters here. `explain` also carries
+    // `queryPlanner.rejectedPlans` — other candidates the multi-planner
+    // tried and discarded (e.g. via idx_history_identity or
+    // idx_history_resource_updated), several of which legitimately contain
+    // their own SORT stage. Scanning the whole explain document (including
+    // rejected plans) would false-positive on those, so only the winning
+    // plan tree is searched for a blocking SORT.
+    let winning_plan = explain
+        .get_document("queryPlanner")
+        .expect("explain missing queryPlanner")
+        .get_document("winningPlan")
+        .expect("explain missing winningPlan");
+    assert!(
+        !contains_stage_named(winning_plan, "SORT"),
+        "winning plan contains a blocking SORT stage: {winning_plan:?}"
+    );
+    let mut index_names = Vec::new();
+    collect_index_names(winning_plan, &mut index_names);
+    assert!(
+        index_names.iter().any(|n| n == "idx_history_type_updated"),
+        "expected idx_history_type_updated in the winning plan, got: {index_names:?}"
+    );
+}
+
+/// Recursively searches a BSON document for a nested `"stage"` field equal
+/// exactly to `name` (case-sensitive). Used to assert the *absence* of a
+/// blocking `SORT` stage without false-positiving on the non-blocking
+/// `SORT_MERGE`.
+fn contains_stage_named(doc: &Document, name: &str) -> bool {
+    if doc.get_str("stage").map(|s| s == name).unwrap_or(false) {
+        return true;
+    }
+    for (_, v) in doc.iter() {
+        match v {
+            mongodb::bson::Bson::Document(d) => {
+                if contains_stage_named(d, name) {
+                    return true;
+                }
+            }
+            mongodb::bson::Bson::Array(arr) => {
+                for item in arr {
+                    if let mongodb::bson::Bson::Document(d) = item {
+                        if contains_stage_named(d, name) {
+                            return true;
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Recursively collects every `"indexName"` field found anywhere in a BSON
+/// document (explain output nests it under queryPlanner/winningPlan/inputStages).
+fn collect_index_names(doc: &Document, out: &mut Vec<String>) {
+    if let Ok(name) = doc.get_str("indexName") {
+        out.push(name.to_string());
+    }
+    for (_, v) in doc.iter() {
+        match v {
+            mongodb::bson::Bson::Document(d) => collect_index_names(d, out),
+            mongodb::bson::Bson::Array(arr) => {
+                for item in arr {
+                    if let mongodb::bson::Bson::Document(d) = item {
+                        collect_index_names(d, out);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 #[tokio::test]
 async fn mongodb_integration_history_delete_trial_use_not_supported() {
     let Some(backend) = create_backend("history_delete_not_supported").await else {
