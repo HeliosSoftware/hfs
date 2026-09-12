@@ -12,7 +12,7 @@ use helios_fhir::FhirVersion;
 use serde_json::Value;
 
 use crate::core::sof_runner::SofRunner;
-use crate::error::{BackendError, ResourceError, StorageError, StorageResult};
+use crate::error::{BackendError, ConcurrencyError, ResourceError, StorageError, StorageResult};
 use crate::tenant::TenantContext;
 use crate::types::StoredResource;
 
@@ -75,6 +75,40 @@ pub fn bucket_floor(ts: DateTime<Utc>, bucket_seconds: i64) -> DateTime<Utc> {
     // have negative epoch seconds) still land on the bucket that contains them.
     let floored = secs.div_euclid(bucket_seconds) * bucket_seconds;
     DateTime::from_timestamp(floored, 0).unwrap_or(ts)
+}
+
+/// Classifies a lost compare-and-swap on `restore_deleted`'s tombstone, from
+/// the version the re-read found (if any).
+///
+/// The guarded restore matched no row, so the tombstone the pre-read observed
+/// is gone. That re-read deliberately carries no `is_deleted` filter:
+/// "someone restored it" and "someone restored it, then re-deleted it" are the
+/// same fact for the caller. So any document still under that id means a
+/// concurrent writer moved the version on — `VersionConflict`, carrying what
+/// is *actually* stored, which `create_or_update` retries from a fresh read.
+/// No document at all means the row was hard-deleted underneath the restore:
+/// there is nothing left to converge on, and the honest answer is `NotFound`.
+///
+/// Shared by the backends so PostgreSQL and MongoDB cannot drift apart on the
+/// taxonomy, which is the whole point of stating it once.
+pub fn restore_cas_miss(
+    resource_type: &str,
+    id: &str,
+    expected_version: String,
+    actual_version: Option<String>,
+) -> StorageError {
+    match actual_version {
+        Some(actual_version) => StorageError::Concurrency(ConcurrencyError::VersionConflict {
+            resource_type: resource_type.to_string(),
+            id: id.to_string(),
+            expected_version,
+            actual_version,
+        }),
+        None => StorageError::Resource(ResourceError::NotFound {
+            resource_type: resource_type.to_string(),
+            id: id.to_string(),
+        }),
+    }
 }
 
 /// One `(weekday, hour)` cell of write-activity, used by
@@ -447,6 +481,25 @@ pub trait ResourceStorage: Send + Sync {
     ///
     /// A tuple of (StoredResource, created: bool) where created indicates
     /// whether a new resource was created (true) or an existing one updated (false).
+    /// Restoring a soft-deleted resource counts as created.
+    ///
+    /// # Concurrency
+    ///
+    /// Unconditional PUT is last-writer-wins: two callers racing on one id —
+    /// on one instance or across instances sharing the store — must both
+    /// succeed, with distinct versions and a complete history. Implementations
+    /// decide existence with a read, write with a version-guarded
+    /// compare-and-swap, and retry a bounded number of times when the read
+    /// went stale (`VersionConflict`, `AlreadyExists`, or `NotFound` from the
+    /// write), so none of those errors reaches the caller for a race the
+    /// caller did not ask to observe.
+    ///
+    /// # Errors
+    ///
+    /// * `StorageError::Tenant` - If the tenant lacks create/update permission
+    /// * `StorageError::Validation` - If the resource content is invalid
+    /// * `StorageError::Concurrency(VersionConflict)` - Only after the bounded
+    ///   retries are exhausted under sustained contention
     async fn create_or_update(
         &self,
         tenant: &TenantContext,
@@ -1136,6 +1189,47 @@ pub trait ConditionalStorage: ResourceStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A restore that lost its CAS to a writer who left *something* under the
+    /// id converges: `create_or_update` retries a `VersionConflict`, and the
+    /// version it reports must be the one actually stored, not the stale one
+    /// the pre-read saw — that is what makes the loser's report truthful.
+    #[test]
+    fn restore_cas_miss_reports_the_version_actually_stored() {
+        let err = restore_cas_miss("Patient", "p1", "2".to_string(), Some("3".to_string()));
+
+        match err {
+            StorageError::Concurrency(ConcurrencyError::VersionConflict {
+                resource_type,
+                id,
+                expected_version,
+                actual_version,
+            }) => {
+                assert_eq!(resource_type, "Patient");
+                assert_eq!(id, "p1");
+                assert_eq!(expected_version, "2", "the tombstone the pre-read observed");
+                assert_eq!(actual_version, "3", "what the winner left behind");
+            }
+            other => panic!("a document still under the id is a conflict, got {other:?}"),
+        }
+    }
+
+    /// The other half of the taxonomy: nothing at all under the id means the
+    /// row was hard-deleted underneath the restore. There is no version to
+    /// converge on, so retrying would spin — `NotFound` is the honest answer,
+    /// and `create_or_update` turns it into a fresh create.
+    #[test]
+    fn restore_cas_miss_reports_not_found_when_the_row_is_gone() {
+        let err = restore_cas_miss("Observation", "o1", "5".to_string(), None);
+
+        match err {
+            StorageError::Resource(ResourceError::NotFound { resource_type, id }) => {
+                assert_eq!(resource_type, "Observation");
+                assert_eq!(id, "o1");
+            }
+            other => panic!("a vanished row is NotFound, not a conflict, got {other:?}"),
+        }
+    }
 
     #[test]
     fn test_conditional_create_result_debug() {
