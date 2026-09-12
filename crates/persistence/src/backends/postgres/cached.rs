@@ -110,16 +110,19 @@
 //! made sargable-under-generic (the same treatment v34 gave the string
 //! predicate) before `auto` is safe to switch on.
 
-use deadpool_postgres::Client;
+use deadpool_postgres::{Client, GenericClient};
 use tokio_postgres::types::ToSql;
 use tokio_postgres::{Error, Row, Statement};
 
 /// `Client::execute` against the connection's cached prepared statement.
-pub(crate) async fn execute_cached(
-    client: &Client,
+pub(crate) async fn execute_cached<C>(
+    client: &C,
     sql: &str,
     params: &[&(dyn ToSql + Sync)],
-) -> Result<u64, Error> {
+) -> Result<u64, Error>
+where
+    C: GenericClient + ?Sized,
+{
     let statement = client.prepare_cached(sql).await?;
     client.execute(&statement, params).await
 }

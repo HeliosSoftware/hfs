@@ -84,11 +84,31 @@ pub enum Phase {
     Commit,
     /// Per-batch overhead outside the entry loop (BEGIN, manifest counters).
     BatchOverhead,
+    /// Fetch one page of stored resources for a reindex job.
+    ReindexFetch,
+    /// One writer rebuilding one reindex page in full.
+    ReindexPage,
+    /// Acquire the PostgreSQL connection used by a reindex page.
+    ReindexConnection,
+    /// Extract and marshal every resource in a PostgreSQL reindex page.
+    ReindexExtract,
+    /// Grouped delete from `search_index` for a PostgreSQL reindex page.
+    ReindexSearchDelete,
+    /// Grouped delete from `resource_fts` for a PostgreSQL reindex page.
+    ReindexFtsDelete,
+    /// Batched insert into `search_index` for a PostgreSQL reindex page.
+    ReindexSearchInsert,
+    /// Rebuild full-text rows for a PostgreSQL reindex page.
+    ReindexFts,
+    /// Commit a PostgreSQL reindex page.
+    ReindexCommit,
+    /// Retry a failed PostgreSQL reindex page through the individual path.
+    ReindexFallback,
 }
 
 impl Phase {
     /// All phases, in report order.
-    pub const ALL: [Phase; 19] = [
+    pub const ALL: [Phase; 29] = [
         Phase::NdjsonParse,
         Phase::Entry,
         Phase::EntryRead,
@@ -108,6 +128,16 @@ impl Phase {
         Phase::Bookkeeping,
         Phase::Commit,
         Phase::BatchOverhead,
+        Phase::ReindexFetch,
+        Phase::ReindexPage,
+        Phase::ReindexConnection,
+        Phase::ReindexExtract,
+        Phase::ReindexSearchDelete,
+        Phase::ReindexFtsDelete,
+        Phase::ReindexSearchInsert,
+        Phase::ReindexFts,
+        Phase::ReindexCommit,
+        Phase::ReindexFallback,
     ];
 
     /// The phase this one is measured inside of, if any. Drives the report's
@@ -130,6 +160,14 @@ impl Phase {
                 Some(Phase::Index)
             }
             Phase::IndexMarshal => Some(Phase::IndexInsert),
+            Phase::ReindexConnection
+            | Phase::ReindexExtract
+            | Phase::ReindexSearchDelete
+            | Phase::ReindexFtsDelete
+            | Phase::ReindexSearchInsert
+            | Phase::ReindexFts
+            | Phase::ReindexCommit
+            | Phase::ReindexFallback => Some(Phase::ReindexPage),
             _ => None,
         }
     }
@@ -156,11 +194,21 @@ impl Phase {
             Phase::Bookkeeping => "bookkeeping",
             Phase::Commit => "commit",
             Phase::BatchOverhead => "batch_overhead",
+            Phase::ReindexFetch => "reindex_fetch",
+            Phase::ReindexPage => "reindex_page (total)",
+            Phase::ReindexConnection => "reindex_connection",
+            Phase::ReindexExtract => "reindex_extract",
+            Phase::ReindexSearchDelete => "reindex_search_delete",
+            Phase::ReindexFtsDelete => "reindex_fts_delete",
+            Phase::ReindexSearchInsert => "reindex_search_insert",
+            Phase::ReindexFts => "reindex_fts",
+            Phase::ReindexCommit => "reindex_commit",
+            Phase::ReindexFallback => "reindex_fallback",
         }
     }
 }
 
-const PHASE_COUNT: usize = 19;
+const PHASE_COUNT: usize = 29;
 
 #[allow(clippy::declare_interior_mutable_const)]
 const ZERO: AtomicU64 = AtomicU64::new(0);
@@ -310,6 +358,38 @@ pub fn reset() {
 /// Renders the snapshot as a table: per-resource cost and share of `wall` for
 /// each phase, children indented under the phase that encloses them.
 pub fn report(resources: u64, wall: Duration) -> String {
+    report_totals(&snapshot(), resources, wall)
+}
+
+/// Renders only work recorded after `before`.
+///
+/// Counters are process-global. This subtraction is useful for a benchmark
+/// that runs one reindex job at a time, but concurrent jobs contribute to the
+/// same delta and cannot be separated by job id.
+pub fn report_since(before: &[PhaseTotals], resources: u64, wall: Duration) -> String {
+    let after = snapshot();
+    let delta: Vec<PhaseTotals> = after
+        .iter()
+        .enumerate()
+        .map(|(index, totals)| {
+            let old = before.get(index).copied().unwrap_or(PhaseTotals {
+                phase: totals.phase,
+                elapsed: Duration::ZERO,
+                hits: 0,
+                rows: 0,
+            });
+            PhaseTotals {
+                phase: totals.phase,
+                elapsed: totals.elapsed.saturating_sub(old.elapsed),
+                hits: totals.hits.saturating_sub(old.hits),
+                rows: totals.rows.saturating_sub(old.rows),
+            }
+        })
+        .collect();
+    report_totals(&delta, resources, wall)
+}
+
+fn report_totals(totals_by_phase: &[PhaseTotals], resources: u64, wall: Duration) -> String {
     let mut out = String::new();
     out.push_str(&format!(
         "{:<28} {:>12} {:>12} {:>10} {:>10}\n",
@@ -323,7 +403,7 @@ pub fn report(resources: u64, wall: Duration) -> String {
         100.0,
         resources
     ));
-    for totals in snapshot() {
+    for totals in totals_by_phase {
         if totals.hits == 0 {
             continue;
         }
@@ -479,5 +559,27 @@ mod tests {
         for (i, phase) in Phase::ALL.iter().enumerate() {
             assert_eq!(*phase as usize, i, "{} out of order", phase.label());
         }
+    }
+
+    #[cfg(perf_phases)]
+    #[test]
+    fn report_since_contains_only_the_counter_delta() {
+        let _guard = SWITCH.lock();
+        set_enabled(true);
+        reset();
+        add_rows(Phase::ReindexSearchInsert, 7);
+        let before = snapshot();
+        {
+            let _span = span(Phase::ReindexSearchInsert);
+            add_rows(Phase::ReindexSearchInsert, 11);
+        }
+        {
+            let _span = span(Phase::ReindexCommit);
+        }
+        let report = report_since(&before, 2, Duration::from_secs(1));
+        set_enabled(false);
+        assert!(report.contains("reindex_search_insert"));
+        assert!(report.contains("rows=11 (5.50/resource)"));
+        assert!(report.contains("reindex_commit"));
     }
 }

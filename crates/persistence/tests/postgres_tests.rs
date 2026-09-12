@@ -1980,6 +1980,10 @@ mod postgres_integration {
     /// Schema is initialized once when the shared container starts; `init_schema()` is
     /// idempotent (uses CREATE TABLE IF NOT EXISTS).
     async fn create_backend() -> PostgresBackend {
+        create_backend_with_max_connections(5).await
+    }
+
+    async fn create_backend_with_max_connections(max_connections: usize) -> PostgresBackend {
         let pg = shared_pg().await;
 
         let data_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -1994,7 +1998,7 @@ mod postgres_integration {
             dbname: "postgres".to_string(),
             user: "postgres".to_string(),
             password: Some("postgres".to_string()),
-            max_connections: 5,
+            max_connections,
             data_dir: Some(data_dir),
             ..Default::default()
         };
@@ -5922,6 +5926,764 @@ mod postgres_integration {
     // Reindex Tests
     // ========================================================================
 
+    async fn reindex_test_client() -> tokio_postgres::Client {
+        let pg = shared_pg().await;
+        let conn_str = format!(
+            "host={} port={} user=postgres password=postgres dbname=postgres",
+            pg.host, pg.port,
+        );
+        let (client, connection) = tokio_postgres::connect(&conn_str, tokio_postgres::NoTls)
+            .await
+            .expect("connect to shared pg for reindex assertions");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        client
+    }
+
+    #[tokio::test]
+    async fn postgres_integration_reindex_page_batches_and_scopes_writes() {
+        use helios_persistence::search::{ReindexSource, ReindexTarget};
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("reindex-page-batch");
+        let other_tenant = create_tenant("reindex-page-bystander");
+        let tenant_id = tenant.tenant_id().as_str();
+        let other_tenant_id = other_tenant.tenant_id().as_str();
+
+        for (id, family) in [
+            ("page-a", "Able"),
+            ("page-b", "Baker"),
+            ("outside", "Clark"),
+        ] {
+            backend
+                .create(
+                    &tenant,
+                    "Patient",
+                    json!({
+                        "resourceType": "Patient",
+                        "id": id,
+                        "name": [{"family": family}],
+                        "contained": [{
+                            "resourceType": "Practitioner",
+                            "id": format!("contained-{id}"),
+                            "name": [{"family": format!("Contained {family}")}]
+                        }]
+                    }),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+        backend
+            .create(
+                &other_tenant,
+                "Patient",
+                json!({
+                    "resourceType": "Patient",
+                    "id": "page-a",
+                    "name": [{"family": "Bystander"}]
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+
+        let client = reindex_test_client().await;
+        for (scoped_tenant, id) in [
+            (tenant_id, "page-a"),
+            (tenant_id, "page-b"),
+            (tenant_id, "outside"),
+            (other_tenant_id, "page-a"),
+        ] {
+            client
+                .execute(
+                    "INSERT INTO search_index
+                     (tenant_id, resource_type, resource_id, param_name, value_string)
+                     VALUES ($1, 'Patient', $2, 'obsolete-batch-probe', 'stale')",
+                    &[&scoped_tenant, &id],
+                )
+                .await
+                .unwrap();
+        }
+
+        let page = backend
+            .fetch_resources_page(&tenant, "Patient", None, 2)
+            .await
+            .unwrap();
+        assert_eq!(
+            page.resources.iter().map(|r| r.id()).collect::<Vec<_>>(),
+            vec!["page-a", "page-b"]
+        );
+
+        let before: Vec<(String, serde_json::Value)> = client
+            .query(
+                "SELECT version_id, data FROM resources
+                 WHERE tenant_id = $1 AND resource_type = 'Patient'
+                   AND id = ANY($2::text[]) ORDER BY id",
+                &[&tenant_id, &vec!["page-a", "page-b"]],
+            )
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| (row.get(0), row.get(1)))
+            .collect();
+        let history_before: i64 = client
+            .query_one(
+                "SELECT COUNT(*) FROM resource_history
+                 WHERE tenant_id = $1 AND resource_type = 'Patient'
+                   AND id = ANY($2::text[])",
+                &[&tenant_id, &vec!["page-a", "page-b"]],
+            )
+            .await
+            .unwrap()
+            .get(0);
+
+        let results = backend
+            .write_search_entries_page(&tenant, &page.resources)
+            .await;
+        assert_eq!(results.len(), 2);
+        assert!(results.iter().all(Result::is_ok));
+        assert!(results.iter().all(|result| *result.as_ref().unwrap() > 0));
+
+        let remaining_stale: Vec<(String, String)> = client
+            .query(
+                "SELECT tenant_id, resource_id FROM search_index
+                 WHERE param_name = 'obsolete-batch-probe'
+                   AND ((tenant_id = $1 AND resource_id = ANY($2::text[]))
+                     OR (tenant_id = $3 AND resource_id = 'page-a'))
+                 ORDER BY tenant_id, resource_id",
+                &[
+                    &tenant_id,
+                    &vec!["page-a", "page-b", "outside"],
+                    &other_tenant_id,
+                ],
+            )
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| (row.get(0), row.get(1)))
+            .collect();
+        assert_eq!(remaining_stale.len(), 2);
+        assert!(remaining_stale.contains(&(tenant_id.to_string(), "outside".to_string())));
+        assert!(remaining_stale.contains(&(other_tenant_id.to_string(), "page-a".to_string())));
+
+        for resource in &page.resources {
+            let contained_count: i64 = client
+                .query_one(
+                    "SELECT COUNT(*) FROM search_index
+                     WHERE tenant_id = $1 AND resource_type = 'Patient'
+                       AND resource_id = $2 AND is_contained = TRUE",
+                    &[&tenant_id, &resource.id()],
+                )
+                .await
+                .unwrap()
+                .get(0);
+            assert!(contained_count > 0);
+        }
+
+        let after: Vec<(String, serde_json::Value)> = client
+            .query(
+                "SELECT version_id, data FROM resources
+                 WHERE tenant_id = $1 AND resource_type = 'Patient'
+                   AND id = ANY($2::text[]) ORDER BY id",
+                &[&tenant_id, &vec!["page-a", "page-b"]],
+            )
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| (row.get(0), row.get(1)))
+            .collect();
+        let history_after: i64 = client
+            .query_one(
+                "SELECT COUNT(*) FROM resource_history
+                 WHERE tenant_id = $1 AND resource_type = 'Patient'
+                   AND id = ANY($2::text[])",
+                &[&tenant_id, &vec!["page-a", "page-b"]],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(after, before);
+        assert_eq!(history_after, history_before);
+    }
+
+    #[tokio::test]
+    async fn postgres_integration_reindex_page_uses_one_transaction_for_all_index_writes() {
+        use helios_persistence::search::{ReindexSource, ReindexTarget};
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("reindex-page-single-transaction");
+        let tenant_id = tenant.tenant_id().as_str();
+        for id in ["tx-a", "tx-b"] {
+            backend
+                .create(
+                    &tenant,
+                    "Patient",
+                    json!({
+                        "resourceType": "Patient",
+                        "id": id,
+                        "name": [{"family": id}]
+                    }),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+        let page = backend
+            .fetch_resources_page(&tenant, "Patient", None, 10)
+            .await
+            .unwrap();
+
+        let client = reindex_test_client().await;
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let table_name = format!("reindex_tx_probe_{suffix}");
+        let function_name = format!("record_reindex_tx_{suffix}");
+        let search_trigger = format!("record_search_tx_{suffix}");
+        let fts_trigger = format!("record_fts_tx_{suffix}");
+        client
+            .batch_execute(&format!(
+                "CREATE TABLE {table_name} (operation text NOT NULL, transaction_id bigint NOT NULL);
+                 CREATE FUNCTION {function_name}() RETURNS trigger LANGUAGE plpgsql AS $$
+                 BEGIN
+                   IF TG_OP = 'DELETE' THEN
+                     IF OLD.tenant_id = '{tenant_id}' THEN
+                       INSERT INTO {table_name} VALUES (TG_TABLE_NAME || '_delete', txid_current());
+                     END IF;
+                     RETURN OLD;
+                   END IF;
+                   IF NEW.tenant_id = '{tenant_id}' THEN
+                     INSERT INTO {table_name} VALUES (TG_TABLE_NAME || '_insert', txid_current());
+                   END IF;
+                   RETURN NEW;
+                 END $$;
+                 CREATE TRIGGER {search_trigger} AFTER INSERT OR DELETE ON search_index
+                 FOR EACH ROW EXECUTE FUNCTION {function_name}();
+                 CREATE TRIGGER {fts_trigger} AFTER INSERT OR DELETE ON resource_fts
+                 FOR EACH ROW EXECUTE FUNCTION {function_name}();"
+            ))
+            .await
+            .unwrap();
+
+        let results = backend
+            .write_search_entries_page(&tenant, &page.resources)
+            .await;
+        let probe_rows: Vec<(String, i64)> = client
+            .query(
+                &format!(
+                    "SELECT DISTINCT operation, transaction_id FROM {table_name} ORDER BY operation"
+                ),
+                &[],
+            )
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| (row.get(0), row.get(1)))
+            .collect();
+
+        client
+            .batch_execute(&format!(
+                "DROP TRIGGER {search_trigger} ON search_index;
+                 DROP TRIGGER {fts_trigger} ON resource_fts;
+                 DROP FUNCTION {function_name}();
+                 DROP TABLE {table_name};"
+            ))
+            .await
+            .unwrap();
+
+        assert!(results.iter().all(Result::is_ok));
+        assert_eq!(
+            probe_rows
+                .iter()
+                .map(|(operation, _)| operation.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "resource_fts_delete",
+                "resource_fts_insert",
+                "search_index_delete",
+                "search_index_insert",
+            ]
+        );
+        assert_eq!(
+            probe_rows
+                .iter()
+                .map(|(_, transaction_id)| *transaction_id)
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            1,
+            "all page index writes must share one PostgreSQL transaction"
+        );
+    }
+
+    #[tokio::test]
+    async fn postgres_integration_reindex_page_failure_releases_single_connection_pool() {
+        use helios_persistence::search::{ReindexSource, ReindexTarget};
+
+        let backend = create_backend_with_max_connections(1).await;
+        let tenant = create_tenant("reindex-page-one-connection");
+        let tenant_id = tenant.tenant_id().as_str();
+        for id in ["one-a", "one-fail", "one-c"] {
+            backend
+                .create(
+                    &tenant,
+                    "Patient",
+                    json!({
+                        "resourceType": "Patient",
+                        "id": id,
+                        "name": [{"family": id}]
+                    }),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+        let page = backend
+            .fetch_resources_page(&tenant, "Patient", None, 10)
+            .await
+            .unwrap();
+        let client = reindex_test_client().await;
+        client
+            .execute(
+                "INSERT INTO search_index
+                 (tenant_id, resource_type, resource_id, param_name, value_string)
+                 VALUES ($1, 'Patient', 'one-fail', 'obsolete-one-connection', 'stale')",
+                &[&tenant_id],
+            )
+            .await
+            .unwrap();
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let function_name = format!("reject_one_connection_{suffix}");
+        let trigger_name = format!("reject_one_connection_{suffix}");
+        client
+            .batch_execute(&format!(
+                "CREATE FUNCTION {function_name}() RETURNS trigger LANGUAGE plpgsql AS $$
+                 BEGIN
+                   IF NEW.tenant_id = '{tenant_id}' AND NEW.resource_id = 'one-fail' THEN
+                     RAISE EXCEPTION 'deliberate one-connection reindex failure';
+                   END IF;
+                   RETURN NEW;
+                 END $$;
+                 CREATE TRIGGER {trigger_name} BEFORE INSERT ON search_index
+                 FOR EACH ROW EXECUTE FUNCTION {function_name}();"
+            ))
+            .await
+            .unwrap();
+
+        let results = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            backend.write_search_entries_page(&tenant, &page.resources),
+        )
+        .await
+        .expect("fallback must not deadlock a one-connection pool");
+
+        client
+            .batch_execute(&format!(
+                "DROP TRIGGER {trigger_name} ON search_index;
+                 DROP FUNCTION {function_name}();"
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(results.len(), 3);
+        for (resource, result) in page.resources.iter().zip(&results) {
+            if resource.id() == "one-fail" {
+                let error = result.as_ref().expect_err("trigger target must fail");
+                assert!(
+                    error
+                        .to_string()
+                        .contains("deliberate one-connection reindex failure"),
+                    "deliberate database cause was lost: {error}"
+                );
+            } else {
+                assert!(result.is_ok(), "{} should be reindexed", resource.id());
+            }
+        }
+        for table in ["search_index", "resource_fts"] {
+            let stale: i64 = client
+                .query_one(
+                    &format!(
+                        "SELECT COUNT(*) FROM {table}
+                         WHERE tenant_id = $1 AND resource_type = 'Patient'
+                           AND resource_id = 'one-fail'"
+                    ),
+                    &[&tenant_id],
+                )
+                .await
+                .unwrap()
+                .get(0);
+            assert_eq!(stale, 0, "failed resource retained stale rows in {table}");
+        }
+    }
+
+    #[tokio::test]
+    async fn postgres_integration_reindex_status_attributes_page_resource_error() {
+        use helios_persistence::search::{ReindexOperation, ReindexRequest, ReindexStatus};
+        use std::sync::Arc;
+
+        let backend = Arc::new(create_backend().await);
+        let tenant = create_tenant("reindex-page-status-error");
+        let tenant_id = tenant.tenant_id().as_str();
+        for id in ["status-a", "status-fail", "status-c"] {
+            backend
+                .create(
+                    &tenant,
+                    "Patient",
+                    json!({
+                        "resourceType": "Patient",
+                        "id": id,
+                        "name": [{"family": id}]
+                    }),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+        let client = reindex_test_client().await;
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let function_name = format!("reject_status_reindex_{suffix}");
+        let trigger_name = format!("reject_status_reindex_{suffix}");
+        client
+            .batch_execute(&format!(
+                "CREATE FUNCTION {function_name}() RETURNS trigger LANGUAGE plpgsql AS $$
+                 BEGIN
+                   IF NEW.tenant_id = '{tenant_id}' AND NEW.resource_id = 'status-fail' THEN
+                     RAISE EXCEPTION 'deliberate status reindex failure';
+                   END IF;
+                   RETURN NEW;
+                 END $$;
+                 CREATE TRIGGER {trigger_name} BEFORE INSERT ON search_index
+                 FOR EACH ROW EXECUTE FUNCTION {function_name}();"
+            ))
+            .await
+            .unwrap();
+
+        let operation = ReindexOperation::new(backend.clone(), backend.tenant_registries().clone());
+        let job_id = operation
+            .start(
+                tenant.clone(),
+                ReindexRequest::for_types(["Patient"]).with_batch_size(10),
+                None,
+            )
+            .await
+            .unwrap();
+        let progress = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let progress = operation.get_progress(&job_id).await.unwrap();
+                if progress.status.is_finished() {
+                    break progress;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("reindex status should become terminal");
+
+        client
+            .batch_execute(&format!(
+                "DROP TRIGGER {trigger_name} ON search_index;
+                 DROP FUNCTION {function_name}();"
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(progress.status, ReindexStatus::Completed);
+        assert_eq!(progress.total_resources, 3);
+        assert_eq!(progress.processed_resources, 3);
+        assert_eq!(progress.errors.len(), 1);
+        assert_eq!(progress.errors[0].resource_type, "Patient");
+        assert_eq!(progress.errors[0].resource_id, "status-fail");
+        assert!(
+            progress.errors[0]
+                .error
+                .contains("deliberate status reindex failure")
+        );
+        let parameters = progress.to_parameters();
+        let error_count = parameters["parameter"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|parameter| parameter["name"] == "errorCount")
+            .unwrap();
+        assert_eq!(error_count["valueInteger"], json!(1));
+    }
+
+    #[tokio::test]
+    async fn postgres_integration_reindex_page_handles_empty_and_extraction_failure() {
+        use helios_persistence::search::ReindexTarget;
+        use helios_persistence::types::StoredResource;
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("reindex-page-extraction");
+        let tenant_id = tenant.tenant_id().as_str();
+        assert!(
+            backend
+                .write_search_entries_page(&tenant, &[])
+                .await
+                .is_empty()
+        );
+
+        let invalid = StoredResource::new(
+            "Patient",
+            "invalid-extraction",
+            tenant.tenant_id().clone(),
+            json!({"resourceType": "Observation", "id": "invalid-extraction"}),
+            FhirVersion::default(),
+        );
+        let empty_fts = StoredResource::new(
+            "Patient",
+            "empty-fts",
+            tenant.tenant_id().clone(),
+            json!({}),
+            FhirVersion::default(),
+        );
+        let client = reindex_test_client().await;
+        client
+            .execute(
+                "INSERT INTO search_index
+                 (tenant_id, resource_type, resource_id, param_name, value_string)
+                 VALUES ($1, 'Patient', 'invalid-extraction', 'obsolete-batch-probe', 'stale')",
+                &[&tenant_id],
+            )
+            .await
+            .unwrap();
+        client
+            .execute(
+                "INSERT INTO resource_fts
+                 (tenant_id, resource_type, resource_id, narrative_tsvector, content_tsvector)
+                 VALUES ($1, 'Patient', 'empty-fts', to_tsvector('english', 'stale'), to_tsvector('english', 'stale'))",
+                &[&tenant_id],
+            )
+            .await
+            .unwrap();
+
+        let results = backend
+            .write_search_entries_page(&tenant, &[invalid, empty_fts])
+            .await;
+        assert_eq!(results.len(), 2);
+        assert!(results[0].is_err());
+        assert!(results[1].is_ok());
+
+        let stale_count: i64 = client
+            .query_one(
+                "SELECT COUNT(*) FROM search_index
+                 WHERE tenant_id = $1 AND resource_id = 'invalid-extraction'",
+                &[&tenant_id],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        let empty_fts_count: i64 = client
+            .query_one(
+                "SELECT COUNT(*) FROM resource_fts
+                 WHERE tenant_id = $1 AND resource_id = 'empty-fts'",
+                &[&tenant_id],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(stale_count, 0);
+        assert_eq!(empty_fts_count, 0);
+    }
+
+    #[tokio::test]
+    async fn postgres_integration_reindex_page_rolls_back_and_falls_back_per_resource() {
+        use helios_persistence::search::{ReindexSource, ReindexTarget};
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("reindex-page-fallback");
+        let tenant_id = tenant.tenant_id().as_str();
+        for id in ["fallback-a", "fallback-fail", "fallback-c"] {
+            backend
+                .create(
+                    &tenant,
+                    "Patient",
+                    json!({
+                        "resourceType": "Patient",
+                        "id": id,
+                        "name": [{"family": id}]
+                    }),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+        let page = backend
+            .fetch_resources_page(&tenant, "Patient", None, 10)
+            .await
+            .unwrap();
+        let client = reindex_test_client().await;
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let function_name = format!("reject_reindex_{suffix}");
+        let trigger_name = format!("reject_reindex_{suffix}");
+        client
+            .batch_execute(&format!(
+                "CREATE FUNCTION {function_name}() RETURNS trigger LANGUAGE plpgsql AS $$
+                 BEGIN
+                   IF NEW.tenant_id = '{tenant_id}' AND NEW.resource_id = 'fallback-fail' THEN
+                     RAISE EXCEPTION 'deliberate reindex failure';
+                   END IF;
+                   RETURN NEW;
+                 END $$;
+                 CREATE TRIGGER {trigger_name} BEFORE INSERT ON search_index
+                 FOR EACH ROW EXECUTE FUNCTION {function_name}();"
+            ))
+            .await
+            .unwrap();
+
+        let results = backend
+            .write_search_entries_page(&tenant, &page.resources)
+            .await;
+
+        client
+            .batch_execute(&format!(
+                "DROP TRIGGER {trigger_name} ON search_index;
+                 DROP FUNCTION {function_name}();"
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(results.len(), 3);
+        for (resource, result) in page.resources.iter().zip(results) {
+            if resource.id() == "fallback-fail" {
+                assert!(result.is_err());
+            } else {
+                assert!(result.is_ok(), "{} should be reindexed", resource.id());
+                let rows: i64 = client
+                    .query_one(
+                        "SELECT COUNT(*) FROM search_index
+                         WHERE tenant_id = $1 AND resource_type = 'Patient'
+                           AND resource_id = $2",
+                        &[&tenant_id, &resource.id()],
+                    )
+                    .await
+                    .unwrap()
+                    .get(0);
+                assert!(rows > 0);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn postgres_integration_reindex_page_retries_oversized_fts_individually() {
+        use helios_persistence::search::ReindexTarget;
+        use helios_persistence::types::StoredResource;
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("reindex-page-oversized-fts");
+        let tenant_id = tenant.tenant_id().as_str();
+        let text = (0..100_000)
+            .map(|index| format!("lexeme{index:08x}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let resource = StoredResource::new(
+            "Patient",
+            "oversized-fts",
+            tenant.tenant_id().clone(),
+            json!({
+                "resourceType": "Patient",
+                "id": "oversized-fts",
+                "text": {"status": "generated", "div": format!("<div>{text}</div>")}
+            }),
+            FhirVersion::default(),
+        );
+
+        let results = backend
+            .write_search_entries_page(&tenant, &[resource])
+            .await;
+        assert_eq!(results.len(), 1);
+        assert!(results[0].is_ok());
+
+        let client = reindex_test_client().await;
+        let fts_rows: i64 = client
+            .query_one(
+                "SELECT COUNT(*) FROM resource_fts
+                 WHERE tenant_id = $1 AND resource_type = 'Patient'
+                   AND resource_id = 'oversized-fts'",
+                &[&tenant_id],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(fts_rows, 1);
+    }
+
+    #[tokio::test]
+    async fn postgres_integration_reindex_clear_rolls_back_when_fts_delete_fails() {
+        use helios_persistence::search::ReindexTarget;
+
+        let backend = create_backend_with_max_connections(1).await;
+        let tenant = create_tenant("reindex-clear-atomic");
+        let tenant_id = tenant.tenant_id().as_str();
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({
+                    "resourceType": "Patient",
+                    "id": "clear-atomic",
+                    "name": [{"family": "Atomic"}]
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+
+        let client = reindex_test_client().await;
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let function_name = format!("reject_fts_clear_{suffix}");
+        let trigger_name = format!("reject_fts_clear_{suffix}");
+        client
+            .batch_execute(&format!(
+                "CREATE FUNCTION {function_name}() RETURNS trigger LANGUAGE plpgsql AS $$
+                 BEGIN
+                   IF OLD.tenant_id = '{tenant_id}' THEN
+                     RAISE EXCEPTION 'deliberate FTS clear failure';
+                   END IF;
+                   RETURN OLD;
+                 END $$;
+                 CREATE TRIGGER {trigger_name} BEFORE DELETE ON resource_fts
+                 FOR EACH ROW EXECUTE FUNCTION {function_name}();"
+            ))
+            .await
+            .unwrap();
+
+        let failed_clear = backend.clear_search_index(&tenant).await;
+
+        client
+            .batch_execute(&format!(
+                "DROP TRIGGER {trigger_name} ON resource_fts;
+                 DROP FUNCTION {function_name}();"
+            ))
+            .await
+            .unwrap();
+
+        assert!(failed_clear.is_err());
+        for table in ["search_index", "resource_fts"] {
+            let rows: i64 = client
+                .query_one(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE tenant_id = $1"),
+                    &[&tenant_id],
+                )
+                .await
+                .unwrap()
+                .get(0);
+            assert!(rows > 0, "{table} deletion should have rolled back");
+        }
+
+        assert!(backend.clear_search_index(&tenant).await.unwrap() > 0);
+        for table in ["search_index", "resource_fts"] {
+            let rows: i64 = client
+                .query_one(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE tenant_id = $1"),
+                    &[&tenant_id],
+                )
+                .await
+                .unwrap()
+                .get(0);
+            assert_eq!(rows, 0);
+        }
+    }
+
     #[tokio::test]
     async fn postgres_integration_reindex_list_types() {
         use helios_persistence::search::ReindexSource;
@@ -6019,6 +6781,18 @@ mod postgres_integration {
                 .unwrap();
         }
 
+        // Force every resource onto the same timestamp so the cursor's id
+        // tiebreaker, rather than incidental clock ordering, carries the page.
+        reindex_test_client()
+            .await
+            .execute(
+                "UPDATE resources SET last_updated = '2026-01-01T00:00:00Z'
+                 WHERE tenant_id = $1 AND resource_type = 'Patient'",
+                &[&tenant.tenant_id().as_str()],
+            )
+            .await
+            .unwrap();
+
         // Fetch first page (5 resources)
         let page1 = backend
             .fetch_resources_page(&tenant, "Patient", None, 5)
@@ -6037,6 +6811,26 @@ mod postgres_integration {
         // Ensure no duplicates between pages
         let page1_ids: Vec<&str> = page1.resources.iter().map(|r| r.id()).collect();
         let page2_ids: Vec<&str> = page2.resources.iter().map(|r| r.id()).collect();
+        assert_eq!(
+            page1_ids,
+            vec![
+                "patient-01",
+                "patient-02",
+                "patient-03",
+                "patient-04",
+                "patient-05"
+            ]
+        );
+        assert_eq!(
+            page2_ids,
+            vec![
+                "patient-06",
+                "patient-07",
+                "patient-08",
+                "patient-09",
+                "patient-10"
+            ]
+        );
         for id in &page1_ids {
             assert!(!page2_ids.contains(id), "Duplicate ID found: {}", id);
         }
