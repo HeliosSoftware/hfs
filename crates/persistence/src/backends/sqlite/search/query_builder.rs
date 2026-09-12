@@ -371,6 +371,7 @@ impl QueryBuilder {
             format!(
                 "resource_id IN (SELECT resource_id FROM search_index \
                  WHERE tenant_id = ?1 AND resource_type = ?2 AND param_name IN ({in_list}) \
+                 AND value_reference IS NOT NULL \
                  AND (value_reference = ?{p1} OR value_reference LIKE ?{p2} || '/_history/%'))"
             ),
             vec![SqlParam::string(base), SqlParam::string(base)],

@@ -91,8 +91,19 @@ build, collection is still off until `HFS_PERF_PHASES=1` or
 `bulk_submit_bench` drives the real `process_ndjson_stream`, the same call the
 bulk-submit worker makes per manifest file, against local NDJSON on a fresh
 database. Useful flags: `--limit` (resources per file), `--batch`, `--defer-index`
-(the `HFS_BULK_SUBMIT_DEFER_INDEXING` path), `--no-phases`, `--keep` (leave the
-database for `dbstat`), `--data-dir`.
+(the `HFS_BULK_SUBMIT_DEFER_INDEXING` path), `--reindex` (then run the
+post-manifest rebuild the worker's hook fires, timed and phased on its own —
+`reindex_fetch_page` / `reindex_write_page` plus the shared `extract`,
+`search_index_insert`, `fts`, `commit`), `--reindex-batch`, `--no-phases`,
+`--keep` (leave the database for `dbstat`), `--data-dir`.
+
+The server's default path is `--batch 1000 --defer-index --reindex`, and on it
+the rebuild is ~90% of the wall clock — profile that stage, not the ingest, when
+the question is "why is import slow". `extract` there sums CPU across the
+extraction pool's threads and can exceed the wall clock; `prepare_batch (wall)`
+is what the writer actually waited for. The mix that fits a coffee break is
+`--limit 20000` over `Observation`, `Condition`, `Patient`, `Encounter` from the
+corpus in `MANUAL_TESTING_MATRIX.md` (72k resources, ~20s per arm).
 
 `bulk_submit_mongo_bench` is its MongoDB twin (#1000), and needs a live server —
 that ingest path is round-trip-bound, which no in-process fake reproduces. Same

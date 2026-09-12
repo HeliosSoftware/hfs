@@ -31,11 +31,22 @@ impl ReferenceHandler {
             return Self::build_identifier_condition(ref_value, param_num);
         }
 
+        // Every `LIKE`-shaped predicate below leads with `IS NOT NULL` on its
+        // column. SQLite cannot infer non-null from `LIKE`, so without it the
+        // partial value indexes (`WHERE value_reference IS NOT NULL`, …) are
+        // unusable and the planner walks every row of the type through
+        // `idx_search_composite`; with it, the family's index narrows the
+        // scan to the parameter's rows. Results are unchanged: a NULL column
+        // never satisfied the predicate.
+
         // Handle :contains modifier - case-insensitive substring match on the
         // stored reference string (e.g. "Patient/123" contains "23").
         if matches!(modifier, Some(SearchModifier::Contains)) {
             return SqlFragment::with_params(
-                format!("value_reference LIKE '%' || ?{} || '%'", param_num),
+                format!(
+                    "value_reference IS NOT NULL AND value_reference LIKE '%' || ?{} || '%'",
+                    param_num
+                ),
                 vec![SqlParam::string(ref_value)],
             );
         }
@@ -45,7 +56,8 @@ impl ReferenceHandler {
         if matches!(modifier, Some(SearchModifier::Text)) {
             return SqlFragment::with_params(
                 format!(
-                    "value_reference_display COLLATE NOCASE LIKE '%' || ?{} || '%'",
+                    "value_reference_display IS NOT NULL AND \
+                     value_reference_display COLLATE NOCASE LIKE '%' || ?{} || '%'",
                     param_num
                 ),
                 vec![SqlParam::string(value.value.to_lowercase())],
@@ -54,7 +66,8 @@ impl ReferenceHandler {
         if matches!(modifier, Some(SearchModifier::CodeText)) {
             return SqlFragment::with_params(
                 format!(
-                    "value_reference_display COLLATE NOCASE LIKE ?{} || '%'",
+                    "value_reference_display IS NOT NULL AND \
+                     value_reference_display COLLATE NOCASE LIKE ?{} || '%'",
                     param_num
                 ),
                 vec![SqlParam::string(value.value.to_lowercase())],
@@ -68,7 +81,8 @@ impl ReferenceHandler {
         if matches!(modifier, Some(SearchModifier::Below)) {
             return SqlFragment::with_params(
                 format!(
-                    "(value_reference = ?{} OR value_reference LIKE ?{} || '/%')",
+                    "value_reference IS NOT NULL AND \
+                     (value_reference = ?{} OR value_reference LIKE ?{} || '/%')",
                     param_num,
                     param_num + 1
                 ),
@@ -78,7 +92,8 @@ impl ReferenceHandler {
         if matches!(modifier, Some(SearchModifier::Above)) {
             return SqlFragment::with_params(
                 format!(
-                    "(?{} = value_reference OR ?{} LIKE value_reference || '/%')",
+                    "value_reference IS NOT NULL AND \
+                     (?{} = value_reference OR ?{} LIKE value_reference || '/%')",
                     param_num,
                     param_num + 1
                 ),
@@ -140,7 +155,8 @@ impl ReferenceHandler {
             // without a trailing `_history` version.
             SqlFragment::with_params(
                 format!(
-                    "(value_reference = ?{} \
+                    "value_reference IS NOT NULL AND \
+                     (value_reference = ?{} \
                       OR value_reference LIKE '%/' || ?{} \
                       OR value_reference LIKE '%/' || ?{} || '/_history/%')",
                     param_num,

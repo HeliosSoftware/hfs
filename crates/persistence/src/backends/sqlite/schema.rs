@@ -10,7 +10,7 @@ use crate::core::bulk_submit_legacy::{
 use crate::error::StorageResult;
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 27;
+pub const SCHEMA_VERSION: i32 = 28;
 
 /// Initialize the database schema.
 pub fn initialize_schema(conn: &Connection) -> StorageResult<()> {
@@ -328,6 +328,7 @@ fn migrate_schema(conn: &Connection, from_version: i32) -> StorageResult<()> {
             24 => migrate_v24_to_v25(conn)?,
             25 => migrate_v25_to_v26(conn)?,
             26 => migrate_v26_to_v27(conn)?,
+            27 => migrate_v27_to_v28(conn)?,
             _ => {
                 return Err(crate::error::StorageError::Backend(
                     crate::error::BackendError::Internal {
@@ -1225,6 +1226,40 @@ fn migrate_v9_to_v10(conn: &Connection) -> StorageResult<()> {
     Ok(())
 }
 
+/// Migrate from schema version 27 to version 28.
+///
+/// Makes `idx_search_string_folded` partial (`WHERE value_string_folded IS NOT
+/// NULL`), the last full index over a value column. Only string rows carry a
+/// folded value — 13% of the rows of a Synthea load — so every other row paid
+/// a b-tree insertion into an index it could never be found by. Measured on
+/// the deferred-index rebuild of a 72k-resource mixed load: 21.1s -> 18.9s
+/// (-10%), database 3% smaller.
+///
+/// v22 kept this index full on purpose: it was the only index leading with
+/// `(tenant_id, resource_type, param_name)` that covered every row, and the
+/// planner fell back to it for `LIKE`-shaped searches (`:contains`, `:text`,
+/// `:code-text`, `:below`, `:above`, a bare reference id) whose predicate
+/// SQLite cannot prove implies `IS NOT NULL`. Those predicates now say so
+/// themselves — every `LIKE` fragment leads with `<column> IS NOT NULL` —
+/// which qualifies the family's own partial index (`idx_search_string`,
+/// `idx_search_token_display`, `idx_search_reference`, …) and narrows the
+/// scan to the parameter's rows. That is a better plan than the old one,
+/// which for the reference, token-display and uri shapes was already a
+/// type-wide walk of `idx_search_composite`, folded index or not.
+fn migrate_v27_to_v28(conn: &Connection) -> StorageResult<()> {
+    let statements = [
+        "DROP INDEX IF EXISTS idx_search_string_folded",
+        "CREATE INDEX idx_search_string_folded
+         ON search_index(tenant_id, resource_type, param_name, value_string_folded)
+         WHERE value_string_folded IS NOT NULL",
+    ];
+    for sql in &statements {
+        conn.execute(sql, [])
+            .map_err(|e| migration_err(format!("v28 partial folded index: {e}")))?;
+    }
+    Ok(())
+}
+
 /// Migrate from schema version 10 to version 11.
 ///
 /// Adds columns supporting `_contained` search: index rows extracted from a
@@ -1553,16 +1588,18 @@ fn migrate_v20_to_v21(conn: &Connection) -> StorageResult<()> {
 /// ```
 ///
 /// Every row therefore paid three b-tree insertions it could never be found
-/// by. `idx_search_string_folded` is deliberately **not** in this list: it is
-/// also the only index leading with `(tenant_id, resource_type, param_name)`
-/// that covers every row, and the query planner falls back to it for the
-/// `LIKE`-shaped modifier searches (`:text`, `:contains`) whose predicate
-/// SQLite cannot prove implies `IS NOT NULL`. Making it partial pushed those
-/// onto `idx_search_composite`'s `(tenant_id, resource_type)` prefix, and
-/// replacing it with a narrow `(tenant_id, resource_type, param_name)` index
-/// made the planner prefer that for token searches too — a selective
-/// `code=…` lookup went from 2.9 ms to 22.1 ms because the value could no
-/// longer be filtered inside the index.
+/// by. `idx_search_string_folded` was deliberately **not** in this list: it
+/// was also the only index leading with `(tenant_id, resource_type,
+/// param_name)` that covered every row, and the query planner fell back to
+/// it for the `LIKE`-shaped modifier searches (`:text`, `:contains`) whose
+/// predicate SQLite cannot prove implies `IS NOT NULL`. Making it partial
+/// pushed those onto `idx_search_composite`'s `(tenant_id, resource_type)`
+/// prefix, and replacing it with a narrow `(tenant_id, resource_type,
+/// param_name)` index made the planner prefer that for token searches too —
+/// a selective `code=…` lookup went from 2.9 ms to 22.1 ms because the value
+/// could no longer be filtered inside the index. v28 finally made it partial
+/// by giving those predicates an explicit `IS NOT NULL` instead (see
+/// [`migrate_v27_to_v28`]).
 ///
 /// `EXPLAIN QUERY PLAN` over 15 representative search shapes (token, token
 /// `:text`, reference, reference `:text`, string prefix and exact, quantity
@@ -2496,12 +2533,9 @@ mod tests {
     ///   column almost every row leaves NULL takes an entry per row for
     ///   nothing.
     ///
-    /// `idx_search_string_folded` is asserted to be *non*-partial on purpose:
-    /// it is also the only full index leading with
-    /// `(tenant_id, resource_type, param_name)`, and the planner falls back to
-    /// it for the `LIKE`-shaped modifier searches whose predicate SQLite
-    /// cannot prove implies `IS NOT NULL`. Making it partial silently pushes
-    /// `:text` and `:contains` onto a `(tenant_id, resource_type)` scan.
+    /// `idx_search_string_folded` joined the partial set in v28; the
+    /// `LIKE`-shaped searches that used to depend on it being full now carry
+    /// their own `IS NOT NULL` (see [`migrate_v27_to_v28`]).
     #[test]
     fn search_index_carries_no_redundant_or_full_value_indexes() {
         let conn = Connection::open_in_memory().unwrap();
@@ -2530,6 +2564,10 @@ mod tests {
 
         for (name, predicate) in [
             (
+                "idx_search_string_folded",
+                "value_string_folded IS NOT NULL",
+            ),
+            (
                 "idx_search_reference_display",
                 "value_reference_display IS NOT NULL",
             ),
@@ -2545,13 +2583,6 @@ mod tests {
                 "{name} must be partial on `{predicate}`, got: {sql}"
             );
         }
-
-        let folded = index_sql("idx_search_string_folded").expect("folded index");
-        assert!(
-            !folded.to_ascii_uppercase().contains("WHERE"),
-            "idx_search_string_folded must stay full: it is the fallback index for \
-             LIKE-shaped modifier searches. Got: {folded}"
-        );
     }
 
     /// A database upgraded through the ladder must end up with exactly the

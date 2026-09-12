@@ -34,6 +34,7 @@ use crate::error::{
 use crate::tenant::{TenantContext, TenantId, TenantPermissions};
 
 use super::SqliteBackend;
+use super::storage::PreparedIndex;
 
 /// Process-local lock serializing manifest claims for the single-instance SQLite
 /// job store (SQLite has no `SELECT … FOR UPDATE SKIP LOCKED`).
@@ -780,7 +781,51 @@ impl BulkSubmitProvider for SqliteBackend {
         })?;
         drop(batch_prologue);
 
+        // Search-value extraction for the whole batch, in parallel, before
+        // the entry loop: it is the largest CPU cost of an indexed ingest and
+        // needs no connection. Ids are fixed first so the extraction sees the
+        // resource exactly as `create` will store it; an entry that turns
+        // out to be an update re-extracts inline from the merged content.
+        let mut entries = entries;
+        let mut prepared: Vec<Option<PreparedIndex>> = Vec::new();
+        if !options.defer_indexing && !self.is_search_offloaded() {
+            for entry in &mut entries {
+                if let Some(obj) = entry.resource.as_object_mut() {
+                    let id = match entry.resource_id.clone() {
+                        Some(id) => id,
+                        None => {
+                            let id = crate::types::new_resource_id();
+                            entry.resource_id = Some(id.clone());
+                            id
+                        }
+                    };
+                    obj.insert("id".to_string(), serde_json::Value::String(id));
+                    obj.insert(
+                        "resourceType".to_string(),
+                        serde_json::Value::String(entry.resource_type.clone()),
+                    );
+                }
+            }
+            let items: Vec<(&str, &str, &serde_json::Value)> = entries
+                .iter()
+                .map(|e| {
+                    (
+                        e.resource_type.as_str(),
+                        e.resource_id.as_deref().unwrap_or(""),
+                        &e.resource,
+                    )
+                })
+                .collect();
+            prepared = self
+                .prepare_index_batch(tenant_id, &items)
+                .into_iter()
+                .map(Some)
+                .collect();
+        }
+        let mut prepared = prepared.into_iter();
+
         for entry in entries {
+            let prepared = prepared.next().flatten();
             // Check if we've hit max errors
             if options.max_errors > 0 && error_count >= options.max_errors {
                 if !options.continue_on_error {
@@ -807,7 +852,7 @@ impl BulkSubmitProvider for SqliteBackend {
 
             let _entry_span = crate::perf::span(crate::perf::Phase::Entry);
             let result = self
-                .ingest_entry_in_txn(&mut txn, manifest_id, &entry, options)
+                .ingest_entry_in_txn(&mut txn, manifest_id, &entry, prepared, options)
                 .await;
 
             let (entry_result, change) = match result {
@@ -1208,6 +1253,7 @@ impl SqliteBackend {
         txn: &mut super::transaction::SqliteTransaction,
         manifest_id: &str,
         entry: &NdjsonEntry,
+        prepared: Option<PreparedIndex>,
         options: &BulkProcessingOptions,
     ) -> StorageResult<(BulkEntryResult, Option<SubmissionChange>)> {
         use crate::core::Transaction;
@@ -1258,7 +1304,7 @@ impl SqliteBackend {
                 // create produced, recorded as this entry's error.
                 None => {
                     let created = txn
-                        .create(&entry.resource_type, entry.resource.clone())
+                        .create_prepared(&entry.resource_type, entry.resource.clone(), prepared)
                         .await?;
                     let change = SubmissionChange::create(
                         manifest_id,
@@ -1280,7 +1326,7 @@ impl SqliteBackend {
             }
         } else {
             let created = txn
-                .create(&entry.resource_type, entry.resource.clone())
+                .create_prepared(&entry.resource_type, entry.resource.clone(), prepared)
                 .await?;
             let change = SubmissionChange::create(
                 manifest_id,

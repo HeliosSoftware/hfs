@@ -1033,12 +1033,33 @@ async fn run_reindex(
 /// types.
 pub struct ReindexOnFinish {
     op: std::sync::Arc<ReindexOperation>,
+    /// Resources per rebuild transaction.
+    batch_size: u32,
 }
+
+/// The page the deferred rebuild uses. `ReindexRequest`'s default of 100
+/// suits an operator-driven `$reindex` on a live server, where a small
+/// transaction keeps the write lock short. The rebuild after a fast-load is
+/// a different workload: it is the bulk of the import's wall clock, and
+/// each page is one COMMIT, whose cost is fixed per transaction rather than
+/// per row. Measured on the SQLite backend, 100 -> 1000 took the rebuild
+/// from 1,695 to 1,926 resources/s; 5,000 gained a further 2% and holds
+/// five times the resources in memory per page, so 1,000 it is.
+pub const DEFERRED_REINDEX_BATCH_SIZE: u32 = 1000;
 
 impl ReindexOnFinish {
     /// Wraps a reindex manager for use as the worker's post-manifest hook.
     pub fn new(op: std::sync::Arc<ReindexOperation>) -> Self {
-        Self { op }
+        Self {
+            op,
+            batch_size: DEFERRED_REINDEX_BATCH_SIZE,
+        }
+    }
+
+    /// Overrides the resources-per-transaction page of the rebuild.
+    pub fn with_batch_size(mut self, batch_size: u32) -> Self {
+        self.batch_size = batch_size.max(1);
+        self
     }
 }
 
@@ -1049,7 +1070,8 @@ impl crate::core::DeferredReindexHook for ReindexOnFinish {
         tenant: &crate::tenant::TenantContext,
         resource_types: Vec<String>,
     ) {
-        let request = ReindexRequest::for_types(resource_types.clone());
+        let request =
+            ReindexRequest::for_types(resource_types.clone()).with_batch_size(self.batch_size);
         match self.op.start(tenant.clone(), request, None).await {
             Ok(job_id) => {
                 tracing::info!(job_id, types = ?resource_types, "deferred-index rebuild started");

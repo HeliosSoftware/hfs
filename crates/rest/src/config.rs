@@ -637,8 +637,9 @@ pub struct BulkSubmitConfig {
     ///   `true` measured ~1.2x faster, winning all 15 interleaved rounds on an
     ///   idle machine. Stopping the clock at the `200` instead gives 3.3x, but
     ///   that instant is before search works. The ~6.7x sometimes quoted comes
-    ///   from `bulk_submit_bench`, which runs no reindex and so measures
-    ///   ingestion with the indexing work removed.
+    ///   from `bulk_submit_bench` without its `--reindex` stage, which then
+    ///   measures ingestion with the indexing work removed; with `--reindex`
+    ///   it runs the same rebuild the worker's hook does and reports both.
     /// - Durability: the rebuild starts only after the manifest is already
     ///   terminal and is fire-and-forget, so `$bulk-submit-status` reports
     ///   `200` while search is still incomplete; the job exists only in an
