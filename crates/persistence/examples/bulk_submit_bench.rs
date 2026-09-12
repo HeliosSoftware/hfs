@@ -185,6 +185,14 @@ async fn main() {
     let backend = SqliteBackend::with_config(&args.db, config).expect("open backend");
     backend.init_schema().expect("init schema");
     let backend = std::sync::Arc::new(backend);
+    // Experiment hook: arbitrary SQL against the fresh schema before the
+    // ingest (drop an index, recreate a trigger, tune FTS5), so a schema
+    // idea can be priced without a build.
+    if let Ok(sql) = std::env::var("HFS_EXPERIMENT_SQL") {
+        let conn = rusqlite::Connection::open(&args.db).expect("open db");
+        conn.execute_batch(&sql).expect("HFS_EXPERIMENT_SQL");
+        println!("(experiment SQL applied: {})", sql.replace('\n', " "));
+    }
 
     let tenant = TenantContext::new(TenantId::new("bench"), TenantPermissions::full_access());
     let submission = SubmissionId::generate("bench-system");

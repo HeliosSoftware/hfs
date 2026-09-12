@@ -359,6 +359,9 @@ impl SqliteBackend {
             // took 417/s -> 501/s on the multi-row branch (commit -> 0.55 ms).
             // Cost: the -wal file grows to ~200 MiB under sustained writes.
             conn.execute_batch("PRAGMA wal_autocheckpoint = 50000;")?;
+            if let Ok(sql) = std::env::var("HFS_EXPERIMENT_CONN_SQL") {
+                conn.execute_batch(&sql)?;
+            }
             crate::sof::sqlite_udfs::register(conn).map_err(|e| {
                 rusqlite::Error::SqliteFailure(
                     rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_ERROR),
