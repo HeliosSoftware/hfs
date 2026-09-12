@@ -134,6 +134,9 @@ tokio-test = "0.4"
 criterion = { version = "0.5", features = ["async_tokio"] }
 testcontainers-modules = { version = "0.15", features = ["postgres", "elastic_search", "minio", "mongo"] }
 paste = "1.0"
+# `#[ctor::dtor]` exit hook that removes testcontainers held in `static`s
+# (tests/common/container_cleanup.rs).
+ctor = "0.2"
 
 # `watchdog` pulls in `signal_hook::iterator`/`SIGQUIT`, which only compile on Unix.
 # Windows test runs don't need SIGTERM cleanup, so drop the feature there.
