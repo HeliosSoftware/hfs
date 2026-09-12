@@ -57,6 +57,12 @@ pub(crate) struct PreparedIndex {
 /// Batches below this size are prepared on the calling thread.
 const PARALLEL_PREPARE_MIN_BATCH: usize = 16;
 
+/// Runs currently inside a bulk index rebuild, process-wide: the indexes are
+/// per database, not per run, so the first run in drops them and the last
+/// one out rebuilds them. Held across the DROP / CREATE so two runs cannot
+/// race each other's transition.
+static BULK_INDEX_REBUILDS: parking_lot::Mutex<usize> = parking_lot::Mutex::new(0);
+
 /// The pool [`SqliteBackend::prepare_index_batch`] runs on. Its own pool
 /// rather than rayon's global one so its width can be set independently of
 /// anything else in the process that uses rayon: `HFS_INDEX_THREADS`,
@@ -1268,6 +1274,11 @@ impl SqliteBackend {
         let rows = match extractor.extract(resource, resource_type) {
             Ok(values) => {
                 let marshal_span = crate::perf::span(crate::perf::Phase::IndexMarshal);
+                // Composite groups missing a component can never match a
+                // composite search (`GROUP BY … HAVING` needs every axis) and
+                // were 6% of all rows on a Synthea load; PostgreSQL already
+                // skips them.
+                let values = crate::search::extractor::drop_incomplete_composites(values);
                 let rows = values
                     .into_iter()
                     .map(|v| {
@@ -4027,6 +4038,52 @@ impl ReindexTarget for SqliteBackend {
         results
     }
 
+    /// Drops the `search_index` value indexes for the duration of the run.
+    /// Measured on a 72k-resource rebuild that already prepared its pages in
+    /// parallel: 18.5s with the indexes maintained row by row, 10.7s without
+    /// them plus 2.75s to build all thirteen sorted at the end — and the
+    /// sorted build is sequential I/O, so the gap widens once the b-trees
+    /// no longer fit the page cache. Reference-counted across concurrent
+    /// runs: the first one in drops, the last one out rebuilds. A process
+    /// that dies inside the window is healed at the next startup by
+    /// `schema::ensure_search_value_indexes`.
+    async fn begin_bulk_index_rebuild(&self) -> StorageResult<()> {
+        if self.is_search_offloaded() {
+            return Ok(());
+        }
+        let mut active = BULK_INDEX_REBUILDS.lock();
+        if *active == 0 {
+            let conn = self.get_connection()?;
+            let started = std::time::Instant::now();
+            super::schema::drop_search_value_indexes(&conn)?;
+            tracing::info!(
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "bulk index rebuild: search_index value indexes dropped for the run"
+            );
+        }
+        *active += 1;
+        Ok(())
+    }
+
+    async fn end_bulk_index_rebuild(&self) -> StorageResult<()> {
+        if self.is_search_offloaded() {
+            return Ok(());
+        }
+        let mut active = BULK_INDEX_REBUILDS.lock();
+        *active = active.saturating_sub(1);
+        if *active == 0 {
+            let conn = self.get_connection()?;
+            let started = std::time::Instant::now();
+            let created = super::schema::ensure_search_value_indexes(&conn)?;
+            tracing::info!(
+                created,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "bulk index rebuild: search_index value indexes rebuilt"
+            );
+        }
+        Ok(())
+    }
+
     async fn clear_search_index(&self, tenant: &TenantContext) -> StorageResult<u64> {
         let conn = self.get_connection()?;
         let tenant_id = tenant.tenant_id().as_str();
@@ -4095,6 +4152,90 @@ mod tests {
             TenantId::new("test-tenant"),
             TenantPermissions::full_access(),
         )
+    }
+
+    /// The SQLite writer drops its value indexes on `begin` and has every one
+    /// of them back on `end`, with the rows written meanwhile indexed — the
+    /// rebuild wrote them into the table only, and the sorted build picked
+    /// them up.
+    #[tokio::test]
+    async fn bulk_index_rebuild_restores_every_value_index_and_search_works() {
+        use crate::search::{ReindexOperation, ReindexRequest};
+
+        let backend = std::sync::Arc::new(create_test_backend());
+        let tenant = create_test_tenant();
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType": "Patient", "id": "p1", "name": [{"family": "Rebuild"}]}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+
+        let index_names = |backend: &SqliteBackend| -> Vec<String> {
+            let conn = backend.get_connection().unwrap();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'search_index' ORDER BY name",
+                )
+                .unwrap();
+            stmt.query_map([], |r| r.get(0))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+        };
+        let before = index_names(&backend);
+        assert!(before.len() > 2);
+
+        backend.begin_bulk_index_rebuild().await.unwrap();
+        assert_eq!(
+            index_names(&backend),
+            vec!["idx_search_composite".to_string()]
+        );
+        // Nested run: still dropped, and the outer end is the one that rebuilds.
+        backend.begin_bulk_index_rebuild().await.unwrap();
+        backend.end_bulk_index_rebuild().await.unwrap();
+        assert_eq!(
+            index_names(&backend),
+            vec!["idx_search_composite".to_string()]
+        );
+        backend.end_bulk_index_rebuild().await.unwrap();
+        assert_eq!(index_names(&backend), before);
+
+        // The whole run, through the driver, on a database whose rows were
+        // written without the indexes.
+        let op = ReindexOperation::new(backend.clone(), backend.tenant_registries().clone());
+        let id = op
+            .start(
+                tenant.clone(),
+                ReindexRequest::for_types(["Patient"]).with_bulk_index_rebuild(true),
+                None,
+            )
+            .await
+            .unwrap();
+        for _ in 0..200 {
+            tokio::task::yield_now().await;
+            if op.get_progress(&id).await.unwrap().status.is_finished() {
+                break;
+            }
+        }
+        let progress = op.get_progress(&id).await.unwrap();
+        assert!(progress.status.is_finished(), "reindex did not finish");
+        assert!(progress.errors.is_empty(), "{:?}", progress.errors);
+        assert_eq!(index_names(&backend), before);
+
+        let query = SearchQuery::new("Patient").with_parameter(SearchParameter {
+            name: "family".to_string(),
+            param_type: SearchParamType::String,
+            modifier: None,
+            values: vec![SearchValue::eq("Rebuild")],
+            chain: vec![],
+            components: vec![],
+        });
+        let results = backend.search(&tenant, &query).await.unwrap();
+        assert_eq!(results.resources.items.len(), 1);
     }
 
     #[tokio::test]

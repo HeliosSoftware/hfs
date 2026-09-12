@@ -12,6 +12,106 @@ use crate::error::StorageResult;
 /// Current schema version.
 pub const SCHEMA_VERSION: i32 = 28;
 
+/// The `search_index` value indexes: every index on the table except
+/// `idx_search_composite`, which the delete-by-resource path needs at all
+/// times. This is the canonical set — a test asserts a fresh schema carries
+/// exactly these — and the list the bulk index rebuild drops and recreates
+/// (see [`drop_search_value_indexes`] / [`ensure_search_value_indexes`]).
+///
+/// Keep each entry's SQL byte-for-byte what the migration ladder creates,
+/// normalised to one line, so the self-heal on startup and the ladder agree.
+pub(crate) const SEARCH_VALUE_INDEXES: [(&str, &str); 13] = [
+    (
+        "idx_search_string",
+        "CREATE INDEX IF NOT EXISTS idx_search_string ON search_index(tenant_id, resource_type, param_name, value_string) WHERE value_string IS NOT NULL",
+    ),
+    (
+        "idx_search_token",
+        "CREATE INDEX IF NOT EXISTS idx_search_token ON search_index(tenant_id, resource_type, param_name, value_token_system, value_token_code) WHERE value_token_system IS NOT NULL OR value_token_code IS NOT NULL",
+    ),
+    (
+        "idx_search_date",
+        "CREATE INDEX IF NOT EXISTS idx_search_date ON search_index(tenant_id, resource_type, param_name, value_date) WHERE value_date IS NOT NULL",
+    ),
+    (
+        "idx_search_number",
+        "CREATE INDEX IF NOT EXISTS idx_search_number ON search_index(tenant_id, resource_type, param_name, value_number) WHERE value_number IS NOT NULL",
+    ),
+    (
+        "idx_search_quantity",
+        "CREATE INDEX IF NOT EXISTS idx_search_quantity ON search_index(tenant_id, resource_type, param_name, value_quantity_value, value_quantity_unit) WHERE value_quantity_value IS NOT NULL",
+    ),
+    (
+        "idx_search_reference",
+        "CREATE INDEX IF NOT EXISTS idx_search_reference ON search_index(tenant_id, resource_type, param_name, value_reference) WHERE value_reference IS NOT NULL",
+    ),
+    (
+        "idx_search_uri",
+        "CREATE INDEX IF NOT EXISTS idx_search_uri ON search_index(tenant_id, resource_type, param_name, value_uri) WHERE value_uri IS NOT NULL",
+    ),
+    (
+        "idx_search_token_display",
+        "CREATE INDEX IF NOT EXISTS idx_search_token_display ON search_index(tenant_id, resource_type, param_name, value_token_display) WHERE value_token_display IS NOT NULL",
+    ),
+    (
+        "idx_search_identifier_type",
+        "CREATE INDEX IF NOT EXISTS idx_search_identifier_type ON search_index(tenant_id, resource_type, param_name, value_identifier_type_system, value_identifier_type_code) WHERE value_identifier_type_system IS NOT NULL OR value_identifier_type_code IS NOT NULL",
+    ),
+    (
+        "idx_search_reference_display",
+        "CREATE INDEX IF NOT EXISTS idx_search_reference_display ON search_index(tenant_id, resource_type, param_name, value_reference_display) WHERE value_reference_display IS NOT NULL",
+    ),
+    (
+        "idx_search_quantity_canonical",
+        "CREATE INDEX IF NOT EXISTS idx_search_quantity_canonical ON search_index(tenant_id, resource_type, param_name, value_quantity_canonical_unit, value_quantity_canonical_value) WHERE value_quantity_canonical_value IS NOT NULL",
+    ),
+    (
+        "idx_search_string_folded",
+        "CREATE INDEX IF NOT EXISTS idx_search_string_folded ON search_index(tenant_id, resource_type, param_name, value_string_folded) WHERE value_string_folded IS NOT NULL",
+    ),
+    (
+        "idx_search_contained",
+        "CREATE INDEX IF NOT EXISTS idx_search_contained ON search_index(tenant_id, contained_type, is_contained, param_name) WHERE is_contained = 1",
+    ),
+];
+
+/// Creates every missing [`SEARCH_VALUE_INDEXES`] entry and returns how many
+/// were missing. Runs on every startup: a bulk index rebuild drops these
+/// indexes for the duration of the load, and a process that died inside that
+/// window would otherwise come back with a `search_index` no search can use.
+/// A no-op on a healthy database.
+pub(crate) fn ensure_search_value_indexes(conn: &Connection) -> StorageResult<usize> {
+    let mut created = 0;
+    for (name, sql) in SEARCH_VALUE_INDEXES {
+        let exists: bool = conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?1",
+                [name],
+                |_| Ok(()),
+            )
+            .is_ok();
+        if !exists {
+            conn.execute(sql, [])
+                .map_err(|e| migration_err(format!("recreate {name}: {e}")))?;
+            created += 1;
+        }
+    }
+    Ok(created)
+}
+
+/// Drops every [`SEARCH_VALUE_INDEXES`] entry. The bulk index rebuild's first
+/// half: with the value indexes gone, a rebuild's rows land in the table
+/// (an append) and `idx_search_composite` alone, and the indexes are then
+/// built once, sorted, by [`ensure_search_value_indexes`] — instead of one
+/// random b-tree insertion per row per index.
+pub(crate) fn drop_search_value_indexes(conn: &Connection) -> StorageResult<()> {
+    for (name, _) in SEARCH_VALUE_INDEXES {
+        conn.execute(&format!("DROP INDEX IF EXISTS {name}"), [])
+            .map_err(|e| migration_err(format!("drop {name}: {e}")))?;
+    }
+    Ok(())
+}
+
 /// Initialize the database schema.
 pub fn initialize_schema(conn: &Connection) -> StorageResult<()> {
     // Check current version
@@ -35,6 +135,16 @@ pub fn initialize_schema(conn: &Connection) -> StorageResult<()> {
     // `IF NOT EXISTS` and idempotent, so ensuring it here every startup
     // self-heals such databases and is a no-op for correctly-migrated ones.
     ensure_tenants_table(conn)?;
+
+    // Self-heal after a bulk index rebuild that never finished (see
+    // `ensure_search_value_indexes`). A healthy database creates nothing.
+    let recreated = ensure_search_value_indexes(conn)?;
+    if recreated > 0 {
+        tracing::warn!(
+            recreated,
+            "search_index value indexes were missing at startup and have been rebuilt"
+        );
+    }
 
     Ok(())
 }
@@ -2583,6 +2693,49 @@ mod tests {
                 "{name} must be partial on `{predicate}`, got: {sql}"
             );
         }
+    }
+
+    /// The canonical value-index list must be exactly what a fresh schema
+    /// carries, name and definition alike — it is what a bulk index rebuild
+    /// recreates and what startup self-heals from, so drift here would
+    /// silently change the indexes of a database that went through either.
+    #[test]
+    fn search_value_indexes_match_the_fresh_schema() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+        let normalise = |sql: &str| {
+            sql.replace("IF NOT EXISTS ", "")
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        let mut actual: Vec<(String, String)> = conn
+            .prepare(
+                "SELECT name, sql FROM sqlite_master
+                 WHERE type = 'index' AND tbl_name = 'search_index' AND name != 'idx_search_composite'",
+            )
+            .unwrap()
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .map(|(n, s)| (n, normalise(&s)))
+            .collect();
+        actual.sort();
+        let mut expected: Vec<(String, String)> = SEARCH_VALUE_INDEXES
+            .iter()
+            .map(|(n, s)| (n.to_string(), normalise(s)))
+            .collect();
+        expected.sort();
+        assert_eq!(actual, expected);
+
+        // Drop, then self-heal: every entry comes back, and a second pass
+        // finds nothing to do.
+        drop_search_value_indexes(&conn).unwrap();
+        assert_eq!(
+            ensure_search_value_indexes(&conn).unwrap(),
+            SEARCH_VALUE_INDEXES.len()
+        );
+        assert_eq!(ensure_search_value_indexes(&conn).unwrap(), 0);
     }
 
     /// A database upgraded through the ladder must end up with exactly the

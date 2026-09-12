@@ -31,6 +31,8 @@
 //!                      its own; `--batch 1000 --defer-index --reindex` is the
 //!                      server's default path end to end
 //! * `--reindex-batch N` resources per rebuild transaction (default: the hook's)
+//! * `--bulk-index-rebuild` drop the value indexes for the rebuild and build them
+//!                      sorted at the end (`HFS_BULK_SUBMIT_BULK_INDEX_REBUILD`)
 //! * `--data-dir DIR`   directory holding `search-parameters-r4.json` (default: `./data`)
 //! * `--keep`           leave the database behind for inspection
 //! * `--no-fk`          `PRAGMA foreign_keys = OFF`, to price the index rows' parent check
@@ -67,6 +69,8 @@ struct Args {
     reindex: bool,
     /// Page size for `--reindex` (default: the hook's, `DEFERRED_REINDEX_BATCH_SIZE`).
     reindex_batch: Option<u32>,
+    /// `--reindex` in bulk index rebuild mode (`HFS_BULK_SUBMIT_BULK_INDEX_REBUILD`).
+    bulk_index_rebuild: bool,
 }
 
 fn parse_args() -> Args {
@@ -82,6 +86,7 @@ fn parse_args() -> Args {
         no_phases: false,
         reindex: false,
         reindex_batch: None,
+        bulk_index_rebuild: false,
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -107,6 +112,7 @@ fn parse_args() -> Args {
             "--no-fk" => args.no_fk = true,
             "--no-phases" => args.no_phases = true,
             "--reindex" => args.reindex = true,
+            "--bulk-index-rebuild" => args.bulk_index_rebuild = true,
             "--reindex-batch" => {
                 args.reindex_batch = Some(
                     it.next()
@@ -298,10 +304,12 @@ async fn main() {
         let op = ReindexOperation::new(backend.clone(), backend.tenant_registries().clone());
         // The same page the submit worker's hook (`ReindexOnFinish`) uses,
         // so this stage measures what the server does after a manifest.
-        let request = ReindexRequest::for_types(types).with_batch_size(
-            args.reindex_batch
-                .unwrap_or(helios_persistence::search::DEFERRED_REINDEX_BATCH_SIZE),
-        );
+        let request = ReindexRequest::for_types(types)
+            .with_batch_size(
+                args.reindex_batch
+                    .unwrap_or(helios_persistence::search::DEFERRED_REINDEX_BATCH_SIZE),
+            )
+            .with_bulk_index_rebuild(args.bulk_index_rebuild);
         let page = request.batch_size;
         perf::reset();
         let started = Instant::now();
@@ -328,11 +336,16 @@ async fn main() {
         let reindex_wall = started.elapsed();
         println!();
         println!(
-            "reindexed {} resources in {:.2}s = {:.0} resources/s (page {})",
+            "reindexed {} resources in {:.2}s = {:.0} resources/s (page {}{})",
             total_lines,
             reindex_wall.as_secs_f64(),
             total_lines as f64 / reindex_wall.as_secs_f64(),
-            page
+            page,
+            if args.bulk_index_rebuild {
+                ", bulk index rebuild"
+            } else {
+                ""
+            }
         );
         let total = wall + reindex_wall;
         println!(

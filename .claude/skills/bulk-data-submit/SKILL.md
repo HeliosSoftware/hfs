@@ -67,6 +67,7 @@ status-only kick-off (no `manifestUrl`) they have nothing to attach to and are i
 | `HFS_BULK_SUBMIT_MAX_CONCURRENT_PER_TENANT` | `4` | Per-tenant active submission cap; returns `429` |
 | `HFS_BULK_SUBMIT_BATCH_SIZE` | `1000` | Ingestion batch size |
 | `HFS_BULK_SUBMIT_DEFER_INDEXING` | `true` | Bulk fast-load (#903): ingest without search-index/FTS writes, then rebuild with an automatic per-type reindex when each manifest finishes. Default since #946; honoured on MongoDB only since #1000, where it was silently inert. Read once at startup, not per submission. A restart before that rebuild lands leaves the data stored but unsearchable; set `false` to close that window — see Ingest performance |
+| `HFS_BULK_SUBMIT_BULK_INDEX_REBUILD` | `false` | SQLite: the deferred rebuild drops the `search_index` value indexes for its duration and builds them once, sorted, at the end. 1.3x at 72k resources, 1.6x at 312k, widening with size — but search on that database is unindexed for every tenant while a rebuild runs, and the final build holds the write lock. For the initial load of a large corpus on a server not serving traffic. Self-heals at startup if a process died inside the window |
 | `HFS_BULK_SUBMIT_LEASE_DURATION` | `60` | Manifest lease length in seconds; must exceed heartbeat |
 | `HFS_BULK_SUBMIT_HEARTBEAT_INTERVAL` | `20` | Worker heartbeat cadence in seconds |
 | `HFS_BULK_SUBMIT_CLEANUP_INTERVAL` | `300` | Cleanup scan interval in seconds |
@@ -140,7 +141,18 @@ The backend capability splits into `BulkSubmitIngest` (the synchronous `BulkSubm
   21.5s end to end (1.94x, 3 of 3 rounds), inline ingest 36.4s -> 25.0s
   (1.45x, 3 of 3), database 15% smaller; at 312k resources of the same mix,
   180.7s -> 110.1s (1.64x) — the gain narrows as the b-trees outgrow the page
-  cache, which is the regime the full 19M-resource corpus lives in. `perf_phases`
+  cache, which is the regime the full 19M-resource corpus lives in. Two
+  later additions: composite groups missing a component are no longer
+  written (`drop_incomplete_composites`; they were 46% of composite rows and
+  can never match — PostgreSQL already skipped them), and the opt-in
+  `HFS_BULK_SUBMIT_BULK_INDEX_REBUILD` above, which is the lever for that
+  regime: with it, 72k resources went 21.0s -> 16.3s and 312k went 110.1s ->
+  69.7s end to end (2.6x over the pre-work numbers at both sizes), because
+  `CREATE INDEX` builds each index from one sort instead of one random
+  b-tree insertion per row per index. Priced and rejected on the same
+  harness: narrowing `idx_search_composite`, FTS5 `automerge`/`pgsz`
+  tuning, `wal_autocheckpoint=0`, `synchronous=OFF` (4%), dropping the two
+  display-text indexes (5%, at a search cost). `perf_phases`
   says what is left is SQLite b-tree maintenance of `search_index` and its
   indexes plus the `search_index_fts` triggers (~20% of the rebuild, priced by
   dropping them; kept, since `:text-advanced` needs the FTS index).

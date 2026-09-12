@@ -94,8 +94,12 @@ database. Useful flags: `--limit` (resources per file), `--batch`, `--defer-inde
 (the `HFS_BULK_SUBMIT_DEFER_INDEXING` path), `--reindex` (then run the
 post-manifest rebuild the worker's hook fires, timed and phased on its own —
 `reindex_fetch_page` / `reindex_write_page` plus the shared `extract`,
-`search_index_insert`, `fts`, `commit`), `--reindex-batch`, `--no-phases`,
-`--keep` (leave the database for `dbstat`), `--data-dir`.
+`search_index_insert`, `fts`, `commit`), `--reindex-batch`,
+`--bulk-index-rebuild` (the `HFS_BULK_SUBMIT_BULK_INDEX_REBUILD` mode),
+`--no-phases`, `--keep` (leave the database for `dbstat`), `--data-dir`.
+`HFS_EXPERIMENT_SQL="<statements>"` runs arbitrary SQL against the fresh
+schema before the ingest — drop an index, recreate a trigger, tune FTS5 — so a
+schema idea can be priced without a build.
 
 The server's default path is `--batch 1000 --defer-index --reindex`, and on it
 the rebuild is ~90% of the wall clock — profile that stage, not the ingest, when

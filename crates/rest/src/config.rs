@@ -654,6 +654,18 @@ pub struct BulkSubmitConfig {
     /// Set `HFS_BULK_SUBMIT_DEFER_INDEXING=false` to give up the speed and
     /// close that window.
     pub defer_indexing: bool,
+    /// Bulk index rebuild for the deferred reindex (SQLite): drop the
+    /// `search_index` value indexes for the duration of each rebuild and
+    /// build them once, sorted, when it finishes. Measured 27% faster on a
+    /// 72k-resource rebuild with everything in memory; the sorted build is
+    /// sequential I/O, so the gap widens on loads whose b-trees outgrow the
+    /// page cache. The cost: while a rebuild runs, search on that database is
+    /// unindexed for **every** tenant and type, and the final index build
+    /// holds the write lock for as long as it takes. Meant for the initial
+    /// load of a large corpus on a server that is not serving traffic; `false`
+    /// by default. Ignored when search is offloaded to a secondary. Set with
+    /// `HFS_BULK_SUBMIT_BULK_INDEX_REBUILD`.
+    pub bulk_index_rebuild: bool,
     /// When `true`, this pod does not run in-process submit workers.
     pub disable_local_worker: bool,
     /// Cap on simultaneous in-flight submissions per tenant.
@@ -719,6 +731,7 @@ impl Default for BulkSubmitConfig {
             file_concurrency: 1,
             disable_local_worker: false,
             defer_indexing: true,
+            bulk_index_rebuild: false,
             max_concurrent_per_tenant: 4,
             batch_size: 1000,
             lease_duration_secs: 60,
@@ -816,6 +829,10 @@ impl BulkSubmitConfig {
             worker_concurrency: env_u32("HFS_BULK_SUBMIT_WORKER_CONCURRENCY", d.worker_concurrency),
             file_concurrency: env_u32("HFS_BULK_SUBMIT_FILE_CONCURRENCY", d.file_concurrency),
             defer_indexing: env_bool("HFS_BULK_SUBMIT_DEFER_INDEXING", d.defer_indexing),
+            bulk_index_rebuild: env_bool(
+                "HFS_BULK_SUBMIT_BULK_INDEX_REBUILD",
+                d.bulk_index_rebuild,
+            ),
             disable_local_worker: env_bool(
                 "HFS_BULK_SUBMIT_DISABLE_LOCAL_WORKER",
                 d.disable_local_worker,
