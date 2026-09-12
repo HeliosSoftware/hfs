@@ -1808,34 +1808,60 @@ impl MongoBackend {
         Some((resource_type, id))
     }
 
-    async fn fetch_resource_by_type_id(
-        &self,
-        tenant: &TenantContext,
-        resource_type: &str,
-        id: &str,
-    ) -> StorageResult<Option<StoredResource>> {
-        let db = self.get_database().await?;
-        let resources = db.collection::<Document>(MongoBackend::RESOURCES_COLLECTION);
-        let tenant_id = tenant.tenant_id().as_str();
-
-        let doc = resources
-            .find_one(doc! {
-                "tenant_id": tenant_id,
-                "resource_type": resource_type,
-                "id": id,
-                "is_deleted": false,
-            })
+    /// Streams the `resource_id`s in `search_index` matching `filter`, capped
+    /// at `limit` distinct ids.
+    ///
+    /// Replaces an unbounded `Collection::distinct("resource_id", ..)`: a
+    /// `distinct` reply is a single BSON document capped at 16 MiB by mongod,
+    /// which a wide reverse-reference set can exceed (error 17217, ~372k
+    /// 36-char ids) — reachable on realistic corpora (#1061). A driver-paged
+    /// `find` cursor can be abandoned as soon as `limit` distinct ids are
+    /// seen, so neither the wire reply nor our memory scales with the
+    /// referring set's true size.
+    ///
+    /// No `sort`: `resource_id` is not a prefix of `idx_search_reference`
+    /// (`tenant_id`, `resource_type`, `param_name`, `value_reference`), so an
+    /// in-memory sort would itself risk MongoDB's 32 MiB sort limit. Ids come
+    /// back in index order, so which ids survive a given truncation is stable
+    /// for a fixed index state (not otherwise meaningful or API-specified).
+    async fn referring_resource_ids(
+        search_index: &mongodb::Collection<Document>,
+        filter: Document,
+        limit: usize,
+    ) -> StorageResult<(Vec<String>, bool)> {
+        let mut cursor = search_index
+            .find(filter)
+            .projection(doc! { "resource_id": 1_i32, "_id": 0_i32 })
+            .batch_size(1000)
             .await
-            .or_query_error("Failed to fetch included resource")?;
+            .or_query_error("Failed to query search_index for revinclude")?;
 
-        match doc {
-            Some(doc) => Ok(Some(self.document_to_stored_resource(
-                tenant,
-                resource_type,
-                doc,
-            )?)),
-            None => Ok(None),
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut ids: Vec<String> = Vec::new();
+        let mut truncated = false;
+
+        while cursor
+            .advance()
+            .await
+            .or_query_error("Failed to advance search_index cursor")?
+        {
+            let doc = cursor
+                .deserialize_current()
+                .or_query_error("Failed to deserialize search_index document")?;
+            let Ok(resource_id) = doc.get_str("resource_id") else {
+                continue;
+            };
+            if !seen.insert(resource_id.to_string()) {
+                continue;
+            }
+            if ids.len() >= limit {
+                truncated = true;
+                break;
+            }
+            ids.push(resource_id.to_string());
         }
+
+        Ok((ids, truncated))
     }
 }
 
@@ -1851,10 +1877,26 @@ impl IncludeProvider for MongoBackend {
             return Ok(Vec::new());
         }
 
-        let mut included = Vec::new();
+        let db = self.get_database().await?;
+        let resources_collection = db.collection::<Document>(MongoBackend::RESOURCES_COLLECTION);
+        let tenant_id = tenant.tenant_id().as_str();
+        // Applied per directive, not as one budget shared across every
+        // directive: a shared budget would let an earlier `_include`/
+        // `_revinclude` directive exhaust the cap and starve every later one
+        // (#1061 review). The Bundle can therefore reach directives × limit,
+        // documented on the config field.
+        let limit = self.config().max_included_resources.max(1);
+
+        let mut included: Vec<StoredResource> = Vec::new();
         let mut seen: HashSet<String> = HashSet::new();
+        let mut truncated_labels: Vec<String> = Vec::new();
 
         for include in includes {
+            // Batch into one `find` per referenced type instead of one
+            // `find_one` per reference (previously N+1 round trips).
+            let mut wanted_by_type: std::collections::HashMap<String, Vec<String>> =
+                std::collections::HashMap::new();
+            let mut wanted_seen: HashSet<String> = HashSet::new();
             for resource in resources {
                 if resource.resource_type() != include.source_type {
                     continue;
@@ -1872,19 +1914,65 @@ impl IncludeProvider for MongoBackend {
                         }
                     }
 
-                    let key = format!("{}/{}", ref_type, ref_id);
-                    if !seen.insert(key) {
-                        continue;
-                    }
-
-                    if let Some(stored) = self
-                        .fetch_resource_by_type_id(tenant, &ref_type, &ref_id)
-                        .await?
-                    {
-                        included.push(stored);
+                    if wanted_seen.insert(format!("{}/{}", ref_type, ref_id)) {
+                        wanted_by_type.entry(ref_type).or_default().push(ref_id);
                     }
                 }
             }
+
+            let mut directive_count = 0usize;
+            let mut directive_truncated = false;
+            'directive: for (ref_type, ids) in wanted_by_type {
+                let id_bson: Vec<Bson> = ids.into_iter().map(Bson::String).collect();
+                let filter = doc! {
+                    "tenant_id": tenant_id,
+                    "resource_type": &ref_type,
+                    "is_deleted": false,
+                    "id": { "$in": Bson::Array(id_bson) },
+                };
+                let docs = collect_documents(
+                    resources_collection
+                        .find(filter)
+                        .await
+                        .or_query_error("Failed to fetch included resources")?,
+                )
+                .await?;
+
+                for doc in docs {
+                    let stored = self.document_to_stored_resource(tenant, &ref_type, doc)?;
+                    let key = format!("{}/{}", stored.resource_type(), stored.id());
+                    if seen.contains(&key) {
+                        continue;
+                    }
+                    if directive_count >= limit {
+                        directive_truncated = true;
+                        break 'directive;
+                    }
+                    seen.insert(key);
+                    directive_count += 1;
+                    included.push(stored);
+                }
+            }
+
+            if directive_truncated {
+                truncated_labels.push(format!(
+                    "_include={}:{}",
+                    include.source_type, include.search_param
+                ));
+            }
+        }
+
+        if !truncated_labels.is_empty() {
+            included.push(crate::core::include_truncation_outcome(
+                tenant,
+                resources
+                    .first()
+                    .map(|r| r.fhir_version())
+                    .unwrap_or_else(FhirVersion::default_enabled),
+                limit,
+                &truncated_labels.join(","),
+                "increase HFS_MONGODB_MAX_INCLUDED_RESOURCES to raise the limit",
+            ));
         }
 
         Ok(included)
@@ -1907,9 +1995,12 @@ impl RevincludeProvider for MongoBackend {
         let tenant_id = tenant.tenant_id().as_str();
         let search_index = db.collection::<Document>(MongoBackend::SEARCH_INDEX_COLLECTION);
         let resources_collection = db.collection::<Document>(MongoBackend::RESOURCES_COLLECTION);
+        // See the matching comment in `resolve_includes`: per directive, not shared.
+        let limit = self.config().max_included_resources.max(1);
 
-        let mut included = Vec::new();
+        let mut included: Vec<StoredResource> = Vec::new();
         let mut seen: HashSet<String> = HashSet::new();
+        let mut truncated_labels: Vec<String> = Vec::new();
 
         for revinclude in revincludes {
             if revinclude.source_type.is_empty() {
@@ -1936,13 +2027,11 @@ impl RevincludeProvider for MongoBackend {
                 "value_reference": { "$in": Bson::Array(bson_values) },
             };
 
-            let matching_ids: Vec<String> = search_index
-                .distinct("resource_id", index_filter)
-                .await
-                .or_query_error("Failed to query search_index for revinclude")?
-                .into_iter()
-                .filter_map(|value| value.as_str().map(ToString::to_string))
-                .collect();
+            // Bounded, streamed id resolution (#1061) — see
+            // `referring_resource_ids`. `reference_values` above is already
+            // bounded by the page; this is what previously was not.
+            let (matching_ids, index_truncated) =
+                Self::referring_resource_ids(&search_index, index_filter, limit).await?;
 
             if matching_ids.is_empty() {
                 continue;
@@ -1964,14 +2053,43 @@ impl RevincludeProvider for MongoBackend {
             )
             .await?;
 
+            let mut directive_count = 0usize;
+            let mut directive_truncated = index_truncated;
             for doc in docs {
                 let stored =
                     self.document_to_stored_resource(tenant, &revinclude.source_type, doc)?;
                 let key = format!("{}/{}", stored.resource_type(), stored.id());
-                if seen.insert(key) {
-                    included.push(stored);
+                if seen.contains(&key) {
+                    continue;
                 }
+                if directive_count >= limit {
+                    directive_truncated = true;
+                    break;
+                }
+                seen.insert(key);
+                directive_count += 1;
+                included.push(stored);
             }
+
+            if directive_truncated {
+                truncated_labels.push(format!(
+                    "_revinclude={}:{}",
+                    revinclude.source_type, revinclude.search_param
+                ));
+            }
+        }
+
+        if !truncated_labels.is_empty() {
+            included.push(crate::core::include_truncation_outcome(
+                tenant,
+                resources
+                    .first()
+                    .map(|r| r.fhir_version())
+                    .unwrap_or_else(FhirVersion::default_enabled),
+                limit,
+                &truncated_labels.join(","),
+                "increase HFS_MONGODB_MAX_INCLUDED_RESOURCES to raise the limit",
+            ));
         }
 
         Ok(included)

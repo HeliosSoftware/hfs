@@ -4943,6 +4943,454 @@ async fn mongodb_integration_resolve_include_and_revinclude() {
     );
 }
 
+/// Like [`create_backend_with_full_registry`] but with a custom
+/// `max_included_resources` cap (#1061), so cap/truncation tests can use a
+/// small fixture instead of exercising the 1000-resource default.
+async fn create_backend_with_full_registry_and_cap(
+    test_name: &str,
+    max_included_resources: usize,
+) -> Option<MongoBackend> {
+    let connection_string = shared_mongo::connection_string().await?;
+    let data_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|p| p.parent())
+        .map(|p| p.join("data"))?;
+    let config = MongoBackendConfig {
+        connection_string,
+        database_name: build_test_database_name(test_name),
+        data_dir: Some(data_dir),
+        max_included_resources,
+        ..Default::default()
+    };
+    build_backend(config).await
+}
+
+/// #1061 part (a): `resolve_revincludes` must resolve the referring id set via
+/// a driver-paged `find` against `search_index`, never via
+/// `Collection::distinct` — a `distinct` reply is a single BSON document
+/// capped at 16 MiB by mongod (error 17217 past ~372k 36-char ids), which is
+/// exactly the failure mode this fix removes.
+///
+/// Enables the per-database profiler around a *direct* `resolve_revincludes`
+/// call (not `search()`, which would also route through the fenced
+/// `matching_resource_ids` — itself still `distinct`-based pending #999 — and
+/// pollute the profiled window with an unrelated `distinct`), then asserts
+/// `system.profile` recorded zero `distinct` commands against `search_index`
+/// and at least one `find` — the second assertion is what keeps the first
+/// from being vacuously true if profiling silently failed to enable.
+#[tokio::test]
+async fn mongodb_revinclude_streams_ids_without_distinct() {
+    let Some(backend) = create_backend_with_full_registry("revinclude_no_distinct").await else {
+        eprintln!(
+            "Skipping mongodb_revinclude_streams_ids_without_distinct (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+
+    let tenant = create_tenant("tenant-revinclude-profiler");
+
+    let patient = backend
+        .create(
+            &tenant,
+            "Patient",
+            json!({"resourceType": "Patient", "name": [{"family": "Streamed"}]}),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+
+    for i in 0..12 {
+        backend
+            .create(
+                &tenant,
+                "Observation",
+                json!({
+                    "resourceType": "Observation",
+                    "status": "final",
+                    "subject": {"reference": format!("Patient/{}", patient.id())},
+                    "code": {"coding": [{"code": format!("stream-{i}")}]}
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+    }
+
+    let Some(connection_string) = shared_mongo::connection_string().await else {
+        eprintln!(
+            "Skipping mongodb_revinclude_streams_ids_without_distinct (shared mongo unreachable)"
+        );
+        return;
+    };
+    let raw_client = raw_test_client(&connection_string)
+        .await
+        .expect("failed to build raw test client");
+    let db = raw_client.database(&backend.config().database_name);
+
+    let profiling_enabled = db.run_command(doc! { "profile": 2_i32 }).await.is_ok();
+    if !profiling_enabled {
+        eprintln!(
+            "mongodb_revinclude_streams_ids_without_distinct: server refused {{profile: 2}} \
+             (likely a managed/shared HFS_TEST_MONGODB_URL); skipping"
+        );
+        return;
+    }
+
+    let revinclude = IncludeDirective {
+        include_type: IncludeType::Revinclude,
+        source_type: "Observation".to_string(),
+        search_param: "subject".to_string(),
+        target_type: None,
+        iterate: false,
+    };
+    let result = backend
+        .resolve_revincludes(
+            &tenant,
+            std::slice::from_ref(&patient),
+            std::slice::from_ref(&revinclude),
+        )
+        .await
+        .expect("resolve_revincludes must succeed");
+
+    db.run_command(doc! { "profile": 0_i32 })
+        .await
+        .expect("failed to disable profiling");
+
+    assert_eq!(
+        result.len(),
+        12,
+        "all 12 Observations should resolve under the default 1000 cap"
+    );
+
+    let ns = format!("{}.search_index", db.name());
+    let profile = db.collection::<Document>("system.profile");
+    let distinct_count = profile
+        .count_documents(doc! { "ns": ns.as_str(), "command.distinct": "search_index" })
+        .await
+        .expect("failed to count distinct commands in system.profile");
+    let find_count = profile
+        .count_documents(doc! { "ns": ns.as_str(), "command.find": "search_index" })
+        .await
+        .expect("failed to count find commands in system.profile");
+
+    assert_eq!(
+        distinct_count, 0,
+        "resolve_revincludes must not issue `distinct` against search_index"
+    );
+    assert!(
+        find_count >= 1,
+        "resolve_revincludes must issue `find` against search_index (find_count=0 would mean \
+         profiling silently captured nothing, making the distinct_count==0 assertion vacuous)"
+    );
+}
+
+/// #1061 part (b): the referring set must be bounded at
+/// `max_included_resources`, applied per directive, with truncation signaled
+/// by a synthetic `OperationOutcome` (`search.mode = outcome`) rather than
+/// silently dropped — proven both through the unsorted `search()` path and
+/// through the fenced `search_param_sorted` path (#1040/#1056), which carries
+/// its own duplicate copy of the include-resolution block and must not be
+/// missed by this fix.
+#[tokio::test]
+async fn mongodb_revinclude_caps_included_and_signals_truncation() {
+    let Some(backend) =
+        create_backend_with_full_registry_and_cap("revinclude_cap_truncation", 5).await
+    else {
+        eprintln!(
+            "Skipping mongodb_revinclude_caps_included_and_signals_truncation (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+
+    let tenant = create_tenant("tenant-revinclude-cap");
+
+    let patient = backend
+        .create(
+            &tenant,
+            "Patient",
+            json!({"resourceType": "Patient", "name": [{"family": "Capped"}]}),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+
+    for i in 0..12 {
+        backend
+            .create(
+                &tenant,
+                "Observation",
+                json!({
+                    "resourceType": "Observation",
+                    "status": "final",
+                    "subject": {"reference": format!("Patient/{}", patient.id())},
+                    "code": {"coding": [{"code": format!("cap-{i}")}]}
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+    }
+
+    let revinclude = IncludeDirective {
+        include_type: IncludeType::Revinclude,
+        source_type: "Observation".to_string(),
+        search_param: "subject".to_string(),
+        target_type: None,
+        iterate: false,
+    };
+    let id_filter = SearchParameter {
+        name: "_id".to_string(),
+        param_type: SearchParamType::Token,
+        modifier: None,
+        values: vec![SearchValue::eq(patient.id())],
+        chain: vec![],
+        components: vec![],
+    };
+
+    let query = SearchQuery::new("Patient")
+        .with_parameter(id_filter.clone())
+        .with_include(revinclude.clone());
+    let result = backend
+        .search(&tenant, &query)
+        .await
+        .expect("search with _revinclude must succeed");
+
+    assert!(
+        result
+            .resources
+            .items
+            .iter()
+            .any(|r| r.id() == patient.id()),
+        "primary page must still contain the Patient"
+    );
+
+    let observation_count = result
+        .included
+        .iter()
+        .filter(|r| r.resource_type() == "Observation")
+        .count();
+    assert_eq!(
+        observation_count, 5,
+        "included Observations must be capped at max_included_resources (5), not all 12"
+    );
+
+    let outcomes: Vec<_> = result
+        .included
+        .iter()
+        .filter(|r| r.resource_type() == "OperationOutcome")
+        .collect();
+    assert_eq!(
+        outcomes.len(),
+        1,
+        "exactly one truncation marker, got: {:?}",
+        result
+            .included
+            .iter()
+            .map(|r| format!("{}/{}", r.resource_type(), r.id()))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        outcomes[0].id(),
+        helios_persistence::core::INCLUDE_TRUNCATION_OUTCOME_ID
+    );
+    let issue = &outcomes[0].content()["issue"][0];
+    assert_eq!(issue["severity"], "warning");
+    let diagnostics = issue["diagnostics"].as_str().expect("diagnostics text");
+    assert!(
+        diagnostics.contains('5'),
+        "diagnostics should name the limit (5): {diagnostics}"
+    );
+    assert!(
+        diagnostics.contains("HFS_MONGODB_MAX_INCLUDED_RESOURCES"),
+        "diagnostics should name the env var: {diagnostics}"
+    );
+
+    // The fenced `search_param_sorted` path (lines ~727-831) carries its own
+    // duplicate include-resolution block — prove the cap and the marker
+    // apply there too, since this fix must not touch that fenced code to get
+    // it right.
+    let sorted_query = SearchQuery::new("Patient")
+        .with_parameter(id_filter)
+        .with_include(revinclude)
+        .with_sort(SortDirective::parse("birthdate").with_param_type(Some(SearchParamType::Date)));
+    let sorted_result = backend
+        .search(&tenant, &sorted_query)
+        .await
+        .expect("sorted search with _revinclude must succeed");
+    let sorted_observation_count = sorted_result
+        .included
+        .iter()
+        .filter(|r| r.resource_type() == "Observation")
+        .count();
+    assert_eq!(
+        sorted_observation_count, 5,
+        "the sorted path (search_param_sorted) must apply the same per-directive cap"
+    );
+    let sorted_outcome_count = sorted_result
+        .included
+        .iter()
+        .filter(|r| r.resource_type() == "OperationOutcome")
+        .count();
+    assert_eq!(
+        sorted_outcome_count, 1,
+        "the sorted path must carry the truncation marker too"
+    );
+}
+
+/// #1063: MongoDB's inline `resolve_includes` never even looks at
+/// `IncludeDirective::iterate` — it applies every directive against the
+/// SAME primary result set on every pass, so a directive whose `source_type`
+/// only matches a resource introduced by an earlier hop (here: `Patient`,
+/// produced by hop 1) contributes nothing. This proves both halves of that:
+/// MongoDB's own `search()` stops at hop 1, and composing it with
+/// `resolve_includes_iterate_continuation` — the composition the REST guard
+/// performs — reaches hop 2 without re-returning hop 1's Patient.
+#[tokio::test]
+async fn mongodb_include_iterate_follows_the_second_hop() {
+    let Some(backend) = create_backend_with_full_registry("include_iterate_second_hop").await
+    else {
+        eprintln!(
+            "Skipping mongodb_include_iterate_follows_the_second_hop (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+
+    let tenant = create_tenant("tenant-include-iterate");
+
+    let (org, _) = backend
+        .create_or_update(
+            &tenant,
+            "Organization",
+            "org-iter-1",
+            json!({"resourceType": "Organization", "id": "org-iter-1", "name": "Iterate Org"}),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    let (patient, _) = backend
+        .create_or_update(
+            &tenant,
+            "Patient",
+            "patient-iter-1",
+            json!({
+                "resourceType": "Patient",
+                "id": "patient-iter-1",
+                "name": [{"family": "Iterate"}],
+                "managingOrganization": {"reference": "Organization/org-iter-1"}
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    let observation = backend
+        .create(
+            &tenant,
+            "Observation",
+            json!({
+                "resourceType": "Observation",
+                "status": "final",
+                "subject": {"reference": "Patient/patient-iter-1"},
+                "code": {"coding": [{"code": "iter"}]}
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+
+    let includes = vec![
+        IncludeDirective {
+            include_type: IncludeType::Include,
+            source_type: "Observation".to_string(),
+            search_param: "subject".to_string(),
+            target_type: Some("Patient".to_string()),
+            iterate: false,
+        },
+        IncludeDirective {
+            include_type: IncludeType::Include,
+            source_type: "Patient".to_string(),
+            search_param: "organization".to_string(),
+            target_type: Some("Organization".to_string()),
+            iterate: true,
+        },
+    ];
+
+    let mut query = SearchQuery::new("Observation").with_parameter(SearchParameter {
+        name: "_id".to_string(),
+        param_type: SearchParamType::Token,
+        modifier: None,
+        values: vec![SearchValue::eq(observation.id())],
+        chain: vec![],
+        components: vec![],
+    });
+    for directive in &includes {
+        query = query.with_include(directive.clone());
+    }
+
+    let result = backend
+        .search(&tenant, &query)
+        .await
+        .expect("search must succeed");
+
+    assert!(
+        result
+            .included
+            .iter()
+            .any(|r| r.resource_type() == "Patient"),
+        "hop 1 (Observation:subject) should resolve inline"
+    );
+    assert!(
+        !result
+            .included
+            .iter()
+            .any(|r| r.resource_type() == "Organization"),
+        "MongoDB's inline resolution must NOT itself chase :iterate hops — that's what makes \
+         this the REST guard's job (#1063)"
+    );
+
+    // The composition `execute_search_bundle`'s `IterativePass::Continuation`
+    // branch performs.
+    let continuation = helios_persistence::core::resolve_includes_iterate_continuation(
+        &backend,
+        &tenant,
+        &result.resources.items,
+        &includes,
+        &result.included,
+    )
+    .await
+    .expect("continuation must succeed");
+
+    assert_eq!(
+        continuation.len(),
+        1,
+        "continuation should return exactly the Organization, got: {:?}",
+        continuation
+            .iter()
+            .map(|r| format!("{}/{}", r.resource_type(), r.id()))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(continuation[0].resource_type(), "Organization");
+    assert_eq!(continuation[0].id(), org.id());
+
+    let mut all_included: Vec<String> = result
+        .included
+        .iter()
+        .map(|r| format!("{}/{}", r.resource_type(), r.id()))
+        .collect();
+    all_included.extend(
+        continuation
+            .iter()
+            .map(|r| format!("{}/{}", r.resource_type(), r.id())),
+    );
+    let unique: std::collections::HashSet<&String> = all_included.iter().collect();
+    assert_eq!(
+        all_included.len(),
+        unique.len(),
+        "no duplicates across hop 1 + continuation: {all_included:?}"
+    );
+    assert!(all_included.contains(&format!("Patient/{}", patient.id())));
+    assert!(all_included.contains(&format!("Organization/{}", org.id())));
+}
+
 // The unreachable-server test that used to live here now sits alongside the same
 // contract for every other backend, in `tests/backend_error_handling.rs`. It needs
 // no server, so it did not belong in a suite whose tests all skip without one —

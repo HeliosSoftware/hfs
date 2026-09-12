@@ -15,9 +15,12 @@ use axum::{
 };
 use helios_persistence::core::{
     IncludeProvider, MultiTypeSearchProvider, ResourceStorage, RevincludeProvider, SearchProvider,
+    is_include_truncation_marker, resolve_includes_iterate_continuation,
     resolve_includes_iterative,
 };
-use helios_persistence::types::{SearchBundle, SearchParamType, TotalMode};
+use helios_persistence::types::{
+    IncludeDirective, SearchBundle, SearchParamType, StoredResource, TotalMode,
+};
 use tracing::{debug, warn};
 
 use helios_fhir::FhirVersion;
@@ -410,24 +413,60 @@ where
             RestError::from(e)
         })?;
 
-    // Resolve _include/_revinclude (with :iterate) for backends whose search()
-    // does not populate includes inline (SQLite, Postgres, Elasticsearch).
-    // MongoDB is the only backend that resolves inline, returning a non-empty
-    // `included` that is left as-is.
-    if !query.includes.is_empty() && result.included.is_empty() {
-        let included = resolve_includes_iterative(
-            state.storage(),
-            tenant.context(),
-            &result.resources.items,
-            &query.includes,
-        )
-        .await
-        .map_err(|e| {
-            warn!(error = %e, "Include resolution failed");
-            RestError::from(e)
-        })?;
-        result.included = included;
+    // Resolve _include/_revinclude for backends whose search() does not
+    // populate includes inline (SQLite, Postgres, Elasticsearch): the Full
+    // pass runs the whole backend-agnostic resolver. MongoDB is the only
+    // backend that resolves inline, and it only ever runs hop 1 itself
+    // (#1063) — when a directive also carries `:iterate`, the Continuation
+    // pass picks up from whatever the backend already returned, without
+    // re-resolving hop 1.
+    // `backend_resolved` treats an `included` holding only a truncation
+    // marker (#1061) as "nothing real resolved", so a backend reply that
+    // truncated to zero real resources still takes the Full path rather than
+    // iterating from a frontier containing the marker.
+    match iterative_pass(&query.includes, backend_resolved(&result.included)) {
+        IterativePass::None => {}
+        IterativePass::Full => {
+            let included = resolve_includes_iterative(
+                state.storage(),
+                tenant.context(),
+                &result.resources.items,
+                &query.includes,
+            )
+            .await
+            .map_err(|e| {
+                warn!(error = %e, "Include resolution failed");
+                RestError::from(e)
+            })?;
+            result.included = included;
+        }
+        IterativePass::Continuation => {
+            let continuation = resolve_includes_iterate_continuation(
+                state.storage(),
+                tenant.context(),
+                &result.resources.items,
+                &query.includes,
+                &result.included,
+            )
+            .await
+            .map_err(|e| {
+                warn!(error = %e, "Include iterate continuation failed");
+                RestError::from(e)
+            })?;
+            result.included.extend(continuation);
+        }
     }
+
+    // Drain any include-truncation marker(s) (#1061) out of `included` before
+    // counting or building the bundle. The marker is control-plane
+    // information about the search, not an included resource, and
+    // `_elements`/`_summary` subsetting (via `apply_subsetting`, which runs
+    // over every entry's resource including this one) could otherwise strip
+    // or mangle an `OperationOutcome` embedded as an ordinary `include` entry
+    // — so the diagnostics are re-emitted through `append_warning_outcome`
+    // below, AFTER subsetting, the same way ignored-parameter and sort
+    // warnings already are.
+    let truncation_messages = drain_truncation_markers(&mut result.included);
 
     // Build the self link URL
     let public_base = state.public_base_url_for_request(tenant);
@@ -494,9 +533,74 @@ where
         for warning in &sort_warnings {
             append_warning_outcome(&mut bundle_json, warning);
         }
+        // #1061: include/revinclude resolution truncated at the configured
+        // resource cap. Emitted here (post-subsetting) rather than by leaving
+        // the marker in `included`, so `_elements`/`_summary` cannot strip it.
+        for message in &truncation_messages {
+            append_warning_outcome_with_code(
+                &mut bundle_json,
+                crate::responses::operation_outcome::IssueType::Incomplete,
+                message,
+            );
+        }
     }
 
     Ok(bundle_json)
+}
+
+/// Decision made once `search()` returns, about whether (and how) to resolve
+/// `:iterate` includes transitively (#1063).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IterativePass {
+    /// No includes requested, or the backend already resolved everything
+    /// there is to resolve (no directive carries `:iterate`).
+    None,
+    /// The backend does not resolve includes inline (SQLite, Postgres):
+    /// run the full backend-agnostic resolver, hop 1 included.
+    Full,
+    /// The backend resolved hop 1 inline and at least one directive carries
+    /// `:iterate`: continue from hop 2 without re-resolving hop 1.
+    Continuation,
+}
+
+/// Pure decision table behind [`IterativePass`] — see its variants for the
+/// rationale of each branch. Kept free of `state`/`result` so it is
+/// unit-testable without a server.
+fn iterative_pass(includes: &[IncludeDirective], backend_resolved: bool) -> IterativePass {
+    if includes.is_empty() {
+        IterativePass::None
+    } else if !backend_resolved {
+        IterativePass::Full
+    } else if includes.iter().any(|d| d.iterate) {
+        IterativePass::Continuation
+    } else {
+        IterativePass::None
+    }
+}
+
+/// True when `included` holds at least one resource that is not the #1061
+/// truncation marker — i.e. the backend genuinely resolved something inline,
+/// as opposed to returning only a "truncated to zero" warning.
+fn backend_resolved(included: &[StoredResource]) -> bool {
+    included.iter().any(|r| !is_include_truncation_marker(r))
+}
+
+/// Removes every #1061 truncation marker from `included` in place, returning
+/// each one's diagnostics message so the caller can re-emit them as bundle
+/// warnings after subsetting.
+fn drain_truncation_markers(included: &mut Vec<StoredResource>) -> Vec<String> {
+    let mut messages = Vec::new();
+    included.retain(|resource| {
+        if is_include_truncation_marker(resource) {
+            if let Some(msg) = resource.content()["issue"][0]["diagnostics"].as_str() {
+                messages.push(msg.to_string());
+            }
+            false
+        } else {
+            true
+        }
+    });
+    messages
 }
 
 /// Appends a `search.mode = outcome` entry to a searchset bundle reporting the
@@ -514,13 +618,27 @@ fn append_ignored_params_outcome(bundle_json: &mut serde_json::Value, ignored: &
     );
 }
 
-/// Appends one `search.mode = outcome` warning entry to the searchset.
+/// Appends one `search.mode = outcome`, `code = not-supported` warning entry
+/// to the searchset. Prefer [`append_warning_outcome_with_code`] for a
+/// warning whose FHIR issue type isn't "not supported" (e.g. #1061
+/// truncation, which is `incomplete`).
 fn append_warning_outcome(bundle_json: &mut serde_json::Value, message: &str) {
+    append_warning_outcome_with_code(
+        bundle_json,
+        crate::responses::operation_outcome::IssueType::NotSupported,
+        message,
+    );
+}
+
+/// Appends one `search.mode = outcome` warning entry to the searchset, with
+/// the given FHIR issue type.
+fn append_warning_outcome_with_code(
+    bundle_json: &mut serde_json::Value,
+    code: crate::responses::operation_outcome::IssueType,
+    message: &str,
+) {
     let outcome = crate::responses::OperationOutcomeBuilder::new()
-        .warning(
-            crate::responses::operation_outcome::IssueType::NotSupported,
-            message.to_string(),
-        )
+        .warning(code, message.to_string())
         .build();
     let entry = serde_json::json!({
         "search": { "mode": "outcome" },
@@ -935,6 +1053,106 @@ mod tests {
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect(),
         )
+    }
+
+    fn include_directive(iterate: bool) -> IncludeDirective {
+        IncludeDirective {
+            include_type: helios_persistence::types::IncludeType::Include,
+            source_type: "Observation".to_string(),
+            search_param: "subject".to_string(),
+            target_type: Some("Patient".to_string()),
+            iterate,
+        }
+    }
+
+    fn real_resource() -> StoredResource {
+        StoredResource::new(
+            "Patient",
+            "1",
+            helios_persistence::tenant::TenantId::new("t1"),
+            serde_json::json!({"resourceType": "Patient", "id": "1"}),
+            helios_fhir::FhirVersion::default(),
+        )
+    }
+
+    fn truncation_marker() -> StoredResource {
+        let tenant = helios_persistence::tenant::TenantContext::new(
+            helios_persistence::tenant::TenantId::new("t1"),
+            helios_persistence::tenant::TenantPermissions::full_access(),
+        );
+        helios_persistence::core::include_truncation_outcome(
+            &tenant,
+            helios_fhir::FhirVersion::default(),
+            5,
+            "_include=Observation:subject",
+            "increase the limit",
+        )
+    }
+
+    /// #1063: pins the full truth table behind [`IterativePass`], including
+    /// the `Continuation` case — unreachable before this change, since the
+    /// old guard only ever produced two outcomes (nothing, or the full pass).
+    #[test]
+    fn iterative_pass_decision_table() {
+        // No includes requested at all: never run anything, regardless of
+        // whether the backend resolved something.
+        assert_eq!(iterative_pass(&[], false), IterativePass::None);
+        assert_eq!(iterative_pass(&[], true), IterativePass::None);
+
+        // A non-iterate directive: run Full only if the backend resolved
+        // nothing itself; otherwise the backend's hop 1 is already the whole
+        // answer.
+        assert_eq!(
+            iterative_pass(&[include_directive(false)], false),
+            IterativePass::Full
+        );
+        assert_eq!(
+            iterative_pass(&[include_directive(false)], true),
+            IterativePass::None
+        );
+
+        // A directive carrying `:iterate`: the backend having resolved hop 1
+        // means there is a second hop left to chase (Continuation); the
+        // backend not having resolved anything still means the Full
+        // backend-agnostic pass (which itself walks every hop).
+        assert_eq!(
+            iterative_pass(&[include_directive(true)], true),
+            IterativePass::Continuation
+        );
+        assert_eq!(
+            iterative_pass(&[include_directive(true)], false),
+            IterativePass::Full
+        );
+
+        // Mixed directives: one iterate directive is enough to trigger
+        // Continuation once the backend has resolved something.
+        assert_eq!(
+            iterative_pass(&[include_directive(false), include_directive(true)], true),
+            IterativePass::Continuation
+        );
+    }
+
+    /// `backend_resolved` must not be fooled by an `included` that holds only
+    /// the #1061 truncation marker — that is "truncated to zero real
+    /// resources", not "the backend resolved something".
+    #[test]
+    fn backend_resolved_ignores_truncation_markers() {
+        assert!(!backend_resolved(&[]));
+        assert!(!backend_resolved(&[truncation_marker()]));
+        assert!(backend_resolved(&[real_resource()]));
+        assert!(backend_resolved(&[truncation_marker(), real_resource()]));
+    }
+
+    /// `drain_truncation_markers` removes the marker(s) and hands back their
+    /// diagnostics text, leaving real resources untouched and in order.
+    #[test]
+    fn drain_truncation_markers_extracts_messages_and_leaves_real_resources() {
+        let mut included = vec![real_resource(), truncation_marker()];
+        let messages = drain_truncation_markers(&mut included);
+        assert_eq!(included.len(), 1);
+        assert_eq!(included[0].resource_type(), "Patient");
+        assert_eq!(messages.len(), 1);
+        assert!(messages[0].contains("_include=Observation:subject"));
     }
 
     #[tokio::test]

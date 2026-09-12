@@ -142,6 +142,21 @@ pub struct MongoBackendConfig {
     /// When true, search indexing is offloaded to a secondary backend.
     #[serde(default)]
     pub search_offloaded: bool,
+
+    /// Upper bound on the number of resources `_include`/`_revinclude`
+    /// resolution will add to a searchset's `included`, applied per directive
+    /// (`_revinclude=Observation:patient&_revinclude=Condition:patient` can
+    /// therefore each independently reach this cap; forward and reverse
+    /// resolution are separate passes, each subject to this bound).
+    ///
+    /// Reverse resolution in particular has no other bound: the referring set
+    /// for a page of primary matches can be arbitrarily large regardless of
+    /// `_count` (#1061). Hitting the cap on any directive appends one
+    /// synthetic `OperationOutcome` warning entry (`search.mode = outcome`)
+    /// to the Bundle rather than silently dropping resources. Clamped to at
+    /// least 1.
+    #[serde(default = "default_max_included_resources")]
+    pub max_included_resources: usize,
 }
 
 fn default_connection_string() -> String {
@@ -164,6 +179,10 @@ fn default_server_selection_timeout_ms() -> u64 {
     15_000
 }
 
+fn default_max_included_resources() -> usize {
+    1000
+}
+
 impl Default for MongoBackendConfig {
     fn default() -> Self {
         Self {
@@ -175,6 +194,7 @@ impl Default for MongoBackendConfig {
             fhir_version: FhirVersion::default_enabled(),
             data_dir: None,
             search_offloaded: false,
+            max_included_resources: default_max_included_resources(),
         }
     }
 }
@@ -275,6 +295,7 @@ impl MongoBackend {
     /// - `HFS_MONGODB_DATABASE` (default: `helios`)
     /// - `HFS_MONGODB_MAX_CONNECTIONS` (default: `10`)
     /// - `HFS_MONGODB_CONNECT_TIMEOUT_MS` (default: `5000`)
+    /// - `HFS_MONGODB_MAX_INCLUDED_RESOURCES` (default: `1000`)
     pub fn from_env() -> StorageResult<Self> {
         let connection_string = std::env::var("HFS_MONGODB_URL")
             .or_else(|_| std::env::var("HFS_MONGODB_URI"))
@@ -294,11 +315,18 @@ impl MongoBackend {
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or_else(default_connect_timeout_ms);
 
+        let max_included_resources = std::env::var("HFS_MONGODB_MAX_INCLUDED_RESOURCES")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or_else(default_max_included_resources)
+            .max(1);
+
         let config = MongoBackendConfig {
             connection_string,
             database_name,
             max_connections,
             connect_timeout_ms,
+            max_included_resources,
             ..Default::default()
         };
 
