@@ -971,6 +971,15 @@ fn poll_due(submission: &Submission) -> bool {
             .unwrap_or(true)
 }
 
+/// Whether the Data Provider has closed the submission out (Abort / Mark
+/// completed). Recipient polls no longer decide its status: HFS answers an
+/// aborted submission's status poll with a clean `200`, which would otherwise
+/// read as a finished import (#1069). `failed` is not terminal — it can still
+/// be resubmitted, aborted, or completed.
+fn is_terminal(status: &str) -> bool {
+    matches!(status, "stopped" | "completed")
+}
+
 /// Materializes a `Retry-After` delta (seconds) into `next_poll_at`.
 fn hold_polls_for(submission: &mut Submission, seconds: u64) {
     submission.next_poll_at = (Utc::now() + chrono::Duration::seconds(seconds as i64))
@@ -987,9 +996,10 @@ fn retry_after_seconds(response: &reqwest::Response) -> Option<u64> {
 
 /// One poll of the recipient's status URL: `202` records `X-Progress`, `200`
 /// records the status manifest as the submission's result, anything else is
-/// logged and polling stops (the poll URL is cleared). `202` and `429` carry
-/// `Retry-After`; both push `next_poll_at` out so the card's refresh cadence
-/// never turns into a poll the recipient would reject (#790).
+/// logged and polling stops (the poll URL is cleared). Neither `200` nor a
+/// failure changes a closed-out submission's status (#1069). `202` and `429`
+/// carry `Retry-After`; both push `next_poll_at` out so the card's refresh
+/// cadence never turns into a poll the recipient would reject (#790).
 async fn poll_status(submission: &mut Submission, tenant: &str) {
     let poll_url = submission.poll_url.clone();
     let response = match with_tenant(
@@ -1061,8 +1071,13 @@ async fn poll_status(submission: &mut Submission, tenant: &str) {
                 })
                 .unwrap_or(0);
             let errors = manifest["error"].as_array().map(Vec::len).unwrap_or(0) + outcome_errors;
+            // A closed-out submission keeps the instant it was closed out.
+            let completed_at = match submission.result["completedAt"].as_str() {
+                Some(at) if is_terminal(&submission.status) && !at.is_empty() => at.to_string(),
+                _ => now_stamp(),
+            };
             submission.result = json!({
-                "completedAt": now_stamp(),
+                "completedAt": completed_at,
                 "outputs": outputs,
                 "errors": errors,
             });
@@ -1073,8 +1088,17 @@ async fn poll_status(submission: &mut Submission, tenant: &str) {
             // verdict is the submission's (#764, #765): errors mark it
             // failed; a clean completion completes it. Complete remains
             // available for closing out early by hand, and a later submit
-            // returns a failed submission to in-progress.
-            if errors > 0 {
+            // returns a failed submission to in-progress. A submission the
+            // provider already closed out keeps its status (#1069).
+            if is_terminal(&submission.status) {
+                let status = submission.status.clone();
+                push_log(
+                    submission,
+                    format!(
+                        "Status: got 200 OK ({outputs} outputs, {errors} error file(s)); submission stays {status}."
+                    ),
+                );
+            } else if errors > 0 {
                 submission.status = "failed".to_string();
                 push_log(
                     submission,
@@ -1101,16 +1125,28 @@ async fn poll_status(submission: &mut Submission, tenant: &str) {
         other => {
             // Polling can never resume (the URL is dropped), so the submission
             // must not keep reading In Progress (#764). completedAt keeps the
-            // status card rendered; the log carries the diagnosis.
+            // status card rendered; the log carries the diagnosis. A
+            // closed-out submission is not reopened as failed, and keeps the
+            // result it was closed out with (#1069).
+            submission.progress = String::new();
+            submission.poll_url = String::new();
+            submission.next_poll_at = String::new();
+            if is_terminal(&submission.status) {
+                let status = submission.status.clone();
+                push_log(
+                    submission,
+                    format!(
+                        "Status poll answered {other}; polling stopped; submission stays {status}."
+                    ),
+                );
+                return;
+            }
             submission.status = "failed".to_string();
             submission.result = json!({
                 "completedAt": now_stamp(),
                 "outputs": 0,
                 "errors": 0,
             });
-            submission.progress = String::new();
-            submission.poll_url = String::new();
-            submission.next_poll_at = String::new();
             push_log(
                 submission,
                 format!(
@@ -1233,6 +1269,21 @@ async fn set_status(
             // The change landed, so any banner from an earlier attempt is
             // stale (#968).
             s.status_error = String::new();
+            // A closed-out submission stops polling the recipient, which
+            // answers an aborted submission's status poll with a clean `200`
+            // that would otherwise flip Stopped to Completed (#1069). The
+            // result stamps the close-out so the card shows its Result form,
+            // keeping any counts an earlier `200` manifest recorded.
+            if is_terminal(status) {
+                s.poll_url = String::new();
+                s.next_poll_at = String::new();
+                s.progress = String::new();
+                s.result = json!({
+                    "completedAt": now_stamp(),
+                    "outputs": s.result["outputs"].as_u64().unwrap_or(0),
+                    "errors": s.result["errors"].as_u64().unwrap_or(0),
+                });
+            }
         }
         Ok((code, content_type, body)) => {
             let detail = format!("{code}: {}", summarize_error_body(&content_type, &body));
@@ -1257,8 +1308,9 @@ async fn set_status(
 }
 
 /// The recipient-status card fragment, polled by htmx while a poll URL is
-/// live. Each fetch performs at most one poll against the recipient, so the
-/// cadence is the page's `every 5s` trigger — no background tasks.
+/// live and the submission is not closed out (#1069). Each fetch performs at
+/// most one poll against the recipient, so the cadence is the page's
+/// `every 5s` trigger — no background tasks.
 #[derive(Template)]
 #[template(path = "partials/bulk_import_status.html")]
 struct StatusCard {
@@ -1302,7 +1354,9 @@ pub async fn status_fragment(
     let Some((mut s, sv)) = load_one(&state, &rt, &id).await else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    if !s.poll_url.is_empty() && poll_due(&s) {
+    // A closed-out submission is never polled, even if it was stored with a
+    // poll URL before #1069 — the recipient's answer no longer decides it.
+    if !s.poll_url.is_empty() && !is_terminal(&s.status) && poll_due(&s) {
         poll_status(&mut s, &rt.id).await;
         save_or_warn(&state, &rt, &id, &s, Some(sv)).await;
     }
@@ -1310,7 +1364,7 @@ pub async fn status_fragment(
     let status_error = status_error_message(&i18n, &s);
     render(StatusCard {
         id,
-        polling: !s.poll_url.is_empty(),
+        polling: !s.poll_url.is_empty() && !is_terminal(&s.status),
         can_abort: matches!(s.status.as_str(), "in-progress" | "failed"),
         percent: progress_percent(&s.progress),
         progress: s.progress.clone(),
@@ -1427,6 +1481,17 @@ mod tests {
         // Non-matching recipients keep the indeterminate sweep.
         assert_eq!(progress_percent("halfway there"), None);
         assert_eq!(progress_percent("processing lots"), None);
+    }
+
+    /// #1069: only a provider close-out is terminal; `failed` can still be
+    /// resubmitted, aborted, or completed.
+    #[test]
+    fn only_stopped_and_completed_are_terminal() {
+        assert!(is_terminal("stopped"));
+        assert!(is_terminal("completed"));
+        for status in ["not-started", "in-progress", "failed", ""] {
+            assert!(!is_terminal(status), "status: {status}");
+        }
     }
 
     #[test]
