@@ -16,10 +16,11 @@ export type DashNotice =
   | "sample";
 
 /** What the server sent for one hard navigation, read from the response body
- * itself rather than the live DOM. The waiting page re-requests `#dash-live`
- * through htmx after a delay, so by the time the DOM is inspected a first
- * render that was waiting may already have been swapped for a ready one; the
- * body cannot have been. */
+ * itself rather than the live DOM. `#dash-live` re-requests itself through
+ * htmx — a waiting page after a short delay, a ready page with approximate
+ * figures on a periodic poll — so by the time the DOM is inspected the first
+ * render may already have been swapped for a newer one; the body cannot have
+ * been. */
 export interface FirstRender {
   /** `data-dash-notice` slugs, in document order. */
   notices: string[];
@@ -27,8 +28,13 @@ export interface FirstRender {
   series: number;
   /** Whether the chart area rendered `.chart-empty` instead of a chart. */
   chartEmpty: boolean;
-  /** Whether `#dash-live` carried the htmx auto-retry (a waiting page). */
+  /** Whether `#dash-live` carried the bounded htmx auto-retry of a waiting
+   * page (`hx-get` without `data-dash-refresh`). */
   autoRetry: boolean;
+  /** Whether `#dash-live` carried the periodic self-refresh of a ready page
+   * whose figures are approximate or an import is running (#1078,
+   * `data-dash-refresh`). Never set together with {@link autoRetry}. */
+  liveRefresh: boolean;
   /** Stat-grid values rendered as the unavailable "—". */
   unavailableCards: number;
 }
@@ -89,9 +95,48 @@ export class DashboardPage {
   get chartWaiting(): Locator {
     return this.page.locator(".chart-card .chart-empty");
   }
-  /** `#dash-live` while it still has an htmx auto-retry scheduled. */
+  /** The swappable region every snapshot-derived figure lives in (#956). */
+  get live(): Locator {
+    return this.page.locator("#dash-live");
+  }
+  /** `#dash-live` while a waiting page still has its bounded htmx auto-retry
+   * scheduled. A ready page's periodic self-refresh also rides on `hx-get`
+   * but carries `data-dash-refresh`, so it never matches here. */
   get pendingAutoRetry(): Locator {
-    return this.page.locator("#dash-live[hx-get]");
+    return this.page.locator("#dash-live[hx-get]:not([data-dash-refresh])");
+  }
+  /** `#dash-live` while a ready page polls itself every few seconds because
+   * its figures are approximate or an import is running (#1078). */
+  get liveRefresh(): Locator {
+    return this.page.locator("#dash-live[data-dash-refresh]");
+  }
+  /** The "Stored Resources" headline value. Compact ("1.4k") past 999, so
+   * compare exact counts through {@link legendTotal} or {@link chartTotal}. */
+  get storedResourcesValue(): Locator {
+    return this.statCards.filter({ hasText: "Stored Resources" }).locator(".stat__value");
+  }
+  /** The chart card's headline total, thousands-separated and exact. */
+  get chartTotal(): Locator {
+    return this.page.locator(".chart-card__head .stat__value");
+  }
+  /** The legend entry's exact count for `type`, or `null` when `type` has no
+   * legend entry (or no parsable count) right now. Reads once, no waiting. */
+  async legendTotal(type: string): Promise<number | null> {
+    const totals = await this.legendItems
+      .filter({ has: this.page.locator("span", { hasText: new RegExp(`^${type}$`) }) })
+      .locator(".chart-legend__total")
+      .allTextContents();
+    if (totals.length !== 1) return null;
+    const value = Number(totals[0].replace(/,/g, "").trim());
+    return Number.isFinite(value) ? value : null;
+  }
+  /** The first notice's "as of" `datetime`, or `null` when there is none.
+   * Reads once, no waiting. */
+  async asOfDatetime(): Promise<string | null> {
+    const stamps = await this.asOfTime.first().evaluateAll((els) =>
+      els.map((el) => el.getAttribute("datetime")),
+    );
+    return stamps[0] ?? null;
   }
   /** The "Resource Types" card; its `.stat__sub` names the effective FHIR
    * version ("used for R4", #553). */
@@ -186,11 +231,16 @@ export class DashboardPage {
 export function parseFirstRender(html: string): FirstRender {
   const statGrid = /<section class="stat-grid[^"]*">([\s\S]*?)<\/section>/.exec(html)?.[1] ?? "";
   const liveOpen = /<div id="dash-live"[^>]*>/.exec(html)?.[0] ?? "";
+  // Both htmx polls ride on `hx-get`; only the ready page's periodic refresh
+  // (#1078) marks itself with `data-dash-refresh`.
+  const polls = liveOpen.includes("hx-get=");
+  const liveRefresh = polls && liveOpen.includes("data-dash-refresh");
   return {
     notices: [...html.matchAll(/data-dash-notice="([^"]*)"/g)].map((m) => m[1]),
     series: (html.match(/<polyline class="series series--/g) ?? []).length,
     chartEmpty: html.includes('class="chart-empty"'),
-    autoRetry: liveOpen.includes("hx-get="),
+    autoRetry: polls && !liveRefresh,
+    liveRefresh,
     unavailableCards: (statGrid.match(/stat__value--unavailable/g) ?? []).length,
   };
 }

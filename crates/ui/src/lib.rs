@@ -870,9 +870,33 @@ struct IndexPage {
     /// bounded number of times and then leaves the manual link, so a server
     /// already too busy to answer is not also asked to serve an endless poll.
     auto_retry_href: Option<String>,
+    /// The same view, re-requested periodically while its figures are still
+    /// moving: counted from recent writes and not yet reconciled, or an import
+    /// is running (#1078). `None` once they settle, which ends the poll.
+    /// Mutually exclusive with [`Self::auto_retry_href`]: that one waits for
+    /// figures that are not here yet, this one follows figures that are.
+    refresh_href: Option<String>,
+    /// Seconds between two [`Self::refresh_href`] polls.
+    refresh_secs: u32,
+    /// Notice kinds (slugs) the requesting page already shows, sent by a
+    /// periodic refresh. Their lines render with `aria-live="off"`, so a
+    /// swap every few seconds does not re-announce an unchanged notice; a
+    /// notice whose kind changed is still announced.
+    quiet_notices: Vec<String>,
     i18n: I18n,
     /// Which sidebar entry carries `aria-current="page"` (see base.html).
     active_page: &'static str,
+}
+
+impl IndexPage {
+    /// The `aria-live` politeness of a notice line of `kind` (#1078).
+    fn notice_aria_live(&self, kind: &DashboardNotice) -> &'static str {
+        if self.quiet_notices.iter().any(|seen| seen == kind.slug()) {
+            "off"
+        } else {
+            "polite"
+        }
+    }
 }
 
 /// Search page (#255, Figma "Search V1.0"): natural language and the visual
@@ -1903,12 +1927,23 @@ async fn index(
         .and_then(|v| v.parse::<u32>().ok())
         .unwrap_or(0)
         .min(DASH_PENDING_RETRIES);
-    render(
-        build_index_page(
-            &state, locale, types, window, all_types, spec_types, focus, retry, rv.0, &rt,
-        )
-        .await,
+    // `?notices=a,b` names the notice kinds a periodically refreshing page
+    // already shows (#1078), so the swap stays quiet for the ones unchanged.
+    let quiet_notices: Vec<String> = query_value(query.as_deref(), "notices")
+        .map(|csv| {
+            csv.split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_lowercase() || c == '-'))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut page = build_index_page(
+        &state, locale, types, window, all_types, spec_types, focus, retry, rv.0, &rt,
     )
+    .await;
+    page.quiet_notices = quiet_notices;
+    render(page)
 }
 
 /// One resource-type rail item â€” the primitive Resources, Search, and Saved
@@ -7554,6 +7589,17 @@ async fn history_diff(locale: RequestLocale, axum::Form(form): axum::Form<DiffFo
 /// out.
 const DASH_PENDING_RETRIES: u32 = 3;
 
+/// Seconds between two refreshes of a dashboard whose figures are still
+/// moving — approximate, or with an import running (#1078).
+///
+/// Unlike [`DASH_PENDING_RETRIES`] this poll is not bounded by a count: what
+/// it re-reads is the in-memory counter snapshot (constant time, no storage
+/// scan) behind a 15s cache, so it cannot add to the load an import puts on
+/// storage, and it stops as soon as the server renders the page without it.
+/// Ten seconds keeps the figures visibly climbing without re-rendering faster
+/// than the snapshot cache can change.
+const DASH_LIVE_REFRESH_SECS: u32 = 10;
+
 /// Assembles the landing page from the live dashboard snapshot.
 ///
 /// Three outcomes, three pages (#956):
@@ -7593,6 +7639,7 @@ async fn build_index_page(
             .await;
 
     let notices = dashboard_notices(&live, Utc::now());
+    let ready = matches!(live, SnapshotState::Ready(_));
     let cold = matches!(live, SnapshotState::Pending);
     let chart_waiting = notices.iter().any(|line| line.kind.is_waiting());
 
@@ -7645,6 +7692,15 @@ async fn build_index_page(
     let retry_href = format!("{retry_base}&retry={}", retry.saturating_add(1));
     let auto_retry_href =
         (chart_waiting && retry < DASH_PENDING_RETRIES).then(|| retry_href.clone());
+    // Figures that are here but still moving follow themselves (#1078): the
+    // counter-backed snapshot is read in constant time, so this poll adds no
+    // storage load, and it ends by itself once the figures are exact and no
+    // import is running. Never on a waiting page (that one is bounded above)
+    // and never on the no-provider sample, which has nothing live to follow.
+    let live_refresh = ready
+        && !chart_waiting
+        && (snapshot.approximate || snapshot.import_jobs_active.is_some_and(|n| n > 0));
+    let refresh_href = live_refresh.then(|| retry_base.clone());
 
     IndexPage {
         status,
@@ -7659,6 +7715,9 @@ async fn build_index_page(
         chart_waiting,
         retry_href,
         auto_retry_href,
+        refresh_href,
+        refresh_secs: DASH_LIVE_REFRESH_SECS,
+        quiet_notices: Vec::new(),
         i18n,
         active_page: "home",
     }
@@ -8380,6 +8439,9 @@ mod tests {
             chart_waiting: false,
             retry_href: "/ui?types=&window=30d&retry=1".to_string(),
             auto_retry_href: None,
+            refresh_href: None,
+            refresh_secs: DASH_LIVE_REFRESH_SECS,
+            quiet_notices: Vec::new(),
             i18n,
             active_page: "home",
         }

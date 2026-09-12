@@ -18,6 +18,14 @@ import { parseFirstRender, type FirstRender } from "../pages/dashboard";
 // still runs — the cards read job state, not counts.
 const noChartData = process.env.HFS_E2E_NO_CHART_DATA === "1";
 
+/** `types` as a `?types=` value no earlier attempt of this test requested:
+ * rotated by the retry count, since the snapshot cache keys on the joined
+ * order (#1078). */
+function coldSelection(...types: string[]): string {
+  const turn = test.info().retry % types.length;
+  return [...types.slice(turn), ...types.slice(0, turn)].join(",");
+}
+
 test.beforeEach(async ({ request }) => {
   await createResource(request, "Patient", { name: [{ family: "Chart" }] });
   await createResource(request, "Observation", {
@@ -249,9 +257,10 @@ test("the chart's numbers are readable as a table", async ({ dashboard }) => {
 //
 // These tests never reload and never lean on waitForSeries: they read the
 // server's own response for each view (DashboardPage.gotoFirstRender, or the
-// response a click produced), because the waiting page's htmx auto-retry would
-// otherwise swap a waiting first render for a ready one before the DOM is
-// looked at. Each view uses a selection no other test in the suite requests
+// response a click produced), because the waiting page's htmx auto-retry — or,
+// on a ready page with approximate figures, the periodic refresh (see the
+// "live refresh" describe below) — would otherwise swap the first render for a
+// newer one before the DOM is looked at. Each view uses a selection no other test in the suite requests
 // (Substance and Specimen are seeded only here), so its snapshot cache key is
 // cold. The selection is part of that key in the order it was requested, so a
 // CI retry rotates the order (`coldSelection`) and meets a cold key again
@@ -261,13 +270,6 @@ test.describe("first view of a window (#1078)", () => {
     await createResource(request, "Substance", { code: { text: "dashboard first view (#1078)" } });
     await createResource(request, "Specimen", { status: "available" });
   });
-
-  /** `types` as a `?types=` value no earlier attempt of this test requested:
-   * rotated by the retry count, since the cache keys on the joined order. */
-  function coldSelection(...types: string[]): string {
-    const turn = test.info().retry % types.length;
-    return [...types.slice(turn), ...types.slice(0, turn)].join(",");
-  }
 
   /** A render that is not the blank waiting page: no "—" in the headline
    * cards, no invented figures, and a chart — or, at worst, this window's
@@ -342,11 +344,14 @@ test.describe("first view of a window (#1078)", () => {
       await expect(dashboard.chart.or(dashboard.notice("series-pending"))).toBeVisible();
     }
 
-    // A picker toggle swaps only the chart card (#599). A still-scheduled
-    // auto-retry of the whole #dash-live region would overwrite that swap with
-    // the previous selection (a known race, out of scope here), so let the
-    // page's own bounded retry settle first — it is not a reload loop, and a
-    // ready render has none to settle.
+    // A picker toggle swaps only the chart card (#599). A waiting page's
+    // still-scheduled bounded auto-retry of the whole #dash-live region would
+    // overwrite that swap with the previous selection (a known race, out of
+    // scope here), so let that retry settle first — it is not a reload loop,
+    // and a ready render has none to settle. A ready page's periodic refresh
+    // (`data-dash-refresh`) is deliberately not waited on: it may poll for as
+    // long as the figures stay approximate, it follows the picker's URL, and
+    // it skips its tick while the picker is open (covered below).
     await expect(dashboard.pendingAutoRetry).toHaveCount(0, { timeout: 15_000 });
     await dashboard.openPicker();
     const option = dashboard.pickerOption("Encounter");
@@ -400,5 +405,240 @@ test.describe("first view of a window (#1078)", () => {
     // The visible text names the same instant, in UTC.
     await expect(stamp).toContainText(new Date(readAt).toISOString().slice(11, 19));
     await expect(stamp).toContainText("UTC");
+  });
+});
+
+// #1078 follow-up: a ready dashboard whose figures are approximate (counted
+// from recent writes, not yet reconciled with storage) — or with an import
+// running — re-requests its own #dash-live region every 10s, so an operator
+// watching an import sees the figures rise without reloading. The poll skips a
+// tick while the user is in the middle of something inside the region (an open
+// picker or data table, keyboard focus, the chart tooltip, a picker fetch),
+// follows the URL the picker pushed, and drops a response whose URL went stale.
+//
+// Timing: a poll serves the cached snapshot for 15s, then serves it stale once
+// while a background refresh recomputes it, so a write reaches an open page on
+// roughly the third poll (~30s). The e2e server also reconciles every 30s; once
+// a reconcile makes the figures exact the swapped-in region stops polling. Each
+// test therefore writes right before its first view (so it opens approximate)
+// and only ever relies on a poll that the region *already on screen* scheduled.
+// Device, Location and Medication are seeded only here, and every test views a
+// selection no other test (or retry, see coldSelection) requests.
+test.describe("live refresh while figures are approximate (#1078)", () => {
+  test.skip(noChartData, "no count read path on this backend");
+
+  /** How long new figures may take to land on an open page (see above). */
+  const FIGURES_LAND_MS = 60_000;
+
+  test.beforeEach(async ({ request }) => {
+    await createResource(request, "Device", { status: "active" });
+    await createResource(request, "Location", { name: "live refresh (#1078)" });
+    await createResource(request, "Medication", { code: { text: "live refresh (#1078)" } });
+  });
+
+  /** Every periodic-refresh request the page sends from now on: htmx's own
+   * `HX-Request` GETs of `/ui` (the picker's swap is a plain fetch, and a
+   * navigation is not an htmx request). */
+  function recordRefreshes(page: Page): URL[] {
+    const seen: URL[] = [];
+    page.on("request", (r) => {
+      const url = new URL(r.url());
+      if (url.pathname === "/ui" && r.headers()["hx-request"] === "true" && !r.isNavigationRequest()) {
+        seen.push(url);
+      }
+    });
+    return seen;
+  }
+
+  /** Hard navigations (reloads included) the page starts from now on. */
+  function recordNavigations(page: Page): string[] {
+    const seen: string[] = [];
+    page.on("request", (r) => {
+      if (r.isNavigationRequest() && r.frame() === page.mainFrame()) seen.push(r.url());
+    });
+    return seen;
+  }
+
+  function exactCount(text: string | null): number {
+    const value = Number((text ?? "").replace(/,/g, "").trim());
+    if (!Number.isFinite(value)) throw new Error(`not an exact count: ${text}`);
+    return value;
+  }
+
+  test("the stored-resources card rises without a reload", async ({ page, request, dashboard }) => {
+    test.setTimeout(150_000);
+    const render = await dashboard.gotoFirstRender(`?types=${coldSelection("Device", "Location")}&window=1h`);
+    expect(render.notices, "a ready page").not.toContain("pending");
+    expect(render.notices, "a ready page").not.toContain("series-pending");
+    expect(render.notices, "figures written moments ago are not reconciled yet").toContain("approximate");
+    expect(render.liveRefresh, "an approximate ready page polls itself").toBe(true);
+    expect(render.autoRetry, "never the waiting page's bounded retry").toBe(false);
+    await expect(dashboard.liveRefresh).toHaveCount(1);
+    await expect(dashboard.live).toHaveAttribute("hx-trigger", /every 10s/);
+
+    const url = page.url();
+    const navigations = recordNavigations(page);
+    const refreshes = recordRefreshes(page);
+    // Survives a same-document swap, not a reload.
+    await page.evaluate(() => {
+      (window as unknown as { __e2eNoReload: boolean }).__e2eNoReload = true;
+    });
+
+    const asOfBefore = await dashboard.asOfDatetime();
+    expect(asOfBefore, "the first notice carries an as-of time").not.toBeNull();
+    const deviceBefore = await dashboard.legendTotal("Device");
+    expect(deviceBefore, "Device is charted").not.toBeNull();
+    const chartBefore = exactCount(await dashboard.chartTotal.textContent());
+    await expect(dashboard.storedResourcesValue).toHaveText(/^\d+(\.\d[kM])?$/);
+    const storedBefore = (await dashboard.storedResourcesValue.textContent()) ?? "";
+
+    // An import in miniature: 25 more Devices, five requests at a time.
+    const added = 25;
+    for (let i = 0; i < added; i += 5) {
+      await Promise.all(
+        Array.from({ length: 5 }, () => createResource(request, "Device", { status: "active" })),
+      );
+    }
+
+    await expect
+      .poll(
+        async () => {
+          const asOf = await dashboard.asOfDatetime();
+          const device = await dashboard.legendTotal("Device");
+          return (
+            asOf !== null &&
+            Date.parse(asOf) > Date.parse(asOfBefore ?? "") &&
+            device !== null &&
+            device >= (deviceBefore ?? 0) + added
+          );
+        },
+        { message: "the as-of time advances and Device rises by the writes", timeout: FIGURES_LAND_MS, intervals: [1_000] },
+      )
+      .toBe(true);
+
+    // Every figure fed by the same snapshot moved with it.
+    expect(exactCount(await dashboard.chartTotal.textContent())).toBeGreaterThanOrEqual(chartBefore + added);
+    await expect(dashboard.storedResourcesValue).toHaveText(/^\d+(\.\d[kM])?$/);
+    if (/^\d+$/.test(storedBefore)) {
+      // Compact past 999 ("1.4k" may not move for 25 writes); exact below.
+      expect(Number(await dashboard.storedResourcesValue.textContent())).toBeGreaterThanOrEqual(
+        Number(storedBefore) + added,
+      );
+    }
+
+    // It was the page's own poll, not a reload or a navigation.
+    expect(page.url()).toBe(url);
+    expect(navigations, "no navigation, reload included").toEqual([]);
+    expect(await page.evaluate(() => (window as unknown as { __e2eNoReload?: boolean }).__e2eNoReload)).toBe(true);
+    expect(refreshes.length, "the figures arrived through the periodic refresh").toBeGreaterThan(0);
+    for (const sent of refreshes) {
+      expect(sent.searchParams.get("types"), "the refresh keeps the charted set").toBe(new URL(url).searchParams.get("types"));
+      expect(sent.searchParams.get("window")).toBe("1h");
+      expect(sent.searchParams.has("notices"), "the refresh names the notices on screen").toBe(true);
+    }
+  });
+
+  test("a refresh does not close the open type picker", async ({ page, dashboard }) => {
+    test.setTimeout(120_000);
+    const render = await dashboard.gotoFirstRender(`?types=${coldSelection("Location", "Medication")}&window=1h`);
+    expect(render.liveRefresh, "an approximate ready page polls itself").toBe(true);
+    await expect(dashboard.liveRefresh).toHaveCount(1);
+
+    // Open the picker and type into its filter straight after the first
+    // render, well before the first 10s tick.
+    const refreshes = recordRefreshes(page);
+    await dashboard.openPicker();
+    await dashboard.pickerFilter.fill("med");
+    await expect(dashboard.pickerOption("Medication")).toBeVisible();
+
+    // Longer than one poll interval.
+    await page.waitForTimeout(12_000);
+    await expect(dashboard.picker).toHaveAttribute("open", "");
+    await expect(dashboard.pickerFilter).toHaveValue("med");
+    await expect(dashboard.pickerFilter).toBeFocused();
+    await expect(dashboard.pickerOption("Medication")).toBeVisible();
+    expect(refreshes.map(String), "the tick is skipped while the picker is open").toEqual([]);
+
+    // The guard skipped ticks; it did not stop the poll. Close the picker and
+    // move focus out of the region, and the next tick refreshes.
+    await dashboard.picker.locator("summary").click();
+    await expect(dashboard.picker).not.toHaveAttribute("open", "");
+    await page.evaluate(() => (document.activeElement as HTMLElement | null)?.blur());
+    await expect.poll(() => refreshes.length, { message: "a tick fires once the picker is closed", timeout: 15_000 }).toBeGreaterThan(0);
+  });
+
+  test("a refresh follows the picker's URL", async ({ page, dashboard }) => {
+    test.setTimeout(120_000);
+    const render = await dashboard.gotoFirstRender(`?types=${coldSelection("Medication", "Device")}&window=1h`);
+    expect(render.liveRefresh, "an approximate ready page polls itself").toBe(true);
+    await expect(dashboard.liveRefresh).toHaveCount(1);
+    const refreshes = recordRefreshes(page);
+
+    // Toggle Location on: the chart card is swapped in place and the URL
+    // pushed; #dash-live itself (and its hx-get) is not replaced.
+    await dashboard.openPicker();
+    const option = dashboard.pickerOption("Location");
+    await expect(option).not.toHaveClass(/chart-pick__option--on/);
+    const swapped = page.waitForResponse(
+      (r) => r.request().resourceType() === "fetch" && /[?&]types=[^&]*Location/.test(r.url()),
+    );
+    await option.click();
+    await swapped;
+    await expect(page).toHaveURL(/[?&]types=[^&]*Location/);
+    await expect(dashboard.legendItems.filter({ hasText: "Location" })).toHaveCount(1);
+    const pickedUrl = page.url();
+    const legendAfterPick = await dashboard.legendItems.count();
+
+    // Let the next tick through: close the picker and move focus out.
+    await dashboard.picker.locator("summary").click();
+    await expect(dashboard.picker).not.toHaveAttribute("open", "");
+    await page.evaluate(() => (document.activeElement as HTMLElement | null)?.blur());
+
+    // Mark the region on screen; the refresh's outerHTML swap replaces it
+    // with a node that has no such mark. This is the region the first render
+    // scheduled the poll on, so it fires even if the swapped-in one is exact
+    // and polls no further — no as-of comparison needed (a poll inside the
+    // 15s cache TTL serves the same as-of time).
+    await dashboard.live.evaluate((el) => el.setAttribute("data-e2e-before-refresh", ""));
+    await expect(page.locator("#dash-live[data-e2e-before-refresh]"), "the next refresh swaps the region").toHaveCount(0, {
+      timeout: 25_000,
+    });
+    await expect(dashboard.live).toHaveCount(1);
+
+    // The refresh asked for the picker's selection and kept it on screen.
+    expect(refreshes.length).toBeGreaterThan(0);
+    const sent = refreshes[refreshes.length - 1];
+    expect(sent.searchParams.get("types") ?? "", "the refresh requests the pushed URL").toContain("Location");
+    expect(page.url(), "the refresh does not restore the old URL").toBe(pickedUrl);
+    await expect(dashboard.legendItems.filter({ hasText: "Location" })).toHaveCount(1);
+    await expect(dashboard.legendItems).toHaveCount(legendAfterPick);
+    await expect(dashboard.pickerOption("Location")).toHaveClass(/chart-pick__option--on/);
+  });
+
+  test("a refresh re-announces only the notices that changed", async ({ page }) => {
+    // What the poll sends: `?notices=` names the kinds already on screen, and
+    // exactly those lines come back `aria-live="off"`; any other kind stays
+    // `polite`. Read from the response body, independent of which kinds this
+    // snapshot happens to carry.
+    const view = `/ui?types=${coldSelection("Location", "Device")}&window=1h`;
+    const noticeLines = async (query: string) => {
+      const res = await page.request.get(`${view}${query}`, { headers: { "HX-Request": "true" } });
+      expect(res.ok()).toBe(true);
+      return [...(await res.text()).matchAll(/<p\b[^>]*\bdata-dash-notice="([^"]*)"[^>]*>/g)].map((m) => ({
+        kind: m[1],
+        ariaLive: /\baria-live="([^"]*)"/.exec(m[0])?.[1],
+      }));
+    };
+
+    const first = await noticeLines("");
+    expect(first.length, "a ready page names its figures").toBeGreaterThan(0);
+    for (const line of first) expect(line.ariaLive, `${line.kind} on a first render`).toBe("polite");
+
+    const quiet = ["approximate", "live"];
+    const again = await noticeLines(`&notices=${quiet.join(",")}`);
+    expect(again.length).toBeGreaterThan(0);
+    for (const line of again) {
+      expect(line.ariaLive, `${line.kind} after notices=${quiet}`).toBe(quiet.includes(line.kind) ? "off" : "polite");
+    }
   });
 });

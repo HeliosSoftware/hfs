@@ -17,8 +17,14 @@
 //!   permanently the cold-timeout case;
 //! - `24h` answers with `partial` set, the half-failed case;
 //! - `30d` answers completely — with `approximate` set under
-//!   [`APPROXIMATE_TENANT`], and with its own distinctive figures under
+//!   [`APPROXIMATE_TENANT`] and [`APPROXIMATE_WAITING_TENANT`], with active
+//!   imports reported under [`IMPORT_ACTIVE_TENANT`] (and none under
+//!   [`IMPORT_IDLE_TENANT`]), and with its own distinctive figures under
 //!   [`WARM_SIBLING_TENANT`].
+//!
+//! A waiting page retries a bounded number of times; a ready page polls
+//! itself every 10 seconds only while its figures can still move — they are
+//! approximate, or an import is running — and never otherwise.
 //!
 //! The snapshot cache is process-global too, so the cases are kept apart:
 //!
@@ -29,8 +35,8 @@
 //!   request without the flag would borrow the `24h`/`30d` figures whenever
 //!   those tests ran first in this binary. No other default-tenant case sets
 //!   `all=1`, so that `1h` key has no sibling and stays a truly cold tenant.
-//! - The warm-sibling and approximate cases mount the UI under a tenant of
-//!   their own (the mount's default tenant is the request's tenant), so their
+//! - The warm-sibling, approximate and import cases mount the UI under a
+//!   tenant of their own (the mount's default tenant is the request's tenant), so their
 //!   cache entries are never anyone else's sibling.
 
 use async_trait::async_trait;
@@ -47,6 +53,13 @@ use tower::ServiceExt;
 const APPROXIMATE_TENANT: &str = "dash-approximate";
 /// A tenant whose `30d` snapshot is warm when its `1h` window is asked for.
 const WARM_SIBLING_TENANT: &str = "dash-warm-sibling";
+/// A tenant whose approximate `30d` snapshot is warm when its `1h` window is
+/// asked for: a page that is both waiting and approximate.
+const APPROXIMATE_WAITING_TENANT: &str = "dash-approximate-waiting";
+/// A tenant whose `30d` snapshot is exact but reports two running imports.
+const IMPORT_ACTIVE_TENANT: &str = "dash-import-active";
+/// A tenant whose `30d` snapshot is exact and reports no running import.
+const IMPORT_IDLE_TENANT: &str = "dash-import-idle";
 
 struct WindowScriptedProvider;
 
@@ -104,12 +117,16 @@ impl DashboardProvider for WindowScriptedProvider {
             series: vec![series("Patient", 5)],
             available: vec![count("Patient", 5)],
             export_jobs: None,
-            import_jobs_active: None,
+            import_jobs_active: match tenant {
+                IMPORT_ACTIVE_TENANT => Some(2),
+                IMPORT_IDLE_TENANT => Some(0),
+                _ => None,
+            },
             partial: window == DashboardWindow::LastDay,
             // Left unset on purpose: the cache stamps it, and the page must
             // still say when the figures were read.
             generated_at: None,
-            approximate: tenant == APPROXIMATE_TENANT,
+            approximate: tenant == APPROXIMATE_TENANT || tenant == APPROXIMATE_WAITING_TENANT,
             series_pending: false,
         }
     }
@@ -155,6 +172,52 @@ async fn get_as(tenant: &str, uri: &str) -> String {
 
 async fn get(uri: &str) -> String {
     get_as("default", uri).await
+}
+
+/// The opening tag of the swappable live region, where its refresh lives.
+fn dash_live_tag(html: &str) -> &str {
+    let start = html
+        .find(r#"<div id="dash-live""#)
+        .expect("the live region");
+    let end = start + html[start..].find('>').expect("its opening tag closes");
+    &html[start..=end]
+}
+
+/// The opening `<p>` tag of the notice line with this slug.
+fn notice_tag<'a>(html: &'a str, slug: &str) -> &'a str {
+    let at = html
+        .find(&format!(r#"data-dash-notice="{slug}">"#))
+        .unwrap_or_else(|| panic!("the {slug} notice line"));
+    let start = html[..at].rfind("<p ").expect("the line's <p>");
+    let end = at + html[at..].find('>').unwrap();
+    &html[start..=end]
+}
+
+/// Asserts the page polls itself as a ready page does: every 10 seconds,
+/// swapping only the live region, from the same view without a retry count.
+fn assert_polls_periodically(html: &str, window: &str) {
+    let tag = dash_live_tag(html);
+    assert!(tag.contains(r#"data-dash-refresh="10""#), "{tag}");
+    assert!(tag.contains("every 10s"), "{tag}");
+    assert!(tag.contains("hx-select=\"#dash-live\""), "{tag}");
+    let href_at = tag
+        .find(r#"hx-get=""#)
+        .expect("the refresh re-requests the page");
+    let href = &tag[href_at + r#"hx-get=""#.len()..];
+    let href = &href[..href.find('"').unwrap()];
+    assert!(href.starts_with("/ui?"), "{href}");
+    assert!(href.contains(&format!("window={window}")), "{href}");
+    assert!(!href.contains("retry="), "a refresh is not a retry: {href}");
+    assert!(
+        !html.contains("hx-trigger=\"load"),
+        "a ready page does not also run the bounded retry"
+    );
+}
+
+/// Asserts nothing on the page polls periodically.
+fn assert_no_periodic_refresh(html: &str) {
+    assert!(!html.contains("data-dash-refresh"));
+    assert!(!html.contains("every 10s"));
 }
 
 /// The regression itself: a window whose snapshot has not landed says it is
@@ -213,6 +276,11 @@ async fn the_waiting_page_offers_an_automatic_and_a_manual_retry() {
         "the first attempt asks for the second"
     );
     assert!(html.contains("Retry now"), "the no-JS way out is present");
+    assert!(
+        html.contains(r#"hx-trigger="load delay:1200ms""#),
+        "waiting keeps its bounded retry"
+    );
+    assert_no_periodic_refresh(&html);
 }
 
 /// The auto-refresh is budgeted: the page stops re-requesting itself after a
@@ -234,6 +302,7 @@ async fn the_automatic_retry_stops_after_its_budget() {
         html.contains("Retry now"),
         "the manual retry outlives the budget"
     );
+    assert_no_periodic_refresh(&html);
 }
 
 /// #1078: a tenant whose figures are already cached under another window
@@ -312,19 +381,47 @@ async fn a_slow_window_with_a_warm_sibling_keeps_the_figures_and_waits_for_the_c
         "the page re-requests itself while the series load"
     );
     assert!(html.contains("retry=1"));
+    assert_no_periodic_refresh(&html);
 
     // The auto-refresh budget applies here too.
     let spent = get_as(WARM_SIBLING_TENANT, "/ui?types=Patient&window=1h&retry=3").await;
     assert!(spent.contains(r#"data-dash-notice="series-pending""#));
     assert!(!spent.contains("hx-trigger=\"load"), "budget spent");
     assert!(spent.contains("Retry now"));
+    assert_no_periodic_refresh(&spent);
+}
+
+/// A page still waiting for its chart keeps the bounded retry even when the
+/// figures it borrowed are approximate: the periodic refresh is for ready
+/// pages only, never stacked on a retry nor outliving its budget.
+#[tokio::test]
+async fn a_waiting_page_with_approximate_figures_retries_and_does_not_poll() {
+    let warm = get_as(APPROXIMATE_WAITING_TENANT, "/ui?types=Patient&window=30d").await;
+    assert_polls_periodically(&warm, "30d");
+
+    let html = get_as(APPROXIMATE_WAITING_TENANT, "/ui?types=Patient&window=1h").await;
+    assert!(html.contains(r#"data-dash-notice="series-pending""#));
+    assert!(html.contains(r#"hx-trigger="load delay:1200ms""#));
+    assert!(html.contains("retry=1"));
+    assert_no_periodic_refresh(&html);
+
+    let spent = get_as(
+        APPROXIMATE_WAITING_TENANT,
+        "/ui?types=Patient&window=1h&retry=3",
+    )
+    .await;
+    assert!(spent.contains(r#"data-dash-notice="series-pending""#));
+    assert!(!spent.contains("hx-trigger=\"load"), "budget spent");
+    assert_no_periodic_refresh(&spent);
 }
 
 /// #1078: figures counted from recent writes rather than read exactly from
-/// storage chart normally, but are labelled approximate and dated — and, as
-/// nothing is missing, the page neither warns nor retries.
+/// storage chart normally, but are labelled approximate and dated. Nothing is
+/// missing, so the page neither warns nor retries — but the figures keep
+/// moving, so it refreshes itself periodically instead of waiting for a
+/// reload.
 #[tokio::test]
-async fn an_approximate_snapshot_charts_with_a_dated_label_and_no_retry() {
+async fn an_approximate_snapshot_charts_with_a_dated_label_and_refreshes_periodically() {
     let html = get_as(APPROXIMATE_TENANT, "/ui?window=30d").await;
 
     assert!(html.contains(r#"<svg class="chart""#), "the chart renders");
@@ -340,6 +437,52 @@ async fn an_approximate_snapshot_charts_with_a_dated_label_and_no_retry() {
     assert!(!html.contains("hx-trigger=\"load"), "nothing to wait for");
     assert!(!html.contains("Retry now"));
     assert!(!html.contains("Waiting for the live figures"));
+    assert_polls_periodically(&html, "30d");
+}
+
+/// An exact snapshot still moves while an import runs, so the page polls.
+#[tokio::test]
+async fn an_exact_snapshot_with_an_active_import_refreshes_periodically() {
+    let html = get_as(IMPORT_ACTIVE_TENANT, "/ui?window=30d").await;
+
+    assert!(html.contains("chart-data"), "the chart renders");
+    assert!(!html.contains(r#"data-dash-notice="approximate""#));
+    assert!(html.contains(r#"data-dash-notice="live""#));
+    assert!(!html.contains("Retry now"));
+    assert_polls_periodically(&html, "30d");
+}
+
+/// An exact snapshot that reports zero running imports is settled: nothing
+/// polls.
+#[tokio::test]
+async fn an_exact_snapshot_with_no_active_import_does_not_poll() {
+    let html = get_as(IMPORT_IDLE_TENANT, "/ui?window=30d").await;
+
+    assert!(html.contains("chart-data"), "the chart renders");
+    assert!(html.contains(r#"data-dash-notice="live""#));
+    assert!(!html.contains("hx-trigger=\"load"));
+    assert_no_periodic_refresh(&html);
+}
+
+/// A periodic swap must not re-announce a notice the user already heard:
+/// `notices=` names the lines the previous render showed, and those render
+/// `aria-live="off"`. A line whose kind is not in the list is new, and is
+/// announced.
+#[tokio::test]
+async fn notices_already_shown_are_not_announced_again() {
+    let fresh = get_as(APPROXIMATE_TENANT, "/ui?window=30d").await;
+    let tag = notice_tag(&fresh, "approximate");
+    assert!(tag.contains(r#"aria-live="polite""#), "{tag}");
+
+    let unchanged = get_as(APPROXIMATE_TENANT, "/ui?window=30d&notices=approximate").await;
+    let tag = notice_tag(&unchanged, "approximate");
+    assert!(tag.contains(r#"aria-live="off""#), "{tag}");
+    assert!(!tag.contains(r#"aria-live="polite""#), "{tag}");
+
+    let changed = get_as(APPROXIMATE_TENANT, "/ui?window=30d&notices=live").await;
+    let tag = notice_tag(&changed, "approximate");
+    assert!(tag.contains(r#"aria-live="polite""#), "{tag}");
+    assert!(!tag.contains(r#"aria-live="off""#), "{tag}");
 }
 
 /// A snapshot the provider had to fill in is labelled, so its zeros are never
@@ -373,4 +516,6 @@ async fn a_complete_snapshot_carries_only_its_as_of_time() {
     assert!(html.contains(r#"<time datetime=""#));
     assert!(!html.contains("hx-trigger=\"load"));
     assert!(html.contains("chart-data"), "the chart renders");
+    // Exact, complete, and no import reported: nothing moves, nothing polls.
+    assert_no_periodic_refresh(&html);
 }

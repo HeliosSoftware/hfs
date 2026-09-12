@@ -134,6 +134,9 @@
     var filterBefore = document.querySelector("[data-pick-filter]");
     var filterValue = filterBefore ? filterBefore.value : "";
 
+    // Marks the swap in flight so the #dash-live refresh (below) does not
+    // re-render the region under it (#1078).
+    document.documentElement.setAttribute("data-dash-picking", "");
     fetch(href)
       .then(function (response) {
         if (!response.ok) throw new Error("unexpected response");
@@ -156,11 +159,76 @@
           }
         }
         history.pushState(null, "", href);
+        document.documentElement.removeAttribute("data-dash-picking");
         document.dispatchEvent(new CustomEvent("hfs:chart-swapped"));
       })
       .catch(function () {
+        document.documentElement.removeAttribute("data-dash-picking");
         window.location = href;
       });
+  });
+})();
+
+/* Live refresh (#1078): while the dashboard's figures are still moving —
+   approximate, or with an import running — the server renders #dash-live
+   with `hx-trigger="every Ns [hfsDashCanRefresh()]"` and data-dash-refresh,
+   and stops rendering them once the figures settle. Three things keep that
+   poll from getting in the user's way:
+
+   - hfsDashCanRefresh() skips a tick (htmx keeps polling) while the tab is
+     hidden, a <details> in the region is open (type picker, data table),
+     focus is inside the region, the chart tooltip is showing, or a picker
+     swap is in flight — an outerHTML swap would close, blur or hide those.
+   - The type picker swaps only the chart card and pushState()s its URL, so
+     the poll's hx-get is left pointing at the old selection. Each refresh
+     request is re-aimed at the current location, and a response is dropped
+     if the location changed while it was in flight.
+   - The request names the notice kinds already on screen (?notices=), so the
+     server renders those lines aria-live="off": an unchanged "approximate"
+     line is not re-announced every tick, a changed one still is. */
+(function () {
+  "use strict";
+
+  function isRefresh(elt) {
+    return !!elt && elt.id === "dash-live" && elt.hasAttribute("data-dash-refresh");
+  }
+
+  function here() {
+    return window.location.pathname + window.location.search;
+  }
+
+  window.hfsDashCanRefresh = function () {
+    if (document.hidden) return false;
+    if (document.documentElement.hasAttribute("data-dash-picking")) return false;
+    var live = document.getElementById("dash-live");
+    if (!live) return false;
+    if (live.querySelector("details[open]")) return false;
+    var active = document.activeElement;
+    if (active && active !== document.body && live.contains(active)) return false;
+    var tip = document.getElementById("chart-tip");
+    if (tip && !tip.hidden) return false;
+    return true;
+  };
+
+  document.addEventListener("htmx:configRequest", function (event) {
+    var elt = event.detail.elt;
+    if (!isRefresh(elt)) return;
+    var path = here();
+    event.detail.path = path;
+    var seen = [];
+    elt.querySelectorAll("[data-dash-notice]").forEach(function (line) {
+      seen.push(line.getAttribute("data-dash-notice"));
+    });
+    if (seen.length) event.detail.parameters.notices = seen.join(",");
+    elt.setAttribute("data-dash-requested", path);
+  });
+
+  document.addEventListener("htmx:beforeSwap", function (event) {
+    var elt = event.detail.elt;
+    if (!isRefresh(elt)) return;
+    if (elt.getAttribute("data-dash-requested") !== here()) {
+      event.detail.shouldSwap = false;
+    }
   });
 })();
 
