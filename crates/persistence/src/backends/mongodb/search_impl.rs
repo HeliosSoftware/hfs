@@ -129,7 +129,8 @@ fn parse_date_for_query(value: &str) -> Option<DateTime<Utc>> {
         .map(|dt| dt.with_timezone(&Utc))
 }
 
-const CANDIDATE_BATCH_SIZE: i64 = 512;
+const CANDIDATE_BATCH_SIZE: usize = 512;
+const MAX_RESULT_ID_SET: usize = 300_000;
 
 async fn collect_documents(mut cursor: Cursor<Document>) -> StorageResult<Vec<Document>> {
     let mut docs = Vec::new();
@@ -141,6 +142,27 @@ async fn collect_documents(mut cursor: Cursor<Document>) -> StorageResult<Vec<Do
         let doc = cursor
             .deserialize_current()
             .or_query_error("Failed to deserialize MongoDB document")?;
+        docs.push(doc);
+    }
+    Ok(docs)
+}
+
+async fn read_cursor_batch(
+    cursor: &mut Cursor<Document>,
+    limit: usize,
+) -> StorageResult<Vec<Document>> {
+    let mut docs = Vec::with_capacity(limit);
+    while docs.len() < limit {
+        if !cursor
+            .advance()
+            .await
+            .or_query_error("Failed to advance cursor")?
+        {
+            break;
+        }
+        let doc = cursor
+            .deserialize_current()
+            .or_query_error("Failed to deserialize cursor document")?;
         docs.push(doc);
     }
     Ok(docs)
@@ -1006,14 +1028,19 @@ impl MongoBackend {
                     .await
                     .or_query_error("Failed to probe search_index for driver selection")?;
                 let docs = collect_documents(cursor).await?;
-                let count = docs
-                    .first()
-                    .and_then(|d| d.get_i32("n").ok())
-                    .map(|n| n as i64)
-                    .unwrap_or(0);
-                if count == 0 {
+                if docs.is_empty() {
                     return Ok(Some(HashSet::new()));
                 }
+                let count = docs
+                    .first()
+                    .and_then(|d| {
+                        d.get_i64("n")
+                            .ok()
+                            .or_else(|| d.get_i32("n").ok().map(|v| v as i64))
+                    })
+                    .ok_or_else(|| {
+                        internal_error("probe count field 'n' missing or unreadable".to_string())
+                    })?;
                 if best.is_none_or(|(_, prev)| count < prev) {
                     best = Some((i, count));
                 }
@@ -1024,27 +1051,17 @@ impl MongoBackend {
         let driver_filter =
             self.build_search_index_filter(tenant_id, resource_type, normal[driver_idx])?;
 
-        let mut last_index_id: Option<Bson> = None;
+        let mut driver_cursor = search_index
+            .find(driver_filter)
+            .projection(doc! { "resource_id": 1 })
+            .await
+            .or_query_error("Failed to open driver cursor")?;
+
         let mut confirmed: HashSet<String> = HashSet::new();
 
         loop {
-            let page_filter = match &last_index_id {
-                Some(last_id) => doc! {
-                    "$and": [driver_filter.clone(), { "_id": { "$gt": last_id.clone() } }]
-                },
-                None => driver_filter.clone(),
-            };
-
-            let cursor = search_index
-                .find(page_filter)
-                .sort(doc! { "_id": 1 })
-                .projection(doc! { "_id": 1, "resource_id": 1 })
-                .limit(CANDIDATE_BATCH_SIZE)
-                .await
-                .or_query_error("Failed to page search_index")?;
-
-            let batch_docs = collect_documents(cursor).await?;
-            let docs_read = batch_docs.len() as i64;
+            let batch_docs = read_cursor_batch(&mut driver_cursor, CANDIDATE_BATCH_SIZE).await?;
+            let docs_read = batch_docs.len();
 
             if docs_read == 0 {
                 break;
@@ -1052,7 +1069,6 @@ impl MongoBackend {
 
             let mut candidates: HashSet<String> = HashSet::new();
             for doc in &batch_docs {
-                last_index_id = doc.get("_id").cloned();
                 if let Ok(rid) = doc.get_str("resource_id") {
                     candidates.insert(rid.to_string());
                 }
@@ -1170,6 +1186,13 @@ impl MongoBackend {
             }
 
             confirmed.extend(candidates);
+
+            if confirmed.len() > MAX_RESULT_ID_SET {
+                return Err(StorageError::Search(SearchError::TooManyResults {
+                    count: confirmed.len(),
+                    max: MAX_RESULT_ID_SET,
+                }));
+            }
 
             if docs_read < CANDIDATE_BATCH_SIZE {
                 break;
@@ -1687,6 +1710,12 @@ impl MongoBackend {
         }];
 
         if let Some(ids) = matched_ids {
+            if ids.len() > MAX_RESULT_ID_SET {
+                return Err(StorageError::Search(SearchError::TooManyResults {
+                    count: ids.len(),
+                    max: MAX_RESULT_ID_SET,
+                }));
+            }
             let id_values = ids.iter().cloned().map(Bson::String).collect::<Vec<_>>();
             conditions.push(doc! {
                 "id": { "$in": Bson::Array(id_values) }
