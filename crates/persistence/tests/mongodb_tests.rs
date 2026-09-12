@@ -3664,6 +3664,151 @@ async fn mongodb_integration_search_missing_not_and_param_sort() {
     assert!(page2.resources.page_info.has_previous);
 }
 
+/// #1055: `_id`/`_lastUpdated` used to bypass the generic modifier dispatch
+/// entirely, so `:not` returned the exact inverse of the request and
+/// `:missing` compared the boolean literal against the id/date fields
+/// (`_lastUpdated:missing` even 400'd, since "true"/"false" is not a date).
+#[tokio::test]
+async fn mongodb_integration_search_id_and_last_updated_modifiers() {
+    let Some(backend) = create_backend_with_full_registry("id_last_updated_modifiers").await else {
+        eprintln!(
+            "Skipping mongodb_integration_search_id_and_last_updated_modifiers (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+
+    let tenant = create_tenant("tenant-id-modifiers");
+
+    for id in ["patient-idm-1", "patient-idm-2", "patient-idm-3"] {
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({
+                    "resourceType": "Patient",
+                    "id": id,
+                    "name": [{"family": format!("Idm-{}", id)}],
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+    }
+
+    let ids = |result: &helios_persistence::core::SearchResult| {
+        let mut got = result
+            .resources
+            .items
+            .iter()
+            .map(|r| r.id().to_string())
+            .collect::<Vec<_>>();
+        got.sort();
+        got
+    };
+
+    // Control: plain `_id=patient-idm-1` is unaffected by this change.
+    let plain = SearchQuery::new("Patient").with_parameter(SearchParameter {
+        name: "_id".to_string(),
+        param_type: SearchParamType::Token,
+        modifier: None,
+        values: vec![SearchValue::eq("patient-idm-1")],
+        chain: vec![],
+        components: vec![],
+    });
+    let result = backend.search(&tenant, &plain).await.unwrap();
+    assert_eq!(ids(&result), vec!["patient-idm-1"]);
+    assert_eq!(backend.search_count(&tenant, &plain).await.unwrap(), 1);
+
+    // `_id:not=patient-idm-1` -> everyone EXCEPT patient-idm-1. Before the
+    // fix this returned ONLY patient-idm-1 (the exact inverse) with count 1.
+    let not_one = SearchQuery::new("Patient").with_parameter(SearchParameter {
+        name: "_id".to_string(),
+        param_type: SearchParamType::Token,
+        modifier: Some(SearchModifier::Not),
+        values: vec![SearchValue::eq("patient-idm-1")],
+        chain: vec![],
+        components: vec![],
+    });
+    let result = backend.search(&tenant, &not_one).await.unwrap();
+    assert_eq!(ids(&result), vec!["patient-idm-2", "patient-idm-3"]);
+    assert_eq!(backend.search_count(&tenant, &not_one).await.unwrap(), 2);
+
+    // `_id:not=patient-idm-1,patient-idm-2` -> only patient-idm-3.
+    let not_two = SearchQuery::new("Patient").with_parameter(SearchParameter {
+        name: "_id".to_string(),
+        param_type: SearchParamType::Token,
+        modifier: Some(SearchModifier::Not),
+        values: vec![
+            SearchValue::eq("patient-idm-1"),
+            SearchValue::eq("patient-idm-2"),
+        ],
+        chain: vec![],
+        components: vec![],
+    });
+    let result = backend.search(&tenant, &not_two).await.unwrap();
+    assert_eq!(ids(&result), vec!["patient-idm-3"]);
+
+    // `_id:missing=false` -> every live resource of the type. Before the fix
+    // this returned nothing (the filter compared ids against the string
+    // "false").
+    let id_missing_false = SearchQuery::new("Patient").with_parameter(SearchParameter {
+        name: "_id".to_string(),
+        param_type: SearchParamType::Token,
+        modifier: Some(SearchModifier::Missing),
+        values: vec![SearchValue::eq("false")],
+        chain: vec![],
+        components: vec![],
+    });
+    let result = backend.search(&tenant, &id_missing_false).await.unwrap();
+    assert_eq!(
+        ids(&result),
+        vec!["patient-idm-1", "patient-idm-2", "patient-idm-3"]
+    );
+
+    // `_id:missing=true` -> empty. NOT a discriminator on its own: `{id:
+    // "true"}` matched nothing before the fix too, so this passes either way
+    // — the filter-shape unit tests above are what actually pin this case.
+    let id_missing_true = SearchQuery::new("Patient").with_parameter(SearchParameter {
+        name: "_id".to_string(),
+        param_type: SearchParamType::Token,
+        modifier: Some(SearchModifier::Missing),
+        values: vec![SearchValue::eq("true")],
+        chain: vec![],
+        components: vec![],
+    });
+    let result = backend.search(&tenant, &id_missing_true).await.unwrap();
+    assert!(ids(&result).is_empty());
+
+    // `_lastUpdated:missing=false` -> every live resource. Before the fix
+    // this was a hard 400 (`Invalid date value 'false'`).
+    let lu_missing_false = SearchQuery::new("Patient").with_parameter(SearchParameter {
+        name: "_lastUpdated".to_string(),
+        param_type: SearchParamType::Date,
+        modifier: Some(SearchModifier::Missing),
+        values: vec![SearchValue::eq("false")],
+        chain: vec![],
+        components: vec![],
+    });
+    let result = backend.search(&tenant, &lu_missing_false).await.unwrap();
+    assert_eq!(
+        ids(&result),
+        vec!["patient-idm-1", "patient-idm-2", "patient-idm-3"]
+    );
+
+    // `_lastUpdated:missing=true` -> empty. Before the fix this was a hard
+    // 400 (`Invalid date value 'true'`), not an empty bundle.
+    let lu_missing_true = SearchQuery::new("Patient").with_parameter(SearchParameter {
+        name: "_lastUpdated".to_string(),
+        param_type: SearchParamType::Date,
+        modifier: Some(SearchModifier::Missing),
+        values: vec![SearchValue::eq("true")],
+        chain: vec![],
+        components: vec![],
+    });
+    let result = backend.search(&tenant, &lu_missing_true).await.unwrap();
+    assert!(ids(&result).is_empty());
+}
+
 /// The in-DB runner compiles no compartment predicate, so a run carrying
 /// `patient`/`group` filters is handed to the in-process engine over a scan
 /// of the same collection instead of failing as uncompilable — and answers
