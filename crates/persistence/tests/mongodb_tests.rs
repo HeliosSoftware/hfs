@@ -8191,3 +8191,164 @@ async fn mongodb_integration_if_none_exist_broad_param_beyond_probe_limit() {
         "no duplicate should have been created"
     );
 }
+
+#[tokio::test]
+async fn mongodb_integration_search_paged_intersection_correctness() {
+    // 550 male + 50 female = 600 active patients.
+    // Both active=true (600) and gender=male (550) exceed CANDIDATE_BATCH_SIZE
+    // (512), so the paging loop must run at least 2 iterations to exhaust the
+    // driver. This is the shape that triggered the distinct-too-big 500 at
+    // real corpus scale (issue #999): one broad param whose full distinct
+    // result would blow the 16 MB BSON cap, intersected with a second param
+    // that narrows the result to a small set.
+    const MALE_ACTIVE: usize = 550;
+    const FEMALE_ACTIVE: usize = 50;
+
+    let Some(backend) =
+        create_backend_with_full_registry("search_paged_intersection_correctness").await
+    else {
+        eprintln!(
+            "Skipping mongodb_integration_search_paged_intersection_correctness \
+             (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+
+    let tenant = create_tenant("tenant-a");
+
+    for chunk_start in (0..MALE_ACTIVE).step_by(50) {
+        let end = (chunk_start + 50).min(MALE_ACTIVE);
+        let entries: Vec<BundleEntry> = (chunk_start..end)
+            .map(|i| BundleEntry {
+                method: BundleMethod::Post,
+                url: "Patient".to_string(),
+                resource: Some(serde_json::json!({
+                    "resourceType": "Patient",
+                    "active": true,
+                    "gender": "male",
+                    "identifier": [{"system": "http://example.org/batch", "value": format!("M-{i}")}]
+                })),
+                if_match: None,
+                if_none_match: None,
+                if_none_exist: None,
+                full_url: Some(format!("urn:uuid:male-{i}")),
+            })
+            .collect();
+        let Some(r) = process_transaction_or_skip(
+            &backend,
+            &tenant,
+            entries,
+            "mongodb_integration_search_paged_intersection_correctness (male setup)",
+        )
+        .await
+        else {
+            return;
+        };
+        assert!(
+            r.entries.iter().all(|e| e.status == 201),
+            "male batch create failed"
+        );
+    }
+
+    for chunk_start in (0..FEMALE_ACTIVE).step_by(50) {
+        let end = (chunk_start + 50).min(FEMALE_ACTIVE);
+        let entries: Vec<BundleEntry> = (chunk_start..end)
+            .map(|i| BundleEntry {
+                method: BundleMethod::Post,
+                url: "Patient".to_string(),
+                resource: Some(serde_json::json!({
+                    "resourceType": "Patient",
+                    "active": true,
+                    "gender": "female",
+                    "identifier": [{"system": "http://example.org/batch", "value": format!("F-{i}")}]
+                })),
+                if_match: None,
+                if_none_match: None,
+                if_none_exist: None,
+                full_url: Some(format!("urn:uuid:female-{i}")),
+            })
+            .collect();
+        let Some(r) = process_transaction_or_skip(
+            &backend,
+            &tenant,
+            entries,
+            "mongodb_integration_search_paged_intersection_correctness (female setup)",
+        )
+        .await
+        else {
+            return;
+        };
+        assert!(
+            r.entries.iter().all(|e| e.status == 201),
+            "female batch create failed"
+        );
+    }
+
+    assert_eq!(
+        backend.count(&tenant, Some("Patient")).await.unwrap(),
+        (MALE_ACTIVE + FEMALE_ACTIVE) as u64,
+        "all patients must be stored before searching"
+    );
+
+    let query = SearchQuery::new("Patient")
+        .with_parameter(SearchParameter {
+            name: "active".to_string(),
+            param_type: SearchParamType::Token,
+            modifier: None,
+            values: vec![SearchValue::eq("true")],
+            chain: vec![],
+            components: vec![],
+        })
+        .with_parameter(SearchParameter {
+            name: "gender".to_string(),
+            param_type: SearchParamType::Token,
+            modifier: None,
+            values: vec![SearchValue::eq("male")],
+            chain: vec![],
+            components: vec![],
+        })
+        .with_count(1000);
+
+    let result = backend.search(&tenant, &query).await.unwrap();
+
+    assert_eq!(
+        result.resources.items.len(),
+        MALE_ACTIVE,
+        "active=true&gender=male must return exactly the {MALE_ACTIVE} male patients, \
+         not all active patients or wrong count"
+    );
+    assert!(
+        result
+            .resources
+            .items
+            .iter()
+            .all(|r| r.content()["gender"] == "male"),
+        "every returned patient must be male"
+    );
+
+    let female_query = SearchQuery::new("Patient")
+        .with_parameter(SearchParameter {
+            name: "active".to_string(),
+            param_type: SearchParamType::Token,
+            modifier: None,
+            values: vec![SearchValue::eq("true")],
+            chain: vec![],
+            components: vec![],
+        })
+        .with_parameter(SearchParameter {
+            name: "gender".to_string(),
+            param_type: SearchParamType::Token,
+            modifier: None,
+            values: vec![SearchValue::eq("female")],
+            chain: vec![],
+            components: vec![],
+        })
+        .with_count(1000);
+
+    let female_result = backend.search(&tenant, &female_query).await.unwrap();
+    assert_eq!(
+        female_result.resources.items.len(),
+        FEMALE_ACTIVE,
+        "active=true&gender=female must return exactly the {FEMALE_ACTIVE} female patients"
+    );
+}
