@@ -25,14 +25,33 @@
 //! * The path it replaces was not atomic across a batch either. It opened a
 //!   *best-effort* per-resource transaction — none at all on a standalone
 //!   `mongod` — and wrote the rollback log and the receipt outside it.
-//! * A batch-wide transaction would turn one transient error into a whole
-//!   batch's worth of lost entries instead of one, which is the failure #1001 is
-//!   already about.
+//! * Multi-document transactions need a replica set, and a 1 000-entry batch is
+//!   tens of thousands of documents — past what one transaction should carry.
 //!
-//! The commands are ordered so a crash mid-flush leaves a state that re-ingesting
-//! the file converges from: resources, then history, then the derived search
-//! index, then the rollback log, then the receipts. Receipts land last, so an
-//! interrupted batch is re-processed rather than falsely reported done.
+//! What keeps a transient error from losing work is retry plus replay rules,
+//! not atomicity (#1001). Every command runs through the bounded, cancel-aware
+//! retry in [`super::retry`], and a retry never duplicates what an earlier
+//! attempt landed:
+//!
+//! * `resources`: a duplicate id or an unmatched version guard on a retry is
+//!   settled by re-reading the row — ours (same version, the batch's own
+//!   `last_updated`, same content) is a success, anything else is still the
+//!   conflict the per-entry path reported.
+//! * `resource_history` and the rollback log: both have a unique key the batch
+//!   minted itself, so a chunk that reports only duplicates on a retry has
+//!   landed.
+//! * `search_index` has no unique key, so a retry clears the batch's rows
+//!   before re-inserting.
+//! * Receipts are upserts keyed by `(manifest, file_url, line)`.
+//!
+//! When a stage outlives its retries the batch does not take the file with it:
+//! every entry gets a `processing-error` receipt (issue code `transient` when
+//! the error was) and the next batch runs. Re-ingesting the file converges —
+//! resources upsert by id and version guard, history and rollback rows dedupe
+//! on their unique indexes. The commands are ordered so that is always true:
+//! resources, then history, then the derived search index, then the rollback
+//! log, then the receipts, which land last so an interrupted batch is
+//! re-processed rather than falsely reported done.
 //!
 //! # Working memory
 //!
