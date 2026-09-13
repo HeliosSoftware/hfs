@@ -526,12 +526,12 @@ impl MongoBackend {
                     continue;
                 }
             };
-            if let Ok(mut def) = loader.parse_resource(&json) {
-                if def.status == SearchParameterStatus::Active {
-                    def.source = SearchParameterSource::Stored;
-                    by_tenant.entry(tenant_id).or_default().push(def);
-                    count += 1;
-                }
+            if let Ok(mut def) = loader.parse_resource(&json)
+                && def.status == SearchParameterStatus::Active
+            {
+                def.source = SearchParameterSource::Stored;
+                by_tenant.entry(tenant_id).or_default().push(def);
+                count += 1;
             }
         }
 
