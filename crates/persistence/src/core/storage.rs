@@ -719,6 +719,59 @@ pub trait ResourceStorage: Send + Sync {
         Ok(Vec::new())
     }
 
+    /// [`count_deltas_by_bucket`](Self::count_deltas_by_bucket) for several
+    /// resource types at once, returned as `(resource_type, delta)` pairs.
+    ///
+    /// Each pair has exactly the semantics of that method's result for its
+    /// type — epoch-aligned `bucket_start`, creation `+1` / delete `-1` / plain
+    /// update `0`, the same flooring of `since` to a bucket boundary, and only
+    /// buckets whose net delta is non-zero — so the result is the union of the
+    /// per-type calls. A requested type with no such bucket contributes no
+    /// pair. Buckets are ascending within a type; the order across types is
+    /// unspecified. A type listed twice is counted once.
+    ///
+    /// The web UI's Home dashboard loads every charted type's history ring of a
+    /// window with one call (#1078), so a tenant seed costs one history query
+    /// per window rather than one per type per window. The SQLite, PostgreSQL
+    /// and MongoDB backends override this with a single grouped query over the
+    /// `(tenant_id, last_updated)` history range; the default implementation
+    /// calls [`count_deltas_by_bucket`](Self::count_deltas_by_bucket) once per
+    /// type, so a backend without an override behaves exactly as those calls
+    /// would. An empty `resource_types` returns an empty list without querying.
+    ///
+    /// # Arguments
+    ///
+    /// * `tenant` - The tenant context for this operation
+    /// * `resource_types` - The FHIR resource types to bucket
+    /// * `since` - Inclusive lower bound on version `last_updated`
+    /// * `bucket_seconds` - Bucket width in seconds, as for
+    ///   [`count_deltas_by_bucket`](Self::count_deltas_by_bucket). Must be
+    ///   positive.
+    async fn count_deltas_by_type_and_bucket(
+        &self,
+        tenant: &TenantContext,
+        resource_types: &[&str],
+        since: DateTime<Utc>,
+        bucket_seconds: i64,
+    ) -> StorageResult<Vec<(String, ResourceCountDelta)>> {
+        let mut out = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for resource_type in resource_types {
+            if !seen.insert(*resource_type) {
+                continue;
+            }
+            let deltas = self
+                .count_deltas_by_bucket(tenant, resource_type, since, bucket_seconds)
+                .await?;
+            out.extend(
+                deltas
+                    .into_iter()
+                    .map(|delta| ((*resource_type).to_string(), delta)),
+            );
+        }
+        Ok(out)
+    }
+
     /// Buckets write activity into a weekly-rhythm grid by UTC weekday and hour.
     ///
     /// Every resource version (create, update, or delete) recorded in
@@ -1185,5 +1238,159 @@ mod tests {
         ));
         let _no_match = ConditionalDeleteResult::NoMatch;
         let _multiple = ConditionalDeleteResult::MultipleMatches(5);
+    }
+
+    /// A backend that only implements the per-type `count_deltas_by_bucket`,
+    /// recording each type it is asked for and answering with a fixed series
+    /// per type.
+    #[derive(Default)]
+    struct PerTypeDeltasOnly {
+        asked: std::sync::Mutex<Vec<(String, DateTime<Utc>, i64)>>,
+    }
+
+    #[async_trait]
+    impl ResourceStorage for PerTypeDeltasOnly {
+        fn backend_name(&self) -> &'static str {
+            "per-type-deltas-only"
+        }
+
+        async fn create(
+            &self,
+            _tenant: &TenantContext,
+            _resource_type: &str,
+            _resource: Value,
+            _fhir_version: FhirVersion,
+        ) -> StorageResult<StoredResource> {
+            unimplemented!("not used by these tests")
+        }
+
+        async fn create_or_update(
+            &self,
+            _tenant: &TenantContext,
+            _resource_type: &str,
+            _id: &str,
+            _resource: Value,
+            _fhir_version: FhirVersion,
+        ) -> StorageResult<(StoredResource, bool)> {
+            unimplemented!("not used by these tests")
+        }
+
+        async fn read(
+            &self,
+            _tenant: &TenantContext,
+            _resource_type: &str,
+            _id: &str,
+        ) -> StorageResult<Option<StoredResource>> {
+            Ok(None)
+        }
+
+        async fn update(
+            &self,
+            _tenant: &TenantContext,
+            _current: &StoredResource,
+            _resource: Value,
+        ) -> StorageResult<StoredResource> {
+            unimplemented!("not used by these tests")
+        }
+
+        async fn delete(
+            &self,
+            _tenant: &TenantContext,
+            _resource_type: &str,
+            _id: &str,
+        ) -> StorageResult<()> {
+            Ok(())
+        }
+
+        async fn count(
+            &self,
+            _tenant: &TenantContext,
+            _resource_type: Option<&str>,
+        ) -> StorageResult<u64> {
+            Ok(0)
+        }
+
+        async fn count_deltas_by_bucket(
+            &self,
+            _tenant: &TenantContext,
+            resource_type: &str,
+            since: DateTime<Utc>,
+            bucket_seconds: i64,
+        ) -> StorageResult<Vec<ResourceCountDelta>> {
+            self.asked
+                .lock()
+                .unwrap()
+                .push((resource_type.to_string(), since, bucket_seconds));
+            if resource_type == "Empty" {
+                return Ok(Vec::new());
+            }
+            let base = bucket_floor(since, bucket_seconds);
+            Ok(vec![
+                ResourceCountDelta {
+                    bucket_start: base,
+                    delta: resource_type.len() as i64,
+                },
+                ResourceCountDelta {
+                    bucket_start: base + chrono::Duration::seconds(bucket_seconds),
+                    delta: -1,
+                },
+            ])
+        }
+    }
+
+    fn tenant() -> TenantContext {
+        TenantContext::new(
+            crate::tenant::TenantId::new("t1"),
+            crate::tenant::TenantPermissions::full_access(),
+        )
+    }
+
+    /// #1078: the provided `count_deltas_by_type_and_bucket` is the per-type
+    /// method called once per distinct type, with the same bounds, its rows
+    /// tagged with their type — so a backend without an override answers
+    /// exactly as the per-type calls would.
+    #[tokio::test]
+    async fn count_deltas_by_type_and_bucket_default_loops_over_the_types() {
+        let storage = PerTypeDeltasOnly::default();
+        let since = DateTime::from_timestamp(1_700_000_123, 0).unwrap();
+        let types = ["Patient", "Empty", "Observation", "Patient"];
+
+        let grouped = storage
+            .count_deltas_by_type_and_bucket(&tenant(), &types, since, 60)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            *storage.asked.lock().unwrap(),
+            vec![
+                ("Patient".to_string(), since, 60),
+                ("Empty".to_string(), since, 60),
+                ("Observation".to_string(), since, 60),
+            ],
+            "one per-type call per distinct type, in order, with the same bounds"
+        );
+        let mut expected = Vec::new();
+        for rt in ["Patient", "Observation"] {
+            for delta in storage
+                .count_deltas_by_bucket(&tenant(), rt, since, 60)
+                .await
+                .unwrap()
+            {
+                expected.push((rt.to_string(), delta));
+            }
+        }
+        assert_eq!(grouped, expected);
+    }
+
+    /// An empty type list is answered without asking the backend anything.
+    #[tokio::test]
+    async fn count_deltas_by_type_and_bucket_default_with_no_types_does_not_query() {
+        let storage = PerTypeDeltasOnly::default();
+        let grouped = storage
+            .count_deltas_by_type_and_bucket(&tenant(), &[], Utc::now(), 60)
+            .await
+            .unwrap();
+        assert!(grouped.is_empty());
+        assert!(storage.asked.lock().unwrap().is_empty());
     }
 }

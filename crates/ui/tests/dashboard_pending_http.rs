@@ -704,8 +704,8 @@ async fn a_tenant_whose_totals_are_pending_renders_waiting_not_zeros() {
     assert!(html.contains("Waiting for the live figures"));
     assert!(!html.contains("chart-data"));
     assert!(
-        !html.contains(r#"<div class="chart-empty">Nothing to chart yet"#),
-        "the chart area waits, it does not claim the tenant is empty"
+        !html.contains("Nothing to chart yet"),
+        "nothing on the page claims the tenant is empty while it waits"
     );
     // The selectors survive the wait with the requested selection.
     assert!(html.contains(r#"href="/ui?types=Patient&window=24h""#));
@@ -714,6 +714,22 @@ async fn a_tenant_whose_totals_are_pending_renders_waiting_not_zeros() {
     assert!(html.contains("retry=1"));
     assert!(html.contains("Retry now"));
     assert_no_periodic_refresh(&html);
+}
+
+/// #1078: with nothing requested and nothing known yet, the type picker is
+/// empty — and says it is waiting, not that there is nothing to chart.
+#[tokio::test]
+async fn an_empty_type_picker_on_a_waiting_page_says_it_is_waiting() {
+    let html = get_as(TOTALS_PENDING_TENANT, "/ui?window=30d").await;
+
+    assert!(
+        html.contains(r#"<p class="chart-pick__none">Waiting for the live figures"#),
+        "the empty picker names the wait"
+    );
+    assert!(
+        !html.contains("Nothing to chart yet"),
+        "an empty picker on a waiting page does not read as an empty tenant"
+    );
 }
 
 /// #1078: once the fast retries are spent, a page waiting on seeding totals

@@ -160,6 +160,10 @@
           <div class="chart-pick__list">
             {% if picker.is_empty() && chart_unsupported %}
             <p class="chart-pick__none">{{ i18n.t("chart-counts-unsupported") }}</p>
+            {% else if picker.is_empty() && chart_waiting %}
+            {# Waiting is not emptiness: "nothing to chart yet" would read as an
+               empty tenant while its figures are still on their way (#1078). #}
+            <p class="chart-pick__none">{{ i18n.t("chart-pending-empty") }}</p>
             {% else if picker.is_empty() %}
             <p class="chart-pick__none">{{ i18n.t("chart-empty") }}</p>
             {% endif %}

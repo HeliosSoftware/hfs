@@ -19,7 +19,7 @@
 //! # No storage aggregate on a page load (#1078)
 //!
 //! Computing figures from storage means a `GROUP BY` over every live row of
-//! the tenant plus one bucketed history scan per charted type. During a
+//! the tenant plus bucketed history scans for the charted types. During a
 //! multi-million-resource import those queries stop finishing within any page
 //! budget, so the chart sat on "Waiting for the live figures…" exactly when an
 //! operator most wanted to watch it move — and a page load that ran them
@@ -58,7 +58,14 @@
 //!
 //! - **Seeds.** A tenant's seed reads its totals (`count_all_types`) and then
 //!   the history rings of its default charted types for every window, plus any
-//!   ring charted recently that is not exact. The default tenant is queued at
+//!   ring charted recently that is not exact. Rings are loaded one window at a
+//!   time: a single
+//!   [`count_deltas_by_type_and_bucket`](ResourceStorage::count_deltas_by_type_and_bucket)
+//!   query returns every type's buckets for that window, over the history
+//!   log's `(tenant_id, last_updated)` range, so a seed costs one history
+//!   query per window however many types it charts. A failed window query
+//!   leaves all of that window's rings unloaded, to be retried with the next
+//!   seed or re-seed of them. The default tenant is queued at
 //!   startup, any other tenant when a page first asks for it, and a purged
 //!   tenant as soon as [`DashboardCounters::invalidate_tenant`] marks it stale —
 //!   its last figures stay on show, labelled approximate, until the reseed
@@ -79,7 +86,9 @@
 //!   and drops its approximate label.
 //! - **Ring seeds.** A page load that charts a ring without storage history
 //!   queues it and wakes the loop, which loads it after a short debounce —
-//!   deferred while a bulk submit is active for the tenant.
+//!   deferred while a bulk submit is active for the tenant. The queued rings of
+//!   a tenant are loaded with one grouped query per window, and a ring whose
+//!   query failed stays queued for the next drain.
 //!
 //! # Counters are process-local
 //!
@@ -90,7 +99,7 @@
 //! reconcile; until then the snapshot is labelled approximate whenever this
 //! instance saw writes, and may be quietly behind when it saw none.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::{Duration as StdDuration, Instant};
 
@@ -102,7 +111,8 @@ use helios_observability::dashboard::{
 };
 use helios_observability::dashboard_counters::{self, CountersSeries, DashboardCounters};
 use helios_persistence::core::{
-    BulkExportJobStore, BulkSubmitJobStore, ExportStatus, ResourceStorage, bucket_floor,
+    BulkExportJobStore, BulkSubmitJobStore, ExportStatus, ResourceCountDelta, ResourceStorage,
+    bucket_floor,
 };
 use helios_persistence::error::StorageResult;
 use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
@@ -131,7 +141,7 @@ const INFRASTRUCTURE_TYPES: &[&str] = &[
     "ValueSet",
 ];
 /// Hard cap on a user selection — matches the palette (six series colors) and
-/// bounds the per-type history reads. The default stays at three; this is how
+/// bounds the type list of the history reads. The default stays at three; this is how
 /// far an explicit selection can go.
 const MAX_CHARTED_TYPES: usize = 6;
 
@@ -284,6 +294,49 @@ where
     }
 
     Ok(series)
+}
+
+/// Splits a grouped history read
+/// ([`ResourceStorage::count_deltas_by_type_and_bucket`]) into each type's
+/// `(bucket_start, delta)` list, keeping only buckets inside `window` as of
+/// `now` (defensive against a clock-skewed, future-dated `last_updated`, as in
+/// [`resource_count_series`]). A requested type with no rows has no entry;
+/// callers seed it with an empty list.
+fn history_deltas_by_type(
+    rows: Vec<(String, ResourceCountDelta)>,
+    window: SeriesWindow,
+    now: DateTime<Utc>,
+) -> HashMap<String, Vec<(DateTime<Utc>, i64)>> {
+    let (first_bucket, last_bucket) = window.bounds(now);
+    let mut by_type: HashMap<String, Vec<(DateTime<Utc>, i64)>> = HashMap::new();
+    for (resource_type, delta) in rows {
+        if delta.bucket_start >= first_bucket && delta.bucket_start <= last_bucket {
+            by_type
+                .entry(resource_type)
+                .or_default()
+                .push((delta.bucket_start, delta.delta));
+        }
+    }
+    by_type
+}
+
+/// Groups `(type, window)` rings by window, in [`DashboardWindow::ALL`] order,
+/// each with its distinct types sorted — one grouped history query per entry.
+fn rings_by_window(
+    rings: impl IntoIterator<Item = (String, DashboardWindow)>,
+) -> Vec<(DashboardWindow, Vec<String>)> {
+    let rings: Vec<(String, DashboardWindow)> = rings.into_iter().collect();
+    DashboardWindow::ALL
+        .iter()
+        .filter_map(|window| {
+            let types: BTreeSet<&String> = rings
+                .iter()
+                .filter(|(_, w)| w == window)
+                .map(|(resource_type, _)| resource_type)
+                .collect();
+            (!types.is_empty()).then(|| (*window, types.into_iter().cloned().collect()))
+        })
+        .collect()
 }
 
 /// Turns one type's `total` and its bucketed net changes into the dense
@@ -711,6 +764,19 @@ impl<S> StorageDashboardProvider<S> {
         rings
     }
 
+    /// The recently charted rings of `tenant` that are not exact — what a seed
+    /// or a quiet reconcile loads from storage.
+    fn inexact_charted_rings(&self, tenant: &str) -> Vec<(String, DashboardWindow)> {
+        self.charted_for(tenant)
+            .into_iter()
+            .filter(|(resource_type, window)| {
+                !self
+                    .ring_view(tenant, resource_type, *window)
+                    .is_some_and(|view| view.exact)
+            })
+            .collect()
+    }
+
     /// The counters' view of one ring, if the tenant is seeded.
     fn ring_view(
         &self,
@@ -993,54 +1059,93 @@ where
         }
     }
 
-    /// Loads one history ring from storage in the background: the window's
-    /// bucketed history read, bracketed as a ring seed. Returns whether the
-    /// ring was seeded; a failed read logs and leaves the ring as it was.
-    async fn seed_ring(&self, tenant: &str, resource_type: &str, window: DashboardWindow) -> bool {
+    /// Loads the history rings of `types` over one `window` from storage in the
+    /// background, with a single grouped history query for all of them
+    /// (#1078).
+    ///
+    /// Every type's ring seed begins before the query and each finishes after
+    /// it with that type's buckets — none when storage has no non-zero bucket
+    /// for it, which is a valid seed of an empty history. Returns how many
+    /// rings were seeded, or `None` when the query failed: that logs and leaves
+    /// every one of those rings as it was (their begun seeds are simply never
+    /// finished).
+    async fn seed_window_rings(
+        &self,
+        tenant: &str,
+        window: DashboardWindow,
+        types: &[String],
+    ) -> Option<usize> {
+        if types.is_empty() {
+            return Some(0);
+        }
         let context = tenant_context(tenant);
         let series_window = SeriesWindow::from_dashboard_window(window);
         let now = Utc::now();
-        let (first_bucket, last_bucket) = series_window.bounds(now);
+        let (first_bucket, _) = series_window.bounds(now);
 
-        let token = self.counters.begin_ring_seed(tenant, resource_type, window);
+        let tokens: Vec<_> = types
+            .iter()
+            .map(|resource_type| self.counters.begin_ring_seed(tenant, resource_type, window))
+            .collect();
+        let type_refs: Vec<&str> = types.iter().map(String::as_str).collect();
         let started = Instant::now();
         let result = self
             .storage
-            .count_deltas_by_bucket(
+            .count_deltas_by_type_and_bucket(
                 &context,
-                resource_type,
+                &type_refs,
                 first_bucket,
                 series_window.bucket_seconds,
             )
             .await;
         debug!(
             tenant = %tenant,
-            resource_type,
             window = window.as_str(),
+            types = types.len(),
             elapsed_ms = started.elapsed().as_millis() as u64,
             ok = result.is_ok(),
-            "dashboard reconcile: history ring read completed"
+            "dashboard reconcile: grouped history ring read completed"
         );
         match result {
-            Ok(deltas) => {
-                let in_window: Vec<(DateTime<Utc>, i64)> = deltas
+            Ok(rows) => {
+                let mut by_type = history_deltas_by_type(rows, series_window, now);
+                let seeded = types
                     .iter()
-                    .filter(|d| d.bucket_start >= first_bucket && d.bucket_start <= last_bucket)
-                    .map(|d| (d.bucket_start, d.delta))
-                    .collect();
-                self.counters.finish_ring_seed(token, &in_window, now)
+                    .zip(tokens)
+                    .map(|(resource_type, token)| {
+                        let deltas = by_type.remove(resource_type.as_str()).unwrap_or_default();
+                        self.counters.finish_ring_seed(token, &deltas, now)
+                    })
+                    .filter(|seeded| *seeded)
+                    .count();
+                Some(seeded)
             }
             Err(error) => {
                 warn!(
                     %error,
                     tenant = %tenant,
-                    resource_type,
                     window = window.as_str(),
-                    "dashboard reconcile: history ring read failed; keeping the previous ring"
+                    types = ?types,
+                    "dashboard reconcile: grouped history ring read failed; keeping the previous rings"
                 );
-                false
+                None
             }
         }
+    }
+
+    /// Loads `rings` of `tenant` from storage: one
+    /// [`seed_window_rings`](Self::seed_window_rings) query per window for all
+    /// of that window's types. Returns how many rings were seeded; a window
+    /// whose query failed seeds none.
+    async fn seed_rings(&self, tenant: &str, rings: Vec<(String, DashboardWindow)>) -> usize {
+        let mut seeded = 0usize;
+        for (window, types) in rings_by_window(rings) {
+            seeded += self
+                .seed_window_rings(tenant, window, &types)
+                .await
+                .unwrap_or(0);
+        }
+        seeded
     }
 
     /// Seeds one tenant from storage: its totals, then every ring worth
@@ -1067,15 +1172,9 @@ where
                 self.note_charted(tenant, &[resource_type], window);
             }
         }
-        let mut rings_seeded = 0usize;
-        for (resource_type, window) in self.charted_for(tenant) {
-            let exact = self
-                .ring_view(tenant, &resource_type, window)
-                .is_some_and(|view| view.exact);
-            if !exact && self.seed_ring(tenant, &resource_type, window).await {
-                rings_seeded += 1;
-            }
-        }
+        let rings_seeded = self
+            .seed_rings(tenant, self.inexact_charted_rings(tenant))
+            .await;
         debug!(
             tenant = %tenant,
             rings_seeded,
@@ -1168,7 +1267,7 @@ where
     /// The reconcile loop's startup step: queues the default tenant's seed and
     /// runs the queue, so the first dashboard view after a restart is usually
     /// served from memory. At a very large store this is one background
-    /// `GROUP BY` plus a few index-backed history reads; no page waits on it
+    /// `GROUP BY` plus one grouped history read per window; no page waits on it
     /// (a page load meanwhile gets a pending snapshot), and a failure leaves
     /// the tenant queued for the next pass.
     pub(crate) async fn seed_default_tenant(
@@ -1190,14 +1289,15 @@ where
         report
     }
 
-    /// Seeds the queued history rings, one at a time, leaving queued the rings
-    /// of tenants with an active bulk submit. Returns how many were seeded.
+    /// Seeds the queued history rings, one tenant at a time and one grouped
+    /// query per window for all of a tenant's queued types in it, leaving
+    /// queued the rings of tenants with an active bulk submit and the rings
+    /// whose query failed (retried on the next drain). Returns how many were
+    /// seeded.
     pub(crate) async fn drain_pending_ring_seeds(&self) -> usize {
-        let mut keys: Vec<RingKey> = lock(&self.seeds.rings).iter().cloned().collect();
-        keys.sort_by(|a, b| (&a.0, &a.1, a.2.as_str()).cmp(&(&b.0, &b.1, b.2.as_str())));
+        let keys: Vec<RingKey> = lock(&self.seeds.rings).iter().cloned().collect();
 
-        let mut import_active: HashMap<String, bool> = HashMap::new();
-        let mut seeded = 0usize;
+        let mut by_tenant: BTreeMap<String, Vec<(String, DashboardWindow)>> = BTreeMap::new();
         for key in keys {
             let (tenant, resource_type, window) = &key;
             if self
@@ -1208,30 +1308,36 @@ where
                 lock(&self.seeds.rings).remove(&key);
                 continue;
             }
-            let active = match import_active.get(tenant) {
-                Some(active) => *active,
-                None => {
-                    let active = self.import_active(tenant).await;
-                    import_active.insert(tenant.clone(), active);
-                    active
-                }
-            };
-            if active {
+            let (tenant, resource_type, window) = key;
+            by_tenant
+                .entry(tenant)
+                .or_default()
+                .push((resource_type, window));
+        }
+
+        let mut seeded = 0usize;
+        for (tenant, rings) in by_tenant {
+            if self.import_active(&tenant).await {
                 debug!(
                     tenant = %tenant,
-                    resource_type = %resource_type,
-                    window = window.as_str(),
-                    "dashboard reconcile: bulk submit active; history ring seed deferred"
+                    rings = rings.len(),
+                    "dashboard reconcile: bulk submit active; history ring seeds deferred"
                 );
                 continue;
             }
-            if self.seed_ring(tenant, resource_type, *window).await {
-                seeded += 1;
+            for (window, types) in rings_by_window(rings) {
+                let Some(n) = self.seed_window_rings(&tenant, window, &types).await else {
+                    // Still queued: the next drain retries the window.
+                    continue;
+                };
+                seeded += n;
+                // Dequeued only after the read, so a page load during it does
+                // not queue the same rings again.
+                let mut queued = lock(&self.seeds.rings);
+                for resource_type in types {
+                    queued.remove(&(tenant.clone(), resource_type, window));
+                }
             }
-            // Dequeued only after the read, so a page load during it does not
-            // queue the same ring again. A failed seed is dropped: the next
-            // view of the ring queues it anew.
-            lock(&self.seeds.rings).remove(&key);
         }
         seeded
     }
@@ -1253,8 +1359,9 @@ where
     ///      and keeps the previous counters.
     ///    - **Rings.** When the tenant is quiet — no write recorded since its
     ///      totals reconcile began — each recently charted ring that is not
-    ///      exact is re-seeded, which is what lets the snapshot drop its
-    ///      approximate label after an import.
+    ///      exact is re-seeded (one grouped history query per window), which
+    ///      is what lets the snapshot drop its approximate label after an
+    ///      import.
     /// 3. **Ring seeds.** The queued ring seeds are drained.
     ///
     /// Does nothing when the backend cannot count.
@@ -1316,14 +1423,9 @@ where
                 );
                 continue;
             }
-            for (resource_type, window) in self.charted_for(&tenant) {
-                let exact = self
-                    .ring_view(&tenant, &resource_type, window)
-                    .is_some_and(|view| view.exact);
-                if !exact && self.seed_ring(&tenant, &resource_type, window).await {
-                    report.rings_seeded += 1;
-                }
-            }
+            report.rings_seeded += self
+                .seed_rings(&tenant, self.inexact_charted_rings(&tenant))
+                .await;
         }
 
         report.rings_seeded += self.drain_pending_ring_seeds().await;
@@ -1500,7 +1602,6 @@ mod tests {
     use crate::config::ServerConfig;
     use helios_fhir::FhirVersion;
     use helios_persistence::backends::sqlite::SqliteBackend;
-    use helios_persistence::core::ResourceCountDelta;
     use helios_persistence::error::{BackendError, StorageError};
     use helios_persistence::types::StoredResource;
     use serde_json::Value;
@@ -1599,8 +1700,15 @@ mod tests {
     struct InstrumentedStorage {
         inner: Arc<SqliteBackend>,
         aggregate_calls: AtomicUsize,
+        /// Per-type `count_deltas_by_bucket` calls (also in `aggregate_calls`).
+        per_type_history_calls: AtomicUsize,
+        /// Grouped `count_deltas_by_type_and_bucket` calls (also in
+        /// `aggregate_calls`).
+        grouped_history_calls: AtomicUsize,
         delay_ms: AtomicU64,
         fail: AtomicBool,
+        /// Fails only the history reads, leaving the totals read working.
+        fail_history: AtomicBool,
         type_counts: AtomicBool,
     }
 
@@ -1609,14 +1717,38 @@ mod tests {
             Arc::new(Self {
                 inner,
                 aggregate_calls: AtomicUsize::new(0),
+                per_type_history_calls: AtomicUsize::new(0),
+                grouped_history_calls: AtomicUsize::new(0),
                 delay_ms: AtomicU64::new(0),
                 fail: AtomicBool::new(false),
+                fail_history: AtomicBool::new(false),
                 type_counts: AtomicBool::new(true),
             })
         }
 
         fn aggregate_calls(&self) -> usize {
             self.aggregate_calls.load(Ordering::SeqCst)
+        }
+
+        fn per_type_history_calls(&self) -> usize {
+            self.per_type_history_calls.load(Ordering::SeqCst)
+        }
+
+        fn grouped_history_calls(&self) -> usize {
+            self.grouped_history_calls.load(Ordering::SeqCst)
+        }
+
+        /// A history read: counted as an aggregate, then failed if
+        /// `fail_history` is set.
+        async fn history_read(&self) -> StorageResult<()> {
+            self.aggregate().await?;
+            if self.fail_history.load(Ordering::SeqCst) {
+                return Err(StorageError::Backend(BackendError::Unavailable {
+                    backend_name: "instrumented".to_string(),
+                    message: "injected history read failure".to_string(),
+                }));
+            }
+            Ok(())
         }
 
         async fn aggregate(&self) -> StorageResult<()> {
@@ -1733,11 +1865,32 @@ mod tests {
             since: DateTime<Utc>,
             bucket_seconds: i64,
         ) -> StorageResult<Vec<ResourceCountDelta>> {
-            self.aggregate().await?;
+            self.per_type_history_calls.fetch_add(1, Ordering::SeqCst);
+            self.history_read().await?;
             ResourceStorage::count_deltas_by_bucket(
                 self.inner.as_ref(),
                 tenant,
                 resource_type,
+                since,
+                bucket_seconds,
+            )
+            .await
+        }
+
+        async fn count_deltas_by_type_and_bucket(
+            &self,
+            tenant: &TenantContext,
+            resource_types: &[&str],
+            since: DateTime<Utc>,
+            bucket_seconds: i64,
+        ) -> StorageResult<Vec<(String, ResourceCountDelta)>> {
+            self.grouped_history_calls.fetch_add(1, Ordering::SeqCst);
+            self.history_read().await?;
+            // SQLite's own grouped query, not the trait's per-type default.
+            ResourceStorage::count_deltas_by_type_and_bucket(
+                self.inner.as_ref(),
+                tenant,
+                resource_types,
                 since,
                 bucket_seconds,
             )
@@ -1789,7 +1942,9 @@ mod tests {
     }
 
     /// Loads `types`' history rings over `window` straight from `storage` into
-    /// `counters`, bracketed exactly as the provider's ring seeds are.
+    /// `counters`, bracketed exactly as the provider's ring seeds are: every
+    /// token begun, one grouped history read, split per type, every token
+    /// finished.
     async fn seed_rings_from<S: ResourceStorage + Sync>(
         counters: &DashboardCounters,
         storage: &S,
@@ -1799,19 +1954,24 @@ mod tests {
         now: DateTime<Utc>,
     ) {
         let series_window = SeriesWindow::from_dashboard_window(window);
-        let (first_bucket, last_bucket) = series_window.bounds(now);
-        for rt in types {
-            let token = counters.begin_ring_seed(tenant.tenant_id().as_str(), rt, window);
-            let deltas = storage
-                .count_deltas_by_bucket(tenant, rt, first_bucket, series_window.bucket_seconds)
-                .await
-                .expect("history read");
-            let in_window: Vec<(DateTime<Utc>, i64)> = deltas
-                .iter()
-                .filter(|d| d.bucket_start >= first_bucket && d.bucket_start <= last_bucket)
-                .map(|d| (d.bucket_start, d.delta))
-                .collect();
-            assert!(counters.finish_ring_seed(token, &in_window, now));
+        let (first_bucket, _) = series_window.bounds(now);
+        let tokens: Vec<_> = types
+            .iter()
+            .map(|rt| counters.begin_ring_seed(tenant.tenant_id().as_str(), rt, window))
+            .collect();
+        let rows = storage
+            .count_deltas_by_type_and_bucket(
+                tenant,
+                types,
+                first_bucket,
+                series_window.bucket_seconds,
+            )
+            .await
+            .expect("grouped history read");
+        let mut by_type = history_deltas_by_type(rows, series_window, now);
+        for (rt, token) in types.iter().zip(tokens) {
+            let deltas = by_type.remove(*rt).unwrap_or_default();
+            assert!(counters.finish_ring_seed(token, &deltas, now));
         }
     }
 
@@ -3229,5 +3389,243 @@ mod tests {
             .await
             .expect("the loop stops once its provider is gone")
             .expect("the loop did not panic");
+    }
+
+    /// Every `(type, window)` ring of `types` in every window is loaded from
+    /// storage history and exact.
+    fn all_rings_exact(counters: &DashboardCounters, types: &[&str]) -> bool {
+        DashboardWindow::ALL.iter().all(|window| {
+            counters
+                .series_view("default", *window, types, Utc::now())
+                .is_some_and(|views| views.iter().all(|v| v.history_seeded && v.exact))
+        })
+    }
+
+    /// #1078: a tenant seed loads its rings with one grouped history query per
+    /// window — not one per type per window — and never the per-type read. A
+    /// charted type with no stored rows is seeded all the same (an empty
+    /// history), and the seeded rings chart what per-type storage reads chart.
+    #[tokio::test]
+    async fn tenant_seed_issues_one_grouped_history_query_per_window() {
+        let storage = InstrumentedStorage::over(sqlite());
+        populate(
+            storage.as_ref(),
+            &[("Patient", 3), ("Observation", 2), ("Condition", 1)],
+        )
+        .await;
+        let counters = isolated_counters();
+        let provider = StorageDashboardProvider::new(Arc::clone(&storage), &test_config())
+            .with_counters(counters);
+        // Charted recently in one window: joins that window's query, and a type
+        // with no rows at all.
+        provider.note_charted("default", &["Procedure"], DashboardWindow::LastDay);
+
+        let report = settle_report(&provider).await;
+        assert_eq!(report.seeded, vec!["default".to_string()]);
+        let default_types = ["Patient", "Observation", "Condition"];
+        assert_eq!(
+            report.rings_seeded,
+            default_types.len() * DashboardWindow::ALL.len() + 1
+        );
+        assert_eq!(
+            storage.grouped_history_calls(),
+            DashboardWindow::ALL.len(),
+            "one grouped history query per window"
+        );
+        assert_eq!(storage.per_type_history_calls(), 0, "no per-type read");
+        assert_eq!(
+            storage.aggregate_calls(),
+            1 + DashboardWindow::ALL.len(),
+            "the totals read plus one history read per window"
+        );
+        assert!(all_rings_exact(counters, &default_types));
+        let procedure = counters
+            .series_view(
+                "default",
+                DashboardWindow::LastDay,
+                &["Procedure"],
+                Utc::now(),
+            )
+            .expect("seeded");
+        assert!(procedure[0].history_seeded && procedure[0].exact);
+
+        let tenant = test_tenant();
+        for window in DashboardWindow::ALL {
+            let now = Utc::now();
+            let from_storage = resource_count_series(
+                storage.inner.as_ref(),
+                &tenant,
+                &default_types,
+                SeriesWindow::from_dashboard_window(window),
+                now,
+            )
+            .await
+            .expect("storage series");
+            let from_counters = resource_count_series_from_counters(
+                counters,
+                "default",
+                window,
+                &default_types,
+                now,
+            )
+            .expect("counter series");
+            assert_eq!(
+                shape(&from_storage),
+                shape(from_counters.iter().map(|c| &c.series)),
+                "{}",
+                window.as_str()
+            );
+        }
+    }
+
+    /// Queues the default tenant's seed the way a page load does and drains
+    /// it, returning the drain's report.
+    async fn settle_report<S>(provider: &StorageDashboardProvider<S>) -> ReconcileReport
+    where
+        S: ResourceStorage + Send + Sync + 'static,
+    {
+        let pending = provider
+            .snapshot(DashboardWindow::LastHour, "", &[], false)
+            .await;
+        assert!(pending.totals_pending);
+        provider.drain_pending_seeds(&mut schedule()).await
+    }
+
+    /// #1078: when a seed's grouped history query fails, the tenant's totals
+    /// still land but none of that query's rings are loaded — they stay
+    /// approximate — and a later quiet pass re-seeds them, again one grouped
+    /// query per window.
+    #[tokio::test]
+    async fn failed_grouped_history_query_in_a_seed_is_retried_by_a_later_pass() {
+        let storage = InstrumentedStorage::over(sqlite());
+        populate(storage.as_ref(), &[("Patient", 2), ("Observation", 1)]).await;
+        let counters = isolated_counters();
+        let provider = StorageDashboardProvider::new(Arc::clone(&storage), &test_config())
+            .with_counters(counters);
+        let types = ["Patient", "Observation"];
+
+        storage.fail_history.store(true, Ordering::SeqCst);
+        let report = settle_report(&provider).await;
+        assert_eq!(report.seeded, vec!["default".to_string()]);
+        assert_eq!(report.rings_seeded, 0, "a failed query seeds no ring");
+        assert_eq!(storage.grouped_history_calls(), DashboardWindow::ALL.len());
+        assert_eq!(storage.per_type_history_calls(), 0);
+        for window in DashboardWindow::ALL {
+            let views = counters
+                .series_view("default", window, &types, Utc::now())
+                .expect("totals seeded");
+            assert!(
+                views.iter().all(|v| !v.history_seeded),
+                "{}",
+                window.as_str()
+            );
+        }
+        let snapshot = provider
+            .snapshot(DashboardWindow::LastHour, "", &[], false)
+            .await;
+        assert!(!snapshot.totals_pending);
+        assert!(snapshot.approximate, "rings without storage history");
+        assert_eq!(snapshot.total_resources, 3);
+
+        storage.fail_history.store(false, Ordering::SeqCst);
+        let grouped_before = storage.grouped_history_calls();
+        let report = provider.reconcile_pass(&mut schedule()).await;
+        assert_eq!(
+            report.rings_seeded,
+            types.len() * DashboardWindow::ALL.len(),
+            "the charted rings are re-seeded"
+        );
+        // The pass seeds every window once, then drains what the snapshot
+        // above queued: nothing left to read by then.
+        assert_eq!(
+            storage.grouped_history_calls() - grouped_before,
+            DashboardWindow::ALL.len()
+        );
+        assert_eq!(storage.per_type_history_calls(), 0);
+        assert!(all_rings_exact(counters, &types));
+        assert!(lock(&provider.seeds.rings).is_empty());
+        let exact = provider
+            .snapshot(DashboardWindow::LastHour, "", &[], false)
+            .await;
+        assert!(!exact.approximate);
+    }
+
+    /// #1078: queued ring seeds are drained one grouped query per window per
+    /// tenant; a failed query leaves every ring of that window queued (not
+    /// dropped) and a later drain seeds them.
+    #[tokio::test]
+    async fn failed_grouped_ring_seed_stays_queued_until_a_later_drain() {
+        let storage = InstrumentedStorage::over(sqlite());
+        populate(
+            storage.as_ref(),
+            &[
+                ("Patient", 2),
+                ("Observation", 2),
+                ("Condition", 2),
+                ("Encounter", 1),
+                ("Procedure", 1),
+            ],
+        )
+        .await;
+        let counters = isolated_counters();
+        let provider = StorageDashboardProvider::new(Arc::clone(&storage), &test_config())
+            .with_counters(counters);
+        settle(&provider, DashboardWindow::LastHour, &[], false).await;
+
+        let extra = vec!["Encounter".to_string(), "Procedure".to_string()];
+        for window in [DashboardWindow::LastHour, DashboardWindow::LastDay] {
+            let snapshot = provider.snapshot(window, "", &extra, false).await;
+            assert!(snapshot.approximate);
+        }
+        assert_eq!(lock(&provider.seeds.rings).len(), 4);
+
+        storage.fail_history.store(true, Ordering::SeqCst);
+        let grouped_before = storage.grouped_history_calls();
+        assert_eq!(provider.drain_pending_ring_seeds().await, 0);
+        assert_eq!(
+            storage.grouped_history_calls() - grouped_before,
+            2,
+            "one grouped query per queued window, not per ring"
+        );
+        assert_eq!(
+            lock(&provider.seeds.rings).len(),
+            4,
+            "the failed rings stay queued"
+        );
+
+        storage.fail_history.store(false, Ordering::SeqCst);
+        let grouped_before = storage.grouped_history_calls();
+        assert_eq!(provider.drain_pending_ring_seeds().await, 4);
+        assert_eq!(storage.grouped_history_calls() - grouped_before, 2);
+        assert_eq!(storage.per_type_history_calls(), 0);
+        assert!(lock(&provider.seeds.rings).is_empty());
+        for window in [DashboardWindow::LastHour, DashboardWindow::LastDay] {
+            let snapshot = provider.snapshot(window, "", &extra, false).await;
+            assert!(!snapshot.approximate, "{}", window.as_str());
+            assert_eq!(snapshot.series.len(), 2);
+        }
+    }
+
+    /// The window grouping behind the grouped seeds: every window once, in
+    /// [`DashboardWindow::ALL`] order, with its distinct types sorted.
+    #[test]
+    fn rings_by_window_groups_distinct_types_per_window() {
+        let grouped = rings_by_window([
+            ("Patient".to_string(), DashboardWindow::LastDay),
+            ("Encounter".to_string(), DashboardWindow::LastHour),
+            ("Patient".to_string(), DashboardWindow::LastHour),
+            ("Encounter".to_string(), DashboardWindow::LastHour),
+        ]);
+        assert_eq!(
+            grouped,
+            vec![
+                (
+                    DashboardWindow::LastHour,
+                    vec!["Encounter".to_string(), "Patient".to_string()]
+                ),
+                (DashboardWindow::LastDay, vec!["Patient".to_string()]),
+            ]
+        );
+        assert!(rings_by_window(Vec::new()).is_empty());
     }
 }

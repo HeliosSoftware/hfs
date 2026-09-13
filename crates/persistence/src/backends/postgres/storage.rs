@@ -774,10 +774,8 @@ impl ResourceStorage for PostgresBackend {
         // Floor each version's `last_updated` to its epoch-aligned bucket:
         // epoch seconds / width, floored, scaled back, then read as a timestamptz.
         // Epoch arithmetic is timezone-independent, so buckets are stable whatever
-        // the session TimeZone. The covering `idx_history_type_updated`
-        // `(tenant_id, resource_type, last_updated) INCLUDE (is_deleted, version_id)`
-        // history index (schema v39, #1078) serves the equality + `>= $3` range
-        // scan for this type alone. Delta rule per the trait doc: creation
+        // the session TimeZone. The `(tenant_id, last_updated)` history index
+        // supports the `>= $3` range scan. Delta rule per the trait doc: creation
         // `+1`, delete `-1`, plain update `0`.
         //
         // `$4::bigint` is cast explicitly: `EXTRACT(EPOCH FROM ...)` is `numeric`, so
@@ -812,6 +810,71 @@ impl ResourceStorage for PostgresBackend {
                 bucket_start,
                 delta,
             });
+        }
+        Ok(out)
+    }
+
+    async fn count_deltas_by_type_and_bucket(
+        &self,
+        tenant: &TenantContext,
+        resource_types: &[&str],
+        since: DateTime<Utc>,
+        bucket_seconds: i64,
+    ) -> StorageResult<Vec<(String, crate::core::ResourceCountDelta)>> {
+        if resource_types.is_empty() {
+            return Ok(Vec::new());
+        }
+        if bucket_seconds <= 0 {
+            return Err(internal_error(
+                "count_deltas_by_type_and_bucket: bucket_seconds must be positive".to_string(),
+            ));
+        }
+        let client = self.get_client().await?;
+        let tenant_id = tenant.tenant_id().as_str();
+        let since_bound = crate::core::bucket_floor(since, bucket_seconds);
+        let mut types: Vec<&str> = resource_types.to_vec();
+        types.sort_unstable();
+        types.dedup();
+
+        // One scan for every requested type (#1078): the same epoch bucketing,
+        // `$4::bigint` cast (see `count_deltas_by_bucket`) and delta rule, over
+        // the `(tenant_id, last_updated)` history index's `>= $3` range, with
+        // `resource_type = ANY($2)` filtering it and splitting the grouping —
+        // so each type's rows equal its per-type call's.
+        let rows = client
+            .query(
+                "SELECT resource_type, \
+                        to_timestamp( \
+                          (FLOOR(EXTRACT(EPOCH FROM last_updated) / $4::bigint) * $4::bigint) \
+                          ::double precision \
+                        ) AS bucket, \
+                        SUM(CASE WHEN is_deleted THEN -1 \
+                                 WHEN version_id = '1' THEN 1 \
+                                 ELSE 0 END)::bigint AS delta \
+                 FROM resource_history \
+                 WHERE tenant_id = $1 AND resource_type = ANY($2) AND last_updated >= $3 \
+                 GROUP BY resource_type, bucket \
+                 HAVING SUM(CASE WHEN is_deleted THEN -1 \
+                                 WHEN version_id = '1' THEN 1 \
+                                 ELSE 0 END) <> 0 \
+                 ORDER BY resource_type, bucket",
+                &[&tenant_id, &types, &since_bound, &bucket_seconds],
+            )
+            .await
+            .or_query_error("Failed to count resource deltas by type")?;
+
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            let resource_type: String = row.get(0);
+            let bucket_start: DateTime<Utc> = row.get(1);
+            let delta: i64 = row.get(2);
+            out.push((
+                resource_type,
+                crate::core::ResourceCountDelta {
+                    bucket_start,
+                    delta,
+                },
+            ));
         }
         Ok(out)
     }

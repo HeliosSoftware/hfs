@@ -1128,6 +1128,20 @@ impl ResourceStorage for CompositeStorage {
             .await
     }
 
+    async fn count_deltas_by_type_and_bucket(
+        &self,
+        tenant: &TenantContext,
+        resource_types: &[&str],
+        since: chrono::DateTime<chrono::Utc>,
+        bucket_seconds: i64,
+    ) -> StorageResult<Vec<(String, crate::core::ResourceCountDelta)>> {
+        // Same history log as `count_deltas_by_bucket`: the primary's, which
+        // answers with its own grouped query rather than the per-type default.
+        self.primary
+            .count_deltas_by_type_and_bucket(tenant, resource_types, since, bucket_seconds)
+            .await
+    }
+
     async fn activity_histogram(
         &self,
         tenant: &TenantContext,
@@ -4147,6 +4161,59 @@ mod tests {
         backends.insert("es".to_string(), Arc::new(MockStorage) as DynStorage);
         let composite = CompositeStorage::new(config, backends).unwrap();
         assert!(composite.supports_type_counts());
+    }
+
+    /// #1078: `count_deltas_by_type_and_bucket` is answered by the primary (its
+    /// grouped query), never the search secondary.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn test_count_deltas_by_type_and_bucket_delegates_to_primary() {
+        use crate::core::ResourceStorage;
+        let sqlite = Arc::new(crate::backends::sqlite::SqliteBackend::in_memory().unwrap());
+        sqlite.init_schema().unwrap();
+        let config = CompositeConfig::builder()
+            .primary("primary", BackendKind::Sqlite)
+            .search_backend("es", BackendKind::Elasticsearch)
+            .build()
+            .unwrap();
+        let mut backends = HashMap::new();
+        backends.insert("primary".to_string(), sqlite.clone() as DynStorage);
+        backends.insert("es".to_string(), Arc::new(MockStorage) as DynStorage);
+        let composite = CompositeStorage::new(config, backends).unwrap();
+
+        let tenant = make_tenant();
+        for rt in ["Patient", "Patient", "Observation"] {
+            sqlite
+                .create(
+                    &tenant,
+                    rt,
+                    serde_json::json!({ "resourceType": rt }),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+        let since = chrono::Utc::now() - chrono::Duration::hours(1);
+        let types = ["Patient", "Observation", "Encounter"];
+        let via_composite = composite
+            .count_deltas_by_type_and_bucket(&tenant, &types, since, 3600)
+            .await
+            .unwrap();
+        let via_primary = sqlite
+            .count_deltas_by_type_and_bucket(&tenant, &types, since, 3600)
+            .await
+            .unwrap();
+        assert_eq!(via_composite, via_primary);
+        assert_eq!(via_composite.iter().map(|(_, d)| d.delta).sum::<i64>(), 3);
+
+        // A primary without history keeps the trait's empty answer.
+        assert!(
+            make_composite_no_secondary()
+                .count_deltas_by_type_and_bucket(&tenant, &types, since, 3600)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     // ── "No capability" error paths ───────────────────────────────

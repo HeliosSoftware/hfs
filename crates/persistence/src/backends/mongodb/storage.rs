@@ -1476,6 +1476,105 @@ impl ResourceStorage for MongoBackend {
         Ok(out)
     }
 
+    async fn count_deltas_by_type_and_bucket(
+        &self,
+        tenant: &TenantContext,
+        resource_types: &[&str],
+        since: DateTime<Utc>,
+        bucket_seconds: i64,
+    ) -> StorageResult<Vec<(String, crate::core::ResourceCountDelta)>> {
+        if resource_types.is_empty() {
+            return Ok(Vec::new());
+        }
+        if bucket_seconds <= 0 {
+            return Err(internal_error(
+                "count_deltas_by_type_and_bucket: bucket_seconds must be positive".to_string(),
+            ));
+        }
+        let db = self.get_database().await?;
+        let history = db.collection::<Document>(MongoBackend::RESOURCE_HISTORY_COLLECTION);
+        let tenant_id = tenant.tenant_id().as_str();
+        let bucket_ms = bucket_seconds * 1000;
+        let since_bson = BsonDateTime::from_millis(
+            crate::core::bucket_floor(since, bucket_seconds).timestamp_millis(),
+        );
+        let mut types: Vec<&str> = resource_types.to_vec();
+        types.sort_unstable();
+        types.dedup();
+
+        // One aggregation for every requested type (#1078): the same `$match`
+        // window, epoch-millis bucket arithmetic and delta rule as
+        // `count_deltas_by_bucket`, with `resource_type` narrowed by `$in` and
+        // added to the group key, so each type's rows equal its per-type call's.
+        // `idx_history_system_updated` (tenant_id, last_updated, resource_type)
+        // serves the tenant + time-range scan.
+        let epoch_ms = doc! { "$toLong": "$last_updated" };
+        let pipeline = vec![
+            doc! { "$match": {
+                "tenant_id": tenant_id,
+                "resource_type": { "$in": types },
+                "last_updated": { "$gte": since_bson },
+            }},
+            doc! { "$group": {
+                "_id": {
+                    "resource_type": "$resource_type",
+                    "bucket": { "$subtract": [
+                        epoch_ms.clone(),
+                        { "$mod": [epoch_ms, bucket_ms] },
+                    ]},
+                },
+                "delta": { "$sum": { "$switch": {
+                    "branches": [
+                        { "case": { "$eq": ["$is_deleted", true] }, "then": -1 },
+                        { "case": { "$eq": ["$version_id", "1"] }, "then": 1 },
+                    ],
+                    "default": 0,
+                }}},
+            }},
+            doc! { "$match": { "delta": { "$ne": 0 } } },
+            doc! { "$sort": { "_id.resource_type": 1, "_id.bucket": 1 } },
+        ];
+
+        let mut cursor = history
+            .aggregate(pipeline)
+            .await
+            .or_query_error("Failed to aggregate count_deltas_by_type_and_bucket")?;
+
+        let mut out = Vec::new();
+        while cursor
+            .advance()
+            .await
+            .or_query_error("count_deltas_by_type cursor advance")?
+        {
+            let doc = cursor
+                .deserialize_current()
+                .or_query_error("count_deltas_by_type cursor deserialize")?;
+            let Ok(key) = doc.get_document("_id") else {
+                continue;
+            };
+            let Ok(resource_type) = key.get_str("resource_type") else {
+                continue;
+            };
+            let bucket_ms_start = key.get_i64("bucket").unwrap_or_default();
+            // `$sum` yields an int32 for small totals and an int64 once it overflows,
+            // so accept either width rather than assuming one.
+            let delta = doc
+                .get_i64("delta")
+                .or_else(|_| doc.get_i32("delta").map(i64::from))
+                .unwrap_or_default();
+            if let Some(bucket_start) = DateTime::from_timestamp_millis(bucket_ms_start) {
+                out.push((
+                    resource_type.to_string(),
+                    crate::core::ResourceCountDelta {
+                        bucket_start,
+                        delta,
+                    },
+                ));
+            }
+        }
+        Ok(out)
+    }
+
     async fn activity_histogram(
         &self,
         tenant: &TenantContext,

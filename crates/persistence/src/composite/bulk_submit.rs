@@ -474,6 +474,18 @@ impl ResourceStorage for CompositeSubmitJobs {
             .await
     }
 
+    async fn count_deltas_by_type_and_bucket(
+        &self,
+        tenant: &TenantContext,
+        resource_types: &[&str],
+        since: DateTime<Utc>,
+        bucket_seconds: i64,
+    ) -> StorageResult<Vec<(String, ResourceCountDelta)>> {
+        self.composite
+            .count_deltas_by_type_and_bucket(tenant, resource_types, since, bucket_seconds)
+            .await
+    }
+
     async fn activity_histogram(
         &self,
         tenant: &TenantContext,
@@ -1234,6 +1246,38 @@ mod tests {
         let (sqlite, jobs, _events) = harness(HashSet::new());
         assert!(sqlite.supports_type_counts());
         assert!(jobs.supports_type_counts());
+    }
+
+    /// #1078: the submit-jobs wrapper forwards the grouped
+    /// `count_deltas_by_type_and_bucket` to the composite (and so to its
+    /// SQLite primary's single query) instead of the per-type default.
+    #[tokio::test]
+    async fn count_deltas_by_type_and_bucket_is_delegated_to_the_composite() {
+        let (sqlite, jobs, _events) = harness(HashSet::new());
+        let tenant = tenant();
+        for rt in ["Patient", "Observation", "Observation"] {
+            ResourceStorage::create(
+                sqlite.as_ref(),
+                &tenant,
+                rt,
+                json!({ "resourceType": rt }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        }
+        let since = Utc::now() - chrono::Duration::hours(1);
+        let types = ["Patient", "Observation"];
+        let via_jobs = jobs
+            .count_deltas_by_type_and_bucket(&tenant, &types, since, 3600)
+            .await
+            .unwrap();
+        let via_sqlite = sqlite
+            .count_deltas_by_type_and_bucket(&tenant, &types, since, 3600)
+            .await
+            .unwrap();
+        assert_eq!(via_jobs, via_sqlite);
+        assert_eq!(via_jobs.iter().map(|(_, d)| d.delta).sum::<i64>(), 3);
     }
 
     /// #986: `sync_ingested_pages` must not treat an empty page carrying a

@@ -671,12 +671,9 @@ impl ResourceStorage for SqliteBackend {
         let tenant_id = tenant.tenant_id().as_str().to_string();
         let resource_type = resource_type.to_string();
 
-        // Bound the scan by the raw `last_updated` column so the covering
-        // `idx_history_type_updated` `(tenant_id, resource_type, last_updated,
-        // is_deleted, version_id)` history index (schema v28, #1078) prunes the
-        // range to this type's rows alone and answers without touching the table
-        // (wrapping the column in `strftime(...)` would force a full scan). The
-        // bound is floored
+        // Bound the scan by the raw `last_updated` column so the
+        // `(tenant_id, last_updated)` history index prunes the range (wrapping the
+        // column in `strftime(...)` would force a full scan). The bound is floored
         // to a bucket boundary, and formatted the same RFC3339 way the rows are
         // written; because it lands exactly on a whole second it carries no
         // fractional part, and any stored value in that same second sorts after it
@@ -720,6 +717,88 @@ impl ResourceStorage for SqliteBackend {
                         bucket_start,
                         delta,
                     });
+                }
+            }
+            Ok(out)
+        })
+        .await
+    }
+
+    async fn count_deltas_by_type_and_bucket(
+        &self,
+        tenant: &TenantContext,
+        resource_types: &[&str],
+        since: chrono::DateTime<chrono::Utc>,
+        bucket_seconds: i64,
+    ) -> StorageResult<Vec<(String, crate::core::ResourceCountDelta)>> {
+        if resource_types.is_empty() {
+            return Ok(Vec::new());
+        }
+        if bucket_seconds <= 0 {
+            return Err(internal_error(
+                "count_deltas_by_type_and_bucket: bucket_seconds must be positive".to_string(),
+            ));
+        }
+        // Owned copies of the borrowed inputs: the aggregate below runs in a
+        // blocking task (#959), whose closure must be `'static`.
+        let tenant_id = tenant.tenant_id().as_str().to_string();
+        let mut resource_types: Vec<String> =
+            resource_types.iter().map(|rt| (*rt).to_string()).collect();
+        resource_types.sort();
+        resource_types.dedup();
+
+        // One scan for every requested type (#1078), bounded exactly like
+        // `count_deltas_by_bucket`: the raw `last_updated` column against a
+        // bucket-floored RFC3339 bound, so the `(tenant_id, last_updated)`
+        // history index prunes the range, and the same strftime bucketing and
+        // delta rule. The type list only filters that range and splits the
+        // grouping, so each type's rows equal its per-type call's.
+        let since_bound = crate::core::bucket_floor(since, bucket_seconds).to_rfc3339();
+
+        self.run_blocking(move |conn| {
+            let placeholders = (0..resource_types.len())
+                .map(|i| format!("?{}", i + 4))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                "SELECT resource_type, \
+                        (CAST(strftime('%s', last_updated) AS INTEGER) / ?3) * ?3 AS bucket, \
+                        SUM(CASE WHEN is_deleted = 1 THEN -1 \
+                                 WHEN version_id = '1' THEN 1 \
+                                 ELSE 0 END) AS delta \
+                 FROM resource_history \
+                 WHERE tenant_id = ?1 AND last_updated >= ?2 \
+                   AND resource_type IN ({placeholders}) \
+                 GROUP BY resource_type, bucket HAVING delta != 0 \
+                 ORDER BY resource_type, bucket"
+            );
+            let mut stmt = conn
+                .prepare(&sql)
+                .or_query_error("Failed to prepare count_deltas_by_type_and_bucket")?;
+
+            let mut bound: Vec<&dyn ToSql> = vec![&tenant_id, &since_bound, &bucket_seconds];
+            bound.extend(resource_types.iter().map(|rt| rt as &dyn ToSql));
+            let rows = stmt
+                .query_map(bound.as_slice(), |row| {
+                    let resource_type: String = row.get(0)?;
+                    let bucket: i64 = row.get(1)?;
+                    let delta: i64 = row.get(2)?;
+                    Ok((resource_type, bucket, delta))
+                })
+                .or_query_error("Failed to query count_deltas_by_type_and_bucket")?;
+
+            let mut out = Vec::new();
+            for row in rows {
+                let (resource_type, bucket, delta) =
+                    row.or_query_error("Failed to read count_deltas_by_type_and_bucket row")?;
+                if let Some(bucket_start) = chrono::DateTime::from_timestamp(bucket, 0) {
+                    out.push((
+                        resource_type,
+                        crate::core::ResourceCountDelta {
+                            bucket_start,
+                            delta,
+                        },
+                    ));
                 }
             }
             Ok(out)
@@ -4514,6 +4593,193 @@ mod tests {
         assert!(
             backend
                 .count_deltas_by_bucket(&tenant, "Patient", since, 0)
+                .await
+                .is_err()
+        );
+    }
+
+    /// #1078: the grouped `count_deltas_by_type_and_bucket` returns exactly the
+    /// `(type, bucket, delta)` rows the per-type `count_deltas_by_bucket` calls
+    /// return — over creates, updates and deletes in two buckets, per tenant,
+    /// with a type netting to zero in a bucket and a requested type with no
+    /// rows at all.
+    #[tokio::test]
+    async fn test_count_deltas_by_type_and_bucket_matches_per_type_calls() {
+        use std::collections::BTreeSet;
+
+        let backend = create_test_backend();
+        let tenant_a = create_test_tenant();
+        let tenant_b = TenantContext::new(
+            TenantId::new("other-tenant"),
+            TenantPermissions::full_access(),
+        );
+        let v = FhirVersion::default();
+
+        // Earlier bucket, backdated below: tenant A creates two Patients
+        // (updating one) and an Observation, and creates then deletes an
+        // Encounter (a net zero); tenant B creates three Patients.
+        let p1 = backend
+            .create(&tenant_a, "Patient", json!({}), v)
+            .await
+            .unwrap();
+        let p2 = backend
+            .create(&tenant_a, "Patient", json!({}), v)
+            .await
+            .unwrap();
+        let p1 = backend
+            .update(&tenant_a, &p1, json!({"active": true}))
+            .await
+            .unwrap();
+        let o1 = backend
+            .create(&tenant_a, "Observation", json!({}), v)
+            .await
+            .unwrap();
+        let e1 = backend
+            .create(&tenant_a, "Encounter", json!({}), v)
+            .await
+            .unwrap();
+        backend
+            .delete(&tenant_a, "Encounter", e1.id())
+            .await
+            .unwrap();
+        let mut b_patients = Vec::new();
+        for _ in 0..3 {
+            b_patients.push(
+                backend
+                    .create(&tenant_b, "Patient", json!({}), v)
+                    .await
+                    .unwrap(),
+            );
+        }
+        let earlier = Utc::now() - chrono::Duration::hours(2);
+        backend
+            .get_connection()
+            .unwrap()
+            .execute(
+                "UPDATE resource_history SET last_updated = ?1",
+                params![earlier.to_rfc3339()],
+            )
+            .unwrap();
+
+        // Current bucket: tenant A deletes a Patient, updates p1 and the
+        // Observation, and creates an Observation and an Encounter; tenant B
+        // deletes a Patient and creates an Observation.
+        backend.delete(&tenant_a, "Patient", p2.id()).await.unwrap();
+        backend
+            .update(&tenant_a, &p1, json!({"active": false}))
+            .await
+            .unwrap();
+        backend
+            .update(&tenant_a, &o1, json!({"status": "final"}))
+            .await
+            .unwrap();
+        backend
+            .create(&tenant_a, "Observation", json!({}), v)
+            .await
+            .unwrap();
+        backend
+            .create(&tenant_a, "Encounter", json!({}), v)
+            .await
+            .unwrap();
+        backend
+            .delete(&tenant_b, "Patient", b_patients[0].id())
+            .await
+            .unwrap();
+        backend
+            .create(&tenant_b, "Observation", json!({}), v)
+            .await
+            .unwrap();
+
+        let since = Utc::now() - chrono::Duration::hours(3);
+        let bucket = 3600;
+        let earlier_bucket = crate::core::bucket_floor(earlier, bucket).timestamp();
+        let types = ["Patient", "Observation", "Encounter", "Condition"];
+
+        type Row = (String, i64, i64);
+        let mut grouped_by_tenant = Vec::new();
+        for tenant in [&tenant_a, &tenant_b] {
+            let grouped: Vec<Row> = backend
+                .count_deltas_by_type_and_bucket(tenant, &types, since, bucket)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|(rt, d)| (rt, d.bucket_start.timestamp(), d.delta))
+                .collect();
+            let mut per_type: BTreeSet<Row> = BTreeSet::new();
+            for rt in types {
+                for d in backend
+                    .count_deltas_by_bucket(tenant, rt, since, bucket)
+                    .await
+                    .unwrap()
+                {
+                    per_type.insert((rt.to_string(), d.bucket_start.timestamp(), d.delta));
+                }
+            }
+            let grouped_set: BTreeSet<Row> = grouped.iter().cloned().collect();
+            assert_eq!(grouped.len(), grouped_set.len(), "no duplicate rows");
+            assert_eq!(grouped_set, per_type, "{}", tenant.tenant_id().as_str());
+            assert!(grouped.iter().all(|(_, b, d)| b % bucket == 0 && *d != 0));
+            assert!(
+                grouped
+                    .windows(2)
+                    .all(|w| w[0].0 != w[1].0 || w[0].1 < w[1].1),
+                "buckets ascend within a type"
+            );
+            assert!(
+                !grouped.iter().any(|(rt, _, _)| rt == "Condition"),
+                "a type with no rows contributes none"
+            );
+            grouped_by_tenant.push(grouped_set);
+        }
+
+        let net = |rows: &BTreeSet<Row>, rt: &str| -> i64 {
+            rows.iter()
+                .filter(|(t, _, _)| t == rt)
+                .map(|(_, _, d)| d)
+                .sum()
+        };
+        let at = |rows: &BTreeSet<Row>, rt: &str, b: i64| -> Option<i64> {
+            rows.iter()
+                .find(|(t, rb, _)| t == rt && *rb == b)
+                .map(|(_, _, d)| *d)
+        };
+        let a = &grouped_by_tenant[0];
+        let buckets: BTreeSet<i64> = a.iter().map(|(_, b, _)| *b).collect();
+        assert!(buckets.len() >= 2, "the fixture spans two buckets: {a:?}");
+        assert_eq!(at(a, "Patient", earlier_bucket), Some(2));
+        assert_eq!(at(a, "Observation", earlier_bucket), Some(1));
+        assert_eq!(
+            at(a, "Encounter", earlier_bucket),
+            None,
+            "a create and delete in one bucket net to zero and are dropped"
+        );
+        assert_eq!(net(a, "Patient"), 1);
+        assert_eq!(net(a, "Observation"), 2);
+        assert_eq!(net(a, "Encounter"), 1);
+
+        let b = &grouped_by_tenant[1];
+        assert_eq!(at(b, "Patient", earlier_bucket), Some(3), "tenant-isolated");
+        assert_eq!(net(b, "Patient"), 2);
+        assert_eq!(net(b, "Observation"), 1);
+        assert_eq!(net(b, "Encounter"), 0);
+
+        // A duplicated type is counted once; no types means no rows; a bogus
+        // width is rejected like the per-type method's.
+        let twice = backend
+            .count_deltas_by_type_and_bucket(&tenant_a, &["Patient", "Patient"], since, bucket)
+            .await
+            .unwrap();
+        assert_eq!(twice.len(), a.iter().filter(|r| r.0 == "Patient").count());
+        assert!(
+            backend
+                .count_deltas_by_type_and_bucket(&tenant_a, &[], since, bucket)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            backend
+                .count_deltas_by_type_and_bucket(&tenant_a, &["Patient"], since, 0)
                 .await
                 .is_err()
         );
