@@ -59,7 +59,7 @@
              hx-trigger="input changed delay:300ms, search"
              hx-target="#sp-rail-list" hx-select="#sp-rail-list" hx-swap="outerHTML">
     </form>
-    {% call recent::group("sp-rail-recent", "sp-rail-list", view.rail_page, view.max_recent, i18n.t("sp-rail-recent"), view.recent) %}{% endcall %}
+    {% call recent::group("sp-rail-recent", "sp-rail-list", view.rail_page, view.max_recent, i18n.t("sp-rail-recent"), view.recent, false) %}{% endcall %}
     <div class="filter-rail__divider" aria-hidden="true"></div>
     <div class="filter-rail__heading filter-rail__heading--group">{{ i18n.t("rail-all-types-heading") }}</div>
     <div class="filter-rail__list" id="sp-rail-list">

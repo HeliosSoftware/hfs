@@ -22,7 +22,15 @@
 //!   [`IMPORT_IDLE_TENANT`]), and with its own distinctive figures under
 //!   [`WARM_SIBLING_TENANT`].
 //!
-//! A waiting page retries a bounded number of times and never polls. A ready
+//! Further tenants script the #1078 provider flags: [`TOTALS_PENDING_TENANT`]
+//! (the seeding read only queued, nothing measured) and
+//! [`COUNTS_UNSUPPORTED_TENANT`] (a backend that cannot count).
+//!
+//! A waiting page retries a bounded number of times. Once that budget is
+//! spent, a page waiting on a snapshot the provider did answer (series or
+//! totals pending) keeps a slow watch at the settled cadence, so it still
+//! picks up its figures; the cache's own cold state stops. A backend that
+//! cannot count never polls. A ready
 //! page always watches itself: every 5 seconds, marked moving, while its
 //! figures can still move — they are approximate, or an import is running —
 //! and every 10 seconds otherwise, so a tab opened on settled figures still
@@ -64,6 +72,12 @@ const APPROXIMATE_WAITING_TENANT: &str = "dash-approximate-waiting";
 const IMPORT_ACTIVE_TENANT: &str = "dash-import-active";
 /// A tenant whose `30d` snapshot is exact and reports no running import.
 const IMPORT_IDLE_TENANT: &str = "dash-import-idle";
+/// A tenant whose provider has only queued the storage read that seeds it:
+/// nothing is measured yet (`totals_pending`).
+const TOTALS_PENDING_TENANT: &str = "dash-totals-pending";
+/// A tenant on a storage backend that cannot count at all
+/// (`counts_unsupported`).
+const COUNTS_UNSUPPORTED_TENANT: &str = "dash-counts-unsupported";
 
 struct WindowScriptedProvider;
 
@@ -99,6 +113,24 @@ impl DashboardProvider for WindowScriptedProvider {
             total,
         };
 
+        if tenant == TOTALS_PENDING_TENANT {
+            // The provider contract: totals, `available` and `series` empty.
+            return DashboardSnapshot {
+                fhir_version: "R4".to_string(),
+                window,
+                totals_pending: true,
+                ..Default::default()
+            };
+        }
+        if tenant == COUNTS_UNSUPPORTED_TENANT {
+            return DashboardSnapshot {
+                fhir_version: "R4".to_string(),
+                window,
+                counts_unsupported: true,
+                ..Default::default()
+            };
+        }
+
         if tenant == WARM_SIBLING_TENANT {
             // Figures no other case produces, so the page can only show them
             // by serving this snapshot's totals.
@@ -132,6 +164,8 @@ impl DashboardProvider for WindowScriptedProvider {
             generated_at: None,
             approximate: tenant == APPROXIMATE_TENANT || tenant == APPROXIMATE_WAITING_TENANT,
             series_pending: false,
+            totals_pending: false,
+            counts_unsupported: false,
         }
     }
 }
@@ -165,6 +199,10 @@ async fn get_as(tenant: &str, uri: &str) -> String {
         .oneshot(Request::get(uri).body(Body::empty()).unwrap())
         .await
         .unwrap();
+    body_text(response).await
+}
+
+async fn body_text(response: axum::response::Response) -> String {
     let bytes = response.into_body().collect().await.unwrap().to_bytes();
     // Links are asserted as written; the escaping of `&` in attributes is
     // the template engine's business, not the page's.
@@ -262,6 +300,28 @@ fn assert_watches_settled(html: &str, window: &str) {
     assert!(!html.contains("every 5s"), "one cadence at a time");
 }
 
+/// Asserts the page keeps the slow watch of a waiting page whose fast retries
+/// are spent: the settled cadence, marked waiting, re-requesting the same view
+/// with the spent retry count kept, and no bounded retry.
+fn assert_watches_while_waiting(html: &str, window: &str) {
+    let tag = dash_live_tag(html);
+    assert_eq!(attr(tag, "data-dash-refresh"), Some("10"), "{tag}");
+    assert_eq!(attr(tag, "data-dash-waiting"), Some("1"), "{tag}");
+    assert!(!tag.contains("data-dash-moving"), "{tag}");
+    assert!(tag.contains("every 10s"), "{tag}");
+    assert!(tag.contains("hx-select=\"#dash-live\""), "{tag}");
+    let href = attr(tag, "hx-get").expect("the watch re-requests the page");
+    assert!(href.starts_with("/ui?"), "{href}");
+    assert!(href.contains(&format!("window={window}")), "{href}");
+    assert!(
+        href.contains("retry=3"),
+        "the spent budget stays spent: {href}"
+    );
+    dash_state(html);
+    assert!(!html.contains("load delay"), "no fast retry any more");
+    assert!(!html.contains("every 5s"));
+}
+
 /// Asserts nothing on the page refreshes periodically, at either cadence.
 fn assert_no_periodic_refresh(html: &str) {
     assert!(!html.contains("data-dash-refresh"));
@@ -352,7 +412,10 @@ async fn the_automatic_retry_stops_after_its_budget() {
         html.contains("Retry now"),
         "the manual retry outlives the budget"
     );
+    // The cache's own cold state keeps no slow watch (#1078): a server too
+    // busy to fill it is not polled.
     assert_no_periodic_refresh(&html);
+    assert!(!html.contains("data-dash-waiting"));
 }
 
 /// #1078: a tenant whose figures are already cached under another window
@@ -433,12 +496,17 @@ async fn a_slow_window_with_a_warm_sibling_keeps_the_figures_and_waits_for_the_c
     assert!(html.contains("retry=1"));
     assert_no_periodic_refresh(&html);
 
-    // The auto-refresh budget applies here too.
+    // The auto-refresh budget applies here too — but the page does not go
+    // dead once it is spent (#1078): it watches slowly for its series.
     let spent = get_as(WARM_SIBLING_TENANT, "/ui?types=Patient&window=1h&retry=3").await;
     assert!(spent.contains(r#"data-dash-notice="series-pending""#));
     assert!(!spent.contains("hx-trigger=\"load"), "budget spent");
     assert!(spent.contains("Retry now"));
-    assert_no_periodic_refresh(&spent);
+    assert_watches_while_waiting(&spent, "1h");
+    assert!(
+        attr(dash_live_tag(&spent), "hx-get").is_some_and(|href| href.contains("types=Patient")),
+        "the watch keeps the requested selection"
+    );
 }
 
 /// A page still waiting for its chart keeps the bounded retry even when the
@@ -462,7 +530,9 @@ async fn a_waiting_page_with_approximate_figures_retries_and_does_not_poll() {
     .await;
     assert!(spent.contains(r#"data-dash-notice="series-pending""#));
     assert!(!spent.contains("hx-trigger=\"load"), "budget spent");
-    assert_no_periodic_refresh(&spent);
+    // Spent, it watches slowly — never at the moving cadence, even though
+    // the figures it borrowed are approximate.
+    assert_watches_while_waiting(&spent, "1h");
 }
 
 /// #1078: figures counted from recent writes rather than read exactly from
@@ -607,4 +677,199 @@ async fn a_complete_snapshot_carries_only_its_as_of_time() {
     // Exact, complete, and no import reported: nothing moves right now, but
     // the page still watches, slowly, for figures that start moving later.
     assert_watches_settled(&html, "30d");
+}
+
+/// #1078: a provider that only queued the read seeding the tenant answers
+/// with nothing measured. The page is the cold waiting page — unknown figures,
+/// the waiting notice undated, the bounded retry — and never a row of zeros.
+#[tokio::test]
+async fn a_tenant_whose_totals_are_pending_renders_waiting_not_zeros() {
+    let html = get_as(TOTALS_PENDING_TENANT, "/ui?types=Patient&window=30d").await;
+
+    assert!(html.contains(r#"data-dash-notice="pending""#));
+    assert!(html.contains("Still gathering the live figures"));
+    assert!(!html.contains(r#"data-dash-notice="live""#));
+    assert!(
+        !html.contains("<time "),
+        "nothing was read, so no \"as of\""
+    );
+    assert!(
+        html.matches("stat__value--unavailable").count() >= 3,
+        "resource types, stored resources and the chart total read as unknown"
+    );
+    assert!(
+        !html.contains(r#"<span class="stat__value">0</span>"#),
+        "no figure renders as zero"
+    );
+    assert!(html.contains("Waiting for the live figures"));
+    assert!(!html.contains("chart-data"));
+    assert!(
+        !html.contains(r#"<div class="chart-empty">Nothing to chart yet"#),
+        "the chart area waits, it does not claim the tenant is empty"
+    );
+    // The selectors survive the wait with the requested selection.
+    assert!(html.contains(r#"href="/ui?types=Patient&window=24h""#));
+
+    assert!(html.contains(r#"hx-trigger="load delay:1200ms""#));
+    assert!(html.contains("retry=1"));
+    assert!(html.contains("Retry now"));
+    assert_no_periodic_refresh(&html);
+}
+
+/// #1078: once the fast retries are spent, a page waiting on seeding totals
+/// keeps watching slowly, keeping the spent count — while the cache's own cold
+/// state (`the_automatic_retry_stops_after_its_budget`) stops.
+#[tokio::test]
+async fn a_spent_totals_pending_page_watches_slowly() {
+    let html = get_as(
+        TOTALS_PENDING_TENANT,
+        "/ui?types=Patient&window=30d&retry=3",
+    )
+    .await;
+
+    assert!(html.contains(r#"data-dash-notice="pending""#));
+    assert!(
+        !html.contains(r#"<span class="stat__value">0</span>"#),
+        "still no zeros"
+    );
+    assert!(html.contains("Retry now"));
+    assert_watches_while_waiting(&html, "30d");
+
+    let cold = get("/ui?window=1h&all=1&retry=3").await;
+    assert_no_periodic_refresh(&cold);
+    assert!(!cold.contains("data-dash-waiting"));
+}
+
+/// #1078: a backend that cannot count says so, once, as a plain label: no
+/// zeros, no waiting, no "as of", no retry and no polling of any kind.
+#[tokio::test]
+async fn a_backend_that_cannot_count_says_so_and_never_polls() {
+    for uri in [
+        "/ui?types=Patient&window=30d",
+        "/ui?types=Patient&window=24h&retry=3",
+    ] {
+        let html = get_as(COUNTS_UNSUPPORTED_TENANT, uri).await;
+
+        let tag = notice_tag(&html, "unsupported");
+        assert!(
+            !tag.contains("notice--warn"),
+            "a label, not a warning: {tag}"
+        );
+        assert_eq!(html.matches("data-dash-notice=").count(), 1, "{uri}");
+        assert!(html.contains("This storage backend cannot count stored resources"));
+        assert!(
+            html.contains(r#"<div class="chart-empty">Resource counts are not available for this storage backend.</div>"#),
+            "{uri}: the chart area names the fact"
+        );
+        assert!(!html.contains("Waiting for the live figures"));
+        assert!(!html.contains("Still gathering the live figures"));
+        assert!(!html.contains("Nothing to chart yet"));
+        assert!(!html.contains("chart-data"));
+        assert!(!html.contains("<time "));
+        assert!(!html.contains("Retry now"));
+        assert!(
+            html.matches("stat__value--unavailable").count() >= 3,
+            "{uri}: the figures read as unavailable"
+        );
+        assert!(
+            !html.contains(r#"<span class="stat__value">0</span>"#),
+            "{uri}"
+        );
+
+        let live = dash_live_tag(&html);
+        assert!(!live.contains("hx-get"), "{uri}: nothing polls: {live}");
+        assert!(!live.contains("hx-trigger"), "{uri}: {live}");
+        assert!(!live.contains("data-dash-waiting"), "{uri}: {live}");
+        assert_no_periodic_refresh(&html);
+    }
+}
+
+/// #1078: the live region names the tenant, FHIR version and locale it was
+/// rendered for, so its requests can send them back.
+#[tokio::test]
+async fn the_live_region_names_its_context() {
+    let ready = get_as(IMPORT_IDLE_TENANT, "/ui?window=30d").await;
+    let ctx = attr(dash_live_tag(&ready), "data-dash-ctx").expect("a context on a ready page");
+    assert_eq!(ctx, "dash-import-idle|R4|en");
+
+    let waiting = get("/ui?window=1h&all=1").await;
+    assert_eq!(
+        attr(dash_live_tag(&waiting), "data-dash-ctx"),
+        Some("default|R4|en"),
+        "the bounded retry sends it too"
+    );
+}
+
+async fn send_as(tenant: &str, uri: &str, htmx: bool) -> axum::response::Response {
+    let mut request = Request::get(uri);
+    if htmx {
+        request = request.header("HX-Request", "true");
+    }
+    app(tenant)
+        .oneshot(request.body(Body::empty()).unwrap())
+        .await
+        .unwrap()
+}
+
+/// #1078: a live-region request made for another tenant, FHIR version or
+/// locale than the one the server resolves now gets an empty `HX-Refresh`
+/// answer, so htmx reloads the page instead of mixing contexts. A matching
+/// context, a request without one, or a non-htmx request renders as usual.
+#[tokio::test]
+async fn a_live_region_request_from_another_context_reloads_the_page() {
+    for stale in [
+        "another-tenant%7CR4%7Cen",
+        "dash-import-idle%7CR5%7Cen",
+        "dash-import-idle%7CR4%7Ces",
+    ] {
+        let response = send_as(
+            IMPORT_IDLE_TENANT,
+            &format!("/ui?window=30d&ctx={stale}"),
+            true,
+        )
+        .await;
+        assert_eq!(response.status(), 200, "{stale}");
+        assert_eq!(
+            response
+                .headers()
+                .get("HX-Refresh")
+                .and_then(|v| v.to_str().ok()),
+            Some("true"),
+            "{stale}"
+        );
+        assert!(body_text(response).await.is_empty(), "{stale}: empty body");
+    }
+
+    let matching = send_as(
+        IMPORT_IDLE_TENANT,
+        "/ui?window=30d&ctx=dash-import-idle%7CR4%7Cen",
+        true,
+    )
+    .await;
+    assert!(matching.headers().get("HX-Refresh").is_none());
+    let html = body_text(matching).await;
+    assert!(html.contains(r#"id="dash-live""#), "the region renders");
+    assert_watches_settled(&html, "30d");
+
+    // An unencoded separator is the same context.
+    let raw = send_as(
+        IMPORT_IDLE_TENANT,
+        "/ui?window=30d&ctx=dash-import-idle|R4|en",
+        true,
+    )
+    .await;
+    assert!(raw.headers().get("HX-Refresh").is_none());
+
+    let without = send_as(IMPORT_IDLE_TENANT, "/ui?window=30d", true).await;
+    assert!(without.headers().get("HX-Refresh").is_none());
+    assert!(body_text(without).await.contains(r#"id="dash-live""#));
+
+    let not_htmx = send_as(
+        IMPORT_IDLE_TENANT,
+        "/ui?window=30d&ctx=another-tenant%7CR4%7Cen",
+        false,
+    )
+    .await;
+    assert!(not_htmx.headers().get("HX-Refresh").is_none());
+    assert!(body_text(not_htmx).await.contains(r#"id="dash-live""#));
 }

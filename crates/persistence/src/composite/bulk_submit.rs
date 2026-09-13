@@ -486,6 +486,10 @@ impl ResourceStorage for CompositeSubmitJobs {
         self.composite.count_all_types(tenant).await
     }
 
+    fn supports_type_counts(&self) -> bool {
+        self.composite.supports_type_counts()
+    }
+
     async fn count_by_tenant(&self) -> StorageResult<Vec<(String, u64)>> {
         self.composite.count_by_tenant().await
     }
@@ -1220,6 +1224,16 @@ mod tests {
             env!("CARGO_MANIFEST_DIR"),
             "/tests/bulk_submit/scripted_pages.rs"
         ));
+    }
+
+    /// #1078: the submit-jobs wrapper forwards `supports_type_counts` from the
+    /// composite (and so from its SQLite primary) instead of keeping the
+    /// trait's `false` default.
+    #[test]
+    fn supports_type_counts_is_delegated_to_the_composite() {
+        let (sqlite, jobs, _events) = harness(HashSet::new());
+        assert!(sqlite.supports_type_counts());
+        assert!(jobs.supports_type_counts());
     }
 
     /// #986: `sync_ingested_pages` must not treat an empty page carrying a

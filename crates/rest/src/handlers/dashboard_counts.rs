@@ -46,8 +46,9 @@ pub(crate) fn changed(tenant: &TenantContext, resource_type: &str, delta: i64) {
     );
 }
 
-/// Forgets the tenant's counters after its data was purged, so the dashboard
-/// waits for a fresh reconcile instead of showing figures for erased data.
+/// Marks the tenant's counters stale after its data was purged: the last
+/// figures stay on the dashboard, labelled approximate, until a background
+/// reseed replaces them with storage's (#1078).
 pub(crate) fn invalidated(tenant_id: &str) {
     dashboard_counters::invalidate_tenant(tenant_id);
 }

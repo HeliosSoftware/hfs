@@ -1141,6 +1141,11 @@ impl ResourceStorage for CompositeStorage {
         self.primary.count_all_types(tenant).await
     }
 
+    fn supports_type_counts(&self) -> bool {
+        // Both count aggregates above delegate to the primary, so it decides.
+        self.primary.supports_type_counts()
+    }
+
     async fn count_by_tenant(&self) -> StorageResult<Vec<(String, u64)>> {
         self.primary.count_by_tenant().await
     }
@@ -4113,6 +4118,35 @@ mod tests {
     fn test_backend_name_is_composite() {
         let composite = make_composite_no_secondary();
         assert_eq!(composite.backend_name(), "composite");
+    }
+
+    /// #1078: `supports_type_counts` defaults to `false` (a backend that keeps
+    /// the empty count defaults, like `MockStorage`), and composite storage
+    /// reports its primary's answer.
+    #[test]
+    fn test_supports_type_counts_defaults_false_and_follows_the_primary() {
+        assert!(!MockStorage.supports_type_counts());
+        assert!(!make_composite_no_secondary().supports_type_counts());
+        assert!(
+            !make_composite_with_secondary().supports_type_counts(),
+            "a secondary never answers for the primary"
+        );
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn test_supports_type_counts_is_true_over_a_sqlite_primary() {
+        let sqlite = crate::backends::sqlite::SqliteBackend::in_memory().unwrap();
+        let config = CompositeConfig::builder()
+            .primary("primary", BackendKind::Sqlite)
+            .search_backend("es", BackendKind::Elasticsearch)
+            .build()
+            .unwrap();
+        let mut backends = HashMap::new();
+        backends.insert("primary".to_string(), Arc::new(sqlite) as DynStorage);
+        backends.insert("es".to_string(), Arc::new(MockStorage) as DynStorage);
+        let composite = CompositeStorage::new(config, backends).unwrap();
+        assert!(composite.supports_type_counts());
     }
 
     // ── "No capability" error paths ───────────────────────────────

@@ -1583,6 +1583,10 @@ impl ResourceStorage for MongoBackend {
         grouped_string_counts(resources, pipeline).await
     }
 
+    fn supports_type_counts(&self) -> bool {
+        true
+    }
+
     fn supports_tenant_registry(&self) -> bool {
         true
     }

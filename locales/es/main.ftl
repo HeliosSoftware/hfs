@@ -190,6 +190,8 @@ chart-series-pending-note = El gráfico de este intervalo todavía se está carg
 # #1078: cifras medidas, pero contadas a partir de contadores de escritura en
 # memoria, no de una lectura exacta del almacenamiento. Etiqueta, no aviso.
 chart-approximate-note = Aproximado: contado a partir de las escrituras recientes y aún en conciliación con el almacenamiento.
+chart-counts-unsupported = Los recuentos de recursos no están disponibles para este backend de almacenamiento.
+chart-counts-unsupported-note = Este backend de almacenamiento no puede contar los recursos almacenados, por lo que no se muestran totales ni gráfico. Esto no significa que el tenant esté vacío.
 # #1078: cuándo se leyeron las cifras de la página. $time es una hora UTC,
 # precedida de la fecha cuando no es de hoy (p. ej. "14:02:31 UTC").
 chart-as-of = Última lectura: { $time }.
@@ -554,6 +556,7 @@ resources-tab-edit = Editar
 resources-tab-history = Historial
 resources-types-heading = Tipos de recurso
 rail-all-types-heading = Todos los tipos
+rail-count-approximate = Aproximado: contado a partir de las escrituras recientes y aún en conciliación con el almacenamiento.
 
 queries-saved-group = Guardadas
 

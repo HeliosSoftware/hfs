@@ -193,6 +193,10 @@ chart-series-pending-note = The chart for this window is still loading. The coun
 # #1078: measured, but counted from in-memory write counters rather than an
 # exact storage read. A label, not a warning.
 chart-approximate-note = Approximate: counted from recent writes and still being reconciled with storage.
+# #1078: the storage backend cannot count resources at all (e.g. an S3
+# primary). Shown in the chart area; the notice line below explains it.
+chart-counts-unsupported = Resource counts are not available for this storage backend.
+chart-counts-unsupported-note = This storage backend cannot count stored resources, so no totals or chart are shown. This does not mean the tenant is empty.
 # #1078: when the figures on the page were read. $time is a UTC time,
 # prefixed with the date when it is not today (e.g. "14:02:31 UTC").
 chart-as-of = As of { $time }.
@@ -569,6 +573,9 @@ resources-tab-edit = Edit
 resources-tab-history = History
 resources-types-heading = Resource Types
 rail-all-types-heading = All Types
+# #1078: a type rail count from a snapshot counted from recent writes, not yet
+# reconciled with storage. Hover title and screen-reader text of the "≈" count.
+rail-count-approximate = Approximate: counted from recent writes and still being reconciled with storage.
 
 queries-saved-group = Saved
 

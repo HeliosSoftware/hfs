@@ -29,11 +29,11 @@
              placeholder="{{ i18n.t("queries-rail-filter") }}"
              aria-label="{{ i18n.t("queries-rail-filter") }}">
     </div>
-    {% call recent::group("type-rail-recent", "type-rail-list", rail_page, max_recent, i18n.t("sp-rail-recent"), recent_entries) %}{% endcall %}
+    {% call recent::group("type-rail-recent", "type-rail-list", rail_page, max_recent, i18n.t("sp-rail-recent"), recent_entries, rail_counts_approximate) %}{% endcall %}
     <div class="filter-rail__divider" aria-hidden="true"></div>
     <div class="filter-rail__heading filter-rail__heading--group">{{ i18n.t("rail-all-types-heading") }}</div>
     <div class="filter-rail__list" id="type-rail-list">
-      {% call rail::rail_items(rail_entries) %}{% endcall %}
+      {% call rail::rail_items(rail_entries, rail_counts_approximate) %}{% endcall %}
     </div>
   </aside>
 

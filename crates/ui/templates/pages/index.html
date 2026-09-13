@@ -18,12 +18,21 @@
   seconds while they are still moving — counted from recent writes and not yet
   reconciled, or with an import running (data-dash-moving) — and slower once
   they settle, so a tab opened before an import starts still notices it. A
-  settled tick whose figures did not change (same data-dash-state) is dropped. assets/dashboard.js keeps what the user is doing across each swap
+  settled tick whose figures did not change (same data-dash-state) is dropped.
+  assets/dashboard.js keeps what the user is doing across each swap
   (the open type picker is preserved as-is, an open table stays open, the
   tooltip follows the pointer) and points each request at the page's current
   URL, which the type picker changes without a reload.
+
+  A waiting page whose snapshot the provider did answer (series or totals
+  still pending) keeps a slow watch once its fast retries are spent
+  (data-dash-waiting), so it still picks up its figures; the cache's own cold
+  state does not. A backend that cannot count shows that fact and never polls.
+  data-dash-ctx names the tenant, FHIR version and locale of this render;
+  every request the region makes sends it back, and the server answers a
+  mismatch with HX-Refresh so contexts never mix on one page.
 #}
-<div id="dash-live"
+<div id="dash-live" data-dash-ctx="{{ dash_ctx }}"
   {% if let Some(href) = auto_retry_href %}
      hx-get="{{ href }}" hx-trigger="load delay:1200ms"
      hx-target="this" hx-select="#dash-live" hx-swap="outerHTML"
@@ -32,6 +41,7 @@
      hx-target="this" hx-select="#dash-live" hx-swap="outerHTML"
      data-dash-refresh="{{ refresh_secs }}" data-dash-state="{{ refresh_state }}"
      {% if refresh_moving %}data-dash-moving="1"{% endif %}
+     {% if refresh_waiting %}data-dash-waiting="1"{% endif %}
   {% endif %}
 >
 
@@ -41,7 +51,7 @@
     {% if let Some(value) = metrics.resource_types %}
     <span class="stat__value">{{ value }}</span>
     {% else %}
-    <span class="stat__value stat__value--unavailable" aria-label="{{ i18n.t("chart-pending-empty") }}">&mdash;</span>
+    <span class="stat__value stat__value--unavailable" aria-label="{{ i18n.t(figures_unknown_key) }}">&mdash;</span>
     {% endif %}
     {# The effective request version, same source as the sidebar selector —
        never the snapshot's boot-time default (#553). #}
@@ -52,7 +62,7 @@
     {% if let Some(value) = metrics.stored_resources %}
     <span class="stat__value">{{ value }}</span>
     {% else %}
-    <span class="stat__value stat__value--unavailable" aria-label="{{ i18n.t("chart-pending-empty") }}">&mdash;</span>
+    <span class="stat__value stat__value--unavailable" aria-label="{{ i18n.t(figures_unknown_key) }}">&mdash;</span>
     {% endif %}
     <span class="stat__sub">{{ i18n.t("card-stored-resources-sub") }}</span>
   </article>
@@ -95,7 +105,7 @@
       {% if let Some(value) = metrics.chart_total %}
       <span class="stat__value">{{ value }}</span>
       {% else %}
-      <span class="stat__value stat__value--unavailable" aria-label="{{ i18n.t("chart-pending-empty") }}">&mdash;</span>
+      <span class="stat__value stat__value--unavailable" aria-label="{{ i18n.t(figures_unknown_key) }}">&mdash;</span>
       {% endif %}
       <span class="stat__sub">{{ chart.types_label }}</span>
     </div>
@@ -148,7 +158,9 @@
                    aria-label="{{ i18n.t("chart-pick-filter") }}" data-pick-filter>
           </div>
           <div class="chart-pick__list">
-            {% if picker.is_empty() %}
+            {% if picker.is_empty() && chart_unsupported %}
+            <p class="chart-pick__none">{{ i18n.t("chart-counts-unsupported") }}</p>
+            {% else if picker.is_empty() %}
             <p class="chart-pick__none">{{ i18n.t("chart-empty") }}</p>
             {% endif %}
             {% for option in picker %}
@@ -187,7 +199,11 @@
   </p>
   {% endfor %}
 
-  {% if chart_waiting %}
+  {% if chart_unsupported %}
+  {# #1078: this backend cannot count, so there is nothing to wait for and
+     no empty chart to show — only the fact. #}
+  <div class="chart-empty">{{ i18n.t("chart-counts-unsupported") }}</div>
+  {% else if chart_waiting %}
   <div class="chart-empty">{{ i18n.t("chart-pending-empty") }}</div>
   {% else if !chart.has_data %}
   <div class="chart-empty">{{ i18n.t("chart-empty") }}</div>

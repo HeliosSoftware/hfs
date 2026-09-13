@@ -86,6 +86,8 @@ impl DashboardProvider for FakeProvider {
             generated_at: None,
             approximate: false,
             series_pending: false,
+            totals_pending: false,
+            counts_unsupported: false,
         }
     }
 }

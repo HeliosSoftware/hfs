@@ -225,6 +225,17 @@ pub struct DashboardSnapshot {
     /// then render as waiting, never as an empty or flat chart: an empty
     /// `series` here is not a measured "nothing happened" (#956).
     pub series_pending: bool,
+    /// The tenant's figures are not known yet: the provider has queued the
+    /// storage read that seeds them and returned without waiting for it
+    /// (#1078). Totals, `available` and `series` are empty and must render as
+    /// waiting, never as zeros (#956). Set only by providers.
+    pub totals_pending: bool,
+    /// The storage backend cannot count resources at all (for example an S3
+    /// primary), so totals, `available` and `series` are empty because nothing
+    /// could be measured, not because the tenant is empty (#1078). The page
+    /// says the figures are unavailable for this backend instead of rendering
+    /// zeros.
+    pub counts_unsupported: bool,
 }
 
 /// Supplies [`DashboardSnapshot`]s on demand. Implemented in `helios-rest` over
@@ -1759,6 +1770,8 @@ mod tests {
                 generated_at: DateTime::from_timestamp(1_752_454_800, 0),
                 approximate: false,
                 series_pending: false,
+                totals_pending: false,
+                counts_unsupported: false,
             }
         }
     }

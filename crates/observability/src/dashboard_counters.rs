@@ -59,6 +59,20 @@
 //! than zeros, and the dashboard keeps showing its "waiting" state instead of
 //! an invented empty chart.
 //!
+//! # Invalidation keeps the last figures
+//!
+//! A purge erases storage behind the counters' back.
+//! [`invalidate_tenant`](DashboardCounters::invalidate_tenant) does not forget
+//! the tenant — a dashboard that went blank after every purge would wait on a
+//! full storage read to show anything again. It keeps the last totals and
+//! rings, starts a new generation (so every reconcile or ring seed begun
+//! before the purge is rejected when it finishes: those reads may describe
+//! erased data), and marks the tenant as
+//! [needing a reseed](TotalsView::needs_reseed): its totals and every series
+//! are no longer `exact`, and every ring reports `history_seeded == false`
+//! until it is loaded again. The next successful reconcile replaces the base
+//! with storage's figures, and each ring seed replaces that ring's history.
+//!
 //! # Buckets
 //!
 //! Each `(type, window)` keeps a fixed ring of [`DashboardWindow::points`]
@@ -257,6 +271,9 @@ struct TenantCounters {
     /// Incremented for every recorded (non-zero) write.
     write_seq: u64,
     reconciled: Option<Reconciled>,
+    /// Storage changed behind the counters (a purge): the figures are kept
+    /// but not exact until the next successful reconcile.
+    needs_reseed: bool,
     types: HashMap<String, TypeCounters>,
 }
 
@@ -327,8 +344,13 @@ pub struct TotalsView {
     /// When the totals were last reconciled from storage.
     pub reconciled_at: DateTime<Utc>,
     /// No write was recorded for the tenant since the last successful
-    /// reconcile began, so the figures equal what storage reported.
+    /// reconcile began, and it was not invalidated since, so the figures equal
+    /// what storage reported.
     pub exact: bool,
+    /// The tenant was [invalidated](DashboardCounters::invalidate_tenant)
+    /// since the last successful reconcile: these are the last known figures,
+    /// kept on show until a reconcile replaces them.
+    pub needs_reseed: bool,
 }
 
 /// One resource type's total and bucketed deltas over a window.
@@ -387,6 +409,7 @@ impl DashboardCounters {
                 generation: self.next_generation.fetch_add(1, Ordering::Relaxed),
                 write_seq: 0,
                 reconciled: None,
+                needs_reseed: false,
                 types: HashMap::new(),
             }))
         });
@@ -418,16 +441,42 @@ impl DashboardCounters {
         });
     }
 
-    /// Forgets everything for a tenant (purge / tenant data wipe). Tokens
-    /// begun before this are rejected by the `finish_*` calls.
+    /// Marks a tenant's figures stale after storage changed behind the
+    /// counters (purge / tenant data wipe), keeping the last figures on show.
+    ///
+    /// The totals and rings are kept, but a new generation starts: every
+    /// reconcile or ring seed begun before this is rejected by its `finish_*`
+    /// call. The totals and every series stop being `exact`
+    /// ([`TotalsView::needs_reseed`]), and each ring reports
+    /// `history_seeded == false`, until a reconcile and ring seeds begun after
+    /// this replace them with storage's figures. A tenant with no counter state
+    /// is left alone.
     pub fn invalidate_tenant(&self, tenant: &str) {
-        self.write_map().remove(tenant);
+        let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
+        self.with_tenant(tenant, |t| {
+            t.generation = generation;
+            t.needs_reseed = true;
+            for tc in t.types.values_mut() {
+                for ring in &mut tc.rings {
+                    ring.seed_seq = None;
+                }
+            }
+        });
     }
 
-    /// Totals have been reconciled from storage at least once since the last
-    /// invalidation.
+    /// Totals have been reconciled from storage at least once. Stays `true`
+    /// after an [invalidation](Self::invalidate_tenant), whose figures are kept
+    /// (see [`needs_reseed`](Self::needs_reseed)).
     pub fn is_seeded(&self, tenant: &str) -> bool {
         self.with_tenant(tenant, |t| t.reconciled.is_some())
+            .unwrap_or(false)
+    }
+
+    /// The tenant was [invalidated](Self::invalidate_tenant) and no reconcile
+    /// begun since has finished: its figures are the last known ones, not
+    /// storage's.
+    pub fn needs_reseed(&self, tenant: &str) -> bool {
+        self.with_tenant(tenant, |t| t.needs_reseed)
             .unwrap_or(false)
     }
 
@@ -469,7 +518,8 @@ impl DashboardCounters {
     /// Returns `false` (and changes nothing) if the tenant was invalidated
     /// since begin. A token older than a reconcile that already finished is
     /// superseded by it: nothing changes and `true` is returned, since the
-    /// tenant is seeded with figures at least as fresh.
+    /// tenant is seeded with figures at least as fresh. A successful finish
+    /// clears [`needs_reseed`](Self::needs_reseed).
     pub fn finish_reconcile(
         &self,
         token: ReconcileToken,
@@ -496,6 +546,7 @@ impl DashboardCounters {
                 tc.live_at_base = token.live_at_begin.get(name).copied().unwrap_or(0);
             }
             t.reconciled = Some(Reconciled { at, seq: token.seq });
+            t.needs_reseed = false;
             true
         })
         .unwrap_or(false)
@@ -587,7 +638,8 @@ impl DashboardCounters {
             Some(TotalsView {
                 totals,
                 reconciled_at: reconciled.at,
-                exact: t.write_seq <= reconciled.seq,
+                exact: !t.needs_reseed && t.write_seq <= reconciled.seq,
+                needs_reseed: t.needs_reseed,
             })
         })
         .flatten()
@@ -645,8 +697,8 @@ impl DashboardCounters {
         .flatten()
     }
 
-    /// Cumulative sum of every delta recorded for `(tenant, type)` since the
-    /// tenant's last invalidation, independent of reconciles. Test helper.
+    /// Cumulative sum of every delta recorded for `(tenant, type)`,
+    /// independent of reconciles and invalidations. Test helper.
     #[doc(hidden)]
     pub fn live_delta(&self, tenant: &str, resource_type: &str) -> i64 {
         self.with_tenant(tenant, |t| {
@@ -674,7 +726,9 @@ pub fn record_deleted(tenant: &str, resource_type: &str, n: u64) {
     global().record(tenant, resource_type, -to_i64(n), Utc::now());
 }
 
-/// Forgets the global counter state of `tenant` (purge / data wipe).
+/// Marks the global counter state of `tenant` stale after a purge / data wipe,
+/// keeping its last figures on show until the dashboard's background reseed
+/// replaces them (see [`DashboardCounters::invalidate_tenant`]).
 pub fn invalidate_tenant(tenant: &str) {
     global().invalidate_tenant(tenant);
 }
@@ -1029,32 +1083,78 @@ mod tests {
         assert!(!c.finish_reconcile(reconcile, &[("Patient".to_string(), 3)], t0()));
         assert!(!c.finish_ring_seed(ring, &[(t0(), 3)], t0()));
         assert!(!c.is_seeded("t"));
-        assert!(c.tenants().is_empty());
+        assert!(c.needs_reseed("t"));
+        assert_eq!(c.live_delta("t", "Patient"), 3, "recorded writes are kept");
 
-        // Also rejected when the tenant has been recreated by a later write.
+        // A token begun after the invalidation is accepted and clears the flag.
         let reconcile = c.begin_reconcile("t");
-        let ring = c.begin_ring_seed("t", "Patient", HOUR);
-        c.invalidate_tenant("t");
-        c.record("t", "Patient", 1, t0());
-        assert!(!c.finish_reconcile(reconcile, &[], t0()));
-        assert!(!c.finish_ring_seed(ring, &[], t0()));
-        assert!(!c.is_seeded("t"));
-        assert_eq!(c.live_delta("t", "Patient"), 1);
+        assert!(c.finish_reconcile(reconcile, &[("Patient".to_string(), 3)], t0()));
+        assert!(!c.needs_reseed("t"));
+        let view = c.totals_view("t").unwrap();
+        assert!(view.exact && !view.needs_reseed);
+        assert_eq!(total_of(&view, "Patient"), Some(3));
+
+        // Invalidating an unknown tenant creates no state.
+        c.invalidate_tenant("nobody");
+        assert!(!c.needs_reseed("nobody"));
+        assert_eq!(c.tenants(), vec!["t".to_string()]);
     }
 
     #[test]
-    fn invalidate_forgets_a_seeded_tenant() {
+    fn invalidate_keeps_the_last_figures_approximate_until_reseeded() {
         let c = DashboardCounters::new();
-        seed(&c, "t", &[("Patient", 3)], t0());
-        seed(&c, "other", &[("Patient", 1)], t0());
-        assert!(c.is_seeded("t"));
+        let now = t0() + secs(10 * 60);
+        seed(&c, "t", &[("Patient", 3)], now);
+        let token = c.begin_ring_seed("t", "Patient", HOUR);
+        assert!(c.finish_ring_seed(token, &[(now, 3)], now));
+        seed(&c, "other", &[("Patient", 1)], now);
+
+        let in_flight = c.begin_reconcile("t");
+        let in_flight_ring = c.begin_ring_seed("t", "Patient", HOUR);
         c.invalidate_tenant("t");
-        assert!(!c.is_seeded("t"));
-        assert!(c.totals_view("t").is_none());
-        assert_eq!(c.live_delta("t", "Patient"), 0);
-        assert!(c.is_seeded("other"), "other tenants are untouched");
-        // Invalidating an unknown tenant is harmless.
-        c.invalidate_tenant("nobody");
+
+        // The last figures stay on show, labelled not exact.
+        assert!(c.is_seeded("t"));
+        assert!(c.needs_reseed("t"));
+        let view = c.totals_view("t").expect("figures are kept");
+        assert_eq!(total_of(&view, "Patient"), Some(3));
+        assert!(!view.exact && view.needs_reseed);
+        let s = series(&c, "t", HOUR, "Patient", now);
+        assert_eq!(s.total, 3);
+        assert_eq!(values(&s)[59], 3, "the ring's history is kept too");
+        assert!(!s.history_seeded && !s.exact, "the ring needs a reseed");
+
+        // Reads begun before the purge may describe erased data: rejected,
+        // and the kept figures are untouched.
+        assert!(!c.finish_reconcile(in_flight, &[], now));
+        assert!(!c.finish_ring_seed(in_flight_ring, &[], now));
+        assert_eq!(total_of(&c.totals_view("t").unwrap(), "Patient"), Some(3));
+        assert!(c.needs_reseed("t"));
+        assert_eq!(values(&series(&c, "t", HOUR, "Patient", now))[59], 3);
+
+        // Other tenants are untouched.
+        assert!(!c.needs_reseed("other"));
+        assert!(c.totals_view("other").unwrap().exact);
+
+        // Writes keep moving the stale figures.
+        c.record("t", "Patient", 1, now);
+        assert_eq!(total_of(&c.totals_view("t").unwrap(), "Patient"), Some(4));
+
+        // The reseed replaces the base with storage's figures…
+        let token = c.begin_reconcile("t");
+        assert!(c.finish_reconcile(token, &[("Patient".to_string(), 1)], now));
+        let view = c.totals_view("t").unwrap();
+        assert!(view.exact && !view.needs_reseed);
+        assert_eq!(total_of(&view, "Patient"), Some(1));
+        let s = series(&c, "t", HOUR, "Patient", now);
+        assert!(!s.exact, "totals alone do not vouch for the ring");
+
+        // …and a ring seed replaces the ring's history.
+        let token = c.begin_ring_seed("t", "Patient", HOUR);
+        assert!(c.finish_ring_seed(token, &[(now, 1)], now));
+        let s = series(&c, "t", HOUR, "Patient", now);
+        assert!(s.history_seeded && s.exact);
+        assert_eq!(values(&s).iter().sum::<i64>(), 1);
     }
 
     #[test]
@@ -1244,8 +1344,13 @@ mod tests {
         record_deleted(tenant, "Patient", 1);
         record_created(tenant, "Patient", 0);
         assert_eq!(global().live_delta(tenant, "Patient"), 2);
+        assert!(!global().needs_reseed(tenant));
         invalidate_tenant(tenant);
-        assert_eq!(global().live_delta(tenant, "Patient"), 0);
-        assert!(!global().tenants().contains(&tenant.to_string()));
+        assert!(global().needs_reseed(tenant));
+        assert_eq!(
+            global().live_delta(tenant, "Patient"),
+            2,
+            "invalidation keeps the recorded figures"
+        );
     }
 }

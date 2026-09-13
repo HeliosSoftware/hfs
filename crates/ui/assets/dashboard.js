@@ -198,7 +198,19 @@
    re-aimed at the current location, and a response is dropped if the location
    changed while it was in flight. The request also names the notice kinds on
    screen (?notices=), so the server renders those lines aria-live="off": an
-   unchanged "approximate" line is not re-announced every tick. */
+   unchanged "approximate" line is not re-announced every tick.
+
+   A waiting page whose fast retries are spent keeps a slow watch instead
+   (data-dash-waiting): its re-aimed request carries the spent retry count
+   from its own hx-get, so the server answers with the watch again rather than
+   restarting the fast retries, until the figures arrive (their flags change
+   the data-dash-state digest, so that response is swapped in).
+
+   Every request the region makes — refresh, slow watch or bounded retry —
+   also sends data-dash-ctx back as ?ctx= (tenant|FHIR version|locale). When
+   another tab switched any of them, the server answers HX-Refresh and htmx
+   reloads the whole page, so one context's figures never land in another's
+   page. */
 (function () {
   "use strict";
 
@@ -233,11 +245,38 @@
     return true;
   };
 
+  // The value of `name` in a relative href's query string, or null.
+  function queryParam(href, name) {
+    try {
+      return new URL(href, window.location.origin).searchParams.get(name);
+    } catch (invalid) {
+      return null;
+    }
+  }
+
   document.addEventListener("htmx:configRequest", function (event) {
     var elt = event.detail.elt;
+    if (!elt || elt.id !== "dash-live") return;
+    var ctx = elt.getAttribute("data-dash-ctx");
+    if (ctx) event.detail.parameters.ctx = ctx;
     if (!isRefresh(elt)) return;
     var path = here();
-    event.detail.path = path;
+    // The location may still name a retry count (the "Retry now" link sets
+    // one); the watch decides its own, below, so it is not sent twice. Only
+    // that pair is dropped, the rest kept byte for byte: URLSearchParams would
+    // re-encode the query and turn ?types=A,B into A%2CB, which the server
+    // reads raw — the refresh would then chart the default types instead.
+    var kept = window.location.search
+      .replace(/^\?/, "")
+      .split("&")
+      .filter(function (pair) {
+        return pair && pair.split("=")[0] !== "retry";
+      });
+    event.detail.path = window.location.pathname + (kept.length ? "?" + kept.join("&") : "");
+    if (elt.hasAttribute("data-dash-waiting")) {
+      var retry = queryParam(elt.getAttribute("hx-get") || "", "retry");
+      if (retry) event.detail.parameters.retry = retry;
+    }
     var seen = [];
     elt.querySelectorAll("[data-dash-notice]").forEach(function (line) {
       seen.push(line.getAttribute("data-dash-notice"));

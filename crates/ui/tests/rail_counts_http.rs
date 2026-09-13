@@ -1,8 +1,12 @@
 //! The shared type rail's server-rendered instance counts (#541), on
 //! Resources, Search, and Saved Queries. The dashboard snapshot provider is
 //! process-global (see `subscriptions_http.rs`), so the unavailable state
-//! must be asserted before any provider is registered, and both phases run
+//! must be asserted before any provider is registered, and every phase runs
 //! inside one test.
+//!
+//! #1078: counts from an approximate snapshot render as "≈N" and say so; a
+//! snapshot with no figures to give (the seeding read only queued, or a backend
+//! that cannot count) shows no count at all, exactly like a partial one (#1082).
 
 use axum::{Router, body::Body, http::Request};
 use http_body_util::BodyExt;
@@ -13,7 +17,16 @@ use helios_observability::dashboard::{
     DashboardProvider, DashboardSnapshot, DashboardWindow, TypeCount, set_provider,
 };
 
-fn app() -> Router {
+/// A tenant whose snapshot is counted from recent writes (approximate).
+const APPROXIMATE_TENANT: &str = "rail-approximate";
+/// A tenant whose provider only queued the read seeding its figures.
+const SEEDING_TENANT: &str = "rail-seeding";
+/// A tenant whose storage backend cannot count at all.
+const UNSUPPORTED_TENANT: &str = "rail-unsupported";
+/// A tenant whose count query failed and was filled in with zeros.
+const PARTIAL_TENANT: &str = "rail-partial";
+
+fn app_as(tenant: &str) -> Router {
     helios_ui::mount_with_conformance_source(
         Router::new(),
         "9.9.9",
@@ -25,7 +38,7 @@ fn app() -> Router {
         },
         None,
         None,
-        "default".to_string(),
+        tenant.to_string(),
         Arc::new(helios_ui::StaticConformanceSource::from_data_dir(
             std::path::Path::new("../../data"),
         )),
@@ -37,7 +50,11 @@ fn app() -> Router {
 }
 
 async fn get(path: &str) -> String {
-    let response = app()
+    get_as("default", path).await
+}
+
+async fn get_as(tenant: &str, path: &str) -> String {
+    let response = app_as(tenant)
         .oneshot(Request::get(path).body(Body::empty()).unwrap())
         .await
         .unwrap();
@@ -70,10 +87,37 @@ impl DashboardProvider for Fixed {
         _types: &[String],
         _include_empty: bool,
     ) -> DashboardSnapshot {
-        if tenant != "default" {
+        let flags = |snapshot: DashboardSnapshot| match tenant {
+            APPROXIMATE_TENANT => DashboardSnapshot {
+                approximate: true,
+                ..snapshot
+            },
+            PARTIAL_TENANT => DashboardSnapshot {
+                partial: true,
+                ..snapshot
+            },
+            // The provider contract: these two come with nothing measured.
+            SEEDING_TENANT => DashboardSnapshot {
+                totals_pending: true,
+                ..DashboardSnapshot::default()
+            },
+            UNSUPPORTED_TENANT => DashboardSnapshot {
+                counts_unsupported: true,
+                ..DashboardSnapshot::default()
+            },
+            _ => snapshot,
+        };
+        let known = [
+            "default",
+            APPROXIMATE_TENANT,
+            PARTIAL_TENANT,
+            SEEDING_TENANT,
+            UNSUPPORTED_TENANT,
+        ];
+        if !known.contains(&tenant) {
             return DashboardSnapshot::default();
         }
-        DashboardSnapshot {
+        flags(DashboardSnapshot {
             available: vec![
                 TypeCount {
                     resource_type: "Patient".into(),
@@ -85,7 +129,7 @@ impl DashboardProvider for Fixed {
                 },
             ],
             ..Default::default()
-        }
+        })
     }
 }
 
@@ -165,5 +209,53 @@ async fn the_rail_goes_from_no_counts_to_server_rendered_counts() {
                 && long_item.contains(r#"<span class="count">0</span>"#),
             "{path}: the accessible name and count remain separate: {long_item}"
         );
+        assert!(
+            !patient.contains("≈") && !patient.contains("count--approximate"),
+            "{path}: exact counts carry no approximation mark: {patient}"
+        );
+    }
+
+    // Phase 3 (#1078) — an approximate snapshot: every count is still shown,
+    // prefixed "≈", with the reason as its title and as screen-reader text.
+    for path in ["/ui/resources", "/ui/search", "/ui/queries"] {
+        let html = get_as(APPROXIMATE_TENANT, path).await;
+        let patient = rail_item(&html, "Patient");
+        assert!(patient.contains(">≈42<"), "{path}: {patient}");
+        assert!(
+            patient.contains(
+                r#"title="Approximate: counted from recent writes and still being reconciled with storage.""#
+            ),
+            "{path}: the count says why it is approximate: {patient}"
+        );
+        assert!(
+            patient.contains(
+                r#"<span class="visually-hidden"> Approximate: counted from recent writes"#
+            ),
+            "{path}: and says so to assistive technology: {patient}"
+        );
+        let encounter = rail_item(&html, "Encounter");
+        assert!(encounter.contains(">≈0<"), "{path}: {encounter}");
+        assert!(
+            !html.contains(r#"<span class="count">"#),
+            "{path}: no count on an approximate page reads as exact"
+        );
+    }
+
+    // Phase 4 — snapshots with no counts to give: a partial one (#1082,
+    // unchanged), one whose seeding read is only queued, and a backend that
+    // cannot count. None renders a count span, so none shows a zero.
+    for tenant in [PARTIAL_TENANT, SEEDING_TENANT, UNSUPPORTED_TENANT] {
+        for path in ["/ui/resources", "/ui/search", "/ui/queries"] {
+            let html = get_as(tenant, path).await;
+            assert!(
+                html.contains(r#"id="type-rail-list""#),
+                "{tenant} {path}: rail present"
+            );
+            let patient = rail_item(&html, "Patient");
+            assert!(
+                !html.contains(r#"class="count"#),
+                "{tenant} {path}: no count span at all: {patient}"
+            );
+        }
     }
 }

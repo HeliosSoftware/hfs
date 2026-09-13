@@ -763,6 +763,22 @@ pub trait ResourceStorage: Send + Sync {
         Ok(Vec::new())
     }
 
+    /// Whether [`count_all_types`](Self::count_all_types) and
+    /// [`count_deltas_by_bucket`](Self::count_deltas_by_bucket) are real
+    /// aggregates on this backend, rather than the provided defaults that
+    /// return empty lists.
+    ///
+    /// Those defaults are indistinguishable from an empty tenant, so a caller
+    /// that presents counts as measurements (the web UI's Home dashboard) asks
+    /// this first and says the figures are unavailable instead of showing
+    /// zeros (#1078). Default `false`; the SQLite, PostgreSQL and MongoDB
+    /// backends override it, and composite storage forwards the primary's
+    /// answer. A wrapper that delegates the two count methods must delegate
+    /// this too.
+    fn supports_type_counts(&self) -> bool {
+        false
+    }
+
     /// Counts non-deleted resources grouped by tenant across the entire backend.
     ///
     /// **This intentionally spans tenants** and exists for operator/admin

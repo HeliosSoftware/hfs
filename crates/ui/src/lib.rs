@@ -684,6 +684,16 @@ struct WindowEntry {
 /// - [`Self::Sample`] alone — no provider, so nothing else applies.
 /// - [`Self::Pending`] alone — a truly cold tenant: no figure is known, so
 ///   there is nothing to qualify and no reading to date.
+/// - [`Self::Unsupported`] alone — a [`SnapshotState::Ready`] with
+///   [`DashboardSnapshot::counts_unsupported`]: the storage backend cannot
+///   count at all, so nothing will ever be measured, nothing waits and nothing
+///   polls. It outranks every other flag, `totals_pending` included: there is
+///   no reading to wait for.
+/// - [`Self::Pending`] alone — a [`SnapshotState::Ready`] with
+///   [`DashboardSnapshot::totals_pending`]: the provider only queued the read
+///   that seeds the tenant, so its figures are empty rather than zero and the
+///   page is the cold waiting page. `series_pending`, `partial` and
+///   `approximate` qualify figures that are not there, so they are not shown.
 /// - Otherwise (a live [`SnapshotState::Ready`]), every qualifier that holds,
 ///   strongest first: [`Self::SeriesPending`] (it decides what the chart area
 ///   shows and carries the retry), then [`Self::Partial`] (figures filled in
@@ -701,9 +711,10 @@ enum DashboardNotice {
     /// A complete, exact live snapshot. Its line carries only the "as of"
     /// time, and is omitted when that is unknown.
     Live,
-    /// A provider is registered but nothing is cached for the tenant yet.
-    /// Nothing is charted and no headline figure is shown — waiting is
-    /// rendered as waiting.
+    /// A provider is registered but nothing is cached for the tenant yet — or
+    /// the provider answered with [`DashboardSnapshot::totals_pending`], having
+    /// only queued the read that seeds the tenant (#1078). Nothing is charted
+    /// and no headline figure is shown — waiting is rendered as waiting.
     Pending,
     /// The tenant's totals, type list and job counts are known, but this
     /// window's series are not ([`DashboardSnapshot::series_pending`]): the
@@ -719,6 +730,11 @@ enum DashboardNotice {
     /// This build has no metrics provider at all, so the placeholder snapshot
     /// is rendered — and labelled as invented.
     Sample,
+    /// The storage backend cannot count resources
+    /// ([`DashboardSnapshot::counts_unsupported`], e.g. an S3 primary). A plain
+    /// label, not a warning: nothing is broken or late, the figures simply do
+    /// not exist here — so no "as of", no retry and no polling.
+    Unsupported,
 }
 
 impl DashboardNotice {
@@ -732,6 +748,7 @@ impl DashboardNotice {
             DashboardNotice::Partial => Some("chart-partial-note"),
             DashboardNotice::Approximate => Some("chart-approximate-note"),
             DashboardNotice::Sample => Some("chart-sample-note"),
+            DashboardNotice::Unsupported => Some("chart-counts-unsupported-note"),
         }
     }
 
@@ -745,14 +762,19 @@ impl DashboardNotice {
             DashboardNotice::Partial => "partial",
             DashboardNotice::Approximate => "approximate",
             DashboardNotice::Sample => "sample",
+            DashboardNotice::Unsupported => "unsupported",
         }
     }
 
     /// Whether the line is a warning (`.notice--warn`) rather than a plain
     /// label: something is missing or invented. Approximate and live figures
-    /// are real readings, so they are labelled, not flagged.
+    /// are real readings, so they are labelled, not flagged; a backend that
+    /// cannot count is a fact about the deployment, not a fault.
     fn is_warning(self) -> bool {
-        !matches!(self, DashboardNotice::Live | DashboardNotice::Approximate)
+        !matches!(
+            self,
+            DashboardNotice::Live | DashboardNotice::Approximate | DashboardNotice::Unsupported
+        )
     }
 
     /// Whether the chart is still waiting on this window's series — the
@@ -813,6 +835,18 @@ fn dashboard_notices(state: &SnapshotState, now: DateTime<Utc>) -> Vec<NoticeLin
         }
         SnapshotState::Ready(snapshot) => snapshot,
     };
+    if snapshot.counts_unsupported {
+        return vec![NoticeLine {
+            kind: DashboardNotice::Unsupported,
+            as_of: None,
+        }];
+    }
+    if snapshot.totals_pending {
+        return vec![NoticeLine {
+            kind: DashboardNotice::Pending,
+            as_of: None,
+        }];
+    }
 
     let mut kinds: Vec<DashboardNotice> = [
         (snapshot.series_pending, DashboardNotice::SeriesPending),
@@ -862,6 +896,13 @@ struct IndexPage {
     /// Whether the chart area renders its waiting state: nothing is known
     /// yet, or this window's series are still loading (#1078).
     chart_waiting: bool,
+    /// Whether the storage backend cannot count at all
+    /// ([`DashboardSnapshot::counts_unsupported`]): the chart area says so
+    /// instead of waiting or charting, and nothing polls.
+    chart_unsupported: bool,
+    /// The i18n key naming why a figure renders as "—": still waiting, or not
+    /// available on this backend.
+    figures_unknown_key: &'static str,
     /// The same view, re-requested. Rendered as a "retry now" link in the
     /// waiting notice so the page is recoverable without JavaScript.
     retry_href: String,
@@ -875,7 +916,21 @@ struct IndexPage {
     /// is running (#1078). `None` once they settle, which ends the poll.
     /// Mutually exclusive with [`Self::auto_retry_href`]: that one waits for
     /// figures that are not here yet, this one follows figures that are.
+    ///
+    /// Also the slow watch of a waiting page whose retry budget is spent
+    /// ([`Self::refresh_waiting`]), so it does not go dead.
     refresh_href: Option<String>,
+    /// Whether [`Self::refresh_href`] is the slow watch of a page still
+    /// waiting for its figures (`data-dash-waiting`): its href keeps the spent
+    /// retry count, and assets/dashboard.js carries that count when it
+    /// re-aims the request, so the server keeps watching slowly instead of
+    /// restarting the fast retries.
+    refresh_waiting: bool,
+    /// `tenant|FHIR version|locale` this render was made for
+    /// (`data-dash-ctx`). Every live-region request sends it back as `ctx`; a
+    /// request whose context no longer matches gets `HX-Refresh` instead of a
+    /// region from another tenant, version or language.
+    dash_ctx: String,
     /// Seconds between two [`Self::refresh_href`] polls.
     refresh_secs: u32,
     /// Whether the figures are still moving — approximate, or an import is
@@ -926,6 +981,8 @@ struct SearchPage {
     /// The saved-query controls are the Saved Queries page's job, not this
     /// page's (see `partials/search-builder.html`).
     show_save: bool,
+    /// Whether the rail's counts are approximate (see [`RailCounts`]).
+    rail_counts_approximate: bool,
     /// The type rail (#541), server-rendered from `resource_types` and the
     /// dashboard snapshot's counts.
     rail_entries: Vec<RailEntry>,
@@ -971,6 +1028,8 @@ struct ResourcesPage {
     /// The search-builder partial's save controls are the Saved Queries page's
     /// job, not this one's.
     show_save: bool,
+    /// Whether the rail's counts are approximate (see [`RailCounts`]).
+    rail_counts_approximate: bool,
     /// The type rail (#541), server-rendered from `resource_types` and the
     /// dashboard snapshot's counts.
     rail_entries: Vec<RailEntry>,
@@ -1010,6 +1069,8 @@ struct QueriesPage {
     /// CompartmentDefinitions already vendored for the compartment viewer.
     resource_types: Vec<String>,
     show_save: bool,
+    /// Whether the rail's counts are approximate (see [`RailCounts`]).
+    rail_counts_approximate: bool,
     /// The type rail (#541), server-rendered from `resource_types` and the
     /// dashboard snapshot's counts.
     rail_entries: Vec<RailEntry>,
@@ -1895,13 +1956,35 @@ async fn revalidate_assets(request: axum::extract::Request, next: middleware::Ne
 /// the picker offers every resource type of the active FHIR version, not just
 /// the ones the tenant stores, and a type with no data can be charted as a
 /// flat zero line.
+///
+/// An htmx request from the live region carries `ctx` (see [`dash_ctx`]). When
+/// it no longer matches the tenant, FHIR version and locale this request
+/// resolves to — switched in another tab — the answer is an empty `200` with
+/// `HX-Refresh: true`, so htmx reloads the whole page (sidebar, selector and
+/// figures together) instead of swapping one context's region into another's
+/// page. A request without `ctx` renders as usual.
 async fn index(
     State(state): State<WebState>,
     locale: RequestLocale,
     rv: RequestVersion,
     rt: RequestTenant,
+    HxRequest(is_htmx): HxRequest,
     RawQuery(query): RawQuery,
 ) -> Response {
+    if is_htmx
+        && let Some(sent) = query.as_deref().and_then(|q| {
+            form_urlencoded::parse(q.as_bytes())
+                .find(|(key, _)| key == "ctx")
+                .map(|(_, value)| value.into_owned())
+        })
+        && sent != dash_ctx(&rt, rv.0, locale)
+    {
+        return (
+            StatusCode::OK,
+            [(axum::http::HeaderName::from_static("hx-refresh"), "true")],
+        )
+            .into_response();
+    }
     let types: Vec<String> = query_value(query.as_deref(), "types")
         .or_else(|| query_value(query.as_deref(), "type"))
         .map(|csv| {
@@ -1973,11 +2056,12 @@ struct RailEntry {
 fn build_rail_entries(
     base: &str,
     resource_types: &[String],
-    available: Option<&[TypeCount]>,
+    available: Option<RailCounts<'_>>,
     selected: Option<&str>,
 ) -> Vec<RailEntry> {
     let counts: Option<std::collections::HashMap<&str, u64>> = available.map(|types| {
         types
+            .available
             .iter()
             .map(|t| (t.resource_type.as_str(), t.total))
             .collect()
@@ -2002,10 +2086,34 @@ fn build_rail_entries(
 /// `available` would render every type as a fabricated `0`, which reads as "the
 /// server lost my data" rather than "counts are momentarily unavailable".
 /// Returning `None` makes [`build_rail_entries`] show no count at all instead.
-fn rail_counts(live: &Option<DashboardSnapshot>) -> Option<&[TypeCount]> {
+///
+/// The same holds when the snapshot has no figures to give (#1078): the
+/// provider only queued the read seeding the tenant (`totals_pending`), or the
+/// backend cannot count at all (`counts_unsupported`) — an empty `available`
+/// there is not "every type is empty".
+fn rail_counts(live: &Option<DashboardSnapshot>) -> Option<RailCounts<'_>> {
     live.as_ref()
-        .filter(|s| !s.partial)
-        .map(|s| s.available.as_slice())
+        .filter(|s| !s.partial && !s.totals_pending && !s.counts_unsupported)
+        .map(|s| RailCounts {
+            available: s.available.as_slice(),
+            approximate: s.approximate,
+        })
+}
+
+/// The per-type counts a type rail may show, from [`rail_counts`].
+#[derive(Clone, Copy)]
+struct RailCounts<'a> {
+    available: &'a [TypeCount],
+    /// Counted from recent writes and not yet reconciled with storage
+    /// ([`DashboardSnapshot::approximate`]): each count renders with "≈" and
+    /// says so (#1078).
+    approximate: bool,
+}
+
+/// Whether the rail's counts are approximate — the page-level flag the rail
+/// partials read, since the "Recently used" rows carry the same counts.
+fn rail_counts_approximate(counts: Option<RailCounts<'_>>) -> bool {
+    counts.is_some_and(|c| c.approximate)
 }
 
 /// For a type rail (Resources, Search, Saved Queries): the stored `last`
@@ -2153,10 +2261,11 @@ async fn search(
     let live =
         helios_observability::dashboard::snapshot(DashboardWindow::default(), &rt.id, &[], false)
             .await;
+    let counts = rail_counts(&live);
     let rail_entries = build_rail_entries(
         "/ui/search",
         &resource_types,
-        rail_counts(&live),
+        counts,
         Some(selected_type.as_str()),
     );
     let recent_entries = resolve_type_recents(&rail, &rail_entries, "/ui/search");
@@ -2168,6 +2277,7 @@ async fn search(
         docs_url: NL_SEARCH_DOCS,
         resource_types,
         show_save: false,
+        rail_counts_approximate: rail_counts_approximate(counts),
         rail_entries,
         selected_type,
         recent_entries,
@@ -2212,10 +2322,11 @@ async fn queries(
     let live =
         helios_observability::dashboard::snapshot(DashboardWindow::default(), &rt.id, &[], false)
             .await;
+    let counts = rail_counts(&live);
     let rail_entries = build_rail_entries(
         "/ui/queries",
         &resource_types,
-        rail_counts(&live),
+        counts,
         Some(selected_type.as_str()),
     );
     let recent_entries = resolve_type_recents(&rail, &rail_entries, "/ui/queries");
@@ -2225,6 +2336,7 @@ async fn queries(
         active_page: "queries",
         resource_types,
         show_save: true,
+        rail_counts_approximate: rail_counts_approximate(counts),
         rail_entries,
         selected_type,
         recent_entries,
@@ -2313,12 +2425,14 @@ async fn resources(
     let live =
         helios_observability::dashboard::snapshot(DashboardWindow::default(), &rt.id, &[], false)
             .await;
+    let counts = rail_counts(&live);
     let rail_entries = build_rail_entries(
         "/ui/resources",
         &resource_types,
-        rail_counts(&live),
+        counts,
         Some(selected_type.as_str()),
     );
+    let rail_counts_approximate = rail_counts_approximate(counts);
     let recent_entries = resolve_type_recents(&rail, &rail_entries, "/ui/resources");
     render(ResourcesPage {
         status: current_status(&state, rv.0, &rt),
@@ -2345,6 +2459,7 @@ async fn resources(
             .unwrap_or_default(),
         create_metadata_available: targets.is_some(),
         show_save: false,
+        rail_counts_approximate,
         rail_entries,
         recent_entries,
         rail_page: rail_state::RailPage::Resources.key(),
@@ -7674,6 +7789,8 @@ fn dash_state(
         snapshot.partial,
         snapshot.approximate,
         snapshot.series_pending,
+        snapshot.totals_pending,
+        snapshot.counts_unsupported,
     )
         .hash(&mut hasher);
     (now.timestamp() / 60).hash(&mut hasher);
@@ -7692,9 +7809,13 @@ fn dash_state(
 ///   this window's series are missing ([`DashboardSnapshot::series_pending`],
 ///   a warm tenant switching to a slow window) the cards and the type picker
 ///   render from the snapshot while the chart area alone waits and retries.
+///   A snapshot with [`DashboardSnapshot::totals_pending`] renders the cold
+///   waiting page below. Either waiting page keeps a slow watch once its
+///   retries are spent. [`DashboardSnapshot::counts_unsupported`] renders
+///   unknown figures, the unsupported-backend notice, and never polls.
 /// - [`SnapshotState::Pending`] — a provider is registered, nothing is cached
 ///   for the tenant yet — renders an explicit waiting state: no chart, no
-///   headline figures, and a retry.
+///   headline figures, and a bounded retry with no slow watch after it.
 /// - [`SnapshotState::NoProvider`] — the build genuinely has no metrics —
 ///   renders the placeholder snapshot, labelled as invented (#555).
 ///
@@ -7720,13 +7841,18 @@ async fn build_index_page(
 
     let notices = dashboard_notices(&live, Utc::now());
     let ready = matches!(live, SnapshotState::Ready(_));
-    let cold = matches!(live, SnapshotState::Pending);
+    let unsupported = matches!(&live, SnapshotState::Ready(s) if s.counts_unsupported);
+    // Nothing is known for the tenant yet: the cache's own cold state, or a
+    // provider that only queued the read seeding it (#1078).
+    let cold = matches!(&live, SnapshotState::Pending)
+        || matches!(&live, SnapshotState::Ready(s) if s.totals_pending && !s.counts_unsupported);
     let chart_waiting = notices.iter().any(|line| line.kind.is_waiting());
 
     let snapshot = match live {
         SnapshotState::Ready(mut s) => {
-            if s.series_pending {
-                // Never chart series the snapshot says are not this window's.
+            if s.series_pending || s.totals_pending || s.counts_unsupported {
+                // Never chart series the snapshot says are not this window's,
+                // nor anything from a snapshot that measured nothing.
                 s.series.clear();
             }
             s
@@ -7760,10 +7886,12 @@ async fn build_index_page(
         // here reads as a measurement.
         dash.metrics.chart_total = None;
     }
-    if cold {
-        // No figure is known yet at all.
+    if cold || unsupported {
+        // No figure is known yet at all — or none can ever be measured here.
+        // Either way a zero would read as a measurement.
         dash.metrics.resource_types = None;
         dash.metrics.stored_resources = None;
+        dash.metrics.chart_total = None;
     }
 
     // The same view again, one attempt further in. Built from the requested
@@ -7772,6 +7900,14 @@ async fn build_index_page(
     let retry_href = format!("{retry_base}&retry={}", retry.saturating_add(1));
     let auto_retry_href =
         (chart_waiting && retry < DASH_PENDING_RETRIES).then(|| retry_href.clone());
+    // Item 4 of #1078: a page waiting on a snapshot the provider did answer
+    // (series or totals still pending) must not go dead once the fast retries
+    // are spent — the figures are on their way and nothing else would fetch
+    // them. It keeps a slow watch at the settled cadence instead, whose href
+    // keeps the spent count so the server answers with the watch again rather
+    // than restarting the fast retries. The cache's own cold `Pending` keeps
+    // only the bounded retry: a server too busy to fill it is not polled.
+    let slow_watch = ready && chart_waiting && retry >= DASH_PENDING_RETRIES;
     // Figures that are here but still moving follow themselves (#1078): the
     // counter-backed snapshot is read in constant time, so this poll adds no
     // storage load, and it ends by itself once the figures are exact and no
@@ -7783,9 +7919,17 @@ async fn build_index_page(
     // knows when that happens. A watch tick whose figures did not change is
     // dropped by assets/dashboard.js (same `refresh_state`), so an idle page
     // is not re-rendered under the user.
-    let live_refresh = ready && !chart_waiting;
-    let refresh_moving = snapshot.approximate || snapshot.import_jobs_active.is_some_and(|n| n > 0);
-    let refresh_href = live_refresh.then(|| retry_base.clone());
+    //
+    // A backend that cannot count has nothing to follow at all, so it is
+    // neither retried nor watched.
+    let live_refresh = ready && !chart_waiting && !unsupported;
+    let refresh_moving = live_refresh
+        && (snapshot.approximate || snapshot.import_jobs_active.is_some_and(|n| n > 0));
+    let refresh_href = if slow_watch {
+        Some(format!("{retry_base}&retry={DASH_PENDING_RETRIES}"))
+    } else {
+        live_refresh.then(|| retry_base.clone())
+    };
     let refresh_secs = if refresh_moving {
         DASH_LIVE_REFRESH_SECS
     } else {
@@ -7804,9 +7948,17 @@ async fn build_index_page(
         all_types_href: dash.all_types_href,
         notices,
         chart_waiting,
+        chart_unsupported: unsupported,
+        figures_unknown_key: if unsupported {
+            "chart-counts-unsupported"
+        } else {
+            "chart-pending-empty"
+        },
         retry_href,
         auto_retry_href,
         refresh_href,
+        refresh_waiting: slow_watch,
+        dash_ctx: dash_ctx(tenant, fhir_version, locale),
         refresh_secs,
         refresh_moving,
         refresh_state,
@@ -7814,6 +7966,24 @@ async fn build_index_page(
         i18n,
         active_page: "home",
     }
+}
+
+/// The context a dashboard render belongs to — `tenant|FHIR version|locale` —
+/// carried on `#dash-live` as `data-dash-ctx` and sent back by every request
+/// the region makes as `ctx` (#1078). The `/ui` handler compares it with the
+/// context it resolves now, so a tab whose tenant, version or language changed
+/// in another tab reloads instead of swapping in figures from the other one.
+fn dash_ctx(
+    tenant: &RequestTenant,
+    fhir_version: helios_fhir::FhirVersion,
+    locale: RequestLocale,
+) -> String {
+    format!(
+        "{}|{}|{}",
+        tenant.id,
+        fhir_version.as_str(),
+        I18n::new(locale).lang()
+    )
 }
 
 /// Everything `build_dashboard` hands the landing page.
@@ -8371,6 +8541,8 @@ fn sample_snapshot(window: DashboardWindow) -> DashboardSnapshot {
         generated_at: None,
         approximate: false,
         series_pending: false,
+        totals_pending: false,
+        counts_unsupported: false,
     }
 }
 
@@ -8379,9 +8551,24 @@ fn rail_counts_are_dropped_when_the_snapshot_is_partial() {
     // A whole snapshot hands its per-type counts to the rail.
     let whole = sample_snapshot(DashboardWindow::default());
     assert!(
-        rail_counts(&Some(whole)).is_some_and(|a| !a.is_empty()),
-        "a whole snapshot should expose its counts"
+        rail_counts(&Some(whole.clone()))
+            .is_some_and(|c| !c.available.is_empty() && !c.approximate),
+        "a whole snapshot should expose its counts, as exact"
     );
+
+    // Approximate counts are still shown, marked as such (#1078).
+    let mut approximate = whole.clone();
+    approximate.approximate = true;
+    assert!(rail_counts(&Some(approximate)).is_some_and(|c| c.approximate));
+
+    // A snapshot with no figures to give — the seeding read only queued, or a
+    // backend that cannot count — shows no count rather than zeros (#1078).
+    let mut seeding = whole.clone();
+    seeding.totals_pending = true;
+    assert!(rail_counts(&Some(seeding)).is_none());
+    let mut uncountable = whole;
+    uncountable.counts_unsupported = true;
+    assert!(rail_counts(&Some(uncountable)).is_none());
 
     // A partial snapshot (a count query failed and was filled with zeros, e.g.
     // under a deferred index rebuild, #1065) must NOT feed those fabricated
@@ -8553,9 +8740,13 @@ mod tests {
             all_types_href: dash.all_types_href,
             notices: dashboard_notices(&SnapshotState::NoProvider, Utc::now()),
             chart_waiting: false,
+            chart_unsupported: false,
+            figures_unknown_key: "chart-pending-empty",
             retry_href: "/ui?types=&window=30d&retry=1".to_string(),
             auto_retry_href: None,
             refresh_href: None,
+            refresh_waiting: false,
+            dash_ctx: "default|R4|en".to_string(),
             refresh_secs: DASH_LIVE_REFRESH_SECS,
             refresh_moving: false,
             refresh_state: String::new(),
@@ -8881,6 +9072,7 @@ mod tests {
             i18n: i18n("en"),
             active_page: "queries",
             show_save: true,
+            rail_counts_approximate: false,
             resource_types,
             selected_type: String::new(),
             rail_entries,
@@ -8946,6 +9138,7 @@ mod tests {
             i18n: i18n("es"),
             active_page: "queries",
             show_save: true,
+            rail_counts_approximate: false,
             resource_types,
             selected_type: String::new(),
             rail_entries,
@@ -9188,6 +9381,8 @@ mod tests {
             generated_at: None,
             approximate: false,
             series_pending: false,
+            totals_pending: false,
+            counts_unsupported: false,
         };
         let dash = build_dashboard(&empty, false, &[], None);
         assert!(!dash.chart.has_data);
@@ -9238,6 +9433,8 @@ mod tests {
             generated_at: None,
             approximate: false,
             series_pending: false,
+            totals_pending: false,
+            counts_unsupported: false,
         };
         let spec_types = vec![
             "Observation".to_string(),
@@ -9482,6 +9679,55 @@ mod tests {
             kinds(&partial_approximate),
             [DashboardNotice::Partial, DashboardNotice::Approximate]
         );
+
+        // #1078: a provider that only queued the seeding read renders the
+        // cold waiting line alone, undated — the qualifiers would qualify
+        // figures that are not there.
+        let seeding = dashboard_notices(
+            &ready(|s| {
+                s.totals_pending = true;
+                s.series_pending = true;
+                s.partial = true;
+                s.approximate = true;
+            }),
+            now,
+        );
+        assert_eq!(kinds(&seeding), [DashboardNotice::Pending]);
+        assert_eq!(dated(&seeding), [None]);
+
+        // A backend that cannot count outranks everything, waiting included:
+        // one plain, undated label that neither warns nor waits.
+        let unsupported = dashboard_notices(
+            &ready(|s| {
+                s.counts_unsupported = true;
+                s.totals_pending = true;
+                s.partial = true;
+            }),
+            now,
+        );
+        assert_eq!(kinds(&unsupported), [DashboardNotice::Unsupported]);
+        assert_eq!(dated(&unsupported), [None]);
+        assert!(!unsupported[0].kind.is_warning() && !unsupported[0].kind.is_waiting());
+        assert_eq!(unsupported[0].kind.slug(), "unsupported");
+    }
+
+    /// #1078: the digest a watch tick compares must change when a waiting or
+    /// unsupported flag flips, so the figures replacing a waiting page are
+    /// swapped in even when every other figure is the same (empty).
+    #[test]
+    fn dash_state_tracks_the_waiting_and_unsupported_flags() {
+        let now = DateTime::from_timestamp(1_752_503_400, 0).expect("valid instant");
+        let base = DashboardSnapshot::default();
+        let state = dash_state(&base, &[], false, now);
+        for flip in [
+            |s: &mut DashboardSnapshot| s.totals_pending = true,
+            |s: &mut DashboardSnapshot| s.counts_unsupported = true,
+            |s: &mut DashboardSnapshot| s.series_pending = true,
+        ] {
+            let mut flipped = base.clone();
+            flip(&mut flipped);
+            assert_ne!(dash_state(&flipped, &[], false, now), state);
+        }
     }
 
     /// The "as of" fallback text is UTC, like the chart axis, and names the

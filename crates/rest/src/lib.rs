@@ -604,12 +604,15 @@ where
             ),
     );
     helios_observability::dashboard::set_provider(dashboard_provider.clone());
-    // The provider serves seeded tenants from the in-memory write counters
-    // (#1078); this background task seeds the default tenant at startup and
-    // periodically reconciles the counters with storage, backing off while a
-    // bulk submit is active. It holds only a weak reference, so it stops once
-    // a later `build_app` replaces this provider (see
-    // `dashboard::spawn_reconcile_loop`). Skipped outside a Tokio runtime.
+    // The provider never runs a storage aggregate on a page load (#1078): it
+    // serves seeded tenants from the in-memory write counters and answers
+    // "pending" for the rest. This background task runs every aggregate
+    // instead: it seeds the default tenant at startup, any tenant a page asks
+    // for, and a purged tenant's reseed, and periodically reconciles the
+    // counters with storage, backing off while a bulk submit is active. It
+    // holds only a weak reference, so it stops once a later `build_app`
+    // replaces this provider (see `dashboard::spawn_reconcile_loop`). Skipped
+    // outside a Tokio runtime.
     let _ = dashboard::spawn_reconcile_loop(&dashboard_provider);
     drop(dashboard_provider);
 

@@ -889,6 +889,10 @@ impl ResourceStorage for SqliteBackend {
         Ok(out)
     }
 
+    fn supports_type_counts(&self) -> bool {
+        true
+    }
+
     fn supports_tenant_registry(&self) -> bool {
         true
     }
@@ -4112,6 +4116,14 @@ mod tests {
             TenantId::new("test-tenant"),
             TenantPermissions::full_access(),
         )
+    }
+
+    /// #1078: SQLite's `count_all_types` / `count_deltas_by_bucket` are real
+    /// aggregates, so it opts in to `supports_type_counts`.
+    #[test]
+    fn test_supports_type_counts() {
+        let backend = SqliteBackend::in_memory().unwrap();
+        assert!(backend.supports_type_counts());
     }
 
     #[tokio::test]

@@ -946,6 +946,10 @@ impl ResourceStorage for PostgresBackend {
         Ok(out)
     }
 
+    fn supports_type_counts(&self) -> bool {
+        true
+    }
+
     fn supports_tenant_registry(&self) -> bool {
         true
     }

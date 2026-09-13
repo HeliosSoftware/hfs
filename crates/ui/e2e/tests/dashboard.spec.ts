@@ -640,6 +640,11 @@ test.describe("live refresh (#1078)", () => {
     expect(refreshes.length, "the figures arrived through the periodic refresh").toBeGreaterThan(0);
     for (const sent of refreshes) {
       expect(sent.searchParams.get("types"), "the refresh keeps the charted set").toBe(new URL(url).searchParams.get("types"));
+      // Byte for byte: the server reads ?types= raw, so a re-encoded
+      // "Device%2CLocation" would silently chart the default types instead.
+      expect(sent.search, "the refresh sends the charted set unencoded").toContain(
+        `types=${new URL(url).searchParams.get("types")}&`,
+      );
       expect(sent.searchParams.get("window")).toBe("1h");
       expect(sent.searchParams.has("notices"), "the refresh names the notices on screen").toBe(true);
     }
