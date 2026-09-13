@@ -4562,6 +4562,23 @@ mod tests {
 
     #[cfg(feature = "R4")]
     #[test]
+    fn validate_view_definition_reports_unknown_resource_type() {
+        let vd = view_definition_from_json(serde_json::json!({
+            "status": "active",
+            "resource": "Nope",
+            "select": [{ "column": [{ "name": "id", "path": "id" }] }]
+        }));
+        let message = invalid_view_definition_message(
+            validate_view_definition(&vd).expect_err("unknown `resource` type must fail"),
+        );
+        assert!(
+            message.contains("unknown resource type \"Nope\""),
+            "got: {message}"
+        );
+    }
+
+    #[cfg(feature = "R4")]
+    #[test]
     fn validate_view_definition_reports_missing_select() {
         let vd = view_definition_from_json(serde_json::json!({
             "status": "active",

@@ -8,12 +8,14 @@
 //! not valid enough to deserialize) and returns every problem it finds,
 //! located by [RFC 6901](https://www.rfc-editor.org/rfc/rfc6901) JSON pointer.
 //!
-//! This is deliberately **structural and syntactic only** — the principle
-//! #821 states is "the browser only knows syntax; the server knows FHIR", and
+//! This is deliberately **structural, syntactic, and — for `resource` — a
+//! name check against the compiled-in resource types**: the principle #821
+//! states is "the browser only knows syntax; the server knows FHIR", and
 //! this module is the FHIR side of that split for the ViewDefinition shape
 //! itself. It does not evaluate FHIRPath expressions, does not resolve
-//! terminology, and does not touch storage: every check here is a pure
-//! function of the document.
+//! terminology, and does not touch storage: every check here — including the
+//! `resource` name check, which only consults `helios_fhir`'s compiled-in
+//! resource type list — is a pure function of the document.
 //!
 //! # What this checks
 //!
@@ -42,6 +44,10 @@
 //!   itself binds (`%rowIndex`) ([`DiagnosticCode::UndeclaredConstant`]).
 //!   Locating the reference still doesn't evaluate the expression — it
 //!   walks the parsed AST [`helios_fhirpath::external_constants`] returns.
+//! - `resource` names a resource type of some FHIR version compiled into
+//!   this build ([`DiagnosticCode::UnknownResourceType`]) — the one check
+//!   here that consults `helios_fhir` (for the list of names), still a pure
+//!   function of the document (#1014).
 //!
 //! # Actionability and localization (#821)
 //!
@@ -82,6 +88,7 @@
 
 use serde_json::Value;
 use std::collections::{BTreeMap, HashSet};
+use std::sync::OnceLock;
 
 // ---------------------------------------------------------------------------
 // Public types (RF1)
@@ -157,6 +164,12 @@ pub enum DiagnosticCode {
     /// variable the evaluator resolves. See the module docs for the exact
     /// set of names this treats as declared.
     UndeclaredConstant,
+    /// `resource` is a non-empty string that names no resource type of any
+    /// FHIR version compiled into this build (`"Nope"`, or `"patient"` —
+    /// the comparison is case-sensitive, as FHIR resource type names are).
+    /// A missing, empty or non-string `resource` is `MissingRequired` /
+    /// `EmptyRequired` / `WrongType` instead, never this.
+    UnknownResourceType,
 }
 
 /// A structural edit [`lint_view_definition`] believes would resolve (or at
@@ -850,6 +863,49 @@ const CONSTANT_VALUE_KEYS: &[&str] = &[
     "valueUuid",
 ];
 
+/// Every resource type name of every FHIR version compiled into this
+/// build, sorted and deduplicated — the same "any enabled version" union
+/// the REST layer admits for URL resource types (`crates/rest/src/fhir_types.rs`),
+/// computed independently here so `lint.rs` never depends on `helios_rest`
+/// (which itself depends on `helios_sof`, so that would be a cycle).
+///
+/// The comparison this backs is exact and case-sensitive — see
+/// [`DiagnosticCode::UnknownResourceType`] — never
+/// `helios_fhir::FhirResourceTypeProvider::is_resource_type`, which is
+/// case-insensitive.
+fn known_resource_types() -> &'static [&'static str] {
+    static CACHE: OnceLock<Vec<&'static str>> = OnceLock::new();
+    CACHE
+        .get_or_init(|| {
+            #[allow(unused_mut)]
+            let mut names: Vec<&'static str> = Vec::new();
+            #[cfg(feature = "R4")]
+            names.extend(
+                <helios_fhir::r4::Resource as helios_fhir::FhirResourceTypeProvider>::get_resource_type_names(
+                ),
+            );
+            #[cfg(feature = "R4B")]
+            names.extend(
+                <helios_fhir::r4b::Resource as helios_fhir::FhirResourceTypeProvider>::get_resource_type_names(
+                ),
+            );
+            #[cfg(feature = "R5")]
+            names.extend(
+                <helios_fhir::r5::Resource as helios_fhir::FhirResourceTypeProvider>::get_resource_type_names(
+                ),
+            );
+            #[cfg(feature = "R6")]
+            names.extend(
+                <helios_fhir::r6::Resource as helios_fhir::FhirResourceTypeProvider>::get_resource_type_names(
+                ),
+            );
+            names.sort_unstable();
+            names.dedup();
+            names
+        })
+        .as_slice()
+}
+
 // ---------------------------------------------------------------------------
 // Public entry point (RF1)
 // ---------------------------------------------------------------------------
@@ -890,6 +946,15 @@ pub fn lint_view_definition(doc: &Value) -> Vec<Diagnostic> {
     }
 
     validate_node(Node::Root, doc, "", &mut diagnostics);
+
+    if let Some(Value::String(resource)) = root.get("resource")
+        && !resource.trim().is_empty()
+        && known_resource_types()
+            .binary_search(&resource.as_str())
+            .is_err()
+    {
+        diagnostics.push(unknown_resource_type(resource));
+    }
 
     if let Some(constants) = root.get("constant").and_then(Value::as_array) {
         for (i, constant) in constants.iter().enumerate() {
@@ -1096,6 +1161,12 @@ fn issue_code(code: DiagnosticCode) -> &'static str {
         | DiagnosticCode::SelectWithoutOutput
         | DiagnosticCode::FhirPathSyntax
         | DiagnosticCode::UndeclaredConstant => "invalid",
+        // `resource` is a FHIR `code` bound to the `resource-types` value
+        // set; a value outside that binding is exactly what IssueType
+        // `code-invalid` ("a code or system in the input value violates
+        // applicable rules") means, distinct from the generic `invalid`
+        // used for the other semantic checks above.
+        DiagnosticCode::UnknownResourceType => "code-invalid",
     }
 }
 
@@ -1439,6 +1510,23 @@ fn empty_required(pointer: &str, key: &str) -> Diagnostic {
         message: "required value must not be empty".to_string(),
         severity: Severity::Error,
         code: DiagnosticCode::EmptyRequired,
+        span: None,
+        args,
+        fixes: Vec::new(),
+    }
+}
+
+/// Builds the [`DiagnosticCode::UnknownResourceType`] diagnostic for a
+/// `resource` value that does not name a resource type of any FHIR version
+/// compiled into this build.
+fn unknown_resource_type(found: &str) -> Diagnostic {
+    let mut args = BTreeMap::new();
+    args.insert("found".to_string(), found.to_string());
+    Diagnostic {
+        pointer: "/resource".to_string(),
+        message: format!("unknown resource type {found:?}"),
+        severity: Severity::Error,
+        code: DiagnosticCode::UnknownResourceType,
         span: None,
         args,
         fixes: Vec::new(),
