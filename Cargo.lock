@@ -3599,6 +3599,7 @@ dependencies = [
  "cdrs-tokio-helpers-derive",
  "chrono",
  "criterion",
+ "ctor",
  "deadpool-postgres",
  "elasticsearch",
  "futures",

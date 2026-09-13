@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
-"""Bulk-submit memory benchmark controller for issue #995 (current HEAD).
+"""Bulk-submit benchmark controller for issues #995 and #1086.
 
 Drives the release ``hfs`` binary natively on macOS against a dedicated
 PostgreSQL container the caller owns, and records **external** observations
 only: HFS RSS from ``ps`` every 0.5 s, host memory pressure/swap/compressor
 vitals every 5 s, PostgreSQL state through ``docker exec <container> psql``,
-and HTTP phase markers with the raw responses behind them.  The server is
-never instrumented and no internal phase is claimed; see
-``MEMORY_MEASUREMENT.md`` next to this file for the protocol.
+and HTTP phase markers with the raw responses behind them. The optional
+``--postgres-reindex-evidence`` profile also captures the opt-in HFS phase
+summary, PostgreSQL activity deltas, and representative cursor plans required
+by the bounded #1086 protocol. See ``MEMORY_MEASUREMENT.md`` beside this file
+for #995 and ``docs/postgres-reindex-benchmark.md`` for #1086.
 
 A successful attempt requires the deferred reindex to be positively verified:
 the ``deferred-index rebuild started job_id=...`` log line, ``$reindex-status``
@@ -47,7 +49,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Optional
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+ISSUE_1086_DEFAULT_RESOURCES = 2000
+ISSUE_1086_MAX_RESOURCES = 10_000
 TENANT = "default"
 FAMILY = "Pilot995"
 MRN_SYSTEM = "http://helios.example/mrn"
@@ -78,6 +82,32 @@ HFS_ENV_BASE = {
 }
 
 
+def effective_hfs_env(
+    args: argparse.Namespace, base_url: str, output_dir: Path
+) -> dict[str, str]:
+    """Build the measured HFS environment, with caller overrides applied last."""
+    env = dict(HFS_ENV_BASE)
+    env["HFS_BASE_URL"] = base_url
+    env["HFS_SERVER_HOST"] = args.host
+    env["HFS_SERVER_PORT"] = str(args.hfs_port)
+    env["HFS_LOG_LEVEL"] = args.hfs_log_level
+    env["HFS_BULK_SUBMIT_FILE_CONCURRENCY"] = str(args.file_concurrency)
+    env["HFS_BULK_SUBMIT_DEFER_INDEXING"] = (
+        "true" if args.defer_indexing else "false"
+    )
+    env["HFS_BULK_SUBMIT_OUTPUT_BACKEND"] = "local-fs"
+    env["HFS_BULK_SUBMIT_OUTPUT_DIR"] = str(output_dir / "artifacts")
+    if args.postgres_reindex_evidence:
+        env["HFS_PERF_PHASES"] = "1"
+        # EnvFilter target directives match prefixes. Without the more-specific
+        # override, `hfs=warn` also suppresses the `hfs_perf` INFO summary.
+        env["RUST_LOG"] = "info,hfs=warn,hfs_perf=info"
+    for item in args.hfs_env:
+        key, _, value = item.partition("=")
+        env[key.strip()] = value
+    return env
+
+
 # --------------------------------------------------------------------------
 # utilities
 # --------------------------------------------------------------------------
@@ -85,6 +115,19 @@ HFS_ENV_BASE = {
 
 def iso_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def parse_reindex_start_log_timestamp(line: str) -> Optional[datetime]:
+    """Parse the RFC3339 prefix from a deferred-reindex start log line."""
+    if "deferred-index rebuild started" not in line:
+        return None
+    match = re.match(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z)\s", line)
+    if not match:
+        return None
+    try:
+        return datetime.fromisoformat(match.group(1)[:-1] + "+00:00")
+    except ValueError:
+        return None
 
 
 def mono() -> float:
@@ -123,8 +166,62 @@ def db_url_parts(url: str) -> dict[str, Optional[str]]:
     }
 
 
-def run_capture(cmd: Iterable[str], timeout: float = 60.0) -> subprocess.CompletedProcess:
-    return subprocess.run(list(cmd), capture_output=True, text=True, timeout=timeout, check=False)
+def run_capture(
+    cmd: Iterable[str], timeout: float = 60.0, cwd: Optional[Path] = None
+) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        list(cmd), capture_output=True, text=True, timeout=timeout, check=False, cwd=cwd
+    )
+
+
+def source_fingerprint(repo_root: Path) -> dict[str, Any]:
+    """Hash HEAD, every tracked change, and every untracked file."""
+
+    def git(*args: str) -> str:
+        result = run_capture(["git", *args], timeout=60, cwd=repo_root)
+        if result.returncode != 0:
+            raise ConfigError(
+                f"git {' '.join(args)} failed in {repo_root}: {result.stderr.strip()[:300]}"
+            )
+        return result.stdout
+
+    head = git("rev-parse", "HEAD").strip()
+    branch = git("rev-parse", "--abbrev-ref", "HEAD").strip()
+    tracked_diff = git("diff", "--binary", "HEAD", "--", ".").encode("utf-8")
+    untracked_paths = sorted(
+        path for path in git("ls-files", "--others", "--exclude-standard", "-z").split("\0") if path
+    )
+    untracked: list[dict[str, Any]] = []
+    digest = hashlib.sha256()
+    digest.update(b"hfs-source-fingerprint-v1\0")
+    digest.update(head.encode("ascii"))
+    digest.update(b"\0tracked-diff\0")
+    digest.update(tracked_diff)
+    for relative in untracked_paths:
+        path = repo_root / relative
+        content = os.readlink(path).encode("utf-8") if path.is_symlink() else path.read_bytes()
+        encoded_path = relative.encode("utf-8")
+        digest.update(b"\0untracked\0")
+        digest.update(len(encoded_path).to_bytes(8, "big"))
+        digest.update(encoded_path)
+        digest.update(len(content).to_bytes(8, "big"))
+        digest.update(content)
+        untracked.append(
+            {
+                "path": relative,
+                "bytes": len(content),
+                "sha256": hashlib.sha256(content).hexdigest(),
+            }
+        )
+    return {
+        "head": head,
+        "branch": branch,
+        "dirty": bool(tracked_diff or untracked),
+        "tracked_diff_bytes": len(tracked_diff),
+        "tracked_diff_sha256": hashlib.sha256(tracked_diff).hexdigest(),
+        "untracked": untracked,
+        "fingerprint_sha256": digest.hexdigest(),
+    }
 
 
 def pgrep_count(name: str) -> int:
@@ -286,6 +383,120 @@ def _json_array_length(path: Path) -> Optional[int]:
     if isinstance(payload, dict) and isinstance(payload.get("entry"), list):
         return len(payload["entry"])
     return None
+
+
+def numeric_delta(before: dict[str, Any], after: dict[str, Any]) -> dict[str, Any]:
+    """Subtract numeric PostgreSQL counters while retaining unsupported fields."""
+    delta: dict[str, Any] = {}
+    for key in sorted(set(before) | set(after)):
+        old, new = before.get(key), after.get(key)
+        if isinstance(old, (int, float)) and isinstance(new, (int, float)):
+            delta[key] = new - old
+        else:
+            delta[key] = None
+    return delta
+
+
+def postgres_activity_intervals(
+    before_kickoff: dict[str, Any],
+    polling_observed_terminal: dict[str, Any],
+    verified_search_ready: dict[str, Any],
+) -> dict[str, Any]:
+    """Build honestly labelled deltas around the observable reindex boundaries."""
+    whole_delta = numeric_delta(before_kickoff, verified_search_ready)
+    return {
+        # Keep the original before/after/delta fields for existing consumers.
+        "before": before_kickoff,
+        "polling_observed_terminal": polling_observed_terminal,
+        "after": verified_search_ready,
+        "delta": whole_delta,
+        "interval_deltas": {
+            "kickoff_to_terminal": numeric_delta(
+                before_kickoff, polling_observed_terminal
+            ),
+            "observed_terminal_to_search_ready": numeric_delta(
+                polling_observed_terminal, verified_search_ready
+            ),
+            "kickoff_to_search_ready": whole_delta,
+        },
+        "attribution": {
+            "terminal_boundary": (
+                "Observed after terminal-manifest polling and validation; it may include a small "
+                "amount of reindex work that started before the snapshot."
+            ),
+            "search_ready_boundary": (
+                "Observed after status and SQL readiness probes; interval deltas include those "
+                "measurement queries and are not exact DB-only reindex attribution."
+            ),
+            "counter_scope": (
+                "Database and WAL counters can include other sessions; use a dedicated PostgreSQL "
+                "container with one benchmark job at a time."
+            ),
+        },
+    }
+
+
+def postgres_reindex_comparability_reasons(
+    attempt: dict[str, Any],
+    preflight: dict[str, Any],
+    fixture: dict[str, Any],
+    hfs_samples: int,
+    postgres_samples: int,
+    require_phase_summary: bool,
+) -> list[str]:
+    """Return missing #1086 evidence without changing functional validation."""
+    reasons: list[str] = []
+    git = preflight.get("git") or {}
+    postgres = preflight.get("postgres") or {}
+    reindex = attempt.get("reindex") or {}
+    work = attempt.get("postgres_work") or {}
+    plans = attempt.get("cursor_plans") or []
+    intervals = work.get("interval_deltas") or {}
+    if not (preflight.get("binary") or {}).get("sha256"):
+        reasons.append("missing binary fingerprint")
+    if not (preflight.get("controller") or {}).get("sha256"):
+        reasons.append("missing controller fingerprint")
+    if not preflight.get("host"):
+        reasons.append("missing host metadata")
+    if not git.get("fingerprint_sha256"):
+        reasons.append("missing full source fingerprint")
+    if not git.get("fingerprint_verified"):
+        reasons.append("source fingerprint was not bound to the expected value")
+    if not postgres.get("image_id"):
+        reasons.append("missing immutable PostgreSQL image ID")
+    if not (postgres.get("server") or {}).get("version"):
+        reasons.append("missing PostgreSQL server version")
+    if not fixture.get("corpus_sha256"):
+        reasons.append("missing corpus fingerprint")
+    if not all(
+        isinstance(work.get(key), dict)
+        for key in ("before", "polling_observed_terminal", "after", "delta")
+    ):
+        reasons.append("missing PostgreSQL activity boundary snapshots")
+    if not all(
+        key in intervals
+        for key in (
+            "kickoff_to_terminal",
+            "observed_terminal_to_search_ready",
+            "kickoff_to_search_ready",
+        )
+    ):
+        reasons.append("missing PostgreSQL activity interval deltas")
+    if reindex.get("start_log_to_completion_observed_interval_s") is None:
+        reasons.append("missing reindex start-log to completion-observation interval")
+    if len(plans) != 3 or {plan.get("label") for plan in plans} != {
+        "early",
+        "middle",
+        "late",
+    } or not all(plan.get("ok") and plan.get("plan") is not None for plan in plans):
+        reasons.append("expected three parsed cursor plans")
+    if require_phase_summary and not reindex.get("phase_summary_available"):
+        reasons.append("required correlated phase summary is missing")
+    if hfs_samples < 1:
+        reasons.append("missing HFS memory sample between kickoff and search readiness")
+    if postgres_samples < 1:
+        reasons.append("missing PostgreSQL memory sample between kickoff and search readiness")
+    return reasons
 
 
 # --------------------------------------------------------------------------
@@ -553,6 +764,89 @@ class PgClient:
             else:
                 flat[key] = number
         return {"counts": flat, "version_spread": version_spread, "history_spread": history_spread}
+
+    def server_info(self) -> dict[str, Any]:
+        rows = self.require(
+            "SELECT current_setting('server_version'), current_setting('server_version_num'), "
+            "pg_size_pretty(pg_database_size(current_database()));"
+        )
+        return {
+            "version": rows[0][0],
+            "version_num": rows[0][1],
+            "database_size": rows[0][2],
+        }
+
+    def activity_snapshot(self) -> dict[str, Any]:
+        names = [
+            "xact_commit", "xact_rollback", "blks_read", "blks_hit",
+            "tup_returned", "tup_fetched", "tup_inserted", "tup_updated",
+            "tup_deleted", "temp_files", "temp_bytes", "wal_bytes",
+        ]
+        rows = self.require(
+            "SELECT xact_commit::text, xact_rollback::text, blks_read::text, blks_hit::text, "
+            "tup_returned::text, tup_fetched::text, tup_inserted::text, tup_updated::text, "
+            "tup_deleted::text, temp_files::text, temp_bytes::text, "
+            "pg_wal_lsn_diff(pg_current_wal_lsn(), '0/0')::text "
+            "FROM pg_stat_database WHERE datname = current_database();"
+        )
+        if not rows:
+            raise PgError("pg_stat_database returned no row for current database")
+        values: dict[str, Any] = {}
+        for name, raw in zip(names, rows[0]):
+            try:
+                values[name] = int(raw)
+            except ValueError:
+                values[name] = float(raw)
+        return values
+
+    def reindex_cursor_plans(self, total: int, analyze: bool = False) -> list[dict[str, Any]]:
+        offsets = [("early", None), ("middle", max(0, total // 2 - 1)), ("late", max(0, total - 101))]
+        plans: list[dict[str, Any]] = []
+        prefix = (
+            "EXPLAIN (ANALYZE, BUFFERS, WAL, SETTINGS, FORMAT JSON)"
+            if analyze
+            else "EXPLAIN (SETTINGS, FORMAT JSON)"
+        )
+        for label, offset in offsets:
+            cursor = None
+            predicate = ""
+            if offset is not None:
+                rows = self.require(
+                    "SELECT last_updated::text, id FROM resources "
+                    f"WHERE tenant_id = '{TENANT}' AND resource_type = 'Patient' "
+                    f"AND is_deleted = FALSE ORDER BY last_updated, id OFFSET {offset} LIMIT 1;"
+                )
+                if not rows:
+                    plans.append({"label": label, "error": "cursor row not found"})
+                    continue
+                cursor = {"last_updated": rows[0][0], "id": rows[0][1]}
+                timestamp = cursor["last_updated"].replace("'", "''")
+                resource_id = cursor["id"].replace("'", "''")
+                predicate = (
+                    f" AND (last_updated > '{timestamp}'::timestamptz OR "
+                    f"(last_updated = '{timestamp}'::timestamptz AND id > '{resource_id}'))"
+                )
+            sql = (
+                f"{prefix} SELECT id, version_id, data, last_updated, fhir_version FROM resources "
+                f"WHERE tenant_id = '{TENANT}' AND resource_type = 'Patient' "
+                f"AND is_deleted = FALSE{predicate} ORDER BY last_updated ASC, id ASC LIMIT 100;"
+            )
+            result = self.psql(sql, timeout=300)
+            raw = "\n".join(row[0] for row in result["rows"] if row)
+            try:
+                plan = json.loads(raw) if result["ok"] else None
+            except json.JSONDecodeError:
+                plan = None
+            plans.append({
+                "label": label,
+                "cursor": cursor,
+                "analyze": analyze,
+                "ok": result["ok"] and plan is not None,
+                "plan": plan,
+                "raw": None if plan is not None else raw,
+                "error": result["error"],
+            })
+        return plans
 
     def detail(self, resource_ids: list[str], submission_id: str) -> dict[str, Any]:
         """Versions, history and receipt bookkeeping.  Never SELECT * on changes."""
@@ -878,6 +1172,7 @@ class Controller:
         self.checks: list[dict[str, Any]] = []
         self.attempts: list[dict[str, Any]] = []
         self.rss_rows: list[dict[str, Any]] = []
+        self.docker_rows: list[dict[str, Any]] = []
         self.preflight_info: dict[str, Any] = {}
         self.fixture_info: dict[str, Any] = {}
         self.current_attempt: Optional[dict[str, Any]] = None
@@ -984,6 +1279,9 @@ class Controller:
                 "files": files,
                 "total": sum(entry["count"] for entry in files),
                 "total_bytes": sum(entry["bytes"] for entry in files),
+                "corpus_sha256": hashlib.sha256(
+                    "".join(entry["sha256"] for entry in files).encode("ascii")
+                ).hexdigest(),
                 "scheme": "identical resources re-submitted with stable ids (reimports)",
             }
         manifest_path = self.fixtures_dir / f"manifest-{job:02d}.json"
@@ -1217,6 +1515,7 @@ class Controller:
             )
         if self.csv_docker:
             self.csv_docker.write(row)
+        self.docker_rows.append(row)
 
     def check_deadline(self) -> None:
         if self.args.deadline > 0 and mono() > self.deadline_mono:
@@ -1299,18 +1598,13 @@ class Controller:
                 "cargo": pgrep_count("cargo"),
             },
         }
-        for key, cmd in (
-            ("head", ["git", "rev-parse", "HEAD"]),
-            ("branch", ["git", "rev-parse", "--abbrev-ref", "HEAD"]),
-        ):
-            try:
-                info["git"][key] = run_capture(cmd, timeout=20).stdout.strip()
-            except Exception as exc:
-                info["git"][key] = f"error: {exc}"
-        try:
-            info["git"]["dirty"] = bool(run_capture(["git", "status", "--porcelain"], timeout=30).stdout.strip())
-        except Exception:
-            info["git"]["dirty"] = None
+        info["git"] = source_fingerprint(self.repo_root)
+        info["git"]["expected_fingerprint"] = self.args.expected_source_fingerprint
+        info["git"]["fingerprint_verified"] = bool(
+            self.args.expected_source_fingerprint
+            and info["git"]["fingerprint_sha256"]
+            == self.args.expected_source_fingerprint
+        )
         try:
             info["host"] = {
                 "macos": run_capture(["sw_vers", "-productVersion"], timeout=20).stdout.strip(),
@@ -1328,6 +1622,7 @@ class Controller:
                 f"psql is not usable inside container {self.args.pg_container!r}; "
                 "the deferred-reindex verdict requires SQL coverage probes"
             )
+        info["postgres"]["server"] = self.pg.server_info()
         info["db_before"] = self.pg.counts()
 
         samples = []
@@ -1353,6 +1648,15 @@ class Controller:
         }
 
         blocked: list[str] = []
+        expected_fingerprint = self.args.expected_source_fingerprint
+        if (
+            expected_fingerprint
+            and info["git"]["fingerprint_sha256"] != expected_fingerprint
+        ):
+            blocked.append(
+                "source fingerprint mismatch: "
+                f"expected {expected_fingerprint}, got {info['git']['fingerprint_sha256']}"
+            )
         counts = info["db_before"]["counts"]
         stale = {
             key: counts[key]
@@ -1365,6 +1669,8 @@ class Controller:
             blocked.append(f"another hfs process is running ({info['foreign_processes']['hfs']})")
         if info["foreign_processes"]["rustc"]:
             blocked.append(f"a rustc build is active ({info['foreign_processes']['rustc']} processes)")
+        if info["foreign_processes"]["cargo"]:
+            blocked.append(f"a cargo build is active ({info['foreign_processes']['cargo']} processes)")
         recent = [s["pressure_level"] for s in samples[-3:]]
         if recent and all(level is not None and level != 1 for level in recent):
             blocked.append(f"memory pressure is not normal: {recent}")
@@ -1397,6 +1703,7 @@ class Controller:
             "container": self.args.pg_container,
             "id": payload.get("Id"),
             "image": (payload.get("Config") or {}).get("Image"),
+            "image_id": payload.get("Image"),
             "running": state.get("Running"),
             "started_at": state.get("StartedAt"),
             "memory_limit_mib": _mib(host_config.get("Memory")),
@@ -1409,19 +1716,7 @@ class Controller:
     # -- HFS lifecycle ----------------------------------------------------
 
     def effective_env(self) -> dict[str, str]:
-        env = dict(HFS_ENV_BASE)
-        env["HFS_BASE_URL"] = self.base_url
-        env["HFS_SERVER_HOST"] = self.args.host
-        env["HFS_SERVER_PORT"] = str(self.args.hfs_port)
-        env["HFS_LOG_LEVEL"] = self.args.hfs_log_level
-        env["HFS_BULK_SUBMIT_FILE_CONCURRENCY"] = str(self.args.file_concurrency)
-        env["HFS_BULK_SUBMIT_DEFER_INDEXING"] = "true" if self.args.defer_indexing else "false"
-        env["HFS_BULK_SUBMIT_OUTPUT_BACKEND"] = "local-fs"
-        env["HFS_BULK_SUBMIT_OUTPUT_DIR"] = str(self.out / "artifacts")
-        for item in self.args.hfs_env:
-            key, _, value = item.partition("=")
-            env[key.strip()] = value
-        return env
+        return effective_hfs_env(self.args, self.base_url, self.out)
 
     def start_hfs(self, job: int) -> None:
         # An unrelated shell's HFS settings must not change this experiment.
@@ -1703,6 +1998,7 @@ class Controller:
         if self.args.defer_indexing:
             deadline = mono() + self.args.reindex_timeout
             job_id = None
+            start_log_timestamp = None
             lines: list[str] = []
             while job_id is None:
                 self.raise_if_aborted()
@@ -1736,9 +2032,21 @@ class Controller:
                             {"job_ids": sorted(ids), "hook_lines": hooks[-3:]},
                         )
                     job_id = ids.pop()
+                    correlated_start_lines = [
+                        line for line in started if job_id in line
+                    ]
+                    start_log_timestamp = parse_reindex_start_log_timestamp(
+                        correlated_start_lines[-1]
+                    )
                 time.sleep(min(1.0, self.args.endpoint_poll_interval))
             evidence["job_id"] = job_id
             evidence["job_id_source"] = "hfs log line 'deferred-index rebuild started' after kickoff"
+            evidence["start_log_timestamp"] = (
+                start_log_timestamp.isoformat().replace("+00:00", "Z")
+                if start_log_timestamp
+                else None
+            )
+            evidence["status_poll_resolution_s"] = self.args.endpoint_poll_interval
             status_deadline = mono() + self.args.reindex_timeout
             status_polls: list[dict[str, Any]] = []
             while True:
@@ -1746,22 +2054,36 @@ class Controller:
                 result = http_json("GET", f"{self.base_url}/$reindex-status/{job_id}", timeout=60)
                 params = parameters_map(result["json"]) if result["status"] == 200 else {}
                 status_polls.append(
-                    {"status": result["status"], "reindex": params.get("status"), "at_s": round(mono() - kickoff_mono, 1)}
+                    {"status": result["status"], "reindex": params.get("status"), "at_s": round(mono() - kickoff_mono, 3)}
                 )
                 if params.get("status") in ("completed", "failed", "cancelled"):
+                    completion_observed_wall = datetime.now(timezone.utc)
                     break
                 if mono() > status_deadline:
                     raise Aborted(
                         "reindex_timeout",
                         {"polls": status_polls[-10:], "evidence": evidence},
                     )
-                time.sleep(max(0.5, self.args.endpoint_poll_interval))
+                time.sleep(max(0.05, self.args.endpoint_poll_interval))
             evidence["status_polls"] = status_polls[-10:]
             evidence["status"] = params.get("status")
             evidence["total"] = params.get("total")
             evidence["processed"] = params.get("processed")
             evidence["entries_created"] = params.get("entriesCreated")
             evidence["error_count"] = params.get("errorCount")
+            evidence["completion_observed_wall"] = completion_observed_wall.isoformat(
+                timespec="milliseconds"
+            ).replace("+00:00", "Z")
+            upper_bound = (
+                (completion_observed_wall - start_log_timestamp).total_seconds()
+                if start_log_timestamp
+                else None
+            )
+            evidence["start_log_to_completion_observed_interval_s"] = (
+                round(upper_bound, 3)
+                if upper_bound is not None and upper_bound >= 0
+                else None
+            )
             if (
                 params.get("status") != "completed"
                 or params.get("errorCount") != 0
@@ -1778,11 +2100,42 @@ class Controller:
         indexed_total = self.search_count(f"family={FAMILY}")
         evidence["search_total_family"] = indexed_total
         evidence["unindexed_patients"] = unindexed
-        evidence["reindex_s"] = round(mono() - kickoff_mono, 3)
         if unindexed != 0:
             raise Aborted("reindex_coverage_incomplete", {"evidence": evidence})
         if indexed_total != total:
             raise Aborted("search_index_count_mismatch", {"evidence": evidence})
+        ready_mono = mono()
+        evidence["reindex_s"] = round(ready_mono - kickoff_mono, 3)
+        evidence["search_ready_observed_mono"] = ready_mono
+        if self.args.postgres_reindex_evidence:
+            try:
+                evidence["postgres_activity_at_search_ready"] = self.pg.activity_snapshot()
+            except Exception as error:
+                evidence["postgres_activity_at_search_ready"] = None
+                evidence["postgres_activity_at_search_ready_error"] = str(error)
+        if self.args.defer_indexing:
+            # Search readiness and its database snapshot are already fixed.
+            # Waiting for buffered log output must not inflate either metric.
+            summary_wait_started = mono()
+            summary_deadline = summary_wait_started + 5.0
+            summary_lines: list[str] = []
+            while mono() <= summary_deadline:
+                lines.extend(self.follower.read_new())
+                summary_lines = [
+                    line
+                    for line in lines
+                    if "reindex phase summary" in line and job_id in line
+                ][-3:]
+                if summary_lines:
+                    break
+                time.sleep(0.05)
+            evidence["phase_summary_wait_limit_s"] = 5.0
+            evidence["phase_summary_wait_elapsed_s"] = round(
+                mono() - summary_wait_started, 3
+            )
+            evidence["phase_summary_required"] = bool(self.args.require_phase_summary)
+            evidence["phase_summary_lines"] = summary_lines
+            evidence["phase_summary_available"] = bool(evidence["phase_summary_lines"])
         evidence["verified"] = True
         self.jsonl_pg.write({"phase": "reindex_verified", "job": job, **evidence})
         return evidence
@@ -2015,6 +2368,8 @@ class Controller:
             "status": "running",
             "timings": {"label": "incomplete", "comparable": False},
             "throughput_resources_per_s": None,
+            "throughput_to_publication_resources_per_s": None,
+            "throughput_to_verified_search_ready_resources_per_s": None,
         }
         self.current_attempt = attempt
         self.attempts.append(attempt)
@@ -2030,6 +2385,17 @@ class Controller:
                 "manifest": str(Path(manifest_url).name),
             },
         )
+        if self.args.postgres_reindex_evidence:
+            attempt["postgres_work"] = {
+                "before_kickoff": None,
+                "measurement_errors": [],
+            }
+            try:
+                attempt["postgres_work"]["before_kickoff"] = self.pg.activity_snapshot()
+            except Exception as error:
+                attempt["postgres_work"]["measurement_errors"].append(
+                    {"boundary": "before_kickoff", "error": str(error)}
+                )
         log_offset = self.follower.seek_end()
         self.phase("kickoff", job, {"submission_id": submission_id})
         kickoff_mono = mono()
@@ -2085,6 +2451,18 @@ class Controller:
             "transaction_time": (terminal["manifest"] or {}).get("transactionTime"),
             "requires_access_token": (terminal["manifest"] or {}).get("requiresAccessToken"),
         }
+        if self.args.postgres_reindex_evidence:
+            # This is the earliest safe boundary after the polled terminal
+            # manifest and its hard invariants have been validated.
+            try:
+                attempt["postgres_work"]["polling_observed_terminal"] = (
+                    self.pg.activity_snapshot()
+                )
+            except Exception as error:
+                attempt["postgres_work"]["polling_observed_terminal"] = None
+                attempt["postgres_work"]["measurement_errors"].append(
+                    {"boundary": "polling_observed_terminal", "error": str(error)}
+                )
         reindex = self.verify_reindex(job, submission_id, log_offset, kickoff_mono)
         self.phase("reindex_terminal", job, {
             "job_id": reindex.get("job_id"), "verified": reindex["verified"],
@@ -2092,6 +2470,67 @@ class Controller:
         })
         attempt["reindex"] = reindex
         attempt["timings"]["kickoff_to_reindex_s"] = reindex["reindex_s"]
+        attempt["timings"]["terminal_to_reindex_s"] = round(
+            reindex["reindex_s"] - terminal["terminal_s"], 3
+        )
+        attempt["timings"]["observed_terminal_to_search_ready_s"] = attempt[
+            "timings"
+        ]["terminal_to_reindex_s"]
+        attempt["timings"]["kickoff_to_verified_search_ready_s"] = reindex[
+            "reindex_s"
+        ]
+        if self.args.postgres_reindex_evidence:
+            work = attempt["postgres_work"]
+            ready_snapshot = reindex.get("postgres_activity_at_search_ready")
+            if ready_snapshot is None:
+                work["measurement_errors"].append(
+                    {
+                        "boundary": "verified_search_ready",
+                        "error": reindex.get("postgres_activity_at_search_ready_error")
+                        or "snapshot unavailable",
+                    }
+                )
+            if all(
+                isinstance(snapshot, dict)
+                for snapshot in (
+                    work.get("before_kickoff"),
+                    work.get("polling_observed_terminal"),
+                    ready_snapshot,
+                )
+            ):
+                completed_work = postgres_activity_intervals(
+                    work["before_kickoff"],
+                    work["polling_observed_terminal"],
+                    ready_snapshot,
+                )
+                completed_work["measurement_errors"] = work["measurement_errors"]
+                attempt["postgres_work"] = completed_work
+            else:
+                attempt["postgres_work"] = {
+                    "before": work.get("before_kickoff"),
+                    "polling_observed_terminal": work.get(
+                        "polling_observed_terminal"
+                    ),
+                    "after": ready_snapshot,
+                    "delta": None,
+                    "interval_deltas": {},
+                    "measurement_errors": work["measurement_errors"],
+                }
+            try:
+                attempt["cursor_plans"] = self.pg.reindex_cursor_plans(
+                    total, analyze=self.args.explain_analyze
+                )
+            except Exception as error:
+                attempt["cursor_plans"] = []
+                attempt["cursor_plan_error"] = str(error)
+            self.write_json(
+                f"jobs/job{job:02d}/postgres-reindex-evidence.json",
+                {
+                    "postgres_work": attempt["postgres_work"],
+                    "cursor_plans": attempt["cursor_plans"],
+                    "phase_summary_lines": reindex.get("phase_summary_lines", []),
+                },
+            )
         self.write_json(f"jobs/job{job:02d}/reindex.json", reindex)
         idle_end = self.idle(job)
         validation = self.validate_job(job, submission_id, terminal["output"])
@@ -2111,18 +2550,91 @@ class Controller:
         attempt["rss"] = self.rss_stats(job, kickoff_mono, idle_end, baseline["rss_mib"])
         if self.args.mode == "restart":
             self.stop_hfs(job, "job_complete")
-        self.write_summary()
         # A failed validation stops the run: the next job would build on an
         # unverified database state.
         if attempt["validation"]["failed_hard"]:
             attempt["status"] = "failed"
+            self.write_summary()
             raise Aborted(
                 "hard_validation_failed",
                 {"job": job, "checks": attempt["validation"]["failed_hard"]},
             )
-        attempt["timings"].update({"label": "complete", "comparable": True, "verified": True})
+        ready_mono = reindex["search_ready_observed_mono"]
+        hfs_memory_values = [
+            row["rss_mib"]
+            for row in self.rss_rows
+            if row.get("job") == job
+            and kickoff_mono <= row["mono_s"] <= ready_mono
+            and row.get("rss_mib") is not None
+        ]
+        postgres_memory_values = [
+            row["mem_usage_mib"]
+            for row in self.docker_rows
+            if row.get("job") == job
+            and kickoff_mono <= row["mono_s"] <= ready_mono
+            and row.get("mem_usage_mib") is not None
+        ]
+        hfs_samples = len(hfs_memory_values)
+        postgres_samples = len(postgres_memory_values)
+        attempt["evidence_sample_counts"] = {
+            "hfs_memory_kickoff_to_search_ready": hfs_samples,
+            "postgres_memory_kickoff_to_search_ready": postgres_samples,
+        }
+        attempt["hfs_memory_kickoff_to_search_ready"] = {
+            "samples": hfs_samples,
+            "peak_mib": max(hfs_memory_values) if hfs_memory_values else None,
+        }
+        attempt["postgres_memory_kickoff_to_search_ready"] = {
+            "samples": postgres_samples,
+            "peak_mib": max(postgres_memory_values) if postgres_memory_values else None,
+        }
+        comparison_reasons = (
+            postgres_reindex_comparability_reasons(
+                attempt,
+                self.preflight_info,
+                self.fixture_info,
+                hfs_samples,
+                postgres_samples,
+                self.args.require_phase_summary,
+            )
+            if self.args.postgres_reindex_evidence
+            else []
+        )
+        attempt["timings"].update(
+            {
+                "label": "complete",
+                "comparable": not comparison_reasons,
+                "comparison_reasons": comparison_reasons,
+                "verified": True,
+            }
+        )
         attempt["status"] = "verified"
-        attempt["throughput_resources_per_s"] = round(total / max(terminal["terminal_s"], 0.001), 3)
+        publication_throughput = round(total / max(terminal["terminal_s"], 0.001), 3)
+        readiness_throughput = round(total / max(reindex["reindex_s"], 0.001), 3)
+        attempt["throughput_to_publication_resources_per_s"] = publication_throughput
+        attempt["throughput_to_verified_search_ready_resources_per_s"] = readiness_throughput
+        # Compatibility alias: this historically meant terminal publication.
+        attempt["throughput_resources_per_s"] = publication_throughput
+        if self.args.postgres_reindex_evidence:
+            self.write_json(
+                f"jobs/job{job:02d}/postgres-reindex-evidence.json",
+                {
+                    "postgres_work": attempt["postgres_work"],
+                    "cursor_plans": attempt["cursor_plans"],
+                    "phase_summary_lines": reindex.get("phase_summary_lines", []),
+                    "memory": {
+                        "hfs": attempt["hfs_memory_kickoff_to_search_ready"],
+                        "postgres": attempt[
+                            "postgres_memory_kickoff_to_search_ready"
+                        ],
+                    },
+                    "comparability": {
+                        "comparable": not comparison_reasons,
+                        "reasons": comparison_reasons,
+                    },
+                },
+            )
+        self.write_summary()
 
     def rss_stats(self, job: int, start: float, end: float, baseline: Optional[float]) -> dict[str, Any]:
         """Measured window is kickoff..idle_end; startup and validation are separate."""
@@ -2158,6 +2670,8 @@ class Controller:
         attempt["failure_reason"] = reason
         attempt["timings"].update({"label": "incomplete", "comparable": False, "verified": False})
         attempt["throughput_resources_per_s"] = None
+        attempt["throughput_to_publication_resources_per_s"] = None
+        attempt["throughput_to_verified_search_ready_resources_per_s"] = None
         attempt["rss"] = self.rss_stats(attempt["ordinal"], 0.0, float("inf"), None)
 
     def hard_failures(self) -> list[dict[str, Any]]:
@@ -2213,6 +2727,10 @@ class Controller:
                 "jobs": self.args.jobs,
                 "mode": self.args.mode,
                 "defer_indexing": bool(self.args.defer_indexing),
+                "postgres_reindex_evidence": bool(self.args.postgres_reindex_evidence),
+                "explain_analyze": bool(self.args.explain_analyze),
+                "require_phase_summary": bool(self.args.require_phase_summary),
+                "expected_source_fingerprint": self.args.expected_source_fingerprint,
                 "idle_seconds": self.args.idle_seconds,
                 "file_concurrency": self.args.file_concurrency,
                 "pg_container": self.args.pg_container,
@@ -2383,7 +2901,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--binary", required=True, help="release hfs binary (R4+postgres)")
     parser.add_argument("--output-dir", required=True, help="new, nonexistent output directory")
-    parser.add_argument("--resources", type=int, default=1000, help="Patients per submission")
+    parser.add_argument(
+        "--resources",
+        type=int,
+        help="Patients per submission (1000 normally, 2000 with --postgres-reindex-evidence)",
+    )
     parser.add_argument("--jobs", type=int, default=1, help="submissions in this run")
     parser.add_argument("--mode", choices=("consecutive", "restart"), default="consecutive")
     parser.add_argument(
@@ -2402,8 +2924,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--hfs-log-level", default="info")
     parser.add_argument("--sample-interval", type=float, default=0.5, help="HFS RSS cadence, seconds")
     parser.add_argument("--host-interval", type=float, default=5.0, help="host vitals cadence, seconds")
-    parser.add_argument("--docker-stats-interval", type=float, default=60.0, help="0 disables")
-    parser.add_argument("--endpoint-poll-interval", type=float, default=1.0)
+    parser.add_argument(
+        "--docker-stats-interval",
+        type=float,
+        help="0 disables; defaults to 1s for #1086 evidence and 60s otherwise",
+    )
+    parser.add_argument(
+        "--endpoint-poll-interval",
+        type=float,
+        help="defaults to 0.25s for #1086 evidence and 1s otherwise",
+    )
     parser.add_argument("--request-timeout", type=float, default=60.0)
     parser.add_argument("--startup-timeout", type=float, default=180.0)
     parser.add_argument("--terminal-timeout", type=float, default=3600.0)
@@ -2419,7 +2949,26 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--strict-validation", dest="strict_validation", action="store_true", default=True)
     parser.add_argument("--no-strict-validation", dest="strict_validation", action="store_false")
     parser.add_argument("--repo-root", help="checkout root containing data/ (default: derived)")
+    parser.add_argument(
+        "--expected-source-fingerprint",
+        help="reject a run if repo-root no longer matches this full source fingerprint",
+    )
     parser.add_argument("--hfs-env", action="append", default=[], metavar="KEY=VALUE")
+    parser.add_argument(
+        "--postgres-reindex-evidence",
+        action="store_true",
+        help="capture the bounded #1086 phase, PostgreSQL delta, and cursor-plan evidence",
+    )
+    parser.add_argument(
+        "--explain-analyze",
+        action="store_true",
+        help="execute the bounded SELECT cursor probes while collecting EXPLAIN plans",
+    )
+    parser.add_argument(
+        "--require-phase-summary",
+        action="store_true",
+        help="make missing correlated phase output a #1086 comparability failure",
+    )
     parser.add_argument("--dry-run", action="store_true", help="print the plan and exit")
     parser.add_argument("--quiet", action="store_true", help="do not echo controller events to stdout")
     return parser
@@ -2435,12 +2984,16 @@ def dry_run_plan(args: argparse.Namespace) -> dict[str, Any]:
     layout = [per_file] * FIXTURE_FILE_COUNT
     for _ in range(per_file * FIXTURE_FILE_COUNT, args.resources):
         layout[-1] += 1
+    output_dir = Path(args.output_dir).expanduser().resolve()
+    base_url = f"http://{args.host}:{args.hfs_port}"
     return {
         "schema_version": SCHEMA_VERSION,
         "dry_run": True,
         "binary": str(Path(args.binary).expanduser().resolve()),
-        "output_dir": str(Path(args.output_dir).expanduser().resolve()),
+        "output_dir": str(output_dir),
         "repo_root": str(repo_root),
+        "source": source_fingerprint(repo_root),
+        "expected_source_fingerprint": args.expected_source_fingerprint,
         "search_parameters_file": str(repo_root / "data" / "search-parameters-r4.json"),
         "fixture": {
             "files": [
@@ -2454,8 +3007,16 @@ def dry_run_plan(args: argparse.Namespace) -> dict[str, Any]:
         "jobs": args.jobs,
         "mode": args.mode,
         "defer_indexing": bool(args.defer_indexing),
+        "postgres_reindex_evidence": bool(args.postgres_reindex_evidence),
+        "explain_analyze": bool(args.explain_analyze),
+        "require_phase_summary": bool(args.require_phase_summary),
+        "hfs_env": effective_hfs_env(args, base_url, output_dir),
         "database": redact_db_url(args.database_url),
         "pg_container": args.pg_container,
+        "sampling": {
+            "docker_stats_interval_s": args.docker_stats_interval,
+            "endpoint_poll_interval_s": args.endpoint_poll_interval,
+        },
         "watchdog": {
             "operational_max_rss_mib": args.operational_max_rss_mib,
             "pressure_samples": args.pressure_samples,
@@ -2469,6 +3030,7 @@ def dry_run_plan(args: argparse.Namespace) -> dict[str, Any]:
             "deferred reindex job id from the hfs log line, $reindex-status completed with errorCount=0 and processed=total",
             "SQL coverage: zero unindexed Patients, parameterised family search equals the expected total",
             "post-idle: version/history spread, content, entry_results receipts, submission changes",
+            "#1086 profile: PostgreSQL work interval deltas, early/middle/late cursor plans, opt-in phase summary",
         ],
     }
 
@@ -2476,8 +3038,29 @@ def dry_run_plan(args: argparse.Namespace) -> dict[str, Any]:
 def main(argv: Optional[list[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.resources is None:
+        args.resources = (
+            ISSUE_1086_DEFAULT_RESOURCES if args.postgres_reindex_evidence else 1000
+        )
+    if args.docker_stats_interval is None:
+        args.docker_stats_interval = 1.0 if args.postgres_reindex_evidence else 60.0
+    if args.endpoint_poll_interval is None:
+        args.endpoint_poll_interval = 0.25 if args.postgres_reindex_evidence else 1.0
     if args.resources < FIXTURE_FILE_COUNT:
         parser.error(f"--resources must be >= {FIXTURE_FILE_COUNT}")
+    if args.postgres_reindex_evidence and args.resources > ISSUE_1086_MAX_RESOURCES:
+        parser.error(
+            f"--resources must be <= {ISSUE_1086_MAX_RESOURCES} "
+            "with --postgres-reindex-evidence"
+        )
+    if args.postgres_reindex_evidence and not args.defer_indexing:
+        parser.error("--postgres-reindex-evidence requires --defer-indexing=true")
+    if args.require_phase_summary and not args.postgres_reindex_evidence:
+        parser.error("--require-phase-summary requires --postgres-reindex-evidence")
+    if args.expected_source_fingerprint and not re.fullmatch(
+        r"[0-9a-f]{64}", args.expected_source_fingerprint
+    ):
+        parser.error("--expected-source-fingerprint must be 64 lowercase hexadecimal characters")
     if args.jobs < 1:
         parser.error("--jobs must be >= 1")
     if args.file_concurrency < 1:
@@ -2487,7 +3070,16 @@ def main(argv: Optional[list[str]] = None) -> int:
     if args.pressure_samples < 1 or args.swap_growth_samples < 1:
         parser.error("--pressure-samples and --swap-growth-samples must be >= 1")
     if args.dry_run:
-        print(json.dumps(dry_run_plan(args), indent=2))
+        plan = dry_run_plan(args)
+        if (
+            args.expected_source_fingerprint
+            and plan["source"]["fingerprint_sha256"]
+            != args.expected_source_fingerprint
+        ):
+            parser.error(
+                "current source does not match --expected-source-fingerprint"
+            )
+        print(json.dumps(plan, indent=2))
         return EXIT_OK
     try:
         args.hfs_port = args.hfs_port or pick_free_port(18810, args.host)

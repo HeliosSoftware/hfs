@@ -6359,6 +6359,11 @@ details.card > summary.card-head::-webkit-details-marker {
   display: block;
 }
 
+.bulk-export-form .combobox--scope-patient + .field__hint--error {
+  margin-top: -8px;
+  margin-bottom: 14px;
+}
+
 .typegrid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));

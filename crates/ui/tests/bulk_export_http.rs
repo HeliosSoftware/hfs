@@ -1523,6 +1523,87 @@ async fn invalid_start_fields_return_one_400_without_a_job_or_kickoff() {
 }
 
 #[tokio::test]
+async fn patient_scope_without_a_selection_returns_400_without_a_job_or_kickoff() {
+    let (base, mock, backend) = serve().await;
+    let (status, html) = post_form_body(
+        &base,
+        "/ui/bulk-export",
+        &[("name", "Everyone by accident"), ("scope", "patient")],
+    )
+    .await;
+
+    assert_eq!(status, 400);
+    assert!(html.contains("Select at least one patient"), "{html}");
+    assert!(
+        html.contains(
+            r#"id="bulk-export-patients-error" class="field__hint field__hint--error" role="alert">"#
+        ),
+        "{html}"
+    );
+    assert!(
+        html.contains(r#"novalidate data-validation-started="true""#),
+        "{html}"
+    );
+    assert!(
+        html.contains(r#"name="scope" value="patient" checked"#),
+        "{html}"
+    );
+    assert!(mock.kickoffs.lock().unwrap().is_empty());
+    assert_no_default_user_jobs(&backend).await;
+}
+
+#[tokio::test]
+async fn patient_scope_with_only_blank_patient_values_is_rejected_the_same_way() {
+    let (base, mock, backend) = serve().await;
+    let (status, html) = post_form_body(
+        &base,
+        "/ui/bulk-export",
+        &[
+            ("name", "Everyone by accident"),
+            ("scope", "patient"),
+            ("patient", "  \n , "),
+        ],
+    )
+    .await;
+
+    assert_eq!(status, 400);
+    assert!(html.contains("Select at least one patient"), "{html}");
+    assert!(
+        html.contains(
+            r#"id="bulk-export-patients-error" class="field__hint field__hint--error" role="alert">"#
+        ),
+        "{html}"
+    );
+    assert!(
+        html.contains(r#"novalidate data-validation-started="true""#),
+        "{html}"
+    );
+    assert!(
+        html.contains(r#"name="scope" value="patient" checked"#),
+        "{html}"
+    );
+    assert!(mock.kickoffs.lock().unwrap().is_empty());
+    assert_no_default_user_jobs(&backend).await;
+}
+
+#[tokio::test]
+async fn the_builder_renders_the_patients_error_hidden_by_default() {
+    let (base, _, _) = serve().await;
+    let (status, html) = get_text(&base, "/ui/bulk-export/new").await;
+    assert_eq!(status, 200);
+    assert!(
+        html.contains(
+            r#"id="bulk-export-patients-error" class="field__hint field__hint--error" role="alert" hidden>Select at least one patient"#
+        ),
+        "{html}"
+    );
+    assert!(
+        !html.contains("Leave empty to export every patient"),
+        "{html}"
+    );
+}
+
+#[tokio::test]
 async fn an_invalid_active_custom_instant_repopulates_the_representable_form() {
     let (base, mock, backend) = serve().await;
     let (status, html) = post_form_body(
@@ -1865,7 +1946,11 @@ async fn patient_and_group_scopes_hit_their_export_paths() {
     post_form(
         &base,
         "/ui/bulk-export",
-        &[("name", "Patient export"), ("scope", "patient")],
+        &[
+            ("name", "Patient export"),
+            ("scope", "patient"),
+            ("patient", "p-1"),
+        ],
     )
     .await;
     post_form(

@@ -507,12 +507,17 @@ test("a patient-only server rejection starts reactive field validation", async (
   await bulkExport.scopeRadio("patient").check();
   await bulkExport.sincePreset.selectOption("custom");
   await bulkExport.sinceCustom.fill("2026-08-01T00:00:00Z");
-  await bulkExport.form.evaluate((form) => {
+  // Inject the malformed value as a combobox chip (`data-combobox-selected-input`)
+  // rather than a bare form field: T2's inline validation now blocks an empty
+  // Patients selection before submit, so the client must see a selection here
+  // for this test to reach the server-side format rejection it exercises.
+  await bulkExport.patientCombobox.evaluate((fieldset) => {
     const patient = document.createElement("input");
     patient.type = "hidden";
     patient.name = "patient";
     patient.value = "Patient/not/valid";
-    form.append(patient);
+    patient.setAttribute("data-combobox-selected-input", "");
+    fieldset.append(patient);
   });
 
   const submitted = page.waitForResponse(
@@ -684,6 +689,75 @@ test("Patient combobox supports keyboard selection, dedupe, removal, and scope s
   await bulkExport.patientCombobox.getByRole("button", { name: "Remove Ana Rivera" }).click();
   await expect(bulkExport.selectedPatients).toHaveCount(0);
   await expect(bulkExport.patientSearch).toBeFocused();
+});
+
+test("Start Export with the Patients scope and no selected patient is blocked inline", async ({
+  page,
+  bulkExport,
+}) => {
+  await page.route("**/ui/lookup/patient-options*", (route) =>
+    route.fulfill({ status: 200, contentType: "text/html", body: patientOptions }),
+  );
+  await bulkExport.goto();
+  let submissions = 0;
+  page.on("request", (request) => {
+    if (request.url().endsWith("/ui/bulk-export") && request.method() === "POST") {
+      submissions += 1;
+    }
+  });
+
+  await bulkExport.nameInput.fill("Patients scope without a selection");
+  await bulkExport.scopeRadio("patient").check();
+  await bulkExport.patientSearch.fill("an");
+  await expect(bulkExport.patientListbox).toBeVisible();
+
+  await bulkExport.startButton.click();
+
+  expect(submissions).toBe(0);
+  await expect(bulkExport.patientsError).toBeVisible();
+  await expect(bulkExport.patientsError).toHaveText(
+    "Select at least one patient. To export every patient, choose the Everything scope.",
+  );
+  await expect(bulkExport.patientSearch).toHaveAttribute("aria-invalid", "true");
+  const describedBy = await bulkExport.patientSearch.getAttribute("aria-describedby");
+  expect(describedBy).toContain("bulk-export-patients-error");
+  expect(describedBy).toContain("bulk-export-patients-hint");
+  await expect(bulkExport.patientSearch).toBeFocused();
+  await expect(bulkExport.nameError).toBeHidden();
+
+  await bulkExport.patientSearch.press("ArrowDown");
+  await bulkExport.patientSearch.press("Enter");
+  await expect(bulkExport.patientsError).toBeHidden();
+  await expect(bulkExport.patientSearch).not.toHaveAttribute("aria-invalid", /.+/);
+
+  await bulkExport.patientCombobox.getByRole("button", { name: "Remove Ana Rivera" }).click();
+  await expect(bulkExport.patientsError).toBeVisible();
+
+  await bulkExport.scopeRadio("system").check();
+  await expect(bulkExport.patientsError).toBeHidden();
+
+  await bulkExport.scopeRadio("patient").check();
+  await expect(bulkExport.patientsError).toBeVisible();
+
+  await bulkExport.patientSearch.fill("an");
+  await expect(bulkExport.patientListbox).toBeVisible();
+  await bulkExport.patientSearch.press("ArrowDown");
+  await bulkExport.patientSearch.press("Enter");
+  await expect(bulkExport.patientsError).toBeHidden();
+
+  await page.route("**/ui/bulk-export", (route) =>
+    route.request().method() === "POST"
+      ? route.fulfill({ status: 204 })
+      : route.continue(),
+  );
+  const submitted = page.waitForRequest(
+    (request) => request.url().endsWith("/ui/bulk-export") && request.method() === "POST",
+  );
+  await bulkExport.startButton.click();
+  const request = await submitted;
+  const params = new URLSearchParams(request.postData() ?? "");
+  expect(params.get("scope")).toBe("patient");
+  expect(params.getAll("patient").length).toBeGreaterThan(0);
 });
 
 test("Patient combobox finds and selects a patient by exact identifier", async ({

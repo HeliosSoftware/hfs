@@ -711,6 +711,34 @@ impl MongoBackend {
                     param_type: param.param_type.to_string(),
                 }));
             }
+
+            // `_id`/`_lastUpdated` are lowered outside the generic modifier
+            // dispatch (see `build_resource_id_condition` /
+            // `build_resource_last_updated_conditions`), which only knows
+            // how to honour a narrow set of modifiers on them. Reject
+            // anything else explicitly here rather than letting it fall
+            // through to a builder that would silently misinterpret it
+            // (#1055).
+            let metadata_param_honoured = match param.name.as_str() {
+                "_id" => matches!(
+                    param.modifier,
+                    None | Some(SearchModifier::Not) | Some(SearchModifier::Missing)
+                ),
+                "_lastUpdated" => {
+                    matches!(param.modifier, None | Some(SearchModifier::Missing))
+                }
+                _ => true,
+            };
+            if !metadata_param_honoured {
+                return Err(StorageError::Search(SearchError::UnsupportedModifier {
+                    modifier: param
+                        .modifier
+                        .as_ref()
+                        .map(ToString::to_string)
+                        .unwrap_or_default(),
+                    param_type: param.param_type.to_string(),
+                }));
+            }
         }
 
         Ok(())
@@ -1107,13 +1135,24 @@ impl MongoBackend {
             return Ok(filter);
         }
 
-        let combine_with_and = matches!(
-            param.param_type,
-            SearchParamType::Date | SearchParamType::Number
-        );
-        let operator = if combine_with_and { "$and" } else { "$or" };
+        // #1062: FHIR comma-separated values are OR for every parameter type
+        // (https://build.fhir.org/search.html#combining) — Date and Number
+        // used to get `$and` here, which was not merely stricter but wrong
+        // in a way that emptied the whole result. This filter is evaluated
+        // against a single `search_index` document (one value of one
+        // parameter, for one resource), so a disjoint AND can never be
+        // satisfied by any row: `distinct_resource_ids` then returns
+        // nothing, and `matching_resource_ids`'s empty-set short circuit
+        // empties the *entire* search result, not just this parameter. The
+        // AND semantics callers actually want is the *repeated*-parameter
+        // form (`?date=ge2020&date=le2021`), which arrives as separate
+        // `SearchParameter`s and is intersected in `matching_resource_ids` —
+        // unaffected by this change. Behavior change: a range-shaped comma
+        // list (`?date=ge2020,le2021`) widens from "in 2020-2021" to "any
+        // date >= 2020 OR any date <= 2021"; use the repeated form above for
+        // a closed range.
         filter.insert(
-            operator,
+            "$or",
             Bson::Array(value_filters.into_iter().map(Bson::Document).collect()),
         );
 
@@ -1485,8 +1524,34 @@ impl MongoBackend {
     }
 
     fn build_resource_id_condition(&self, param: &SearchParameter) -> StorageResult<Document> {
-        let mut ids = Vec::new();
+        // `:missing` is a presence test on `id`, not a value to compare
+        // against it — resolved before the values loop so the boolean
+        // literal ("true"/"false") is never consumed as an id (#1055).
+        if matches!(param.modifier, Some(SearchModifier::Missing)) {
+            let wants_missing = param
+                .values
+                .first()
+                .map(|v| v.value == "true")
+                .unwrap_or(false);
+            return Ok(if wants_missing {
+                doc! { "id": Bson::Null }
+            } else {
+                doc! { "id": { "$ne": Bson::Null } }
+            });
+        }
 
+        let negated = match &param.modifier {
+            None => false,
+            Some(SearchModifier::Not) => true,
+            Some(other) => {
+                return Err(StorageError::Search(SearchError::UnsupportedModifier {
+                    modifier: other.to_string(),
+                    param_type: param.param_type.to_string(),
+                }));
+            }
+        };
+
+        let mut ids = Vec::new();
         for value in &param.values {
             if value.prefix != SearchPrefix::Eq {
                 return Err(StorageError::Search(SearchError::QueryParseError {
@@ -1496,12 +1561,15 @@ impl MongoBackend {
             ids.push(value.value.clone());
         }
 
-        if ids.len() == 1 {
-            return Ok(doc! { "id": ids.remove(0) });
-        }
-
-        Ok(doc! {
-            "id": { "$in": Bson::Array(ids.into_iter().map(Bson::String).collect()) }
+        Ok(match (ids.len(), negated) {
+            (1, false) => doc! { "id": ids.remove(0) },
+            (1, true) => doc! { "id": { "$ne": ids.remove(0) } },
+            (_, false) => doc! {
+                "id": { "$in": Bson::Array(ids.into_iter().map(Bson::String).collect()) }
+            },
+            (_, true) => doc! {
+                "id": { "$nin": Bson::Array(ids.into_iter().map(Bson::String).collect()) }
+            },
         })
     }
 
@@ -1509,11 +1577,51 @@ impl MongoBackend {
         &self,
         param: &SearchParameter,
     ) -> StorageResult<Vec<Document>> {
-        param
-            .values
-            .iter()
-            .map(|value| self.build_date_filter(value, "last_updated"))
-            .collect()
+        match &param.modifier {
+            None => {
+                let mut conditions = param
+                    .values
+                    .iter()
+                    .map(|value| self.build_date_filter(value, "last_updated"))
+                    .collect::<StorageResult<Vec<_>>>()?;
+
+                // #1062: comma-separated `_lastUpdated` values are OR, the
+                // same defect and fix as `build_search_index_filter` above
+                // (see the comment there). Returning a single combined
+                // document - instead of one document per value - keeps
+                // `build_resource_filter` unchanged: it still `extend`s
+                // whatever comes back into the top-level `$and`, so two
+                // *separate* `_lastUpdated` parameters (the repeated form)
+                // still AND.
+                if conditions.len() <= 1 {
+                    return Ok(conditions);
+                }
+                Ok(vec![doc! {
+                    "$or": Bson::Array(conditions.drain(..).map(Bson::Document).collect()),
+                }])
+            }
+            // Presence test on `last_updated`, mirroring `_id:missing` above.
+            // Every live resource carries a `last_updated`, so `:missing=true`
+            // is trivially empty and `:missing=false` trivially everything -
+            // but the boolean literal must never reach `build_date_filter`
+            // (#1055: it previously 400'd there as an unparseable date).
+            Some(SearchModifier::Missing) => {
+                let wants_missing = param
+                    .values
+                    .first()
+                    .map(|v| v.value == "true")
+                    .unwrap_or(false);
+                Ok(vec![if wants_missing {
+                    doc! { "last_updated": Bson::Null }
+                } else {
+                    doc! { "last_updated": { "$ne": Bson::Null } }
+                }])
+            }
+            Some(other) => Err(StorageError::Search(SearchError::UnsupportedModifier {
+                modifier: other.to_string(),
+                param_type: param.param_type.to_string(),
+            })),
+        }
     }
 
     fn build_cursor_condition(&self, cursor: &PageCursor) -> StorageResult<Document> {
@@ -1783,34 +1891,60 @@ impl MongoBackend {
         Some((resource_type, id))
     }
 
-    async fn fetch_resource_by_type_id(
-        &self,
-        tenant: &TenantContext,
-        resource_type: &str,
-        id: &str,
-    ) -> StorageResult<Option<StoredResource>> {
-        let db = self.get_database().await?;
-        let resources = db.collection::<Document>(MongoBackend::RESOURCES_COLLECTION);
-        let tenant_id = tenant.tenant_id().as_str();
-
-        let doc = resources
-            .find_one(doc! {
-                "tenant_id": tenant_id,
-                "resource_type": resource_type,
-                "id": id,
-                "is_deleted": false,
-            })
+    /// Streams the `resource_id`s in `search_index` matching `filter`, capped
+    /// at `limit` distinct ids.
+    ///
+    /// Replaces an unbounded `Collection::distinct("resource_id", ..)`: a
+    /// `distinct` reply is a single BSON document capped at 16 MiB by mongod,
+    /// which a wide reverse-reference set can exceed (error 17217, ~372k
+    /// 36-char ids) — reachable on realistic corpora (#1061). A driver-paged
+    /// `find` cursor can be abandoned as soon as `limit` distinct ids are
+    /// seen, so neither the wire reply nor our memory scales with the
+    /// referring set's true size.
+    ///
+    /// No `sort`: `resource_id` is not a prefix of `idx_search_reference`
+    /// (`tenant_id`, `resource_type`, `param_name`, `value_reference`), so an
+    /// in-memory sort would itself risk MongoDB's 32 MiB sort limit. Ids come
+    /// back in index order, so which ids survive a given truncation is stable
+    /// for a fixed index state (not otherwise meaningful or API-specified).
+    async fn referring_resource_ids(
+        search_index: &mongodb::Collection<Document>,
+        filter: Document,
+        limit: usize,
+    ) -> StorageResult<(Vec<String>, bool)> {
+        let mut cursor = search_index
+            .find(filter)
+            .projection(doc! { "resource_id": 1_i32, "_id": 0_i32 })
+            .batch_size(1000)
             .await
-            .or_query_error("Failed to fetch included resource")?;
+            .or_query_error("Failed to query search_index for revinclude")?;
 
-        match doc {
-            Some(doc) => Ok(Some(self.document_to_stored_resource(
-                tenant,
-                resource_type,
-                doc,
-            )?)),
-            None => Ok(None),
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut ids: Vec<String> = Vec::new();
+        let mut truncated = false;
+
+        while cursor
+            .advance()
+            .await
+            .or_query_error("Failed to advance search_index cursor")?
+        {
+            let doc = cursor
+                .deserialize_current()
+                .or_query_error("Failed to deserialize search_index document")?;
+            let Ok(resource_id) = doc.get_str("resource_id") else {
+                continue;
+            };
+            if !seen.insert(resource_id.to_string()) {
+                continue;
+            }
+            if ids.len() >= limit {
+                truncated = true;
+                break;
+            }
+            ids.push(resource_id.to_string());
         }
+
+        Ok((ids, truncated))
     }
 }
 
@@ -1826,10 +1960,26 @@ impl IncludeProvider for MongoBackend {
             return Ok(Vec::new());
         }
 
-        let mut included = Vec::new();
+        let db = self.get_database().await?;
+        let resources_collection = db.collection::<Document>(MongoBackend::RESOURCES_COLLECTION);
+        let tenant_id = tenant.tenant_id().as_str();
+        // Applied per directive, not as one budget shared across every
+        // directive: a shared budget would let an earlier `_include`/
+        // `_revinclude` directive exhaust the cap and starve every later one
+        // (#1061 review). The Bundle can therefore reach directives × limit,
+        // documented on the config field.
+        let limit = self.config().max_included_resources.max(1);
+
+        let mut included: Vec<StoredResource> = Vec::new();
         let mut seen: HashSet<String> = HashSet::new();
+        let mut truncated_labels: Vec<String> = Vec::new();
 
         for include in includes {
+            // Batch into one `find` per referenced type instead of one
+            // `find_one` per reference (previously N+1 round trips).
+            let mut wanted_by_type: std::collections::HashMap<String, Vec<String>> =
+                std::collections::HashMap::new();
+            let mut wanted_seen: HashSet<String> = HashSet::new();
             for resource in resources {
                 if resource.resource_type() != include.source_type {
                     continue;
@@ -1847,19 +1997,65 @@ impl IncludeProvider for MongoBackend {
                         }
                     }
 
-                    let key = format!("{}/{}", ref_type, ref_id);
-                    if !seen.insert(key) {
-                        continue;
-                    }
-
-                    if let Some(stored) = self
-                        .fetch_resource_by_type_id(tenant, &ref_type, &ref_id)
-                        .await?
-                    {
-                        included.push(stored);
+                    if wanted_seen.insert(format!("{}/{}", ref_type, ref_id)) {
+                        wanted_by_type.entry(ref_type).or_default().push(ref_id);
                     }
                 }
             }
+
+            let mut directive_count = 0usize;
+            let mut directive_truncated = false;
+            'directive: for (ref_type, ids) in wanted_by_type {
+                let id_bson: Vec<Bson> = ids.into_iter().map(Bson::String).collect();
+                let filter = doc! {
+                    "tenant_id": tenant_id,
+                    "resource_type": &ref_type,
+                    "is_deleted": false,
+                    "id": { "$in": Bson::Array(id_bson) },
+                };
+                let docs = collect_documents(
+                    resources_collection
+                        .find(filter)
+                        .await
+                        .or_query_error("Failed to fetch included resources")?,
+                )
+                .await?;
+
+                for doc in docs {
+                    let stored = self.document_to_stored_resource(tenant, &ref_type, doc)?;
+                    let key = format!("{}/{}", stored.resource_type(), stored.id());
+                    if seen.contains(&key) {
+                        continue;
+                    }
+                    if directive_count >= limit {
+                        directive_truncated = true;
+                        break 'directive;
+                    }
+                    seen.insert(key);
+                    directive_count += 1;
+                    included.push(stored);
+                }
+            }
+
+            if directive_truncated {
+                truncated_labels.push(format!(
+                    "_include={}:{}",
+                    include.source_type, include.search_param
+                ));
+            }
+        }
+
+        if !truncated_labels.is_empty() {
+            included.push(crate::core::include_truncation_outcome(
+                tenant,
+                resources
+                    .first()
+                    .map(|r| r.fhir_version())
+                    .unwrap_or_else(FhirVersion::default_enabled),
+                limit,
+                &truncated_labels.join(","),
+                "increase HFS_MONGODB_MAX_INCLUDED_RESOURCES to raise the limit",
+            ));
         }
 
         Ok(included)
@@ -1882,9 +2078,12 @@ impl RevincludeProvider for MongoBackend {
         let tenant_id = tenant.tenant_id().as_str();
         let search_index = db.collection::<Document>(MongoBackend::SEARCH_INDEX_COLLECTION);
         let resources_collection = db.collection::<Document>(MongoBackend::RESOURCES_COLLECTION);
+        // See the matching comment in `resolve_includes`: per directive, not shared.
+        let limit = self.config().max_included_resources.max(1);
 
-        let mut included = Vec::new();
+        let mut included: Vec<StoredResource> = Vec::new();
         let mut seen: HashSet<String> = HashSet::new();
+        let mut truncated_labels: Vec<String> = Vec::new();
 
         for revinclude in revincludes {
             if revinclude.source_type.is_empty() {
@@ -1911,13 +2110,11 @@ impl RevincludeProvider for MongoBackend {
                 "value_reference": { "$in": Bson::Array(bson_values) },
             };
 
-            let matching_ids: Vec<String> = search_index
-                .distinct("resource_id", index_filter)
-                .await
-                .or_query_error("Failed to query search_index for revinclude")?
-                .into_iter()
-                .filter_map(|value| value.as_str().map(ToString::to_string))
-                .collect();
+            // Bounded, streamed id resolution (#1061) — see
+            // `referring_resource_ids`. `reference_values` above is already
+            // bounded by the page; this is what previously was not.
+            let (matching_ids, index_truncated) =
+                Self::referring_resource_ids(&search_index, index_filter, limit).await?;
 
             if matching_ids.is_empty() {
                 continue;
@@ -1939,14 +2136,43 @@ impl RevincludeProvider for MongoBackend {
             )
             .await?;
 
+            let mut directive_count = 0usize;
+            let mut directive_truncated = index_truncated;
             for doc in docs {
                 let stored =
                     self.document_to_stored_resource(tenant, &revinclude.source_type, doc)?;
                 let key = format!("{}/{}", stored.resource_type(), stored.id());
-                if seen.insert(key) {
-                    included.push(stored);
+                if seen.contains(&key) {
+                    continue;
                 }
+                if directive_count >= limit {
+                    directive_truncated = true;
+                    break;
+                }
+                seen.insert(key);
+                directive_count += 1;
+                included.push(stored);
             }
+
+            if directive_truncated {
+                truncated_labels.push(format!(
+                    "_revinclude={}:{}",
+                    revinclude.source_type, revinclude.search_param
+                ));
+            }
+        }
+
+        if !truncated_labels.is_empty() {
+            included.push(crate::core::include_truncation_outcome(
+                tenant,
+                resources
+                    .first()
+                    .map(|r| r.fhir_version())
+                    .unwrap_or_else(FhirVersion::default_enabled),
+                limit,
+                &truncated_labels.join(","),
+                "increase HFS_MONGODB_MAX_INCLUDED_RESOURCES to raise the limit",
+            ));
         }
 
         Ok(included)
@@ -2098,5 +2324,383 @@ mod query_support_tests {
                 ..
             }) if modifier == "below"
         ));
+    }
+}
+
+/// #1062: comma-separated search values are OR per FHIR
+/// (https://build.fhir.org/search.html#combining), for every parameter
+/// type. These pins target the exact filter document `build_search_index_filter`
+/// sends to `distinct_resource_ids` (:832), because *where* the predicate is
+/// evaluated is what made the old `$and` catastrophic rather than merely
+/// strict: a `search_index` document holds one value of one parameter for
+/// one resource, so a disjoint `$and` can never be satisfied by any single
+/// row. `distinct` then returns empty, `matching_resource_ids`'s empty-set
+/// short circuit fires, and the *entire* search result is emptied — not
+/// just the one parameter.
+///
+/// This is unrelated to the repeated-parameter form
+/// (`?birthdate=ge1980-01-01&birthdate=lt1990-01-01`), which arrives as two
+/// separate `SearchParameter` entries and is intersected across parameters
+/// in `matching_resource_ids`; that AND is correct per spec and is guarded
+/// here too, so a change that widens the comma-list join cannot silently
+/// widen the repeated form as well.
+#[cfg(test)]
+mod value_list_tests {
+    use super::*;
+    use crate::backends::mongodb::MongoBackendConfig;
+
+    fn backend() -> MongoBackend {
+        MongoBackend::new(MongoBackendConfig::default()).unwrap()
+    }
+
+    #[test]
+    fn comma_separated_date_values_are_ored() {
+        let backend = backend();
+        let param = SearchParameter {
+            name: "birthdate".to_string(),
+            param_type: SearchParamType::Date,
+            modifier: None,
+            values: vec![SearchValue::parse("2019"), SearchValue::parse("2021")],
+            chain: vec![],
+            components: vec![],
+        };
+
+        let filter = backend
+            .build_search_index_filter("t1", "Patient", &param)
+            .expect("valid filter");
+
+        assert!(
+            filter.get("$and").is_none(),
+            "date value list must not be ANDed: {filter:?}"
+        );
+        let arms = filter.get_array("$or").expect("$or array");
+        assert_eq!(arms.len(), 2);
+        for arm in arms {
+            let doc = arm.as_document().expect("$or arm is a document");
+            assert!(
+                doc.contains_key("value_date"),
+                "each $or arm constrains value_date: {doc:?}"
+            );
+        }
+    }
+
+    /// A regression a partial fix could pass: dropping only `Date` from the
+    /// old `matches!` would leave `Number` ANDed and this test red.
+    #[test]
+    fn comma_separated_number_values_are_ored() {
+        let backend = backend();
+        let param = SearchParameter {
+            name: "factor-override".to_string(),
+            param_type: SearchParamType::Number,
+            modifier: None,
+            values: vec![SearchValue::parse("0.25"), SearchValue::parse("1.5")],
+            chain: vec![],
+            components: vec![],
+        };
+
+        let filter = backend
+            .build_search_index_filter("t1", "ChargeItem", &param)
+            .expect("valid filter");
+
+        assert!(
+            filter.get("$and").is_none(),
+            "number value list must not be ANDed: {filter:?}"
+        );
+        let arms = filter.get_array("$or").expect("$or array");
+        assert_eq!(arms.len(), 2);
+        for arm in arms {
+            let doc = arm.as_document().expect("$or arm is a document");
+            assert!(
+                doc.contains_key("value_number"),
+                "each $or arm constrains value_number: {doc:?}"
+            );
+        }
+    }
+
+    /// Quantity was never in the AND list. Confirmed here rather than
+    /// assumed, so this module pins the join for every parameter type in
+    /// one place.
+    #[test]
+    fn comma_separated_quantity_values_stay_ored() {
+        let backend = backend();
+        let param = SearchParameter {
+            name: "value-quantity".to_string(),
+            param_type: SearchParamType::Quantity,
+            modifier: None,
+            values: vec![SearchValue::parse("5"), SearchValue::parse("10")],
+            chain: vec![],
+            components: vec![],
+        };
+
+        let filter = backend
+            .build_search_index_filter("t1", "Observation", &param)
+            .expect("valid filter");
+
+        assert!(filter.get("$and").is_none());
+        assert_eq!(filter.get_array("$or").expect("$or array").len(), 2);
+    }
+
+    /// Second site, same defect, one function away:
+    /// `build_resource_last_updated_conditions` (:1508) is the `_lastUpdated`
+    /// equivalent of `build_search_index_filter`, resolved against the
+    /// resource document instead of `search_index`. A disjoint comma list
+    /// must OR into a single combined condition.
+    #[test]
+    fn comma_separated_last_updated_values_are_ored() {
+        let backend = backend();
+        let query = SearchQuery::new("Patient").with_parameter(SearchParameter {
+            name: "_lastUpdated".to_string(),
+            param_type: SearchParamType::Date,
+            modifier: None,
+            values: vec![SearchValue::parse("2019"), SearchValue::parse("2021")],
+            chain: vec![],
+            components: vec![],
+        });
+
+        let filter = backend
+            .build_resource_filter("t1", "Patient", &query, None, None)
+            .expect("valid filter");
+
+        let and_arms = filter.get_array("$and").expect("$and array");
+        assert_eq!(
+            and_arms.len(),
+            2,
+            "base document plus one combined last_updated condition: {filter:?}"
+        );
+        let combined = and_arms[1].as_document().expect("condition is a document");
+        let or_arms = combined.get_array("$or").expect("$or array");
+        assert_eq!(or_arms.len(), 2);
+        for arm in or_arms {
+            let doc = arm.as_document().expect("$or arm is a document");
+            assert!(doc.contains_key("last_updated"));
+        }
+    }
+
+    /// Guard: the repeated-parameter form is a different mechanism (two
+    /// separate `SearchParameter` entries, not one with two values) and
+    /// must keep ANDing exactly as before — MANUAL_TESTING_MATRIX row 4.3
+    /// depends on it. Must stay green before and after the fix.
+    #[test]
+    fn repeated_last_updated_parameters_still_and() {
+        let backend = backend();
+        let query = SearchQuery::new("Patient")
+            .with_parameter(SearchParameter {
+                name: "_lastUpdated".to_string(),
+                param_type: SearchParamType::Date,
+                modifier: None,
+                values: vec![SearchValue::parse("ge2019")],
+                chain: vec![],
+                components: vec![],
+            })
+            .with_parameter(SearchParameter {
+                name: "_lastUpdated".to_string(),
+                param_type: SearchParamType::Date,
+                modifier: None,
+                values: vec![SearchValue::parse("le2021")],
+                chain: vec![],
+                components: vec![],
+            });
+
+        let filter = backend
+            .build_resource_filter("t1", "Patient", &query, None, None)
+            .expect("valid filter");
+
+        let and_arms = filter.get_array("$and").expect("$and array");
+        assert_eq!(
+            and_arms.len(),
+            3,
+            "base document plus one condition per repeated parameter: {filter:?}"
+        );
+        for arm in &and_arms[1..] {
+            let doc = arm.as_document().expect("condition is a document");
+            assert!(doc.contains_key("last_updated"));
+            assert!(
+                doc.get("$or").is_none(),
+                "a single-value condition stays flat, not wrapped in $or"
+            );
+        }
+    }
+}
+
+/// #1055: `_id`/`_lastUpdated` are lowered outside the generic modifier
+/// dispatch (`matching_resource_ids` skips them and hands them to
+/// `build_resource_id_condition` / `build_resource_last_updated_conditions`
+/// instead), so these two builders must honour `param.modifier` themselves.
+/// Pinned at the filter-shape level, without a live MongoDB, because the
+/// integration test cannot fully discriminate `_id:missing=true` (an
+/// accidental pass either way — see the sibling integration test).
+#[cfg(test)]
+mod metadata_param_modifier_tests {
+    use super::*;
+    use crate::backends::mongodb::MongoBackendConfig;
+
+    fn backend() -> MongoBackend {
+        MongoBackend::new(MongoBackendConfig::default()).unwrap()
+    }
+
+    fn id_param(modifier: Option<SearchModifier>, values: &[&str]) -> SearchParameter {
+        SearchParameter {
+            name: "_id".to_string(),
+            param_type: SearchParamType::Token,
+            modifier,
+            values: values.iter().map(|v| SearchValue::eq(*v)).collect(),
+            chain: vec![],
+            components: vec![],
+        }
+    }
+
+    fn last_updated_param(modifier: Option<SearchModifier>, value: &str) -> SearchParameter {
+        SearchParameter {
+            name: "_lastUpdated".to_string(),
+            param_type: SearchParamType::Date,
+            modifier,
+            values: vec![SearchValue::eq(value)],
+            chain: vec![],
+            components: vec![],
+        }
+    }
+
+    /// The metadata-param condition alone: `build_resource_filter`'s first
+    /// `$and` arm is always the tenant/resource_type/is_deleted seed, so with
+    /// a single parameter and no matched-id set the second arm is the
+    /// condition under test.
+    fn condition(backend: &MongoBackend, param: SearchParameter) -> Document {
+        let query = SearchQuery::new("Patient").with_parameter(param);
+        let filter = backend
+            .build_resource_filter("t", "Patient", &query, None, None)
+            .expect("filter should build");
+        filter.get_array("$and").expect("$and array")[1]
+            .as_document()
+            .expect("condition document")
+            .clone()
+    }
+
+    #[test]
+    fn plain_id_match_is_unchanged() {
+        let backend = backend();
+        let cond = condition(&backend, id_param(None, &["pat-a"]));
+        assert_eq!(cond.get_str("id").unwrap(), "pat-a");
+    }
+
+    #[test]
+    fn id_not_negates_instead_of_matching() {
+        let backend = backend();
+
+        let single = condition(&backend, id_param(Some(SearchModifier::Not), &["pat-a"]));
+        assert_eq!(
+            single.get_document("id").unwrap().get_str("$ne").unwrap(),
+            "pat-a"
+        );
+
+        let multi = condition(
+            &backend,
+            id_param(Some(SearchModifier::Not), &["pat-a", "pat-b"]),
+        );
+        let nin = multi.get_document("id").unwrap().get_array("$nin").unwrap();
+        let values: Vec<&str> = nin.iter().map(|b| b.as_str().unwrap()).collect();
+        assert_eq!(values, vec!["pat-a", "pat-b"]);
+    }
+
+    #[test]
+    fn id_missing_is_a_presence_test_on_the_id_field() {
+        let backend = backend();
+
+        let missing_true = condition(&backend, id_param(Some(SearchModifier::Missing), &["true"]));
+        assert!(matches!(missing_true.get("id"), Some(Bson::Null)));
+
+        let missing_false = condition(
+            &backend,
+            id_param(Some(SearchModifier::Missing), &["false"]),
+        );
+        assert!(matches!(
+            missing_false.get_document("id").unwrap().get("$ne"),
+            Some(Bson::Null)
+        ));
+    }
+
+    /// Control for #519: the refactor of `build_resource_last_updated_conditions`
+    /// into a modifier match must leave the no-modifier (period-comparison) arm
+    /// byte-identical.
+    #[test]
+    fn last_updated_no_modifier_control_still_builds_a_date_range() {
+        let backend = backend();
+        let cond = condition(&backend, last_updated_param(None, "2024"));
+        let bounds = cond.get_document("last_updated").expect("field doc");
+        assert!(bounds.get_datetime("$gte").is_ok());
+        assert!(bounds.get_datetime("$lt").is_ok());
+    }
+
+    #[test]
+    fn last_updated_missing_does_not_parse_the_boolean_as_a_date() {
+        let backend = backend();
+
+        let missing_true = condition(
+            &backend,
+            last_updated_param(Some(SearchModifier::Missing), "true"),
+        );
+        assert!(matches!(missing_true.get("last_updated"), Some(Bson::Null)));
+
+        let missing_false = condition(
+            &backend,
+            last_updated_param(Some(SearchModifier::Missing), "false"),
+        );
+        assert!(matches!(
+            missing_false
+                .get_document("last_updated")
+                .unwrap()
+                .get("$ne"),
+            Some(Bson::Null)
+        ));
+    }
+
+    #[test]
+    fn unhonoured_modifiers_on_metadata_params_are_rejected() {
+        let backend = backend();
+
+        let id_text = SearchQuery::new("Patient")
+            .with_parameter(id_param(Some(SearchModifier::Text), &["abc"]));
+        let err = backend.validate_query_support(&id_text).unwrap_err();
+        assert!(matches!(
+            err,
+            StorageError::Search(SearchError::UnsupportedModifier { ref modifier, .. })
+                if modifier == "text"
+        ));
+
+        let last_updated_not = SearchQuery::new("Patient")
+            .with_parameter(last_updated_param(Some(SearchModifier::Not), "2024"));
+        let err = backend
+            .validate_query_support(&last_updated_not)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            StorageError::Search(SearchError::UnsupportedModifier { ref modifier, .. })
+                if modifier == "not"
+        ));
+
+        // The three honoured combinations must not be rejected.
+        assert!(
+            backend
+                .validate_query_support(
+                    &SearchQuery::new("Patient")
+                        .with_parameter(id_param(Some(SearchModifier::Not), &["pat-a"]))
+                )
+                .is_ok()
+        );
+        assert!(
+            backend
+                .validate_query_support(
+                    &SearchQuery::new("Patient")
+                        .with_parameter(id_param(Some(SearchModifier::Missing), &["true"]))
+                )
+                .is_ok()
+        );
+        assert!(
+            backend
+                .validate_query_support(
+                    &SearchQuery::new("Patient")
+                        .with_parameter(last_updated_param(Some(SearchModifier::Missing), "true"))
+                )
+                .is_ok()
+        );
     }
 }

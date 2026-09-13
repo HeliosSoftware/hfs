@@ -139,6 +139,96 @@ async fn enforce_mode_rejects_invalid_batch_entries_individually() {
     );
 }
 
+/// The write validator's own issues reach a batch entry, not a flattened
+/// sentence.
+///
+/// `check_write` returns a fully-formed multi-issue OperationOutcome — one
+/// issue per finding, each with its own code, severity and `expression` giving
+/// the FHIRPath location of the element that failed. The batch arm used to walk
+/// `issue[].details.text`, join the strings with `"; "`, and hand one sentence
+/// to a wrapper that stamped `processing` over it: N coded, located issues
+/// became one uncoded, unlocated issue.
+///
+/// The transaction arm never did that — it propagates the same error from the
+/// same call with a bare `?`, reaching `IntoResponse`'s pass-through. So an
+/// identical resource returned typed codes and FHIRPath expressions as a
+/// `transaction` and one English sentence as a `batch`, decided purely by
+/// `Bundle.type` (#504).
+///
+/// Complements `enforce_mode_rejects_invalid_writes_with_outcome` above, which
+/// pinned the single-resource half and left the batch half asserting only a
+/// status.
+#[tokio::test]
+async fn the_two_surfaces_report_the_same_validation_issues() {
+    let server = create_test_server("enforce").await;
+
+    /// Every `(code, expression)` pair in an outcome, sorted.
+    fn issue_keys(outcome: &Value) -> Vec<(String, String)> {
+        let mut keys: Vec<(String, String)> = outcome["issue"]
+            .as_array()
+            .expect("issue array")
+            .iter()
+            .map(|i| {
+                (
+                    i["code"].as_str().unwrap_or_default().to_string(),
+                    i["expression"][0].as_str().unwrap_or_default().to_string(),
+                )
+            })
+            .collect();
+        keys.sort();
+        keys
+    }
+
+    let single: Value = server
+        .post("/Patient")
+        .json(&invalid_patient())
+        .await
+        .json();
+
+    let batch: Value = server
+        .post("/")
+        .json(&json!({
+            "resourceType": "Bundle",
+            "type": "batch",
+            "entry": [{
+                "request": { "method": "POST", "url": "Patient" },
+                "resource": invalid_patient()
+            }]
+        }))
+        .await
+        .json();
+    let entry = &batch["entry"][0]["response"];
+
+    assert!(
+        entry["status"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("422"),
+        "entry status: {batch:#}"
+    );
+
+    let entry_outcome = &entry["outcome"];
+    assert_eq!(
+        entry_outcome["resourceType"], "OperationOutcome",
+        "{batch:#}"
+    );
+
+    let single_keys = issue_keys(&single);
+    let entry_keys = issue_keys(entry_outcome);
+    assert_eq!(
+        entry_keys, single_keys,
+        "a batch entry must report the issues the resource endpoint reports\n\
+         single: {single:#}\nentry: {entry_outcome:#}"
+    );
+
+    // Pinned literally, not just to each other: a regression that flattened
+    // *both* surfaces would satisfy the equality above vacuously.
+    assert!(
+        entry_keys.contains(&("structure".to_string(), "Patient.bogusElement".to_string())),
+        "the structural issue must survive with its FHIRPath location: {entry_outcome:#}"
+    );
+}
+
 #[tokio::test]
 async fn stored_profile_registers_and_validates() {
     let server = create_test_server("off").await;

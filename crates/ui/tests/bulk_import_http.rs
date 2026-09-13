@@ -883,8 +883,15 @@ async fn abort_sends_a_status_only_kickoff() {
     let abort_path = create_submission(&ctx).await;
     post_form(&ctx, &format!("{abort_path}/abort"), "").await;
     let (_, html) = get(&ctx, &abort_path).await;
-    assert!(html.contains("Stopped"));
+    assert!(
+        html.contains(r#"<div id="submission-status">Stopped</div>"#),
+        "{html}"
+    );
     assert!(html.contains("Recipient acknowledged (200)"));
+    // The landed Abort closes the submission out: its card is the settled
+    // result, not a progress card that keeps polling (#1069).
+    let (_, fragment) = get(&ctx, &format!("{abort_path}/status")).await;
+    assert_closed_out_card(&fragment, &abort_path, "Stopped");
 
     // The abort kick-off is status-only: no manifestUrl rides along.
     let bodies = received.lock().unwrap().clone();
@@ -910,8 +917,13 @@ async fn complete_sends_a_status_only_kickoff() {
     set_submission_status(&ctx, &detail_path, "in-progress").await;
     post_form(&ctx, &format!("{detail_path}/complete"), "").await;
     let (_, html) = get(&ctx, &detail_path).await;
-    assert!(html.contains("Completed"), "{html}");
+    assert!(
+        html.contains(r#"<div id="submission-status">Completed</div>"#),
+        "{html}"
+    );
     assert!(html.contains("Recipient acknowledged (200)"), "{html}");
+    let (_, fragment) = get(&ctx, &format!("{detail_path}/status")).await;
+    assert_closed_out_card(&fragment, &detail_path, "Completed");
 
     let bodies = received.lock().unwrap().clone();
     let params = bodies.last().unwrap()["parameter"].as_array().unwrap();
@@ -1007,8 +1019,9 @@ async fn a_successful_abort_clears_the_error_banner_and_the_buttons() {
     // The recipient base URL is captured on the submission at create time, so
     // the retry must reach the same origin — this mock changes its mind
     // instead.
-    let (recipient_url, answer) = mock_recipient_with_switchable_status(StatusCode::OK).await;
-    let ctx = ctx(&recipient_url);
+    let recipient = mock_recipient_with_switchable_status(StatusCode::OK, 3600).await;
+    let answer = &recipient.answer;
+    let ctx = ctx(&recipient.url);
     let detail_path = create_submission(&ctx).await;
 
     // First Abort: the recipient is saturated and rejects it.
@@ -1061,35 +1074,226 @@ async fn a_successful_abort_clears_the_error_banner_and_the_buttons() {
         !fragment.contains(&format!(r#"action="{detail_path}/complete""#)),
         "{fragment}"
     );
+    // A landed Abort closes the submission out, so the card stops polling and
+    // settles on the result (#1069).
+    assert!(!fragment.contains("every 5s"), "{fragment}");
+    assert!(fragment.contains(RESULT_CARD), "{fragment}");
+}
+
+/// The opening of the settled, non-polling status card — the one a finished
+/// or closed-out submission renders.
+const RESULT_CARD: &str = r#"<div id="bulk-status" class="card panel bulk-import-section">"#;
+
+/// Asserts the status fragment shows a closed-out submission: the result card
+/// (its "Result" label and closing instant), no htmx refresh, no Abort or
+/// Mark completed, and the out-of-band STATUS cell reading `label`.
+fn assert_closed_out_card(fragment: &str, detail_path: &str, label: &str) {
+    assert!(
+        !fragment.contains("every 5s"),
+        "polling stopped: {fragment}"
+    );
+    assert!(fragment.contains(RESULT_CARD), "{fragment}");
+    assert!(fragment.contains("<span>Result</span>"), "{fragment}");
+    assert!(
+        fragment.contains("Processing finished at <code>"),
+        "{fragment}"
+    );
+    assert!(
+        fragment.contains(&format!(
+            r#"<div id="submission-status" hx-swap-oob="true">{label}</div>"#
+        )),
+        "{fragment}"
+    );
+    assert!(
+        !fragment.contains(&format!(r#"action="{detail_path}/abort""#)),
+        "{fragment}"
+    );
+    assert!(
+        !fragment.contains(&format!(r#"action="{detail_path}/complete""#)),
+        "{fragment}"
+    );
+}
+
+/// #1069: Abort showed Stopped, then the next 5s refresh flipped it to
+/// Completed. The landed Abort left the poll URL on the submission, so the
+/// card kept polling — and HFS answers an aborted submission's status poll
+/// with a terminal `200` whose `outcome` is empty, which read as a clean
+/// finish. Here the recipient does exactly that, with no `Retry-After` hold
+/// in the way, so the only thing keeping the submission Stopped is the UI
+/// refusing to poll (or believe) the recipient once it is closed out.
+#[tokio::test]
+async fn an_aborted_submission_stays_stopped_when_the_recipient_later_answers_200() {
+    let recipient = mock_recipient_with_switchable_status(StatusCode::OK, 0).await;
+    let ctx = ctx(&recipient.url);
+    let detail_path = create_submission(&ctx).await;
+    let status_path = format!("{detail_path}/status");
+
+    // Before the abort the card polls the recipient, which is still running.
+    let (_, fragment) = get(&ctx, &status_path).await;
+    assert!(fragment.contains("every 5s"), "{fragment}");
+    assert!(
+        fragment.contains(&format!(r#"action="{detail_path}/abort""#)),
+        "{fragment}"
+    );
+    let polls_before_abort = recipient.polls.load(std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(polls_before_abort, 1, "the card polled the recipient");
+
+    let (status, _, _) = post_form(&ctx, &format!("{detail_path}/abort"), "").await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    // The recipient now answers the poll the way HFS does once aborted.
+    *recipient.poll_manifest.lock().unwrap() = Some(aborted_status_manifest());
+
+    // The card's refresh keeps firing on an open page; every one of them must
+    // still read Stopped.
+    for refresh in 1..=2 {
+        let (status, fragment) = get(&ctx, &status_path).await;
+        assert_eq!(status, StatusCode::OK, "refresh {refresh}");
+        assert_closed_out_card(&fragment, &detail_path, "Stopped");
+    }
+    assert_eq!(
+        recipient.polls.load(std::sync::atomic::Ordering::SeqCst),
+        polls_before_abort,
+        "a stopped submission is never polled again"
+    );
+
+    let (_, detail) = get(&ctx, &detail_path).await;
+    assert!(
+        detail.contains(r#"<div id="submission-status">Stopped</div>"#),
+        "{detail}"
+    );
+    assert!(
+        !detail.contains(r#"<div id="submission-status">Completed</div>"#),
+        "{detail}"
+    );
+    assert!(!detail.contains("finished cleanly"), "{detail}");
+    assert!(!detail.contains("submission completed"), "{detail}");
+}
+
+/// #1069's companion for Mark completed: a closed-out submission keeps the
+/// provider's verdict, so a recipient poll that would report error files does
+/// not reopen it as Failed.
+#[tokio::test]
+async fn a_completed_submission_is_not_failed_by_a_later_poll_with_errors() {
+    let recipient = mock_recipient_with_switchable_status(StatusCode::OK, 0).await;
+    let ctx = ctx(&recipient.url);
+    let detail_path = create_submission(&ctx).await;
+    let status_path = format!("{detail_path}/status");
+
+    let (_, fragment) = get(&ctx, &status_path).await;
+    assert!(fragment.contains("every 5s"), "{fragment}");
+    let polls_before = recipient.polls.load(std::sync::atomic::Ordering::SeqCst);
+
+    let (status, _, _) = post_form(&ctx, &format!("{detail_path}/complete"), "").await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    *recipient.poll_manifest.lock().unwrap() = Some(serde_json::json!({
+        "output": [{"type": "Patient", "url": "http://example/out.ndjson"}],
+        "outcome": [{
+            "type": "OperationOutcome",
+            "url": "http://example/errors.ndjson",
+            "countSeverity": {"error": 2}
+        }]
+    }));
+
+    for _ in 1..=2 {
+        let (_, fragment) = get(&ctx, &status_path).await;
+        assert_closed_out_card(&fragment, &detail_path, "Completed");
+    }
+    assert_eq!(
+        recipient.polls.load(std::sync::atomic::Ordering::SeqCst),
+        polls_before
+    );
+    let (_, detail) = get(&ctx, &detail_path).await;
+    assert!(
+        detail.contains(r#"<div id="submission-status">Completed</div>"#),
+        "{detail}"
+    );
+    assert!(!detail.contains("marked failed"), "{detail}");
+}
+
+/// #1069: submissions the old UI already stopped still carry a live poll URL
+/// in storage. The card must not poll the recipient for them either — nor let
+/// its terminal `200` rewrite the status.
+#[tokio::test]
+async fn a_stored_stopped_submission_with_a_poll_url_is_not_polled() {
+    let recipient = mock_recipient_with_switchable_status(StatusCode::OK, 0).await;
+    let ctx = ctx(&recipient.url);
+    let detail_path = create_submission(&ctx).await;
+    // Stopped the old way: the status changed, the poll URL stayed.
+    set_submission_status(&ctx, &detail_path, "stopped").await;
+    *recipient.poll_manifest.lock().unwrap() = Some(aborted_status_manifest());
+
+    for _ in 1..=2 {
+        let (_, fragment) = get(&ctx, &format!("{detail_path}/status")).await;
+        assert!(!fragment.contains("every 5s"), "{fragment}");
+        assert!(
+            fragment.contains(r#"<div id="submission-status" hx-swap-oob="true">Stopped</div>"#),
+            "{fragment}"
+        );
+    }
+    assert_eq!(recipient.polls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    let (_, detail) = get(&ctx, &detail_path).await;
+    assert!(
+        detail.contains(r#"<div id="submission-status">Stopped</div>"#),
+        "{detail}"
+    );
+    assert!(!detail.contains("submission completed"), "{detail}");
+}
+
+/// The handles of [`mock_recipient_with_switchable_status`].
+struct SwitchableRecipient {
+    url: String,
+    /// The status code the *next* `$bulk-submit` kick-off gets.
+    answer: Arc<std::sync::atomic::AtomicU16>,
+    /// What the *next* `/poll` gets: `None` is `202` with `X-Progress`, while
+    /// `Some(manifest)` is `200` with that status manifest — the recipient
+    /// saying the submission is over.
+    poll_manifest: Arc<std::sync::Mutex<Option<serde_json::Value>>>,
+    /// How many `/poll` requests actually arrived.
+    polls: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 /// A recipient that accepts the submission, hands out a status poll URL, and
-/// whose `$bulk-submit` answer the test can change between requests — the
-/// returned handle holds the status code the *next* kick-off gets.
+/// whose answers the test can change between requests: the `$bulk-submit`
+/// status code, and whether `/poll` is still running (`202`) or has finished
+/// (`200` with a manifest).
 ///
 /// Two reasons for the shape: a submission stores one recipient base URL for
 /// its whole life, so a retry cannot simply be pointed at a second mock; and
 /// only a submission with a poll URL renders the status card that carries
 /// Abort and Mark completed, which is the state #968 was reported from.
-/// `/poll` answers `202` with a long `Retry-After`, so reading the card never
-/// moves the submission on its own.
+///
+/// A running `/poll` answers `202` with the given `Retry-After`. A long one
+/// (`3600`) means reading the card never moves the submission on its own; `0`
+/// leaves the next poll due at once, which is what #1069 needs — HFS answers
+/// an aborted submission's poll with a terminal `200`, and only a poll that
+/// actually goes out after the abort can show whether the UI trusts it.
 async fn mock_recipient_with_switchable_status(
     initial: StatusCode,
-) -> (String, Arc<std::sync::atomic::AtomicU16>) {
+    retry_after: u64,
+) -> SwitchableRecipient {
     use axum::extract::State as AxState;
     #[derive(Clone)]
     struct S {
         answer: Arc<std::sync::atomic::AtomicU16>,
+        poll_manifest: Arc<std::sync::Mutex<Option<serde_json::Value>>>,
+        polls: Arc<std::sync::atomic::AtomicUsize>,
         base: Arc<std::sync::Mutex<String>>,
     }
     let state = S {
         answer: Arc::new(std::sync::atomic::AtomicU16::new(initial.as_u16())),
+        poll_manifest: Arc::new(std::sync::Mutex::new(None)),
+        polls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         base: Arc::new(std::sync::Mutex::new(String::new())),
     };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     *state.base.lock().unwrap() = format!("http://{addr}");
-    let answer = Arc::clone(&state.answer);
+    let handles = SwitchableRecipient {
+        url: format!("http://{addr}"),
+        answer: Arc::clone(&state.answer),
+        poll_manifest: Arc::clone(&state.poll_manifest),
+        polls: Arc::clone(&state.polls),
+    };
     let recipient = Router::new()
         .route(
             "/$bulk-submit",
@@ -1116,17 +1320,39 @@ async fn mock_recipient_with_switchable_status(
         )
         .route(
             "/poll",
-            axum::routing::get(|| async {
-                (
-                    StatusCode::ACCEPTED,
-                    [("x-progress", "50%"), ("retry-after", "3600")],
-                    "",
-                )
+            axum::routing::get(move |AxState(s): AxState<S>| async move {
+                s.polls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let manifest = s.poll_manifest.lock().unwrap().clone();
+                match manifest {
+                    Some(manifest) => axum::Json(manifest).into_response(),
+                    None => (
+                        StatusCode::ACCEPTED,
+                        [
+                            ("x-progress", "50%".to_string()),
+                            ("retry-after", retry_after.to_string()),
+                        ],
+                        "",
+                    )
+                        .into_response(),
+                }
             }),
         )
         .with_state(state);
     tokio::spawn(async move { axum::serve(listener, recipient).await.unwrap() });
-    (format!("http://{addr}"), answer)
+    handles
+}
+
+/// The status manifest HFS answers an aborted submission's poll with: a
+/// terminal `200` listing what was ingested before the abort, with an empty
+/// `outcome` — indistinguishable, on its own, from a clean finish (#1069).
+fn aborted_status_manifest() -> serde_json::Value {
+    serde_json::json!({
+        "transactionTime": "2026-09-11T10:00:00Z",
+        "request": "http://recipient.example/$bulk-submit-status",
+        "requiresAccessToken": false,
+        "output": [{"type": "Patient", "url": "http://example/out.ndjson", "count": 3}],
+        "outcome": []
+    })
 }
 
 #[tokio::test]
@@ -1163,7 +1389,10 @@ async fn terminal_submissions_reject_status_changes_without_side_effects() {
     assert_eq!(stored_after, stored_before);
 
     let (_, html) = get(&ctx, &detail_path).await;
-    assert!(html.contains("Completed"));
+    assert!(
+        html.contains(r#"<div id="submission-status">Completed</div>"#),
+        "{html}"
+    );
 }
 
 #[tokio::test]

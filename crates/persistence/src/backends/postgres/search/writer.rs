@@ -168,6 +168,13 @@ fn internal_error(message: String) -> crate::error::StorageError {
     })
 }
 
+fn postgres_error_message(error: &tokio_postgres::Error) -> String {
+    error.as_db_error().map_or_else(
+        || error.to_string(),
+        |db_error| db_error.message().to_string(),
+    )
+}
+
 /// Parses an extracted date value into the UTC timestamp stored in `value_date`.
 ///
 /// Returns `None` when the value cannot be parsed, so the caller can skip the
@@ -1200,7 +1207,10 @@ impl PostgresSearchIndexWriter {
             execute_cached(client, sql, &param_refs)
                 .await
                 .map_err(|e| {
-                    internal_error(format!("Failed to insert search index rows: {}", e))
+                    internal_error(format!(
+                        "Failed to insert search index rows: {}",
+                        postgres_error_message(&e)
+                    ))
                 })?;
         }
 
@@ -1220,11 +1230,14 @@ impl PostgresSearchIndexWriter {
     /// Chunked at [`MULTI_BATCH_ROWS`] so one caller's flush is normally one
     /// statement, and a single pathological resource (`Provenance.target` writes
     /// 1,626 rows) cannot make the arrays unbounded.
-    pub(crate) async fn insert_rows_multi(
-        client: &deadpool_postgres::Client,
+    pub(crate) async fn insert_rows_multi<C>(
+        client: &C,
         tenant_id: &str,
         batches: &[(&str, &str, &[IndexRow])],
-    ) -> StorageResult<()> {
+    ) -> StorageResult<()>
+    where
+        C: deadpool_postgres::GenericClient + ?Sized,
+    {
         let total: usize = batches.iter().map(|(_, _, rows)| rows.len()).sum();
         if total == 0 {
             return Ok(());
@@ -1263,7 +1276,10 @@ impl PostgresSearchIndexWriter {
             execute_cached(client, INSERT_SQL_MULTI.as_str(), &param_refs)
                 .await
                 .map_err(|e| {
-                    internal_error(format!("Failed to insert search index rows: {}", e))
+                    internal_error(format!(
+                        "Failed to insert search index rows: {}",
+                        postgres_error_message(&e)
+                    ))
                 })?;
         }
 

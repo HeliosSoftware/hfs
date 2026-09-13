@@ -514,6 +514,21 @@ impl BundleEntry {
             }),
         }
     }
+
+    /// Creates a new outcome entry (`search.mode = outcome`): information
+    /// about the search itself (e.g. a truncation warning) rather than a
+    /// matched or included resource. Carries no `fullUrl` — the resource has
+    /// no identity of its own to link to.
+    pub fn outcome_entry(resource: Value) -> Self {
+        Self {
+            full_url: None,
+            resource: Some(resource),
+            search: Some(BundleEntrySearch {
+                mode: SearchEntryMode::Outcome,
+                score: None,
+            }),
+        }
+    }
 }
 
 #[cfg(test)]

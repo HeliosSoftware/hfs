@@ -695,6 +695,7 @@ struct BulkExportPage {
     error: Option<String>,
     name_error: Option<String>,
     since_custom_error: Option<String>,
+    patients_error: Option<String>,
     form: StartForm,
     rejected: bool,
     patient_value: String,
@@ -782,6 +783,7 @@ async fn bulk_export_page(
         error,
         name_error: errors.name,
         since_custom_error: errors.since_custom,
+        patients_error: errors.patients,
         form,
         rejected,
         patient_value,
@@ -840,6 +842,9 @@ impl StartForm {
 struct StartErrors {
     name: Option<String>,
     since_custom: Option<String>,
+    /// Set when the effective scope is `patient` and the reference list
+    /// parsed cleanly but came out empty (no selection at all).
+    patients: Option<String>,
     rejected: bool,
 }
 
@@ -901,12 +906,18 @@ pub async fn start(
             .is_empty()
             .then(|| i18n.t("bulk-export-name-required")),
         since_custom: since.is_err().then(|| i18n.t("bulk-export-since-invalid")),
+        patients: (scope == "patient" && matches!(patient_refs, Ok(ref refs) if refs.is_empty()))
+            .then(|| i18n.t("bulk-export-patients-required")),
         rejected: true,
     };
     let patient_error = patient_refs
         .is_err()
         .then(|| i18n.t("bulk-export-patient-invalid"));
-    if errors.name.is_some() || errors.since_custom.is_some() || patient_error.is_some() {
+    if errors.name.is_some()
+        || errors.since_custom.is_some()
+        || errors.patients.is_some()
+        || patient_error.is_some()
+    {
         let mut response =
             bulk_export_page(&state, locale, rv.0, &rt, form, errors, patient_error).await;
         *response.status_mut() = StatusCode::BAD_REQUEST;
