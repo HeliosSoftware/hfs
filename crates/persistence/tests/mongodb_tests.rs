@@ -3675,8 +3675,7 @@ async fn mongodb_integration_search_missing_not_and_param_sort() {
 /// page fetch would then drop.
 #[tokio::test]
 async fn mongodb_integration_param_sorted_page_is_one_result_set() {
-    let Some(backend) =
-        create_backend_with_full_registry("param_sorted_page_one_result_set").await
+    let Some(backend) = create_backend_with_full_registry("param_sorted_page_one_result_set").await
     else {
         eprintln!(
             "Skipping mongodb_integration_param_sorted_page_is_one_result_set (requires Docker or HFS_TEST_MONGODB_URL)"
