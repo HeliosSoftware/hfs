@@ -51,9 +51,6 @@ pub(super) const BULK_INGEST_RETRY: RetryPolicy = RetryPolicy {
 /// An operation's final result and how many times it ran.
 pub(super) struct Attempted<T> {
     pub result: Result<T, MongoError>,
-    /// Not yet read outside this module's tests; consumed once
-    /// `bulk_ingest.rs` maps exhausted attempts to a `StorageError`.
-    #[allow(dead_code)]
     pub attempts: u32,
 }
 
@@ -155,10 +152,6 @@ where
 
 /// Maps an operation's final driver error to a `StorageError`: a transient
 /// error that outlived its retries is `Unavailable`, anything else `Internal`.
-///
-/// Not yet called outside this module's tests; `bulk_ingest.rs` calls it
-/// (via [`or_exhausted`]) once its stages retry through this policy.
-#[allow(dead_code)]
 pub(super) fn exhausted(context: &str, attempts: u32, err: &MongoError) -> StorageError {
     let message = if attempts == 1 {
         format!("{context}: {err}")

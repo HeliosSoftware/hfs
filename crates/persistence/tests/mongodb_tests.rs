@@ -675,14 +675,12 @@ async fn create_backend_with_app_name(test_name: &str, app_name: &str) -> Option
 
 /// Counts documents in one of a test database's collections, through a plain
 /// driver client (no failpoint `appName`, so never subject to one).
-#[allow(dead_code)] // not every failpoint test in this module exercises every helper
-async fn count_docs(test_name: &str, collection: &str, filter: Document) -> u64 {
-    let connection_string = shared_mongo::connection_string()
+async fn count_docs(backend: &MongoBackend, collection: &str, filter: Document) -> u64 {
+    let client = raw_test_client(&backend.config().connection_string)
         .await
-        .expect("count_docs is only called after a backend was created");
-    let client = Client::with_uri_str(&connection_string).await.unwrap();
+        .expect("failed to connect MongoDB client for count_docs");
     client
-        .database(&build_test_database_name(test_name))
+        .database(&backend.config().database_name)
         .collection::<Document>(collection)
         .count_documents(filter)
         .await
@@ -7914,6 +7912,176 @@ mod bulk_submit {
         fail_point.off().await;
 
         assert!(results.iter().all(|r| r.is_success()));
+    }
+
+    /// Asserts each id has exactly one resource, history and rollback row.
+    async fn assert_one_row_each(backend: &MongoBackend, tenant: &TenantContext, ids: &[&str]) {
+        let tenant_id = tenant.tenant_id().as_str();
+        for id in ids {
+            let by_id = doc! { "tenant_id": tenant_id, "resource_type": "Patient", "id": *id };
+            assert_eq!(
+                count_docs(backend, "resources", by_id.clone()).await,
+                1,
+                "resources {id}"
+            );
+            assert_eq!(
+                count_docs(backend, "resource_history", by_id).await,
+                1,
+                "history {id}"
+            );
+            let change =
+                doc! { "tenant_id": tenant_id, "resource_type": "Patient", "resource_id": *id };
+            assert_eq!(
+                count_docs(backend, "bulk_submission_changes", change).await,
+                1,
+                "changes {id}"
+            );
+        }
+    }
+
+    /// Spec §5.2 case 1: a dropped `insert` is retried and every entry lands once.
+    #[tokio::test]
+    async fn dropped_insert_is_retried_and_lands_once() {
+        let test = "submit_fp_dropped_insert";
+        let app = "fp-dropped-insert";
+        let Some(backend) = create_backend_with_app_name(test, app).await else {
+            return;
+        };
+        let tenant = create_tenant("submit-tenant");
+        let (id, manifest_id) = seed(&backend, &tenant).await;
+        let Some(fail_point) = FailPoint::enable(
+            app,
+            doc! { "failCommands": ["insert"], "closeConnection": true },
+            doc! { "times": 2 },
+        )
+        .await
+        else {
+            return;
+        };
+
+        let results = backend
+            .process_entries(
+                &tenant,
+                &id,
+                &manifest_id,
+                three_patients("drop"),
+                &BulkProcessingOptions::new(),
+            )
+            .await
+            .unwrap();
+        fail_point.off().await;
+
+        assert!(results.iter().all(|r| r.is_success()), "{results:?}");
+        assert_one_row_each(&backend, &tenant, &["drop-1", "drop-2", "drop-3"]).await;
+    }
+
+    /// Spec §5.2 case 2: the server executes the insert, then reports a
+    /// retryable write-concern error. The retry finds its own rows (dup-key)
+    /// and `confirm_landed` recognises them by version, timestamp and content.
+    /// `times: 2` = the first insert (landed + error) and the retry (dup-key +
+    /// error, which is attributed, not retried).
+    #[tokio::test]
+    async fn unacknowledged_insert_is_confirmed_not_duplicated() {
+        let test = "submit_fp_unacked_insert";
+        let app = "fp-unacked-insert";
+        let Some(backend) = create_backend_with_app_name(test, app).await else {
+            return;
+        };
+        let tenant = create_tenant("submit-tenant");
+        let (id, manifest_id) = seed(&backend, &tenant).await;
+        let Some(fail_point) = FailPoint::enable(
+            app,
+            doc! {
+                "failCommands": ["insert"],
+                "writeConcernError": {
+                    "code": 91,
+                    "errmsg": "Replication is being shut down",
+                    "errorLabels": ["RetryableWriteError"],
+                },
+            },
+            doc! { "times": 2 },
+        )
+        .await
+        else {
+            return;
+        };
+
+        let results = backend
+            .process_entries(
+                &tenant,
+                &id,
+                &manifest_id,
+                three_patients("unack"),
+                &BulkProcessingOptions::new(),
+            )
+            .await
+            .unwrap();
+        fail_point.off().await;
+
+        assert!(results.iter().all(|r| r.is_success()), "{results:?}");
+        assert_one_row_each(&backend, &tenant, &["unack-1", "unack-2", "unack-3"]).await;
+    }
+
+    /// The update path: one `update_one` per existing id, each its own retry unit.
+    /// `times: 3` = the two dropped `processing` promotions plus one dropped update.
+    #[tokio::test]
+    async fn dropped_update_is_retried_and_versions_once() {
+        let test = "submit_fp_dropped_update";
+        let app = "fp-dropped-update";
+        let Some(backend) = create_backend_with_app_name(test, app).await else {
+            return;
+        };
+        let tenant = create_tenant("submit-tenant");
+        let (id, manifest_id) = seed(&backend, &tenant).await;
+        backend
+            .process_entries(
+                &tenant,
+                &id,
+                &manifest_id,
+                three_patients("upd"),
+                &BulkProcessingOptions::new(),
+            )
+            .await
+            .unwrap();
+
+        let Some(fail_point) = FailPoint::enable(
+            app,
+            doc! { "failCommands": ["update"], "closeConnection": true },
+            doc! { "times": 3 },
+        )
+        .await
+        else {
+            return;
+        };
+        let updates: Vec<NdjsonEntry> = (1..=3)
+            .map(|i| {
+                NdjsonEntry::new(
+                    i,
+                    "Patient",
+                    json!({"resourceType": "Patient", "id": format!("upd-{i}"), "active": true}),
+                )
+            })
+            .collect();
+        let results = backend
+            .process_entries(
+                &tenant,
+                &id,
+                &manifest_id,
+                updates,
+                &BulkProcessingOptions::new(),
+            )
+            .await
+            .unwrap();
+        fail_point.off().await;
+
+        assert!(results.iter().all(|r| r.is_success()), "{results:?}");
+        for i in 1..=3 {
+            let versions = backend
+                .list_versions(&tenant, "Patient", &format!("upd-{i}"))
+                .await
+                .unwrap();
+            assert_eq!(versions.len(), 2, "upd-{i} has exactly versions 1 and 2");
+        }
     }
 }
 

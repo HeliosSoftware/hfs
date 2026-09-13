@@ -68,6 +68,7 @@ use mongodb::{
 use serde_json::Value;
 
 use crate::core::ResourceStorage;
+use crate::core::bulk_submit::CancelToken;
 use crate::core::{
     BulkEntryResult, BulkProcessingOptions, NdjsonEntry, SubmissionChange, SubmissionId,
 };
@@ -75,6 +76,7 @@ use crate::error::{ConcurrencyError, ResourceError, StorageError, StorageResult}
 use crate::tenant::{Operation, TenantContext};
 
 use super::MongoBackend;
+use super::retry::{Attempted, BULK_INGEST_RETRY, exhausted, or_exhausted, retry_transient_with};
 use super::storage::{
     chrono_to_bson, document_to_value, ensure_resource_identity, extract_created_at,
     extract_fhir_version, internal_error, next_version, value_to_document,
@@ -165,7 +167,9 @@ impl MongoBackend {
         let existing = self.load_existing(&db, tenant_id, entries).await?;
         let mut planned = self.plan_batch(tenant, manifest_id, entries, &existing, options)?;
 
-        let failed = self.write_resources(&db, tenant_id, &planned).await?;
+        let failed = self
+            .write_resources(&db, tenant_id, &planned, options.cancel.as_ref())
+            .await?;
         self.write_history(&db, &mut planned, &failed).await?;
         self.write_search_index(&db, tenant_id, &planned, &failed, options)
             .await?;
@@ -536,12 +540,19 @@ impl MongoBackend {
     }
 
     /// Writes the batch's `resources` rows: one `insert` for the creates, one
-    /// `update` for the updates. Returns the plans neither applied to.
+    /// `update` per update. Returns the plans neither applied to.
+    ///
+    /// Attempt 1 keeps the per-entry path's semantics: a duplicate id is the
+    /// race the pre-read could not see, and an update that matched nothing is a
+    /// version conflict. On a retry the same outcomes are ambiguous — the
+    /// earlier attempt may have landed the row before its acknowledgement was
+    /// lost — so they are settled by [`Self::confirm_landed`] instead.
     async fn write_resources(
         &self,
         db: &Database,
         tenant_id: &str,
         planned: &PlannedBatch,
+        cancel: Option<&CancelToken>,
     ) -> StorageResult<HashMap<usize, String>> {
         let mut failed = HashMap::new();
         let mut create_docs = Vec::new();
@@ -596,43 +607,59 @@ impl MongoBackend {
             for chunk in create_docs.chunks(INSERT_DOCS_PER_COMMAND) {
                 // Unordered: one duplicate id must not stop the rest of the
                 // batch, the way one failing entry did not stop the next.
-                match collection.insert_many(chunk).ordered(false).await {
-                    Ok(_) => {}
-                    Err(e) => match e.kind.as_ref() {
-                        ErrorKind::InsertMany(insert_many) => {
-                            let Some(write_errors) = insert_many.write_errors.as_ref() else {
-                                return Err(internal_error(format!(
-                                    "Failed to insert batch resources: {e}"
-                                )));
+                let Attempted { result, attempts } = retry_transient_with(
+                    &BULK_INGEST_RETRY,
+                    cancel,
+                    "insert batch resources",
+                    || async { collection.insert_many(chunk).ordered(false).await },
+                )
+                .await;
+                if let Err(e) = result {
+                    // Phase 1: attribute per document without holding `e`
+                    // across an await.
+                    let needs_confirm = {
+                        let ErrorKind::InsertMany(insert_many) = e.kind.as_ref() else {
+                            return Err(exhausted("insert batch resources", attempts, &e));
+                        };
+                        let Some(write_errors) = insert_many.write_errors.as_ref() else {
+                            return Err(exhausted("insert batch resources", attempts, &e));
+                        };
+                        let mut needs_confirm = Vec::new();
+                        for write_error in write_errors {
+                            let plan_idx = create_plans[offset + write_error.index];
+                            if write_error.code == 11000 && attempts > 1 {
+                                needs_confirm.push(plan_idx);
+                                continue;
+                            }
+                            let plan = &planned.plans[plan_idx];
+                            // A duplicate id means the row appeared between
+                            // this batch's pre-read and its insert; the
+                            // per-entry path reported the same conflict from
+                            // `create`'s existence probe.
+                            let diagnostics = if write_error.code == 11000 {
+                                already_exists(plan)
+                            } else {
+                                format!(
+                                    "Failed to insert {}/{}: {}",
+                                    plan.resource_type, plan.id, write_error.message
+                                )
                             };
-                            for write_error in write_errors {
-                                let plan_idx = create_plans[offset + write_error.index];
-                                let plan = &planned.plans[plan_idx];
-                                // A duplicate id means the row appeared between
-                                // this batch's pre-read and its insert; the
-                                // per-entry path reported the same conflict from
-                                // `create`'s existence probe.
-                                let diagnostics = if write_error.code == 11000 {
-                                    StorageError::Resource(ResourceError::AlreadyExists {
-                                        resource_type: plan.resource_type.clone(),
-                                        id: plan.id.clone(),
-                                    })
-                                    .to_string()
-                                } else {
-                                    format!(
-                                        "Failed to insert {}/{}: {}",
-                                        plan.resource_type, plan.id, write_error.message
-                                    )
-                                };
-                                failed.insert(plan_idx, diagnostics);
+                            failed.insert(plan_idx, diagnostics);
+                        }
+                        needs_confirm
+                    };
+                    // Phase 2: a duplicate on a retry is either our own earlier
+                    // attempt or a concurrent writer.
+                    if !needs_confirm.is_empty() {
+                        let landed = self
+                            .confirm_landed(db, tenant_id, planned, &needs_confirm, cancel)
+                            .await?;
+                        for plan_idx in needs_confirm {
+                            if !landed.contains(&plan_idx) {
+                                failed.insert(plan_idx, already_exists(&planned.plans[plan_idx]));
                             }
                         }
-                        _ => {
-                            return Err(internal_error(format!(
-                                "Failed to insert batch resources: {e}"
-                            )));
-                        }
-                    },
+                    }
                 }
                 offset += chunk.len();
             }
@@ -641,28 +668,38 @@ impl MongoBackend {
         if !update_ops.is_empty() {
             let collection = db.collection::<Document>(MongoBackend::RESOURCES_COLLECTION);
             let concurrency = self.bulk_write_concurrency().clamp(1, 16);
-            let applied: Vec<(usize, StorageResult<bool>)> = futures::stream::iter(update_ops)
-                .map(|(plan_idx, filter, update)| {
-                    let collection = collection.clone();
-                    async move {
-                        let outcome = collection
-                            .update_one(filter, update)
-                            .await
-                            .map(|result| result.matched_count == 1)
-                            .map_err(|e| {
-                                internal_error(format!("Failed to update batch resource: {e}"))
-                            });
-                        (plan_idx, outcome)
-                    }
-                })
-                .buffer_unordered(concurrency)
-                .collect()
-                .await;
+            let cancel_owned = cancel.cloned();
+            let applied: Vec<(usize, Attempted<mongodb::results::UpdateResult>)> =
+                futures::stream::iter(update_ops)
+                    .map(|(plan_idx, filter, update)| {
+                        let collection = collection.clone();
+                        let cancel_owned = cancel_owned.clone();
+                        async move {
+                            let attempted = retry_transient_with(
+                                &BULK_INGEST_RETRY,
+                                cancel_owned.as_ref(),
+                                "update batch resource",
+                                || {
+                                    let filter = filter.clone();
+                                    let update = update.clone();
+                                    let collection = collection.clone();
+                                    async move { collection.update_one(filter, update).await }
+                                },
+                            )
+                            .await;
+                            (plan_idx, attempted)
+                        }
+                    })
+                    .buffer_unordered(concurrency)
+                    .collect()
+                    .await;
 
-            for (plan_idx, outcome) in applied {
+            let mut needs_confirm = Vec::new();
+            for (plan_idx, Attempted { result, attempts }) in applied {
                 let plan = &planned.plans[plan_idx];
-                match outcome {
-                    Ok(true) => {}
+                match result {
+                    Ok(outcome) if outcome.matched_count == 1 => {}
+                    Ok(_) if attempts > 1 => needs_confirm.push(plan_idx),
                     // The guard matched nothing: another writer moved the row
                     // between this batch's pre-read and its write. There is no
                     // way to see that from a batched `update`'s aggregate
@@ -671,26 +708,101 @@ impl MongoBackend {
                     // write put it there — which is why each update is its own
                     // statement. They still go out `bulk_write_concurrency` at a
                     // time, and a fresh import has none of them at all.
-                    Ok(false) => {
-                        failed.insert(
-                            plan_idx,
-                            StorageError::Concurrency(ConcurrencyError::VersionConflict {
-                                resource_type: plan.resource_type.clone(),
-                                id: plan.id.clone(),
-                                expected_version: plan.base_version.clone().unwrap_or_default(),
-                                actual_version: "unknown".to_string(),
-                            })
-                            .to_string(),
-                        );
+                    Ok(_) => {
+                        failed.insert(plan_idx, version_conflict(plan));
                     }
                     Err(e) => {
-                        failed.insert(plan_idx, e.to_string());
+                        failed.insert(
+                            plan_idx,
+                            exhausted("update batch resource", attempts, &e).to_string(),
+                        );
+                    }
+                }
+            }
+            if !needs_confirm.is_empty() {
+                let landed = self
+                    .confirm_landed(db, tenant_id, planned, &needs_confirm, cancel)
+                    .await?;
+                for plan_idx in needs_confirm {
+                    if !landed.contains(&plan_idx) {
+                        failed.insert(plan_idx, version_conflict(&planned.plans[plan_idx]));
                     }
                 }
             }
         }
 
         Ok(failed)
+    }
+
+    /// Which of `plan_idxs` the batch's own earlier attempt already wrote.
+    ///
+    /// A row counts as ours only when its version, its `last_updated` and its
+    /// content all match the plan. The timestamp is the batch's own, minted
+    /// once in `plan_batch`, so an unrelated writer's identical-content write
+    /// carries a different one — except within the same millisecond, which is
+    /// accepted: that collision at attempt 1 reports the conflict, and the
+    /// window only exists inside a retry that already needed a transient error.
+    async fn confirm_landed(
+        &self,
+        db: &Database,
+        tenant_id: &str,
+        planned: &PlannedBatch,
+        plan_idxs: &[usize],
+        cancel: Option<&CancelToken>,
+    ) -> StorageResult<HashSet<usize>> {
+        let resources = db.collection::<Document>(MongoBackend::RESOURCES_COLLECTION);
+        let mut by_type: HashMap<&str, Vec<usize>> = HashMap::new();
+        for &plan_idx in plan_idxs {
+            by_type
+                .entry(planned.plans[plan_idx].resource_type.as_str())
+                .or_default()
+                .push(plan_idx);
+        }
+
+        let mut landed = HashSet::new();
+        for (resource_type, idxs) in by_type {
+            let ids: Vec<Bson> = idxs
+                .iter()
+                .map(|&i| Bson::from(planned.plans[i].id.as_str()))
+                .collect();
+            let filter = doc! {
+                "tenant_id": tenant_id,
+                "resource_type": resource_type,
+                "id": { "$in": ids },
+            };
+            let rows: Vec<Document> = or_exhausted(
+                "confirm batch writes",
+                retry_transient_with(
+                    &BULK_INGEST_RETRY,
+                    cancel,
+                    "confirm batch writes",
+                    || async {
+                        resources
+                            .find(filter.clone())
+                            .projection(
+                                doc! { "id": 1, "version_id": 1, "last_updated": 1, "data": 1 },
+                            )
+                            .await?
+                            .try_collect()
+                            .await
+                    },
+                )
+                .await,
+            )?;
+            let by_id: HashMap<&str, &Document> = rows
+                .iter()
+                .filter_map(|row| row.get_str("id").ok().map(|id| (id, row)))
+                .collect();
+            for plan_idx in idxs {
+                let plan = &planned.plans[plan_idx];
+                if let Some(row) = by_id.get(plan.id.as_str())
+                    && row_matches_plan(row, plan)?
+                {
+                    landed.insert(plan_idx);
+                }
+            }
+        }
+        Ok(landed)
     }
 
     /// Writes one `resource_history` document per written version.
@@ -899,6 +1011,44 @@ async fn run_update_command(
     Ok(UpdateOutcome { failures })
 }
 
+/// True when `row` is exactly what `plan` meant to write: same version, the
+/// batch's own `last_updated`, and identical content.
+fn row_matches_plan(row: &Document, plan: &ResourcePlan) -> StorageResult<bool> {
+    let version_ok = row.get_str("version_id").is_ok_and(|v| v == plan.version);
+    let stamp_ok = row
+        .get_datetime("last_updated")
+        .is_ok_and(|t| *t == chrono_to_bson(plan.last_updated));
+    if !(version_ok && stamp_ok) {
+        return Ok(false);
+    }
+    let planned = value_to_document(&plan.content)?;
+    Ok(row.get_document("data").is_ok_and(|data| *data == planned))
+}
+
+/// The diagnostics an id already occupied by another row gets, whether that
+/// surfaces on attempt 1 (the pre-read missed a concurrent insert) or after a
+/// retry's duplicate key turns out not to be our own write.
+fn already_exists(plan: &ResourcePlan) -> String {
+    StorageError::Resource(ResourceError::AlreadyExists {
+        resource_type: plan.resource_type.clone(),
+        id: plan.id.clone(),
+    })
+    .to_string()
+}
+
+/// The diagnostics an update guard that matched nothing gets, whether that
+/// surfaces on attempt 1 or after a retry's unmatched guard turns out not to
+/// be our own write landing under it.
+fn version_conflict(plan: &ResourcePlan) -> String {
+    StorageError::Concurrency(ConcurrencyError::VersionConflict {
+        resource_type: plan.resource_type.clone(),
+        id: plan.id.clone(),
+        expected_version: plan.base_version.clone().unwrap_or_default(),
+        actual_version: "unknown".to_string(),
+    })
+    .to_string()
+}
+
 /// Inserts `documents` in chunked, unordered `insert` commands.
 async fn insert_documents(
     db: &Database,
@@ -920,4 +1070,68 @@ async fn insert_documents(
             .map_err(|e| internal_error(format!("{context}: {e}")))?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn plan() -> ResourcePlan {
+        let now = Utc::now();
+        ResourcePlan {
+            resource_type: "Patient".to_string(),
+            id: "p1".to_string(),
+            base_version: None,
+            version: "1".to_string(),
+            content: serde_json::json!({"resourceType": "Patient", "id": "p1", "active": true}),
+            created_at: now,
+            last_updated: now,
+            fhir_version: FhirVersion::default_enabled(),
+        }
+    }
+
+    fn row_for(plan: &ResourcePlan) -> Document {
+        doc! {
+            "id": &plan.id,
+            "version_id": &plan.version,
+            "last_updated": chrono_to_bson(plan.last_updated),
+            "data": Bson::Document(value_to_document(&plan.content).unwrap()),
+        }
+    }
+
+    #[test]
+    fn a_row_with_the_planned_version_stamp_and_content_landed() {
+        let plan = plan();
+        assert!(row_matches_plan(&row_for(&plan), &plan).unwrap());
+    }
+
+    #[test]
+    fn a_different_version_did_not_land() {
+        let plan = plan();
+        let mut row = row_for(&plan);
+        row.insert("version_id", "2");
+        assert!(!row_matches_plan(&row, &plan).unwrap());
+    }
+
+    #[test]
+    fn a_different_timestamp_is_another_writer() {
+        let plan = plan();
+        let mut row = row_for(&plan);
+        row.insert(
+            "last_updated",
+            chrono_to_bson(plan.last_updated + chrono::Duration::milliseconds(1)),
+        );
+        assert!(!row_matches_plan(&row, &plan).unwrap());
+    }
+
+    #[test]
+    fn different_content_is_another_writer() {
+        let plan = plan();
+        let mut row = row_for(&plan);
+        row.insert(
+            "data",
+            Bson::Document(doc! {"resourceType": "Patient", "id": "p1", "active": false}),
+        );
+        assert!(!row_matches_plan(&row, &plan).unwrap());
+    }
 }
