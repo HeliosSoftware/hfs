@@ -93,7 +93,7 @@ bulk-submit worker makes per manifest file, against local NDJSON on a fresh
 database. Useful flags: `--limit` (resources per file), `--batch`, `--defer-index`
 (the `HFS_BULK_SUBMIT_DEFER_INDEXING` path), `--reindex` (then run the
 post-manifest rebuild the worker's hook fires, timed and phased on its own —
-`reindex_fetch_page` / `reindex_write_page` plus the shared `extract`,
+`reindex_fetch` / `reindex_page (total)` plus the shared `extract`,
 `search_index_insert`, `fts`, `commit`), `--reindex-batch`,
 `--bulk-index-rebuild` (the `HFS_BULK_SUBMIT_BULK_INDEX_REBUILD` mode),
 `--no-phases`, `--keep` (leave the database for `dbstat`), `--data-dir`.

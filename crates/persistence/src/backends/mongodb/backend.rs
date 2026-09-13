@@ -738,13 +738,22 @@ impl MongoBackend {
     /// value, so `:missing` there would answer from an empty index rather
     /// than a real absence check.
     ///
-    /// One known-imprecise case, not fixed here: `matching_resource_ids`
-    /// skips `_id`/`_lastUpdated` by name and never evaluates their modifiers
-    /// at all, but this function is keyed on parameter type only, so the
-    /// common-param loop in `resource_search_capabilities` will still
-    /// advertise `:missing` on `_lastUpdated` (and `:not`/`:missing` on
-    /// `_id`, via its Token fallback type) even though the Mongo index path
-    /// silently ignores those modifiers there.
+    /// `_id` and `_lastUpdated` take a different route and are no longer
+    /// imprecise here (#1055). `matching_resource_ids` skips them by name and
+    /// hands them to `build_resource_id_condition` /
+    /// `build_resource_last_updated_conditions`, which now honour the
+    /// modifiers this function advertises for them: `:not` and `:missing` on
+    /// `_id`, `:missing` on `_lastUpdated`. Anything else on those two names
+    /// is rejected with `UnsupportedModifier` rather than silently degrading
+    /// to a positive match — which is what `_id:not` used to do, returning
+    /// exactly the resource the caller asked to exclude.
+    ///
+    /// One residual imprecision: this function is keyed on parameter *type*,
+    /// so the Token arm advertises `text`/`code-text` for every token param
+    /// including `_id` (via its Token fallback), while
+    /// `validate_query_support` now rejects `_id:text`. Advertised-but-
+    /// rejected is a visible 400 rather than the old silent wrong answer;
+    /// narrowing it would need a name-aware capability path.
     ///
     /// Still unimplemented and therefore still unadvertised: `:above`/
     /// `:below`/`:in`/`:not-in` (rejected outright by `validate_query_support`

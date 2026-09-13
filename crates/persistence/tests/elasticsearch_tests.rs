@@ -646,6 +646,9 @@ mod parameter_handler_tests {
 #[path = "search/date_boundary_suite.rs"]
 mod date_boundary_suite;
 
+#[path = "common/container_cleanup.rs"]
+mod container_cleanup;
+
 #[cfg(test)]
 mod es_integration {
     use std::path::PathBuf;
@@ -706,13 +709,17 @@ mod es_integration {
         let run_id = std::env::var("GITHUB_RUN_ID").unwrap_or_default();
         let mut last_err = None;
         for attempt in 1..=ES_START_ATTEMPTS {
-            match ElasticSearch::default()
-                .with_tag(ES_IMAGE_TAG)
-                .with_env_var("ES_JAVA_OPTS", "-Xms256m -Xmx256m")
-                .with_label("github.run_id", &run_id)
-                .with_startup_timeout(ES_STARTUP_TIMEOUT)
-                .start()
-                .await
+            // `SHARED_ES` is a static and never dropped; the cleanup label
+            // lets the exit hook remove the container.
+            match super::container_cleanup::with_cleanup_label(
+                ElasticSearch::default()
+                    .with_tag(ES_IMAGE_TAG)
+                    .with_env_var("ES_JAVA_OPTS", "-Xms256m -Xmx256m")
+                    .with_label("github.run_id", &run_id)
+                    .with_startup_timeout(ES_STARTUP_TIMEOUT),
+            )
+            .start()
+            .await
             {
                 Ok(container) => return container,
                 Err(err) => {

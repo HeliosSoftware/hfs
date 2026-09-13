@@ -3792,7 +3792,6 @@ impl ReindexSource for SqliteBackend {
         cursor: Option<&str>,
         limit: u32,
     ) -> StorageResult<ResourcePage> {
-        let _fetch_span = crate::perf::span(crate::perf::Phase::ReindexFetch);
         let conn = self.get_connection()?;
         let tenant_id = tenant.tenant_id().as_str().to_string();
 

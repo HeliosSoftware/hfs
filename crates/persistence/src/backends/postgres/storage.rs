@@ -1348,7 +1348,10 @@ impl PostgresBackend {
     /// instance is serving: the table is created by `initialize_schema` and
     /// only migrations touch it, both of which run at startup under an advisory
     /// lock before any request is accepted.
-    async fn fts_table_exists(&self, client: &deadpool_postgres::Client) -> StorageResult<bool> {
+    async fn fts_table_exists<C>(&self, client: &C) -> StorageResult<bool>
+    where
+        C: deadpool_postgres::GenericClient + ?Sized,
+    {
         if let Some(known) = self.fts_table_exists.get() {
             return Ok(*known);
         }
@@ -1430,14 +1433,17 @@ impl PostgresBackend {
     /// deliberately: the fix adds a `to_tsvector` per bundle entry, which is
     /// cost on the import path, and it belongs with a decision about the
     /// paragraph above rather than inside a performance change.
-    async fn index_fts_content(
+    async fn index_fts_content<C>(
         &self,
-        client: &deadpool_postgres::Client,
+        client: &C,
         tenant_id: &str,
         resource_type: &str,
         resource_id: &str,
         resource: &Value,
-    ) -> StorageResult<()> {
+    ) -> StorageResult<()>
+    where
+        C: deadpool_postgres::GenericClient + ?Sized,
+    {
         if !self.fts_table_exists(client).await? {
             return Ok(());
         }
@@ -1450,12 +1456,13 @@ impl PostgresBackend {
             // `resourceType`, so this is unreachable in practice, but if a
             // rewrite ever did empty a resource out, the previous row has to go
             // rather than survive as a stale match.
-            let _ = execute_cached(
-                    client,
-                    "DELETE FROM resource_fts WHERE tenant_id = $1 AND resource_type = $2 AND resource_id = $3",
-                    &[&tenant_id, &resource_type, &resource_id],
-                )
-                .await;
+            execute_cached(
+                client,
+                "DELETE FROM resource_fts WHERE tenant_id = $1 AND resource_type = $2 AND resource_id = $3",
+                &[&tenant_id, &resource_type, &resource_id],
+            )
+            .await
+            .map_err(|e| internal_error(format!("Failed to delete empty FTS index: {}", e)))?;
             return Ok(());
         }
 
@@ -1494,10 +1501,13 @@ impl PostgresBackend {
         // error surfaced as a 500 and the whole `POST` failed, so an entirely
         // valid resource could not be created at all.
         //
-        // Retry once against a truncated input instead. Nothing here runs
-        // inside an explicit transaction — the bundle path
-        // (`PostgresTransaction`) does not write `resource_fts` at all — so the
-        // failed statement leaves the session usable.
+        // Retry once against a truncated input instead. Ordinary resource
+        // writes run without an explicit transaction, so their session remains
+        // usable. A batched reindex calls this inside its managed page
+        // transaction; PostgreSQL aborts that transaction after this error, so
+        // the retry fails and the page writer rolls back and repeats each
+        // resource through the ordinary path. The bundle path
+        // (`PostgresTransaction`) does not write `resource_fts` at all.
         if err.code() != Some(&tokio_postgres::error::SqlState::PROGRAM_LIMIT_EXCEEDED) {
             return Err(internal_error(format!(
                 "Failed to insert FTS content: {}",
@@ -1577,14 +1587,34 @@ impl PostgresBackend {
             .map_err(|e| internal_error(format!("Failed to delete search index: {}", e)))?;
 
         // The full-text row goes with them.
-        let _ = execute_cached(
-                client,
-                "DELETE FROM resource_fts WHERE tenant_id = $1 AND resource_type = $2 AND resource_id = $3",
-                &[&tenant_id, &resource_type, &resource_id],
-            )
-            .await;
+        execute_cached(
+            client,
+            "DELETE FROM resource_fts WHERE tenant_id = $1 AND resource_type = $2 AND resource_id = $3",
+            &[&tenant_id, &resource_type, &resource_id],
+        )
+        .await
+        .map_err(|e| internal_error(format!("Failed to delete FTS index: {}", e)))?;
 
         Ok(deleted)
+    }
+
+    async fn write_reindex_page_individually(
+        &self,
+        tenant: &TenantContext,
+        resources: &[StoredResource],
+    ) -> Vec<StorageResult<usize>> {
+        let _fallback_span = crate::perf::span(crate::perf::Phase::ReindexFallback);
+        let mut results = Vec::with_capacity(resources.len());
+        for resource in resources {
+            match self
+                .delete_search_entries(tenant, resource.resource_type(), resource.id())
+                .await
+            {
+                Ok(_) => results.push(self.write_search_entries(tenant, resource).await),
+                Err(error) => results.push(Err(error)),
+            }
+        }
+        results
     }
 }
 
@@ -3687,26 +3717,246 @@ impl ReindexTarget for PostgresBackend {
         Ok(count)
     }
 
-    async fn clear_search_index(&self, tenant: &TenantContext) -> StorageResult<u64> {
-        let client = self.get_client().await?;
-        let tenant_id = tenant.tenant_id().as_str();
+    async fn write_search_entries_page(
+        &self,
+        tenant: &TenantContext,
+        resources: &[StoredResource],
+    ) -> Vec<StorageResult<usize>> {
+        if resources.is_empty() {
+            return Vec::new();
+        }
+        let _page_span = crate::perf::span(crate::perf::Phase::ReindexPage);
 
-        let deleted = client
+        // Composite deployments historically run the PostgreSQL per-resource
+        // writer even when reads are offloaded. Keep that behavior outside the
+        // new batched path so this optimization does not change pg-es.
+        if self.is_search_offloaded() {
+            return self
+                .write_reindex_page_individually(tenant, resources)
+                .await;
+        }
+
+        let tenant_id = tenant.tenant_id().as_str();
+        let mut rows_by_resource = Vec::with_capacity(resources.len());
+        let mut extraction_errors = Vec::with_capacity(resources.len());
+
+        let extraction_span = crate::perf::span(crate::perf::Phase::ReindexExtract);
+        for resource in resources {
+            let resource_type = resource.resource_type();
+            let resource_id = resource.id();
+            let content = resource.content();
+            match self
+                .tenant_extractor(tenant_id)
+                .extract(content, resource_type)
+            {
+                Ok(values) => {
+                    let mut rows = PostgresSearchIndexWriter::build_rows(
+                        resource_type,
+                        resource_id,
+                        resource.last_modified(),
+                        self.index_layout(),
+                        values,
+                    );
+                    rows.extend(self.contained_index_rows(
+                        tenant_id,
+                        resource_type,
+                        resource_id,
+                        content,
+                    ));
+                    rows_by_resource.push(rows);
+                    extraction_errors.push(None);
+                }
+                Err(error) => {
+                    rows_by_resource.push(Vec::new());
+                    extraction_errors.push(Some(internal_error(format!(
+                        "Search parameter extraction failed: {}",
+                        error
+                    ))));
+                }
+            }
+        }
+        drop(extraction_span);
+
+        let resource_types: Vec<&str> = resources
+            .iter()
+            .map(StoredResource::resource_type)
+            .collect();
+        let resource_ids: Vec<&str> = resources.iter().map(StoredResource::id).collect();
+
+        let connection_span = crate::perf::span(crate::perf::Phase::ReindexConnection);
+        let connection = self.get_client().await;
+        drop(connection_span);
+        let mut client = match connection {
+            Ok(client) => client,
+            Err(error) => {
+                tracing::warn!(
+                    "Failed to acquire a connection for batched PostgreSQL reindex; retrying the page per resource: {error}"
+                );
+                return self
+                    .write_reindex_page_individually(tenant, resources)
+                    .await;
+            }
+        };
+
+        let transaction_result = client.transaction().await;
+        if let Err(error) = &transaction_result {
+            let error = error.to_string();
+            drop(transaction_result);
+            drop(client);
+            tracing::warn!(
+                "Failed to begin batched PostgreSQL reindex; retrying the page per resource: {error}"
+            );
+            return self
+                .write_reindex_page_individually(tenant, resources)
+                .await;
+        }
+        let transaction = transaction_result.expect("transaction error handled above");
+
+        let batch_result: StorageResult<()> = async {
+            let search_delete_span = crate::perf::span(crate::perf::Phase::ReindexSearchDelete);
+            let deleted = execute_cached(
+                &transaction,
+                "DELETE FROM search_index
+                 WHERE tenant_id = $1
+                   AND (resource_type, resource_id) IN (
+                       SELECT * FROM unnest($2::text[], $3::text[])
+                   )",
+                &[&tenant_id, &resource_types, &resource_ids],
+            )
+            .await;
+            drop(search_delete_span);
+            deleted.map_err(|e| {
+                internal_error(format!("Failed to delete search index page: {}", e))
+            })?;
+
+            let fts_delete_span = crate::perf::span(crate::perf::Phase::ReindexFtsDelete);
+            let deleted = execute_cached(
+                &transaction,
+                "DELETE FROM resource_fts
+                 WHERE tenant_id = $1
+                   AND (resource_type, resource_id) IN (
+                       SELECT * FROM unnest($2::text[], $3::text[])
+                   )",
+                &[&tenant_id, &resource_types, &resource_ids],
+            )
+            .await;
+            drop(fts_delete_span);
+            deleted
+                .map_err(|e| internal_error(format!("Failed to delete FTS index page: {}", e)))?;
+
+            let valid_batches: Vec<(&str, &str, &[IndexRow])> = resources
+                .iter()
+                .zip(&rows_by_resource)
+                .zip(&extraction_errors)
+                .filter_map(|((resource, rows), error)| {
+                    error.is_none().then_some((
+                        resource.resource_type(),
+                        resource.id(),
+                        rows.as_slice(),
+                    ))
+                })
+                .collect();
+            let search_insert_span = crate::perf::span(crate::perf::Phase::ReindexSearchInsert);
+            let inserted = PostgresSearchIndexWriter::insert_rows_multi(
+                &transaction,
+                tenant_id,
+                &valid_batches,
+            )
+            .await;
+            drop(search_insert_span);
+            inserted?;
+            crate::perf::add_rows(
+                crate::perf::Phase::ReindexSearchInsert,
+                valid_batches
+                    .iter()
+                    .map(|(_, _, rows)| rows.len() as u64)
+                    .sum(),
+            );
+
+            let fts_span = crate::perf::span(crate::perf::Phase::ReindexFts);
+            for (resource, error) in resources.iter().zip(&extraction_errors) {
+                if error.is_none() {
+                    self.index_fts_content(
+                        &transaction,
+                        tenant_id,
+                        resource.resource_type(),
+                        resource.id(),
+                        resource.content(),
+                    )
+                    .await?;
+                }
+            }
+            drop(fts_span);
+            Ok(())
+        }
+        .await;
+
+        if let Err(error) = batch_result {
+            // Dropping the managed transaction schedules a rollback. Drop the
+            // pooled client too, so a one-connection pool can service the
+            // per-resource fallback. Protocol ordering makes the rollback run
+            // before the next borrower can issue a query.
+            tracing::warn!(
+                "Batched PostgreSQL reindex failed; retrying the page per resource: {error}"
+            );
+            drop(transaction);
+            drop(client);
+            return self
+                .write_reindex_page_individually(tenant, resources)
+                .await;
+        }
+
+        let commit_span = crate::perf::span(crate::perf::Phase::ReindexCommit);
+        let committed = transaction.commit().await;
+        drop(commit_span);
+        drop(client);
+        if let Err(error) = committed {
+            // Commit consumes the transaction, so its result can be uncertain.
+            // The fallback remains idempotent because it deletes every
+            // resource's rows before writing them again.
+            tracing::warn!(
+                "Failed to commit batched PostgreSQL reindex; retrying the page per resource: {error}"
+            );
+            return self
+                .write_reindex_page_individually(tenant, resources)
+                .await;
+        }
+
+        rows_by_resource
+            .into_iter()
+            .zip(extraction_errors)
+            .map(|(rows, error)| match error {
+                Some(error) => Err(error),
+                None => Ok(rows.len()),
+            })
+            .collect()
+    }
+
+    async fn clear_search_index(&self, tenant: &TenantContext) -> StorageResult<u64> {
+        let mut client = self.get_client().await?;
+        let tenant_id = tenant.tenant_id().as_str();
+        let transaction = client
+            .transaction()
+            .await
+            .or_query_error("Failed to begin clearing search index")?;
+        let deleted = transaction
             .execute(
                 "DELETE FROM search_index WHERE tenant_id = $1",
                 &[&tenant_id],
             )
             .await
             .or_query_error("Failed to clear search index")?;
-
-        // Also clear FTS entries
-        let _ = client
+        transaction
             .execute(
                 "DELETE FROM resource_fts WHERE tenant_id = $1",
                 &[&tenant_id],
             )
-            .await;
-
+            .await
+            .or_query_error("Failed to clear FTS index")?;
+        transaction
+            .commit()
+            .await
+            .or_query_error("Failed to commit clearing search index")?;
         Ok(deleted)
     }
 }

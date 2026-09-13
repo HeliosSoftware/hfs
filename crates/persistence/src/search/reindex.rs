@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use parking_lot::RwLock;
@@ -885,6 +885,7 @@ async fn run_reindex(
     jobs: Arc<RwLock<HashMap<String, ReindexProgress>>>,
     mut cancel_rx: mpsc::Receiver<()>,
 ) {
+    let perf_run = crate::perf::enabled().then(|| (Instant::now(), crate::perf::snapshot()));
     // The writers extract with their own tenant registries; the driver no
     // longer runs a second extraction just to count entries — the per-page
     // outcomes report what was actually written.
@@ -1002,15 +1003,17 @@ async fn run_reindex(
                 }
 
                 // Fetch a page of resources
-                let page = match source
+                let fetch_span = crate::perf::span(crate::perf::Phase::ReindexFetch);
+                let fetched = source
                     .fetch_resources_page(
                         &tenant,
                         resource_type,
                         cursor.as_deref(),
                         request.batch_size,
                     )
-                    .await
-                {
+                    .await;
+                drop(fetch_span);
+                let page = match fetched {
                     Ok(page) => page,
                     Err(e) => {
                         return Err(RunExit::Failed(format!("Failed to fetch resources: {e}")));
@@ -1084,6 +1087,25 @@ async fn run_reindex(
         Err(RunExit::Cancelled) => return mark_cancelled(&jobs, &job_id),
         Err(RunExit::Failed(msg)) => return mark_failed(&jobs, &job_id, msg),
         Ok(()) => {}
+    }
+
+    if let Some((started, before)) = perf_run {
+        let processed = jobs
+            .read()
+            .get(&job_id)
+            .map(|progress| progress.processed_resources)
+            .unwrap_or(0);
+        let report =
+            crate::perf::report_since(&before, processed, started.elapsed()).replace('\n', " | ");
+        tracing::info!(
+            target: "hfs_perf",
+            job_id = %job_id,
+            resources = processed,
+            process_global = true,
+            single_job_required = true,
+            phases = %report,
+            "reindex phase summary"
+        );
     }
 
     // Mark as completed

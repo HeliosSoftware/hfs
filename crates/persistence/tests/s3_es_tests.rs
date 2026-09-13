@@ -45,6 +45,12 @@ use testcontainers_modules::elastic_search::ElasticSearch;
 use tokio::sync::OnceCell;
 use uuid::Uuid;
 
+// `SHARED_MINIO` / `SHARED_ES` are statics and never dropped; containers
+// labeled via `with_cleanup_label` are removed by an exit hook instead.
+#[path = "common/container_cleanup.rs"]
+mod container_cleanup;
+use container_cleanup::with_cleanup_label;
+
 // ============================================================================
 // Container setup
 // ============================================================================
@@ -94,15 +100,17 @@ async fn shared_minio() -> &'static SharedMinio {
             let root_password = std::env::var("MINIO_ROOT_PASSWORD")
                 .unwrap_or_else(|_| DEFAULT_MINIO_ROOT_PASSWORD.to_string());
 
-            let container = GenericImage::new(image, tag)
-                .with_wait_for(WaitFor::message_on_stderr("API:"))
-                .with_exposed_port(9000.tcp())
-                .with_env_var("MINIO_ROOT_USER", root_user.clone())
-                .with_env_var("MINIO_ROOT_PASSWORD", root_password.clone())
-                .with_cmd(["server", "/data", "--console-address", ":9001"])
-                .start()
-                .await
-                .expect("failed to start MinIO container");
+            let container = with_cleanup_label(
+                GenericImage::new(image, tag)
+                    .with_wait_for(WaitFor::message_on_stderr("API:"))
+                    .with_exposed_port(9000.tcp())
+                    .with_env_var("MINIO_ROOT_USER", root_user.clone())
+                    .with_env_var("MINIO_ROOT_PASSWORD", root_password.clone())
+                    .with_cmd(["server", "/data", "--console-address", ":9001"]),
+            )
+            .start()
+            .await
+            .expect("failed to start MinIO container");
 
             let host = container
                 .get_host()
@@ -159,13 +167,15 @@ async fn start_es_container() -> testcontainers::ContainerAsync<ElasticSearch> {
     let run_id = std::env::var("GITHUB_RUN_ID").unwrap_or_default();
     let mut last_err = None;
     for attempt in 1..=ES_START_ATTEMPTS {
-        match ElasticSearch::default()
-            .with_tag(ES_IMAGE_TAG)
-            .with_env_var("ES_JAVA_OPTS", "-Xms256m -Xmx256m")
-            .with_label("github.run_id", &run_id)
-            .with_startup_timeout(ES_STARTUP_TIMEOUT)
-            .start()
-            .await
+        match with_cleanup_label(
+            ElasticSearch::default()
+                .with_tag(ES_IMAGE_TAG)
+                .with_env_var("ES_JAVA_OPTS", "-Xms256m -Xmx256m")
+                .with_label("github.run_id", &run_id)
+                .with_startup_timeout(ES_STARTUP_TIMEOUT),
+        )
+        .start()
+        .await
         {
             Ok(container) => return container,
             Err(err) => {

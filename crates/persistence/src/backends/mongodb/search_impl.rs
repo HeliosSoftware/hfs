@@ -711,6 +711,34 @@ impl MongoBackend {
                     param_type: param.param_type.to_string(),
                 }));
             }
+
+            // `_id`/`_lastUpdated` are lowered outside the generic modifier
+            // dispatch (see `build_resource_id_condition` /
+            // `build_resource_last_updated_conditions`), which only knows
+            // how to honour a narrow set of modifiers on them. Reject
+            // anything else explicitly here rather than letting it fall
+            // through to a builder that would silently misinterpret it
+            // (#1055).
+            let metadata_param_honoured = match param.name.as_str() {
+                "_id" => matches!(
+                    param.modifier,
+                    None | Some(SearchModifier::Not) | Some(SearchModifier::Missing)
+                ),
+                "_lastUpdated" => {
+                    matches!(param.modifier, None | Some(SearchModifier::Missing))
+                }
+                _ => true,
+            };
+            if !metadata_param_honoured {
+                return Err(StorageError::Search(SearchError::UnsupportedModifier {
+                    modifier: param
+                        .modifier
+                        .as_ref()
+                        .map(ToString::to_string)
+                        .unwrap_or_default(),
+                    param_type: param.param_type.to_string(),
+                }));
+            }
         }
 
         Ok(())
@@ -1496,8 +1524,34 @@ impl MongoBackend {
     }
 
     fn build_resource_id_condition(&self, param: &SearchParameter) -> StorageResult<Document> {
-        let mut ids = Vec::new();
+        // `:missing` is a presence test on `id`, not a value to compare
+        // against it — resolved before the values loop so the boolean
+        // literal ("true"/"false") is never consumed as an id (#1055).
+        if matches!(param.modifier, Some(SearchModifier::Missing)) {
+            let wants_missing = param
+                .values
+                .first()
+                .map(|v| v.value == "true")
+                .unwrap_or(false);
+            return Ok(if wants_missing {
+                doc! { "id": Bson::Null }
+            } else {
+                doc! { "id": { "$ne": Bson::Null } }
+            });
+        }
 
+        let negated = match &param.modifier {
+            None => false,
+            Some(SearchModifier::Not) => true,
+            Some(other) => {
+                return Err(StorageError::Search(SearchError::UnsupportedModifier {
+                    modifier: other.to_string(),
+                    param_type: param.param_type.to_string(),
+                }));
+            }
+        };
+
+        let mut ids = Vec::new();
         for value in &param.values {
             if value.prefix != SearchPrefix::Eq {
                 return Err(StorageError::Search(SearchError::QueryParseError {
@@ -1507,12 +1561,15 @@ impl MongoBackend {
             ids.push(value.value.clone());
         }
 
-        if ids.len() == 1 {
-            return Ok(doc! { "id": ids.remove(0) });
-        }
-
-        Ok(doc! {
-            "id": { "$in": Bson::Array(ids.into_iter().map(Bson::String).collect()) }
+        Ok(match (ids.len(), negated) {
+            (1, false) => doc! { "id": ids.remove(0) },
+            (1, true) => doc! { "id": { "$ne": ids.remove(0) } },
+            (_, false) => doc! {
+                "id": { "$in": Bson::Array(ids.into_iter().map(Bson::String).collect()) }
+            },
+            (_, true) => doc! {
+                "id": { "$nin": Bson::Array(ids.into_iter().map(Bson::String).collect()) }
+            },
         })
     }
 
@@ -1520,25 +1577,51 @@ impl MongoBackend {
         &self,
         param: &SearchParameter,
     ) -> StorageResult<Vec<Document>> {
-        let mut conditions = param
-            .values
-            .iter()
-            .map(|value| self.build_date_filter(value, "last_updated"))
-            .collect::<StorageResult<Vec<_>>>()?;
+        match &param.modifier {
+            None => {
+                let mut conditions = param
+                    .values
+                    .iter()
+                    .map(|value| self.build_date_filter(value, "last_updated"))
+                    .collect::<StorageResult<Vec<_>>>()?;
 
-        // #1062: comma-separated `_lastUpdated` values are OR, the same
-        // defect and fix as `build_search_index_filter` above (see the
-        // comment there). Returning a single combined document — instead of
-        // one document per value — keeps `build_resource_filter` unchanged:
-        // it still `extend`s whatever comes back into the top-level `$and`,
-        // so two *separate* `_lastUpdated` parameters (the repeated form)
-        // still AND.
-        if conditions.len() <= 1 {
-            return Ok(conditions);
+                // #1062: comma-separated `_lastUpdated` values are OR, the
+                // same defect and fix as `build_search_index_filter` above
+                // (see the comment there). Returning a single combined
+                // document - instead of one document per value - keeps
+                // `build_resource_filter` unchanged: it still `extend`s
+                // whatever comes back into the top-level `$and`, so two
+                // *separate* `_lastUpdated` parameters (the repeated form)
+                // still AND.
+                if conditions.len() <= 1 {
+                    return Ok(conditions);
+                }
+                Ok(vec![doc! {
+                    "$or": Bson::Array(conditions.drain(..).map(Bson::Document).collect()),
+                }])
+            }
+            // Presence test on `last_updated`, mirroring `_id:missing` above.
+            // Every live resource carries a `last_updated`, so `:missing=true`
+            // is trivially empty and `:missing=false` trivially everything -
+            // but the boolean literal must never reach `build_date_filter`
+            // (#1055: it previously 400'd there as an unparseable date).
+            Some(SearchModifier::Missing) => {
+                let wants_missing = param
+                    .values
+                    .first()
+                    .map(|v| v.value == "true")
+                    .unwrap_or(false);
+                Ok(vec![if wants_missing {
+                    doc! { "last_updated": Bson::Null }
+                } else {
+                    doc! { "last_updated": { "$ne": Bson::Null } }
+                }])
+            }
+            Some(other) => Err(StorageError::Search(SearchError::UnsupportedModifier {
+                modifier: other.to_string(),
+                param_type: param.param_type.to_string(),
+            })),
         }
-        Ok(vec![doc! {
-            "$or": Bson::Array(conditions.drain(..).map(Bson::Document).collect()),
-        }])
     }
 
     fn build_cursor_condition(&self, cursor: &PageCursor) -> StorageResult<Document> {
@@ -2436,5 +2519,188 @@ mod value_list_tests {
                 "a single-value condition stays flat, not wrapped in $or"
             );
         }
+    }
+}
+
+/// #1055: `_id`/`_lastUpdated` are lowered outside the generic modifier
+/// dispatch (`matching_resource_ids` skips them and hands them to
+/// `build_resource_id_condition` / `build_resource_last_updated_conditions`
+/// instead), so these two builders must honour `param.modifier` themselves.
+/// Pinned at the filter-shape level, without a live MongoDB, because the
+/// integration test cannot fully discriminate `_id:missing=true` (an
+/// accidental pass either way — see the sibling integration test).
+#[cfg(test)]
+mod metadata_param_modifier_tests {
+    use super::*;
+    use crate::backends::mongodb::MongoBackendConfig;
+
+    fn backend() -> MongoBackend {
+        MongoBackend::new(MongoBackendConfig::default()).unwrap()
+    }
+
+    fn id_param(modifier: Option<SearchModifier>, values: &[&str]) -> SearchParameter {
+        SearchParameter {
+            name: "_id".to_string(),
+            param_type: SearchParamType::Token,
+            modifier,
+            values: values.iter().map(|v| SearchValue::eq(*v)).collect(),
+            chain: vec![],
+            components: vec![],
+        }
+    }
+
+    fn last_updated_param(modifier: Option<SearchModifier>, value: &str) -> SearchParameter {
+        SearchParameter {
+            name: "_lastUpdated".to_string(),
+            param_type: SearchParamType::Date,
+            modifier,
+            values: vec![SearchValue::eq(value)],
+            chain: vec![],
+            components: vec![],
+        }
+    }
+
+    /// The metadata-param condition alone: `build_resource_filter`'s first
+    /// `$and` arm is always the tenant/resource_type/is_deleted seed, so with
+    /// a single parameter and no matched-id set the second arm is the
+    /// condition under test.
+    fn condition(backend: &MongoBackend, param: SearchParameter) -> Document {
+        let query = SearchQuery::new("Patient").with_parameter(param);
+        let filter = backend
+            .build_resource_filter("t", "Patient", &query, None, None)
+            .expect("filter should build");
+        filter.get_array("$and").expect("$and array")[1]
+            .as_document()
+            .expect("condition document")
+            .clone()
+    }
+
+    #[test]
+    fn plain_id_match_is_unchanged() {
+        let backend = backend();
+        let cond = condition(&backend, id_param(None, &["pat-a"]));
+        assert_eq!(cond.get_str("id").unwrap(), "pat-a");
+    }
+
+    #[test]
+    fn id_not_negates_instead_of_matching() {
+        let backend = backend();
+
+        let single = condition(&backend, id_param(Some(SearchModifier::Not), &["pat-a"]));
+        assert_eq!(
+            single.get_document("id").unwrap().get_str("$ne").unwrap(),
+            "pat-a"
+        );
+
+        let multi = condition(
+            &backend,
+            id_param(Some(SearchModifier::Not), &["pat-a", "pat-b"]),
+        );
+        let nin = multi.get_document("id").unwrap().get_array("$nin").unwrap();
+        let values: Vec<&str> = nin.iter().map(|b| b.as_str().unwrap()).collect();
+        assert_eq!(values, vec!["pat-a", "pat-b"]);
+    }
+
+    #[test]
+    fn id_missing_is_a_presence_test_on_the_id_field() {
+        let backend = backend();
+
+        let missing_true = condition(&backend, id_param(Some(SearchModifier::Missing), &["true"]));
+        assert!(matches!(missing_true.get("id"), Some(Bson::Null)));
+
+        let missing_false = condition(
+            &backend,
+            id_param(Some(SearchModifier::Missing), &["false"]),
+        );
+        assert!(matches!(
+            missing_false.get_document("id").unwrap().get("$ne"),
+            Some(Bson::Null)
+        ));
+    }
+
+    /// Control for #519: the refactor of `build_resource_last_updated_conditions`
+    /// into a modifier match must leave the no-modifier (period-comparison) arm
+    /// byte-identical.
+    #[test]
+    fn last_updated_no_modifier_control_still_builds_a_date_range() {
+        let backend = backend();
+        let cond = condition(&backend, last_updated_param(None, "2024"));
+        let bounds = cond.get_document("last_updated").expect("field doc");
+        assert!(bounds.get_datetime("$gte").is_ok());
+        assert!(bounds.get_datetime("$lt").is_ok());
+    }
+
+    #[test]
+    fn last_updated_missing_does_not_parse_the_boolean_as_a_date() {
+        let backend = backend();
+
+        let missing_true = condition(
+            &backend,
+            last_updated_param(Some(SearchModifier::Missing), "true"),
+        );
+        assert!(matches!(missing_true.get("last_updated"), Some(Bson::Null)));
+
+        let missing_false = condition(
+            &backend,
+            last_updated_param(Some(SearchModifier::Missing), "false"),
+        );
+        assert!(matches!(
+            missing_false
+                .get_document("last_updated")
+                .unwrap()
+                .get("$ne"),
+            Some(Bson::Null)
+        ));
+    }
+
+    #[test]
+    fn unhonoured_modifiers_on_metadata_params_are_rejected() {
+        let backend = backend();
+
+        let id_text = SearchQuery::new("Patient")
+            .with_parameter(id_param(Some(SearchModifier::Text), &["abc"]));
+        let err = backend.validate_query_support(&id_text).unwrap_err();
+        assert!(matches!(
+            err,
+            StorageError::Search(SearchError::UnsupportedModifier { ref modifier, .. })
+                if modifier == "text"
+        ));
+
+        let last_updated_not = SearchQuery::new("Patient")
+            .with_parameter(last_updated_param(Some(SearchModifier::Not), "2024"));
+        let err = backend
+            .validate_query_support(&last_updated_not)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            StorageError::Search(SearchError::UnsupportedModifier { ref modifier, .. })
+                if modifier == "not"
+        ));
+
+        // The three honoured combinations must not be rejected.
+        assert!(
+            backend
+                .validate_query_support(
+                    &SearchQuery::new("Patient")
+                        .with_parameter(id_param(Some(SearchModifier::Not), &["pat-a"]))
+                )
+                .is_ok()
+        );
+        assert!(
+            backend
+                .validate_query_support(
+                    &SearchQuery::new("Patient")
+                        .with_parameter(id_param(Some(SearchModifier::Missing), &["true"]))
+                )
+                .is_ok()
+        );
+        assert!(
+            backend
+                .validate_query_support(
+                    &SearchQuery::new("Patient")
+                        .with_parameter(last_updated_param(Some(SearchModifier::Missing), "true"))
+                )
+                .is_ok()
+        );
     }
 }
