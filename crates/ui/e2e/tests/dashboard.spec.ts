@@ -1,7 +1,7 @@
-import type { Page, Response } from "@playwright/test";
+import type { APIRequestContext, Page, Response } from "@playwright/test";
 import { test, expect } from "../pages/fixtures";
 import { createResource } from "../pages/api";
-import { parseFirstRender, type FirstRender } from "../pages/dashboard";
+import { parseFirstRender, type DashboardPage, type FirstRender } from "../pages/dashboard";
 
 // The landing dashboard (/ui) and its functional chart (#555): the type
 // picker and the window selector are plain links (they work without JS —
@@ -350,8 +350,9 @@ test.describe("first view of a window (#1078)", () => {
     // scope here), so let that retry settle first — it is not a reload loop,
     // and a ready render has none to settle. A ready page's periodic refresh
     // (`data-dash-refresh`) is deliberately not waited on: it may poll for as
-    // long as the figures stay approximate, it follows the picker's URL, and
-    // it skips its tick while the picker is open (covered below).
+    // long as the figures stay approximate, it follows the picker's URL, it
+    // stands down while a picker fetch is in flight, and it keeps the open
+    // picker's own node (covered below).
     await expect(dashboard.pendingAutoRetry).toHaveCount(0, { timeout: 15_000 });
     await dashboard.openPicker();
     const option = dashboard.pickerOption("Encounter");
@@ -410,25 +411,31 @@ test.describe("first view of a window (#1078)", () => {
 
 // #1078 follow-up: a ready dashboard whose figures are approximate (counted
 // from recent writes, not yet reconciled with storage) — or with an import
-// running — re-requests its own #dash-live region every 10s, so an operator
-// watching an import sees the figures rise without reloading. The poll skips a
-// tick while the user is in the middle of something inside the region (an open
-// picker or data table, keyboard focus, the chart tooltip, a picker fetch),
-// follows the URL the picker pushed, and drops a response whose URL went stale.
+// running — re-requests its own #dash-live region every 5s, so an operator
+// watching an import sees the figures rise without reloading. The poll follows
+// the URL the picker pushed and drops a response whose URL went stale. It
+// stands down only while the tab is hidden, a picker fetch is in flight, or
+// keyboard focus sits inside the region outside the type picker: an open type
+// picker (kept as the very same node across the swap), an open data table
+// (reopened), a visible tooltip (re-shown for the pointer) and focus left by a
+// mouse click all let the refresh through, since figures that froze until the
+// user moved or closed something were the bug.
 //
-// Timing: a poll serves the cached snapshot for 15s, then serves it stale once
-// while a background refresh recomputes it, so a write reaches an open page on
-// roughly the third poll (~30s). The e2e server also reconciles every 30s; once
-// a reconcile makes the figures exact the swapped-in region stops polling. Each
-// test therefore writes right before its first view (so it opens approximate)
-// and only ever relies on a poll that the region *already on screen* scheduled.
-// Device, Location and Medication are seeded only here, and every test views a
-// selection no other test (or retry, see coldSelection) requests.
+// Timing: an approximate snapshot is cached for at most 2s and a refresh waits
+// up to 500ms for the fresh value, so a write reaches an open page on the next
+// 5s tick. The e2e server also reconciles every 30s; once a reconcile makes the
+// figures exact the swapped-in region stops polling. Each test therefore writes
+// right after its first view (so it opens approximate, and the writes land
+// before a reconcile can quiet the page) and only relies on the poll the region
+// on screen scheduled. Device, Location and Medication are seeded only here,
+// and every test views a selection no other test (or retry, see coldSelection)
+// requests.
 test.describe("live refresh while figures are approximate (#1078)", () => {
   test.skip(noChartData, "no count read path on this backend");
 
-  /** How long new figures may take to land on an open page (see above). */
-  const FIGURES_LAND_MS = 60_000;
+  /** How long new figures may take to land on an open page: one 5s tick plus
+   * the ≤2s cache, with headroom for a machine busy running the suite. */
+  const FIGURES_LAND_MS = 30_000;
 
   test.beforeEach(async ({ request }) => {
     await createResource(request, "Device", { status: "active" });
@@ -465,16 +472,68 @@ test.describe("live refresh while figures are approximate (#1078)", () => {
     return value;
   }
 
-  test("the stored-resources card rises without a reload", async ({ page, request, dashboard }) => {
-    test.setTimeout(150_000);
-    const render = await dashboard.gotoFirstRender(`?types=${coldSelection("Device", "Location")}&window=1h`);
+  /** Opens `/ui?types=…&window=1h` on a selection cold for this test and
+   * checks it is a ready, approximate page that polls itself. */
+  async function openLive(dashboard: DashboardPage, ...types: string[]): Promise<void> {
+    const render = await dashboard.gotoFirstRender(`?types=${coldSelection(...types)}&window=1h`);
     expect(render.notices, "a ready page").not.toContain("pending");
     expect(render.notices, "a ready page").not.toContain("series-pending");
     expect(render.notices, "figures written moments ago are not reconciled yet").toContain("approximate");
     expect(render.liveRefresh, "an approximate ready page polls itself").toBe(true);
     expect(render.autoRetry, "never the waiting page's bounded retry").toBe(false);
     await expect(dashboard.liveRefresh).toHaveCount(1);
-    await expect(dashboard.live).toHaveAttribute("hx-trigger", /every 10s/);
+  }
+
+  const BODIES = {
+    Device: { status: "active" },
+    Location: { name: "live refresh (#1078)" },
+    Medication: { code: { text: "live refresh (#1078)" } },
+  } as const;
+
+  /** `count` more `type` resources, five requests at a time. */
+  async function write(request: APIRequestContext, type: keyof typeof BODIES, count: number): Promise<void> {
+    for (let i = 0; i < count; i += 5) {
+      await Promise.all(
+        Array.from({ length: Math.min(5, count - i) }, () => createResource(request, type, BODIES[type])),
+      );
+    }
+  }
+
+  /** What the figures read before a write, to compare a refresh against. */
+  async function figures(dashboard: DashboardPage, type: string): Promise<{ legend: number; chart: number }> {
+    const legend = await dashboard.legendTotal(type);
+    expect(legend, `${type} is charted`).not.toBeNull();
+    return { legend: legend ?? 0, chart: exactCount(await dashboard.chartTotal.textContent()) };
+  }
+
+  /** Waits until a refresh has replaced the marked region (see
+   * DashboardPage.markLive) and `type`'s legend entry and the chart total
+   * both rose by `added` — no reload, no interaction. */
+  async function expectFiguresRose(
+    dashboard: DashboardPage,
+    type: string,
+    before: { legend: number; chart: number },
+    added: number,
+    message: string,
+  ): Promise<void> {
+    await expect
+      .poll(
+        async () => {
+          if ((await dashboard.unrefreshedLive.count()) > 0) return false;
+          const legend = await dashboard.legendTotal(type);
+          const chart = Number(((await dashboard.chartTotal.allTextContents())[0] ?? "").replace(/,/g, "").trim());
+          return legend !== null && legend >= before.legend + added && chart >= before.chart + added;
+        },
+        { message, timeout: FIGURES_LAND_MS, intervals: [500] },
+      )
+      .toBe(true);
+  }
+
+  test("the stored-resources card rises without a reload", async ({ page, request, dashboard }) => {
+    test.setTimeout(120_000);
+    await openLive(dashboard, "Device", "Location");
+    await expect(dashboard.live).toHaveAttribute("hx-trigger", /every 5s/);
+    await expect(dashboard.live).toHaveAttribute("data-dash-refresh", "5");
 
     const url = page.url();
     const navigations = recordNavigations(page);
@@ -494,11 +553,7 @@ test.describe("live refresh while figures are approximate (#1078)", () => {
 
     // An import in miniature: 25 more Devices, five requests at a time.
     const added = 25;
-    for (let i = 0; i < added; i += 5) {
-      await Promise.all(
-        Array.from({ length: 5 }, () => createResource(request, "Device", { status: "active" })),
-      );
-    }
+    await write(request, "Device", added);
 
     await expect
       .poll(
@@ -512,7 +567,7 @@ test.describe("live refresh while figures are approximate (#1078)", () => {
             device >= (deviceBefore ?? 0) + added
           );
         },
-        { message: "the as-of time advances and Device rises by the writes", timeout: FIGURES_LAND_MS, intervals: [1_000] },
+        { message: "the as-of time advances and Device rises by the writes", timeout: FIGURES_LAND_MS, intervals: [500] },
       )
       .toBe(true);
 
@@ -538,33 +593,111 @@ test.describe("live refresh while figures are approximate (#1078)", () => {
     }
   });
 
-  test("a refresh does not close the open type picker", async ({ page, dashboard }) => {
+  test("a refresh lands while the type picker is open and keeps it as it was", async ({ page, request, dashboard }) => {
     test.setTimeout(120_000);
-    const render = await dashboard.gotoFirstRender(`?types=${coldSelection("Location", "Medication")}&window=1h`);
-    expect(render.liveRefresh, "an approximate ready page polls itself").toBe(true);
-    await expect(dashboard.liveRefresh).toHaveCount(1);
-
-    // Open the picker and type into its filter straight after the first
-    // render, well before the first 10s tick.
+    await openLive(dashboard, "Location", "Medication");
     const refreshes = recordRefreshes(page);
+
+    // Open the picker and type into its filter, then mark the picker node: a
+    // swap that re-rendered it would bring a node without the property.
     await dashboard.openPicker();
     await dashboard.pickerFilter.fill("med");
     await expect(dashboard.pickerOption("Medication")).toBeVisible();
+    await expect(dashboard.pickerOption("Location")).toBeHidden();
+    await dashboard.picker.evaluate((el) => {
+      (el as unknown as { __e2ePicker: boolean }).__e2ePicker = true;
+    });
+    await dashboard.markLive();
+    const before = await figures(dashboard, "Medication");
 
-    // Longer than one poll interval.
-    await page.waitForTimeout(12_000);
+    const added = 10;
+    await write(request, "Medication", added);
+    await expectFiguresRose(dashboard, "Medication", before, added, "a refresh lands with the picker open and the figures rise");
+    expect(refreshes.length, "the figures arrived through the periodic refresh").toBeGreaterThan(0);
+
+    // The very same picker node, exactly as the user left it.
+    await expect(dashboard.picker).toHaveCount(1);
+    expect(
+      await dashboard.picker.evaluate((el) => (el as unknown as { __e2ePicker?: boolean }).__e2ePicker === true),
+      "the open picker is the same element after the refresh",
+    ).toBe(true);
     await expect(dashboard.picker).toHaveAttribute("open", "");
     await expect(dashboard.pickerFilter).toHaveValue("med");
     await expect(dashboard.pickerFilter).toBeFocused();
     await expect(dashboard.pickerOption("Medication")).toBeVisible();
-    expect(refreshes.map(String), "the tick is skipped while the picker is open").toEqual([]);
+    await expect(dashboard.pickerOption("Location")).toBeHidden();
+  });
 
-    // The guard skipped ticks; it did not stop the poll. Close the picker and
-    // move focus out of the region, and the next tick refreshes.
-    await dashboard.picker.locator("summary").click();
-    await expect(dashboard.picker).not.toHaveAttribute("open", "");
-    await page.evaluate(() => (document.activeElement as HTMLElement | null)?.blur());
-    await expect.poll(() => refreshes.length, { message: "a tick fires once the picker is closed", timeout: 15_000 }).toBeGreaterThan(0);
+  test("a refresh lands while the mouse rests on the chart", async ({ page, request, dashboard }) => {
+    test.setTimeout(120_000);
+    await openLive(dashboard, "Device", "Medication");
+    const refreshes = recordRefreshes(page);
+
+    const box = await dashboard.chart.boundingBox();
+    if (!box) throw new Error("chart has no box");
+    await page.mouse.move(box.x + box.width * 0.6, box.y + box.height * 0.5);
+    await expect(dashboard.tooltip).toBeVisible();
+    await dashboard.markLive();
+    const before = await figures(dashboard, "Device");
+
+    const added = 10;
+    await write(request, "Device", added);
+    await expectFiguresRose(dashboard, "Device", before, added, "a refresh lands under the resting pointer and the figures rise");
+    expect(refreshes.length, "the figures arrived through the periodic refresh").toBeGreaterThan(0);
+
+    // The pointer never moved: the new chart's tooltip is showing for it.
+    await expect(dashboard.tooltip).toBeVisible();
+    await expect(dashboard.tooltip.locator(".chart-tip__row").first()).toBeVisible();
+    await expect(dashboard.tooltip).toContainText("Device");
+  });
+
+  test("a refresh keeps the data table open", async ({ page, request, dashboard }) => {
+    test.setTimeout(120_000);
+    await openLive(dashboard, "Location", "Device");
+    const refreshes = recordRefreshes(page);
+
+    await dashboard.dataTableToggle.click();
+    await expect(dashboard.dataTable).toHaveAttribute("open", "");
+    await expect(dashboard.dataTable.locator("table.data-table")).toBeVisible();
+    await dashboard.markLive();
+    const before = await figures(dashboard, "Location");
+
+    const added = 10;
+    await write(request, "Location", added);
+    await expectFiguresRose(dashboard, "Location", before, added, "a refresh lands with the data table open and the figures rise");
+    expect(refreshes.length, "the figures arrived through the periodic refresh").toBeGreaterThan(0);
+
+    await expect(dashboard.dataTable).toHaveAttribute("open", "");
+    await expect(dashboard.dataTable.locator("table.data-table")).toBeVisible();
+  });
+
+  test("a mouse click inside the chart does not stop the refresh", async ({ page, request, dashboard }) => {
+    test.setTimeout(120_000);
+    await openLive(dashboard, "Medication", "Location");
+    const refreshes = recordRefreshes(page);
+
+    // Open and close the data table by mouse: nothing navigates, and the
+    // click leaves focus on its <summary>, inside #dash-live — focus that is
+    // not :focus-visible, so it must not hold the poll back.
+    await dashboard.dataTableToggle.click();
+    await expect(dashboard.dataTable).toHaveAttribute("open", "");
+    await dashboard.dataTableToggle.click();
+    await expect(dashboard.dataTable).not.toHaveAttribute("open", "");
+    expect(
+      await page.evaluate(() => {
+        const active = document.activeElement;
+        return !!active && active !== document.body && !!document.getElementById("dash-live")?.contains(active);
+      }),
+      "the click left focus inside the region",
+    ).toBe(true);
+    await dashboard.markLive();
+    const before = await figures(dashboard, "Medication");
+
+    const added = 10;
+    await write(request, "Medication", added);
+    await expectFiguresRose(dashboard, "Medication", before, added, "a refresh lands after a mouse click inside the region");
+    expect(refreshes.length, "the figures arrived through the periodic refresh").toBeGreaterThan(0);
+    await expect(page).not.toHaveURL(/focus=/);
   });
 
   test("a refresh follows the picker's URL", async ({ page, dashboard }) => {
@@ -589,19 +722,18 @@ test.describe("live refresh while figures are approximate (#1078)", () => {
     const pickedUrl = page.url();
     const legendAfterPick = await dashboard.legendItems.count();
 
-    // Let the next tick through: close the picker and move focus out.
+    // Close the picker so the refreshed one is re-rendered too (an open
+    // picker keeps its own node, option states included).
     await dashboard.picker.locator("summary").click();
     await expect(dashboard.picker).not.toHaveAttribute("open", "");
-    await page.evaluate(() => (document.activeElement as HTMLElement | null)?.blur());
 
     // Mark the region on screen; the refresh's outerHTML swap replaces it
     // with a node that has no such mark. This is the region the first render
     // scheduled the poll on, so it fires even if the swapped-in one is exact
-    // and polls no further — no as-of comparison needed (a poll inside the
-    // 15s cache TTL serves the same as-of time).
-    await dashboard.live.evaluate((el) => el.setAttribute("data-e2e-before-refresh", ""));
-    await expect(page.locator("#dash-live[data-e2e-before-refresh]"), "the next refresh swaps the region").toHaveCount(0, {
-      timeout: 25_000,
+    // and polls no further — no as-of comparison needed.
+    await dashboard.markLive();
+    await expect(dashboard.unrefreshedLive, "the next refresh swaps the region").toHaveCount(0, {
+      timeout: FIGURES_LAND_MS,
     });
     await expect(dashboard.live).toHaveCount(1);
 

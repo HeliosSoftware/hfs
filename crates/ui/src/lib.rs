@@ -7594,11 +7594,11 @@ const DASH_PENDING_RETRIES: u32 = 3;
 ///
 /// Unlike [`DASH_PENDING_RETRIES`] this poll is not bounded by a count: what
 /// it re-reads is the in-memory counter snapshot (constant time, no storage
-/// scan) behind a 15s cache, so it cannot add to the load an import puts on
-/// storage, and it stops as soon as the server renders the page without it.
-/// Ten seconds keeps the figures visibly climbing without re-rendering faster
-/// than the snapshot cache can change.
-const DASH_LIVE_REFRESH_SECS: u32 = 10;
+/// scan), which the snapshot cache keeps for at most a couple of seconds, so
+/// it cannot add to the load an import puts on storage, and it stops as soon
+/// as the server renders the page without it. Five seconds keeps the figures
+/// visibly climbing during an import.
+const DASH_LIVE_REFRESH_SECS: u32 = 5;
 
 /// Assembles the landing page from the live dashboard snapshot.
 ///

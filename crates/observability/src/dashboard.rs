@@ -276,7 +276,9 @@ type CacheKey = (DashboardWindow, String, String, bool);
 
 /// A snapshot written to the cache, with what the freshness rules need.
 struct CachedValue {
-    /// When the value was written — what [`CACHE_TTL`] is measured from.
+    /// When the value was written — what [`CACHE_TTL`] and [`LIVE_TTL`] are
+    /// measured from, and how a request inside [`LIVE_WAIT`] tells its
+    /// refresh from the stale value.
     written_at: Instant,
     /// Generation of the compute that produced the value. Generations are
     /// handed out under the cache lock as computes start, so comparing them
@@ -307,7 +309,36 @@ type SnapCache = Arc<RwLock<HashMap<CacheKey, CacheEntry>>>;
 static CACHE: std::sync::LazyLock<SnapCache> = std::sync::LazyLock::new(SnapCache::default);
 
 /// How long a computed snapshot is served without recomputing.
+///
+/// Applies to snapshots read from storage, whose computes can be expensive.
+/// An [approximate](DashboardSnapshot::approximate) snapshot — served from
+/// in-memory write counters, so it costs milliseconds to recompute — is only
+/// fresh for [`LIVE_TTL`] instead (#1078).
 const CACHE_TTL: Duration = Duration::from_secs(15);
+/// How long an [approximate](DashboardSnapshot::approximate) snapshot is
+/// served without recomputing (#1078).
+///
+/// Approximate snapshots come from in-memory write counters while an import
+/// runs, and the dashboard polls them every few seconds so the operator can
+/// watch the figures move. Held for the full [`CACHE_TTL`], every poll tick
+/// would show the previous tick's figures — up to ~20s behind. Their computes
+/// are O(1), so a short TTL costs nothing. Values that are not approximate
+/// keep [`CACHE_TTL`].
+const LIVE_TTL: Duration = Duration::from_secs(2);
+/// How long a request that finds a stale
+/// [approximate](DashboardSnapshot::approximate) snapshot waits for the
+/// refresh it triggered before serving the stale value (#1078).
+///
+/// Stale-while-revalidate is right for storage-backed snapshots, but for
+/// counter-backed ones it means each request shows what the *previous*
+/// request computed. The refresh takes milliseconds, so waiting a short beat
+/// serves the current figures on every poll; a refresh slower than this (a
+/// backend under pressure) still falls back to the stale value rather than
+/// holding the page.
+const LIVE_WAIT: Duration = Duration::from_millis(500);
+/// How often a request inside [`LIVE_WAIT`] re-checks the cache for its
+/// refresh.
+const LIVE_POLL: Duration = Duration::from_millis(20);
 /// How long a cold request waits for the first compute before falling back to
 /// a sibling snapshot or [`SnapshotState::Pending`]. Long enough for row-store
 /// backends (milliseconds); deliberately far below what an object-store scan
@@ -367,7 +398,9 @@ const LATE_WRITE_FACTOR: u32 = 20;
 #[derive(Clone, Debug)]
 pub enum SnapshotState {
     /// A snapshot from the registered provider — fresh, the previous one while
-    /// a refresh runs, or (for a window whose first compute has not landed
+    /// a refresh runs (for an [approximate](DashboardSnapshot::approximate)
+    /// snapshot, only when the refresh does not land within [`LIVE_WAIT`]),
+    /// or (for a window whose first compute has not landed
     /// yet) a sibling's figures with [`DashboardSnapshot::series_pending`]
     /// set. Check [`DashboardSnapshot::partial`],
     /// [`DashboardSnapshot::approximate`] and
@@ -422,6 +455,14 @@ pub async fn snapshot(
 /// S3 primary reads one object per resource — minutes once conformance seeding
 /// has populated the store, #326).
 ///
+/// [Approximate](DashboardSnapshot::approximate) snapshots take a fast path
+/// (#1078): they come from in-memory write counters, so recomputing them is
+/// O(1) while serving them stale would show each dashboard poll the previous
+/// poll's figures. They are fresh only for [`LIVE_TTL`], and a stale request
+/// waits up to [`LIVE_WAIT`] for its refresh to land — serving the stale value
+/// only if it does not. Single-flight and the other refresh rules are the
+/// same for both kinds.
+///
 /// A cold request that outlasts [`COLD_WAIT`] is answered from the freshest
 /// snapshot cached for the same tenant and "View all resources" setting under
 /// another window or selection (the same selection preferred), re-labelled
@@ -455,6 +496,8 @@ pub async fn snapshot_state(
         CACHE_TTL,
         COLD_WAIT,
         COMPUTE_TIMEOUT,
+        LIVE_TTL,
+        LIVE_WAIT,
     )
     .await
 }
@@ -474,6 +517,8 @@ async fn snapshot_via(
     ttl: Duration,
     cold_wait: Duration,
     compute_timeout: Duration,
+    live_ttl: Duration,
+    live_wait: Duration,
 ) -> SnapshotState {
     // The charted set (and the "View all resources" toggle, #599) is part of
     // the cache identity: two selections — or the same selection with the
@@ -490,10 +535,17 @@ async fn snapshot_via(
             return SnapshotState::Pending;
         };
         let entry = guard.entry(key.clone()).or_default();
-        if let Some(value) = &entry.value
-            && value.written_at.elapsed() < ttl
-        {
-            return SnapshotState::Ready(value.snapshot.clone());
+        if let Some(value) = &entry.value {
+            // Counter-backed figures are cheap to recompute and watched live,
+            // so they go stale much sooner than storage reads (#1078).
+            let fresh_for = if value.snapshot.approximate {
+                ttl.min(live_ttl)
+            } else {
+                ttl
+            };
+            if value.written_at.elapsed() < fresh_for {
+                return SnapshotState::Ready(value.snapshot.clone());
+            }
         }
         // Single-flight, with the computes that overran their budget still
         // counted against the key so retries under load cannot stampede.
@@ -505,7 +557,10 @@ async fn snapshot_via(
             None
         };
         (
-            entry.value.as_ref().map(|value| value.snapshot.clone()),
+            entry
+                .value
+                .as_ref()
+                .map(|value| (value.written_at, value.snapshot.clone())),
             claimed,
         )
     };
@@ -521,9 +576,33 @@ async fn snapshot_via(
         ));
     }
 
-    // Stale beats absent: serve it now, the refresh lands for the next load.
-    if let Some(value) = cached {
-        return SnapshotState::Ready(value);
+    if let Some((stale_written_at, stale)) = cached {
+        // Stale beats absent: a storage-backed value is served now, and the
+        // refresh lands for the next load.
+        if !stale.approximate {
+            return SnapshotState::Ready(stale);
+        }
+        // A counter-backed refresh takes milliseconds: give it a short beat so
+        // this request shows current figures, not the previous request's
+        // (#1078). Only a value written after the stale one counts; the lock
+        // is never held across the sleep.
+        let deadline = Instant::now() + live_wait;
+        loop {
+            if let Ok(guard) = cache.read()
+                && let Some(value) = guard.get(&key).and_then(|e| e.value.as_ref())
+                && value.written_at > stale_written_at
+            {
+                return SnapshotState::Ready(value.snapshot.clone());
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            tokio::time::sleep(LIVE_POLL.min(remaining)).await;
+        }
+        // The refresh is slower than the beat: the stale value it is, and the
+        // refresh still lands for the next load.
+        return SnapshotState::Ready(stale);
     }
 
     // Cold: give a fast backend a beat to fill the cache before degrading.
@@ -762,6 +841,8 @@ mod tests {
             ttl,
             cold,
             TEST_COMPUTE_TIMEOUT,
+            LIVE_TTL,
+            LIVE_WAIT,
         )
         .await
         .ready()
@@ -778,6 +859,8 @@ mod tests {
             ttl,
             cold,
             TEST_COMPUTE_TIMEOUT,
+            LIVE_TTL,
+            LIVE_WAIT,
         )
         .await
         .ready()
@@ -807,6 +890,8 @@ mod tests {
             ttl,
             cold,
             TEST_COMPUTE_TIMEOUT,
+            LIVE_TTL,
+            LIVE_WAIT,
         )
         .await
         .ready()
@@ -823,6 +908,8 @@ mod tests {
             ttl,
             cold,
             TEST_COMPUTE_TIMEOUT,
+            LIVE_TTL,
+            LIVE_WAIT,
         )
         .await
         .ready()
@@ -846,6 +933,8 @@ mod tests {
             ttl,
             cold,
             TEST_COMPUTE_TIMEOUT,
+            LIVE_TTL,
+            LIVE_WAIT,
         )
         .await
         .ready()
@@ -878,6 +967,8 @@ mod tests {
             ttl,
             cold,
             TEST_COMPUTE_TIMEOUT,
+            LIVE_TTL,
+            LIVE_WAIT,
         )
         .await;
         assert!(
@@ -896,6 +987,8 @@ mod tests {
             ttl,
             cold,
             TEST_COMPUTE_TIMEOUT,
+            LIVE_TTL,
+            LIVE_WAIT,
         )
         .await
         .ready()
@@ -957,6 +1050,8 @@ mod tests {
         ttl: Duration,
         cold: Duration,
         compute: Duration,
+        live_ttl: Duration,
+        live_wait: Duration,
     }
 
     /// One read of the default tenant's default selection over `window`.
@@ -976,6 +1071,8 @@ mod tests {
             timings.ttl,
             timings.cold,
             timings.compute,
+            timings.live_ttl,
+            timings.live_wait,
         )
         .await
     }
@@ -1032,6 +1129,8 @@ mod tests {
             ttl: Duration::from_secs(60),
             cold: Duration::from_millis(50),
             compute: Duration::from_millis(100),
+            live_ttl: LIVE_TTL,
+            live_wait: LIVE_WAIT,
         };
         let key = default_key(DashboardWindow::LastMonth);
 
@@ -1105,6 +1204,8 @@ mod tests {
             ttl: Duration::from_secs(60),
             cold: Duration::from_millis(50),
             compute: Duration::from_millis(100),
+            live_ttl: LIVE_TTL,
+            live_wait: LIVE_WAIT,
         };
         let key = default_key(DashboardWindow::LastMonth);
 
@@ -1147,6 +1248,8 @@ mod tests {
             ttl: Duration::from_secs(60),
             cold: Duration::from_millis(50),
             compute: Duration::from_millis(100),
+            live_ttl: LIVE_TTL,
+            live_wait: LIVE_WAIT,
         };
         let key = default_key(DashboardWindow::LastMonth);
 
@@ -1206,6 +1309,8 @@ mod tests {
             ttl: Duration::from_secs(60),
             cold: Duration::from_millis(20),
             compute: Duration::from_millis(300),
+            live_ttl: LIVE_TTL,
+            live_wait: LIVE_WAIT,
         };
         let key = default_key(DashboardWindow::LastMonth);
 
@@ -1256,6 +1361,8 @@ mod tests {
             ttl: Duration::ZERO, // every landed value is instantly stale
             cold: Duration::from_millis(20),
             compute: Duration::from_millis(50),
+            live_ttl: LIVE_TTL,
+            live_wait: LIVE_WAIT,
         };
         let key = default_key(DashboardWindow::LastDay);
 
@@ -1305,6 +1412,8 @@ mod tests {
             cold: Duration::from_millis(20),
             // Abandoned 20 × 20ms = 400ms after each start.
             compute: Duration::from_millis(20),
+            live_ttl: LIVE_TTL,
+            live_wait: LIVE_WAIT,
         };
         let key = default_key(DashboardWindow::LastHour);
 
@@ -1332,6 +1441,211 @@ mod tests {
             .ready()
             .expect("a new compute starts and lands");
         assert_eq!(recovered.total_resources, MAX_OVERRUNNING as u64 + 1);
+    }
+
+    /// Like [`Scripted`] — the n-th compute answers `n` after `delays[n - 1]`
+    /// — with every snapshot's `approximate` flag fixed, standing in for a
+    /// counter-backed provider (`true`) or a storage read (`false`).
+    struct Counters {
+        hits: AtomicUsize,
+        delays: Vec<Duration>,
+        approximate: bool,
+    }
+
+    impl Counters {
+        fn new(approximate: bool, delays: &[Duration]) -> Arc<Self> {
+            Arc::new(Counters {
+                hits: AtomicUsize::new(0),
+                delays: delays.to_vec(),
+                approximate,
+            })
+        }
+
+        fn hits(&self) -> usize {
+            self.hits.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl DashboardProvider for Counters {
+        async fn snapshot(
+            &self,
+            window: DashboardWindow,
+            _tenant: &str,
+            _types: &[String],
+            _include_empty: bool,
+        ) -> DashboardSnapshot {
+            let hit = self.hits.fetch_add(1, Ordering::SeqCst) + 1;
+            if let Some(delay) = self.delays.get(hit - 1)
+                && !delay.is_zero()
+            {
+                tokio::time::sleep(*delay).await;
+            }
+            DashboardSnapshot {
+                total_resources: hit as u64,
+                window,
+                approximate: self.approximate,
+                ..DashboardSnapshot::default()
+            }
+        }
+    }
+
+    /// #1078: the dashboard polls counter-backed figures every few seconds. An
+    /// approximate value past the live TTL — though well inside the storage
+    /// TTL — is recomputed, and the request that noticed gets the *new*
+    /// figures, not the previous poll's.
+    #[tokio::test]
+    async fn a_stale_approximate_value_is_recomputed_and_the_request_sees_the_new_figures() {
+        let cache = SnapCache::default();
+        let provider = Counters::new(true, &[]);
+        let timings = Timings {
+            ttl: Duration::from_secs(60),
+            cold: Duration::from_millis(800),
+            compute: TEST_COMPUTE_TIMEOUT,
+            live_ttl: Duration::from_millis(100),
+            live_wait: Duration::from_millis(500),
+        };
+
+        let first = read(&cache, provider.clone(), DashboardWindow::LastHour, timings)
+            .await
+            .ready()
+            .expect("cold load");
+        assert_eq!(first.total_resources, 1);
+        let fresh = read(&cache, provider.clone(), DashboardWindow::LastHour, timings)
+            .await
+            .ready()
+            .expect("fresh hit");
+        assert_eq!(fresh.total_resources, 1, "inside the live TTL: cached");
+        assert_eq!(provider.hits(), 1);
+
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let live = read(&cache, provider.clone(), DashboardWindow::LastHour, timings)
+            .await
+            .ready()
+            .expect("refreshed");
+        assert_eq!(
+            live.total_resources, 2,
+            "the refresh this request triggered, not the previous value"
+        );
+        assert_eq!(provider.hits(), 2);
+    }
+
+    /// The live TTL is for counter-backed figures only: a storage-backed value
+    /// of the same age is still inside its TTL and served without a recompute.
+    #[tokio::test]
+    async fn a_non_approximate_value_keeps_the_full_ttl() {
+        let cache = SnapCache::default();
+        let provider = Counters::new(false, &[]);
+        let timings = Timings {
+            ttl: Duration::from_secs(60),
+            cold: Duration::from_millis(800),
+            compute: TEST_COMPUTE_TIMEOUT,
+            live_ttl: Duration::from_millis(100),
+            live_wait: Duration::from_millis(500),
+        };
+
+        let first = read(&cache, provider.clone(), DashboardWindow::LastHour, timings)
+            .await
+            .ready()
+            .expect("cold load");
+        assert_eq!(first.total_resources, 1);
+
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let cached = read(&cache, provider.clone(), DashboardWindow::LastHour, timings)
+            .await
+            .ready()
+            .expect("fresh hit");
+        assert_eq!(cached.total_resources, 1, "served from cache");
+        assert_eq!(provider.hits(), 1, "no recompute inside the TTL");
+    }
+
+    /// A counter-backed refresh slower than the live wait does not hold the
+    /// page: the stale value is served once the wait runs out, and the refresh
+    /// still lands for the next request.
+    #[tokio::test]
+    async fn a_slow_approximate_refresh_serves_the_stale_value_then_lands() {
+        let cache = SnapCache::default();
+        let provider = Counters::new(true, &[Duration::ZERO, Duration::from_millis(400)]);
+        let timings = Timings {
+            ttl: Duration::from_secs(60),
+            cold: Duration::from_millis(800),
+            compute: TEST_COMPUTE_TIMEOUT,
+            live_ttl: Duration::from_millis(300),
+            live_wait: Duration::from_millis(100),
+        };
+        let key = default_key(DashboardWindow::LastHour);
+
+        let first = read(&cache, provider.clone(), DashboardWindow::LastHour, timings)
+            .await
+            .ready()
+            .expect("cold load");
+        assert_eq!(first.total_resources, 1);
+
+        tokio::time::sleep(Duration::from_millis(350)).await;
+        let started = Instant::now();
+        let stale = read(&cache, provider.clone(), DashboardWindow::LastHour, timings)
+            .await
+            .ready()
+            .expect("stale beats absent");
+        assert_eq!(stale.total_resources, 1, "the refresh has not landed");
+        assert!(
+            started.elapsed() >= timings.live_wait,
+            "waited for the refresh first: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(provider.hits(), 2, "the refresh was started");
+
+        assert!(
+            eventually(|| observe(&cache, &key).total == Some(2)).await,
+            "the slow refresh lands"
+        );
+        let refreshed = read(&cache, provider.clone(), DashboardWindow::LastHour, timings)
+            .await
+            .ready()
+            .expect("cached");
+        assert_eq!(refreshed.total_resources, 2);
+        assert_eq!(provider.hits(), 2);
+    }
+
+    /// Waiting on the refresh must not undo single-flight: concurrent requests
+    /// on a stale approximate key share one compute and all see its value.
+    #[tokio::test]
+    async fn concurrent_requests_on_a_stale_approximate_key_run_one_compute() {
+        let cache = SnapCache::default();
+        let provider = Counters::new(true, &[Duration::ZERO, Duration::from_millis(150)]);
+        let timings = Timings {
+            ttl: Duration::from_secs(60),
+            cold: Duration::from_millis(800),
+            compute: TEST_COMPUTE_TIMEOUT,
+            live_ttl: Duration::from_millis(50),
+            live_wait: Duration::from_millis(500),
+        };
+
+        let first = read(&cache, provider.clone(), DashboardWindow::LastHour, timings)
+            .await
+            .ready()
+            .expect("cold load");
+        assert_eq!(first.total_resources, 1);
+
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        let requests: Vec<_> = (0..8)
+            .map(|_| {
+                let cache = cache.clone();
+                let provider: Arc<dyn DashboardProvider> = provider.clone();
+                tokio::spawn(async move {
+                    read(&cache, provider, DashboardWindow::LastHour, timings).await
+                })
+            })
+            .collect();
+        for request in requests {
+            let snapshot = request
+                .await
+                .expect("request task")
+                .ready()
+                .expect("served");
+            assert_eq!(snapshot.total_resources, 2, "every waiter sees the refresh");
+        }
+        assert_eq!(provider.hits(), 2, "single-flight: one refresh compute");
     }
 
     /// Echoes back the window it was asked for, so the test can assert the
@@ -1420,6 +1734,8 @@ mod tests {
             ttl,
             cold,
             TEST_COMPUTE_TIMEOUT,
+            LIVE_TTL,
+            LIVE_WAIT,
         )
         .await
         .ready()
@@ -1436,6 +1752,8 @@ mod tests {
             ttl,
             cold,
             TEST_COMPUTE_TIMEOUT,
+            LIVE_TTL,
+            LIVE_WAIT,
         )
         .await
         .ready()
@@ -1520,6 +1838,8 @@ mod tests {
             timings.ttl,
             timings.cold,
             timings.compute,
+            timings.live_ttl,
+            timings.live_wait,
         )
         .await
     }
@@ -1537,6 +1857,8 @@ mod tests {
             ttl: Duration::from_secs(60),
             cold: Duration::from_millis(50),
             compute: TEST_COMPUTE_TIMEOUT,
+            live_ttl: LIVE_TTL,
+            live_wait: LIVE_WAIT,
         };
 
         // Same selection as the cold read below, computed first.
@@ -1641,6 +1963,8 @@ mod tests {
             ttl: Duration::from_secs(60),
             cold: Duration::from_millis(50),
             compute: TEST_COMPUTE_TIMEOUT,
+            live_ttl: LIVE_TTL,
+            live_wait: LIVE_WAIT,
         };
 
         let fresh_cache_cold = read_key(
@@ -1721,6 +2045,8 @@ mod tests {
             Duration::from_secs(60),
             Duration::from_millis(800),
             TEST_COMPUTE_TIMEOUT,
+            LIVE_TTL,
+            LIVE_WAIT,
         )
         .await
         .ready()

@@ -33,7 +33,7 @@ export interface FirstRender {
   autoRetry: boolean;
   /** Whether `#dash-live` carried the periodic self-refresh of a ready page
    * whose figures are approximate or an import is running (#1078,
-   * `data-dash-refresh`). Never set together with {@link autoRetry}. */
+   * `data-dash-refresh`, every 5s). Never set together with {@link autoRetry}. */
   liveRefresh: boolean;
   /** Stat-grid values rendered as the unavailable "—". */
   unavailableCards: number;
@@ -105,10 +105,24 @@ export class DashboardPage {
   get pendingAutoRetry(): Locator {
     return this.page.locator("#dash-live[hx-get]:not([data-dash-refresh])");
   }
-  /** `#dash-live` while a ready page polls itself every few seconds because
-   * its figures are approximate or an import is running (#1078). */
+  /** `#dash-live` while a ready page polls itself every 5s because its
+   * figures are approximate or an import is running (#1078). The tick only
+   * stands down while the tab is hidden, a picker fetch is in flight, or
+   * keyboard focus sits inside the region outside the type picker; an open
+   * picker or data table, the tooltip and a mouse click do not stop it. */
   get liveRefresh(): Locator {
     return this.page.locator("#dash-live[data-dash-refresh]");
+  }
+  /** Marks the `#dash-live` node on screen. A refresh swaps the region's
+   * outerHTML, so the mark is gone once one has landed — see
+   * {@link unrefreshedLive}. */
+  async markLive(): Promise<void> {
+    await this.live.evaluate((el) => el.setAttribute("data-e2e-before-refresh", ""));
+  }
+  /** The `#dash-live` node {@link markLive} marked, while it is still on
+   * screen: a count of 0 means a refresh has replaced it. */
+  get unrefreshedLive(): Locator {
+    return this.page.locator("#dash-live[data-e2e-before-refresh]");
   }
   /** The "Stored Resources" headline value. Compact ("1.4k") past 999, so
    * compare exact counts through {@link legendTotal} or {@link chartTotal}. */
@@ -161,8 +175,10 @@ export class DashboardPage {
   get legendItems(): Locator {
     return this.page.locator(".chart-legend__item");
   }
+  /** The type picker, `<details class="menu chart-pick" id="chart-pick">`.
+   * While it is open a refresh keeps this very node (#1078). */
   get picker(): Locator {
-    return this.page.locator(".chart-pick");
+    return this.page.locator("details.chart-pick");
   }
   async openPicker(): Promise<void> {
     if ((await this.picker.getAttribute("open")) === null) {
@@ -182,6 +198,11 @@ export class DashboardPage {
   }
   get tooltip(): Locator {
     return this.page.locator("#chart-tip");
+  }
+  /** The chart's tabular alternative, `<details class="chart-table"
+   * id="chart-table">`; an open one stays open across a refresh (#1078). */
+  get dataTable(): Locator {
+    return this.page.locator("details.chart-table");
   }
   get dataTableToggle(): Locator {
     return this.page.locator(".chart-table > summary");

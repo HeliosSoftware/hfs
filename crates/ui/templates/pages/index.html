@@ -17,9 +17,10 @@
   Figures that are here but still moving — counted from recent writes and not
   yet reconciled, or with an import running (#1078) — follow themselves the
   same way, every few seconds, until the server renders the region without
-  the poll. assets/dashboard.js skips a tick while the user is working in the
-  region (picker or table open, focus, tooltip) and points each request at
-  the page's current URL, which the type picker changes without a reload.
+  the poll. assets/dashboard.js keeps what the user is doing across each swap
+  (the open type picker is preserved as-is, an open table stays open, the
+  tooltip follows the pointer) and points each request at the page's current
+  URL, which the type picker changes without a reload.
 #}
 <div id="dash-live"
   {% if let Some(href) = auto_retry_href %}
@@ -118,7 +119,7 @@
         the charted set — the same progressive-enhancement contract as the
         window selector.
       -->
-      <details class="menu chart-pick">
+      <details class="menu chart-pick" id="chart-pick">
         <!-- The aria-label keeps the summary named even when pick_label is
              empty (a backend with no count read path offers zero types). -->
         <summary class="pill" aria-label="{{ i18n.t("chart-pick-heading") }}">
@@ -239,7 +240,7 @@
   <script type="application/json" id="chart-data">{{ chart.tip_json|safe }}</script>
 
   <!-- The same numbers as text: the sampled buckets, one column per series. -->
-  <details class="chart-table">
+  <details class="chart-table" id="chart-table">
     <summary>{{ i18n.t("chart-table-toggle") }}</summary>
     <div class="table-wrap">
       <table class="data-table">

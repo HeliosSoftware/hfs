@@ -197,8 +197,8 @@ fn notice_tag<'a>(html: &'a str, slug: &str) -> &'a str {
 /// swapping only the live region, from the same view without a retry count.
 fn assert_polls_periodically(html: &str, window: &str) {
     let tag = dash_live_tag(html);
-    assert!(tag.contains(r#"data-dash-refresh="10""#), "{tag}");
-    assert!(tag.contains("every 10s"), "{tag}");
+    assert!(tag.contains(r#"data-dash-refresh="5""#), "{tag}");
+    assert!(tag.contains("every 5s"), "{tag}");
     assert!(tag.contains("hx-select=\"#dash-live\""), "{tag}");
     let href_at = tag
         .find(r#"hx-get=""#)
@@ -217,7 +217,7 @@ fn assert_polls_periodically(html: &str, window: &str) {
 /// Asserts nothing on the page polls periodically.
 fn assert_no_periodic_refresh(html: &str) {
     assert!(!html.contains("data-dash-refresh"));
-    assert!(!html.contains("every 10s"));
+    assert!(!html.contains("every 5s"));
 }
 
 /// The regression itself: a window whose snapshot has not landed says it is

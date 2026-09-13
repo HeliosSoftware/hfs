@@ -307,7 +307,7 @@ async fn a_build_with_no_provider_names_that_reason_and_offers_no_retry() {
     assert!(!html.contains("Retry now"));
     // Nor does it refresh itself periodically: sample figures never change.
     assert!(!html.contains("data-dash-refresh"));
-    assert!(!html.contains("every 10s"));
+    assert!(!html.contains("every 5s"));
 }
 
 #[tokio::test]
