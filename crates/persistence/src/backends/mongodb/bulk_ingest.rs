@@ -859,6 +859,8 @@ impl MongoBackend {
             return Ok(());
         }
 
+        let collection = db.collection::<Document>(MongoBackend::SEARCH_INDEX_COLLECTION);
+
         // Only ids that carried rows before the batch need clearing; a create
         // has nothing to delete, which is the whole of a first import. The
         // per-entry path issued this delete unconditionally, once per resource.
@@ -872,7 +874,6 @@ impl MongoBackend {
             }
         }
         if !stale_by_type.is_empty() {
-            let collection = db.collection::<Document>(MongoBackend::SEARCH_INDEX_COLLECTION);
             for (resource_type, ids) in stale_by_type {
                 let filter = doc! {
                     "tenant_id": tenant_id,
@@ -892,11 +893,17 @@ impl MongoBackend {
             }
         }
 
+        // Ids of every plan the batch wrote, for the replay delete below.
+        let mut written_by_type: HashMap<&str, Vec<Bson>> = HashMap::new();
         let mut documents = Vec::new();
         for (plan_idx, plan) in planned.plans.iter().enumerate() {
             if failed.contains_key(&plan_idx) {
                 continue;
             }
+            written_by_type
+                .entry(plan.resource_type.as_str())
+                .or_default()
+                .push(Bson::from(plan.id.as_str()));
             documents.extend(self.search_index_documents(
                 tenant_id,
                 &plan.resource_type,
@@ -904,14 +911,47 @@ impl MongoBackend {
                 &plan.content,
             ));
         }
-        insert_documents(
-            db,
-            MongoBackend::SEARCH_INDEX_COLLECTION,
-            documents,
+        if documents.is_empty() {
+            return Ok(());
+        }
+
+        // `search_index` has no unique key, so a replayed insert would
+        // duplicate rows. The retry unit is therefore the whole insert phase,
+        // and every attempt after the first clears the batch's rows first —
+        // creates included, since their rows may have partially landed.
+        let mut first = true;
+        or_exhausted(
             "insert batch search index",
-            options.cancel.as_ref(),
+            retry_transient_with(
+                &BULK_INGEST_RETRY,
+                options.cancel.as_ref(),
+                "insert batch search index",
+                || {
+                    let replay = !std::mem::replace(&mut first, false);
+                    let collection = collection.clone();
+                    let written_by_type = &written_by_type;
+                    let documents = &documents;
+                    async move {
+                        if replay {
+                            for (resource_type, ids) in written_by_type {
+                                collection
+                                    .delete_many(doc! {
+                                        "tenant_id": tenant_id,
+                                        "resource_type": *resource_type,
+                                        "resource_id": { "$in": ids.clone() },
+                                    })
+                                    .await?;
+                            }
+                        }
+                        for chunk in documents.chunks(INSERT_DOCS_PER_COMMAND) {
+                            collection.insert_many(chunk).ordered(false).await?;
+                        }
+                        Ok(())
+                    }
+                },
+            )
+            .await,
         )
-        .await
     }
 
     /// Writes the batch's rollback log in one `insert`.

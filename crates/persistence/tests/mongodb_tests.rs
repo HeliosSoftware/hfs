@@ -8316,6 +8316,85 @@ mod bulk_submit {
             );
         }
     }
+
+    /// Spec §3.2 search index: `search_index` has no unique key, so a replayed
+    /// insert would duplicate rows. The retry deletes every batch id's rows
+    /// first. `times: 6` with inline indexing = resources (2), history (2),
+    /// then the search-index insert lands + errors twice before succeeding.
+    #[tokio::test]
+    async fn unacknowledged_search_index_insert_is_not_duplicated() {
+        let test = "submit_fp_unacked_search";
+        let app = "fp-unacked-search";
+        let Some(backend) = create_backend_with_app_name(test, app).await else {
+            return;
+        };
+        let tenant = create_tenant("submit-tenant");
+        let (id, manifest_id) = seed(&backend, &tenant).await;
+        // Control: the same shape ingested without a failpoint.
+        backend
+            .process_entries(
+                &tenant,
+                &id,
+                &manifest_id,
+                vec![NdjsonEntry::new(
+                    1,
+                    "Patient",
+                    json!({"resourceType": "Patient", "id": "control", "name": [{"family": "Indexed"}]}),
+                )],
+                &BulkProcessingOptions::new(),
+            )
+            .await
+            .unwrap();
+        let expected = search_index_entry_count(&backend, &tenant, "Patient", "control").await;
+        assert!(expected > 0);
+
+        let Some(fail_point) = FailPoint::enable(
+            app,
+            doc! {
+                "failCommands": ["insert"],
+                "writeConcernError": {
+                    "code": 91,
+                    "errmsg": "Replication is being shut down",
+                    "errorLabels": ["RetryableWriteError"],
+                },
+            },
+            doc! { "times": 6 },
+        )
+        .await
+        else {
+            return;
+        };
+        let entries: Vec<NdjsonEntry> = (1..=3)
+            .map(|i| {
+                NdjsonEntry::new(
+                    i,
+                    "Patient",
+                    json!({"resourceType": "Patient", "id": format!("sidx-{i}"), "name": [{"family": "Indexed"}]}),
+                )
+            })
+            .collect();
+        let results = backend
+            .process_entries(
+                &tenant,
+                &id,
+                &manifest_id,
+                entries,
+                &BulkProcessingOptions::new(),
+            )
+            .await
+            .unwrap();
+        fail_point.off().await;
+
+        assert!(results.iter().all(|r| r.is_success()), "{results:?}");
+        for i in 1..=3 {
+            assert_eq!(
+                search_index_entry_count(&backend, &tenant, "Patient", &format!("sidx-{i}")).await,
+                expected,
+                "sidx-{i} indexed exactly once"
+            );
+        }
+        assert_one_row_each(&backend, &tenant, &["sidx-1", "sidx-2", "sidx-3"]).await;
+    }
 }
 
 // ============================================================================
