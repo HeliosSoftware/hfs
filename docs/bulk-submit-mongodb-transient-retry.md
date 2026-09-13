@@ -475,12 +475,21 @@ counters):
 6. **Cancel during backoff** — `times: 100`; spawn the ingest, sleep 150 ms
    (long enough for attempt 1 to fail and the first 100 ms backoff to begin,
    short enough to precede the 2.5 s budget by a wide margin), then trip the
-   `CancelToken`. This proves only that cancellation ends the batch well
-   before the backoff budget is spent — assert total elapsed `< 1 s` — not
-   that it lands in a specific backoff step; the test says so in its comment.
-   Also assert `process_ndjson_stream` reports the cancelled abort reason and
-   the three entries carry `processing-error` receipts (the batch was recorded
-   before the between-batch cancel check ran).
+   `CancelToken`. Wall-clock elapsed is not asserted beyond a loose `< 10 s`
+   hang guard: a `closeConnection` failpoint makes each attempt pay a real
+   driver reconnect, and how long that costs is environment-dependent, not
+   something cancellation controls (observed ~1 s per reconnect on Windows +
+   Docker Desktop, stacking to ~2 s once containment's receipt write also
+   needs a fresh connection after the cancelled flush). What the test proves
+   deterministically instead: cancellation ends the retry loop before its
+   6-attempt budget. Read the three `processing-error` receipts
+   (`get_entry_results_page`) and assert each `issue[0].diagnostics` contains
+   `(after N attempts)` with `N < 6` — 2 or 3 is expected, but only the bound
+   is asserted, since it depends on reconnect speed. Also assert
+   `process_ndjson_stream` reports the cancelled abort reason and
+   `counts.processing_error == 3` (the batch was recorded before the
+   between-batch cancel check ran), both from the stream result and a fresh
+   `get_entry_counts`.
 7. **`confirm_landed`** directly: a row with the planned version and content
    ⇒ landed; same version, different content ⇒ not landed; absent ⇒ not landed.
 

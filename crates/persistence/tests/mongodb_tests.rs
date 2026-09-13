@@ -8548,9 +8548,13 @@ mod bulk_submit {
         );
     }
 
-    /// Spec §5.2 case 6. This proves only that cancellation ends the batch well
-    /// before the 2.5 s backoff budget is spent, not which backoff step it
-    /// lands in: 150 ms is after attempt 1 fails and inside the first sleep.
+    /// Spec §5.2 case 6. Proves cancellation ends the retry loop before its
+    /// 6-attempt budget: the in-flight batch's receipts carry an attempt count
+    /// under 6. 150 ms is after attempt 1 fails and inside the first sleep.
+    /// Wall-clock elapsed is not asserted beyond a loose hang guard — a
+    /// `closeConnection` failpoint costs a real reconnect per attempt, and how
+    /// long that takes is environment-dependent, not something cancellation
+    /// controls.
     #[tokio::test]
     async fn cancel_during_backoff_returns_promptly() {
         let test = "submit_fp_cancel_backoff";
@@ -8600,7 +8604,7 @@ mod bulk_submit {
         let elapsed = started.elapsed();
         fail_point.off().await;
 
-        assert!(elapsed < Duration::from_secs(1), "took {elapsed:?}");
+        assert!(elapsed < Duration::from_secs(10), "hung: took {elapsed:?}");
         assert!(result.aborted);
         assert_eq!(result.abort_reason.as_deref(), Some(CANCELLED_ABORT_REASON));
         assert_eq!(
@@ -8612,6 +8616,28 @@ mod bulk_submit {
             .await
             .unwrap();
         assert_eq!(counts.processing_error, 3);
+
+        let page = backend
+            .get_entry_results_page(&tenant, &id, &manifest_id, None, 10, None)
+            .await
+            .unwrap();
+        assert_eq!(page.entries.len(), 3);
+        for entry in &page.entries {
+            let r = &entry.result;
+            assert_eq!(r.outcome, BulkEntryOutcome::ProcessingError, "{r:?}");
+            let issue = &r.operation_outcome.as_ref().unwrap()["issue"][0];
+            let diagnostics = issue["diagnostics"].as_str().unwrap();
+            let attempts: u32 = diagnostics
+                .split("(after ")
+                .nth(1)
+                .and_then(|s| s.split(' ').next())
+                .and_then(|s| s.parse().ok())
+                .unwrap_or_else(|| panic!("no attempt count in {diagnostics}"));
+            assert!(
+                attempts < 6,
+                "cancellation should stop the retry loop short of its budget: {diagnostics}"
+            );
+        }
     }
 }
 
