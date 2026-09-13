@@ -305,6 +305,12 @@ async fn a_build_with_no_provider_names_that_reason_and_offers_no_retry() {
     // retry: re-asking a provider-less build would only redraw the same page.
     assert!(!html.contains(r#"hx-trigger="load delay:1200ms""#));
     assert!(!html.contains("Retry now"));
+    // Nor does it refresh itself periodically, fast or slow: sample figures
+    // never change, so there is nothing for the page to watch.
+    assert!(!html.contains("data-dash-refresh"));
+    assert!(!html.contains("data-dash-moving"));
+    assert!(!html.contains("every 5s"));
+    assert!(!html.contains("every 10s"));
 }
 
 #[tokio::test]

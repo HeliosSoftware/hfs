@@ -134,6 +134,9 @@
     var filterBefore = document.querySelector("[data-pick-filter]");
     var filterValue = filterBefore ? filterBefore.value : "";
 
+    // Marks the swap in flight so the #dash-live refresh (below) does not
+    // re-render the region under it (#1078).
+    document.documentElement.setAttribute("data-dash-picking", "");
     fetch(href)
       .then(function (response) {
         if (!response.ok) throw new Error("unexpected response");
@@ -156,11 +159,181 @@
           }
         }
         history.pushState(null, "", href);
+        document.documentElement.removeAttribute("data-dash-picking");
         document.dispatchEvent(new CustomEvent("hfs:chart-swapped"));
       })
       .catch(function () {
+        document.documentElement.removeAttribute("data-dash-picking");
         window.location = href;
       });
+  });
+})();
+
+/* Live refresh (#1078): every ready dashboard renders #dash-live with
+   `hx-trigger="every Ns [hfsDashCanRefresh()]"`, data-dash-refresh and a
+   data-dash-state digest of its figures — every few seconds while they are
+   still moving (approximate, or an import running: data-dash-moving), slower
+   once they settle, so a tab opened before an import starts still notices it.
+   A settled tick whose digest did not change is dropped, leaving a quiet page
+   untouched. The point is that the figures keep climbing on their own, so the
+   refresh must not stall while the user is merely looking at or using the
+   dashboard. Instead of skipping ticks, each swap carries the user's state
+   across:
+
+   - The open type picker is kept as the very same node (hx-preserve is added
+     to the response's #chart-pick just before the swap), so it stays open with
+     its filter text, list scroll and focus; its counts update once it closes.
+   - An open data table (#chart-table) is re-opened in the response.
+   - A tooltip showing when the refresh lands is re-shown for the pointer's
+     position over the new chart.
+   - Returning to the tab refreshes at once instead of waiting for a tick.
+
+   hfsDashCanRefresh() only skips a tick while the tab is hidden, a picker swap
+   is in flight, or keyboard focus sits in the region outside the picker — an
+   outerHTML swap would drop a keyboard user's place, while a mouse click's
+   leftover focus is harmless to lose.
+
+   The type picker swaps only the chart card and pushState()s its URL, so the
+   poll's hx-get is left pointing at the old selection: each refresh request is
+   re-aimed at the current location, and a response is dropped if the location
+   changed while it was in flight. The request also names the notice kinds on
+   screen (?notices=), so the server renders those lines aria-live="off": an
+   unchanged "approximate" line is not re-announced every tick. */
+(function () {
+  "use strict";
+
+  var pointer = null;
+  document.addEventListener("mousemove", function (event) {
+    pointer = { x: event.clientX, y: event.clientY };
+  });
+
+  function isRefresh(elt) {
+    return !!elt && elt.id === "dash-live" && elt.hasAttribute("data-dash-refresh");
+  }
+
+  function here() {
+    return window.location.pathname + window.location.search;
+  }
+
+  window.hfsDashCanRefresh = function () {
+    if (document.hidden) return false;
+    if (document.documentElement.hasAttribute("data-dash-picking")) return false;
+    var live = document.getElementById("dash-live");
+    if (!live) return false;
+    var active = document.activeElement;
+    if (
+      active &&
+      active !== document.body &&
+      live.contains(active) &&
+      !active.closest("#chart-pick") &&
+      active.matches(":focus-visible")
+    ) {
+      return false;
+    }
+    return true;
+  };
+
+  document.addEventListener("htmx:configRequest", function (event) {
+    var elt = event.detail.elt;
+    if (!isRefresh(elt)) return;
+    var path = here();
+    event.detail.path = path;
+    var seen = [];
+    elt.querySelectorAll("[data-dash-notice]").forEach(function (line) {
+      seen.push(line.getAttribute("data-dash-notice"));
+    });
+    if (seen.length) event.detail.parameters.notices = seen.join(",");
+    elt.setAttribute("data-dash-requested", path);
+  });
+
+  document.addEventListener("htmx:beforeSwap", function (event) {
+    var elt = event.detail.elt;
+    if (!isRefresh(elt)) return;
+    if (elt.getAttribute("data-dash-requested") !== here()) {
+      event.detail.shouldSwap = false;
+      return;
+    }
+    var html = event.detail.serverResponse;
+    if (typeof html !== "string") return;
+    // A settled page is only watched: when neither it nor the answer is
+    // moving and the figures are the same, leave the page untouched.
+    var tag = /<div id="dash-live"[^>]*>/.exec(html);
+    if (tag && !elt.hasAttribute("data-dash-moving") && tag[0].indexOf("data-dash-moving") === -1) {
+      var state = /data-dash-state="([^"]*)"/.exec(tag[0]);
+      if (state && state[1] && state[1] === elt.getAttribute("data-dash-state")) {
+        event.detail.shouldSwap = false;
+        return;
+      }
+    }
+    var pick = document.getElementById("chart-pick");
+    var state = { tip: false, focus: null, selection: null, scrolls: [] };
+    if (pick && pick.open) {
+      html = html.replace('id="chart-pick"', 'id="chart-pick" hx-preserve');
+      // htmx keeps the node, but moving it can drop focus, caret and list
+      // scroll, so they are put back after the swap.
+      var active = document.activeElement;
+      if (active && pick.contains(active)) {
+        state.focus = active;
+        if (typeof active.selectionStart === "number") {
+          state.selection = [active.selectionStart, active.selectionEnd];
+        }
+      }
+      pick.querySelectorAll("*").forEach(function (node) {
+        if (node.scrollTop > 0) state.scrolls.push([node, node.scrollTop]);
+      });
+    }
+    var table = document.getElementById("chart-table");
+    if (table && table.open) {
+      html = html.replace('id="chart-table"', 'id="chart-table" open');
+    }
+    var tip = document.getElementById("chart-tip");
+    state.tip = !!(tip && !tip.hidden);
+    // Kept here, not on #dash-live: the swap throws that node away.
+    carried = state;
+    event.detail.serverResponse = html;
+  });
+
+  // State carried across the refresh swap in flight, set just before it.
+  var carried = null;
+
+  // Runs after the tooltip IIFE's own afterSettle listener has rebound the new
+  // chart, so the synthetic move lands on a live handler.
+  document.addEventListener("htmx:afterSettle", function () {
+    if (!carried) return;
+    var state = carried;
+    carried = null;
+    state.scrolls.forEach(function (entry) {
+      if (entry[0].isConnected) entry[0].scrollTop = entry[1];
+    });
+    var focus = state.focus;
+    if (focus && focus.isConnected && document.activeElement !== focus) {
+      focus.focus({ preventScroll: true });
+      if (state.selection && typeof focus.setSelectionRange === "function") {
+        try {
+          focus.setSelectionRange(state.selection[0], state.selection[1]);
+        } catch (unsupported) {
+          /* not a text field */
+        }
+      }
+    }
+    if (!state.tip || !pointer) return;
+    var wrap = document.getElementById("chart-wrap");
+    if (!wrap || !wrap.matches(":hover")) return;
+    wrap.dispatchEvent(
+      new MouseEvent("mousemove", { clientX: pointer.x, clientY: pointer.y, bubbles: true })
+    );
+  });
+
+  document.addEventListener("visibilitychange", function () {
+    if (document.hidden || !window.htmx) return;
+    var live = document.getElementById("dash-live");
+    if (!isRefresh(live) || !window.hfsDashCanRefresh()) return;
+    window.htmx.ajax("GET", here(), {
+      source: live,
+      target: live,
+      select: "#dash-live",
+      swap: "outerHTML",
+    });
   });
 })();
 

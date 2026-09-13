@@ -182,6 +182,9 @@ where
         .storage()
         .delete(tenant.context(), &resource_type, &id)
         .await?;
+    // `delete` only succeeds against a live resource (an already-deleted or
+    // missing one is `NotFound`), so a success always removes one.
+    super::dashboard_counts::deleted(tenant.context(), &resource_type, 1);
 
     debug!(
         resource_type = %resource_type,
@@ -274,6 +277,7 @@ where
     use helios_persistence::core::ConditionalDeleteResult;
     match result {
         ConditionalDeleteResult::Deleted(deleted) => {
+            super::dashboard_counts::deleted(tenant.context(), &resource_type, 1);
             debug!(
                 resource_type = %resource_type,
                 id = %deleted.id(),

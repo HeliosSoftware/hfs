@@ -1939,6 +1939,53 @@ async fn build_bulk_submit(
     }))
 }
 
+/// Feeds `$bulk-submit` imports into the Home dashboard's process-global live
+/// resource counters (#1078), keyed like the REST write paths by the tenant
+/// context id, so the "FHIR Resources over Time" chart moves during an import
+/// instead of waiting on storage aggregates the import keeps busy.
+///
+/// The worker reports every committed entry as created (see
+/// [`helios_persistence::core::ImportedResourcesHook::resources_imported`]), so
+/// a re-import over existing ids over-counts until the dashboard's background
+/// reconcile corrects it from storage.
+#[cfg(any(
+    feature = "sqlite",
+    feature = "postgres",
+    feature = "mongodb",
+    feature = "s3"
+))]
+struct DashboardImportCounts;
+
+#[cfg(any(
+    feature = "sqlite",
+    feature = "postgres",
+    feature = "mongodb",
+    feature = "s3"
+))]
+impl helios_persistence::core::ImportedResourcesHook for DashboardImportCounts {
+    fn resources_imported(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        created: u64,
+        _updated: u64,
+    ) {
+        helios_observability::dashboard_counters::record_created(
+            tenant.tenant_id().as_str(),
+            resource_type,
+            created,
+        );
+    }
+
+    fn resources_deleted(&self, tenant: &TenantContext, resource_type: &str, deleted: u64) {
+        helios_observability::dashboard_counters::record_deleted(
+            tenant.tenant_id().as_str(),
+            resource_type,
+            deleted,
+        );
+    }
+}
+
 /// Spawns the in-process submit worker pool and the periodic cleanup task.
 #[cfg(any(
     feature = "sqlite",
@@ -1979,6 +2026,7 @@ fn spawn_submit_workers(
         tokio::spawn(async move {
             let worker = DefaultSubmitWorker::new(jobs.clone(), fetcher, output, worker_id.clone())
                 .with_deferred_indexing(defer_indexing, reindex_hook.clone())
+                .with_imported_resources_hook(Some(Arc::new(DashboardImportCounts)))
                 .with_file_concurrency(file_concurrency);
             loop {
                 match jobs.claim_next_manifest(&worker_id, lease).await {

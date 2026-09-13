@@ -151,6 +151,10 @@ where
 
     match purge.purge(tenant.context(), &resource_type, &id).await {
         Ok(()) => {
+            // The purge erased live rows *and* history, which the dashboard's
+            // counters and seeded history rings cannot subtract precisely.
+            // Drop the tenant's counters; the next reconcile reseeds them.
+            super::dashboard_counts::invalidated(tenant.context().tenant_id().as_str());
             emit_purge_audit(
                 &state,
                 principal.as_ref(),
@@ -211,6 +215,8 @@ where
 
     match purge.purge_all(tenant.context(), &resource_type).await {
         Ok(count) => {
+            // As for the instance purge: live rows and history are gone.
+            super::dashboard_counts::invalidated(tenant.context().tenant_id().as_str());
             emit_purge_audit(
                 &state,
                 principal.as_ref(),

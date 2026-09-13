@@ -671,9 +671,12 @@ impl ResourceStorage for SqliteBackend {
         let tenant_id = tenant.tenant_id().as_str().to_string();
         let resource_type = resource_type.to_string();
 
-        // Bound the scan by the raw `last_updated` column so the
-        // `(tenant_id, last_updated)` history index prunes the range (wrapping the
-        // column in `strftime(...)` would force a full scan). The bound is floored
+        // Bound the scan by the raw `last_updated` column so the covering
+        // `idx_history_type_updated` `(tenant_id, resource_type, last_updated,
+        // is_deleted, version_id)` history index (schema v28, #1078) prunes the
+        // range to this type's rows alone and answers without touching the table
+        // (wrapping the column in `strftime(...)` would force a full scan). The
+        // bound is floored
         // to a bucket boundary, and formatted the same RFC3339 way the rows are
         // written; because it lands exactly on a whole second it carries no
         // fractional part, and any stored value in that same second sorts after it

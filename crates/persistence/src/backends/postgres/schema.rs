@@ -9,7 +9,7 @@ use crate::core::bulk_submit_legacy::{
 use crate::error::{BackendError, StorageResult};
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 38;
+pub const SCHEMA_VERSION: i32 = 39;
 
 /// Advisory-lock key serializing schema migration across HFS instances sharing
 /// one database. Arbitrary but must stay stable across releases.
@@ -373,6 +373,7 @@ async fn migrate_schema(
                 continue;
             }
             37 => migrate_v37_to_v38(client).await?,
+            38 => migrate_v38_to_v39(client).await?,
             _ => {
                 return Err(pg_error(format!("Unknown schema version: {}", version)));
             }
@@ -3647,6 +3648,70 @@ async fn migrate_v37_to_v38(client: &deadpool_postgres::Client) -> StorageResult
     Ok(())
 }
 
+/// DDL for `idx_history_type_updated`, built by [`migrate_v38_to_v39`].
+///
+/// Kept as a constant so the unit tests can pin its column order and the
+/// absence of `CONCURRENTLY` without a live database.
+const V39_HISTORY_TYPE_UPDATED_INDEX_SQL: &str =
+    "CREATE INDEX IF NOT EXISTS idx_history_type_updated
+     ON resource_history (tenant_id, resource_type, last_updated)
+     INCLUDE (is_deleted, version_id)";
+
+/// v38 -> v39: per-type history range index for the dashboard (#1078).
+///
+/// The UI dashboard's resource-count sparkline calls `count_deltas_by_bucket`
+/// once per resource type, and each call filters
+/// `resource_history WHERE tenant_id = $1 AND resource_type = $2 AND
+/// last_updated >= $3`, reading `is_deleted` and `version_id` to decide whether
+/// a version is a create (`+1`), a delete (`-1`) or a plain update (`0`). The
+/// only range index on the table, `idx_history_updated (tenant_id,
+/// last_updated)`, has no `resource_type`, so every per-type call walked the
+/// history of *every* type in the window and filtered the rest out on the heap
+/// — during a bulk import that is millions of rows, repeated once per type on
+/// every dashboard refresh. The primary key `(tenant_id, resource_type, id,
+/// version_id)` does not help either: `id` sits between the type and the
+/// range column.
+///
+/// `idx_history_type_updated` puts both equality columns first and the range
+/// column last, so the query becomes one bounded seek, and `INCLUDE (is_deleted,
+/// version_id)` carries the two columns the delta rule reads so the scan can be
+/// index-only (history is append-mostly, so the visibility map stays largely
+/// set). The same key order also serves type-level `_history` with `_since` /
+/// `_before`, which binds the identical prefix. `idx_history_updated` is kept:
+/// system-level `_history` and `activity_histogram` bind no resource type and
+/// still need it.
+///
+/// This is the same index the SQLite backend adds under the same name; SQLite
+/// has no `INCLUDE`, so there the payload columns are trailing key columns.
+///
+/// ## Cost
+///
+/// v35 took `resource_history` down to two indexes because every history write
+/// pays an insertion into each one; this adds a third. That is a deliberate
+/// trade: the write is one narrow b-tree entry per version, against a read that
+/// otherwise scans every type's history on each dashboard poll.
+///
+/// The build takes a `SHARE` lock on `resource_history`, **blocking writes to
+/// that table for the duration** — on a large table this makes the startup
+/// upgrade take noticeably longer. As with v15, v18 and v19 it runs under the
+/// `initialize_schema` advisory lock before the instance serves traffic.
+/// Operators with a large existing database can pre-build it
+/// `CONCURRENTLY` by hand, after which `IF NOT EXISTS` makes this a no-op.
+/// `CREATE INDEX CONCURRENTLY` is not used here for the reason given on v15: a
+/// process death mid-build leaves an `INVALID` index that a later
+/// `IF NOT EXISTS` would skip forever.
+///
+/// `resource_history` is an ordinary heap table (not partitioned, no per-tenant
+/// tables), so a plain `CREATE INDEX` covers every tenant's rows.
+async fn migrate_v38_to_v39(client: &deadpool_postgres::Client) -> StorageResult<()> {
+    client
+        .execute(V39_HISTORY_TYPE_UPDATED_INDEX_SQL, &[])
+        .await
+        .map_err(|e| pg_error(format!("Migration v38->v39 failed: {}", e)))?;
+
+    Ok(())
+}
+
 /// v23 -> v24: drop `fk_search_resource`.
 ///
 /// `search_index` carried a composite FK to `resources` with `ON DELETE
@@ -5168,5 +5233,111 @@ mod postgres_integration_v37_migration {
         );
         assert_eq!(classification(&client, output).await, first_classification);
         assert_eq!(index_count(&client).await, 2);
+    }
+
+    /// `(indexdef, indisvalid)` for a named index, or `None` if it is absent.
+    async fn index_definition(
+        client: &deadpool_postgres::Client,
+        name: &str,
+    ) -> Option<(String, bool)> {
+        client
+            .query_opt(
+                "SELECT pg_get_indexdef(i.indexrelid), i.indisvalid
+                 FROM pg_index i
+                 JOIN pg_class c ON c.oid = i.indexrelid
+                 JOIN pg_namespace n ON n.oid = c.relnamespace
+                 WHERE n.nspname = current_schema() AND c.relname = $1",
+                &[&name],
+            )
+            .await
+            .expect("read index definition")
+            .map(|row| (row.get(0), row.get(1)))
+    }
+
+    #[tokio::test]
+    async fn postgres_integration_v38_to_v39_builds_history_type_index() {
+        let _guard = POSTGRES_TEST_LOCK.lock().await;
+        let pg = shared_pg().await;
+        let backend = create_database(
+            pg,
+            &format!("hfs_v39_test_{}", uuid::Uuid::new_v4().simple()),
+        )
+        .await;
+        let client = backend.get_client().await.unwrap();
+        migrate_through_v36(&client).await.unwrap();
+        let mut migration_client = backend.get_client().await.unwrap();
+        // The v37 helper stamps its own version marker.
+        migrate_v36_to_v37(&mut migration_client).await.unwrap();
+        migrate_v37_to_v38(&client).await.unwrap();
+        set_schema_version(&client, 38).await.unwrap();
+        assert_eq!(
+            index_definition(&client, "idx_history_type_updated").await,
+            None,
+            "v38 must not carry the v39 index yet"
+        );
+
+        initialize_schema(&mut migration_client)
+            .await
+            .expect("upgrade v38 to current");
+        assert_eq!(get_schema_version(&client).await.unwrap(), SCHEMA_VERSION);
+
+        let (definition, valid) = index_definition(&client, "idx_history_type_updated")
+            .await
+            .expect("v39 must create idx_history_type_updated");
+        assert!(valid, "index must be VALID: {definition}");
+        assert!(
+            definition.contains(
+                "resource_history USING btree (tenant_id, resource_type, last_updated) \
+                 INCLUDE (is_deleted, version_id)"
+            ),
+            "unexpected definition: {definition}"
+        );
+        // The tenant-wide range index still serves system `_history` and the
+        // activity histogram, so v39 must leave it in place.
+        assert!(
+            index_definition(&client, "idx_history_updated")
+                .await
+                .is_some()
+        );
+
+        // `IF NOT EXISTS` makes a replay (or a hand-built index) a no-op.
+        migrate_v38_to_v39(&client)
+            .await
+            .expect("replaying v39 must be a no-op");
+    }
+}
+
+#[cfg(test)]
+mod v39_history_type_index_tests {
+    use super::*;
+
+    fn normalized(sql: &str) -> String {
+        sql.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    #[test]
+    fn schema_version_is_v39() {
+        assert_eq!(SCHEMA_VERSION, 39);
+    }
+
+    #[test]
+    fn v39_index_keys_equality_columns_before_range_and_covers_delta_columns() {
+        assert_eq!(
+            normalized(V39_HISTORY_TYPE_UPDATED_INDEX_SQL),
+            "CREATE INDEX IF NOT EXISTS idx_history_type_updated \
+             ON resource_history (tenant_id, resource_type, last_updated) \
+             INCLUDE (is_deleted, version_id)"
+        );
+    }
+
+    #[test]
+    fn v39_index_is_not_built_concurrently_or_partial() {
+        let upper = V39_HISTORY_TYPE_UPDATED_INDEX_SQL.to_ascii_uppercase();
+        // See `migrate_v14_to_v15`: an interrupted CONCURRENTLY build leaves an
+        // INVALID index that `IF NOT EXISTS` would then skip forever.
+        assert!(!upper.contains("CONCURRENTLY"));
+        // A predicate would stop the planner proving the index usable for the
+        // unfiltered delta query.
+        assert!(!upper.contains("WHERE"));
     }
 }

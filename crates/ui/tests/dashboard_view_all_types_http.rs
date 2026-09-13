@@ -83,6 +83,9 @@ impl DashboardProvider for FakeProvider {
             export_jobs: None,
             import_jobs_active: None,
             partial: false,
+            generated_at: None,
+            approximate: false,
+            series_pending: false,
         }
     }
 }

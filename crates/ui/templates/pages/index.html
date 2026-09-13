@@ -7,15 +7,31 @@
 
 {#
   Everything derived from the dashboard snapshot lives in one swappable
-  region (#956). While the snapshot is still being computed the page renders
-  a waiting state and — with JavaScript — re-requests just this region a
-  bounded number of times, so the figures appear without a manual reload and
-  without ever standing in for them with invented ones.
+  region (#956). While the chart is still waiting — nothing known yet, or
+  (#1078) the tenant's figures known but this window's series not — the page
+  renders a waiting state and, with JavaScript, re-requests just this region
+  a bounded number of times, so the figures appear without a manual reload
+  and without ever standing in for them with invented ones. The stat cards
+  render whenever a figure is known; only the chart area waits.
+
+  Figures that are here follow themselves the same way (#1078): every few
+  seconds while they are still moving — counted from recent writes and not yet
+  reconciled, or with an import running (data-dash-moving) — and slower once
+  they settle, so a tab opened before an import starts still notices it. A
+  settled tick whose figures did not change (same data-dash-state) is dropped. assets/dashboard.js keeps what the user is doing across each swap
+  (the open type picker is preserved as-is, an open table stays open, the
+  tooltip follows the pointer) and points each request at the page's current
+  URL, which the type picker changes without a reload.
 #}
 <div id="dash-live"
   {% if let Some(href) = auto_retry_href %}
      hx-get="{{ href }}" hx-trigger="load delay:1200ms"
      hx-target="this" hx-select="#dash-live" hx-swap="outerHTML"
+  {% else if let Some(href) = refresh_href %}
+     hx-get="{{ href }}" hx-trigger="every {{ refresh_secs }}s [hfsDashCanRefresh()]"
+     hx-target="this" hx-select="#dash-live" hx-swap="outerHTML"
+     data-dash-refresh="{{ refresh_secs }}" data-dash-state="{{ refresh_state }}"
+     {% if refresh_moving %}data-dash-moving="1"{% endif %}
   {% endif %}
 >
 
@@ -105,7 +121,7 @@
         the charted set — the same progressive-enhancement contract as the
         window selector.
       -->
-      <details class="menu chart-pick">
+      <details class="menu chart-pick" id="chart-pick">
         <!-- The aria-label keeps the summary named even when pick_label is
              empty (a backend with no count read path offers zero types). -->
         <summary class="pill" aria-label="{{ i18n.t("chart-pick-heading") }}">
@@ -150,22 +166,28 @@
   </header>
 
   {#
-    Whatever is short of a complete live reading is named here, and named
-    precisely: waiting is not "no provider", and a half-failed snapshot is
-    not a measurement (#956). `aria-live` so the swap announces itself.
+    Whatever is short of a complete, exact live reading is named here, and
+    named precisely: waiting is not "no provider", a half-failed snapshot is
+    not a measurement (#956), and a figure counted from recent writes is not
+    an exact storage read (#1078). One line per fact, in the precedence
+    `DashboardNotice` documents; the first line of a live render says when
+    its figures were read. `aria-live` so the swap announces itself.
   #}
-  {% if let Some(key) = notice.key() %}
-  <p class="notice notice--warn" aria-live="polite">
-    {{ i18n.t(key) }}
-    {% if notice.is_pending() %}
+  {% for line in notices %}
+  <p class="notice{% if line.kind.is_warning() %} notice--warn{% endif %}" aria-live="{{ self.notice_aria_live(line.kind) }}" data-dash-notice="{{ line.kind.slug() }}">
+    {% if let Some(key) = line.kind.key() %}{{ i18n.t(key) }}{% endif %}
+    {% if let Some(as_of) = line.as_of %}
+    <time datetime="{{ as_of.datetime }}">{{ i18n.t_arg("chart-as-of", "time", as_of.label.clone()) }}</time>
+    {% endif %}
+    {% if line.kind.is_waiting() %}
     {# Always present, auto-refresh or not: the page stays recoverable
        without JavaScript, and after the poll budget it is the only way on. #}
     <a href="{{ retry_href }}">{{ i18n.t("chart-pending-retry") }}</a>
     {% endif %}
   </p>
-  {% endif %}
+  {% endfor %}
 
-  {% if notice.is_pending() %}
+  {% if chart_waiting %}
   <div class="chart-empty">{{ i18n.t("chart-pending-empty") }}</div>
   {% else if !chart.has_data %}
   <div class="chart-empty">{{ i18n.t("chart-empty") }}</div>
@@ -220,7 +242,7 @@
   <script type="application/json" id="chart-data">{{ chart.tip_json|safe }}</script>
 
   <!-- The same numbers as text: the sampled buckets, one column per series. -->
-  <details class="chart-table">
+  <details class="chart-table" id="chart-table">
     <summary>{{ i18n.t("chart-table-toggle") }}</summary>
     <div class="table-wrap">
       <table class="data-table">

@@ -670,6 +670,13 @@ where
                 emit_transaction_entry_event(state, &tenant, fhir_version, entry, result);
             }
 
+            // Feed the dashboard's live counts from the same committed results
+            // (#1078) — unconditionally, unlike the subscription announcement.
+            for ((_, entry, _), result) in indexed_entries.iter().zip(bundle_result.entries.iter())
+            {
+                record_transaction_entry_count(&tenant, entry, result);
+            }
+
             // GET searches run against the committed state (see above). A
             // failure here cannot roll the transaction back, so it surfaces
             // as that entry's own error outcome rather than a misleading
@@ -963,6 +970,58 @@ fn emit_transaction_entry_event<S>(
     }
 }
 
+/// The dashboard live-count change of one committed transaction entry
+/// (#1078), as `(resource_type, delta)`, or `None` when the entry changed no
+/// live count.
+///
+/// Reads the results the way the subscription announcement does
+/// (`transaction_write_event_type`): only 2xx entries committed a write; a
+/// POST or PUT that created answers 201 (`+1`), and a PUT that updated — or an
+/// `ifNoneExist` POST that matched — answers 200 (no change). A 2xx DELETE is
+/// `-1`: SQLite and PostgreSQL fail the whole bundle on a missing resource, so
+/// there it always removed a live one. MongoDB answers 204 for a missing
+/// resource too, which the result cannot tell apart; such an entry
+/// under-counts by one until the dashboard's background reconcile corrects it.
+/// The type comes from the stored resource when the result carries one, else
+/// from the URL.
+fn transaction_entry_count_delta(
+    entry: &BundleEntry,
+    result: &BundleEntryResult,
+) -> Option<(String, i64)> {
+    if !(200..300).contains(&result.status) {
+        return None;
+    }
+    let delta = match entry.method {
+        BundleMethod::Post | BundleMethod::Put if result.status == 201 => 1,
+        BundleMethod::Delete => -1,
+        _ => return None,
+    };
+    let resource_type = result
+        .resource
+        .as_ref()
+        .and_then(|r| r.get("resourceType"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .or_else(|| {
+            parse_request_url(&entry.url)
+                .ok()
+                .map(|(resource_type, _)| resource_type)
+        })
+        .filter(|resource_type| !resource_type.is_empty())?;
+    Some((resource_type, delta))
+}
+
+/// Records one committed transaction entry's live-count change (#1078).
+fn record_transaction_entry_count(
+    tenant: &TenantExtractor,
+    entry: &BundleEntry,
+    result: &BundleEntryResult,
+) {
+    if let Some((resource_type, delta)) = transaction_entry_count_delta(entry, result) {
+        super::dashboard_counts::changed(tenant.context(), &resource_type, delta);
+    }
+}
+
 /// Processes a single batch entry, returning a structured BundleEntryResult.
 ///
 /// `audit_target` is an out-parameter for the one case where neither the
@@ -1199,6 +1258,7 @@ where
                     .await
                 {
                     Ok(ConditionalCreateResult::Created(stored)) => {
+                        super::dashboard_counts::created(tenant.context(), &resource_type);
                         record_stored_profile(state, tenant, fhir_version, &stored);
                         BundleEntryResult::created(stored)
                     }
@@ -1228,6 +1288,7 @@ where
                 .await
             {
                 Ok(stored) => {
+                    super::dashboard_counts::created(tenant.context(), &resource_type);
                     record_stored_profile(state, tenant, fhir_version, &stored);
                     #[cfg(feature = "subscriptions")]
                     emit_bundle_write_event(
@@ -1294,6 +1355,7 @@ where
                         result
                     }
                     Ok(ConditionalUpdateResult::Created(stored)) => {
+                        super::dashboard_counts::created(tenant.context(), &resource_type);
                         record_stored_profile(state, tenant, fhir_version, &stored);
                         BundleEntryResult::created(stored)
                     }
@@ -1359,6 +1421,7 @@ where
                 .await
             {
                 Ok((stored, created)) => {
+                    super::dashboard_counts::upserted(tenant.context(), &resource_type, created);
                     record_stored_profile(state, tenant, fhir_version, &stored);
                     #[cfg(feature = "subscriptions")]
                     emit_bundle_write_event(
@@ -1403,6 +1466,7 @@ where
                     .await
                 {
                     Ok(ConditionalDeleteResult::Deleted(deleted)) => {
+                        super::dashboard_counts::deleted(tenant.context(), &resource_type, 1);
                         *audit_target = Some(AuditTarget::from_stored(&deleted));
                         BundleEntryResult::deleted()
                     }
@@ -1442,6 +1506,7 @@ where
                 .await
             {
                 Ok(()) => {
+                    super::dashboard_counts::deleted(tenant.context(), &resource_type, 1);
                     #[cfg(feature = "subscriptions")]
                     emit_bundle_delete_event(
                         state,
@@ -3924,6 +3989,93 @@ mod tests {
         // A non-2xx entry never committed, so it announces nothing.
         assert_eq!(transaction_write_event_type(BundleMethod::Post, 409), None);
         assert_eq!(transaction_write_event_type(BundleMethod::Put, 412), None);
+    }
+
+    /// #1078: the dashboard's live count moves only for committed entries that
+    /// changed it — a created POST/PUT (+1) or a 2xx DELETE (-1) — whatever
+    /// the `subscriptions` feature says.
+    #[test]
+    fn transaction_entry_count_delta_counts_only_live_count_changes() {
+        let entry = |method: BundleMethod, url: &str| BundleEntry {
+            method,
+            url: url.to_string(),
+            ..Default::default()
+        };
+        let result = |status: u16, resource: Option<Value>| BundleEntryResult {
+            status,
+            location: None,
+            etag: None,
+            last_modified: None,
+            resource,
+            outcome: None,
+        };
+        let patient = Some(serde_json::json!({"resourceType": "Patient", "id": "p1"}));
+
+        assert_eq!(
+            transaction_entry_count_delta(
+                &entry(BundleMethod::Post, "Patient"),
+                &result(201, patient.clone())
+            ),
+            Some(("Patient".to_string(), 1))
+        );
+        assert_eq!(
+            transaction_entry_count_delta(
+                &entry(BundleMethod::Put, "Patient/p1"),
+                &result(201, patient.clone())
+            ),
+            Some(("Patient".to_string(), 1))
+        );
+        // The type falls back to the URL when the result carries no body.
+        assert_eq!(
+            transaction_entry_count_delta(
+                &entry(BundleMethod::Post, "Observation"),
+                &result(201, None)
+            ),
+            Some(("Observation".to_string(), 1))
+        );
+        // An update, or an `ifNoneExist` POST that matched, adds nothing.
+        assert_eq!(
+            transaction_entry_count_delta(
+                &entry(BundleMethod::Put, "Patient/p1"),
+                &result(200, patient.clone())
+            ),
+            None
+        );
+        assert_eq!(
+            transaction_entry_count_delta(
+                &entry(BundleMethod::Post, "Patient"),
+                &result(200, patient.clone())
+            ),
+            None
+        );
+        assert_eq!(
+            transaction_entry_count_delta(
+                &entry(BundleMethod::Delete, "Patient/p1"),
+                &result(204, None)
+            ),
+            Some(("Patient".to_string(), -1))
+        );
+        assert_eq!(
+            transaction_entry_count_delta(
+                &entry(BundleMethod::Delete, "Patient/p1"),
+                &result(404, None)
+            ),
+            None
+        );
+        assert_eq!(
+            transaction_entry_count_delta(
+                &entry(BundleMethod::Get, "Patient/p1"),
+                &result(200, patient)
+            ),
+            None
+        );
+        assert_eq!(
+            transaction_entry_count_delta(
+                &entry(BundleMethod::Post, "Patient"),
+                &result(409, None)
+            ),
+            None
+        );
     }
 
     #[test]

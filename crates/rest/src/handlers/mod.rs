@@ -14,6 +14,7 @@
 //! - [`capabilities`] - Get server capabilities (CapabilityStatement)
 //! - [`versions`] - Get supported FHIR versions ($versions operation)
 //! - [`health`] - Health check endpoint
+//! - `dashboard_counts` - Live resource-count recording for the Home dashboard
 
 pub mod admin_tenants;
 pub mod batch;
@@ -25,6 +26,7 @@ pub mod capabilities;
 pub mod compartment;
 pub mod console_metrics;
 pub mod create;
+pub(crate) mod dashboard_counts;
 pub mod delete;
 pub mod health;
 pub mod history;

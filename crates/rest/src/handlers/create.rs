@@ -131,6 +131,7 @@ where
         use helios_persistence::core::ConditionalCreateResult;
         return match result {
             ConditionalCreateResult::Created(stored) => {
+                super::dashboard_counts::created(tenant.context(), &resource_type);
                 // Stored StructureDefinitions feed the tenant's profile
                 // registry.
                 if resource_type == "StructureDefinition" {
@@ -210,6 +211,7 @@ where
         .storage()
         .create(tenant.context(), &resource_type, resource, fhir_version)
         .await?;
+    super::dashboard_counts::created(tenant.context(), &resource_type);
 
     // Stored StructureDefinitions feed the tenant's profile registry.
     if resource_type == "StructureDefinition" {

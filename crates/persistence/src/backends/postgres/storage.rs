@@ -774,8 +774,10 @@ impl ResourceStorage for PostgresBackend {
         // Floor each version's `last_updated` to its epoch-aligned bucket:
         // epoch seconds / width, floored, scaled back, then read as a timestamptz.
         // Epoch arithmetic is timezone-independent, so buckets are stable whatever
-        // the session TimeZone. The `(tenant_id, last_updated)` history index
-        // supports the `>= $3` range scan. Delta rule per the trait doc: creation
+        // the session TimeZone. The covering `idx_history_type_updated`
+        // `(tenant_id, resource_type, last_updated) INCLUDE (is_deleted, version_id)`
+        // history index (schema v39, #1078) serves the equality + `>= $3` range
+        // scan for this type alone. Delta rule per the trait doc: creation
         // `+1`, delete `-1`, plain update `0`.
         //
         // `$4::bigint` is cast explicitly: `EXTRACT(EPOCH FROM ...)` is `numeric`, so
