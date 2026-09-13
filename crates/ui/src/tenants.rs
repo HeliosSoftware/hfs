@@ -29,7 +29,8 @@ use axum::{
     http::{HeaderValue, StatusCode},
     response::{Html, IntoResponse, Response},
 };
-use helios_persistence::core::ResourceStorage;
+use helios_persistence::core::{ErasedScope, ResourceStorage, WriteEvent};
+use helios_persistence::tenant::TenantId;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -553,6 +554,7 @@ pub async fn create(
     let fhir_version = state.fhir_version;
     let job_id = id.clone();
     let job_name = display_name.clone();
+    let observer = state.write_observer.clone();
     tokio::spawn(async move {
         match job_storage
             .register_tenant(&job_id, job_name.as_deref())
@@ -569,6 +571,7 @@ pub async fn create(
                     fhir_version,
                     &data_dir,
                     &job_id,
+                    observer.as_deref(),
                 )
                 .await;
                 registry.lock().unwrap().remove(&job_id);
@@ -679,9 +682,15 @@ pub async fn delete(
     let purge_error = if query.purge {
         match storage.purge_tenant_data(&id).await {
             Ok(_) => {
-                // The tenant's data is gone; so must be its dashboard live
-                // counters, or the Home chart would keep showing it (#1078).
-                helios_observability::dashboard_counters::invalidate_tenant(&id);
+                // The tenant's data is gone; whoever holds figures for it (the
+                // dashboard's live counters) must drop them, or the Home chart
+                // would keep showing it (#1078).
+                if let Some(observer) = state.write_observer.as_deref() {
+                    observer.on_write(&WriteEvent::Erased {
+                        tenant: TenantId::new(id.as_str()),
+                        scope: ErasedScope::Tenant,
+                    });
+                }
                 None
             }
             Err(e) => Some(format!(

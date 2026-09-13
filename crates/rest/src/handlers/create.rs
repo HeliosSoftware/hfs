@@ -8,7 +8,7 @@ use axum::{
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
 };
-use helios_persistence::core::{ConditionalStorage, ResourceStorage};
+use helios_persistence::core::{ConditionalStorage, ResourceStorage, WriteKind};
 use tracing::debug;
 
 use crate::error::{RestError, RestResult};
@@ -131,7 +131,15 @@ where
         use helios_persistence::core::ConditionalCreateResult;
         return match result {
             ConditionalCreateResult::Created(stored) => {
-                super::dashboard_counts::created(tenant.context(), &resource_type);
+                // Counted, but conditional writes announce nothing.
+                super::write_event::report(
+                    &state,
+                    tenant.context(),
+                    fhir_version,
+                    &resource_type,
+                    1,
+                    None,
+                );
                 // Stored StructureDefinitions feed the tenant's profile
                 // registry.
                 if resource_type == "StructureDefinition" {
@@ -211,7 +219,17 @@ where
         .storage()
         .create(tenant.context(), &resource_type, resource, fhir_version)
         .await?;
-    super::dashboard_counts::created(tenant.context(), &resource_type);
+    super::write_event::report(
+        &state,
+        tenant.context(),
+        fhir_version,
+        &resource_type,
+        1,
+        Some(super::write_event::stored_notice(
+            WriteKind::Create,
+            &stored,
+        )),
+    );
 
     // Stored StructureDefinitions feed the tenant's profile registry.
     if resource_type == "StructureDefinition" {
@@ -230,18 +248,6 @@ where
         id = %stored.id(),
         "Resource created"
     );
-
-    // Emit subscription event
-    #[cfg(feature = "subscriptions")]
-    if let Some(engine) = state.subscription_engine() {
-        super::subscription_event::emit_subscription_event(
-            engine,
-            tenant.context(),
-            &stored,
-            fhir_version,
-            helios_subscriptions::ResourceEventType::Create,
-        );
-    }
 
     build_create_response(
         StatusCode::CREATED,

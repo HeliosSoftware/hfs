@@ -346,57 +346,68 @@ impl BulkSubmitProvider for S3Backend {
         let mut error_count = 0u32;
         let file_url = options.file_url.as_deref();
 
-        for entry in entries {
-            if options.max_errors > 0 && error_count >= options.max_errors {
-                if !options.continue_on_error {
-                    return Err(StorageError::BulkSubmit(
-                        BulkSubmitError::MaxErrorsExceeded {
-                            submission_id: submission_id.submission_id.clone(),
-                            max_errors: options.max_errors,
-                        },
-                    ));
+        // S3 writes each entry on its own, so an entry is durable as soon as
+        // its write returns. The loop runs in a block so that however it ends —
+        // exhausted, max errors reached, or a storage error part-way — the
+        // entries it already wrote are reported before that outcome
+        // propagates (#1078).
+        let walked: StorageResult<()> = async {
+            for entry in entries {
+                if options.max_errors > 0 && error_count >= options.max_errors {
+                    if !options.continue_on_error {
+                        return Err(StorageError::BulkSubmit(
+                            BulkSubmitError::MaxErrorsExceeded {
+                                submission_id: submission_id.submission_id.clone(),
+                                max_errors: options.max_errors,
+                            },
+                        ));
+                    }
+
+                    let skipped = BulkEntryResult::skipped(
+                        entry.line_number,
+                        &entry.resource_type,
+                        "max errors exceeded",
+                    );
+                    self.persist_entry_result(
+                        &location,
+                        submission_id,
+                        manifest_id,
+                        file_url,
+                        &skipped,
+                    )
+                    .await?;
+                    results.push(skipped);
+                    continue;
                 }
 
-                let skipped = BulkEntryResult::skipped(
-                    entry.line_number,
-                    &entry.resource_type,
-                    "max errors exceeded",
-                );
-                self.persist_entry_result(
-                    &location,
-                    submission_id,
-                    manifest_id,
-                    file_url,
-                    &skipped,
-                )
-                .await?;
-                results.push(skipped);
-                continue;
+                self.persist_raw_entry(&location, submission_id, manifest_id, file_url, &entry)
+                    .await?;
+
+                let result = match self
+                    .process_single_entry(tenant, submission_id, manifest_id, &entry, options)
+                    .await
+                {
+                    Ok(result) => result,
+                    Err(err) => BulkEntryResult::processing_error(
+                        entry.line_number,
+                        &entry.resource_type,
+                        Self::bulk_submit_operation_outcome(&err),
+                    ),
+                };
+
+                if result.is_error() {
+                    error_count += 1;
+                }
+
+                self.persist_entry_result(&location, submission_id, manifest_id, file_url, &result)
+                    .await?;
+                results.push(result);
             }
-
-            self.persist_raw_entry(&location, submission_id, manifest_id, file_url, &entry)
-                .await?;
-
-            let result = match self
-                .process_single_entry(tenant, submission_id, manifest_id, &entry, options)
-                .await
-            {
-                Ok(result) => result,
-                Err(err) => BulkEntryResult::processing_error(
-                    entry.line_number,
-                    &entry.resource_type,
-                    Self::bulk_submit_operation_outcome(&err),
-                ),
-            };
-
-            if result.is_error() {
-                error_count += 1;
-            }
-
-            self.persist_entry_result(&location, submission_id, manifest_id, file_url, &result)
-                .await?;
-            results.push(result);
+            Ok(())
         }
+        .await;
+        options.notify_batch_committed(tenant, submission_id, manifest_id, &results);
+        walked?;
 
         let success_count = results.iter().filter(|r| r.is_success()).count() as u64;
         let failed_count = results.iter().filter(|r| r.is_error()).count() as u64;

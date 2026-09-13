@@ -13,8 +13,9 @@
 //! - [`dashboard`] — process-global provider of storage-count snapshots for the
 //!   web UI's "FHIR resources over time" chart, registered by the server.
 //! - [`dashboard_counters`] — process-local per-tenant, per-type live resource
-//!   counters recorded by the write paths and reconciled from storage, so the
-//!   chart stays readable while storage aggregates are too slow (#1078).
+//!   counters fed by the server's post-commit write observer and reconciled
+//!   from storage, so the chart stays readable while storage aggregates are too
+//!   slow (#1078). The server owns and injects the instance; there is no global.
 //!
 //! ## Typical wiring
 //!

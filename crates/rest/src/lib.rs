@@ -171,7 +171,7 @@ pub mod validation;
 pub use config::{MultitenancyConfig, ServerConfig, StorageBackendMode, TenantRoutingMode};
 pub use error::{RestError, RestResult};
 pub use middleware::auth::AuthMiddlewareState;
-pub use state::AppState;
+pub use state::{AppState, WriteObservability};
 pub use tenant::{ResolvedTenant, TenantResolver, TenantSource};
 
 use std::sync::Arc;
@@ -314,6 +314,11 @@ pub struct OperationsBundle {
     pub purge: Option<Arc<dyn helios_persistence::core::PurgableStorage>>,
     /// Driver for `$reindex`.
     pub reindex: Option<Arc<helios_persistence::search::ReindexOperation>>,
+    /// Post-commit write observer and dashboard counters (#1078). Pass the set
+    /// the server also hands to background writers (the `$bulk-submit`
+    /// worker, conformance seeding) so their writes reach the same consumers;
+    /// `None` creates a fresh one.
+    pub observability: Option<WriteObservability>,
 }
 
 /// The bulk-submit job store, input fetcher, output store, and download
@@ -591,6 +596,15 @@ where
     // Storage arrives pre-wrapped in an Arc so we can share it with the SofRunner.
     let storage_arc = storage;
 
+    // The post-commit write observer every write path reports to, and the
+    // dashboard counters it feeds (#1078). Injected, never process-global.
+    let OperationsBundle {
+        purge: ops_purge,
+        reindex: ops_reindex,
+        observability,
+    } = ops;
+    let observability = observability.unwrap_or_default();
+
     // Register the process-global dashboard data provider so the web UI can
     // render real per-type resource counts (default tenant), plus bulk-export
     // and bulk-submit job counts when those subsystems are wired, without
@@ -598,6 +612,7 @@ where
     // via `helios_observability::dashboard::snapshot()`.
     let dashboard_provider = Arc::new(
         dashboard::StorageDashboardProvider::new(Arc::clone(&storage_arc), &config)
+            .with_counters(Arc::clone(&observability.counters))
             .with_job_stores(
                 bulk_export.as_ref().map(|b| Arc::clone(&b.jobs)),
                 bulk_submit.as_ref().map(|b| Arc::clone(&b.jobs)),
@@ -639,15 +654,16 @@ where
         auth_state.clone(),
         app_audit_sink,
         app_audit_source_observer,
-    );
+    )
+    .with_write_observability(observability.clone());
 
     // Persistence-layer operations. Absent capabilities leave the handler to
     // report 501 rather than the route to 404 — the endpoint exists on every
     // deployment, it just cannot always be served.
-    if let Some(purge) = ops.purge {
+    if let Some(purge) = ops_purge {
         state = state.with_purge(purge);
     }
-    if let Some(reindex) = ops.reindex {
+    if let Some(reindex) = ops_reindex {
         state = state.with_reindex(reindex);
     }
 
@@ -879,6 +895,11 @@ where
                 );
             }
             let engine = Arc::new(engine);
+            // Every committed write reaches the engine through the shared
+            // post-commit observer (#1078), not through per-handler calls.
+            observability.observers.subscribe(Arc::new(
+                helios_subscriptions::SubscriptionWriteObserver::new(Arc::clone(&engine)),
+            ));
             spawn_subscription_rehydration(Arc::clone(&engine), Arc::clone(&storage_arc), &config);
             // The operator page's read path (#580): a plain-data snapshot of the
             // engine's inventory, registered process-globally so the UI crate

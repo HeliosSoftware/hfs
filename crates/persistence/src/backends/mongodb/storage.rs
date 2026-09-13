@@ -3046,7 +3046,7 @@ impl MongoBackend {
                                 pending_search_parameter_changes,
                             )
                             .await?;
-                        Ok(BundleEntryResult::ok(updated))
+                        Ok(BundleEntryResult::updated(updated))
                     }
                     None => {
                         // A supplied `ifMatch` — including `*` — cannot be
@@ -3116,8 +3116,10 @@ impl MongoBackend {
                         .await
                     {
                         Ok(()) => Ok(BundleEntryResult::deleted()),
+                        // Still 204 on the wire (delete is idempotent), but
+                        // nothing live went away (#1078).
                         Err(StorageError::Resource(ResourceError::NotFound { .. })) => {
-                            Ok(BundleEntryResult::deleted())
+                            Ok(BundleEntryResult::delete_not_found())
                         }
                         Err(e) => Err(e),
                     }

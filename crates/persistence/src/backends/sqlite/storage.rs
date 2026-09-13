@@ -3734,7 +3734,7 @@ impl SqliteBackend {
                 match existing {
                     Some(existing) => {
                         let updated = tx.update(&existing, resource).await?;
-                        Ok(BundleEntryResult::ok(updated))
+                        Ok(BundleEntryResult::updated(updated))
                     }
                     None => {
                         // Create new resource with specified ID

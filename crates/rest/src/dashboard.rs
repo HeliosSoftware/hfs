@@ -109,7 +109,7 @@ use helios_observability::dashboard::{
     DashboardPoint, DashboardProvider, DashboardSeries, DashboardSnapshot, DashboardWindow,
     ExportJobCounts, TypeCount,
 };
-use helios_observability::dashboard_counters::{self, CountersSeries, DashboardCounters};
+use helios_observability::dashboard_counters::{CountersSeries, DashboardCounters};
 use helios_persistence::core::{
     BulkExportJobStore, BulkSubmitJobStore, ExportStatus, ResourceCountDelta, ResourceStorage,
     bucket_floor,
@@ -661,9 +661,9 @@ pub(crate) struct StorageDashboardProvider<S> {
     export_jobs: Option<Arc<dyn BulkExportJobStore>>,
     /// Bulk-submit job store, when the active backend provides one.
     submit_jobs: Option<Arc<dyn BulkSubmitJobStore>>,
-    /// The live write counters every figure is served from (#1078). The
-    /// process-global set in production; tests pass an isolated one.
-    counters: &'static DashboardCounters,
+    /// The live write counters every figure is served from (#1078): the set
+    /// the server's write observer feeds, injected by `build_app`.
+    counters: Arc<DashboardCounters>,
     /// Per-tenant cache of the job-store counts (see [`JOB_COUNTS_TTL`]).
     job_counts: Mutex<HashMap<String, JobCountsEntry>>,
     /// Background seeds, drained by the reconcile loop.
@@ -675,8 +675,9 @@ impl<S> StorageDashboardProvider<S> {
     /// version. The window and the charted types are chosen per request by the
     /// UI, so neither is fixed here; the default selection is the tenant's
     /// largest stored types (#555). Job-store counts start unwired; call
-    /// [`Self::with_job_stores`] to attach them. Reads the process-global
-    /// write counters; see [`Self::with_counters`].
+    /// [`Self::with_job_stores`] to attach them. Starts with a private, empty
+    /// counter set; the server injects the shared one with
+    /// [`Self::with_counters`].
     pub(crate) fn new(storage: Arc<S>, config: &ServerConfig) -> Self {
         Self {
             default_tenant: config.default_tenant.clone(),
@@ -684,7 +685,7 @@ impl<S> StorageDashboardProvider<S> {
             storage,
             export_jobs: None,
             submit_jobs: None,
-            counters: dashboard_counters::global(),
+            counters: Arc::new(DashboardCounters::new()),
             job_counts: Mutex::new(HashMap::new()),
             seeds: SeedQueue::default(),
         }
@@ -704,11 +705,9 @@ impl<S> StorageDashboardProvider<S> {
         self
     }
 
-    /// Replaces the write counters this provider reads and seeds (the
-    /// process-global set by default). Tests use an isolated set, so figures
-    /// recorded by other tests in the same process cannot leak in.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn with_counters(mut self, counters: &'static DashboardCounters) -> Self {
+    /// Replaces the write counters this provider reads and seeds — the set the
+    /// server's post-commit write observer records into.
+    pub(crate) fn with_counters(mut self, counters: Arc<DashboardCounters>) -> Self {
         self.counters = counters;
         self
     }
@@ -956,7 +955,7 @@ where
         // `totals_view` just returned figures and a tenant is never un-seeded,
         // so this is `Some`; `None` would only mean "not seeded" again.
         let counted = resource_count_series_from_counters(
-            self.counters,
+            &self.counters,
             tenant_key,
             window,
             &selection,
@@ -1607,10 +1606,9 @@ mod tests {
     use serde_json::Value;
     use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
-    /// A private counter set per test: the production default is the
-    /// process-global one, which every test in this binary would share.
-    fn isolated_counters() -> &'static DashboardCounters {
-        Box::leak(Box::new(DashboardCounters::new()))
+    /// A private counter set per test.
+    fn isolated_counters() -> Arc<DashboardCounters> {
+        Arc::new(DashboardCounters::new())
     }
 
     fn test_config() -> ServerConfig {
@@ -2543,7 +2541,7 @@ mod tests {
         let counters = isolated_counters();
         let provider = Arc::new(
             StorageDashboardProvider::new(Arc::clone(&storage), &test_config())
-                .with_counters(counters),
+                .with_counters(Arc::clone(&counters)),
         );
 
         storage.delay_ms.store(1_500, Ordering::SeqCst);
@@ -2664,7 +2662,7 @@ mod tests {
         create_in(storage.as_ref(), "Patient").await;
         let counters = isolated_counters();
         let provider = StorageDashboardProvider::new(Arc::clone(&storage), &test_config())
-            .with_counters(counters);
+            .with_counters(Arc::clone(&counters));
         let mut schedule = schedule();
 
         storage.fail.store(true, Ordering::SeqCst);
@@ -2708,7 +2706,7 @@ mod tests {
         create_in(storage.as_ref(), "Patient").await;
         let counters = isolated_counters();
         let provider = StorageDashboardProvider::new(Arc::clone(&storage), &test_config())
-            .with_counters(counters);
+            .with_counters(Arc::clone(&counters));
 
         storage.fail.store(true, Ordering::SeqCst);
         let pending = provider
@@ -2769,7 +2767,7 @@ mod tests {
         let counters = isolated_counters();
         let provider = Arc::new(
             StorageDashboardProvider::new(Arc::clone(&storage), &test_config())
-                .with_counters(counters)
+                .with_counters(Arc::clone(&counters))
                 .with_job_stores(
                     None,
                     Some(Arc::clone(&storage.inner) as Arc<dyn BulkSubmitJobStore>),
@@ -2838,7 +2836,7 @@ mod tests {
             .expect("create submission");
         let counters = isolated_counters();
         let provider = StorageDashboardProvider::new(Arc::clone(&storage), &test_config())
-            .with_counters(counters)
+            .with_counters(Arc::clone(&counters))
             .with_job_stores(
                 None,
                 Some(Arc::clone(&storage.inner) as Arc<dyn BulkSubmitJobStore>),
@@ -2888,7 +2886,7 @@ mod tests {
         populate(storage.as_ref(), &[("Patient", 2), ("Observation", 1)]).await;
         let counters = isolated_counters();
         let provider = StorageDashboardProvider::new(Arc::clone(&storage), &test_config())
-            .with_counters(counters);
+            .with_counters(Arc::clone(&counters));
         let before = settle(&provider, DashboardWindow::LastHour, &[], false).await;
         assert_eq!(before.total_resources, 3);
         assert!(!before.approximate);
@@ -2959,7 +2957,7 @@ mod tests {
         populate(storage.as_ref(), &[("Patient", 2)]).await;
         let counters = isolated_counters();
         let provider = StorageDashboardProvider::new(Arc::clone(&storage), &test_config())
-            .with_counters(counters);
+            .with_counters(Arc::clone(&counters));
 
         settle(&provider, DashboardWindow::LastHour, &[], false).await;
         let after_seed = storage.aggregate_calls();
@@ -3116,7 +3114,7 @@ mod tests {
         create_in(backend.as_ref(), "Patient").await;
         let counters = isolated_counters();
         let provider = StorageDashboardProvider::new(Arc::clone(&backend), &test_config())
-            .with_counters(counters);
+            .with_counters(Arc::clone(&counters));
         let seeded = settle(&provider, DashboardWindow::LastHour, &[], false).await;
         assert!(!seeded.approximate);
 
@@ -3172,7 +3170,7 @@ mod tests {
         .await
         .expect("storage series");
         let from_counters = resource_count_series_from_counters(
-            counters,
+            &counters,
             "default",
             DashboardWindow::LastHour,
             &["Patient", "Observation"],
@@ -3208,7 +3206,7 @@ mod tests {
             .expect("create submission");
         let counters = isolated_counters();
         let provider = StorageDashboardProvider::new(Arc::clone(&storage), &test_config())
-            .with_counters(counters)
+            .with_counters(Arc::clone(&counters))
             .with_job_stores(
                 None,
                 Some(Arc::clone(&storage.inner) as Arc<dyn BulkSubmitJobStore>),
@@ -3274,7 +3272,7 @@ mod tests {
                 .await
                 .expect("count_all_types");
             assert!(counters.finish_reconcile(token, &totals, now));
-            seed_rings_from(counters, backend.as_ref(), &tenant, &types, window, now).await;
+            seed_rings_from(&counters, backend.as_ref(), &tenant, &types, window, now).await;
             let from_storage = resource_count_series(
                 backend.as_ref(),
                 &tenant,
@@ -3285,7 +3283,7 @@ mod tests {
             .await
             .expect("storage series");
             let from_counters =
-                resource_count_series_from_counters(counters, "default", window, &types, now)
+                resource_count_series_from_counters(&counters, "default", window, &types, now)
                     .expect("counter series");
             assert_eq!(
                 shape(&from_storage),
@@ -3314,7 +3312,7 @@ mod tests {
             .await
             .expect("storage series");
             let from_counters =
-                resource_count_series_from_counters(counters, "default", window, &types, now)
+                resource_count_series_from_counters(&counters, "default", window, &types, now)
                     .expect("counter series");
             assert_eq!(
                 shape(&from_storage),
@@ -3339,7 +3337,7 @@ mod tests {
         let counters = isolated_counters();
         let provider = Arc::new(
             StorageDashboardProvider::new(Arc::clone(&backend), &test_config())
-                .with_counters(counters),
+                .with_counters(Arc::clone(&counters)),
         );
         // An hour between passes: anything seeded below came from the startup
         // step or a wake-up.
@@ -3415,7 +3413,7 @@ mod tests {
         .await;
         let counters = isolated_counters();
         let provider = StorageDashboardProvider::new(Arc::clone(&storage), &test_config())
-            .with_counters(counters);
+            .with_counters(Arc::clone(&counters));
         // Charted recently in one window: joins that window's query, and a type
         // with no rows at all.
         provider.note_charted("default", &["Procedure"], DashboardWindow::LastDay);
@@ -3438,7 +3436,7 @@ mod tests {
             1 + DashboardWindow::ALL.len(),
             "the totals read plus one history read per window"
         );
-        assert!(all_rings_exact(counters, &default_types));
+        assert!(all_rings_exact(&counters, &default_types));
         let procedure = counters
             .series_view(
                 "default",
@@ -3462,7 +3460,7 @@ mod tests {
             .await
             .expect("storage series");
             let from_counters = resource_count_series_from_counters(
-                counters,
+                &counters,
                 "default",
                 window,
                 &default_types,
@@ -3501,7 +3499,7 @@ mod tests {
         populate(storage.as_ref(), &[("Patient", 2), ("Observation", 1)]).await;
         let counters = isolated_counters();
         let provider = StorageDashboardProvider::new(Arc::clone(&storage), &test_config())
-            .with_counters(counters);
+            .with_counters(Arc::clone(&counters));
         let types = ["Patient", "Observation"];
 
         storage.fail_history.store(true, Ordering::SeqCst);
@@ -3542,7 +3540,7 @@ mod tests {
             DashboardWindow::ALL.len()
         );
         assert_eq!(storage.per_type_history_calls(), 0);
-        assert!(all_rings_exact(counters, &types));
+        assert!(all_rings_exact(&counters, &types));
         assert!(lock(&provider.seeds.rings).is_empty());
         let exact = provider
             .snapshot(DashboardWindow::LastHour, "", &[], false)
@@ -3569,7 +3567,7 @@ mod tests {
         .await;
         let counters = isolated_counters();
         let provider = StorageDashboardProvider::new(Arc::clone(&storage), &test_config())
-            .with_counters(counters);
+            .with_counters(Arc::clone(&counters));
         settle(&provider, DashboardWindow::LastHour, &[], false).await;
 
         let extra = vec!["Encounter".to_string(), "Procedure".to_string()];

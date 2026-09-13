@@ -20,11 +20,11 @@ use std::sync::Arc;
 use helios_fhir::FhirVersion;
 use helios_persistence::backends::mongodb::{MongoBackend, MongoBackendConfig};
 use helios_persistence::core::{
-    Backend, BackendCapability, BackendKind, BundleEntry, BundleMethod, BundleProvider,
-    BundleResult, ConditionalCreateResult, ConditionalDeleteResult, ConditionalStorage,
-    ConditionalUpdateResult, HistoryParams, IncludeProvider, InstanceHistoryProvider, PatchFormat,
-    ResourceStorage, RevincludeProvider, SearchProvider, SettingsStore, SystemHistoryProvider,
-    TypeHistoryProvider, VersionedStorage,
+    Backend, BackendCapability, BackendKind, BundleEntry, BundleEntryEffect, BundleMethod,
+    BundleProvider, BundleResult, ConditionalCreateResult, ConditionalDeleteResult,
+    ConditionalStorage, ConditionalUpdateResult, HistoryParams, IncludeProvider,
+    InstanceHistoryProvider, PatchFormat, ResourceStorage, RevincludeProvider, SearchProvider,
+    SettingsStore, SystemHistoryProvider, TypeHistoryProvider, VersionedStorage,
 };
 use helios_persistence::error::{
     BackendError, ConcurrencyError, ResourceError, StorageError, TransactionError,
@@ -1269,8 +1269,11 @@ async fn mongodb_integration_transaction_bundle_mixed_operations_and_idempotent_
 
     assert_eq!(result.entries.len(), 3);
     assert_eq!(result.entries[0].status, 204);
+    assert_eq!(result.entries[0].effect, BundleEntryEffect::Deleted);
     assert_eq!(result.entries[1].status, 201);
+    assert_eq!(result.entries[1].effect, BundleEntryEffect::Created);
     assert_eq!(result.entries[2].status, 200);
+    assert_eq!(result.entries[2].effect, BundleEntryEffect::Updated);
 
     let updated = backend
         .read(&tenant, "Patient", "update-me")
@@ -1314,6 +1317,11 @@ async fn mongodb_integration_transaction_bundle_mixed_operations_and_idempotent_
 
     assert_eq!(idempotent_result.entries.len(), 1);
     assert_eq!(idempotent_result.entries[0].status, 204);
+    assert_eq!(
+        idempotent_result.entries[0].effect,
+        BundleEntryEffect::NotFound,
+        "a delete of a missing resource is still 204 but removes nothing"
+    );
 }
 
 #[tokio::test]
@@ -1386,6 +1394,7 @@ async fn mongodb_integration_transaction_if_none_exist_match_resolves_urn_refere
         result.entries[0].status, 200,
         "the match is answered, not duplicated"
     );
+    assert_eq!(result.entries[0].effect, BundleEntryEffect::NoOp);
     assert_eq!(result.entries[1].status, 201);
 
     let observation = result.entries[1]
@@ -1447,6 +1456,7 @@ async fn mongodb_integration_transaction_bundle_conditional_headers() {
         return;
     };
     assert_eq!(second_create.entries[0].status, 200);
+    assert_eq!(second_create.entries[0].effect, BundleEntryEffect::NoOp);
     // A matched `ifNoneExist` names the match in `location`, exactly as a
     // fresh create names the row it wrote; that is what the transaction's
     // fullUrl → id map is built from (#511).
@@ -8029,6 +8039,7 @@ async fn mongodb_integration_if_none_exist_multi_param_and_semantics() {
         result.entries[0].status, 200,
         "both params match the active patient — should not create a duplicate"
     );
+    assert_eq!(result.entries[0].effect, BundleEntryEffect::NoOp);
 
     let count = backend.count(&tenant, Some("Patient")).await.unwrap();
     assert_eq!(count, 2, "no third patient should have been created");
@@ -8077,6 +8088,7 @@ async fn mongodb_integration_if_none_exist_same_transaction_read_your_writes() {
         result.entries[1].status, 200,
         "second entry must see the first entry's write via session"
     );
+    assert_eq!(result.entries[1].effect, BundleEntryEffect::NoOp);
     assert_eq!(
         result.entries[1].location, result.entries[0].location,
         "second entry must resolve to the same resource as the first"

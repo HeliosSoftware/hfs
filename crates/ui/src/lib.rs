@@ -194,6 +194,10 @@ struct WebState {
     /// the tenant's operators. None when the backend has no store; the Bulk
     /// Import workspace then reports itself unavailable.
     bulk_provider: Option<Arc<dyn BulkProviderStore>>,
+    /// The server's post-commit write observer (#1078): tenant provisioning
+    /// seeds and purges started from the tenants page report to it, so the
+    /// dashboard's live figures follow them. `None` reports nothing.
+    write_observer: Option<Arc<dyn helios_persistence::core::WriteObserver>>,
 }
 
 /// The settings keys holding the user's FHIR-version and tenant choices, and
@@ -1286,10 +1290,14 @@ pub fn mount_with_body_limit(
         false,
         bulk_provider,
         PatientNameSearchSupport::Enabled,
+        None,
     )
 }
 
 /// Mounts the UI with explicit tenant-path routing behavior.
+///
+/// `write_observer` is the server's post-commit write observer; the tenants
+/// page reports its conformance seeds and purges to it (#1078).
 #[allow(clippy::too_many_arguments)]
 pub fn mount_with_body_limit_and_tenant_routing(
     fhir_app: Router,
@@ -1308,6 +1316,7 @@ pub fn mount_with_body_limit_and_tenant_routing(
     tenant_path_routing: bool,
     bulk_provider: Option<Arc<dyn BulkProviderStore>>,
     patient_name_search: PatientNameSearchSupport,
+    write_observer: Option<Arc<dyn helios_persistence::core::WriteObserver>>,
 ) -> Router {
     let source: Arc<dyn ConformanceSource> = Arc::new(conformance::HttpConformanceSource::new(
         self_base_url.clone(),
@@ -1332,6 +1341,7 @@ pub fn mount_with_body_limit_and_tenant_routing(
         bulk_provider,
         self_base_url,
         patient_name_search,
+        write_observer,
     )
 }
 
@@ -1444,6 +1454,7 @@ pub fn mount_with_conformance_source_and_body_limit_and_tenant_routing(
         bulk_provider,
         public_base_url,
         PatientNameSearchSupport::Enabled,
+        None,
     )
 }
 
@@ -1467,6 +1478,7 @@ pub fn mount_with_conformance_source_and_runtime(
     bulk_provider: Option<Arc<dyn BulkProviderStore>>,
     self_base_url: String,
     patient_name_search: PatientNameSearchSupport,
+    write_observer: Option<Arc<dyn helios_persistence::core::WriteObserver>>,
 ) -> Router {
     let nl_enabled = nl.enabled;
     let mut parsed_self_base = reqwest::Url::parse(&self_base_url)
@@ -1721,6 +1733,7 @@ pub fn mount_with_conformance_source_and_runtime(
         provisioning: Default::default(),
         settings,
         bulk_provider,
+        write_observer,
         data_dir,
         fhir_version,
         default_tenant,

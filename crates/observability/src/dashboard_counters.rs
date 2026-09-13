@@ -9,9 +9,12 @@
 //! writing, so the one moment an operator most wants to watch the chart move
 //! (a bulk load) was the moment it sat on "Waiting…" forever.
 //!
-//! The write paths (REST create/update/delete, Bundles, `$bulk-submit`) now
-//! call [`record`](DashboardCounters::record) with the net live-count change of
-//! each committed write, and the dashboard reads the result in O(1). Storage is
+//! The write paths (REST create/update/delete, Bundles, `$bulk-submit`) report
+//! each committed write to the server's post-commit write observer, which feeds
+//! [`record`](DashboardCounters::record) the net live-count change, and the
+//! dashboard reads the result in O(1). There is no process-global instance: the
+//! server creates one set of counters and injects it into both the observer and
+//! the dashboard provider. Storage is
 //! still the source of truth: a background reconcile periodically re-reads the
 //! totals ([`begin_reconcile`](DashboardCounters::begin_reconcile) /
 //! [`finish_reconcile`](DashboardCounters::finish_reconcile)) and each window's
@@ -88,7 +91,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, LazyLock, Mutex, MutexGuard, RwLock};
+use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 
 use chrono::{DateTime, Utc};
 
@@ -708,31 +711,6 @@ impl DashboardCounters {
     }
 }
 
-static GLOBAL: LazyLock<DashboardCounters> = LazyLock::new(DashboardCounters::new);
-
-/// The process-global counters the server's write paths record into and the
-/// dashboard provider reads.
-pub fn global() -> &'static DashboardCounters {
-    &GLOBAL
-}
-
-/// Records `n` committed creates of `resource_type` for `tenant` now.
-pub fn record_created(tenant: &str, resource_type: &str, n: u64) {
-    global().record(tenant, resource_type, to_i64(n), Utc::now());
-}
-
-/// Records `n` committed deletes of `resource_type` for `tenant` now.
-pub fn record_deleted(tenant: &str, resource_type: &str, n: u64) {
-    global().record(tenant, resource_type, -to_i64(n), Utc::now());
-}
-
-/// Marks the global counter state of `tenant` stale after a purge / data wipe,
-/// keeping its last figures on show until the dashboard's background reseed
-/// replaces them (see [`DashboardCounters::invalidate_tenant`]).
-pub fn invalidate_tenant(tenant: &str) {
-    global().invalidate_tenant(tenant);
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -978,7 +956,7 @@ mod tests {
         assert_eq!(total_of(&c.totals_view("t").unwrap(), "Patient"), Some(1));
         assert_eq!(c.live_delta("t", "Patient"), -1);
 
-        // `record_created`/`record_deleted`-style saturation on huge counts.
+        // Saturation on huge counts.
         assert_eq!(to_i64(u64::MAX), i64::MAX);
         assert_eq!(clamp_count(i64::MIN), 0);
     }
@@ -1335,22 +1313,5 @@ mod tests {
         // The 1h ring saw every Patient write (all within two minutes).
         let s = series(&c, "even", HOUR, "Patient", t0() + secs(119));
         assert_eq!(values(&s).iter().sum::<i64>(), 20_000);
-    }
-
-    #[test]
-    fn global_helpers_record_into_the_global_counters() {
-        let tenant = "dashboard-counters-global-helper-test";
-        record_created(tenant, "Patient", 3);
-        record_deleted(tenant, "Patient", 1);
-        record_created(tenant, "Patient", 0);
-        assert_eq!(global().live_delta(tenant, "Patient"), 2);
-        assert!(!global().needs_reseed(tenant));
-        invalidate_tenant(tenant);
-        assert!(global().needs_reseed(tenant));
-        assert_eq!(
-            global().live_delta(tenant, "Patient"),
-            2,
-            "invalidation keeps the recorded figures"
-        );
     }
 }

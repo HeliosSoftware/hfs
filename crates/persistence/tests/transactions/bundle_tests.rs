@@ -6,7 +6,9 @@
 use serde_json::json;
 
 use helios_fhir::FhirVersion;
-use helios_persistence::core::{BundleEntry, BundleMethod, BundleProvider, ResourceStorage};
+use helios_persistence::core::{
+    BundleEntry, BundleEntryEffect, BundleMethod, BundleProvider, ResourceStorage,
+};
 use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
 
 #[cfg(feature = "sqlite")]
@@ -113,6 +115,7 @@ async fn test_bundle_create_entries() {
     // Both should be successful creates
     for entry in &result.entries {
         assert_eq!(entry.status, 201);
+        assert_eq!(entry.effect, BundleEntryEffect::Created);
         assert!(entry.location.is_some());
     }
 
@@ -149,6 +152,8 @@ async fn test_bundle_put_entries() {
 
     assert_eq!(result.entries.len(), 1);
     assert!(result.entries[0].status == 201 || result.entries[0].status == 200);
+    // The target did not exist, so the PUT created it.
+    assert_eq!(result.entries[0].effect, BundleEntryEffect::Created);
 
     // Verify resource
     let read = backend
@@ -195,6 +200,7 @@ async fn test_bundle_delete_entries() {
 
     assert_eq!(result.entries.len(), 1);
     assert!(result.entries[0].status == 200 || result.entries[0].status == 204);
+    assert_eq!(result.entries[0].effect, BundleEntryEffect::Deleted);
 
     // Verify deleted
     assert!(
@@ -405,6 +411,7 @@ async fn test_bundle_conditional_create() {
         .await
         .unwrap();
     assert_eq!(result1.entries[0].status, 201);
+    assert_eq!(result1.entries[0].effect, BundleEntryEffect::Created);
 
     // Second bundle with same condition - should return existing
     let result2 = backend
@@ -422,6 +429,11 @@ async fn test_bundle_conditional_create() {
     assert_eq!(
         result2.entries[0].status, 200,
         "the match is answered, not duplicated"
+    );
+    assert_eq!(
+        result2.entries[0].effect,
+        BundleEntryEffect::NoOp,
+        "a matched ifNoneExist writes nothing"
     );
     assert_eq!(
         result2.entries[0].location, result1.entries[0].location,
@@ -641,6 +653,7 @@ async fn test_bundle_conditional_update_if_match() {
         .await
         .unwrap();
     assert_eq!(result.entries[0].status, 200);
+    assert_eq!(result.entries[0].effect, BundleEntryEffect::Updated);
 
     // Verify update
     let read = backend
@@ -649,6 +662,83 @@ async fn test_bundle_conditional_update_if_match() {
         .unwrap()
         .unwrap();
     assert_eq!(read.content()["name"][0]["family"], "UpdatedWithMatch");
+}
+
+/// Every entry reports the effect it really had, independent of its status
+/// (#1078): a `200` PUT over an existing resource is an update, a `200` GET is
+/// a read, and neither changes the live count the way a create or delete does.
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn test_bundle_entry_effects() {
+    let backend = create_sqlite_backend();
+    let tenant = create_tenant();
+
+    for id in ["effect-update", "effect-read", "effect-delete"] {
+        backend
+            .create_or_update(
+                &tenant,
+                "Patient",
+                id,
+                json!({"resourceType": "Patient", "id": id}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+    }
+
+    let entry =
+        |method: BundleMethod, url: &str, resource: Option<serde_json::Value>| BundleEntry {
+            method,
+            url: url.to_string(),
+            resource,
+            if_match: None,
+            if_none_match: None,
+            if_none_exist: None,
+            full_url: None,
+        };
+
+    let entries = vec![
+        entry(
+            BundleMethod::Post,
+            "Patient",
+            Some(json!({"resourceType": "Patient"})),
+        ),
+        entry(
+            BundleMethod::Put,
+            "Patient/effect-update",
+            Some(json!({"resourceType": "Patient", "id": "effect-update", "active": true})),
+        ),
+        entry(BundleMethod::Get, "Patient/effect-read", None),
+        entry(BundleMethod::Delete, "Patient/effect-delete", None),
+    ];
+
+    let result = backend
+        .process_transaction(&tenant, entries, FhirVersion::default())
+        .await
+        .unwrap();
+
+    let observed: Vec<(u16, BundleEntryEffect)> = result
+        .entries
+        .iter()
+        .map(|e| (e.status, e.effect))
+        .collect();
+    assert_eq!(
+        observed,
+        vec![
+            (201, BundleEntryEffect::Created),
+            (200, BundleEntryEffect::Updated),
+            (200, BundleEntryEffect::Read),
+            (204, BundleEntryEffect::Deleted),
+        ]
+    );
+
+    let delta: i64 = result
+        .entries
+        .iter()
+        .map(|e| e.effect.live_count_delta())
+        .sum();
+    assert_eq!(delta, 0, "one create and one delete");
+    assert_eq!(backend.count(&tenant, Some("Patient")).await.unwrap(), 3);
 }
 
 /// Test bundle with if-match failure.

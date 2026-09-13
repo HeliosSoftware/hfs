@@ -865,6 +865,50 @@ impl CancelToken {
     }
 }
 
+/// One ingestion batch whose writes just became durable.
+///
+/// Handed to a [`BatchCommitObserver`] by
+/// [`BulkSubmitProvider::process_entries`] right after the batch committed.
+#[derive(Debug, Clone, Copy)]
+pub struct BatchCommitted<'a> {
+    /// Tenant the batch was written for.
+    pub tenant: &'a TenantContext,
+    /// Submission the batch belongs to.
+    pub submission_id: &'a SubmissionId,
+    /// Manifest the batch belongs to.
+    pub manifest_id: &'a str,
+    /// The committed batch's entry results, in input order. Only the
+    /// [`BulkEntryOutcome::Success`] ones wrote a resource; each one's
+    /// [`BulkEntryResult::created`] was decided by the committing write, so a
+    /// re-ingested id (a reclaimed manifest re-walking its files) reads as an
+    /// update, never as a second create.
+    pub results: &'a [BulkEntryResult],
+}
+
+/// Told about every ingestion batch as soon as its writes are durable (#1078).
+///
+/// Engines call it once per committed batch — before any post-commit early
+/// return such as [`crate::error::BulkSubmitError::MaxErrorsExceeded`] and before separate
+/// bookkeeping statements — so committed work is reported even when the file
+/// later fails, the worker's lease is lost, or the ingest is cancelled.
+/// Called synchronously on the ingest task: implementations must be cheap and
+/// must not block.
+pub trait BatchCommitObserver: Send + Sync {
+    /// A batch committed.
+    fn batch_committed(&self, batch: &BatchCommitted<'_>);
+}
+
+/// Shared handle to a [`BatchCommitObserver`], so [`BulkProcessingOptions`]
+/// stays `Clone` and `Debug`.
+#[derive(Clone)]
+pub struct BatchObserverHandle(pub std::sync::Arc<dyn BatchCommitObserver>);
+
+impl std::fmt::Debug for BatchObserverHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("BatchObserverHandle(..)")
+    }
+}
+
 /// Options for bulk processing.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BulkProcessingOptions {
@@ -906,6 +950,14 @@ pub struct BulkProcessingOptions {
     /// manifest it already claimed instead of running it to the end (#968).
     #[serde(skip)]
     pub cancel: Option<CancelToken>,
+    /// Told about every batch as soon as its writes are durable, when the
+    /// caller wants per-batch reporting (see [`BatchCommitObserver`]). The
+    /// submit worker uses it to feed live resource counts (#1078): reporting
+    /// per committed batch keeps the figures smooth, splits creates from
+    /// updates, and keeps committed work reported when the file later fails
+    /// or the lease is lost.
+    #[serde(skip)]
+    pub batch_observer: Option<BatchObserverHandle>,
 }
 
 fn default_submit_batch_size() -> u32 {
@@ -939,6 +991,7 @@ impl BulkProcessingOptions {
             defer_indexing: false,
             byte_progress: None,
             cancel: None,
+            batch_observer: None,
         }
     }
 
@@ -964,6 +1017,40 @@ impl BulkProcessingOptions {
     pub fn with_cancel(mut self, cancel: CancelToken) -> Self {
         self.cancel = Some(cancel);
         self
+    }
+
+    /// Attaches the observer told about every committed batch (#1078).
+    pub fn with_batch_observer(
+        mut self,
+        observer: std::sync::Arc<dyn BatchCommitObserver>,
+    ) -> Self {
+        self.batch_observer = Some(BatchObserverHandle(observer));
+        self
+    }
+
+    /// Reports a committed batch to the [`Self::batch_observer`], if any.
+    ///
+    /// Engines call it right after the batch's writes are durable and before
+    /// any post-commit early return, passing only results whose writes
+    /// committed. An empty batch reports nothing.
+    pub fn notify_batch_committed(
+        &self,
+        tenant: &TenantContext,
+        submission_id: &SubmissionId,
+        manifest_id: &str,
+        results: &[BulkEntryResult],
+    ) {
+        if results.is_empty() {
+            return;
+        }
+        if let Some(BatchObserverHandle(observer)) = &self.batch_observer {
+            observer.batch_committed(&BatchCommitted {
+                tenant,
+                submission_id,
+                manifest_id,
+                results,
+            });
+        }
     }
 
     /// Returns whether the caller has asked this ingest to stop. Ingest loops
@@ -1679,6 +1766,51 @@ mod tests {
         assert_eq!(options.batch_size, 50);
         assert_eq!(options.max_errors, 10);
         assert!(!options.continue_on_error);
+    }
+
+    /// #1078: the batch observer is reached through the options, survives a
+    /// clone, stays out of serialization, and is not told about empty batches.
+    #[test]
+    fn test_batch_observer_is_notified_through_options() {
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Default)]
+        struct Recording(Mutex<Vec<(String, String, usize)>>);
+        impl BatchCommitObserver for Recording {
+            fn batch_committed(&self, batch: &BatchCommitted<'_>) {
+                self.0.lock().unwrap().push((
+                    batch.tenant.tenant_id().as_str().to_string(),
+                    batch.manifest_id.to_string(),
+                    batch.results.len(),
+                ));
+            }
+        }
+
+        let recording = Arc::new(Recording::default());
+        let options = BulkProcessingOptions::new()
+            .with_batch_observer(recording.clone())
+            .clone();
+        assert!(format!("{options:?}").contains("BatchObserverHandle"));
+
+        let tenant = crate::tenant::TenantContext::new(
+            crate::tenant::TenantId::new("t1"),
+            crate::tenant::TenantPermissions::full_access(),
+        );
+        let sub_id = SubmissionId::new("sys", "sub");
+        let results = vec![BulkEntryResult::success(1, "Patient", "p1", true)];
+        options.notify_batch_committed(&tenant, &sub_id, "m1", &results);
+        options.notify_batch_committed(&tenant, &sub_id, "m1", &[]);
+        BulkProcessingOptions::new().notify_batch_committed(&tenant, &sub_id, "m1", &results);
+
+        assert_eq!(
+            *recording.0.lock().unwrap(),
+            vec![("t1".to_string(), "m1".to_string(), 1)]
+        );
+
+        let json = serde_json::to_value(&options).unwrap();
+        assert!(json.get("batch_observer").is_none());
+        let back: BulkProcessingOptions = serde_json::from_value(json).unwrap();
+        assert!(back.batch_observer.is_none());
     }
 
     #[test]

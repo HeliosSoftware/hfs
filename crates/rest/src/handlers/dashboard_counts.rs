@@ -1,134 +1,282 @@
-//! Dashboard live-count recording for the REST write paths (#1078).
+//! The dashboard's live resource counters as a post-commit write observer
+//! (#1078).
 //!
-//! Every handler that commits a change to a tenant's live resource count calls
-//! one of these after the write succeeded, feeding the process-global
-//! [`helios_observability::dashboard_counters`] the Home dashboard reads in
-//! O(1). Unlike subscription events this is unconditional — it does not depend
-//! on the `subscriptions` feature or on an engine being configured.
+//! The write paths report every committed write to the server's
+//! [`WriteObservers`](helios_persistence::core::WriteObservers) fan-out (see
+//! [`crate::handlers::write_event`] and [`crate::WriteObservability`]); this
+//! observer turns those events into [`DashboardCounters`] updates the Home
+//! dashboard reads in O(1). It is subscribed unconditionally — it does not
+//! depend on the `subscriptions` feature or on an engine being configured.
 //!
-//! Only real live-count changes are recorded: a create (or an update that
-//! created, including one that brought a deleted resource back) is `+1`, a
-//! delete that removed a live resource is `-1`, and everything else — a plain
-//! update, a conditional create that matched, a delete of something already
-//! gone — records nothing. The tenant key is always the request's
-//! `TenantContext` id, which is how the dashboard provider keys its reads.
+//! - A single resource write records its `live_delta` (`+1` create, `-1`
+//!   delete of a live resource; a plain update, a matched conditional create
+//!   or a delete of something already gone report `0` and record nothing).
+//! - An aggregate write (`$bulk-submit`, conformance seeding) records
+//!   `+created` and `-deleted`; updates change no count.
+//! - A purge of any scope marks the tenant's figures stale.
 //!
-//! The counters are an approximation that a background reconcile corrects; see
-//! the module docs of [`helios_observability::dashboard_counters`].
+//! The tenant key is the tenant id the write was made under, which is how the
+//! dashboard provider keys its reads. The counters are an approximation that a
+//! background reconcile corrects; see the module docs of
+//! [`helios_observability::dashboard_counters`].
 
-use helios_observability::dashboard_counters;
-use helios_persistence::tenant::TenantContext;
+use std::sync::Arc;
 
-/// Records one committed create of `resource_type`.
-pub(crate) fn created(tenant: &TenantContext, resource_type: &str) {
-    dashboard_counters::record_created(tenant.tenant_id().as_str(), resource_type, 1);
+use helios_observability::dashboard_counters::DashboardCounters;
+use helios_persistence::core::{WriteEvent, WriteObserver};
+
+/// `u64` → `i64`, saturating instead of wrapping.
+fn saturating_i64(n: u64) -> i64 {
+    i64::try_from(n).unwrap_or(i64::MAX)
 }
 
-/// Records a committed create-or-update: counts only when it created.
-pub(crate) fn upserted(tenant: &TenantContext, resource_type: &str, created: bool) {
-    if created {
-        self::created(tenant, resource_type);
+/// Records committed writes into the dashboard counters.
+#[derive(Debug)]
+pub struct DashboardCountsObserver {
+    counters: Arc<DashboardCounters>,
+}
+
+impl DashboardCountsObserver {
+    /// An observer recording into `counters`.
+    pub fn new(counters: Arc<DashboardCounters>) -> Self {
+        Self { counters }
     }
 }
 
-/// Records `n` committed deletes of live `resource_type` resources.
-pub(crate) fn deleted(tenant: &TenantContext, resource_type: &str, n: u64) {
-    dashboard_counters::record_deleted(tenant.tenant_id().as_str(), resource_type, n);
+impl WriteObserver for DashboardCountsObserver {
+    fn on_write(&self, event: &WriteEvent) {
+        match event {
+            WriteEvent::Resource(write) => {
+                if write.live_delta != 0 {
+                    self.counters.record(
+                        write.tenant.as_str(),
+                        &write.resource_type,
+                        write.live_delta,
+                        write.at,
+                    );
+                }
+            }
+            WriteEvent::Counts {
+                tenant,
+                resource_type,
+                created,
+                deleted,
+                at,
+                ..
+            } => {
+                // `record` ignores a zero delta.
+                self.counters.record(
+                    tenant.as_str(),
+                    resource_type,
+                    saturating_i64(*created),
+                    *at,
+                );
+                self.counters.record(
+                    tenant.as_str(),
+                    resource_type,
+                    -saturating_i64(*deleted),
+                    *at,
+                );
+            }
+            // The purge erased live rows *and* history, which the counters and
+            // seeded history rings cannot subtract precisely: mark the tenant
+            // stale so the background reconcile reseeds it.
+            WriteEvent::Erased { tenant, .. } => self.counters.invalidate_tenant(tenant.as_str()),
+        }
+    }
 }
 
-/// Records a signed live-count change (`+n` created, `-n` deleted).
-pub(crate) fn changed(tenant: &TenantContext, resource_type: &str, delta: i64) {
-    dashboard_counters::global().record(
-        tenant.tenant_id().as_str(),
-        resource_type,
-        delta,
-        chrono::Utc::now(),
-    );
-}
+#[cfg(test)]
+mod observer_tests {
+    use chrono::Utc;
+    use helios_fhir::FhirVersion;
+    use helios_persistence::core::{ErasedScope, ResourceWrite, WriteOrigin};
+    use helios_persistence::tenant::TenantId;
 
-/// Marks the tenant's counters stale after its data was purged: the last
-/// figures stay on the dashboard, labelled approximate, until a background
-/// reseed replaces them with storage's (#1078).
-pub(crate) fn invalidated(tenant_id: &str) {
-    dashboard_counters::invalidate_tenant(tenant_id);
+    use super::*;
+
+    fn tenant(id: &str) -> TenantId {
+        TenantId::new(id.to_string())
+    }
+
+    #[test]
+    fn records_resource_deltas_counts_and_purges() {
+        let counters = Arc::new(DashboardCounters::new());
+        let observer = DashboardCountsObserver::new(Arc::clone(&counters));
+        let resource = |t: &str, delta: i64| {
+            WriteEvent::Resource(ResourceWrite {
+                tenant: tenant(t),
+                fhir_version: FhirVersion::default(),
+                resource_type: "Patient".to_string(),
+                live_delta: delta,
+                notice: None,
+                at: Utc::now(),
+            })
+        };
+
+        observer.on_write(&resource("a", 1));
+        observer.on_write(&resource("a", 0));
+        observer.on_write(&resource("b", -1));
+        assert_eq!(counters.live_delta("a", "Patient"), 1);
+        assert_eq!(counters.live_delta("b", "Patient"), -1);
+
+        observer.on_write(&WriteEvent::Counts {
+            tenant: tenant("a"),
+            resource_type: "Patient".to_string(),
+            created: 5,
+            updated: 7,
+            deleted: 2,
+            origin: WriteOrigin::BulkSubmit,
+            at: Utc::now(),
+        });
+        assert_eq!(
+            counters.live_delta("a", "Patient"),
+            4,
+            "+created −deleted; updates change no count"
+        );
+
+        for scope in [
+            ErasedScope::Instance {
+                resource_type: "Patient".to_string(),
+                id: "p1".to_string(),
+            },
+            ErasedScope::Type("Patient".to_string()),
+            ErasedScope::Tenant,
+        ] {
+            let other = Arc::new(DashboardCounters::new());
+            other.record("a", "Patient", 1, Utc::now());
+            DashboardCountsObserver::new(Arc::clone(&other)).on_write(&WriteEvent::Erased {
+                tenant: tenant("a"),
+                scope: scope.clone(),
+            });
+            assert!(other.needs_reseed("a"), "{scope:?}");
+        }
+        assert!(!counters.needs_reseed("a"));
+    }
 }
 
 #[cfg(all(test, feature = "sqlite"))]
 mod tests {
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex};
 
     use axum::http::{HeaderName, HeaderValue, StatusCode};
     use axum_test::TestServer;
-    use helios_observability::dashboard_counters::global;
+    use helios_observability::dashboard_counters::DashboardCounters;
     use helios_persistence::backends::sqlite::SqliteBackend;
+    use helios_persistence::core::{
+        ErasedScope, PurgableStorage, WriteEvent, WriteKind, WriteObserver,
+    };
     use serde_json::json;
 
     use crate::ServerConfig;
 
     const X_TENANT_ID: HeaderName = HeaderName::from_static("x-tenant-id");
+    const TENANT: &str = "dash-counts";
+    const OTHER_TENANT: &str = "dash-counts-other";
 
-    /// A tenant id no other test (in this or any parallel test) records into:
-    /// the counters are process-global.
-    fn unique_tenant(label: &str) -> String {
-        static NEXT: AtomicU64 = AtomicU64::new(0);
-        format!(
-            "dash-counts-{label}-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        )
+    /// Every event reported to the state's observer, in order.
+    #[derive(Default)]
+    struct Recording {
+        events: Mutex<Vec<WriteEvent>>,
     }
 
-    fn server() -> TestServer {
-        let backend = SqliteBackend::in_memory().expect("in-memory sqlite");
+    impl WriteObserver for Recording {
+        fn on_write(&self, event: &WriteEvent) {
+            self.events.lock().unwrap().push(event.clone());
+        }
+    }
+
+    impl Recording {
+        fn take(&self) -> Vec<WriteEvent> {
+            std::mem::take(&mut *self.events.lock().unwrap())
+        }
+    }
+
+    struct Harness {
+        server: TestServer,
+        counters: Arc<DashboardCounters>,
+        recording: Arc<Recording>,
+    }
+
+    fn harness() -> Harness {
+        let backend = Arc::new(SqliteBackend::in_memory().expect("in-memory sqlite"));
         backend.init_schema().expect("init schema");
-        let state = crate::AppState::new(Arc::new(backend), ServerConfig::for_testing());
+        let state = crate::AppState::new(Arc::clone(&backend), ServerConfig::for_testing())
+            .with_purge(backend as Arc<dyn PurgableStorage>);
+        let recording = Arc::new(Recording::default());
+        state.write_observer().subscribe(recording.clone());
+        let counters = Arc::clone(state.dashboard_counters());
         let app = crate::routing::fhir_routes::create_routes(state);
-        TestServer::new(app).expect("test server")
+        Harness {
+            server: TestServer::new(app).expect("test server"),
+            counters,
+            recording,
+        }
     }
 
     fn header(tenant: &str) -> HeaderValue {
         HeaderValue::from_str(tenant).expect("tenant header")
     }
 
-    fn live(tenant: &str, resource_type: &str) -> i64 {
-        global().live_delta(tenant, resource_type)
+    impl Harness {
+        fn live(&self, tenant: &str, resource_type: &str) -> i64 {
+            self.counters.live_delta(tenant, resource_type)
+        }
+    }
+
+    /// `(resource_type, live_delta, notice kind, notice id)` of each resource
+    /// event, and a label for the others.
+    fn summarize(events: &[WriteEvent]) -> Vec<(String, i64, Option<WriteKind>, Option<String>)> {
+        events
+            .iter()
+            .map(|event| match event {
+                WriteEvent::Resource(write) => (
+                    write.resource_type.clone(),
+                    write.live_delta,
+                    write.notice.as_ref().map(|n| n.kind),
+                    write.notice.as_ref().map(|n| n.resource_id.clone()),
+                ),
+                other => (format!("{other:?}"), 0, None, None),
+            })
+            .collect()
     }
 
     #[tokio::test]
     async fn create_records_plus_one() {
-        let server = server();
-        let tenant = unique_tenant("create");
-        let response = server
+        let h = harness();
+        let response = h
+            .server
             .post("/Patient")
-            .add_header(X_TENANT_ID, header(&tenant))
+            .add_header(X_TENANT_ID, header(TENANT))
             .json(&json!({"resourceType": "Patient", "name": [{"family": "A"}]}))
             .await;
         response.assert_status(StatusCode::CREATED);
-        assert_eq!(live(&tenant, "Patient"), 1);
+        assert_eq!(h.live(TENANT, "Patient"), 1);
+        assert_eq!(h.live(OTHER_TENANT, "Patient"), 0, "tenants are separate");
 
         // A refused create records nothing.
-        let response = server
+        let response = h
+            .server
             .post("/Patient")
-            .add_header(X_TENANT_ID, header(&tenant))
+            .add_header(X_TENANT_ID, header(TENANT))
             .json(&json!({"resourceType": "Observation"}))
             .await;
         assert!(response.status_code().is_client_error());
-        assert_eq!(live(&tenant, "Patient"), 1);
-        assert_eq!(live(&tenant, "Observation"), 0);
+        assert_eq!(h.live(TENANT, "Patient"), 1);
+        assert_eq!(h.live(TENANT, "Observation"), 0);
     }
 
     #[tokio::test]
     async fn conditional_create_that_matches_records_nothing() {
-        let server = server();
-        let tenant = unique_tenant("cond-create");
+        let h = harness();
         let if_none_exist = HeaderName::from_static("if-none-exist");
         let body = json!({"resourceType": "Patient"});
 
         // No match: the conditional create creates.
-        let first = server
+        let first = h
+            .server
             .post("/Patient")
-            .add_header(X_TENANT_ID, header(&tenant))
+            .add_header(X_TENANT_ID, header(TENANT))
             .add_header(
                 if_none_exist.clone(),
                 HeaderValue::from_static("_id=dash-none"),
@@ -136,16 +284,17 @@ mod tests {
             .json(&body)
             .await;
         first.assert_status(StatusCode::CREATED);
-        assert_eq!(live(&tenant, "Patient"), 1);
+        assert_eq!(h.live(TENANT, "Patient"), 1);
         let id = first.json::<serde_json::Value>()["id"]
             .as_str()
             .expect("id")
             .to_string();
 
         // A match answers 200 with the existing resource and writes nothing.
-        let second = server
+        let second = h
+            .server
             .post("/Patient")
-            .add_header(X_TENANT_ID, header(&tenant))
+            .add_header(X_TENANT_ID, header(TENANT))
             .add_header(
                 if_none_exist,
                 HeaderValue::from_str(&format!("_id={id}")).expect("header"),
@@ -154,7 +303,7 @@ mod tests {
             .await;
         second.assert_status_ok();
         assert_eq!(
-            live(&tenant, "Patient"),
+            h.live(TENANT, "Patient"),
             1,
             "the matched create wrote nothing"
         );
@@ -162,31 +311,30 @@ mod tests {
 
     #[tokio::test]
     async fn update_counts_only_when_it_creates() {
-        let server = server();
-        let tenant = unique_tenant("update");
+        let h = harness();
         let put = |family: &'static str| {
-            server
+            h.server
                 .put("/Patient/dash-p1")
-                .add_header(X_TENANT_ID, header(&tenant))
+                .add_header(X_TENANT_ID, header(TENANT))
                 .json(&json!({"resourceType": "Patient", "id": "dash-p1", "name": [{"family": family}]}))
         };
 
         put("A").await.assert_status(StatusCode::CREATED);
-        assert_eq!(live(&tenant, "Patient"), 1, "update-as-create counts");
+        assert_eq!(h.live(TENANT, "Patient"), 1, "update-as-create counts");
 
         put("B").await.assert_status_ok();
-        assert_eq!(live(&tenant, "Patient"), 1, "a plain update does not");
+        assert_eq!(h.live(TENANT, "Patient"), 1, "a plain update does not");
 
-        server
+        h.server
             .delete("/Patient/dash-p1")
-            .add_header(X_TENANT_ID, header(&tenant))
+            .add_header(X_TENANT_ID, header(TENANT))
             .await
             .assert_status(StatusCode::NO_CONTENT);
-        assert_eq!(live(&tenant, "Patient"), 0);
+        assert_eq!(h.live(TENANT, "Patient"), 0);
 
         put("C").await.assert_status(StatusCode::CREATED);
         assert_eq!(
-            live(&tenant, "Patient"),
+            h.live(TENANT, "Patient"),
             1,
             "resurrecting a deleted resource counts as a create"
         );
@@ -194,11 +342,11 @@ mod tests {
 
     #[tokio::test]
     async fn delete_records_minus_one_only_for_a_live_resource() {
-        let server = server();
-        let tenant = unique_tenant("delete");
-        let created = server
+        let h = harness();
+        let created = h
+            .server
             .post("/Patient")
-            .add_header(X_TENANT_ID, header(&tenant))
+            .add_header(X_TENANT_ID, header(TENANT))
             .json(&json!({"resourceType": "Patient"}))
             .await;
         created.assert_status(StatusCode::CREATED);
@@ -206,75 +354,75 @@ mod tests {
             .as_str()
             .expect("id")
             .to_string();
-        assert_eq!(live(&tenant, "Patient"), 1);
+        assert_eq!(h.live(TENANT, "Patient"), 1);
 
-        server
+        h.server
             .delete(&format!("/Patient/{id}"))
-            .add_header(X_TENANT_ID, header(&tenant))
+            .add_header(X_TENANT_ID, header(TENANT))
             .await
             .assert_status(StatusCode::NO_CONTENT);
-        assert_eq!(live(&tenant, "Patient"), 0);
+        assert_eq!(h.live(TENANT, "Patient"), 0);
 
         // Already gone / never existed: no live-count change.
-        let again = server
+        let again = h
+            .server
             .delete(&format!("/Patient/{id}"))
-            .add_header(X_TENANT_ID, header(&tenant))
+            .add_header(X_TENANT_ID, header(TENANT))
             .await;
         assert!(!again.status_code().is_success());
-        let missing = server
+        let missing = h
+            .server
             .delete("/Patient/never-existed")
-            .add_header(X_TENANT_ID, header(&tenant))
+            .add_header(X_TENANT_ID, header(TENANT))
             .await;
         assert!(!missing.status_code().is_success());
-        assert_eq!(live(&tenant, "Patient"), 0);
+        assert_eq!(h.live(TENANT, "Patient"), 0);
     }
 
     #[tokio::test]
     async fn conditional_delete_records_the_deleted_resource() {
-        let server = server();
-        let tenant = unique_tenant("cond-delete");
-        server
+        let h = harness();
+        h.server
             .put("/Patient/dash-cd")
-            .add_header(X_TENANT_ID, header(&tenant))
+            .add_header(X_TENANT_ID, header(TENANT))
             .json(&json!({"resourceType": "Patient", "id": "dash-cd"}))
             .await
             .assert_status(StatusCode::CREATED);
-        assert_eq!(live(&tenant, "Patient"), 1);
+        assert_eq!(h.live(TENANT, "Patient"), 1);
 
-        server
+        h.server
             .delete("/Patient?_id=dash-cd")
-            .add_header(X_TENANT_ID, header(&tenant))
+            .add_header(X_TENANT_ID, header(TENANT))
             .await
             .assert_status(StatusCode::NO_CONTENT);
-        assert_eq!(live(&tenant, "Patient"), 0);
+        assert_eq!(h.live(TENANT, "Patient"), 0);
 
         // No match is a success that deletes nothing.
-        server
+        h.server
             .delete("/Patient?_id=dash-cd")
-            .add_header(X_TENANT_ID, header(&tenant))
+            .add_header(X_TENANT_ID, header(TENANT))
             .await
             .assert_status(StatusCode::NO_CONTENT);
-        assert_eq!(live(&tenant, "Patient"), 0);
+        assert_eq!(h.live(TENANT, "Patient"), 0);
     }
 
     #[tokio::test]
     async fn transaction_bundle_records_committed_entries() {
-        let server = server();
-        let tenant = unique_tenant("transaction");
-        server
+        let h = harness();
+        h.server
             .put("/Patient/dash-existing")
-            .add_header(X_TENANT_ID, header(&tenant))
+            .add_header(X_TENANT_ID, header(TENANT))
             .json(&json!({"resourceType": "Patient", "id": "dash-existing"}))
             .await
             .assert_status(StatusCode::CREATED);
-        server
+        h.server
             .put("/Observation/dash-doomed")
-            .add_header(X_TENANT_ID, header(&tenant))
+            .add_header(X_TENANT_ID, header(TENANT))
             .json(&json!({"resourceType": "Observation", "id": "dash-doomed", "status": "final", "code": {"text": "x"}}))
             .await
             .assert_status(StatusCode::CREATED);
-        assert_eq!(live(&tenant, "Patient"), 1);
-        assert_eq!(live(&tenant, "Observation"), 1);
+        assert_eq!(h.live(TENANT, "Patient"), 1);
+        assert_eq!(h.live(TENANT, "Observation"), 1);
 
         let bundle = json!({
             "resourceType": "Bundle",
@@ -298,18 +446,19 @@ mod tests {
                 }
             ]
         });
-        let response = server
+        let response = h
+            .server
             .post("/")
-            .add_header(X_TENANT_ID, header(&tenant))
+            .add_header(X_TENANT_ID, header(TENANT))
             .json(&bundle)
             .await;
         response.assert_status_ok();
         assert_eq!(
-            live(&tenant, "Patient"),
+            h.live(TENANT, "Patient"),
             3,
             "POST and update-as-create count; the plain update does not"
         );
-        assert_eq!(live(&tenant, "Observation"), 0);
+        assert_eq!(h.live(TENANT, "Observation"), 0);
 
         // A rolled-back transaction records nothing.
         let failing = json!({
@@ -325,26 +474,31 @@ mod tests {
                 }
             ]
         });
-        let response = server
+        h.recording.take();
+        let response = h
+            .server
             .post("/")
-            .add_header(X_TENANT_ID, header(&tenant))
+            .add_header(X_TENANT_ID, header(TENANT))
             .json(&failing)
             .await;
         assert!(!response.status_code().is_success());
-        assert_eq!(live(&tenant, "Patient"), 3);
+        assert_eq!(h.live(TENANT, "Patient"), 3);
+        assert!(
+            h.recording.take().is_empty(),
+            "nothing committed, nothing reported"
+        );
     }
 
     #[tokio::test]
     async fn batch_bundle_records_each_successful_entry() {
-        let server = server();
-        let tenant = unique_tenant("batch");
-        server
+        let h = harness();
+        h.server
             .put("/Patient/dash-b-existing")
-            .add_header(X_TENANT_ID, header(&tenant))
+            .add_header(X_TENANT_ID, header(TENANT))
             .json(&json!({"resourceType": "Patient", "id": "dash-b-existing"}))
             .await
             .assert_status(StatusCode::CREATED);
-        assert_eq!(live(&tenant, "Patient"), 1);
+        assert_eq!(h.live(TENANT, "Patient"), 1);
 
         let bundle = json!({
             "resourceType": "Bundle",
@@ -370,13 +524,237 @@ mod tests {
                 }
             ]
         });
-        let response = server
+        let response = h
+            .server
             .post("/")
-            .add_header(X_TENANT_ID, header(&tenant))
+            .add_header(X_TENANT_ID, header(TENANT))
             .json(&bundle)
             .await;
         response.assert_status_ok();
         // +1 POST, +1 update-as-create, 0 update, -1 delete, 0 failed delete.
-        assert_eq!(live(&tenant, "Patient"), 2);
+        assert_eq!(h.live(TENANT, "Patient"), 2);
+    }
+
+    // -- Observer-level: what the write paths report ------------------------
+
+    #[tokio::test]
+    async fn single_create_reports_plus_one_and_a_create_notice() {
+        let h = harness();
+        let created = h
+            .server
+            .post("/Patient")
+            .add_header(X_TENANT_ID, header(TENANT))
+            .json(&json!({"resourceType": "Patient"}))
+            .await;
+        created.assert_status(StatusCode::CREATED);
+        let body = created.json::<serde_json::Value>();
+        let id = body["id"].as_str().expect("id").to_string();
+
+        let events = h.recording.take();
+        assert_eq!(events.len(), 1, "exactly one event per committed write");
+        let WriteEvent::Resource(write) = &events[0] else {
+            panic!("expected a resource event, got {:?}", events[0]);
+        };
+        assert_eq!(write.tenant.as_str(), TENANT);
+        assert_eq!(write.resource_type, "Patient");
+        assert_eq!(write.live_delta, 1);
+        let notice = write.notice.as_ref().expect("a create announces");
+        assert_eq!(notice.kind, WriteKind::Create);
+        assert_eq!(notice.resource_id, id);
+        assert_eq!(notice.version_id, "1");
+        let resource = notice.resource.as_ref().expect("content");
+        assert_eq!(resource["id"], json!(id));
+        assert_eq!(
+            resource["meta"]["versionId"],
+            json!("1"),
+            "content with meta"
+        );
+        assert!(notice.previous.is_none());
+    }
+
+    #[tokio::test]
+    async fn plain_update_reports_no_delta_and_an_update_notice() {
+        let h = harness();
+        h.server
+            .put("/Patient/obs-u1")
+            .add_header(X_TENANT_ID, header(TENANT))
+            .json(&json!({"resourceType": "Patient", "id": "obs-u1"}))
+            .await
+            .assert_status(StatusCode::CREATED);
+        assert_eq!(
+            summarize(&h.recording.take()),
+            vec![(
+                "Patient".to_string(),
+                1,
+                Some(WriteKind::Create),
+                Some("obs-u1".to_string())
+            )]
+        );
+
+        h.server
+            .put("/Patient/obs-u1")
+            .add_header(X_TENANT_ID, header(TENANT))
+            .json(&json!({"resourceType": "Patient", "id": "obs-u1", "active": true}))
+            .await
+            .assert_status_ok();
+        let events = h.recording.take();
+        assert_eq!(
+            summarize(&events),
+            vec![(
+                "Patient".to_string(),
+                0,
+                Some(WriteKind::Update),
+                Some("obs-u1".to_string())
+            )]
+        );
+        let WriteEvent::Resource(write) = &events[0] else {
+            unreachable!()
+        };
+        assert_eq!(write.notice.as_ref().unwrap().version_id, "2");
+    }
+
+    #[tokio::test]
+    async fn conditional_create_reports_plus_one_without_a_notice() {
+        let h = harness();
+        h.server
+            .post("/Patient")
+            .add_header(X_TENANT_ID, header(TENANT))
+            .add_header(
+                HeaderName::from_static("if-none-exist"),
+                HeaderValue::from_static("_id=obs-none"),
+            )
+            .json(&json!({"resourceType": "Patient"}))
+            .await
+            .assert_status(StatusCode::CREATED);
+        assert_eq!(
+            summarize(&h.recording.take()),
+            vec![("Patient".to_string(), 1, None, None)],
+            "conditional writes keep announcing nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_reports_minus_one_and_a_delete_notice_with_previous() {
+        let h = harness();
+        h.server
+            .put("/Patient/obs-d1")
+            .add_header(X_TENANT_ID, header(TENANT))
+            .json(&json!({"resourceType": "Patient", "id": "obs-d1", "active": true}))
+            .await
+            .assert_status(StatusCode::CREATED);
+        h.recording.take();
+
+        h.server
+            .delete("/Patient/obs-d1")
+            .add_header(X_TENANT_ID, header(TENANT))
+            .await
+            .assert_status(StatusCode::NO_CONTENT);
+        let events = h.recording.take();
+        assert_eq!(
+            summarize(&events),
+            vec![(
+                "Patient".to_string(),
+                -1,
+                Some(WriteKind::Delete),
+                Some("obs-d1".to_string())
+            )]
+        );
+        let WriteEvent::Resource(write) = &events[0] else {
+            unreachable!()
+        };
+        let notice = write.notice.as_ref().unwrap();
+        assert!(notice.version_id.is_empty());
+        assert!(notice.resource.is_none());
+        assert_eq!(
+            notice.previous.as_ref().expect("previous content")["active"],
+            json!(true)
+        );
+    }
+
+    /// The transaction path keeps deciding notices by HTTP status (#1023), so
+    /// an `ifNoneExist` POST that matched (200, nothing written) still reports
+    /// an Update notice — but its live delta, read from the entry's effect, is
+    /// 0.
+    #[tokio::test]
+    async fn transaction_if_none_exist_match_reports_no_delta_and_an_update_notice() {
+        let h = harness();
+        h.server
+            .put("/Patient/obs-t1")
+            .add_header(X_TENANT_ID, header(TENANT))
+            .json(&json!({"resourceType": "Patient", "id": "obs-t1"}))
+            .await
+            .assert_status(StatusCode::CREATED);
+        h.recording.take();
+
+        let bundle = json!({
+            "resourceType": "Bundle",
+            "type": "transaction",
+            "entry": [{
+                "fullUrl": "urn:uuid:9d8a0a3e-0000-4000-8000-0000000000a1",
+                "resource": {"resourceType": "Patient"},
+                "request": {"method": "POST", "url": "Patient", "ifNoneExist": "_id=obs-t1"}
+            }]
+        });
+        h.server
+            .post("/")
+            .add_header(X_TENANT_ID, header(TENANT))
+            .json(&bundle)
+            .await
+            .assert_status_ok();
+        assert_eq!(
+            summarize(&h.recording.take()),
+            vec![(
+                "Patient".to_string(),
+                0,
+                Some(WriteKind::Update),
+                Some("obs-t1".to_string())
+            )]
+        );
+        assert_eq!(h.live(TENANT, "Patient"), 1);
+    }
+
+    #[tokio::test]
+    async fn purges_report_erased() {
+        let h = harness();
+        for id in ["obs-p1", "obs-p2"] {
+            h.server
+                .put(&format!("/Patient/{id}"))
+                .add_header(X_TENANT_ID, header(TENANT))
+                .json(&json!({"resourceType": "Patient", "id": id}))
+                .await
+                .assert_status(StatusCode::CREATED);
+        }
+        h.recording.take();
+
+        h.server
+            .delete("/Patient/obs-p1/$purge")
+            .add_header(X_TENANT_ID, header(TENANT))
+            .await
+            .assert_status_ok();
+        let events = h.recording.take();
+        assert!(
+            matches!(
+                events.as_slice(),
+                [WriteEvent::Erased { tenant, scope: ErasedScope::Instance { resource_type, id } }]
+                    if tenant.as_str() == TENANT && resource_type == "Patient" && id == "obs-p1"
+            ),
+            "{events:?}"
+        );
+        assert!(h.counters.needs_reseed(TENANT));
+
+        h.server
+            .post("/Patient/$purge")
+            .add_header(X_TENANT_ID, header(TENANT))
+            .await
+            .assert_status_ok();
+        let events = h.recording.take();
+        assert!(
+            matches!(
+                events.as_slice(),
+                [WriteEvent::Erased { tenant, scope: ErasedScope::Type(resource_type) }]
+                    if tenant.as_str() == TENANT && resource_type == "Patient"
+            ),
+            "{events:?}"
+        );
     }
 }
