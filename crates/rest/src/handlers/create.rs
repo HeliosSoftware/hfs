@@ -113,6 +113,9 @@ where
         .check_write(tenant.tenant_id(), fhir_version, &resource_type, &resource)
         .await?;
 
+    // #1014: an unknown ViewDefinition.resource is rejected on every write.
+    super::sof::reject_unknown_view_definition_resource(&resource_type, &resource)?;
+
     // Check for conditional create
     if let Some(search_params) = conditional.if_none_exist() {
         debug!(search_params = %search_params, "Processing conditional create");
