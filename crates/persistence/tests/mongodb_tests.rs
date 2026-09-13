@@ -662,7 +662,6 @@ async fn create_backend_with_search_offloaded(
 
 /// A backend whose driver connections carry `app_name`, so a `failCommand`
 /// failpoint configured with `data.appName` hits only this backend.
-#[allow(dead_code)] // not every failpoint test in this module exercises every helper
 async fn create_backend_with_app_name(test_name: &str, app_name: &str) -> Option<MongoBackend> {
     let connection_string = shared_mongo::connection_string().await?;
     let config = MongoBackendConfig {
@@ -7823,6 +7822,98 @@ mod bulk_submit {
         assert_eq!(preserved_legacy_rows.len(), 1);
         assert!(preserved_legacy_rows[0].manifest_id.is_none());
         assert!(preserved_legacy_rows[0].legacy_locator);
+    }
+
+    fn three_patients(prefix: &str) -> Vec<NdjsonEntry> {
+        (1..=3)
+            .map(|i| {
+                NdjsonEntry::new(
+                    i,
+                    "Patient",
+                    json!({"resourceType": "Patient", "id": format!("{prefix}-{i}")}),
+                )
+            })
+            .collect()
+    }
+
+    /// The manifest bookkeeping around a batch — the `processing` promotion,
+    /// the counters and `touch_submission` — is retried like the batch itself.
+    /// On a standalone server the driver adds no retry, so two dropped
+    /// `update`s are exactly two of ours.
+    #[tokio::test]
+    async fn bookkeeping_updates_survive_dropped_connections() {
+        let app = "fp-bookkeeping-update";
+        let Some(backend) = create_backend_with_app_name("submit_fp_bookkeeping_update", app).await
+        else {
+            return;
+        };
+        let tenant = create_tenant("submit-tenant");
+        let (id, manifest_id) = seed(&backend, &tenant).await;
+        let Some(fail_point) = FailPoint::enable(
+            app,
+            doc! { "failCommands": ["update"], "closeConnection": true },
+            doc! { "times": 2 },
+        )
+        .await
+        else {
+            return;
+        };
+
+        let results = backend
+            .process_entries(
+                &tenant,
+                &id,
+                &manifest_id,
+                three_patients("bk"),
+                &BulkProcessingOptions::new(),
+            )
+            .await
+            .unwrap();
+        fail_point.off().await;
+
+        assert!(results.iter().all(|r| r.is_success()));
+        let counts = backend
+            .get_entry_counts(&tenant, &id, &manifest_id)
+            .await
+            .unwrap();
+        assert_eq!(counts.total, 3);
+        assert_eq!(counts.success, 3);
+    }
+
+    /// The manifest existence check before a batch is a `find`; the driver may
+    /// retry a read once on its own, so this asserts recovery, not attempts.
+    #[tokio::test]
+    async fn manifest_check_survives_dropped_connections() {
+        let app = "fp-bookkeeping-find";
+        let Some(backend) = create_backend_with_app_name("submit_fp_bookkeeping_find", app).await
+        else {
+            return;
+        };
+        let tenant = create_tenant("submit-tenant");
+        let (id, manifest_id) = seed(&backend, &tenant).await;
+        let Some(fail_point) = FailPoint::enable(
+            app,
+            doc! { "failCommands": ["find"], "closeConnection": true },
+            doc! { "times": 3 },
+        )
+        .await
+        else {
+            return;
+        };
+
+        let results = backend
+            .process_entries(
+                &tenant,
+                &id,
+                &manifest_id,
+                three_patients("bkf"),
+                &BulkProcessingOptions::new(),
+            )
+            .await
+            .unwrap();
+        fail_point.off().await;
+
+        assert!(results.iter().all(|r| r.is_success()));
     }
 }
 

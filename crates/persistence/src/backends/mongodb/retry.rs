@@ -42,10 +42,6 @@ pub(super) const SETTINGS_RETRY: RetryPolicy = RetryPolicy {
 
 /// Bulk-ingest policy: 100, 200, 400, 800, 1000 ms — 2.5 s of sleep across
 /// six attempts, enough for a cleared pool to reconnect under load (#1001).
-///
-/// Not yet read outside this module's tests: the bulk-ingest call sites land
-/// in a later commit.
-#[allow(dead_code)]
 pub(super) const BULK_INGEST_RETRY: RetryPolicy = RetryPolicy {
     max_attempts: 6,
     base: Duration::from_millis(100),
@@ -184,9 +180,6 @@ pub(super) fn exhausted(context: &str, attempts: u32, err: &MongoError) -> Stora
 }
 
 /// [`exhausted`] applied to an [`Attempted`].
-///
-/// Not yet called; the bulk-ingest retry call sites land in a later commit.
-#[allow(dead_code)]
 pub(super) fn or_exhausted<T>(context: &str, attempted: Attempted<T>) -> StorageResult<T> {
     let Attempted { result, attempts } = attempted;
     result.map_err(|err| exhausted(context, attempts, &err))
