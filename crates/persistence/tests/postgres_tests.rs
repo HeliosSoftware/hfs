@@ -5926,11 +5926,11 @@ mod postgres_integration {
     // Reindex Tests
     // ========================================================================
 
-    async fn reindex_test_client() -> tokio_postgres::Client {
+    async fn reindex_test_client_for(dbname: &str) -> tokio_postgres::Client {
         let pg = shared_pg().await;
         let conn_str = format!(
-            "host={} port={} user=postgres password=postgres dbname=postgres",
-            pg.host, pg.port,
+            "host={} port={} user=postgres password=postgres dbname={dbname}",
+            pg.host, pg.port
         );
         let (client, connection) = tokio_postgres::connect(&conn_str, tokio_postgres::NoTls)
             .await
@@ -5939,6 +5939,200 @@ mod postgres_integration {
             let _ = connection.await;
         });
         client
+    }
+
+    async fn reindex_test_client() -> tokio_postgres::Client {
+        reindex_test_client_for("postgres").await
+    }
+
+    async fn isolated_reindex_backend() -> (PostgresBackend, String) {
+        let pg = shared_pg().await;
+        let dbname = format!("reindex_coord_{}", uuid::Uuid::new_v4().simple());
+        reindex_test_client()
+            .await
+            .batch_execute(&format!("CREATE DATABASE {dbname}"))
+            .await
+            .expect("create isolated deferred-reindex database");
+
+        let data_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|path| path.parent())
+            .map(|path| path.join("data"))
+            .unwrap_or_else(|| PathBuf::from("data"));
+        let backend = PostgresBackend::new(PostgresConfig {
+            host: pg.host.clone(),
+            port: pg.port,
+            dbname: dbname.clone(),
+            user: "postgres".to_string(),
+            password: Some("postgres".to_string()),
+            max_connections: 5,
+            data_dir: Some(data_dir),
+            ..Default::default()
+        })
+        .await
+        .expect("connect to isolated deferred-reindex database");
+        backend
+            .init_schema()
+            .await
+            .expect("initialize isolated deferred-reindex database");
+        (backend, dbname)
+    }
+
+    /// Exercises the production deferred-reindex hook against PostgreSQL.
+    ///
+    /// It uses an isolated database because it briefly takes an exclusive lock
+    /// on `search_index` so generation one is known to have fetched the old
+    /// resource before generation two is enqueued.
+    #[tokio::test]
+    async fn postgres_integration_deferred_reindex_coordination() {
+        use helios_persistence::core::DeferredReindexHook;
+        use helios_persistence::search::{ReindexOnFinish, ReindexOperation, ReindexStatus};
+        use std::sync::Arc;
+
+        let (backend, dbname) = isolated_reindex_backend().await;
+        let backend = Arc::new(backend);
+        let tenant = create_tenant("deferred-reindex-coordination");
+        let tenant_id = tenant.tenant_id().as_str().to_string();
+        let resource_id = format!("coord-{}", uuid::Uuid::new_v4().simple());
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({
+                    "resourceType": "Patient",
+                    "id": resource_id,
+                    "name": [{"family": "BeforeCoordination"}]
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+
+        let operation = Arc::new(ReindexOperation::new(
+            backend.clone(),
+            backend.tenant_registries().clone(),
+        ));
+        let hook = ReindexOnFinish::with_max_concurrency(operation.clone(), 2);
+
+        let mut lock_client = reindex_test_client_for(&dbname).await;
+        let observer = reindex_test_client_for(&dbname).await;
+        let transaction = lock_client.transaction().await.unwrap();
+        let blocker_pid: i32 = transaction
+            .query_one("SELECT pg_backend_pid()", &[])
+            .await
+            .unwrap()
+            .get(0);
+        transaction
+            .batch_execute("LOCK TABLE search_index IN ACCESS EXCLUSIVE MODE")
+            .await
+            .unwrap();
+
+        hook.reindex_types(&tenant, vec!["Patient".to_string()])
+            .await;
+
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let blocked: i64 = observer
+                    .query_one(
+                        "SELECT COUNT(*) FROM pg_stat_activity
+                         WHERE $1 = ANY(pg_blocking_pids(pid))",
+                        &[&blocker_pid],
+                    )
+                    .await
+                    .unwrap()
+                    .get(0);
+                if blocked > 0 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("first reindex generation did not block on the controlled table lock");
+
+        let jobs_while_blocked = operation.list_jobs();
+        assert_eq!(jobs_while_blocked.len(), 1);
+        assert_eq!(jobs_while_blocked[0].status, ReindexStatus::InProgress);
+
+        let updated = json!({
+            "resourceType": "Patient",
+            "id": resource_id,
+            "name": [{"family": "FreshCoordination"}]
+        });
+        transaction
+            .execute(
+                "UPDATE resources SET data = $3
+                 WHERE tenant_id = $1 AND resource_type = 'Patient' AND id = $2",
+                &[&tenant_id, &resource_id, &updated],
+            )
+            .await
+            .unwrap();
+
+        // The second callback arrives after generation one fetched the stale
+        // value. It must merge into a pending generation, not start a second
+        // PostgreSQL scan while generation one is blocked.
+        hook.reindex_types(&tenant, vec!["Patient".to_string()])
+            .await;
+        assert_eq!(
+            operation.list_jobs().len(),
+            1,
+            "compatible automatic requests overlapped as physical jobs"
+        );
+
+        transaction.commit().await.unwrap();
+
+        let mut jobs = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            loop {
+                let jobs = operation.list_jobs();
+                if jobs.len() == 2 && jobs.iter().all(|job| job.status.is_finished()) {
+                    break jobs;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("deferred reindex generations did not finish");
+        jobs.sort_by_key(|job| job.started_at.clone());
+        assert!(
+            jobs.iter()
+                .all(|job| { job.status == ReindexStatus::Completed && !job.has_errors() }),
+            "both generations must complete cleanly: {jobs:?}"
+        );
+        let first_completed =
+            chrono::DateTime::parse_from_rfc3339(jobs[0].completed_at.as_deref().unwrap()).unwrap();
+        let second_started =
+            chrono::DateTime::parse_from_rfc3339(jobs[1].started_at.as_deref().unwrap()).unwrap();
+        assert!(
+            first_completed <= second_started,
+            "same-tenant generations overlapped: {jobs:?}"
+        );
+
+        let family_rows: Vec<(String, i64)> = observer
+            .query(
+                "SELECT value_string, COUNT(*)
+                 FROM search_index
+                 WHERE tenant_id = $1 AND resource_type = 'Patient'
+                   AND resource_id = $2 AND param_name = 'family'
+                 GROUP BY value_string ORDER BY value_string",
+                &[&tenant_id, &resource_id],
+            )
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| (row.get(0), row.get(1)))
+            .collect();
+        assert_eq!(family_rows, vec![("FreshCoordination".to_string(), 1)]);
+
+        let fts_rows: i64 = observer
+            .query_one(
+                "SELECT COUNT(*) FROM resource_fts
+                 WHERE tenant_id = $1 AND resource_type = 'Patient' AND resource_id = $2",
+                &[&tenant_id, &resource_id],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(fts_rows, 1, "the follow-up generation duplicated FTS rows");
     }
 
     #[tokio::test]

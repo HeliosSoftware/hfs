@@ -512,10 +512,32 @@ impl<T> BulkSubmitJobStore for T where
 /// Rebuilds deferred search indexes once a manifest finishes ingesting
 /// (bulk fast-load, #903). Implemented over the reindex machinery by the
 /// server wiring; fire-and-forget from the worker's perspective.
+#[derive(Clone, Debug, Default)]
+pub struct DeferredReindexContext {
+    /// Submission whose completed manifest requested the rebuild.
+    pub submission_id: Option<String>,
+    /// Completed manifest that requested the rebuild.
+    pub manifest_id: Option<String>,
+}
+
+/// Receives automatic reindex requests after deferred bulk ingestion.
 #[async_trait]
 pub trait DeferredReindexHook: Send + Sync {
     /// Kicks a reindex of the given resource types for the tenant.
     async fn reindex_types(&self, tenant: &TenantContext, resource_types: Vec<String>);
+
+    /// Kicks a reindex and supplies bulk-submit identifiers for diagnostics.
+    ///
+    /// Existing hook implementations need not retain or interpret this
+    /// context. The default preserves the original hook contract.
+    async fn reindex_types_with_context(
+        &self,
+        tenant: &TenantContext,
+        resource_types: Vec<String>,
+        _context: DeferredReindexContext,
+    ) {
+        self.reindex_types(tenant, resource_types).await;
+    }
 }
 
 /// The default in-process submit worker.
@@ -1973,7 +1995,15 @@ where
                     types = ?types,
                     "bulk fast-load: rebuilding deferred search indexes"
                 );
-                hook.reindex_types(&lease.tenant, types).await;
+                hook.reindex_types_with_context(
+                    &lease.tenant,
+                    types,
+                    DeferredReindexContext {
+                        submission_id: Some(lease.submission_id.to_string()),
+                        manifest_id: Some(lease.manifest_id.clone()),
+                    },
+                )
+                .await;
             }
             _ => {
                 tracing::warn!(
@@ -3177,12 +3207,23 @@ mod tests {
     /// Captures the deferred-reindex callbacks the worker fires.
     struct MockReindexHook {
         calls: std::sync::Mutex<Vec<Vec<String>>>,
+        contexts: std::sync::Mutex<Vec<DeferredReindexContext>>,
     }
 
     #[async_trait]
     impl DeferredReindexHook for MockReindexHook {
         async fn reindex_types(&self, _tenant: &TenantContext, resource_types: Vec<String>) {
             self.calls.lock().unwrap().push(resource_types);
+        }
+
+        async fn reindex_types_with_context(
+            &self,
+            tenant: &TenantContext,
+            resource_types: Vec<String>,
+            context: DeferredReindexContext,
+        ) {
+            self.contexts.lock().unwrap().push(context);
+            self.reindex_types(tenant, resource_types).await;
         }
     }
 
@@ -4332,7 +4373,7 @@ mod tests {
             .create_submission(&tenant, &sub_id, None)
             .await
             .unwrap();
-        backend
+        let manifest = backend
             .add_manifest(
                 &tenant,
                 &sub_id,
@@ -4363,6 +4404,7 @@ mod tests {
 
         let hook = Arc::new(MockReindexHook {
             calls: std::sync::Mutex::new(Vec::new()),
+            contexts: std::sync::Mutex::new(Vec::new()),
         });
         let worker = DefaultSubmitWorker::new(
             backend.clone(),
@@ -4410,6 +4452,19 @@ mod tests {
             hook.calls.lock().unwrap().clone(),
             vec![vec!["Patient".to_string()]]
         );
+        let expected_submission = sub_id.to_string();
+        {
+            let contexts = hook.contexts.lock().unwrap();
+            assert_eq!(contexts.len(), 1);
+            assert_eq!(
+                contexts[0].submission_id.as_deref(),
+                Some(expected_submission.as_str())
+            );
+            assert_eq!(
+                contexts[0].manifest_id.as_deref(),
+                Some(manifest.manifest_id.as_str())
+            );
+        }
 
         // The real hook + reindex machinery restores searchability.
         let op = Arc::new(ReindexOperation::new(
@@ -5678,6 +5733,7 @@ mod tests {
 
         let hook = Arc::new(MockReindexHook {
             calls: std::sync::Mutex::new(Vec::new()),
+            contexts: std::sync::Mutex::new(Vec::new()),
         });
         let output = Arc::new(LocalFsOutputStore::new(
             tmp.path().join("objects"),
