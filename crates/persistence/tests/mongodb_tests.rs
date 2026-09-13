@@ -263,7 +263,16 @@ mod shared_mongo {
                     // suite's tiny datasets. `--bind_ip_all` matches the stock
                     // image default and keeps the mapped port reachable once we
                     // supply our own command.
-                    .with_cmd(["mongod", "--bind_ip_all", "--wiredTigerCacheSizeGB", "0.25"])
+                    .with_cmd([
+                        "mongod",
+                        "--bind_ip_all",
+                        "--wiredTigerCacheSizeGB",
+                        "0.25",
+                        // `failCommand` (used by the bulk-submit retry tests)
+                        // is only registered when test commands are enabled.
+                        "--setParameter",
+                        "enableTestCommands=1",
+                    ])
                     // Every test creates its own uniquely-named database, and
                     // WiredTiger holds file handles open per collection/index
                     // across all of them. With 50+ test databases the stock
@@ -649,6 +658,36 @@ async fn create_backend_with_search_offloaded(
     };
 
     build_backend(config).await
+}
+
+/// A backend whose driver connections carry `app_name`, so a `failCommand`
+/// failpoint configured with `data.appName` hits only this backend.
+#[allow(dead_code)] // not every failpoint test in this module exercises every helper
+async fn create_backend_with_app_name(test_name: &str, app_name: &str) -> Option<MongoBackend> {
+    let connection_string = shared_mongo::connection_string().await?;
+    let config = MongoBackendConfig {
+        connection_string,
+        database_name: build_test_database_name(test_name),
+        app_name: app_name.to_string(),
+        ..Default::default()
+    };
+    build_backend(config).await
+}
+
+/// Counts documents in one of a test database's collections, through a plain
+/// driver client (no failpoint `appName`, so never subject to one).
+#[allow(dead_code)] // not every failpoint test in this module exercises every helper
+async fn count_docs(test_name: &str, collection: &str, filter: Document) -> u64 {
+    let connection_string = shared_mongo::connection_string()
+        .await
+        .expect("count_docs is only called after a backend was created");
+    let client = Client::with_uri_str(&connection_string).await.unwrap();
+    client
+        .database(&build_test_database_name(test_name))
+        .collection::<Document>(collection)
+        .count_documents(filter)
+        .await
+        .unwrap()
 }
 
 /// Creates a backend whose registry is loaded from the repo's spec files, so
@@ -5877,6 +5916,120 @@ mod bulk_submit {
                 Some(len),
             ))
         }
+    }
+
+    /// `failCommand` is one server-global failpoint: every `configureFailPoint`
+    /// replaces its configuration. Tests that use it hold this lock for their
+    /// whole duration; `data.appName` keeps them from touching the rest of the
+    /// suite, which keeps running in parallel.
+    static FAILPOINT_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// A `failCommand` failpoint scoped to one client's `appName`.
+    struct FailPoint {
+        admin: mongodb::Database,
+        _lock: tokio::sync::MutexGuard<'static, ()>,
+    }
+
+    impl FailPoint {
+        /// Configures `failCommand` for connections whose `appName` is `app_name`.
+        /// Returns `None`, after printing why, when the server was not started
+        /// with `enableTestCommands=1` (an external `HFS_TEST_MONGODB_URL`).
+        async fn enable(app_name: &str, mut data: Document, mode: Document) -> Option<FailPoint> {
+            let lock = FAILPOINT_LOCK.lock().await;
+            let connection_string = shared_mongo::connection_string().await?;
+            let admin = Client::with_uri_str(&connection_string)
+                .await
+                .unwrap()
+                .database("admin");
+            let enabled = admin
+                .run_command(doc! { "getParameter": 1, "enableTestCommands": 1 })
+                .await
+                .ok()
+                .and_then(|r| r.get_bool("enableTestCommands").ok())
+                .unwrap_or(false);
+            if !enabled {
+                eprintln!(
+                    "Skipping failpoint test: mongod was not started with \
+                     --setParameter enableTestCommands=1"
+                );
+                return None;
+            }
+            data.insert("appName", app_name);
+            admin
+                .run_command(doc! {
+                    "configureFailPoint": "failCommand",
+                    "mode": mode,
+                    "data": data,
+                })
+                .await
+                .expect("configureFailPoint failCommand");
+            Some(FailPoint { admin, _lock: lock })
+        }
+
+        /// Turns the failpoint off and releases the lock. Call at the end of
+        /// every test; a `times`-bounded failpoint that is never turned off
+        /// still only affects its own `appName`.
+        async fn off(self) {
+            let _ = self
+                .admin
+                .run_command(doc! { "configureFailPoint": "failCommand", "mode": "off" })
+                .await;
+        }
+    }
+
+    /// Pins the failpoint plumbing every retry test relies on: it fires for the
+    /// scoped `appName`, is spent after `times`, and does not touch another client.
+    #[tokio::test]
+    async fn failpoint_hits_only_the_scoped_app_name() {
+        let Some(connection_string) = shared_mongo::connection_string().await else {
+            return;
+        };
+        let Some(fail_point) = FailPoint::enable(
+            "fp-smoke-target",
+            doc! { "failCommands": ["insert"], "closeConnection": true },
+            doc! { "times": 1 },
+        )
+        .await
+        else {
+            return;
+        };
+
+        let client_for = |app_name: &str| {
+            let connection_string = connection_string.clone();
+            let app_name = app_name.to_string();
+            async move {
+                let mut options = mongodb::options::ClientOptions::parse(&connection_string)
+                    .await
+                    .unwrap();
+                options.app_name = Some(app_name);
+                Client::with_options(options).unwrap()
+            }
+        };
+        let db_name = build_test_database_name("failpoint_smoke");
+
+        let target = client_for("fp-smoke-target").await;
+        let coll = target.database(&db_name).collection::<Document>("smoke");
+        let first = coll.insert_one(doc! { "n": 1 }).await;
+        assert!(
+            matches!(
+                first.as_ref().map_err(|e| e.kind.as_ref()),
+                Err(mongodb::error::ErrorKind::Io(_))
+            ),
+            "the scoped client's first insert is dropped: {first:?}"
+        );
+        coll.insert_one(doc! { "n": 2 })
+            .await
+            .expect("the failpoint is spent after one use");
+
+        let other = client_for("fp-smoke-other").await;
+        other
+            .database(&db_name)
+            .collection::<Document>("smoke")
+            .insert_one(doc! { "n": 3 })
+            .await
+            .expect("a client with another appName is unaffected");
+
+        fail_point.off().await;
     }
 
     #[tokio::test]
