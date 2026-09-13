@@ -211,6 +211,7 @@ where
         data_dir: config.data_dir.clone(),
         search_offloaded,
         max_included_resources,
+        app_name: MongoBackendConfig::default().app_name,
     }
 }
 

@@ -44,7 +44,7 @@ pub(crate) async fn connect_client(config: &MongoBackendConfig) -> StorageResult
 
     client_options.max_pool_size = Some(config.max_connections);
     client_options.connect_timeout = Some(Duration::from_millis(config.connect_timeout_ms));
-    client_options.app_name = Some("helios-persistence".to_string());
+    client_options.app_name = Some(config.app_name.clone());
 
     // Fail fast when no healthy server can be selected. `connect_timeout`
     // only covers new TCP handshakes; this caps requests once server
@@ -157,6 +157,12 @@ pub struct MongoBackendConfig {
     /// least 1.
     #[serde(default = "default_max_included_resources")]
     pub max_included_resources: usize,
+
+    /// `appName` the driver sends on every connection. Visible in the server's
+    /// `currentOp`/logs and usable to scope a `failCommand` failpoint to one
+    /// client in tests.
+    #[serde(default = "default_app_name")]
+    pub app_name: String,
 }
 
 fn default_connection_string() -> String {
@@ -183,6 +189,10 @@ fn default_max_included_resources() -> usize {
     1000
 }
 
+fn default_app_name() -> String {
+    "helios-persistence".to_string()
+}
+
 impl Default for MongoBackendConfig {
     fn default() -> Self {
         Self {
@@ -195,6 +205,7 @@ impl Default for MongoBackendConfig {
             data_dir: None,
             search_offloaded: false,
             max_included_resources: default_max_included_resources(),
+            app_name: default_app_name(),
         }
     }
 }
@@ -1007,5 +1018,15 @@ mod capability_tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn app_name_defaults_to_the_historical_constant() {
+        assert_eq!(MongoBackendConfig::default().app_name, "helios-persistence");
     }
 }
