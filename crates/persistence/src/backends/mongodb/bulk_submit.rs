@@ -64,6 +64,7 @@ use crate::tenant::{TenantContext, TenantId, TenantPermissions};
 
 use super::MongoBackend;
 use super::bulk_ingest::BatchOutcome;
+use super::retry::{BULK_INGEST_RETRY, or_exhausted, retry_transient_with};
 
 /// Submissions: one document per `(tenant, submitter, submission_id)`.
 pub(crate) const SUBMISSIONS_COLLECTION: &str = "bulk_submissions";
@@ -312,14 +313,20 @@ impl MongoBackend {
         tenant: &TenantContext,
         id: &SubmissionId,
     ) -> StorageResult<()> {
-        self.submissions()
-            .await?
-            .update_one(
-                submission_filter(tenant, id),
-                doc! { "$set": { "updated_at": to_bson_time(Utc::now()) } },
-            )
-            .await
-            .map_err(|e| internal_error(format!("touch submission: {e}")))?;
+        let submissions = self.submissions().await?;
+        let filter = submission_filter(tenant, id);
+        or_exhausted(
+            "touch submission",
+            retry_transient_with(&BULK_INGEST_RETRY, None, "touch submission", || async {
+                submissions
+                    .update_one(
+                        filter.clone(),
+                        doc! { "$set": { "updated_at": to_bson_time(Utc::now()) } },
+                    )
+                    .await
+            })
+            .await,
+        )?;
         Ok(())
     }
 
@@ -828,11 +835,17 @@ impl BulkSubmitProvider for MongoBackend {
         entries: Vec<NdjsonEntry>,
         options: &BulkProcessingOptions,
     ) -> StorageResult<Vec<BulkEntryResult>> {
-        if self
-            .get_manifest(tenant, submission_id, manifest_id)
-            .await?
-            .is_none()
-        {
+        let manifests = self.manifests().await?;
+        let cancel = options.cancel.as_ref();
+        let filter = manifest_filter(tenant, submission_id, manifest_id);
+        let present = or_exhausted(
+            "load manifest",
+            retry_transient_with(&BULK_INGEST_RETRY, cancel, "load manifest", || async {
+                manifests.find_one(filter.clone()).await
+            })
+            .await,
+        )?;
+        if present.is_none() {
             return Err(StorageError::BulkSubmit(
                 BulkSubmitError::ManifestNotFound {
                     submission_id: submission_id.submission_id.clone(),
@@ -846,7 +859,6 @@ impl BulkSubmitProvider for MongoBackend {
         // `abort_submission` moved the manifest to `failed` would quietly put
         // it back to `processing` and the abort would read as if it had never
         // happened (#968).
-        let manifests = self.manifests().await?;
         let mut promote = manifest_filter(tenant, submission_id, manifest_id);
         promote.insert(
             "status",
@@ -855,13 +867,23 @@ impl BulkSubmitProvider for MongoBackend {
                 ManifestStatus::Processing.to_string(),
             ]},
         );
-        manifests
-            .update_one(
-                promote,
-                doc! { "$set": { "status": ManifestStatus::Processing.to_string() } },
+        or_exhausted(
+            "mark manifest processing",
+            retry_transient_with(
+                &BULK_INGEST_RETRY,
+                cancel,
+                "mark manifest processing",
+                || async {
+                    manifests
+                        .update_one(
+                            promote.clone(),
+                            doc! { "$set": { "status": ManifestStatus::Processing.to_string() } },
+                        )
+                        .await
+                },
             )
-            .await
-            .map_err(|e| internal_error(format!("mark manifest processing: {e}")))?;
+            .await,
+        )?;
 
         // One batch, a fixed number of commands (#1000). The per-entry pipeline
         // this replaces made ~9 round trips per resource, which held ingest at
@@ -883,18 +905,32 @@ impl BulkSubmitProvider for MongoBackend {
             ..
         } = outcome;
 
-        manifests
-            .update_one(
-                manifest_filter(tenant, submission_id, manifest_id),
-                doc! { "$inc": {
-                    "total_entries": results.len() as i64,
-                    "processed_entries": results.iter().filter(|r| r.is_success()).count() as i64,
-                    "failed_entries": error_count as i64,
-                    "last_processed_line": results.len() as i64,
-                }},
+        // `$inc` is not idempotent: an attempt whose acknowledgement was lost
+        // double-counts this batch on retry. Accepted — the receipts stay
+        // authoritative and a manifest re-walk already over-counts the same way.
+        let counters = doc! { "$inc": {
+            "total_entries": results.len() as i64,
+            "processed_entries": results.iter().filter(|r| r.is_success()).count() as i64,
+            "failed_entries": error_count as i64,
+            "last_processed_line": results.len() as i64,
+        }};
+        or_exhausted(
+            "update manifest counts",
+            retry_transient_with(
+                &BULK_INGEST_RETRY,
+                cancel,
+                "update manifest counts",
+                || async {
+                    manifests
+                        .update_one(
+                            manifest_filter(tenant, submission_id, manifest_id),
+                            counters.clone(),
+                        )
+                        .await
+                },
             )
-            .await
-            .map_err(|e| internal_error(format!("update manifest counts: {e}")))?;
+            .await,
+        )?;
         self.touch_submission(tenant, submission_id).await?;
 
         Ok(results)
