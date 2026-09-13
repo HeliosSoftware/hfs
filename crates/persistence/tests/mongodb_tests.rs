@@ -3828,9 +3828,9 @@ async fn mongodb_integration_param_sorted_page_is_one_result_set() {
     assert!(!page2.resources.page_info.has_next);
     assert_eq!(page2.total, Some(2));
 
-    // C. Deleted resource — a soft-deleted resource's search-index rows
-    // survive the delete; it must not occupy a page slot or count toward
-    // `total`.
+    // C. Deleted resource — `delete` removes the resource's search-index
+    // rows and `all_resource_ids` excludes it, so this pins that a deleted
+    // resource neither occupies a page slot nor counts toward `total`.
     backend
         .delete(&tenant, "Patient", "patient-psors-6")
         .await
