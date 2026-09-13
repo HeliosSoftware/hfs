@@ -164,13 +164,16 @@ impl MongoBackend {
         let db = self.get_database().await?;
         let tenant_id = tenant.tenant_id().as_str();
 
-        let existing = self.load_existing(&db, tenant_id, entries).await?;
+        let existing = self
+            .load_existing(&db, tenant_id, entries, options.cancel.as_ref())
+            .await?;
         let mut planned = self.plan_batch(tenant, manifest_id, entries, &existing, options)?;
 
         let failed = self
             .write_resources(&db, tenant_id, &planned, options.cancel.as_ref())
             .await?;
-        self.write_history(&db, &mut planned, &failed).await?;
+        self.write_history(&db, &mut planned, &failed, options.cancel.as_ref())
+            .await?;
         self.write_search_index(&db, tenant_id, &planned, &failed, options)
             .await?;
 
@@ -197,8 +200,15 @@ impl MongoBackend {
             }
         }
 
-        self.write_changes(tenant, submission_id, &db, &planned, &failed)
-            .await?;
+        self.write_changes(
+            tenant,
+            submission_id,
+            &db,
+            &planned,
+            &failed,
+            options.cancel.as_ref(),
+        )
+        .await?;
         self.write_entry_results(&db, tenant, submission_id, manifest_id, options, &planned)
             .await?;
 
@@ -227,6 +237,7 @@ impl MongoBackend {
         db: &Database,
         tenant_id: &str,
         entries: &[NdjsonEntry],
+        cancel: Option<&CancelToken>,
     ) -> StorageResult<HashMap<(String, String), ExistingResource>> {
         let mut ids_by_type: HashMap<&str, HashSet<&str>> = HashMap::new();
         for entry in entries {
@@ -245,21 +256,21 @@ impl MongoBackend {
         let mut found = HashMap::new();
         for (resource_type, ids) in ids_by_type {
             let ids: Vec<Bson> = ids.into_iter().map(Bson::from).collect();
-            let mut cursor = resources
-                .find(doc! {
-                    "tenant_id": tenant_id,
-                    "resource_type": resource_type,
-                    "id": { "$in": ids },
+            let filter = doc! {
+                "tenant_id": tenant_id,
+                "resource_type": resource_type,
+                "id": { "$in": ids },
+            };
+            let rows: Vec<Document> = or_exhausted(
+                "resolve batch ids",
+                retry_transient_with(&BULK_INGEST_RETRY, cancel, "resolve batch ids", || async {
+                    resources.find(filter.clone()).await?.try_collect().await
                 })
-                .await
-                .map_err(|e| internal_error(format!("Failed to resolve batch ids: {e}")))?;
+                .await,
+            )?;
 
             let now = Utc::now();
-            while let Some(document) = cursor
-                .try_next()
-                .await
-                .map_err(|e| internal_error(format!("Failed to resolve batch ids: {e}")))?
-            {
+            for document in rows {
                 let (Ok(id), Ok(version_id)) =
                     (document.get_str("id"), document.get_str("version_id"))
                 else {
@@ -811,6 +822,7 @@ impl MongoBackend {
         db: &Database,
         planned: &mut PlannedBatch,
         failed: &HashMap<usize, String>,
+        cancel: Option<&CancelToken>,
     ) -> StorageResult<()> {
         let documents: Vec<Document> = std::mem::take(&mut planned.history)
             .into_iter()
@@ -822,6 +834,7 @@ impl MongoBackend {
             MongoBackend::RESOURCE_HISTORY_COLLECTION,
             documents,
             "insert batch resource history",
+            cancel,
         )
         .await
     }
@@ -861,16 +874,21 @@ impl MongoBackend {
         if !stale_by_type.is_empty() {
             let collection = db.collection::<Document>(MongoBackend::SEARCH_INDEX_COLLECTION);
             for (resource_type, ids) in stale_by_type {
-                collection
-                    .delete_many(doc! {
-                        "tenant_id": tenant_id,
-                        "resource_type": resource_type,
-                        "resource_id": { "$in": ids },
-                    })
-                    .await
-                    .map_err(|e| {
-                        internal_error(format!("Failed to clear batch search index: {e}"))
-                    })?;
+                let filter = doc! {
+                    "tenant_id": tenant_id,
+                    "resource_type": resource_type,
+                    "resource_id": { "$in": ids },
+                };
+                or_exhausted(
+                    "clear batch search index",
+                    retry_transient_with(
+                        &BULK_INGEST_RETRY,
+                        options.cancel.as_ref(),
+                        "clear batch search index",
+                        || async { collection.delete_many(filter.clone()).await },
+                    )
+                    .await,
+                )?;
             }
         }
 
@@ -891,6 +909,7 @@ impl MongoBackend {
             MongoBackend::SEARCH_INDEX_COLLECTION,
             documents,
             "insert batch search index",
+            options.cancel.as_ref(),
         )
         .await
     }
@@ -903,6 +922,7 @@ impl MongoBackend {
         db: &Database,
         planned: &PlannedBatch,
         failed: &HashMap<usize, String>,
+        cancel: Option<&CancelToken>,
     ) -> StorageResult<()> {
         let mut documents = Vec::new();
         for (plan_idx, _, change) in &planned.changes {
@@ -916,6 +936,7 @@ impl MongoBackend {
             super::bulk_submit::CHANGES_COLLECTION,
             documents,
             "insert batch rollback log",
+            cancel,
         )
         .await
     }
@@ -951,6 +972,7 @@ impl MongoBackend {
                 super::bulk_submit::ENTRY_RESULTS_COLLECTION,
                 chunk,
                 "store batch entry results",
+                options.cancel.as_ref(),
             )
             .await?;
             if let Some((index, message)) = applied.failures.first() {
@@ -981,15 +1003,20 @@ async fn run_update_command(
     collection: &str,
     statements: &[Document],
     context: &str,
+    cancel: Option<&CancelToken>,
 ) -> StorageResult<UpdateOutcome> {
-    let response = db
-        .run_command(doc! {
-            "update": collection,
-            "updates": statements.to_vec(),
-            "ordered": false,
+    let command = doc! {
+        "update": collection,
+        "updates": statements.to_vec(),
+        "ordered": false,
+    };
+    let response = or_exhausted(
+        context,
+        retry_transient_with(&BULK_INGEST_RETRY, cancel, context, || async {
+            db.run_command(command.clone()).await
         })
-        .await
-        .map_err(|e| internal_error(format!("{context}: {e}")))?;
+        .await,
+    )?;
 
     let mut failures = Vec::new();
     if let Ok(write_errors) = response.get_array("writeErrors") {
@@ -1049,12 +1076,19 @@ fn version_conflict(plan: &ResourcePlan) -> String {
     .to_string()
 }
 
-/// Inserts `documents` in chunked, unordered `insert` commands.
+/// Inserts `documents` in chunked, unordered `insert` commands, each chunk its
+/// own retry unit.
+///
+/// On a retry, duplicate-key errors are the chunk's own rows from the attempt
+/// whose acknowledgement was lost — every collection this writes has a unique
+/// key the batch minted itself — so a chunk that reports only duplicates has
+/// landed.
 async fn insert_documents(
     db: &Database,
     collection: &str,
     mut documents: Vec<Document>,
     context: &str,
+    cancel: Option<&CancelToken>,
 ) -> StorageResult<()> {
     if documents.is_empty() {
         return Ok(());
@@ -1063,11 +1097,25 @@ async fn insert_documents(
     while !documents.is_empty() {
         let take = documents.len().min(INSERT_DOCS_PER_COMMAND);
         let chunk: Vec<Document> = documents.drain(..take).collect();
-        collection
-            .insert_many(chunk)
-            .ordered(false)
-            .await
-            .map_err(|e| internal_error(format!("{context}: {e}")))?;
+        let Attempted { result, attempts } =
+            retry_transient_with(&BULK_INGEST_RETRY, cancel, context, || async {
+                collection.insert_many(&chunk).ordered(false).await
+            })
+            .await;
+        if let Err(err) = result {
+            let only_duplicates = attempts > 1
+                && matches!(
+                    err.kind.as_ref(),
+                    ErrorKind::InsertMany(insert_many)
+                        if insert_many
+                            .write_errors
+                            .as_ref()
+                            .is_some_and(|errors| errors.iter().all(|e| e.code == 11000))
+                );
+            if !only_duplicates {
+                return Err(exhausted(context, attempts, &err));
+            }
+        }
     }
     Ok(())
 }

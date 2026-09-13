@@ -8083,6 +8083,239 @@ mod bulk_submit {
             assert_eq!(versions.len(), 2, "upd-{i} has exactly versions 1 and 2");
         }
     }
+
+    /// Spec §3.2: history and rollback-log inserts whose acknowledgement was
+    /// lost find their own rows on retry (both collections have a unique key)
+    /// and treat the duplicates as landed. `times: 4` = resources (landed +
+    /// error, then dup-key) and history (landed + error, then dup-key).
+    #[tokio::test]
+    async fn unacknowledged_history_insert_is_not_duplicated() {
+        let test = "submit_fp_unacked_history";
+        let app = "fp-unacked-history";
+        let Some(backend) = create_backend_with_app_name(test, app).await else {
+            return;
+        };
+        let tenant = create_tenant("submit-tenant");
+        let (id, manifest_id) = seed(&backend, &tenant).await;
+        let Some(fail_point) = FailPoint::enable(
+            app,
+            doc! {
+                "failCommands": ["insert"],
+                "writeConcernError": {
+                    "code": 91,
+                    "errmsg": "Replication is being shut down",
+                    "errorLabels": ["RetryableWriteError"],
+                },
+            },
+            doc! { "times": 4 },
+        )
+        .await
+        else {
+            return;
+        };
+
+        let results = backend
+            .process_entries(
+                &tenant,
+                &id,
+                &manifest_id,
+                three_patients("hist"),
+                &BulkProcessingOptions::new().with_defer_indexing(true),
+            )
+            .await
+            .unwrap();
+        fail_point.off().await;
+
+        assert!(results.iter().all(|r| r.is_success()), "{results:?}");
+        assert_one_row_each(&backend, &tenant, &["hist-1", "hist-2", "hist-3"]).await;
+    }
+
+    /// Same for the rollback log: `times: 6` reaches the third insert stage
+    /// (resources, history, changes — indexing deferred so no search insert).
+    #[tokio::test]
+    async fn unacknowledged_rollback_log_insert_is_not_duplicated() {
+        let test = "submit_fp_unacked_changes";
+        let app = "fp-unacked-changes";
+        let Some(backend) = create_backend_with_app_name(test, app).await else {
+            return;
+        };
+        let tenant = create_tenant("submit-tenant");
+        let (id, manifest_id) = seed(&backend, &tenant).await;
+        let Some(fail_point) = FailPoint::enable(
+            app,
+            doc! {
+                "failCommands": ["insert"],
+                "writeConcernError": {
+                    "code": 91,
+                    "errmsg": "Replication is being shut down",
+                    "errorLabels": ["RetryableWriteError"],
+                },
+            },
+            doc! { "times": 6 },
+        )
+        .await
+        else {
+            return;
+        };
+
+        let results = backend
+            .process_entries(
+                &tenant,
+                &id,
+                &manifest_id,
+                three_patients("chg"),
+                &BulkProcessingOptions::new().with_defer_indexing(true),
+            )
+            .await
+            .unwrap();
+        fail_point.off().await;
+
+        assert!(results.iter().all(|r| r.is_success()), "{results:?}");
+        assert_one_row_each(&backend, &tenant, &["chg-1", "chg-2", "chg-3"]).await;
+    }
+
+    /// The pre-read is a `find`; recovery only (the driver may retry reads).
+    /// `times: 3` outlasts any single driver retry and the manifest check.
+    #[tokio::test]
+    async fn dropped_pre_read_is_retried() {
+        let test = "submit_fp_dropped_find";
+        let app = "fp-dropped-find";
+        let Some(backend) = create_backend_with_app_name(test, app).await else {
+            return;
+        };
+        let tenant = create_tenant("submit-tenant");
+        let (id, manifest_id) = seed(&backend, &tenant).await;
+        let Some(fail_point) = FailPoint::enable(
+            app,
+            doc! { "failCommands": ["find"], "closeConnection": true },
+            doc! { "times": 3 },
+        )
+        .await
+        else {
+            return;
+        };
+
+        let results = backend
+            .process_entries(
+                &tenant,
+                &id,
+                &manifest_id,
+                three_patients("find"),
+                &BulkProcessingOptions::new(),
+            )
+            .await
+            .unwrap();
+        fail_point.off().await;
+
+        assert!(results.iter().all(|r| r.is_success()), "{results:?}");
+    }
+
+    /// Spec §5.2 case 5: the receipt upsert is a raw `update` command with no
+    /// driver retry at all. `times: 3` = two dropped `processing` promotions
+    /// plus the first receipt command.
+    #[tokio::test]
+    async fn dropped_receipt_write_is_retried() {
+        let test = "submit_fp_dropped_receipts";
+        let app = "fp-dropped-receipts";
+        let Some(backend) = create_backend_with_app_name(test, app).await else {
+            return;
+        };
+        let tenant = create_tenant("submit-tenant");
+        let (id, manifest_id) = seed(&backend, &tenant).await;
+        let Some(fail_point) = FailPoint::enable(
+            app,
+            doc! { "failCommands": ["update"], "closeConnection": true },
+            doc! { "times": 3 },
+        )
+        .await
+        else {
+            return;
+        };
+
+        let results = backend
+            .process_entries(
+                &tenant,
+                &id,
+                &manifest_id,
+                three_patients("rcpt"),
+                &BulkProcessingOptions::new(),
+            )
+            .await
+            .unwrap();
+        fail_point.off().await;
+
+        assert!(results.iter().all(|r| r.is_success()), "{results:?}");
+        let counts = backend
+            .get_entry_counts(&tenant, &id, &manifest_id)
+            .await
+            .unwrap();
+        assert_eq!(counts.total, 3, "every receipt landed");
+        assert_eq!(counts.success, 3);
+    }
+
+    /// The search-index delete is a multi-document `delete`, which the driver
+    /// never retries. Updates with inline indexing issue it; `times: 2`.
+    #[tokio::test]
+    async fn dropped_search_index_delete_is_retried() {
+        let test = "submit_fp_dropped_delete";
+        let app = "fp-dropped-delete";
+        let Some(backend) = create_backend_with_app_name(test, app).await else {
+            return;
+        };
+        let tenant = create_tenant("submit-tenant");
+        let (id, manifest_id) = seed(&backend, &tenant).await;
+        backend
+            .process_entries(
+                &tenant,
+                &id,
+                &manifest_id,
+                three_patients("del"),
+                &BulkProcessingOptions::new(),
+            )
+            .await
+            .unwrap();
+
+        let Some(fail_point) = FailPoint::enable(
+            app,
+            doc! { "failCommands": ["delete"], "closeConnection": true },
+            doc! { "times": 2 },
+        )
+        .await
+        else {
+            return;
+        };
+        let updates: Vec<NdjsonEntry> = (1..=3)
+            .map(|i| {
+                NdjsonEntry::new(
+                    i,
+                    "Patient",
+                    json!({"resourceType": "Patient", "id": format!("del-{i}"), "name": [{"family": "Retried"}]}),
+                )
+            })
+            .collect();
+        let results = backend
+            .process_entries(
+                &tenant,
+                &id,
+                &manifest_id,
+                updates,
+                &BulkProcessingOptions::new(),
+            )
+            .await
+            .unwrap();
+        fail_point.off().await;
+
+        assert!(results.iter().all(|r| r.is_success()), "{results:?}");
+        let expected = search_index_entry_count(&backend, &tenant, "Patient", "del-1").await;
+        assert!(expected > 0);
+        for i in 2..=3 {
+            assert_eq!(
+                search_index_entry_count(&backend, &tenant, "Patient", &format!("del-{i}")).await,
+                expected,
+                "del-{i} indexed exactly once"
+            );
+        }
+    }
 }
 
 // ============================================================================
