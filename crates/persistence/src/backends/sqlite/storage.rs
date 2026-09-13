@@ -4215,14 +4215,20 @@ mod tests {
             )
             .await
             .unwrap();
-        for _ in 0..200 {
-            tokio::task::yield_now().await;
+        // The run does its SQLite work on blocking threads, so yielding the
+        // async runtime is not enough to let it finish: wait on the clock.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        loop {
             if op.get_progress(&id).await.unwrap().status.is_finished() {
                 break;
             }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "reindex did not finish within 60s"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         let progress = op.get_progress(&id).await.unwrap();
-        assert!(progress.status.is_finished(), "reindex did not finish");
         assert!(progress.errors.is_empty(), "{:?}", progress.errors);
         assert_eq!(index_names(&backend), before);
 
