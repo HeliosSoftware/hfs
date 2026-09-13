@@ -16,9 +16,6 @@
 //! lock failure. This yields the same read-modify-write + monotonic-version
 //! semantics as the relational stores without requiring a replica set.
 
-use std::future::Future;
-use std::time::Duration;
-
 use async_trait::async_trait;
 use chrono::Utc;
 use mongodb::bson::{Document, doc};
@@ -31,6 +28,7 @@ use crate::core::user_settings::{
 use crate::error::{BackendError, ConcurrencyError, StorageError, StorageResult};
 
 use super::MongoBackend;
+use super::retry::retry_transient;
 
 /// Name of the collection backing the per-user settings store.
 pub(crate) const USER_SETTINGS_COLLECTION: &str = "user_settings";
@@ -370,60 +368,6 @@ async fn reload_version(
 
 fn is_duplicate_key_error(err: &MongoError) -> bool {
     err.to_string().contains("E11000")
-}
-
-/// Bound on retries when a MongoDB operation fails with a *transient* error.
-/// Four attempts with exponential backoff (25/50/100 ms) covers a brief server
-/// blip without stalling a genuine outage for long.
-const MAX_TRANSIENT_RETRIES: u32 = 4;
-
-/// True when a MongoDB error is transient and safe to retry: one the driver has
-/// itself labelled retryable, or a fast network/connection failure (e.g. a
-/// connection reset by a momentarily overloaded server). The driver retries such
-/// errors once; a server that stays busy longer than that outlasts the single
-/// retry, so we add a short bounded retry on top. Non-transient errors
-/// (duplicate key, bad command, decode) are never retried here.
-///
-/// A `ServerSelection` timeout is deliberately *not* treated as transient: it
-/// already means the driver waited its full `server_selection_timeout` and found
-/// no usable server, so a fast backoff-retry would just pay that wait again
-/// (blocking the caller for minutes against a genuinely-down server) without
-/// improving the odds. Such an error is surfaced promptly instead.
-fn is_transient_mongo_error(err: &MongoError) -> bool {
-    use mongodb::error::{ErrorKind, RETRYABLE_ERROR, RETRYABLE_WRITE_ERROR};
-
-    err.contains_label(RETRYABLE_ERROR)
-        || err.contains_label(RETRYABLE_WRITE_ERROR)
-        || matches!(
-            err.kind.as_ref(),
-            ErrorKind::Io(_) | ErrorKind::ConnectionPoolCleared { .. }
-        )
-}
-
-/// Runs a MongoDB operation, retrying it on a [transient error](is_transient_mongo_error)
-/// with exponential backoff.
-///
-/// The settings-store writes are already safe to re-run: reads are pure, and a
-/// re-executed insert/update is caught by the version-conditioned filter and the
-/// duplicate-key path in [`MongoBackend::write_settings`], so a retry after a
-/// lost acknowledgement cannot double-apply.
-async fn retry_transient<T, F, Fut>(mut op: F) -> Result<T, MongoError>
-where
-    F: FnMut() -> Fut,
-    Fut: Future<Output = Result<T, MongoError>>,
-{
-    let mut attempt: u32 = 1;
-    loop {
-        match op().await {
-            Ok(value) => return Ok(value),
-            Err(err) if attempt < MAX_TRANSIENT_RETRIES && is_transient_mongo_error(&err) => {
-                let backoff = Duration::from_millis(25u64 << (attempt - 1));
-                tokio::time::sleep(backoff).await;
-                attempt += 1;
-            }
-            Err(err) => return Err(err),
-        }
-    }
 }
 
 /// Builds an `OptimisticLockFailure` for a `user_settings` write whose
