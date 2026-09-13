@@ -84,11 +84,19 @@ pub enum Phase {
     Commit,
     /// Per-batch overhead outside the entry loop (BEGIN, manifest counters).
     BatchOverhead,
+    /// Reindex: one page fetched from `resources` and deserialised.
+    ReindexFetch,
+    /// Reindex: one page's index rebuild, BEGIN to COMMIT.
+    ReindexPage,
+    /// Wall clock of one batch's parallel extraction (`prepare_index_batch`),
+    /// as opposed to `extract`, which sums the CPU time across the pool's
+    /// threads. The gap between the two is the parallel speed-up.
+    PrepareBatch,
 }
 
 impl Phase {
     /// All phases, in report order.
-    pub const ALL: [Phase; 19] = [
+    pub const ALL: [Phase; 22] = [
         Phase::NdjsonParse,
         Phase::Entry,
         Phase::EntryRead,
@@ -108,6 +116,9 @@ impl Phase {
         Phase::Bookkeeping,
         Phase::Commit,
         Phase::BatchOverhead,
+        Phase::ReindexFetch,
+        Phase::ReindexPage,
+        Phase::PrepareBatch,
     ];
 
     /// The phase this one is measured inside of, if any. Drives the report's
@@ -156,11 +167,14 @@ impl Phase {
             Phase::Bookkeeping => "bookkeeping",
             Phase::Commit => "commit",
             Phase::BatchOverhead => "batch_overhead",
+            Phase::ReindexFetch => "reindex_fetch_page",
+            Phase::ReindexPage => "reindex_write_page",
+            Phase::PrepareBatch => "prepare_batch (wall)",
         }
     }
 }
 
-const PHASE_COUNT: usize = 19;
+const PHASE_COUNT: usize = 22;
 
 #[allow(clippy::declare_interior_mutable_const)]
 const ZERO: AtomicU64 = AtomicU64::new(0);

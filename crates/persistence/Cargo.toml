@@ -65,6 +65,8 @@ json-patch = "3"
 humantime = "2"
 futures = "0.3"
 unicode-normalization = "0.1"
+# Parallel search-value extraction for bulk ingest and reindex pages.
+rayon = "1.8"
 # Bulk-submit result receipts spool to a per-run temp directory (#982) instead
 # of accumulating in memory. Uses the platform temp dir, so `TMPDIR` isolates it.
 tempfile = "3"

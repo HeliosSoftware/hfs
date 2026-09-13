@@ -22,7 +22,6 @@ use crate::error::TransactionError;
 use crate::error::{
     BackendError, ConcurrencyError, QueryErrorExt, ResourceError, StorageError, StorageResult,
 };
-use crate::search::extractor::ExtractedValue;
 use crate::search::reindex::{ReindexSource, ReindexTarget, ResourcePage};
 use crate::tenant::{Operation, TenantContext};
 use crate::types::Pagination;
@@ -42,6 +41,50 @@ fn internal_error(message: String) -> StorageError {
 
 fn serialization_error(message: String) -> StorageError {
     StorageError::Backend(BackendError::SerializationError { message })
+}
+
+/// The database-free product of indexing one resource: every `search_index`
+/// row's bound parameters (or the extraction error that sends the write to
+/// the minimal fallback), the contained resources' rows, and the full-text
+/// content. Built by [`SqliteBackend::prepare_index`], written by
+/// [`SqliteBackend::write_prepared_index`].
+pub(crate) struct PreparedIndex {
+    rows: Result<Vec<Vec<SqlValue>>, String>,
+    contained_rows: Vec<Vec<SqlValue>>,
+    fts: Option<super::search::fts::SearchableContent>,
+}
+
+/// Batches below this size are prepared on the calling thread.
+const PARALLEL_PREPARE_MIN_BATCH: usize = 16;
+
+/// Runs currently inside a bulk index rebuild, process-wide: the indexes are
+/// per database, not per run, so the first run in drops them and the last
+/// one out rebuilds them. Held across the DROP / CREATE so two runs cannot
+/// race each other's transition.
+static BULK_INDEX_REBUILDS: parking_lot::Mutex<usize> = parking_lot::Mutex::new(0);
+
+/// The pool [`SqliteBackend::prepare_index_batch`] runs on. Its own pool
+/// rather than rayon's global one so its width can be set independently of
+/// anything else in the process that uses rayon: `HFS_INDEX_THREADS`,
+/// defaulting to the machine's parallelism.
+fn index_prepare_pool() -> &'static rayon::ThreadPool {
+    static POOL: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
+    POOL.get_or_init(|| {
+        let threads = std::env::var("HFS_INDEX_THREADS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or_else(|| {
+                std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(4)
+            });
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .thread_name(|i| format!("hfs-index-{i}"))
+            .build()
+            .expect("build index thread pool")
+    })
 }
 
 /// Whether the optional `resource_fts` FTS5 virtual table exists on this
@@ -1180,10 +1223,12 @@ impl SqliteBackend {
 
     /// Index a resource for search.
     ///
-    /// This method uses the SearchParameterExtractor to dynamically extract
-    /// searchable values based on the configured SearchParameterRegistry.
-    /// Falls back to hardcoded common parameter extraction if the registry
-    /// extraction fails.
+    /// Extracts the resource's search values with the tenant's registry-driven
+    /// extractor and writes them, falling back to the hardcoded `_id` /
+    /// `_lastUpdated` pair if extraction fails. The two halves are
+    /// [`Self::prepare_index`] (pure CPU, no connection) and
+    /// [`Self::write_prepared_index`] (the statements); bulk paths prepare a
+    /// whole batch in parallel and call the second half alone.
     pub(crate) fn index_resource(
         &self,
         conn: &rusqlite::Connection,
@@ -1196,10 +1241,211 @@ impl SqliteBackend {
         if self.is_search_offloaded() {
             return Ok(());
         }
+        let prepared = self.prepare_index(tenant_id, resource_type, resource_id, resource);
+        self.write_prepared_index(
+            conn,
+            tenant_id,
+            resource_type,
+            resource_id,
+            resource,
+            prepared,
+        )
+        .map(|_| ())
+    }
 
-        // Try dynamic extraction using the registry-driven extractor
-        match self.index_resource_dynamic(conn, tenant_id, resource_type, resource_id, resource) {
-            Ok(count) => {
+    /// The database-free half of indexing one resource: FHIRPath extraction,
+    /// value normalisation, the bound parameters of every `search_index` row,
+    /// and the full-text content. Holds no connection and takes no lock other
+    /// than the registry's read lock, so a batch of these can be built on a
+    /// thread pool while the single writer connection is busy with the
+    /// previous batch (see [`Self::prepare_index_batch`]).
+    pub(crate) fn prepare_index(
+        &self,
+        tenant_id: &str,
+        resource_type: &str,
+        resource_id: &str,
+        resource: &Value,
+    ) -> PreparedIndex {
+        use super::search::fts::extract_searchable_content;
+        use crate::search::converters::IndexValue;
+
+        let _span = crate::perf::span(crate::perf::Phase::Extract);
+        let extractor = self.tenant_extractor(tenant_id);
+        let rows = match extractor.extract(resource, resource_type) {
+            Ok(values) => {
+                let marshal_span = crate::perf::span(crate::perf::Phase::IndexMarshal);
+                // Composite groups missing a component can never match a
+                // composite search (`GROUP BY … HAVING` needs every axis) and
+                // were 6% of all rows on a Synthea load; PostgreSQL already
+                // skips them.
+                let values = crate::search::extractor::drop_incomplete_composites(values);
+                let rows = values
+                    .into_iter()
+                    .map(|v| {
+                        let normalized = match &v.value {
+                            IndexValue::Date {
+                                value: d,
+                                precision,
+                            } => {
+                                let mut n = v.clone();
+                                n.value = IndexValue::Date {
+                                    value: Self::normalize_date_for_sqlite(d),
+                                    precision: *precision,
+                                };
+                                n
+                            }
+                            _ => v,
+                        };
+                        SqliteSearchIndexWriter::to_sql_params(
+                            tenant_id,
+                            resource_type,
+                            resource_id,
+                            &normalized,
+                        )
+                    })
+                    .collect();
+                drop(marshal_span);
+                Ok(rows)
+            }
+            Err(e) => Err(e.to_string()),
+        };
+
+        // Contained resources, for `_contained` search: each value row is
+        // flagged `is_contained = 1` and carries the contained resource's
+        // type and local id, with `resource_type` / `resource_id` naming the
+        // container.
+        let mut contained_rows = Vec::new();
+        for contained in extractor.extract_contained(resource) {
+            for value in &contained.values {
+                let normalized = match &value.value {
+                    IndexValue::Date {
+                        value: d,
+                        precision,
+                    } => {
+                        let mut n = value.clone();
+                        n.value = IndexValue::Date {
+                            value: Self::normalize_date_for_sqlite(d),
+                            precision: *precision,
+                        };
+                        Some(n)
+                    }
+                    _ => None,
+                };
+                let mut params = SqliteSearchIndexWriter::to_sql_params(
+                    tenant_id,
+                    resource_type,
+                    resource_id,
+                    normalized.as_ref().unwrap_or(value),
+                );
+                params.push(SqlValue::Int(1));
+                params.push(SqlValue::String(contained.contained_type.clone()));
+                params.push(SqlValue::String(contained.local_id.clone()));
+                contained_rows.push(params);
+            }
+        }
+
+        let fts = {
+            let content = extract_searchable_content(resource);
+            (!content.is_empty()).then_some(content)
+        };
+
+        PreparedIndex {
+            rows,
+            contained_rows,
+            fts,
+        }
+    }
+
+    /// [`Self::prepare_index`] for a whole batch, spread across a thread
+    /// pool. Extraction is the largest CPU cost of indexing and is
+    /// independent per resource; SQLite's single writer cannot be
+    /// parallelised, but this can, and it moves the extraction off the
+    /// writer's critical path entirely.
+    ///
+    /// Items are `(resource_type, resource_id, resource)`; the result is in
+    /// input order. Small batches are prepared inline — the pool's
+    /// scheduling overhead is not worth paying for a handful of resources.
+    pub(crate) fn prepare_index_batch(
+        &self,
+        tenant_id: &str,
+        items: &[(&str, &str, &Value)],
+    ) -> Vec<PreparedIndex> {
+        use rayon::prelude::*;
+
+        let _span = crate::perf::span(crate::perf::Phase::PrepareBatch);
+        if items.len() < PARALLEL_PREPARE_MIN_BATCH {
+            return items
+                .iter()
+                .map(|(rt, id, res)| self.prepare_index(tenant_id, rt, id, res))
+                .collect();
+        }
+        index_prepare_pool().install(|| {
+            items
+                .par_iter()
+                .map(|(rt, id, res)| self.prepare_index(tenant_id, rt, id, res))
+                .collect()
+        })
+    }
+
+    /// The statement half of indexing one resource: `search_index` rows
+    /// eight per INSERT, the contained rows, then the full-text row. Returns
+    /// the number of `search_index` rows written. Runs the minimal `_id` /
+    /// `_lastUpdated` fallback when extraction failed, as
+    /// [`Self::index_resource`] always has.
+    pub(crate) fn write_prepared_index(
+        &self,
+        conn: &rusqlite::Connection,
+        tenant_id: &str,
+        resource_type: &str,
+        resource_id: &str,
+        resource: &Value,
+        prepared: PreparedIndex,
+    ) -> StorageResult<usize> {
+        let mut count = 0;
+        match prepared.rows {
+            Ok(rows) => {
+                // Rows are written eight at a time: a single-row INSERT stepped
+                // once per row spends a measurable share of its time entering
+                // and leaving the statement, and every resource writes ~10-30
+                // rows. The B-tree work is unchanged; only the per-statement
+                // overhead is amortized (measured +9% bulk-ingest throughput
+                // on the real 31 GB manifest).
+                let _span = crate::perf::span(crate::perf::Phase::IndexInsert);
+                let mut i = 0;
+                while i + 8 <= rows.len() {
+                    let refs: Vec<&dyn ToSql> = rows[i..i + 8]
+                        .iter()
+                        .flatten()
+                        .map(|p| self.sql_value_to_ref(p))
+                        .collect();
+                    conn.prepare_cached(SqliteSearchIndexWriter::insert_sql_rows8())
+                        .and_then(|mut s| s.execute(refs.as_slice()))
+                        .map_err(|e| internal_error(format!("multi-row index insert: {e}")))?;
+                    i += 8;
+                    count += 8;
+                }
+                for row in &rows[i..] {
+                    let refs: Vec<&dyn ToSql> =
+                        row.iter().map(|p| self.sql_value_to_ref(p)).collect();
+                    conn.prepare_cached(SqliteSearchIndexWriter::insert_sql())
+                        .and_then(|mut s| s.execute(refs.as_slice()))
+                        .map_err(|e| internal_error(format!("index insert: {e}")))?;
+                    count += 1;
+                }
+                for row in &prepared.contained_rows {
+                    let refs: Vec<&dyn ToSql> =
+                        row.iter().map(|p| self.sql_value_to_ref(p)).collect();
+                    conn.prepare_cached(SqliteSearchIndexWriter::insert_contained_sql())
+                        .and_then(|mut s| s.execute(refs.as_slice()))
+                        .map_err(|e| {
+                            internal_error(format!(
+                                "Failed to insert contained search index entry: {}",
+                                e
+                            ))
+                        })?;
+                    count += 1;
+                }
+                crate::perf::add_rows(crate::perf::Phase::IndexInsert, count as u64);
                 tracing::debug!(
                     "Dynamically indexed {} values for {}/{}",
                     count,
@@ -1220,36 +1466,26 @@ impl SqliteBackend {
         }
 
         // Index FTS content for _text and _content searches
-        {
+        if let Some(content) = prepared.fts {
             let _span = crate::perf::span(crate::perf::Phase::Fts);
-            self.index_fts_content(conn, tenant_id, resource_type, resource_id, resource)?;
+            self.index_fts_content(conn, tenant_id, resource_type, resource_id, content)?;
         }
 
-        Ok(())
+        Ok(count)
     }
 
-    /// Index full-text search content for _text and _content searches.
-    ///
-    /// This populates the resource_fts table if FTS5 is available.
+    /// Writes the full-text row for `_text` / `_content` searches, if FTS5 is
+    /// available, and records the rowid FTS5 assigned.
     fn index_fts_content(
         &self,
         conn: &rusqlite::Connection,
         tenant_id: &str,
         resource_type: &str,
         resource_id: &str,
-        resource: &Value,
+        content: super::search::fts::SearchableContent,
     ) -> StorageResult<()> {
-        use super::search::fts::extract_searchable_content;
-
         if !fts_table_exists(conn)? {
             // FTS5 not available - skip silently
-            return Ok(());
-        }
-
-        // Extract searchable content
-        let content = extract_searchable_content(resource);
-
-        if content.is_empty() {
             return Ok(());
         }
 
@@ -1284,246 +1520,6 @@ impl SqliteBackend {
             conn.last_insert_rowid()
         ])
         .map_err(|e| internal_error(format!("Failed to record FTS rowid: {}", e)))?;
-
-        Ok(())
-    }
-
-    /// Index a resource using dynamic extraction from the SearchParameterRegistry.
-    ///
-    /// Returns the number of index entries created.
-    fn index_resource_dynamic(
-        &self,
-        conn: &rusqlite::Connection,
-        tenant_id: &str,
-        resource_type: &str,
-        resource_id: &str,
-        resource: &Value,
-    ) -> StorageResult<usize> {
-        // Extract values using the tenant's registry-driven extractor
-        let values = {
-            let _span = crate::perf::span(crate::perf::Phase::Extract);
-            self.tenant_extractor(tenant_id)
-                .extract(resource, resource_type)
-                .map_err(|e| internal_error(format!("Search parameter extraction failed: {}", e)))?
-        };
-
-        // Rows are written eight at a time: a single-row INSERT stepped once
-        // per row spends a measurable share of its time entering and leaving
-        // the statement, and every resource writes ~10-30 rows. The B-tree
-        // work is unchanged; only the per-statement overhead is amortized
-        // (measured +9% bulk-ingest throughput on the real 31 GB manifest).
-        let mut count = 0;
-        {
-            // The whole insert, plus its Rust-side half (normalising values and
-            // building the bound parameters) as a nested phase, so a profile can
-            // tell our marshalling apart from SQLite's b-tree work (#947).
-            let _span = crate::perf::span(crate::perf::Phase::IndexInsert);
-            use crate::search::converters::IndexValue;
-            let marshal_span = crate::perf::span(crate::perf::Phase::IndexMarshal);
-            let owned: Vec<_> = values
-                .into_iter()
-                .map(|v| match &v.value {
-                    IndexValue::Date {
-                        value: d,
-                        precision,
-                    } => {
-                        let mut n = v.clone();
-                        n.value = IndexValue::Date {
-                            value: Self::normalize_date_for_sqlite(d),
-                            precision: *precision,
-                        };
-                        n
-                    }
-                    _ => v,
-                })
-                .collect();
-            let rows: Vec<Vec<_>> = owned
-                .iter()
-                .map(|v| {
-                    SqliteSearchIndexWriter::to_sql_params(tenant_id, resource_type, resource_id, v)
-                })
-                .collect();
-            drop(marshal_span);
-            let mut i = 0;
-            while i + 8 <= rows.len() {
-                let refs: Vec<&dyn ToSql> = rows[i..i + 8]
-                    .iter()
-                    .flatten()
-                    .map(|p| self.sql_value_to_ref(p))
-                    .collect();
-                conn.prepare_cached(SqliteSearchIndexWriter::insert_sql_rows8())
-                    .and_then(|mut s| s.execute(refs.as_slice()))
-                    .map_err(|e| internal_error(format!("multi-row index insert: {e}")))?;
-                i += 8;
-                count += 8;
-            }
-            for row in &rows[i..] {
-                let refs: Vec<&dyn ToSql> = row.iter().map(|p| self.sql_value_to_ref(p)).collect();
-                conn.prepare_cached(SqliteSearchIndexWriter::insert_sql())
-                    .and_then(|mut s| s.execute(refs.as_slice()))
-                    .map_err(|e| internal_error(format!("index insert: {e}")))?;
-                count += 1;
-            }
-        }
-        crate::perf::add_rows(crate::perf::Phase::IndexInsert, count as u64);
-
-        // Also index any contained resources for `_contained` search.
-        count +=
-            self.index_contained_resources(conn, tenant_id, resource_type, resource_id, resource)?;
-
-        Ok(count)
-    }
-
-    /// Writes a single ExtractedValue to the search_index table.
-    fn write_index_entry(
-        &self,
-        conn: &rusqlite::Connection,
-        tenant_id: &str,
-        resource_type: &str,
-        resource_id: &str,
-        value: &ExtractedValue,
-    ) -> StorageResult<()> {
-        use crate::search::converters::IndexValue;
-
-        let marshal_span = crate::perf::span(crate::perf::Phase::IndexMarshal);
-        // For date values, normalize the date format for consistent SQLite comparisons
-        let normalized_value = match &value.value {
-            IndexValue::Date {
-                value: date_str,
-                precision,
-            } => {
-                let normalized_date = Self::normalize_date_for_sqlite(date_str);
-                let mut normalized = value.clone();
-                normalized.value = IndexValue::Date {
-                    value: normalized_date,
-                    precision: *precision,
-                };
-                Some(normalized)
-            }
-            _ => None,
-        };
-
-        let value_to_use = normalized_value.as_ref().unwrap_or(value);
-        let sql_params = SqliteSearchIndexWriter::to_sql_params(
-            tenant_id,
-            resource_type,
-            resource_id,
-            value_to_use,
-        );
-
-        // Build parameter refs for rusqlite
-        let param_refs: Vec<&dyn ToSql> = sql_params
-            .iter()
-            .map(|p| self.sql_value_to_ref(p))
-            .collect();
-
-        drop(marshal_span);
-        // `prepare_cached`, not `execute`: `Connection::execute` compiles the
-        // statement on every call, and a bulk import runs this one ~14 times
-        // per resource. The 24-column INSERT costs more to compile than to
-        // run, and the cache is keyed on the `&'static str` above, so every
-        // row after the first on a given connection reuses the same program.
-        conn.prepare_cached(SqliteSearchIndexWriter::insert_sql())
-            .map_err(|e| internal_error(format!("Failed to prepare search index insert: {}", e)))?
-            .execute(param_refs.as_slice())
-            .map_err(|e| internal_error(format!("Failed to insert search index entry: {}", e)))?;
-
-        Ok(())
-    }
-
-    /// Extracts and indexes a container's `contained[]` resources for
-    /// `_contained` search. Each contained resource's search values are written
-    /// as `is_contained = 1` rows whose `resource_type` / `resource_id` identify
-    /// the container. Returns the number of entries written.
-    fn index_contained_resources(
-        &self,
-        conn: &rusqlite::Connection,
-        tenant_id: &str,
-        container_type: &str,
-        container_id: &str,
-        resource: &Value,
-    ) -> StorageResult<usize> {
-        let mut count = 0;
-        let container = (container_type, container_id);
-        for contained in self.tenant_extractor(tenant_id).extract_contained(resource) {
-            for value in &contained.values {
-                self.write_contained_index_entry(
-                    conn,
-                    tenant_id,
-                    container,
-                    (&contained.contained_type, &contained.local_id),
-                    value,
-                )?;
-                count += 1;
-            }
-        }
-        Ok(count)
-    }
-
-    /// Writes a single contained `ExtractedValue` to the search_index table,
-    /// flagged `is_contained = 1` and carrying the contained resource's type and
-    /// local id (mirrors [`Self::write_index_entry`]). `container` is the
-    /// `(type, id)` of the holding resource; `contained` is the
-    /// `(type, local id)` of the nested resource.
-    fn write_contained_index_entry(
-        &self,
-        conn: &rusqlite::Connection,
-        tenant_id: &str,
-        container: (&str, &str),
-        contained: (&str, &str),
-        value: &ExtractedValue,
-    ) -> StorageResult<()> {
-        use crate::search::converters::IndexValue;
-
-        let (container_type, container_id) = container;
-        let (contained_type, contained_local_id) = contained;
-
-        let normalized_value = match &value.value {
-            IndexValue::Date {
-                value: date_str,
-                precision,
-            } => {
-                let mut normalized = value.clone();
-                normalized.value = IndexValue::Date {
-                    value: Self::normalize_date_for_sqlite(date_str),
-                    precision: *precision,
-                };
-                Some(normalized)
-            }
-            _ => None,
-        };
-        let value_to_use = normalized_value.as_ref().unwrap_or(value);
-
-        let mut sql_params = SqliteSearchIndexWriter::to_sql_params(
-            tenant_id,
-            container_type,
-            container_id,
-            value_to_use,
-        );
-        // Trailing contained columns (?25..?27).
-        sql_params.push(SqlValue::Int(1));
-        sql_params.push(SqlValue::String(contained_type.to_string()));
-        sql_params.push(SqlValue::String(contained_local_id.to_string()));
-
-        let param_refs: Vec<&dyn ToSql> = sql_params
-            .iter()
-            .map(|p| self.sql_value_to_ref(p))
-            .collect();
-
-        conn.prepare_cached(SqliteSearchIndexWriter::insert_contained_sql())
-            .map_err(|e| {
-                internal_error(format!(
-                    "Failed to prepare contained search index insert: {}",
-                    e
-                ))
-            })?
-            .execute(param_refs.as_slice())
-            .map_err(|e| {
-                internal_error(format!(
-                    "Failed to insert contained search index entry: {}",
-                    e
-                ))
-            })?;
 
         Ok(())
     }
@@ -3796,6 +3792,7 @@ impl ReindexSource for SqliteBackend {
         cursor: Option<&str>,
         limit: u32,
     ) -> StorageResult<ResourcePage> {
+        let _fetch_span = crate::perf::span(crate::perf::Phase::ReindexFetch);
         let conn = self.get_connection()?;
         let tenant_id = tenant.tenant_id().as_str().to_string();
 
@@ -3913,58 +3910,43 @@ impl SqliteBackend {
         let resource_id = resource.id();
         let content = resource.content();
 
-        // Use the dynamic extraction over the tenant's registry
-        let values = self
-            .tenant_extractor(tenant.tenant_id().as_str())
-            .extract(content, resource_type)
-            .map_err(|e| internal_error(format!("Search parameter extraction failed: {}", e)))?;
-
-        let mut count = 0;
-        for value in values {
-            self.write_index_entry(
-                conn,
-                tenant.tenant_id().as_str(),
-                resource_type,
-                resource_id,
-                &value,
-            )?;
-            count += 1;
-        }
-
-        // Re-index contained resources too, so `$reindex` rebuilds `_contained`
-        // search entries.
-        count += self.index_contained_resources(
+        // The same two halves the CRUD path uses. Every caller deletes the
+        // resource's search entries (FTS row included) immediately before
+        // this — without that, `$reindex` was a *destructive* operation for
+        // `_text`/`_content`: the delete dropped the FTS row and nothing put
+        // it back. `index_fts_content` is a bare INSERT with no
+        // delete-first, so if that ordering ever changes this must become
+        // delete-then-insert.
+        let tenant_id = tenant.tenant_id().as_str();
+        let prepared = self.prepare_index(tenant_id, resource_type, resource_id, content);
+        self.write_prepared_index(
             conn,
-            tenant.tenant_id().as_str(),
+            tenant_id,
             resource_type,
             resource_id,
             content,
-        )?;
+            prepared,
+        )
+    }
 
-        // Rebuild the full-text row as well. Without this, `$reindex` was a
-        // *destructive* operation for `_text`/`_content`: `run_reindex` deletes
-        // each resource's search entries via `delete_search_entries` ->
-        // `delete_search_index`, which does drop the FTS row, and nothing here
-        // put it back. That happened on every reindex, with or without
-        // `clear_existing`, so the documented recovery operation silently
-        // disabled full-text search until each resource was next written.
-        //
-        // Not counted in `count`: that value is the number of `search_index`
-        // entries, which `$reindex-status` reports, and an FTS row is not one.
-        //
-        // Safe against duplicates because every caller deletes the resource's
-        // search entries (FTS row included) immediately before this, and
-        // SQLite's `index_fts_content` is a bare INSERT with no delete-first.
-        // If that ordering ever changes, this must become delete-then-insert.
-        self.index_fts_content(
+    /// [`Self::write_search_entries_on`] with the extraction already done —
+    /// the reindex page loop prepares a page in parallel and then writes it
+    /// through here on the one connection.
+    fn write_prepared_search_entries_on(
+        &self,
+        conn: &rusqlite::Connection,
+        tenant: &TenantContext,
+        resource: &StoredResource,
+        prepared: PreparedIndex,
+    ) -> StorageResult<usize> {
+        self.write_prepared_index(
             conn,
             tenant.tenant_id().as_str(),
-            resource_type,
-            resource_id,
-            content,
-        )?;
-
-        Ok(count)
+            resource.resource_type(),
+            resource.id(),
+            resource.content(),
+            prepared,
+        )
     }
 }
 
@@ -4022,15 +4004,30 @@ impl ReindexTarget for SqliteBackend {
                 .map(|_| Err(internal_error(msg.clone())))
                 .collect();
         }
+        let page_span = crate::perf::span(crate::perf::Phase::ReindexPage);
         let tenant_id = tenant.tenant_id().as_str();
+        // Extraction for the whole page first, across the thread pool, while
+        // this connection holds the write lock for nothing else; the loop
+        // below is then statements only.
+        let items: Vec<(&str, &str, &Value)> = resources
+            .iter()
+            .map(|r| (r.resource_type(), r.id(), r.content()))
+            .collect();
+        let prepared = self.prepare_index_batch(tenant_id, &items);
         let mut results: Vec<StorageResult<usize>> = Vec::with_capacity(resources.len());
-        for resource in resources {
-            let outcome = self
-                .delete_search_index(&conn, tenant_id, resource.resource_type(), resource.id())
-                .and_then(|_| self.write_search_entries_on(&conn, tenant, resource));
+        for (resource, prepared) in resources.iter().zip(prepared) {
+            let outcome = {
+                let _span = crate::perf::span(crate::perf::Phase::IndexDelete);
+                self.delete_search_index(&conn, tenant_id, resource.resource_type(), resource.id())
+            }
+            .and_then(|_| self.write_prepared_search_entries_on(&conn, tenant, resource, prepared));
             results.push(outcome);
         }
-        if let Err(e) = conn.execute("COMMIT", []) {
+        let commit_span = crate::perf::span(crate::perf::Phase::Commit);
+        let committed = conn.execute("COMMIT", []);
+        drop(commit_span);
+        drop(page_span);
+        if let Err(e) = committed {
             let _ = conn.execute("ROLLBACK", []);
             let msg = format!("Failed to commit reindex batch: {e}");
             return resources
@@ -4039,6 +4036,52 @@ impl ReindexTarget for SqliteBackend {
                 .collect();
         }
         results
+    }
+
+    /// Drops the `search_index` value indexes for the duration of the run.
+    /// Measured on a 72k-resource rebuild that already prepared its pages in
+    /// parallel: 18.5s with the indexes maintained row by row, 10.7s without
+    /// them plus 2.75s to build all thirteen sorted at the end — and the
+    /// sorted build is sequential I/O, so the gap widens once the b-trees
+    /// no longer fit the page cache. Reference-counted across concurrent
+    /// runs: the first one in drops, the last one out rebuilds. A process
+    /// that dies inside the window is healed at the next startup by
+    /// `schema::ensure_search_value_indexes`.
+    async fn begin_bulk_index_rebuild(&self) -> StorageResult<()> {
+        if self.is_search_offloaded() {
+            return Ok(());
+        }
+        let mut active = BULK_INDEX_REBUILDS.lock();
+        if *active == 0 {
+            let conn = self.get_connection()?;
+            let started = std::time::Instant::now();
+            super::schema::drop_search_value_indexes(&conn)?;
+            tracing::info!(
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "bulk index rebuild: search_index value indexes dropped for the run"
+            );
+        }
+        *active += 1;
+        Ok(())
+    }
+
+    async fn end_bulk_index_rebuild(&self) -> StorageResult<()> {
+        if self.is_search_offloaded() {
+            return Ok(());
+        }
+        let mut active = BULK_INDEX_REBUILDS.lock();
+        *active = active.saturating_sub(1);
+        if *active == 0 {
+            let conn = self.get_connection()?;
+            let started = std::time::Instant::now();
+            let created = super::schema::ensure_search_value_indexes(&conn)?;
+            tracing::info!(
+                created,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "bulk index rebuild: search_index value indexes rebuilt"
+            );
+        }
+        Ok(())
     }
 
     async fn clear_search_index(&self, tenant: &TenantContext) -> StorageResult<u64> {
@@ -4109,6 +4152,96 @@ mod tests {
             TenantId::new("test-tenant"),
             TenantPermissions::full_access(),
         )
+    }
+
+    /// The SQLite writer drops its value indexes on `begin` and has every one
+    /// of them back on `end`, with the rows written meanwhile indexed — the
+    /// rebuild wrote them into the table only, and the sorted build picked
+    /// them up.
+    #[tokio::test]
+    async fn bulk_index_rebuild_restores_every_value_index_and_search_works() {
+        use crate::search::{ReindexOperation, ReindexRequest};
+
+        let backend = std::sync::Arc::new(create_test_backend());
+        let tenant = create_test_tenant();
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType": "Patient", "id": "p1", "name": [{"family": "Rebuild"}]}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+
+        let index_names = |backend: &SqliteBackend| -> Vec<String> {
+            let conn = backend.get_connection().unwrap();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'search_index' ORDER BY name",
+                )
+                .unwrap();
+            stmt.query_map([], |r| r.get(0))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+        };
+        let before = index_names(&backend);
+        assert!(before.len() > 2);
+
+        backend.begin_bulk_index_rebuild().await.unwrap();
+        assert_eq!(
+            index_names(&backend),
+            vec!["idx_search_composite".to_string()]
+        );
+        // Nested run: still dropped, and the outer end is the one that rebuilds.
+        backend.begin_bulk_index_rebuild().await.unwrap();
+        backend.end_bulk_index_rebuild().await.unwrap();
+        assert_eq!(
+            index_names(&backend),
+            vec!["idx_search_composite".to_string()]
+        );
+        backend.end_bulk_index_rebuild().await.unwrap();
+        assert_eq!(index_names(&backend), before);
+
+        // The whole run, through the driver, on a database whose rows were
+        // written without the indexes.
+        let op = ReindexOperation::new(backend.clone(), backend.tenant_registries().clone());
+        let id = op
+            .start(
+                tenant.clone(),
+                ReindexRequest::for_types(["Patient"]).with_bulk_index_rebuild(true),
+                None,
+            )
+            .await
+            .unwrap();
+        // The run does its SQLite work on blocking threads, so yielding the
+        // async runtime is not enough to let it finish: wait on the clock.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        loop {
+            if op.get_progress(&id).await.unwrap().status.is_finished() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "reindex did not finish within 60s"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let progress = op.get_progress(&id).await.unwrap();
+        assert!(progress.errors.is_empty(), "{:?}", progress.errors);
+        assert_eq!(index_names(&backend), before);
+
+        let query = SearchQuery::new("Patient").with_parameter(SearchParameter {
+            name: "family".to_string(),
+            param_type: SearchParamType::String,
+            modifier: None,
+            values: vec![SearchValue::eq("Rebuild")],
+            chain: vec![],
+            components: vec![],
+        });
+        let results = backend.search(&tenant, &query).await.unwrap();
+        assert_eq!(results.resources.items.len(), 1);
     }
 
     #[tokio::test]

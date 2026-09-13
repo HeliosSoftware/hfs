@@ -124,6 +124,57 @@ pub struct ContainedExtraction {
     pub values: Vec<ExtractedValue>,
 }
 
+/// Removes the composite groups that can never match a composite search.
+///
+/// A composite search matches only when every component matches, so an
+/// instance missing a component is dead weight: every Observation with a
+/// `code` but no `valueString` still produced a `code-value-string` row, and
+/// on a Synthea load those single-component groups were 46% of all composite
+/// rows and 6% of the whole index. `composite_arity` is how many distinct
+/// axes a complete instance has; a group is kept when it produced that many
+/// (an axis is a `(slot, value family)` pair, as in the PostgreSQL writer's
+/// `fold_composites`, which applies the same rule). Values without an arity —
+/// older extractors, hand-built values — are kept as they were. Plain values
+/// pass through untouched, and the input order is preserved.
+pub fn drop_incomplete_composites(values: Vec<ExtractedValue>) -> Vec<ExtractedValue> {
+    use std::collections::HashMap;
+    use std::mem::discriminant;
+
+    // Axes seen per (param, group), counted once per (slot, family).
+    type Axis = (u8, std::mem::Discriminant<IndexValue>);
+    let mut axes: HashMap<(&str, u32), Vec<Axis>> = HashMap::new();
+    for v in &values {
+        if let Some(group) = v.composite_group {
+            let axis = (v.composite_slot.unwrap_or(1), discriminant(&v.value));
+            let seen = axes.entry((v.param_name.as_str(), group)).or_default();
+            if !seen.contains(&axis) {
+                seen.push(axis);
+            }
+        }
+    }
+    let incomplete: std::collections::HashSet<(String, u32)> = values
+        .iter()
+        .filter_map(|v| {
+            let group = v.composite_group?;
+            let required = usize::from(v.composite_arity?);
+            let have = axes
+                .get(&(v.param_name.as_str(), group))
+                .map_or(0, Vec::len);
+            (have < required).then(|| (v.param_name.clone(), group))
+        })
+        .collect();
+    if incomplete.is_empty() {
+        return values;
+    }
+    values
+        .into_iter()
+        .filter(|v| match v.composite_group {
+            Some(group) => !incomplete.contains(&(v.param_name.clone(), group)),
+            None => true,
+        })
+        .collect()
+}
+
 /// A search-parameter expression with all of its per-`(expression,
 /// resource_type)` preparation already done.
 ///
@@ -1164,6 +1215,78 @@ impl std::fmt::Debug for SearchParameterExtractor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn incomplete_composite_groups_are_dropped_and_plain_values_kept() {
+        let token = |group: u32, slot: u8, arity: u8| {
+            ExtractedValue::new(
+                "code-value-quantity",
+                "http://x/code-value-quantity",
+                SearchParamType::Composite,
+                IndexValue::Token {
+                    system: Some("http://loinc.org".into()),
+                    code: "1234".into(),
+                    display: None,
+                    identifier_type_system: None,
+                    identifier_type_code: None,
+                },
+            )
+            .with_composite_group(group)
+            .with_composite_slot(slot)
+            .with_composite_arity(arity)
+        };
+        let quantity = |group: u32| {
+            ExtractedValue::new(
+                "code-value-quantity",
+                "http://x/code-value-quantity",
+                SearchParamType::Composite,
+                IndexValue::Quantity {
+                    value: 5.0,
+                    unit: Some("kg".into()),
+                    system: None,
+                    code: None,
+                },
+            )
+            .with_composite_group(group)
+            .with_composite_slot(1)
+            .with_composite_arity(2)
+        };
+        let plain = ExtractedValue::new(
+            "code",
+            "http://x/code",
+            SearchParamType::Token,
+            IndexValue::Token {
+                system: None,
+                code: "1234".into(),
+                display: None,
+                identifier_type_system: None,
+                identifier_type_code: None,
+            },
+        );
+        // Group 0 is complete (token + quantity); group 1 has only its code;
+        // group 2 has two codings but still only one axis.
+        let values = vec![
+            plain.clone(),
+            token(0, 1, 2),
+            quantity(0),
+            token(1, 1, 2),
+            token(2, 1, 2),
+            token(2, 1, 2),
+            // No arity: the legacy rule keeps any non-empty group.
+            token(3, 1, 2)
+                .with_composite_arity(0)
+                .with_composite_group(3),
+        ];
+        let mut legacy = values[6].clone();
+        legacy.composite_arity = None;
+        let mut values = values;
+        values[6] = legacy;
+
+        let kept = drop_incomplete_composites(values);
+        let groups: Vec<Option<u32>> = kept.iter().map(|v| v.composite_group).collect();
+        assert_eq!(groups, vec![None, Some(0), Some(0), Some(3)]);
+        assert_eq!(kept[0].param_name, "code");
+    }
     use crate::search::loader::SearchParameterLoader;
     use helios_fhir::FhirVersion;
     use serde_json::json;

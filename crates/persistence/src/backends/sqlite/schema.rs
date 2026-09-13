@@ -10,7 +10,107 @@ use crate::core::bulk_submit_legacy::{
 use crate::error::StorageResult;
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 27;
+pub const SCHEMA_VERSION: i32 = 28;
+
+/// The `search_index` value indexes: every index on the table except
+/// `idx_search_composite`, which the delete-by-resource path needs at all
+/// times. This is the canonical set — a test asserts a fresh schema carries
+/// exactly these — and the list the bulk index rebuild drops and recreates
+/// (see [`drop_search_value_indexes`] / [`ensure_search_value_indexes`]).
+///
+/// Keep each entry's SQL byte-for-byte what the migration ladder creates,
+/// normalised to one line, so the self-heal on startup and the ladder agree.
+pub(crate) const SEARCH_VALUE_INDEXES: [(&str, &str); 13] = [
+    (
+        "idx_search_string",
+        "CREATE INDEX IF NOT EXISTS idx_search_string ON search_index(tenant_id, resource_type, param_name, value_string) WHERE value_string IS NOT NULL",
+    ),
+    (
+        "idx_search_token",
+        "CREATE INDEX IF NOT EXISTS idx_search_token ON search_index(tenant_id, resource_type, param_name, value_token_system, value_token_code) WHERE value_token_system IS NOT NULL OR value_token_code IS NOT NULL",
+    ),
+    (
+        "idx_search_date",
+        "CREATE INDEX IF NOT EXISTS idx_search_date ON search_index(tenant_id, resource_type, param_name, value_date) WHERE value_date IS NOT NULL",
+    ),
+    (
+        "idx_search_number",
+        "CREATE INDEX IF NOT EXISTS idx_search_number ON search_index(tenant_id, resource_type, param_name, value_number) WHERE value_number IS NOT NULL",
+    ),
+    (
+        "idx_search_quantity",
+        "CREATE INDEX IF NOT EXISTS idx_search_quantity ON search_index(tenant_id, resource_type, param_name, value_quantity_value, value_quantity_unit) WHERE value_quantity_value IS NOT NULL",
+    ),
+    (
+        "idx_search_reference",
+        "CREATE INDEX IF NOT EXISTS idx_search_reference ON search_index(tenant_id, resource_type, param_name, value_reference) WHERE value_reference IS NOT NULL",
+    ),
+    (
+        "idx_search_uri",
+        "CREATE INDEX IF NOT EXISTS idx_search_uri ON search_index(tenant_id, resource_type, param_name, value_uri) WHERE value_uri IS NOT NULL",
+    ),
+    (
+        "idx_search_token_display",
+        "CREATE INDEX IF NOT EXISTS idx_search_token_display ON search_index(tenant_id, resource_type, param_name, value_token_display) WHERE value_token_display IS NOT NULL",
+    ),
+    (
+        "idx_search_identifier_type",
+        "CREATE INDEX IF NOT EXISTS idx_search_identifier_type ON search_index(tenant_id, resource_type, param_name, value_identifier_type_system, value_identifier_type_code) WHERE value_identifier_type_system IS NOT NULL OR value_identifier_type_code IS NOT NULL",
+    ),
+    (
+        "idx_search_reference_display",
+        "CREATE INDEX IF NOT EXISTS idx_search_reference_display ON search_index(tenant_id, resource_type, param_name, value_reference_display) WHERE value_reference_display IS NOT NULL",
+    ),
+    (
+        "idx_search_quantity_canonical",
+        "CREATE INDEX IF NOT EXISTS idx_search_quantity_canonical ON search_index(tenant_id, resource_type, param_name, value_quantity_canonical_unit, value_quantity_canonical_value) WHERE value_quantity_canonical_value IS NOT NULL",
+    ),
+    (
+        "idx_search_string_folded",
+        "CREATE INDEX IF NOT EXISTS idx_search_string_folded ON search_index(tenant_id, resource_type, param_name, value_string_folded) WHERE value_string_folded IS NOT NULL",
+    ),
+    (
+        "idx_search_contained",
+        "CREATE INDEX IF NOT EXISTS idx_search_contained ON search_index(tenant_id, contained_type, is_contained, param_name) WHERE is_contained = 1",
+    ),
+];
+
+/// Creates every missing [`SEARCH_VALUE_INDEXES`] entry and returns how many
+/// were missing. Runs on every startup: a bulk index rebuild drops these
+/// indexes for the duration of the load, and a process that died inside that
+/// window would otherwise come back with a `search_index` no search can use.
+/// A no-op on a healthy database.
+pub(crate) fn ensure_search_value_indexes(conn: &Connection) -> StorageResult<usize> {
+    let mut created = 0;
+    for (name, sql) in SEARCH_VALUE_INDEXES {
+        let exists: bool = conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?1",
+                [name],
+                |_| Ok(()),
+            )
+            .is_ok();
+        if !exists {
+            conn.execute(sql, [])
+                .map_err(|e| migration_err(format!("recreate {name}: {e}")))?;
+            created += 1;
+        }
+    }
+    Ok(created)
+}
+
+/// Drops every [`SEARCH_VALUE_INDEXES`] entry. The bulk index rebuild's first
+/// half: with the value indexes gone, a rebuild's rows land in the table
+/// (an append) and `idx_search_composite` alone, and the indexes are then
+/// built once, sorted, by [`ensure_search_value_indexes`] — instead of one
+/// random b-tree insertion per row per index.
+pub(crate) fn drop_search_value_indexes(conn: &Connection) -> StorageResult<()> {
+    for (name, _) in SEARCH_VALUE_INDEXES {
+        conn.execute(&format!("DROP INDEX IF EXISTS {name}"), [])
+            .map_err(|e| migration_err(format!("drop {name}: {e}")))?;
+    }
+    Ok(())
+}
 
 /// Initialize the database schema.
 pub fn initialize_schema(conn: &Connection) -> StorageResult<()> {
@@ -35,6 +135,16 @@ pub fn initialize_schema(conn: &Connection) -> StorageResult<()> {
     // `IF NOT EXISTS` and idempotent, so ensuring it here every startup
     // self-heals such databases and is a no-op for correctly-migrated ones.
     ensure_tenants_table(conn)?;
+
+    // Self-heal after a bulk index rebuild that never finished (see
+    // `ensure_search_value_indexes`). A healthy database creates nothing.
+    let recreated = ensure_search_value_indexes(conn)?;
+    if recreated > 0 {
+        tracing::warn!(
+            recreated,
+            "search_index value indexes were missing at startup and have been rebuilt"
+        );
+    }
 
     Ok(())
 }
@@ -328,6 +438,7 @@ fn migrate_schema(conn: &Connection, from_version: i32) -> StorageResult<()> {
             24 => migrate_v24_to_v25(conn)?,
             25 => migrate_v25_to_v26(conn)?,
             26 => migrate_v26_to_v27(conn)?,
+            27 => migrate_v27_to_v28(conn)?,
             _ => {
                 return Err(crate::error::StorageError::Backend(
                     crate::error::BackendError::Internal {
@@ -1225,6 +1336,40 @@ fn migrate_v9_to_v10(conn: &Connection) -> StorageResult<()> {
     Ok(())
 }
 
+/// Migrate from schema version 27 to version 28.
+///
+/// Makes `idx_search_string_folded` partial (`WHERE value_string_folded IS NOT
+/// NULL`), the last full index over a value column. Only string rows carry a
+/// folded value — 13% of the rows of a Synthea load — so every other row paid
+/// a b-tree insertion into an index it could never be found by. Measured on
+/// the deferred-index rebuild of a 72k-resource mixed load: 21.1s -> 18.9s
+/// (-10%), database 3% smaller.
+///
+/// v22 kept this index full on purpose: it was the only index leading with
+/// `(tenant_id, resource_type, param_name)` that covered every row, and the
+/// planner fell back to it for `LIKE`-shaped searches (`:contains`, `:text`,
+/// `:code-text`, `:below`, `:above`, a bare reference id) whose predicate
+/// SQLite cannot prove implies `IS NOT NULL`. Those predicates now say so
+/// themselves — every `LIKE` fragment leads with `<column> IS NOT NULL` —
+/// which qualifies the family's own partial index (`idx_search_string`,
+/// `idx_search_token_display`, `idx_search_reference`, …) and narrows the
+/// scan to the parameter's rows. That is a better plan than the old one,
+/// which for the reference, token-display and uri shapes was already a
+/// type-wide walk of `idx_search_composite`, folded index or not.
+fn migrate_v27_to_v28(conn: &Connection) -> StorageResult<()> {
+    let statements = [
+        "DROP INDEX IF EXISTS idx_search_string_folded",
+        "CREATE INDEX idx_search_string_folded
+         ON search_index(tenant_id, resource_type, param_name, value_string_folded)
+         WHERE value_string_folded IS NOT NULL",
+    ];
+    for sql in &statements {
+        conn.execute(sql, [])
+            .map_err(|e| migration_err(format!("v28 partial folded index: {e}")))?;
+    }
+    Ok(())
+}
+
 /// Migrate from schema version 10 to version 11.
 ///
 /// Adds columns supporting `_contained` search: index rows extracted from a
@@ -1553,16 +1698,18 @@ fn migrate_v20_to_v21(conn: &Connection) -> StorageResult<()> {
 /// ```
 ///
 /// Every row therefore paid three b-tree insertions it could never be found
-/// by. `idx_search_string_folded` is deliberately **not** in this list: it is
-/// also the only index leading with `(tenant_id, resource_type, param_name)`
-/// that covers every row, and the query planner falls back to it for the
-/// `LIKE`-shaped modifier searches (`:text`, `:contains`) whose predicate
-/// SQLite cannot prove implies `IS NOT NULL`. Making it partial pushed those
-/// onto `idx_search_composite`'s `(tenant_id, resource_type)` prefix, and
-/// replacing it with a narrow `(tenant_id, resource_type, param_name)` index
-/// made the planner prefer that for token searches too — a selective
-/// `code=…` lookup went from 2.9 ms to 22.1 ms because the value could no
-/// longer be filtered inside the index.
+/// by. `idx_search_string_folded` was deliberately **not** in this list: it
+/// was also the only index leading with `(tenant_id, resource_type,
+/// param_name)` that covered every row, and the query planner fell back to
+/// it for the `LIKE`-shaped modifier searches (`:text`, `:contains`) whose
+/// predicate SQLite cannot prove implies `IS NOT NULL`. Making it partial
+/// pushed those onto `idx_search_composite`'s `(tenant_id, resource_type)`
+/// prefix, and replacing it with a narrow `(tenant_id, resource_type,
+/// param_name)` index made the planner prefer that for token searches too —
+/// a selective `code=…` lookup went from 2.9 ms to 22.1 ms because the value
+/// could no longer be filtered inside the index. v28 finally made it partial
+/// by giving those predicates an explicit `IS NOT NULL` instead (see
+/// [`migrate_v27_to_v28`]).
 ///
 /// `EXPLAIN QUERY PLAN` over 15 representative search shapes (token, token
 /// `:text`, reference, reference `:text`, string prefix and exact, quantity
@@ -2496,12 +2643,9 @@ mod tests {
     ///   column almost every row leaves NULL takes an entry per row for
     ///   nothing.
     ///
-    /// `idx_search_string_folded` is asserted to be *non*-partial on purpose:
-    /// it is also the only full index leading with
-    /// `(tenant_id, resource_type, param_name)`, and the planner falls back to
-    /// it for the `LIKE`-shaped modifier searches whose predicate SQLite
-    /// cannot prove implies `IS NOT NULL`. Making it partial silently pushes
-    /// `:text` and `:contains` onto a `(tenant_id, resource_type)` scan.
+    /// `idx_search_string_folded` joined the partial set in v28; the
+    /// `LIKE`-shaped searches that used to depend on it being full now carry
+    /// their own `IS NOT NULL` (see [`migrate_v27_to_v28`]).
     #[test]
     fn search_index_carries_no_redundant_or_full_value_indexes() {
         let conn = Connection::open_in_memory().unwrap();
@@ -2530,6 +2674,10 @@ mod tests {
 
         for (name, predicate) in [
             (
+                "idx_search_string_folded",
+                "value_string_folded IS NOT NULL",
+            ),
+            (
                 "idx_search_reference_display",
                 "value_reference_display IS NOT NULL",
             ),
@@ -2545,13 +2693,49 @@ mod tests {
                 "{name} must be partial on `{predicate}`, got: {sql}"
             );
         }
+    }
 
-        let folded = index_sql("idx_search_string_folded").expect("folded index");
-        assert!(
-            !folded.to_ascii_uppercase().contains("WHERE"),
-            "idx_search_string_folded must stay full: it is the fallback index for \
-             LIKE-shaped modifier searches. Got: {folded}"
+    /// The canonical value-index list must be exactly what a fresh schema
+    /// carries, name and definition alike — it is what a bulk index rebuild
+    /// recreates and what startup self-heals from, so drift here would
+    /// silently change the indexes of a database that went through either.
+    #[test]
+    fn search_value_indexes_match_the_fresh_schema() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+        let normalise = |sql: &str| {
+            sql.replace("IF NOT EXISTS ", "")
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        let mut actual: Vec<(String, String)> = conn
+            .prepare(
+                "SELECT name, sql FROM sqlite_master
+                 WHERE type = 'index' AND tbl_name = 'search_index' AND name != 'idx_search_composite'",
+            )
+            .unwrap()
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .map(|(n, s)| (n, normalise(&s)))
+            .collect();
+        actual.sort();
+        let mut expected: Vec<(String, String)> = SEARCH_VALUE_INDEXES
+            .iter()
+            .map(|(n, s)| (n.to_string(), normalise(s)))
+            .collect();
+        expected.sort();
+        assert_eq!(actual, expected);
+
+        // Drop, then self-heal: every entry comes back, and a second pass
+        // finds nothing to do.
+        drop_search_value_indexes(&conn).unwrap();
+        assert_eq!(
+            ensure_search_value_indexes(&conn).unwrap(),
+            SEARCH_VALUE_INDEXES.len()
         );
+        assert_eq!(ensure_search_value_indexes(&conn).unwrap(), 0);
     }
 
     /// A database upgraded through the ladder must end up with exactly the

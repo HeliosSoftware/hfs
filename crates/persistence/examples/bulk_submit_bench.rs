@@ -22,12 +22,21 @@
 //!
 //! Options:
 //!
-//! * `--db PATH`      database file to create (deleted first; default: a temp file)
-//! * `--limit N`      resources to ingest per input file (default: all)
-//! * `--batch N`      entries per transaction (default: the server default, 100)
-//! * `--defer-index`  set `defer_indexing`, the `HFS_BULK_SUBMIT_DEFER_INDEXING` path
-//! * `--data-dir DIR` directory holding `search-parameters-r4.json` (default: `./data`)
-//! * `--keep`         leave the database behind for inspection
+//! * `--db PATH`        database file to create (deleted first; default: a temp file)
+//! * `--limit N`        resources to ingest per input file (default: all)
+//! * `--batch N`        entries per transaction (default: 100; the server's is 1000)
+//! * `--defer-index`    set `defer_indexing`, the `HFS_BULK_SUBMIT_DEFER_INDEXING` path
+//! * `--reindex`        after the ingest, run the post-manifest rebuild the submit
+//!                      worker fires under deferred indexing, timed and phased on
+//!                      its own; `--batch 1000 --defer-index --reindex` is the
+//!                      server's default path end to end
+//! * `--reindex-batch N` resources per rebuild transaction (default: the hook's)
+//! * `--bulk-index-rebuild` drop the value indexes for the rebuild and build them
+//!                      sorted at the end (`HFS_BULK_SUBMIT_BULK_INDEX_REBUILD`)
+//! * `--data-dir DIR`   directory holding `search-parameters-r4.json` (default: `./data`)
+//! * `--keep`           leave the database behind for inspection
+//! * `--no-fk`          `PRAGMA foreign_keys = OFF`, to price the index rows' parent check
+//! * `--no-phases`      collection off, to price the instrumentation itself
 
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -53,6 +62,15 @@ struct Args {
     /// Run with phase collection off — the rate an uninstrumented build
     /// achieves, and the way to price the instrumentation itself.
     no_phases: bool,
+    /// After the ingest, run the post-manifest reindex the submit worker
+    /// fires under `HFS_BULK_SUBMIT_DEFER_INDEXING`, timed and phased
+    /// separately. With `--defer-index` this is the server's default path
+    /// end to end.
+    reindex: bool,
+    /// Page size for `--reindex` (default: the hook's, `DEFERRED_REINDEX_BATCH_SIZE`).
+    reindex_batch: Option<u32>,
+    /// `--reindex` in bulk index rebuild mode (`HFS_BULK_SUBMIT_BULK_INDEX_REBUILD`).
+    bulk_index_rebuild: bool,
 }
 
 fn parse_args() -> Args {
@@ -66,6 +84,9 @@ fn parse_args() -> Args {
         keep: false,
         no_fk: false,
         no_phases: false,
+        reindex: false,
+        reindex_batch: None,
+        bulk_index_rebuild: false,
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -90,6 +111,16 @@ fn parse_args() -> Args {
             "--defer-index" => args.defer_index = true,
             "--no-fk" => args.no_fk = true,
             "--no-phases" => args.no_phases = true,
+            "--reindex" => args.reindex = true,
+            "--bulk-index-rebuild" => args.bulk_index_rebuild = true,
+            "--reindex-batch" => {
+                args.reindex_batch = Some(
+                    it.next()
+                        .expect("--reindex-batch needs a count")
+                        .parse()
+                        .expect("--reindex-batch must be a number"),
+                )
+            }
             "--keep" => args.keep = true,
             "--data-dir" => {
                 args.data_dir = PathBuf::from(it.next().expect("--data-dir needs a path"))
@@ -159,6 +190,15 @@ async fn main() {
     };
     let backend = SqliteBackend::with_config(&args.db, config).expect("open backend");
     backend.init_schema().expect("init schema");
+    let backend = std::sync::Arc::new(backend);
+    // Experiment hook: arbitrary SQL against the fresh schema before the
+    // ingest (drop an index, recreate a trigger, tune FTS5), so a schema
+    // idea can be priced without a build.
+    if let Ok(sql) = std::env::var("HFS_EXPERIMENT_SQL") {
+        let conn = rusqlite::Connection::open(&args.db).expect("open db");
+        conn.execute_batch(&sql).expect("HFS_EXPERIMENT_SQL");
+        println!("(experiment SQL applied: {})", sql.replace('\n', " "));
+    }
 
     let tenant = TenantContext::new(TenantId::new("bench"), TenantPermissions::full_access());
     let submission = SubmissionId::generate("bench-system");
@@ -254,6 +294,69 @@ async fn main() {
         );
     } else {
         print!("{}", perf::report(total_lines as u64, wall));
+    }
+
+    if args.reindex {
+        use helios_persistence::search::{ReindexOperation, ReindexRequest};
+        let mut types: Vec<String> = inputs.iter().map(|(t, _, _)| t.clone()).collect();
+        types.sort();
+        types.dedup();
+        let op = ReindexOperation::new(backend.clone(), backend.tenant_registries().clone());
+        // The same page the submit worker's hook (`ReindexOnFinish`) uses,
+        // so this stage measures what the server does after a manifest.
+        let request = ReindexRequest::for_types(types)
+            .with_batch_size(
+                args.reindex_batch
+                    .unwrap_or(helios_persistence::search::DEFERRED_REINDEX_BATCH_SIZE),
+            )
+            .with_bulk_index_rebuild(args.bulk_index_rebuild);
+        let page = request.batch_size;
+        perf::reset();
+        let started = Instant::now();
+        let job_id = op
+            .start(tenant.clone(), request, None)
+            .await
+            .expect("start reindex");
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            let progress = op
+                .get_progress(&job_id)
+                .await
+                .expect("reindex job vanished");
+            if progress.status.is_finished() {
+                assert!(
+                    progress.errors.is_empty(),
+                    "reindex reported {} errors, first: {:?}",
+                    progress.errors.len(),
+                    progress.errors.first()
+                );
+                break;
+            }
+        }
+        let reindex_wall = started.elapsed();
+        println!();
+        println!(
+            "reindexed {} resources in {:.2}s = {:.0} resources/s (page {}{})",
+            total_lines,
+            reindex_wall.as_secs_f64(),
+            total_lines as f64 / reindex_wall.as_secs_f64(),
+            page,
+            if args.bulk_index_rebuild {
+                ", bulk index rebuild"
+            } else {
+                ""
+            }
+        );
+        let total = wall + reindex_wall;
+        println!(
+            "ingest + reindex: {:.2}s = {:.0} resources/s end to end",
+            total.as_secs_f64(),
+            total_lines as f64 / total.as_secs_f64()
+        );
+        println!();
+        if !args.no_phases && perf::enabled() {
+            print!("{}", perf::report(total_lines as u64, reindex_wall));
+        }
     }
 
     // Row counts, so the write volume the phases describe is visible.
