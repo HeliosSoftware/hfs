@@ -12,6 +12,11 @@
 //! tools, so this runner introduces no new SQL-on-FHIR semantics. Resource
 //! access is abstracted behind [`ResourceScan`] so the runner is
 //! backend-agnostic.
+//!
+//! The chunk-processing loop runs in a `spawn_blocking` thread whose
+//! `JoinHandle` is watched by [`watch_row_producer`](crate::core::sof_runner::watch_row_producer)
+//! so a panic reaches the consumer as an `Err` item instead of a silent end
+//! of stream.
 
 use async_trait::async_trait;
 use helios_fhir::FhirVersion;
@@ -23,7 +28,9 @@ use serde_json::{Map, Value};
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::debug;
 
-use crate::core::sof_runner::{RowStream, SofError, SofRunner, ViewFilters, ViewRow};
+use crate::core::sof_runner::{
+    RowStream, SofError, SofRunner, ViewFilters, ViewRow, watch_row_producer,
+};
 use crate::sof::reference_resolver::{StorageReferenceResolver, collect_missing_references};
 use crate::tenant::TenantContext;
 
@@ -199,10 +206,11 @@ impl SofRunner for InProcessSofRunner {
         let limit = filters.limit;
         let version = self.fhir_version;
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<ViewRow, SofError>>(CHANNEL_BUFFER);
+        let guard_tx = tx.clone();
 
         // FHIRPath evaluation is CPU-bound (and `process_chunk` parallelises via
         // rayon), so run it off the async runtime.
-        tokio::task::spawn_blocking(move || {
+        let producer = tokio::task::spawn_blocking(move || {
             let columns = prepared.columns().to_vec();
             let total = resources.len();
             let mut emitted = 0usize;
@@ -255,6 +263,7 @@ impl SofRunner for InProcessSofRunner {
 
             debug!(rows = emitted, "in-process view run complete");
         });
+        watch_row_producer(self.runner_name(), guard_tx, producer);
 
         Ok(Box::pin(ReceiverStream::new(rx)))
     }

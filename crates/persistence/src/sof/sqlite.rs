@@ -9,7 +9,10 @@
 //! Rows are sent one-by-one through a bounded `tokio::sync::mpsc` channel
 //! (buffer: 256) so the HTTP layer can begin flushing to the client before the
 //! full result set is read.  The blocking SQLite iteration runs in a dedicated
-//! `spawn_blocking` thread so it never stalls the async runtime.
+//! `spawn_blocking` thread so it never stalls the async runtime. Its
+//! `JoinHandle` is watched by [`watch_row_producer`](crate::core::sof_runner::watch_row_producer)
+//! so a panic inside the blocking thread reaches the consumer as an `Err`
+//! item instead of a silent end of stream.
 
 use helios_fhir::FhirVersion;
 use r2d2::Pool;
@@ -19,7 +22,9 @@ use serde_json::{Map, Value};
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::debug;
 
-use crate::core::sof_runner::{RowStream, SofError, SofRunner, ViewFilters, ViewRow};
+use crate::core::sof_runner::{
+    RowStream, SofError, SofRunner, ViewFilters, ViewRow, watch_row_producer,
+};
 use crate::tenant::TenantContext;
 
 use super::compiler::{SqlDialect, compile_view_definition_dialect};
@@ -116,8 +121,9 @@ impl SofRunner for SqliteInDbRunner {
         );
 
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<ViewRow, SofError>>(CHANNEL_BUFFER);
+        let guard_tx = tx.clone();
 
-        tokio::task::spawn_blocking(move || {
+        let producer = tokio::task::spawn_blocking(move || {
             stream_sqlite_rows(
                 &pool,
                 &sql,
@@ -129,6 +135,7 @@ impl SofRunner for SqliteInDbRunner {
                 tx,
             );
         });
+        watch_row_producer(self.runner_name(), guard_tx, producer);
 
         Ok(Box::pin(ReceiverStream::new(rx)))
     }
