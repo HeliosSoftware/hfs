@@ -252,6 +252,13 @@ pub trait DashboardProvider: Send + Sync {
         types: &[String],
         include_empty: bool,
     ) -> DashboardSnapshot;
+
+    /// Whether a snapshot for `tenant` is computed in constant time right now (for example served
+    /// from in-memory counters rather than storage aggregates). The cache then keeps it only briefly
+    /// and waits for a recompute instead of serving a stale value (#1078). Defaults to `false`.
+    fn serves_in_constant_time(&self, _tenant: &str) -> bool {
+        false
+    }
 }
 
 static PROVIDER: RwLock<Option<Arc<dyn DashboardProvider>>> = RwLock::new(None);
@@ -311,23 +318,27 @@ static CACHE: std::sync::LazyLock<SnapCache> = std::sync::LazyLock::new(SnapCach
 /// How long a computed snapshot is served without recomputing.
 ///
 /// Applies to snapshots read from storage, whose computes can be expensive.
-/// An [approximate](DashboardSnapshot::approximate) snapshot — served from
-/// in-memory write counters, so it costs milliseconds to recompute — is only
-/// fresh for [`LIVE_TTL`] instead (#1078).
+/// An [approximate](DashboardSnapshot::approximate) snapshot, or any snapshot
+/// whose provider [serves it in constant
+/// time](DashboardProvider::serves_in_constant_time) — from in-memory write
+/// counters, so it costs milliseconds to recompute — is only fresh for
+/// [`LIVE_TTL`] instead (#1078).
 const CACHE_TTL: Duration = Duration::from_secs(15);
-/// How long an [approximate](DashboardSnapshot::approximate) snapshot is
-/// served without recomputing (#1078).
+/// How long a counter-backed snapshot — [approximate](DashboardSnapshot::approximate),
+/// or from a provider that [serves it in constant
+/// time](DashboardProvider::serves_in_constant_time) — is served without
+/// recomputing (#1078).
 ///
-/// Approximate snapshots come from in-memory write counters while an import
-/// runs, and the dashboard polls them every few seconds so the operator can
-/// watch the figures move. Held for the full [`CACHE_TTL`], every poll tick
-/// would show the previous tick's figures — up to ~20s behind. Their computes
-/// are O(1), so a short TTL costs nothing. Values that are not approximate
-/// keep [`CACHE_TTL`].
+/// Such snapshots come from in-memory write counters, and the dashboard polls
+/// them every few seconds so the operator can watch the figures move — and so
+/// a page that settled before an import started notices it. Held for the full
+/// [`CACHE_TTL`], every poll tick would show the previous tick's figures — up
+/// to ~25s behind. Their computes are O(1), so a short TTL costs nothing.
+/// Other values keep [`CACHE_TTL`].
 const LIVE_TTL: Duration = Duration::from_secs(2);
-/// How long a request that finds a stale
-/// [approximate](DashboardSnapshot::approximate) snapshot waits for the
-/// refresh it triggered before serving the stale value (#1078).
+/// How long a request that finds a stale counter-backed snapshot (see
+/// [`LIVE_TTL`]) waits for the refresh it triggered before serving the stale
+/// value (#1078).
 ///
 /// Stale-while-revalidate is right for storage-backed snapshots, but for
 /// counter-backed ones it means each request shows what the *previous*
@@ -398,8 +409,8 @@ const LATE_WRITE_FACTOR: u32 = 20;
 #[derive(Clone, Debug)]
 pub enum SnapshotState {
     /// A snapshot from the registered provider — fresh, the previous one while
-    /// a refresh runs (for an [approximate](DashboardSnapshot::approximate)
-    /// snapshot, only when the refresh does not land within [`LIVE_WAIT`]),
+    /// a refresh runs (for a counter-backed snapshot, see [`LIVE_TTL`], only
+    /// when the refresh does not land within [`LIVE_WAIT`]),
     /// or (for a window whose first compute has not landed
     /// yet) a sibling's figures with [`DashboardSnapshot::series_pending`]
     /// set. Check [`DashboardSnapshot::partial`],
@@ -455,10 +466,13 @@ pub async fn snapshot(
 /// S3 primary reads one object per resource — minutes once conformance seeding
 /// has populated the store, #326).
 ///
-/// [Approximate](DashboardSnapshot::approximate) snapshots take a fast path
-/// (#1078): they come from in-memory write counters, so recomputing them is
-/// O(1) while serving them stale would show each dashboard poll the previous
-/// poll's figures. They are fresh only for [`LIVE_TTL`], and a stale request
+/// [Approximate](DashboardSnapshot::approximate) snapshots, and every snapshot
+/// of a tenant the provider currently [serves in constant
+/// time](DashboardProvider::serves_in_constant_time) (exact or not), take a
+/// fast path (#1078): they come from in-memory write counters, so recomputing
+/// them is O(1) while serving them stale would show each dashboard poll the
+/// previous poll's figures — or, for a settled page, hide an import that has
+/// just started. They are fresh only for [`LIVE_TTL`], and a stale request
 /// waits up to [`LIVE_WAIT`] for its refresh to land — serving the stale value
 /// only if it does not. Single-flight and the other refresh rules are the
 /// same for both kinds.
@@ -526,6 +540,9 @@ async fn snapshot_via(
     // (providers cap them), so the joined key stays small and the cache stays
     // bounded by user behavior.
     let key: CacheKey = (window, tenant.to_string(), types.join(","), include_empty);
+    // Asked before taking the cache lock, so the provider's own bookkeeping
+    // (its counters' lock) is never nested inside it.
+    let constant_time = provider.serves_in_constant_time(tenant);
     // One pass under the lock: serve fresh hits, note staleness, and claim the
     // compute slot if nobody holds it.
     let (cached, claimed) = {
@@ -538,7 +555,7 @@ async fn snapshot_via(
         if let Some(value) = &entry.value {
             // Counter-backed figures are cheap to recompute and watched live,
             // so they go stale much sooner than storage reads (#1078).
-            let fresh_for = if value.snapshot.approximate {
+            let fresh_for = if value.snapshot.approximate || constant_time {
                 ttl.min(live_ttl)
             } else {
                 ttl
@@ -579,7 +596,7 @@ async fn snapshot_via(
     if let Some((stale_written_at, stale)) = cached {
         // Stale beats absent: a storage-backed value is served now, and the
         // refresh lands for the next load.
-        if !stale.approximate {
+        if !(stale.approximate || constant_time) {
             return SnapshotState::Ready(stale);
         }
         // A counter-backed refresh takes milliseconds: give it a short beat so
@@ -1445,11 +1462,13 @@ mod tests {
 
     /// Like [`Scripted`] — the n-th compute answers `n` after `delays[n - 1]`
     /// — with every snapshot's `approximate` flag fixed, standing in for a
-    /// counter-backed provider (`true`) or a storage read (`false`).
+    /// counter-backed provider (`true`) or a storage read (`false`), and
+    /// [`DashboardProvider::serves_in_constant_time`] fixed too.
     struct Counters {
         hits: AtomicUsize,
         delays: Vec<Duration>,
         approximate: bool,
+        constant_time: bool,
     }
 
     impl Counters {
@@ -1458,6 +1477,18 @@ mod tests {
                 hits: AtomicUsize::new(0),
                 delays: delays.to_vec(),
                 approximate,
+                constant_time: false,
+            })
+        }
+
+        /// A seeded counter-backed provider: exact snapshots, served in
+        /// constant time.
+        fn exact_in_constant_time(delays: &[Duration]) -> Arc<Self> {
+            Arc::new(Counters {
+                hits: AtomicUsize::new(0),
+                delays: delays.to_vec(),
+                approximate: false,
+                constant_time: true,
             })
         }
 
@@ -1487,6 +1518,10 @@ mod tests {
                 approximate: self.approximate,
                 ..DashboardSnapshot::default()
             }
+        }
+
+        fn serves_in_constant_time(&self, _tenant: &str) -> bool {
+            self.constant_time
         }
     }
 
@@ -1530,7 +1565,49 @@ mod tests {
         assert_eq!(provider.hits(), 2);
     }
 
+    /// #1078: a settled page polls exact figures, and an import starting must
+    /// show on the next poll. An exact value from a provider that serves the
+    /// tenant in constant time takes the same fast path as an approximate one:
+    /// recomputed past the live TTL, with the request seeing the new figures.
+    #[tokio::test]
+    async fn an_exact_value_served_in_constant_time_is_recomputed_after_the_live_ttl() {
+        let cache = SnapCache::default();
+        let provider = Counters::exact_in_constant_time(&[]);
+        let timings = Timings {
+            ttl: Duration::from_secs(60),
+            cold: Duration::from_millis(800),
+            compute: TEST_COMPUTE_TIMEOUT,
+            live_ttl: Duration::from_millis(100),
+            live_wait: Duration::from_millis(500),
+        };
+
+        let first = read(&cache, provider.clone(), DashboardWindow::LastHour, timings)
+            .await
+            .ready()
+            .expect("cold load");
+        assert_eq!(first.total_resources, 1);
+        assert!(!first.approximate);
+        let fresh = read(&cache, provider.clone(), DashboardWindow::LastHour, timings)
+            .await
+            .ready()
+            .expect("fresh hit");
+        assert_eq!(fresh.total_resources, 1, "inside the live TTL: cached");
+        assert_eq!(provider.hits(), 1);
+
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let live = read(&cache, provider.clone(), DashboardWindow::LastHour, timings)
+            .await
+            .ready()
+            .expect("refreshed");
+        assert_eq!(
+            live.total_resources, 2,
+            "the refresh this request triggered, not the stale exact value"
+        );
+        assert_eq!(provider.hits(), 2);
+    }
+
     /// The live TTL is for counter-backed figures only: a storage-backed value
+    /// (not approximate, and not served in constant time — the trait default)
     /// of the same age is still inside its TTL and served without a recompute.
     #[tokio::test]
     async fn a_non_approximate_value_keeps_the_full_ttl() {

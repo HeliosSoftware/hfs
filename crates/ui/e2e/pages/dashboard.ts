@@ -17,10 +17,9 @@ export type DashNotice =
 
 /** What the server sent for one hard navigation, read from the response body
  * itself rather than the live DOM. `#dash-live` re-requests itself through
- * htmx — a waiting page after a short delay, a ready page with approximate
- * figures on a periodic poll — so by the time the DOM is inspected the first
- * render may already have been swapped for a newer one; the body cannot have
- * been. */
+ * htmx — a waiting page after a short delay, every ready page on a periodic
+ * poll — so by the time the DOM is inspected the first render may already
+ * have been swapped for a newer one; the body cannot have been. */
 export interface FirstRender {
   /** `data-dash-notice` slugs, in document order. */
   notices: string[];
@@ -31,10 +30,18 @@ export interface FirstRender {
   /** Whether `#dash-live` carried the bounded htmx auto-retry of a waiting
    * page (`hx-get` without `data-dash-refresh`). */
   autoRetry: boolean;
-  /** Whether `#dash-live` carried the periodic self-refresh of a ready page
-   * whose figures are approximate or an import is running (#1078,
-   * `data-dash-refresh`, every 5s). Never set together with {@link autoRetry}. */
+  /** Whether `#dash-live` carried the periodic self-refresh every ready page
+   * schedules (#1078, `data-dash-refresh`): every 5s while the figures are
+   * moving, every 10s once they settle. Never set together with
+   * {@link autoRetry}. */
   liveRefresh: boolean;
+  /** Whether that refresh was marked `data-dash-moving`: the figures are
+   * approximate or an import is running. Only ever set with
+   * {@link liveRefresh}. */
+  moving: boolean;
+  /** The refresh's `data-dash-state` digest of the figures, or `null` when
+   * the render carries no refresh. */
+  state: string | null;
   /** Stat-grid values rendered as the unavailable "—". */
   unavailableCards: number;
 }
@@ -100,18 +107,30 @@ export class DashboardPage {
     return this.page.locator("#dash-live");
   }
   /** `#dash-live` while a waiting page still has its bounded htmx auto-retry
-   * scheduled. A ready page's periodic self-refresh also rides on `hx-get`
-   * but carries `data-dash-refresh`, so it never matches here. */
+   * scheduled. Every ready page's periodic self-refresh also rides on
+   * `hx-get` but carries `data-dash-refresh`, so it never matches here. */
   get pendingAutoRetry(): Locator {
     return this.page.locator("#dash-live[hx-get]:not([data-dash-refresh])");
   }
-  /** `#dash-live` while a ready page polls itself every 5s because its
-   * figures are approximate or an import is running (#1078). The tick only
-   * stands down while the tab is hidden, a picker fetch is in flight, or
-   * keyboard focus sits inside the region outside the type picker; an open
-   * picker or data table, the tooltip and a mouse click do not stop it. */
+  /** `#dash-live` on any ready page: it polls itself (#1078) — every 5s
+   * while the figures are moving ({@link movingRefresh}), every 10s once they
+   * settle ({@link settledRefresh}). The tick only stands down while the tab
+   * is hidden, a picker fetch is in flight, or keyboard focus sits inside the
+   * region outside the type picker; an open picker or data table, the tooltip
+   * and a mouse click do not stop it. */
   get liveRefresh(): Locator {
     return this.page.locator("#dash-live[data-dash-refresh]");
+  }
+  /** `#dash-live` while its figures are approximate or an import is running
+   * (`data-dash-moving`, 5s poll). */
+  get movingRefresh(): Locator {
+    return this.page.locator("#dash-live[data-dash-moving]");
+  }
+  /** `#dash-live` on a ready page whose figures have settled: still polling
+   * (10s), so a later write reaches it, but a tick whose `data-dash-state`
+   * did not change is dropped by assets/dashboard.js instead of swapped. */
+  get settledRefresh(): Locator {
+    return this.page.locator("#dash-live[data-dash-refresh]:not([data-dash-moving])");
   }
   /** Marks the `#dash-live` node on screen. A refresh swaps the region's
    * outerHTML, so the mark is gone once one has landed — see
@@ -262,6 +281,8 @@ export function parseFirstRender(html: string): FirstRender {
     chartEmpty: html.includes('class="chart-empty"'),
     autoRetry: polls && !liveRefresh,
     liveRefresh,
+    moving: liveRefresh && liveOpen.includes("data-dash-moving"),
+    state: liveRefresh ? (/data-dash-state="([^"]*)"/.exec(liveOpen)?.[1] ?? null) : null,
     unavailableCards: (statGrid.match(/stat__value--unavailable/g) ?? []).length,
   };
 }

@@ -22,9 +22,13 @@
 //!   [`IMPORT_IDLE_TENANT`]), and with its own distinctive figures under
 //!   [`WARM_SIBLING_TENANT`].
 //!
-//! A waiting page retries a bounded number of times; a ready page polls
-//! itself every 10 seconds only while its figures can still move — they are
-//! approximate, or an import is running — and never otherwise.
+//! A waiting page retries a bounded number of times and never polls. A ready
+//! page always watches itself: every 5 seconds, marked moving, while its
+//! figures can still move — they are approximate, or an import is running —
+//! and every 10 seconds otherwise, so a tab opened on settled figures still
+//! notices an import started later. Each ready render carries a state hash of
+//! its figures (never of its "as of" time), so the client can tell a refresh
+//! that changed something from one that did not.
 //!
 //! The snapshot cache is process-global too, so the cases are kept apart:
 //!
@@ -193,31 +197,77 @@ fn notice_tag<'a>(html: &'a str, slug: &str) -> &'a str {
     &html[start..=end]
 }
 
-/// Asserts the page polls itself as a ready page does: every 10 seconds,
-/// swapping only the live region, from the same view without a retry count.
-fn assert_polls_periodically(html: &str, window: &str) {
+/// The value of attribute `name` in an opening tag, if the tag carries it.
+fn attr<'a>(tag: &'a str, name: &str) -> Option<&'a str> {
+    let needle = format!(r#" {name}=""#);
+    let at = tag.find(&needle)? + needle.len();
+    let value = &tag[at..];
+    Some(&value[..value.find('"').expect("the attribute value closes")])
+}
+
+/// The live region's figure-state hash, asserted to be 16 lowercase hex chars.
+fn dash_state(html: &str) -> String {
     let tag = dash_live_tag(html);
-    assert!(tag.contains(r#"data-dash-refresh="5""#), "{tag}");
-    assert!(tag.contains("every 5s"), "{tag}");
+    let state = attr(tag, "data-dash-state").unwrap_or_else(|| panic!("a state hash: {tag}"));
+    assert_eq!(state.len(), 16, "{tag}");
+    assert!(
+        state
+            .chars()
+            .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)),
+        "lowercase hex: {tag}"
+    );
+    state.to_string()
+}
+
+/// Asserts what every ready page's periodic refresh shares, whatever its
+/// cadence: it runs every `seconds` behind the client's guard, swaps only the
+/// live region, re-requests the same view without a retry count, carries a
+/// state hash of its figures, and does not also run the bounded retry.
+fn assert_refreshes_every(html: &str, window: &str, seconds: u32) {
+    let tag = dash_live_tag(html);
+    assert_eq!(
+        attr(tag, "data-dash-refresh"),
+        Some(seconds.to_string().as_str()),
+        "{tag}"
+    );
+    assert!(tag.contains(&format!("every {seconds}s")), "{tag}");
     assert!(tag.contains("hx-select=\"#dash-live\""), "{tag}");
-    let href_at = tag
-        .find(r#"hx-get=""#)
-        .expect("the refresh re-requests the page");
-    let href = &tag[href_at + r#"hx-get=""#.len()..];
-    let href = &href[..href.find('"').unwrap()];
+    let href = attr(tag, "hx-get").expect("the refresh re-requests the page");
     assert!(href.starts_with("/ui?"), "{href}");
     assert!(href.contains(&format!("window={window}")), "{href}");
     assert!(!href.contains("retry="), "a refresh is not a retry: {href}");
+    dash_state(html);
     assert!(
         !html.contains("hx-trigger=\"load"),
         "a ready page does not also run the bounded retry"
     );
+    assert!(!html.contains("load delay"), "nor any delayed load");
 }
 
-/// Asserts nothing on the page polls periodically.
+/// Asserts the page polls itself as a ready page with moving figures does:
+/// every 5 seconds, marked moving.
+fn assert_polls_periodically(html: &str, window: &str) {
+    assert_refreshes_every(html, window, 5);
+    let tag = dash_live_tag(html);
+    assert_eq!(attr(tag, "data-dash-moving"), Some("1"), "{tag}");
+    assert!(!html.contains("every 10s"), "one cadence at a time");
+}
+
+/// Asserts the page watches settled figures as a ready page does: every 10
+/// seconds, not marked moving, so an import started later is still noticed.
+fn assert_watches_settled(html: &str, window: &str) {
+    assert_refreshes_every(html, window, 10);
+    let tag = dash_live_tag(html);
+    assert!(!tag.contains("data-dash-moving"), "{tag}");
+    assert!(!html.contains("every 5s"), "one cadence at a time");
+}
+
+/// Asserts nothing on the page refreshes periodically, at either cadence.
 fn assert_no_periodic_refresh(html: &str) {
     assert!(!html.contains("data-dash-refresh"));
+    assert!(!html.contains("data-dash-moving"));
     assert!(!html.contains("every 5s"));
+    assert!(!html.contains("every 10s"));
 }
 
 /// The regression itself: a window whose snapshot has not landed says it is
@@ -452,16 +502,51 @@ async fn an_exact_snapshot_with_an_active_import_refreshes_periodically() {
     assert_polls_periodically(&html, "30d");
 }
 
-/// An exact snapshot that reports zero running imports is settled: nothing
-/// polls.
+/// An exact snapshot that reports zero running imports is settled, but the
+/// page still watches it — slowly, and not marked moving — so a tab opened
+/// now notices an import started later.
 #[tokio::test]
-async fn an_exact_snapshot_with_no_active_import_does_not_poll() {
+async fn an_exact_snapshot_with_no_active_import_watches_slowly() {
     let html = get_as(IMPORT_IDLE_TENANT, "/ui?window=30d").await;
 
     assert!(html.contains("chart-data"), "the chart renders");
     assert!(html.contains(r#"data-dash-notice="live""#));
     assert!(!html.contains("hx-trigger=\"load"));
-    assert_no_periodic_refresh(&html);
+    assert_watches_settled(&html, "30d");
+}
+
+/// The state hash follows the figures, not the moment they were rendered:
+/// the same view asked for twice carries the same state.
+#[tokio::test]
+async fn the_same_figures_rendered_twice_carry_the_same_state() {
+    let uri = "/ui?types=Patient&window=30d";
+    let first = get_as(IMPORT_IDLE_TENANT, uri).await;
+    let second = get_as(IMPORT_IDLE_TENANT, uri).await;
+    let third = get_as(IMPORT_IDLE_TENANT, uri).await;
+
+    for html in [&first, &second, &third] {
+        assert_watches_settled(html, "30d");
+    }
+    // The server folds the current minute into the digest so a settled page
+    // still re-renders about once a minute; three back-to-back renders cross
+    // at most one minute boundary, so at least one consecutive pair agrees.
+    let (a, b, c) = (dash_state(&first), dash_state(&second), dash_state(&third));
+    assert!(a == b || b == c, "{a} {b} {c}");
+}
+
+/// Different figures carry a different state: two tenants whose providers
+/// answer the same view with different totals never share a hash.
+#[tokio::test]
+async fn different_figures_carry_a_different_state() {
+    let idle = get_as(IMPORT_IDLE_TENANT, "/ui?types=Patient&window=30d").await;
+    let sibling = get_as(WARM_SIBLING_TENANT, "/ui?types=Patient&window=30d").await;
+
+    // Both settled and ready, so only the figures differ.
+    assert_watches_settled(&idle, "30d");
+    assert_watches_settled(&sibling, "30d");
+    assert!(sibling.contains(r#"<span class="stat__value">777</span>"#));
+    assert!(!idle.contains(r#"<span class="stat__value">777</span>"#));
+    assert_ne!(dash_state(&idle), dash_state(&sibling));
 }
 
 /// A periodic swap must not re-announce a notice the user already heard:
@@ -498,6 +583,9 @@ async fn a_partial_snapshot_says_so() {
     // Unlike the waiting page, the figures it does have are shown.
     assert!(html.contains("chart-data"));
     assert!(html.contains(r#"<time datetime=""#), "and dated");
+    // Nothing is waiting and nothing is approximate or importing: a ready
+    // page, watched at the settled cadence.
+    assert_watches_settled(&html, "24h");
 }
 
 /// A complete snapshot carries no warning at all — the states above must not
@@ -516,6 +604,7 @@ async fn a_complete_snapshot_carries_only_its_as_of_time() {
     assert!(html.contains(r#"<time datetime=""#));
     assert!(!html.contains("hx-trigger=\"load"));
     assert!(html.contains("chart-data"), "the chart renders");
-    // Exact, complete, and no import reported: nothing moves, nothing polls.
-    assert_no_periodic_refresh(&html);
+    // Exact, complete, and no import reported: nothing moves right now, but
+    // the page still watches, slowly, for figures that start moving later.
+    assert_watches_settled(&html, "30d");
 }

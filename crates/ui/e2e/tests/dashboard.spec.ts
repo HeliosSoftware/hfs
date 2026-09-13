@@ -257,10 +257,10 @@ test("the chart's numbers are readable as a table", async ({ dashboard }) => {
 //
 // These tests never reload and never lean on waitForSeries: they read the
 // server's own response for each view (DashboardPage.gotoFirstRender, or the
-// response a click produced), because the waiting page's htmx auto-retry — or,
-// on a ready page with approximate figures, the periodic refresh (see the
-// "live refresh" describe below) — would otherwise swap the first render for a
-// newer one before the DOM is looked at. Each view uses a selection no other test in the suite requests
+// response a click produced), because the waiting page's htmx auto-retry — or
+// the periodic refresh every ready page schedules (see the "live refresh"
+// describe below) — would otherwise swap the first render for a newer one
+// before the DOM is looked at. Each view uses a selection no other test in the suite requests
 // (Substance and Specimen are seeded only here), so its snapshot cache key is
 // cold. The selection is part of that key in the order it was requested, so a
 // CI retry rotates the order (`coldSelection`) and meets a cold key again
@@ -304,6 +304,8 @@ test.describe("first view of a window (#1078)", () => {
       expect(render.notices).not.toContain("series-pending");
       expect(render.notices).not.toContain("sample");
       expect(render.autoRetry, "a ready page schedules no auto-retry").toBe(false);
+      expect(render.liveRefresh, "every ready page polls itself").toBe(true);
+      expect(render.state, "the refresh carries a digest of the figures").toMatch(/^[0-9a-f]{16}$/);
       expect(render.chartEmpty, "the chart area is not waiting").toBe(false);
       expect(render.series).toBeGreaterThanOrEqual(1);
       expect(render.unavailableCards).toBe(0);
@@ -349,10 +351,10 @@ test.describe("first view of a window (#1078)", () => {
     // overwrite that swap with the previous selection (a known race, out of
     // scope here), so let that retry settle first — it is not a reload loop,
     // and a ready render has none to settle. A ready page's periodic refresh
-    // (`data-dash-refresh`) is deliberately not waited on: it may poll for as
-    // long as the figures stay approximate, it follows the picker's URL, it
-    // stands down while a picker fetch is in flight, and it keeps the open
-    // picker's own node (covered below).
+    // (`data-dash-refresh`) is deliberately not waited on: every ready page
+    // polls for as long as it is open, it follows the picker's URL, it stands
+    // down while a picker fetch is in flight, and it keeps the open picker's
+    // own node (covered below).
     await expect(dashboard.pendingAutoRetry).toHaveCount(0, { timeout: 15_000 });
     await dashboard.openPicker();
     const option = dashboard.pickerOption("Encounter");
@@ -409,10 +411,14 @@ test.describe("first view of a window (#1078)", () => {
   });
 });
 
-// #1078 follow-up: a ready dashboard whose figures are approximate (counted
-// from recent writes, not yet reconciled with storage) — or with an import
-// running — re-requests its own #dash-live region every 5s, so an operator
-// watching an import sees the figures rise without reloading. The poll follows
+// #1078 follow-up: every ready dashboard re-requests its own #dash-live region —
+// every 5s while its figures are moving (approximate: counted from recent
+// writes, not yet reconciled with storage; or an import running), marked
+// `data-dash-moving`, and every 10s once they settle — so an operator watching
+// an import sees the figures rise without reloading, and a tab opened before
+// the import started notices it too. While both the region on screen and the
+// response are settled with the same `data-dash-state`, the response is
+// dropped: an idle page is not re-rendered under the user. The poll follows
 // the URL the picker pushed and drops a response whose URL went stale. It
 // stands down only while the tab is hidden, a picker fetch is in flight, or
 // keyboard focus sits inside the region outside the type picker: an open type
@@ -421,21 +427,30 @@ test.describe("first view of a window (#1078)", () => {
 // mouse click all let the refresh through, since figures that froze until the
 // user moved or closed something were the bug.
 //
-// Timing: an approximate snapshot is cached for at most 2s and a refresh waits
-// up to 500ms for the fresh value, so a write reaches an open page on the next
-// 5s tick. The e2e server also reconciles every 30s; once a reconcile makes the
-// figures exact the swapped-in region stops polling. Each test therefore writes
-// right after its first view (so it opens approximate, and the writes land
-// before a reconcile can quiet the page) and only relies on the poll the region
-// on screen scheduled. Device, Location and Medication are seeded only here,
-// and every test views a selection no other test (or retry, see coldSelection)
-// requests.
-test.describe("live refresh while figures are approximate (#1078)", () => {
+// Timing: a seeded tenant's snapshot is cached for at most 2s and a refresh
+// waits up to 500ms for the fresh value, so a write reaches an open page on the
+// next tick (5s moving, 10s settled). The e2e server also reconciles every 30s;
+// once a reconcile makes the figures exact the swapped-in region slows to the
+// settled tick. Each test therefore writes after marking the region, so the
+// figures it waits for always differ from the ones on screen and the response
+// is swapped, never dropped. Device, Location and Medication are seeded only
+// here, and every test views a selection no other test (or retry, see
+// coldSelection) requests.
+test.describe("live refresh (#1078)", () => {
   test.skip(noChartData, "no count read path on this backend");
 
-  /** How long new figures may take to land on an open page: one 5s tick plus
-   * the ≤2s cache, with headroom for a machine busy running the suite. */
+  /** How long new figures may take to land on an open page: one 10s settled
+   * tick plus the ≤2s cache, with headroom for a machine busy running the
+   * suite. */
   const FIGURES_LAND_MS = 30_000;
+
+  /** How long a quiet default tenant may take to settle: a 30s reconcile pass
+   * that begins after the last write (the beforeEach seeding) must run, and
+   * the page's own 5s poll must then bring the exact figures in. */
+  const SETTLE_MS = 90_000;
+
+  /** The settled refresh interval, in seconds (`data-dash-refresh`). */
+  const SETTLED_SECS = 10;
 
   test.beforeEach(async ({ request }) => {
     await createResource(request, "Device", { status: "active" });
@@ -480,8 +495,44 @@ test.describe("live refresh while figures are approximate (#1078)", () => {
     expect(render.notices, "a ready page").not.toContain("series-pending");
     expect(render.notices, "figures written moments ago are not reconciled yet").toContain("approximate");
     expect(render.liveRefresh, "an approximate ready page polls itself").toBe(true);
+    expect(render.moving, "approximate figures are moving").toBe(true);
     expect(render.autoRetry, "never the waiting page's bounded retry").toBe(false);
     await expect(dashboard.liveRefresh).toHaveCount(1);
+  }
+
+  /** Opens `/ui{query}` and waits — without reloading — until the page's own
+   * poll has brought in settled figures: a `data-dash-refresh` region with no
+   * `data-dash-moving`, and a plain `live` first notice. */
+  async function waitSettled(dashboard: DashboardPage, query: string): Promise<void> {
+    await dashboard.goto(query);
+    await expect
+      .poll(
+        async () =>
+          (await dashboard.settledRefresh.count()) === 1 &&
+          (await dashboard.pendingAutoRetry.count()) === 0 &&
+          (await dashboard.noticeKinds())[0] === "live",
+        { message: "the quiet tenant's figures settle (a reconcile runs every 30s)", timeout: SETTLE_MS, intervals: [1000] },
+      )
+      .toBe(true);
+  }
+
+  /** Every refresh request (`/ui?…&notices=…`, htmx's own GET) the page sends
+   * from now on, with the response's own `data-dash-state` and whether it was
+   * moving once it arrives. */
+  function recordRefreshResponses(page: Page): { url: URL; response: Promise<FirstRender | null> }[] {
+    const seen: { url: URL; response: Promise<FirstRender | null> }[] = [];
+    page.on("request", (r) => {
+      const url = new URL(r.url());
+      if (url.pathname !== "/ui" || !url.searchParams.has("notices") || r.headers()["hx-request"] !== "true") return;
+      seen.push({
+        url,
+        response: r
+          .response()
+          .then(async (res) => (res ? parseFirstRender(await res.text()) : null))
+          .catch(() => null),
+      });
+    });
+    return seen;
   }
 
   const BODIES = {
@@ -534,6 +585,7 @@ test.describe("live refresh while figures are approximate (#1078)", () => {
     await openLive(dashboard, "Device", "Location");
     await expect(dashboard.live).toHaveAttribute("hx-trigger", /every 5s/);
     await expect(dashboard.live).toHaveAttribute("data-dash-refresh", "5");
+    await expect(dashboard.movingRefresh).toHaveCount(1);
 
     const url = page.url();
     const navigations = recordNavigations(page);
@@ -700,7 +752,7 @@ test.describe("live refresh while figures are approximate (#1078)", () => {
     await expect(page).not.toHaveURL(/focus=/);
   });
 
-  test("a refresh follows the picker's URL", async ({ page, dashboard }) => {
+  test("a refresh follows the picker's URL", async ({ page, request, dashboard }) => {
     test.setTimeout(120_000);
     const render = await dashboard.gotoFirstRender(`?types=${coldSelection("Medication", "Device")}&window=1h`);
     expect(render.liveRefresh, "an approximate ready page polls itself").toBe(true);
@@ -728,10 +780,12 @@ test.describe("live refresh while figures are approximate (#1078)", () => {
     await expect(dashboard.picker).not.toHaveAttribute("open", "");
 
     // Mark the region on screen; the refresh's outerHTML swap replaces it
-    // with a node that has no such mark. This is the region the first render
-    // scheduled the poll on, so it fires even if the swapped-in one is exact
-    // and polls no further — no as-of comparison needed.
+    // with a node that has no such mark. A write right after the mark makes
+    // sure the next refresh brings different figures: a region that settled
+    // in the meantime would otherwise drop an unchanged settled response and
+    // keep the mark.
     await dashboard.markLive();
+    await createResource(request, "Medication", { code: { text: "live refresh (#1078)" } });
     await expect(dashboard.unrefreshedLive, "the next refresh swaps the region").toHaveCount(0, {
       timeout: FIGURES_LAND_MS,
     });
@@ -772,5 +826,128 @@ test.describe("live refresh while figures are approximate (#1078)", () => {
     for (const line of again) {
       expect(line.ariaLive, `${line.kind} after notices=${quiet}`).toBe(quiet.includes(line.kind) ? "off" : "polite");
     }
+  });
+
+  // The user's bug: a Home tab opened before an import started was rendered
+  // with settled, exact figures, carried no poll, and never moved. Settled
+  // pages now poll every 10s. Driven on the default tenant: the UI's tenant is
+  // the user's stored choice of a provisioned tenant, and provisioning one
+  // seeds ~1.4k conformance resources (see dashboard-tenants.spec.ts) — far
+  // too slow for this file. Tests run one at a time on the shared server, so
+  // the default tenant is quiet once this test's own beforeEach writes have
+  // been reconciled.
+  test("a tab opened while figures are settled starts refreshing when writes arrive", async ({
+    page,
+    request,
+    dashboard,
+  }) => {
+    test.setTimeout(240_000);
+    const query = `?types=${coldSelection("Device", "Location")}&window=1h`;
+    await waitSettled(dashboard, query);
+
+    // Now open the tab the way the user did, on figures that are already
+    // settled: the first render polls, slowly, and is not moving.
+    const render = await dashboard.gotoFirstRender(query);
+    expect(render.notices[0], "exact figures").toBe("live");
+    expect(render.notices, "exact figures").not.toContain("approximate");
+    expect(render.autoRetry, "never the waiting page's bounded retry").toBe(false);
+    expect(render.liveRefresh, "a settled page still polls itself").toBe(true);
+    expect(render.moving, "settled figures are not moving").toBe(false);
+    expect(render.state).toMatch(/^[0-9a-f]{16}$/);
+    await expect(dashboard.settledRefresh).toHaveCount(1);
+    await expect(dashboard.live).toHaveAttribute("hx-trigger", new RegExp(`every ${SETTLED_SECS}s`));
+    await expect(dashboard.live).toHaveAttribute("data-dash-refresh", String(SETTLED_SECS));
+
+    const url = page.url();
+    const navigations = recordNavigations(page);
+    const refreshes = recordRefreshes(page);
+    await page.evaluate(() => {
+      (window as unknown as { __e2eNoReload: boolean }).__e2eNoReload = true;
+    });
+    await dashboard.markLive();
+    const deviceBefore = await dashboard.legendTotal("Device");
+    expect(deviceBefore, "Device is charted").not.toBeNull();
+
+    // The import starts after the tab was opened.
+    const added = 25;
+    await write(request, "Device", added);
+
+    await expect
+      .poll(
+        async () => {
+          if ((await dashboard.unrefreshedLive.count()) > 0) return false;
+          if ((await dashboard.movingRefresh.count()) > 0) return true;
+          const device = await dashboard.legendTotal("Device");
+          return device !== null && device >= (deviceBefore ?? 0) + added;
+        },
+        { message: "the settled tab picks the writes up on its own poll", timeout: FIGURES_LAND_MS, intervals: [500] },
+      )
+      .toBe(true);
+    await expect
+      .poll(async () => ((await dashboard.legendTotal("Device")) ?? 0) >= (deviceBefore ?? 0) + added, {
+        message: "Device rises by the writes",
+        timeout: FIGURES_LAND_MS,
+        intervals: [500],
+      })
+      .toBe(true);
+
+    expect(page.url()).toBe(url);
+    expect(navigations, "no navigation, reload included").toEqual([]);
+    expect(await page.evaluate(() => (window as unknown as { __e2eNoReload?: boolean }).__e2eNoReload)).toBe(true);
+    expect(refreshes.length, "the figures arrived through the periodic refresh").toBeGreaterThan(0);
+  });
+
+  // The other half of the contract: watching a quiet page costs a request per
+  // tick, never a re-render. The digest includes the current UTC minute (the
+  // 1h chart's buckets roll every minute), so a settled page is legitimately
+  // swapped once a minute; the observation below is placed inside one minute.
+  test("a settled page is not re-rendered when nothing changed", async ({ page, dashboard }) => {
+    test.setTimeout(240_000);
+    const query = `?types=${coldSelection("Location", "Medication")}&window=1h`;
+    await waitSettled(dashboard, query);
+
+    const OBSERVE_MS = 2 * SETTLED_SECS * 1000 + 2_000;
+    const isRefresh = (r: { url(): string; headers(): Record<string, string> }) => {
+      const url = new URL(r.url());
+      return url.pathname === "/ui" && url.searchParams.has("notices") && r.headers()["hx-request"] === "true";
+    };
+    // Start early enough in a UTC minute that one tick lands, and the whole
+    // observation ends, before the minute rolls over.
+    let aligned = false;
+    for (let attempt = 0; attempt < 3 && !aligned; attempt++) {
+      const second = new Date().getUTCSeconds();
+      if (second < 1 || second > 15) await page.waitForTimeout(((61 - second) % 60) * 1000 + 500);
+      // Let one tick of this minute land (swapped or dropped), so the region
+      // on screen already carries this minute's digest.
+      await page.waitForResponse((r) => isRefresh(r.request()), { timeout: 15_000 });
+      await page.waitForTimeout(500);
+      aligned = new Date().getUTCSeconds() * 1000 + OBSERVE_MS < 55_000;
+    }
+    expect(aligned, "an observation window inside one UTC minute").toBe(true);
+
+    await dashboard.markLive();
+    const stateOnScreen = await dashboard.live.getAttribute("data-dash-state");
+    const movingOnScreen = (await dashboard.movingRefresh.count()) > 0;
+    const refreshes = recordRefreshResponses(page);
+    const navigations = recordNavigations(page);
+    await page.waitForTimeout(OBSERVE_MS);
+
+    expect(refreshes.length, "the settled page kept polling").toBeGreaterThanOrEqual(2);
+    const responses = await Promise.all(refreshes.map((r) => r.response));
+    // Anything else writing to the default tenant (another spec's leftover
+    // import job, a write from a concurrent run against a shared server)
+    // legitimately moves the figures; the no-re-render contract only holds
+    // for a quiet page, so stand down rather than assert on moving figures.
+    test.skip(
+      movingOnScreen || responses.some((r) => r?.moving),
+      "the default tenant's figures moved during the observation window",
+    );
+    for (const render of responses) {
+      expect(render, "each refresh was answered with a ready region").not.toBeNull();
+      expect(render?.state, "a quiet page answers with the same digest").toBe(stateOnScreen);
+    }
+    await expect(dashboard.unrefreshedLive, "no response was swapped in").toHaveCount(1);
+    await expect(dashboard.settledRefresh).toHaveCount(1);
+    expect(navigations, "no navigation, reload included").toEqual([]);
   });
 });

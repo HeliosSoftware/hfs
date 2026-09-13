@@ -878,6 +878,13 @@ struct IndexPage {
     refresh_href: Option<String>,
     /// Seconds between two [`Self::refresh_href`] polls.
     refresh_secs: u32,
+    /// Whether the figures are still moving — approximate, or an import is
+    /// running — which is what the fast poll follows; settled figures are only
+    /// watched (#1078).
+    refresh_moving: bool,
+    /// A digest of the figures this render shows (see [`dash_state`]). A watch
+    /// tick that brings back the same digest is not swapped in.
+    refresh_state: String,
     /// Notice kinds (slugs) the requesting page already shows, sent by a
     /// periodic refresh. Their lines render with `aria-live="off"`, so a
     /// swap every few seconds does not re-announce an unchanged notice; a
@@ -7600,6 +7607,66 @@ const DASH_PENDING_RETRIES: u32 = 3;
 /// visibly climbing during an import.
 const DASH_LIVE_REFRESH_SECS: u32 = 5;
 
+/// Seconds between two watch ticks of a dashboard whose figures are settled
+/// (#1078): exact, and no import running.
+///
+/// Without it a tab opened before an import starts never learns the import
+/// began — the page it was given has nothing moving to follow. Ten seconds
+/// notices an import soon after it starts; a tick whose figures did not change
+/// is not swapped in (see [`dash_state`]), so a quiet page stays still.
+const DASH_IDLE_REFRESH_SECS: u32 = 10;
+
+/// A short digest of the figures a dashboard render shows, carried on
+/// `#dash-live` as `data-dash-state` (#1078).
+///
+/// Covers what the region renders from the snapshot — totals, the picker's
+/// type counts, every plotted point, job counts, the qualifying flags — plus
+/// the requested selection, but not the "as of" time, so two renders of the
+/// same figures digest the same and a watch tick can be dropped. The current
+/// minute is folded in so a settled page still re-renders at most once a
+/// minute, keeping the uptime card and the 1h axis current.
+fn dash_state(
+    snapshot: &DashboardSnapshot,
+    types: &[String],
+    all_types: bool,
+    now: DateTime<Utc>,
+) -> String {
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    snapshot.window.as_str().hash(&mut hasher);
+    types.hash(&mut hasher);
+    all_types.hash(&mut hasher);
+    snapshot.total_resources.hash(&mut hasher);
+    snapshot.distinct_types.hash(&mut hasher);
+    for entry in &snapshot.available {
+        entry.resource_type.hash(&mut hasher);
+        entry.total.hash(&mut hasher);
+    }
+    for series in &snapshot.series {
+        series.resource_type.hash(&mut hasher);
+        series.total.hash(&mut hasher);
+        for point in &series.points {
+            point.bucket_start.timestamp().hash(&mut hasher);
+            point.delta.hash(&mut hasher);
+            point.cumulative.hash(&mut hasher);
+        }
+    }
+    snapshot
+        .export_jobs
+        .map(|jobs| (jobs.running, jobs.queued))
+        .hash(&mut hasher);
+    snapshot.import_jobs_active.hash(&mut hasher);
+    (
+        snapshot.partial,
+        snapshot.approximate,
+        snapshot.series_pending,
+    )
+        .hash(&mut hasher);
+    (now.timestamp() / 60).hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
 /// Assembles the landing page from the live dashboard snapshot.
 ///
 /// Three outcomes, three pages (#956):
@@ -7697,10 +7764,21 @@ async fn build_index_page(
     // storage load, and it ends by itself once the figures are exact and no
     // import is running. Never on a waiting page (that one is bounded above)
     // and never on the no-provider sample, which has nothing live to follow.
-    let live_refresh = ready
-        && !chart_waiting
-        && (snapshot.approximate || snapshot.import_jobs_active.is_some_and(|n| n > 0));
+    //
+    // Settled figures are watched too, only slower: a tab opened before an
+    // import starts must notice it without a reload, and the server alone
+    // knows when that happens. A watch tick whose figures did not change is
+    // dropped by assets/dashboard.js (same `refresh_state`), so an idle page
+    // is not re-rendered under the user.
+    let live_refresh = ready && !chart_waiting;
+    let refresh_moving = snapshot.approximate || snapshot.import_jobs_active.is_some_and(|n| n > 0);
     let refresh_href = live_refresh.then(|| retry_base.clone());
+    let refresh_secs = if refresh_moving {
+        DASH_LIVE_REFRESH_SECS
+    } else {
+        DASH_IDLE_REFRESH_SECS
+    };
+    let refresh_state = dash_state(&snapshot, &types, all_types, Utc::now());
 
     IndexPage {
         status,
@@ -7716,7 +7794,9 @@ async fn build_index_page(
         retry_href,
         auto_retry_href,
         refresh_href,
-        refresh_secs: DASH_LIVE_REFRESH_SECS,
+        refresh_secs,
+        refresh_moving,
+        refresh_state,
         quiet_notices: Vec::new(),
         i18n,
         active_page: "home",
@@ -8441,6 +8521,8 @@ mod tests {
             auto_retry_href: None,
             refresh_href: None,
             refresh_secs: DASH_LIVE_REFRESH_SECS,
+            refresh_moving: false,
+            refresh_state: String::new(),
             quiet_notices: Vec::new(),
             i18n,
             active_page: "home",
@@ -9231,6 +9313,51 @@ mod tests {
         assert_eq!(axis_time_label(at, DashboardWindow::LastHour), "14:30");
         assert_eq!(axis_time_label(at, DashboardWindow::LastDay), "14:30");
         assert_eq!(axis_time_label(at, DashboardWindow::LastMonth), "JUL 14");
+    }
+
+    /// #1078: the `data-dash-state` digest lets a settled watch tick be
+    /// dropped, so it must not change when only the "as of" time does — and
+    /// must change with the figures, the selection, or a new minute.
+    #[test]
+    fn dash_state_ignores_the_as_of_time_and_tracks_the_figures() {
+        let now = DateTime::parse_from_rfc3339("2026-09-13T08:00:30Z")
+            .expect("valid instant")
+            .with_timezone(&Utc);
+        let types = vec!["Patient".to_string()];
+        let base = DashboardSnapshot {
+            window: DashboardWindow::LastHour,
+            total_resources: 100,
+            distinct_types: 1,
+            available: vec![helios_observability::dashboard::TypeCount {
+                resource_type: "Patient".to_string(),
+                total: 100,
+            }],
+            generated_at: Some(now),
+            ..Default::default()
+        };
+        let state = dash_state(&base, &types, false, now);
+        assert_eq!(state.len(), 16);
+        assert!(state.chars().all(|c| c.is_ascii_hexdigit()));
+
+        // Read again a few seconds later: same figures, same digest.
+        let reread = DashboardSnapshot {
+            generated_at: Some(now + chrono::Duration::seconds(20)),
+            ..base.clone()
+        };
+        assert_eq!(dash_state(&reread, &types, false, now), state);
+
+        // More resources, another selection, or a new minute all change it.
+        let grown = DashboardSnapshot {
+            total_resources: 101,
+            ..base.clone()
+        };
+        assert_ne!(dash_state(&grown, &types, false, now), state);
+        let other = vec!["Observation".to_string()];
+        assert_ne!(dash_state(&base, &other, false, now), state);
+        assert_ne!(
+            dash_state(&base, &types, false, now + chrono::Duration::seconds(60)),
+            state
+        );
     }
 
     /// #1078: every qualifier a live snapshot carries gets its own line, in

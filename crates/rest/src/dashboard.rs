@@ -1407,6 +1407,18 @@ where
         self.snapshot_from_storage(&tenant, window, types, include_empty)
             .await
     }
+
+    /// A seeded tenant's snapshots all come from the in-memory counters —
+    /// exact or approximate — so the cache keeps them only briefly and a
+    /// settled dashboard notices an import on its next poll (#1078).
+    fn serves_in_constant_time(&self, tenant: &str) -> bool {
+        let tenant_id = if tenant.is_empty() {
+            self.default_tenant.as_str()
+        } else {
+            tenant
+        };
+        self.counters.is_seeded(tenant_id)
+    }
 }
 
 /// The reconcile interval: `HFS_DASHBOARD_RECONCILE_SECS` when set to a
@@ -2472,6 +2484,36 @@ mod tests {
                 .collect()
         };
         assert_eq!(ends(&second), ends(&first));
+    }
+
+    /// #1078: the provider reports constant-time snapshots exactly for seeded
+    /// tenants, so the cache's live fast path covers a seeded tenant's exact
+    /// snapshots too. `""` resolves to the default tenant, as in `snapshot`.
+    #[tokio::test]
+    async fn serves_in_constant_time_once_the_tenant_is_seeded() {
+        let backend = sqlite();
+        create_in(backend.as_ref(), "Patient").await;
+        let counters = isolated_counters();
+        let provider = StorageDashboardProvider::new(Arc::clone(&backend), &test_config())
+            .with_counters(counters);
+        assert!(!provider.serves_in_constant_time("default"));
+        assert!(!provider.serves_in_constant_time(""));
+
+        let seeding = provider
+            .snapshot(DashboardWindow::LastHour, "", &[], false)
+            .await;
+        assert!(!seeding.partial);
+        assert!(counters.is_seeded("default"));
+
+        assert!(provider.serves_in_constant_time("default"));
+        assert!(
+            provider.serves_in_constant_time(""),
+            "the empty tenant is the default tenant"
+        );
+        assert!(
+            !provider.serves_in_constant_time("other"),
+            "seeding is per tenant"
+        );
     }
 
     /// A failed storage read must never seed the counters: the tenant stays

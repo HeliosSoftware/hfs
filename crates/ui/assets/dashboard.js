@@ -169,13 +169,16 @@
   });
 })();
 
-/* Live refresh (#1078): while the dashboard's figures are still moving —
-   approximate, or with an import running — the server renders #dash-live
-   with `hx-trigger="every Ns [hfsDashCanRefresh()]"` and data-dash-refresh,
-   and stops rendering them once the figures settle. The point is that the
-   figures keep climbing on their own, so the refresh must not stall while the
-   user is merely looking at or using the dashboard. Instead of skipping ticks,
-   each swap carries the user's state across:
+/* Live refresh (#1078): every ready dashboard renders #dash-live with
+   `hx-trigger="every Ns [hfsDashCanRefresh()]"`, data-dash-refresh and a
+   data-dash-state digest of its figures — every few seconds while they are
+   still moving (approximate, or an import running: data-dash-moving), slower
+   once they settle, so a tab opened before an import starts still notices it.
+   A settled tick whose digest did not change is dropped, leaving a quiet page
+   untouched. The point is that the figures keep climbing on their own, so the
+   refresh must not stall while the user is merely looking at or using the
+   dashboard. Instead of skipping ticks, each swap carries the user's state
+   across:
 
    - The open type picker is kept as the very same node (hx-preserve is added
      to the response's #chart-pick just before the swap), so it stays open with
@@ -252,6 +255,16 @@
     }
     var html = event.detail.serverResponse;
     if (typeof html !== "string") return;
+    // A settled page is only watched: when neither it nor the answer is
+    // moving and the figures are the same, leave the page untouched.
+    var tag = /<div id="dash-live"[^>]*>/.exec(html);
+    if (tag && !elt.hasAttribute("data-dash-moving") && tag[0].indexOf("data-dash-moving") === -1) {
+      var state = /data-dash-state="([^"]*)"/.exec(tag[0]);
+      if (state && state[1] && state[1] === elt.getAttribute("data-dash-state")) {
+        event.detail.shouldSwap = false;
+        return;
+      }
+    }
     var pick = document.getElementById("chart-pick");
     var state = { tip: false, focus: null, selection: null, scrolls: [] };
     if (pick && pick.open) {

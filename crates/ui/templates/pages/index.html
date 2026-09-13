@@ -14,10 +14,11 @@
   and without ever standing in for them with invented ones. The stat cards
   render whenever a figure is known; only the chart area waits.
 
-  Figures that are here but still moving — counted from recent writes and not
-  yet reconciled, or with an import running (#1078) — follow themselves the
-  same way, every few seconds, until the server renders the region without
-  the poll. assets/dashboard.js keeps what the user is doing across each swap
+  Figures that are here follow themselves the same way (#1078): every few
+  seconds while they are still moving — counted from recent writes and not yet
+  reconciled, or with an import running (data-dash-moving) — and slower once
+  they settle, so a tab opened before an import starts still notices it. A
+  settled tick whose figures did not change (same data-dash-state) is dropped. assets/dashboard.js keeps what the user is doing across each swap
   (the open type picker is preserved as-is, an open table stays open, the
   tooltip follows the pointer) and points each request at the page's current
   URL, which the type picker changes without a reload.
@@ -29,7 +30,8 @@
   {% else if let Some(href) = refresh_href %}
      hx-get="{{ href }}" hx-trigger="every {{ refresh_secs }}s [hfsDashCanRefresh()]"
      hx-target="this" hx-select="#dash-live" hx-swap="outerHTML"
-     data-dash-refresh="{{ refresh_secs }}"
+     data-dash-refresh="{{ refresh_secs }}" data-dash-state="{{ refresh_state }}"
+     {% if refresh_moving %}data-dash-moving="1"{% endif %}
   {% endif %}
 >
 
