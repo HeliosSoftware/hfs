@@ -343,6 +343,10 @@ references; 6.4 gives the exact messages. On `s3`/`s3-es` run 6.2 and 6.4 only.
 
 ## 7. T3 — Import the Synthea corpus from the Import page
 
+For issue #1086 development measurements, use the bounded 2,000-resource
+[PostgreSQL reindex benchmark](docs/postgres-reindex-benchmark.md). That protocol
+does not replace this full-corpus release-matrix test or change its pass criteria.
+
 The corpus is a Bulk Data export of 11,704 Synthea patients (18,955,865 resources in
 24 NDJSON files) plus a `manifest.json` that references those files at
 `http://localhost:8000/…`. HFS ingests it with the Bulk Data `$bulk-submit`
