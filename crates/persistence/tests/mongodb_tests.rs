@@ -5932,11 +5932,15 @@ mod bulk_submit {
 
     impl FailPoint {
         /// Configures `failCommand` for connections whose `appName` is `app_name`.
-        /// Returns `None`, after printing why, when the server was not started
-        /// with `enableTestCommands=1` (an external `HFS_TEST_MONGODB_URL`).
+        /// Returns `None`, after printing why, when no Mongo is available or
+        /// the server was not started with `enableTestCommands=1` (an
+        /// external `HFS_TEST_MONGODB_URL`).
         async fn enable(app_name: &str, mut data: Document, mode: Document) -> Option<FailPoint> {
             let lock = FAILPOINT_LOCK.lock().await;
-            let connection_string = shared_mongo::connection_string().await?;
+            let Some(connection_string) = shared_mongo::connection_string().await else {
+                eprintln!("Skipping failpoint test (requires Docker or HFS_TEST_MONGODB_URL)");
+                return None;
+            };
             let admin = Client::with_uri_str(&connection_string)
                 .await
                 .unwrap()
@@ -5982,6 +5986,9 @@ mod bulk_submit {
     #[tokio::test]
     async fn failpoint_hits_only_the_scoped_app_name() {
         let Some(connection_string) = shared_mongo::connection_string().await else {
+            eprintln!(
+                "Skipping failpoint_hits_only_the_scoped_app_name (requires Docker or HFS_TEST_MONGODB_URL)"
+            );
             return;
         };
         let Some(fail_point) = FailPoint::enable(
