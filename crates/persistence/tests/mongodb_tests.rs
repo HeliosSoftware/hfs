@@ -5849,11 +5849,11 @@ mod bulk_submit {
 
     use helios_persistence::core::bulk_submit::{CANCELLED_ABORT_REASON, CancelToken};
     use helios_persistence::core::{
-        BulkProcessingOptions, BulkSubmitProvider, BulkSubmitRollbackProvider, ChangeType,
-        DefaultSubmitWorker, IMPORT_MODE_PARAMETER_URL, LeaseError, ManifestFetchParams,
-        ManifestPublicationStatus, ManifestStatus, NdjsonEntry, RemoteFile, RemoteManifest,
-        StreamingBulkSubmitProvider, SubmissionId, SubmissionStatus, SubmitClaimStrategy,
-        SubmitFileRecord, SubmitInputFetcher, SubmitWorkerStorage, WorkerId,
+        BulkEntryOutcome, BulkProcessingOptions, BulkSubmitProvider, BulkSubmitRollbackProvider,
+        ChangeType, DefaultSubmitWorker, IMPORT_MODE_PARAMETER_URL, LeaseError,
+        ManifestFetchParams, ManifestPublicationStatus, ManifestStatus, NdjsonEntry, RemoteFile,
+        RemoteManifest, StreamingBulkSubmitProvider, SubmissionId, SubmissionStatus,
+        SubmitClaimStrategy, SubmitFileRecord, SubmitInputFetcher, SubmitWorkerStorage, WorkerId,
     };
     use helios_persistence::error::StorageResult;
     use std::collections::HashMap;
@@ -8394,6 +8394,224 @@ mod bulk_submit {
             );
         }
         assert_one_row_each(&backend, &tenant, &["sidx-1", "sidx-2", "sidx-3"]).await;
+    }
+
+    fn six_lines(prefix: &str) -> Vec<u8> {
+        (1..=6)
+            .map(|i| format!("{{\"resourceType\":\"Patient\",\"id\":\"{prefix}-{i}\"}}\n"))
+            .collect::<String>()
+            .into_bytes()
+    }
+
+    fn cursor_reader(bytes: Vec<u8>) -> Box<dyn tokio::io::AsyncBufRead + Send + Unpin> {
+        Box::new(tokio::io::BufReader::new(std::io::Cursor::new(bytes)))
+    }
+
+    /// Spec §5.2 case 3. `times: 6` is exact: batch 1 is one chunk, so its
+    /// resources insert is one `insert` per attempt; the policy allows six;
+    /// the standalone server adds no driver retry; and the exhausted error
+    /// short-circuits `write_batch` before history or the rollback log issue
+    /// any further `insert`. The failpoint is spent exactly when batch 1
+    /// gives up, and batch 2's first insert succeeds.
+    #[tokio::test]
+    async fn exhausted_retries_contain_to_the_batch() {
+        let test = "submit_fp_exhausted";
+        let app = "fp-exhausted";
+        let Some(backend) = create_backend_with_app_name(test, app).await else {
+            return;
+        };
+        let tenant = create_tenant("submit-tenant");
+        let (id, manifest_id) = seed(&backend, &tenant).await;
+        let Some(fail_point) = FailPoint::enable(
+            app,
+            doc! { "failCommands": ["insert"], "closeConnection": true },
+            doc! { "times": 6 },
+        )
+        .await
+        else {
+            return;
+        };
+
+        let options = BulkProcessingOptions::new().with_batch_size(3);
+        let result = backend
+            .process_ndjson_stream(
+                &tenant,
+                &id,
+                &manifest_id,
+                "Patient",
+                cursor_reader(six_lines("ex")),
+                &options,
+            )
+            .await
+            .unwrap();
+        fail_point.off().await;
+
+        assert!(!result.aborted, "{result:?}");
+        assert_eq!(result.counts.processing_error, 3);
+        assert_eq!(result.counts.success, 3);
+        assert_eq!(result.lines_processed, 6, "the file was read to the end");
+
+        let page = backend
+            .get_entry_results_page(&tenant, &id, &manifest_id, None, 10, None)
+            .await
+            .unwrap();
+        let mut by_line: Vec<_> = page.entries.iter().map(|e| &e.result).collect();
+        by_line.sort_by_key(|r| r.line_number);
+        for r in &by_line[..3] {
+            assert_eq!(r.outcome, BulkEntryOutcome::ProcessingError, "{r:?}");
+            let issue = &r.operation_outcome.as_ref().unwrap()["issue"][0];
+            assert_eq!(issue["code"], "transient");
+            let diagnostics = issue["diagnostics"].as_str().unwrap();
+            assert!(diagnostics.contains("(after 6 attempts)"), "{diagnostics}");
+            assert!(
+                diagnostics.contains("re-ingesting this file"),
+                "{diagnostics}"
+            );
+        }
+        for r in &by_line[3..] {
+            assert_eq!(r.outcome, BulkEntryOutcome::Success, "{r:?}");
+        }
+        assert!(
+            backend
+                .read(&tenant, "Patient", "ex-1")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            backend
+                .read(&tenant, "Patient", "ex-6")
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        let manifest = backend
+            .get_manifest(&tenant, &id, &manifest_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(manifest.total_entries, 6);
+        assert_eq!(manifest.failed_entries, 3);
+        assert_eq!(manifest.processed_entries, 3);
+    }
+
+    /// Spec §5.2 case 4: with strict options the stream aborts on the failed
+    /// batch and never attempts the next one.
+    #[tokio::test]
+    async fn max_errors_now_sees_backend_failures() {
+        let test = "submit_fp_max_errors";
+        let app = "fp-max-errors";
+        let Some(backend) = create_backend_with_app_name(test, app).await else {
+            return;
+        };
+        let tenant = create_tenant("submit-tenant");
+        let (id, manifest_id) = seed(&backend, &tenant).await;
+        let Some(fail_point) = FailPoint::enable(
+            app,
+            doc! { "failCommands": ["insert"], "closeConnection": true },
+            doc! { "times": 6 },
+        )
+        .await
+        else {
+            return;
+        };
+
+        let options = BulkProcessingOptions {
+            continue_on_error: false,
+            max_errors: 3,
+            ..BulkProcessingOptions::new().with_batch_size(3)
+        };
+        let result = backend
+            .process_ndjson_stream(
+                &tenant,
+                &id,
+                &manifest_id,
+                "Patient",
+                cursor_reader(six_lines("me")),
+                &options,
+            )
+            .await
+            .unwrap();
+        fail_point.off().await;
+
+        assert!(result.aborted);
+        assert_eq!(result.abort_reason.as_deref(), Some("max errors exceeded"));
+        assert_eq!(result.counts.processing_error, 3);
+        assert!(
+            backend
+                .read(&tenant, "Patient", "me-4")
+                .await
+                .unwrap()
+                .is_none(),
+            "batch 2 never ran"
+        );
+    }
+
+    /// Spec §5.2 case 6. This proves only that cancellation ends the batch well
+    /// before the 2.5 s backoff budget is spent, not which backoff step it
+    /// lands in: 150 ms is after attempt 1 fails and inside the first sleep.
+    #[tokio::test]
+    async fn cancel_during_backoff_returns_promptly() {
+        let test = "submit_fp_cancel_backoff";
+        let app = "fp-cancel-backoff";
+        let Some(backend) = create_backend_with_app_name(test, app).await else {
+            return;
+        };
+        let backend = std::sync::Arc::new(backend);
+        let tenant = create_tenant("submit-tenant");
+        let (id, manifest_id) = seed(&backend, &tenant).await;
+        let Some(fail_point) = FailPoint::enable(
+            app,
+            doc! { "failCommands": ["insert"], "closeConnection": true },
+            doc! { "times": 100 },
+        )
+        .await
+        else {
+            return;
+        };
+
+        let cancel = CancelToken::new();
+        let options = BulkProcessingOptions::new()
+            .with_batch_size(3)
+            .with_cancel(cancel.clone());
+        let started = std::time::Instant::now();
+        let run = {
+            let backend = backend.clone();
+            let tenant = tenant.clone();
+            let id = id.clone();
+            let manifest_id = manifest_id.clone();
+            tokio::spawn(async move {
+                backend
+                    .process_ndjson_stream(
+                        &tenant,
+                        &id,
+                        &manifest_id,
+                        "Patient",
+                        cursor_reader(six_lines("cb")),
+                        &options,
+                    )
+                    .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        cancel.cancel();
+        let result = run.await.unwrap().unwrap();
+        let elapsed = started.elapsed();
+        fail_point.off().await;
+
+        assert!(elapsed < Duration::from_secs(1), "took {elapsed:?}");
+        assert!(result.aborted);
+        assert_eq!(result.abort_reason.as_deref(), Some(CANCELLED_ABORT_REASON));
+        assert_eq!(
+            result.counts.processing_error, 3,
+            "the batch in flight was recorded before the cancel check"
+        );
+        let counts = backend
+            .get_entry_counts(&tenant, &id, &manifest_id)
+            .await
+            .unwrap();
+        assert_eq!(counts.processing_error, 3);
     }
 }
 

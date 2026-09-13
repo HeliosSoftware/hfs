@@ -72,7 +72,7 @@ use crate::core::bulk_submit::CancelToken;
 use crate::core::{
     BulkEntryResult, BulkProcessingOptions, NdjsonEntry, SubmissionChange, SubmissionId,
 };
-use crate::error::{ConcurrencyError, ResourceError, StorageError, StorageResult};
+use crate::error::{BackendError, ConcurrencyError, ResourceError, StorageError, StorageResult};
 use crate::tenant::{Operation, TenantContext};
 
 use super::MongoBackend;
@@ -151,8 +151,14 @@ pub(super) struct BatchOutcome {
 impl MongoBackend {
     /// Ingests one batch of NDJSON entries in a fixed number of commands.
     ///
-    /// See the [module docs](self) for the write order and why the batch is not
-    /// one transaction.
+    /// See the [module docs](self) for the write order, the retry rules and
+    /// why the batch is not one transaction.
+    ///
+    /// A flush that fails after its retries does not fail the batch: every
+    /// entry gets a `processing-error` receipt naming the stage and the error,
+    /// the manifest's counters charge them, and the file continues with its
+    /// next batch. Only the receipt write itself still propagates — with it
+    /// gone there is nothing left to record into.
     pub(super) async fn ingest_batch(
         &self,
         tenant: &TenantContext,
@@ -162,25 +168,78 @@ impl MongoBackend {
         options: &BulkProcessingOptions,
     ) -> StorageResult<BatchOutcome> {
         let db = self.get_database().await?;
-        let tenant_id = tenant.tenant_id().as_str();
 
-        let existing = self
-            .load_existing(&db, tenant_id, entries, options.cancel.as_ref())
+        let (results, error_count, aborted_on_max_errors, touched_search_parameters) = match self
+            .write_batch(&db, tenant, submission_id, manifest_id, entries, options)
+            .await
+        {
+            Ok(planned) => (
+                planned.results,
+                planned.error_count,
+                planned.aborted_on_max_errors,
+                planned.touched_search_parameters,
+            ),
+            Err(err) => {
+                tracing::warn!(
+                    manifest_id,
+                    entries = entries.len(),
+                    "batch flush failed; recording every entry as processing-error: {err}"
+                );
+                (
+                    all_failed(entries, &err),
+                    entries.len() as u32,
+                    false,
+                    false,
+                )
+            }
+        };
+
+        self.write_entry_results(&db, tenant, submission_id, manifest_id, options, &results)
             .await?;
+
+        // A SearchParameter write may change a tenant's overlay. The per-entry
+        // path reloaded the cache once per such resource; once per batch is the
+        // same invalidation for a fraction of the reloads.
+        if touched_search_parameters && let Err(e) = self.reload_stored_cache().await {
+            tracing::warn!("SearchParameter cache reload failed: {e}");
+        }
+
+        Ok(BatchOutcome {
+            results,
+            error_count,
+            aborted_on_max_errors,
+        })
+    }
+
+    /// Everything from the pre-read through the rollback log. Fails as a whole
+    /// when a stage exhausts its retries; [`Self::ingest_batch`] turns that
+    /// into receipts.
+    async fn write_batch(
+        &self,
+        db: &Database,
+        tenant: &TenantContext,
+        submission_id: &SubmissionId,
+        manifest_id: &str,
+        entries: &[NdjsonEntry],
+        options: &BulkProcessingOptions,
+    ) -> StorageResult<PlannedBatch> {
+        let tenant_id = tenant.tenant_id().as_str();
+        let cancel = options.cancel.as_ref();
+
+        let existing = self.load_existing(db, tenant_id, entries, cancel).await?;
         let mut planned = self.plan_batch(tenant, manifest_id, entries, &existing, options)?;
 
         let failed = self
-            .write_resources(&db, tenant_id, &planned, options.cancel.as_ref())
+            .write_resources(db, tenant_id, &planned, cancel)
             .await?;
-        self.write_history(&db, &mut planned, &failed, options.cancel.as_ref())
+        self.write_history(db, &mut planned, &failed, cancel)
             .await?;
-        self.write_search_index(&db, tenant_id, &planned, &failed, options)
+        self.write_search_index(db, tenant_id, &planned, &failed, options)
             .await?;
 
         // A resource the batch could not write takes its entry's result down
         // with it: the per-entry path reported the same failure per entry, and
         // its history, index, rollback and receipt rows were never written.
-        let mut error_count = planned.error_count;
         for (plan_idx, result_idx, _) in &planned.changes {
             if let Some(diagnostics) = failed.get(plan_idx) {
                 let plan = &planned.plans[*plan_idx];
@@ -196,36 +255,13 @@ impl MongoBackend {
                         }]
                     }),
                 );
-                error_count += 1;
+                planned.error_count += 1;
             }
         }
 
-        self.write_changes(
-            tenant,
-            submission_id,
-            &db,
-            &planned,
-            &failed,
-            options.cancel.as_ref(),
-        )
-        .await?;
-        self.write_entry_results(&db, tenant, submission_id, manifest_id, options, &planned)
+        self.write_changes(tenant, submission_id, db, &planned, &failed, cancel)
             .await?;
-
-        // A SearchParameter write may change a tenant's overlay. The per-entry
-        // path reloaded the cache once per such resource; once per batch is the
-        // same invalidation for a fraction of the reloads.
-        if planned.touched_search_parameters
-            && let Err(e) = self.reload_stored_cache().await
-        {
-            tracing::warn!("SearchParameter cache reload failed: {e}");
-        }
-
-        Ok(BatchOutcome {
-            results: planned.results,
-            error_count,
-            aborted_on_max_errors: planned.aborted_on_max_errors,
-        })
+        Ok(planned)
     }
 
     /// Resolves in one `find` per resource type which of the batch's ids already
@@ -989,14 +1025,14 @@ impl MongoBackend {
         submission_id: &SubmissionId,
         manifest_id: &str,
         options: &BulkProcessingOptions,
-        planned: &PlannedBatch,
+        results: &[BulkEntryResult],
     ) -> StorageResult<()> {
-        if planned.results.is_empty() {
+        if results.is_empty() {
             return Ok(());
         }
         let file_url = options.file_url.as_deref().unwrap_or("");
-        let mut statements = Vec::with_capacity(planned.results.len());
-        for result in &planned.results {
+        let mut statements = Vec::with_capacity(results.len());
+        for result in results {
             statements.push(self.entry_result_statement(
                 tenant,
                 submission_id,
@@ -1076,6 +1112,40 @@ async fn run_update_command(
         }
     }
     Ok(UpdateOutcome { failures })
+}
+
+/// One `processing-error` per entry of a batch whose flush failed. `transient`
+/// (FHIR issue-type: the sender may resubmit) when the stage outlived its
+/// retries on a transient error, `exception` otherwise.
+///
+/// `Unavailable`'s `Display` renders only `backend_name` (its `message` is
+/// meant to be read off the field, as the REST error mapping and the retry
+/// unit tests already do), so the detail — the exhausted-attempts count —
+/// comes from there rather than `err.to_string()`.
+fn all_failed(entries: &[NdjsonEntry], err: &StorageError) -> Vec<BulkEntryResult> {
+    let (code, detail) = match err {
+        StorageError::Backend(BackendError::Unavailable { message, .. }) => {
+            ("transient", message.clone())
+        }
+        _ => ("exception", err.to_string()),
+    };
+    entries
+        .iter()
+        .map(|entry| {
+            BulkEntryResult::processing_error(
+                entry.line_number,
+                &entry.resource_type,
+                serde_json::json!({
+                    "resourceType": "OperationOutcome",
+                    "issue": [{
+                        "severity": "error",
+                        "code": code,
+                        "diagnostics": format!("{detail}; re-ingesting this file will retry the entry"),
+                    }]
+                }),
+            )
+        })
+        .collect()
 }
 
 /// True when `row` is exactly what `plan` meant to write: same version, the
