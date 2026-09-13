@@ -33,7 +33,7 @@ use helios_persistence::search::SearchParameterStatus;
 use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
 use helios_persistence::types::{
     IncludeDirective, IncludeType, SearchModifier, SearchParamType, SearchParameter, SearchPrefix,
-    SearchQuery, SearchValue, SortDirective,
+    SearchQuery, SearchValue, SortDirective, TotalMode,
 };
 use mongodb::Client;
 use mongodb::bson::{Document, doc};
@@ -3662,6 +3662,227 @@ async fn mongodb_integration_search_missing_not_and_param_sort() {
     assert_eq!(ids(&page2), vec!["patient-mns-4"]);
     assert!(!page2.resources.page_info.has_next);
     assert!(page2.resources.page_info.has_previous);
+}
+
+/// #1056: a MongoDB parameter-sorted page's rows, `has_next` and `total` must
+/// all derive from one id sequence. `_id`/`_lastUpdated` are resource-level
+/// predicates that never reach the search index, so before the fix they
+/// narrowed the page fetch but not the ordering/count `has_next`/`total` were
+/// computed from — a page could come back short, or even empty, while
+/// `has_next`/`total` still reflected the wider, unfiltered set. A stale
+/// search-index row (a deleted resource's leftover entry, or an orphan row)
+/// produced the same symptom by occupying a slot in the ordering that the
+/// page fetch would then drop.
+#[tokio::test]
+async fn mongodb_integration_param_sorted_page_is_one_result_set() {
+    let Some(backend) =
+        create_backend_with_full_registry("param_sorted_page_one_result_set").await
+    else {
+        eprintln!(
+            "Skipping mongodb_integration_param_sorted_page_is_one_result_set (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+
+    let tenant = create_tenant("tenant-psors");
+
+    for n in 1..=6u32 {
+        let birth_date = format!("199{}-01-01", n - 1);
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({
+                    "resourceType": "Patient",
+                    "id": format!("patient-psors-{n}"),
+                    "name": [{"family": format!("Psors-{n}")}],
+                    "birthDate": birth_date,
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+    }
+
+    let ids = |result: &helios_persistence::core::SearchResult| {
+        result
+            .resources
+            .items
+            .iter()
+            .map(|r| r.id().to_string())
+            .collect::<Vec<_>>()
+    };
+
+    // A. `_id` subset — the issue's exact symptom. `_id` narrows the
+    // resource-level fetch but `matched_ids` (search-index derived) never
+    // saw it, so the ordering/count `has_next`/`total` were computed from
+    // stayed at all six patients.
+    let mut id_subset = SearchQuery::new("Patient")
+        .with_parameter(SearchParameter {
+            name: "_id".to_string(),
+            param_type: SearchParamType::Token,
+            modifier: None,
+            values: vec![
+                SearchValue::eq("patient-psors-3"),
+                SearchValue::eq("patient-psors-4"),
+                SearchValue::eq("patient-psors-5"),
+                SearchValue::eq("patient-psors-6"),
+            ],
+            chain: vec![],
+            components: vec![],
+        })
+        .with_sort(SortDirective::parse("birthdate").with_param_type(Some(SearchParamType::Date)))
+        .with_count(2);
+    id_subset.total = Some(TotalMode::Accurate);
+
+    let page1 = backend.search(&tenant, &id_subset).await.unwrap();
+    assert_eq!(ids(&page1), vec!["patient-psors-3", "patient-psors-4"]);
+    assert!(page1.resources.page_info.has_next);
+    assert!(!page1.resources.page_info.has_previous);
+    assert_eq!(page1.total, Some(4));
+    assert_eq!(page1.resources.page_info.total, Some(4));
+
+    id_subset.offset = Some(2);
+    let page2 = backend.search(&tenant, &id_subset).await.unwrap();
+    assert_eq!(ids(&page2), vec!["patient-psors-5", "patient-psors-6"]);
+    assert!(!page2.resources.page_info.has_next);
+    assert!(page2.resources.page_info.has_previous);
+    assert_eq!(page2.total, Some(4));
+
+    id_subset.offset = None;
+    id_subset.total = Some(TotalMode::None);
+    let page_no_total = backend.search(&tenant, &id_subset).await.unwrap();
+    assert_eq!(page_no_total.total, None);
+
+    // B. `_lastUpdated` window — same defect, reached via a date range
+    // instead of explicit ids. `cut` is compared with second precision
+    // (`SecondsFormat::Secs`, per the resource-level date filter's implied-
+    // period semantics for a value with no fractional seconds), so it must
+    // land in a whole second strictly after the six creates above — this
+    // sleep guarantees that regardless of how fast setup ran.
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    let cut = chrono::Utc::now();
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+
+    let p2 = backend
+        .read(&tenant, "Patient", "patient-psors-2")
+        .await
+        .unwrap()
+        .unwrap();
+    backend
+        .update(
+            &tenant,
+            &p2,
+            json!({
+                "resourceType": "Patient",
+                "id": "patient-psors-2",
+                "name": [{"family": "Psors-2-Updated"}],
+                "birthDate": "1991-01-01",
+            }),
+        )
+        .await
+        .unwrap();
+
+    let p5 = backend
+        .read(&tenant, "Patient", "patient-psors-5")
+        .await
+        .unwrap()
+        .unwrap();
+    backend
+        .update(
+            &tenant,
+            &p5,
+            json!({
+                "resourceType": "Patient",
+                "id": "patient-psors-5",
+                "name": [{"family": "Psors-5-Updated"}],
+                "birthDate": "1994-01-01",
+            }),
+        )
+        .await
+        .unwrap();
+
+    let mut last_updated_window = SearchQuery::new("Patient")
+        .with_parameter(SearchParameter {
+            name: "_lastUpdated".to_string(),
+            param_type: SearchParamType::Date,
+            modifier: None,
+            values: vec![SearchValue::new(
+                SearchPrefix::Gt,
+                cut.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            )],
+            chain: vec![],
+            components: vec![],
+        })
+        .with_sort(SortDirective::parse("birthdate").with_param_type(Some(SearchParamType::Date)))
+        .with_count(1);
+    last_updated_window.total = Some(TotalMode::Accurate);
+
+    let page1 = backend.search(&tenant, &last_updated_window).await.unwrap();
+    assert_eq!(ids(&page1), vec!["patient-psors-2"]);
+    assert!(page1.resources.page_info.has_next);
+    assert_eq!(page1.total, Some(2));
+
+    last_updated_window.offset = Some(1);
+    let page2 = backend.search(&tenant, &last_updated_window).await.unwrap();
+    assert_eq!(ids(&page2), vec!["patient-psors-5"]);
+    assert!(!page2.resources.page_info.has_next);
+    assert_eq!(page2.total, Some(2));
+
+    // C. Deleted resource — a soft-deleted resource's search-index rows
+    // survive the delete; it must not occupy a page slot or count toward
+    // `total`.
+    backend
+        .delete(&tenant, "Patient", "patient-psors-6")
+        .await
+        .unwrap();
+
+    let mut all_sorted = SearchQuery::new("Patient")
+        .with_sort(SortDirective::parse("birthdate").with_param_type(Some(SearchParamType::Date)))
+        .with_count(10);
+    all_sorted.total = Some(TotalMode::Accurate);
+    let result = backend.search(&tenant, &all_sorted).await.unwrap();
+    assert_eq!(
+        ids(&result),
+        vec![
+            "patient-psors-1",
+            "patient-psors-2",
+            "patient-psors-3",
+            "patient-psors-4",
+            "patient-psors-5",
+        ]
+    );
+    assert!(!result.resources.page_info.has_next);
+    assert_eq!(result.total, Some(5));
+
+    // D. Stale search-index row — an orphan row (no matching live resource)
+    // sorts first (epoch value) but must not shorten the page.
+    let client = raw_test_client(&backend.config().connection_string)
+        .await
+        .expect("failed to connect MongoDB client for search_index fixture");
+    let database = client.database(&backend.config().database_name);
+    let search_index = database.collection::<Document>("search_index");
+    search_index
+        .insert_one(doc! {
+            "tenant_id": tenant.tenant_id().as_str(),
+            "resource_type": "Patient",
+            "resource_id": "patient-psors-ghost",
+            "param_name": "birthdate",
+            "param_url": "http://hl7.org/fhir/SearchParameter/individual-birthdate",
+            "value_date": mongodb::bson::DateTime::from_millis(0),
+            "value_date_precision": "day",
+        })
+        .await
+        .expect("failed to insert stale search_index row");
+
+    let mut ghost_sorted = SearchQuery::new("Patient")
+        .with_sort(SortDirective::parse("birthdate").with_param_type(Some(SearchParamType::Date)))
+        .with_count(2);
+    ghost_sorted.total = Some(TotalMode::Accurate);
+    let result = backend.search(&tenant, &ghost_sorted).await.unwrap();
+    assert_eq!(ids(&result), vec!["patient-psors-1", "patient-psors-2"]);
+    assert!(result.resources.page_info.has_next);
+    assert_eq!(result.total, Some(5));
 }
 
 /// #1055: `_id`/`_lastUpdated` used to bypass the generic modifier dispatch
