@@ -5945,36 +5945,57 @@ mod postgres_integration {
         reindex_test_client_for("postgres").await
     }
 
+    /// Creates a dedicated database for tests that install triggers or table locks.
+    ///
+    /// Unique tenant IDs isolate rows, but PostgreSQL DDL still locks the shared
+    /// `search_index` and `resource_fts` tables and can deadlock parallel tests.
     async fn isolated_reindex_backend() -> (PostgresBackend, String) {
+        isolated_reindex_backend_with_max_connections(5).await
+    }
+
+    async fn isolated_reindex_backend_with_max_connections(
+        max_connections: usize,
+    ) -> (PostgresBackend, String) {
         let pg = shared_pg().await;
-        let dbname = format!("reindex_coord_{}", uuid::Uuid::new_v4().simple());
+        let dbname = format!("reindex_test_{}", uuid::Uuid::new_v4().simple());
         reindex_test_client()
             .await
             .batch_execute(&format!("CREATE DATABASE {dbname}"))
             .await
-            .expect("create isolated deferred-reindex database");
+            .expect("create isolated reindex database");
 
         let data_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .and_then(|path| path.parent())
             .map(|path| path.join("data"))
             .unwrap_or_else(|| PathBuf::from("data"));
-        let backend = PostgresBackend::new(PostgresConfig {
+        let config = PostgresConfig {
             host: pg.host.clone(),
             port: pg.port,
             dbname: dbname.clone(),
             user: "postgres".to_string(),
             password: Some("postgres".to_string()),
-            max_connections: 5,
+            max_connections,
             data_dir: Some(data_dir),
             ..Default::default()
+        };
+        let schema_backend = PostgresBackend::new(PostgresConfig {
+            max_connections: 5,
+            ..config.clone()
         })
         .await
-        .expect("connect to isolated deferred-reindex database");
-        backend
+        .expect("connect to isolated reindex database");
+        schema_backend
             .init_schema()
             .await
-            .expect("initialize isolated deferred-reindex database");
+            .expect("initialize isolated reindex database");
+        if max_connections == 5 {
+            return (schema_backend, dbname);
+        }
+        drop(schema_backend);
+        let backend = PostgresBackend::new(config)
+            .await
+            .expect("connect to initialized isolated reindex database");
         (backend, dbname)
     }
 
@@ -6306,7 +6327,7 @@ mod postgres_integration {
     async fn postgres_integration_reindex_page_uses_one_transaction_for_all_index_writes() {
         use helios_persistence::search::{ReindexSource, ReindexTarget};
 
-        let backend = create_backend().await;
+        let (backend, dbname) = isolated_reindex_backend().await;
         let tenant = create_tenant("reindex-page-single-transaction");
         let tenant_id = tenant.tenant_id().as_str();
         for id in ["tx-a", "tx-b"] {
@@ -6329,7 +6350,7 @@ mod postgres_integration {
             .await
             .unwrap();
 
-        let client = reindex_test_client().await;
+        let client = reindex_test_client_for(&dbname).await;
         let suffix = uuid::Uuid::new_v4().simple().to_string();
         let table_name = format!("reindex_tx_probe_{suffix}");
         let function_name = format!("record_reindex_tx_{suffix}");
@@ -6413,7 +6434,7 @@ mod postgres_integration {
     async fn postgres_integration_reindex_page_failure_releases_single_connection_pool() {
         use helios_persistence::search::{ReindexSource, ReindexTarget};
 
-        let backend = create_backend_with_max_connections(1).await;
+        let (backend, dbname) = isolated_reindex_backend_with_max_connections(1).await;
         let tenant = create_tenant("reindex-page-one-connection");
         let tenant_id = tenant.tenant_id().as_str();
         for id in ["one-a", "one-fail", "one-c"] {
@@ -6435,7 +6456,7 @@ mod postgres_integration {
             .fetch_resources_page(&tenant, "Patient", None, 10)
             .await
             .unwrap();
-        let client = reindex_test_client().await;
+        let client = reindex_test_client_for(&dbname).await;
         client
             .execute(
                 "INSERT INTO search_index
@@ -6514,7 +6535,8 @@ mod postgres_integration {
         use helios_persistence::search::{ReindexOperation, ReindexRequest, ReindexStatus};
         use std::sync::Arc;
 
-        let backend = Arc::new(create_backend().await);
+        let (backend, dbname) = isolated_reindex_backend().await;
+        let backend = Arc::new(backend);
         let tenant = create_tenant("reindex-page-status-error");
         let tenant_id = tenant.tenant_id().as_str();
         for id in ["status-a", "status-fail", "status-c"] {
@@ -6532,7 +6554,7 @@ mod postgres_integration {
                 .await
                 .unwrap();
         }
-        let client = reindex_test_client().await;
+        let client = reindex_test_client_for(&dbname).await;
         let suffix = uuid::Uuid::new_v4().simple().to_string();
         let function_name = format!("reject_status_reindex_{suffix}");
         let trigger_name = format!("reject_status_reindex_{suffix}");
@@ -6683,7 +6705,7 @@ mod postgres_integration {
     async fn postgres_integration_reindex_page_rolls_back_and_falls_back_per_resource() {
         use helios_persistence::search::{ReindexSource, ReindexTarget};
 
-        let backend = create_backend().await;
+        let (backend, dbname) = isolated_reindex_backend().await;
         let tenant = create_tenant("reindex-page-fallback");
         let tenant_id = tenant.tenant_id().as_str();
         for id in ["fallback-a", "fallback-fail", "fallback-c"] {
@@ -6705,7 +6727,7 @@ mod postgres_integration {
             .fetch_resources_page(&tenant, "Patient", None, 10)
             .await
             .unwrap();
-        let client = reindex_test_client().await;
+        let client = reindex_test_client_for(&dbname).await;
         let suffix = uuid::Uuid::new_v4().simple().to_string();
         let function_name = format!("reject_reindex_{suffix}");
         let trigger_name = format!("reject_reindex_{suffix}");
@@ -6805,7 +6827,7 @@ mod postgres_integration {
     async fn postgres_integration_reindex_clear_rolls_back_when_fts_delete_fails() {
         use helios_persistence::search::ReindexTarget;
 
-        let backend = create_backend_with_max_connections(1).await;
+        let (backend, dbname) = isolated_reindex_backend_with_max_connections(1).await;
         let tenant = create_tenant("reindex-clear-atomic");
         let tenant_id = tenant.tenant_id().as_str();
         backend
@@ -6822,7 +6844,7 @@ mod postgres_integration {
             .await
             .unwrap();
 
-        let client = reindex_test_client().await;
+        let client = reindex_test_client_for(&dbname).await;
         let suffix = uuid::Uuid::new_v4().simple().to_string();
         let function_name = format!("reject_fts_clear_{suffix}");
         let trigger_name = format!("reject_fts_clear_{suffix}");
