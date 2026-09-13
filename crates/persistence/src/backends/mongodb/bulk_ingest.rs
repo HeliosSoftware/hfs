@@ -780,7 +780,7 @@ impl MongoBackend {
                     Err(e) => {
                         failed.insert(
                             plan_idx,
-                            exhausted("update batch resource", attempts, &e).to_string(),
+                            detail(&exhausted("update batch resource", attempts, &e)),
                         );
                     }
                 }
@@ -1133,21 +1133,27 @@ async fn run_update_command(
     Ok(UpdateOutcome { failures })
 }
 
+/// `Unavailable`'s `Display` renders only `backend_name` (its `message` is
+/// meant to be read off the field, as the REST error mapping and the retry
+/// unit tests already do), so this reads that field directly rather than
+/// dropping the detail — the exhausted-attempts count — through
+/// `err.to_string()`. Falls back to `Display` for every other variant.
+fn detail(err: &StorageError) -> String {
+    match err {
+        StorageError::Backend(BackendError::Unavailable { message, .. }) => message.clone(),
+        _ => err.to_string(),
+    }
+}
+
 /// One `processing-error` per entry of a batch whose flush failed. `transient`
 /// (FHIR issue-type: the sender may resubmit) when the stage outlived its
 /// retries on a transient error, `exception` otherwise.
-///
-/// `Unavailable`'s `Display` renders only `backend_name` (its `message` is
-/// meant to be read off the field, as the REST error mapping and the retry
-/// unit tests already do), so the detail — the exhausted-attempts count —
-/// comes from there rather than `err.to_string()`.
 fn all_failed(entries: &[NdjsonEntry], err: &StorageError) -> Vec<BulkEntryResult> {
-    let (code, detail) = match err {
-        StorageError::Backend(BackendError::Unavailable { message, .. }) => {
-            ("transient", message.clone())
-        }
-        _ => ("exception", err.to_string()),
+    let code = match err {
+        StorageError::Backend(BackendError::Unavailable { .. }) => "transient",
+        _ => "exception",
     };
+    let detail = detail(err);
     entries
         .iter()
         .map(|entry| {
@@ -1310,5 +1316,19 @@ mod tests {
             Bson::Document(doc! {"resourceType": "Patient", "id": "p1", "active": false}),
         );
         assert!(!row_matches_plan(&row, &plan).unwrap());
+    }
+
+    #[test]
+    fn detail_reads_the_unavailable_message_instead_of_dropping_it_through_display() {
+        let io_error =
+            mongodb::error::Error::from(std::io::Error::from(std::io::ErrorKind::TimedOut));
+        let err = exhausted("update batch resource", 6, &io_error);
+        // `StorageError`'s `Display` for `Backend` is transparent, and
+        // `Unavailable`'s own `Display` renders only `backend_name` — so
+        // `.to_string()` alone drops the attempt count `detail` must recover.
+        assert_eq!(err.to_string(), "backend unavailable: mongodb");
+        let text = detail(&err);
+        assert!(text.contains("update batch resource"), "{text}");
+        assert!(text.contains("(after 6 attempts)"), "{text}");
     }
 }

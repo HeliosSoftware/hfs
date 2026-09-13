@@ -8023,7 +8023,10 @@ mod bulk_submit {
     }
 
     /// The update path: one `update_one` per existing id, each its own retry unit.
-    /// `times: 3` = the two dropped `processing` promotions plus one dropped update.
+    /// Scoped to the `resources` namespace so the manifest's own
+    /// processing-promotion `update` (a different collection) never spends the
+    /// failpoint budget; `times: 1` drops exactly one of the three concurrent
+    /// `update_one` calls, forcing its retry.
     #[tokio::test]
     async fn dropped_update_is_retried_and_versions_once() {
         let test = "submit_fp_dropped_update";
@@ -8046,8 +8049,12 @@ mod bulk_submit {
 
         let Some(fail_point) = FailPoint::enable(
             app,
-            doc! { "failCommands": ["update"], "closeConnection": true },
-            doc! { "times": 3 },
+            doc! {
+                "failCommands": ["update"],
+                "closeConnection": true,
+                "namespace": format!("{}.resources", backend.config().database_name),
+            },
+            doc! { "times": 1 },
         )
         .await
         else {
@@ -8174,8 +8181,11 @@ mod bulk_submit {
         assert_one_row_each(&backend, &tenant, &["chg-1", "chg-2", "chg-3"]).await;
     }
 
-    /// The pre-read is a `find`; recovery only (the driver may retry reads).
-    /// `times: 3` outlasts any single driver retry and the manifest check.
+    /// The pre-read is a `find` against `resources`; recovery only (the driver
+    /// may retry reads). Scoped to that namespace so the manifest-existence
+    /// check (a different collection) is unaffected; `times: 2` survives the
+    /// driver's own possible single retry and still forces this module's
+    /// bounded retry to recover the connection drop.
     #[tokio::test]
     async fn dropped_pre_read_is_retried() {
         let test = "submit_fp_dropped_find";
@@ -8187,8 +8197,12 @@ mod bulk_submit {
         let (id, manifest_id) = seed(&backend, &tenant).await;
         let Some(fail_point) = FailPoint::enable(
             app,
-            doc! { "failCommands": ["find"], "closeConnection": true },
-            doc! { "times": 3 },
+            doc! {
+                "failCommands": ["find"],
+                "closeConnection": true,
+                "namespace": format!("{}.resources", backend.config().database_name),
+            },
+            doc! { "times": 2 },
         )
         .await
         else {
@@ -8211,8 +8225,10 @@ mod bulk_submit {
     }
 
     /// Spec §5.2 case 5: the receipt upsert is a raw `update` command with no
-    /// driver retry at all. `times: 3` = two dropped `processing` promotions
-    /// plus the first receipt command.
+    /// driver retry at all, sent as one command for the whole batch. Scoped to
+    /// the `bulk_entry_results` namespace so the manifest's own
+    /// processing-promotion `update` never spends the failpoint budget;
+    /// `times: 1` drops that single command once, forcing its retry.
     #[tokio::test]
     async fn dropped_receipt_write_is_retried() {
         let test = "submit_fp_dropped_receipts";
@@ -8224,8 +8240,12 @@ mod bulk_submit {
         let (id, manifest_id) = seed(&backend, &tenant).await;
         let Some(fail_point) = FailPoint::enable(
             app,
-            doc! { "failCommands": ["update"], "closeConnection": true },
-            doc! { "times": 3 },
+            doc! {
+                "failCommands": ["update"],
+                "closeConnection": true,
+                "namespace": format!("{}.bulk_entry_results", backend.config().database_name),
+            },
+            doc! { "times": 1 },
         )
         .await
         else {
