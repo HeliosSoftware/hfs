@@ -3997,6 +3997,343 @@ async fn mongodb_integration_param_sorted_page_is_one_result_set() {
     assert_eq!(result.total, Some(5));
 }
 
+/// #1040: `_sort` used to order by running an aggregation (`$group`, sorted
+/// server-side) over every search-index row of the *whole resource type*,
+/// then a second type-wide `distinct` pass to drop stale rows, and only
+/// after both of those filter by the query's matched ids. On a large type
+/// that never returns even when the filtered result is tiny. The ordering
+/// aggregation must instead be bounded to the candidate set the query
+/// already matched: chunked `$in` on the composite index, ordered
+/// client-side, with the unkeyed tail drawn from the candidate set itself
+/// rather than a type-wide `distinct`.
+#[tokio::test]
+async fn mongodb_integration_param_sort_is_bounded_by_the_candidate_set() {
+    let Some(backend) = create_backend_with_full_registry("param_sort_bounded").await else {
+        eprintln!(
+            "Skipping mongodb_integration_param_sort_is_bounded_by_the_candidate_set (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+
+    let tenant = create_tenant("tenant-bps");
+
+    for n in 1..=40u32 {
+        let id = format!("patient-bps-{n:02}");
+        let gender = if matches!(n, 5 | 17 | 29 | 33) {
+            "female"
+        } else {
+            "male"
+        };
+        let mut resource = json!({
+            "resourceType": "Patient",
+            "id": id,
+            "name": [{"family": format!("Bps-{n}")}],
+            "gender": gender,
+        });
+        if n != 33 {
+            let birth_year = 1950 + n;
+            resource["birthDate"] = json!(format!("{birth_year}-01-01"));
+        }
+        backend
+            .create(&tenant, "Patient", resource, FhirVersion::default())
+            .await
+            .unwrap();
+    }
+
+    let ids = |result: &helios_persistence::core::SearchResult| {
+        result
+            .resources
+            .items
+            .iter()
+            .map(|r| r.id().to_string())
+            .collect::<Vec<_>>()
+    };
+
+    let gender_filter = || SearchParameter {
+        name: "gender".to_string(),
+        param_type: SearchParamType::Token,
+        modifier: None,
+        values: vec![SearchValue::eq("female")],
+        chain: vec![],
+        components: vec![],
+    };
+
+    let mut ascending = SearchQuery::new("Patient")
+        .with_parameter(gender_filter())
+        .with_sort(SortDirective::parse("birthdate").with_param_type(Some(SearchParamType::Date)))
+        .with_count(2);
+    ascending.total = Some(TotalMode::Accurate);
+
+    let page1 = backend.search(&tenant, &ascending).await.unwrap();
+    assert_eq!(ids(&page1), vec!["patient-bps-05", "patient-bps-17"]);
+    assert!(page1.resources.page_info.has_next);
+    assert_eq!(page1.total, Some(4));
+
+    ascending.offset = Some(2);
+    let page2 = backend.search(&tenant, &ascending).await.unwrap();
+    assert_eq!(ids(&page2), vec!["patient-bps-29", "patient-bps-33"]);
+    assert!(!page2.resources.page_info.has_next);
+    assert_eq!(page2.total, Some(4));
+
+    let mut descending = SearchQuery::new("Patient")
+        .with_parameter(gender_filter())
+        .with_sort(SortDirective::parse("-birthdate").with_param_type(Some(SearchParamType::Date)))
+        .with_count(10);
+    descending.total = Some(TotalMode::Accurate);
+    let result = backend.search(&tenant, &descending).await.unwrap();
+    assert_eq!(
+        ids(&result),
+        vec![
+            "patient-bps-29",
+            "patient-bps-17",
+            "patient-bps-05",
+            "patient-bps-33",
+        ]
+    );
+    assert_eq!(result.total, Some(4));
+
+    // Ghost rows: write two orphan search_index entries for a resource that
+    // was never created. If `allowed` were still taken straight from
+    // `distinct` over `search_index` (pre-fix), the gender row would make
+    // this dead id match the filter, take a page slot ahead of a live one,
+    // get dropped by the page fetch, and inflate `total` by one (#1056's
+    // failure mode reopened on the filtered sorted path, #1040). Resolving
+    // `allowed` through `resource_level_ids` (is_deleted: false) must keep
+    // both ghost rows out of the candidate set entirely.
+    let raw_client = raw_test_client(&backend.config().connection_string)
+        .await
+        .expect("failed to connect raw MongoDB client");
+    let raw_db = raw_client.database(&backend.config().database_name);
+    let search_index: Collection<Document> = raw_db.collection("search_index");
+    search_index
+        .insert_many(vec![
+            doc! {
+                "tenant_id": tenant.tenant_id().as_str(),
+                "resource_type": "Patient",
+                "resource_id": "patient-bps-ghost",
+                "param_name": "gender",
+                "param_url": "http://hl7.org/fhir/SearchParameter/individual-gender",
+                "value_token_system": "http://hl7.org/fhir/administrative-gender",
+                "value_token_code": "female",
+            },
+            doc! {
+                "tenant_id": tenant.tenant_id().as_str(),
+                "resource_type": "Patient",
+                "resource_id": "patient-bps-ghost",
+                "param_name": "birthdate",
+                "param_url": "http://hl7.org/fhir/SearchParameter/individual-birthdate",
+                "value_date": mongodb::bson::DateTime::from_millis(0),
+                "value_date_precision": "day",
+            },
+        ])
+        .await
+        .expect("failed to insert ghost search_index rows");
+
+    ascending.offset = None;
+    let page1_with_ghost = backend.search(&tenant, &ascending).await.unwrap();
+    assert_eq!(
+        ids(&page1_with_ghost),
+        vec!["patient-bps-05", "patient-bps-17"]
+    );
+    assert!(page1_with_ghost.resources.page_info.has_next);
+    assert_eq!(page1_with_ghost.total, Some(4));
+
+    let result_with_ghost = backend.search(&tenant, &descending).await.unwrap();
+    assert_eq!(
+        ids(&result_with_ghost),
+        vec![
+            "patient-bps-29",
+            "patient-bps-17",
+            "patient-bps-05",
+            "patient-bps-33",
+        ]
+    );
+    assert_eq!(result_with_ghost.total, Some(4));
+
+    // Plan guard: the ordering aggregation over `search_index` must be a
+    // bounded index walk over the candidate set (`idx_search_composite`,
+    // hinted, `resource_id: {$in: [...]}`), not a type-wide scan, and the
+    // type-wide `distinct` pass over `resources` must not run at all.
+    let client = raw_test_client(&backend.config().connection_string)
+        .await
+        .expect("failed to connect raw MongoDB client");
+    let db_name = backend.config().database_name.clone();
+    let database = client.database(&db_name);
+
+    if let Err(e) = database.run_command(doc! { "profile": 2_i32 }).await {
+        eprintln!(
+            "Skipping mongodb_integration_param_sort_is_bounded_by_the_candidate_set plan assertions: \
+             {{profile: 2}} was refused ({e})"
+        );
+        return;
+    }
+
+    let _ = backend.search(&tenant, &descending).await.unwrap();
+
+    let _ = database.run_command(doc! { "profile": 0_i32 }).await;
+
+    let profile: Collection<Document> = database.collection("system.profile");
+    let opts = mongodb::options::FindOptions::builder()
+        .sort(doc! { "ts": -1_i32 })
+        .limit(20)
+        .build();
+    let mut cursor = profile
+        .find(doc! {
+            "ns": format!("{db_name}.search_index"),
+            "command.aggregate": "search_index",
+        })
+        .with_options(opts)
+        .await
+        .expect("failed to query system.profile");
+
+    // Only the newest matching entry is of interest, so advance once rather
+    // than looping (a `while` with an unconditional `break` trips
+    // `clippy::never_loop`, which CI denies).
+    let entry: Option<Document> = if cursor
+        .advance()
+        .await
+        .expect("failed to advance profile cursor")
+    {
+        Some(
+            cursor
+                .deserialize_current()
+                .expect("failed to deserialize profile entry"),
+        )
+    } else {
+        None
+    };
+    let entry = entry.expect("expected a profiled aggregate on search_index");
+
+    let plan_summary = entry.get_str("planSummary").unwrap_or_default();
+    assert!(
+        plan_summary.contains("resource_id: 1"),
+        "expected the composite index (naming resource_id) in the plan, got: {plan_summary}"
+    );
+
+    let keys_examined = entry
+        .get_i64("keysExamined")
+        .or_else(|_| entry.get_i32("keysExamined").map(i64::from))
+        .expect("profile entry missing keysExamined");
+    assert!(
+        keys_examined <= 12,
+        "keysExamined {keys_examined} exceeds the bounded-candidate-set budget (<=12)"
+    );
+
+    let command = entry
+        .get_document("command")
+        .expect("profile entry missing command");
+    let pipeline = command
+        .get_array("pipeline")
+        .expect("profile entry missing pipeline");
+    let first_stage = pipeline
+        .first()
+        .and_then(mongodb::bson::Bson::as_document)
+        .expect("pipeline[0] is not a document");
+    let match_stage = first_stage
+        .get_document("$match")
+        .expect("pipeline[0] missing $match");
+    assert!(
+        match_stage.contains_key("resource_id"),
+        "expected $match to filter by resource_id, got: {match_stage:?}"
+    );
+
+    let distinct_on_resources = profile
+        .count_documents(doc! { "command.distinct": "resources" })
+        .await
+        .expect("failed to count distinct-on-resources profile entries");
+    assert_eq!(
+        distinct_on_resources, 0,
+        "the bounded path must not run a type-wide distinct on resources"
+    );
+}
+
+/// #1040: the parameter-sort aggregation mapped `Quantity` sorts to
+/// `value_number`, but the search-index writer stores quantity values in
+/// `value_quantity_value` — so `_sort=value-quantity` matched nothing and
+/// silently degraded to id order.
+#[tokio::test]
+async fn mongodb_integration_param_sort_by_quantity_orders_by_value() {
+    let Some(backend) = create_backend_with_full_registry("param_sort_quantity").await else {
+        eprintln!(
+            "Skipping mongodb_integration_param_sort_by_quantity_orders_by_value (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+
+    let tenant = create_tenant("tenant-psqty");
+
+    for (id, value) in [
+        ("obs-qty-a", 150.0),
+        ("obs-qty-b", 5.0),
+        ("obs-qty-c", 42.0),
+    ] {
+        backend
+            .create(
+                &tenant,
+                "Observation",
+                json!({
+                    "resourceType": "Observation",
+                    "id": id,
+                    "status": "final",
+                    "code": { "coding": [{ "system": "http://loinc.org", "code": "29463-7" }] },
+                    "valueQuantity": {
+                        "value": value,
+                        "unit": "kg",
+                        "system": "http://unitsofmeasure.org",
+                        "code": "kg"
+                    }
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+    }
+
+    let ids = |result: &helios_persistence::core::SearchResult| {
+        result
+            .resources
+            .items
+            .iter()
+            .map(|r| r.id().to_string())
+            .collect::<Vec<_>>()
+    };
+
+    let ascending = SearchQuery::new("Observation")
+        .with_sort(
+            SortDirective::parse("value-quantity").with_param_type(Some(SearchParamType::Quantity)),
+        )
+        .with_count(10);
+    let result = backend.search(&tenant, &ascending).await.unwrap();
+    assert_eq!(ids(&result), vec!["obs-qty-b", "obs-qty-c", "obs-qty-a"]);
+
+    let descending = SearchQuery::new("Observation")
+        .with_sort(
+            SortDirective::parse("-value-quantity")
+                .with_param_type(Some(SearchParamType::Quantity)),
+        )
+        .with_count(10);
+    let result = backend.search(&tenant, &descending).await.unwrap();
+    assert_eq!(ids(&result), vec!["obs-qty-a", "obs-qty-c", "obs-qty-b"]);
+
+    // The bounded path (a candidate set from a `code` filter) must honour
+    // the same quantity mapping.
+    let filtered_ascending = SearchQuery::new("Observation")
+        .with_parameter(SearchParameter {
+            name: "code".to_string(),
+            param_type: SearchParamType::Token,
+            modifier: None,
+            values: vec![SearchValue::eq("29463-7")],
+            chain: vec![],
+            components: vec![],
+        })
+        .with_sort(
+            SortDirective::parse("value-quantity").with_param_type(Some(SearchParamType::Quantity)),
+        )
+        .with_count(10);
+    let result = backend.search(&tenant, &filtered_ascending).await.unwrap();
+    assert_eq!(ids(&result), vec!["obs-qty-b", "obs-qty-c", "obs-qty-a"]);
+}
+
 /// #1055: `_id`/`_lastUpdated` used to bypass the generic modifier dispatch
 /// entirely, so `:not` returned the exact inverse of the request and
 /// `:missing` compared the boolean literal against the id/date fields

@@ -27,6 +27,11 @@ use crate::types::{
 
 use super::MongoBackend;
 
+/// Candidate ids per `$in` chunk when the parameter-sort aggregation is
+/// bounded to a matched set (#1040). Keeps each aggregate command well under
+/// the 16 MB BSON limit (10 000 UUID-length ids ≈ 0.5 MB).
+const SORT_ID_CHUNK: usize = 10_000;
+
 fn internal_error(message: String) -> StorageError {
     StorageError::Backend(BackendError::Internal {
         backend_name: "mongodb".to_string(),
@@ -142,6 +147,64 @@ async fn collect_documents(mut cursor: Cursor<Document>) -> StorageResult<Vec<Do
         docs.push(doc);
     }
     Ok(docs)
+}
+
+/// Orders `(resource_id, key)` pairs the way the server's
+/// `{ key: <order>, _id: 1 }` sort would: by key in the requested direction,
+/// ties broken by id ascending in both directions. Returns the ids.
+fn order_sort_keys(
+    mut keyed: Vec<(String, Bson)>,
+    direction: crate::types::SortDirection,
+) -> Vec<String> {
+    use crate::types::SortDirection;
+    keyed.sort_by(|(id_a, key_a), (id_b, key_b)| {
+        let by_key = compare_sort_keys(key_a, key_b);
+        let by_key = match direction {
+            SortDirection::Ascending => by_key,
+            SortDirection::Descending => by_key.reverse(),
+        };
+        by_key.then_with(|| id_a.cmp(id_b))
+    });
+    keyed.into_iter().map(|(id, _)| id).collect()
+}
+
+/// Total order over the sort-key values the search index writes: dates by
+/// instant, strings byte-wise (the server's default, collation-free order),
+/// numbers numerically across the integer/double representations. Mixed
+/// types within one parameter do not occur (the writer emits one field per
+/// parameter type); they fall back to a fixed type rank so the order is
+/// still total.
+fn compare_sort_keys(a: &Bson, b: &Bson) -> std::cmp::Ordering {
+    match (a, b) {
+        (Bson::DateTime(x), Bson::DateTime(y)) => x.cmp(y),
+        (Bson::String(x), Bson::String(y)) => x.cmp(y),
+        _ => match (sort_key_as_f64(a), sort_key_as_f64(b)) {
+            (Some(x), Some(y)) => x.total_cmp(&y),
+            _ => sort_key_type_rank(a)
+                .cmp(&sort_key_type_rank(b))
+                .then_with(|| a.to_string().cmp(&b.to_string())),
+        },
+    }
+}
+
+fn sort_key_as_f64(value: &Bson) -> Option<f64> {
+    match value {
+        Bson::Double(d) => Some(*d),
+        Bson::Int32(i) => Some(f64::from(*i)),
+        Bson::Int64(i) => Some(*i as f64),
+        Bson::Decimal128(d) => d.to_string().parse().ok(),
+        _ => None,
+    }
+}
+
+fn sort_key_type_rank(value: &Bson) -> u8 {
+    match value {
+        Bson::Null => 0,
+        Bson::Double(_) | Bson::Int32(_) | Bson::Int64(_) | Bson::Decimal128(_) => 1,
+        Bson::String(_) => 2,
+        Bson::DateTime(_) => 3,
+        _ => 4,
+    }
 }
 
 /// Finds the `contained[]` entry with the given local `id` in a container's
@@ -764,37 +827,37 @@ impl MongoBackend {
         matched_ids: Option<HashSet<String>>,
         directive: &crate::types::SortDirective,
     ) -> StorageResult<SearchResult> {
-        // Resource-level predicates (`_id`, `_lastUpdated`) are not in the
-        // search index, so `matched_ids` cannot carry them. Resolve them
-        // here, against the resources collection, into the id set that the
-        // page, `has_next` and `total` all draw from (#1056). Without them
-        // the matched set is already that sequence.
-        let allowed: Option<HashSet<String>> = if Self::has_resource_level_params(query) {
-            Some(
-                self.resource_level_ids(
-                    db,
-                    tenant_id,
-                    &query.resource_type,
-                    query,
-                    matched_ids.as_ref(),
-                )
-                .await?,
-            )
-        } else {
-            matched_ids
+        // Any filtered sort resolves its candidate set through the resources
+        // collection: that folds in the resource-level predicates (`_id`,
+        // `_lastUpdated`) AND makes the set live-only by construction, so a
+        // stale search-index row can never occupy a page slot (#1056/#1040).
+        // With no filter at all `allowed` stays `None` and the ordering is
+        // computed over the whole type.
+        let allowed: Option<HashSet<String>> = match matched_ids {
+            Some(set) if set.is_empty() => Some(set),
+            Some(set) => Some(
+                self.resource_level_ids(db, tenant_id, &query.resource_type, query, Some(&set))
+                    .await?,
+            ),
+            None if Self::has_resource_level_params(query) => Some(
+                self.resource_level_ids(db, tenant_id, &query.resource_type, query, None)
+                    .await?,
+            ),
+            None => None,
         };
 
-        // Nothing can match: skip the type-wide ordering aggregation.
+        // Nothing can match: skip the ordering aggregation entirely.
         let ordered: Vec<String> = if allowed.as_ref().is_some_and(|set| set.is_empty()) {
             Vec::new()
         } else {
-            let ordered = self
-                .param_sorted_ids(db, tenant_id, &query.resource_type, directive)
-                .await?;
-            match &allowed {
-                Some(set) => ordered.into_iter().filter(|id| set.contains(id)).collect(),
-                None => ordered,
-            }
+            self.param_sorted_ids(
+                db,
+                tenant_id,
+                &query.resource_type,
+                directive,
+                allowed.as_ref(),
+            )
+            .await?
         };
 
         let page_size = query.count.unwrap_or(100).max(1) as usize;
@@ -898,9 +961,10 @@ impl MongoBackend {
     }
 
     /// Ids of the live resources that satisfy the resource-level predicates
-    /// (`_id`, `_lastUpdated`) within `matched_ids`. This is the same
-    /// predicate `search_count` counts, so a page cut from this set and its
-    /// `total` agree by construction (#1056).
+    /// (`_id`, `_lastUpdated`) within `matched_ids` — also the liveness
+    /// filter for every filtered parameter sort. This is the same predicate
+    /// `search_count` counts, so a page cut from this set and its `total`
+    /// agree by construction (#1056).
     async fn resource_level_ids(
         &self,
         db: &mongodb::Database,
@@ -964,23 +1028,36 @@ impl MongoBackend {
             .collect())
     }
 
-    /// Resource ids of the type ordered by an indexed search parameter's
-    /// value (#881): grouped per resource in the search index taking the
-    /// smallest value for ascending sorts and the largest for descending
-    /// (the SQL backends' MIN/MAX), with resources that have no value for
-    /// the parameter appended last in id order.
+    /// Resource ids ordered by an indexed search parameter's value (#881):
+    /// grouped per resource in the search index taking the smallest value
+    /// for ascending sorts and the largest for descending (the SQL backends'
+    /// MIN/MAX), with resources that have no value for the parameter
+    /// appended last in id order.
+    ///
+    /// With `allowed` — the ids the query matched — the aggregation is
+    /// bounded to that set (`resource_id: {$in: chunk}`, hinted onto
+    /// `idx_search_composite`), the per-resource keys are ordered client-side
+    /// and the unkeyed tail is taken from `allowed` itself, so the cost is
+    /// proportional to the result set rather than to the resource type
+    /// (#1040). Without `allowed` (no filter at all) the ordering is still
+    /// computed over the whole type.
     async fn param_sorted_ids(
         &self,
         db: &mongodb::Database,
         tenant_id: &str,
         resource_type: &str,
         directive: &crate::types::SortDirective,
+        allowed: Option<&HashSet<String>>,
     ) -> StorageResult<Vec<String>> {
         use crate::types::{SearchParamType as Spt, SortDirection};
 
         let value_field = match directive.param_type {
             Some(Spt::Date) => "value_date",
-            Some(Spt::Number) | Some(Spt::Quantity) => "value_number",
+            Some(Spt::Number) => "value_number",
+            // The writer stores quantities in `value_quantity_value`, not
+            // `value_number`; mapping them to the latter made every quantity
+            // sort degrade silently to id order (#1040).
+            Some(Spt::Quantity) => "value_quantity_value",
             Some(Spt::Token) => "value_token_code",
             Some(Spt::Reference) => "value_reference",
             Some(Spt::Uri) => "value_uri",
@@ -990,8 +1067,62 @@ impl MongoBackend {
             SortDirection::Ascending => ("$min", 1),
             SortDirection::Descending => ("$max", -1),
         };
-
         let search_index = db.collection::<Document>(MongoBackend::SEARCH_INDEX_COLLECTION);
+
+        if let Some(allowed) = allowed {
+            // Bounded path (#1040): one `$match`+`$group` per chunk of the
+            // candidate set, then order the keys client-side. Chunks are cut
+            // from a sorted view of the set so the sequence of commands is
+            // deterministic for a given query.
+            let mut candidates: Vec<&String> = allowed.iter().collect();
+            candidates.sort();
+            let mut keyed: Vec<(String, Bson)> = Vec::with_capacity(allowed.len());
+            for chunk in candidates.chunks(SORT_ID_CHUNK) {
+                let ids: Vec<Bson> = chunk.iter().map(|id| Bson::String((*id).clone())).collect();
+                let pipeline = vec![
+                    doc! { "$match": {
+                        "tenant_id": tenant_id,
+                        "resource_type": resource_type,
+                        "resource_id": { "$in": Bson::Array(ids) },
+                        "param_name": &directive.parameter,
+                        value_field: { "$ne": Bson::Null },
+                    }},
+                    doc! { "$group": {
+                        "_id": "$resource_id",
+                        "key": { accumulator: format!("${value_field}") },
+                    }},
+                ];
+                let cursor = search_index
+                    .aggregate(pipeline)
+                    .hint(mongodb::options::Hint::Name(
+                        "idx_search_composite".to_string(),
+                    ))
+                    .await
+                    .or_query_error("Failed to sort by search parameter")?;
+                for d in collect_documents(cursor).await? {
+                    if let (Ok(id), Some(key)) = (d.get_str("_id"), d.get("key")) {
+                        keyed.push((id.to_string(), key.clone()));
+                    }
+                }
+            }
+            let mut ordered = order_sort_keys(keyed, directive.direction);
+            let keyed_set: HashSet<String> = ordered.iter().cloned().collect();
+            let mut unkeyed: Vec<String> = allowed
+                .iter()
+                .filter(|id| !keyed_set.contains(*id))
+                .cloned()
+                .collect();
+            unkeyed.sort();
+            ordered.extend(unkeyed);
+            // `allowed` is live-only by construction — `search_param_sorted`
+            // resolves every filtered candidate set through the resources
+            // collection with `is_deleted: false` — so no liveness pass is
+            // needed here.
+            return Ok(ordered);
+        }
+
+        // Unfiltered sort: the ordering is still computed over the whole
+        // type. Unchanged from #881/#1056 apart from the value-field mapping.
         let pipeline = vec![
             doc! { "$match": {
                 "tenant_id": tenant_id,
@@ -2694,6 +2825,92 @@ mod metadata_param_modifier_tests {
                         .with_parameter(last_updated_param(Some(SearchModifier::Missing), "true"))
                 )
                 .is_ok()
+        );
+    }
+}
+
+/// #1040: `order_sort_keys` must reproduce the server's `{ key: <order>,
+/// _id: 1 }` sort — including the tie-break — now that the bounded path
+/// orders the keyed candidates client-side instead of server-side.
+#[cfg(test)]
+mod sort_key_order_tests {
+    use super::*;
+    use crate::types::SortDirection;
+
+    fn dt(millis: i64) -> Bson {
+        Bson::DateTime(mongodb::bson::DateTime::from_millis(millis))
+    }
+
+    #[test]
+    fn dates_ascending_order_by_instant() {
+        let keyed = vec![
+            ("c".to_string(), dt(300)),
+            ("a".to_string(), dt(100)),
+            ("b".to_string(), dt(200)),
+        ];
+        assert_eq!(
+            order_sort_keys(keyed, SortDirection::Ascending),
+            vec!["a", "b", "c"]
+        );
+    }
+
+    #[test]
+    fn dates_descending_reverses_by_instant_with_id_ascending_ties() {
+        let keyed = vec![
+            ("c".to_string(), dt(300)),
+            ("a".to_string(), dt(100)),
+            ("b".to_string(), dt(200)),
+        ];
+        assert_eq!(
+            order_sort_keys(keyed.clone(), SortDirection::Descending),
+            vec!["c", "b", "a"]
+        );
+
+        // Equal keys keep id-ascending order in BOTH directions — this is
+        // the server's `{key: -1, _id: 1}` semantics.
+        let tied = vec![("z".to_string(), dt(100)), ("y".to_string(), dt(100))];
+        assert_eq!(
+            order_sort_keys(tied.clone(), SortDirection::Ascending),
+            vec!["y", "z"]
+        );
+        assert_eq!(
+            order_sort_keys(tied, SortDirection::Descending),
+            vec!["y", "z"]
+        );
+    }
+
+    #[test]
+    fn strings_order_byte_wise() {
+        let keyed = vec![
+            ("id-c".to_string(), Bson::String("c".to_string())),
+            ("id-ba".to_string(), Bson::String("ba".to_string())),
+            ("id-b".to_string(), Bson::String("b".to_string())),
+        ];
+        assert_eq!(
+            order_sort_keys(keyed, SortDirection::Ascending),
+            vec!["id-b", "id-ba", "id-c"]
+        );
+
+        let case_sensitive = vec![
+            ("id-a".to_string(), Bson::String("a".to_string())),
+            ("id-B".to_string(), Bson::String("B".to_string())),
+        ];
+        assert_eq!(
+            order_sort_keys(case_sensitive, SortDirection::Ascending),
+            vec!["id-B", "id-a"]
+        );
+    }
+
+    #[test]
+    fn numbers_order_numerically_across_representations() {
+        let keyed = vec![
+            ("id-7".to_string(), Bson::Int32(7)),
+            ("id-6.5".to_string(), Bson::Double(6.5)),
+            ("id-8".to_string(), Bson::Int64(8)),
+        ];
+        assert_eq!(
+            order_sort_keys(keyed, SortDirection::Ascending),
+            vec!["id-6.5", "id-7", "id-8"]
         );
     }
 }
