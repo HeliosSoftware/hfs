@@ -70,6 +70,12 @@ pub enum Phase {
     Create,
     /// The `SELECT 1 FROM resources` existence probe inside `create`.
     CreateExists,
+    /// Deep clones of the parsed `serde_json::Value` on the create path: the
+    /// entry's copy handed to `create`, and `create`'s own copy that receives
+    /// `id`/`resourceType`. The SQLite ingest path never round-trips through
+    /// the typed FHIR model (#947 item 5), so this is the whole cost of
+    /// "re-materialising" the resource between parse and serialize.
+    EntryClone,
     /// `serde_json::to_vec` of the resource being stored.
     Serialize,
     /// `INSERT INTO resources`.
@@ -99,12 +105,6 @@ pub enum Phase {
     BookkeepingChange,
     /// `INSERT OR REPLACE INTO bulk_entry_results` — the per-line receipt.
     BookkeepingResult,
-    /// Deep clones of the parsed `serde_json::Value` on the create path: the
-    /// entry's copy handed to `create`, and `create`'s own copy that receives
-    /// `id`/`resourceType`. The SQLite ingest path never round-trips through
-    /// the typed FHIR model (#947 item 5), so this is the whole cost of
-    /// "re-materialising" the resource between parse and serialize.
-    EntryClone,
     /// `COMMIT` of one batch transaction.
     Commit,
     /// Per-batch overhead outside the entry loop (BEGIN, manifest counters).
@@ -143,6 +143,7 @@ impl Phase {
         Phase::EntryRead,
         Phase::Create,
         Phase::CreateExists,
+        Phase::EntryClone,
         Phase::Serialize,
         Phase::ResourceInsert,
         Phase::HistoryInsert,
@@ -157,7 +158,6 @@ impl Phase {
         Phase::Bookkeeping,
         Phase::BookkeepingChange,
         Phase::BookkeepingResult,
-        Phase::EntryClone,
         Phase::Commit,
         Phase::BatchOverhead,
         Phase::ReindexFetch,
