@@ -31,6 +31,7 @@ public address explicitly behind a proxy. Request `Host`, `Forwarded`, and
 | `HFS_REQUEST_TIMEOUT` | `30` | Request timeout (seconds) |
 | `HFS_DEFAULT_PAGE_SIZE` | `20` | Default search result page size |
 | `HFS_MAX_PAGE_SIZE` | `1000` | Maximum search result page size |
+| `HFS_EVERYTHING_MAX_UNPAGED` | `10000` | Ceiling on `match` entries for an unpaged `Patient/$everything`; when reached the response is paged and carries a `next` link. |
 
 Request bodies may be sent compressed (`Content-Encoding: gzip`, `deflate`,
 `br`, or `zstd`); unsupported encodings are rejected with `415`. Responses
