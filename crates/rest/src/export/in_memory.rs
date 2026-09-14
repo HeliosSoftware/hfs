@@ -463,7 +463,9 @@ fn record_subject_finished(
 }
 
 /// The ViewDefinition half of an export job: run each named view through the
-/// `SofRunner` and shard its rows into output files.
+/// `SofRunner` and shard its rows into output files. An error from a view's
+/// row stream fails the whole job instead of being skipped, so a shard is
+/// never published as a complete file when rows are actually missing.
 #[allow(clippy::too_many_arguments)]
 async fn run_views_job<Sink: ExportSink>(
     jobs: &DashMap<String, JobStatus>,
@@ -503,18 +505,17 @@ async fn run_views_job<Sink: ExportSink>(
             .await
             .map_err(|e| format!("view '{}': {e}", named.name))?;
 
-        let rows: Vec<serde_json::Value> = stream
-            .filter_map(|r| async move {
-                match r {
-                    Ok(v) => Some(v),
-                    Err(e) => {
-                        warn!("export row error (skipped): {e}");
-                        None
-                    }
+        let mut rows: Vec<serde_json::Value> = Vec::new();
+        let mut stream = stream;
+        while let Some(item) = stream.next().await {
+            match item {
+                Ok(v) => rows.push(v),
+                Err(e) => {
+                    warn!(view = %named.name, error = %e, "export row stream failed");
+                    return Err(format!("view '{}': {e}", named.name));
                 }
-            })
-            .collect()
-            .await;
+            }
+        }
 
         total_rows += rows.len();
 
@@ -1325,6 +1326,70 @@ mod tests {
                 );
             }
             other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    /// A storage failure mid-materialization of a ViewDefinition subject must
+    /// fail the export job with a diagnostic naming the view and the cause,
+    /// instead of silently dropping the failed rows and reporting the job as
+    /// complete with a truncated file.
+    #[tokio::test]
+    async fn view_export_fails_with_diagnostic_when_row_stream_errors() {
+        let runner = Arc::new(FailingRunner);
+        let controller =
+            InMemoryController::new(runner, InMemorySink::new("http://localhost"), None);
+
+        let tenant = TenantContext::new(TenantId::new("t1"), TenantPermissions::full_access());
+        let view = serde_json::json!({
+            "resourceType": "ViewDefinition",
+            "resource": "Patient",
+            "status": "active",
+            "select": [{"column": [{"name": "id", "path": "id"}]}]
+        });
+
+        let job_id = controller.submit(ExportTask {
+            work: ExportWork {
+                views: vec![NamedView {
+                    name: "patients".to_string(),
+                    view,
+                }],
+                queries: vec![],
+                limits: SqlExportLimits::default(),
+            },
+            tenant,
+            filters: ViewFilters::default(),
+            format: "ndjson".to_string(),
+            header: true,
+            client_tracking_id: None,
+        });
+
+        let status = tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                match controller.get_status("t1", &job_id) {
+                    Some(status @ JobStatus::Completed { .. })
+                    | Some(status @ JobStatus::Failed { .. }) => return status,
+                    _ => tokio::time::sleep(Duration::from_millis(20)).await,
+                }
+            }
+        })
+        .await
+        .expect("export job must reach a terminal state before the timeout");
+
+        match status {
+            JobStatus::Failed { message, .. } => {
+                assert!(
+                    message.contains("view 'patients'"),
+                    "unexpected message: {message}"
+                );
+                assert!(
+                    message.contains("statement timeout"),
+                    "unexpected message: {message}"
+                );
+            }
+            other => panic!(
+                "expected Failed (a mid-stream error must not be reported as a completed job \
+                 with a truncated file), got {other:?}"
+            ),
         }
     }
 
