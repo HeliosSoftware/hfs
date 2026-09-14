@@ -171,6 +171,7 @@ The server is configured via environment variables:
 | `HFS_LOG_LEVEL` | info | Log level |
 | `HFS_MAX_BODY_SIZE` | 10485760 | Max request body (bytes; applies to the decompressed body for compressed requests) |
 | `HFS_REQUEST_TIMEOUT` | 30 | Request timeout (seconds) |
+| `HFS_DASHBOARD_RECONCILE_SECS` | 30 | Seconds between dashboard count reconcile passes (whole seconds, > 0; `0` or non-numeric fails startup) |
 | `HFS_BATCH_MAX_CONCURRENCY` | 16 | Ceiling on concurrent entries within one `batch` Bundle (see below) |
 | `HFS_ENABLE_CORS` | true | Enable CORS |
 | `HFS_DEFAULT_TENANT` | default | Default tenant ID |

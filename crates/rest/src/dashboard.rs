@@ -16,7 +16,7 @@
 //! curves from the write counters with the same cumulative-bucketing helper
 //! ([`cumulative_series`]), so those semantics live in exactly one place.
 //!
-//! # No storage aggregate on a page load (#1078)
+//! # No storage query on a page load (#1078)
 //!
 //! Computing figures from storage means a `GROUP BY` over every live row of
 //! the tenant plus bucketed history scans for the charted types. During a
@@ -25,36 +25,40 @@
 //! operator most wanted to watch it move — and a page load that ran them
 //! inline held a request, a connection and the backend's attention hostage.
 //!
-//! So [`DashboardProvider::snapshot`] never runs one. A page load gets one of
-//! three snapshots:
+//! So [`DashboardProvider::snapshot`] never awaits storage. A page load gets
+//! one of three snapshots, told apart by [`DashboardSnapshot::figures`]:
 //!
 //! - **Seeded tenant — served from memory.** Once a tenant's totals have been
 //!   read from storage, every snapshot is built from the process-global
 //!   [`DashboardCounters`] that the REST write handlers and `$bulk-submit`
-//!   record into. Figures the counters cannot vouch for (writes recorded since
-//!   the last reconcile, a purge not reseeded yet, or a window whose history
-//!   ring has not been loaded from storage) are flagged
-//!   [`DashboardSnapshot::approximate`] — measured, never invented (#956). A
-//!   charted ring that lacks storage history is queued for a background seed.
+//!   record into. When the totals and every charted series still match what
+//!   storage last reported the figures are [`Figures::Exact`]; figures the
+//!   counters cannot vouch for (writes recorded since the last reconcile, a
+//!   change the storage write marker detected elsewhere, a purge not reseeded
+//!   yet, or a window whose history ring has not been loaded from storage) are
+//!   [`Figures::Approximate`] — measured, never invented (#956). A charted
+//!   ring that lacks storage history is queued for a background seed.
 //! - **Unseeded tenant — pending.** A tenant the counters have no storage base
-//!   for gets [`DashboardSnapshot::totals_pending`] with empty figures and no
-//!   `generated_at`, and a background seed of the tenant is queued (once,
-//!   however many page loads ask). The page renders as waiting and is served
-//!   from memory once the seed lands.
+//!   for gets [`Figures::Pending`] with empty figures, and a background seed of
+//!   the tenant is queued (once, however many page loads ask). The page
+//!   renders as waiting and is served from memory once the seed lands.
 //! - **Backend that cannot count — unsupported.** When
 //!   [`ResourceStorage::supports_type_counts`] is `false` (an S3 primary, for
 //!   example) the count aggregates are empty defaults, so nothing can be
-//!   measured: the snapshot sets [`DashboardSnapshot::counts_unsupported`] with
-//!   empty figures, and no tenant is ever seeded or reconciled.
+//!   measured: the snapshot is [`Figures::Unsupported`] with empty figures, and
+//!   no tenant is ever seeded or reconciled.
 //!
-//! Every shape carries the bulk-export and bulk-submit job counts: small
-//! job-table reads, cached per tenant for [`JOB_COUNTS_TTL`].
+//! Every shape carries the bulk-export and bulk-submit job counts last read
+//! for the tenant (`None` before the first read). Reading them is background
+//! work too: a snapshot that finds them missing or older than
+//! [`JOB_COUNTS_TTL`] queues a refresh, and the loop runs it.
 //!
 //! # Background seeding and reconcile
 //!
 //! [`spawn_reconcile_loop`] (wired next to the provider registration in
-//! [`crate::build_app`]) runs every storage aggregate the dashboard needs, one
-//! at a time, on a single task:
+//! [`crate::build_app`]) runs every storage query the dashboard needs, one at
+//! a time, on a single supervised task (a panicking pass is logged and the
+//! task restarted with exponential back-off):
 //!
 //! - **Seeds.** A tenant's seed reads its totals (`count_all_types`) and then
 //!   the history rings of its default charted types for every window, plus any
@@ -76,48 +80,66 @@
 //!   waiting state as soon as one grouping query finishes — while the reseed
 //!   of an already seeded tenant, which has figures on show and whose counters
 //!   follow the import, backs off like the periodic reconcile.
-//! - **Reconciles.** Every [`reconcile interval`](DEFAULT_RECONCILE_INTERVAL)
-//!   each seeded tenant's totals are re-read, backing off while a bulk submit
-//!   is active for the tenant and never spending more than about
+//! - **Reconciles.** Every reconcile interval
+//!   (`HFS_DASHBOARD_RECONCILE_SECS`, [`ServerConfig::dashboard_reconcile_interval_secs`])
+//!   each seeded tenant's totals are re-read when due, backing off while a
+//!   bulk submit is active for the tenant and never spending more than about
 //!   1/[`RECONCILE_DUTY_FACTOR`] of the time on one tenant's grouping query.
-//!   When a tenant is quiet (no write recorded since its totals reconcile
-//!   began) the history rings of its charted types that are no longer exact
-//!   are re-seeded, after which the snapshot converges to exact storage figures
-//!   and drops its approximate label.
+//!   The storage write marker
+//!   ([`ResourceStorage::latest_write_marker`]) is read around every totals
+//!   read, and probed once per pass for a tenant that is not due: a change
+//!   this process did not record (a sibling instance, a direct database edit)
+//!   labels the figures approximate and makes the totals due at once. The
+//!   history rings of its charted types that are no longer exact are re-seeded
+//!   when the tenant is quiet, or once their history is older than
+//!   [`RESEED_MAX_AGE_FACTOR`] intervals even under continuous writes.
 //! - **Ring seeds.** A page load that charts a ring without storage history
 //!   queues it and wakes the loop, which loads it after a short debounce —
 //!   deferred while a bulk submit is active for the tenant. The queued rings of
 //!   a tenant are loaded with one grouped query per window, and a ring whose
 //!   query failed stays queued for the next drain.
+//! - **Bounded passes.** A pass visits tenants most recently viewed first
+//!   ([`DashboardCounters::tenants_by_priority`]), stops after
+//!   [`MAX_TENANTS_PER_PASS`] tenants or [`MAX_PASS_TIME`] (at most one
+//!   interval), and starts the next pass with the tenants it skipped. The first
+//!   seed of a tenant viewed within [`RECENT_VIEW`] is never skipped. Tenants
+//!   nobody viewed for [`CHARTED_KEY_TTL`] are evicted (the default tenant is
+//!   kept), and a deregistered tenant's state is dropped; either is seeded
+//!   again on its next view.
 //!
 //! # Counters are process-local
 //!
 //! A multi-instance deployment sharing one PostgreSQL or MongoDB database only
-//! records the writes that land on *this* instance. Writes made through a
-//! sibling instance, direct database edits, and the write paths that do not
-//! record (conformance seeding, history deletes) show up only after the next
-//! reconcile; until then the snapshot is labelled approximate whenever this
-//! instance saw writes, and may be quietly behind when it saw none.
+//! records the writes that land on *this* instance. On backends with a write
+//! marker, writes made elsewhere are detected by the next pass and labelled
+//! approximate until the reconcile that follows; on the others (and for the
+//! write paths that do not record, such as conformance seeding and history
+//! deletes) they show up only after the next reconcile, and the snapshot may
+//! be quietly behind until then.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::sync::{Arc, Mutex, MutexGuard, Weak};
+use std::future::Future;
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
 use std::time::{Duration as StdDuration, Instant};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
 use helios_observability::dashboard::{
     DashboardPoint, DashboardProvider, DashboardSeries, DashboardSnapshot, DashboardWindow,
-    ExportJobCounts, TypeCount,
+    ExportJobCounts, Figures, TypeCount,
 };
-use helios_observability::dashboard_counters::{CountersSeries, DashboardCounters};
+use helios_observability::dashboard_counters::{
+    CountersSeries, DashboardCounters, ReconcileOutcome, StorageMarker,
+};
+use helios_observability::dashboard_metrics::{self, StorageQuery};
 use helios_persistence::core::{
     BulkExportJobStore, BulkSubmitJobStore, ExportStatus, ResourceCountDelta, ResourceStorage,
-    bucket_floor,
+    WriteMarker, bucket_floor,
 };
 use helios_persistence::error::StorageResult;
 use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
 use tokio::sync::Notify;
-use tracing::{debug, warn};
+use tracing::{debug, error, warn};
 
 use crate::config::ServerConfig;
 
@@ -145,25 +167,22 @@ const INFRASTRUCTURE_TYPES: &[&str] = &[
 /// far an explicit selection can go.
 const MAX_CHARTED_TYPES: usize = 6;
 
-/// How long a tenant's bulk-export and bulk-submit job counts are reused
-/// (#1078). They are small job-table reads, but every page load (and every
-/// sibling snapshot key) asked for them, which during an import is exactly the
-/// traffic the database can least afford. It must stay below the snapshot
-/// layer's 15s TTL: an entry is only refreshed as a side effect of a snapshot
-/// recompute, so a shorter TTL is always expired by the time the same key
-/// recomputes, while still absorbing the sibling keys that ask in between.
+/// How long a tenant's last read bulk-export and bulk-submit job counts are
+/// served before a page load queues a background refresh of them (#1078).
+/// They are small job-table reads, but a page load never awaits them: every
+/// load (and every sibling snapshot key) asking for them is exactly the
+/// traffic the database can least afford during an import, and a slow job
+/// store must not hold a page. The loop refreshes a queued tenant within a
+/// seed debounce, so the counts on show are at most a few seconds old while
+/// someone watches.
 const JOB_COUNTS_TTL: StdDuration = StdDuration::from_secs(5);
 
-/// Default pause between background reconcile passes (#1078).
-///
-/// Overridable with `HFS_DASHBOARD_RECONCILE_SECS` (whole seconds, > 0). A
-/// pass only runs a tenant's grouping query when that tenant is due (see
-/// [`RECONCILE_DUTY_FACTOR`]), so a short interval does not by itself make a
-/// large store scan more often. It is also how soon a failed seed is retried.
-const DEFAULT_RECONCILE_INTERVAL: StdDuration = StdDuration::from_secs(30);
-
-/// Environment variable overriding [`DEFAULT_RECONCILE_INTERVAL`].
-const RECONCILE_INTERVAL_ENV: &str = "HFS_DASHBOARD_RECONCILE_SECS";
+/// Upper bound on one job-store count or write-marker probe made by the
+/// background loop. Both are meant to be index reads; one that overruns is
+/// abandoned (and counted as a failed query) so a stuck job store or a
+/// saturated connection pool cannot stall the whole pass. The previous value
+/// is kept.
+const PROBE_TIMEOUT: StdDuration = StdDuration::from_secs(2);
 
 /// Duty-cycle bound on a tenant's totals reconcile: after a `count_all_types`
 /// that took `t`, the tenant is not reconciled again for
@@ -172,8 +191,33 @@ const RECONCILE_INTERVAL_ENV: &str = "HFS_DASHBOARD_RECONCILE_SECS";
 /// standing load on a busy backend — including during a REST-driven load that
 /// the bulk-submit back-off cannot see. Seeds are not held back by it (a
 /// tenant with no figures, or stale ones after a purge, is read right away),
-/// but they do record their read in it.
+/// but they do record their read in it. A change the storage write marker
+/// detects makes the totals due at once.
 const RECONCILE_DUTY_FACTOR: u32 = 10;
+
+/// How far before the previous totals reconcile began the write marker counts
+/// recent writes. Covers writes committed with an earlier timestamp than the
+/// newest history row (a lagging clock, a long transaction), which leave the
+/// marker's `latest` unchanged.
+const RECENT_WRITES_LOOKBACK: Duration = Duration::minutes(5);
+
+/// A charted ring whose storage history is older than this many reconcile
+/// intervals is re-seeded even while writes keep arriving, so a tenant under a
+/// continuous load still converges instead of staying approximate forever.
+const RESEED_MAX_AGE_FACTOR: u32 = 5;
+
+/// How many tenants one pass (or one wake-up drain) visits at most. The rest
+/// go first in the next pass.
+const MAX_TENANTS_PER_PASS: usize = 64;
+
+/// How long one pass (or one wake-up drain) keeps starting tenants' work,
+/// capped by the reconcile interval. A tenant whose work already started
+/// finishes it.
+const MAX_PASS_TIME: StdDuration = StdDuration::from_secs(20);
+
+/// A tenant viewed this recently has its *first* seed run even when the pass
+/// budget is spent, so a page someone is looking at leaves its waiting state.
+const RECENT_VIEW: StdDuration = StdDuration::from_secs(60);
 
 /// How long the reconcile loop waits after being woken for a seed before
 /// draining the queues, so a page that charts several types (or a burst of
@@ -181,9 +225,21 @@ const RECONCILE_DUTY_FACTOR: u32 = 10;
 const SEED_DEBOUNCE: StdDuration = StdDuration::from_millis(250);
 
 /// How long a `(tenant, type, window)` stays on the re-seed list after it was
-/// last charted. Bounds the list by recent user behaviour rather than by every
-/// type anyone ever picked.
+/// last charted, and how long a tenant nobody views keeps its counters before
+/// it is evicted. Bounds both by recent user behaviour rather than by every
+/// tenant and type anyone ever looked at.
 const CHARTED_KEY_TTL: StdDuration = StdDuration::from_secs(60 * 60);
+
+/// First pause before restarting a reconcile task that panicked; doubled on
+/// each further panic up to [`RESTART_BACKOFF_MAX`].
+const RESTART_BACKOFF_MIN: StdDuration = StdDuration::from_secs(1);
+
+/// Longest pause before restarting a panicked reconcile task.
+const RESTART_BACKOFF_MAX: StdDuration = StdDuration::from_secs(60);
+
+/// A reconcile task that ran at least this long before panicking is
+/// considered healthy: its restart starts over from [`RESTART_BACKOFF_MIN`].
+const HEALTHY_RUN: StdDuration = StdDuration::from_secs(5 * 60);
 
 /// A span to chart, and the bucket width that samples it.
 ///
@@ -556,7 +612,7 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// A tenant's cached job counts (see [`JOB_COUNTS_TTL`]).
+/// A tenant's last read job counts (see [`JOB_COUNTS_TTL`]).
 #[derive(Clone, Copy, Default)]
 struct JobCountsEntry {
     /// When the stores were last asked; `None` before the first read.
@@ -565,6 +621,14 @@ struct JobCountsEntry {
     export: Option<ExportJobCounts>,
     /// Last successfully read active-submission count.
     import: Option<u64>,
+}
+
+impl JobCountsEntry {
+    /// Read within [`JOB_COUNTS_TTL`].
+    fn is_fresh(&self) -> bool {
+        self.fetched_at
+            .is_some_and(|at| at.elapsed() < JOB_COUNTS_TTL)
+    }
 }
 
 /// `(tenant, resource type, window)` — one history ring of the write counters.
@@ -581,11 +645,14 @@ struct SeedQueue {
     /// Rings a snapshot charted without storage history, awaiting their seed.
     /// A set for the same reason.
     rings: Mutex<HashSet<RingKey>>,
-    /// Rings charted recently, with when — what a seed loads and a quiet
-    /// reconcile re-seeds once they stop being exact (see
-    /// [`CHARTED_KEY_TTL`]).
+    /// Rings charted recently, with when — what a seed loads and a reconcile
+    /// re-seeds once they stop being exact (see [`CHARTED_KEY_TTL`]).
     charted: Mutex<HashMap<RingKey, Instant>>,
-    /// Wakes the reconcile loop when `tenants` or `rings` gains a key.
+    /// Tenants whose job counts a snapshot found missing or older than
+    /// [`JOB_COUNTS_TTL`], awaiting a background refresh.
+    job_counts: Mutex<HashSet<String>>,
+    /// Wakes the reconcile loop when `tenants`, `rings` or `job_counts` gains
+    /// a key.
     wake: Arc<Notify>,
 }
 
@@ -606,15 +673,43 @@ pub(crate) struct ReconcileReport {
     pub(crate) skipped_active_import: Vec<String>,
     /// Seeded tenants whose totals reconcile is not due yet (duty cycle).
     pub(crate) not_due: Vec<String>,
+    /// Seeded tenants whose storage write marker showed a change this process
+    /// did not record; their totals were made due at once.
+    pub(crate) external_changes: Vec<String>,
+    /// Tenants whose work waits for the next pass because this one spent its
+    /// budget ([`MAX_TENANTS_PER_PASS`], [`MAX_PASS_TIME`]).
+    pub(crate) budget_skipped: Vec<String>,
+    /// Tenants whose provider state was dropped: evicted as idle, or no longer
+    /// known to the counters (deregistered).
+    pub(crate) dropped: Vec<String>,
+    /// Tenants whose job counts were read from the job stores.
+    pub(crate) job_counts_refreshed: Vec<String>,
     /// History rings loaded from storage during the pass.
     pub(crate) rings_seeded: usize,
 }
 
-/// When each tenant's totals may next be re-read (see
-/// [`RECONCILE_DUTY_FACTOR`]). Owned by the reconcile loop.
+/// The reconcile loop's own per-tenant bookkeeping: when each tenant's totals
+/// may next be re-read (see [`RECONCILE_DUTY_FACTOR`]), which write-marker
+/// bound its markers were read with, and which tenants the budget left for
+/// the next pass. Owned by the loop.
 pub(crate) struct ReconcileSchedule {
     interval: StdDuration,
     next_due: HashMap<String, Instant>,
+    /// When each tenant's last totals reconcile began.
+    last_begin: HashMap<String, DateTime<Utc>>,
+    /// The `recent_since` bound the counters' current marker for the tenant
+    /// was read with. Markers are only comparable when read with the same
+    /// bound, so probes reuse it (see [`Self::reconcile_bound`]).
+    marker_bound: HashMap<String, Option<DateTime<Utc>>>,
+    /// Tenants a budget left out, oldest first: they go first next time.
+    carried_over: Vec<String>,
+    /// Tenants visited per pass at most ([`MAX_TENANTS_PER_PASS`]).
+    max_tenants_per_pass: usize,
+    /// Time after which a pass starts no further tenant (see
+    /// [`MAX_PASS_TIME`]).
+    pass_time: StdDuration,
+    /// Idle time after which a tenant is evicted ([`CHARTED_KEY_TTL`]).
+    idle_ttl: StdDuration,
 }
 
 impl ReconcileSchedule {
@@ -622,6 +717,12 @@ impl ReconcileSchedule {
         Self {
             interval,
             next_due: HashMap::new(),
+            last_begin: HashMap::new(),
+            marker_bound: HashMap::new(),
+            carried_over: Vec::new(),
+            max_tenants_per_pass: MAX_TENANTS_PER_PASS,
+            pass_time: interval.min(MAX_PASS_TIME),
+            idle_ttl: CHARTED_KEY_TTL,
         }
     }
 
@@ -629,6 +730,11 @@ impl ReconcileSchedule {
         self.next_due
             .get(tenant)
             .is_none_or(|due| Instant::now() >= *due)
+    }
+
+    /// Makes `tenant`'s totals due now (an external change was detected).
+    fn force_due(&mut self, tenant: &str) {
+        self.next_due.remove(tenant);
     }
 
     /// Records a totals read of `elapsed` that just finished for `tenant`.
@@ -639,15 +745,172 @@ impl ReconcileSchedule {
         self.next_due
             .insert(tenant.to_string(), Instant::now() + pause);
     }
+
+    /// The bound a between-reconcile marker probe of `tenant` uses: the one
+    /// its reconciled marker was read with.
+    fn probe_bound(&self, tenant: &str) -> Option<DateTime<Utc>> {
+        self.marker_bound.get(tenant).copied().flatten()
+    }
+
+    /// The bound a totals reconcile of `tenant` reads its markers with, and
+    /// notes it (with the reconcile's begin) for later probes.
+    ///
+    /// A marker's `recent_writes` depends on the bound, and the counters flag
+    /// any marker that differs from the reconciled one as an external change.
+    /// So the bound only moves forward (to [`RECENT_WRITES_LOOKBACK`] before
+    /// the previous reconcile began) when `figures_exact` is `false`: the
+    /// tenant is already approximate then, and the re-seed that follows covers
+    /// its rings anyway. A tenant that stays exact keeps its bound, so a quiet
+    /// tenant is never flagged by the bound moving. The first reconcile of a
+    /// tenant asks for no recent-write count.
+    fn reconcile_bound(
+        &mut self,
+        tenant: &str,
+        figures_exact: bool,
+        begin: DateTime<Utc>,
+    ) -> Option<DateTime<Utc>> {
+        let bound = match (self.marker_bound.get(tenant), figures_exact) {
+            (Some(bound), true) => *bound,
+            _ => self
+                .last_begin
+                .get(tenant)
+                .map(|previous| *previous - RECENT_WRITES_LOOKBACK),
+        };
+        self.marker_bound.insert(tenant.to_string(), bound);
+        self.last_begin.insert(tenant.to_string(), begin);
+        bound
+    }
+
+    /// A fresh budget for one pass or drain.
+    fn budget(&self) -> PassBudget {
+        PassBudget {
+            started: Instant::now(),
+            visited: HashSet::new(),
+        }
+    }
+
+    /// `candidates` in visiting order: the tenants a budget left out last time
+    /// first, then by `priority` ([`DashboardCounters::tenants_by_priority`]),
+    /// then the rest by name.
+    fn order(&self, candidates: BTreeSet<String>, priority: &[String]) -> Vec<String> {
+        let mut remaining = candidates;
+        let mut ordered = Vec::with_capacity(remaining.len());
+        for tenant in self.carried_over.iter().chain(priority) {
+            if remaining.remove(tenant) {
+                ordered.push(tenant.clone());
+            }
+        }
+        ordered.extend(remaining);
+        ordered
+    }
+
+    /// Whether `budget` lets the pass start work for `tenant`. A tenant
+    /// already visited in this pass always may; an `exempt` one (a first seed
+    /// someone is waiting for) may even when the budget is spent. A tenant
+    /// turned away is carried over to go first next time.
+    fn admit(&mut self, budget: &mut PassBudget, tenant: &str, exempt: bool) -> bool {
+        if budget.visited.contains(tenant) {
+            return true;
+        }
+        let spent = budget.visited.len() >= self.max_tenants_per_pass
+            || budget.started.elapsed() >= self.pass_time;
+        if spent && !exempt {
+            if !self.carried_over.iter().any(|t| t == tenant) {
+                self.carried_over.push(tenant.to_string());
+            }
+            return false;
+        }
+        budget.visited.insert(tenant.to_string());
+        self.carried_over.retain(|t| t != tenant);
+        true
+    }
+
+    /// Whether the pass's time budget is spent (for work not tied to a
+    /// tenant's admission, such as job-count refreshes).
+    fn out_of_time(&self, budget: &PassBudget) -> bool {
+        budget.started.elapsed() >= self.pass_time
+    }
+
+    /// Drops everything kept for `tenant`.
+    fn forget(&mut self, tenant: &str) {
+        self.next_due.remove(tenant);
+        self.last_begin.remove(tenant);
+        self.marker_bound.remove(tenant);
+        self.carried_over.retain(|t| t != tenant);
+    }
+
+    fn tenants(&self) -> impl Iterator<Item = &String> {
+        self.next_due
+            .keys()
+            .chain(self.last_begin.keys())
+            .chain(self.marker_bound.keys())
+            .chain(self.carried_over.iter())
+    }
+}
+
+/// The work one pass (or one wake-up drain) has started, against the limits
+/// in [`ReconcileSchedule`].
+struct PassBudget {
+    started: Instant,
+    /// Tenants whose work started in this pass.
+    visited: HashSet<String>,
 }
 
 /// Why a snapshot carries no figures.
 #[derive(Clone, Copy)]
 enum NoFigures {
-    /// The tenant's seed is queued ([`DashboardSnapshot::totals_pending`]).
+    /// The tenant's seed is queued ([`Figures::Pending`]).
     Pending,
-    /// The backend cannot count ([`DashboardSnapshot::counts_unsupported`]).
+    /// The backend cannot count ([`Figures::Unsupported`]).
     Unsupported,
+}
+
+/// `persistence`'s write marker in the counters' comparable form.
+fn storage_marker(marker: WriteMarker) -> StorageMarker {
+    StorageMarker {
+        latest_millis: marker.latest.map(|at| at.timestamp_millis()),
+        recent_writes: marker.recent_writes,
+    }
+}
+
+/// Runs one small storage probe for the background loop with
+/// [`PROBE_TIMEOUT`], recording it as a `query` storage query. `None` on an
+/// error or a timeout, which is logged.
+async fn timed_probe<T>(
+    query: StorageQuery,
+    tenant: &str,
+    what: &'static str,
+    probe: impl Future<Output = StorageResult<T>>,
+) -> Option<T> {
+    let started = Instant::now();
+    let result = tokio::time::timeout(PROBE_TIMEOUT, probe).await;
+    let elapsed = started.elapsed();
+    match result {
+        Ok(Ok(value)) => {
+            dashboard_metrics::record_storage_query(query, elapsed, true);
+            Some(value)
+        }
+        Ok(Err(error)) => {
+            dashboard_metrics::record_storage_query(query, elapsed, false);
+            warn!(
+                %error,
+                tenant = %tenant,
+                probe = what,
+                "dashboard reconcile: storage probe failed; keeping the previous value"
+            );
+            None
+        }
+        Err(_) => {
+            dashboard_metrics::record_storage_query(query, elapsed, false);
+            warn!(
+                tenant = %tenant,
+                probe = what,
+                timeout_ms = PROBE_TIMEOUT.as_millis() as u64,
+                "dashboard reconcile: storage probe timed out; keeping the previous value"
+            );
+            None
+        }
+    }
 }
 
 /// [`DashboardProvider`] backed by a live storage backend. Registered once in
@@ -657,6 +920,9 @@ pub(crate) struct StorageDashboardProvider<S> {
     default_tenant: String,
     fhir_version: String,
     storage: Arc<S>,
+    /// Pause between reconcile passes
+    /// ([`ServerConfig::dashboard_reconcile_interval_secs`]).
+    reconcile_interval: StdDuration,
     /// Bulk-export job store, when the active backend provides one.
     export_jobs: Option<Arc<dyn BulkExportJobStore>>,
     /// Bulk-submit job store, when the active backend provides one.
@@ -664,30 +930,41 @@ pub(crate) struct StorageDashboardProvider<S> {
     /// The live write counters every figure is served from (#1078): the set
     /// the server's write observer feeds, injected by `build_app`.
     counters: Arc<DashboardCounters>,
-    /// Per-tenant cache of the job-store counts (see [`JOB_COUNTS_TTL`]).
+    /// Per-tenant last read job-store counts (see [`JOB_COUNTS_TTL`]).
     job_counts: Mutex<HashMap<String, JobCountsEntry>>,
+    /// When each tenant was last viewed, for the budget exemption of a first
+    /// seed (see [`RECENT_VIEW`]).
+    viewed: Mutex<HashMap<String, Instant>>,
     /// Background seeds, drained by the reconcile loop.
     seeds: SeedQueue,
+    /// The supervisor of the reconcile loop, aborted when the provider drops.
+    reconcile_task: OnceLock<tokio::task::AbortHandle>,
 }
 
 impl<S> StorageDashboardProvider<S> {
-    /// Builds a provider for the server's default tenant and default FHIR
-    /// version. The window and the charted types are chosen per request by the
-    /// UI, so neither is fixed here; the default selection is the tenant's
-    /// largest stored types (#555). Job-store counts start unwired; call
-    /// [`Self::with_job_stores`] to attach them. Starts with a private, empty
-    /// counter set; the server injects the shared one with
+    /// Builds a provider for the server's default tenant, default FHIR version
+    /// and reconcile interval. The window and the charted types are chosen per
+    /// request by the UI, so neither is fixed here; the default selection is
+    /// the tenant's largest stored types (#555). Job-store counts start
+    /// unwired; call [`Self::with_job_stores`] to attach them. Starts with a
+    /// private, empty counter set; the server injects the shared one with
     /// [`Self::with_counters`].
     pub(crate) fn new(storage: Arc<S>, config: &ServerConfig) -> Self {
         Self {
             default_tenant: config.default_tenant.clone(),
             fhir_version: config.default_fhir_version.to_string(),
             storage,
+            // `validate` rejects 0; a hand-built config still never spins.
+            reconcile_interval: StdDuration::from_secs(
+                config.dashboard_reconcile_interval_secs.max(1),
+            ),
             export_jobs: None,
             submit_jobs: None,
             counters: Arc::new(DashboardCounters::new()),
             job_counts: Mutex::new(HashMap::new()),
+            viewed: Mutex::new(HashMap::new()),
             seeds: SeedQueue::default(),
+            reconcile_task: OnceLock::new(),
         }
     }
 
@@ -721,8 +998,24 @@ impl<S> StorageDashboardProvider<S> {
         }
     }
 
+    /// Notes a dashboard view of `tenant`: it keeps the tenant from eviction,
+    /// puts it first in the reconcile order, and exempts its first seed from
+    /// the pass budget for [`RECENT_VIEW`].
+    fn note_viewed(&self, tenant: &str) {
+        let now = Instant::now();
+        self.counters.note_viewed(tenant, now);
+        lock(&self.viewed).insert(tenant.to_string(), now);
+    }
+
+    /// Whether `tenant` was viewed within `within`.
+    fn viewed_within(&self, tenant: &str, within: StdDuration) -> bool {
+        lock(&self.viewed)
+            .get(tenant)
+            .is_some_and(|at| at.elapsed() < within)
+    }
+
     /// Notes that `types` were charted over `window` for `tenant`, so a seed
-    /// or a quiet reconcile keeps their history rings exact.
+    /// or a reconcile keeps their history rings exact.
     fn note_charted(&self, tenant: &str, types: &[&str], window: DashboardWindow) {
         if types.is_empty() {
             return;
@@ -750,6 +1043,29 @@ impl<S> StorageDashboardProvider<S> {
         if inserted {
             self.seeds.wake.notify_one();
         }
+    }
+
+    /// The tenant's last read job counts, `None` for a count never read (or
+    /// with no store wired). Never reads storage: when the counts are missing
+    /// or older than [`JOB_COUNTS_TTL`], a background refresh is queued, waking
+    /// the loop the first time.
+    ///
+    /// Counts degrade to the last successfully read value rather than zero on
+    /// a read error: a zero here would tell an operator "no jobs" when the
+    /// truth is "could not ask". They carry their own unavailable state on the
+    /// page, so they never affect [`DashboardSnapshot::figures`].
+    fn cached_job_counts(&self, tenant: &str) -> (Option<ExportJobCounts>, Option<u64>) {
+        if self.export_jobs.is_none() && self.submit_jobs.is_none() {
+            return (None, None);
+        }
+        let entry = lock(&self.job_counts)
+            .get(tenant)
+            .copied()
+            .unwrap_or_default();
+        if !entry.is_fresh() && lock(&self.seeds.job_counts).insert(tenant.to_string()) {
+            self.seeds.wake.notify_one();
+        }
+        (entry.export, entry.import)
     }
 
     /// Recently charted `(type, window)` rings of `tenant`, in a stable order.
@@ -787,12 +1103,76 @@ impl<S> StorageDashboardProvider<S> {
             .series_view(tenant, window, &[resource_type], Utc::now())
             .and_then(|mut views| views.pop())
     }
+
+    /// Publishes the seed queue depth.
+    fn publish_seed_queue(&self) {
+        let rings = lock(&self.seeds.rings).len();
+        dashboard_metrics::set_seed_queue(rings);
+    }
+
+    /// Drops the provider's state for tenants the counters evicted as idle
+    /// (not viewed for `schedule.idle_ttl`; the default tenant is kept) and
+    /// for tenants the counters no longer hold at all — a deregistered tenant
+    /// whose state [`DashboardCounters::remove_tenant`] dropped. Either is
+    /// seeded again on its next view.
+    fn drop_stale_tenants(
+        &self,
+        schedule: &mut ReconcileSchedule,
+        evict: bool,
+        report: &mut ReconcileReport,
+    ) {
+        let mut dropped: BTreeSet<String> = if evict {
+            self.counters
+                .evict_idle(
+                    schedule.idle_ttl,
+                    Instant::now(),
+                    &[self.default_tenant.as_str()],
+                )
+                .into_iter()
+                .collect()
+        } else {
+            BTreeSet::new()
+        };
+
+        let present: HashSet<String> = self.counters.tenants_by_priority().into_iter().collect();
+        let mut held: BTreeSet<String> = schedule.tenants().cloned().collect();
+        held.extend(lock(&self.seeds.tenants).iter().cloned());
+        held.extend(lock(&self.seeds.rings).iter().map(|(t, _, _)| t.clone()));
+        held.extend(lock(&self.seeds.charted).keys().map(|(t, _, _)| t.clone()));
+        held.extend(lock(&self.seeds.job_counts).iter().cloned());
+        held.extend(lock(&self.job_counts).keys().cloned());
+        held.extend(lock(&self.viewed).keys().cloned());
+        dropped.extend(
+            held.into_iter()
+                .filter(|tenant| *tenant != self.default_tenant && !present.contains(tenant)),
+        );
+
+        for tenant in &dropped {
+            schedule.forget(tenant);
+            lock(&self.seeds.tenants).remove(tenant);
+            lock(&self.seeds.rings).retain(|(t, _, _)| t != tenant);
+            lock(&self.seeds.charted).retain(|(t, _, _), _| t != tenant);
+            lock(&self.seeds.job_counts).remove(tenant);
+            lock(&self.job_counts).remove(tenant);
+            lock(&self.viewed).remove(tenant);
+        }
+        if !dropped.is_empty() {
+            debug!(
+                tenants = dropped.len(),
+                "dashboard reconcile: dropped the state of idle or deregistered tenants"
+            );
+        }
+        report.dropped.extend(dropped);
+    }
 }
 
-/// Wakes the reconcile loop, if one runs, so it notices at once that its
-/// provider is gone instead of at its next tick.
+/// Stops the reconcile loop, if one runs, and wakes it so a pass in flight
+/// notices at its next step that its provider is gone.
 impl<S> Drop for StorageDashboardProvider<S> {
     fn drop(&mut self) {
+        if let Some(task) = self.reconcile_task.get() {
+            task.abort();
+        }
         self.seeds.wake.notify_one();
     }
 }
@@ -801,30 +1181,80 @@ impl<S> StorageDashboardProvider<S>
 where
     S: ResourceStorage + Send + Sync + 'static,
 {
+    /// Reads `tenant`'s storage write marker with `recent_since`, for the
+    /// background loop. `None` when the backend has none, or on an error or a
+    /// timeout (logged, and recorded as a failed query).
+    async fn read_marker(
+        &self,
+        tenant: &str,
+        recent_since: Option<DateTime<Utc>>,
+    ) -> Option<StorageMarker> {
+        let context = tenant_context(tenant);
+        let started = Instant::now();
+        let result = tokio::time::timeout(
+            PROBE_TIMEOUT,
+            self.storage.latest_write_marker(&context, recent_since),
+        )
+        .await;
+        let elapsed = started.elapsed();
+        match result {
+            // The backend has no marker: nothing was queried.
+            Ok(Ok(None)) => None,
+            Ok(Ok(Some(marker))) => {
+                dashboard_metrics::record_storage_query(StorageQuery::WriteMarker, elapsed, true);
+                Some(storage_marker(marker))
+            }
+            Ok(Err(error)) => {
+                dashboard_metrics::record_storage_query(StorageQuery::WriteMarker, elapsed, false);
+                warn!(%error, tenant = %tenant, "dashboard reconcile: write marker read failed");
+                None
+            }
+            Err(_) => {
+                dashboard_metrics::record_storage_query(StorageQuery::WriteMarker, elapsed, false);
+                warn!(
+                    tenant = %tenant,
+                    timeout_ms = PROBE_TIMEOUT.as_millis() as u64,
+                    "dashboard reconcile: write marker read timed out"
+                );
+                None
+            }
+        }
+    }
+
     /// Reads `tenant`'s per-type totals from storage as a counters reconcile
     /// (#1078), recording the read in `schedule`. Only the background loop
     /// calls this.
     ///
-    /// The reconcile is begun right before `count_all_types` and finished only
-    /// with its successful result, so an error never marks the tenant seeded.
-    /// `Ok(false)` means the tenant was invalidated (purged) while the query
-    /// ran: those figures may describe erased data, so the counters dropped
-    /// them and the tenant still needs a reseed.
+    /// The storage write marker is read right before the reconcile begins and
+    /// right after `count_all_types`, so the counters can tell whether storage
+    /// changed while it was counted (see
+    /// [`DashboardCounters::finish_reconcile`]). The reconcile is finished only
+    /// with the count's successful result, so an error never marks the tenant
+    /// seeded. `Ok(false)` means the tenant was invalidated (purged), evicted
+    /// or removed while the query ran: those figures may describe erased data,
+    /// so the counters dropped them and the tenant still needs a reseed.
     async fn reconcile_totals(
         &self,
         tenant: &str,
         schedule: &mut ReconcileSchedule,
     ) -> StorageResult<bool> {
         let context = tenant_context(tenant);
+        let figures_exact = self
+            .counters
+            .totals_view(tenant)
+            .is_some_and(|totals| totals.exact);
         let read_at = Utc::now();
-        let token = self.counters.begin_reconcile(tenant);
+        let bound = schedule.reconcile_bound(tenant, figures_exact, read_at);
+        let before = self.read_marker(tenant, bound).await;
+        let token = self.counters.begin_reconcile(tenant, before);
 
         // Timed, so an operator staring at a slow backend can tell from the
-        // logs which query is responsible (#959).
+        // logs (and the query metrics) which query is responsible (#959).
         let started = Instant::now();
         let result = self.storage.count_all_types(&context).await;
         let elapsed = started.elapsed();
         schedule.record(tenant, elapsed);
+        dashboard_metrics::record_storage_query(StorageQuery::Totals, elapsed, result.is_ok());
         debug!(
             tenant = %tenant,
             elapsed_ms = elapsed.as_millis() as u64,
@@ -832,128 +1262,153 @@ where
             "dashboard reconcile: count_all_types completed"
         );
         let counts = result?;
+        let after = self.read_marker(tenant, bound).await;
 
-        let accepted = self.counters.finish_reconcile(token, &counts, read_at);
-        if !accepted {
-            debug!(
-                tenant = %tenant,
-                "dashboard: tenant invalidated during count_all_types; counters not seeded"
-            );
+        match self
+            .counters
+            .finish_reconcile(token, &counts, after, read_at)
+        {
+            ReconcileOutcome::Applied { correction } => {
+                dashboard_metrics::record_reconcile_correction(correction);
+                Ok(true)
+            }
+            ReconcileOutcome::Superseded => Ok(true),
+            ReconcileOutcome::Invalidated => {
+                debug!(
+                    tenant = %tenant,
+                    "dashboard: tenant invalidated during count_all_types; counters not seeded"
+                );
+                Ok(false)
+            }
         }
-        Ok(accepted)
     }
 
-    /// The tenant's bulk-export and bulk-submit job counts, cached for
-    /// [`JOB_COUNTS_TTL`].
-    ///
-    /// Counts degrade to the last successfully read value, or `None`
-    /// (unavailable) when there is none, rather than zero on a read error: a
-    /// zero here would tell an operator "no jobs" when the truth is "could not
-    /// ask". `None` also covers the normal case of a deployment with no
-    /// bulk-export/bulk-submit job store wired at all. They carry their own
-    /// unavailable state on the page, so they never set `partial` — that flag
-    /// is for figures with no honest rendering of their own.
-    async fn job_counts(&self, tenant: &TenantContext) -> (Option<ExportJobCounts>, Option<u64>) {
-        if self.export_jobs.is_none() && self.submit_jobs.is_none() {
-            return (None, None);
-        }
-        let tenant_key = tenant.tenant_id().as_str();
-        let cached = lock(&self.job_counts)
-            .get(tenant_key)
+    /// Reads `tenant`'s job counts from the job stores — background only, each
+    /// store call bounded by [`PROBE_TIMEOUT`] — and caches them. A count that
+    /// could not be read keeps its previous value.
+    async fn refresh_job_counts(&self, tenant: &str) -> JobCountsEntry {
+        let context = tenant_context(tenant);
+        let previous = lock(&self.job_counts)
+            .get(tenant)
             .copied()
             .unwrap_or_default();
-        if cached
-            .fetched_at
-            .is_some_and(|at| at.elapsed() < JOB_COUNTS_TTL)
-        {
-            return (cached.export, cached.import);
-        }
 
         let export = match &self.export_jobs {
             None => None,
             Some(store) => {
-                let running = store
-                    .count_exports_by_status(tenant, ExportStatus::InProgress)
-                    .await;
-                let queued = store
-                    .count_exports_by_status(tenant, ExportStatus::Accepted)
-                    .await;
+                let running = timed_probe(
+                    StorageQuery::JobCounts,
+                    tenant,
+                    "running exports",
+                    store.count_exports_by_status(&context, ExportStatus::InProgress),
+                )
+                .await;
+                let queued = timed_probe(
+                    StorageQuery::JobCounts,
+                    tenant,
+                    "queued exports",
+                    store.count_exports_by_status(&context, ExportStatus::Accepted),
+                )
+                .await;
                 match (running, queued) {
-                    (Ok(running), Ok(queued)) => Some(ExportJobCounts { running, queued }),
-                    (Err(error), _) | (_, Err(error)) => {
-                        warn!(%error, "dashboard snapshot: export job count query failed");
-                        cached.export
-                    }
+                    (Some(running), Some(queued)) => Some(ExportJobCounts { running, queued }),
+                    _ => previous.export,
                 }
             }
         };
 
         let import = match &self.submit_jobs {
             None => None,
-            Some(store) => match store.count_active_submissions(tenant).await {
-                Ok(n) => Some(n),
-                Err(error) => {
-                    warn!(%error, "dashboard snapshot: import job count query failed");
-                    cached.import
-                }
-            },
+            Some(store) => timed_probe(
+                StorageQuery::JobCounts,
+                tenant,
+                "active submissions",
+                store.count_active_submissions(&context),
+            )
+            .await
+            .or(previous.import),
         };
 
-        lock(&self.job_counts).insert(
-            tenant_key.to_string(),
-            JobCountsEntry {
-                fetched_at: Some(Instant::now()),
-                export,
-                import,
-            },
-        );
-        (export, import)
+        let entry = JobCountsEntry {
+            fetched_at: Some(Instant::now()),
+            export,
+            import,
+        };
+        lock(&self.job_counts).insert(tenant.to_string(), entry);
+        entry
+    }
+
+    /// Refreshes the job counts snapshots queued, skipping any another path
+    /// refreshed since, until the pass's time budget is spent (the rest stay
+    /// queued).
+    async fn refresh_queued_job_counts(
+        &self,
+        schedule: &ReconcileSchedule,
+        budget: &PassBudget,
+        report: &mut ReconcileReport,
+    ) {
+        let queued: BTreeSet<String> = lock(&self.seeds.job_counts).iter().cloned().collect();
+        for tenant in queued {
+            if schedule.out_of_time(budget) {
+                break;
+            }
+            lock(&self.seeds.job_counts).remove(&tenant);
+            let fresh = lock(&self.job_counts)
+                .get(&tenant)
+                .is_some_and(JobCountsEntry::is_fresh);
+            if !fresh {
+                self.refresh_job_counts(&tenant).await;
+                report.job_counts_refreshed.push(tenant);
+            }
+        }
     }
 
     /// Whether a bulk submit is active for `tenant` — the background loop's
-    /// back-off signal. `false` when no submit store is wired or its count is
-    /// unknown.
+    /// back-off signal, refreshing the job counts when they are stale. `false`
+    /// when no submit store is wired or its count is unknown.
     async fn import_active(&self, tenant: &str) -> bool {
         if self.submit_jobs.is_none() {
             return false;
         }
-        self.job_counts(&tenant_context(tenant))
-            .await
-            .1
-            .is_some_and(|active| active > 0)
+        let cached = lock(&self.job_counts)
+            .get(tenant)
+            .copied()
+            .filter(JobCountsEntry::is_fresh);
+        let entry = match cached {
+            Some(entry) => entry,
+            None => self.refresh_job_counts(tenant).await,
+        };
+        entry.import.is_some_and(|active| active > 0)
     }
 
     /// A snapshot built entirely from the write counters, or `None` when the
     /// tenant has never been reconciled from storage (#1078).
     ///
-    /// Runs no storage aggregate: totals, the picker list and every charted
-    /// series come from memory. Only the cached job counts may touch storage.
-    /// A tenant marked stale by a purge is served its last figures, labelled
-    /// approximate, and its reseed is queued.
-    async fn snapshot_from_counters(
+    /// Awaits nothing: totals, the picker list, every charted series and the
+    /// job counts come from memory. A tenant marked stale by a purge is served
+    /// its last figures, labelled approximate, and its reseed is queued.
+    fn snapshot_from_counters(
         &self,
-        tenant: &TenantContext,
+        tenant_key: &str,
         window: DashboardWindow,
         types: &[String],
         include_empty: bool,
     ) -> Option<DashboardSnapshot> {
         let started = Instant::now();
-        let tenant_key = tenant.tenant_id().as_str();
         let now = Utc::now();
 
         let totals = self.counters.totals_view(tenant_key)?;
         if totals.needs_reseed {
             self.enqueue_tenant_seed(tenant_key);
         }
-        let totals_exact = totals.exact;
         let TypeSummary {
             total_resources,
             distinct_types,
             available,
         } = summarize_type_counts(totals.totals, include_empty);
         let selection = select_charted_types(&available, types, include_empty);
-        // `totals_view` just returned figures and a tenant is never un-seeded,
-        // so this is `Some`; `None` would only mean "not seeded" again.
+        // `totals_view` just returned figures, so this is `Some` unless the
+        // tenant was evicted or removed in between; then it is pending again.
         let counted = resource_count_series_from_counters(
             &self.counters,
             tenant_key,
@@ -964,23 +1419,31 @@ where
         self.note_charted(tenant_key, &selection, window);
         let charted_types = selection.len();
 
-        // Approximate when a write was recorded (or a purge ran) since the
-        // totals or a charted ring were last read from storage, or when a ring
-        // has no storage history at all yet (#956: measured, but not an exact
-        // storage read).
-        let mut approximate = !totals_exact;
+        // Approximate when a write was recorded, a change detected through the
+        // storage write marker, or a purge ran since the totals or a charted
+        // ring were last read from storage, or when a ring has no storage
+        // history at all yet (#956: measured, but not an exact storage read).
+        let mut exact = totals.exact;
         let mut awaiting_history = 0usize;
         let mut series = Vec::with_capacity(counted.len());
         for entry in counted {
-            approximate |= !entry.exact;
+            exact &= entry.exact;
             if !entry.history_seeded {
                 awaiting_history += 1;
                 self.enqueue_ring_seed(tenant_key, &entry.series.resource_type, window);
             }
             series.push(entry.series);
         }
+        let figures = if exact {
+            Figures::Exact { read_at: now }
+        } else {
+            Figures::Approximate {
+                read_at: now,
+                reconciled_at: totals.reconciled_at,
+            }
+        };
 
-        let (export_jobs, import_jobs_active) = self.job_counts(tenant).await;
+        let (export_jobs, import_jobs_active) = self.cached_job_counts(tenant_key);
 
         // The acceptance signal for #1078: a page load logs this line (or the
         // pending one below) and never a storage-query timing.
@@ -988,7 +1451,7 @@ where
             tenant = %tenant_key,
             window = window.as_str(),
             charted_types,
-            approximate,
+            exact,
             awaiting_history,
             needs_reseed = totals.needs_reseed,
             elapsed_ms = started.elapsed().as_millis() as u64,
@@ -1004,26 +1467,19 @@ where
             available,
             export_jobs,
             import_jobs_active,
-            partial: false,
-            // The counters are live: these are the figures as of this call.
-            generated_at: Some(now),
-            approximate,
-            series_pending: false,
-            totals_pending: false,
-            counts_unsupported: false,
+            figures,
         })
     }
 
     /// A snapshot with no figures — pending or unsupported — carrying only the
     /// job counts. Pending also queues the tenant's background seed.
-    async fn snapshot_without_figures(
+    fn snapshot_without_figures(
         &self,
-        tenant: &TenantContext,
+        tenant_key: &str,
         window: DashboardWindow,
         reason: NoFigures,
     ) -> DashboardSnapshot {
-        let tenant_key = tenant.tenant_id().as_str();
-        match reason {
+        let figures = match reason {
             NoFigures::Pending => {
                 self.enqueue_tenant_seed(tenant_key);
                 debug!(
@@ -1031,14 +1487,18 @@ where
                     window = window.as_str(),
                     "dashboard snapshot: tenant not seeded yet; background seed queued"
                 );
+                Figures::Pending
             }
-            NoFigures::Unsupported => debug!(
-                tenant = %tenant_key,
-                backend = self.storage.backend_name(),
-                "dashboard snapshot: storage backend cannot count resources"
-            ),
-        }
-        let (export_jobs, import_jobs_active) = self.job_counts(tenant).await;
+            NoFigures::Unsupported => {
+                debug!(
+                    tenant = %tenant_key,
+                    backend = self.storage.backend_name(),
+                    "dashboard snapshot: storage backend cannot count resources"
+                );
+                Figures::Unsupported
+            }
+        };
+        let (export_jobs, import_jobs_active) = self.cached_job_counts(tenant_key);
         DashboardSnapshot {
             fhir_version: self.fhir_version.clone(),
             total_resources: 0,
@@ -1048,13 +1508,7 @@ where
             available: Vec::new(),
             export_jobs,
             import_jobs_active,
-            partial: false,
-            // Nothing was measured, so there is no "as of" to report.
-            generated_at: None,
-            approximate: false,
-            series_pending: false,
-            totals_pending: matches!(reason, NoFigures::Pending),
-            counts_unsupported: matches!(reason, NoFigures::Unsupported),
+            figures,
         }
     }
 
@@ -1097,11 +1551,13 @@ where
                 series_window.bucket_seconds,
             )
             .await;
+        let elapsed = started.elapsed();
+        dashboard_metrics::record_storage_query(StorageQuery::History, elapsed, result.is_ok());
         debug!(
             tenant = %tenant,
             window = window.as_str(),
             types = types.len(),
-            elapsed_ms = started.elapsed().as_millis() as u64,
+            elapsed_ms = elapsed.as_millis() as u64,
             ok = result.is_ok(),
             "dashboard reconcile: grouped history ring read completed"
         );
@@ -1185,33 +1641,45 @@ where
 
     /// Runs the queued tenant seeds, plus the reseed of every seeded tenant a
     /// purge marked stale (so a purge is reseeded even while nobody looks at
-    /// the dashboard), one tenant at a time. A tenant leaves the queue only
-    /// when its seed succeeded; a failed or deferred seed is retried on the
-    /// next drain.
+    /// the dashboard), one tenant at a time, in [`ReconcileSchedule::order`].
+    /// A tenant leaves the queue only when its seed succeeded; a failed,
+    /// deferred or budget-skipped seed is retried on the next drain or pass.
     ///
     /// A first seed runs even while a bulk submit is active for the tenant:
     /// it has nothing on show until the seed lands, and one grouping query at
-    /// a time is a bounded cost. A reseed of an already seeded tenant backs
-    /// off during an import like the periodic reconcile: its last figures stay
-    /// on show, labelled approximate, and its counters follow the import.
+    /// a time is a bounded cost. For the same reason the first seed of a
+    /// tenant viewed within [`RECENT_VIEW`] runs even when the budget is spent.
+    /// A reseed of an already seeded tenant backs off during an import like
+    /// the periodic reconcile: its last figures stay on show, labelled
+    /// approximate, and its counters follow the import.
     async fn seed_pending_tenants(
         &self,
         schedule: &mut ReconcileSchedule,
+        budget: &mut PassBudget,
         report: &mut ReconcileReport,
     ) {
-        let mut tenants: BTreeSet<String> = lock(&self.seeds.tenants).iter().cloned().collect();
-        tenants.extend(
+        let mut candidates: BTreeSet<String> = lock(&self.seeds.tenants).iter().cloned().collect();
+        candidates.extend(
             self.counters
                 .tenants()
                 .into_iter()
                 .filter(|t| self.counters.is_seeded(t) && self.counters.needs_reseed(t)),
         );
+        if candidates.is_empty() {
+            return;
+        }
+        let order = schedule.order(candidates, &self.counters.tenants_by_priority());
 
-        for tenant in tenants {
+        for tenant in order {
             let first_seed = !self.counters.is_seeded(&tenant);
             if !first_seed && !self.counters.needs_reseed(&tenant) {
                 // Queued twice, and already seeded by the first.
                 lock(&self.seeds.tenants).remove(&tenant);
+                continue;
+            }
+            let exempt = first_seed && self.viewed_within(&tenant, RECENT_VIEW);
+            if !schedule.admit(budget, &tenant, exempt) {
+                report.budget_skipped.push(tenant);
                 continue;
             }
             if !first_seed && self.import_active(&tenant).await {
@@ -1247,19 +1715,26 @@ where
         }
     }
 
-    /// Runs everything page loads queued: tenant seeds first (see
-    /// [`Self::seed_pending_tenants`]), then ring seeds. What the loop does
-    /// when woken.
+    /// Runs everything page loads queued: job-count refreshes, tenant seeds
+    /// (see [`Self::seed_pending_tenants`]), then ring seeds, within one pass
+    /// budget. What the loop does when woken.
     pub(crate) async fn drain_pending_seeds(
         &self,
         schedule: &mut ReconcileSchedule,
     ) -> ReconcileReport {
         let mut report = ReconcileReport::default();
-        if !self.storage.supports_type_counts() {
-            return report;
+        let mut budget = schedule.budget();
+        self.refresh_queued_job_counts(schedule, &budget, &mut report)
+            .await;
+        if self.storage.supports_type_counts() {
+            self.drop_stale_tenants(schedule, false, &mut report);
+            self.seed_pending_tenants(schedule, &mut budget, &mut report)
+                .await;
+            report.rings_seeded += self
+                .drain_ring_seeds(schedule, &mut budget, &mut report)
+                .await;
         }
-        self.seed_pending_tenants(schedule, &mut report).await;
-        report.rings_seeded += self.drain_pending_ring_seeds().await;
+        self.publish_seed_queue();
         report
     }
 
@@ -1288,12 +1763,27 @@ where
         report
     }
 
-    /// Seeds the queued history rings, one tenant at a time and one grouped
-    /// query per window for all of a tenant's queued types in it, leaving
-    /// queued the rings of tenants with an active bulk submit and the rings
-    /// whose query failed (retried on the next drain). Returns how many were
-    /// seeded.
+    /// [`Self::drain_ring_seeds`] with a fresh schedule and budget.
+    #[cfg(test)]
     pub(crate) async fn drain_pending_ring_seeds(&self) -> usize {
+        let mut schedule = ReconcileSchedule::new(self.reconcile_interval);
+        let mut budget = schedule.budget();
+        let mut report = ReconcileReport::default();
+        self.drain_ring_seeds(&mut schedule, &mut budget, &mut report)
+            .await
+    }
+
+    /// Seeds the queued history rings, one tenant at a time (within `budget`)
+    /// and one grouped query per window for all of a tenant's queued types in
+    /// it, leaving queued the rings of tenants with an active bulk submit or
+    /// beyond the budget, and the rings whose query failed (retried on the
+    /// next drain). Returns how many were seeded.
+    async fn drain_ring_seeds(
+        &self,
+        schedule: &mut ReconcileSchedule,
+        budget: &mut PassBudget,
+        report: &mut ReconcileReport,
+    ) -> usize {
         let keys: Vec<RingKey> = lock(&self.seeds.rings).iter().cloned().collect();
 
         let mut by_tenant: BTreeMap<String, Vec<(String, DashboardWindow)>> = BTreeMap::new();
@@ -1313,9 +1803,23 @@ where
                 .or_default()
                 .push((resource_type, window));
         }
+        if by_tenant.is_empty() {
+            return 0;
+        }
+        let order = schedule.order(
+            by_tenant.keys().cloned().collect(),
+            &self.counters.tenants_by_priority(),
+        );
 
         let mut seeded = 0usize;
-        for (tenant, rings) in by_tenant {
+        for tenant in order {
+            let Some(rings) = by_tenant.remove(&tenant) else {
+                continue;
+            };
+            if !schedule.admit(budget, &tenant, false) {
+                report.budget_skipped.push(tenant);
+                continue;
+            }
             if self.import_active(&tenant).await {
                 debug!(
                     tenant = %tenant,
@@ -1346,41 +1850,66 @@ where
     /// Sequential by design — one tenant, one query at a time — so the pass
     /// never competes much with writers:
     ///
-    /// 1. **Seeds.** Queued tenant seeds and purge reseeds run first (see
+    /// 1. **Job counts** snapshots queued are refreshed.
+    /// 2. **Housekeeping** (also when the backend cannot count). Tenants not viewed for [`CHARTED_KEY_TTL`] are
+    ///    evicted (the default tenant is kept), and the provider forgets every
+    ///    tenant the counters no longer hold (deregistered).
+    /// 3. **Seeds.** Queued tenant seeds and purge reseeds run (see
     ///    [`Self::seed_pending_tenants`]); this is where a failed seed is
     ///    retried.
-    /// 2. **Per seeded tenant**, skipping one still awaiting its reseed:
+    /// 4. **Per seeded tenant**, most recently viewed first (tenants the last
+    ///    pass's budget skipped before them), skipping one still awaiting its
+    ///    reseed, until the budget is spent:
     ///    - **Back-off.** A tenant with an active bulk submit is skipped
     ///      entirely: its grouping query is exactly what the import keeps from
     ///      finishing, and the counters already follow the import.
+    ///    - **External changes.** When its totals are not due, the storage
+    ///      write marker is probed once; a change this process did not record
+    ///      makes them due now.
     ///    - **Totals.** When due (see [`RECONCILE_DUTY_FACTOR`]),
     ///      `count_all_types` is re-read as a counters reconcile. An error logs
     ///      and keeps the previous counters.
-    ///    - **Rings.** When the tenant is quiet — no write recorded since its
-    ///      totals reconcile began — each recently charted ring that is not
-    ///      exact is re-seeded (one grouped history query per window), which
-    ///      is what lets the snapshot drop its approximate label after an
-    ///      import.
-    /// 3. **Ring seeds.** The queued ring seeds are drained.
+    ///    - **Rings.** When the tenant is quiet — its totals exact — each
+    ///      recently charted ring that is not exact is re-seeded (one grouped
+    ///      history query per window), which is what lets the snapshot become
+    ///      exact after an import. Under continuous writes the rings
+    ///      [`DashboardCounters::rings_to_reseed`] names are re-seeded instead:
+    ///      those whose history is older than [`RESEED_MAX_AGE_FACTOR`]
+    ///      intervals, or that only an external change made inexact.
+    /// 5. **Ring seeds.** The queued ring seeds are drained.
     ///
-    /// Does nothing when the backend cannot count.
+    /// Only the job counts are refreshed when the backend cannot count.
     pub(crate) async fn reconcile_pass(&self, schedule: &mut ReconcileSchedule) -> ReconcileReport {
         let started = Instant::now();
         let mut report = ReconcileReport::default();
+        let mut budget = schedule.budget();
+        self.refresh_queued_job_counts(schedule, &budget, &mut report)
+            .await;
+        self.drop_stale_tenants(schedule, true, &mut report);
         if !self.storage.supports_type_counts() {
+            dashboard_metrics::record_reconcile_pass(started.elapsed());
             return report;
         }
         lock(&self.seeds.charted).retain(|_, at| at.elapsed() < CHARTED_KEY_TTL);
 
-        self.seed_pending_tenants(schedule, &mut report).await;
+        self.seed_pending_tenants(schedule, &mut budget, &mut report)
+            .await;
 
-        for tenant in self.counters.tenants() {
+        let max_age = Duration::from_std(schedule.interval.saturating_mul(RESEED_MAX_AGE_FACTOR))
+            .unwrap_or(Duration::MAX);
+        let priority = self.counters.tenants_by_priority();
+        let order = schedule.order(priority.iter().cloned().collect(), &priority);
+        for tenant in order {
             if !self.counters.is_seeded(&tenant) {
-                // Recorded writes but never viewed: its first view queues it.
+                // Recorded writes or a view but no seed yet: its view queues it.
                 continue;
             }
             if self.counters.needs_reseed(&tenant) {
                 // Its reseed failed or was deferred above; retried next pass.
+                continue;
+            }
+            if !schedule.admit(&mut budget, &tenant, false) {
+                report.budget_skipped.push(tenant);
                 continue;
             }
             if self.import_active(&tenant).await {
@@ -1392,11 +1921,27 @@ where
                 continue;
             }
 
-            if schedule.is_due(&tenant) {
+            let mut due = schedule.is_due(&tenant);
+            if !due
+                && let Some(marker) = self
+                    .read_marker(&tenant, schedule.probe_bound(&tenant))
+                    .await
+                && self.counters.note_marker(&tenant, marker)
+            {
+                debug!(
+                    tenant = %tenant,
+                    "dashboard reconcile: storage changed outside this process; totals due now"
+                );
+                schedule.force_due(&tenant);
+                report.external_changes.push(tenant.clone());
+                due = true;
+            }
+            if due {
                 match self.reconcile_totals(&tenant, schedule).await {
                     Ok(true) => report.reconciled.push(tenant.clone()),
-                    // Purged while the query ran: the next pass reseeds it.
-                    Ok(false) => {}
+                    // Invalidated or removed while the query ran: the next
+                    // pass reseeds or forgets it.
+                    Ok(false) => continue,
                     Err(error) => warn!(
                         %error,
                         tenant = %tenant,
@@ -1415,19 +1960,27 @@ where
                 .counters
                 .totals_view(&tenant)
                 .is_some_and(|totals| totals.exact);
-            if !quiet {
-                debug!(
-                    tenant = %tenant,
-                    "dashboard reconcile: writes in flight; history ring re-seed deferred"
-                );
-                continue;
+            let rings = if quiet {
+                self.inexact_charted_rings(&tenant)
+            } else {
+                self.counters.rings_to_reseed(
+                    &tenant,
+                    &self.charted_for(&tenant),
+                    max_age,
+                    Utc::now(),
+                )
+            };
+            if !rings.is_empty() {
+                report.rings_seeded += self.seed_rings(&tenant, rings).await;
             }
-            report.rings_seeded += self
-                .seed_rings(&tenant, self.inexact_charted_rings(&tenant))
-                .await;
         }
 
-        report.rings_seeded += self.drain_pending_ring_seeds().await;
+        report.rings_seeded += self
+            .drain_ring_seeds(schedule, &mut budget, &mut report)
+            .await;
+        self.publish_seed_queue();
+        let elapsed = started.elapsed();
+        dashboard_metrics::record_reconcile_pass(elapsed);
         debug!(
             seeded = report.seeded.len(),
             seed_failed = report.seed_failed.len(),
@@ -1435,8 +1988,12 @@ where
             reconciled = report.reconciled.len(),
             skipped_active_import = report.skipped_active_import.len(),
             not_due = report.not_due.len(),
+            external_changes = report.external_changes.len(),
+            budget_skipped = report.budget_skipped.len(),
+            dropped = report.dropped.len(),
+            job_counts_refreshed = report.job_counts_refreshed.len(),
             rings_seeded = report.rings_seeded,
-            elapsed_ms = started.elapsed().as_millis() as u64,
+            elapsed_ms = elapsed.as_millis() as u64,
             "dashboard reconcile: pass completed"
         );
         report
@@ -1448,8 +2005,8 @@ impl<S> DashboardProvider for StorageDashboardProvider<S>
 where
     S: ResourceStorage + Send + Sync + 'static,
 {
-    /// Never runs a storage aggregate (#1078): see the
-    /// [module documentation](self) for the three shapes a snapshot takes.
+    /// Never awaits storage (#1078): see the [module documentation](self) for
+    /// the three shapes a snapshot takes.
     async fn snapshot(
         &self,
         window: DashboardWindow,
@@ -1457,75 +2014,46 @@ where
         types: &[String],
         include_empty: bool,
     ) -> DashboardSnapshot {
-        let tenant = tenant_context(self.tenant_or_default(tenant));
+        let tenant_key = self.tenant_or_default(tenant);
+        self.note_viewed(tenant_key);
 
         if !self.storage.supports_type_counts() {
-            return self
-                .snapshot_without_figures(&tenant, window, NoFigures::Unsupported)
-                .await;
+            return self.snapshot_without_figures(tenant_key, window, NoFigures::Unsupported);
         }
-        if let Some(snapshot) = self
-            .snapshot_from_counters(&tenant, window, types, include_empty)
-            .await
+        if let Some(snapshot) =
+            self.snapshot_from_counters(tenant_key, window, types, include_empty)
         {
             return snapshot;
         }
-        self.snapshot_without_figures(&tenant, window, NoFigures::Pending)
-            .await
-    }
-
-    /// Every snapshot is built from memory — the counters, or a pending or
-    /// unsupported placeholder — plus job counts cached for
-    /// [`JOB_COUNTS_TTL`], so the cache keeps each only briefly: a settled
-    /// dashboard notices an import on its next poll, and a pending one picks
-    /// up the figures as soon as the background seed lands (#1078).
-    fn serves_in_constant_time(&self, _tenant: &str) -> bool {
-        true
-    }
-}
-
-/// The reconcile interval: `HFS_DASHBOARD_RECONCILE_SECS` when set to a
-/// positive whole number of seconds, else [`DEFAULT_RECONCILE_INTERVAL`].
-fn reconcile_interval_from_env() -> StdDuration {
-    match std::env::var(RECONCILE_INTERVAL_ENV) {
-        Err(_) => DEFAULT_RECONCILE_INTERVAL,
-        Ok(raw) => match raw.trim().parse::<u64>() {
-            Ok(secs) if secs > 0 => StdDuration::from_secs(secs),
-            _ => {
-                warn!(
-                    env = RECONCILE_INTERVAL_ENV,
-                    value = %raw,
-                    default_secs = DEFAULT_RECONCILE_INTERVAL.as_secs(),
-                    "invalid dashboard reconcile interval; using the default"
-                );
-                DEFAULT_RECONCILE_INTERVAL
-            }
-        },
+        self.snapshot_without_figures(tenant_key, window, NoFigures::Pending)
     }
 }
 
 /// Spawns the dashboard's background seeding and reconcile for `provider`
-/// (#1078); see the [module documentation](self) for what it does.
+/// (#1078), every [`ServerConfig::dashboard_reconcile_interval_secs`]; see the
+/// [module documentation](self) for what it does.
 ///
 /// Called from [`crate::build_app`] right after the provider is registered.
-/// The loop holds only a [`Weak`] reference: once the provider is no longer
-/// registered (a later `build_app` replaced it) and its last in-flight compute
-/// has released it, the loop stops — so repeated app construction, as in the
-/// test suites, never accumulates loops. It also stops at once when the
-/// backend cannot count. Returns `None`, without spawning, outside a Tokio
-/// runtime (`build_app` is synchronous and may be called from non-async
-/// contexts); nothing seeds the counters then, so every snapshot of that
-/// provider stays pending.
-pub(crate) fn spawn_reconcile_loop<S>(
-    provider: &Arc<StorageDashboardProvider<S>>,
-) -> Option<tokio::task::JoinHandle<()>>
+/// The task is supervised (see [`supervise_reconcile_loop`]) and owned by the
+/// provider, which aborts it when dropped; the loop itself holds only a
+/// [`Weak`] reference, so once the provider is no longer registered (a later
+/// `build_app` replaced it) and its last in-flight compute has released it,
+/// the loop stops — repeated app construction, as in the test suites, never
+/// accumulates loops. It also stops at once when the backend cannot count and
+/// no job store is wired. Does nothing outside a Tokio runtime (`build_app` is
+/// synchronous and may be called from non-async contexts); nothing seeds the
+/// counters then, so every snapshot of that provider stays pending.
+pub(crate) fn spawn_reconcile_loop<S>(provider: &Arc<StorageDashboardProvider<S>>)
 where
     S: ResourceStorage + Send + Sync + 'static,
 {
-    spawn_reconcile_loop_every(provider, reconcile_interval_from_env())
+    let interval = provider.reconcile_interval;
+    // The supervisor's handle is only for tests: the provider owns the task.
+    drop(spawn_reconcile_loop_every(provider, interval));
 }
 
-/// [`spawn_reconcile_loop`] with the interval injected.
+/// [`spawn_reconcile_loop`] with the interval injected, returning the
+/// supervisor's handle.
 fn spawn_reconcile_loop_every<S>(
     provider: &Arc<StorageDashboardProvider<S>>,
     interval: StdDuration,
@@ -1540,17 +2068,93 @@ where
         );
         return None;
     }
-    let wake = Arc::clone(&provider.seeds.wake);
-    Some(tokio::spawn(run_reconcile_loop(
+    dashboard_metrics::set_reconcile_interval(interval);
+    let handle = tokio::spawn(supervise_reconcile_loop(
         Arc::downgrade(provider),
-        wake,
+        Arc::clone(&provider.seeds.wake),
         interval,
-    )))
+    ));
+    if provider.reconcile_task.set(handle.abort_handle()).is_err() {
+        // Already running for this provider: keep the first loop.
+        handle.abort();
+    }
+    Some(handle)
+}
+
+/// Aborts the task it holds when dropped, so aborting the supervisor also
+/// stops the worker it awaits.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// The text of a panic payload.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        (*message).to_string()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "non-string panic payload".to_string()
+    }
+}
+
+/// Runs [`run_reconcile_loop`] as a worker task and restarts it when it
+/// panics (#1078): the panic is logged and counted
+/// (`dashboard_reconcile_restarts_total`), and the worker restarts after an
+/// exponential back-off from [`RESTART_BACKOFF_MIN`] to
+/// [`RESTART_BACKOFF_MAX`], reset once a worker ran for [`HEALTHY_RUN`].
+/// Stops when the worker returns (its provider is gone, or there is nothing to
+/// do), when it is cancelled, or when the provider is gone by restart time.
+async fn supervise_reconcile_loop<S>(
+    provider: Weak<StorageDashboardProvider<S>>,
+    wake: Arc<Notify>,
+    interval: StdDuration,
+) where
+    S: ResourceStorage + Send + Sync + 'static,
+{
+    let mut backoff = RESTART_BACKOFF_MIN;
+    loop {
+        let started = Instant::now();
+        let mut worker = AbortOnDrop(tokio::spawn(run_reconcile_loop(
+            provider.clone(),
+            Arc::clone(&wake),
+            interval,
+        )));
+        let error = match (&mut worker.0).await {
+            Ok(()) => return,
+            Err(error) if error.is_cancelled() => return,
+            Err(error) => error,
+        };
+        if started.elapsed() >= HEALTHY_RUN {
+            backoff = RESTART_BACKOFF_MIN;
+        }
+        let message = match error.try_into_panic() {
+            Ok(payload) => panic_message(payload.as_ref()),
+            Err(error) => error.to_string(),
+        };
+        error!(
+            panic = %message,
+            restart_in_ms = backoff.as_millis() as u64,
+            "dashboard reconcile loop panicked; restarting it"
+        );
+        dashboard_metrics::record_reconcile_restart();
+        tokio::time::sleep(backoff).await;
+        backoff = backoff.saturating_mul(2).min(RESTART_BACKOFF_MAX);
+        if provider.strong_count() == 0 {
+            debug!("dashboard reconcile: provider gone; not restarting the loop");
+            return;
+        }
+    }
 }
 
 /// The loop body: the startup seed, then a [`reconcile
 /// pass`](StorageDashboardProvider::reconcile_pass) every `interval`, draining
-/// queued seeds in between whenever a page load wakes it.
+/// queued seeds and job-count refreshes in between whenever a page load wakes
+/// it.
 async fn run_reconcile_loop<S>(
     provider: Weak<StorageDashboardProvider<S>>,
     wake: Arc<Notify>,
@@ -1560,10 +2164,15 @@ async fn run_reconcile_loop<S>(
 {
     let mut schedule = ReconcileSchedule::new(interval);
     match provider.upgrade() {
-        Some(provider) if !provider.storage.supports_type_counts() => {
+        Some(provider)
+            if !provider.storage.supports_type_counts()
+                && provider.export_jobs.is_none()
+                && provider.submit_jobs.is_none() =>
+        {
             debug!(
                 backend = provider.storage.backend_name(),
-                "dashboard reconcile: storage backend cannot count resources; not running"
+                "dashboard reconcile: storage backend cannot count resources and no job \
+                 store is wired; not running"
             );
             return;
         }
@@ -1599,8 +2208,11 @@ async fn run_reconcile_loop<S>(
 mod tests {
     use super::*;
     use crate::config::ServerConfig;
+    use futures::FutureExt;
     use helios_fhir::FhirVersion;
     use helios_persistence::backends::sqlite::SqliteBackend;
+    use helios_persistence::core::WriteEvent;
+    use helios_persistence::core::WriteObserver;
     use helios_persistence::error::{BackendError, StorageError};
     use helios_persistence::types::StoredResource;
     use serde_json::Value;
@@ -1680,14 +2292,15 @@ mod tests {
         S: ResourceStorage + Send + Sync + 'static,
     {
         let pending = provider.snapshot(window, "", types, include_empty).await;
-        assert!(
-            pending.totals_pending,
+        assert_eq!(
+            pending.figures,
+            Figures::Pending,
             "an unseeded tenant's first load is pending"
         );
         let report = provider.drain_pending_seeds(&mut schedule()).await;
         assert_eq!(report.seeded, vec!["default".to_string()], "the seed ran");
         let snapshot = provider.snapshot(window, "", types, include_empty).await;
-        assert!(!snapshot.totals_pending);
+        assert!(snapshot.figures.is_known());
         snapshot
     }
 
@@ -1708,6 +2321,10 @@ mod tests {
         /// Fails only the history reads, leaving the totals read working.
         fail_history: AtomicBool,
         type_counts: AtomicBool,
+        /// Panics the next `count_all_types`, once.
+        panic_once: AtomicBool,
+        /// A write marker to report instead of SQLite's own.
+        marker: Mutex<Option<Option<WriteMarker>>>,
     }
 
     impl InstrumentedStorage {
@@ -1721,7 +2338,14 @@ mod tests {
                 fail: AtomicBool::new(false),
                 fail_history: AtomicBool::new(false),
                 type_counts: AtomicBool::new(true),
+                panic_once: AtomicBool::new(false),
+                marker: Mutex::new(None),
             })
+        }
+
+        /// Reports `marker` as the storage write marker from now on.
+        fn set_marker(&self, marker: Option<WriteMarker>) {
+            *lock(&self.marker) = Some(marker);
         }
 
         fn aggregate_calls(&self) -> usize {
@@ -1899,8 +2523,26 @@ mod tests {
             &self,
             tenant: &TenantContext,
         ) -> StorageResult<Vec<(String, u64)>> {
+            if self.panic_once.swap(false, Ordering::SeqCst) {
+                panic!("injected count_all_types panic");
+            }
             self.aggregate().await?;
             ResourceStorage::count_all_types(self.inner.as_ref(), tenant).await
+        }
+
+        async fn latest_write_marker(
+            &self,
+            tenant: &TenantContext,
+            recent_since: Option<DateTime<Utc>>,
+        ) -> StorageResult<Option<WriteMarker>> {
+            let marker = *lock(&self.marker);
+            match marker {
+                Some(marker) => Ok(marker),
+                None => {
+                    ResourceStorage::latest_write_marker(self.inner.as_ref(), tenant, recent_since)
+                        .await
+                }
+            }
         }
     }
 
@@ -1991,9 +2633,7 @@ mod tests {
         assert!(!snapshot.fhir_version.is_empty());
         // Every read answered: these zeros are measurements, not fallbacks,
         // and the page may present them as such (#956).
-        assert!(!snapshot.partial);
-        assert!(!snapshot.approximate);
-        assert!(snapshot.generated_at.is_some());
+        assert!(matches!(snapshot.figures, Figures::Exact { .. }));
     }
 
     /// Every window yields a dense series of exactly its own length, on
@@ -2316,7 +2956,7 @@ mod tests {
             let snapshot = provider
                 .snapshot(*window, tenant, types, *include_empty)
                 .await;
-            assert!(snapshot.totals_pending);
+            assert_eq!(snapshot.figures, Figures::Pending);
         }
         assert_eq!(storage.aggregate_calls(), 0);
         assert_eq!(queued_tenants(&provider), vec!["default".to_string()]);
@@ -2334,7 +2974,7 @@ mod tests {
             let snapshot = provider
                 .snapshot(*window, tenant, types, *include_empty)
                 .await;
-            assert!(!snapshot.totals_pending);
+            assert!(snapshot.figures.is_known());
             assert_eq!(snapshot.total_resources, 1);
         }
         assert_eq!(storage.aggregate_calls(), calls);
@@ -2344,7 +2984,8 @@ mod tests {
             provider
                 .snapshot(DashboardWindow::LastHour, "other", &[], false)
                 .await
-                .totals_pending
+                .figures
+                == Figures::Pending
         );
         assert_eq!(queued_tenants(&provider), vec!["other".to_string()]);
     }
@@ -2386,6 +3027,10 @@ mod tests {
 
         assert_eq!(snapshot.export_jobs, None);
         assert_eq!(snapshot.import_jobs_active, None);
+        assert!(
+            lock(&provider.seeds.job_counts).is_empty(),
+            "nothing to refresh without a store"
+        );
     }
 
     /// With both job stores wired but nothing submitted yet, the counts are
@@ -2409,7 +3054,14 @@ mod tests {
         let snapshot = provider
             .snapshot(DashboardWindow::default(), "", &[], false)
             .await;
+        assert_eq!(snapshot.export_jobs, None, "never read yet");
+        assert_eq!(snapshot.import_jobs_active, None);
 
+        let report = provider.drain_pending_seeds(&mut schedule()).await;
+        assert_eq!(report.job_counts_refreshed, vec!["default".to_string()]);
+        let snapshot = provider
+            .snapshot(DashboardWindow::default(), "", &[], false)
+            .await;
         assert_eq!(
             snapshot.export_jobs,
             Some(ExportJobCounts {
@@ -2471,6 +3123,10 @@ mod tests {
         let provider = StorageDashboardProvider::new(Arc::clone(&backend), &config)
             .with_counters(isolated_counters())
             .with_job_stores(Some(export_jobs), Some(submit_jobs));
+        provider
+            .snapshot(DashboardWindow::default(), "", &[], false)
+            .await;
+        provider.drain_pending_seeds(&mut schedule()).await;
         let snapshot = provider
             .snapshot(DashboardWindow::default(), "", &[], false)
             .await;
@@ -2485,10 +3141,12 @@ mod tests {
         assert_eq!(snapshot.import_jobs_active, Some(1));
     }
 
-    /// Job counts are small reads, but every page load asked for them; during
-    /// an import they are cached per tenant for [`JOB_COUNTS_TTL`] (#1078).
+    /// Job counts are served from the last background read (#1078): a load
+    /// inside [`JOB_COUNTS_TTL`] neither reads the stores nor queues a
+    /// refresh; a load after it serves the previous counts and queues one,
+    /// which the loop's next drain runs.
     #[tokio::test]
-    async fn job_counts_are_cached_briefly_per_tenant() {
+    async fn job_counts_are_served_from_the_last_background_read() {
         use helios_persistence::core::{BulkSubmitProvider, SubmissionId};
 
         let backend = sqlite();
@@ -2500,7 +3158,14 @@ mod tests {
         let first = provider
             .snapshot(DashboardWindow::LastHour, "", &[], false)
             .await;
-        assert_eq!(first.import_jobs_active, Some(0));
+        assert_eq!(first.import_jobs_active, None);
+        assert_eq!(
+            lock(&provider.seeds.job_counts).len(),
+            1,
+            "a refresh is queued"
+        );
+        provider.drain_pending_seeds(&mut schedule()).await;
+        assert!(lock(&provider.seeds.job_counts).is_empty());
 
         backend
             .create_submission(&test_tenant(), &SubmissionId::generate("test-system"), None)
@@ -2513,23 +3178,92 @@ mod tests {
         assert_eq!(
             cached.import_jobs_active,
             Some(0),
-            "inside the TTL the cached count is served"
+            "inside the TTL the last read count is served"
+        );
+        assert!(
+            lock(&provider.seeds.job_counts).is_empty(),
+            "and nothing is queued"
         );
 
-        // A cold cache reads the new submission.
-        let fresh = StorageDashboardProvider::new(Arc::clone(&backend), &test_config())
-            .with_counters(isolated_counters())
-            .with_job_stores(
-                None,
-                Some(Arc::clone(&backend) as Arc<dyn BulkSubmitJobStore>),
-            )
+        // Age the entry past the TTL: the stale count is still served at once,
+        // and a refresh is queued for the loop.
+        if let Some(entry) = lock(&provider.job_counts).get_mut("default") {
+            entry.fetched_at = Instant::now().checked_sub(JOB_COUNTS_TTL);
+        }
+        let stale = provider
+            .snapshot(DashboardWindow::LastDay, "", &[], false)
+            .await;
+        assert_eq!(stale.import_jobs_active, Some(0));
+        assert_eq!(lock(&provider.seeds.job_counts).len(), 1);
+
+        let report = provider.drain_pending_seeds(&mut schedule()).await;
+        assert_eq!(report.job_counts_refreshed, vec!["default".to_string()]);
+        let fresh = provider
             .snapshot(DashboardWindow::LastDay, "", &[], false)
             .await;
         assert_eq!(fresh.import_jobs_active, Some(1));
     }
 
+    /// #1078 decision (a): the job counts are never read on the request path.
+    /// Every snapshot — pending, from the counters, or unsupported — completes
+    /// on its first poll, so it cannot be waiting on a job store however slow
+    /// one is (the SQLite stores answer through a blocking task, which is never
+    /// ready on a first poll), and a submission the stores hold only shows
+    /// once the background refresh has read it.
+    #[tokio::test]
+    async fn job_counts_are_never_awaited_on_the_request_path() {
+        use helios_persistence::core::{BulkSubmitProvider, SubmissionId};
+
+        let backend = sqlite();
+        create_in(backend.as_ref(), "Patient").await;
+        backend
+            .create_submission(&test_tenant(), &SubmissionId::generate("test-system"), None)
+            .await
+            .expect("create submission");
+        let storage = InstrumentedStorage::over(Arc::clone(&backend));
+        let provider = StorageDashboardProvider::new(Arc::clone(&storage), &test_config())
+            .with_counters(isolated_counters())
+            .with_job_stores(
+                Some(Arc::clone(&backend) as Arc<dyn BulkExportJobStore>),
+                Some(Arc::clone(&backend) as Arc<dyn BulkSubmitJobStore>),
+            );
+
+        let pending = provider
+            .snapshot(DashboardWindow::LastHour, "", &[], false)
+            .now_or_never()
+            .expect("a pending snapshot completes on its first poll");
+        assert_eq!(pending.figures, Figures::Pending);
+        assert_eq!(pending.import_jobs_active, None, "not read on the request");
+
+        let report = provider.drain_pending_seeds(&mut schedule()).await;
+        assert_eq!(report.seeded, vec!["default".to_string()]);
+        assert_eq!(report.job_counts_refreshed, vec!["default".to_string()]);
+
+        let seeded = provider
+            .snapshot(DashboardWindow::LastHour, "", &[], false)
+            .now_or_never()
+            .expect("a counter snapshot completes on its first poll");
+        assert!(seeded.figures.is_known());
+        assert_eq!(seeded.import_jobs_active, Some(1));
+        assert_eq!(
+            seeded.export_jobs,
+            Some(ExportJobCounts {
+                running: 0,
+                queued: 0
+            })
+        );
+
+        storage.type_counts.store(false, Ordering::SeqCst);
+        let unsupported = provider
+            .snapshot(DashboardWindow::LastHour, "other", &[], false)
+            .now_or_never()
+            .expect("an unsupported snapshot completes on its first poll");
+        assert_eq!(unsupported.figures, Figures::Unsupported);
+        assert_eq!(unsupported.import_jobs_active, None);
+    }
+
     /// The #1078 request-path guarantee for an unseeded tenant: every load
-    /// answers at once with `totals_pending` and empty figures, running no
+    /// answers at once with [`Figures::Pending`] and empty figures, running no
     /// storage aggregate — even over a backend whose aggregates take seconds,
     /// and while the seed itself is in flight. The background seed loads the
     /// totals and the default charted types' rings for every window, after
@@ -2552,13 +3286,11 @@ mod tests {
             )
             .await
             .expect("an unseeded tenant's load must not wait on storage");
-            assert!(pending.totals_pending, "{}", window.as_str());
-            assert!(!pending.counts_unsupported);
-            assert!(!pending.partial && !pending.approximate && !pending.series_pending);
+            assert_eq!(pending.figures, Figures::Pending, "{}", window.as_str());
             assert_eq!(pending.total_resources, 0);
             assert_eq!(pending.distinct_types, 0);
             assert!(pending.series.is_empty() && pending.available.is_empty());
-            assert!(pending.generated_at.is_none(), "nothing was measured");
+            assert!(pending.figures.read_at().is_none(), "nothing was measured");
             assert!(!pending.fhir_version.is_empty());
         }
         assert_eq!(
@@ -2585,7 +3317,7 @@ mod tests {
         )
         .await
         .expect("a load never waits on a seed in flight");
-        assert!(during.totals_pending);
+        assert_eq!(during.figures, Figures::Pending);
         storage.delay_ms.store(0, Ordering::SeqCst);
         let report = seeding.await.expect("the seed task did not panic");
         assert_eq!(report.seeded, vec!["default".to_string()]);
@@ -2612,10 +3344,9 @@ mod tests {
         let tenant = test_tenant();
         for window in DashboardWindow::ALL {
             let snapshot = provider.snapshot(window, "", &[], false).await;
-            assert!(!snapshot.totals_pending && !snapshot.approximate && !snapshot.partial);
+            assert!(matches!(snapshot.figures, Figures::Exact { .. }));
             assert_eq!(snapshot.total_resources, 3);
             assert_eq!(snapshot.distinct_types, 2);
-            assert!(snapshot.generated_at.is_some());
             let from_storage = resource_count_series(
                 storage.inner.as_ref(),
                 &tenant,
@@ -2632,25 +3363,6 @@ mod tests {
             calls,
             "a seeded tenant's loads run no aggregate"
         );
-    }
-
-    /// #1078: no snapshot of this provider reads a storage aggregate, so every
-    /// one — pending, unsupported or from the counters, for any tenant — is
-    /// constant time. That keeps a pending snapshot in the cache only for its
-    /// short live TTL, so the page picks up the seeded figures promptly.
-    #[tokio::test]
-    async fn serves_every_snapshot_in_constant_time() {
-        let backend = sqlite();
-        create_in(backend.as_ref(), "Patient").await;
-        let provider = StorageDashboardProvider::new(Arc::clone(&backend), &test_config())
-            .with_counters(isolated_counters());
-        for tenant in ["", "default", "other"] {
-            assert!(provider.serves_in_constant_time(tenant), "{tenant:?}");
-        }
-        settle(&provider, DashboardWindow::LastHour, &[], false).await;
-        for tenant in ["", "default", "other"] {
-            assert!(provider.serves_in_constant_time(tenant), "{tenant:?}");
-        }
     }
 
     /// #1078 item 2: a failed startup seed is not dropped. The tenant stays
@@ -2681,8 +3393,7 @@ mod tests {
         let meanwhile = provider
             .snapshot(DashboardWindow::LastHour, "", &[], false)
             .await;
-        assert!(meanwhile.totals_pending);
-        assert!(!meanwhile.partial);
+        assert_eq!(meanwhile.figures, Figures::Pending);
         assert_eq!(storage.aggregate_calls(), calls);
 
         storage.fail.store(false, Ordering::SeqCst);
@@ -2694,7 +3405,7 @@ mod tests {
         let seeded = provider
             .snapshot(DashboardWindow::LastHour, "", &[], false)
             .await;
-        assert!(!seeded.totals_pending && !seeded.approximate);
+        assert!(matches!(seeded.figures, Figures::Exact { .. }));
         assert_eq!(seeded.total_resources, 1);
     }
 
@@ -2712,7 +3423,7 @@ mod tests {
         let pending = provider
             .snapshot(DashboardWindow::LastHour, "", &[], false)
             .await;
-        assert!(pending.totals_pending && !pending.partial);
+        assert_eq!(pending.figures, Figures::Pending);
         let report = provider.drain_pending_seeds(&mut schedule()).await;
         assert_eq!(report.seed_failed, vec!["default".to_string()]);
         assert!(!counters.is_seeded("default"));
@@ -2733,7 +3444,8 @@ mod tests {
             provider
                 .snapshot(DashboardWindow::LastHour, "", &[], false)
                 .await
-                .totals_pending
+                .figures
+                == Figures::Pending
         );
 
         storage.fail.store(false, Ordering::SeqCst);
@@ -2742,16 +3454,18 @@ mod tests {
         let recovered = provider
             .snapshot(DashboardWindow::LastHour, "", &[], false)
             .await;
-        assert!(!recovered.partial && !recovered.totals_pending);
+        assert!(recovered.figures.is_known());
         assert_eq!(recovered.total_resources, 1);
         assert!(counters.is_seeded("default"));
     }
 
     /// #1078 item 16: over a backend whose count aggregates are only the
     /// trait's empty defaults, every snapshot says the counts are unsupported
-    /// — empty figures, no timestamp, job counts as usual — without a storage
-    /// aggregate, and nothing ever seeds or reconciles the tenant: not a page
-    /// load, not the startup seed, not a pass, not the loop (which stops).
+    /// — empty figures, no timestamp, job counts as usual (read in the
+    /// background) — without a storage aggregate, and nothing ever seeds or
+    /// reconciles the tenant: not a page load, not the startup seed, not a
+    /// pass, not the loop. The loop keeps running only to refresh job counts,
+    /// and stops at once when no job store is wired either.
     #[tokio::test]
     async fn storage_that_cannot_count_is_unsupported_and_never_seeded() {
         use helios_persistence::core::{BulkSubmitProvider, SubmissionId};
@@ -2780,21 +3494,19 @@ mod tests {
                 (vec!["Patient".to_string()], true),
             ] {
                 let snapshot = provider.snapshot(window, "", &types, include_empty).await;
-                assert!(snapshot.counts_unsupported, "{}", window.as_str());
-                assert!(!snapshot.totals_pending);
-                assert!(!snapshot.partial && !snapshot.approximate);
+                assert_eq!(
+                    snapshot.figures,
+                    Figures::Unsupported,
+                    "{}",
+                    window.as_str()
+                );
                 assert_eq!(snapshot.total_resources, 0);
                 assert_eq!(snapshot.distinct_types, 0);
                 assert!(snapshot.series.is_empty() && snapshot.available.is_empty());
-                assert!(snapshot.generated_at.is_none());
-                assert_eq!(
-                    snapshot.import_jobs_active,
-                    Some(1),
-                    "job counts are reported as usual"
-                );
+                assert!(snapshot.figures.read_at().is_none());
             }
         }
-        assert!(queued_tenants(&provider).is_empty(), "nothing is queued");
+        assert!(queued_tenants(&provider).is_empty(), "no seed is queued");
 
         // A recorded write gives the tenant counter state; it must still never
         // be seeded.
@@ -2804,18 +3516,53 @@ mod tests {
         assert!(report.seeded.is_empty() && report.seed_failed.is_empty());
         let report = provider.reconcile_pass(&mut schedule).await;
         assert!(report.seeded.is_empty() && report.reconciled.is_empty());
+        assert_eq!(
+            report.job_counts_refreshed,
+            vec!["default".to_string()],
+            "job counts are still refreshed"
+        );
         provider.drain_pending_seeds(&mut schedule).await;
         assert_eq!(storage.aggregate_calls(), 0);
         assert!(!counters.is_seeded("default"));
+        assert_eq!(
+            provider
+                .snapshot(DashboardWindow::LastHour, "", &[], false)
+                .await
+                .import_jobs_active,
+            Some(1),
+            "job counts are reported as usual"
+        );
 
+        // The loop refreshes a tenant's job counts when a load asks.
         let handle = spawn_reconcile_loop_every(&provider, StdDuration::from_secs(3600))
+            .expect("inside a runtime");
+        let other = provider
+            .snapshot(DashboardWindow::LastHour, "other", &[], false)
+            .await;
+        assert_eq!(other.import_jobs_active, None);
+        assert!(
+            eventually(|| lock(&provider.job_counts)
+                .get("other")
+                .is_some_and(|entry| entry.import == Some(0)))
+            .await,
+            "the loop refreshed the job counts a load queued"
+        );
+        assert!(!handle.is_finished());
+        assert_eq!(storage.aggregate_calls(), 0);
+        assert!(!counters.is_seeded("default"));
+
+        // Without any job store there is nothing to do: the loop stops.
+        let bare = Arc::new(
+            StorageDashboardProvider::new(Arc::clone(&storage), &test_config())
+                .with_counters(isolated_counters()),
+        );
+        let handle = spawn_reconcile_loop_every(&bare, StdDuration::from_secs(3600))
             .expect("inside a runtime");
         tokio::time::timeout(StdDuration::from_secs(5), handle)
             .await
             .expect("the loop has nothing to do and stops")
             .expect("the loop did not panic");
         assert_eq!(storage.aggregate_calls(), 0);
-        assert!(!counters.is_seeded("default"));
     }
 
     /// #1078: the first seed of a never-seeded tenant runs even while a bulk
@@ -2846,8 +3593,8 @@ mod tests {
         let pending = provider
             .snapshot(DashboardWindow::LastHour, "", &[], false)
             .await;
-        assert!(pending.totals_pending);
-        assert_eq!(pending.import_jobs_active, Some(1));
+        assert_eq!(pending.figures, Figures::Pending);
+        assert_eq!(pending.import_jobs_active, None, "not read yet");
         let report = provider.drain_pending_seeds(&mut schedule).await;
         assert_eq!(
             report.seeded,
@@ -2858,8 +3605,9 @@ mod tests {
         let seeded = provider
             .snapshot(DashboardWindow::LastHour, "", &[], false)
             .await;
-        assert!(!seeded.totals_pending);
+        assert!(seeded.figures.is_known());
         assert_eq!(seeded.total_resources, 1);
+        assert_eq!(seeded.import_jobs_active, Some(1));
 
         counters.invalidate_tenant("default");
         let calls = storage.aggregate_calls();
@@ -2871,7 +3619,7 @@ mod tests {
         let kept = provider
             .snapshot(DashboardWindow::LastHour, "", &[], false)
             .await;
-        assert!(!kept.totals_pending && kept.approximate);
+        assert!(kept.figures.is_approximate());
         assert_eq!(kept.total_resources, 1);
     }
 
@@ -2889,7 +3637,7 @@ mod tests {
             .with_counters(Arc::clone(&counters));
         let before = settle(&provider, DashboardWindow::LastHour, &[], false).await;
         assert_eq!(before.total_resources, 3);
-        assert!(!before.approximate);
+        assert!(matches!(before.figures, Figures::Exact { .. }));
 
         // What the purge handlers do: erase storage, then invalidate.
         storage
@@ -2902,13 +3650,13 @@ mod tests {
         let calls = storage.aggregate_calls();
         for window in DashboardWindow::ALL {
             let kept = provider.snapshot(window, "", &[], false).await;
-            assert!(!kept.totals_pending, "the last figures stay on show");
-            assert!(kept.approximate, "labelled approximate until the reseed");
-            assert!(!kept.partial);
+            assert!(
+                kept.figures.is_approximate(),
+                "the last figures stay on show, labelled approximate until the reseed"
+            );
             assert_eq!(kept.total_resources, 3);
             assert_eq!(kept.distinct_types, 2);
             assert_eq!(kept.series.len(), 2);
-            assert!(kept.generated_at.is_some());
         }
         assert_eq!(
             storage.aggregate_calls(),
@@ -2928,7 +3676,7 @@ mod tests {
         let after = provider
             .snapshot(DashboardWindow::LastHour, "", &[], false)
             .await;
-        assert!(!after.totals_pending && !after.approximate);
+        assert!(matches!(after.figures, Figures::Exact { .. }));
         assert_eq!(after.total_resources, 0);
         assert_eq!(after.distinct_types, 0);
         assert!(after.available.is_empty() && after.series.is_empty());
@@ -2942,7 +3690,7 @@ mod tests {
         let reseeded = provider
             .snapshot(DashboardWindow::LastHour, "", &[], false)
             .await;
-        assert!(!reseeded.approximate);
+        assert!(matches!(reseeded.figures, Figures::Exact { .. }));
         assert_eq!(reseeded.total_resources, 1);
         assert_eq!(reseeded.series[0].resource_type, "Encounter");
     }
@@ -2976,12 +3724,24 @@ mod tests {
         for window in DashboardWindow::ALL {
             for (types, include_empty) in &selections {
                 let snapshot = provider.snapshot(window, "", types, *include_empty).await;
-                assert!(!snapshot.partial);
-                assert!(snapshot.approximate, "a recorded write is not reconciled");
-                assert!(!snapshot.series_pending);
+                let Figures::Approximate {
+                    read_at,
+                    reconciled_at,
+                } = snapshot.figures
+                else {
+                    panic!("a recorded write is not reconciled: {:?}", snapshot.figures);
+                };
+                assert_eq!(
+                    reconciled_at,
+                    counters
+                        .totals_view("default")
+                        .expect("seeded")
+                        .reconciled_at,
+                    "approximate figures say when the counters last matched storage"
+                );
+                assert!(read_at >= reconciled_at);
                 assert_eq!(snapshot.total_resources, 3);
                 assert_eq!(snapshot.distinct_types, 1);
-                assert!(snapshot.generated_at.is_some());
             }
         }
         assert_eq!(
@@ -3032,8 +3792,11 @@ mod tests {
             )
             .await
             .expect("a seeded tenant must not wait on the slow backend");
-            assert!(!defaults.partial);
-            assert!(!defaults.approximate, "{}", window.as_str());
+            assert!(
+                matches!(defaults.figures, Figures::Exact { .. }),
+                "{}",
+                window.as_str()
+            );
             assert_eq!(defaults.total_resources, 7);
             assert_eq!(defaults.series.len(), 3);
 
@@ -3043,9 +3806,8 @@ mod tests {
             )
             .await
             .expect("a seeded tenant must not wait on the slow backend");
-            assert!(!snapshot.partial);
             assert!(
-                snapshot.approximate,
+                snapshot.figures.is_approximate(),
                 "no storage history for Encounter's ring yet ({})",
                 window.as_str()
             );
@@ -3091,7 +3853,7 @@ mod tests {
             let snapshot = provider
                 .snapshot(DashboardWindow::LastDay, "", &encounter, false)
                 .await;
-            assert!(snapshot.approximate);
+            assert!(snapshot.figures.is_approximate());
         }
         assert_eq!(lock(&provider.seeds.rings).len(), 1);
 
@@ -3100,7 +3862,7 @@ mod tests {
         let snapshot = provider
             .snapshot(DashboardWindow::LastDay, "", &encounter, false)
             .await;
-        assert!(!snapshot.approximate);
+        assert!(matches!(snapshot.figures, Figures::Exact { .. }));
         assert_eq!(snapshot.series[0].points.last().unwrap().cumulative, 1);
     }
 
@@ -3116,7 +3878,7 @@ mod tests {
         let provider = StorageDashboardProvider::new(Arc::clone(&backend), &test_config())
             .with_counters(Arc::clone(&counters));
         let seeded = settle(&provider, DashboardWindow::LastHour, &[], false).await;
-        assert!(!seeded.approximate);
+        assert!(matches!(seeded.figures, Figures::Exact { .. }));
 
         let recorded = create_in(backend.as_ref(), "Patient").await;
         counters.record("default", "Patient", 1, recorded.last_modified());
@@ -3126,7 +3888,7 @@ mod tests {
         let during = provider
             .snapshot(DashboardWindow::LastHour, "", &[], false)
             .await;
-        assert!(during.approximate);
+        assert!(during.figures.is_approximate());
         assert_eq!(during.total_resources, 2);
 
         let mut schedule = ReconcileSchedule::new(StdDuration::from_secs(30));
@@ -3151,13 +3913,16 @@ mod tests {
         assert_eq!(after.total_resources, live);
         assert_eq!(after.distinct_types, 2);
         // Observation is charted for the first time, from counters only.
-        assert!(after.approximate);
+        assert!(after.figures.is_approximate());
         assert_eq!(provider.drain_pending_ring_seeds().await, 1);
 
         let converged = provider
             .snapshot(DashboardWindow::LastHour, "", &[], false)
             .await;
-        assert!(!converged.approximate, "reconciled and loaded: exact again");
+        assert!(
+            matches!(converged.figures, Figures::Exact { .. }),
+            "reconciled and loaded: exact again"
+        );
         assert_eq!(converged.total_resources, live);
         let now = Utc::now();
         let from_storage = resource_count_series(
@@ -3182,10 +3947,11 @@ mod tests {
             shape(from_counters.iter().map(|c| &c.series))
         );
 
-        // Straight away, the next pass is not due (duty cycle) and reads
-        // nothing.
+        // Straight away, the next pass is not due (duty cycle): it probes the
+        // unchanged write marker and runs no aggregate.
         let report = provider.reconcile_pass(&mut schedule).await;
         assert!(report.reconciled.is_empty());
+        assert!(report.external_changes.is_empty());
         assert_eq!(report.not_due, vec!["default".to_string()]);
         assert_eq!(report.rings_seeded, 0);
     }
@@ -3267,11 +4033,14 @@ mod tests {
         let types = ["Patient", "Observation", "Encounter"];
         for window in DashboardWindow::ALL {
             let now = Utc::now();
-            let token = counters.begin_reconcile("default");
+            let token = counters.begin_reconcile("default", None);
             let totals = ResourceStorage::count_all_types(backend.as_ref(), &tenant)
                 .await
                 .expect("count_all_types");
-            assert!(counters.finish_reconcile(token, &totals, now));
+            assert!(matches!(
+                counters.finish_reconcile(token, &totals, None, now),
+                ReconcileOutcome::Applied { .. }
+            ));
             seed_rings_from(&counters, backend.as_ref(), &tenant, &types, window, now).await;
             let from_storage = resource_count_series(
                 backend.as_ref(),
@@ -3365,7 +4134,10 @@ mod tests {
                 true,
             )
             .await;
-        assert!(snapshot.approximate, "Encounter's ring has no history yet");
+        assert!(
+            snapshot.figures.is_approximate(),
+            "Encounter's ring has no history yet"
+        );
         assert!(
             eventually(|| {
                 counters
@@ -3383,10 +4155,14 @@ mod tests {
         assert!(!handle.is_finished());
 
         drop(provider);
-        tokio::time::timeout(StdDuration::from_secs(5), handle)
+        let stopped = tokio::time::timeout(StdDuration::from_secs(5), handle)
             .await
-            .expect("the loop stops once its provider is gone")
-            .expect("the loop did not panic");
+            .expect("the loop stops once its provider is gone");
+        // Dropping the provider aborts its supervisor.
+        assert!(
+            stopped.is_ok() || stopped.as_ref().is_err_and(|error| error.is_cancelled()),
+            "the loop did not panic: {stopped:?}"
+        );
     }
 
     /// Every `(type, window)` ring of `types` in every window is loaded from
@@ -3485,7 +4261,7 @@ mod tests {
         let pending = provider
             .snapshot(DashboardWindow::LastHour, "", &[], false)
             .await;
-        assert!(pending.totals_pending);
+        assert_eq!(pending.figures, Figures::Pending);
         provider.drain_pending_seeds(&mut schedule()).await
     }
 
@@ -3521,8 +4297,10 @@ mod tests {
         let snapshot = provider
             .snapshot(DashboardWindow::LastHour, "", &[], false)
             .await;
-        assert!(!snapshot.totals_pending);
-        assert!(snapshot.approximate, "rings without storage history");
+        assert!(
+            snapshot.figures.is_approximate(),
+            "rings without storage history"
+        );
         assert_eq!(snapshot.total_resources, 3);
 
         storage.fail_history.store(false, Ordering::SeqCst);
@@ -3545,7 +4323,7 @@ mod tests {
         let exact = provider
             .snapshot(DashboardWindow::LastHour, "", &[], false)
             .await;
-        assert!(!exact.approximate);
+        assert!(matches!(exact.figures, Figures::Exact { .. }));
     }
 
     /// #1078: queued ring seeds are drained one grouped query per window per
@@ -3573,7 +4351,7 @@ mod tests {
         let extra = vec!["Encounter".to_string(), "Procedure".to_string()];
         for window in [DashboardWindow::LastHour, DashboardWindow::LastDay] {
             let snapshot = provider.snapshot(window, "", &extra, false).await;
-            assert!(snapshot.approximate);
+            assert!(snapshot.figures.is_approximate());
         }
         assert_eq!(lock(&provider.seeds.rings).len(), 4);
 
@@ -3599,7 +4377,11 @@ mod tests {
         assert!(lock(&provider.seeds.rings).is_empty());
         for window in [DashboardWindow::LastHour, DashboardWindow::LastDay] {
             let snapshot = provider.snapshot(window, "", &extra, false).await;
-            assert!(!snapshot.approximate, "{}", window.as_str());
+            assert!(
+                matches!(snapshot.figures, Figures::Exact { .. }),
+                "{}",
+                window.as_str()
+            );
             assert_eq!(snapshot.series.len(), 2);
         }
     }
@@ -3625,5 +4407,430 @@ mod tests {
             ]
         );
         assert!(rings_by_window(Vec::new()).is_empty());
+    }
+
+    /// Creates one resource of `resource_type` in `tenant`.
+    async fn create_for<S: ResourceStorage>(storage: &S, tenant: &str, resource_type: &str) {
+        storage
+            .create(
+                &tenant_context(tenant),
+                resource_type,
+                serde_json::json!({ "resourceType": resource_type }),
+                FhirVersion::R4,
+            )
+            .await
+            .expect("create");
+    }
+
+    fn strings(items: &[&str]) -> Vec<String> {
+        items.iter().map(|item| (*item).to_string()).collect()
+    }
+
+    fn sorted(mut items: Vec<String>) -> Vec<String> {
+        items.sort();
+        items
+    }
+
+    /// The provider holds nothing for `tenant` any more.
+    fn assert_forgotten<S>(
+        provider: &StorageDashboardProvider<S>,
+        schedule: &ReconcileSchedule,
+        tenant: &str,
+    ) {
+        assert!(!queued_tenants(provider).iter().any(|t| t == tenant));
+        assert!(
+            !lock(&provider.seeds.rings)
+                .iter()
+                .any(|(t, _, _)| t == tenant)
+        );
+        assert!(
+            !lock(&provider.seeds.charted)
+                .keys()
+                .any(|(t, _, _)| t == tenant)
+        );
+        assert!(!lock(&provider.seeds.job_counts).contains(tenant));
+        assert!(!lock(&provider.job_counts).contains_key(tenant));
+        assert!(!lock(&provider.viewed).contains_key(tenant));
+        assert!(!schedule.tenants().any(|t| t == tenant));
+    }
+
+    /// #1078 decision (b): a write made outside this process (a sibling
+    /// instance) is detected through the storage write marker. The next pass
+    /// labels the figures approximate and makes the totals due at once, even
+    /// inside the duty cycle; once a reconcile succeeds they are exact again,
+    /// with the external write counted.
+    #[tokio::test]
+    async fn marker_detected_external_change_is_approximate_until_a_reconcile() {
+        let storage = InstrumentedStorage::over(sqlite());
+        create_in(storage.as_ref(), "Patient").await;
+        let marker = |millis: i64| {
+            Some(WriteMarker {
+                latest: DateTime::from_timestamp_millis(millis),
+                recent_writes: None,
+            })
+        };
+        storage.set_marker(marker(1_000));
+        let provider = StorageDashboardProvider::new(Arc::clone(&storage), &test_config())
+            .with_counters(isolated_counters());
+        let patient = strings(&["Patient"]);
+        let load = || provider.snapshot(DashboardWindow::LastHour, "", &patient, false);
+        let mut schedule = schedule();
+
+        assert_eq!(load().await.figures, Figures::Pending);
+        provider.drain_pending_seeds(&mut schedule).await;
+        assert!(matches!(load().await.figures, Figures::Exact { .. }));
+
+        // Nothing changed: inside the duty cycle, the probe finds nothing.
+        let report = provider.reconcile_pass(&mut schedule).await;
+        assert_eq!(report.not_due, strings(&["default"]));
+        assert!(report.external_changes.is_empty() && report.reconciled.is_empty());
+
+        // A sibling instance writes: storage only, and the marker moves. The
+        // forced reconcile fails, so the figures stay as they were — labelled.
+        create_in(storage.inner.as_ref(), "Patient").await;
+        storage.set_marker(marker(2_000));
+        storage.fail.store(true, Ordering::SeqCst);
+        let calls = storage.aggregate_calls();
+        let report = provider.reconcile_pass(&mut schedule).await;
+        assert_eq!(report.external_changes, strings(&["default"]));
+        assert!(
+            report.not_due.is_empty(),
+            "the change made the totals due now"
+        );
+        assert!(report.reconciled.is_empty());
+        assert!(
+            storage.aggregate_calls() > calls,
+            "a reconcile was attempted"
+        );
+        let detected = load().await;
+        assert!(detected.figures.is_approximate(), "{:?}", detected.figures);
+        assert_eq!(detected.total_resources, 1);
+
+        storage.fail.store(false, Ordering::SeqCst);
+        let report = provider.reconcile_pass(&mut schedule).await;
+        assert_eq!(report.external_changes, strings(&["default"]));
+        assert_eq!(report.reconciled, strings(&["default"]));
+        let reconciled = load().await;
+        assert!(
+            matches!(reconciled.figures, Figures::Exact { .. }),
+            "{:?}",
+            reconciled.figures
+        );
+        assert_eq!(reconciled.total_resources, 2);
+        assert_eq!(reconciled.series[0].points.last().unwrap().cumulative, 2);
+
+        // Settled: the next probe sees the reconciled marker again.
+        let report = provider.reconcile_pass(&mut schedule).await;
+        assert!(report.external_changes.is_empty());
+        assert_eq!(report.not_due, strings(&["default"]));
+    }
+
+    /// #1078 decision (c): a tenant that keeps receiving writes never becomes
+    /// quiet, yet its charted rings are still re-seeded from storage once
+    /// their history is older than [`RESEED_MAX_AGE_FACTOR`] intervals — and
+    /// not before.
+    #[tokio::test]
+    async fn charted_rings_are_reseeded_under_continuous_writes_after_the_max_age() {
+        let backend = sqlite();
+        create_in(backend.as_ref(), "Patient").await;
+        let counters = isolated_counters();
+        let provider = StorageDashboardProvider::new(Arc::clone(&backend), &test_config())
+            .with_counters(Arc::clone(&counters));
+        let interval = StdDuration::from_millis(200);
+        let mut schedule = ReconcileSchedule::new(interval);
+        provider
+            .snapshot(DashboardWindow::LastHour, "", &[], false)
+            .await;
+        let report = provider.drain_pending_seeds(&mut schedule).await;
+        assert_eq!(report.seeded, strings(&["default"]));
+        let seeded_at = || {
+            counters
+                .series_view(
+                    "default",
+                    DashboardWindow::LastHour,
+                    &["Patient"],
+                    Utc::now(),
+                )
+                .expect("seeded")[0]
+                .history_seeded_at
+        };
+        let first_seed = seeded_at().expect("the seed loaded the ring");
+
+        // An import keeps writing; the totals are held not due so only the
+        // rings are in question.
+        let write = || counters.record("default", "Patient", 1, Utc::now());
+        schedule.next_due.insert(
+            "default".to_string(),
+            Instant::now() + StdDuration::from_secs(3600),
+        );
+        write();
+        let report = provider.reconcile_pass(&mut schedule).await;
+        assert_eq!(report.not_due, strings(&["default"]));
+        assert_eq!(report.rings_seeded, 0, "younger than the max age");
+        assert_eq!(seeded_at(), Some(first_seed));
+
+        tokio::time::sleep(interval * RESEED_MAX_AGE_FACTOR + StdDuration::from_millis(100)).await;
+        write();
+        let report = provider.reconcile_pass(&mut schedule).await;
+        assert_eq!(
+            report.rings_seeded,
+            DashboardWindow::ALL.len(),
+            "every charted Patient ring is re-seeded despite the writes"
+        );
+        assert!(seeded_at().is_some_and(|at| at > first_seed));
+        let snapshot = provider
+            .snapshot(DashboardWindow::LastHour, "", &[], false)
+            .await;
+        assert!(
+            snapshot.figures.is_approximate(),
+            "the totals still carry unreconciled writes"
+        );
+    }
+
+    /// #1078 decision (e): a pass visits at most its budget of tenants, most
+    /// recently viewed first, and the tenants it skipped go first next pass.
+    /// Even with the budget spent, the first seed of a tenant someone just
+    /// opened runs, while a purge reseed waits.
+    #[tokio::test]
+    async fn pass_budget_serves_recent_views_first_and_carries_skipped_tenants_over() {
+        let backend = sqlite();
+        for tenant in ["a", "b", "c", "d"] {
+            create_for(backend.as_ref(), tenant, "Patient").await;
+        }
+        let counters = isolated_counters();
+        let provider = StorageDashboardProvider::new(Arc::clone(&backend), &test_config())
+            .with_counters(Arc::clone(&counters));
+        for tenant in ["a", "b", "c"] {
+            provider
+                .snapshot(DashboardWindow::LastHour, tenant, &[], false)
+                .await;
+        }
+        let report = provider.drain_pending_seeds(&mut schedule()).await;
+        assert_eq!(sorted(report.seeded), strings(&["a", "b", "c"]));
+
+        // Viewed c, then a, then b: b is the most recent.
+        for tenant in ["c", "a", "b"] {
+            tokio::time::sleep(StdDuration::from_millis(2)).await;
+            provider
+                .snapshot(DashboardWindow::LastHour, tenant, &[], false)
+                .await;
+        }
+        let mut schedule = schedule();
+        schedule.max_tenants_per_pass = 2;
+        let report = provider.reconcile_pass(&mut schedule).await;
+        assert_eq!(report.reconciled, strings(&["b", "a"]));
+        assert_eq!(report.budget_skipped, strings(&["c"]));
+
+        let report = provider.reconcile_pass(&mut schedule).await;
+        assert_eq!(
+            report.reconciled,
+            strings(&["c"]),
+            "the skipped tenant goes first"
+        );
+        assert_eq!(report.not_due, strings(&["b"]));
+        assert_eq!(report.budget_skipped, strings(&["a"]));
+
+        schedule.max_tenants_per_pass = 0;
+        counters.invalidate_tenant("a");
+        let pending = provider
+            .snapshot(DashboardWindow::LastHour, "d", &[], false)
+            .await;
+        assert_eq!(pending.figures, Figures::Pending);
+        let report = provider.reconcile_pass(&mut schedule).await;
+        assert_eq!(report.seeded, strings(&["d"]), "a recent view's first seed");
+        assert!(report.budget_skipped.contains(&"a".to_string()));
+        assert!(counters.needs_reseed("a"), "the purge reseed waits");
+        assert!(counters.is_seeded("d"));
+    }
+
+    /// #1078 decision (d): a tenant nobody views for the idle TTL is evicted —
+    /// counters and provider state alike, the default tenant excepted — and
+    /// its next view seeds it again from storage.
+    #[tokio::test]
+    async fn idle_tenants_are_evicted_and_seeded_again_on_their_next_view() {
+        let backend = sqlite();
+        create_in(backend.as_ref(), "Patient").await;
+        create_for(backend.as_ref(), "other", "Patient").await;
+        let counters = isolated_counters();
+        let provider = StorageDashboardProvider::new(Arc::clone(&backend), &test_config())
+            .with_counters(Arc::clone(&counters))
+            .with_job_stores(
+                None,
+                Some(Arc::clone(&backend) as Arc<dyn BulkSubmitJobStore>),
+            );
+        let mut schedule = schedule();
+        for tenant in ["", "other"] {
+            provider
+                .snapshot(DashboardWindow::LastHour, tenant, &[], false)
+                .await;
+        }
+        let report = provider.drain_pending_seeds(&mut schedule).await;
+        assert_eq!(sorted(report.seeded), strings(&["default", "other"]));
+        // A queued ring and read job counts for "other"; then nobody looks.
+        provider
+            .snapshot(
+                DashboardWindow::LastDay,
+                "other",
+                &strings(&["Encounter"]),
+                true,
+            )
+            .await;
+        assert!(
+            lock(&provider.seeds.rings)
+                .iter()
+                .any(|(t, _, _)| t == "other")
+        );
+        assert!(lock(&provider.job_counts).contains_key("other"));
+
+        schedule.idle_ttl = StdDuration::from_millis(50);
+        tokio::time::sleep(StdDuration::from_millis(100)).await;
+        let report = provider.reconcile_pass(&mut schedule).await;
+        assert_eq!(report.dropped, strings(&["other"]), "the default is kept");
+        assert!(!counters.is_seeded("other"));
+        assert!(counters.is_seeded("default"));
+        assert_forgotten(&provider, &schedule, "other");
+
+        let pending = provider
+            .snapshot(DashboardWindow::LastHour, "other", &[], false)
+            .await;
+        assert_eq!(pending.figures, Figures::Pending);
+        assert_eq!(queued_tenants(&provider), strings(&["other"]));
+        let report = provider.drain_pending_seeds(&mut schedule).await;
+        assert_eq!(report.seeded, strings(&["other"]));
+        let back = provider
+            .snapshot(DashboardWindow::LastHour, "other", &[], false)
+            .await;
+        assert!(matches!(back.figures, Figures::Exact { .. }));
+        assert_eq!(back.total_resources, 1);
+    }
+
+    /// #1078 decision (d): `TenantRemoved` drops the tenant's counters at once
+    /// (through the write observer), and the provider forgets its queued work,
+    /// schedule and job counts when it next runs — a queued ring of the
+    /// removed tenant is not loaded.
+    #[tokio::test]
+    async fn tenant_removed_drops_the_tenants_state() {
+        let backend = sqlite();
+        create_for(backend.as_ref(), "other", "Patient").await;
+        let counters = isolated_counters();
+        let observer =
+            crate::handlers::dashboard_counts::DashboardCountsObserver::new(Arc::clone(&counters));
+        let storage = InstrumentedStorage::over(Arc::clone(&backend));
+        let provider = StorageDashboardProvider::new(Arc::clone(&storage), &test_config())
+            .with_counters(Arc::clone(&counters))
+            .with_job_stores(
+                None,
+                Some(Arc::clone(&backend) as Arc<dyn BulkSubmitJobStore>),
+            );
+        let mut schedule = schedule();
+        provider
+            .snapshot(DashboardWindow::LastHour, "other", &[], false)
+            .await;
+        provider.drain_pending_seeds(&mut schedule).await;
+        assert!(counters.is_seeded("other"));
+        provider
+            .snapshot(
+                DashboardWindow::LastDay,
+                "other",
+                &strings(&["Encounter"]),
+                true,
+            )
+            .await;
+        assert_eq!(lock(&provider.seeds.rings).len(), 1);
+
+        observer.on_write(&WriteEvent::TenantRemoved {
+            tenant: TenantId::new("other"),
+        });
+        assert!(!counters.is_seeded("other"));
+        let grouped = storage.grouped_history_calls();
+        let report = provider.drain_pending_seeds(&mut schedule).await;
+        assert_eq!(report.dropped, strings(&["other"]));
+        assert_eq!(report.rings_seeded, 0);
+        assert_eq!(
+            storage.grouped_history_calls(),
+            grouped,
+            "the removed tenant's queued ring is not loaded"
+        );
+        assert_forgotten(&provider, &schedule, "other");
+
+        // A later view starts over.
+        let again = provider
+            .snapshot(DashboardWindow::LastHour, "other", &[], false)
+            .await;
+        assert_eq!(again.figures, Figures::Pending);
+        assert_eq!(queued_tenants(&provider), strings(&["other"]));
+    }
+
+    /// #1078 decision (g): the loop is supervised. A pass that panics (here
+    /// the startup seed's totals read) is logged and the loop restarted after
+    /// a back-off, and the restarted loop seeds the tenant; the supervisor
+    /// stops with its provider.
+    #[tokio::test]
+    async fn reconcile_loop_is_restarted_after_a_panic_and_still_seeds() {
+        let storage = InstrumentedStorage::over(sqlite());
+        create_in(storage.as_ref(), "Patient").await;
+        storage.panic_once.store(true, Ordering::SeqCst);
+        let counters = isolated_counters();
+        let provider = Arc::new(
+            StorageDashboardProvider::new(Arc::clone(&storage), &test_config())
+                .with_counters(Arc::clone(&counters)),
+        );
+        let handle = spawn_reconcile_loop_every(&provider, StdDuration::from_secs(3600))
+            .expect("inside a runtime");
+
+        assert!(
+            eventually(|| !storage.panic_once.load(Ordering::SeqCst)).await,
+            "the startup seed ran and panicked"
+        );
+        assert!(
+            eventually(|| counters.is_seeded("default")).await,
+            "the restarted loop seeded the default tenant"
+        );
+        assert!(
+            !handle.is_finished(),
+            "the supervisor keeps the loop running"
+        );
+
+        drop(provider);
+        let stopped = tokio::time::timeout(StdDuration::from_secs(5), handle)
+            .await
+            .expect("the supervisor stops with its provider");
+        assert!(
+            stopped.is_ok() || stopped.as_ref().is_err_and(|error| error.is_cancelled()),
+            "{stopped:?}"
+        );
+    }
+
+    /// The write-marker bound only moves while the figures are already
+    /// approximate, so a quiet tenant's markers stay comparable; a probe uses
+    /// the bound of the reconcile that stored the marker.
+    #[test]
+    fn marker_bound_moves_only_while_figures_are_approximate() {
+        let mut schedule = schedule();
+        let t0 = Utc::now();
+        assert_eq!(
+            schedule.reconcile_bound("t", false, t0),
+            None,
+            "first reconcile"
+        );
+        assert_eq!(schedule.probe_bound("t"), None);
+
+        let t1 = t0 + Duration::minutes(1);
+        assert_eq!(
+            schedule.reconcile_bound("t", true, t1),
+            None,
+            "exact figures keep the bound"
+        );
+        let t2 = t1 + Duration::minutes(1);
+        let moved = Some(t1 - RECENT_WRITES_LOOKBACK);
+        assert_eq!(schedule.reconcile_bound("t", false, t2), moved);
+        assert_eq!(schedule.probe_bound("t"), moved);
+        assert_eq!(
+            schedule.reconcile_bound("t", true, t2 + Duration::minutes(1)),
+            moved
+        );
+
+        schedule.forget("t");
+        assert_eq!(schedule.probe_bound("t"), None);
     }
 }

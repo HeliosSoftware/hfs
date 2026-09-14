@@ -672,7 +672,7 @@ pub async fn delete(
         JobOutcome::None => {}
     }
 
-    let _ = storage.deregister_tenant(&id).await;
+    let deregistered = storage.deregister_tenant(&id).await.is_ok();
     // A failed purge must be surfaced, not swallowed. The tenant has already
     // been deregistered by the line above, so discarding this error leaves the
     // data on disk with nothing in the registry pointing at it, while the page
@@ -700,6 +700,16 @@ pub async fn delete(
     } else {
         None
     };
+    if deregistered {
+        // Whether or not its data was purged, the tenant is gone from the
+        // registry; whoever holds state for it (the dashboard's live figures)
+        // can drop that state (#1078). Reported after the purge's own event.
+        if let Some(observer) = state.write_observer.as_deref() {
+            observer.on_write(&WriteEvent::TenantRemoved {
+                tenant: TenantId::new(id.as_str()),
+            });
+        }
+    }
 
     load(purge_error).await
 }

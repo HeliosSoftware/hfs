@@ -3,17 +3,11 @@
 import type { Page, Locator, Response } from "@playwright/test";
 
 /** A `data-dash-notice` slug (#956, #1078) — see `DashboardNotice` in
- * crates/ui/src/lib.rs. `live` and `approximate` are real readings; `pending`
- * (nothing known, cards blank) and `series-pending` (cards known, only the
- * chart waits) are the waiting states; `partial` and `sample` flag figures
- * that are filled in or invented. */
-export type DashNotice =
-  | "live"
-  | "pending"
-  | "series-pending"
-  | "partial"
-  | "approximate"
-  | "sample";
+ * crates/ui/src/lib.rs. A render carries exactly one. `live` and
+ * `approximate` are real readings; `pending` (nothing known, cards blank) is
+ * the waiting state; `sample` flags invented figures; `unsupported` is a
+ * backend that cannot count at all. */
+export type DashNotice = "live" | "pending" | "approximate" | "sample" | "unsupported";
 
 /** What the server sent for one hard navigation, read from the response body
  * itself rather than the live DOM. `#dash-live` re-requests itself through

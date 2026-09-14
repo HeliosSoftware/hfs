@@ -1133,6 +1133,18 @@ pub struct ServerConfig {
     #[arg(long, env = "HFS_UI_ENABLED", default_value = "true")]
     pub ui_enabled: bool,
 
+    /// Seconds between the web UI dashboard's background reconcile passes
+    /// (#1078).
+    ///
+    /// Each pass re-reads the per-type totals of the tenants that are due and
+    /// re-seeds their charted history, so the dashboard's in-memory counters
+    /// converge on storage. A tenant's totals query is additionally held back
+    /// to a small duty cycle of its own duration, so a short interval does not
+    /// by itself make a large store scan more often; it is also how soon a
+    /// failed seed is retried. Must be greater than 0.
+    #[arg(long, env = "HFS_DASHBOARD_RECONCILE_SECS", default_value = "30")]
+    pub dashboard_reconcile_interval_secs: u64,
+
     /// Natural-language search master switch. When false the feature is
     /// completely off: the endpoint 404s and the UI renders nothing.
     #[arg(long, env = "HFS_NL_SEARCH_ENABLED", default_value = "true")]
@@ -1349,6 +1361,7 @@ impl Default for ServerConfig {
             elasticsearch_write_refresh: "false".to_string(),
             sof_enabled: true,
             ui_enabled: true,
+            dashboard_reconcile_interval_secs: 30,
             nl_search_enabled: true,
             nl_search_api_key: None,
             nl_search_model: "claude-opus-4-8".to_string(),
@@ -1482,6 +1495,10 @@ impl ServerConfig {
             errors.push("Batch max concurrency cannot be 0".to_string());
         }
 
+        if self.dashboard_reconcile_interval_secs == 0 {
+            errors.push("Dashboard reconcile interval cannot be 0".to_string());
+        }
+
         if self.default_page_size == 0 {
             errors.push("Default page size cannot be 0".to_string());
         }
@@ -1572,6 +1589,7 @@ impl ServerConfig {
             elasticsearch_write_refresh: "false".to_string(),
             sof_enabled: true,
             ui_enabled: true,
+            dashboard_reconcile_interval_secs: 30,
             nl_search_enabled: true,
             nl_search_api_key: None,
             nl_search_model: "claude-opus-4-8".to_string(),
@@ -1983,6 +2001,53 @@ mod tests {
         assert!(result.is_err());
         let errors = result.unwrap_err();
         assert!(errors.iter().any(|e| e.contains("Batch max concurrency")));
+    }
+
+    // ── dashboard_reconcile_interval_secs (#1078) ────────────────
+
+    /// A zero interval would spin the dashboard's reconcile loop, so it is
+    /// rejected at startup; the defaults agree with the CLI default.
+    #[test]
+    fn test_validate_dashboard_reconcile_interval_zero() {
+        assert_eq!(
+            ServerConfig::default().dashboard_reconcile_interval_secs,
+            30
+        );
+        assert_eq!(
+            ServerConfig::for_testing().dashboard_reconcile_interval_secs,
+            30
+        );
+        let config = ServerConfig {
+            dashboard_reconcile_interval_secs: 0,
+            ..Default::default()
+        };
+        let errors = config.validate().unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e == "Dashboard reconcile interval cannot be 0")
+        );
+    }
+
+    #[test]
+    fn test_cli_dashboard_reconcile_interval_parses() {
+        let parsed = ServerConfig::try_parse_from(["rest-server"]).unwrap();
+        assert_eq!(parsed.dashboard_reconcile_interval_secs, 30);
+        let parsed = ServerConfig::try_parse_from([
+            "rest-server",
+            "--dashboard-reconcile-interval-secs",
+            "5",
+        ])
+        .unwrap();
+        assert_eq!(parsed.dashboard_reconcile_interval_secs, 5);
+        assert!(
+            ServerConfig::try_parse_from([
+                "rest-server",
+                "--dashboard-reconcile-interval-secs",
+                "soon"
+            ])
+            .is_err()
+        );
     }
 
     // ── validate() – default_page_size == 0 ──────────────────────

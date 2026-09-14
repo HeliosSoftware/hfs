@@ -203,7 +203,7 @@
    A waiting page whose fast retries are spent keeps a slow watch instead
    (data-dash-waiting): its re-aimed request carries the spent retry count
    from its own hx-get, so the server answers with the watch again rather than
-   restarting the fast retries, until the figures arrive (their flags change
+   restarting the fast retries, until the figures arrive (their kind changes
    the data-dash-state digest, so that response is swapped in).
 
    Every request the region makes — refresh, slow watch or bounded retry —

@@ -502,6 +502,16 @@ impl ResourceStorage for CompositeSubmitJobs {
         self.composite.supports_type_counts()
     }
 
+    async fn latest_write_marker(
+        &self,
+        tenant: &TenantContext,
+        recent_since: Option<DateTime<Utc>>,
+    ) -> StorageResult<Option<crate::core::WriteMarker>> {
+        self.composite
+            .latest_write_marker(tenant, recent_since)
+            .await
+    }
+
     async fn count_by_tenant(&self) -> StorageResult<Vec<(String, u64)>> {
         self.composite.count_by_tenant().await
     }
@@ -1246,6 +1256,35 @@ mod tests {
         let (sqlite, jobs, _events) = harness(HashSet::new());
         assert!(sqlite.supports_type_counts());
         assert!(jobs.supports_type_counts());
+    }
+
+    /// #1078: the submit-jobs wrapper forwards `latest_write_marker` to the
+    /// composite (and so to its SQLite primary) instead of the trait's `None`.
+    #[tokio::test]
+    async fn latest_write_marker_is_delegated_to_the_composite() {
+        let (sqlite, jobs, _events) = harness(HashSet::new());
+        let tenant = tenant();
+        let since = Some(Utc::now() - chrono::Duration::hours(1));
+        let created = ResourceStorage::create(
+            sqlite.as_ref(),
+            &tenant,
+            "Patient",
+            json!({ "resourceType": "Patient" }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+
+        let via_jobs = jobs.latest_write_marker(&tenant, since).await.unwrap();
+        let via_sqlite = sqlite.latest_write_marker(&tenant, since).await.unwrap();
+        assert_eq!(via_jobs, via_sqlite);
+        assert_eq!(
+            via_jobs,
+            Some(crate::core::WriteMarker {
+                latest: Some(created.last_modified()),
+                recent_writes: Some(1),
+            })
+        );
     }
 
     /// #1078: the submit-jobs wrapper forwards the grouped

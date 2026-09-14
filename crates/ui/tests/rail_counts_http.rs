@@ -5,8 +5,8 @@
 //! inside one test.
 //!
 //! #1078: counts from an approximate snapshot render as "≈N" and say so; a
-//! snapshot with no figures to give (the seeding read only queued, or a backend
-//! that cannot count) shows no count at all, exactly like a partial one (#1082).
+//! snapshot with no figures to give (the tenant still being seeded, or a
+//! backend that cannot count) shows no count at all, never a zero (#1082).
 
 use axum::{Router, body::Body, http::Request};
 use http_body_util::BodyExt;
@@ -14,17 +14,15 @@ use std::sync::Arc;
 use tower::ServiceExt;
 
 use helios_observability::dashboard::{
-    DashboardProvider, DashboardSnapshot, DashboardWindow, TypeCount, set_provider,
+    DashboardProvider, DashboardSnapshot, DashboardWindow, Figures, TypeCount, set_provider,
 };
 
 /// A tenant whose snapshot is counted from recent writes (approximate).
 const APPROXIMATE_TENANT: &str = "rail-approximate";
-/// A tenant whose provider only queued the read seeding its figures.
+/// A tenant the provider is still seeding: no figures yet.
 const SEEDING_TENANT: &str = "rail-seeding";
 /// A tenant whose storage backend cannot count at all.
 const UNSUPPORTED_TENANT: &str = "rail-unsupported";
-/// A tenant whose count query failed and was filled in with zeros.
-const PARTIAL_TENANT: &str = "rail-partial";
 
 fn app_as(tenant: &str) -> Router {
     helios_ui::mount_with_conformance_source(
@@ -87,22 +85,22 @@ impl DashboardProvider for Fixed {
         _types: &[String],
         _include_empty: bool,
     ) -> DashboardSnapshot {
+        let read_at = chrono::Utc::now();
         let flags = |snapshot: DashboardSnapshot| match tenant {
             APPROXIMATE_TENANT => DashboardSnapshot {
-                approximate: true,
-                ..snapshot
-            },
-            PARTIAL_TENANT => DashboardSnapshot {
-                partial: true,
+                figures: Figures::Approximate {
+                    read_at,
+                    reconciled_at: read_at,
+                },
                 ..snapshot
             },
             // The provider contract: these two come with nothing measured.
             SEEDING_TENANT => DashboardSnapshot {
-                totals_pending: true,
+                figures: Figures::Pending,
                 ..DashboardSnapshot::default()
             },
             UNSUPPORTED_TENANT => DashboardSnapshot {
-                counts_unsupported: true,
+                figures: Figures::Unsupported,
                 ..DashboardSnapshot::default()
             },
             _ => snapshot,
@@ -110,7 +108,6 @@ impl DashboardProvider for Fixed {
         let known = [
             "default",
             APPROXIMATE_TENANT,
-            PARTIAL_TENANT,
             SEEDING_TENANT,
             UNSUPPORTED_TENANT,
         ];
@@ -128,6 +125,7 @@ impl DashboardProvider for Fixed {
                     total: 7,
                 },
             ],
+            figures: Figures::Exact { read_at },
             ..Default::default()
         })
     }
@@ -241,10 +239,10 @@ async fn the_rail_goes_from_no_counts_to_server_rendered_counts() {
         );
     }
 
-    // Phase 4 — snapshots with no counts to give: a partial one (#1082,
-    // unchanged), one whose seeding read is only queued, and a backend that
-    // cannot count. None renders a count span, so none shows a zero.
-    for tenant in [PARTIAL_TENANT, SEEDING_TENANT, UNSUPPORTED_TENANT] {
+    // Phase 4 — snapshots with no counts to give (#1082): a tenant still being
+    // seeded, and a backend that cannot count. Neither renders a count span,
+    // so neither shows a zero.
+    for tenant in [SEEDING_TENANT, UNSUPPORTED_TENANT] {
         for path in ["/ui/resources", "/ui/search", "/ui/queries"] {
             let html = get_as(tenant, path).await;
             assert!(

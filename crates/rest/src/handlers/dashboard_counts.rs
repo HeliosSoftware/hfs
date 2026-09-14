@@ -14,6 +14,7 @@
 //! - An aggregate write (`$bulk-submit`, conformance seeding) records
 //!   `+created` and `-deleted`; updates change no count.
 //! - A purge of any scope marks the tenant's figures stale.
+//! - A tenant deregistration drops the tenant's counters.
 //!
 //! The tenant key is the tenant id the write was made under, which is how the
 //! dashboard provider keys its reads. The counters are an approximation that a
@@ -82,6 +83,13 @@ impl WriteObserver for DashboardCountsObserver {
             // seeded history rings cannot subtract precisely: mark the tenant
             // stale so the background reconcile reseeds it.
             WriteEvent::Erased { tenant, .. } => self.counters.invalidate_tenant(tenant.as_str()),
+            // The tenant was deregistered: drop its counters now rather than
+            // waiting for idle eviction. The dashboard provider forgets its own
+            // state for the tenant on its next pass, and a later view seeds
+            // the tenant again from storage.
+            WriteEvent::TenantRemoved { tenant } => {
+                self.counters.remove_tenant(tenant.as_str());
+            }
         }
     }
 }
@@ -152,6 +160,28 @@ mod observer_tests {
             assert!(other.needs_reseed("a"), "{scope:?}");
         }
         assert!(!counters.needs_reseed("a"));
+    }
+
+    /// A deregistered tenant's counters are dropped at once; other tenants
+    /// keep theirs.
+    #[test]
+    fn tenant_removed_drops_the_tenants_counters() {
+        let counters = Arc::new(DashboardCounters::new());
+        let observer = DashboardCountsObserver::new(Arc::clone(&counters));
+        counters.record("a", "Patient", 2, Utc::now());
+        counters.record("b", "Patient", 1, Utc::now());
+
+        observer.on_write(&WriteEvent::TenantRemoved {
+            tenant: tenant("a"),
+        });
+        assert_eq!(counters.live_delta("a", "Patient"), 0);
+        assert_eq!(counters.tenants(), vec!["b".to_string()]);
+
+        // Removing a tenant with no state is harmless.
+        observer.on_write(&WriteEvent::TenantRemoved {
+            tenant: tenant("ghost"),
+        });
+        assert_eq!(counters.live_delta("b", "Patient"), 1);
     }
 }
 

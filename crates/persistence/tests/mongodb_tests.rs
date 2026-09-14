@@ -1775,6 +1775,73 @@ async fn mongodb_integration_count_all_types() {
     assert_eq!(map.get("Observation"), Some(&1));
 }
 
+/// #1078: the write marker is empty for a fresh tenant, changes on every
+/// create/update/delete, ignores other tenants, and counts recent rows.
+#[tokio::test]
+async fn mongodb_integration_latest_write_marker() {
+    let Some(backend) = create_backend("console_latest_write_marker").await else {
+        eprintln!("Skipping mongodb_integration_latest_write_marker (set HFS_TEST_MONGODB_URL)");
+        return;
+    };
+    let tenant = create_tenant("tenant-console-write-marker");
+    let other = create_tenant("tenant-console-write-marker-other");
+    let since = Some(chrono::Utc::now() - chrono::Duration::hours(1));
+
+    let empty = backend
+        .latest_write_marker(&tenant, since)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(empty.latest, None);
+    assert_eq!(empty.recent_writes, Some(0));
+    let unbounded = backend
+        .latest_write_marker(&tenant, None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(unbounded.recent_writes, None);
+
+    let created = backend
+        .create(&tenant, "Patient", json!({}), FhirVersion::default())
+        .await
+        .unwrap();
+    let after_create = backend.latest_write_marker(&tenant, since).await.unwrap();
+    assert_ne!(after_create, Some(empty));
+    assert_eq!(after_create.unwrap().recent_writes, Some(1));
+
+    backend
+        .update(&tenant, &created, json!({"active": true}))
+        .await
+        .unwrap();
+    let after_update = backend.latest_write_marker(&tenant, since).await.unwrap();
+    assert_ne!(after_update, after_create);
+
+    backend
+        .delete(&tenant, "Patient", created.id())
+        .await
+        .unwrap();
+    let after_delete = backend.latest_write_marker(&tenant, since).await.unwrap();
+    assert_ne!(after_delete, after_update);
+    assert_eq!(after_delete.unwrap().recent_writes, Some(3));
+
+    backend
+        .create(&other, "Patient", json!({}), FhirVersion::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        backend.latest_write_marker(&tenant, since).await.unwrap(),
+        after_delete
+    );
+    let future = Some(chrono::Utc::now() + chrono::Duration::hours(1));
+    let marker = backend
+        .latest_write_marker(&tenant, future)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(marker.recent_writes, Some(0));
+    assert!(marker.latest.is_some());
+}
+
 #[tokio::test]
 async fn mongodb_integration_count_by_day() {
     let Some(backend) = create_backend("console_count_by_day").await else {

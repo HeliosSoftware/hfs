@@ -186,10 +186,6 @@ chart-sample-note = Sample data: this build has no live metrics provider, so the
 chart-pending-note = Still gathering the live figures for this window. Nothing is charted until they arrive — no placeholder numbers are shown.
 chart-pending-empty = Waiting for the live figures…
 chart-pending-retry = Retry now
-chart-partial-note = Some figures could not be read from storage and are shown as zero. Reload to try again.
-# #1078: the tenant's counts are known but this window's series are not yet —
-# the cards show real figures while the chart alone waits.
-chart-series-pending-note = The chart for this window is still loading. The counts shown are real, from the latest reading; nothing is charted until this window's own figures arrive.
 # #1078: measured, but counted from in-memory write counters rather than an
 # exact storage read. A label, not a warning.
 chart-approximate-note = Approximate: counted from recent writes and still being reconciled with storage.

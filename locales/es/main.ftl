@@ -183,10 +183,6 @@ chart-sample-note = Datos de muestra: esta build no tiene proveedor de métricas
 chart-pending-note = Todavía se están recopilando las cifras en vivo de este intervalo. No se grafica nada hasta que lleguen: no se muestran números de relleno.
 chart-pending-empty = Esperando las cifras en vivo…
 chart-pending-retry = Reintentar ahora
-chart-partial-note = Algunas cifras no se pudieron leer del almacenamiento y se muestran como cero. Recarga para volver a intentarlo.
-# #1078: los recuentos del tenant se conocen, pero las series de este intervalo
-# todavía no — las tarjetas muestran cifras reales y solo el gráfico espera.
-chart-series-pending-note = El gráfico de este intervalo todavía se está cargando. Los recuentos mostrados son reales, de la lectura más reciente; no se grafica nada hasta que lleguen las cifras propias de este intervalo.
 # #1078: cifras medidas, pero contadas a partir de contadores de escritura en
 # memoria, no de una lectura exacta del almacenamiento. Etiqueta, no aviso.
 chart-approximate-note = Aproximado: contado a partir de las escrituras recientes y aún en conciliación con el almacenamiento.

@@ -1013,6 +1013,58 @@ impl ResourceStorage for PostgresBackend {
         true
     }
 
+    async fn latest_write_marker(
+        &self,
+        tenant: &TenantContext,
+        recent_since: Option<DateTime<Utc>>,
+    ) -> StorageResult<Option<crate::core::WriteMarker>> {
+        /// Cap on `recent_writes`: a change detector, not a figure (#1078).
+        const RECENT_CAP: i64 = 10_000;
+
+        let client = self.get_client().await?;
+        let tenant_id = tenant.tenant_id().as_str();
+
+        // Both probes ride `idx_history_updated (tenant_id, last_updated)`: the
+        // newest timestamp is one backward index step (no sort), and the recent
+        // count walks the `>= $2` range only until the inner `LIMIT` stops it.
+        // One round trip for both.
+        let (latest, recent_writes) = match recent_since {
+            Some(since) => {
+                let row = client
+                    .query_one(
+                        "SELECT \
+                           (SELECT last_updated FROM resource_history \
+                             WHERE tenant_id = $1 ORDER BY last_updated DESC LIMIT 1), \
+                           (SELECT COUNT(*)::bigint FROM \
+                             (SELECT 1 FROM resource_history \
+                               WHERE tenant_id = $1 AND last_updated >= $2 LIMIT $3) recent)",
+                        &[&tenant_id, &since, &RECENT_CAP],
+                    )
+                    .await
+                    .or_query_error("Failed to query latest write marker")?;
+                let latest: Option<DateTime<Utc>> = row.get(0);
+                let n: i64 = row.get(1);
+                (latest, Some(n.max(0) as u64))
+            }
+            None => {
+                let row = client
+                    .query_opt(
+                        "SELECT last_updated FROM resource_history \
+                         WHERE tenant_id = $1 ORDER BY last_updated DESC LIMIT 1",
+                        &[&tenant_id],
+                    )
+                    .await
+                    .or_query_error("Failed to query latest write marker")?;
+                (row.map(|r| r.get::<_, DateTime<Utc>>(0)), None)
+            }
+        };
+
+        Ok(Some(crate::core::WriteMarker {
+            latest,
+            recent_writes,
+        }))
+    }
+
     fn supports_tenant_registry(&self) -> bool {
         true
     }

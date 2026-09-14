@@ -1160,6 +1160,16 @@ impl ResourceStorage for CompositeStorage {
         self.primary.supports_type_counts()
     }
 
+    async fn latest_write_marker(
+        &self,
+        tenant: &TenantContext,
+        recent_since: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> StorageResult<Option<crate::core::WriteMarker>> {
+        // The history log the marker reads lives with the authoritative primary,
+        // same as the count aggregates above.
+        self.primary.latest_write_marker(tenant, recent_since).await
+    }
+
     async fn count_by_tenant(&self) -> StorageResult<Vec<(String, u64)>> {
         self.primary.count_by_tenant().await
     }
@@ -4161,6 +4171,77 @@ mod tests {
         backends.insert("es".to_string(), Arc::new(MockStorage) as DynStorage);
         let composite = CompositeStorage::new(config, backends).unwrap();
         assert!(composite.supports_type_counts());
+    }
+
+    /// #1078: `latest_write_marker` defaults to `None` (a backend that cannot
+    /// probe its history cheaply, like `MockStorage`), and composite storage
+    /// reports its primary's answer, never a secondary's.
+    #[tokio::test]
+    async fn test_latest_write_marker_defaults_none_and_follows_the_primary() {
+        let tenant = make_tenant();
+        let since = Some(chrono::Utc::now());
+        assert_eq!(
+            MockStorage
+                .latest_write_marker(&tenant, since)
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            make_composite_no_secondary()
+                .latest_write_marker(&tenant, since)
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            make_composite_with_secondary()
+                .latest_write_marker(&tenant, since)
+                .await
+                .unwrap(),
+            None,
+            "a secondary never answers for the primary"
+        );
+    }
+
+    /// #1078: over a SQLite primary the composite's marker is the primary's.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn test_latest_write_marker_delegates_to_primary() {
+        let sqlite = Arc::new(crate::backends::sqlite::SqliteBackend::in_memory().unwrap());
+        sqlite.init_schema().unwrap();
+        let config = CompositeConfig::builder()
+            .primary("primary", BackendKind::Sqlite)
+            .search_backend("es", BackendKind::Elasticsearch)
+            .build()
+            .unwrap();
+        let mut backends = HashMap::new();
+        backends.insert("primary".to_string(), sqlite.clone() as DynStorage);
+        backends.insert("es".to_string(), Arc::new(MockStorage) as DynStorage);
+        let composite = CompositeStorage::new(config, backends).unwrap();
+
+        let tenant = make_tenant();
+        let since = Some(chrono::Utc::now() - chrono::Duration::hours(1));
+        let created = sqlite
+            .create(
+                &tenant,
+                "Patient",
+                serde_json::json!({ "resourceType": "Patient" }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+
+        let via_composite = composite.latest_write_marker(&tenant, since).await.unwrap();
+        let via_primary = sqlite.latest_write_marker(&tenant, since).await.unwrap();
+        assert_eq!(via_composite, via_primary);
+        assert_eq!(
+            via_composite,
+            Some(crate::core::WriteMarker {
+                latest: Some(created.last_modified()),
+                recent_writes: Some(1),
+            })
+        );
     }
 
     /// #1078: `count_deltas_by_type_and_bucket` is answered by the primary (its

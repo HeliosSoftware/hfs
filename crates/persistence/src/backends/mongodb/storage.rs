@@ -1686,6 +1686,54 @@ impl ResourceStorage for MongoBackend {
         true
     }
 
+    async fn latest_write_marker(
+        &self,
+        tenant: &TenantContext,
+        recent_since: Option<DateTime<Utc>>,
+    ) -> StorageResult<Option<crate::core::WriteMarker>> {
+        /// Cap on `recent_writes`: a change detector, not a figure (#1078).
+        const RECENT_CAP: u64 = 10_000;
+
+        let db = self.get_database().await?;
+        let history = db.collection::<Document>(MongoBackend::RESOURCE_HISTORY_COLLECTION);
+        let tenant_id = tenant.tenant_id().as_str();
+
+        // Newest timestamp: the first key of `idx_history_system_updated`
+        // (`tenant_id: 1, last_updated: -1, ...`) for this tenant. Projecting
+        // only `last_updated` (and dropping `_id`) keeps it a covered query —
+        // one index key, no document fetch, no in-memory sort.
+        let newest = history
+            .find_one(doc! { "tenant_id": tenant_id })
+            .sort(doc! { "last_updated": -1_i32 })
+            .projection(doc! { "_id": 0_i32, "last_updated": 1_i32 })
+            .await
+            .or_query_error("Failed to query latest write marker")?;
+        let latest = newest
+            .as_ref()
+            .and_then(|doc| doc.get_datetime("last_updated").ok())
+            .map(bson_to_chrono);
+
+        // Recent writes: a range over the same index, stopped at the cap.
+        let recent_writes = match recent_since {
+            Some(since) => Some(
+                history
+                    .count_documents(doc! {
+                        "tenant_id": tenant_id,
+                        "last_updated": { "$gte": chrono_to_bson(since) },
+                    })
+                    .limit(RECENT_CAP)
+                    .await
+                    .or_query_error("Failed to count recent writes")?,
+            ),
+            None => None,
+        };
+
+        Ok(Some(crate::core::WriteMarker {
+            latest,
+            recent_writes,
+        }))
+    }
+
     fn supports_tenant_registry(&self) -> bool {
         true
     }

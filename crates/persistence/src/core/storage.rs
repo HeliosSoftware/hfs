@@ -14,6 +14,25 @@ use serde_json::Value;
 use crate::core::sof_runner::SofRunner;
 use crate::error::{BackendError, ResourceError, StorageError, StorageResult};
 use crate::tenant::TenantContext;
+
+/// A cheap per-tenant change detector for committed writes (#1078).
+///
+/// Lets a consumer holding figures for a tenant — the dashboard's in-memory
+/// counters — notice that storage changed without its knowledge (another
+/// server instance sharing the database, or a write that bypassed the write
+/// observer). Compare two markers for equality only; never use one as a cursor:
+/// a purge can move `latest` backwards, and instances stamp writes with their
+/// own clocks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WriteMarker {
+    /// Timestamp of the tenant's newest history row, if it has any.
+    pub latest: Option<DateTime<Utc>>,
+    /// History rows written at or after the `recent_since` bound the caller
+    /// asked for, capped by the backend. Catches writes stamped earlier than
+    /// `latest` (a lagging clock, a long transaction committing late), which
+    /// leave `latest` unchanged. `None` when no bound was asked for.
+    pub recent_writes: Option<u64>,
+}
 use crate::types::StoredResource;
 
 /// A registered tenant, as returned by the tenant registry.
@@ -830,6 +849,22 @@ pub trait ResourceStorage: Send + Sync {
     /// this too.
     fn supports_type_counts(&self) -> bool {
         false
+    }
+
+    /// The tenant's [`WriteMarker`], or `None` when this backend cannot provide
+    /// one cheaply (#1078).
+    ///
+    /// Must be a single index probe (plus, when `recent_since` is given, a
+    /// capped index range count), never a scan: callers read it on every
+    /// dashboard reconcile pass. Default `Ok(None)`; the SQLite, PostgreSQL and
+    /// MongoDB backends override it, and a wrapper that delegates the count
+    /// methods must delegate this too.
+    async fn latest_write_marker(
+        &self,
+        _tenant: &TenantContext,
+        _recent_since: Option<DateTime<Utc>>,
+    ) -> StorageResult<Option<WriteMarker>> {
+        Ok(None)
     }
 
     /// Counts non-deleted resources grouped by tenant across the entire backend.

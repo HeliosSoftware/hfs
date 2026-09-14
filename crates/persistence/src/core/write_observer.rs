@@ -132,6 +132,12 @@ pub enum WriteEvent {
         /// What was erased.
         scope: ErasedScope,
     },
+    /// The tenant was deregistered (its data may still exist). Consumers
+    /// holding state for it can drop that state; a later use rebuilds it.
+    TenantRemoved {
+        /// Tenant that was deregistered.
+        tenant: TenantId,
+    },
 }
 
 impl WriteEvent {
@@ -139,7 +145,9 @@ impl WriteEvent {
     pub fn tenant(&self) -> &TenantId {
         match self {
             WriteEvent::Resource(write) => &write.tenant,
-            WriteEvent::Counts { tenant, .. } | WriteEvent::Erased { tenant, .. } => tenant,
+            WriteEvent::Counts { tenant, .. }
+            | WriteEvent::Erased { tenant, .. }
+            | WriteEvent::TenantRemoved { tenant } => tenant,
         }
     }
 }
@@ -226,6 +234,7 @@ mod tests {
                 WriteEvent::Resource(write) => format!("resource:{}", write.resource_type),
                 WriteEvent::Counts { resource_type, .. } => format!("counts:{resource_type}"),
                 WriteEvent::Erased { .. } => "erased".to_string(),
+                WriteEvent::TenantRemoved { .. } => "removed".to_string(),
             };
             self.seen.lock().unwrap().push(label);
         }

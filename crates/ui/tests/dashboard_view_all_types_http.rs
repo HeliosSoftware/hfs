@@ -15,7 +15,7 @@ use axum::{Router, body::Body, http::Request};
 use chrono::{DateTime, Utc};
 use helios_observability::dashboard::{
     DashboardPoint, DashboardProvider, DashboardSeries, DashboardSnapshot, DashboardWindow,
-    TypeCount, set_provider,
+    Figures, TypeCount, set_provider,
 };
 use http_body_util::BodyExt;
 use tower::ServiceExt;
@@ -82,12 +82,9 @@ impl DashboardProvider for FakeProvider {
             available,
             export_jobs: None,
             import_jobs_active: None,
-            partial: false,
-            generated_at: None,
-            approximate: false,
-            series_pending: false,
-            totals_pending: false,
-            counts_unsupported: false,
+            figures: Figures::Exact {
+                read_at: chrono::Utc::now(),
+            },
         }
     }
 }

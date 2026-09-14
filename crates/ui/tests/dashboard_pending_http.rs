@@ -6,77 +6,66 @@
 //! the notice "no live metrics provider is registered on this build" — while a
 //! provider was registered and merely slow. The window is part of the snapshot
 //! cache key, so every window switch is a cold key and takes the timeout path.
-//! #1078 then asked that a slow window not blank the figures the page already
-//! knows, and that figures which are stale or approximate say so.
+//! #1078 then asked that figures which are approximate say so, and that every
+//! measured figure say when it was read.
 //!
 //! Registers its own [`DashboardProvider`] (process-global state), so this
 //! lives in its own test binary. The provider discriminates on the window and
 //! the tenant, both part of the cache key:
 //!
 //! - `1h` never answers (it sleeps past the end of the test), so it is
-//!   permanently the cold-timeout case;
-//! - `24h` answers with `partial` set, the half-failed case;
-//! - `30d` answers completely — with `approximate` set under
-//!   [`APPROXIMATE_TENANT`] and [`APPROXIMATE_WAITING_TENANT`], with active
-//!   imports reported under [`IMPORT_ACTIVE_TENANT`] (and none under
-//!   [`IMPORT_IDLE_TENANT`]), and with its own distinctive figures under
-//!   [`WARM_SIBLING_TENANT`].
-//!
-//! Further tenants script the #1078 provider flags: [`TOTALS_PENDING_TENANT`]
-//! (the seeding read only queued, nothing measured) and
-//! [`COUNTS_UNSUPPORTED_TENANT`] (a backend that cannot count).
+//!   permanently the cold case: the cache's own [`SnapshotState::Pending`];
+//! - every other window answers with the tenant's [`Figures`]:
+//!   [`Figures::Approximate`] under [`APPROXIMATE_TENANT`],
+//!   [`Figures::Pending`] under [`FIGURES_PENDING_TENANT`] (the provider still
+//!   seeding the tenant, nothing measured), [`Figures::Unsupported`] under
+//!   [`COUNTS_UNSUPPORTED_TENANT`], and [`Figures::Exact`] otherwise — with
+//!   active imports reported under [`IMPORT_ACTIVE_TENANT`] (and none under
+//!   [`IMPORT_IDLE_TENANT`]), and with distinctive figures under
+//!   [`DISTINCT_FIGURES_TENANT`].
 //!
 //! A waiting page retries a bounded number of times. Once that budget is
-//! spent, a page waiting on a snapshot the provider did answer (series or
-//! totals pending) keeps a slow watch at the settled cadence, so it still
-//! picks up its figures; the cache's own cold state stops. A backend that
-//! cannot count never polls. A ready
-//! page always watches itself: every 5 seconds, marked moving, while its
+//! spent, a page whose provider did answer with [`Figures::Pending`] keeps a
+//! slow watch at the settled cadence, so it still picks up its figures; the
+//! cache's own cold state stops. A backend that cannot count never polls. A
+//! ready page always watches itself: every 5 seconds, marked moving, while its
 //! figures can still move — they are approximate, or an import is running —
 //! and every 10 seconds otherwise, so a tab opened on settled figures still
 //! notices an import started later. Each ready render carries a state hash of
 //! its figures (never of its "as of" time), so the client can tell a refresh
 //! that changed something from one that did not.
 //!
-//! The snapshot cache is process-global too, so the cases are kept apart:
+//! The snapshot cache is process-global too. It never answers a key from a
+//! snapshot cached under another window, so the cold `1h` key stays cold
+//! whatever ran first in this binary; cases with figures of their own still
+//! mount the UI under a tenant of their own (the mount's default tenant is the
+//! request's tenant), so their cache entries never mix.
 //!
-//! - The truly cold case is always requested with `all=1` under the default
-//!   tenant. Since #1078 the cache answers a cold window from a snapshot the
-//!   same tenant has cached under another window with the same "View all
-//!   resources" setting (totals kept, series marked pending), so a `1h`
-//!   request without the flag would borrow the `24h`/`30d` figures whenever
-//!   those tests ran first in this binary. No other default-tenant case sets
-//!   `all=1`, so that `1h` key has no sibling and stays a truly cold tenant.
-//! - The warm-sibling, approximate and import cases mount the UI under a
-//!   tenant of their own (the mount's default tenant is the request's tenant), so their
-//!   cache entries are never anyone else's sibling.
+//! [`SnapshotState::Pending`]: helios_observability::dashboard::SnapshotState::Pending
 
 use async_trait::async_trait;
 use axum::{Router, body::Body, http::Request};
 use chrono::{DateTime, Utc};
 use helios_observability::dashboard::{
     DashboardPoint, DashboardProvider, DashboardSeries, DashboardSnapshot, DashboardWindow,
-    TypeCount, set_provider,
+    Figures, TypeCount, set_provider,
 };
 use http_body_util::BodyExt;
 use tower::ServiceExt;
 
-/// A tenant whose `30d` snapshot is measured but not reconciled with storage.
+/// A tenant whose snapshot is measured but not an exact storage match.
 const APPROXIMATE_TENANT: &str = "dash-approximate";
-/// A tenant whose `30d` snapshot is warm when its `1h` window is asked for.
-const WARM_SIBLING_TENANT: &str = "dash-warm-sibling";
-/// A tenant whose approximate `30d` snapshot is warm when its `1h` window is
-/// asked for: a page that is both waiting and approximate.
-const APPROXIMATE_WAITING_TENANT: &str = "dash-approximate-waiting";
-/// A tenant whose `30d` snapshot is exact but reports two running imports.
+/// A tenant whose snapshot carries figures no other case produces.
+const DISTINCT_FIGURES_TENANT: &str = "dash-distinct-figures";
+/// A tenant whose snapshot is exact but reports two running imports.
 const IMPORT_ACTIVE_TENANT: &str = "dash-import-active";
-/// A tenant whose `30d` snapshot is exact and reports no running import.
+/// A tenant whose snapshot is exact and reports no running import.
 const IMPORT_IDLE_TENANT: &str = "dash-import-idle";
-/// A tenant whose provider has only queued the storage read that seeds it:
-/// nothing is measured yet (`totals_pending`).
-const TOTALS_PENDING_TENANT: &str = "dash-totals-pending";
+/// A tenant the provider is still seeding: nothing is measured yet
+/// ([`Figures::Pending`]).
+const FIGURES_PENDING_TENANT: &str = "dash-figures-pending";
 /// A tenant on a storage backend that cannot count at all
-/// (`counts_unsupported`).
+/// ([`Figures::Unsupported`]).
 const COUNTS_UNSUPPORTED_TENANT: &str = "dash-counts-unsupported";
 
 struct WindowScriptedProvider;
@@ -91,10 +80,9 @@ impl DashboardProvider for WindowScriptedProvider {
         _include_empty: bool,
     ) -> DashboardSnapshot {
         if window == DashboardWindow::LastHour {
-            // Far past the 800ms cold-load budget and past the test's own
-            // lifetime, so this key stays pending however often it is asked
-            // for — the storage contention the real bug happens under, held
-            // still.
+            // Far past the cold-load budget and past the test's own lifetime,
+            // so this key stays pending however often it is asked for — the
+            // storage contention the real bug happens under, held still.
             tokio::time::sleep(std::time::Duration::from_secs(3_600)).await;
         }
 
@@ -113,12 +101,13 @@ impl DashboardProvider for WindowScriptedProvider {
             total,
         };
 
-        if tenant == TOTALS_PENDING_TENANT {
-            // The provider contract: totals, `available` and `series` empty.
+        // The provider contract: without figures, totals, `available` and
+        // `series` stay empty.
+        if tenant == FIGURES_PENDING_TENANT {
             return DashboardSnapshot {
                 fhir_version: "R4".to_string(),
                 window,
-                totals_pending: true,
+                figures: Figures::Pending,
                 ..Default::default()
             };
         }
@@ -126,14 +115,24 @@ impl DashboardProvider for WindowScriptedProvider {
             return DashboardSnapshot {
                 fhir_version: "R4".to_string(),
                 window,
-                counts_unsupported: true,
+                figures: Figures::Unsupported,
                 ..Default::default()
             };
         }
 
-        if tenant == WARM_SIBLING_TENANT {
+        let read_at = Utc::now();
+        let figures = if tenant == APPROXIMATE_TENANT {
+            Figures::Approximate {
+                read_at,
+                reconciled_at: read_at - chrono::Duration::minutes(1),
+            }
+        } else {
+            Figures::Exact { read_at }
+        };
+
+        if tenant == DISTINCT_FIGURES_TENANT {
             // Figures no other case produces, so the page can only show them
-            // by serving this snapshot's totals.
+            // by serving this tenant's own snapshot.
             return DashboardSnapshot {
                 fhir_version: "R4".to_string(),
                 total_resources: 777,
@@ -141,6 +140,7 @@ impl DashboardProvider for WindowScriptedProvider {
                 window,
                 series: vec![series("Patient", 700)],
                 available: vec![count("Patient", 700), count("Observation", 77)],
+                figures,
                 ..Default::default()
             };
         }
@@ -158,14 +158,7 @@ impl DashboardProvider for WindowScriptedProvider {
                 IMPORT_IDLE_TENANT => Some(0),
                 _ => None,
             },
-            partial: window == DashboardWindow::LastDay,
-            // Left unset on purpose: the cache stamps it, and the page must
-            // still say when the figures were read.
-            generated_at: None,
-            approximate: tenant == APPROXIMATE_TENANT || tenant == APPROXIMATE_WAITING_TENANT,
-            series_pending: false,
-            totals_pending: false,
-            counts_unsupported: false,
+            figures,
         }
     }
 }
@@ -335,12 +328,15 @@ fn assert_no_periodic_refresh(html: &str) {
 /// nothing.
 #[tokio::test]
 async fn a_slow_window_renders_waiting_not_sample_data() {
-    let html = get("/ui?window=1h&all=1").await;
+    let html = get("/ui?window=1h").await;
 
     assert!(
         html.contains("Still gathering the live figures"),
         "the waiting notice should render"
     );
+    let tag = notice_tag(&html, "pending");
+    assert!(tag.contains("notice--warn"), "{tag}");
+    assert_eq!(html.matches("data-dash-notice=").count(), 1, "one line");
     assert!(
         !html.contains("no live metrics provider"),
         "a registered-but-slow provider must not be reported as absent"
@@ -367,14 +363,13 @@ async fn a_slow_window_renders_waiting_not_sample_data() {
         !html.contains("<time "),
         "nothing was read, so no \"as of\""
     );
-    assert!(!html.contains(r#"data-dash-notice="series-pending""#));
 }
 
 /// Waiting is recoverable both ways: htmx re-requests the live region on its
 /// own, and the notice always carries a plain link for a browser without it.
 #[tokio::test]
 async fn the_waiting_page_offers_an_automatic_and_a_manual_retry() {
-    let html = get("/ui?window=1h&all=1").await;
+    let html = get("/ui?window=1h").await;
 
     assert!(html.contains(r#"id="dash-live""#));
     assert!(
@@ -398,7 +393,7 @@ async fn the_waiting_page_offers_an_automatic_and_a_manual_retry() {
 /// caused by load, so the recovery must not add to it indefinitely.
 #[tokio::test]
 async fn the_automatic_retry_stops_after_its_budget() {
-    let html = get("/ui?window=1h&all=1&retry=3").await;
+    let html = get("/ui?window=1h&retry=3").await;
 
     assert!(
         html.contains("Still gathering the live figures"),
@@ -418,121 +413,49 @@ async fn the_automatic_retry_stops_after_its_budget() {
     assert!(!html.contains("data-dash-waiting"));
 }
 
-/// #1078: a tenant whose figures are already cached under another window
-/// keeps them on screen when it switches to a window that is slow to compute.
-/// The cards and the type picker render from the borrowed snapshot, the chart
-/// area alone waits (never an empty chart), the notice says when the figures
-/// were read, and the page keeps retrying until the window's own series land.
+/// #1078: a window that is slow to compute never borrows the figures the same
+/// tenant has cached under another window — those would be another window's
+/// reading. It is the cold waiting page: unknown figures, the undated waiting
+/// line, the bounded retry and, once that is spent, no slow watch.
 #[tokio::test]
-async fn a_slow_window_with_a_warm_sibling_keeps_the_figures_and_waits_for_the_chart() {
+async fn a_slow_window_never_borrows_another_windows_figures() {
     // Warm the tenant's 30d key with the same selection.
-    let warm = get_as(WARM_SIBLING_TENANT, "/ui?types=Patient&window=30d").await;
+    let warm = get_as(DISTINCT_FIGURES_TENANT, "/ui?types=Patient&window=30d").await;
     assert!(warm.contains("chart-data"), "the 30d chart renders");
+    assert!(warm.contains(r#"<span class="stat__value">777</span>"#));
 
-    let html = get_as(WARM_SIBLING_TENANT, "/ui?types=Patient&window=1h").await;
+    let html = get_as(DISTINCT_FIGURES_TENANT, "/ui?types=Patient&window=1h").await;
 
-    // The headline figures are the sibling's real ones, not unknown.
+    assert!(html.contains(r#"data-dash-notice="pending""#));
+    assert_eq!(html.matches("data-dash-notice=").count(), 1, "one line");
+    assert!(html.contains("Still gathering the live figures"));
     assert!(
-        html.contains(r#"<span class="stat__value">7</span>"#),
-        "resource types card: {html}"
+        !html.contains(r#"<span class="stat__value">777</span>"#),
+        "no figure from the 30d snapshot"
     );
+    assert!(!html.contains(r#"<span class="stat__value">7</span>"#));
     assert!(
-        html.contains(r#"<span class="stat__value">777</span>"#),
-        "stored resources card"
+        html.matches("stat__value--unavailable").count() >= 3,
+        "resource types, stored resources and the chart total read as unknown"
     );
-    // The picker offers the tenant's types with their counts, checked from
-    // the requested selection, and a toggle keeps that selection.
-    assert!(html.contains(r#"data-pick-name="Patient""#));
-    assert!(html.contains(r#"data-pick-name="Observation""#));
-    let option = |name: &str| {
-        let at = html
-            .find(&format!(r#"data-pick-name="{name}""#))
-            .expect("picker option");
-        let start = html[..at].rfind("<a ").expect("option anchor");
-        html[start..at].to_string()
-    };
-    assert!(
-        option("Patient").contains("chart-pick__option--on"),
-        "the requested type is checked"
-    );
-    assert!(
-        option("Patient").contains(r#"href="/ui?types=&window=1h""#),
-        "unchecking it empties the requested selection"
-    );
-    assert!(!option("Observation").contains("chart-pick__option--on"));
-    assert!(
-        html.contains(r#"href="/ui?types=Patient,Observation&window=1h""#),
-        "picking another type adds to the requested selection"
-    );
-    assert!(
-        html.contains(r#"href="/ui?types=Patient&window=30d""#),
-        "the window selector keeps the requested selection"
-    );
-
-    // The chart area alone waits: no chart, no chart data, no charted total.
-    assert!(html.contains("Waiting for the live figures"));
-    assert!(!html.contains(r#"<svg class="chart""#));
+    assert!(!html.contains("<time "), "nothing was read for this window");
     assert!(!html.contains("chart-data"));
-    assert!(
-        !html.contains("Nothing to chart yet"),
-        "a series still loading is not an empty chart"
-    );
-    assert!(
-        !html.contains("Still gathering the live figures"),
-        "not the cold-tenant notice"
-    );
-    assert!(!html.contains("no live metrics provider"));
-
-    // The notice names the state, dates the figures, and offers both retries.
-    assert!(html.contains(r#"data-dash-notice="series-pending""#));
-    assert!(html.contains("The chart for this window is still loading"));
-    assert!(html.contains(r#"<time datetime=""#), "figures are dated");
-    assert!(html.contains("As of "));
-    assert!(html.contains("Retry now"));
-    assert!(
-        html.contains("hx-trigger=\"load"),
-        "the page re-requests itself while the series load"
-    );
-    assert!(html.contains("retry=1"));
-    assert_no_periodic_refresh(&html);
-
-    // The auto-refresh budget applies here too — but the page does not go
-    // dead once it is spent (#1078): it watches slowly for its series.
-    let spent = get_as(WARM_SIBLING_TENANT, "/ui?types=Patient&window=1h&retry=3").await;
-    assert!(spent.contains(r#"data-dash-notice="series-pending""#));
-    assert!(!spent.contains("hx-trigger=\"load"), "budget spent");
-    assert!(spent.contains("Retry now"));
-    assert_watches_while_waiting(&spent, "1h");
-    assert!(
-        attr(dash_live_tag(&spent), "hx-get").is_some_and(|href| href.contains("types=Patient")),
-        "the watch keeps the requested selection"
-    );
-}
-
-/// A page still waiting for its chart keeps the bounded retry even when the
-/// figures it borrowed are approximate: the periodic refresh is for ready
-/// pages only, never stacked on a retry nor outliving its budget.
-#[tokio::test]
-async fn a_waiting_page_with_approximate_figures_retries_and_does_not_poll() {
-    let warm = get_as(APPROXIMATE_WAITING_TENANT, "/ui?types=Patient&window=30d").await;
-    assert_polls_periodically(&warm, "30d");
-
-    let html = get_as(APPROXIMATE_WAITING_TENANT, "/ui?types=Patient&window=1h").await;
-    assert!(html.contains(r#"data-dash-notice="series-pending""#));
+    // The selectors survive the wait with the requested selection.
+    assert!(html.contains(r#"href="/ui?types=Patient&window=30d""#));
     assert!(html.contains(r#"hx-trigger="load delay:1200ms""#));
     assert!(html.contains("retry=1"));
     assert_no_periodic_refresh(&html);
 
     let spent = get_as(
-        APPROXIMATE_WAITING_TENANT,
+        DISTINCT_FIGURES_TENANT,
         "/ui?types=Patient&window=1h&retry=3",
     )
     .await;
-    assert!(spent.contains(r#"data-dash-notice="series-pending""#));
+    assert!(spent.contains(r#"data-dash-notice="pending""#));
     assert!(!spent.contains("hx-trigger=\"load"), "budget spent");
-    // Spent, it watches slowly — never at the moving cadence, even though
-    // the figures it borrowed are approximate.
-    assert_watches_while_waiting(&spent, "1h");
+    assert!(spent.contains("Retry now"));
+    assert_no_periodic_refresh(&spent);
+    assert!(!spent.contains("data-dash-waiting"));
 }
 
 /// #1078: figures counted from recent writes rather than read exactly from
@@ -609,14 +532,14 @@ async fn the_same_figures_rendered_twice_carry_the_same_state() {
 #[tokio::test]
 async fn different_figures_carry_a_different_state() {
     let idle = get_as(IMPORT_IDLE_TENANT, "/ui?types=Patient&window=30d").await;
-    let sibling = get_as(WARM_SIBLING_TENANT, "/ui?types=Patient&window=30d").await;
+    let distinct = get_as(DISTINCT_FIGURES_TENANT, "/ui?types=Patient&window=30d").await;
 
     // Both settled and ready, so only the figures differ.
     assert_watches_settled(&idle, "30d");
-    assert_watches_settled(&sibling, "30d");
-    assert!(sibling.contains(r#"<span class="stat__value">777</span>"#));
+    assert_watches_settled(&distinct, "30d");
+    assert!(distinct.contains(r#"<span class="stat__value">777</span>"#));
     assert!(!idle.contains(r#"<span class="stat__value">777</span>"#));
-    assert_ne!(dash_state(&idle), dash_state(&sibling));
+    assert_ne!(dash_state(&idle), dash_state(&distinct));
 }
 
 /// A periodic swap must not re-announce a notice the user already heard:
@@ -640,37 +563,19 @@ async fn notices_already_shown_are_not_announced_again() {
     assert!(!tag.contains(r#"aria-live="off""#), "{tag}");
 }
 
-/// A snapshot the provider had to fill in is labelled, so its zeros are never
-/// read as measurements — and it is not confused with either of the other two
-/// states.
-#[tokio::test]
-async fn a_partial_snapshot_says_so() {
-    let html = get("/ui?window=24h").await;
-
-    assert!(html.contains("Some figures could not be read from storage"));
-    assert!(!html.contains("no live metrics provider"));
-    assert!(!html.contains("Still gathering the live figures"));
-    // Unlike the waiting page, the figures it does have are shown.
-    assert!(html.contains("chart-data"));
-    assert!(html.contains(r#"<time datetime=""#), "and dated");
-    // Nothing is waiting and nothing is approximate or importing: a ready
-    // page, watched at the settled cadence.
-    assert_watches_settled(&html, "24h");
-}
-
-/// A complete snapshot carries no warning at all — the states above must not
-/// leak into the ordinary page. It still says when its figures were read
-/// (#1078): a snapshot can be served stale while a refresh runs.
+/// Exact figures carry no warning at all — the states above must not leak into
+/// the ordinary page. They still say when they were read (#1078): a snapshot
+/// can be served stale while a refresh runs.
 #[tokio::test]
 async fn a_complete_snapshot_carries_only_its_as_of_time() {
     let html = get("/ui?window=30d").await;
 
     assert!(!html.contains("no live metrics provider"));
     assert!(!html.contains("Still gathering the live figures"));
-    assert!(!html.contains("Some figures could not be read from storage"));
     assert!(!html.contains("Approximate:"));
     assert!(!html.contains("notice notice--warn"));
     assert!(html.contains(r#"data-dash-notice="live""#));
+    assert_eq!(html.matches("data-dash-notice=").count(), 1, "one line");
     assert!(html.contains(r#"<time datetime=""#));
     assert!(!html.contains("hx-trigger=\"load"));
     assert!(html.contains("chart-data"), "the chart renders");
@@ -679,12 +584,12 @@ async fn a_complete_snapshot_carries_only_its_as_of_time() {
     assert_watches_settled(&html, "30d");
 }
 
-/// #1078: a provider that only queued the read seeding the tenant answers
-/// with nothing measured. The page is the cold waiting page — unknown figures,
+/// #1078: a provider still seeding the tenant answers with nothing measured
+/// ([`Figures::Pending`]). The page is the cold waiting page — unknown figures,
 /// the waiting notice undated, the bounded retry — and never a row of zeros.
 #[tokio::test]
-async fn a_tenant_whose_totals_are_pending_renders_waiting_not_zeros() {
-    let html = get_as(TOTALS_PENDING_TENANT, "/ui?types=Patient&window=30d").await;
+async fn a_tenant_whose_figures_are_pending_renders_waiting_not_zeros() {
+    let html = get_as(FIGURES_PENDING_TENANT, "/ui?types=Patient&window=30d").await;
 
     assert!(html.contains(r#"data-dash-notice="pending""#));
     assert!(html.contains("Still gathering the live figures"));
@@ -720,7 +625,7 @@ async fn a_tenant_whose_totals_are_pending_renders_waiting_not_zeros() {
 /// empty — and says it is waiting, not that there is nothing to chart.
 #[tokio::test]
 async fn an_empty_type_picker_on_a_waiting_page_says_it_is_waiting() {
-    let html = get_as(TOTALS_PENDING_TENANT, "/ui?window=30d").await;
+    let html = get_as(FIGURES_PENDING_TENANT, "/ui?window=30d").await;
 
     assert!(
         html.contains(r#"<p class="chart-pick__none">Waiting for the live figures"#),
@@ -732,13 +637,13 @@ async fn an_empty_type_picker_on_a_waiting_page_says_it_is_waiting() {
     );
 }
 
-/// #1078: once the fast retries are spent, a page waiting on seeding totals
-/// keeps watching slowly, keeping the spent count — while the cache's own cold
+/// #1078: once the fast retries are spent, a page waiting on a tenant the
+/// provider is still seeding keeps watching slowly, keeping the spent count — while the cache's own cold
 /// state (`the_automatic_retry_stops_after_its_budget`) stops.
 #[tokio::test]
-async fn a_spent_totals_pending_page_watches_slowly() {
+async fn a_spent_figures_pending_page_watches_slowly() {
     let html = get_as(
-        TOTALS_PENDING_TENANT,
+        FIGURES_PENDING_TENANT,
         "/ui?types=Patient&window=30d&retry=3",
     )
     .await;
@@ -751,7 +656,7 @@ async fn a_spent_totals_pending_page_watches_slowly() {
     assert!(html.contains("Retry now"));
     assert_watches_while_waiting(&html, "30d");
 
-    let cold = get("/ui?window=1h&all=1&retry=3").await;
+    let cold = get("/ui?window=1h&retry=3").await;
     assert_no_periodic_refresh(&cold);
     assert!(!cold.contains("data-dash-waiting"));
 }
@@ -808,7 +713,7 @@ async fn the_live_region_names_its_context() {
     let ctx = attr(dash_live_tag(&ready), "data-dash-ctx").expect("a context on a ready page");
     assert_eq!(ctx, "dash-import-idle|R4|en");
 
-    let waiting = get("/ui?window=1h&all=1").await;
+    let waiting = get("/ui?window=1h").await;
     assert_eq!(
         attr(dash_live_tag(&waiting), "data-dash-ctx"),
         Some("default|R4|en"),

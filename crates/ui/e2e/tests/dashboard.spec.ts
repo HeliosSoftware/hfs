@@ -250,10 +250,10 @@ test("the chart's numbers are readable as a table", async ({ dashboard }) => {
 // #1078: during an import the 1h chart sat on "Waiting for the live figures…"
 // because every window switch was a cold snapshot computed from storage
 // aggregates. A seeded tenant is now served from in-memory write counters, so
-// a window or selection nobody has viewed yet charts on its first render, and
-// a window whose series are genuinely slow still shows the real headline
-// figures while only the chart area waits (`series-pending`) — never the
-// blank `pending` page.
+// a window or selection nobody has viewed yet charts on its first render, with
+// its headline figures — never the blank `pending` page. The cache never
+// stands in for a slow window with another window's figures, so there is no
+// in-between state: a render either has its figures or waits for all of them.
 //
 // These tests never reload and never lean on waitForSeries: they read the
 // server's own response for each view (DashboardPage.gotoFirstRender, or the
@@ -272,15 +272,13 @@ test.describe("first view of a window (#1078)", () => {
   });
 
   /** A render that is not the blank waiting page: no "—" in the headline
-   * cards, no invented figures, and a chart — or, at worst, this window's
-   * series still loading under real cards. */
+   * cards, no invented figures, and a chart. */
   function expectFiguresShown(render: FirstRender, step: string): void {
     expect(render.notices, `${step}: never the blank pending page`).not.toContain("pending");
     expect(render.notices, `${step}: no invented figures`).not.toContain("sample");
     expect(render.unavailableCards, `${step}: headline cards show figures`).toBe(0);
-    if (render.series === 0) {
-      expect(render.notices, `${step}: a chart, or its series pending`).toContain("series-pending");
-    }
+    expect(render.chartEmpty, `${step}: the chart area is not waiting`).toBe(false);
+    expect(render.series, `${step}: a chart`).toBeGreaterThanOrEqual(1);
   }
 
   /** Reads the live DOM's headline cards once, without auto-waiting: an
@@ -301,7 +299,6 @@ test.describe("first view of a window (#1078)", () => {
 
       const render = await dashboard.gotoFirstRender(`?window=${span}&types=${coldSelection("Substance", "Patient")}`);
       expect(render.notices).not.toContain("pending");
-      expect(render.notices).not.toContain("series-pending");
       expect(render.notices).not.toContain("sample");
       expect(render.autoRetry, "a ready page schedules no auto-retry").toBe(false);
       expect(render.liveRefresh, "every ready page polls itself").toBe(true);
@@ -343,7 +340,7 @@ test.describe("first view of a window (#1078)", () => {
       expectFiguresShown(render, span);
       await expectCardsInDom(dashboard, span);
       await expect(dashboard.notice("pending")).toHaveCount(0);
-      await expect(dashboard.chart.or(dashboard.notice("series-pending"))).toBeVisible();
+      await expect(dashboard.chart).toBeVisible();
     }
 
     // A picker toggle swaps only the chart card (#599). A waiting page's
@@ -368,10 +365,8 @@ test.describe("first view of a window (#1078)", () => {
     expectFiguresShown(toggled, "toggle Encounter");
     await expectCardsInDom(dashboard, "toggle Encounter");
     await expect(dashboard.notice("pending")).toHaveCount(0);
-    await expect(dashboard.chart.or(dashboard.notice("series-pending"))).toBeVisible();
-    if (toggled.series > 0) {
-      await expect(dashboard.legendItems.filter({ hasText: "Encounter" })).toHaveCount(1);
-    }
+    await expect(dashboard.chart).toBeVisible();
+    await expect(dashboard.legendItems.filter({ hasText: "Encounter" })).toHaveCount(1);
   });
 
   test("figures carry an as-of label", async ({ request, dashboard }) => {
@@ -440,8 +435,8 @@ test.describe("live refresh (#1078)", () => {
   test.skip(noChartData, "no count read path on this backend");
 
   /** How long new figures may take to land on an open page: one 10s settled
-   * tick plus the ≤2s cache, with headroom for a machine busy running the
-   * suite. */
+   * tick plus the cache's 2s TTL and its 500ms wait for a fresh value, with
+   * headroom for a machine busy running the suite. */
   const FIGURES_LAND_MS = 30_000;
 
   /** How long a quiet default tenant may take to settle: a 30s reconcile pass
@@ -492,7 +487,6 @@ test.describe("live refresh (#1078)", () => {
   async function openLive(dashboard: DashboardPage, ...types: string[]): Promise<void> {
     const render = await dashboard.gotoFirstRender(`?types=${coldSelection(...types)}&window=1h`);
     expect(render.notices, "a ready page").not.toContain("pending");
-    expect(render.notices, "a ready page").not.toContain("series-pending");
     expect(render.notices, "figures written moments ago are not reconciled yet").toContain("approximate");
     expect(render.liveRefresh, "an approximate ready page polls itself").toBe(true);
     expect(render.moving, "approximate figures are moving").toBe(true);

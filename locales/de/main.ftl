@@ -183,10 +183,6 @@ chart-sample-note = Beispieldaten: dieser Build hat keinen Live-Metrikanbieter, 
 chart-pending-note = Die Live-Zahlen für dieses Zeitfenster werden noch erhoben. Bis sie eintreffen wird nichts dargestellt — es werden keine Platzhalterzahlen gezeigt.
 chart-pending-empty = Warten auf die Live-Zahlen…
 chart-pending-retry = Jetzt erneut versuchen
-chart-partial-note = Einige Zahlen konnten nicht aus dem Speicher gelesen werden und werden als Null angezeigt. Zum erneuten Versuch neu laden.
-# #1078: die Zählungen des Tenants sind bekannt, die Serien dieses Zeitfensters
-# noch nicht — die Karten zeigen echte Zahlen, nur das Diagramm wartet.
-chart-series-pending-note = Das Diagramm für dieses Zeitfenster wird noch geladen. Die angezeigten Zählungen sind echt und stammen aus der letzten Erhebung; dargestellt wird erst, wenn die Zahlen für dieses Zeitfenster eintreffen.
 # #1078: gemessen, aber aus Schreibzählern im Speicher statt aus einem exakten
 # Speicherlesevorgang gezählt. Eine Kennzeichnung, keine Warnung.
 chart-approximate-note = Näherungswert: aus den jüngsten Schreibvorgängen gezählt und noch nicht mit dem Speicher abgeglichen.

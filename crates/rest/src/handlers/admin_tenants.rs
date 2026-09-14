@@ -323,6 +323,12 @@ where
     } else {
         None
     };
+    // Reported after the purge's `Erased`: consumers holding state for the
+    // tenant (the dashboard counters) drop it, and a later use of the tenant
+    // rebuilds it from storage (#1078).
+    state.write_observer().on_write(&WriteEvent::TenantRemoved {
+        tenant: TenantId::new(id.clone()),
+    });
 
     debug!(tenant = %id, purge = query.purge, "Deleted tenant");
     audit(

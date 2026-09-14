@@ -7,12 +7,10 @@
 
 {#
   Everything derived from the dashboard snapshot lives in one swappable
-  region (#956). While the chart is still waiting — nothing known yet, or
-  (#1078) the tenant's figures known but this window's series not — the page
-  renders a waiting state and, with JavaScript, re-requests just this region
-  a bounded number of times, so the figures appear without a manual reload
-  and without ever standing in for them with invented ones. The stat cards
-  render whenever a figure is known; only the chart area waits.
+  region (#956). While no figure is known yet the page renders a waiting
+  state and, with JavaScript, re-requests just this region a bounded number
+  of times, so the figures appear without a manual reload and without ever
+  standing in for them with invented ones.
 
   Figures that are here follow themselves the same way (#1078): every few
   seconds while they are still moving — counted from recent writes and not yet
@@ -24,8 +22,8 @@
   tooltip follows the pointer) and points each request at the page's current
   URL, which the type picker changes without a reload.
 
-  A waiting page whose snapshot the provider did answer (series or totals
-  still pending) keeps a slow watch once its fast retries are spent
+  A waiting page whose provider did answer (still seeding the tenant, #1078)
+  keeps a slow watch once its fast retries are spent
   (data-dash-waiting), so it still picks up its figures; the cache's own cold
   state does not. A backend that cannot count shows that fact and never polls.
   data-dash-ctx names the tenant, FHIR version and locale of this render;
@@ -182,26 +180,23 @@
   </header>
 
   {#
-    Whatever is short of a complete, exact live reading is named here, and
-    named precisely: waiting is not "no provider", a half-failed snapshot is
-    not a measurement (#956), and a figure counted from recent writes is not
-    an exact storage read (#1078). One line per fact, in the precedence
-    `DashboardNotice` documents; the first line of a live render says when
-    its figures were read. `aria-live` so the swap announces itself.
+    Where the figures come from is named here, and named precisely: waiting
+    is not "no provider" (#956), and a figure counted from recent writes is
+    not an exact storage read (#1078). One line, mapped from the figures as
+    `DashboardNotice` documents; a line for measured figures says when they
+    were read. `aria-live` so the swap announces itself.
   #}
-  {% for line in notices %}
-  <p class="notice{% if line.kind.is_warning() %} notice--warn{% endif %}" aria-live="{{ self.notice_aria_live(line.kind) }}" data-dash-notice="{{ line.kind.slug() }}">
-    {% if let Some(key) = line.kind.key() %}{{ i18n.t(key) }}{% endif %}
-    {% if let Some(as_of) = line.as_of %}
+  <p class="notice{% if notice.kind.is_warning() %} notice--warn{% endif %}" aria-live="{{ self.notice_aria_live(notice.kind) }}" data-dash-notice="{{ notice.kind.slug() }}">
+    {% if let Some(key) = notice.kind.key() %}{{ i18n.t(key) }}{% endif %}
+    {% if let Some(as_of) = notice.as_of %}
     <time datetime="{{ as_of.datetime }}">{{ i18n.t_arg("chart-as-of", "time", as_of.label.clone()) }}</time>
     {% endif %}
-    {% if line.kind.is_waiting() %}
+    {% if notice.kind.is_waiting() %}
     {# Always present, auto-refresh or not: the page stays recoverable
        without JavaScript, and after the poll budget it is the only way on. #}
     <a href="{{ retry_href }}">{{ i18n.t("chart-pending-retry") }}</a>
     {% endif %}
   </p>
-  {% endfor %}
 
   {% if chart_unsupported %}
   {# #1078: this backend cannot count, so there is nothing to wait for and

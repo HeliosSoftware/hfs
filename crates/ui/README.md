@@ -986,8 +986,18 @@ falls through to the normal REST surface.
   `helios_observability::dashboard`, a provider the server registers at startup.
   That keeps this crate free of any persistence dependency for the read path;
   with no provider registered, the dashboard renders placeholder figures through
-  the same rendering path. Counts reflect the **default tenant** only — an
+  the same rendering path. Counts reflect the **request's tenant** (#344) — an
   operator view, never exported to the public Prometheus `/metrics` endpoint.
+  Operators should note: figures come from **per-process** in-memory write
+  counters that a background loop reconciles with storage every
+  `HFS_DASHBOARD_RECONCILE_SECS` (default `30`); page loads never query
+  storage. Between reconciles a figure is labelled **Approximate** when this
+  process recorded writes, when a cheap storage write marker shows data changed
+  elsewhere (another instance sharing PostgreSQL/MongoDB, or writes that bypass
+  the server), or when a charted window's history is not loaded yet. Idle
+  tenants' in-memory state is evicted and rebuilt on the next view, and a
+  backend that cannot count (e.g. an S3 primary) shows "not available" rather
+  than zeros.
 - **Per-user preferences** (theme, nav state, FHIR version, tenant, saved and
   recent queries, and — since #754/#755 — every sidebar rail's `rails.<page>`
   record of `last`/`recent`, tenant-scoped, see `rail_state`) roam in the

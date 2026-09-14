@@ -69,6 +69,76 @@ pub(crate) fn fts_table_exists(conn: &rusqlite::Connection) -> StorageResult<boo
         .map_err(|e| internal_error(format!("Failed to probe for resource_fts: {e}")))
 }
 
+/// Cap on [`WriteMarker::recent_writes`](crate::core::WriteMarker): the count is
+/// a change detector, not a figure, so it stops at this many rows (#1078).
+const WRITE_MARKER_RECENT_CAP: i64 = 10_000;
+
+/// The tenant's newest history timestamp: one descending probe of the
+/// `(tenant_id, last_updated)` index (`idx_history_updated`), no sort.
+const LATEST_WRITE_SQL: &str = "SELECT last_updated FROM resource_history \
+     WHERE tenant_id = ?1 ORDER BY last_updated DESC LIMIT 1";
+
+/// History rows at or after `?2`, counted over the same index range and
+/// stopped after `?3` rows by the inner `LIMIT`.
+const RECENT_WRITES_SQL: &str = "SELECT COUNT(*) FROM (SELECT 1 FROM resource_history \
+     WHERE tenant_id = ?1 AND last_updated >= ?2 LIMIT ?3)";
+
+impl SqliteBackend {
+    /// [`ResourceStorage::latest_write_marker`] with the `recent_writes` cap as
+    /// a parameter, so tests can exercise the cap without 10,000 writes.
+    async fn latest_write_marker_capped(
+        &self,
+        tenant: &TenantContext,
+        recent_since: Option<chrono::DateTime<Utc>>,
+        cap: i64,
+    ) -> StorageResult<Option<crate::core::WriteMarker>> {
+        use rusqlite::OptionalExtension;
+
+        // Owned copies: the probes run in a blocking task (#959).
+        let tenant_id = tenant.tenant_id().as_str().to_string();
+        // Formatted the same RFC3339 way rows are written, so the raw-column
+        // `last_updated >= ?2` range compares like-for-like and stays sargable
+        // (see `count_deltas_by_bucket`).
+        let since_bound = recent_since.map(|since| since.to_rfc3339());
+
+        self.run_blocking(move |conn| {
+            let latest: Option<String> = conn
+                .prepare_cached(LATEST_WRITE_SQL)
+                .and_then(|mut stmt| {
+                    stmt.query_row(params![tenant_id], |row| row.get(0))
+                        .optional()
+                })
+                .or_query_error("Failed to query latest write marker")?;
+            let latest = latest
+                .map(|s| {
+                    chrono::DateTime::parse_from_rfc3339(&s)
+                        .map(|dt| dt.with_timezone(&Utc))
+                        .map_err(|e| internal_error(format!("Failed to parse last_updated: {}", e)))
+                })
+                .transpose()?;
+
+            let recent_writes = match since_bound {
+                Some(bound) => {
+                    let n: i64 = conn
+                        .prepare_cached(RECENT_WRITES_SQL)
+                        .and_then(|mut stmt| {
+                            stmt.query_row(params![tenant_id, bound, cap], |row| row.get(0))
+                        })
+                        .or_query_error("Failed to count recent writes")?;
+                    Some(n.max(0) as u64)
+                }
+                None => None,
+            };
+
+            Ok(Some(crate::core::WriteMarker {
+                latest,
+                recent_writes,
+            }))
+        })
+        .await
+    }
+}
+
 /// Runs a `DELETE FROM resource_fts …` on a purge path, skipping it when FTS5
 /// is unavailable and propagating any other failure.
 ///
@@ -970,6 +1040,15 @@ impl ResourceStorage for SqliteBackend {
 
     fn supports_type_counts(&self) -> bool {
         true
+    }
+
+    async fn latest_write_marker(
+        &self,
+        tenant: &TenantContext,
+        recent_since: Option<chrono::DateTime<Utc>>,
+    ) -> StorageResult<Option<crate::core::WriteMarker>> {
+        self.latest_write_marker_capped(tenant, recent_since, WRITE_MARKER_RECENT_CAP)
+            .await
     }
 
     fn supports_tenant_registry(&self) -> bool {
@@ -4203,6 +4282,190 @@ mod tests {
     fn test_supports_type_counts() {
         let backend = SqliteBackend::in_memory().unwrap();
         assert!(backend.supports_type_counts());
+    }
+
+    fn other_tenant() -> TenantContext {
+        TenantContext::new(
+            TenantId::new("other-tenant"),
+            TenantPermissions::full_access(),
+        )
+    }
+
+    /// #1078: an empty tenant has no newest write, and zero recent writes only
+    /// when a bound was asked for.
+    #[tokio::test]
+    async fn test_latest_write_marker_empty_tenant() {
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+
+        let marker = backend
+            .latest_write_marker(&tenant, None)
+            .await
+            .unwrap()
+            .expect("SQLite provides a marker");
+        assert_eq!(
+            marker,
+            crate::core::WriteMarker {
+                latest: None,
+                recent_writes: None
+            }
+        );
+
+        let since = Utc::now() - chrono::Duration::hours(1);
+        let marker = backend
+            .latest_write_marker(&tenant, Some(since))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(marker.latest, None);
+        assert_eq!(marker.recent_writes, Some(0));
+    }
+
+    /// #1078: every committed write of the tenant — create, update, delete —
+    /// changes its marker; another tenant's writes do not.
+    #[tokio::test]
+    async fn test_latest_write_marker_changes_on_each_write_and_is_tenant_scoped() {
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+        let since = Some(Utc::now() - chrono::Duration::hours(1));
+        let marker = || async { backend.latest_write_marker(&tenant, since).await.unwrap() };
+
+        let empty = marker().await;
+
+        let created = backend
+            .create(&tenant, "Patient", json!({}), FhirVersion::default())
+            .await
+            .unwrap();
+        let after_create = marker().await;
+        assert_ne!(after_create, empty, "a create changes the marker");
+        let after_create_marker = after_create.unwrap();
+        assert_eq!(after_create_marker.latest, Some(created.last_modified()));
+        assert_eq!(after_create_marker.recent_writes, Some(1));
+
+        let updated = backend
+            .update(&tenant, &created, json!({"active": true}))
+            .await
+            .unwrap();
+        let after_update = marker().await;
+        assert_ne!(after_update, after_create, "an update changes the marker");
+        assert_eq!(after_update.unwrap().latest, Some(updated.last_modified()));
+
+        backend
+            .delete(&tenant, "Patient", created.id())
+            .await
+            .unwrap();
+        let after_delete = marker().await;
+        assert_ne!(after_delete, after_update, "a delete changes the marker");
+        assert_eq!(after_delete.unwrap().recent_writes, Some(3));
+
+        // Another tenant's writes leave this tenant's marker alone.
+        let other = other_tenant();
+        backend
+            .create(&other, "Patient", json!({}), FhirVersion::default())
+            .await
+            .unwrap();
+        assert_eq!(marker().await, after_delete);
+        let other_marker = backend
+            .latest_write_marker(&other, since)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(other_marker.recent_writes, Some(1));
+    }
+
+    /// #1078: `recent_writes` counts only the tenant's history rows at or after
+    /// the bound, and stops at the cap.
+    #[tokio::test]
+    async fn test_latest_write_marker_recent_writes_bound_and_cap() {
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+        let start = Utc::now() - chrono::Duration::seconds(1);
+
+        for _ in 0..3 {
+            backend
+                .create(&tenant, "Patient", json!({}), FhirVersion::default())
+                .await
+                .unwrap();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        let bound = Utc::now();
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        for _ in 0..2 {
+            backend
+                .create(&tenant, "Observation", json!({}), FhirVersion::default())
+                .await
+                .unwrap();
+        }
+
+        let recent = |since, cap| {
+            let backend = &backend;
+            let tenant = &tenant;
+            async move {
+                backend
+                    .latest_write_marker_capped(tenant, Some(since), cap)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .recent_writes
+            }
+        };
+        assert_eq!(recent(bound, WRITE_MARKER_RECENT_CAP).await, Some(2));
+        assert_eq!(recent(start, WRITE_MARKER_RECENT_CAP).await, Some(5));
+        assert_eq!(recent(start, 3).await, Some(3), "capped");
+        assert_eq!(
+            recent(Utc::now() + chrono::Duration::hours(1), 3).await,
+            Some(0)
+        );
+
+        // The trait method uses the production cap.
+        let marker = backend
+            .latest_write_marker(&tenant, Some(start))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(marker.recent_writes, Some(5));
+    }
+
+    /// #1078: both marker probes are index searches on `idx_history_updated` —
+    /// never a table or full-index scan, and the newest-row probe never sorts.
+    #[test]
+    fn test_latest_write_marker_query_plans_use_the_history_index() {
+        let backend = create_test_backend();
+        let conn = backend.get_connection().unwrap();
+        let plan = |sql: &str, binds: &[&dyn ToSql]| -> Vec<String> {
+            let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+            stmt.query_map(binds, |row| row.get::<_, String>(3))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+        };
+        let bound = Utc::now().to_rfc3339();
+
+        for (name, details) in [
+            ("latest", plan(LATEST_WRITE_SQL, &[&"t"])),
+            (
+                "recent",
+                plan(RECENT_WRITES_SQL, &[&"t", &bound, &WRITE_MARKER_RECENT_CAP]),
+            ),
+        ] {
+            assert!(
+                details
+                    .iter()
+                    .any(|d| d.starts_with("SEARCH resource_history")
+                        && d.contains("idx_history_updated")),
+                "{name}: expected an idx_history_updated search, got {details:?}"
+            );
+            assert!(
+                !details
+                    .iter()
+                    .any(|d| d.starts_with("SCAN resource_history")),
+                "{name}: must not scan resource_history, got {details:?}"
+            );
+            assert!(
+                !details.iter().any(|d| d.contains("TEMP B-TREE")),
+                "{name}: must not sort, got {details:?}"
+            );
+        }
     }
 
     #[tokio::test]
