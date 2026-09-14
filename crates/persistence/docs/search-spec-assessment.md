@@ -143,17 +143,23 @@ recursively by `resolve_reverse_chain`: the inner chain selects the qualifying s
 id, then the outer level collects their references to the base type. A reverse-depth cap
 (`ChainConfig::max_reverse_depth`, default 4) is enforced.
 
-**Include resolution (`_include`/`_revinclude`).** Elasticsearch and MongoDB populate `included`
-inside their own `search()`. SQLite and Postgres do not — so the REST handler resolves includes via
-the backend-agnostic `core::resolve_includes_iterative` whenever the backend left `included` empty.
-References are extracted through the search-parameter registry's FHIRPath expression (so a parameter
-whose name differs from its JSON field — e.g. Patient `organization` → `managingOrganization` —
-resolves correctly), and the referenced/referencing resources are fetched with `search()`.
+**Include resolution (`_include`/`_revinclude`).** Every `IncludeProvider` implementation (SQLite,
+Postgres, Elasticsearch, MongoDB, Composite) delegates to the single backend-agnostic
+`core::resolve_includes_iterative`. SQLite, Postgres and Elasticsearch leave `included` empty in
+their own `search()` and let the REST handler run that resolver as the `Full` pass. MongoDB is the
+only backend that calls it inline, from within its own `search()`, but only for hop 1 — bounded by
+the `HFS_MONGODB_MAX_INCLUDED_RESOURCES` directive (a truncated result is flagged with an
+`OperationOutcome` marker, see note ¹) — so the REST handler still finishes any `:iterate` hops
+afterward. References are extracted through the search-parameter registry's FHIRPath expression (so
+a parameter whose name differs from its JSON field — e.g. Patient `organization` →
+`managingOrganization` — resolves correctly), and the referenced/referencing resources are fetched
+with `search()`.
 
 ¹ `:iterate` transitively follows includes of already-included resources (depth-capped, deduped) via
-  `resolve_includes_iterative`. Both spellings are accepted: `_include=Obs:subject:iterate` and the
-  spec's `_include:iterate=Obs:subject`. `_include=Type:*` expands at query-build time to one
-  directive per reference search parameter of `Type`.
+  `resolve_includes_iterative` for the `Full` pass, or `resolve_includes_iterate_continuation` for
+  the `Continuation` pass that picks up after MongoDB's inline hop 1. Both spellings are accepted:
+  `_include=Obs:subject:iterate` and the spec's `_include:iterate=Obs:subject`. `_include=Type:*`
+  expands at query-build time to one directive per reference search parameter of `Type`.
 
 ## 6. Result control (paging, sort, total, summary, elements)
 
