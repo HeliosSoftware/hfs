@@ -170,14 +170,18 @@ walked so a page boundary mid-patient resumes correctly. The unpaged ceiling
 applies to the whole response, so type-level without `_count` on a large
 tenant flips to paging immediately — expected.
 
-**Auth.** SMART scopes are enforced where they are today: existing search
-authorization filters each per-type query and the Patient read is
-scope-checked like any read. If the token carries a `patient` context,
-type-level narrows to that patient. No new scope semantics.
+**Auth.** SMART scopes are enforced where they are today: `authz_middleware`
+(`crates/rest/src/middleware/auth.rs`) checks the path's resource type and
+operation before the handler runs. `Principal` carries no SMART `patient`
+launch context, so type-level `$everything` does not narrow to a patient
+context; that is deferred until launch context exists. No new scope
+semantics.
 
-**Audit.** One `AuditEvent` per request, operation `everything`, patient as
-the entity — the shape bulk-export kickoff emits. Not one event per member
-type.
+**Audit.** The existing `audit_middleware` records one `AuditEvent` per
+request. The handler attaches `helios_audit::AuditResponseContext` with
+`resource_type = "Patient"`, `resource_id` and `patient_reference` so the
+event names the patient — the same enrichment `create`/`delete` do. Not one
+event per member type.
 
 **Backend matrix.** The handler is generic over
 `S: ResourceStorage + SearchProvider`; support falls out of capabilities.
@@ -220,12 +224,16 @@ referenced Practitioner and Organization, and a control patient. Assert:
 - unknown patient → 404; GET and POST `Parameters` produce identical bundles;
 - CapabilityStatement lists `everything` under Patient.
 
-**Backend integration** (testcontainers, one test each in the existing
-`postgres_tests.rs`, `mongodb_tests.rs`, Elasticsearch and Composite suites,
-gated as those suites are): same seed, instance-level with `_count=2`, walk
-to exhaustion, compare the id set with SQLite's. This exercises the
-pushed-down compartment predicate and inner-cursor pass-through per engine,
-not the handler logic again. S3 standalone: assert 501.
+**Backend integration** (testcontainers, gated as the existing suites are):
+REST-level tests for PostgreSQL and MongoDB in `crates/rest/tests/`
+(fixtures copied from `sof_conformance_postgres.rs` and
+`mongodb_include_iterate.rs`), and a persistence-level Elasticsearch test
+that pins compartment predicate + `_lastUpdated` + cursor pass-through, the
+three primitives the handler composes. Same seed, instance-level with
+`_count=2`, walk to exhaustion, compare the id set with SQLite's. S3
+standalone 501 is exercised by the existing `From<BackendError>` → 501
+mapping and verified manually (`HFS_STORAGE_BACKEND=s3`) — there is no
+REST-level MinIO fixture today.
 
 **Out of scope for tests:** performance on the 11M-resource corpus. That is a
 manual-matrix row after shipping and the trigger for the native-path
