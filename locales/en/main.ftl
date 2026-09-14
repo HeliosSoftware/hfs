@@ -921,6 +921,7 @@ vd-lint-multiple-iteration-directives = A select may set at most one of forEach,
 vd-lint-select-without-output = A select must have at least one of column, select, or unionAll
 vd-lint-fhirpath-syntax = FHIRPath syntax: { $detail }
 vd-lint-undeclared-constant = Undeclared constant "%{ $name }"
+vd-lint-unknown-resource-type = Unknown resource type "{ $found }"
 vd-fix-rename-key = Rename to "{ $to }"
 vd-fix-remove-key = Remove "{ $key }"
 vd-fix-set-string = Set to "{ $value }"

@@ -2270,6 +2270,48 @@ async fn prune_stale_selection(
     }
 }
 
+/// Existence sweep for a SQL rail's "Recently used" group (#1014): every
+/// recent id absent from `live_ids` (this render's own page, plus the id
+/// resolved as the current selection) is checked against the server;
+/// `404`/`410` prune it, anything else keeps it. Persists once, only when
+/// something was pruned. At most `MAX_RECENT` lookups, sequential.
+#[allow(clippy::too_many_arguments)]
+async fn prune_gone_recents(
+    state: &WebState,
+    user_key: &str,
+    tenant: &str,
+    version: helios_fhir::FhirVersion,
+    page: rail_state::RailPage,
+    resource_type: &str,
+    rail: rail_state::RailState,
+    live_ids: &std::collections::HashSet<String>,
+) -> rail_state::RailState {
+    let mut verdicts = Vec::new();
+    for entry in &rail.recent {
+        if live_ids.contains(&entry.id) {
+            continue;
+        }
+        let verdict = state
+            .conformance
+            .resource_exists(resource_type, &entry.id, version, tenant)
+            .await;
+        if let Err(error) = &verdict {
+            tracing::debug!(
+                "existence check failed for {resource_type}/{}: {error}",
+                entry.id
+            );
+        }
+        verdicts.push((entry.id.clone(), verdict));
+    }
+    match rail.prune_gone(&verdicts) {
+        Some(next) => {
+            rail_state::persist(&state.settings, user_key, tenant, page, &next).await;
+            next
+        }
+        None => rail,
+    }
+}
+
 /// Search page: natural language and the visual builder over one editable query.
 async fn search(
     State(state): State<WebState>,
@@ -3344,7 +3386,9 @@ async fn sql_view_definitions_page(
     } else {
         // No explicit selection: try the stored `last`, falling back to
         // the rail's first visible entry when there is none or it no
-        // longer resolves — both silently: no write either way.
+        // longer resolves — both silently: no write either way. (A recent
+        // entry that has since been deleted server-side is instead caught
+        // by the existence sweep below, [`prune_gone_recents`], #1014.)
         let stored_id = rail_before.last.clone().filter(|id| !id.is_empty());
         let mut resolved = match stored_id.as_deref() {
             Some(id) => resolve_vd_by_id(&state, rv.0, &rt.id, id, &mut page_resources).await,
@@ -3365,6 +3409,28 @@ async fn sql_view_definitions_page(
             None => (None, None, rail_before),
         }
     };
+
+    // Existence sweep (#1014): a recent id off this render's own page and
+    // not the current selection is checked against the server, and a
+    // definitive 404/410 prunes it from the stored registry.
+    let mut live_ids: std::collections::HashSet<String> =
+        summaries.iter().map(|s| s.id.clone()).collect();
+    if let Some(s) = &selected {
+        if !s.id.is_empty() {
+            live_ids.insert(s.id.clone());
+        }
+    }
+    let rail = prune_gone_recents(
+        &state,
+        &settings.user_key,
+        &rt.id,
+        rv.0,
+        rail_state::RailPage::ViewDefinitions,
+        "ViewDefinition",
+        rail,
+        &live_ids,
+    )
+    .await;
 
     let recent_entries =
         resolve_vd_recents(&rail, &summaries, selected.as_ref().map(|s| s.id.as_str()));

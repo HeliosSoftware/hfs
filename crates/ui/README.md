@@ -164,14 +164,17 @@ exactly one applies it directly, more than one opens the lint panel
 (`openLintPanel`), none falls through to `.`'s normal self-insertion;
 `lintKeymap` rides along in the same keymap, adding F8 (next diagnostic) and
 Ctrl-Shift-M (open the panel). Submitting `#vd-editor-form` as Save (not
-Duplicate) while the most recently *completed* lint pass still has at least
-one `error`-severity diagnostic — local JSON syntax errors included — pops a
-native, plural-correct `window.confirm` (`data-msg-save-errors-one`/`-other`
-on `#vd-editor-grid`, Fluent `vd-save-with-errors-one`/`-other`); cancelling
-it keeps the page as it is with focus back on the editor, and warnings alone
-(or no lint result yet) never prompt at all. None of this requires anything
-beyond `window.HfsCodeMirror` — no JavaScript at all means Save always just
-submits, exactly as it does today.
+Duplicate) pops a native, plural-correct `window.confirm`
+(`data-msg-save-errors-one`/`-other` on `#vd-editor-grid`, Fluent
+`vd-save-with-errors-one`/`-other`) when either of two sources reports an
+error: the most recently *completed* lint pass — local JSON syntax errors
+included — or the guided form's validity chip (`data-error-count` on
+`.editor-validity`, the server's own count of FHIR schema, required-binding,
+and lint findings; #1014). The confirmation names the larger of the two
+counts. Cancelling it keeps the page as it is with focus back on the editor,
+and warnings alone (or no lint result and no chip issues) never prompt at
+all. None of this requires anything beyond `window.HfsCodeMirror` — no
+JavaScript at all means Save always just submits, exactly as it does today.
 
 The editor also talks to `POST /ui/sql/view-definitions/complete` (#821),
 a sibling of `/lint` following the same "the browser knows syntax, the

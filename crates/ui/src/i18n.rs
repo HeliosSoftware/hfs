@@ -450,6 +450,7 @@ mod tests {
             DiagnosticCode::SelectWithoutOutput,
             DiagnosticCode::FhirPathSyntax,
             DiagnosticCode::UndeclaredConstant,
+            DiagnosticCode::UnknownResourceType,
         ];
         // A stand-in value for every placeable any `vd-lint-*` message might
         // interpolate — `t_args`, not the argument-free `t`, since most of

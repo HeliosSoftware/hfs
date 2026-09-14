@@ -354,7 +354,7 @@ test("visiting a view and returning through a plain arrival (no ?vd=) restores i
   );
 });
 
-test("a filtered-out recent stays in the group; deleting the selected view falls back, and clicking the stale recent prunes it", async ({
+test("a filtered-out recent stays in the group; a deleted view disappears from the group on the next render", async ({
   page,
   request,
 }) => {
@@ -382,27 +382,27 @@ test("a filtered-out recent stays in the group; deleting the selected view falls
   await expect(page).toHaveURL(/\/ui\/sql\/view-definitions$/);
 
   // The stored `last` no longer resolves: the page falls back to the rail's
-  // first visible entry, in silence — some real, non-deleted view
-  // (the redirect carries no `?filter=`, so which one exactly depends on the
-  // shared e2e server's full ViewDefinition collection, not just this test's
-  // own two) — but the group still shows the now-deleted entry from its
-  // snapshot, since a silent fallback never prunes.
+  // first visible entry, in silence — some real, non-deleted view (the
+  // redirect carries no `?filter=`, so which one exactly depends on the
+  // shared e2e server's full ViewDefinition collection, not just this
+  // test's own two). This same render's existence sweep (#1014) also
+  // checks the deleted id — off this page and no longer the selection —
+  // against the server; the 404/410 it gets back prunes it from the group
+  // right away, with no separate click needed.
   //
   // Not `.toBeVisible()`: the CodeMirror editor (#753/#820) progressively
   // enhances this textarea and hides it once mounted (`vd-editor__source--
   // mounted`, `display: none`), while staying its form's live source of
   // truth. A non-empty value proves a real selection landed regardless of
   // which of the two — raw textarea or its mounted replacement — is the one
-  // actually on screen; the "no selection" render has no textarea at all
-  // (see the pruned case's `toHaveCount(0)` below).
+  // actually on screen.
   await expect(page.locator("textarea[name='json']")).not.toHaveValue("");
   await expect(page.locator(`#vd-rail-list [data-type='${deleteId}']`)).toHaveCount(0);
-  await expect(recentGroup.locator(`[data-type='${deleteId}']`)).toBeVisible();
+  await expect(recentGroup.locator(`[data-type='${deleteId}']`)).toHaveCount(0);
 
-  // Clicking that stale recent (an explicit `?vd=`) prunes it: the page
-  // lands on its no-selection render and the group no longer shows it.
-  await recentGroup.locator(`[data-type='${deleteId}']`).click();
-  await expect(page).toHaveURL(new RegExp(`vd=${deleteId}`));
+  // Navigating straight to the deleted id (an explicit `?vd=`) renders the
+  // page's "no selection" state, and the group still has no trace of it.
+  await page.goto(`/ui/sql/view-definitions?vd=${deleteId}`);
   await expect(page.locator("textarea[name='json']")).toHaveCount(0);
   await expect(recentGroup.locator(`[data-type='${deleteId}']`)).toHaveCount(0);
 });

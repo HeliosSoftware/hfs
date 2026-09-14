@@ -123,6 +123,9 @@ where
         .check_write(tenant.tenant_id(), fhir_version, &resource_type, &resource)
         .await?;
 
+    // #1014: an unknown ViewDefinition.resource is rejected on every write.
+    super::sof::reject_unknown_view_definition_resource(&resource_type, &resource)?;
+
     // Handle the If-Match precondition (RFC 9110 §13.1.1).
     //
     // `If-Match` is a comma-separated list and is satisfied when ANY listed tag
@@ -378,6 +381,9 @@ where
         .validation()
         .check_write(tenant.tenant_id(), fhir_version, &resource_type, &resource)
         .await?;
+
+    // #1014: an unknown ViewDefinition.resource is rejected on every write.
+    super::sof::reject_unknown_view_definition_resource(&resource_type, &resource)?;
 
     let result = state
         .storage()

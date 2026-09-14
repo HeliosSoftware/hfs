@@ -23,4 +23,5 @@ pub use export::{
     cancel_export_handler, download_export_file_handler, get_export_result_handler,
     get_export_status_handler, sql_export_handler,
 };
+pub(crate) use run::reject_unknown_view_definition_resource;
 pub use run::sql_run_handler;
