@@ -322,6 +322,7 @@ impl SqliteBackend {
         // them directly without dialect-specific shimming.
         let busy_timeout_ms = config.busy_timeout_ms;
         let enable_foreign_keys = config.enable_foreign_keys;
+        let enable_wal = config.enable_wal;
         let manager = manager.with_init(move |conn| {
             conn.busy_timeout(std::time::Duration::from_millis(busy_timeout_ms as u64))?;
             // The write path runs its statements through `prepare_cached`, so
@@ -359,6 +360,17 @@ impl SqliteBackend {
             // took 417/s -> 501/s on the multi-row branch (commit -> 0.55 ms).
             // Cost: the -wal file grows to ~200 MiB under sustained writes.
             conn.execute_batch("PRAGMA wal_autocheckpoint = 50000;")?;
+            // synchronous=NORMAL is SQLite's recommended durability level for
+            // WAL: it fsyncs the WAL only at checkpoint instead of on every
+            // commit, which is where the bulk-ingest write path spent ~45% of
+            // its wall (#947). It stays corruption-safe in WAL — a crash can
+            // lose only transactions committed since the last checkpoint, never
+            // the database itself. Applied only when WAL is on: NORMAL under a
+            // rollback journal is not crash-safe, and an in-memory database
+            // never fsyncs anyway.
+            if enable_wal && !is_memory {
+                conn.execute_batch("PRAGMA synchronous = NORMAL;")?;
+            }
             crate::sof::sqlite_udfs::register(conn).map_err(|e| {
                 rusqlite::Error::SqliteFailure(
                     rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_ERROR),
@@ -974,6 +986,35 @@ mod tests {
         let backend = SqliteBackend::in_memory().unwrap();
         backend.init_schema().unwrap();
         backend.init_schema().unwrap(); // Should be idempotent
+    }
+
+    #[test]
+    fn file_backend_uses_synchronous_normal_under_wal() {
+        // NORMAL is only crash-safe paired with WAL, so this rides on a real
+        // file-backed (WAL) backend rather than the in-memory one, whose
+        // connections never fsync anyway (#947).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sync.db");
+        let backend = SqliteBackend::with_config(&path, SqliteBackendConfig::default()).unwrap();
+        backend.init_schema().unwrap();
+
+        let conn = backend.get_connection().unwrap();
+        let journal: String = conn
+            .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            journal.to_lowercase(),
+            "wal",
+            "file backend should be in WAL"
+        );
+        // synchronous: 0=OFF, 1=NORMAL, 2=FULL, 3=EXTRA.
+        let synchronous: i64 = conn
+            .query_row("PRAGMA synchronous", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            synchronous, 1,
+            "a WAL file backend should use synchronous=NORMAL"
+        );
     }
 
     #[test]
