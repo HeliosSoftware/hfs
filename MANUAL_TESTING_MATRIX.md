@@ -347,6 +347,19 @@ For issue #1086 development measurements, use the bounded 2,000-resource
 [PostgreSQL reindex benchmark](docs/postgres-reindex-benchmark.md). That protocol
 does not replace this full-corpus release-matrix test or change its pass criteria.
 
+For issue #1087 coordination measurements, use the focused
+[deferred reindex coordination benchmark](docs/deferred-reindex-coordination-benchmark.md).
+It submits combined, consecutive, overlapping, and burst manifests against a
+dedicated PostgreSQL instance. The controller records physical reindex jobs,
+summed job totals, processed resources, created index entries, observed overlap,
+and indexed-search readiness. Run the controller separately because its
+concurrent API traffic does not fit this UI-only release pass.
+
+Deferred automatic reindex coordination is common to every backend that wires a
+`ReindexOperation`, but the #1087 performance protocol supports claims about
+PostgreSQL only. The guarantee is process-local. Explicit `$reindex` jobs and
+jobs started on another HFS process can overlap the automatic work.
+
 The corpus is a Bulk Data export of 11,704 Synthea patients (18,955,865 resources in
 24 NDJSON files) plus a `manifest.json` that references those files at
 `http://localhost:8000/…`. HFS ingests it with the Bulk Data `$bulk-submit`

@@ -3,17 +3,21 @@
 //! Provides the ability to rebuild search indexes for existing resources
 //! when new SearchParameters are added or when indexes need to be repaired.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use futures::FutureExt;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
-use tokio::sync::mpsc;
+use tokio::sync::{Mutex as AsyncMutex, Semaphore, mpsc, oneshot};
 use uuid::Uuid;
 
+use crate::core::DeferredReindexContext;
 use crate::error::StorageResult;
 use crate::tenant::TenantContext;
 use crate::types::StoredResource;
@@ -452,9 +456,92 @@ struct ReindexAudit {
 const REINDEX_STATUS_RETENTION_SECONDS: i64 = 24 * 60 * 60;
 const MAX_RETAINED_REINDEX_STATUSES: usize = 1024;
 const REINDEX_CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
+const DEFAULT_AUTOMATIC_REINDEX_CONCURRENCY: usize = 1;
 
 type ReindexJobs = RwLock<HashMap<String, ReindexProgress>>;
 type ReindexChannels = RwLock<HashMap<String, mpsc::Sender<()>>>;
+
+#[derive(Clone)]
+struct AutomaticReindexLimits {
+    max_concurrency: usize,
+    resident_tenants: Arc<Semaphore>,
+    running_generations: Arc<Semaphore>,
+}
+
+impl AutomaticReindexLimits {
+    fn new(max_concurrency: usize) -> Self {
+        let max_concurrency = max_concurrency.clamp(1, Semaphore::MAX_PERMITS);
+        let resident_capacity = max_concurrency
+            .saturating_mul(2)
+            .min(Semaphore::MAX_PERMITS);
+        Self {
+            max_concurrency,
+            resident_tenants: Arc::new(Semaphore::new(resident_capacity)),
+            running_generations: Arc::new(Semaphore::new(max_concurrency)),
+        }
+    }
+}
+
+/// Shape of the `ReindexRequest` an automatic generation starts with.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct AutomaticRunOptions {
+    /// Resources per rebuild transaction.
+    pub(crate) batch_size: u32,
+    /// `ReindexRequest::bulk_index_rebuild` for the runs the hook starts.
+    pub(crate) bulk_index_rebuild: bool,
+}
+
+impl Default for AutomaticRunOptions {
+    fn default() -> Self {
+        Self {
+            batch_size: DEFERRED_REINDEX_BATCH_SIZE,
+            bulk_index_rebuild: false,
+        }
+    }
+}
+
+#[derive(Default)]
+struct AutomaticTenantState {
+    pending_types: BTreeSet<String>,
+    next_generation: u64,
+    consecutive_failures: u8,
+    context: DeferredReindexContext,
+    options: AutomaticRunOptions,
+    waiting_for_generation: bool,
+}
+
+#[derive(Default)]
+struct AutomaticReindexCoordinator {
+    limits: OnceLock<AutomaticReindexLimits>,
+    tenants: AsyncMutex<HashMap<String, AutomaticTenantState>>,
+    tenant_changed: tokio::sync::Notify,
+    #[cfg(test)]
+    terminal_barrier: AsyncMutex<Option<Arc<AutomaticTerminalBarrier>>>,
+}
+
+#[cfg(test)]
+struct AutomaticTerminalBarrier {
+    removed: tokio::sync::Notify,
+    resume: Semaphore,
+}
+
+struct ReindexTaskExit(Option<oneshot::Sender<()>>);
+
+impl ReindexTaskExit {
+    fn signal(mut self) {
+        if let Some(tx) = self.0.take() {
+            let _ = tx.send(());
+        }
+    }
+}
+
+impl Drop for ReindexTaskExit {
+    fn drop(&mut self) {
+        if let Some(tx) = self.0.take() {
+            let _ = tx.send(());
+        }
+    }
+}
 
 /// Only tasks that have exited are eligible, including after cancellation was
 /// already reported to the client. All paths acquire jobs before channels and
@@ -567,6 +654,8 @@ pub struct ReindexOperation {
     jobs: Arc<RwLock<HashMap<String, ReindexProgress>>>,
     /// Cancellation channels.
     cancel_channels: Arc<RwLock<HashMap<String, mpsc::Sender<()>>>>,
+    /// Coordinates only the automatic reindex requests emitted by bulk submit.
+    automatic: Arc<AutomaticReindexCoordinator>,
     /// Lazily started by the first job, so construction needs no Tokio runtime.
     cleanup_started: AtomicBool,
     /// Optional audit sink for reindex lifecycle events.
@@ -603,6 +692,7 @@ impl ReindexOperation {
             registries,
             jobs: Arc::new(RwLock::new(HashMap::new())),
             cancel_channels: Arc::new(RwLock::new(HashMap::new())),
+            automatic: Arc::new(AutomaticReindexCoordinator::default()),
             cleanup_started: AtomicBool::new(false),
             audit: None,
         }
@@ -661,6 +751,22 @@ impl ReindexOperation {
         request: ReindexRequest,
         agent: Option<String>,
     ) -> Result<String, ReindexError> {
+        let (job_id, _task_exit) = self.start_tracked(tenant, request, agent).await?;
+        Ok(job_id)
+    }
+
+    /// Starts a job and returns a signal sent after index work has stopped.
+    ///
+    /// The automatic bulk-submit coordinator uses the signal instead of the
+    /// public terminal status. Cancellation marks that status before the task
+    /// has necessarily returned, and terminal audit writes may block after the
+    /// index scan itself is done.
+    async fn start_tracked(
+        &self,
+        tenant: TenantContext,
+        request: ReindexRequest,
+        agent: Option<String>,
+    ) -> Result<(String, oneshot::Receiver<()>), ReindexError> {
         self.ensure_cleanup_task();
         self.cleanup_old_jobs(REINDEX_STATUS_RETENTION_SECONDS);
         let job_id = Uuid::new_v4().to_string();
@@ -706,11 +812,16 @@ impl ReindexOperation {
         let jobs = self.jobs.clone();
         let audit = self.audit.clone();
         let job_id_clone = job_id.clone();
+        let (task_exit_tx, task_exit_rx) = oneshot::channel();
 
         // Spawn background task
         tokio::spawn(async move {
+            // Declare this before the lifecycle guard. If the task is aborted,
+            // the lifecycle guard marks the job failed before this signal wakes
+            // the automatic coordinator.
+            let task_exit = ReindexTaskExit(Some(task_exit_tx));
             let _lifecycle = lifecycle;
-            run_reindex(
+            let outcome = AssertUnwindSafe(run_reindex(
                 job_id_clone.clone(),
                 tenant,
                 request,
@@ -719,8 +830,18 @@ impl ReindexOperation {
                 registries,
                 jobs.clone(),
                 cancel_rx,
-            )
+            ))
+            .catch_unwind()
             .await;
+            if outcome.is_err() {
+                mark_failed(
+                    &jobs,
+                    &job_id_clone,
+                    "Reindex task panicked before completing".to_string(),
+                );
+                tracing::error!(job_id = %job_id_clone, "reindex task panicked");
+            }
+            task_exit.signal();
 
             // Terminal audit event, read back from whatever state the run left
             // the job in.
@@ -757,7 +878,7 @@ impl ReindexOperation {
             }
         });
 
-        Ok(job_id)
+        Ok((job_id, task_exit_rx))
     }
 
     /// Gets the progress of a reindex job.
@@ -818,6 +939,307 @@ impl std::fmt::Debug for ReindexOperation {
             .field("active_jobs", &self.jobs.read().len())
             .field("writers", &self.writers.len())
             .finish()
+    }
+}
+
+#[derive(Debug)]
+enum AutomaticGenerationOutcome {
+    Clean,
+    Cancelled,
+    Failed(String),
+}
+
+impl AutomaticReindexCoordinator {
+    fn limits(&self, requested: usize) -> AutomaticReindexLimits {
+        let requested = requested.max(1);
+        let limits = self
+            .limits
+            .get_or_init(|| AutomaticReindexLimits::new(requested));
+        if limits.max_concurrency != requested {
+            tracing::warn!(
+                configured = limits.max_concurrency,
+                ignored = requested,
+                "automatic reindex concurrency was already fixed for this operation"
+            );
+        }
+        limits.clone()
+    }
+
+    async fn enqueue(
+        self: Arc<Self>,
+        op: Arc<ReindexOperation>,
+        tenant: TenantContext,
+        resource_types: Vec<String>,
+        context: DeferredReindexContext,
+        options: AutomaticRunOptions,
+        max_concurrency: usize,
+    ) {
+        let requested_types: BTreeSet<_> = resource_types.into_iter().collect();
+        if requested_types.is_empty() {
+            return;
+        }
+        let tenant_id = tenant.tenant_id().to_string();
+        let limits = self.limits(max_concurrency);
+
+        // Same-tenant callbacks never wait for admission. They only add to the
+        // one pending set already owned by that tenant's driver.
+        {
+            let mut tenants = self.tenants.lock().await;
+            if let Some(state) = tenants.get_mut(&tenant_id) {
+                state.pending_types.extend(requested_types);
+                state.context = context.clone();
+                state.options = options;
+                tracing::info!(
+                    tenant = %tenant_id,
+                    submission = ?context.submission_id,
+                    manifest = ?context.manifest_id,
+                    types = ?state.pending_types,
+                    "merged deferred reindex work into the pending generation"
+                );
+                return;
+            }
+        }
+
+        // A waiter must also wake when another callback inserts this tenant.
+        // Otherwise two simultaneous first callbacks can both observe an
+        // absent entry and the loser can wait for admission until the winner's
+        // whole scan has drained instead of merging into its pending set.
+        let resident_permit = loop {
+            let changed = self.tenant_changed.notified();
+            {
+                let mut tenants = self.tenants.lock().await;
+                if let Some(state) = tenants.get_mut(&tenant_id) {
+                    state.pending_types.extend(requested_types.clone());
+                    state.context = context.clone();
+                    state.options = options;
+                    return;
+                }
+            }
+            tokio::select! {
+                biased;
+                permit = limits.resident_tenants.clone().acquire_owned() => {
+                    let Ok(permit) = permit else {
+                        tracing::warn!(
+                            tenant = %tenant_id,
+                            "deferred reindex coordinator closed before admission; run $reindex manually"
+                        );
+                        return;
+                    };
+                    break permit;
+                }
+                _ = changed => {}
+            }
+        };
+
+        // Another callback for the same tenant may have won admission while we
+        // waited. Merge into it and release this redundant permit.
+        {
+            let mut tenants = self.tenants.lock().await;
+            if let Some(state) = tenants.get_mut(&tenant_id) {
+                state.pending_types.extend(requested_types);
+                state.context = context;
+                state.options = options;
+                return;
+            }
+            tenants.insert(
+                tenant_id.clone(),
+                AutomaticTenantState {
+                    pending_types: requested_types,
+                    context,
+                    options,
+                    ..Default::default()
+                },
+            );
+        }
+        self.tenant_changed.notify_waiters();
+
+        tokio::spawn(self.run_tenant(op, tenant, tenant_id, limits, resident_permit));
+    }
+
+    async fn run_tenant(
+        self: Arc<Self>,
+        op: Arc<ReindexOperation>,
+        tenant: TenantContext,
+        tenant_id: String,
+        limits: AutomaticReindexLimits,
+        _resident_permit: tokio::sync::OwnedSemaphorePermit,
+    ) {
+        loop {
+            let (resource_types, generation, context, options) = {
+                let mut tenants = self.tenants.lock().await;
+                let Some(state) = tenants.get_mut(&tenant_id) else {
+                    return;
+                };
+                if state.pending_types.is_empty() {
+                    tenants.remove(&tenant_id);
+                    return;
+                }
+                let types = std::mem::take(&mut state.pending_types)
+                    .into_iter()
+                    .collect::<Vec<_>>();
+                let generation = state.next_generation;
+                state.next_generation += 1;
+                state.waiting_for_generation = true;
+                (types, generation, state.context.clone(), state.options)
+            };
+
+            // Acquire for each generation, then release before a follow-up.
+            // Tokio's fair semaphore lets another resident tenant run first.
+            let Ok(running_permit) = limits.running_generations.clone().acquire_owned().await
+            else {
+                tracing::warn!(
+                    tenant = %tenant_id,
+                    generation,
+                    "deferred reindex coordinator closed; run $reindex manually"
+                );
+                self.tenants.lock().await.remove(&tenant_id);
+                return;
+            };
+            if let Some(state) = self.tenants.lock().await.get_mut(&tenant_id) {
+                state.waiting_for_generation = false;
+            }
+
+            let started = op
+                .start_tracked(
+                    tenant.clone(),
+                    ReindexRequest::for_types(resource_types.clone())
+                        .with_batch_size(options.batch_size)
+                        .with_bulk_index_rebuild(options.bulk_index_rebuild),
+                    None,
+                )
+                .await;
+            let (job_id, outcome) = match started {
+                Ok((job_id, task_exit)) => {
+                    tracing::info!(
+                        tenant = %tenant_id,
+                        generation,
+                        job_id = %job_id,
+                        submission = ?context.submission_id,
+                        manifest = ?context.manifest_id,
+                        types = ?resource_types,
+                        "deferred reindex generation started"
+                    );
+                    let _ = task_exit.await;
+                    let outcome = match op.get_progress(&job_id).await {
+                        Some(progress)
+                            if progress.status == ReindexStatus::Completed
+                                && !progress.has_errors() =>
+                        {
+                            AutomaticGenerationOutcome::Clean
+                        }
+                        Some(progress) if progress.status == ReindexStatus::Cancelled => {
+                            AutomaticGenerationOutcome::Cancelled
+                        }
+                        Some(progress) => AutomaticGenerationOutcome::Failed(format!(
+                            "status {:?}, {} resource errors{}",
+                            progress.status,
+                            progress.errors.len(),
+                            progress
+                                .error_message
+                                .as_deref()
+                                .map(|message| format!(", error: {message}"))
+                                .unwrap_or_default()
+                        )),
+                        None => AutomaticGenerationOutcome::Failed(
+                            "job status disappeared after task exit".to_string(),
+                        ),
+                    };
+                    (Some(job_id), outcome)
+                }
+                Err(error) => (
+                    None,
+                    AutomaticGenerationOutcome::Failed(format!(
+                        "failed to start reindex job: {error}"
+                    )),
+                ),
+            };
+            drop(running_permit);
+
+            let mut retry = false;
+            let continue_driver = {
+                let mut tenants = self.tenants.lock().await;
+                let Some(state) = tenants.get_mut(&tenant_id) else {
+                    return;
+                };
+                match &outcome {
+                    AutomaticGenerationOutcome::Clean => {
+                        state.consecutive_failures = 0;
+                    }
+                    AutomaticGenerationOutcome::Cancelled => {
+                        state.consecutive_failures = 0;
+                    }
+                    AutomaticGenerationOutcome::Failed(_) => {
+                        state.consecutive_failures += 1;
+                        if state.consecutive_failures == 1 {
+                            state.pending_types.extend(resource_types.iter().cloned());
+                            retry = true;
+                        } else {
+                            // This generation exhausted its retry, but callbacks
+                            // may have queued independent work while it ran.
+                            // Give that later batch its own retry budget instead
+                            // of removing the whole tenant entry below.
+                            state.consecutive_failures = 0;
+                        }
+                    }
+                }
+                if state.pending_types.is_empty() {
+                    tenants.remove(&tenant_id);
+                    false
+                } else {
+                    true
+                }
+            };
+            self.tenant_changed.notify_waiters();
+
+            #[cfg(test)]
+            if !continue_driver && let Some(barrier) = self.terminal_barrier.lock().await.take() {
+                barrier.removed.notify_one();
+                let permit = barrier
+                    .resume
+                    .acquire()
+                    .await
+                    .expect("terminal test barrier remains open");
+                permit.forget();
+            }
+
+            match outcome {
+                AutomaticGenerationOutcome::Clean => tracing::info!(
+                    tenant = %tenant_id,
+                    generation,
+                    job_id = ?job_id,
+                    types = ?resource_types,
+                    "deferred reindex generation completed"
+                ),
+                AutomaticGenerationOutcome::Cancelled => tracing::warn!(
+                    tenant = %tenant_id,
+                    generation,
+                    job_id = ?job_id,
+                    types = ?resource_types,
+                    "deferred reindex generation was cancelled"
+                ),
+                AutomaticGenerationOutcome::Failed(error) if retry => tracing::warn!(
+                    tenant = %tenant_id,
+                    generation,
+                    job_id = ?job_id,
+                    error = %error,
+                    types = ?resource_types,
+                    "deferred reindex generation failed; retrying once"
+                ),
+                AutomaticGenerationOutcome::Failed(error) => tracing::error!(
+                    tenant = %tenant_id,
+                    generation,
+                    job_id = ?job_id,
+                    error = %error,
+                    types = ?resource_types,
+                    "deferred reindex failed twice; run $reindex manually"
+                ),
+            }
+
+            if !continue_driver {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
     }
 }
 
@@ -1126,12 +1548,12 @@ async fn run_reindex(
 /// manifest that ingested with deferred indexing, and it starts the same
 /// background reindex `POST /$reindex` would, restricted to the manifest's
 /// types.
+#[derive(Clone)]
 pub struct ReindexOnFinish {
     op: std::sync::Arc<ReindexOperation>,
-    /// Resources per rebuild transaction.
-    batch_size: u32,
-    /// `ReindexRequest::bulk_index_rebuild` for the runs this hook starts.
-    bulk_index_rebuild: bool,
+    max_concurrency: usize,
+    /// Request shape for the generations this hook enqueues.
+    options: AutomaticRunOptions,
 }
 
 /// The page the deferred rebuild uses. `ReindexRequest`'s default of 100
@@ -1145,18 +1567,28 @@ pub struct ReindexOnFinish {
 pub const DEFERRED_REINDEX_BATCH_SIZE: u32 = 1000;
 
 impl ReindexOnFinish {
-    /// Wraps a reindex manager for use as the worker's post-manifest hook.
+    /// Wraps a reindex manager with one automatic generation at a time.
     pub fn new(op: std::sync::Arc<ReindexOperation>) -> Self {
+        Self::with_max_concurrency(op, DEFAULT_AUTOMATIC_REINDEX_CONCURRENCY)
+    }
+
+    /// Wraps a reindex manager and limits automatic generations to
+    /// `max_concurrency`. Resident tenant state is limited to twice that value,
+    /// so queued tenants can compete with follow-up generations.
+    pub fn with_max_concurrency(
+        op: std::sync::Arc<ReindexOperation>,
+        max_concurrency: usize,
+    ) -> Self {
         Self {
             op,
-            batch_size: DEFERRED_REINDEX_BATCH_SIZE,
-            bulk_index_rebuild: false,
+            max_concurrency: max_concurrency.clamp(1, Semaphore::MAX_PERMITS),
+            options: AutomaticRunOptions::default(),
         }
     }
 
     /// Overrides the resources-per-transaction page of the rebuild.
     pub fn with_batch_size(mut self, batch_size: u32) -> Self {
-        self.batch_size = batch_size.max(1);
+        self.options.batch_size = batch_size.max(1);
         self
     }
 
@@ -1164,8 +1596,28 @@ impl ReindexOnFinish {
     /// (`HFS_BULK_SUBMIT_BULK_INDEX_REBUILD`): the writer's value indexes are
     /// dropped for the duration and built once, sorted, at the end.
     pub fn with_bulk_index_rebuild(mut self, on: bool) -> Self {
-        self.bulk_index_rebuild = on;
+        self.options.bulk_index_rebuild = on;
         self
+    }
+
+    async fn enqueue(
+        &self,
+        tenant: &crate::tenant::TenantContext,
+        resource_types: Vec<String>,
+        context: DeferredReindexContext,
+    ) {
+        self.op
+            .automatic
+            .clone()
+            .enqueue(
+                self.op.clone(),
+                tenant.clone(),
+                resource_types,
+                context,
+                self.options,
+                self.max_concurrency,
+            )
+            .await;
     }
 }
 
@@ -1176,27 +1628,24 @@ impl crate::core::DeferredReindexHook for ReindexOnFinish {
         tenant: &crate::tenant::TenantContext,
         resource_types: Vec<String>,
     ) {
-        let request = ReindexRequest::for_types(resource_types.clone())
-            .with_batch_size(self.batch_size)
-            .with_bulk_index_rebuild(self.bulk_index_rebuild);
-        match self.op.start(tenant.clone(), request, None).await {
-            Ok(job_id) => {
-                tracing::info!(job_id, types = ?resource_types, "deferred-index rebuild started");
-            }
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    types = ?resource_types,
-                    "deferred-index rebuild failed to start — run $reindex manually"
-                );
-            }
-        }
+        self.enqueue(tenant, resource_types, DeferredReindexContext::default())
+            .await;
+    }
+
+    async fn reindex_types_with_context(
+        &self,
+        tenant: &crate::tenant::TenantContext,
+        resource_types: Vec<String>,
+        context: DeferredReindexContext,
+    ) {
+        self.enqueue(tenant, resource_types, context).await;
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::DeferredReindexHook;
 
     #[derive(Default)]
     struct LifecycleSource {
@@ -1236,6 +1685,256 @@ mod tests {
         ) -> StorageResult<ResourcePage> {
             unreachable!("empty source has no pages")
         }
+    }
+
+    #[derive(Clone, Copy)]
+    enum CountBehavior {
+        Clean,
+        Fail,
+        Panic,
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum ControlledEvent {
+        Count {
+            tenant: String,
+            resource_type: String,
+        },
+        Write {
+            tenant: String,
+            resource_type: String,
+        },
+    }
+
+    struct ControlledBackend {
+        events: tokio::sync::mpsc::UnboundedSender<ControlledEvent>,
+        write_gate: Arc<Semaphore>,
+        count_behaviors: parking_lot::Mutex<std::collections::VecDeque<CountBehavior>>,
+        count_calls: std::sync::atomic::AtomicUsize,
+        write_calls: std::sync::atomic::AtomicUsize,
+        active_writes: std::sync::atomic::AtomicUsize,
+        max_active_writes: std::sync::atomic::AtomicUsize,
+        failing_writes: std::sync::atomic::AtomicUsize,
+    }
+
+    impl ControlledBackend {
+        fn new(
+            count_behaviors: Vec<CountBehavior>,
+            failing_writes: usize,
+        ) -> (
+            Arc<Self>,
+            tokio::sync::mpsc::UnboundedReceiver<ControlledEvent>,
+        ) {
+            let (events, receiver) = tokio::sync::mpsc::unbounded_channel();
+            (
+                Arc::new(Self {
+                    events,
+                    write_gate: Arc::new(Semaphore::new(0)),
+                    count_behaviors: parking_lot::Mutex::new(count_behaviors.into()),
+                    count_calls: std::sync::atomic::AtomicUsize::new(0),
+                    write_calls: std::sync::atomic::AtomicUsize::new(0),
+                    active_writes: std::sync::atomic::AtomicUsize::new(0),
+                    max_active_writes: std::sync::atomic::AtomicUsize::new(0),
+                    failing_writes: std::sync::atomic::AtomicUsize::new(failing_writes),
+                }),
+                receiver,
+            )
+        }
+
+        fn record_active_write(&self) {
+            let active = self.active_writes.fetch_add(1, Ordering::SeqCst) + 1;
+            let mut observed = self.max_active_writes.load(Ordering::SeqCst);
+            while active > observed {
+                match self.max_active_writes.compare_exchange_weak(
+                    observed,
+                    active,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                ) {
+                    Ok(_) => break,
+                    Err(current) => observed = current,
+                }
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ReindexSource for ControlledBackend {
+        async fn list_resource_types(&self, _: &TenantContext) -> StorageResult<Vec<String>> {
+            Ok(vec!["Patient".to_string()])
+        }
+
+        async fn count_resources(
+            &self,
+            tenant: &TenantContext,
+            resource_type: &str,
+        ) -> StorageResult<u64> {
+            self.count_calls.fetch_add(1, Ordering::SeqCst);
+            let _ = self.events.send(ControlledEvent::Count {
+                tenant: tenant.tenant_id().to_string(),
+                resource_type: resource_type.to_string(),
+            });
+            match self
+                .count_behaviors
+                .lock()
+                .pop_front()
+                .unwrap_or(CountBehavior::Clean)
+            {
+                CountBehavior::Clean => Ok(1),
+                CountBehavior::Fail => Err(crate::error::BackendError::Unavailable {
+                    backend_name: "controlled".into(),
+                    message: "injected count failure".into(),
+                }
+                .into()),
+                CountBehavior::Panic => panic!("injected count panic"),
+            }
+        }
+
+        async fn fetch_resources_page(
+            &self,
+            tenant: &TenantContext,
+            resource_type: &str,
+            _: Option<&str>,
+            _: u32,
+        ) -> StorageResult<ResourcePage> {
+            Ok(ResourcePage {
+                resources: vec![StoredResource::new(
+                    resource_type,
+                    "controlled-1",
+                    tenant.tenant_id().clone(),
+                    serde_json::json!({"resourceType": resource_type, "id": "controlled-1"}),
+                    helios_fhir::FhirVersion::default(),
+                )],
+                next_cursor: None,
+            })
+        }
+    }
+
+    #[async_trait]
+    impl ReindexTarget for ControlledBackend {
+        async fn delete_search_entries(
+            &self,
+            _: &TenantContext,
+            _: &str,
+            _: &str,
+        ) -> StorageResult<u64> {
+            Ok(0)
+        }
+
+        async fn write_search_entries(
+            &self,
+            tenant: &TenantContext,
+            resource: &StoredResource,
+        ) -> StorageResult<usize> {
+            self.write_calls.fetch_add(1, Ordering::SeqCst);
+            self.record_active_write();
+            let _ = self.events.send(ControlledEvent::Write {
+                tenant: tenant.tenant_id().to_string(),
+                resource_type: resource.resource_type().to_string(),
+            });
+            let permit = self
+                .write_gate
+                .acquire()
+                .await
+                .expect("controlled write gate remains open");
+            permit.forget();
+            self.active_writes.fetch_sub(1, Ordering::SeqCst);
+            if self
+                .failing_writes
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok()
+            {
+                return Err(crate::error::BackendError::Unavailable {
+                    backend_name: "controlled".into(),
+                    message: "injected write failure".into(),
+                }
+                .into());
+            }
+            Ok(1)
+        }
+
+        async fn clear_search_index(&self, _: &TenantContext) -> StorageResult<u64> {
+            Ok(0)
+        }
+    }
+
+    fn controlled_operation(backend: Arc<ControlledBackend>) -> Arc<ReindexOperation> {
+        Arc::new(ReindexOperation::new(
+            backend,
+            Arc::new(crate::search::TenantSearchRegistries::base_only()),
+        ))
+    }
+
+    fn named_tenant(name: &str) -> TenantContext {
+        TenantContext::new(
+            crate::tenant::TenantId::new(name),
+            crate::tenant::TenantPermissions::full_access(),
+        )
+    }
+
+    async fn next_controlled_event(
+        events: &mut tokio::sync::mpsc::UnboundedReceiver<ControlledEvent>,
+    ) -> ControlledEvent {
+        tokio::time::timeout(Duration::from_secs(2), events.recv())
+            .await
+            .expect("controlled reindex emitted no event")
+            .expect("controlled event channel closed")
+    }
+
+    async fn await_automatic_idle(op: &ReindexOperation) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if op.automatic.tenants.lock().await.is_empty() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("automatic reindex coordinator did not become idle");
+    }
+
+    async fn await_tenant_waiting(op: &ReindexOperation, tenant: &str) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if op
+                    .automatic
+                    .tenants
+                    .lock()
+                    .await
+                    .get(tenant)
+                    .is_some_and(|state| state.waiting_for_generation)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("tenant did not wait for a generation permit");
+    }
+
+    async fn await_controlled_write(
+        events: &mut tokio::sync::mpsc::UnboundedReceiver<ControlledEvent>,
+        tenant: &str,
+        resource_type: &str,
+    ) {
+        assert_eq!(
+            next_controlled_event(events).await,
+            ControlledEvent::Count {
+                tenant: tenant.to_string(),
+                resource_type: resource_type.to_string(),
+            }
+        );
+        assert_eq!(
+            next_controlled_event(events).await,
+            ControlledEvent::Write {
+                tenant: tenant.to_string(),
+                resource_type: resource_type.to_string(),
+            }
+        );
     }
 
     fn lifecycle_operation(source: Arc<LifecycleSource>) -> ReindexOperation {
@@ -1592,6 +2291,430 @@ mod tests {
         tokio::task::yield_now().await;
         assert!(jobs.upgrade().is_none());
         assert!(channels.upgrade().is_none());
+    }
+
+    #[tokio::test]
+    async fn automatic_reindex_clones_coalesce_same_tenant_after_resource_fetch() {
+        let (backend, mut events) = ControlledBackend::new(Vec::new(), 0);
+        let op = controlled_operation(backend.clone());
+        let hook = ReindexOnFinish::with_max_concurrency(op.clone(), 2);
+        let cloned_hook = hook.clone();
+        let tenant = named_tenant("coalesced");
+
+        hook.reindex_types(&tenant, vec!["Patient".to_string()])
+            .await;
+        await_controlled_write(&mut events, "coalesced", "Patient").await;
+
+        // The first scan has fetched this Patient and is blocked in its write.
+        // A callback on a cloned wrapper must create one follow-up generation.
+        cloned_hook
+            .reindex_types(&tenant, vec!["Patient".to_string()])
+            .await;
+        backend.write_gate.add_permits(1);
+        await_controlled_write(&mut events, "coalesced", "Patient").await;
+        backend.write_gate.add_permits(1);
+
+        await_automatic_idle(&op).await;
+        assert_eq!(backend.count_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(backend.write_calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn automatic_reindex_keeps_tenants_separate_and_respects_concurrency() {
+        let (backend, mut events) = ControlledBackend::new(Vec::new(), 0);
+        let op = controlled_operation(backend.clone());
+        let hook = ReindexOnFinish::with_max_concurrency(op.clone(), 2);
+        let alpha = named_tenant("alpha");
+        let beta = named_tenant("beta");
+
+        hook.reindex_types(&alpha, vec!["Patient".to_string()])
+            .await;
+        hook.reindex_types(&beta, vec!["Observation".to_string()])
+            .await;
+
+        let mut writes = Vec::new();
+        while writes.len() < 2 {
+            if let ControlledEvent::Write {
+                tenant,
+                resource_type,
+            } = next_controlled_event(&mut events).await
+            {
+                writes.push((tenant, resource_type));
+            }
+        }
+        writes.sort();
+        assert_eq!(
+            writes,
+            vec![
+                ("alpha".to_string(), "Patient".to_string()),
+                ("beta".to_string(), "Observation".to_string())
+            ]
+        );
+        assert_eq!(backend.max_active_writes.load(Ordering::SeqCst), 2);
+        assert_eq!(op.automatic.tenants.lock().await.len(), 2);
+
+        backend.write_gate.add_permits(2);
+        await_automatic_idle(&op).await;
+    }
+
+    #[tokio::test]
+    async fn automatic_reindex_backpressures_before_adding_a_new_tenant() {
+        let (backend, mut events) = ControlledBackend::new(Vec::new(), 0);
+        let op = controlled_operation(backend.clone());
+        let hook = ReindexOnFinish::with_max_concurrency(op.clone(), 1);
+        let alpha = named_tenant("bounded-alpha");
+        let beta = named_tenant("bounded-beta");
+        let gamma = named_tenant("bounded-gamma");
+
+        hook.reindex_types(&alpha, vec!["Patient".to_string()])
+            .await;
+        await_controlled_write(&mut events, "bounded-alpha", "Patient").await;
+
+        hook.reindex_types(&beta, vec!["Observation".to_string()])
+            .await;
+        await_tenant_waiting(&op, "bounded-beta").await;
+        assert_eq!(op.automatic.tenants.lock().await.len(), 2);
+
+        let waiting = tokio::spawn({
+            let hook = hook.clone();
+            async move {
+                hook.reindex_types(&gamma, vec!["Condition".to_string()])
+                    .await;
+            }
+        });
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        assert!(!waiting.is_finished());
+        assert_eq!(op.automatic.tenants.lock().await.len(), 2);
+
+        backend.write_gate.add_permits(1);
+        await_controlled_write(&mut events, "bounded-beta", "Observation").await;
+        waiting.await.unwrap();
+        assert_eq!(op.automatic.tenants.lock().await.len(), 2);
+        backend.write_gate.add_permits(1);
+        await_controlled_write(&mut events, "bounded-gamma", "Condition").await;
+        backend.write_gate.add_permits(1);
+        await_automatic_idle(&op).await;
+    }
+
+    #[tokio::test]
+    async fn simultaneous_first_callbacks_recheck_and_merge_before_scan_finishes() {
+        let (backend, mut events) = ControlledBackend::new(Vec::new(), 0);
+        let op = controlled_operation(backend.clone());
+        let hook = ReindexOnFinish::with_max_concurrency(op.clone(), 1);
+        let tenant = named_tenant("simultaneous");
+        let limits = op.automatic.limits(1);
+        let held_first = limits
+            .resident_tenants
+            .clone()
+            .acquire_owned()
+            .await
+            .unwrap();
+        let held_second = limits
+            .resident_tenants
+            .clone()
+            .acquire_owned()
+            .await
+            .unwrap();
+
+        let first = tokio::spawn({
+            let hook = hook.clone();
+            let tenant = tenant.clone();
+            async move {
+                hook.reindex_types(&tenant, vec!["Patient".to_string()])
+                    .await
+            }
+        });
+        let second = tokio::spawn({
+            let hook = hook.clone();
+            async move {
+                hook.reindex_types(&tenant, vec!["Observation".to_string()])
+                    .await
+            }
+        });
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        assert!(!first.is_finished());
+        assert!(!second.is_finished());
+
+        drop(held_first);
+        let first_write = loop {
+            let event = next_controlled_event(&mut events).await;
+            if matches!(event, ControlledEvent::Write { .. }) {
+                break event;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(2), async {
+            first.await.unwrap();
+            second.await.unwrap();
+        })
+        .await
+        .expect("the losing callback waited for the active scan to drain");
+
+        drop(held_second);
+        backend.write_gate.add_permits(4);
+        await_automatic_idle(&op).await;
+        let written_types: BTreeSet<_> = std::iter::once(first_write)
+            .chain(std::iter::from_fn(|| events.try_recv().ok()))
+            .filter_map(|event| match event {
+                ControlledEvent::Write { resource_type, .. } => Some(resource_type),
+                ControlledEvent::Count { .. } => None,
+            })
+            .collect();
+        assert_eq!(
+            written_types,
+            BTreeSet::from(["Observation".to_string(), "Patient".to_string()])
+        );
+        assert_eq!(backend.count_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(backend.write_calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn queued_tenant_runs_before_an_active_tenants_follow_up() {
+        let (backend, mut events) = ControlledBackend::new(Vec::new(), 0);
+        let op = controlled_operation(backend.clone());
+        let hook = ReindexOnFinish::with_max_concurrency(op.clone(), 1);
+        let alpha = named_tenant("fair-alpha");
+        let beta = named_tenant("fair-beta");
+
+        hook.reindex_types(&alpha, vec!["Patient".to_string()])
+            .await;
+        await_controlled_write(&mut events, "fair-alpha", "Patient").await;
+        hook.reindex_types(&alpha, vec!["Condition".to_string()])
+            .await;
+        hook.reindex_types(&beta, vec!["Observation".to_string()])
+            .await;
+        await_tenant_waiting(&op, "fair-beta").await;
+
+        backend.write_gate.add_permits(1);
+        await_controlled_write(&mut events, "fair-beta", "Observation").await;
+        backend.write_gate.add_permits(1);
+        await_controlled_write(&mut events, "fair-alpha", "Condition").await;
+        backend.write_gate.add_permits(1);
+        await_automatic_idle(&op).await;
+    }
+
+    #[tokio::test]
+    async fn terminal_driver_does_not_adopt_a_reinserted_tenant_entry() {
+        let (backend, mut events) = ControlledBackend::new(Vec::new(), 0);
+        let op = controlled_operation(backend.clone());
+        let hook = ReindexOnFinish::with_max_concurrency(op.clone(), 1);
+        let tenant = named_tenant("reinserted");
+        let barrier = Arc::new(AutomaticTerminalBarrier {
+            removed: tokio::sync::Notify::new(),
+            resume: Semaphore::new(0),
+        });
+        *op.automatic.terminal_barrier.lock().await = Some(barrier.clone());
+
+        hook.reindex_types(&tenant, vec!["Patient".to_string()])
+            .await;
+        await_controlled_write(&mut events, "reinserted", "Patient").await;
+        let removed = barrier.removed.notified();
+        backend.write_gate.add_permits(1);
+        removed.await;
+
+        // Model a fresh callback after the old driver removed its entry but
+        // before that driver returned. Keep the fresh entry resident without
+        // spawning its new driver so any scan can only come from the stale one.
+        let limits = op.automatic.limits(1);
+        let fresh_resident = limits
+            .resident_tenants
+            .clone()
+            .acquire_owned()
+            .await
+            .unwrap();
+        op.automatic.tenants.lock().await.insert(
+            "reinserted".to_string(),
+            AutomaticTenantState {
+                pending_types: BTreeSet::from(["Observation".to_string()]),
+                ..Default::default()
+            },
+        );
+        op.automatic.tenant_changed.notify_waiters();
+        barrier.resume.add_permits(1);
+
+        let released_by_old_driver = tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::select! {
+                permit = limits.resident_tenants.clone().acquire_owned() => {
+                    permit.expect("resident semaphore remains open")
+                }
+                event = events.recv() => {
+                    panic!("stale driver consumed the fresh tenant entry: {event:?}")
+                }
+            }
+        })
+        .await
+        .expect("old tenant driver did not return after removing its entry");
+
+        assert_eq!(backend.count_calls.load(Ordering::SeqCst), 1);
+        op.automatic.tenants.lock().await.remove("reinserted");
+        drop(fresh_resident);
+        drop(released_by_old_driver);
+    }
+
+    #[tokio::test]
+    async fn explicit_reindex_is_independent_from_automatic_admission() {
+        let (backend, mut events) = ControlledBackend::new(Vec::new(), 0);
+        let op = controlled_operation(backend.clone());
+        let hook = ReindexOnFinish::with_max_concurrency(op.clone(), 1);
+        let tenant = named_tenant("explicit-independent");
+
+        hook.reindex_types(&tenant, vec!["Patient".to_string()])
+            .await;
+        await_controlled_write(&mut events, "explicit-independent", "Patient").await;
+        let explicit_job = op
+            .start(tenant, ReindexRequest::for_types(["Observation"]), None)
+            .await
+            .unwrap();
+        await_controlled_write(&mut events, "explicit-independent", "Observation").await;
+        assert_eq!(backend.max_active_writes.load(Ordering::SeqCst), 2);
+
+        backend.write_gate.add_permits(2);
+        await_automatic_idle(&op).await;
+        assert_eq!(
+            await_terminal(&op, &explicit_job).await.status,
+            ReindexStatus::Completed
+        );
+    }
+
+    #[tokio::test]
+    async fn automatic_reindex_clean_success_does_not_retry() {
+        let (backend, mut events) = ControlledBackend::new(Vec::new(), 0);
+        let op = controlled_operation(backend.clone());
+        let hook = ReindexOnFinish::new(op.clone());
+
+        hook.reindex_types(&named_tenant("clean"), vec!["Patient".to_string()])
+            .await;
+        await_controlled_write(&mut events, "clean", "Patient").await;
+        backend.write_gate.add_permits(1);
+        await_automatic_idle(&op).await;
+
+        assert_eq!(backend.count_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(backend.write_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn automatic_reindex_retries_failure_error_result_and_panic_once() {
+        for behavior in [CountBehavior::Fail, CountBehavior::Panic] {
+            let (backend, mut events) = ControlledBackend::new(vec![behavior, behavior], 0);
+            let op = controlled_operation(backend.clone());
+            let hook = ReindexOnFinish::new(op.clone());
+            let tenant = named_tenant("failed-count");
+
+            hook.reindex_types(&tenant, vec!["Patient".to_string()])
+                .await;
+            for _ in 0..2 {
+                assert_eq!(
+                    next_controlled_event(&mut events).await,
+                    ControlledEvent::Count {
+                        tenant: "failed-count".to_string(),
+                        resource_type: "Patient".to_string(),
+                    }
+                );
+            }
+            await_automatic_idle(&op).await;
+            assert_eq!(backend.count_calls.load(Ordering::SeqCst), 2);
+        }
+
+        // Per-resource write errors leave the physical job Completed but are
+        // still failures for automatic retry policy.
+        let (backend, mut events) = ControlledBackend::new(Vec::new(), 2);
+        let op = controlled_operation(backend.clone());
+        let hook = ReindexOnFinish::new(op.clone());
+        hook.reindex_types(
+            &named_tenant("errorful-completion"),
+            vec!["Patient".to_string()],
+        )
+        .await;
+        for _ in 0..2 {
+            await_controlled_write(&mut events, "errorful-completion", "Patient").await;
+            backend.write_gate.add_permits(1);
+        }
+        await_automatic_idle(&op).await;
+        assert_eq!(backend.count_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(backend.write_calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn automatic_reindex_keeps_new_work_after_a_retry_is_exhausted() {
+        let (backend, mut events) = ControlledBackend::new(Vec::new(), 2);
+        let op = controlled_operation(backend.clone());
+        let hook = ReindexOnFinish::new(op.clone());
+        let tenant = named_tenant("failed-retry-with-pending");
+
+        hook.reindex_types(&tenant, vec!["Patient".to_string()])
+            .await;
+        await_controlled_write(&mut events, "failed-retry-with-pending", "Patient").await;
+        backend.write_gate.add_permits(1);
+
+        // The first failure schedules one retry. Queue unrelated work while
+        // that retry is in flight, then make the retry fail as well.
+        await_controlled_write(&mut events, "failed-retry-with-pending", "Patient").await;
+        hook.reindex_types(&tenant, vec!["Observation".to_string()])
+            .await;
+        backend.write_gate.add_permits(1);
+
+        // Exhausting Patient's retry must not discard the later callback.
+        await_controlled_write(&mut events, "failed-retry-with-pending", "Observation").await;
+        backend.write_gate.add_permits(1);
+        await_automatic_idle(&op).await;
+
+        assert_eq!(backend.count_calls.load(Ordering::SeqCst), 3);
+        assert_eq!(backend.write_calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn automatic_reindex_cancellation_drops_active_types_but_runs_pending_types() {
+        let (backend, mut events) = ControlledBackend::new(Vec::new(), 0);
+        let op = controlled_operation(backend.clone());
+        let hook = ReindexOnFinish::new(op.clone());
+        let tenant = named_tenant("cancelled");
+
+        hook.reindex_types(&tenant, vec!["Patient".to_string()])
+            .await;
+        await_controlled_write(&mut events, "cancelled", "Patient").await;
+        hook.reindex_types(&tenant, vec!["Observation".to_string()])
+            .await;
+        let active_job = op
+            .list_jobs()
+            .into_iter()
+            .find(|progress| progress.status == ReindexStatus::InProgress)
+            .expect("automatic job is running")
+            .job_id;
+        op.cancel(&active_job).await.unwrap();
+        backend.write_gate.add_permits(1);
+
+        await_controlled_write(&mut events, "cancelled", "Observation").await;
+        backend.write_gate.add_permits(1);
+        await_automatic_idle(&op).await;
+        assert_eq!(backend.count_calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn automatic_reindex_operation_instances_do_not_share_targets() {
+        let (first, mut first_events) = ControlledBackend::new(Vec::new(), 0);
+        let (second, mut second_events) = ControlledBackend::new(Vec::new(), 0);
+        let first_op = controlled_operation(first.clone());
+        let second_op = controlled_operation(second.clone());
+        let tenant = named_tenant("same-tenant");
+
+        ReindexOnFinish::new(first_op.clone())
+            .reindex_types(&tenant, vec!["Patient".to_string()])
+            .await;
+        ReindexOnFinish::new(second_op.clone())
+            .reindex_types(&tenant, vec!["Observation".to_string()])
+            .await;
+        await_controlled_write(&mut first_events, "same-tenant", "Patient").await;
+        await_controlled_write(&mut second_events, "same-tenant", "Observation").await;
+
+        assert_eq!(first.write_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(second.write_calls.load(Ordering::SeqCst), 1);
+        first.write_gate.add_permits(1);
+        second.write_gate.add_permits(1);
+        await_automatic_idle(&first_op).await;
+        await_automatic_idle(&second_op).await;
     }
 
     #[test]

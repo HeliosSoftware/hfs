@@ -633,12 +633,10 @@ async fn start_mongodb(
     // Bulk submit needs no sidecar: MongoDB hosts the submission, manifest,
     // lease, and artifact state itself, in the same store the ingestion engine
     // writes resources to.
-    let reindex_hook = ops.reindex.clone().map(|op| {
-        Arc::new(
-            helios_persistence::search::ReindexOnFinish::new(op)
-                .with_bulk_index_rebuild(config.bulk_submit.bulk_index_rebuild),
-        ) as Arc<dyn helios_persistence::core::DeferredReindexHook>
-    });
+    let reindex_hook = ops
+        .reindex
+        .clone()
+        .map(|op| automatic_reindex_hook(op, &config));
     let submit_bundle = build_bulk_submit(
         &config,
         backend.clone(),
@@ -1472,12 +1470,10 @@ async fn start_sqlite(
         audit_state.as_ref(),
         observability.clone(),
     );
-    let reindex_hook = ops.reindex.clone().map(|op| {
-        Arc::new(
-            helios_persistence::search::ReindexOnFinish::new(op)
-                .with_bulk_index_rebuild(config.bulk_submit.bulk_index_rebuild),
-        ) as Arc<dyn helios_persistence::core::DeferredReindexHook>
-    });
+    let reindex_hook = ops
+        .reindex
+        .clone()
+        .map(|op| automatic_reindex_hook(op, &config));
     let submit_bundle = build_bulk_submit(
         &config,
         backend.clone(),
@@ -1684,6 +1680,27 @@ fn wire_reindex(
     Arc::new(op)
 }
 
+/// Builds the deferred bulk-submit hook using the existing submit-worker
+/// concurrency as the per-process automatic reindex limit.
+#[cfg(any(
+    feature = "sqlite",
+    feature = "postgres",
+    feature = "mongodb",
+    feature = "elasticsearch"
+))]
+fn automatic_reindex_hook(
+    op: Arc<ReindexOperation>,
+    config: &ServerConfig,
+) -> Arc<dyn helios_persistence::core::DeferredReindexHook> {
+    Arc::new(
+        helios_persistence::search::ReindexOnFinish::with_max_concurrency(
+            op,
+            config.bulk_submit.worker_concurrency as usize,
+        )
+        .with_bulk_index_rebuild(config.bulk_submit.bulk_index_rebuild),
+    )
+}
+
 /// Ops bundle for a backend that indexes itself — the standalone deployments
 /// (SQLite, PostgreSQL, MongoDB), where resources and search index share a home.
 #[cfg(any(feature = "sqlite", feature = "postgres", feature = "mongodb"))]
@@ -1824,7 +1841,12 @@ fn spawn_export_workers<Dp>(
 /// [`CompositeSubmitJobs`]: helios_persistence::composite::CompositeSubmitJobs
 #[cfg(all(
     feature = "elasticsearch",
-    any(feature = "sqlite", feature = "postgres")
+    any(
+        feature = "sqlite",
+        feature = "postgres",
+        feature = "mongodb",
+        feature = "s3"
+    )
 ))]
 fn composite_submit_jobs(
     primary: Arc<dyn BulkSubmitJobStore>,
@@ -2259,12 +2281,10 @@ async fn start_sqlite_elasticsearch(
         audit_state.as_ref(),
         observability.clone(),
     );
-    let reindex_hook = ops.reindex.clone().map(|op| {
-        Arc::new(
-            helios_persistence::search::ReindexOnFinish::new(op)
-                .with_bulk_index_rebuild(config.bulk_submit.bulk_index_rebuild),
-        ) as Arc<dyn helios_persistence::core::DeferredReindexHook>
-    });
+    let reindex_hook = ops
+        .reindex
+        .clone()
+        .map(|op| automatic_reindex_hook(op, &config));
     // Bulk ingestion runs on the SQLite primary's engine, but wrapped so that
     // finished manifests sync their resources into Elasticsearch — the raw
     // primary skips local indexing when search is offloaded, and without the
@@ -2352,12 +2372,10 @@ async fn start_postgres(
         audit_state.as_ref(),
         observability.clone(),
     );
-    let reindex_hook = ops.reindex.clone().map(|op| {
-        Arc::new(
-            helios_persistence::search::ReindexOnFinish::new(op)
-                .with_bulk_index_rebuild(config.bulk_submit.bulk_index_rebuild),
-        ) as Arc<dyn helios_persistence::core::DeferredReindexHook>
-    });
+    let reindex_hook = ops
+        .reindex
+        .clone()
+        .map(|op| automatic_reindex_hook(op, &config));
     let submit_bundle = build_bulk_submit(
         &config,
         backend.clone(),
@@ -2552,12 +2570,10 @@ async fn start_postgres_elasticsearch(
         audit_state.as_ref(),
         observability.clone(),
     );
-    let reindex_hook = ops.reindex.clone().map(|op| {
-        Arc::new(
-            helios_persistence::search::ReindexOnFinish::new(op)
-                .with_bulk_index_rebuild(config.bulk_submit.bulk_index_rebuild),
-        ) as Arc<dyn helios_persistence::core::DeferredReindexHook>
-    });
+    let reindex_hook = ops
+        .reindex
+        .clone()
+        .map(|op| automatic_reindex_hook(op, &config));
     // Wrapped like sqlite-es: finished manifests sync their ingested
     // resources into Elasticsearch, which the raw primary never does (#882),
     // unless fast-load's post-manifest reindex covers it (#903).
@@ -2776,12 +2792,10 @@ async fn start_mongodb_elasticsearch(
         audit_state.as_ref(),
         observability.clone(),
     );
-    let reindex_hook = ops.reindex.clone().map(|op| {
-        Arc::new(
-            helios_persistence::search::ReindexOnFinish::new(op)
-                .with_bulk_index_rebuild(config.bulk_submit.bulk_index_rebuild),
-        ) as Arc<dyn helios_persistence::core::DeferredReindexHook>
-    });
+    let reindex_hook = ops
+        .reindex
+        .clone()
+        .map(|op| automatic_reindex_hook(op, &config));
     // Bulk submit runs against the MongoDB primary, which hosts its own job
     // state, but wrapped like sqlite-es and pg-es so finished manifests sync
     // their resources into Elasticsearch (#882). The comment this replaces said
@@ -3230,12 +3244,10 @@ async fn start_s3_elasticsearch(
     // indexing hooks for the composite's search half to be "fed by", which is
     // what the comment this replaces claimed. Without the wrapper a completed
     // `$bulk-submit` here leaves its resources searchable nowhere (#1021).
-    let reindex_hook = ops.reindex.clone().map(|op| {
-        Arc::new(
-            helios_persistence::search::ReindexOnFinish::new(op)
-                .with_bulk_index_rebuild(config.bulk_submit.bulk_index_rebuild),
-        ) as Arc<dyn helios_persistence::core::DeferredReindexHook>
-    });
+    let reindex_hook = ops
+        .reindex
+        .clone()
+        .map(|op| automatic_reindex_hook(op, &config));
     let bulk_submit = if s3.supports_bulk_submit_worker() {
         let submit_jobs = composite_submit_jobs(
             s3.clone(),
