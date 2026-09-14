@@ -241,3 +241,21 @@ async fn errors() {
         "POST body must be Parameters"
     );
 }
+
+#[tokio::test]
+async fn capability_statement_declares_everything_on_patient() {
+    let server = server_with(10_000).await;
+    let b: Value = server.get("/metadata").await.json();
+    let patient = b["rest"][0]["resource"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["type"] == "Patient")
+        .expect("Patient resource entry");
+    let ops = patient["operation"].as_array().expect("operation array");
+    assert!(
+        ops.iter().any(|o| o["name"] == "everything"
+            && o["definition"] == "http://hl7.org/fhir/OperationDefinition/Patient-everything"),
+        "{ops:?}"
+    );
+}
