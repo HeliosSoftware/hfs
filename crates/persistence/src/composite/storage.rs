@@ -1898,72 +1898,22 @@ impl BundleProvider for CompositeStorage {
 
 #[async_trait]
 impl IncludeProvider for CompositeStorage {
+    /// Delegates to the shared, registry-driven resolver so `_include` (and
+    /// `:iterate`) follows the same search-parameter definitions and the same
+    /// backend routing as `search()` (the Search-role backend if one is
+    /// configured, otherwise the primary) — matching what the REST search
+    /// path already does for this storage.
     async fn resolve_includes(
         &self,
         tenant: &TenantContext,
         resources: &[StoredResource],
         includes: &[IncludeDirective],
     ) -> StorageResult<Vec<StoredResource>> {
-        // Include resolution always uses primary (has all resources)
-        let primary_id = self.config.primary_id().unwrap_or("primary");
-
-        if let Some(_provider) = self.search_providers.get(primary_id) {
-            // Try to downcast to IncludeProvider
-            // This is a limitation - we need trait objects
-            // For now, fall back to a basic implementation
-            self.resolve_includes_basic(tenant, resources, includes)
-                .await
-        } else {
-            self.resolve_includes_basic(tenant, resources, includes)
-                .await
-        }
+        crate::core::resolve_includes_iterative(self, tenant, resources, includes).await
     }
 }
 
 impl CompositeStorage {
-    /// Basic include resolution by reading referenced resources.
-    async fn resolve_includes_basic(
-        &self,
-        tenant: &TenantContext,
-        resources: &[StoredResource],
-        includes: &[IncludeDirective],
-    ) -> StorageResult<Vec<StoredResource>> {
-        use std::collections::HashSet;
-
-        let mut included = Vec::new();
-        let mut seen_ids = HashSet::new();
-
-        for resource in resources {
-            for include in includes {
-                // Extract references from resource based on search param
-                let refs = self.extract_references(tenant, resource, &include.search_param);
-
-                for reference in refs {
-                    // Parse reference: "ResourceType/id"
-                    if let Some((ref_type, ref_id)) = reference.split_once('/') {
-                        // Check target type filter
-                        if let Some(ref target) = include.target_type {
-                            if target != ref_type {
-                                continue;
-                            }
-                        }
-
-                        let key = format!("{}/{}", ref_type, ref_id);
-                        if seen_ids.insert(key) {
-                            if let Ok(Some(included_resource)) =
-                                self.primary.read(tenant, ref_type, ref_id).await
-                            {
-                                included.push(included_resource);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        Ok(included)
-    }
-
     /// Extracts references from a resource for a given search parameter.
     ///
     /// Resolution order:
@@ -3418,6 +3368,7 @@ mod tests {
         name: &'static str,
         calls: Mutex<Vec<SearchQuery>>,
         results: Vec<StoredResource>,
+        registry: Option<Arc<parking_lot::RwLock<crate::search::SearchParameterRegistry>>>,
     }
 
     impl RecordingSearchProvider {
@@ -3426,7 +3377,20 @@ mod tests {
                 name,
                 calls: Mutex::new(Vec::new()),
                 results,
+                registry: None,
             }
+        }
+
+        /// Attaches a search-parameter registry so `search_param_registry`
+        /// returns it instead of the empty default — used by tests that need
+        /// this fake to answer registry-driven lookups (e.g. include
+        /// resolution via `resolve_includes_iterative`).
+        fn with_registry(
+            mut self,
+            registry: Arc<parking_lot::RwLock<crate::search::SearchParameterRegistry>>,
+        ) -> Self {
+            self.registry = Some(registry);
+            self
         }
 
         fn call_count(&self) -> usize {
@@ -3538,9 +3502,11 @@ mod tests {
             &self,
             _tenant: &TenantContext,
         ) -> std::sync::Arc<parking_lot::RwLock<crate::search::SearchParameterRegistry>> {
-            std::sync::Arc::new(parking_lot::RwLock::new(
-                crate::search::SearchParameterRegistry::new(),
-            ))
+            self.registry.clone().unwrap_or_else(|| {
+                std::sync::Arc::new(parking_lot::RwLock::new(
+                    crate::search::SearchParameterRegistry::new(),
+                ))
+            })
         }
     }
 
@@ -3617,6 +3583,128 @@ mod tests {
             .with_search_providers(search_providers);
 
         (composite, primary)
+    }
+
+    #[tokio::test]
+    async fn resolve_includes_delegates_to_shared_resolver_via_search_backend() {
+        use crate::search::{SearchParameterDefinition, SearchParameterRegistry};
+        use crate::types::IncludeType;
+
+        let tenant = TenantContext::new(
+            TenantId::new("composite-test"),
+            TenantPermissions::full_access(),
+        );
+
+        let registry = Arc::new(parking_lot::RwLock::new(SearchParameterRegistry::new()));
+        registry
+            .write()
+            .register(
+                SearchParameterDefinition::new(
+                    "http://hl7.org/fhir/SearchParameter/Patient-organization",
+                    "organization",
+                    SearchParamType::Reference,
+                    "Patient.managingOrganization",
+                )
+                .with_base(vec!["Patient"])
+                .with_targets(vec!["Organization"]),
+            )
+            .unwrap();
+
+        let org = StoredResourceBuilder::new()
+            .resource_type("Organization")
+            .id("org-1")
+            .tenant_id(TenantId::new("composite-test"))
+            .content(json!({
+                "resourceType": "Organization",
+                "id": "org-1",
+            }))
+            .build();
+
+        let primary = Arc::new(RecordingSearchProvider::new("primary", vec![]));
+        let search = Arc::new(
+            RecordingSearchProvider::new("search", vec![org.clone()]).with_registry(registry),
+        );
+
+        let composite_config = CompositeConfig::builder()
+            .primary("primary", BackendKind::Sqlite)
+            .search_backend("search", BackendKind::Sqlite)
+            .build()
+            .expect("build composite config");
+
+        let mut backends: HashMap<String, DynStorage> = HashMap::new();
+        backends.insert("primary".to_string(), primary.clone() as DynStorage);
+        backends.insert("search".to_string(), search.clone() as DynStorage);
+
+        let mut search_providers: HashMap<String, DynSearchProvider> = HashMap::new();
+        search_providers.insert("primary".to_string(), primary.clone() as DynSearchProvider);
+        search_providers.insert("search".to_string(), search.clone() as DynSearchProvider);
+
+        let composite = CompositeStorage::new(composite_config, backends)
+            .expect("create composite storage")
+            .with_search_providers(search_providers);
+
+        let patient = StoredResourceBuilder::new()
+            .resource_type("Patient")
+            .id("p1")
+            .tenant_id(TenantId::new("composite-test"))
+            .content(json!({
+                "resourceType": "Patient",
+                "id": "p1",
+                "managingOrganization": {"reference": "Organization/org-1"},
+            }))
+            .build();
+
+        let include = IncludeDirective {
+            include_type: IncludeType::Include,
+            source_type: "Patient".to_string(),
+            search_param: "organization".to_string(),
+            target_type: None,
+            iterate: false,
+        };
+
+        let included = composite
+            .resolve_includes(
+                &tenant,
+                std::slice::from_ref(&patient),
+                std::slice::from_ref(&include),
+            )
+            .await
+            .expect("resolve_includes should succeed");
+
+        assert_eq!(included.len(), 1);
+        assert_eq!(included[0].resource_type(), "Organization");
+        assert_eq!(included[0].id(), "org-1");
+
+        {
+            let calls = search.calls.lock().expect("calls mutex poisoned");
+            assert_eq!(calls.len(), 1);
+            assert_eq!(calls[0].resource_type, "Organization");
+            assert_eq!(calls[0].parameters.len(), 1);
+            assert_eq!(calls[0].parameters[0].name, "_id");
+            assert_eq!(calls[0].parameters[0].values.len(), 1);
+            assert_eq!(calls[0].parameters[0].values[0].value, "org-1");
+        }
+        assert_eq!(primary.call_count(), 0);
+
+        // A target-type filter that doesn't match the reference's resource
+        // type yields no included resources and never issues a search — the
+        // shared resolver skips fetching when nothing survives the filter.
+        let include_wrong_target = IncludeDirective {
+            target_type: Some("Practitioner".to_string()),
+            ..include
+        };
+        let included_filtered = composite
+            .resolve_includes(
+                &tenant,
+                std::slice::from_ref(&patient),
+                std::slice::from_ref(&include_wrong_target),
+            )
+            .await
+            .expect("resolve_includes should succeed");
+
+        assert_eq!(included_filtered.len(), 0);
+        assert_eq!(search.call_count(), 1);
+        assert_eq!(primary.call_count(), 0);
     }
 
     #[tokio::test]

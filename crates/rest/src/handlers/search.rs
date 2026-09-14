@@ -415,11 +415,13 @@ where
 
     // Resolve _include/_revinclude for backends whose search() does not
     // populate includes inline (SQLite, Postgres, Elasticsearch): the Full
-    // pass runs the whole backend-agnostic resolver. MongoDB is the only
-    // backend that resolves inline, and it only ever runs hop 1 itself
-    // (#1063) — when a directive also carries `:iterate`, the Continuation
-    // pass picks up from whatever the backend already returned, without
-    // re-resolving hop 1.
+    // pass runs the whole backend-agnostic resolver
+    // (`core::resolve_includes_iterative`). MongoDB is the only backend that
+    // resolves inline, and it does so by calling that same common resolver
+    // itself, bounded by the `HFS_MONGODB_MAX_INCLUDED_RESOURCES` directive
+    // (#1061) — but only for hop 1 (#1063). When a directive also carries
+    // `:iterate`, the Continuation pass picks up from whatever MongoDB
+    // already returned, without re-resolving hop 1.
     // `backend_resolved` treats an `included` holding only a truncation
     // marker (#1061) as "nothing real resolved", so a backend reply that
     // truncated to zero real resources still takes the Full path rather than
@@ -555,11 +557,13 @@ enum IterativePass {
     /// No includes requested, or the backend already resolved everything
     /// there is to resolve (no directive carries `:iterate`).
     None,
-    /// The backend does not resolve includes inline (SQLite, Postgres):
-    /// run the full backend-agnostic resolver, hop 1 included.
+    /// The backend does not resolve includes inline (SQLite, Postgres,
+    /// Elasticsearch): run the full backend-agnostic resolver, hop 1
+    /// included.
     Full,
-    /// The backend resolved hop 1 inline and at least one directive carries
-    /// `:iterate`: continue from hop 2 without re-resolving hop 1.
+    /// The backend resolved hop 1 inline (MongoDB, via the common resolver)
+    /// and at least one directive carries `:iterate`: continue from hop 2
+    /// without re-resolving hop 1.
     Continuation,
 }
 

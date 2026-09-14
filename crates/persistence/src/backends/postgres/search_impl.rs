@@ -694,55 +694,17 @@ impl MultiTypeSearchProvider for PostgresBackend {
 
 #[async_trait]
 impl IncludeProvider for PostgresBackend {
+    /// Delegates to the shared, registry-driven resolver so `_include` (and
+    /// `:iterate`) follows the same search-parameter definitions (with FHIRPath
+    /// expression evaluation) used elsewhere; Postgres does not resolve
+    /// includes inline in `search()`.
     async fn resolve_includes(
         &self,
         tenant: &TenantContext,
         resources: &[StoredResource],
         includes: &[IncludeDirective],
     ) -> StorageResult<Vec<StoredResource>> {
-        if resources.is_empty() || includes.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let client = self.get_client().await?;
-        let tenant_id = tenant.tenant_id().as_str();
-
-        let mut included = Vec::new();
-        let mut seen_refs: HashSet<String> = HashSet::new();
-
-        for include in includes {
-            for resource in resources {
-                if resource.resource_type() != include.source_type {
-                    continue;
-                }
-
-                let refs = Self::extract_references(resource.content(), &include.search_param);
-
-                for reference in refs {
-                    if let Some((ref_type, ref_id)) = Self::parse_reference(&reference) {
-                        if let Some(ref target) = include.target_type {
-                            if ref_type != *target {
-                                continue;
-                            }
-                        }
-
-                        let ref_key = format!("{}/{}", ref_type, ref_id);
-                        if seen_refs.contains(&ref_key) {
-                            continue;
-                        }
-                        seen_refs.insert(ref_key);
-
-                        if let Some(included_resource) =
-                            Self::fetch_resource(&client, tenant_id, &ref_type, &ref_id).await?
-                        {
-                            included.push(included_resource);
-                        }
-                    }
-                }
-            }
-        }
-
-        Ok(included)
+        crate::core::resolve_includes_iterative(self, tenant, resources, includes).await
     }
 }
 
@@ -1366,99 +1328,6 @@ impl PostgresBackend {
                 v.map(CursorValue::String).unwrap_or(CursorValue::Null)
             }
         }
-    }
-
-    /// Extract references from a resource for a given search parameter.
-    fn extract_references(content: &serde_json::Value, search_param: &str) -> Vec<String> {
-        let mut refs = Vec::new();
-        if let Some(value) = content.get(search_param) {
-            Self::collect_references_from_value(value, &mut refs);
-        }
-        refs
-    }
-
-    /// Recursively collect reference strings from a JSON value.
-    fn collect_references_from_value(value: &serde_json::Value, refs: &mut Vec<String>) {
-        match value {
-            serde_json::Value::Object(obj) => {
-                if let Some(serde_json::Value::String(ref_str)) = obj.get("reference") {
-                    refs.push(ref_str.clone());
-                }
-                for v in obj.values() {
-                    Self::collect_references_from_value(v, refs);
-                }
-            }
-            serde_json::Value::Array(arr) => {
-                for item in arr {
-                    Self::collect_references_from_value(item, refs);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    /// Parse a reference string into (type, id).
-    fn parse_reference(reference: &str) -> Option<(String, String)> {
-        let path = reference
-            .strip_prefix("http://")
-            .or_else(|| reference.strip_prefix("https://"))
-            .map(|s| s.rsplit('/').take(2).collect::<Vec<_>>())
-            .unwrap_or_else(|| reference.split('/').collect());
-
-        if path.len() >= 2 {
-            if reference.starts_with("http") {
-                Some((path[1].to_string(), path[0].to_string()))
-            } else {
-                Some((path[0].to_string(), path[1].to_string()))
-            }
-        } else {
-            None
-        }
-    }
-
-    /// Fetch a single resource by type and ID.
-    async fn fetch_resource(
-        client: &deadpool_postgres::Client,
-        tenant_id: &str,
-        resource_type: &str,
-        id: &str,
-    ) -> StorageResult<Option<StoredResource>> {
-        // One statement per included reference: an `_include` that resolves 20
-        // subjects issues this 20 times for one search. Literal text, primary-key
-        // lookup — the safest thing in the file to cache, and it was the only
-        // hot uncached statement left outside the query builder's output.
-        let rows = query_dyn_cached(
-            client,
-            "SELECT version_id, data, last_updated, fhir_version FROM resources
-                 WHERE tenant_id = $1 AND resource_type = $2 AND id = $3 AND is_deleted = FALSE",
-            &[&tenant_id, &resource_type, &id],
-        )
-        .await
-        .or_query_error("Failed to fetch resource")?;
-
-        if rows.is_empty() {
-            return Ok(None);
-        }
-
-        let row = &rows[0];
-        let version_id: String = row.get(0);
-        let json_data: serde_json::Value = row.get(1);
-        let last_updated: chrono::DateTime<Utc> = row.get(2);
-        let fhir_version_str: String = row.get(3);
-        let fhir_version = FhirVersion::from_storage(&fhir_version_str)
-            .unwrap_or_else(helios_fhir::FhirVersion::default_enabled);
-
-        Ok(Some(StoredResource::from_storage(
-            resource_type,
-            id,
-            version_id,
-            crate::tenant::TenantId::new(tenant_id),
-            json_data,
-            last_updated,
-            last_updated,
-            None,
-            fhir_version,
-        )))
     }
 }
 
