@@ -166,6 +166,19 @@ where
             }]
         })));
     }
+    if out.includes_truncated {
+        bundle.entry.push(BundleEntry::outcome_entry(serde_json::json!({
+            "resourceType": "OperationOutcome",
+            "issue": [{
+                "severity": "information",
+                "code": "informational",
+                "diagnostics": format!(
+                    "Supporting resources exceeded the server's limit of {} and were truncated",
+                    state.everything_max_unpaged()
+                )
+            }]
+        })));
+    }
     crate::public_url::rewrite_bundle_full_urls(&mut bundle, |resource_type, id| {
         state.public_url_for_request(&tenant, [resource_type, id])
     });

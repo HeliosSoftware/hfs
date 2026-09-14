@@ -15,6 +15,10 @@ pub(crate) struct WalkOutput {
     pub included: Vec<StoredResource>,
     pub next: Option<EverythingCursor>,
     pub ceiling_hit: bool,
+    /// `true` when the number of distinct supporting-resource references
+    /// found on this page's matches exceeded the resolution cap, so some
+    /// were not resolved into `included`.
+    pub includes_truncated: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -116,17 +120,24 @@ where
     Ok(Step::Done)
 }
 
+/// Resolves the supporting resources referenced by `matches`, stopping after
+/// `limit` distinct references. Returns the resolved resources and whether
+/// truncation occurred (i.e. there were more than `limit` distinct
+/// references).
 async fn resolve_supporting<S>(
     state: &AppState<S>,
     tenant: &TenantContext,
     version: FhirVersion,
     matches: &[StoredResource],
-) -> RestResult<Vec<StoredResource>>
+    limit: usize,
+) -> RestResult<(Vec<StoredResource>, bool)>
 where
     S: ResourceStorage + SearchProvider + Send + Sync,
 {
+    let refs = collect_supporting_refs(version, matches);
+    let truncated = refs.len() > limit;
     let mut included = Vec::new();
-    for (rt, id) in collect_supporting_refs(version, matches) {
+    for (rt, id) in refs.into_iter().take(limit) {
         match state.storage().read(tenant, &rt, &id).await {
             Ok(Some(res)) => included.push(res),
             Ok(None) => {}
@@ -138,7 +149,7 @@ where
             Err(e) => return Err(e.into()),
         }
     }
-    Ok(included)
+    Ok((included, truncated))
 }
 
 pub(crate) async fn walk_patient<S>(
@@ -184,12 +195,14 @@ where
         Step::Done => None,
     };
     let ceiling_hit = limits.page.is_none() && next.is_some();
-    let included = resolve_supporting(state, tenant, version, &matches).await?;
+    let (included, includes_truncated) =
+        resolve_supporting(state, tenant, version, &matches, limits.unpaged_ceiling).await?;
     Ok(WalkOutput {
         matches,
         included,
         next,
         ceiling_hit,
+        includes_truncated,
     })
 }
 
@@ -298,11 +311,108 @@ where
         Some(c)
     };
     let ceiling_hit = limits.page.is_none() && next.is_some();
-    let included = resolve_supporting(state, tenant, version, &matches).await?;
+    let (included, includes_truncated) =
+        resolve_supporting(state, tenant, version, &matches, limits.unpaged_ceiling).await?;
     Ok(WalkOutput {
         matches,
         included,
         next,
         ceiling_hit,
+        includes_truncated,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    use helios_persistence::backends::sqlite::{SqliteBackend, SqliteBackendConfig};
+    use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
+
+    use super::*;
+    use crate::config::ServerConfig;
+
+    fn data_dir() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data")
+    }
+
+    async fn state_with_backend() -> AppState<SqliteBackend> {
+        let backend = SqliteBackend::with_config(
+            ":memory:",
+            SqliteBackendConfig {
+                data_dir: Some(data_dir()),
+                ..Default::default()
+            },
+        )
+        .expect("create sqlite backend");
+        backend.init_schema().expect("init schema");
+        AppState::new(Arc::new(backend), ServerConfig::for_testing())
+    }
+
+    fn tenant() -> TenantContext {
+        TenantContext::new(TenantId::new("test"), TenantPermissions::full_access())
+    }
+
+    /// `resolve_supporting` stops after `limit` distinct supporting refs and
+    /// reports truncation whenever there were more than `limit` distinct
+    /// refs to resolve — regardless of whether the excess ones would have
+    /// resolved successfully. This is asserted directly (rather than via a
+    /// full router walk) because the include cap and the match-page ceiling
+    /// share one knob (`unpaged_ceiling`): a router-level page small enough
+    /// to trigger the include cap also caps matches-per-page so low that
+    /// only a single match (with a single supporting ref) reaches
+    /// `resolve_supporting`, so the truncation path is never exercised at
+    /// the router layer with the shared seed data.
+    #[tokio::test]
+    async fn resolve_supporting_caps_distinct_refs_and_reports_truncation() {
+        let state = state_with_backend().await;
+        let t = tenant();
+
+        for id in ["dr1", "dr2", "dr3"] {
+            state
+                .storage()
+                .create(
+                    &t,
+                    "Practitioner",
+                    serde_json::json!({"resourceType": "Practitioner", "id": id}),
+                    FhirVersion::R4,
+                )
+                .await
+                .expect("create practitioner");
+        }
+        let patient = StoredResource::new(
+            "Patient",
+            "p1",
+            TenantId::new("test"),
+            serde_json::json!({
+                "resourceType": "Patient",
+                "id": "p1",
+                "generalPractitioner": [
+                    {"reference": "Practitioner/dr1"},
+                    {"reference": "Practitioner/dr2"},
+                    {"reference": "Practitioner/dr3"}
+                ]
+            }),
+            FhirVersion::R4,
+        );
+
+        // Cap below the number of distinct refs: resolution stops early and
+        // truncation is reported.
+        let (included, truncated) =
+            resolve_supporting(&state, &t, FhirVersion::R4, std::slice::from_ref(&patient), 2)
+                .await
+                .unwrap();
+        assert_eq!(included.len(), 2, "{included:?}");
+        assert!(truncated);
+
+        // Cap at (or above) the number of distinct refs: nothing is
+        // truncated.
+        let (included, truncated) =
+            resolve_supporting(&state, &t, FhirVersion::R4, std::slice::from_ref(&patient), 3)
+                .await
+                .unwrap();
+        assert_eq!(included.len(), 3, "{included:?}");
+        assert!(!truncated);
+    }
 }
