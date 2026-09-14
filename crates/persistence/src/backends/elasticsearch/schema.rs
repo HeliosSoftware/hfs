@@ -3,7 +3,10 @@
 //! Defines the index structure for FHIR resources in Elasticsearch.
 //! Uses nested objects for search parameters to ensure correct multi-value matching.
 
-use elasticsearch::indices::{IndicesCreateParts, IndicesExistsParts, IndicesPutTemplateParts};
+use elasticsearch::indices::{
+    IndicesCreateParts, IndicesExistsParts, IndicesGetSettingsParts, IndicesPutSettingsParts,
+    IndicesPutTemplateParts,
+};
 use serde_json::json;
 
 use crate::error::{BackendError, StorageResult};
@@ -24,6 +27,7 @@ pub fn create_index_mapping(config: &super::backend::ElasticsearchConfig) -> ser
             "number_of_shards": config.number_of_shards,
             "number_of_replicas": config.number_of_replicas,
             "index.max_result_window": config.max_result_window,
+            "index.mapping.nested_objects.limit": config.nested_objects_limit,
             "refresh_interval": config.refresh_interval,
             "analysis": {
                 "normalizer": {
@@ -259,6 +263,121 @@ pub async fn create_index_template(backend: &ElasticsearchBackend) -> StorageRes
 }
 
 /// Ensures an index exists for the given tenant and resource type, creating it if necessary.
+/// The index setting capping how many nested objects one document may hold.
+const NESTED_OBJECTS_LIMIT_SETTING: &str = "index.mapping.nested_objects.limit";
+
+/// Raises the nested-object limit on every existing index under the configured
+/// prefix whose current limit is below the configured one, and returns how many
+/// indices were raised.
+///
+/// New indices take the limit from the index template, but a template only
+/// applies when an index is created. A deployment that indexed data before
+/// #1050 keeps Elasticsearch's default of 10000 on those indices, and keeps
+/// silently dropping large resources from search on the next write or
+/// `$reindex`. The setting is dynamic, so it changes on a live index without
+/// closing or reindexing it.
+///
+/// The limit is only ever raised: an index an operator already set higher by
+/// hand is left alone.
+pub async fn raise_nested_objects_limit(backend: &ElasticsearchBackend) -> StorageResult<usize> {
+    /// Index names per update request, keeping the request URL short.
+    const INDICES_PER_REQUEST: usize = 50;
+
+    let target = u64::from(backend.config().nested_objects_limit);
+    let pattern = format!("{}_*", backend.config().index_prefix);
+
+    let response = backend
+        .client()
+        .indices()
+        .get_settings(IndicesGetSettingsParts::IndexName(
+            &[&pattern],
+            &[NESTED_OBJECTS_LIMIT_SETTING],
+        ))
+        .include_defaults(true)
+        .flat_settings(true)
+        .allow_no_indices(true)
+        .ignore_unavailable(true)
+        .send()
+        .await
+        .map_err(|e| settings_error(format!("Failed to read index settings: {e}")))?;
+    let status = response.status_code();
+    let body: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|e| settings_error(format!("Failed to parse index settings: {e}")))?;
+    if !status.is_success() {
+        return Err(settings_error(format!(
+            "Reading index settings failed (status {status}): {body}"
+        )));
+    }
+
+    let below = indices_below_nested_limit(&body, target);
+    for chunk in below.chunks(INDICES_PER_REQUEST) {
+        let names: Vec<&str> = chunk.iter().map(String::as_str).collect();
+        let mut settings = serde_json::Map::new();
+        settings.insert(NESTED_OBJECTS_LIMIT_SETTING.to_string(), json!(target));
+        let response = backend
+            .client()
+            .indices()
+            .put_settings(IndicesPutSettingsParts::Index(&names))
+            .body(serde_json::Value::Object(settings))
+            .send()
+            .await
+            .map_err(|e| {
+                settings_error(format!(
+                    "Failed to raise {NESTED_OBJECTS_LIMIT_SETTING}: {e}"
+                ))
+            })?;
+        let status = response.status_code();
+        if !status.is_success() {
+            let text = response.text().await.unwrap_or_default();
+            return Err(settings_error(format!(
+                "Raising {NESTED_OBJECTS_LIMIT_SETTING} failed (status {status}): {text}"
+            )));
+        }
+    }
+    Ok(below.len())
+}
+
+/// The indices in a `GET _settings?include_defaults=true&flat_settings=true`
+/// response whose nested-object limit is below `target`, sorted by name.
+///
+/// An explicit per-index value wins over the cluster default. An index that
+/// reports the setting in neither place is left alone rather than guessed at.
+fn indices_below_nested_limit(body: &serde_json::Value, target: u64) -> Vec<String> {
+    let Some(indices) = body.as_object() else {
+        return Vec::new();
+    };
+    let mut below: Vec<String> = indices
+        .iter()
+        .filter_map(|(name, entry)| {
+            let value = entry
+                .get("settings")
+                .and_then(|s| s.get(NESTED_OBJECTS_LIMIT_SETTING))
+                .or_else(|| {
+                    entry
+                        .get("defaults")
+                        .and_then(|d| d.get(NESTED_OBJECTS_LIMIT_SETTING))
+                })?;
+            let current = value
+                .as_str()
+                .and_then(|s| s.parse::<u64>().ok())
+                .or_else(|| value.as_u64())?;
+            (current < target).then(|| name.clone())
+        })
+        .collect();
+    below.sort();
+    below
+}
+
+fn settings_error(message: String) -> crate::error::StorageError {
+    crate::error::StorageError::Backend(BackendError::Internal {
+        backend_name: "elasticsearch".to_string(),
+        message,
+        source: None,
+    })
+}
+
 pub async fn ensure_index(
     backend: &ElasticsearchBackend,
     tenant_id: &str,
@@ -468,6 +587,12 @@ mod tests {
         // Verify settings
         assert_eq!(mapping["settings"]["number_of_shards"], 1);
         assert_eq!(mapping["settings"]["number_of_replicas"], 1);
+        // #1050: raised above Elasticsearch's 10000 default, which silently
+        // drops resources with many indexed values from search.
+        assert_eq!(
+            mapping["settings"]["index.mapping.nested_objects.limit"],
+            50_000
+        );
 
         // Verify mappings exist
         let props = &mapping["mappings"]["properties"];
@@ -488,5 +613,40 @@ mod tests {
 
         // Verify normalizer
         assert!(mapping["settings"]["analysis"]["normalizer"]["lowercase_normalizer"].is_object());
+    }
+
+    /// #1050: which existing indices the startup pass raises. An explicit
+    /// value beats the cluster default, an index already above the target is
+    /// never lowered, and an index that reports no value is not guessed at.
+    #[test]
+    fn test_indices_below_nested_limit() {
+        let body = json!({
+            "hfs_t_provenance": {
+                "settings": {},
+                "defaults": { "index.mapping.nested_objects.limit": "10000" }
+            },
+            "hfs_t_observation": {
+                "settings": { "index.mapping.nested_objects.limit": "10000" },
+                "defaults": {}
+            },
+            "hfs_t_patient": {
+                "settings": { "index.mapping.nested_objects.limit": "80000" },
+                "defaults": { "index.mapping.nested_objects.limit": "10000" }
+            },
+            "hfs_t_encounter": {
+                "settings": { "index.mapping.nested_objects.limit": "50000" }
+            },
+            "hfs_t_unknown": { "settings": {}, "defaults": {} }
+        });
+
+        assert_eq!(
+            indices_below_nested_limit(&body, 50_000),
+            vec![
+                "hfs_t_observation".to_string(),
+                "hfs_t_provenance".to_string()
+            ]
+        );
+        assert!(indices_below_nested_limit(&json!({}), 50_000).is_empty());
+        assert!(indices_below_nested_limit(&json!("not an object"), 50_000).is_empty());
     }
 }
