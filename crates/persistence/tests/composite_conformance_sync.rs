@@ -55,6 +55,7 @@ async fn conformance_seeding_reaches_the_search_secondary() {
         FhirVersion::R4,
         &data_dir(),
         "default",
+        None,
     )
     .await;
 
@@ -121,6 +122,7 @@ async fn synchronous_batch_seeding_reaches_the_search_secondary() {
         FhirVersion::R4,
         &data_dir(),
         "default",
+        None,
     )
     .await;
     assert!(first.created > 1000, "first seed created: {first:?}");
@@ -142,6 +144,7 @@ async fn synchronous_batch_seeding_reaches_the_search_secondary() {
         FhirVersion::R4,
         &data_dir(),
         "default",
+        None,
     )
     .await;
     assert_eq!(second.created, 0, "second seed: {second:?}");

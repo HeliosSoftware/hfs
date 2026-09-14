@@ -35,6 +35,9 @@ HFS_SERVER_PORT=3000 HFS_LOG_LEVEL=debug cargo run --bin hfs
 | `HFS_LOG_LEVEL` | `info` | Log level: error, warn, info, debug, trace |
 | `HFS_BASE_URL` | `http://localhost:8080` | Public HTTP(S) base for Location headers and Bundle links |
 | `HFS_DATA_DIR` | `./data` | FHIR data directory, including search parameters |
+| `HFS_DASHBOARD_RECONCILE_SECS` | `30` | Seconds between Home dashboard reconcile passes (`--dashboard-reconcile-interval-secs`). Whole seconds, `> 0`; `0` or non-numeric fails startup. Also spaces per-tenant full recounts (max(interval, 10 × last recount duration)) and failed-seed retries |
+| `HFS_DASHBOARD_REFRESH_SECS` | `5` | Seconds between refreshes of a Home dashboard whose figures are moving (`--dashboard-refresh-secs`). Whole seconds, `> 0`, `<=` `HFS_DASHBOARD_IDLE_REFRESH_SECS`; otherwise fails startup. In-memory counters only |
+| `HFS_DASHBOARD_IDLE_REFRESH_SECS` | `10` | Seconds between watch ticks of a settled Home dashboard (`--dashboard-idle-refresh-secs`). Whole seconds, `> 0`, `>=` `HFS_DASHBOARD_REFRESH_SECS`; otherwise fails startup |
 
 Set `HFS_BASE_URL` explicitly for containers and reverse proxies. Include any
 published path prefix. HFS rejects non-HTTP(S) values, credentials, query

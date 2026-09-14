@@ -691,3 +691,165 @@ async fn a_lost_lease_aborts_the_run_quietly() {
         "the stale worker must not ingest under a lost lease"
     );
 }
+
+/// #1078: a manifest reclaimed after its first worker died re-walks its file
+/// from the top. The observer hears every batch the new worker commits, and
+/// the entries the dead worker had already committed come back as updates —
+/// so the live counts see each resource created exactly once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reclaimed_manifest_reports_reingested_entries_as_updates() {
+    use std::sync::Mutex;
+
+    use helios_persistence::backends::local_fs::LocalFsOutputStore;
+    use helios_persistence::core::{
+        BulkSubmitJobStore, DefaultSubmitWorker, ExportOutputStore, RemoteFile, RemoteManifest,
+        ResourceStorage, SubmitInputFetcher, WorkerId, WriteEvent, WriteObserver, WriteOrigin,
+    };
+    use helios_persistence::error::StorageResult;
+
+    const URL: &str = "https://provider.example/reclaim/file-0.ndjson";
+
+    struct InMemoryFetcher {
+        manifest: RemoteManifest,
+        lines: Vec<u8>,
+    }
+
+    #[async_trait::async_trait]
+    impl SubmitInputFetcher for InMemoryFetcher {
+        async fn fetch_manifest(
+            &self,
+            _url: &str,
+            _headers: &[(String, String)],
+            _oauth: &[String],
+            _key: Option<&serde_json::Value>,
+        ) -> StorageResult<RemoteManifest> {
+            Ok(self.manifest.clone())
+        }
+
+        async fn open_file_stream(
+            &self,
+            _url: &str,
+            _headers: &[(String, String)],
+            _requires_access_token: bool,
+            _oauth: &[String],
+            _key: Option<&serde_json::Value>,
+        ) -> StorageResult<(Box<dyn tokio::io::AsyncBufRead + Send + Unpin>, Option<u64>)> {
+            let len = self.lines.len() as u64;
+            Ok((
+                Box::new(tokio::io::BufReader::new(std::io::Cursor::new(
+                    self.lines.clone(),
+                ))),
+                Some(len),
+            ))
+        }
+    }
+
+    #[derive(Default)]
+    struct Recording(Mutex<Vec<(u64, u64, u64)>>);
+
+    impl WriteObserver for Recording {
+        fn on_write(&self, event: &WriteEvent) {
+            match event {
+                WriteEvent::Counts {
+                    tenant,
+                    resource_type,
+                    created,
+                    updated,
+                    deleted,
+                    origin,
+                    ..
+                } => {
+                    assert_eq!(tenant.as_str(), "submit-tenant");
+                    assert_eq!(resource_type, "Patient");
+                    assert_eq!(*origin, WriteOrigin::BulkSubmit);
+                    self.0.lock().unwrap().push((*created, *updated, *deleted));
+                }
+                other => panic!("unexpected write event {other:?}"),
+            }
+        }
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let backend = SqliteBackend::with_config(
+        tmp.path().join("submit-reclaim.db").to_str().unwrap(),
+        SqliteBackendConfig::default(),
+    )
+    .unwrap();
+    backend.init_schema().unwrap();
+    let backend = Arc::new(backend);
+    let (sub_id, manifest_id) = seed(&backend, "reclaim").await;
+    let lines = ndjson("reclaim", 250);
+
+    // The first worker claims the manifest and commits its first 120 entries
+    // (the first 120 lines, in batches) before it dies holding the lease.
+    let jobs: Arc<dyn BulkSubmitJobStore> = backend.clone();
+    let dead = jobs
+        .claim_next_manifest(&WorkerId::new("dead-worker"), Duration::from_secs(1))
+        .await
+        .unwrap()
+        .expect("a pending manifest to claim");
+    let head: Vec<u8> = lines
+        .split_inclusive(|b| *b == b'\n')
+        .take(120)
+        .flatten()
+        .copied()
+        .collect();
+    let partial = backend
+        .process_ndjson_stream(
+            &dead.tenant,
+            &sub_id,
+            &manifest_id,
+            "Patient",
+            Box::new(tokio::io::BufReader::new(std::io::Cursor::new(head))),
+            &BulkProcessingOptions::new()
+                .with_batch_size(50)
+                .with_file_url(URL),
+        )
+        .await
+        .unwrap();
+    assert_eq!(partial.counts.success, 120);
+
+    // Its lease lapses and a second worker reclaims the manifest.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let rival_id = WorkerId::new("rival-worker");
+    let rival = jobs
+        .claim_next_manifest(&rival_id, Duration::from_secs(60))
+        .await
+        .unwrap()
+        .expect("the expired lease must be reclaimable");
+    assert!(rival.fencing_token > dead.fencing_token);
+
+    let fetcher: Arc<dyn SubmitInputFetcher> = Arc::new(InMemoryFetcher {
+        manifest: RemoteManifest {
+            output: vec![RemoteFile {
+                resource_type: Some("Patient".to_string()),
+                url: URL.to_string(),
+                count: None,
+            }],
+            ..Default::default()
+        },
+        lines,
+    });
+    let output: Arc<dyn ExportOutputStore> = Arc::new(LocalFsOutputStore::new(
+        tmp.path().join("out"),
+        "http://localhost:8080",
+    ));
+    let recording = Arc::new(Recording::default());
+    let observer: Arc<dyn WriteObserver> = recording.clone();
+    let worker = DefaultSubmitWorker::new(jobs.clone(), fetcher, output, rival_id)
+        .with_write_observer(Some(observer));
+    tokio::time::timeout(Duration::from_secs(60), worker.run_job(rival))
+        .await
+        .expect("the reclaimed manifest must finish")
+        .unwrap();
+
+    // Worker batches are 100 entries: the first is entirely re-ingested, the
+    // second straddles the dead worker's last committed line.
+    assert_eq!(
+        *recording.0.lock().unwrap(),
+        vec![(0, 100, 0), (80, 20, 0), (50, 0, 0)],
+        "re-ingested entries are updates; only the 130 new ones are creates"
+    );
+    let total = backend.count(&tenant(), Some("Patient")).await.unwrap();
+    assert_eq!(total, 250);
+}

@@ -15,7 +15,9 @@
   and `count` (the type rails' live count, `partials/type_rail.html`) are
   mutually exclusive in practice — a page's `ResolvedRailEntry`s only ever
   populate the one its own list uses — but both render conditionally so the
-  same macro serves every rail unchanged.
+  same macro serves every rail unchanged. `approximate` (#1078) marks the
+  counts as counted from recent writes, exactly as `partials/type_rail.html`
+  renders them; rails without live counts pass `false`.
 
   `rail_page` and `max_recent` are the only values a client script needs to
   write this page's own `rails.<page>` record back — the single source for
@@ -24,7 +26,7 @@
   (no store configured renders the same way), so CSS never has to key off
   its absence.
 -->
-{% macro group(id, rail_list_id, rail_page, max_recent, heading, entries) %}
+{% macro group(id, rail_list_id, rail_page, max_recent, heading, entries, approximate) %}
 <div class="filter-rail__group" id="{{ id }}"
      data-rail-page="{{ rail_page }}" data-max-recent="{{ max_recent }}"
      data-rail-list="{{ rail_list_id }}"{% if entries.is_empty() %} hidden{% endif %}>
@@ -34,7 +36,7 @@
      href="{{ e.href }}" title="{{ e.label }}"{% if e.current %} aria-current="true"{% endif %}>
     <span class="filter-rail__label">{{ e.label }}</span>
     {% if let Some(m) = e.meta %}<span class="filter-rail__meta">{{ m }}</span>{% endif %}
-    {% if let Some(c) = e.count %}<span class="count">{{ c }}</span>{% endif %}
+    {% if let Some(c) = e.count %}{% if approximate %}<span class="count count--approximate" title="{{ i18n.t("rail-count-approximate") }}">≈{{ c }}<span class="visually-hidden"> {{ i18n.t("rail-count-approximate") }}</span></span>{% else %}<span class="count">{{ c }}</span>{% endif %}{% endif %}
   </a>
   {% endfor %}
 </div>

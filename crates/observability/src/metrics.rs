@@ -11,7 +11,7 @@ use std::sync::OnceLock;
 use axum::{Router, http::StatusCode, response::IntoResponse, routing::get};
 use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
 
-use crate::uptime;
+use crate::{dashboard_metrics, uptime};
 
 static HANDLE: OnceLock<PrometheusHandle> = OnceLock::new();
 
@@ -38,16 +38,39 @@ pub fn init(service_name: &str) {
     if HANDLE.get().is_some() {
         return;
     }
-    let handle = PrometheusBuilder::new()
-        .add_global_label("service", service_name)
-        .set_buckets_for_metric(
-            Matcher::Full("http_request_duration_seconds".to_string()),
-            LATENCY_BUCKETS,
-        )
-        .expect("failed to set latency histogram buckets")
+    let handle = builder(service_name)
         .install_recorder()
         .expect("failed to install Prometheus recorder");
     let _ = HANDLE.set(handle);
+}
+
+/// The exporter configuration [`init`] installs: the `service` label and the
+/// explicit histogram buckets. Split out so tests can build an identical,
+/// thread-local recorder without installing a global one.
+pub(crate) fn builder(service_name: &str) -> PrometheusBuilder {
+    let histograms: [(&str, &[f64]); 4] = [
+        ("http_request_duration_seconds", LATENCY_BUCKETS),
+        (
+            dashboard_metrics::RECONCILE_PASS_DURATION,
+            dashboard_metrics::DURATION_BUCKETS,
+        ),
+        (
+            dashboard_metrics::STORAGE_QUERY_DURATION,
+            dashboard_metrics::DURATION_BUCKETS,
+        ),
+        (
+            dashboard_metrics::RECONCILE_CORRECTION,
+            dashboard_metrics::CORRECTION_BUCKETS,
+        ),
+    ];
+    histograms.into_iter().fold(
+        PrometheusBuilder::new().add_global_label("service", service_name),
+        |builder, (name, buckets)| {
+            builder
+                .set_buckets_for_metric(Matcher::Full(name.to_string()), buckets)
+                .expect("histogram buckets are non-empty")
+        },
+    )
 }
 
 /// A state-free [`Router`] exposing `GET /metrics`. Merge it into each server's
@@ -61,6 +84,12 @@ pub fn router() -> Router {
 // and tenant is never a metric label — exporting per-tenant counts would leak
 // cross-tenant data to any anonymous scraper. Per-tenant stored-resource counts
 // are served only via the authenticated console `resource-counts` JSON endpoint.
+//
+// The same rule covers every other metric exported here, including the
+// dashboard reconcile metrics in `crate::dashboard_metrics`: they are
+// process-level only. No tenant or resource-type label, and no metric from
+// which the number of tenants could be derived (no per-tenant series to count,
+// no tenant totals). Per-tenant dashboard figures stay behind authentication.
 
 /// Render the Prometheus exposition text. The `uptime_seconds` gauge is set
 /// immediately before rendering because the pull exporter has no scrape

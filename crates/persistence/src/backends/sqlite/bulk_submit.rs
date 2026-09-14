@@ -974,6 +974,8 @@ impl BulkSubmitProvider for SqliteBackend {
         }
 
         crate::core::Transaction::commit(Box::new(txn)).await?;
+        // Durable now: report it before the max-errors return below (#1078).
+        options.notify_batch_committed(tenant, submission_id, manifest_id, &results);
 
         if aborted_on_max_errors {
             return Err(StorageError::BulkSubmit(
@@ -5210,6 +5212,95 @@ mod tests {
             .map(|i| format!("{{\"resourceType\":\"Patient\",\"id\":\"cancel-{i}\"}}\n"))
             .collect::<String>()
             .into_bytes()
+    }
+
+    /// #1078: the batch observer hears every committed batch, with only that
+    /// batch's results, and each result's `created` comes from the committing
+    /// write — so ingesting the same ids again reads as updates.
+    #[tokio::test]
+    async fn batch_observer_hears_each_committed_batch_with_its_created_flags() {
+        use crate::core::bulk_submit::{BatchCommitObserver, BatchCommitted};
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Default)]
+        struct Recording(Mutex<Vec<Vec<(String, bool)>>>);
+        impl BatchCommitObserver for Recording {
+            fn batch_committed(&self, batch: &BatchCommitted<'_>) {
+                assert_eq!(batch.tenant.tenant_id().as_str(), "test-tenant");
+                self.0.lock().unwrap().push(
+                    batch
+                        .results
+                        .iter()
+                        .map(|r| {
+                            assert!(r.is_success());
+                            (r.resource_id.clone().unwrap(), r.created)
+                        })
+                        .collect(),
+                );
+            }
+        }
+
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+        let sub_id = SubmissionId::generate("test-system");
+        backend
+            .create_submission(&tenant, &sub_id, None)
+            .await
+            .unwrap();
+        let manifest = backend
+            .add_manifest(&tenant, &sub_id, None, None)
+            .await
+            .unwrap();
+
+        let lines: Vec<u8> = (1..=5)
+            .map(|i| format!("{{\"resourceType\":\"Patient\",\"id\":\"obs-{i}\"}}\n"))
+            .collect::<String>()
+            .into_bytes();
+        let mut runs = Vec::new();
+        for _ in 0..2 {
+            let recording = Arc::new(Recording::default());
+            let options = BulkProcessingOptions::new()
+                .with_batch_size(2)
+                .with_file_url("http://provider/patient.ndjson")
+                .with_batch_observer(recording.clone());
+            let reader = Box::new(tokio::io::BufReader::new(std::io::Cursor::new(
+                lines.clone(),
+            )));
+            backend
+                .process_ndjson_stream(
+                    &tenant,
+                    &sub_id,
+                    &manifest.manifest_id,
+                    "Patient",
+                    reader,
+                    &options,
+                )
+                .await
+                .unwrap();
+            runs.push(recording.0.lock().unwrap().clone());
+        }
+
+        let batch = |ids: &[u32], created: bool| -> Vec<(String, bool)> {
+            ids.iter().map(|i| (format!("obs-{i}"), created)).collect()
+        };
+        assert_eq!(
+            runs[0],
+            vec![
+                batch(&[1, 2], true),
+                batch(&[3, 4], true),
+                batch(&[5], true)
+            ],
+            "one notification per committed batch, all creates"
+        );
+        assert_eq!(
+            runs[1],
+            vec![
+                batch(&[1, 2], false),
+                batch(&[3, 4], false),
+                batch(&[5], false)
+            ],
+            "re-ingested ids are reported as updates"
+        );
     }
 
     /// #968: a token already tripped when the ingest starts stops it before it

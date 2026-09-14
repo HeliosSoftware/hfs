@@ -111,6 +111,7 @@ pub mod storage;
 pub mod transaction;
 pub mod user_settings;
 pub mod versioned;
+pub mod write_observer;
 
 // Re-export main types
 pub use backend::{Backend, BackendCapability, BackendConfig, BackendKind, BackendPoolStats};
@@ -129,12 +130,13 @@ pub use bulk_export_worker::{
 };
 pub use bulk_provider::{BulkProviderStore, StoredProviderSubmission};
 pub use bulk_submit::{
-    BulkEntryOutcome, BulkEntryResult, BulkProcessingOptions, BulkSubmitProvider,
-    BulkSubmitRollbackProvider, ChangeType, EntryCountSummary, EntryResultContinuation,
-    EntryResultCursor, EntryResultPage, IMPORT_MODE_PARAMETER_URL, ImportMode, ManifestPhase,
-    ManifestStatus, NdjsonEntry, PagedEntryResult, StreamProcessingResult,
-    StreamingBulkSubmitProvider, SubmissionChange, SubmissionId, SubmissionManifest,
-    SubmissionStatus, SubmissionSummary, UnindexedEntry, merge_resource,
+    BatchCommitObserver, BatchCommitted, BatchObserverHandle, BulkEntryOutcome, BulkEntryResult,
+    BulkProcessingOptions, BulkSubmitProvider, BulkSubmitRollbackProvider, ChangeType,
+    EntryCountSummary, EntryResultContinuation, EntryResultCursor, EntryResultPage,
+    IMPORT_MODE_PARAMETER_URL, ImportMode, ManifestPhase, ManifestStatus, NdjsonEntry,
+    PagedEntryResult, StreamProcessingResult, StreamingBulkSubmitProvider, SubmissionChange,
+    SubmissionId, SubmissionManifest, SubmissionStatus, SubmissionSummary, UnindexedEntry,
+    merge_resource,
 };
 pub use bulk_submit_input::{
     FileTokenProvider, RemoteFile, RemoteManifest, SubmitInputFetcher, submission_output_job_id,
@@ -171,14 +173,19 @@ pub use sof_runner::{RowStream, SofError, SofRunner, ViewFilters, ViewRow};
 pub use storage::{
     ActivityCell, ConditionalCreateResult, ConditionalDeleteResult, ConditionalPatchResult,
     ConditionalStorage, ConditionalUpdateResult, DailyResourceCount, PatchFormat, PurgableStorage,
-    ResourceCountDelta, ResourceStorage, TenantRecord, bucket_floor,
+    ResourceCountDelta, ResourceStorage, TenantRecord, WriteMarker, bucket_floor,
 };
 pub use transaction::{
-    BundleEntry, BundleEntryResult, BundleMethod, BundleProvider, BundleResult, BundleType,
-    IsolationLevel, LockingStrategy, Transaction, TransactionOptions, TransactionProvider,
+    BundleEntry, BundleEntryEffect, BundleEntryResult, BundleMethod, BundleProvider, BundleResult,
+    BundleType, IsolationLevel, LockingStrategy, Transaction, TransactionOptions,
+    TransactionProvider,
 };
 pub use user_settings::{
     BY_TENANT_KEY, GLOBAL_SETTINGS_KEYS, SettingsStore, StoredUserSettings, apply_merge_patch,
     normalize_legacy, project_for_tenant, purge_tenant_subtree, scope_merge_patch, stored_for_put,
 };
 pub use versioned::{VersionConflictInfo, VersionedStorage, check_version_match, normalize_etag};
+pub use write_observer::{
+    ErasedScope, ResourceWrite, WriteEvent, WriteKind, WriteNotice, WriteObserver, WriteObservers,
+    WriteOrigin,
+};

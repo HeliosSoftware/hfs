@@ -457,9 +457,30 @@ http_request_duration_seconds{service="hfs",...}                                
 uptime_seconds{service="hfs"}                                                                14691.53
 ```
 
+The Home dashboard's reconcile loop (see `HFS_DASHBOARD_RECONCILE_SECS`) adds
+its own series. Like the HTTP series they have no `hfs_` prefix, carry only the
+global `service` label, and have no tenant or resource-type label:
+
+| Series | Type | Meaning |
+|--------|------|---------|
+| `dashboard_reconcile_pass_duration_seconds` | histogram | Wall time of one reconcile pass |
+| `dashboard_reconcile_last_pass_timestamp_seconds` | gauge | Unix seconds when the last pass finished. Alert when `time() - value > 3 × interval` |
+| `dashboard_reconcile_interval_seconds` | gauge | The configured reconcile interval |
+| `dashboard_reconcile_restarts_total` | counter | Times the supervised loop restarted after a panic (restarts use backoff) |
+| `dashboard_storage_query_duration_seconds{query}` | histogram | Storage query time; `query` is `totals`, `history`, `write_marker`, or `job_counts` |
+| `dashboard_storage_query_errors_total{query}` | counter | Failed storage queries, same `query` values |
+| `dashboard_seed_queue_rings` | gauge | History rings waiting for a background seed (queued tenants are not exported: the depth would reveal the tenant count) |
+| `dashboard_reconcile_correction_resources` | histogram | Absolute number of resources a reconcile corrected, summed over types |
+
+A stale-timestamp alert, for example:
+
+```
+time() - dashboard_reconcile_last_pass_timestamp_seconds > 3 * dashboard_reconcile_interval_seconds
+```
+
 Per-tenant stored-resource counts are **deliberately NOT exported to
 `/metrics`**. Tenant is never a metric label (see the rule in
-`crates/observability/src/middleware.rs` and `CLAUDE.md`): because `/metrics` is
+`crates/observability/src/metrics.rs` and `crates/observability/src/middleware.rs`): because `/metrics` is
 unauthenticated, a tenant-labelled gauge would leak the identity and
 resource counts of every tenant to any anonymous scraper — the same cross-tenant
 data the `tenants` endpoint gates behind a `system/*.r` admin scope. Per-tenant

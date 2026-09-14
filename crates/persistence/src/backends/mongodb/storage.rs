@@ -1476,6 +1476,105 @@ impl ResourceStorage for MongoBackend {
         Ok(out)
     }
 
+    async fn count_deltas_by_type_and_bucket(
+        &self,
+        tenant: &TenantContext,
+        resource_types: &[&str],
+        since: DateTime<Utc>,
+        bucket_seconds: i64,
+    ) -> StorageResult<Vec<(String, crate::core::ResourceCountDelta)>> {
+        if resource_types.is_empty() {
+            return Ok(Vec::new());
+        }
+        if bucket_seconds <= 0 {
+            return Err(internal_error(
+                "count_deltas_by_type_and_bucket: bucket_seconds must be positive".to_string(),
+            ));
+        }
+        let db = self.get_database().await?;
+        let history = db.collection::<Document>(MongoBackend::RESOURCE_HISTORY_COLLECTION);
+        let tenant_id = tenant.tenant_id().as_str();
+        let bucket_ms = bucket_seconds * 1000;
+        let since_bson = BsonDateTime::from_millis(
+            crate::core::bucket_floor(since, bucket_seconds).timestamp_millis(),
+        );
+        let mut types: Vec<&str> = resource_types.to_vec();
+        types.sort_unstable();
+        types.dedup();
+
+        // One aggregation for every requested type (#1078): the same `$match`
+        // window, epoch-millis bucket arithmetic and delta rule as
+        // `count_deltas_by_bucket`, with `resource_type` narrowed by `$in` and
+        // added to the group key, so each type's rows equal its per-type call's.
+        // `idx_history_system_updated` (tenant_id, last_updated, resource_type)
+        // serves the tenant + time-range scan.
+        let epoch_ms = doc! { "$toLong": "$last_updated" };
+        let pipeline = vec![
+            doc! { "$match": {
+                "tenant_id": tenant_id,
+                "resource_type": { "$in": types },
+                "last_updated": { "$gte": since_bson },
+            }},
+            doc! { "$group": {
+                "_id": {
+                    "resource_type": "$resource_type",
+                    "bucket": { "$subtract": [
+                        epoch_ms.clone(),
+                        { "$mod": [epoch_ms, bucket_ms] },
+                    ]},
+                },
+                "delta": { "$sum": { "$switch": {
+                    "branches": [
+                        { "case": { "$eq": ["$is_deleted", true] }, "then": -1 },
+                        { "case": { "$eq": ["$version_id", "1"] }, "then": 1 },
+                    ],
+                    "default": 0,
+                }}},
+            }},
+            doc! { "$match": { "delta": { "$ne": 0 } } },
+            doc! { "$sort": { "_id.resource_type": 1, "_id.bucket": 1 } },
+        ];
+
+        let mut cursor = history
+            .aggregate(pipeline)
+            .await
+            .or_query_error("Failed to aggregate count_deltas_by_type_and_bucket")?;
+
+        let mut out = Vec::new();
+        while cursor
+            .advance()
+            .await
+            .or_query_error("count_deltas_by_type cursor advance")?
+        {
+            let doc = cursor
+                .deserialize_current()
+                .or_query_error("count_deltas_by_type cursor deserialize")?;
+            let Ok(key) = doc.get_document("_id") else {
+                continue;
+            };
+            let Ok(resource_type) = key.get_str("resource_type") else {
+                continue;
+            };
+            let bucket_ms_start = key.get_i64("bucket").unwrap_or_default();
+            // `$sum` yields an int32 for small totals and an int64 once it overflows,
+            // so accept either width rather than assuming one.
+            let delta = doc
+                .get_i64("delta")
+                .or_else(|_| doc.get_i32("delta").map(i64::from))
+                .unwrap_or_default();
+            if let Some(bucket_start) = DateTime::from_timestamp_millis(bucket_ms_start) {
+                out.push((
+                    resource_type.to_string(),
+                    crate::core::ResourceCountDelta {
+                        bucket_start,
+                        delta,
+                    },
+                ));
+            }
+        }
+        Ok(out)
+    }
+
     async fn activity_histogram(
         &self,
         tenant: &TenantContext,
@@ -1581,6 +1680,58 @@ impl ResourceStorage for MongoBackend {
             doc! { "$group": { "_id": "$tenant_id", "n": { "$sum": 1 } } },
         ];
         grouped_string_counts(resources, pipeline).await
+    }
+
+    fn supports_type_counts(&self) -> bool {
+        true
+    }
+
+    async fn latest_write_marker(
+        &self,
+        tenant: &TenantContext,
+        recent_since: Option<DateTime<Utc>>,
+    ) -> StorageResult<Option<crate::core::WriteMarker>> {
+        /// Cap on `recent_writes`: a change detector, not a figure (#1078).
+        const RECENT_CAP: u64 = 10_000;
+
+        let db = self.get_database().await?;
+        let history = db.collection::<Document>(MongoBackend::RESOURCE_HISTORY_COLLECTION);
+        let tenant_id = tenant.tenant_id().as_str();
+
+        // Newest timestamp: the first key of `idx_history_system_updated`
+        // (`tenant_id: 1, last_updated: -1, ...`) for this tenant. Projecting
+        // only `last_updated` (and dropping `_id`) keeps it a covered query —
+        // one index key, no document fetch, no in-memory sort.
+        let newest = history
+            .find_one(doc! { "tenant_id": tenant_id })
+            .sort(doc! { "last_updated": -1_i32 })
+            .projection(doc! { "_id": 0_i32, "last_updated": 1_i32 })
+            .await
+            .or_query_error("Failed to query latest write marker")?;
+        let latest = newest
+            .as_ref()
+            .and_then(|doc| doc.get_datetime("last_updated").ok())
+            .map(bson_to_chrono);
+
+        // Recent writes: a range over the same index, stopped at the cap.
+        let recent_writes = match recent_since {
+            Some(since) => Some(
+                history
+                    .count_documents(doc! {
+                        "tenant_id": tenant_id,
+                        "last_updated": { "$gte": chrono_to_bson(since) },
+                    })
+                    .limit(RECENT_CAP)
+                    .await
+                    .or_query_error("Failed to count recent writes")?,
+            ),
+            None => None,
+        };
+
+        Ok(Some(crate::core::WriteMarker {
+            latest,
+            recent_writes,
+        }))
     }
 
     fn supports_tenant_registry(&self) -> bool {
@@ -2943,7 +3094,7 @@ impl MongoBackend {
                                 pending_search_parameter_changes,
                             )
                             .await?;
-                        Ok(BundleEntryResult::ok(updated))
+                        Ok(BundleEntryResult::updated(updated))
                     }
                     None => {
                         // A supplied `ifMatch` — including `*` — cannot be
@@ -3013,8 +3164,10 @@ impl MongoBackend {
                         .await
                     {
                         Ok(()) => Ok(BundleEntryResult::deleted()),
+                        // Still 204 on the wire (delete is idempotent), but
+                        // nothing live went away (#1078).
                         Err(StorageError::Resource(ResourceError::NotFound { .. })) => {
-                            Ok(BundleEntryResult::deleted())
+                            Ok(BundleEntryResult::delete_not_found())
                         }
                         Err(e) => Err(e),
                     }

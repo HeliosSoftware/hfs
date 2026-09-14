@@ -8,19 +8,59 @@ use std::sync::Arc;
 
 use helios_audit::AuditSink;
 use helios_auth::AuthConfig;
+use helios_observability::dashboard_counters::DashboardCounters;
 use helios_persistence::core::PurgableStorage;
 use helios_persistence::core::sof_runner::SofRunner;
 use helios_persistence::core::{
     BulkExportJobStore, BulkSubmitJobStore, ExportOutputStore, ResourceStorage, SettingsStore,
-    SubmitInputFetcher,
+    SubmitInputFetcher, WriteObservers,
 };
 use helios_persistence::search::ReindexOperation;
 
 use crate::bulk_export_auth::ExportFileAuth;
 use crate::config::{BulkExportConfig, BulkSubmitConfig, ServerConfig};
 use crate::export::ExportJobController;
+use crate::handlers::dashboard_counts::DashboardCountsObserver;
 use crate::middleware::auth::AuthMiddlewareState;
 use crate::public_url::PublicUrl;
+
+/// The post-commit write observer the server's write paths report to, and the
+/// dashboard live counters it feeds (#1078).
+///
+/// Every committed write — REST handlers, batch and transaction bundles,
+/// `$bulk-submit` ingestion, conformance seeding, purges — reports one
+/// [`WriteEvent`](helios_persistence::core::WriteEvent) to [`Self::observers`].
+/// [`WriteObservability::new`] subscribes the dashboard counters; the server
+/// subscribes further consumers (the subscriptions engine) as it wires them.
+/// Cloning shares the same counters and fan-out.
+#[derive(Clone, Debug)]
+pub struct WriteObservability {
+    /// Live resource counters the Home dashboard reads.
+    pub counters: Arc<DashboardCounters>,
+    /// The fan-out every write path reports to.
+    pub observers: Arc<WriteObservers>,
+}
+
+impl WriteObservability {
+    /// Fresh counters and a fan-out with the counters already subscribed.
+    pub fn new() -> Self {
+        let counters = Arc::new(DashboardCounters::new());
+        let observers = Arc::new(WriteObservers::new());
+        observers.subscribe(Arc::new(DashboardCountsObserver::new(Arc::clone(
+            &counters,
+        ))));
+        Self {
+            counters,
+            observers,
+        }
+    }
+}
+
+impl Default for WriteObservability {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 /// Shared application state for the REST API.
 ///
@@ -124,6 +164,9 @@ pub struct AppState<S> {
     /// Resource validation service ($validate + optional write-path
     /// enforcement). Always present; write-path behavior is config-gated.
     validation: Arc<crate::validation::ValidationService>,
+
+    /// Post-commit write observer and the dashboard counters it feeds.
+    write_observability: WriteObservability,
 }
 
 // Manually implement Clone since S is wrapped in Arc and doesn't need to be Clone
@@ -154,6 +197,7 @@ impl<S> Clone for AppState<S> {
             bulk_submit_file_auth: self.bulk_submit_file_auth.clone(),
             bulk_submit_config: Arc::clone(&self.bulk_submit_config),
             validation: Arc::clone(&self.validation),
+            write_observability: self.write_observability.clone(),
         }
     }
 }
@@ -201,6 +245,7 @@ impl<S: ResourceStorage> AppState<S> {
             bulk_submit_file_auth: None,
             bulk_submit_config,
             validation,
+            write_observability: WriteObservability::new(),
         }
     }
 
@@ -258,6 +303,7 @@ impl<S: ResourceStorage> AppState<S> {
             bulk_submit_file_auth: None,
             bulk_submit_config,
             validation,
+            write_observability: WriteObservability::new(),
         }
     }
 
@@ -269,6 +315,23 @@ impl<S: ResourceStorage> AppState<S> {
     ) -> Self {
         self.validation = validation;
         self
+    }
+
+    /// Replaces the post-commit write observer and dashboard counters (the
+    /// server passes the set it also hands to background writers).
+    pub fn with_write_observability(mut self, observability: WriteObservability) -> Self {
+        self.write_observability = observability;
+        self
+    }
+
+    /// The observer every committed write is reported to.
+    pub fn write_observer(&self) -> &Arc<WriteObservers> {
+        &self.write_observability.observers
+    }
+
+    /// The dashboard live counters fed by [`Self::write_observer`].
+    pub fn dashboard_counters(&self) -> &Arc<DashboardCounters> {
+        &self.write_observability.counters
     }
 
     /// Returns the resource validation service.

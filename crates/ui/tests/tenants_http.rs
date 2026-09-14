@@ -21,7 +21,7 @@ use axum::{
 };
 use helios_fhir::FhirVersion;
 use helios_persistence::backends::sqlite::SqliteBackend;
-use helios_persistence::core::ResourceStorage;
+use helios_persistence::core::{ErasedScope, ResourceStorage, WriteEvent, WriteObserver};
 use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
 use http_body_util::BodyExt;
 use tower::ServiceExt;
@@ -716,4 +716,101 @@ async fn a_provisioned_tenant_settles_into_a_normal_row() {
 
     assert!(html.contains(r#"hx-delete="/ui/tenants/acme""#));
     assert!(!html.contains(r#"class="busy-status""#));
+}
+
+/// Records every write event the UI reports to its observer.
+#[derive(Default)]
+struct RecordingObserver(std::sync::Mutex<Vec<WriteEvent>>);
+
+impl WriteObserver for RecordingObserver {
+    fn on_write(&self, event: &WriteEvent) {
+        self.0.lock().unwrap().push(event.clone());
+    }
+}
+
+impl RecordingObserver {
+    /// The tenant-level events reported since the first `from` events, as
+    /// `(what, tenant)`: purges of a whole tenant and deregistrations.
+    fn tenant_events(&self, from: usize) -> Vec<(&'static str, TenantId)> {
+        self.0.lock().unwrap()[from..]
+            .iter()
+            .filter_map(|event| match event {
+                WriteEvent::Erased { tenant, scope } => {
+                    assert_eq!(
+                        scope,
+                        &ErasedScope::Tenant,
+                        "a tenant purge erases the tenant"
+                    );
+                    Some(("erased", tenant.clone()))
+                }
+                WriteEvent::TenantRemoved { tenant } => Some(("removed", tenant.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn len(&self) -> usize {
+        self.0.lock().unwrap().len()
+    }
+}
+
+/// #1078: deleting a tenant tells the write observer the tenant is gone, so
+/// the dashboard can drop what it holds for it — right after the purge's own
+/// `Erased` event when the data was purged, and on its own when it was not.
+#[tokio::test]
+async fn delete_reports_the_removed_tenant_to_the_write_observer() {
+    let store = store();
+    let observer = Arc::new(RecordingObserver::default());
+    let router = helios_ui::mount_with_conformance_source_and_runtime(
+        Router::new(),
+        "9.9.9",
+        None,
+        helios_ui::NlSearch::default(),
+        Some(Arc::clone(&store)),
+        None,
+        "default".to_string(),
+        Arc::new(helios_ui::StaticConformanceSource::empty()),
+        FhirVersion::R4,
+        None,
+        "http://localhost:8080".to_string(),
+        10 * 1024 * 1024,
+        false,
+        None,
+        "http://localhost:8080".to_string(),
+        helios_ui::PatientNameSearchSupport::Enabled,
+        Some(observer.clone() as Arc<dyn WriteObserver>),
+    );
+    for form in ["id=acme&display_name=Acme", "id=beta&display_name=Beta"] {
+        let (status, _) = post_form(&router, form).await;
+        assert_eq!(status, StatusCode::OK);
+        wait_settled(&router).await;
+    }
+
+    let delete = |uri: &'static str| {
+        let router = router.clone();
+        async move {
+            router
+                .oneshot(Request::delete(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap()
+                .status()
+        }
+    };
+
+    let before = observer.len();
+    assert_eq!(delete("/ui/tenants/acme?purge=true").await, StatusCode::OK);
+    assert_eq!(
+        observer.tenant_events(before),
+        [
+            ("erased", TenantId::new("acme")),
+            ("removed", TenantId::new("acme")),
+        ]
+    );
+
+    let before = observer.len();
+    assert_eq!(delete("/ui/tenants/beta").await, StatusCode::OK);
+    assert_eq!(
+        observer.tenant_events(before),
+        [("removed", TenantId::new("beta"))]
+    );
 }

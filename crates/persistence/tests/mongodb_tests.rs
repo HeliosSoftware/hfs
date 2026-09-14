@@ -20,11 +20,11 @@ use std::sync::Arc;
 use helios_fhir::FhirVersion;
 use helios_persistence::backends::mongodb::{MongoBackend, MongoBackendConfig};
 use helios_persistence::core::{
-    Backend, BackendCapability, BackendKind, BundleEntry, BundleMethod, BundleProvider,
-    BundleResult, ConditionalCreateResult, ConditionalDeleteResult, ConditionalStorage,
-    ConditionalUpdateResult, HistoryParams, IncludeProvider, InstanceHistoryProvider, PatchFormat,
-    ResourceStorage, RevincludeProvider, SearchProvider, SettingsStore, SystemHistoryProvider,
-    TypeHistoryProvider, VersionedStorage,
+    Backend, BackendCapability, BackendKind, BundleEntry, BundleEntryEffect, BundleMethod,
+    BundleProvider, BundleResult, ConditionalCreateResult, ConditionalDeleteResult,
+    ConditionalStorage, ConditionalUpdateResult, HistoryParams, IncludeProvider,
+    InstanceHistoryProvider, PatchFormat, ResourceStorage, RevincludeProvider, SearchProvider,
+    SettingsStore, SystemHistoryProvider, TypeHistoryProvider, VersionedStorage,
 };
 use helios_persistence::error::{
     BackendError, ConcurrencyError, ResourceError, StorageError, TransactionError,
@@ -1305,8 +1305,11 @@ async fn mongodb_integration_transaction_bundle_mixed_operations_and_idempotent_
 
     assert_eq!(result.entries.len(), 3);
     assert_eq!(result.entries[0].status, 204);
+    assert_eq!(result.entries[0].effect, BundleEntryEffect::Deleted);
     assert_eq!(result.entries[1].status, 201);
+    assert_eq!(result.entries[1].effect, BundleEntryEffect::Created);
     assert_eq!(result.entries[2].status, 200);
+    assert_eq!(result.entries[2].effect, BundleEntryEffect::Updated);
 
     let updated = backend
         .read(&tenant, "Patient", "update-me")
@@ -1350,6 +1353,11 @@ async fn mongodb_integration_transaction_bundle_mixed_operations_and_idempotent_
 
     assert_eq!(idempotent_result.entries.len(), 1);
     assert_eq!(idempotent_result.entries[0].status, 204);
+    assert_eq!(
+        idempotent_result.entries[0].effect,
+        BundleEntryEffect::NotFound,
+        "a delete of a missing resource is still 204 but removes nothing"
+    );
 }
 
 #[tokio::test]
@@ -1422,6 +1430,7 @@ async fn mongodb_integration_transaction_if_none_exist_match_resolves_urn_refere
         result.entries[0].status, 200,
         "the match is answered, not duplicated"
     );
+    assert_eq!(result.entries[0].effect, BundleEntryEffect::NoOp);
     assert_eq!(result.entries[1].status, 201);
 
     let observation = result.entries[1]
@@ -1483,6 +1492,7 @@ async fn mongodb_integration_transaction_bundle_conditional_headers() {
         return;
     };
     assert_eq!(second_create.entries[0].status, 200);
+    assert_eq!(second_create.entries[0].effect, BundleEntryEffect::NoOp);
     // A matched `ifNoneExist` names the match in `location`, exactly as a
     // fresh create names the row it wrote; that is what the transaction's
     // fullUrl → id map is built from (#511).
@@ -1799,6 +1809,73 @@ async fn mongodb_integration_count_all_types() {
     let map: std::collections::HashMap<String, u64> = counts.into_iter().collect();
     assert_eq!(map.get("Patient"), Some(&2));
     assert_eq!(map.get("Observation"), Some(&1));
+}
+
+/// #1078: the write marker is empty for a fresh tenant, changes on every
+/// create/update/delete, ignores other tenants, and counts recent rows.
+#[tokio::test]
+async fn mongodb_integration_latest_write_marker() {
+    let Some(backend) = create_backend("console_latest_write_marker").await else {
+        eprintln!("Skipping mongodb_integration_latest_write_marker (set HFS_TEST_MONGODB_URL)");
+        return;
+    };
+    let tenant = create_tenant("tenant-console-write-marker");
+    let other = create_tenant("tenant-console-write-marker-other");
+    let since = Some(chrono::Utc::now() - chrono::Duration::hours(1));
+
+    let empty = backend
+        .latest_write_marker(&tenant, since)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(empty.latest, None);
+    assert_eq!(empty.recent_writes, Some(0));
+    let unbounded = backend
+        .latest_write_marker(&tenant, None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(unbounded.recent_writes, None);
+
+    let created = backend
+        .create(&tenant, "Patient", json!({}), FhirVersion::default())
+        .await
+        .unwrap();
+    let after_create = backend.latest_write_marker(&tenant, since).await.unwrap();
+    assert_ne!(after_create, Some(empty));
+    assert_eq!(after_create.unwrap().recent_writes, Some(1));
+
+    backend
+        .update(&tenant, &created, json!({"active": true}))
+        .await
+        .unwrap();
+    let after_update = backend.latest_write_marker(&tenant, since).await.unwrap();
+    assert_ne!(after_update, after_create);
+
+    backend
+        .delete(&tenant, "Patient", created.id())
+        .await
+        .unwrap();
+    let after_delete = backend.latest_write_marker(&tenant, since).await.unwrap();
+    assert_ne!(after_delete, after_update);
+    assert_eq!(after_delete.unwrap().recent_writes, Some(3));
+
+    backend
+        .create(&other, "Patient", json!({}), FhirVersion::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        backend.latest_write_marker(&tenant, since).await.unwrap(),
+        after_delete
+    );
+    let future = Some(chrono::Utc::now() + chrono::Duration::hours(1));
+    let marker = backend
+        .latest_write_marker(&tenant, future)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(marker.recent_writes, Some(0));
+    assert!(marker.latest.is_some());
 }
 
 #[tokio::test]
@@ -9244,6 +9321,7 @@ async fn mongodb_integration_if_none_exist_multi_param_and_semantics() {
         result.entries[0].status, 200,
         "both params match the active patient — should not create a duplicate"
     );
+    assert_eq!(result.entries[0].effect, BundleEntryEffect::NoOp);
 
     let count = backend.count(&tenant, Some("Patient")).await.unwrap();
     assert_eq!(count, 2, "no third patient should have been created");
@@ -9292,6 +9370,7 @@ async fn mongodb_integration_if_none_exist_same_transaction_read_your_writes() {
         result.entries[1].status, 200,
         "second entry must see the first entry's write via session"
     );
+    assert_eq!(result.entries[1].effect, BundleEntryEffect::NoOp);
     assert_eq!(
         result.entries[1].location, result.entries[0].location,
         "second entry must resolve to the same resource as the first"

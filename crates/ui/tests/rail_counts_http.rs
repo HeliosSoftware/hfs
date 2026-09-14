@@ -1,8 +1,12 @@
 //! The shared type rail's server-rendered instance counts (#541), on
 //! Resources, Search, and Saved Queries. The dashboard snapshot provider is
 //! process-global (see `subscriptions_http.rs`), so the unavailable state
-//! must be asserted before any provider is registered, and both phases run
+//! must be asserted before any provider is registered, and every phase runs
 //! inside one test.
+//!
+//! #1078: counts from an approximate snapshot render as "≈N" and say so; a
+//! snapshot with no figures to give (the tenant still being seeded, or a
+//! backend that cannot count) shows no count at all, never a zero (#1082).
 
 use axum::{Router, body::Body, http::Request};
 use http_body_util::BodyExt;
@@ -10,10 +14,25 @@ use std::sync::Arc;
 use tower::ServiceExt;
 
 use helios_observability::dashboard::{
-    DashboardProvider, DashboardSnapshot, DashboardWindow, TypeCount, set_provider,
+    DashboardProvider, DashboardSnapshot, DashboardWindow, Figures, TypeCount, set_provider,
 };
 
-fn app() -> Router {
+#[path = "support/html.rs"]
+mod html;
+use html::{Dom, El};
+
+/// A tenant whose snapshot is counted from recent writes (approximate).
+const APPROXIMATE_TENANT: &str = "rail-approximate";
+/// A tenant the provider is still seeding: no figures yet.
+const SEEDING_TENANT: &str = "rail-seeding";
+/// A tenant whose storage backend cannot count at all.
+const UNSUPPORTED_TENANT: &str = "rail-unsupported";
+
+/// Why an approximate count is approximate, as the rail says it.
+const APPROXIMATE_REASON: &str =
+    "Approximate: counted from recent writes and still being reconciled with storage.";
+
+fn app_as(tenant: &str) -> Router {
     helios_ui::mount_with_conformance_source(
         Router::new(),
         "9.9.9",
@@ -25,7 +44,7 @@ fn app() -> Router {
         },
         None,
         None,
-        "default".to_string(),
+        tenant.to_string(),
         Arc::new(helios_ui::StaticConformanceSource::from_data_dir(
             std::path::Path::new("../../data"),
         )),
@@ -36,27 +55,25 @@ fn app() -> Router {
     )
 }
 
-async fn get(path: &str) -> String {
-    let response = app()
+async fn get(path: &str) -> Dom {
+    get_as("default", path).await
+}
+
+async fn get_as(tenant: &str, path: &str) -> Dom {
+    let response = app_as(tenant)
         .oneshot(Request::get(path).body(Body::empty()).unwrap())
         .await
         .unwrap();
     let bytes = response.into_body().collect().await.unwrap().to_bytes();
-    String::from_utf8(bytes.to_vec()).unwrap()
+    Dom::page(std::str::from_utf8(&bytes).unwrap())
 }
 
-/// Slices out one rail item's `<a ...>...</a>` markup so assertions about its
-/// count/aria-current do not accidentally match a neighboring item.
-fn rail_item<'a>(html: &'a str, resource_type: &str) -> &'a str {
-    let needle = format!(r#"data-type="{resource_type}""#);
-    let start = html
-        .find(&needle)
-        .unwrap_or_else(|| panic!("rail item for {resource_type} not found"));
-    let end = html[start..]
-        .find("</a>")
-        .map(|i| start + i)
-        .unwrap_or(html.len());
-    &html[start..end]
+/// One rail item's `<a>`, so assertions about its count/aria-current never
+/// match a neighboring item.
+fn rail_item<'a>(dom: &'a Dom, resource_type: &str) -> El<'a> {
+    dom.one(&format!(
+        r#"#type-rail-list a.filter-rail__item[data-type="{resource_type}"]"#
+    ))
 }
 
 struct Fixed;
@@ -70,10 +87,36 @@ impl DashboardProvider for Fixed {
         _types: &[String],
         _include_empty: bool,
     ) -> DashboardSnapshot {
-        if tenant != "default" {
+        let read_at = chrono::Utc::now();
+        let flags = |snapshot: DashboardSnapshot| match tenant {
+            APPROXIMATE_TENANT => DashboardSnapshot {
+                figures: Figures::Approximate {
+                    read_at,
+                    reconciled_at: read_at,
+                },
+                ..snapshot
+            },
+            // The provider contract: these two come with nothing measured.
+            SEEDING_TENANT => DashboardSnapshot {
+                figures: Figures::Pending,
+                ..DashboardSnapshot::default()
+            },
+            UNSUPPORTED_TENANT => DashboardSnapshot {
+                figures: Figures::Unsupported,
+                ..DashboardSnapshot::default()
+            },
+            _ => snapshot,
+        };
+        let known = [
+            "default",
+            APPROXIMATE_TENANT,
+            SEEDING_TENANT,
+            UNSUPPORTED_TENANT,
+        ];
+        if !known.contains(&tenant) {
             return DashboardSnapshot::default();
         }
-        DashboardSnapshot {
+        flags(DashboardSnapshot {
             available: vec![
                 TypeCount {
                     resource_type: "Patient".into(),
@@ -84,8 +127,9 @@ impl DashboardProvider for Fixed {
                     total: 7,
                 },
             ],
+            figures: Figures::Exact { read_at },
             ..Default::default()
-        }
+        })
     }
 }
 
@@ -99,32 +143,34 @@ async fn the_rail_goes_from_no_counts_to_server_rendered_counts() {
         ("/ui/search?type=Observation", "/ui/search"),
         ("/ui/queries?type=Observation", "/ui/queries"),
     ] {
-        let html = get(path).await;
-        assert!(
-            html.contains(r#"id="type-rail-list""#),
-            "{path}: rail present"
-        );
+        let dom = get(path).await;
+        dom.one("#type-rail-list");
         // The rail's chrome is unified across the four pages (#603
         // follow-up): the flat Resources look, not a bordered card.
-        assert!(
-            !html.contains(r#"class="card filter-rail""#),
+        assert_eq!(
+            dom.count(".card.filter-rail"),
+            0,
             "{path}: no bordered card around the type rail"
         );
-        let item = rail_item(&html, "Observation");
-        assert!(
-            item.contains(&format!(r#"href="{base}?type=Observation""#)),
-            "{path}: {item}"
+        let item = rail_item(&dom, "Observation");
+        assert_eq!(
+            item.attr("href"),
+            Some(format!("{base}?type=Observation").as_str()),
+            "{path}: {item:?}"
         );
-        assert!(
-            item.contains(r#"aria-current="true""#),
-            "{path}: the deep-linked type is marked current: {item}"
+        assert_eq!(
+            item.attr("aria-current"),
+            Some("true"),
+            "{path}: the deep-linked type is marked current: {item:?}"
         );
-        assert!(
-            item.contains(r#"title="Observation""#),
-            "{path}: the full type name is accessible via title (#604): {item}"
+        assert_eq!(
+            item.attr("title"),
+            Some("Observation"),
+            "{path}: the full type name is accessible via title (#604): {item:?}"
         );
-        assert!(
-            !html.contains(r#"class="count""#),
+        assert_eq!(
+            dom.count(".count"),
+            0,
             "{path}: no provider means no count span at all"
         );
     }
@@ -137,33 +183,95 @@ async fn the_rail_goes_from_no_counts_to_server_rendered_counts() {
         ("/ui/search", "/ui/search"),
         ("/ui/queries", "/ui/queries"),
     ] {
-        let html = get(path).await;
-        let patient = rail_item(&html, "Patient");
-        assert!(
-            patient.contains(&format!(r#"href="{base}?type=Patient""#)) && patient.contains(">42<"),
-            "{path}: {patient}"
+        let dom = get(path).await;
+        let patient = rail_item(&dom, "Patient");
+        assert_eq!(
+            patient.attr("href"),
+            Some(format!("{base}?type=Patient").as_str()),
+            "{path}: {patient:?}"
         );
-        let observation = rail_item(&html, "Observation");
-        assert!(observation.contains(">7<"), "{path}: {observation}");
-        let encounter = rail_item(&html, "Encounter");
-        assert!(
-            encounter.contains(">0<"),
-            "{path}: a type with no stored resources still renders 0: {encounter}"
+        assert_eq!(patient.one(".count").text(), "42", "{path}: {patient:?}");
+        let observation = rail_item(&dom, "Observation");
+        assert_eq!(
+            observation.one(".count").text(),
+            "7",
+            "{path}: {observation:?}"
+        );
+        let encounter = rail_item(&dom, "Encounter");
+        assert_eq!(
+            encounter.one(".count").text(),
+            "0",
+            "{path}: a type with no stored resources still renders 0: {encounter:?}"
         );
         let long_name = "MedicinalProductUndesirableEffect";
-        let long_item = rail_item(&html, long_name);
+        let long_item = rail_item(&dom, long_name);
+        assert_eq!(
+            long_item.attr("data-full-name"),
+            Some(long_name),
+            "{path}: the full name feeds the shared hover/focus tooltip: {long_item:?}"
+        );
+        assert_eq!(
+            long_item.attr("title"),
+            Some(long_name),
+            "{path}: the no-JS tooltip fallback remains available: {long_item:?}"
+        );
+        let label = long_item.one("span.filter-rail__label");
+        let count = long_item.one("span.count");
         assert!(
-            long_item.contains(&format!(r#"data-full-name="{long_name}""#)),
-            "{path}: the full name feeds the shared hover/focus tooltip: {long_item}"
+            label.text() == long_name && label.all(".count").is_empty() && count.text() == "0",
+            "{path}: the accessible name and count remain separate: {long_item:?}"
         );
         assert!(
-            long_item.contains(&format!(r#"title="{long_name}""#)),
-            "{path}: the no-JS tooltip fallback remains available: {long_item}"
+            !patient.text().contains('≈') && patient.all(".count--approximate").is_empty(),
+            "{path}: exact counts carry no approximation mark: {patient:?}"
+        );
+    }
+
+    // Phase 3 (#1078) — an approximate snapshot: every count is still shown,
+    // prefixed "≈", with the reason as its title and as screen-reader text.
+    for path in ["/ui/resources", "/ui/search", "/ui/queries"] {
+        let dom = get_as(APPROXIMATE_TENANT, path).await;
+        let patient = rail_item(&dom, "Patient");
+        let count = patient.one(".count.count--approximate");
+        assert_eq!(count.own_text(), "≈42", "{path}: {patient:?}");
+        assert_eq!(
+            count.attr("title"),
+            Some(APPROXIMATE_REASON),
+            "{path}: the count says why it is approximate: {patient:?}"
         );
         assert!(
-            long_item.contains(&format!(r#">{long_name}</span>"#))
-                && long_item.contains(r#"<span class="count">0</span>"#),
-            "{path}: the accessible name and count remain separate: {long_item}"
+            count
+                .one("span.visually-hidden")
+                .text()
+                .starts_with("Approximate: counted from recent writes"),
+            "{path}: and says so to assistive technology: {patient:?}"
         );
+        let encounter = rail_item(&dom, "Encounter");
+        assert_eq!(
+            encounter.one(".count.count--approximate").own_text(),
+            "≈0",
+            "{path}: {encounter:?}"
+        );
+        assert_eq!(
+            dom.count(".count:not(.count--approximate)"),
+            0,
+            "{path}: no count on an approximate page reads as exact"
+        );
+    }
+
+    // Phase 4 — snapshots with no counts to give (#1082): a tenant still being
+    // seeded, and a backend that cannot count. Neither renders a count span,
+    // so neither shows a zero.
+    for tenant in [SEEDING_TENANT, UNSUPPORTED_TENANT] {
+        for path in ["/ui/resources", "/ui/search", "/ui/queries"] {
+            let dom = get_as(tenant, path).await;
+            dom.one("#type-rail-list");
+            let patient = rail_item(&dom, "Patient");
+            assert_eq!(
+                dom.count(".count"),
+                0,
+                "{tenant} {path}: no count span at all: {patient:?}"
+            );
+        }
     }
 }

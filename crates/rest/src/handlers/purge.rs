@@ -38,8 +38,8 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use helios_auth::Principal;
-use helios_persistence::core::ResourceStorage;
 use helios_persistence::core::storage::audit::record_purge_event;
+use helios_persistence::core::{ErasedScope, ResourceStorage, WriteEvent, WriteObserver};
 use helios_persistence::error::{ResourceError, StorageError};
 use serde_json::json;
 
@@ -151,6 +151,15 @@ where
 
     match purge.purge(tenant.context(), &resource_type, &id).await {
         Ok(()) => {
+            // The purge erased live rows *and* history; consumers holding
+            // figures for them (the dashboard counters) treat them as stale.
+            state.write_observer().on_write(&WriteEvent::Erased {
+                tenant: tenant.context().tenant_id().clone(),
+                scope: ErasedScope::Instance {
+                    resource_type: resource_type.clone(),
+                    id: id.clone(),
+                },
+            });
             emit_purge_audit(
                 &state,
                 principal.as_ref(),
@@ -211,6 +220,11 @@ where
 
     match purge.purge_all(tenant.context(), &resource_type).await {
         Ok(count) => {
+            // As for the instance purge: live rows and history are gone.
+            state.write_observer().on_write(&WriteEvent::Erased {
+                tenant: tenant.context().tenant_id().clone(),
+                scope: ErasedScope::Type(resource_type.clone()),
+            });
             emit_purge_audit(
                 &state,
                 principal.as_ref(),

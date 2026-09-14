@@ -1128,6 +1128,20 @@ impl ResourceStorage for CompositeStorage {
             .await
     }
 
+    async fn count_deltas_by_type_and_bucket(
+        &self,
+        tenant: &TenantContext,
+        resource_types: &[&str],
+        since: chrono::DateTime<chrono::Utc>,
+        bucket_seconds: i64,
+    ) -> StorageResult<Vec<(String, crate::core::ResourceCountDelta)>> {
+        // Same history log as `count_deltas_by_bucket`: the primary's, which
+        // answers with its own grouped query rather than the per-type default.
+        self.primary
+            .count_deltas_by_type_and_bucket(tenant, resource_types, since, bucket_seconds)
+            .await
+    }
+
     async fn activity_histogram(
         &self,
         tenant: &TenantContext,
@@ -1139,6 +1153,21 @@ impl ResourceStorage for CompositeStorage {
 
     async fn count_all_types(&self, tenant: &TenantContext) -> StorageResult<Vec<(String, u64)>> {
         self.primary.count_all_types(tenant).await
+    }
+
+    fn supports_type_counts(&self) -> bool {
+        // Both count aggregates above delegate to the primary, so it decides.
+        self.primary.supports_type_counts()
+    }
+
+    async fn latest_write_marker(
+        &self,
+        tenant: &TenantContext,
+        recent_since: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> StorageResult<Option<crate::core::WriteMarker>> {
+        // The history log the marker reads lives with the authoritative primary,
+        // same as the count aggregates above.
+        self.primary.latest_write_marker(tenant, recent_since).await
     }
 
     async fn count_by_tenant(&self) -> StorageResult<Vec<(String, u64)>> {
@@ -4113,6 +4142,159 @@ mod tests {
     fn test_backend_name_is_composite() {
         let composite = make_composite_no_secondary();
         assert_eq!(composite.backend_name(), "composite");
+    }
+
+    /// #1078: `supports_type_counts` defaults to `false` (a backend that keeps
+    /// the empty count defaults, like `MockStorage`), and composite storage
+    /// reports its primary's answer.
+    #[test]
+    fn test_supports_type_counts_defaults_false_and_follows_the_primary() {
+        assert!(!MockStorage.supports_type_counts());
+        assert!(!make_composite_no_secondary().supports_type_counts());
+        assert!(
+            !make_composite_with_secondary().supports_type_counts(),
+            "a secondary never answers for the primary"
+        );
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn test_supports_type_counts_is_true_over_a_sqlite_primary() {
+        let sqlite = crate::backends::sqlite::SqliteBackend::in_memory().unwrap();
+        let config = CompositeConfig::builder()
+            .primary("primary", BackendKind::Sqlite)
+            .search_backend("es", BackendKind::Elasticsearch)
+            .build()
+            .unwrap();
+        let mut backends = HashMap::new();
+        backends.insert("primary".to_string(), Arc::new(sqlite) as DynStorage);
+        backends.insert("es".to_string(), Arc::new(MockStorage) as DynStorage);
+        let composite = CompositeStorage::new(config, backends).unwrap();
+        assert!(composite.supports_type_counts());
+    }
+
+    /// #1078: `latest_write_marker` defaults to `None` (a backend that cannot
+    /// probe its history cheaply, like `MockStorage`), and composite storage
+    /// reports its primary's answer, never a secondary's.
+    #[tokio::test]
+    async fn test_latest_write_marker_defaults_none_and_follows_the_primary() {
+        let tenant = make_tenant();
+        let since = Some(chrono::Utc::now());
+        assert_eq!(
+            MockStorage
+                .latest_write_marker(&tenant, since)
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            make_composite_no_secondary()
+                .latest_write_marker(&tenant, since)
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            make_composite_with_secondary()
+                .latest_write_marker(&tenant, since)
+                .await
+                .unwrap(),
+            None,
+            "a secondary never answers for the primary"
+        );
+    }
+
+    /// #1078: over a SQLite primary the composite's marker is the primary's.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn test_latest_write_marker_delegates_to_primary() {
+        let sqlite = Arc::new(crate::backends::sqlite::SqliteBackend::in_memory().unwrap());
+        sqlite.init_schema().unwrap();
+        let config = CompositeConfig::builder()
+            .primary("primary", BackendKind::Sqlite)
+            .search_backend("es", BackendKind::Elasticsearch)
+            .build()
+            .unwrap();
+        let mut backends = HashMap::new();
+        backends.insert("primary".to_string(), sqlite.clone() as DynStorage);
+        backends.insert("es".to_string(), Arc::new(MockStorage) as DynStorage);
+        let composite = CompositeStorage::new(config, backends).unwrap();
+
+        let tenant = make_tenant();
+        let since = Some(chrono::Utc::now() - chrono::Duration::hours(1));
+        let created = sqlite
+            .create(
+                &tenant,
+                "Patient",
+                serde_json::json!({ "resourceType": "Patient" }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+
+        let via_composite = composite.latest_write_marker(&tenant, since).await.unwrap();
+        let via_primary = sqlite.latest_write_marker(&tenant, since).await.unwrap();
+        assert_eq!(via_composite, via_primary);
+        assert_eq!(
+            via_composite,
+            Some(crate::core::WriteMarker {
+                latest: Some(created.last_modified()),
+                recent_writes: Some(1),
+            })
+        );
+    }
+
+    /// #1078: `count_deltas_by_type_and_bucket` is answered by the primary (its
+    /// grouped query), never the search secondary.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn test_count_deltas_by_type_and_bucket_delegates_to_primary() {
+        use crate::core::ResourceStorage;
+        let sqlite = Arc::new(crate::backends::sqlite::SqliteBackend::in_memory().unwrap());
+        sqlite.init_schema().unwrap();
+        let config = CompositeConfig::builder()
+            .primary("primary", BackendKind::Sqlite)
+            .search_backend("es", BackendKind::Elasticsearch)
+            .build()
+            .unwrap();
+        let mut backends = HashMap::new();
+        backends.insert("primary".to_string(), sqlite.clone() as DynStorage);
+        backends.insert("es".to_string(), Arc::new(MockStorage) as DynStorage);
+        let composite = CompositeStorage::new(config, backends).unwrap();
+
+        let tenant = make_tenant();
+        for rt in ["Patient", "Patient", "Observation"] {
+            sqlite
+                .create(
+                    &tenant,
+                    rt,
+                    serde_json::json!({ "resourceType": rt }),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+        let since = chrono::Utc::now() - chrono::Duration::hours(1);
+        let types = ["Patient", "Observation", "Encounter"];
+        let via_composite = composite
+            .count_deltas_by_type_and_bucket(&tenant, &types, since, 3600)
+            .await
+            .unwrap();
+        let via_primary = sqlite
+            .count_deltas_by_type_and_bucket(&tenant, &types, since, 3600)
+            .await
+            .unwrap();
+        assert_eq!(via_composite, via_primary);
+        assert_eq!(via_composite.iter().map(|(_, d)| d.delta).sum::<i64>(), 3);
+
+        // A primary without history keeps the trait's empty answer.
+        assert!(
+            make_composite_no_secondary()
+                .count_deltas_by_type_and_bucket(&tenant, &types, since, 3600)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     // ── "No capability" error paths ───────────────────────────────

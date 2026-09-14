@@ -165,3 +165,6 @@ helios-persistence = { path = "../persistence", version = "0.2.1", default-featu
 helios-fhir = { path = "../fhir", version = "0.2.1", default-features = false, features = ["R4"] }
 serde_json = "1"
 zip = { version = "2.4", default-features = false, features = ["deflate"] }
+# Parses rendered pages and htmx fragments so tests assert on elements and
+# attributes (CSS selectors) instead of searching the markup as text.
+scraper = { version = "0.27", default-features = false }

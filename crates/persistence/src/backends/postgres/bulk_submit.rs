@@ -784,6 +784,9 @@ impl BulkSubmitProvider for PostgresBackend {
         }
 
         crate::core::Transaction::commit(Box::new(txn)).await?;
+        // Durable now: report it before the max-errors return and the separate
+        // counter statement below, so neither can lose committed work (#1078).
+        options.notify_batch_committed(tenant, submission_id, manifest_id, &results);
 
         if aborted_on_max_errors {
             return Err(StorageError::BulkSubmit(

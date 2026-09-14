@@ -87,6 +87,9 @@ Options:
 | `HFS_SEARCH_PARAM_CACHE_TTL` | 3600 | Seconds between refreshes of the in-memory SearchParameter registry from storage; a param POSTed to one cluster node becomes visible to others within this interval. `0` disables the refresh. |
 | `HFS_MAX_BODY_SIZE` | 10485760 | Max request body size (bytes; applies to the decompressed body for compressed requests) |
 | `HFS_REQUEST_TIMEOUT` | 30 | Request timeout (seconds) |
+| `HFS_DASHBOARD_RECONCILE_SECS` | 30 | Seconds between Home dashboard reconcile passes against storage (CLI `--dashboard-reconcile-interval-secs`). Whole seconds, must be `> 0`; `0` or a non-numeric value is a startup error. A tenant's full recount is additionally spaced to at most every max(interval, 10 × its last recount duration); also how soon a failed background seed is retried. |
+| `HFS_DASHBOARD_REFRESH_SECS` | 5 | Seconds between refreshes of a Home dashboard whose figures are moving (approximate, or an import running) (CLI `--dashboard-refresh-secs`). Re-reads in-memory counters only, never storage. Whole seconds, must be `> 0` and `<=` `HFS_DASHBOARD_IDLE_REFRESH_SECS`; otherwise a startup error. |
+| `HFS_DASHBOARD_IDLE_REFRESH_SECS` | 10 | Seconds between watch ticks of a Home dashboard whose figures are settled (exact, no import running), so an open tab notices an import starting (CLI `--dashboard-idle-refresh-secs`). Whole seconds, must be `> 0` and `>=` `HFS_DASHBOARD_REFRESH_SECS`; otherwise a startup error. |
 | `HFS_ENABLE_CORS` | true | Enable CORS |
 | `HFS_CORS_ORIGINS` | * | Allowed CORS origins |
 | `HFS_CORS_METHODS` | GET,POST,PUT,DELETE,OPTIONS | Allowed HTTP methods |

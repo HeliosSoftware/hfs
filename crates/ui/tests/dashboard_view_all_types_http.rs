@@ -15,10 +15,14 @@ use axum::{Router, body::Body, http::Request};
 use chrono::{DateTime, Utc};
 use helios_observability::dashboard::{
     DashboardPoint, DashboardProvider, DashboardSeries, DashboardSnapshot, DashboardWindow,
-    TypeCount, set_provider,
+    Figures, TypeCount, set_provider,
 };
 use http_body_util::BodyExt;
 use tower::ServiceExt;
+
+#[path = "support/html.rs"]
+mod html;
+use html::Dom;
 
 /// Reports exactly one stored type (`Patient`, total 5). Honors the selection
 /// guard the way `helios_rest::dashboard::StorageDashboardProvider` does:
@@ -82,7 +86,9 @@ impl DashboardProvider for FakeProvider {
             available,
             export_jobs: None,
             import_jobs_active: None,
-            partial: false,
+            figures: Figures::Exact {
+                read_at: chrono::Utc::now(),
+            },
         }
     }
 }
@@ -111,56 +117,54 @@ fn app() -> Router {
     )
 }
 
-async fn body_text(response: axum::response::Response) -> String {
+/// The dashboard page at `uri`, parsed.
+async fn get(uri: &str) -> Dom {
+    let response = app()
+        .oneshot(Request::get(uri).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
     let bytes = response.into_body().collect().await.unwrap().to_bytes();
-    String::from_utf8(bytes.to_vec()).unwrap()
+    Dom::page(std::str::from_utf8(&bytes).unwrap())
+}
+
+/// The CSS selector of the picker option for `resource_type`.
+fn option(resource_type: &str) -> String {
+    format!(r#"#chart-pick a.chart-pick__option[data-pick-name="{resource_type}"]"#)
 }
 
 /// Without the flag, the picker only ever offers what the tenant stores —
 /// today's behavior, unchanged.
 #[tokio::test]
 async fn without_the_flag_the_picker_offers_only_stored_types() {
-    let response = app()
-        .oneshot(Request::get("/ui").body(Body::empty()).unwrap())
-        .await
-        .unwrap();
-    let html = body_text(response).await;
+    let dom = get("/ui").await;
 
-    assert!(html.contains(r#"data-pick-name="Patient""#));
-    assert!(!html.contains(r#"data-pick-name="Observation""#));
+    dom.one(&option("Patient"));
+    assert_eq!(dom.count(&option("Observation")), 0);
     // The toggle itself renders, off, and links to `?all=1`.
-    assert!(html.contains("all=1"));
+    let toggle = dom.one("#chart-pick a.chart-pick__option--all");
+    assert!(
+        toggle
+            .attr("href")
+            .is_some_and(|href| href.contains("all=1")),
+        "{toggle:?}"
+    );
+    assert_eq!(toggle.attr("aria-pressed"), Some("false"), "{toggle:?}");
 }
 
 /// With `?all=1`, the picker's option list is the union of stored types and
 /// every other resource type of the active FHIR version, offered at `0`.
 #[tokio::test]
 async fn the_flag_offers_every_type_of_the_version_with_zero_for_the_unstored_ones() {
-    let response = app()
-        .oneshot(Request::get("/ui?all=1").body(Body::empty()).unwrap())
-        .await
-        .unwrap();
-    let html = body_text(response).await;
+    let dom = get("/ui?all=1").await;
 
-    assert!(html.contains(r#"data-pick-name="Patient""#));
-    assert!(
-        html.contains(r#"data-pick-name="Observation""#),
-        "a never-stored type from the version's full list is offered"
-    );
-    // The unstored option's count renders as a real 0, not blank/omitted.
-    // Scoped to the option's own `<a>...</a>` so this cannot accidentally
-    // match a "0" appearing anywhere later in the page.
-    let after_name = html
-        .split(r#"data-pick-name="Observation""#)
-        .nth(1)
-        .expect("Observation option present");
-    let option_html = after_name
-        .split("</a>")
-        .next()
-        .expect("the option row closes with </a>");
-    assert!(
-        option_html.contains(r#"chart-pick__count">0</span>"#),
-        "Observation's picker count should render 0, got: {option_html}"
+    dom.one(&option("Patient"));
+    // A never-stored type from the version's full list is offered, and its
+    // count renders as a real 0, not blank/omitted.
+    let observation = dom.one(&option("Observation"));
+    assert_eq!(
+        observation.one(".chart-pick__count").text(),
+        "0",
+        "Observation's picker count should render 0: {observation:?}"
     );
 }
 
@@ -169,41 +173,27 @@ async fn the_flag_offers_every_type_of_the_version_with_zero_for_the_unstored_on
 /// ("Resource types") still reflects only what is actually stored.
 #[tokio::test]
 async fn selecting_an_unstored_type_with_the_flag_charts_a_flat_series() {
-    let response = app()
-        .oneshot(
-            Request::get("/ui?types=Observation&all=1")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    let html = body_text(response).await;
+    let dom = get("/ui?types=Observation&all=1").await;
 
-    assert!(
-        html.contains(r#"<polyline class="series"#),
-        "the flat zero series is drawn, not the empty state"
-    );
-    assert!(html.contains("Observation"));
+    dom.one(r#"svg.chart polyline.series[data-series="Observation"]"#);
     // distinct_types is unaffected by the flag or the selection: still 1.
-    assert!(html.contains(r#"<span class="stat__value">1</span>"#));
+    let resource_types = dom.one(".stat-grid > .stat:first-child .stat__value");
+    assert!(
+        !resource_types.has_class("stat__value--unavailable"),
+        "{resource_types:?}"
+    );
+    assert_eq!(resource_types.text(), "1");
 }
 
 /// Without the flag, an unstored `?types=` selection is dropped — today's
 /// behavior, unaffected by this feature.
 #[tokio::test]
 async fn selecting_an_unstored_type_without_the_flag_is_dropped() {
-    let response = app()
-        .oneshot(
-            Request::get("/ui?types=Observation")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    let html = body_text(response).await;
+    let dom = get("/ui?types=Observation").await;
 
-    assert!(
-        !html.contains(r#"<polyline class="series"#),
+    assert_eq!(
+        dom.count("polyline.series"),
+        0,
         "an unstored type with no flag charts nothing"
     );
 }

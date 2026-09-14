@@ -891,6 +891,9 @@ impl BulkSubmitProvider for MongoBackend {
         let outcome = self
             .ingest_batch(tenant, submission_id, manifest_id, &entries, options)
             .await?;
+        // The batch's writes are in: report them before the max-errors return
+        // and the counter update below (#1078).
+        options.notify_batch_committed(tenant, submission_id, manifest_id, &outcome.results);
         if outcome.aborted_on_max_errors {
             return Err(StorageError::BulkSubmit(
                 BulkSubmitError::MaxErrorsExceeded {

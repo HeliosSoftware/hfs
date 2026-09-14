@@ -240,6 +240,9 @@ AWS_REGION=us-east-1 \
 | `HFS_DEFAULT_FHIR_VERSION` | `R4` | FHIR version (R4, R4B, R5, R6) |
 | `HFS_LOG_LEVEL` | `info` | Log level (error, warn, info, debug, trace) |
 | `HFS_UI_ENABLED` | `true` | Serve the web UI at `/ui`. Set `false` for headless deployments; `/ui` then returns `404` + OperationOutcome. Has no effect on a binary built without the `ui` feature. |
+| `HFS_DASHBOARD_RECONCILE_SECS` | `30` | Seconds between Home dashboard reconcile passes against storage (CLI `--dashboard-reconcile-interval-secs`). Whole seconds, must be `> 0`; `0` or a non-numeric value is a startup error. A tenant's full recount is additionally spaced to at most every max(interval, 10 × its last recount duration); also how soon a failed background seed is retried. |
+| `HFS_DASHBOARD_REFRESH_SECS` | `5` | Seconds between refreshes of a Home dashboard whose figures are moving (approximate, or an import running) (CLI `--dashboard-refresh-secs`). Re-reads in-memory counters only, never storage. Whole seconds, must be `> 0` and `<=` `HFS_DASHBOARD_IDLE_REFRESH_SECS`; otherwise a startup error. |
+| `HFS_DASHBOARD_IDLE_REFRESH_SECS` | `10` | Seconds between watch ticks of a Home dashboard whose figures are settled (exact, no import running), so an open tab notices an import starting (CLI `--dashboard-idle-refresh-secs`). Whole seconds, must be `> 0` and `>=` `HFS_DASHBOARD_REFRESH_SECS`; otherwise a startup error. |
 
 Set `HFS_BASE_URL` to the URL clients use, including any reverse-proxy path
 prefix, for example `https://fhir.example.com/fhir`. HFS accepts only absolute

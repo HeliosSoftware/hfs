@@ -82,7 +82,6 @@ pub async fn delete_handler<S>(
     State(state): State<AppState<S>>,
     Path((resource_type, id)): Path<(String, String)>,
     tenant: TenantExtractor,
-    #[cfg_attr(not(feature = "subscriptions"), allow(unused_variables))]
     version: FhirVersionExtractor,
     conditional: ConditionalHeaders,
 ) -> RestResult<Response>
@@ -170,7 +169,6 @@ where
         });
     }
 
-    #[cfg(feature = "subscriptions")]
     let fhir_version = existing_resource
         .as_ref()
         .map(|stored| stored.fhir_version())
@@ -198,18 +196,19 @@ where
         .as_ref()
         .and_then(|stored| super::extract_patient_from_resource(&resource_type, stored.content()));
 
-    // Emit subscription event
-    #[cfg(feature = "subscriptions")]
-    if let Some(engine) = state.subscription_engine() {
-        super::subscription_event::emit_delete_event(
-            engine,
-            tenant.context(),
-            &resource_type,
+    // `delete` only succeeds against a live resource (an already-deleted or
+    // missing one is `NotFound`), so a success always removes one.
+    super::write_event::report(
+        &state,
+        tenant.context(),
+        fhir_version,
+        &resource_type,
+        -1,
+        Some(super::write_event::delete_notice(
             &id,
-            fhir_version,
             existing_resource.map(|stored| stored.content().clone()),
-        );
-    }
+        )),
+    );
 
     // Return 204 No Content (or 200 with OperationOutcome)
     let mut response = StatusCode::NO_CONTENT.into_response();
@@ -274,6 +273,15 @@ where
     use helios_persistence::core::ConditionalDeleteResult;
     match result {
         ConditionalDeleteResult::Deleted(deleted) => {
+            // Counted, but conditional writes announce nothing.
+            super::write_event::report(
+                &state,
+                tenant.context(),
+                deleted.fhir_version(),
+                &resource_type,
+                -1,
+                None,
+            );
             debug!(
                 resource_type = %resource_type,
                 id = %deleted.id(),

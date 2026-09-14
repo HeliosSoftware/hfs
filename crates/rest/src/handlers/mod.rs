@@ -14,6 +14,8 @@
 //! - [`capabilities`] - Get server capabilities (CapabilityStatement)
 //! - [`versions`] - Get supported FHIR versions ($versions operation)
 //! - [`health`] - Health check endpoint
+//! - `dashboard_counts` - The dashboard counters' post-commit write observer
+//! - `write_event` - Reporting committed writes to the post-commit write observer
 
 pub mod admin_tenants;
 pub mod batch;
@@ -25,6 +27,7 @@ pub mod capabilities;
 pub mod compartment;
 pub mod console_metrics;
 pub mod create;
+pub mod dashboard_counts;
 pub mod delete;
 pub mod health;
 pub mod history;
@@ -37,14 +40,13 @@ pub mod search;
 pub mod smart_discovery;
 pub mod sof;
 #[cfg(feature = "subscriptions")]
-pub mod subscription_event;
-#[cfg(feature = "subscriptions")]
 pub mod subscriptions;
 pub mod update;
 pub mod user_settings;
 pub mod validate;
 pub mod versions;
 pub mod vread;
+pub(crate) mod write_event;
 #[cfg(feature = "subscriptions")]
 pub mod ws;
 
