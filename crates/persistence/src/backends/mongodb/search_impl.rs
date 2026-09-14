@@ -825,24 +825,23 @@ impl MongoBackend {
         matched_ids: Option<HashSet<String>>,
         directive: &crate::types::SortDirective,
     ) -> StorageResult<SearchResult> {
-        // Resource-level predicates (`_id`, `_lastUpdated`) are not in the
-        // search index, so `matched_ids` cannot carry them. Resolve them
-        // here, against the resources collection, into the id set that the
-        // page, `has_next` and `total` all draw from (#1056). Without them
-        // the matched set is already that sequence.
-        let allowed: Option<HashSet<String>> = if Self::has_resource_level_params(query) {
-            Some(
-                self.resource_level_ids(
-                    db,
-                    tenant_id,
-                    &query.resource_type,
-                    query,
-                    matched_ids.as_ref(),
-                )
-                .await?,
-            )
-        } else {
-            matched_ids
+        // Any filtered sort resolves its candidate set through the resources
+        // collection: that folds in the resource-level predicates (`_id`,
+        // `_lastUpdated`) AND makes the set live-only by construction, so a
+        // stale search-index row can never occupy a page slot (#1056/#1040).
+        // With no filter at all `allowed` stays `None` and the ordering is
+        // computed over the whole type.
+        let allowed: Option<HashSet<String>> = match matched_ids {
+            Some(set) if set.is_empty() => Some(set),
+            Some(set) => Some(
+                self.resource_level_ids(db, tenant_id, &query.resource_type, query, Some(&set))
+                    .await?,
+            ),
+            None if Self::has_resource_level_params(query) => Some(
+                self.resource_level_ids(db, tenant_id, &query.resource_type, query, None)
+                    .await?,
+            ),
+            None => None,
         };
 
         // Nothing can match: skip the ordering aggregation entirely.
@@ -958,9 +957,10 @@ impl MongoBackend {
     }
 
     /// Ids of the live resources that satisfy the resource-level predicates
-    /// (`_id`, `_lastUpdated`) within `matched_ids`. This is the same
-    /// predicate `search_count` counts, so a page cut from this set and its
-    /// `total` agree by construction (#1056).
+    /// (`_id`, `_lastUpdated`) within `matched_ids` — also the liveness
+    /// filter for every filtered parameter sort. This is the same predicate
+    /// `search_count` counts, so a page cut from this set and its `total`
+    /// agree by construction (#1056).
     async fn resource_level_ids(
         &self,
         db: &mongodb::Database,
@@ -1110,12 +1110,10 @@ impl MongoBackend {
                 .collect();
             unkeyed.sort();
             ordered.extend(unkeyed);
-            // No separate #1056 liveness pass here: `allowed` is already
-            // live-only by construction (its positive-match arms `distinct`
-            // over `search_index`, and `MongoBackend::delete` removes the
-            // matching rows via `delete_search_index`), and re-adding a
-            // type-wide liveness check would reintroduce the type-wide scan
-            // this bounded path exists to avoid (#1040).
+            // `allowed` is live-only by construction — `search_param_sorted`
+            // resolves every filtered candidate set through the resources
+            // collection with `is_deleted: false` — so no liveness pass is
+            // needed here.
             return Ok(ordered);
         }
 

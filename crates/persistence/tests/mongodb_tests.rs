@@ -3979,6 +3979,64 @@ async fn mongodb_integration_param_sort_is_bounded_by_the_candidate_set() {
     );
     assert_eq!(result.total, Some(4));
 
+    // Ghost rows: write two orphan search_index entries for a resource that
+    // was never created. If `allowed` were still taken straight from
+    // `distinct` over `search_index` (pre-fix), the gender row would make
+    // this dead id match the filter, take a page slot ahead of a live one,
+    // get dropped by the page fetch, and inflate `total` by one (#1056's
+    // failure mode reopened on the filtered sorted path, #1040). Resolving
+    // `allowed` through `resource_level_ids` (is_deleted: false) must keep
+    // both ghost rows out of the candidate set entirely.
+    let raw_client = raw_test_client(&backend.config().connection_string)
+        .await
+        .expect("failed to connect raw MongoDB client");
+    let raw_db = raw_client.database(&backend.config().database_name);
+    let search_index: Collection<Document> = raw_db.collection("search_index");
+    search_index
+        .insert_many(vec![
+            doc! {
+                "tenant_id": tenant.tenant_id().as_str(),
+                "resource_type": "Patient",
+                "resource_id": "patient-bps-ghost",
+                "param_name": "gender",
+                "param_url": "http://hl7.org/fhir/SearchParameter/individual-gender",
+                "value_token_system": "http://hl7.org/fhir/administrative-gender",
+                "value_token_code": "female",
+            },
+            doc! {
+                "tenant_id": tenant.tenant_id().as_str(),
+                "resource_type": "Patient",
+                "resource_id": "patient-bps-ghost",
+                "param_name": "birthdate",
+                "param_url": "http://hl7.org/fhir/SearchParameter/individual-birthdate",
+                "value_date": mongodb::bson::DateTime::from_millis(0),
+                "value_date_precision": "day",
+            },
+        ])
+        .await
+        .expect("failed to insert ghost search_index rows");
+
+    ascending.offset = None;
+    let page1_with_ghost = backend.search(&tenant, &ascending).await.unwrap();
+    assert_eq!(
+        ids(&page1_with_ghost),
+        vec!["patient-bps-05", "patient-bps-17"]
+    );
+    assert!(page1_with_ghost.resources.page_info.has_next);
+    assert_eq!(page1_with_ghost.total, Some(4));
+
+    let result_with_ghost = backend.search(&tenant, &descending).await.unwrap();
+    assert_eq!(
+        ids(&result_with_ghost),
+        vec![
+            "patient-bps-29",
+            "patient-bps-17",
+            "patient-bps-05",
+            "patient-bps-33",
+        ]
+    );
+    assert_eq!(result_with_ghost.total, Some(4));
+
     // Plan guard: the ordering aggregation over `search_index` must be a
     // bounded index walk over the candidate set (`idx_search_composite`,
     // hinted, `resource_id: {$in: [...]}`), not a type-wide scan, and the
