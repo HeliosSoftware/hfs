@@ -1008,6 +1008,16 @@ mod es_integration {
             error.to_string().contains("nested"),
             "the rejection must be the nested-object limit, got: {error}"
         );
+        // A rejection, not an outage: `$reindex` must not retry it (#1050).
+        assert!(
+            matches!(
+                error,
+                helios_persistence::error::StorageError::Backend(
+                    helios_persistence::error::BackendError::Internal { .. }
+                )
+            ),
+            "the nested-object rejection must be permanent, got: {error:?}"
+        );
         assert!(
             before
                 .read(&tenant, "Provenance", "oversized")
