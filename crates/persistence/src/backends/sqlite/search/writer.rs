@@ -110,7 +110,11 @@ impl SqliteSearchIndexWriter {
             SqlValue::String(resource_type.to_string()),
             SqlValue::String(resource_id.to_string()),
             SqlValue::String(extracted.param_name.clone()),
-            SqlValue::String(extracted.param_url.clone()),
+            // `param_url` is not written. No SQLite read path consults it —
+            // every lookup is by `param_name` — and at ~57 bytes on every one
+            // of a resource's ~20 rows it was 11% of a bulk-loaded database.
+            // The column stays so older rows and the schema are untouched.
+            SqlValue::Null,
         ];
 
         // `value_reference_display` and the UCUM-canonical quantity columns are

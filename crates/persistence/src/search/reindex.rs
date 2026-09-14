@@ -174,6 +174,23 @@ pub trait ReindexTarget: Send + Sync {
     /// Implementations MUST scope the deletion to `tenant` and nothing else.
     async fn clear_search_index(&self, tenant: &TenantContext) -> StorageResult<u64>;
 
+    /// Enters bulk index rebuild mode for a run that asked for it
+    /// (`ReindexRequest::bulk_index_rebuild`): a writer that maintains
+    /// secondary indexes row by row may drop them here and build them in
+    /// [`Self::end_bulk_index_rebuild`], which the driver calls on every exit
+    /// path of the run — completion, failure and cancellation alike. Nested
+    /// runs are the writer's business (SQLite reference-counts). The default
+    /// does nothing, which is right for a writer whose index *is* the
+    /// document (Elasticsearch).
+    async fn begin_bulk_index_rebuild(&self) -> StorageResult<()> {
+        Ok(())
+    }
+
+    /// Leaves bulk index rebuild mode; see [`Self::begin_bulk_index_rebuild`].
+    async fn end_bulk_index_rebuild(&self) -> StorageResult<()> {
+        Ok(())
+    }
+
     /// Rebuilds a whole page of resources — delete each one's stale entries,
     /// write fresh ones — returning a per-resource result of entries written,
     /// in input order.
@@ -230,6 +247,13 @@ pub struct ReindexRequest {
     /// Whether to clear existing indexes before reindexing.
     #[serde(default)]
     pub clear_existing: bool,
+
+    /// Bulk index rebuild: writers that support it drop their value indexes
+    /// for the duration of the run and build them once, sorted, at the end
+    /// (see [`ReindexTarget::begin_bulk_index_rebuild`]). Much faster for a
+    /// large load; search on the affected store is unindexed meanwhile.
+    #[serde(default)]
+    pub bulk_index_rebuild: bool,
 }
 
 fn default_batch_size() -> u32 {
@@ -243,6 +267,7 @@ impl Default for ReindexRequest {
             search_param_urls: None,
             batch_size: default_batch_size(),
             clear_existing: false,
+            bulk_index_rebuild: false,
         }
     }
 }
@@ -286,6 +311,12 @@ impl ReindexRequest {
     /// Enables clearing existing indexes.
     pub fn clear_existing(mut self) -> Self {
         self.clear_existing = true;
+        self
+    }
+
+    /// Sets the bulk index rebuild mode (see the field).
+    pub fn with_bulk_index_rebuild(mut self, on: bool) -> Self {
+        self.bulk_index_rebuild = on;
         self
     }
 }
@@ -451,12 +482,31 @@ impl AutomaticReindexLimits {
     }
 }
 
+/// Shape of the `ReindexRequest` an automatic generation starts with.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct AutomaticRunOptions {
+    /// Resources per rebuild transaction.
+    pub(crate) batch_size: u32,
+    /// `ReindexRequest::bulk_index_rebuild` for the runs the hook starts.
+    pub(crate) bulk_index_rebuild: bool,
+}
+
+impl Default for AutomaticRunOptions {
+    fn default() -> Self {
+        Self {
+            batch_size: DEFERRED_REINDEX_BATCH_SIZE,
+            bulk_index_rebuild: false,
+        }
+    }
+}
+
 #[derive(Default)]
 struct AutomaticTenantState {
     pending_types: BTreeSet<String>,
     next_generation: u64,
     consecutive_failures: u8,
     context: DeferredReindexContext,
+    options: AutomaticRunOptions,
     waiting_for_generation: bool,
 }
 
@@ -921,6 +971,7 @@ impl AutomaticReindexCoordinator {
         tenant: TenantContext,
         resource_types: Vec<String>,
         context: DeferredReindexContext,
+        options: AutomaticRunOptions,
         max_concurrency: usize,
     ) {
         let requested_types: BTreeSet<_> = resource_types.into_iter().collect();
@@ -937,6 +988,7 @@ impl AutomaticReindexCoordinator {
             if let Some(state) = tenants.get_mut(&tenant_id) {
                 state.pending_types.extend(requested_types);
                 state.context = context.clone();
+                state.options = options;
                 tracing::info!(
                     tenant = %tenant_id,
                     submission = ?context.submission_id,
@@ -959,6 +1011,7 @@ impl AutomaticReindexCoordinator {
                 if let Some(state) = tenants.get_mut(&tenant_id) {
                     state.pending_types.extend(requested_types.clone());
                     state.context = context.clone();
+                    state.options = options;
                     return;
                 }
             }
@@ -985,6 +1038,7 @@ impl AutomaticReindexCoordinator {
             if let Some(state) = tenants.get_mut(&tenant_id) {
                 state.pending_types.extend(requested_types);
                 state.context = context;
+                state.options = options;
                 return;
             }
             tenants.insert(
@@ -992,6 +1046,7 @@ impl AutomaticReindexCoordinator {
                 AutomaticTenantState {
                     pending_types: requested_types,
                     context,
+                    options,
                     ..Default::default()
                 },
             );
@@ -1010,7 +1065,7 @@ impl AutomaticReindexCoordinator {
         _resident_permit: tokio::sync::OwnedSemaphorePermit,
     ) {
         loop {
-            let (resource_types, generation, context) = {
+            let (resource_types, generation, context, options) = {
                 let mut tenants = self.tenants.lock().await;
                 let Some(state) = tenants.get_mut(&tenant_id) else {
                     return;
@@ -1025,7 +1080,7 @@ impl AutomaticReindexCoordinator {
                 let generation = state.next_generation;
                 state.next_generation += 1;
                 state.waiting_for_generation = true;
-                (types, generation, state.context.clone())
+                (types, generation, state.context.clone(), state.options)
             };
 
             // Acquire for each generation, then release before a follow-up.
@@ -1047,7 +1102,9 @@ impl AutomaticReindexCoordinator {
             let started = op
                 .start_tracked(
                     tenant.clone(),
-                    ReindexRequest::for_types(resource_types.clone()),
+                    ReindexRequest::for_types(resource_types.clone())
+                        .with_batch_size(options.batch_size)
+                        .with_bulk_index_rebuild(options.bulk_index_rebuild),
                     None,
                 )
                 .await;
@@ -1198,6 +1255,12 @@ fn mark_failed(jobs: &Arc<RwLock<HashMap<String, ReindexProgress>>>, job_id: &st
     }
 }
 
+/// How the page loop of a run ended, short of completion.
+enum RunExit {
+    Cancelled,
+    Failed(String),
+}
+
 /// Marks a job as cancelled.
 fn mark_cancelled(jobs: &Arc<RwLock<HashMap<String, ReindexProgress>>>, job_id: &str) {
     let mut jobs_guard = jobs.write();
@@ -1322,94 +1385,130 @@ async fn run_reindex(
         }
     }
 
-    // Process each resource type
-    for resource_type in &resource_types {
-        // Check for cancellation
-        if cancel_rx.try_recv().is_ok() {
-            mark_cancelled(&jobs, &job_id);
-            return;
-        }
-
-        // Update current resource type
-        {
-            let mut jobs_guard = jobs.write();
-            if let Some(progress) = jobs_guard.get_mut(&job_id) {
-                progress.current_resource_type = Some(resource_type.clone());
-            }
-        }
-
-        // Process resources in batches
-        let mut cursor: Option<String> = None;
-        loop {
-            // Check for cancellation
-            if cancel_rx.try_recv().is_ok() {
-                mark_cancelled(&jobs, &job_id);
+    // Bulk index rebuild (opt-in): every writer drops what it can before the
+    // pages, and gets its `end` on every exit path below.
+    if request.bulk_index_rebuild {
+        for writer in &writers {
+            if let Err(e) = writer.begin_bulk_index_rebuild().await {
+                mark_failed(
+                    &jobs,
+                    &job_id,
+                    format!("Failed to enter bulk index rebuild: {e}"),
+                );
                 return;
             }
+        }
+    }
 
-            // Fetch a page of resources
-            let fetch_span = crate::perf::span(crate::perf::Phase::ReindexFetch);
-            let fetched = source
-                .fetch_resources_page(
-                    &tenant,
-                    resource_type,
-                    cursor.as_deref(),
-                    request.batch_size,
-                )
-                .await;
-            drop(fetch_span);
-            let page = match fetched {
-                Ok(page) => page,
-                Err(e) => {
-                    mark_failed(&jobs, &job_id, format!("Failed to fetch resources: {e}"));
-                    return;
-                }
-            };
-
-            // Rebuild the page through every writer. Page-at-a-time so a
-            // writer can wrap it in one transaction; each writer reports a
-            // per-resource outcome for error attribution. The entry count for
-            // progress comes from the writers' own extraction — the driver no
-            // longer extracts a second time just to count.
-            let mut wrote_any: Vec<bool> = vec![false; page.resources.len()];
-            let mut entry_counts: Vec<u64> = vec![0; page.resources.len()];
-            for writer in &writers {
-                let outcomes = writer
-                    .write_search_entries_page(&tenant, &page.resources)
-                    .await;
-                for (i, outcome) in outcomes.into_iter().enumerate() {
-                    match outcome {
-                        Ok(written) => {
-                            wrote_any[i] = true;
-                            entry_counts[i] = entry_counts[i].max(written as u64);
-                        }
-                        Err(e) => push_error(
-                            &jobs,
-                            &job_id,
-                            resource_type,
-                            page.resources[i].id(),
-                            format!("Failed to rebuild index entries: {e}"),
-                        ),
-                    }
-                }
+    let outcome: Result<(), RunExit> = async {
+        // Process each resource type
+        for resource_type in &resource_types {
+            // Check for cancellation
+            if cancel_rx.try_recv().is_ok() {
+                return Err(RunExit::Cancelled);
             }
 
-            for (i, _resource) in page.resources.iter().enumerate() {
+            // Update current resource type
+            {
                 let mut jobs_guard = jobs.write();
                 if let Some(progress) = jobs_guard.get_mut(&job_id) {
-                    progress.processed_resources += 1;
-                    if wrote_any[i] {
-                        progress.entries_created += entry_counts[i];
-                    }
+                    progress.current_resource_type = Some(resource_type.clone());
                 }
             }
 
-            // Check if there are more pages
-            match page.next_cursor {
-                Some(next) => cursor = Some(next),
-                None => break,
+            // Process resources in batches
+            let mut cursor: Option<String> = None;
+            loop {
+                // Check for cancellation
+                if cancel_rx.try_recv().is_ok() {
+                    return Err(RunExit::Cancelled);
+                }
+
+                // Fetch a page of resources
+                let fetch_span = crate::perf::span(crate::perf::Phase::ReindexFetch);
+                let fetched = source
+                    .fetch_resources_page(
+                        &tenant,
+                        resource_type,
+                        cursor.as_deref(),
+                        request.batch_size,
+                    )
+                    .await;
+                drop(fetch_span);
+                let page = match fetched {
+                    Ok(page) => page,
+                    Err(e) => {
+                        return Err(RunExit::Failed(format!("Failed to fetch resources: {e}")));
+                    }
+                };
+
+                // Rebuild the page through every writer. Page-at-a-time so a
+                // writer can wrap it in one transaction; each writer reports a
+                // per-resource outcome for error attribution. The entry count for
+                // progress comes from the writers' own extraction — the driver no
+                // longer extracts a second time just to count.
+                let mut wrote_any: Vec<bool> = vec![false; page.resources.len()];
+                let mut entry_counts: Vec<u64> = vec![0; page.resources.len()];
+                for writer in &writers {
+                    let outcomes = writer
+                        .write_search_entries_page(&tenant, &page.resources)
+                        .await;
+                    for (i, outcome) in outcomes.into_iter().enumerate() {
+                        match outcome {
+                            Ok(written) => {
+                                wrote_any[i] = true;
+                                entry_counts[i] = entry_counts[i].max(written as u64);
+                            }
+                            Err(e) => push_error(
+                                &jobs,
+                                &job_id,
+                                resource_type,
+                                page.resources[i].id(),
+                                format!("Failed to rebuild index entries: {e}"),
+                            ),
+                        }
+                    }
+                }
+
+                for (i, _resource) in page.resources.iter().enumerate() {
+                    let mut jobs_guard = jobs.write();
+                    if let Some(progress) = jobs_guard.get_mut(&job_id) {
+                        progress.processed_resources += 1;
+                        if wrote_any[i] {
+                            progress.entries_created += entry_counts[i];
+                        }
+                    }
+                }
+
+                // Check if there are more pages
+                match page.next_cursor {
+                    Some(next) => cursor = Some(next),
+                    None => break,
+                }
             }
         }
+
+        Ok(())
+    }
+    .await;
+
+    if request.bulk_index_rebuild {
+        for writer in &writers {
+            if let Err(e) = writer.end_bulk_index_rebuild().await {
+                mark_failed(
+                    &jobs,
+                    &job_id,
+                    format!("Failed to leave bulk index rebuild: {e}"),
+                );
+                return;
+            }
+        }
+    }
+
+    match outcome {
+        Err(RunExit::Cancelled) => return mark_cancelled(&jobs, &job_id),
+        Err(RunExit::Failed(msg)) => return mark_failed(&jobs, &job_id, msg),
+        Ok(()) => {}
     }
 
     if let Some((started, before)) = perf_run {
@@ -1453,7 +1552,19 @@ async fn run_reindex(
 pub struct ReindexOnFinish {
     op: std::sync::Arc<ReindexOperation>,
     max_concurrency: usize,
+    /// Request shape for the generations this hook enqueues.
+    options: AutomaticRunOptions,
 }
+
+/// The page the deferred rebuild uses. `ReindexRequest`'s default of 100
+/// suits an operator-driven `$reindex` on a live server, where a small
+/// transaction keeps the write lock short. The rebuild after a fast-load is
+/// a different workload: it is the bulk of the import's wall clock, and
+/// each page is one COMMIT, whose cost is fixed per transaction rather than
+/// per row. Measured on the SQLite backend, 100 -> 1000 took the rebuild
+/// from 1,695 to 1,926 resources/s; 5,000 gained a further 2% and holds
+/// five times the resources in memory per page, so 1,000 it is.
+pub const DEFERRED_REINDEX_BATCH_SIZE: u32 = 1000;
 
 impl ReindexOnFinish {
     /// Wraps a reindex manager with one automatic generation at a time.
@@ -1471,7 +1582,22 @@ impl ReindexOnFinish {
         Self {
             op,
             max_concurrency: max_concurrency.clamp(1, Semaphore::MAX_PERMITS),
+            options: AutomaticRunOptions::default(),
         }
+    }
+
+    /// Overrides the resources-per-transaction page of the rebuild.
+    pub fn with_batch_size(mut self, batch_size: u32) -> Self {
+        self.options.batch_size = batch_size.max(1);
+        self
+    }
+
+    /// Runs the rebuild in bulk index rebuild mode
+    /// (`HFS_BULK_SUBMIT_BULK_INDEX_REBUILD`): the writer's value indexes are
+    /// dropped for the duration and built once, sorted, at the end.
+    pub fn with_bulk_index_rebuild(mut self, on: bool) -> Self {
+        self.options.bulk_index_rebuild = on;
+        self
     }
 
     async fn enqueue(
@@ -1488,6 +1614,7 @@ impl ReindexOnFinish {
                 tenant.clone(),
                 resource_types,
                 context,
+                self.options,
                 self.max_concurrency,
             )
             .await;
@@ -1838,6 +1965,104 @@ mod tests {
             }
         }
         panic!("job never reached terminal status");
+    }
+
+    /// One type whose page fetch fails, so the run leaves through the
+    /// failure path of the page loop.
+    struct FailingPageSource;
+
+    #[async_trait]
+    impl ReindexSource for FailingPageSource {
+        async fn list_resource_types(&self, _: &TenantContext) -> StorageResult<Vec<String>> {
+            Ok(vec!["Patient".to_string()])
+        }
+        async fn count_resources(&self, _: &TenantContext, _: &str) -> StorageResult<u64> {
+            Ok(1)
+        }
+        async fn fetch_resources_page(
+            &self,
+            _: &TenantContext,
+            _: &str,
+            _: Option<&str>,
+            _: u32,
+        ) -> StorageResult<ResourcePage> {
+            Err(crate::error::BackendError::Unavailable {
+                backend_name: "test".into(),
+                message: "injected page failure".into(),
+            }
+            .into())
+        }
+    }
+
+    /// Counts the bulk-rebuild transitions it is asked for.
+    #[derive(Default)]
+    struct CountingTarget {
+        begun: std::sync::atomic::AtomicUsize,
+        ended: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl ReindexTarget for CountingTarget {
+        async fn delete_search_entries(
+            &self,
+            _: &TenantContext,
+            _: &str,
+            _: &str,
+        ) -> StorageResult<u64> {
+            Ok(0)
+        }
+        async fn write_search_entries(
+            &self,
+            _: &TenantContext,
+            _: &StoredResource,
+        ) -> StorageResult<usize> {
+            Ok(0)
+        }
+        async fn clear_search_index(&self, _: &TenantContext) -> StorageResult<u64> {
+            Ok(0)
+        }
+        async fn begin_bulk_index_rebuild(&self) -> StorageResult<()> {
+            self.begun.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+        async fn end_bulk_index_rebuild(&self) -> StorageResult<()> {
+            self.ended.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    /// A run that fails inside its page loop still leaves bulk index rebuild
+    /// mode: the writer would otherwise be left without its indexes until the
+    /// next process start.
+    #[tokio::test]
+    async fn bulk_index_rebuild_ends_on_the_failure_path() {
+        let target = Arc::new(CountingTarget::default());
+        let op = ReindexOperation::with_parts(
+            Arc::new(FailingPageSource),
+            vec![target.clone()],
+            Arc::new(crate::search::TenantSearchRegistries::base_only()),
+        );
+        let id = op
+            .start(
+                TenantContext::system(),
+                ReindexRequest::default().with_bulk_index_rebuild(true),
+                None,
+            )
+            .await
+            .unwrap();
+        let progress = await_terminal(&op, &id).await;
+        assert_eq!(progress.status, ReindexStatus::Failed);
+        assert_eq!(target.begun.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(target.ended.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        // And a run without the flag never touches the hooks.
+        let id = op
+            .start(TenantContext::system(), ReindexRequest::default(), None)
+            .await
+            .unwrap();
+        await_terminal(&op, &id).await;
+        assert_eq!(target.begun.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(target.ended.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

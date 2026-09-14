@@ -1644,7 +1644,8 @@ fn automatic_reindex_hook(
         helios_persistence::search::ReindexOnFinish::with_max_concurrency(
             op,
             config.bulk_submit.worker_concurrency as usize,
-        ),
+        )
+        .with_bulk_index_rebuild(config.bulk_submit.bulk_index_rebuild),
     )
 }
 
@@ -2861,8 +2862,10 @@ async fn start_s3(
             &config,
             backend.clone(),
             ops.reindex.clone().map(|op| {
-                Arc::new(helios_persistence::search::ReindexOnFinish::new(op))
-                    as Arc<dyn helios_persistence::core::DeferredReindexHook>
+                Arc::new(
+                    helios_persistence::search::ReindexOnFinish::new(op)
+                        .with_bulk_index_rebuild(config.bulk_submit.bulk_index_rebuild),
+                ) as Arc<dyn helios_persistence::core::DeferredReindexHook>
             }),
         )
         .await?
