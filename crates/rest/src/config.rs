@@ -1145,6 +1145,26 @@ pub struct ServerConfig {
     #[arg(long, env = "HFS_DASHBOARD_RECONCILE_SECS", default_value = "30")]
     pub dashboard_reconcile_interval_secs: u64,
 
+    /// Seconds between two refreshes of a web UI Home dashboard whose figures
+    /// are still moving — approximate, or with an import running (#1078).
+    ///
+    /// The refresh re-reads the in-memory counter snapshot, never storage, so
+    /// a short cadence adds no storage load. Must be greater than 0 and not
+    /// greater than [`Self::dashboard_idle_refresh_secs`].
+    #[arg(long, env = "HFS_DASHBOARD_REFRESH_SECS", default_value = "5")]
+    pub dashboard_refresh_secs: u64,
+
+    /// Seconds between two watch ticks of a web UI Home dashboard whose
+    /// figures are settled — exact, and no import running (#1078).
+    ///
+    /// The watch is how a tab opened before an import starts notices it
+    /// without a reload; a tick whose figures did not change is answered
+    /// `204` and swaps nothing. Must be greater than 0 and at least
+    /// [`Self::dashboard_refresh_secs`]: a settled page never polls faster
+    /// than a moving one.
+    #[arg(long, env = "HFS_DASHBOARD_IDLE_REFRESH_SECS", default_value = "10")]
+    pub dashboard_idle_refresh_secs: u64,
+
     /// Natural-language search master switch. When false the feature is
     /// completely off: the endpoint 404s and the UI renders nothing.
     #[arg(long, env = "HFS_NL_SEARCH_ENABLED", default_value = "true")]
@@ -1362,6 +1382,8 @@ impl Default for ServerConfig {
             sof_enabled: true,
             ui_enabled: true,
             dashboard_reconcile_interval_secs: 30,
+            dashboard_refresh_secs: 5,
+            dashboard_idle_refresh_secs: 10,
             nl_search_enabled: true,
             nl_search_api_key: None,
             nl_search_model: "claude-opus-4-8".to_string(),
@@ -1499,6 +1521,19 @@ impl ServerConfig {
             errors.push("Dashboard reconcile interval cannot be 0".to_string());
         }
 
+        if self.dashboard_refresh_secs == 0 {
+            errors.push("Dashboard refresh interval cannot be 0".to_string());
+        }
+
+        if self.dashboard_idle_refresh_secs == 0 {
+            errors.push("Dashboard idle refresh interval cannot be 0".to_string());
+        } else if self.dashboard_idle_refresh_secs < self.dashboard_refresh_secs {
+            errors.push(format!(
+                "Dashboard idle refresh interval ({}) must be greater than or equal to the dashboard refresh interval ({})",
+                self.dashboard_idle_refresh_secs, self.dashboard_refresh_secs
+            ));
+        }
+
         if self.default_page_size == 0 {
             errors.push("Default page size cannot be 0".to_string());
         }
@@ -1590,6 +1625,8 @@ impl ServerConfig {
             sof_enabled: true,
             ui_enabled: true,
             dashboard_reconcile_interval_secs: 30,
+            dashboard_refresh_secs: 5,
+            dashboard_idle_refresh_secs: 10,
             nl_search_enabled: true,
             nl_search_api_key: None,
             nl_search_model: "claude-opus-4-8".to_string(),
@@ -2047,6 +2084,94 @@ mod tests {
                 "soon"
             ])
             .is_err()
+        );
+    }
+
+    // ── dashboard_refresh_secs / dashboard_idle_refresh_secs (#1078) ──
+
+    /// The defaults agree with the CLI defaults, and validate.
+    #[test]
+    fn test_dashboard_refresh_defaults() {
+        for config in [ServerConfig::default(), ServerConfig::for_testing()] {
+            assert_eq!(config.dashboard_refresh_secs, 5);
+            assert_eq!(config.dashboard_idle_refresh_secs, 10);
+        }
+        assert!(ServerConfig::default().validate().is_ok());
+        // Equal cadences are allowed.
+        let config = ServerConfig {
+            dashboard_refresh_secs: 1,
+            dashboard_idle_refresh_secs: 1,
+            ..Default::default()
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    /// A zero moving cadence would have the page poll continuously.
+    #[test]
+    fn test_validate_dashboard_refresh_zero() {
+        let config = ServerConfig {
+            dashboard_refresh_secs: 0,
+            ..Default::default()
+        };
+        let errors = config.validate().unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e == "Dashboard refresh interval cannot be 0")
+        );
+    }
+
+    /// A zero settled cadence is rejected on its own, not as an ordering error.
+    #[test]
+    fn test_validate_dashboard_idle_refresh_zero() {
+        let config = ServerConfig {
+            dashboard_idle_refresh_secs: 0,
+            ..Default::default()
+        };
+        let errors = config.validate().unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e == "Dashboard idle refresh interval cannot be 0")
+        );
+        assert!(!errors.iter().any(|e| e.contains("greater than or equal")));
+    }
+
+    /// A settled page must never poll faster than a moving one.
+    #[test]
+    fn test_validate_dashboard_idle_refresh_below_moving() {
+        let config = ServerConfig {
+            dashboard_refresh_secs: 10,
+            dashboard_idle_refresh_secs: 5,
+            ..Default::default()
+        };
+        let errors = config.validate().unwrap_err();
+        assert!(errors.iter().any(|e| e
+            == "Dashboard idle refresh interval (5) must be greater than or equal to the dashboard refresh interval (10)"));
+    }
+
+    #[test]
+    fn test_cli_dashboard_refresh_parses() {
+        let parsed = ServerConfig::try_parse_from(["rest-server"]).unwrap();
+        assert_eq!(parsed.dashboard_refresh_secs, 5);
+        assert_eq!(parsed.dashboard_idle_refresh_secs, 10);
+        let parsed = ServerConfig::try_parse_from([
+            "rest-server",
+            "--dashboard-refresh-secs",
+            "1",
+            "--dashboard-idle-refresh-secs",
+            "2",
+        ])
+        .unwrap();
+        assert_eq!(parsed.dashboard_refresh_secs, 1);
+        assert_eq!(parsed.dashboard_idle_refresh_secs, 2);
+        assert!(
+            ServerConfig::try_parse_from(["rest-server", "--dashboard-refresh-secs", "soon"])
+                .is_err()
+        );
+        assert!(
+            ServerConfig::try_parse_from(["rest-server", "--dashboard-idle-refresh-secs", "-1"])
+                .is_err()
         );
     }
 

@@ -9,6 +9,64 @@ import type { Page, Locator, Response } from "@playwright/test";
  * backend that cannot count at all. */
 export type DashNotice = "live" | "pending" | "approximate" | "sample" | "unsupported";
 
+/** Whether the suite drives a server it did not boot (the backend matrix sets
+ * HFS_E2E_BASE_URL), which runs with production cadences unless told
+ * otherwise. */
+const externalServer = !!process.env.HFS_E2E_BASE_URL;
+
+/** One dashboard knob in seconds: the exported variable when set, else the
+ * value boot.mjs gives a server this suite boots, else the production default
+ * an external server runs with. */
+function knobSecs(name: string, booted: number, production: number): number {
+  const value = Number(process.env[name]);
+  if (Number.isFinite(value) && value > 0) return value;
+  return externalServer ? production : booted;
+}
+
+/** The Home dashboard's server knobs (#1078), in seconds. **Must match
+ * boot.mjs**, which sets them for every server it boots; an exported
+ * variable of the same name overrides a value on both sides. Every dashboard
+ * wait in this suite is sized from these, or read from the page itself
+ * (`data-dash-refresh`), never from a hard-coded production cadence. */
+export const DASH_KNOBS = {
+  /** `HFS_DASHBOARD_RECONCILE_SECS`: the background reconcile interval that
+   * turns approximate figures exact (production 30). */
+  reconcileSecs: knobSecs("HFS_DASHBOARD_RECONCILE_SECS", 3, 30),
+  /** `HFS_DASHBOARD_REFRESH_SECS`: the refresh cadence of a page whose figures
+   * are moving (production 5). */
+  movingSecs: knobSecs("HFS_DASHBOARD_REFRESH_SECS", 2, 5),
+  /** `HFS_DASHBOARD_IDLE_REFRESH_SECS`: the watch cadence of a settled page
+   * (production 10). */
+  settledSecs: knobSecs("HFS_DASHBOARD_IDLE_REFRESH_SECS", 3, 10),
+} as const;
+
+/** Fixed server timings the knobs do not cover: a seeded tenant's snapshot is
+ * cached for at most 2s, and a refresh waits up to 500ms for a fresh value. */
+export const DASH_SNAPSHOT = { cacheTtlMs: 2_000, freshWaitMs: 500 } as const;
+
+/** Headroom added to every dashboard budget for a machine busy running the
+ * whole suite next to three servers: a tick answered late, a request dropped
+ * while another is in flight (`hx-sync`), a slow reconcile pass. */
+export const CI_SLACK_MS = 15_000;
+
+/** How long new figures may take to land on an open page after a write: two
+ * ticks of the slower (settled) cadence — the page may be moving or settled,
+ * and a tick in flight during the write can still carry the old figures —
+ * plus the snapshot cache's TTL and its wait for a fresh value. */
+export const FIGURES_LAND_MS =
+  2 * DASH_KNOBS.settledSecs * 1000 + DASH_SNAPSHOT.cacheTtlMs + DASH_SNAPSHOT.freshWaitMs + CI_SLACK_MS;
+
+/** How long a quiet tenant may take to settle after its last write: a
+ * reconcile pass that starts after the write makes the totals exact, a later
+ * one may still have to re-seed the charted rings, and the page's moving tick
+ * must then bring the exact figures in. */
+export const SETTLE_MS =
+  3 * DASH_KNOBS.reconcileSecs * 1000 +
+  DASH_KNOBS.movingSecs * 1000 +
+  DASH_SNAPSHOT.cacheTtlMs +
+  DASH_SNAPSHOT.freshWaitMs +
+  CI_SLACK_MS;
+
 /** What the server sent for one hard navigation, read from the response body
  * itself rather than the live DOM. `#dash-live` re-requests itself through
  * htmx — a waiting page after a short delay, every ready page on a periodic
@@ -24,14 +82,15 @@ export interface FirstRender {
   /** Whether `#dash-live` carried the bounded htmx auto-retry of a waiting
    * page (`hx-get` without `data-dash-refresh`). */
   autoRetry: boolean;
-  /** Whether `#dash-live` carried the periodic self-refresh every ready page
-   * schedules (#1078, `data-dash-refresh`): every 5s while the figures are
-   * moving, every 10s once they settle. Never set together with
-   * {@link autoRetry}. */
-  liveRefresh: boolean;
+  /** The period, in seconds, of the self-refresh `#dash-live` carried
+   * (#1078, `data-dash-refresh`), or `null` when it carried none. Every ready
+   * page schedules one: {@link DASH_KNOBS}.movingSecs while the figures are
+   * moving, {@link DASH_KNOBS}.settledSecs once they settle. Never set
+   * together with {@link autoRetry}. */
+  refreshSecs: number | null;
   /** Whether that refresh was marked `data-dash-moving`: the figures are
    * approximate or an import is running. Only ever set with
-   * {@link liveRefresh}. */
+   * {@link refreshSecs}. */
   moving: boolean;
   /** The refresh's `data-dash-state` digest of the figures, or `null` when
    * the render carries no refresh. */
@@ -52,8 +111,7 @@ export class DashboardPage {
   async gotoFirstRender(query = ""): Promise<FirstRender> {
     const response = await this.goto(query);
     if (!response) throw new Error(`no response for /ui${query}`);
-    if (!response.ok()) throw new Error(`/ui${query} -> ${response.status()}`);
-    return parseFirstRender(await response.text());
+    return parseFirstRender(this.page, response);
   }
 
   get statCards(): Locator {
@@ -106,9 +164,11 @@ export class DashboardPage {
   get pendingAutoRetry(): Locator {
     return this.page.locator("#dash-live[hx-get]:not([data-dash-refresh])");
   }
-  /** `#dash-live` on any ready page: it polls itself (#1078) — every 5s
-   * while the figures are moving ({@link movingRefresh}), every 10s once they
-   * settle ({@link settledRefresh}). The tick only stands down while the tab
+  /** `#dash-live` on any ready page: it polls itself (#1078) — every
+   * {@link DASH_KNOBS}.movingSecs while the figures are moving
+   * ({@link movingRefresh}), every {@link DASH_KNOBS}.settledSecs once they
+   * settle ({@link settledRefresh}); the period is on the page as
+   * `data-dash-refresh` ({@link refreshSecsOnScreen}). The tick only stands down while the tab
    * is hidden or keyboard focus sits inside the region outside the type
    * picker (a picker request in flight aborts or drops it through `hx-sync`);
    * an open picker or data table, the tooltip and a mouse click do not stop
@@ -117,16 +177,26 @@ export class DashboardPage {
     return this.page.locator("#dash-live[data-dash-refresh]");
   }
   /** `#dash-live` while its figures are approximate or an import is running
-   * (`data-dash-moving`, 5s poll). */
+   * (`data-dash-moving`, polling at the moving cadence). */
   get movingRefresh(): Locator {
     return this.page.locator("#dash-live[data-dash-moving]");
   }
   /** `#dash-live` on a ready page whose figures have settled: still polling
-   * (10s), so a later write reaches it, but the tick sends its
+   * (at the settled cadence), so a later write reaches it, but the tick sends its
    * `data-dash-state` as `?state=` and the server answers `204` (nothing
    * swapped) while the figures are unchanged. */
   get settledRefresh(): Locator {
     return this.page.locator("#dash-live[data-dash-refresh]:not([data-dash-moving])");
+  }
+  /** The refresh period, in seconds, the `#dash-live` on screen renders
+   * (`data-dash-refresh`) — the tick length to size a wait from — or `null`
+   * when the region carries no periodic refresh. Reads once, no waiting. */
+  async refreshSecsOnScreen(): Promise<number | null> {
+    const values = await this.page
+      .locator("#dash-live[data-dash-refresh]")
+      .evaluateAll((els) => els.map((el) => el.getAttribute("data-dash-refresh")));
+    const secs = Number(values[0] ?? "");
+    return values.length === 1 && Number.isFinite(secs) && secs > 0 ? secs : null;
   }
   /** Marks the `#dash-live` node on screen. A refresh swaps the region's
    * outerHTML, so the mark is gone once one has landed — see
@@ -232,16 +302,13 @@ export class DashboardPage {
    * view, and a warm key serves its cached snapshot (which already plots
    * series) while it refreshes, so on the SQLite leg this normally returns on
    * the first iteration. It stays for the older tests whose subject is not
-   * load timing and that run against slower backends in the matrix. New tests
-   * must not use it (or any reload loop) to paper over a waiting state —
-   * assert on the first render instead (`gotoFirstRender`). */
+   * load timing and that run against slower backends in the matrix, and for a
+   * freshly provisioned tenant, whose figures wait on a reconcile pass to seed
+   * it — hence the reload budget in {@link reloadUntil}. New tests must not use
+   * it (or any reload loop) to paper over a waiting state — assert on the
+   * first render instead (`gotoFirstRender`). */
   async waitForSeries(): Promise<void> {
-    for (let attempt = 0; attempt < 12; attempt++) {
-      if ((await this.seriesLines.count()) > 0) return;
-      await this.page.waitForTimeout(2000);
-      await this.page.reload({ waitUntil: "networkidle" });
-    }
-    throw new Error("no chart series appeared after seeding");
+    await this.reloadUntil(async () => (await this.seriesLines.count()) > 0, "no chart series appeared after seeding");
   }
 
   /** Reloads until the type picker offers `type`, leaving the picker open.
@@ -253,35 +320,77 @@ export class DashboardPage {
    * showing the types of a minute ago. A type seeded moments earlier only
    * appears once a refresh has landed. */
   async waitForPickerOption(type: string): Promise<void> {
-    for (let attempt = 0; attempt < 12; attempt++) {
+    await this.reloadUntil(async () => {
       await this.openPicker();
-      if ((await this.pickerOption(type).count()) > 0) return;
-      await this.page.waitForTimeout(2000);
+      return (await this.pickerOption(type).count()) > 0;
+    }, `the type picker never offered ${type}`);
+  }
+
+  /** Checks `done` on the page, reloading between checks, until it holds or
+   * the budget is spent (then throws `failure`). Sized from the reconcile knob:
+   * the budget covers two reconcile passes (one to seed or reconcile the
+   * tenant, one more in case the first began just before the write) plus the
+   * snapshot cache, and a reload waits a third of an interval — never less
+   * than the cache's TTL, which is the soonest a reload can see anything new. */
+  private async reloadUntil(done: () => Promise<boolean>, failure: string): Promise<void> {
+    const reconcileMs = DASH_KNOBS.reconcileSecs * 1000;
+    const pauseMs = Math.max(DASH_SNAPSHOT.cacheTtlMs, Math.ceil(reconcileMs / 3));
+    const deadline =
+      Date.now() + 2 * reconcileMs + DASH_SNAPSHOT.cacheTtlMs + DASH_SNAPSHOT.freshWaitMs + CI_SLACK_MS;
+    for (;;) {
+      if (await done()) return;
+      if (Date.now() >= deadline) throw new Error(failure);
+      await this.page.waitForTimeout(pauseMs);
       await this.page.reload({ waitUntil: "networkidle" });
     }
-    throw new Error(`the type picker never offered ${type}`);
   }
 }
 
-/** Reads a dashboard response body into a {@link FirstRender}. The markup
- * hooks are the template's own (crates/ui/templates/pages/index.html). Feed
- * it a `200` body only: a refresh answered `204` (figures unchanged) has no
- * body to read. */
-export function parseFirstRender(html: string): FirstRender {
-  const statGrid = /<section class="stat-grid[^"]*">([\s\S]*?)<\/section>/.exec(html)?.[1] ?? "";
-  const liveOpen = /<div id="dash-live"[^>]*>/.exec(html)?.[0] ?? "";
+/** Reads a dashboard response into a {@link FirstRender}: a full page, or a
+ * `#dash-live` or `#dash-chart` fragment an htmx request got back (a chart
+ * fragment has no stat grid and no `#dash-live`, so it reports no unavailable
+ * cards and no refresh). The markup hooks are the template's own
+ * (crates/ui/templates/pages/index.html).
+ *
+ * The body is parsed as HTML by the browser's `DOMParser`, in `page` — Node
+ * has no DOM — and never touches the live document. Only a `200` is read: a
+ * refresh answered `204` (figures unchanged) has no body, and anything else
+ * is not a render, so both throw. */
+export async function parseFirstRender(page: Page, response: Response): Promise<FirstRender> {
+  const status = response.status();
+  if (status !== 200) throw new Error(`${response.url()} -> ${status}: no dashboard render to read`);
+  const html = await response.text();
+  // A navigation that commits while the parse runs destroys the context it
+  // runs in; the parse does not depend on the document, so run it again in
+  // the new one.
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await page.evaluate(readRender, html);
+    } catch (error) {
+      if (attempt >= 2 || !/context was destroyed|navigat/i.test(String(error))) throw error;
+      await page.waitForLoadState("domcontentloaded");
+    }
+  }
+}
+
+/** Runs in the browser (see {@link parseFirstRender}); self-contained, since
+ * Playwright ships only its source. */
+function readRender(html: string): FirstRender {
+  const doc = new DOMParser().parseFromString(html, "text/html");
+  const live = doc.getElementById("dash-live");
   // Both htmx polls ride on `hx-get`; only the ready page's periodic refresh
   // (#1078) marks itself with `data-dash-refresh`.
-  const polls = liveOpen.includes("hx-get=");
-  const liveRefresh = polls && liveOpen.includes("data-dash-refresh");
+  const polls = !!live?.hasAttribute("hx-get");
+  const refreshAttr = polls ? live?.getAttribute("data-dash-refresh") : null;
+  const refreshSecs = refreshAttr == null || refreshAttr === "" ? null : Number(refreshAttr);
   return {
-    notices: [...html.matchAll(/data-dash-notice="([^"]*)"/g)].map((m) => m[1]),
-    series: (html.match(/<polyline class="series series--/g) ?? []).length,
-    chartEmpty: html.includes('class="chart-empty"'),
-    autoRetry: polls && !liveRefresh,
-    liveRefresh,
-    moving: liveRefresh && liveOpen.includes("data-dash-moving"),
-    state: liveRefresh ? (/data-dash-state="([^"]*)"/.exec(liveOpen)?.[1] ?? null) : null,
-    unavailableCards: (statGrid.match(/stat__value--unavailable/g) ?? []).length,
+    notices: Array.from(doc.querySelectorAll("[data-dash-notice]"), (el) => el.getAttribute("data-dash-notice") ?? ""),
+    series: doc.querySelectorAll("svg polyline.series").length,
+    chartEmpty: doc.querySelector(".chart-empty") !== null,
+    autoRetry: polls && refreshSecs === null,
+    refreshSecs,
+    moving: refreshSecs !== null && !!live?.hasAttribute("data-dash-moving"),
+    state: refreshSecs !== null ? (live?.getAttribute("data-dash-state") ?? null) : null,
+    unavailableCards: doc.querySelectorAll(".stat-grid .stat__value--unavailable").length,
   };
 }

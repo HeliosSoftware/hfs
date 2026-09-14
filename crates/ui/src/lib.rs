@@ -102,7 +102,7 @@ use helios_persistence::core::{BulkProviderStore, ResourceStorage, SettingsStore
 use rust_embed::RustEmbed;
 use serde::Deserialize;
 use std::path::PathBuf;
-use std::sync::{Arc, atomic::AtomicBool};
+use std::sync::{Arc, RwLock, atomic::AtomicBool};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Static UI assets (htmx, CSS) embedded into the binary at compile time.
@@ -2022,7 +2022,17 @@ async fn index(
     // The selection's own link, pushed by a picker request.
     let canonical_href = dash_href(&types, window, all_types, focus.as_deref());
     let mut page = build_index_page(
-        &state, locale, types, window, all_types, spec_types, focus, retry, rv.0, &rt,
+        &state,
+        locale,
+        types,
+        window,
+        all_types,
+        spec_types,
+        focus,
+        retry,
+        rv.0,
+        &rt,
+        dashboard_refresh(),
     )
     .await;
     page.quiet_notices = quiet_notices;
@@ -7666,6 +7676,7 @@ async fn status(
                 0,
                 rv.0,
                 &rt,
+                dashboard_refresh(),
             )
             .await,
         )
@@ -7750,25 +7761,82 @@ async fn history_diff(locale: RequestLocale, axum::Form(form): axum::Form<DiffFo
 /// out.
 const DASH_PENDING_RETRIES: u32 = 3;
 
-/// Seconds between two refreshes of a dashboard whose figures are still
-/// moving — approximate, or with an import running (#1078).
+/// The Home dashboard's refresh cadences (#1078), in whole seconds.
 ///
-/// Unlike [`DASH_PENDING_RETRIES`] this poll is not bounded by a count: what
-/// it re-reads is the in-memory counter snapshot (constant time, no storage
-/// scan), which the snapshot cache keeps for at most a couple of seconds, so
-/// it cannot add to the load an import puts on storage, and it stops as soon
-/// as the server renders the page without it. Five seconds keeps the figures
-/// visibly climbing during an import.
-const DASH_LIVE_REFRESH_SECS: u32 = 5;
+/// **Process-wide**: installed once at startup with [`set_dashboard_refresh`]
+/// (the server passes `HFS_DASHBOARD_REFRESH_SECS` /
+/// `HFS_DASHBOARD_IDLE_REFRESH_SECS`), the same way the dashboard provider is
+/// installed with `helios_observability::dashboard::set_provider`, so the
+/// mount functions' signatures do not carry it. A process that never installs
+/// one renders the [`Default`] cadences. Zero is clamped to one second when a
+/// page renders.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DashboardRefresh {
+    /// Seconds between two refreshes of a dashboard whose figures are still
+    /// moving — approximate, or with an import running. Default `5`.
+    ///
+    /// Unlike the bounded pending retry this poll is not bounded by a count:
+    /// what it re-reads is the in-memory counter snapshot (constant time, no
+    /// storage scan), which the snapshot cache keeps for at most a couple of
+    /// seconds, so it cannot add to the load an import puts on storage, and it
+    /// stops as soon as the server renders the page without it. Five seconds
+    /// keeps the figures visibly climbing during an import.
+    pub moving_secs: u32,
+    /// Seconds between two watch ticks of a dashboard whose figures are
+    /// settled: exact, and no import running. Default `10`.
+    ///
+    /// Without it a tab opened before an import starts never learns the
+    /// import began — the page it was given has nothing moving to follow. Ten
+    /// seconds notices an import soon after it starts; a tick whose figures
+    /// did not change is not swapped in, so a quiet page stays still. It
+    /// should not be shorter than [`Self::moving_secs`]: a settled page has
+    /// less reason to poll than a moving one.
+    pub settled_secs: u32,
+}
 
-/// Seconds between two watch ticks of a dashboard whose figures are settled
-/// (#1078): exact, and no import running.
-///
-/// Without it a tab opened before an import starts never learns the import
-/// began — the page it was given has nothing moving to follow. Ten seconds
-/// notices an import soon after it starts; a tick whose figures did not change
-/// is not swapped in (see [`dash_state`]), so a quiet page stays still.
-const DASH_IDLE_REFRESH_SECS: u32 = 10;
+impl Default for DashboardRefresh {
+    fn default() -> Self {
+        Self {
+            moving_secs: 5,
+            settled_secs: 10,
+        }
+    }
+}
+
+impl DashboardRefresh {
+    /// The cadence a page renders with: the moving one while its figures
+    /// move, the settled one otherwise, never below one second.
+    fn secs(self, moving: bool) -> u32 {
+        let secs = if moving {
+            self.moving_secs
+        } else {
+            self.settled_secs
+        };
+        secs.max(1)
+    }
+}
+
+static DASHBOARD_REFRESH: RwLock<Option<DashboardRefresh>> = RwLock::new(None);
+
+/// Install (or replace) the process-wide Home dashboard refresh cadences
+/// (#1078). Called once from the server's startup before the UI is mounted;
+/// the most recent call wins, and every later page render reads it.
+pub fn set_dashboard_refresh(refresh: DashboardRefresh) {
+    match DASHBOARD_REFRESH.write() {
+        Ok(mut guard) => *guard = Some(refresh),
+        Err(poisoned) => *poisoned.into_inner() = Some(refresh),
+    }
+}
+
+/// The installed cadences, or the defaults when none were installed (or the
+/// lock was poisoned).
+fn dashboard_refresh() -> DashboardRefresh {
+    DASHBOARD_REFRESH
+        .read()
+        .ok()
+        .and_then(|guard| *guard)
+        .unwrap_or_default()
+}
 
 /// A short digest of the figures a dashboard render shows, carried on
 /// `#dash-live` as `data-dash-state` (#1078).
@@ -7847,6 +7915,7 @@ async fn build_index_page(
     retry: u32,
     fhir_version: helios_fhir::FhirVersion,
     tenant: &RequestTenant,
+    refresh: DashboardRefresh,
 ) -> IndexPage {
     let status = current_status(state, fhir_version, tenant);
     let i18n = I18n::new(locale);
@@ -7941,11 +8010,7 @@ async fn build_index_page(
     } else {
         live_refresh.then(|| retry_base.clone())
     };
-    let refresh_secs = if refresh_moving {
-        DASH_LIVE_REFRESH_SECS
-    } else {
-        DASH_IDLE_REFRESH_SECS
-    };
+    let refresh_secs = refresh.secs(refresh_moving);
     let refresh_state = dash_state(&snapshot, &types, all_types, Utc::now());
 
     IndexPage {
@@ -8758,7 +8823,7 @@ mod tests {
             refresh_href: None,
             refresh_waiting: false,
             dash_ctx: "default|R4|en".to_string(),
-            refresh_secs: DASH_LIVE_REFRESH_SECS,
+            refresh_secs: DashboardRefresh::default().moving_secs,
             refresh_moving: false,
             refresh_state: String::new(),
             quiet_notices: Vec::new(),
@@ -9755,6 +9820,44 @@ mod tests {
         let patient = &picker[1];
         assert!(patient.selected);
         assert_eq!(patient.href, "/ui?types=&window=1h");
+    }
+
+    /// #1078: the configured cadences reach the rendered page — a moving page
+    /// polls at `moving_secs`, a settled one at `settled_secs`, and a zero is
+    /// clamped to one second. Renders with an explicit [`DashboardRefresh`],
+    /// never the process-wide one, so parallel tests cannot race on it.
+    #[test]
+    fn dashboard_refresh_sets_the_rendered_cadence() {
+        let refresh = DashboardRefresh {
+            moving_secs: 2,
+            settled_secs: 7,
+        };
+        let mut page = sample_index_page("1.2.3", 42, i18n("en"));
+        page.refresh_href = Some("/ui?types=&window=30d".to_string());
+
+        for (moving, secs) in [(true, 2), (false, 7)] {
+            page.refresh_moving = moving;
+            page.refresh_secs = refresh.secs(moving);
+            let html = page.render().expect("index renders");
+            assert!(
+                html.contains(&format!(
+                    r#"hx-trigger="every {secs}s [hfsDashCanRefresh()]""#
+                )),
+                "moving={moving}"
+            );
+            assert!(
+                html.contains(&format!(r#"data-dash-refresh="{secs}""#)),
+                "moving={moving}"
+            );
+        }
+
+        let defaults = DashboardRefresh::default();
+        assert_eq!((defaults.secs(true), defaults.secs(false)), (5, 10));
+        let zero = DashboardRefresh {
+            moving_secs: 0,
+            settled_secs: 0,
+        };
+        assert_eq!((zero.secs(true), zero.secs(false)), (1, 1));
     }
 
     /// The notice line renders as documented: a plain label for approximate

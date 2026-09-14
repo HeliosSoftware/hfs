@@ -1,7 +1,15 @@
 import type { APIRequestContext, Page, Response } from "@playwright/test";
 import { test, expect } from "../pages/fixtures";
 import { createResource } from "../pages/api";
-import { parseFirstRender, type DashboardPage, type FirstRender } from "../pages/dashboard";
+import {
+  CI_SLACK_MS,
+  DASH_KNOBS,
+  FIGURES_LAND_MS,
+  SETTLE_MS,
+  parseFirstRender,
+  type DashboardPage,
+  type FirstRender,
+} from "../pages/dashboard";
 
 // The landing dashboard (/ui) and its functional chart (#555): the type
 // picker and the window selector are plain links (they work without JS —
@@ -24,6 +32,12 @@ const noChartData = process.env.HFS_E2E_NO_CHART_DATA === "1";
 function coldSelection(...types: string[]): string {
   const turn = test.info().retry % types.length;
   return [...types.slice(turn), ...types.slice(0, turn)].join(",");
+}
+
+/** Raises this test's timeout by `ms` over the suite's configured budget. The
+ * dashboard budgets come from pages/dashboard.ts, sized from the server knobs. */
+function extendTimeout(ms: number): void {
+  test.setTimeout(test.info().timeout + ms);
 }
 
 test.beforeEach(async ({ request }) => {
@@ -269,14 +283,7 @@ test("hovering the chart shows the tooltip readout", async ({ dashboard }) => {
   await expect(dashboard.tooltip).toBeHidden();
 });
 
-test("the chart has no expand/collapse toggle", async ({ dashboard }) => {
-  test.skip(noChartData, "no count read path on this backend");
-  await dashboard.goto();
-  await dashboard.waitForSeries();
-  await expect(dashboard.page.locator('[href*="expand=1"]')).toHaveCount(0);
-  await expect(dashboard.page.locator(".chart-card__tools a.pill--square")).toHaveCount(0);
-  await expect(dashboard.chart).toHaveAttribute("viewBox", /0 0 1060 300/);
-});
+// "the chart has no expand/collapse toggle" is a rendering rule: crates/ui/tests/dashboard_pending_http.rs.
 
 test("the chart's numbers are readable as a table", async ({ dashboard }) => {
   test.skip(noChartData, "no count read path on this backend");
@@ -338,15 +345,9 @@ test.describe("first view of a window (#1078)", () => {
     test(`${span} renders chart and headline figures on first view`, async ({ page, dashboard }) => {
       test.skip(noChartData, "no count read path on this backend");
 
+      // A cold key, through the real provider: figures, never the waiting page.
       const render = await dashboard.gotoFirstRender(`?window=${span}&types=${coldSelection("Substance", "Patient")}`);
-      expect(render.notices).not.toContain("pending");
-      expect(render.notices).not.toContain("sample");
-      expect(render.autoRetry, "a ready page schedules no auto-retry").toBe(false);
-      expect(render.liveRefresh, "every ready page polls itself").toBe(true);
-      expect(render.state, "the refresh carries a digest of the figures").toMatch(/^[0-9a-f]{16}$/);
-      expect(render.chartEmpty, "the chart area is not waiting").toBe(false);
-      expect(render.series).toBeGreaterThanOrEqual(1);
-      expect(render.unavailableCards).toBe(0);
+      expectFiguresShown(render, span);
 
       // The DOM is that same render: nothing was retried or reloaded into it.
       await expect(page).not.toHaveURL(/retry=/);
@@ -376,8 +377,10 @@ test.describe("first view of a window (#1078)", () => {
     for (const span of ["24h", "30d"] as const) {
       const response = navigationTo(page, new RegExp(`[?&]window=${span}(&|$)`));
       await dashboard.windowOption(new RegExp(`^${span}$`)).click();
-      const render = parseFirstRender(await (await response).text());
+      const landed = await response;
+      // Parsed in the page once the navigation has landed, not mid-commit.
       await page.waitForURL(new RegExp(`[?&]window=${span}(&|$)`), { waitUntil: "domcontentloaded" });
+      const render = await parseFirstRender(page, landed);
       expectFiguresShown(render, span);
       await expectCardsInDom(dashboard, span);
       await expect(dashboard.notice("pending")).toHaveCount(0);
@@ -402,7 +405,7 @@ test.describe("first view of a window (#1078)", () => {
       (r) => r.request().headers()["hx-target"] === "dash-chart" && /[?&]types=[^&]*Encounter/.test(r.url()),
     );
     await option.click();
-    const toggled = parseFirstRender(await (await swapped).text());
+    const toggled = await parseFirstRender(page, await swapped);
     await expect(page).toHaveURL(/[?&]types=[^&]*Encounter/);
     expectFiguresShown(toggled, "toggle Encounter");
     await expectCardsInDom(dashboard, "toggle Encounter");
@@ -449,9 +452,11 @@ test.describe("first view of a window (#1078)", () => {
 });
 
 // #1078 follow-up: every ready dashboard re-requests its own #dash-live region —
-// every 5s while its figures are moving (approximate: counted from recent
-// writes, not yet reconciled with storage; or an import running), marked
-// `data-dash-moving`, and every 10s once they settle — so an operator watching
+// at the moving cadence while its figures are moving (approximate: counted from
+// recent writes, not yet reconciled with storage; or an import running), marked
+// `data-dash-moving`, and at the slower settled cadence once they settle
+// (HFS_DASHBOARD_REFRESH_SECS / HFS_DASHBOARD_IDLE_REFRESH_SECS, 5s and 10s in
+// production, rendered as `data-dash-refresh`) — so an operator watching
 // an import sees the figures rise without reloading, and a tab opened before
 // the import started notices it too. Each tick is an htmx GET with
 // `HX-Target: dash-live`. A settled region sends its `data-dash-state` as
@@ -467,30 +472,24 @@ test.describe("first view of a window (#1078)", () => {
 // through, since figures that froze until the user moved or closed something
 // were the bug.
 //
-// Timing: a seeded tenant's snapshot is cached for at most 2s and a refresh
-// waits up to 500ms for the fresh value, so a write reaches an open page on the
-// next tick (5s moving, 10s settled). The e2e server also reconciles every 30s;
-// once a reconcile makes the figures exact the swapped-in region slows to the
-// settled tick. Each test therefore writes after marking the region, so the
-// figures it waits for always differ from the ones on screen and the response
-// is swapped, never dropped. Device, Location and Medication are seeded only
-// here, and every test views a selection no other test (or retry, see
-// coldSelection) requests.
+// Timing: every wait below is sized from the server's dashboard knobs
+// (DASH_KNOBS and the budgets derived from it in pages/dashboard.ts, which must
+// match boot.mjs) or read from the page's own `data-dash-refresh` — never from
+// a production cadence. A seeded tenant's snapshot is cached for at most 2s
+// and a refresh waits up to 500ms for the fresh value, so a write reaches an
+// open page on its next tick, moving or settled. The e2e server reconciles
+// every few seconds, so figures written in a beforeEach may already be exact
+// at first render, or turn exact right after it: no test here needs a moving
+// page at first render. Each test writes after opening and marking the region
+// instead, so the figures it waits for always differ from the ones on screen
+// and the response is swapped, never dropped, whichever cadence the page is
+// on. One test ("approximate figures settle…") watches the approximate →
+// settled transition itself, in whichever order the reconcile and the first
+// render happen. Device, Location and Medication are seeded only here, and
+// every test views a selection no other test (or retry, see coldSelection)
+// requests.
 test.describe("live refresh (#1078)", () => {
   test.skip(noChartData, "no count read path on this backend");
-
-  /** How long new figures may take to land on an open page: one 10s settled
-   * tick plus the cache's 2s TTL and its 500ms wait for a fresh value, with
-   * headroom for a machine busy running the suite. */
-  const FIGURES_LAND_MS = 30_000;
-
-  /** How long a quiet default tenant may take to settle: a 30s reconcile pass
-   * that begins after the last write (the beforeEach seeding) must run, and
-   * the page's own 5s poll must then bring the exact figures in. */
-  const SETTLE_MS = 90_000;
-
-  /** The settled refresh interval, in seconds (`data-dash-refresh`). */
-  const SETTLED_SECS = 10;
 
   test.beforeEach(async ({ request }) => {
     await createResource(request, "Device", { status: "active" });
@@ -533,15 +532,31 @@ test.describe("live refresh (#1078)", () => {
   }
 
   /** Opens `/ui?types=…&window=1h` on a selection cold for this test and
-   * checks it is a ready, approximate page that polls itself. */
+   * checks it is a ready page that polls itself. Its figures may be
+   * approximate (moving) or already exact (settled) — a reconcile can land
+   * between the beforeEach writes and this render — so a test that needs the
+   * figures to move writes after opening. */
   async function openLive(dashboard: DashboardPage, ...types: string[]): Promise<void> {
     const render = await dashboard.gotoFirstRender(`?types=${coldSelection(...types)}&window=1h`);
     expect(render.notices, "a ready page").not.toContain("pending");
-    expect(render.notices, "figures written moments ago are not reconciled yet").toContain("approximate");
-    expect(render.liveRefresh, "an approximate ready page polls itself").toBe(true);
-    expect(render.moving, "approximate figures are moving").toBe(true);
-    expect(render.autoRetry, "never the waiting page's bounded retry").toBe(false);
+    expect(render.refreshSecs, "a ready page polls itself").not.toBeNull();
     await expect(dashboard.liveRefresh).toHaveCount(1);
+  }
+
+  /** Checks the region on screen polls at the cadence DASH_KNOBS names for its
+   * state (moving or settled), read in one go so a swap cannot split it. Every
+   * wait in this file is sized from those knobs, so a boot.mjs that drifted
+   * from them must fail here rather than as a timeout somewhere else. */
+  async function expectKnobCadence(dashboard: DashboardPage): Promise<void> {
+    const [moving, refresh, trigger] = await dashboard.live.evaluate((el) => [
+      el.hasAttribute("data-dash-moving"),
+      el.getAttribute("data-dash-refresh"),
+      el.getAttribute("hx-trigger") ?? "",
+    ] as const);
+    const expected = moving ? DASH_KNOBS.movingSecs : DASH_KNOBS.settledSecs;
+    const what = `${moving ? "moving" : "settled"} cadence (DASH_KNOBS, must match boot.mjs)`;
+    expect(refresh, `data-dash-refresh is the ${what}`).toBe(String(expected));
+    expect(trigger, `the tick runs at the ${what}`).toMatch(new RegExp(`every ${expected}s`));
   }
 
   /** Opens `/ui{query}` and waits — without reloading — until the page's own
@@ -555,7 +570,11 @@ test.describe("live refresh (#1078)", () => {
           (await dashboard.settledRefresh.count()) === 1 &&
           (await dashboard.pendingAutoRetry.count()) === 0 &&
           (await dashboard.noticeKinds())[0] === "live",
-        { message: "the quiet tenant's figures settle (a reconcile runs every 30s)", timeout: SETTLE_MS, intervals: [1000] },
+        {
+          message: `the quiet tenant's figures settle (a reconcile runs every ${DASH_KNOBS.reconcileSecs}s)`,
+          timeout: SETTLE_MS,
+          intervals: [1000],
+        },
       )
       .toBe(true);
   }
@@ -579,7 +598,7 @@ test.describe("live refresh (#1078)", () => {
             if (!res) return null;
             const status = res.status();
             // A 204 has no body to parse.
-            return { status, render: status === 200 ? parseFirstRender(await res.text()) : null };
+            return { status, render: status === 200 ? await parseFirstRender(page, res) : null };
           })
           .catch(() => null),
       });
@@ -633,11 +652,9 @@ test.describe("live refresh (#1078)", () => {
   }
 
   test("the stored-resources card rises without a reload", async ({ page, request, dashboard }) => {
-    test.setTimeout(120_000);
+    extendTimeout(FIGURES_LAND_MS);
     await openLive(dashboard, "Device", "Location");
-    await expect(dashboard.live).toHaveAttribute("hx-trigger", /every 5s/);
-    await expect(dashboard.live).toHaveAttribute("data-dash-refresh", "5");
-    await expect(dashboard.movingRefresh).toHaveCount(1);
+    await expectKnobCadence(dashboard);
 
     const url = page.url();
     const navigations = recordNavigations(page);
@@ -703,7 +720,7 @@ test.describe("live refresh (#1078)", () => {
   });
 
   test("a refresh lands while the type picker is open and keeps it as it was", async ({ page, request, dashboard }) => {
-    test.setTimeout(120_000);
+    extendTimeout(FIGURES_LAND_MS);
     await openLive(dashboard, "Location", "Medication");
     const refreshes = recordRefreshes(page);
 
@@ -743,7 +760,7 @@ test.describe("live refresh (#1078)", () => {
   });
 
   test("a refresh lands while the mouse rests on the chart", async ({ page, request, dashboard }) => {
-    test.setTimeout(120_000);
+    extendTimeout(FIGURES_LAND_MS);
     await openLive(dashboard, "Device", "Medication");
     const refreshes = recordRefreshes(page);
 
@@ -766,7 +783,7 @@ test.describe("live refresh (#1078)", () => {
   });
 
   test("a refresh keeps the data table open", async ({ page, request, dashboard }) => {
-    test.setTimeout(120_000);
+    extendTimeout(FIGURES_LAND_MS);
     await openLive(dashboard, "Location", "Device");
     const refreshes = recordRefreshes(page);
 
@@ -791,7 +808,7 @@ test.describe("live refresh (#1078)", () => {
   });
 
   test("a mouse click inside the chart does not stop the refresh", async ({ page, request, dashboard }) => {
-    test.setTimeout(120_000);
+    extendTimeout(FIGURES_LAND_MS);
     await openLive(dashboard, "Medication", "Location");
     const refreshes = recordRefreshes(page);
 
@@ -820,9 +837,9 @@ test.describe("live refresh (#1078)", () => {
   });
 
   test("a refresh follows the picker's URL", async ({ page, request, dashboard }) => {
-    test.setTimeout(120_000);
+    extendTimeout(FIGURES_LAND_MS);
     const render = await dashboard.gotoFirstRender(`?types=${coldSelection("Medication", "Device")}&window=1h`);
-    expect(render.liveRefresh, "an approximate ready page polls itself").toBe(true);
+    expect(render.refreshSecs, "a ready page polls itself").not.toBeNull();
     await expect(dashboard.liveRefresh).toHaveCount(1);
     const refreshes = recordRefreshes(page);
 
@@ -869,37 +886,48 @@ test.describe("live refresh (#1078)", () => {
     await expect(dashboard.pickerOption("Location")).toHaveClass(/chart-pick__option--on/);
   });
 
-  test("a refresh re-announces only the notices that changed", async ({ page }) => {
-    // What the poll sends: `?notices=` names the kinds already on screen, and
-    // exactly those lines come back `aria-live="off"`; any other kind stays
-    // `polite`. Read from the response body, independent of which kinds this
-    // snapshot happens to carry.
-    const view = `/ui?types=${coldSelection("Location", "Device")}&window=1h`;
-    const noticeLines = async (query: string) => {
-      const res = await page.request.get(`${view}${query}`, { headers: { "HX-Request": "true" } });
-      expect(res.ok()).toBe(true);
-      return [...(await res.text()).matchAll(/<p\b[^>]*\bdata-dash-notice="([^"]*)"[^>]*>/g)].map((m) => ({
-        kind: m[1],
-        ariaLive: /\baria-live="([^"]*)"/.exec(m[0])?.[1],
-      }));
-    };
+  // "a refresh re-announces only the notices that changed" is a rendering rule: crates/ui/tests/dashboard_pending_http.rs.
 
-    const first = await noticeLines("");
-    expect(first.length, "a ready page names its figures").toBeGreaterThan(0);
-    for (const line of first) expect(line.ariaLive, `${line.kind} on a first render`).toBe("polite");
-
-    const quiet = ["approximate", "live"];
-    const again = await noticeLines(`&notices=${quiet.join(",")}`);
-    expect(again.length).toBeGreaterThan(0);
-    for (const line of again) {
-      expect(line.ariaLive, `${line.kind} after notices=${quiet}`).toBe(quiet.includes(line.kind) ? "off" : "polite");
+  // The approximate → settled transition, observed on one open page. Figures
+  // written right before the first view are counted at once but only made
+  // exact by a reconcile, which on the e2e server may run before that view
+  // renders: the first render is either approximate (moving) or already live,
+  // and both pass. What must hold is that the open page ends on exact, settled
+  // figures through its own poll, never a reload.
+  test("approximate figures settle on the open page without a reload", async ({ page, request, dashboard }) => {
+    extendTimeout(SETTLE_MS);
+    await write(request, "Location", 5);
+    const render = await dashboard.gotoFirstRender(`?types=${coldSelection("Location", "Medication", "Device")}&window=1h`);
+    expect(render.notices, "a ready page").not.toContain("pending");
+    expect(render.notices[0], "a real reading").toMatch(/^(live|approximate)$/);
+    if (render.notices.includes("approximate")) {
+      expect(render.moving, "approximate figures are moving").toBe(true);
     }
+    const navigations = recordNavigations(page);
+
+    await expect
+      .poll(
+        async () => {
+          if ((await dashboard.settledRefresh.count()) !== 1) return false;
+          const kinds = await dashboard.noticeKinds();
+          return kinds[0] === "live" && !kinds.includes("approximate");
+        },
+        {
+          message: `the open page settles on exact figures (a reconcile runs every ${DASH_KNOBS.reconcileSecs}s)`,
+          timeout: SETTLE_MS,
+          intervals: [500],
+        },
+      )
+      .toBe(true);
+    await expectKnobCadence(dashboard);
+    expect(navigations, "no navigation, reload included").toEqual([]);
   });
 
   // The user's bug: a Home tab opened before an import started was rendered
   // with settled, exact figures, carried no poll, and never moved. Settled
-  // pages now poll every 10s. Driven on the default tenant: the UI's tenant is
-  // the user's stored choice of a provisioned tenant, and provisioning one
+  // pages now poll too, at the settled cadence. Driven on the default tenant:
+  // the UI's tenant is the user's stored choice of a provisioned tenant, and
+  // provisioning one
   // seeds ~1.4k conformance resources (see dashboard-tenants.spec.ts) — far
   // too slow for this file. Tests run one at a time on the shared server, so
   // the default tenant is quiet once this test's own beforeEach writes have
@@ -909,7 +937,7 @@ test.describe("live refresh (#1078)", () => {
     request,
     dashboard,
   }) => {
-    test.setTimeout(240_000);
+    extendTimeout(SETTLE_MS + 2 * FIGURES_LAND_MS);
     const query = `?types=${coldSelection("Device", "Location")}&window=1h`;
     await waitSettled(dashboard, query);
 
@@ -918,13 +946,9 @@ test.describe("live refresh (#1078)", () => {
     const render = await dashboard.gotoFirstRender(query);
     expect(render.notices[0], "exact figures").toBe("live");
     expect(render.notices, "exact figures").not.toContain("approximate");
-    expect(render.autoRetry, "never the waiting page's bounded retry").toBe(false);
-    expect(render.liveRefresh, "a settled page still polls itself").toBe(true);
+    expect(render.refreshSecs, "a settled page still polls itself").not.toBeNull();
     expect(render.moving, "settled figures are not moving").toBe(false);
-    expect(render.state).toMatch(/^[0-9a-f]{16}$/);
     await expect(dashboard.settledRefresh).toHaveCount(1);
-    await expect(dashboard.live).toHaveAttribute("hx-trigger", new RegExp(`every ${SETTLED_SECS}s`));
-    await expect(dashboard.live).toHaveAttribute("data-dash-refresh", String(SETTLED_SECS));
 
     const url = page.url();
     const navigations = recordNavigations(page);
@@ -970,24 +994,38 @@ test.describe("live refresh (#1078)", () => {
   // 1h chart's buckets roll every minute), so a settled page is legitimately
   // swapped once a minute; the observation below is placed inside one minute.
   test("a settled page is not re-rendered when nothing changed", async ({ page, dashboard }) => {
-    test.setTimeout(240_000);
+    const settledMs = DASH_KNOBS.settledSecs * 1000;
+    // Settling, then up to a minute's wait to align, up to three ticks, and
+    // the observation itself (two ticks and a margin, see OBSERVE_MS).
+    extendTimeout(SETTLE_MS + 60_000 + 3 * (settledMs + CI_SLACK_MS) + 2 * settledMs + 2_000);
     const query = `?types=${coldSelection("Location", "Medication")}&window=1h`;
     await waitSettled(dashboard, query);
 
-    const OBSERVE_MS = 2 * SETTLED_SECS * 1000 + 2_000;
+    // The tick is the one this page renders, not an assumed cadence.
+    const tickSecs = await dashboard.refreshSecsOnScreen();
+    expect(tickSecs, "the settled page renders its tick").not.toBeNull();
+    const tickMs = (tickSecs ?? DASH_KNOBS.settledSecs) * 1000;
+    // Long enough for at least two ticks to be sent and answered.
+    const OBSERVE_MS = 2 * tickMs + 2_000;
+    // Keep the observation out of the last seconds before the digest's minute
+    // rolls over.
+    const MINUTE_END_MS = 55_000;
     const isRefresh = (r: { url(): string; headers(): Record<string, string> }) =>
       isRefreshRequest(r) && new URL(r.url()).searchParams.has("notices");
+    const msIntoUtcMinute = () => Date.now() % 60_000;
     // Start early enough in a UTC minute that one tick lands, and the whole
     // observation ends, before the minute rolls over.
     let aligned = false;
     for (let attempt = 0; attempt < 3 && !aligned; attempt++) {
-      const second = new Date().getUTCSeconds();
-      if (second < 1 || second > 15) await page.waitForTimeout(((61 - second) % 60) * 1000 + 500);
+      const into = msIntoUtcMinute();
+      const latestStart = MINUTE_END_MS - OBSERVE_MS - tickMs - 1_000;
+      if (into < 1_000) await page.waitForTimeout(1_500 - into);
+      else if (into > latestStart) await page.waitForTimeout(61_500 - into);
       // Let one tick of this minute land (swapped or dropped), so the region
       // on screen already carries this minute's digest.
-      await page.waitForResponse((r) => isRefresh(r.request()), { timeout: 15_000 });
+      await page.waitForResponse((r) => isRefresh(r.request()), { timeout: tickMs + CI_SLACK_MS });
       await page.waitForTimeout(500);
-      aligned = new Date().getUTCSeconds() * 1000 + OBSERVE_MS < 55_000;
+      aligned = msIntoUtcMinute() + OBSERVE_MS < MINUTE_END_MS;
     }
     expect(aligned, "an observation window inside one UTC minute").toBe(true);
 

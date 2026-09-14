@@ -997,7 +997,12 @@ falls through to the normal REST surface.
   the server), or when a charted window's history is not loaded yet. Idle
   tenants' in-memory state is evicted and rebuilt on the next view, and a
   backend that cannot count (e.g. an S3 primary) shows "not available" rather
-  than zeros.
+  than zeros. An open Home page refreshes its figures every
+  `HFS_DASHBOARD_REFRESH_SECS` (default `5`) while they are moving (approximate,
+  or an import running) and watches settled figures every
+  `HFS_DASHBOARD_IDLE_REFRESH_SECS` (default `10`); both re-read the in-memory
+  counters only. The cadences are process-wide, installed by the server with
+  `helios_ui::set_dashboard_refresh` before mounting.
   The page refreshes itself with plain htmx (#1078): `/ui` answers
   `HX-Target: dash-live` with only the `dash_live` block of `pages/index.html`
   and `HX-Target: dash-chart` (a type-picker option) with only the

@@ -848,6 +848,12 @@ fn mount_ui(
             .storage_backend_mode()
             .expect("storage backend was validated before server startup"),
     );
+    // The Home dashboard's refresh cadences are process-wide, like its
+    // provider: installed here, right before the UI is mounted (#1078).
+    helios_ui::set_dashboard_refresh(helios_ui::DashboardRefresh {
+        moving_secs: u32::try_from(config.dashboard_refresh_secs).unwrap_or(u32::MAX),
+        settled_secs: u32::try_from(config.dashboard_idle_refresh_secs).unwrap_or(u32::MAX),
+    });
     helios_ui::mount_with_body_limit_and_tenant_routing(
         app,
         env!("CARGO_PKG_VERSION"),
