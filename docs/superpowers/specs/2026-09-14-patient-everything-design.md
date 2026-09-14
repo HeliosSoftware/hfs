@@ -69,9 +69,9 @@ Output: `searchset` Bundle built with the existing
 paging. Entries carry `search.mode = match`, except supporting resources
 (section 2, tier 3) which carry `search.mode = include`.
 
-Errors: unknown or deleted Patient → 404; backend without `BasicSearch`
-(S3 standalone) → 501 `UnsupportedCapability`, the same path search takes
-today.
+Errors: unknown Patient → 404; deleted Patient → 410; backend without
+`BasicSearch` (S3 standalone) → 501 `UnsupportedCapability`, the same path
+search takes today.
 
 CapabilityStatement: `everything` is declared under
 `rest.resource[Patient].operation` in `build_resource_capability`

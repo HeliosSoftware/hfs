@@ -263,6 +263,18 @@ async fn errors() {
 }
 
 #[tokio::test]
+async fn deleted_patient_yields_410() {
+    let server = server_with(10_000).await;
+    seed(&server).await;
+    let del = server.delete("/Patient/p2").await;
+    assert!(del.status_code().is_success(), "{}", del.text());
+    let resp = server.get("/Patient/p2/$everything").await;
+    assert_eq!(resp.status_code(), StatusCode::GONE, "{}", resp.text());
+    let body: Value = resp.json();
+    assert_eq!(body["resourceType"], "OperationOutcome");
+}
+
+#[tokio::test]
 async fn capability_statement_declares_everything_on_patient() {
     let server = server_with(10_000).await;
     let b: Value = server.get("/metadata").await.json();
