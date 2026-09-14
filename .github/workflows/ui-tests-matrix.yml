@@ -263,6 +263,10 @@ jobs:
       # conditional writes the backend requires (see /run-hfs-server), and a
       # fresh container per run replaces the old per-run prefix cleanup.
       # Real-AWS coverage stays with the bulk-export/submit smokes.
+      #
+      # Images come from quay.io: MinIO removed the `minio/minio` and
+      # `minio/mc` repositories from Docker Hub, so pulls there fail with
+      # "pull access denied" on any runner without a cached copy.
       - name: Start MinIO
         if: matrix.backend == 's3-elasticsearch'
         run: |
@@ -274,7 +278,7 @@ jobs:
             --label github.workflow=ui-tests-matrix \
             -e MINIO_ROOT_USER=minioadmin \
             -e MINIO_ROOT_PASSWORD=minioadmin \
-            minio/minio server /data
+            quay.io/minio/minio server /data
 
           echo "MINIO_CONTAINER=$MINIO_CONTAINER" >> "$GITHUB_ENV"
 
@@ -292,7 +296,7 @@ jobs:
                   --label github.run_id=${{ github.run_id }} \
                   --label github.workflow=ui-tests-matrix \
                   -e MC_HOST_minio="http://minioadmin:minioadmin@$DOCKER_HOST_IP:$MINIO_PORT" \
-                  minio/mc mb minio/hfs-ui-matrix
+                  quay.io/minio/mc mb minio/hfs-ui-matrix
                 exit 0
               fi
             fi

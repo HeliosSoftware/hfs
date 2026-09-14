@@ -1030,7 +1030,7 @@ The suite is opt-in and env-gated:
 
 Optional overrides:
 
-- `MINIO_IMAGE` (default: `minio/minio`)
+- `MINIO_IMAGE` (default: `quay.io/minio/minio`)
 - `MINIO_TAG` (default: `RELEASE.2025-02-28T09-55-16Z`)
 - `MINIO_ROOT_USER` (default: `minioadmin`)
 - `MINIO_ROOT_PASSWORD` (default: `minioadmin`)

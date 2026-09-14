@@ -255,7 +255,7 @@ jobs:
           docker run -d --name "$MINIO_CONTAINER" -p 0:9000 -p 0:9001 \
             -e MINIO_ROOT_USER=hfs-minio \
             -e MINIO_ROOT_PASSWORD=hfs-minio-secret \
-            minio/minio:latest server /data --console-address ":9001"
+            quay.io/minio/minio:latest server /data --console-address ":9001"
 
           echo "MINIO_CONTAINER=$MINIO_CONTAINER" >> "$GITHUB_ENV"
 
@@ -283,7 +283,7 @@ jobs:
 
           docker run --rm --network "container:$MINIO_CONTAINER" \
             --entrypoint /bin/sh \
-            minio/mc:latest \
+            quay.io/minio/mc:latest \
             -c 'mc alias set local http://127.0.0.1:9000 hfs-minio hfs-minio-secret && mc mb -p local/hfs-export'
 
       - name: Generate Keycloak realm for Inferno client

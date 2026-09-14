@@ -150,10 +150,10 @@ docker run -d --name hfs-mongo -p 27017:27017 mongo:7.0
 # MinIO (s3, s3-es, and the S3 output-backend variants of T5/T7)
 docker run -d --name hfs-minio -p 9000:9000 -p 9001:9001 \
   -e MINIO_ROOT_USER=hfs-minio -e MINIO_ROOT_PASSWORD=hfs-minio-secret \
-  minio/minio:latest server /data --console-address ":9001"
+  quay.io/minio/minio:latest server /data --console-address ":9001"
 # create the buckets once MinIO is up (console at http://localhost:9001)
 docker run --rm --network host -e MC_HOST_local=http://hfs-minio:hfs-minio-secret@localhost:9000 \
-  minio/mc mb --ignore-existing local/hfs local/hfs-export local/hfs-sql-export
+  quay.io/minio/mc mb --ignore-existing local/hfs local/hfs-export local/hfs-sql-export
 ```
 
 Readiness checks:
