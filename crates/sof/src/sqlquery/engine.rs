@@ -196,6 +196,33 @@ impl InMemorySqlEngine {
         Ok(())
     }
 
+    /// Creates a view named `label` that exposes every row and column of
+    /// the existing table (or view) `source`, so a consumer's SQL can address
+    /// that table under a second name without copying a single row. Both
+    /// identifiers go through the same validation as [`Self::create_table`].
+    /// The view lives in this request's in-memory database and disappears
+    /// with it.
+    pub fn create_view(&self, label: &str, source: &str) -> Result<(), SqlQueryError> {
+        validate_identifier(label)?;
+        validate_identifier(source)?;
+        self.conn.execute(
+            &format!("CREATE VIEW \"{label}\" AS SELECT * FROM \"{source}\""),
+            [],
+        )?;
+        // SQLite defers a view's column/table resolution to first use (the
+        // same forward-reference allowance it grants triggers), so a missing
+        // `source` would otherwise go unnoticed until a caller later queries
+        // `label`. Prepare (without running) a statement against the new
+        // view right away so a missing `source` is reported from
+        // `create_view` itself, and drop the unusable view instead of
+        // leaving a dangling one behind.
+        if let Err(e) = self.conn.prepare(&format!("SELECT * FROM \"{label}\"")) {
+            let _ = self.conn.execute(&format!("DROP VIEW \"{label}\""), []);
+            return Err(e.into());
+        }
+        Ok(())
+    }
+
     /// Streams `rows` into `label` on a dedicated blocking thread, then
     /// hands the engine back to the caller.
     ///
@@ -698,5 +725,99 @@ mod tests {
             s.columns.iter().map(|c| c.name.clone()).collect::<Vec<_>>(),
             vec!["a", "b", "c"]
         );
+    }
+
+    #[tokio::test]
+    async fn create_view_exposes_source_rows_and_columns() {
+        let engine = InMemorySqlEngine::open().unwrap();
+        let s = schema(&[
+            ("id", ColumnFhirType::String("id".into())),
+            ("n", ColumnFhirType::Integer),
+        ]);
+        engine.create_table("t", &s).unwrap();
+        let rows = stream::iter(vec![
+            Ok(json!({"id": "a", "n": 1})),
+            Ok(json!({"id": "b", "n": 2})),
+            Ok(json!({"id": "c", "n": 3})),
+        ]);
+        let (engine, inserted) = engine
+            .insert_rows("t", &s, Box::pin(rows), 10)
+            .await
+            .unwrap();
+        assert_eq!(inserted, 3);
+        engine.create_view("v", "t").unwrap();
+
+        let from_view = engine
+            .execute_select("SELECT id, n FROM v ORDER BY n", &[], 100)
+            .unwrap();
+        let from_table = engine
+            .execute_select("SELECT id, n FROM t ORDER BY n", &[], 100)
+            .unwrap();
+        assert_eq!(from_view.rows.len(), 3);
+        assert_eq!(from_view.rows, from_table.rows);
+        assert_eq!(from_view.rows[0][0], Some(Value::String("a".into())));
+        assert_eq!(from_view.rows[0][1], Some(Value::Number(1.into())));
+        assert_eq!(from_view.rows[2][0], Some(Value::String("c".into())));
+        assert_eq!(from_view.rows[2][1], Some(Value::Number(3.into())));
+    }
+
+    #[tokio::test]
+    async fn create_view_reports_the_same_inferred_column_types_as_the_table() {
+        let engine = InMemorySqlEngine::open().unwrap();
+        let s = schema(&[
+            ("id", ColumnFhirType::String("id".into())),
+            ("n", ColumnFhirType::Integer),
+        ]);
+        engine.create_table("t", &s).unwrap();
+        let rows = stream::iter(vec![
+            Ok(json!({"id": "a", "n": 1})),
+            Ok(json!({"id": "b", "n": 2})),
+            Ok(json!({"id": "c", "n": 3})),
+        ]);
+        let (engine, _inserted) = engine
+            .insert_rows("t", &s, Box::pin(rows), 10)
+            .await
+            .unwrap();
+        engine.create_view("v", "t").unwrap();
+
+        let from_view = engine.execute_select("SELECT * FROM v", &[], 100).unwrap();
+        let from_table = engine.execute_select("SELECT * FROM t", &[], 100).unwrap();
+        assert_eq!(from_view.columns, from_table.columns);
+        assert_eq!(from_view.column_types.len(), from_table.column_types.len());
+        for (view_ty, table_ty) in from_view.column_types.iter().zip(&from_table.column_types) {
+            assert_eq!(view_ty.code(), table_ty.code());
+        }
+    }
+
+    #[test]
+    fn create_view_over_empty_schema_table_works() {
+        let engine = InMemorySqlEngine::open().unwrap();
+        let s = TableSchema { columns: vec![] };
+        engine.create_table("e", &s).unwrap();
+        engine.create_view("ve", "e").unwrap();
+        let result = engine
+            .execute_select("SELECT COUNT(*) AS c FROM ve", &[], 100)
+            .unwrap();
+        assert_eq!(result.rows[0][0], Some(Value::Number(0.into())));
+    }
+
+    #[test]
+    fn create_view_rejects_invalid_identifiers() {
+        let engine = InMemorySqlEngine::open().unwrap();
+        let s = schema(&[("a", ColumnFhirType::Integer)]);
+        engine.create_table("t", &s).unwrap();
+
+        let err = engine.create_view("bad\"name", "t").unwrap_err();
+        assert!(matches!(err, SqlQueryError::InvalidIdentifier(_)));
+
+        let err = engine.create_view("v", "").unwrap_err();
+        assert!(matches!(err, SqlQueryError::InvalidIdentifier(_)));
+    }
+
+    #[test]
+    fn create_view_on_missing_source_is_an_error() {
+        let engine = InMemorySqlEngine::open().unwrap();
+        let err = engine.create_view("v", "does_not_exist").unwrap_err();
+        assert!(!matches!(err, SqlQueryError::InvalidIdentifier(_)));
     }
 }
