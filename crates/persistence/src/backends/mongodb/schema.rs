@@ -16,8 +16,11 @@ use super::backend::MongoBackendConfig;
 /// v7 adds the Bulk Data Submit collections and their indexes. v8 moves the
 /// artifact identity under its owning manifest. v9 replaces
 /// `idx_resources_type_deleted` with a longer index that also carries the
-/// `$reindex` page order (#1021).
-pub const SCHEMA_VERSION: i32 = 9;
+/// `$reindex` page order (#1021). v10 replaces `idx_bulk_entry_results_outcome`
+/// with `idx_bulk_entry_results_outcome_line`, which also carries the receipt
+/// keyset order, so outcome-filtered receipt pages need no in-memory sort
+/// (#1046).
+pub const SCHEMA_VERSION: i32 = 10;
 
 /// Initialize MongoDB collections/indexes required by the backend.
 ///
@@ -443,16 +446,22 @@ async fn ensure_bulk_submit_indexes(database: &Database) -> StorageResult<()> {
         true,
     )
     .await?;
+    // Receipt pages walk `(file_url, line_number)` after an optional outcome
+    // filter. `idx_bulk_entry_results_line` serves the unfiltered walk; this
+    // serves the filtered one, and its prefix still serves outcome counts.
     let mut outcome_key = submission_key.clone();
     outcome_key.insert("manifest_id", 1_i32);
     outcome_key.insert("outcome", 1_i32);
+    outcome_key.insert("file_url", 1_i32);
+    outcome_key.insert("line_number", 1_i32);
     create_index(
         &entry_results,
         outcome_key,
-        "idx_bulk_entry_results_outcome",
+        "idx_bulk_entry_results_outcome_line",
         false,
     )
     .await?;
+    drop_index_if_present(&entry_results, "idx_bulk_entry_results_outcome").await?;
 
     let changes = database.collection::<Document>(CHANGES_COLLECTION);
     let mut change_key = submission_key.clone();

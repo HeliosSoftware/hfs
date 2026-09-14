@@ -4394,8 +4394,12 @@ mod tests {
 
     #[tokio::test]
     async fn bulk_submit_exact_keyset_pages() {
-        paging_contract::exact_sql_pages(&create_test_backend(), &create_test_tenant(), i64::MAX)
-            .await;
+        paging_contract::exact_keyset_pages(
+            &create_test_backend(),
+            &create_test_tenant(),
+            i64::MAX,
+        )
+        .await;
     }
 
     #[tokio::test]

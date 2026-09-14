@@ -559,10 +559,11 @@ pub struct EntryResultCursor {
 /// to the same provider with the same scope, outcome filter and page limit.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EntryResultContinuation {
-    /// PostgreSQL and SQLite continue strictly after this stored identity.
+    /// PostgreSQL, SQLite and MongoDB continue strictly after this stored
+    /// identity.
     Keyset(EntryResultCursor),
-    /// MongoDB and S3 retain their existing offset-based traversal internally.
-    /// SQL providers reject this variant, including offset zero.
+    /// S3 retains its existing offset-based traversal internally. Keyset
+    /// providers reject this variant, including offset zero.
     Offset(u32),
 }
 
@@ -571,7 +572,7 @@ pub enum EntryResultContinuation {
 pub struct PagedEntryResult {
     /// The unchanged ingestion result, also used by persisted S3 objects.
     pub result: BulkEntryResult,
-    /// Always present for PostgreSQL and SQLite. Other adapters may omit this:
+    /// Always present for PostgreSQL, SQLite and MongoDB. S3 may omit this:
     /// old S3 receipt objects do not retain a recoverable original file URL.
     pub stored_identity: Option<EntryResultCursor>,
 }
@@ -1523,8 +1524,8 @@ pub trait BulkSubmitProvider: ResourceStorage {
     /// nonzero limit unchanged throughout that traversal. Filtering happens
     /// before limiting; a full last page may require a final empty request.
     ///
-    /// SQL providers use native keyset pagination and return every stored
-    /// identity. MongoDB/S3 encapsulate their existing offset mechanism. A
+    /// PostgreSQL, SQLite and MongoDB use native keyset pagination and return
+    /// every stored identity. S3 encapsulates its existing offset mechanism. A
     /// continuation of the wrong kind is an error, never a fallback request.
     ///
     /// This replaces the former `get_entry_results` offset method and is a

@@ -1890,7 +1890,7 @@ mod postgres_integration {
 
     #[tokio::test]
     async fn postgres_bulk_submit_exact_keyset_pages() {
-        receipt_paging_contract::exact_sql_pages(
+        receipt_paging_contract::exact_keyset_pages(
             &create_backend().await,
             &create_tenant("receipt-pages"),
             i64::from(i32::MAX),
