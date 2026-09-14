@@ -37,6 +37,9 @@ HFS_SERVER_PORT=3000 HFS_LOG_LEVEL=debug cargo run --bin hfs
 | `HFS_DATA_DIR` | `./data` | FHIR data directory, including search parameters |
 | `HFS_SEARCH_PARAM_CACHE_TTL` | `3600` | Seconds between refreshes of the in-memory SearchParameter registry from storage; a param POSTed to one cluster node becomes visible to others within this interval. `0` disables the refresh. |
 | `HFS_UI_ENABLED` | `true` | Serve the web UI at `/ui`. `false` = headless (`/ui` returns 404 + OperationOutcome). Replaces the removed `headless` build feature (#975) |
+| `HFS_DASHBOARD_RECONCILE_SECS` | `30` | Seconds between Home dashboard reconcile passes (`--dashboard-reconcile-interval-secs`). Whole seconds, `> 0`; `0` or non-numeric fails startup. Also spaces per-tenant full recounts (max(interval, 10 × last recount duration)) and failed-seed retries |
+| `HFS_DASHBOARD_REFRESH_SECS` | `5` | Seconds between refreshes of a Home dashboard whose figures are moving (`--dashboard-refresh-secs`). Whole seconds, `> 0`, `<=` `HFS_DASHBOARD_IDLE_REFRESH_SECS`; otherwise fails startup. In-memory counters only |
+| `HFS_DASHBOARD_IDLE_REFRESH_SECS` | `10` | Seconds between watch ticks of a settled Home dashboard (`--dashboard-idle-refresh-secs`). Whole seconds, `> 0`, `>=` `HFS_DASHBOARD_REFRESH_SECS`; otherwise fails startup |
 
 ## Limits
 

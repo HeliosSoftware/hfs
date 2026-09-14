@@ -734,6 +734,7 @@ async fn serve_with_runtime(
         None,
         base.clone(),
         patient_name_search,
+        None,
     )
     .layer(axum::middleware::from_fn(inject_test_principal));
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -773,6 +774,7 @@ async fn serve_with_separate_public_base(
         tenant_path_routing,
         None,
         helios_ui::PatientNameSearchSupport::Enabled,
+        None,
     )
     .layer(axum::middleware::from_fn(inject_test_principal));
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });

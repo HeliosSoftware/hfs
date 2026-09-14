@@ -186,7 +186,16 @@ chart-sample-note = Sample data: this build has no live metrics provider, so the
 chart-pending-note = Still gathering the live figures for this window. Nothing is charted until they arrive — no placeholder numbers are shown.
 chart-pending-empty = Waiting for the live figures…
 chart-pending-retry = Retry now
-chart-partial-note = Some figures could not be read from storage and are shown as zero. Reload to try again.
+# #1078: measured, but counted from in-memory write counters rather than an
+# exact storage read. A label, not a warning.
+chart-approximate-note = Approximate: counted from recent writes and still being reconciled with storage.
+# #1078: the storage backend cannot count resources at all (e.g. an S3
+# primary). Shown in the chart area; the notice line below explains it.
+chart-counts-unsupported = Resource counts are not available for this storage backend.
+chart-counts-unsupported-note = This storage backend cannot count stored resources, so no totals or chart are shown. This does not mean the tenant is empty.
+# #1078: when the figures on the page were read. $time is a UTC time,
+# prefixed with the date when it is not today (e.g. "14:02:31 UTC").
+chart-as-of = As of { $time }.
 chart-table-toggle = View as Table
 chart-table-when = Time
 chart-focus-series = Focus this series
@@ -560,6 +569,9 @@ resources-tab-edit = Edit
 resources-tab-history = History
 resources-types-heading = Resource Types
 rail-all-types-heading = All Types
+# #1078: a type rail count from a snapshot counted from recent writes, not yet
+# reconciled with storage. Hover title and screen-reader text of the "≈" count.
+rail-count-approximate = Approximate: counted from recent writes and still being reconciled with storage.
 
 queries-saved-group = Saved
 
@@ -909,6 +921,7 @@ vd-lint-multiple-iteration-directives = A select may set at most one of forEach,
 vd-lint-select-without-output = A select must have at least one of column, select, or unionAll
 vd-lint-fhirpath-syntax = FHIRPath syntax: { $detail }
 vd-lint-undeclared-constant = Undeclared constant "%{ $name }"
+vd-lint-unknown-resource-type = Unknown resource type "{ $found }"
 vd-fix-rename-key = Rename to "{ $to }"
 vd-fix-remove-key = Remove "{ $key }"
 vd-fix-set-string = Set to "{ $value }"

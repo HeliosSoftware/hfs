@@ -785,6 +785,112 @@ fn undeclared_constant_serializes_with_the_documented_code_and_a_span_object() {
 }
 
 // ---------------------------------------------------------------------------
+// UnknownResourceType (#1014)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn unknown_resource_type_positive() {
+    let mut doc = valid_doc();
+    doc["resource"] = json!("Nope");
+    let diagnostics = lint_view_definition(&doc);
+    let unknown = diagnostics_of(&diagnostics, DiagnosticCode::UnknownResourceType);
+    assert_eq!(unknown.len(), 1, "{diagnostics:?}");
+    let diagnostic = unknown[0];
+    assert_eq!(diagnostic.pointer, "/resource");
+    assert_eq!(diagnostic.severity, Severity::Error);
+    assert_eq!(
+        diagnostic.args.get("found").map(String::as_str),
+        Some("Nope")
+    );
+    assert!(diagnostic.fixes.is_empty());
+    assert!(
+        diagnostic.message.contains("Nope"),
+        "{}",
+        diagnostic.message
+    );
+}
+
+#[test]
+fn unknown_resource_type_is_case_sensitive() {
+    let mut doc = valid_doc();
+    doc["resource"] = json!("patient");
+    let diagnostics = lint_view_definition(&doc);
+    assert_eq!(
+        diagnostics_of(&diagnostics, DiagnosticCode::UnknownResourceType).len(),
+        1,
+        "{diagnostics:?}"
+    );
+}
+
+#[test]
+fn unknown_resource_type_negative() {
+    assert!(
+        diagnostics_of(
+            &lint_view_definition(&valid_doc()),
+            DiagnosticCode::UnknownResourceType
+        )
+        .is_empty()
+    );
+
+    let mut doc = valid_doc();
+    doc["resource"] = json!("Observation");
+    assert!(
+        diagnostics_of(
+            &lint_view_definition(&doc),
+            DiagnosticCode::UnknownResourceType
+        )
+        .is_empty()
+    );
+}
+
+#[test]
+fn unknown_resource_type_never_stacks_on_a_missing_empty_or_non_string_resource() {
+    let mut missing = valid_doc();
+    missing.as_object_mut().unwrap().remove("resource");
+    let diagnostics = lint_view_definition(&missing);
+    assert!(diagnostics_of(&diagnostics, DiagnosticCode::UnknownResourceType).is_empty());
+    assert!(
+        diagnostics_of(&diagnostics, DiagnosticCode::MissingRequired)
+            .iter()
+            .any(|d| d.pointer.is_empty() && d.message.contains("resource"))
+    );
+
+    let mut empty = valid_doc();
+    empty["resource"] = json!("  ");
+    let diagnostics = lint_view_definition(&empty);
+    assert!(diagnostics_of(&diagnostics, DiagnosticCode::UnknownResourceType).is_empty());
+    assert!(
+        diagnostics_of(&diagnostics, DiagnosticCode::EmptyRequired)
+            .iter()
+            .any(|d| d.pointer == "/resource")
+    );
+
+    let mut wrong_type = valid_doc();
+    wrong_type["resource"] = json!(5);
+    let diagnostics = lint_view_definition(&wrong_type);
+    assert!(diagnostics_of(&diagnostics, DiagnosticCode::UnknownResourceType).is_empty());
+    assert!(
+        diagnostics_of(&diagnostics, DiagnosticCode::WrongType)
+            .iter()
+            .any(|d| d.pointer == "/resource")
+    );
+}
+
+#[test]
+fn operation_outcome_maps_unknown_resource_type_to_code_invalid() {
+    let mut doc = valid_doc();
+    doc["resource"] = json!("Nope");
+    let outcome = lint_operation_outcome(&lint_view_definition(&doc));
+    let issue = &outcome["issue"][0];
+    assert_eq!(issue["code"], "code-invalid");
+    assert_eq!(
+        issue["details"]["coding"][0]["code"],
+        "unknown-resource-type"
+    );
+    assert_eq!(issue["expression"][0], "ViewDefinition.resource");
+}
+
+// ---------------------------------------------------------------------------
 // Pointer escaping (RFC 6901) and ordering (RF1)
 // ---------------------------------------------------------------------------
 
@@ -1174,6 +1280,7 @@ fn serializes_every_diagnostic_code_as_the_documented_kebab_case_string() {
         (DiagnosticCode::SelectWithoutOutput, "select-without-output"),
         (DiagnosticCode::FhirPathSyntax, "fhirpath-syntax"),
         (DiagnosticCode::UndeclaredConstant, "undeclared-constant"),
+        (DiagnosticCode::UnknownResourceType, "unknown-resource-type"),
     ];
     for (code, wire) in expected {
         let value = serde_json::to_value(code).unwrap();

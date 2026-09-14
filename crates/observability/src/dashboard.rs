@@ -11,6 +11,15 @@
 //! This mirrors the process-global pattern already used by [`crate::uptime`] and
 //! [`crate::metrics`]: install once at startup, read cheaply per request.
 //!
+//! ## Where the figures come from
+//!
+//! The provider answers in constant time from in-memory counters
+//! ([`crate::dashboard_counters`]) that a background task reconciles against
+//! storage; no page load reads storage (#1078). Each snapshot says how far its
+//! figures can be trusted through [`DashboardSnapshot::figures`]. The cache here
+//! is therefore thin: it deduplicates concurrent reads of one key for a couple
+//! of seconds and bounds a provider that stalls, nothing more.
+//!
 //! ## Scope and trust
 //!
 //! Each snapshot reports counts for the single tenant passed to [`snapshot`]
@@ -27,7 +36,9 @@
 //! the immutable history log — see [`DashboardWindow`] for why both of those
 //! matter.
 
+use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -184,31 +195,84 @@ pub struct DashboardSnapshot {
     /// Non-terminal bulk-submit (import) jobs for the tenant. `None` under the
     /// same conditions as [`Self::export_jobs`].
     pub import_jobs_active: Option<u64>,
-    /// Whether part of this snapshot could not be read and was filled in with
-    /// an empty series or a zero (#956).
-    ///
-    /// Providers degrade rather than error — a failed count query becomes a
-    /// zero, a failed series query an empty chart — which otherwise makes a
-    /// half-failed snapshot indistinguishable from a real one, and caches it
-    /// as truth for the whole cache TTL. Setting this lets the UI say so
-    /// instead of presenting the degraded figures as complete.
-    pub partial: bool,
+    /// Where the figures come from and how far they can be trusted (#1078).
+    /// Only [`Figures::Exact`] and [`Figures::Approximate`] carry figures; the
+    /// other variants leave totals, `available` and `series` empty, and those
+    /// empties are never measurements (#956).
+    pub figures: Figures,
+}
+
+/// Where a [`DashboardSnapshot`]'s figures come from, and how far they can be
+/// trusted (#956, #1078).
+///
+/// One value instead of independent flags, so a snapshot cannot claim to be
+/// both waiting and approximate, or carry an "as of" time for figures nobody
+/// read. Defaults to [`Figures::Pending`]: a snapshot built without saying
+/// otherwise renders as waiting, never as zeros.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Figures {
+    /// Read from counters that matched storage at the last reconcile, with no
+    /// change to the tenant's data seen since.
+    Exact {
+        /// When the figures were read — the UI's "as of" time.
+        read_at: DateTime<Utc>,
+    },
+    /// Measured, but storage changed since the counters last matched it —
+    /// writes recorded by this process or detected elsewhere — or a charted
+    /// window's history is not loaded yet.
+    Approximate {
+        /// When the figures were read — the UI's "as of" time.
+        read_at: DateTime<Utc>,
+        /// When the counters last matched storage.
+        reconciled_at: DateTime<Utc>,
+    },
+    /// Not known yet: the tenant is being seeded in the background.
+    #[default]
+    Pending,
+    /// The storage backend cannot count resources, so there are no figures —
+    /// which is not the same as an empty tenant.
+    Unsupported,
+}
+
+impl Figures {
+    /// The "as of" time, for the variants that carry figures.
+    pub fn read_at(&self) -> Option<DateTime<Utc>> {
+        match self {
+            Figures::Exact { read_at } | Figures::Approximate { read_at, .. } => Some(*read_at),
+            Figures::Pending | Figures::Unsupported => None,
+        }
+    }
+
+    /// Whether the snapshot carries figures at all.
+    pub fn is_known(&self) -> bool {
+        matches!(self, Figures::Exact { .. } | Figures::Approximate { .. })
+    }
+
+    /// Whether the figures are measured but not an exact storage match.
+    pub fn is_approximate(&self) -> bool {
+        matches!(self, Figures::Approximate { .. })
+    }
 }
 
 /// Supplies [`DashboardSnapshot`]s on demand. Implemented in `helios-rest` over
-/// the live storage backend and registered via [`set_provider`] at startup.
+/// the server's live resource counters and registered via [`set_provider`] at
+/// startup.
 #[async_trait]
 pub trait DashboardProvider: Send + Sync {
-    /// Compute a fresh snapshot over `window`, charting `types` (an empty slice
-    /// asks for the provider's default selection — its top stored types).
+    /// Build a snapshot over `window`, charting `types` (an empty slice asks
+    /// for the provider's default selection — its top stored types).
     /// `include_empty` is the "View all resources" toggle (#599): when `true`,
     /// the implementation should also accept a requested type that is not
     /// among its stored types, charting it as a flat zero series, rather than
-    /// silently dropping it. Called per dashboard page load, so implementations
-    /// keep the query fan-out bounded (implementations cap the charted set) and
-    /// degrade gracefully — returning zeros — rather than erroring. An
-    /// implementation that degrades must set [`DashboardSnapshot::partial`], so
-    /// the filled-in zeros are never read as measurements (#956).
+    /// silently dropping it.
+    ///
+    /// Called per dashboard page load and on every dashboard poll, so an
+    /// implementation answers in constant time from what it already holds in
+    /// memory and never reads storage here (#1078). It reports how far the
+    /// figures can be trusted in [`DashboardSnapshot::figures`], stamping the
+    /// moment it read them, and uses [`Figures::Pending`] or
+    /// [`Figures::Unsupported`] rather than filling in zeros that would read as
+    /// measurements (#956). The cache passes the snapshot through unchanged.
     async fn snapshot(
         &self,
         window: DashboardWindow,
@@ -234,44 +298,54 @@ fn provider() -> Option<Arc<dyn DashboardProvider>> {
     PROVIDER.read().ok().and_then(|guard| guard.clone())
 }
 
-/// One cached window: the last computed snapshot (if any) and whether a
-/// compute task is currently in flight for it.
+/// Cache identity: window, tenant, the joined charted types, and the "View all
+/// resources" toggle (#599).
+type CacheKey = (DashboardWindow, String, String, bool);
+
+/// One cached key: the last snapshot written (with when it was written) and
+/// whether a compute holds the refresh slot.
+#[derive(Default)]
 struct CacheEntry {
-    value: Option<(std::time::Instant, DashboardSnapshot)>,
+    value: Option<(Instant, DashboardSnapshot)>,
     computing: bool,
 }
 
-type SnapCache =
-    Arc<RwLock<std::collections::HashMap<(DashboardWindow, String, String, bool), CacheEntry>>>;
+type SnapCache = Arc<RwLock<HashMap<CacheKey, CacheEntry>>>;
 
 static CACHE: std::sync::LazyLock<SnapCache> = std::sync::LazyLock::new(SnapCache::default);
 
-/// How long a computed snapshot is served without recomputing.
-const CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(15);
-/// How long a cold request waits for the first compute before falling back to
-/// placeholder figures. Long enough for row-store backends (milliseconds);
-/// deliberately far below what an object-store scan can take.
-const COLD_WAIT: std::time::Duration = std::time::Duration::from_millis(800);
-/// How long a background compute may run before the cache stops waiting on it
-/// and frees the refresh slot (#959).
+/// How long a written snapshot is served without recomputing.
 ///
-/// Without this, a compute that never returns — a snapshot stuck behind a
-/// 30s connection-pool acquire, say — leaves its cache entry pinned at
-/// `computing: true` forever, and *no* later request ever spawns a refresh:
-/// the entry goes permanently stale (or, if it was cold, permanently absent)
-/// for the lifetime of the process.
-///
-/// The value is deliberately ≥ 2× [`CACHE_TTL`]. Anything shorter and a
-/// slow-but-progressing compute would be abandoned on nearly every pass, so
-/// the cache would never land a value while detached computes piled up behind
-/// each other — replacing a stuck entry with a stampede.
-///
-/// Honest limitation: elapsing only releases the `computing` flag. It does
-/// **not** cancel the underlying work — for the SQLite backend that work runs
-/// on `spawn_blocking` and is not cancellable at all, and even for async
-/// backends the detached task is free to finish and write its (late) value.
-/// So this prevents permanent lockout, not wasted work.
-const COMPUTE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// The dashboard polls every few seconds so the operator can watch figures
+/// move; the provider answers in constant time, so this only has to collapse
+/// bursts of identical reads (several tabs, the rail counts) into one compute.
+const TTL: Duration = Duration::from_secs(2);
+/// How long a request that did not find a fresh value waits for a compute to
+/// write one before serving the stale value, or [`SnapshotState::Pending`] when
+/// there is none. A constant-time provider lands well inside it.
+const WAIT: Duration = Duration::from_millis(500);
+/// How long a compute may run before it is aborted and its refresh slot freed,
+/// so a provider that never returns cannot pin a key (#959).
+const COMPUTE_TIMEOUT: Duration = Duration::from_secs(10);
+/// How often a waiting request re-checks the cache.
+const POLL: Duration = Duration::from_millis(20);
+
+/// The cache's timings, injected so tests run on fast clocks.
+#[derive(Clone, Copy, Debug)]
+struct Timings {
+    /// See [`TTL`].
+    ttl: Duration,
+    /// See [`WAIT`].
+    wait: Duration,
+    /// See [`COMPUTE_TIMEOUT`].
+    compute_timeout: Duration,
+}
+
+const TIMINGS: Timings = Timings {
+    ttl: TTL,
+    wait: WAIT,
+    compute_timeout: COMPUTE_TIMEOUT,
+};
 
 /// The outcome of a dashboard read. The two ways of not having a snapshot are
 /// kept apart on purpose (#956): "this build has no metrics" and "the metrics
@@ -279,13 +353,15 @@ const COMPUTE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 /// `None` is what let a slow window render as invented sample data.
 #[derive(Clone, Debug)]
 pub enum SnapshotState {
-    /// A snapshot from the registered provider — fresh, or the previous one
-    /// while a refresh runs. Check [`DashboardSnapshot::partial`] before
-    /// presenting its figures as complete.
+    /// A snapshot from the registered provider: fresh, freshly recomputed, or —
+    /// when a refresh does not land within the wait — the previous one. Its
+    /// [`DashboardSnapshot::figures`] says whether it carries figures at all,
+    /// how far they can be trusted, and when they were read.
     Ready(DashboardSnapshot),
-    /// A provider is registered, but the first compute for this key has not
-    /// landed within the cold-load budget. It is still running and will fill
-    /// the cache, so the same request repeated shortly usually succeeds.
+    /// A provider is registered, but its compute did not answer within the
+    /// wait and nothing was cached for this key yet — a cold key under a
+    /// stalled provider. The compute keeps running (up to its timeout) and
+    /// fills the cache, so the same request repeated shortly usually succeeds.
     Pending,
     /// No provider is registered: this build has no live metrics at all (a
     /// server without persistence, or the standalone UI example).
@@ -305,7 +381,7 @@ impl SnapshotState {
 }
 
 /// Fetch a dashboard snapshot over `window`, or `None` when no provider is
-/// registered or the first compute is still in flight. Prefer
+/// registered or nothing has been computed for the key yet. Prefer
 /// [`snapshot_state`] where the difference between those two matters.
 pub async fn snapshot(
     window: DashboardWindow,
@@ -321,17 +397,13 @@ pub async fn snapshot(
 /// Fetch a dashboard snapshot over `window`, reporting which of the three
 /// outcomes in [`SnapshotState`] occurred.
 ///
-/// Snapshots are cached per window and recomputed in the background: a request
-/// inside [`CACHE_TTL`] returns the cached value, a stale request returns the
-/// stale value immediately while one refresh task recomputes, and a cold
-/// request waits up to [`COLD_WAIT`] before reporting
-/// [`SnapshotState::Pending`]. This keeps page loads O(1) even on backends
-/// where computing the snapshot walks storage (the S3 primary reads one object
-/// per resource — minutes once conformance seeding has populated the store,
-/// #326).
-///
-/// A background refresh that overruns [`COMPUTE_TIMEOUT`] releases its refresh
-/// slot, so a single stuck compute cannot freeze the entry forever (#959).
+/// Snapshots are cached per (window, tenant, types, "View all resources") key.
+/// A value written within [`TTL`] is served as is. Otherwise the request starts
+/// the key's compute unless one is already running (single-flight), then waits
+/// up to [`WAIT`] for a value written after the one it saw: it gets that value,
+/// else the stale value (stale-while-revalidate), else
+/// [`SnapshotState::Pending`]. A compute that outlasts [`COMPUTE_TIMEOUT`] is
+/// aborted and frees the slot for the next request (#959).
 pub async fn snapshot_state(
     window: DashboardWindow,
     tenant: &str,
@@ -342,15 +414,13 @@ pub async fn snapshot_state(
         return SnapshotState::NoProvider;
     };
     snapshot_via(
-        CACHE.clone(),
+        &CACHE,
         provider,
         window,
         tenant,
         types,
         include_empty,
-        CACHE_TTL,
-        COLD_WAIT,
-        COMPUTE_TIMEOUT,
+        TIMINGS,
     )
     .await
 }
@@ -359,144 +429,192 @@ pub async fn snapshot_state(
 /// serve paths are testable against private caches and fast clocks. Never
 /// returns [`SnapshotState::NoProvider`]: it is only reached with a provider
 /// in hand.
-#[allow(clippy::too_many_arguments)]
 async fn snapshot_via(
-    cache: SnapCache,
+    cache: &SnapCache,
     provider: Arc<dyn DashboardProvider>,
     window: DashboardWindow,
     tenant: &str,
     types: &[String],
     include_empty: bool,
-    ttl: std::time::Duration,
-    cold_wait: std::time::Duration,
-    compute_timeout: std::time::Duration,
+    timings: Timings,
 ) -> SnapshotState {
     // The charted set (and the "View all resources" toggle, #599) is part of
     // the cache identity: two selections — or the same selection with the
-    // toggle flipped — are two different snapshots. Selections are short
-    // (providers cap them), so the joined key stays small and the cache stays
-    // bounded by user behavior.
-    let key = (window, tenant.to_string(), types.join(","), include_empty);
-    // One pass under the lock: serve fresh hits, note staleness, and claim the
-    // compute slot if nobody holds it.
-    let (cached, spawn_compute) = {
-        // A poisoned cache lock means a compute panicked mid-write: nothing is
-        // readable and nothing can be spawned, which is exactly "not here yet".
+    // toggle flipped — are two different snapshots.
+    let key: CacheKey = (window, tenant.to_string(), types.join(","), include_empty);
+    // One pass under the lock: serve a fresh value, or remember what is there
+    // and claim the compute slot if nobody holds it.
+    let (seen, claimed) = {
+        // A poisoned cache lock means a writer panicked mid-update: nothing is
+        // readable and nothing can be spawned, which is "not here yet".
         let Ok(mut guard) = cache.write() else {
             return SnapshotState::Pending;
         };
-        let entry = guard.entry(key.clone()).or_insert(CacheEntry {
-            value: None,
-            computing: false,
-        });
-        if let Some((at, value)) = &entry.value
-            && at.elapsed() < ttl
+        let entry = guard.entry(key.clone()).or_default();
+        if let Some((written_at, snapshot)) = &entry.value
+            && written_at.elapsed() < timings.ttl
         {
-            return SnapshotState::Ready(value.clone());
+            return SnapshotState::Ready(snapshot.clone());
         }
-        let spawn_compute = !entry.computing;
-        if spawn_compute {
-            entry.computing = true;
-        }
-        (entry.value.clone(), spawn_compute)
+        let claimed = !entry.computing;
+        entry.computing = true;
+        (entry.value.clone(), claimed)
     };
 
-    if spawn_compute {
-        let cache = cache.clone();
-        let key = key.clone();
-        let tenant = tenant.to_string();
-        let types = types.to_vec();
-        tokio::spawn(async move {
-            // Time-boxed: a compute that never returns must not pin
-            // `computing: true` forever, which would stop every later request
-            // from ever spawning a refresh and freeze the entry permanently
-            // (#959). Note this releases the *slot*, not the work: the inner
-            // future is dropped here, but a `spawn_blocking` query behind it
-            // (the SQLite backend) keeps running to completion regardless.
-            let computed = tokio::time::timeout(
-                compute_timeout,
-                provider.snapshot(window, &tenant, &types, include_empty),
-            )
-            .await;
-            match computed {
-                Ok(value) => {
-                    if let Ok(mut guard) = cache.write()
-                        && let Some(entry) = guard.get_mut(&key)
-                    {
-                        entry.value = Some((std::time::Instant::now(), value));
-                        entry.computing = false;
-                    }
-                }
-                Err(_elapsed) => {
-                    warn!(
-                        window = window.as_str(),
-                        tenant = %tenant,
-                        timeout_ms = compute_timeout.as_millis() as u64,
-                        "dashboard snapshot compute timed out; releasing the refresh slot"
-                    );
-                    // Clear the flag but write no value: the entry keeps
-                    // whatever (stale) snapshot it had, and the next request
-                    // is free to retry.
-                    if let Ok(mut guard) = cache.write()
-                        && let Some(entry) = guard.get_mut(&key)
-                    {
-                        entry.computing = false;
-                    }
-                }
-            }
-        });
+    if claimed {
+        tokio::spawn(run_compute(
+            cache.clone(),
+            provider,
+            key.clone(),
+            types.to_vec(),
+            timings.compute_timeout,
+        ));
     }
 
-    // Stale beats absent: serve it now, the refresh lands for the next load.
-    if let Some((_, value)) = cached {
-        return SnapshotState::Ready(value);
-    }
-
-    // Cold: give a fast backend a beat to fill the cache before degrading.
-    let deadline = std::time::Instant::now() + cold_wait;
-    while std::time::Instant::now() < deadline {
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        if let Ok(guard) = cache.read()
-            && let Some(value) = guard.get(&key).and_then(|e| e.value.as_ref())
+    // Cold and stale requests wait alike, for a value written after the one
+    // this request saw. The lock is never held across the sleep.
+    let seen_at = seen.as_ref().map(|(written_at, _)| *written_at);
+    let deadline = Instant::now() + timings.wait;
+    loop {
         {
-            return SnapshotState::Ready(value.1.clone());
+            let Ok(guard) = cache.read() else {
+                return SnapshotState::Pending;
+            };
+            if let Some((written_at, snapshot)) = guard.get(&key).and_then(|e| e.value.as_ref())
+                && seen_at.is_none_or(|seen_at| *written_at > seen_at)
+            {
+                return SnapshotState::Ready(snapshot.clone());
+            }
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        tokio::time::sleep(POLL.min(remaining)).await;
+    }
+
+    match seen {
+        // Stale beats absent; the compute still lands for the next request.
+        Some((_, stale)) => SnapshotState::Ready(stale),
+        // Not "no data" — the compute is still running and will fill the
+        // cache, so callers must render waiting, not absence (#956).
+        None => SnapshotState::Pending,
+    }
+}
+
+/// Run `key`'s compute and write its value, always freeing the slot.
+///
+/// The provider runs on its own task: a panic surfaces as a join error instead
+/// of unwinding through the cache, and the timeout can abort the work rather
+/// than leave it running unobserved. The snapshot is written exactly as the
+/// provider built it.
+async fn run_compute(
+    cache: SnapCache,
+    provider: Arc<dyn DashboardProvider>,
+    key: CacheKey,
+    types: Vec<String>,
+    compute_timeout: Duration,
+) {
+    let (window, tenant, _, include_empty) = key.clone();
+    let mut work = tokio::spawn({
+        let tenant = tenant.clone();
+        async move {
+            provider
+                .snapshot(window, &tenant, &types, include_empty)
+                .await
+        }
+    });
+
+    let snapshot = match tokio::time::timeout(compute_timeout, &mut work).await {
+        Ok(Ok(snapshot)) => Some(snapshot),
+        Ok(Err(error)) => {
+            warn!(
+                window = window.as_str(),
+                tenant = %tenant,
+                %error,
+                "dashboard snapshot compute failed"
+            );
+            None
+        }
+        Err(_elapsed) => {
+            work.abort();
+            warn!(
+                window = window.as_str(),
+                tenant = %tenant,
+                timeout_ms = compute_timeout.as_millis() as u64,
+                "dashboard snapshot compute timed out; aborted it and freed the refresh slot"
+            );
+            None
+        }
+    };
+
+    if let Ok(mut guard) = cache.write()
+        && let Some(entry) = guard.get_mut(&key)
+    {
+        entry.computing = false;
+        if let Some(snapshot) = snapshot {
+            entry.value = Some((Instant::now(), snapshot));
         }
     }
-    // Not "no data" — the compute is still running and will land in the cache.
-    // Every window switch takes this path (the window is part of the key), so
-    // callers must render waiting, not absence (#956).
-    SnapshotState::Pending
 }
 
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::time::Duration;
 
     use super::*;
 
     /// Compute budget for the tests that are not about the timeout: far longer
     /// than any fake provider's delay, so it never fires.
-    const TEST_COMPUTE_TIMEOUT: Duration = Duration::from_secs(30);
+    const NO_TIMEOUT: Duration = Duration::from_secs(30);
 
-    /// Counts computes and answers with that count as `total_resources`, after
-    /// an optional delay — enough to tell cached from recomputed values apart.
-    struct Counting {
+    /// Answers its n-th compute (1-based) with `n` as `total_resources`, after
+    /// `delays[n - 1]` (instantly once the script runs out), panicking instead
+    /// on the computes listed in `panics`. Counts computes started and computes
+    /// whose future was dropped before finishing (aborted).
+    struct Scripted {
         hits: AtomicUsize,
-        delay: Duration,
+        dropped: Arc<AtomicUsize>,
+        delays: Vec<Duration>,
+        panics: Vec<usize>,
     }
 
-    impl Counting {
-        fn new(delay: Duration) -> Arc<Self> {
-            Arc::new(Counting {
+    impl Scripted {
+        fn new(delays: &[Duration]) -> Arc<Self> {
+            Self::panicking(delays, &[])
+        }
+
+        fn panicking(delays: &[Duration], panics: &[usize]) -> Arc<Self> {
+            Arc::new(Scripted {
                 hits: AtomicUsize::new(0),
-                delay,
+                dropped: Arc::new(AtomicUsize::new(0)),
+                delays: delays.to_vec(),
+                panics: panics.to_vec(),
             })
+        }
+
+        fn hits(&self) -> usize {
+            self.hits.load(Ordering::SeqCst)
+        }
+
+        fn dropped(&self) -> usize {
+            self.dropped.load(Ordering::SeqCst)
+        }
+    }
+
+    /// Counts a compute future dropped before it finished.
+    struct DropGuard(Option<Arc<AtomicUsize>>);
+
+    impl Drop for DropGuard {
+        fn drop(&mut self) {
+            if let Some(dropped) = &self.0 {
+                dropped.fetch_add(1, Ordering::SeqCst);
+            }
         }
     }
 
     #[async_trait]
-    impl DashboardProvider for Counting {
+    impl DashboardProvider for Scripted {
         async fn snapshot(
             &self,
             window: DashboardWindow,
@@ -505,304 +623,291 @@ mod tests {
             _include_empty: bool,
         ) -> DashboardSnapshot {
             let hit = self.hits.fetch_add(1, Ordering::SeqCst) + 1;
-            if !self.delay.is_zero() {
-                tokio::time::sleep(self.delay).await;
+            let mut guard = DropGuard(Some(self.dropped.clone()));
+            if let Some(delay) = self.delays.get(hit - 1)
+                && !delay.is_zero()
+            {
+                tokio::time::sleep(*delay).await;
+            }
+            guard.0 = None;
+            if self.panics.contains(&hit) {
+                panic!("scripted provider panic on compute {hit}");
             }
             DashboardSnapshot {
                 total_resources: hit as u64,
                 window,
+                figures: Figures::Exact {
+                    read_at: Utc::now(),
+                },
                 ..DashboardSnapshot::default()
             }
         }
+    }
+
+    fn timings(ttl: Duration, wait: Duration, compute_timeout: Duration) -> Timings {
+        Timings {
+            ttl,
+            wait,
+            compute_timeout,
+        }
+    }
+
+    /// One read of the default tenant's default selection over the 1h window.
+    async fn read(
+        cache: &SnapCache,
+        provider: &Arc<Scripted>,
+        include_empty: bool,
+        timings: Timings,
+    ) -> SnapshotState {
+        snapshot_via(
+            cache,
+            provider.clone(),
+            DashboardWindow::LastHour,
+            "default",
+            &[],
+            include_empty,
+            timings,
+        )
+        .await
+    }
+
+    fn total(state: SnapshotState) -> u64 {
+        match state {
+            SnapshotState::Ready(snapshot) => snapshot.total_resources,
+            other => panic!("expected a ready snapshot, got {other:?}"),
+        }
+    }
+
+    fn default_key() -> CacheKey {
+        (
+            DashboardWindow::LastHour,
+            "default".to_string(),
+            String::new(),
+            false,
+        )
+    }
+
+    /// Whether a compute holds `key`'s slot, and the cached `total_resources`.
+    fn observe(cache: &SnapCache, key: &CacheKey) -> (bool, Option<u64>) {
+        let guard = cache.read().expect("cache readable");
+        let entry = guard.get(key).expect("the entry exists");
+        (
+            entry.computing,
+            entry.value.as_ref().map(|(_, s)| s.total_resources),
+        )
+    }
+
+    /// Polls `cond` every 10ms for up to two seconds, reporting whether it
+    /// became true.
+    async fn eventually(mut cond: impl FnMut() -> bool) -> bool {
+        for _ in 0..200 {
+            if cond() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        cond()
     }
 
     #[tokio::test]
     async fn cold_load_fills_the_cache_and_fresh_hits_reuse_it() {
         let cache = SnapCache::default();
-        let provider = Counting::new(Duration::ZERO);
-        let ttl = Duration::from_secs(60);
-        let cold = Duration::from_millis(800);
+        let provider = Scripted::new(&[]);
+        let t = timings(Duration::from_secs(60), WAIT, NO_TIMEOUT);
 
-        let first = snapshot_via(
-            cache.clone(),
-            provider.clone(),
-            DashboardWindow::LastHour,
-            "default",
-            &[],
-            false,
-            ttl,
-            cold,
-            TEST_COMPUTE_TIMEOUT,
-        )
-        .await
-        .ready()
-        .expect("cold load fills within the wait");
-        assert_eq!(first.total_resources, 1);
-
-        let second = snapshot_via(
-            cache,
-            provider.clone(),
-            DashboardWindow::LastHour,
-            "default",
-            &[],
-            false,
-            ttl,
-            cold,
-            TEST_COMPUTE_TIMEOUT,
-        )
-        .await
-        .ready()
-        .expect("fresh hit");
-        assert_eq!(second.total_resources, 1, "served from cache");
+        assert_eq!(total(read(&cache, &provider, false, t).await), 1);
         assert_eq!(
-            provider.hits.load(Ordering::SeqCst),
+            total(read(&cache, &provider, false, t).await),
             1,
-            "no recompute inside the TTL"
+            "served from cache"
         );
+        assert_eq!(provider.hits(), 1, "no recompute inside the TTL");
+        assert_eq!(observe(&cache, &default_key()), (false, Some(1)));
     }
 
+    /// Past the TTL the request that noticed waits for its refresh and gets the
+    /// new figures, not the previous poll's.
     #[tokio::test]
-    async fn stale_hits_serve_immediately_and_refresh_in_the_background() {
+    async fn a_stale_value_is_replaced_by_the_refresh_landing_within_the_wait() {
         let cache = SnapCache::default();
-        let provider = Counting::new(Duration::ZERO);
-        let ttl = Duration::ZERO; // everything is instantly stale
-        let cold = Duration::from_millis(800);
+        let provider = Scripted::new(&[]);
+        let t = timings(Duration::from_millis(50), WAIT, NO_TIMEOUT);
 
-        let first = snapshot_via(
-            cache.clone(),
-            provider.clone(),
-            DashboardWindow::LastDay,
-            "default",
-            &[],
-            false,
-            ttl,
-            cold,
-            TEST_COMPUTE_TIMEOUT,
-        )
-        .await
-        .ready()
-        .expect("cold load");
-        assert_eq!(first.total_resources, 1);
-
-        let stale = snapshot_via(
-            cache.clone(),
-            provider.clone(),
-            DashboardWindow::LastDay,
-            "default",
-            &[],
-            false,
-            ttl,
-            cold,
-            TEST_COMPUTE_TIMEOUT,
-        )
-        .await
-        .ready()
-        .expect("stale value served without waiting");
-        assert_eq!(stale.total_resources, 1, "the old value, not the refresh");
-
-        // The background refresh lands; a later hit sees the new compute.
-        for _ in 0..40 {
-            tokio::time::sleep(Duration::from_millis(25)).await;
-            if provider.hits.load(Ordering::SeqCst) >= 2 {
-                break;
-            }
-        }
-        let refreshed = snapshot_via(
-            cache,
-            provider.clone(),
-            DashboardWindow::LastDay,
-            "default",
-            &[],
-            false,
-            ttl,
-            cold,
-            TEST_COMPUTE_TIMEOUT,
-        )
-        .await
-        .ready()
-        .expect("refreshed value");
-        assert!(
-            refreshed.total_resources >= 2,
-            "got {}",
-            refreshed.total_resources
-        );
-    }
-
-    /// #956: a cold load past the wait is *pending*, not absent. Every window
-    /// switch is a cold key, so this is the path the dashboard took when it
-    /// swapped in invented sample data mid-import; the state it reports has to
-    /// keep "still computing" apart from "this build has no provider".
-    #[tokio::test]
-    async fn slow_cold_compute_reports_pending_then_lands() {
-        let cache = SnapCache::default();
-        let provider = Counting::new(Duration::from_millis(400));
-        let ttl = Duration::from_secs(60);
-        let cold = Duration::from_millis(120);
-
-        let first = snapshot_via(
-            cache.clone(),
-            provider.clone(),
-            DashboardWindow::LastMonth,
-            "default",
-            &[],
-            false,
-            ttl,
-            cold,
-            TEST_COMPUTE_TIMEOUT,
-        )
-        .await;
-        assert!(
-            matches!(first, SnapshotState::Pending),
-            "cold load past the wait is pending, not missing: {first:?}"
-        );
-
-        tokio::time::sleep(Duration::from_millis(600)).await;
-        let second = snapshot_via(
-            cache,
-            provider.clone(),
-            DashboardWindow::LastMonth,
-            "default",
-            &[],
-            false,
-            ttl,
-            cold,
-            TEST_COMPUTE_TIMEOUT,
-        )
-        .await
-        .ready()
-        .expect("the detached compute landed");
-        assert_eq!(second.total_resources, 1);
+        assert_eq!(total(read(&cache, &provider, false, t).await), 1);
+        tokio::time::sleep(Duration::from_millis(80)).await;
         assert_eq!(
-            provider.hits.load(Ordering::SeqCst),
-            1,
-            "single-flight: no compute stampede"
-        );
-    }
-
-    /// Hangs on its first compute — past any timeout a test would use — and
-    /// answers instantly afterwards. That asymmetry is what makes the timeout
-    /// observable: only a *second* spawned compute can land a value, and a
-    /// second compute is only spawned if the first one's refresh slot was
-    /// released.
-    struct HangsOnce {
-        hits: AtomicUsize,
-        first_delay: Duration,
-    }
-
-    impl HangsOnce {
-        fn new(first_delay: Duration) -> Arc<Self> {
-            Arc::new(HangsOnce {
-                hits: AtomicUsize::new(0),
-                first_delay,
-            })
-        }
-    }
-
-    #[async_trait]
-    impl DashboardProvider for HangsOnce {
-        async fn snapshot(
-            &self,
-            window: DashboardWindow,
-            _tenant: &str,
-            _types: &[String],
-            _include_empty: bool,
-        ) -> DashboardSnapshot {
-            let hit = self.hits.fetch_add(1, Ordering::SeqCst) + 1;
-            if hit == 1 {
-                tokio::time::sleep(self.first_delay).await;
-            }
-            DashboardSnapshot {
-                total_resources: hit as u64,
-                window,
-                ..DashboardSnapshot::default()
-            }
-        }
-    }
-
-    /// A compute that overruns `compute_timeout` must release its refresh slot
-    /// (#959). Before the time-box, `computing` stayed `true` forever and the
-    /// entry could never be refreshed again for the life of the process — this
-    /// test would hang at [`SnapshotState::Pending`] on the second call.
-    #[tokio::test]
-    async fn timed_out_compute_releases_the_slot_so_a_later_request_retries() {
-        let cache = SnapCache::default();
-        // Effectively never returns within this test.
-        let provider = HangsOnce::new(Duration::from_secs(30));
-        let ttl = Duration::from_secs(60);
-        let cold = Duration::from_millis(80);
-        let compute_timeout = Duration::from_millis(150);
-
-        let first = snapshot_via(
-            cache.clone(),
-            provider.clone(),
-            DashboardWindow::LastMonth,
-            "default",
-            &[],
-            false,
-            ttl,
-            cold,
-            compute_timeout,
-        )
-        .await;
-        assert!(
-            matches!(first, SnapshotState::Pending),
-            "the stuck compute cannot fill the cache, and a registered provider \
-             that is merely slow is pending, never absent (#956)"
-        );
-        assert_eq!(provider.hits.load(Ordering::SeqCst), 1);
-
-        // Let the time-box elapse and the spawned task clear `computing`.
-        for _ in 0..40 {
-            tokio::time::sleep(Duration::from_millis(25)).await;
-            if cache
-                .read()
-                .ok()
-                .and_then(|g| g.values().next().map(|e| !e.computing))
-                .unwrap_or(false)
-            {
-                break;
-            }
-        }
-        {
-            let guard = cache.read().expect("cache readable");
-            let entry = guard.values().next().expect("the entry exists");
-            assert!(
-                !entry.computing,
-                "the elapsed compute must free the refresh slot"
-            );
-            assert!(
-                entry.value.is_none(),
-                "a timed-out compute writes no value, it only frees the slot"
-            );
-        }
-
-        // With the slot free, the next request spawns a fresh compute — which
-        // is instant this time — and a value finally lands.
-        let second = snapshot_via(
-            cache,
-            provider.clone(),
-            DashboardWindow::LastMonth,
-            "default",
-            &[],
-            false,
-            ttl,
-            cold,
-            compute_timeout,
-        )
-        .await
-        .ready()
-        .expect("a new compute was spawned and landed");
-        assert_eq!(second.total_resources, 2);
-        assert_eq!(
-            provider.hits.load(Ordering::SeqCst),
+            total(read(&cache, &provider, false, t).await),
             2,
-            "exactly one retry, not a stampede"
+            "the refresh this request triggered, not the stale value"
         );
+        assert_eq!(provider.hits(), 2);
     }
 
-    /// Echoes back the window it was asked for, so the test can assert the
-    /// requested window reaches the provider.
+    /// A refresh slower than the wait does not hold the page: the stale value
+    /// is served once the wait runs out, and the refresh lands for the next
+    /// request.
+    #[tokio::test]
+    async fn a_slow_refresh_serves_the_stale_value_then_lands() {
+        let cache = SnapCache::default();
+        let provider = Scripted::new(&[Duration::ZERO, Duration::from_millis(300)]);
+        let t = timings(
+            Duration::from_millis(50),
+            Duration::from_millis(100),
+            NO_TIMEOUT,
+        );
+
+        assert_eq!(total(read(&cache, &provider, false, t).await), 1);
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        let started = Instant::now();
+        assert_eq!(
+            total(read(&cache, &provider, false, t).await),
+            1,
+            "stale beats absent"
+        );
+        assert!(
+            started.elapsed() >= t.wait,
+            "waited for the refresh first: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(provider.hits(), 2, "the refresh was started");
+
+        assert!(eventually(|| observe(&cache, &default_key()) == (false, Some(2))).await);
+    }
+
+    /// #956: a cold key whose compute outlasts the wait is *pending*, not
+    /// absent, and the compute still fills the cache.
+    #[tokio::test]
+    async fn slow_cold_compute_reports_pending_then_ready() {
+        let cache = SnapCache::default();
+        let provider = Scripted::new(&[Duration::from_millis(300)]);
+        let t = timings(
+            Duration::from_secs(60),
+            Duration::from_millis(50),
+            NO_TIMEOUT,
+        );
+
+        let first = read(&cache, &provider, false, t).await;
+        assert!(matches!(first, SnapshotState::Pending), "{first:?}");
+
+        let second = read(&cache, &provider, false, t).await;
+        assert!(
+            matches!(second, SnapshotState::Pending),
+            "still computing: {second:?}"
+        );
+        assert_eq!(provider.hits(), 1, "single-flight: no second compute");
+
+        assert!(eventually(|| observe(&cache, &default_key()).1.is_some()).await);
+        assert_eq!(total(read(&cache, &provider, false, t).await), 1);
+        assert_eq!(provider.hits(), 1);
+    }
+
+    /// The "View all resources" toggle (#599) is part of the cache identity.
+    #[tokio::test]
+    async fn include_empty_is_part_of_the_cache_key() {
+        let cache = SnapCache::default();
+        let provider = Scripted::new(&[]);
+        let t = timings(Duration::from_secs(60), WAIT, NO_TIMEOUT);
+
+        assert_eq!(total(read(&cache, &provider, false, t).await), 1);
+        assert_eq!(
+            total(read(&cache, &provider, true, t).await),
+            2,
+            "not served from the flag-off entry"
+        );
+        assert_eq!(total(read(&cache, &provider, false, t).await), 1);
+        assert_eq!(provider.hits(), 2);
+    }
+
+    /// #959: a compute past its timeout is aborted — its future dropped, not
+    /// left running — and frees the slot, so the next request computes again.
+    #[tokio::test]
+    async fn a_timed_out_compute_is_aborted_and_frees_the_slot() {
+        let cache = SnapCache::default();
+        let provider = Scripted::new(&[Duration::from_secs(30)]);
+        let t = timings(
+            Duration::from_secs(60),
+            Duration::from_millis(20),
+            Duration::from_millis(100),
+        );
+        let key = default_key();
+
+        let first = read(&cache, &provider, false, t).await;
+        assert!(matches!(first, SnapshotState::Pending), "{first:?}");
+        assert!(observe(&cache, &key).0, "the compute holds the slot");
+
+        assert!(
+            eventually(|| provider.dropped() == 1).await,
+            "the timed-out compute is aborted"
+        );
+        assert!(
+            eventually(|| observe(&cache, &key) == (false, None)).await,
+            "the slot is freed and nothing is written"
+        );
+
+        read(&cache, &provider, false, t).await;
+        assert_eq!(provider.hits(), 2, "a new compute started");
+        assert!(eventually(|| observe(&cache, &key) == (false, Some(2))).await);
+    }
+
+    /// A panicking provider surfaces as a join error: the slot is freed, the
+    /// cache stays usable, and the next request computes again.
+    #[tokio::test]
+    async fn a_panicking_provider_frees_the_slot() {
+        let cache = SnapCache::default();
+        let provider = Scripted::panicking(&[], &[1]);
+        let t = timings(
+            Duration::from_secs(60),
+            Duration::from_millis(100),
+            NO_TIMEOUT,
+        );
+        let key = default_key();
+
+        let first = read(&cache, &provider, false, t).await;
+        assert!(matches!(first, SnapshotState::Pending), "{first:?}");
+        assert_eq!(observe(&cache, &key), (false, None), "slot freed");
+
+        assert_eq!(total(read(&cache, &provider, false, t).await), 2);
+        assert_eq!(provider.hits(), 2);
+    }
+
+    /// Concurrent requests share one compute, on a cold key and on a stale one.
+    #[tokio::test]
+    async fn concurrent_requests_run_one_compute() {
+        let cache = SnapCache::default();
+        let provider = Scripted::new(&[Duration::from_millis(100), Duration::from_millis(100)]);
+        let t = timings(Duration::from_millis(300), WAIT, NO_TIMEOUT);
+
+        let burst = |expected: u64| {
+            let requests: Vec<_> = (0..8)
+                .map(|_| {
+                    let cache = cache.clone();
+                    let provider = provider.clone();
+                    tokio::spawn(async move { read(&cache, &provider, false, t).await })
+                })
+                .collect();
+            async move {
+                for request in requests {
+                    assert_eq!(
+                        total(request.await.expect("request task")),
+                        expected,
+                        "every waiter sees the one compute"
+                    );
+                }
+            }
+        };
+
+        burst(1).await;
+        assert_eq!(provider.hits(), 1, "single-flight on a cold key");
+
+        tokio::time::sleep(Duration::from_millis(350)).await;
+        burst(2).await;
+        assert_eq!(provider.hits(), 2, "single-flight on a stale key");
+    }
+
+    /// Echoes back the window it was asked for, with a fixed "as of" time.
     struct Fixed;
+
+    const FIXED_READ_AT: i64 = 1_752_454_800;
 
     #[async_trait]
     impl DashboardProvider for Fixed {
@@ -830,7 +935,9 @@ mod tests {
                 available: Vec::new(),
                 export_jobs: None,
                 import_jobs_active: None,
-                partial: false,
+                figures: Figures::Exact {
+                    read_at: DateTime::from_timestamp(FIXED_READ_AT, 0).unwrap(),
+                },
             }
         }
     }
@@ -850,6 +957,13 @@ mod tests {
         assert_eq!(snap.series.len(), 1);
         assert_eq!(snap.series[0].resource_type, "Patient");
         assert_eq!(snap.series[0].points.last().unwrap().cumulative, 7);
+        // The provider's figures pass through the cache untouched.
+        assert_eq!(
+            snap.figures,
+            Figures::Exact {
+                read_at: DateTime::from_timestamp(FIXED_READ_AT, 0).unwrap(),
+            }
+        );
 
         // The same read through the three-state entry point reports Ready —
         // the state the UI needs to tell a real snapshot from a slow one.
@@ -857,50 +971,23 @@ mod tests {
         assert!(matches!(state, SnapshotState::Ready(_)), "{state:?}");
     }
 
-    /// The "View all resources" toggle (#599) is part of the cache identity:
-    /// the same window/tenant/types with `include_empty` flipped must not
-    /// reuse a value computed under the other setting.
-    #[tokio::test]
-    async fn include_empty_is_part_of_the_cache_key() {
-        let cache = SnapCache::default();
-        let provider = Counting::new(Duration::ZERO);
-        let ttl = Duration::from_secs(60);
-        let cold = Duration::from_millis(800);
-
-        let without = snapshot_via(
-            cache.clone(),
-            provider.clone(),
-            DashboardWindow::LastHour,
-            "default",
-            &[],
-            false,
-            ttl,
-            cold,
-            TEST_COMPUTE_TIMEOUT,
-        )
-        .await
-        .ready()
-        .expect("cold load, flag off");
-        assert_eq!(without.total_resources, 1);
-
-        let with = snapshot_via(
-            cache,
-            provider.clone(),
-            DashboardWindow::LastHour,
-            "default",
-            &[],
-            true,
-            ttl,
-            cold,
-            TEST_COMPUTE_TIMEOUT,
-        )
-        .await
-        .ready()
-        .expect("cold load, flag on — a separate cache entry");
-        assert_eq!(
-            with.total_resources, 2,
-            "not served from the flag-off entry"
-        );
+    #[test]
+    fn figures_helpers_follow_the_variant() {
+        let read_at = DateTime::from_timestamp(FIXED_READ_AT, 0).unwrap();
+        let exact = Figures::Exact { read_at };
+        let approximate = Figures::Approximate {
+            read_at,
+            reconciled_at: read_at,
+        };
+        assert_eq!(exact.read_at(), Some(read_at));
+        assert!(exact.is_known() && !exact.is_approximate());
+        assert_eq!(approximate.read_at(), Some(read_at));
+        assert!(approximate.is_known() && approximate.is_approximate());
+        for unknown in [Figures::Pending, Figures::Unsupported] {
+            assert_eq!(unknown.read_at(), None);
+            assert!(!unknown.is_known() && !unknown.is_approximate());
+        }
+        assert_eq!(DashboardSnapshot::default().figures, Figures::Pending);
     }
 
     /// Every window stays inside a legible point budget, and its span is exactly

@@ -164,14 +164,17 @@ exactly one applies it directly, more than one opens the lint panel
 (`openLintPanel`), none falls through to `.`'s normal self-insertion;
 `lintKeymap` rides along in the same keymap, adding F8 (next diagnostic) and
 Ctrl-Shift-M (open the panel). Submitting `#vd-editor-form` as Save (not
-Duplicate) while the most recently *completed* lint pass still has at least
-one `error`-severity diagnostic — local JSON syntax errors included — pops a
-native, plural-correct `window.confirm` (`data-msg-save-errors-one`/`-other`
-on `#vd-editor-grid`, Fluent `vd-save-with-errors-one`/`-other`); cancelling
-it keeps the page as it is with focus back on the editor, and warnings alone
-(or no lint result yet) never prompt at all. None of this requires anything
-beyond `window.HfsCodeMirror` — no JavaScript at all means Save always just
-submits, exactly as it does today.
+Duplicate) pops a native, plural-correct `window.confirm`
+(`data-msg-save-errors-one`/`-other` on `#vd-editor-grid`, Fluent
+`vd-save-with-errors-one`/`-other`) when either of two sources reports an
+error: the most recently *completed* lint pass — local JSON syntax errors
+included — or the guided form's validity chip (`data-error-count` on
+`.editor-validity`, the server's own count of FHIR schema, required-binding,
+and lint findings; #1014). The confirmation names the larger of the two
+counts. Cancelling it keeps the page as it is with focus back on the editor,
+and warnings alone (or no lint result and no chip issues) never prompt at
+all. None of this requires anything beyond `window.HfsCodeMirror` — no
+JavaScript at all means Save always just submits, exactly as it does today.
 
 The editor also talks to `POST /ui/sql/view-definitions/complete` (#821),
 a sibling of `/lint` following the same "the browser knows syntax, the
@@ -986,8 +989,30 @@ falls through to the normal REST surface.
   `helios_observability::dashboard`, a provider the server registers at startup.
   That keeps this crate free of any persistence dependency for the read path;
   with no provider registered, the dashboard renders placeholder figures through
-  the same rendering path. Counts reflect the **default tenant** only — an
+  the same rendering path. Counts reflect the **request's tenant** (#344) — an
   operator view, never exported to the public Prometheus `/metrics` endpoint.
+  Operators should note: figures come from **per-process** in-memory write
+  counters that a background loop reconciles with storage every
+  `HFS_DASHBOARD_RECONCILE_SECS` (default `30`); page loads never query
+  storage. Between reconciles a figure is labelled **Approximate** when this
+  process recorded writes, when a cheap storage write marker shows data changed
+  elsewhere (another instance sharing PostgreSQL/MongoDB, or writes that bypass
+  the server), or when a charted window's history is not loaded yet. Idle
+  tenants' in-memory state is evicted and rebuilt on the next view, and a
+  backend that cannot count (e.g. an S3 primary) shows "not available" rather
+  than zeros. An open Home page refreshes its figures every
+  `HFS_DASHBOARD_REFRESH_SECS` (default `5`) while they are moving (approximate,
+  or an import running) and watches settled figures every
+  `HFS_DASHBOARD_IDLE_REFRESH_SECS` (default `10`); both re-read the in-memory
+  counters only. The cadences are process-wide, installed by the server with
+  `helios_ui::set_dashboard_refresh` before mounting.
+  The page refreshes itself with plain htmx (#1078): `/ui` answers
+  `HX-Target: dash-live` with only the `dash_live` block of `pages/index.html`
+  and `HX-Target: dash-chart` (a type-picker option) with only the
+  `chart_card` block plus `HX-Push-Url` (askama `blocks = [...]`, no duplicated
+  markup); a history restore or plain load gets the full page. A settled tick
+  sending an unchanged `state` digest gets `204`, and `open=pick,table` renders
+  what the user had open.
 - **Per-user preferences** (theme, nav state, FHIR version, tenant, saved and
   recent queries, and — since #754/#755 — every sidebar rail's `rails.<page>`
   record of `last`/`recent`, tenant-scoped, see `rail_state`) roam in the

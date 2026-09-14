@@ -183,7 +183,14 @@ chart-sample-note = Beispieldaten: dieser Build hat keinen Live-Metrikanbieter, 
 chart-pending-note = Die Live-Zahlen für dieses Zeitfenster werden noch erhoben. Bis sie eintreffen wird nichts dargestellt — es werden keine Platzhalterzahlen gezeigt.
 chart-pending-empty = Warten auf die Live-Zahlen…
 chart-pending-retry = Jetzt erneut versuchen
-chart-partial-note = Einige Zahlen konnten nicht aus dem Speicher gelesen werden und werden als Null angezeigt. Zum erneuten Versuch neu laden.
+# #1078: gemessen, aber aus Schreibzählern im Speicher statt aus einem exakten
+# Speicherlesevorgang gezählt. Eine Kennzeichnung, keine Warnung.
+chart-approximate-note = Näherungswert: aus den jüngsten Schreibvorgängen gezählt und noch nicht mit dem Speicher abgeglichen.
+chart-counts-unsupported = Ressourcenzählungen sind für dieses Speicher-Backend nicht verfügbar.
+chart-counts-unsupported-note = Dieses Speicher-Backend kann gespeicherte Ressourcen nicht zählen, daher werden weder Summen noch ein Diagramm angezeigt. Das bedeutet nicht, dass der Mandant leer ist.
+# #1078: wann die Zahlen auf der Seite gelesen wurden. $time ist eine UTC-Uhrzeit,
+# mit vorangestelltem Datum, wenn sie nicht von heute ist (z. B. "14:02:31 UTC").
+chart-as-of = Stand: { $time }.
 chart-table-toggle = Als Tabelle anzeigen
 chart-table-when = Zeitpunkt
 chart-focus-series = Diese Serie fokussieren
@@ -545,6 +552,7 @@ resources-tab-edit = Bearbeiten
 resources-tab-history = Verlauf
 resources-types-heading = Ressourcentypen
 rail-all-types-heading = Alle Typen
+rail-count-approximate = Näherungswert: aus den jüngsten Schreibvorgängen gezählt und noch nicht mit dem Speicher abgeglichen.
 
 queries-saved-group = Gespeichert
 
@@ -887,6 +895,7 @@ vd-lint-multiple-iteration-directives = Ein select darf höchstens eines von for
 vd-lint-select-without-output = Ein select muss mindestens eines von column, select oder unionAll enthalten
 vd-lint-fhirpath-syntax = FHIRPath-Syntax: { $detail }
 vd-lint-undeclared-constant = Nicht deklarierte Konstante "%{ $name }"
+vd-lint-unknown-resource-type = Unbekannter Ressourcentyp "{ $found }"
 vd-fix-rename-key = Umbenennen zu "{ $to }"
 vd-fix-remove-key = "{ $key }" entfernen
 vd-fix-set-string = Auf "{ $value }" setzen

@@ -481,10 +481,7 @@ pub fn bundle_if_none_exist_gate(matches: Vec<StoredResource>) -> Option<BundleE
         0 => None,
         1 => {
             let existing = matches.into_iter().next().expect("length checked");
-            let location = existing.versioned_url();
-            let mut result = BundleEntryResult::ok(existing);
-            result.location = Some(location);
-            Some(result)
+            Some(BundleEntryResult::matched_existing(existing))
         }
         n => Some(multiple_matches_entry("create", n)),
     }
@@ -857,6 +854,11 @@ mod tests {
     fn if_none_exist_gate_answers_200_with_a_location_for_the_single_match() {
         let result = bundle_if_none_exist_gate(vec![stored("p1")]).expect("gated");
         assert_eq!(result.status, 200);
+        assert_eq!(
+            result.effect,
+            crate::core::transaction::BundleEntryEffect::NoOp,
+            "a matched conditional create writes nothing"
+        );
         assert_eq!(result.location.as_deref(), Some("Patient/p1/_history/1"));
         assert_eq!(
             result
@@ -873,6 +875,10 @@ mod tests {
     fn if_none_exist_gate_answers_412_for_several_matches() {
         let result = bundle_if_none_exist_gate(vec![stored("p1"), stored("p2")]).expect("gated");
         assert_eq!(result.status, 412);
+        assert_eq!(
+            result.effect,
+            crate::core::transaction::BundleEntryEffect::Failed
+        );
         assert!(result.resource.is_none());
         let outcome = result.outcome.expect("outcome");
         assert_eq!(outcome["issue"][0]["code"], "multiple-matches");
@@ -886,6 +892,10 @@ mod tests {
     fn not_supported_entry_is_a_501_with_the_diagnostics() {
         let result = not_supported_entry("why");
         assert_eq!(result.status, 501);
+        assert_eq!(
+            result.effect,
+            crate::core::transaction::BundleEntryEffect::Failed
+        );
         let outcome = result.outcome.expect("outcome");
         assert_eq!(outcome["issue"][0]["code"], "not-supported");
         assert_eq!(outcome["issue"][0]["diagnostics"], "why");

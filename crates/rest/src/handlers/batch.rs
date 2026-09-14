@@ -17,9 +17,10 @@ use helios_audit::{AuditAction, AuditCorrelation, AuditEventBuilder};
 use helios_auth::{FhirOperation, Principal, SmartScopePolicy};
 use helios_fhir::FhirVersion;
 use helios_persistence::core::{
-    BundleEntry, BundleEntryResult, BundleMethod, BundleProvider, ConditionalCreateResult,
-    ConditionalDeleteResult, ConditionalStorage, ConditionalUpdateResult, IncludeProvider,
-    ResourceStorage, RevincludeProvider, SearchProvider, bundle_if_match_gate,
+    BundleEntry, BundleEntryEffect, BundleEntryResult, BundleMethod, BundleProvider,
+    ConditionalCreateResult, ConditionalDeleteResult, ConditionalStorage, ConditionalUpdateResult,
+    IncludeProvider, ResourceStorage, RevincludeProvider, SearchProvider, WriteKind, WriteNotice,
+    bundle_if_match_gate,
 };
 use helios_persistence::error::{ResourceError, StorageError, TransactionError};
 use serde_json::Value;
@@ -658,16 +659,27 @@ where
                 }
             }
 
-            // Announce each committed write to subscribers (#1023). The batch
-            // arm emits per-entry as it writes; the transaction path commits
-            // atomically in the persistence layer and returns results, so its
-            // emission happens here, once the bundle has committed, against
-            // those results. `indexed_entries` and `bundle_result.entries`
-            // share an order (the writes, sorted the same way).
-            #[cfg(feature = "subscriptions")]
+            // Report each committed write to the post-commit write observer
+            // (#1023, #1078). The batch arm reports per-entry as it writes; the
+            // transaction path commits atomically in the persistence layer and
+            // returns results, so its reports happen here, once the bundle has
+            // committed, against those results. `indexed_entries` and
+            // `bundle_result.entries` share an order (the writes, sorted the
+            // same way).
             for ((_, entry, _), result) in indexed_entries.iter().zip(bundle_result.entries.iter())
             {
-                emit_transaction_entry_event(state, &tenant, fhir_version, entry, result);
+                if let Some((resource_type, live_delta, notice)) =
+                    transaction_entry_write(entry, result)
+                {
+                    super::write_event::report(
+                        state,
+                        tenant.context(),
+                        fhir_version,
+                        &resource_type,
+                        live_delta,
+                        notice,
+                    );
+                }
             }
 
             // GET searches run against the committed state (see above). A
@@ -832,135 +844,87 @@ where
     bundle_if_match_gate(if_match, current.as_ref().map(|r| r.version_id()))
 }
 
-/// Emits a create/update subscription event for a Bundle-driven write, the
-/// same announcement the single-resource handlers make (#1023). A write
-/// performed through a batch or transaction Bundle must reach subscribers just
-/// as a direct `POST`/`PUT` does; this is the seam the batch arms call so a
-/// Bundle write is never silent.
-#[cfg(feature = "subscriptions")]
-fn emit_bundle_write_event<S>(
-    state: &AppState<S>,
-    tenant: &TenantExtractor,
-    fhir_version: FhirVersion,
-    stored: &helios_persistence::types::StoredResource,
-    event_type: helios_subscriptions::ResourceEventType,
-) where
-    S: ResourceStorage,
-{
-    if let Some(engine) = state.subscription_engine() {
-        super::subscription_event::emit_subscription_event(
-            engine,
-            tenant.context(),
-            stored,
-            fhir_version,
-            event_type,
-        );
-    }
-}
-
-/// Emits a delete subscription event for a Bundle-driven delete (#1023).
-#[cfg(feature = "subscriptions")]
-fn emit_bundle_delete_event<S>(
-    state: &AppState<S>,
-    tenant: &TenantExtractor,
-    fhir_version: FhirVersion,
-    resource_type: &str,
-    resource_id: &str,
-    previous_resource: Option<serde_json::Value>,
-) where
-    S: ResourceStorage,
-{
-    if let Some(engine) = state.subscription_engine() {
-        super::subscription_event::emit_delete_event(
-            engine,
-            tenant.context(),
-            resource_type,
-            resource_id,
-            fhir_version,
-            previous_resource,
-        );
-    }
-}
-
-/// The create/update event a committed transaction write announces, or `None`
-/// when the entry is not an announcing write (a non-2xx result, or a method
-/// other than POST/PUT). A create answers 201, an update — a conditional PUT
-/// that matched an existing resource — answers 200. DELETE is handled apart
-/// from this: it carries no body, so its event is built from the URL instead.
-#[cfg(feature = "subscriptions")]
-fn transaction_write_event_type(
-    method: BundleMethod,
-    status: u16,
-) -> Option<helios_subscriptions::ResourceEventType> {
-    use helios_subscriptions::ResourceEventType;
+/// The notice kind a committed transaction write announces, or `None` when
+/// the entry is not an announcing write (a non-2xx result, or a method other
+/// than POST/PUT). A create answers 201, an update — a conditional PUT that
+/// matched an existing resource — answers 200. DELETE is handled apart from
+/// this: it carries no body, so its notice is built from the URL instead.
+///
+/// This is the status-based rule subscription announcements have always used
+/// on the transaction path (#1023); it is kept unchanged even though a `200`
+/// also answers an `ifNoneExist` POST that matched and wrote nothing.
+fn transaction_write_event_type(method: BundleMethod, status: u16) -> Option<WriteKind> {
     if !(200..300).contains(&status) {
         return None;
     }
     match method {
         BundleMethod::Post | BundleMethod::Put => Some(if status == 201 {
-            ResourceEventType::Create
+            WriteKind::Create
         } else {
-            ResourceEventType::Update
+            WriteKind::Update
         }),
         _ => None,
     }
 }
 
-/// Emits a subscription event for one committed transaction entry (#1023).
+/// The notice one committed transaction entry announces (#1023).
 ///
 /// The atomic transaction path returns `BundleEntryResult`s rather than
-/// `StoredResource`s, so the event is built from the entry's method and the
-/// result's stored JSON instead of going through the `StoredResource` helpers
-/// the batch arm uses. Only 2xx write entries announce; a POST or a PUT that
-/// created answers 201 (Create), an update answers 200 (Update).
-#[cfg(feature = "subscriptions")]
-fn emit_transaction_entry_event<S>(
-    state: &AppState<S>,
-    tenant: &TenantExtractor,
-    fhir_version: FhirVersion,
+/// `StoredResource`s, so the notice is built from the entry's method and the
+/// result's stored JSON. Only 2xx write entries announce; a POST or a PUT that
+/// created answers 201 (Create), an update answers 200 (Update). A 2xx DELETE
+/// carries no body, so its type and id come from the entry URL; a conditional
+/// delete that resolved to no id has nothing to announce.
+fn transaction_entry_notice(
     entry: &BundleEntry,
     result: &BundleEntryResult,
-) where
-    S: ResourceStorage,
-{
-    let Some(engine) = state.subscription_engine() else {
-        return;
-    };
+) -> Option<WriteNotice> {
     match entry.method {
         BundleMethod::Post | BundleMethod::Put => {
-            let (Some(event_type), Some(resource)) = (
-                transaction_write_event_type(entry.method, result.status),
-                &result.resource,
-            ) else {
-                return;
-            };
-            super::subscription_event::emit_subscription_event_from_json(
-                engine,
-                tenant.context(),
-                resource,
-                fhir_version,
-                event_type,
-            );
+            let kind = transaction_write_event_type(entry.method, result.status)?;
+            let (_, notice) = super::write_event::json_notice(kind, result.resource.as_ref()?)?;
+            Some(notice)
         }
         BundleMethod::Delete if (200..300).contains(&result.status) => {
-            // A 2xx delete carries no body; take type/id from the entry URL.
-            // A conditional delete that resolved to no id has nothing to
-            // announce.
-            if let Ok((resource_type, id)) = parse_request_url(&entry.url)
-                && !id.is_empty()
-            {
-                super::subscription_event::emit_delete_event(
-                    engine,
-                    tenant.context(),
-                    &resource_type,
-                    &id,
-                    fhir_version,
-                    None,
-                );
-            }
+            let (_, id) = parse_request_url(&entry.url).ok()?;
+            (!id.is_empty()).then(|| super::write_event::delete_notice(&id, None))
         }
-        _ => {}
+        _ => None,
     }
+}
+
+/// What one committed transaction entry reports to the write observer, as
+/// `(resource_type, live_delta, notice)`, or `None` when it neither wrote,
+/// changed a live count, nor announces.
+///
+/// The two facts are decided independently. The live delta comes from the
+/// entry's typed [`BundleEntryEffect`] (#1078), so an `ifNoneExist` POST that
+/// matched, or a delete of a resource that was not there, moves no count. The
+/// notice keeps the status-based rule of [`transaction_entry_notice`]. The
+/// type comes from the stored resource when the result carries one, else from
+/// the URL.
+fn transaction_entry_write(
+    entry: &BundleEntry,
+    result: &BundleEntryResult,
+) -> Option<(String, i64, Option<WriteNotice>)> {
+    let notice = transaction_entry_notice(entry, result);
+    let live_delta = result.effect.live_count_delta();
+    if live_delta == 0 && notice.is_none() && !result.effect.is_write() {
+        return None;
+    }
+    let resource_type = result
+        .resource
+        .as_ref()
+        .and_then(|r| r.get("resourceType"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .or_else(|| {
+            parse_request_url(&entry.url)
+                .ok()
+                .map(|(resource_type, _)| resource_type)
+        })
+        .filter(|resource_type| !resource_type.is_empty())?;
+    Some((resource_type, live_delta, notice))
 }
 
 /// Processes a single batch entry, returning a structured BundleEntryResult.
@@ -1199,6 +1163,15 @@ where
                     .await
                 {
                     Ok(ConditionalCreateResult::Created(stored)) => {
+                        // Counted, but conditional writes announce nothing.
+                        super::write_event::report(
+                            state,
+                            tenant.context(),
+                            fhir_version,
+                            &resource_type,
+                            1,
+                            None,
+                        );
                         record_stored_profile(state, tenant, fhir_version, &stored);
                         BundleEntryResult::created(stored)
                     }
@@ -1207,10 +1180,7 @@ where
                     // transaction executors also set through
                     // `bundle_if_none_exist_gate`.
                     Ok(ConditionalCreateResult::Exists(stored)) => {
-                        let location = stored.versioned_url();
-                        let mut result = BundleEntryResult::ok(stored);
-                        result.location = Some(location);
-                        result
+                        BundleEntryResult::matched_existing(stored)
                     }
                     Ok(ConditionalCreateResult::MultipleMatches(count)) => {
                         entry_failure(RestError::MultipleMatches {
@@ -1228,15 +1198,20 @@ where
                 .await
             {
                 Ok(stored) => {
-                    record_stored_profile(state, tenant, fhir_version, &stored);
-                    #[cfg(feature = "subscriptions")]
-                    emit_bundle_write_event(
+                    // A Bundle write reaches subscribers just as a direct
+                    // `POST` does (#1023).
+                    super::write_event::report(
                         state,
-                        tenant,
+                        tenant.context(),
                         fhir_version,
-                        &stored,
-                        helios_subscriptions::ResourceEventType::Create,
+                        &resource_type,
+                        1,
+                        Some(super::write_event::stored_notice(
+                            WriteKind::Create,
+                            &stored,
+                        )),
                     );
+                    record_stored_profile(state, tenant, fhir_version, &stored);
                     BundleEntryResult::created(stored)
                 }
                 Err(e) => entry_storage_failure(e),
@@ -1287,13 +1262,30 @@ where
                     .await
                 {
                     Ok(ConditionalUpdateResult::Updated(stored)) => {
+                        // Conditional writes announce nothing.
+                        super::write_event::report(
+                            state,
+                            tenant.context(),
+                            fhir_version,
+                            &resource_type,
+                            0,
+                            None,
+                        );
                         record_stored_profile(state, tenant, fhir_version, &stored);
                         let location = format!("{}/{}", stored.resource_type(), stored.id());
-                        let mut result = BundleEntryResult::ok(stored);
+                        let mut result = BundleEntryResult::updated(stored);
                         result.location = Some(location);
                         result
                     }
                     Ok(ConditionalUpdateResult::Created(stored)) => {
+                        super::write_event::report(
+                            state,
+                            tenant.context(),
+                            fhir_version,
+                            &resource_type,
+                            1,
+                            None,
+                        );
                         record_stored_profile(state, tenant, fhir_version, &stored);
                         BundleEntryResult::created(stored)
                     }
@@ -1359,24 +1351,23 @@ where
                 .await
             {
                 Ok((stored, created)) => {
-                    record_stored_profile(state, tenant, fhir_version, &stored);
-                    #[cfg(feature = "subscriptions")]
-                    emit_bundle_write_event(
+                    super::write_event::report(
                         state,
-                        tenant,
+                        tenant.context(),
                         fhir_version,
-                        &stored,
-                        if created {
-                            helios_subscriptions::ResourceEventType::Create
-                        } else {
-                            helios_subscriptions::ResourceEventType::Update
-                        },
+                        &resource_type,
+                        i64::from(created),
+                        Some(super::write_event::stored_notice(
+                            super::write_event::upsert_kind(created),
+                            &stored,
+                        )),
                     );
+                    record_stored_profile(state, tenant, fhir_version, &stored);
                     if created {
                         BundleEntryResult::created(stored)
                     } else {
                         // For updates, include location with versioned URL
-                        let mut result = BundleEntryResult::ok(stored);
+                        let mut result = BundleEntryResult::updated(stored);
                         result.location = Some(format!("{}/{}", resource_type, id));
                         result
                     }
@@ -1403,10 +1394,19 @@ where
                     .await
                 {
                     Ok(ConditionalDeleteResult::Deleted(deleted)) => {
+                        // Counted, but conditional writes announce nothing.
+                        super::write_event::report(
+                            state,
+                            tenant.context(),
+                            fhir_version,
+                            &resource_type,
+                            -1,
+                            None,
+                        );
                         *audit_target = Some(AuditTarget::from_stored(&deleted));
                         BundleEntryResult::deleted()
                     }
-                    Ok(ConditionalDeleteResult::NoMatch) => BundleEntryResult::deleted(),
+                    Ok(ConditionalDeleteResult::NoMatch) => BundleEntryResult::delete_not_found(),
                     Ok(ConditionalDeleteResult::MultipleMatches(count)) => {
                         entry_failure(RestError::MultipleMatches {
                             operation: "delete".to_string(),
@@ -1442,14 +1442,13 @@ where
                 .await
             {
                 Ok(()) => {
-                    #[cfg(feature = "subscriptions")]
-                    emit_bundle_delete_event(
+                    super::write_event::report(
                         state,
-                        tenant,
+                        tenant.context(),
                         fhir_version,
                         &resource_type,
-                        &id,
-                        None,
+                        -1,
+                        Some(super::write_event::delete_notice(&id, None)),
                     );
                     BundleEntryResult::deleted()
                 }
@@ -2112,6 +2111,7 @@ fn searchset_result(bundle: Value) -> BundleEntryResult {
         last_modified: None,
         resource: Some(bundle),
         outcome: None,
+        effect: BundleEntryEffect::Read,
     }
 }
 
@@ -3118,6 +3118,7 @@ mod tests {
                 "id": "123"
             })),
             outcome: None,
+            effect: BundleEntryEffect::Read,
         };
         let result_2 = BundleEntryResult {
             status: 201,
@@ -3130,6 +3131,7 @@ mod tests {
                 "subject": { "reference": "Patient/123" }
             })),
             outcome: None,
+            effect: BundleEntryEffect::Created,
         };
         let correlation = AuditCorrelation::new("batch");
         let correlation_0 = EntryAuditCorrelation::from_bundle(&correlation, 0);
@@ -3893,28 +3895,26 @@ mod tests {
         }
     }
 
-    /// The event a committed transaction write announces (#1023). A POST or a
-    /// PUT that created answers 201 (Create); a PUT that matched answers 200
-    /// (Update). DELETE and non-2xx entries announce nothing here — DELETE is
-    /// emitted from its URL, and a failed entry never committed.
-    #[cfg(feature = "subscriptions")]
+    /// The notice kind a committed transaction write announces (#1023). A POST
+    /// or a PUT that created answers 201 (Create); a PUT that matched answers
+    /// 200 (Update). DELETE and non-2xx entries announce nothing here — DELETE
+    /// is announced from its URL, and a failed entry never committed.
     #[test]
     fn transaction_write_event_type_maps_status_to_the_right_event() {
-        use helios_subscriptions::ResourceEventType;
         assert_eq!(
             transaction_write_event_type(BundleMethod::Post, 201),
-            Some(ResourceEventType::Create)
+            Some(WriteKind::Create)
         );
         assert_eq!(
             transaction_write_event_type(BundleMethod::Put, 201),
-            Some(ResourceEventType::Create)
+            Some(WriteKind::Create)
         );
         // A conditional PUT that matched an existing resource updates it.
         assert_eq!(
             transaction_write_event_type(BundleMethod::Put, 200),
-            Some(ResourceEventType::Update)
+            Some(WriteKind::Update)
         );
-        // DELETE carries no body; its event is built from the URL, not here.
+        // DELETE carries no body; its notice is built from the URL, not here.
         assert_eq!(
             transaction_write_event_type(BundleMethod::Delete, 200),
             None
@@ -3924,6 +3924,121 @@ mod tests {
         // A non-2xx entry never committed, so it announces nothing.
         assert_eq!(transaction_write_event_type(BundleMethod::Post, 409), None);
         assert_eq!(transaction_write_event_type(BundleMethod::Put, 412), None);
+    }
+
+    /// #1078: a committed transaction entry's live delta comes from its typed
+    /// effect, while its notice keeps the status-based rule (#1023).
+    #[test]
+    fn transaction_entry_write_reads_delta_from_effect_and_notice_from_status() {
+        let entry = |method: BundleMethod, url: &str| BundleEntry {
+            method,
+            url: url.to_string(),
+            ..Default::default()
+        };
+        let result =
+            |status: u16, resource: Option<Value>, effect: BundleEntryEffect| BundleEntryResult {
+                status,
+                location: None,
+                etag: None,
+                last_modified: None,
+                resource,
+                outcome: None,
+                effect,
+            };
+        let patient = Some(serde_json::json!({
+            "resourceType": "Patient",
+            "id": "p1",
+            "meta": {"versionId": "3"}
+        }));
+        let summary = |written: Option<(String, i64, Option<WriteNotice>)>| {
+            written.map(|(resource_type, delta, notice)| {
+                (
+                    resource_type,
+                    delta,
+                    notice.map(|n| (n.kind, n.resource_id, n.version_id)),
+                )
+            })
+        };
+        let notice =
+            |kind: WriteKind, version: &str| Some((kind, "p1".to_string(), version.to_string()));
+
+        assert_eq!(
+            summary(transaction_entry_write(
+                &entry(BundleMethod::Post, "Patient"),
+                &result(201, patient.clone(), BundleEntryEffect::Created)
+            )),
+            Some(("Patient".to_string(), 1, notice(WriteKind::Create, "3")))
+        );
+        assert_eq!(
+            summary(transaction_entry_write(
+                &entry(BundleMethod::Put, "Patient/p1"),
+                &result(200, patient.clone(), BundleEntryEffect::Updated)
+            )),
+            Some(("Patient".to_string(), 0, notice(WriteKind::Update, "3")))
+        );
+        // An `ifNoneExist` POST that matched: nothing written, no count, but
+        // the status-based notice is preserved.
+        assert_eq!(
+            summary(transaction_entry_write(
+                &entry(BundleMethod::Post, "Patient"),
+                &result(200, patient.clone(), BundleEntryEffect::NoOp)
+            )),
+            Some(("Patient".to_string(), 0, notice(WriteKind::Update, "3")))
+        );
+        // The type falls back to the URL when the result carries no body; with
+        // no body there is no create/update notice.
+        assert_eq!(
+            summary(transaction_entry_write(
+                &entry(BundleMethod::Post, "Observation"),
+                &result(201, None, BundleEntryEffect::Created)
+            )),
+            Some(("Observation".to_string(), 1, None))
+        );
+        assert_eq!(
+            summary(transaction_entry_write(
+                &entry(BundleMethod::Delete, "Patient/p1"),
+                &result(204, None, BundleEntryEffect::Deleted)
+            )),
+            Some((
+                "Patient".to_string(),
+                -1,
+                Some((WriteKind::Delete, "p1".to_string(), String::new()))
+            ))
+        );
+        // A delete of something that was not there moves no count, but its
+        // 2xx still announces from the URL as before.
+        assert_eq!(
+            summary(transaction_entry_write(
+                &entry(BundleMethod::Delete, "Patient/p1"),
+                &result(204, None, BundleEntryEffect::NotFound)
+            )),
+            Some((
+                "Patient".to_string(),
+                0,
+                Some((WriteKind::Delete, "p1".to_string(), String::new()))
+            ))
+        );
+        assert_eq!(
+            summary(transaction_entry_write(
+                &entry(BundleMethod::Delete, "Patient/p1"),
+                &result(404, None, BundleEntryEffect::Failed)
+            )),
+            None
+        );
+        assert_eq!(
+            summary(transaction_entry_write(
+                &entry(BundleMethod::Get, "Patient/p1"),
+                &result(200, patient, BundleEntryEffect::Read)
+            )),
+            None
+        );
+        assert_eq!(
+            summary(transaction_entry_write(
+                &entry(BundleMethod::Post, "Patient"),
+                &result(409, None, BundleEntryEffect::Failed)
+            )),
+            None
+        );
     }
 
     #[test]

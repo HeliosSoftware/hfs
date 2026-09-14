@@ -123,6 +123,9 @@ where
         .check_write(tenant.tenant_id(), fhir_version, &resource_type, &resource)
         .await?;
 
+    // #1014: an unknown ViewDefinition.resource is rejected on every write.
+    super::sof::reject_unknown_view_definition_resource(&resource_type, &resource)?;
+
     // Handle the If-Match precondition (RFC 9110 §13.1.1).
     //
     // `If-Match` is a comma-separated list and is satisfied when ANY listed tag
@@ -257,6 +260,19 @@ where
             )
             .await?
     };
+    // A create — including the restore of a deleted resource, which storage
+    // reports as created — adds a live resource; a plain update does not.
+    super::write_event::report(
+        &state,
+        tenant.context(),
+        fhir_version,
+        &resource_type,
+        i64::from(created),
+        Some(super::write_event::stored_notice(
+            super::write_event::upsert_kind(created),
+            &stored,
+        )),
+    );
 
     // Stored StructureDefinitions feed the tenant's profile registry.
     if resource_type == "StructureDefinition" {
@@ -281,23 +297,6 @@ where
         created = created,
         "Resource updated"
     );
-
-    // Emit subscription event
-    #[cfg(feature = "subscriptions")]
-    if let Some(engine) = state.subscription_engine() {
-        let event_type = if created {
-            helios_subscriptions::ResourceEventType::Create
-        } else {
-            helios_subscriptions::ResourceEventType::Update
-        };
-        super::subscription_event::emit_subscription_event(
-            engine,
-            tenant.context(),
-            &stored,
-            fhir_version,
-            event_type,
-        );
-    }
 
     let location = created
         .then(|| state.public_url_for_request(&tenant, [stored.resource_type(), stored.id()]));
@@ -383,6 +382,9 @@ where
         .check_write(tenant.tenant_id(), fhir_version, &resource_type, &resource)
         .await?;
 
+    // #1014: an unknown ViewDefinition.resource is rejected on every write.
+    super::sof::reject_unknown_view_definition_resource(&resource_type, &resource)?;
+
     let result = state
         .storage()
         .conditional_update(
@@ -398,6 +400,15 @@ where
     use helios_persistence::core::ConditionalUpdateResult;
     match result {
         ConditionalUpdateResult::Updated(stored) => {
+            // Conditional writes announce nothing.
+            super::write_event::report(
+                &state,
+                tenant.context(),
+                fhir_version,
+                &resource_type,
+                0,
+                None,
+            );
             let headers = ResourceHeaders::from_stored(&stored, &state);
             build_update_response(
                 StatusCode::OK,
@@ -423,6 +434,14 @@ where
             })
         }
         ConditionalUpdateResult::Created(stored) => {
+            super::write_event::report(
+                &state,
+                tenant.context(),
+                fhir_version,
+                &resource_type,
+                1,
+                None,
+            );
             let headers = ResourceHeaders::from_stored(&stored, &state);
             let location =
                 state.public_url_for_request(&tenant, [stored.resource_type(), stored.id()]);

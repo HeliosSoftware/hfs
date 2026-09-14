@@ -23,14 +23,16 @@ use serde_json::{Value, json};
 use crate::core::bulk_export_output::{ExportOutputStore, ExportPartKey};
 use crate::core::bulk_export_worker::{LeaseError, WorkerId};
 use crate::core::bulk_submit::{
-    BulkEntryOutcome, BulkProcessingOptions, BulkSubmitProvider, BulkSubmitRollbackProvider,
-    ByteProgress, CancelToken, EntryResultPage, ImportMode, ManifestPhase,
-    StreamingBulkSubmitProvider, SubmissionId, SubmissionStatus, entry_result_pages,
+    BatchCommitObserver, BatchCommitted, BulkEntryOutcome, BulkProcessingOptions,
+    BulkSubmitProvider, BulkSubmitRollbackProvider, ByteProgress, CancelToken, EntryResultPage,
+    ImportMode, ManifestPhase, StreamingBulkSubmitProvider, SubmissionId, SubmissionStatus,
+    entry_result_pages,
 };
 use crate::core::bulk_submit_input::{RemoteFile, SubmitInputFetcher};
 use crate::core::bulk_submit_output::submit_artifact_key;
 use crate::core::bulk_submit_publication::{ManifestPublicationResult, ManifestPublicationStatus};
 use crate::core::bulk_submit_receipts::{ReceiptSpools, SPOOL_BUFFER_BYTES, Spool};
+use crate::core::write_observer::{WriteEvent, WriteObserver, WriteOrigin};
 use crate::error::{StorageError, StorageResult};
 use crate::tenant::TenantContext;
 
@@ -540,6 +542,47 @@ pub trait DeferredReindexHook: Send + Sync {
     }
 }
 
+/// Turns each committed ingestion batch into [`WriteEvent::Counts`] for the
+/// worker's [`WriteObserver`] (#1078).
+///
+/// Attached to the options every `output` file ingests with, so the engine
+/// reports each batch the moment it commits: the live counts follow an import
+/// batch by batch instead of jumping once per file, and a batch that committed
+/// stays reported when its file later fails, the ingest is cancelled, or the
+/// worker's lease is lost. A reclaimed manifest re-walks its files from the
+/// top, but the entries re-ingested there carry ids that already exist, so the
+/// engine reports them as updates — the resources are not counted twice.
+struct BatchCountsReporter {
+    observer: Arc<dyn WriteObserver>,
+}
+
+impl BatchCommitObserver for BatchCountsReporter {
+    fn batch_committed(&self, batch: &BatchCommitted<'_>) {
+        // (created, updated) per resource type; only successes wrote.
+        let mut per_type = std::collections::BTreeMap::<&str, (u64, u64)>::new();
+        for result in batch.results.iter().filter(|r| r.is_success()) {
+            let tally = per_type.entry(result.resource_type.as_str()).or_default();
+            if result.created {
+                tally.0 += 1;
+            } else {
+                tally.1 += 1;
+            }
+        }
+        let at = Utc::now();
+        for (resource_type, (created, updated)) in per_type {
+            self.observer.on_write(&WriteEvent::Counts {
+                tenant: batch.tenant.tenant_id().clone(),
+                resource_type: resource_type.to_string(),
+                created,
+                updated,
+                deleted: 0,
+                origin: WriteOrigin::BulkSubmit,
+                at,
+            });
+        }
+    }
+}
+
 /// The default in-process submit worker.
 ///
 /// Binds a [`BulkSubmitJobStore`] (job state + claim + worker storage + ingestion
@@ -560,6 +603,9 @@ pub struct DefaultSubmitWorker<Js: ?Sized, Fetcher: ?Sized, Os: ?Sized> {
     /// Rebuilds the deferred indexes after each finished manifest. Without a
     /// hook, deferred mode still ingests and logs that $reindex is owed.
     reindex_hook: Option<Arc<dyn DeferredReindexHook>>,
+    /// Told what each committed batch and each successful `deleted`-file
+    /// removal wrote (dashboard live counts, #1078).
+    write_observer: Option<Arc<dyn WriteObserver>>,
     /// How many of a manifest's `output` files to ingest at once (#fan-out).
     /// `1` keeps the historical sequential behavior. Higher values overlap
     /// per-file fetch, parse, and write, which a concurrent-writer backend
@@ -924,6 +970,7 @@ where
             worker_id,
             defer_indexing: false,
             reindex_hook: None,
+            write_observer: None,
             file_concurrency: 1,
         }
     }
@@ -944,6 +991,22 @@ where
     ) -> Self {
         self.defer_indexing = defer;
         self.reindex_hook = hook;
+        self
+    }
+
+    /// Sets the observer told what the worker writes (#1078).
+    ///
+    /// Every committed ingestion batch reports one [`WriteEvent::Counts`] per
+    /// resource type with successful entries (`origin`
+    /// [`WriteOrigin::BulkSubmit`], `created` / `updated` split by whether the
+    /// committing write created the resource), as soon as the batch commits —
+    /// so committed work is reported even when its file later fails or the
+    /// lease is lost. A reclaimed manifest re-ingests ids that already exist,
+    /// which report as updates, so a reclaim does not double count creates.
+    /// Every successful removal from a `deleted` file reports `deleted: 1` for
+    /// its type. `None` reports nothing.
+    pub fn with_write_observer(mut self, observer: Option<Arc<dyn WriteObserver>>) -> Self {
+        self.write_observer = observer;
         self
     }
 
@@ -1083,6 +1146,14 @@ where
             .with_defer_indexing(self.defer_indexing)
             .with_byte_progress(progress.clone())
             .with_cancel(cancel.clone());
+        // Per-batch write reporting (#1078): the engine calls it the moment
+        // each batch commits, independently of how the file or run ends.
+        let opts = match &self.write_observer {
+            Some(observer) => opts.with_batch_observer(Arc::new(BatchCountsReporter {
+                observer: Arc::clone(observer),
+            })),
+            None => opts,
+        };
         let file_count = manifest.output.len() as u64;
         // Reserve 0 for the aggregated entry-error artifact and 1 for the
         // manifest-fetch failure. Per-file output/deleted indexes follow their
@@ -1814,23 +1885,39 @@ where
                             .get("request")
                             .and_then(|r| r.get("url"))
                             .and_then(|u| u.as_str())
+                            && let Some((ty, id)) = url.split_once('/')
+                            && self.jobs.delete(&lease.tenant, ty, id).await.is_ok()
                         {
-                            if let Some((ty, id)) = url.split_once('/') {
-                                if self.jobs.delete(&lease.tenant, ty, id).await.is_ok() {
-                                    refs.push(format!("{ty}/{id}"));
-                                }
-                            }
+                            self.report_deleted(lease, ty);
+                            refs.push(format!("{ty}/{id}"));
                         }
                     }
                 }
             } else if let (Some(ty), Some(id)) = (
                 val.get("resourceType").and_then(|v| v.as_str()),
                 val.get("id").and_then(|v| v.as_str()),
-            ) {
-                if self.jobs.delete(&lease.tenant, ty, id).await.is_ok() {
-                    refs.push(format!("{ty}/{id}"));
-                }
+            ) && self.jobs.delete(&lease.tenant, ty, id).await.is_ok()
+            {
+                self.report_deleted(lease, ty);
+                refs.push(format!("{ty}/{id}"));
             }
+        }
+    }
+
+    /// Reports one live resource of `resource_type` removed by a `deleted`
+    /// file (#1078). `delete` only succeeds against a live resource, so each
+    /// call is one real removal, reported the moment it happened.
+    fn report_deleted(&self, lease: &ManifestLease, resource_type: &str) {
+        if let Some(observer) = &self.write_observer {
+            observer.on_write(&WriteEvent::Counts {
+                tenant: lease.tenant.tenant_id().clone(),
+                resource_type: resource_type.to_string(),
+                created: 0,
+                updated: 0,
+                deleted: 1,
+                origin: WriteOrigin::BulkSubmit,
+                at: Utc::now(),
+            });
         }
     }
 
@@ -3858,6 +3945,341 @@ mod tests {
         // Byte progress reached the file's full advertised size.
         assert_eq!(manifests[0].bytes_total, ndjson.len() as u64);
         assert_eq!(manifests[0].bytes_processed, ndjson.len() as u64);
+    }
+
+    /// Records every [`WriteEvent`] the worker reports (#1078).
+    #[derive(Default)]
+    struct RecordingWriteObserver {
+        events: std::sync::Mutex<Vec<WriteEvent>>,
+    }
+
+    impl WriteObserver for RecordingWriteObserver {
+        fn on_write(&self, event: &WriteEvent) {
+            self.events.lock().unwrap().push(event.clone());
+        }
+    }
+
+    impl RecordingWriteObserver {
+        /// `(tenant, type, created, updated, deleted)` per reported Counts
+        /// event, in report order. Any other event kind fails the test.
+        fn counts(&self) -> Vec<(String, String, u64, u64, u64)> {
+            self.events
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|event| match event {
+                    WriteEvent::Counts {
+                        tenant,
+                        resource_type,
+                        created,
+                        updated,
+                        deleted,
+                        origin,
+                        ..
+                    } => {
+                        assert_eq!(*origin, WriteOrigin::BulkSubmit);
+                        (
+                            tenant.as_str().to_string(),
+                            resource_type.clone(),
+                            *created,
+                            *updated,
+                            *deleted,
+                        )
+                    }
+                    other => panic!("unexpected write event {other:?}"),
+                })
+                .collect()
+        }
+    }
+
+    /// `n` Patients with ids `{prefix}-0..n`, one per line.
+    fn patient_lines(prefix: &str, n: usize) -> String {
+        (0..n)
+            .map(|i| format!("{{\"resourceType\":\"Patient\",\"id\":\"{prefix}-{i}\"}}\n"))
+            .collect()
+    }
+
+    /// A file store whose streams end in a read error once their bytes run
+    /// out — a connection dropped part-way through a file.
+    struct BrokenTailFetcher(MockFetcher);
+
+    /// Fails every read: the broken tail of a [`BrokenTailFetcher`] stream.
+    struct BrokenTail;
+
+    impl tokio::io::AsyncRead for BrokenTail {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Err(std::io::Error::other("connection reset")))
+        }
+    }
+
+    #[async_trait]
+    impl SubmitInputFetcher for BrokenTailFetcher {
+        async fn fetch_manifest(
+            &self,
+            url: &str,
+            headers: &[(String, String)],
+            oauth: &[String],
+            encryption_key: Option<&Value>,
+        ) -> StorageResult<RemoteManifest> {
+            self.0
+                .fetch_manifest(url, headers, oauth, encryption_key)
+                .await
+        }
+
+        async fn open_file_stream(
+            &self,
+            url: &str,
+            _headers: &[(String, String)],
+            _requires_access_token: bool,
+            _oauth: &[String],
+            _encryption_key: Option<&Value>,
+        ) -> StorageResult<(Box<dyn tokio::io::AsyncBufRead + Send + Unpin>, Option<u64>)> {
+            use tokio::io::AsyncReadExt;
+            let data = self.0.files.get(url).cloned().unwrap_or_default();
+            Ok((
+                Box::new(tokio::io::BufReader::new(
+                    std::io::Cursor::new(data).chain(BrokenTail),
+                )),
+                None,
+            ))
+        }
+    }
+
+    /// Adds a manifest to `sub_id`, claims it, and runs it with `observer`.
+    async fn run_observed_manifest(
+        backend: &Arc<SqliteBackend>,
+        fetcher: Arc<dyn SubmitInputFetcher>,
+        tenant: &TenantContext,
+        sub_id: &SubmissionId,
+        manifest_url: &str,
+        observer: Arc<RecordingWriteObserver>,
+    ) {
+        backend
+            .add_manifest(tenant, sub_id, Some(manifest_url), None)
+            .await
+            .unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let output = Arc::new(LocalFsOutputStore::new(
+            tmp.path().to_path_buf(),
+            "http://localhost:8080",
+        ));
+        let worker = DefaultSubmitWorker::new(
+            backend.clone(),
+            fetcher,
+            output,
+            WorkerId::new("test-worker"),
+        )
+        .with_write_observer(Some(observer));
+        let lease = backend
+            .claim_next_manifest(&WorkerId::new("test-worker"), StdDuration::from_secs(60))
+            .await
+            .unwrap()
+            .expect("claimable manifest");
+        worker.run_job(lease).await.unwrap();
+    }
+
+    fn observed_manifest(
+        files: Vec<(&str, String)>,
+        output: Vec<(&str, &str)>,
+        deleted: Option<&str>,
+    ) -> MockFetcher {
+        MockFetcher {
+            files: files
+                .into_iter()
+                .map(|(url, data)| (url.to_string(), data.into_bytes()))
+                .collect(),
+            manifest: RemoteManifest {
+                requires_access_token: false,
+                output: output
+                    .into_iter()
+                    .map(|(ty, url)| RemoteFile {
+                        resource_type: Some(ty.to_string()),
+                        url: url.to_string(),
+                        count: None,
+                    })
+                    .collect(),
+                deleted: deleted
+                    .map(|url| {
+                        vec![RemoteFile {
+                            resource_type: None,
+                            url: url.to_string(),
+                            count: None,
+                        }]
+                    })
+                    .unwrap_or_default(),
+            },
+        }
+    }
+
+    /// #1078: the worker reports every committed batch — one Counts event per
+    /// type per batch, with the batch's own creates — and every successful
+    /// removal of a `deleted` file on its own.
+    #[tokio::test]
+    async fn test_worker_reports_each_committed_batch_and_each_delete() {
+        let backend = Arc::new(SqliteBackend::in_memory().unwrap());
+        backend.init_schema().unwrap();
+        let tenant = tenant();
+        let sub_id = SubmissionId::generate("mock-system");
+        backend
+            .create_submission(&tenant, &sub_id, None)
+            .await
+            .unwrap();
+
+        // 250 Patients: three batches at the worker's batch size of 100.
+        let mut patients = patient_lines("p", 250);
+        // Rejected by the stream (wrong type): in no batch, never a success.
+        patients.push_str("{\"resourceType\":\"Observation\",\"id\":\"o-wrong\"}\n");
+        let observations = "{\"resourceType\":\"Observation\",\"id\":\"o1\",\"status\":\"final\",\"code\":{\"text\":\"x\"}}\n".to_string();
+        let deleted = concat!(
+            "{\"resourceType\":\"Patient\",\"id\":\"p-1\"}\n",
+            "{\"resourceType\":\"Patient\",\"id\":\"p-2\"}\n",
+            // Never existed: its delete fails and is not reported.
+            "{\"resourceType\":\"Patient\",\"id\":\"missing\"}\n"
+        )
+        .to_string();
+        let fetcher = Arc::new(observed_manifest(
+            vec![
+                ("http://provider/patient.ndjson", patients),
+                ("http://provider/observation.ndjson", observations),
+                ("http://provider/deleted.ndjson", deleted),
+            ],
+            vec![
+                ("Patient", "http://provider/patient.ndjson"),
+                ("Observation", "http://provider/observation.ndjson"),
+            ],
+            Some("http://provider/deleted.ndjson"),
+        ));
+
+        let observer = Arc::new(RecordingWriteObserver::default());
+        run_observed_manifest(
+            &backend,
+            fetcher,
+            &tenant,
+            &sub_id,
+            "http://provider/manifest.json",
+            observer.clone(),
+        )
+        .await;
+
+        let t = || "t1".to_string();
+        let p = || "Patient".to_string();
+        assert_eq!(
+            observer.counts(),
+            vec![
+                (t(), p(), 100, 0, 0),
+                (t(), p(), 100, 0, 0),
+                (t(), p(), 50, 0, 0),
+                (t(), "Observation".to_string(), 1, 0, 0),
+                (t(), p(), 0, 0, 1),
+                (t(), p(), 0, 0, 1),
+            ],
+            "one event per committed batch per type, then one per removal"
+        );
+    }
+
+    /// #1078: ids that already exist — a second run of the same data, as a
+    /// reclaimed manifest re-walking its files does — report as updates, so the
+    /// live counts do not count those resources twice.
+    #[tokio::test]
+    async fn test_worker_reports_reingested_ids_as_updates() {
+        let backend = Arc::new(SqliteBackend::in_memory().unwrap());
+        backend.init_schema().unwrap();
+        let tenant = tenant();
+        let sub_id = SubmissionId::generate("mock-system");
+        backend
+            .create_submission(&tenant, &sub_id, None)
+            .await
+            .unwrap();
+        let fetcher = || -> Arc<dyn SubmitInputFetcher> {
+            Arc::new(observed_manifest(
+                vec![("http://provider/patient.ndjson", patient_lines("r", 150))],
+                vec![("Patient", "http://provider/patient.ndjson")],
+                None,
+            ))
+        };
+
+        let first = Arc::new(RecordingWriteObserver::default());
+        run_observed_manifest(
+            &backend,
+            fetcher(),
+            &tenant,
+            &sub_id,
+            "http://provider/manifest-1.json",
+            first.clone(),
+        )
+        .await;
+        let second = Arc::new(RecordingWriteObserver::default());
+        run_observed_manifest(
+            &backend,
+            fetcher(),
+            &tenant,
+            &sub_id,
+            "http://provider/manifest-2.json",
+            second.clone(),
+        )
+        .await;
+
+        let t = || "t1".to_string();
+        let p = || "Patient".to_string();
+        assert_eq!(
+            first.counts(),
+            vec![(t(), p(), 100, 0, 0), (t(), p(), 50, 0, 0)]
+        );
+        assert_eq!(
+            second.counts(),
+            vec![(t(), p(), 0, 100, 0), (t(), p(), 0, 50, 0)],
+            "re-ingested ids are updates, not creates"
+        );
+        assert_eq!(backend.count(&tenant, Some("Patient")).await.unwrap(), 150);
+    }
+
+    /// #1078: a file whose stream breaks part-way still reports the batches it
+    /// committed before the break — the file-level failure does not erase them.
+    #[tokio::test]
+    async fn test_worker_reports_batches_committed_before_a_file_fails() {
+        let backend = Arc::new(SqliteBackend::in_memory().unwrap());
+        backend.init_schema().unwrap();
+        let tenant = tenant();
+        let sub_id = SubmissionId::generate("mock-system");
+        backend
+            .create_submission(&tenant, &sub_id, None)
+            .await
+            .unwrap();
+        // Two full batches commit; the third is still filling when the read
+        // error surfaces and fails the file.
+        let fetcher = Arc::new(BrokenTailFetcher(observed_manifest(
+            vec![("http://provider/patient.ndjson", patient_lines("b", 250))],
+            vec![("Patient", "http://provider/patient.ndjson")],
+            None,
+        )));
+
+        let observer = Arc::new(RecordingWriteObserver::default());
+        run_observed_manifest(
+            &backend,
+            fetcher,
+            &tenant,
+            &sub_id,
+            "http://provider/manifest.json",
+            observer.clone(),
+        )
+        .await;
+
+        let t = || "t1".to_string();
+        let p = || "Patient".to_string();
+        assert_eq!(
+            observer.counts(),
+            vec![(t(), p(), 100, 0, 0), (t(), p(), 100, 0, 0)],
+            "the committed batches are reported even though the file failed"
+        );
+        assert_eq!(
+            backend.count(&tenant, Some("Patient")).await.unwrap(),
+            200,
+            "and they are exactly what storage holds"
+        );
     }
 
     /// A minimal secondary that rejects `create`/`create_many` for one

@@ -305,6 +305,12 @@ async fn a_build_with_no_provider_names_that_reason_and_offers_no_retry() {
     // retry: re-asking a provider-less build would only redraw the same page.
     assert!(!html.contains(r#"hx-trigger="load delay:1200ms""#));
     assert!(!html.contains("Retry now"));
+    // Nor does it refresh itself periodically, fast or slow: sample figures
+    // never change, so there is nothing for the page to watch.
+    assert!(!html.contains("data-dash-refresh"));
+    assert!(!html.contains("data-dash-moving"));
+    assert!(!html.contains("every 5s"));
+    assert!(!html.contains("every 10s"));
 }
 
 #[tokio::test]
@@ -1712,6 +1718,109 @@ async fn editor_pane_form_does_not_duplicate_the_validators_own_binding_error() 
     // exactly one issue, instead of always falling through to `[other]`.
     assert!(html.contains("1 issue"), "{html}");
     assert!(!html.contains("1 issues"), "{html}");
+}
+
+/// #1014: `vd-editor.js`'s Save guard reads `data-error-count` off the
+/// `.editor-validity` chip as a second source alongside the last completed
+/// lint pass — the chip carries the server's own analysis (FHIR schema,
+/// required bindings, lint), which catches findings the lint endpoint never
+/// reports (an unknown `resourceType`, here). Rendered unconditionally, both
+/// through the View Definitions page's own inline first paint
+/// (`render_vd_form_pane`, `needs_js: true`) and through the shared `POST
+/// /ui/editor/render` endpoint (`needs_js: false`) that `editor-form.js`
+/// re-renders the card through after every settled edit — a gate on
+/// `needs_js` there would drop the attribute on the very first edit and
+/// leave the Save guard permanently blind (adenda, iter 1).
+/// Slices out the `.editor-validity` chip's own opening tag — from
+/// `<div class="editor-validity` up to its closing `>` — so an assertion on
+/// it cannot accidentally match the unrelated, always-present
+/// `data-error-count` on `#editor-form` (`editor-hidden-form.html`), which
+/// carries the same number for a different reason.
+fn chip_html(html: &str) -> &str {
+    let start = html
+        .find(r#"<div class="editor-validity"#)
+        .expect("no .editor-validity chip rendered");
+    let end = html[start..]
+        .find('>')
+        .expect("chip opening tag never closes");
+    &html[start..start + end + 1]
+}
+
+#[tokio::test]
+async fn form_pane_chip_carries_the_error_count_for_the_editor_guard() {
+    let unknown_type = serde_json::json!({
+        "resourceType": "ViewDefinition",
+        "id": "vd1",
+        "name": "broken",
+        "resource": "Nope",
+        "status": "draft",
+        "select": [{"column": [{"name": "id", "path": "getResourceKey()"}]}]
+    });
+    let source = helios_ui::StaticConformanceSource::empty().with(
+        "ViewDefinition",
+        helios_fhir::FhirVersion::R4,
+        vec![unknown_type],
+    );
+    let app = view_definitions_app(source);
+    let html = body_text(
+        app.oneshot(
+            Request::get("/ui/sql/view-definitions?vd=vd1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap(),
+    )
+    .await;
+    let chip = chip_html(&html);
+    assert!(chip.contains(r#"data-error-count="1""#), "chip: {chip}");
+    assert!(html.contains("1 issue"), "{html}");
+
+    let valid = serde_json::json!({
+        "resourceType": "ViewDefinition",
+        "id": "vd2",
+        "name": "active_patients",
+        "resource": "Patient",
+        "status": "draft",
+        "select": [{"column": [{"name": "id", "path": "getResourceKey()"}]}]
+    });
+    let source = helios_ui::StaticConformanceSource::empty().with(
+        "ViewDefinition",
+        helios_fhir::FhirVersion::R4,
+        vec![valid],
+    );
+    let app = view_definitions_app(source);
+    let html = body_text(
+        app.oneshot(
+            Request::get("/ui/sql/view-definitions?vd=vd2")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap(),
+    )
+    .await;
+    let chip = chip_html(&html);
+    assert!(chip.contains(r#"data-error-count="0""#), "chip: {chip}");
+    assert!(chip.contains("editor-validity--ok"), "chip: {chip}");
+
+    // The AJAX path is the one that matters live: `editor-form.js` re-renders
+    // this exact chip through `POST /ui/editor/render` (`pane=form`) after
+    // every settled edit, always with `needs_js: false`. `data-error-count`
+    // must still be there, or the Save guard goes blind after the first
+    // keystroke (adenda, iter 1).
+    let unknown_type = serde_json::json!({
+        "resourceType": "ViewDefinition",
+        "id": "vd1",
+        "name": "broken",
+        "resource": "Nope",
+        "status": "draft",
+        "select": [{"column": [{"name": "id", "path": "getResourceKey()"}]}]
+    });
+    let html = edit(&form_pane_body(&unknown_type, &[])).await;
+    let chip = chip_html(&html);
+    assert!(chip.contains(r#"data-error-count="1""#), "chip: {chip}");
+    assert!(html.contains("1 issue"), "{html}");
 }
 
 /// A missing `select` has no row of its own (the key is absent from the

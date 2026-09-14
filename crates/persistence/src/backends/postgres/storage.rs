@@ -814,6 +814,71 @@ impl ResourceStorage for PostgresBackend {
         Ok(out)
     }
 
+    async fn count_deltas_by_type_and_bucket(
+        &self,
+        tenant: &TenantContext,
+        resource_types: &[&str],
+        since: DateTime<Utc>,
+        bucket_seconds: i64,
+    ) -> StorageResult<Vec<(String, crate::core::ResourceCountDelta)>> {
+        if resource_types.is_empty() {
+            return Ok(Vec::new());
+        }
+        if bucket_seconds <= 0 {
+            return Err(internal_error(
+                "count_deltas_by_type_and_bucket: bucket_seconds must be positive".to_string(),
+            ));
+        }
+        let client = self.get_client().await?;
+        let tenant_id = tenant.tenant_id().as_str();
+        let since_bound = crate::core::bucket_floor(since, bucket_seconds);
+        let mut types: Vec<&str> = resource_types.to_vec();
+        types.sort_unstable();
+        types.dedup();
+
+        // One scan for every requested type (#1078): the same epoch bucketing,
+        // `$4::bigint` cast (see `count_deltas_by_bucket`) and delta rule, over
+        // the `(tenant_id, last_updated)` history index's `>= $3` range, with
+        // `resource_type = ANY($2)` filtering it and splitting the grouping —
+        // so each type's rows equal its per-type call's.
+        let rows = client
+            .query(
+                "SELECT resource_type, \
+                        to_timestamp( \
+                          (FLOOR(EXTRACT(EPOCH FROM last_updated) / $4::bigint) * $4::bigint) \
+                          ::double precision \
+                        ) AS bucket, \
+                        SUM(CASE WHEN is_deleted THEN -1 \
+                                 WHEN version_id = '1' THEN 1 \
+                                 ELSE 0 END)::bigint AS delta \
+                 FROM resource_history \
+                 WHERE tenant_id = $1 AND resource_type = ANY($2) AND last_updated >= $3 \
+                 GROUP BY resource_type, bucket \
+                 HAVING SUM(CASE WHEN is_deleted THEN -1 \
+                                 WHEN version_id = '1' THEN 1 \
+                                 ELSE 0 END) <> 0 \
+                 ORDER BY resource_type, bucket",
+                &[&tenant_id, &types, &since_bound, &bucket_seconds],
+            )
+            .await
+            .or_query_error("Failed to count resource deltas by type")?;
+
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            let resource_type: String = row.get(0);
+            let bucket_start: DateTime<Utc> = row.get(1);
+            let delta: i64 = row.get(2);
+            out.push((
+                resource_type,
+                crate::core::ResourceCountDelta {
+                    bucket_start,
+                    delta,
+                },
+            ));
+        }
+        Ok(out)
+    }
+
     async fn activity_histogram(
         &self,
         tenant: &TenantContext,
@@ -942,6 +1007,62 @@ impl ResourceStorage for PostgresBackend {
             out.push((tid, n.max(0) as u64));
         }
         Ok(out)
+    }
+
+    fn supports_type_counts(&self) -> bool {
+        true
+    }
+
+    async fn latest_write_marker(
+        &self,
+        tenant: &TenantContext,
+        recent_since: Option<DateTime<Utc>>,
+    ) -> StorageResult<Option<crate::core::WriteMarker>> {
+        /// Cap on `recent_writes`: a change detector, not a figure (#1078).
+        const RECENT_CAP: i64 = 10_000;
+
+        let client = self.get_client().await?;
+        let tenant_id = tenant.tenant_id().as_str();
+
+        // Both probes ride `idx_history_updated (tenant_id, last_updated)`: the
+        // newest timestamp is one backward index step (no sort), and the recent
+        // count walks the `>= $2` range only until the inner `LIMIT` stops it.
+        // One round trip for both.
+        let (latest, recent_writes) = match recent_since {
+            Some(since) => {
+                let row = client
+                    .query_one(
+                        "SELECT \
+                           (SELECT last_updated FROM resource_history \
+                             WHERE tenant_id = $1 ORDER BY last_updated DESC LIMIT 1), \
+                           (SELECT COUNT(*)::bigint FROM \
+                             (SELECT 1 FROM resource_history \
+                               WHERE tenant_id = $1 AND last_updated >= $2 LIMIT $3) recent)",
+                        &[&tenant_id, &since, &RECENT_CAP],
+                    )
+                    .await
+                    .or_query_error("Failed to query latest write marker")?;
+                let latest: Option<DateTime<Utc>> = row.get(0);
+                let n: i64 = row.get(1);
+                (latest, Some(n.max(0) as u64))
+            }
+            None => {
+                let row = client
+                    .query_opt(
+                        "SELECT last_updated FROM resource_history \
+                         WHERE tenant_id = $1 ORDER BY last_updated DESC LIMIT 1",
+                        &[&tenant_id],
+                    )
+                    .await
+                    .or_query_error("Failed to query latest write marker")?;
+                (row.map(|r| r.get::<_, DateTime<Utc>>(0)), None)
+            }
+        };
+
+        Ok(Some(crate::core::WriteMarker {
+            latest,
+            recent_writes,
+        }))
     }
 
     fn supports_tenant_registry(&self) -> bool {
@@ -3414,7 +3535,7 @@ impl PostgresBackend {
                 match existing {
                     Some(existing) => {
                         let updated = tx.update(&existing, resource).await?;
-                        Ok(BundleEntryResult::ok(updated))
+                        Ok(BundleEntryResult::updated(updated))
                     }
                     None => {
                         // Create new resource with specified ID

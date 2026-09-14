@@ -271,7 +271,8 @@ impl RailState {
     /// The type rails never call this: a stale type is simply hidden by
     /// [`Self::resolve_recents`]'s `is_valid` filter, never written away,
     /// since a stale `last` already falls back to the page default in
-    /// silence. The SQL rails prune on a stale explicit selection's click.
+    /// silence. The SQL rails prune on a stale explicit selection's click,
+    /// and on the existence sweep [`Self::prune_gone`] runs at render (#1014).
     pub(crate) fn prune(&self, id: &str) -> Option<Self> {
         let in_recent = self.recent.iter().any(|e| e.id == id);
         let is_last = self.last.as_deref() == Some(id);
@@ -286,6 +287,25 @@ impl RailState {
                 self.recent.clone()
             },
         })
+    }
+
+    /// Applies the outcome of an existence sweep over `recent`: every id whose
+    /// verdict is `Ok(false)` (the server answered 404/410) is pruned;
+    /// `Ok(true)` and `Err(_)` (unverifiable: outage, auth, other version)
+    /// keep the entry. `None` when nothing changed, so the caller persists
+    /// only on a real prune (#1014).
+    pub(crate) fn prune_gone(&self, verdicts: &[(String, Result<bool, String>)]) -> Option<Self> {
+        let mut current: Option<Self> = None;
+        for (id, verdict) in verdicts {
+            if !matches!(verdict, Ok(false)) {
+                continue;
+            }
+            let base = current.as_ref().unwrap_or(self);
+            if let Some(next) = base.prune(id) {
+                current = Some(next);
+            }
+        }
+        current
     }
 
     /// Resolves `recent`, in order, against a rail's currently-live items
@@ -778,6 +798,42 @@ mod tests {
         assert_eq!(state.prune("Patient"), None);
     }
 
+    #[test]
+    fn prune_gone_drops_only_the_ids_the_server_declared_gone() {
+        let state = RailState {
+            last: Some("b".to_string()),
+            recent: vec![
+                RailEntry::id_only("a"),
+                RailEntry::id_only("b"),
+                RailEntry::id_only("c"),
+            ],
+        };
+        let verdicts = vec![
+            ("a".to_string(), Ok(true)),
+            ("b".to_string(), Ok(false)),
+            ("c".to_string(), Err("boom".to_string())),
+        ];
+        let next = state.prune_gone(&verdicts).expect("b was pruned");
+        assert_eq!(next.last, None);
+        assert_eq!(
+            next.recent,
+            vec![RailEntry::id_only("a"), RailEntry::id_only("c")]
+        );
+    }
+
+    #[test]
+    fn prune_gone_is_a_no_op_without_a_gone_verdict() {
+        let state = RailState {
+            last: Some("a".to_string()),
+            recent: vec![RailEntry::id_only("a"), RailEntry::id_only("c")],
+        };
+        let verdicts = vec![
+            ("a".to_string(), Ok(true)),
+            ("c".to_string(), Err("boom".to_string())),
+        ];
+        assert_eq!(state.prune_gone(&verdicts), None);
+    }
+
     // ── Resolving recents against the live rail ──────────────────────────
 
     #[test]
@@ -979,6 +1035,7 @@ mod tests {
             terminology: None,
             settings,
             bulk_provider: None,
+            write_observer: None,
             patient_name_search: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         }
     }

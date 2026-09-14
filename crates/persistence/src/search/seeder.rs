@@ -22,10 +22,11 @@
 use std::future::Future;
 use std::path::Path;
 
+use chrono::Utc;
 use helios_fhir::FhirVersion;
 use serde_json::Value;
 
-use crate::core::ResourceStorage;
+use crate::core::{ResourceStorage, WriteEvent, WriteObserver, WriteOrigin};
 use crate::error::{ResourceError, StorageError, StorageResult};
 use crate::search::loader::SearchParameterLoader;
 use crate::tenant::{TenantContext, TenantId, TenantPermissions};
@@ -48,6 +49,32 @@ pub struct SeedOutcome {
 ///
 /// [`create_many`]: ResourceStorage::create_many
 const SEED_BATCH_SIZE: usize = 256;
+
+/// Reports the resources a seeding pass created for one type to `observer`, as
+/// one [`WriteEvent::Counts`] (#1078). Nothing is reported when the pass created
+/// nothing — an already-seeded tenant changes no figure.
+fn report_seeded(
+    observer: Option<&dyn WriteObserver>,
+    tenant: &TenantContext,
+    resource_type: &str,
+    outcome: &SeedOutcome,
+) {
+    let Some(observer) = observer else {
+        return;
+    };
+    if outcome.created == 0 {
+        return;
+    }
+    observer.on_write(&WriteEvent::Counts {
+        tenant: tenant.tenant_id().clone(),
+        resource_type: resource_type.to_string(),
+        created: outcome.created as u64,
+        updated: 0,
+        deleted: 0,
+        origin: WriteOrigin::ConformanceSeed,
+        at: Utc::now(),
+    });
+}
 
 /// Writes every resource of `resource_type` for `tenant` in
 /// [`SEED_BATCH_SIZE`] batches through [`create_many`], whose default fans
@@ -225,11 +252,15 @@ where
 /// as the spec set, the pass is skipped entirely — one `count` per boot. A
 /// partial set (interrupted seed, or user-POSTed parameters predating this
 /// feature) is completed resource-by-resource, skipping whatever exists.
+///
+/// When `observer` is given, the resources this pass created are reported to it
+/// as one [`WriteEvent::Counts`] with [`WriteOrigin::ConformanceSeed`].
 pub async fn seed_spec_search_parameters<S>(
     storage: &S,
     fhir_version: FhirVersion,
     data_dir: &Path,
     tenant_id: &str,
+    observer: Option<&dyn WriteObserver>,
 ) -> StorageResult<SeedOutcome>
 where
     S: ResourceStorage + ?Sized,
@@ -285,6 +316,7 @@ where
     }
 
     let outcome = create_all(storage, &tenant, "SearchParameter", resources, fhir_version).await;
+    report_seeded(observer, &tenant, "SearchParameter", &outcome);
     tracing::info!(
         created = outcome.created,
         existing = outcome.existing,
@@ -300,11 +332,15 @@ where
 /// per set: an error in one is logged and does not block the other. Returns the
 /// combined outcome. Idempotent; safe to call at startup and on tenant
 /// provisioning.
+///
+/// `observer` receives one [`WriteEvent::Counts`] per resource type the pass
+/// created resources for (none when everything already existed).
 pub async fn seed_tenant_conformance<S>(
     storage: &S,
     fhir_version: FhirVersion,
     data_dir: &Path,
     tenant_id: &str,
+    observer: Option<&dyn WriteObserver>,
 ) -> SeedOutcome
 where
     S: ResourceStorage + ?Sized,
@@ -323,11 +359,12 @@ where
         Err(e) => tracing::warn!(tenant = %tenant_id, "{kind} seeding failed: {e}"),
     };
     add(
-        seed_spec_search_parameters(storage, fhir_version, data_dir, tenant_id).await,
+        seed_spec_search_parameters(storage, fhir_version, data_dir, tenant_id, observer).await,
         "SearchParameter",
     );
     add(
-        seed_spec_compartment_definitions(storage, fhir_version, data_dir, tenant_id).await,
+        seed_spec_compartment_definitions(storage, fhir_version, data_dir, tenant_id, observer)
+            .await,
         "CompartmentDefinition",
     );
     total
@@ -347,11 +384,15 @@ where
 /// `AlreadyExists` and is treated as already-seeded; existing resources are
 /// never clobbered. When the tenant already holds at least the bundle's count,
 /// the pass short-circuits to a single `count`.
+///
+/// When `observer` is given, the resources this pass created are reported to it
+/// as one [`WriteEvent::Counts`] with [`WriteOrigin::ConformanceSeed`].
 pub async fn seed_spec_compartment_definitions<S>(
     storage: &S,
     fhir_version: FhirVersion,
     data_dir: &Path,
     tenant_id: &str,
+    observer: Option<&dyn WriteObserver>,
 ) -> StorageResult<SeedOutcome>
 where
     S: ResourceStorage + ?Sized,
@@ -394,6 +435,7 @@ where
         fhir_version,
     )
     .await;
+    report_seeded(observer, &tenant, "CompartmentDefinition", &outcome);
     tracing::info!(
         created = outcome.created,
         existing = outcome.existing,
@@ -583,5 +625,107 @@ mod tests {
         .await;
         assert_eq!(outcome.created, 0);
         assert_eq!(outcome.failed, 2);
+    }
+
+    /// One recorded `Counts` event: tenant, resource type, created, updated,
+    /// deleted and origin.
+    #[cfg(feature = "sqlite")]
+    type RecordedCount = (String, String, u64, u64, u64, WriteOrigin);
+
+    /// Records the `Counts` events a seeding pass reports.
+    #[cfg(feature = "sqlite")]
+    #[derive(Default)]
+    struct RecordingObserver {
+        counts: std::sync::Mutex<Vec<RecordedCount>>,
+        other: AtomicUsize,
+    }
+
+    #[cfg(feature = "sqlite")]
+    impl WriteObserver for RecordingObserver {
+        fn on_write(&self, event: &WriteEvent) {
+            match event {
+                WriteEvent::Counts {
+                    tenant,
+                    resource_type,
+                    created,
+                    updated,
+                    deleted,
+                    origin,
+                    ..
+                } => self.counts.lock().unwrap().push((
+                    tenant.as_str().to_string(),
+                    resource_type.clone(),
+                    *created,
+                    *updated,
+                    *deleted,
+                    *origin,
+                )),
+                _ => {
+                    self.other.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn seeding_reports_one_count_per_seeded_type_and_nothing_when_seeded() {
+        use crate::backends::sqlite::{SqliteBackend, SqliteBackendConfig};
+
+        let data_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data");
+        let backend = SqliteBackend::with_config(
+            ":memory:",
+            SqliteBackendConfig {
+                data_dir: Some(data_dir.clone()),
+                ..Default::default()
+            },
+        )
+        .expect("in-memory sqlite");
+        backend.init_schema().expect("init schema");
+        let observer = RecordingObserver::default();
+
+        let first = seed_tenant_conformance(
+            &backend,
+            FhirVersion::R4,
+            &data_dir,
+            "acme",
+            Some(&observer),
+        )
+        .await;
+        assert!(first.created > 0, "first seed created: {first:?}");
+
+        let tenant = TenantContext::new(TenantId::new("acme"), TenantPermissions::full_access());
+        let counts = observer.counts.lock().unwrap().clone();
+        let types: Vec<&str> = counts.iter().map(|c| c.1.as_str()).collect();
+        assert_eq!(types, vec!["SearchParameter", "CompartmentDefinition"]);
+        for (tenant_id, resource_type, created, updated, deleted, origin) in &counts {
+            assert_eq!(tenant_id, "acme");
+            assert_eq!((*updated, *deleted), (0, 0));
+            assert_eq!(*origin, WriteOrigin::ConformanceSeed);
+            let stored = backend
+                .count(&tenant, Some(resource_type))
+                .await
+                .expect("count seeded");
+            assert_eq!(*created, stored, "{resource_type} created count");
+        }
+        assert_eq!(
+            counts.iter().map(|c| c.2).sum::<u64>(),
+            first.created as u64,
+            "the reported counts add up to the pass's outcome"
+        );
+        assert_eq!(observer.other.load(Ordering::SeqCst), 0);
+
+        // Everything exists now: the second pass reports nothing.
+        let second = seed_tenant_conformance(
+            &backend,
+            FhirVersion::R4,
+            &data_dir,
+            "acme",
+            Some(&observer),
+        )
+        .await;
+        assert_eq!(second.created, 0, "second seed: {second:?}");
+        assert_eq!(observer.counts.lock().unwrap().len(), 2);
+        assert_eq!(observer.other.load(Ordering::SeqCst), 0);
     }
 }

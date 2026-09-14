@@ -20,11 +20,11 @@ use std::sync::Arc;
 use helios_fhir::FhirVersion;
 use helios_persistence::backends::mongodb::{MongoBackend, MongoBackendConfig};
 use helios_persistence::core::{
-    Backend, BackendCapability, BackendKind, BundleEntry, BundleMethod, BundleProvider,
-    BundleResult, ConditionalCreateResult, ConditionalDeleteResult, ConditionalStorage,
-    ConditionalUpdateResult, HistoryParams, IncludeProvider, InstanceHistoryProvider, PatchFormat,
-    ResourceStorage, RevincludeProvider, SearchProvider, SettingsStore, SystemHistoryProvider,
-    TypeHistoryProvider, VersionedStorage,
+    Backend, BackendCapability, BackendKind, BundleEntry, BundleEntryEffect, BundleMethod,
+    BundleProvider, BundleResult, ConditionalCreateResult, ConditionalDeleteResult,
+    ConditionalStorage, ConditionalUpdateResult, HistoryParams, IncludeProvider,
+    InstanceHistoryProvider, PatchFormat, ResourceStorage, RevincludeProvider, SearchProvider,
+    SettingsStore, SystemHistoryProvider, TypeHistoryProvider, VersionedStorage,
 };
 use helios_persistence::error::{
     BackendError, ConcurrencyError, ResourceError, StorageError, TransactionError,
@@ -33,7 +33,7 @@ use helios_persistence::search::SearchParameterStatus;
 use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
 use helios_persistence::types::{
     IncludeDirective, IncludeType, SearchModifier, SearchParamType, SearchParameter, SearchPrefix,
-    SearchQuery, SearchValue, SortDirective,
+    SearchQuery, SearchValue, SortDirective, TotalMode,
 };
 use mongodb::Client;
 use mongodb::bson::{Document, doc};
@@ -1305,8 +1305,11 @@ async fn mongodb_integration_transaction_bundle_mixed_operations_and_idempotent_
 
     assert_eq!(result.entries.len(), 3);
     assert_eq!(result.entries[0].status, 204);
+    assert_eq!(result.entries[0].effect, BundleEntryEffect::Deleted);
     assert_eq!(result.entries[1].status, 201);
+    assert_eq!(result.entries[1].effect, BundleEntryEffect::Created);
     assert_eq!(result.entries[2].status, 200);
+    assert_eq!(result.entries[2].effect, BundleEntryEffect::Updated);
 
     let updated = backend
         .read(&tenant, "Patient", "update-me")
@@ -1350,6 +1353,11 @@ async fn mongodb_integration_transaction_bundle_mixed_operations_and_idempotent_
 
     assert_eq!(idempotent_result.entries.len(), 1);
     assert_eq!(idempotent_result.entries[0].status, 204);
+    assert_eq!(
+        idempotent_result.entries[0].effect,
+        BundleEntryEffect::NotFound,
+        "a delete of a missing resource is still 204 but removes nothing"
+    );
 }
 
 #[tokio::test]
@@ -1422,6 +1430,7 @@ async fn mongodb_integration_transaction_if_none_exist_match_resolves_urn_refere
         result.entries[0].status, 200,
         "the match is answered, not duplicated"
     );
+    assert_eq!(result.entries[0].effect, BundleEntryEffect::NoOp);
     assert_eq!(result.entries[1].status, 201);
 
     let observation = result.entries[1]
@@ -1483,6 +1492,7 @@ async fn mongodb_integration_transaction_bundle_conditional_headers() {
         return;
     };
     assert_eq!(second_create.entries[0].status, 200);
+    assert_eq!(second_create.entries[0].effect, BundleEntryEffect::NoOp);
     // A matched `ifNoneExist` names the match in `location`, exactly as a
     // fresh create names the row it wrote; that is what the transaction's
     // fullUrl → id map is built from (#511).
@@ -1799,6 +1809,73 @@ async fn mongodb_integration_count_all_types() {
     let map: std::collections::HashMap<String, u64> = counts.into_iter().collect();
     assert_eq!(map.get("Patient"), Some(&2));
     assert_eq!(map.get("Observation"), Some(&1));
+}
+
+/// #1078: the write marker is empty for a fresh tenant, changes on every
+/// create/update/delete, ignores other tenants, and counts recent rows.
+#[tokio::test]
+async fn mongodb_integration_latest_write_marker() {
+    let Some(backend) = create_backend("console_latest_write_marker").await else {
+        eprintln!("Skipping mongodb_integration_latest_write_marker (set HFS_TEST_MONGODB_URL)");
+        return;
+    };
+    let tenant = create_tenant("tenant-console-write-marker");
+    let other = create_tenant("tenant-console-write-marker-other");
+    let since = Some(chrono::Utc::now() - chrono::Duration::hours(1));
+
+    let empty = backend
+        .latest_write_marker(&tenant, since)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(empty.latest, None);
+    assert_eq!(empty.recent_writes, Some(0));
+    let unbounded = backend
+        .latest_write_marker(&tenant, None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(unbounded.recent_writes, None);
+
+    let created = backend
+        .create(&tenant, "Patient", json!({}), FhirVersion::default())
+        .await
+        .unwrap();
+    let after_create = backend.latest_write_marker(&tenant, since).await.unwrap();
+    assert_ne!(after_create, Some(empty));
+    assert_eq!(after_create.unwrap().recent_writes, Some(1));
+
+    backend
+        .update(&tenant, &created, json!({"active": true}))
+        .await
+        .unwrap();
+    let after_update = backend.latest_write_marker(&tenant, since).await.unwrap();
+    assert_ne!(after_update, after_create);
+
+    backend
+        .delete(&tenant, "Patient", created.id())
+        .await
+        .unwrap();
+    let after_delete = backend.latest_write_marker(&tenant, since).await.unwrap();
+    assert_ne!(after_delete, after_update);
+    assert_eq!(after_delete.unwrap().recent_writes, Some(3));
+
+    backend
+        .create(&other, "Patient", json!({}), FhirVersion::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        backend.latest_write_marker(&tenant, since).await.unwrap(),
+        after_delete
+    );
+    let future = Some(chrono::Utc::now() + chrono::Duration::hours(1));
+    let marker = backend
+        .latest_write_marker(&tenant, future)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(marker.recent_writes, Some(0));
+    assert!(marker.latest.is_some());
 }
 
 #[tokio::test]
@@ -3700,6 +3777,563 @@ async fn mongodb_integration_search_missing_not_and_param_sort() {
     assert!(page2.resources.page_info.has_previous);
 }
 
+/// #1056: a MongoDB parameter-sorted page's rows, `has_next` and `total` must
+/// all derive from one id sequence. `_id`/`_lastUpdated` are resource-level
+/// predicates that never reach the search index, so before the fix they
+/// narrowed the page fetch but not the ordering/count `has_next`/`total` were
+/// computed from — a page could come back short, or even empty, while
+/// `has_next`/`total` still reflected the wider, unfiltered set. A stale
+/// search-index row (a deleted resource's leftover entry, or an orphan row)
+/// produced the same symptom by occupying a slot in the ordering that the
+/// page fetch would then drop.
+#[tokio::test]
+async fn mongodb_integration_param_sorted_page_is_one_result_set() {
+    let Some(backend) = create_backend_with_full_registry("param_sorted_page_one_result_set").await
+    else {
+        eprintln!(
+            "Skipping mongodb_integration_param_sorted_page_is_one_result_set (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+
+    let tenant = create_tenant("tenant-psors");
+
+    for n in 1..=6u32 {
+        let birth_date = format!("199{}-01-01", n - 1);
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({
+                    "resourceType": "Patient",
+                    "id": format!("patient-psors-{n}"),
+                    "name": [{"family": format!("Psors-{n}")}],
+                    "birthDate": birth_date,
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+    }
+
+    let ids = |result: &helios_persistence::core::SearchResult| {
+        result
+            .resources
+            .items
+            .iter()
+            .map(|r| r.id().to_string())
+            .collect::<Vec<_>>()
+    };
+
+    // A. `_id` subset — the issue's exact symptom. `_id` narrows the
+    // resource-level fetch but `matched_ids` (search-index derived) never
+    // saw it, so the ordering/count `has_next`/`total` were computed from
+    // stayed at all six patients.
+    let mut id_subset = SearchQuery::new("Patient")
+        .with_parameter(SearchParameter {
+            name: "_id".to_string(),
+            param_type: SearchParamType::Token,
+            modifier: None,
+            values: vec![
+                SearchValue::eq("patient-psors-3"),
+                SearchValue::eq("patient-psors-4"),
+                SearchValue::eq("patient-psors-5"),
+                SearchValue::eq("patient-psors-6"),
+            ],
+            chain: vec![],
+            components: vec![],
+        })
+        .with_sort(SortDirective::parse("birthdate").with_param_type(Some(SearchParamType::Date)))
+        .with_count(2);
+    id_subset.total = Some(TotalMode::Accurate);
+
+    let page1 = backend.search(&tenant, &id_subset).await.unwrap();
+    assert_eq!(ids(&page1), vec!["patient-psors-3", "patient-psors-4"]);
+    assert!(page1.resources.page_info.has_next);
+    assert!(!page1.resources.page_info.has_previous);
+    assert_eq!(page1.total, Some(4));
+    assert_eq!(page1.resources.page_info.total, Some(4));
+
+    id_subset.offset = Some(2);
+    let page2 = backend.search(&tenant, &id_subset).await.unwrap();
+    assert_eq!(ids(&page2), vec!["patient-psors-5", "patient-psors-6"]);
+    assert!(!page2.resources.page_info.has_next);
+    assert!(page2.resources.page_info.has_previous);
+    assert_eq!(page2.total, Some(4));
+
+    id_subset.offset = None;
+    id_subset.total = Some(TotalMode::None);
+    let page_no_total = backend.search(&tenant, &id_subset).await.unwrap();
+    assert_eq!(page_no_total.total, None);
+
+    // B. `_lastUpdated` window — same defect, reached via a date range
+    // instead of explicit ids. `cut` is compared with second precision
+    // (`SecondsFormat::Secs`, per the resource-level date filter's implied-
+    // period semantics for a value with no fractional seconds), so it must
+    // land in a whole second strictly after the six creates above — this
+    // sleep guarantees that regardless of how fast setup ran.
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    let cut = chrono::Utc::now();
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+
+    let p2 = backend
+        .read(&tenant, "Patient", "patient-psors-2")
+        .await
+        .unwrap()
+        .unwrap();
+    backend
+        .update(
+            &tenant,
+            &p2,
+            json!({
+                "resourceType": "Patient",
+                "id": "patient-psors-2",
+                "name": [{"family": "Psors-2-Updated"}],
+                "birthDate": "1991-01-01",
+            }),
+        )
+        .await
+        .unwrap();
+
+    let p5 = backend
+        .read(&tenant, "Patient", "patient-psors-5")
+        .await
+        .unwrap()
+        .unwrap();
+    backend
+        .update(
+            &tenant,
+            &p5,
+            json!({
+                "resourceType": "Patient",
+                "id": "patient-psors-5",
+                "name": [{"family": "Psors-5-Updated"}],
+                "birthDate": "1994-01-01",
+            }),
+        )
+        .await
+        .unwrap();
+
+    let mut last_updated_window = SearchQuery::new("Patient")
+        .with_parameter(SearchParameter {
+            name: "_lastUpdated".to_string(),
+            param_type: SearchParamType::Date,
+            modifier: None,
+            values: vec![SearchValue::new(
+                SearchPrefix::Gt,
+                cut.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            )],
+            chain: vec![],
+            components: vec![],
+        })
+        .with_sort(SortDirective::parse("birthdate").with_param_type(Some(SearchParamType::Date)))
+        .with_count(1);
+    last_updated_window.total = Some(TotalMode::Accurate);
+
+    let page1 = backend.search(&tenant, &last_updated_window).await.unwrap();
+    assert_eq!(ids(&page1), vec!["patient-psors-2"]);
+    assert!(page1.resources.page_info.has_next);
+    assert_eq!(page1.total, Some(2));
+
+    last_updated_window.offset = Some(1);
+    let page2 = backend.search(&tenant, &last_updated_window).await.unwrap();
+    assert_eq!(ids(&page2), vec!["patient-psors-5"]);
+    assert!(!page2.resources.page_info.has_next);
+    assert_eq!(page2.total, Some(2));
+
+    // C. Deleted resource — `delete` removes the resource's search-index
+    // rows and `all_resource_ids` excludes it, so this pins that a deleted
+    // resource neither occupies a page slot nor counts toward `total`.
+    backend
+        .delete(&tenant, "Patient", "patient-psors-6")
+        .await
+        .unwrap();
+
+    let mut all_sorted = SearchQuery::new("Patient")
+        .with_sort(SortDirective::parse("birthdate").with_param_type(Some(SearchParamType::Date)))
+        .with_count(10);
+    all_sorted.total = Some(TotalMode::Accurate);
+    let result = backend.search(&tenant, &all_sorted).await.unwrap();
+    assert_eq!(
+        ids(&result),
+        vec![
+            "patient-psors-1",
+            "patient-psors-2",
+            "patient-psors-3",
+            "patient-psors-4",
+            "patient-psors-5",
+        ]
+    );
+    assert!(!result.resources.page_info.has_next);
+    assert_eq!(result.total, Some(5));
+
+    // D. Stale search-index row — an orphan row (no matching live resource)
+    // sorts first (epoch value) but must not shorten the page.
+    let client = raw_test_client(&backend.config().connection_string)
+        .await
+        .expect("failed to connect MongoDB client for search_index fixture");
+    let database = client.database(&backend.config().database_name);
+    let search_index = database.collection::<Document>("search_index");
+    search_index
+        .insert_one(doc! {
+            "tenant_id": tenant.tenant_id().as_str(),
+            "resource_type": "Patient",
+            "resource_id": "patient-psors-ghost",
+            "param_name": "birthdate",
+            "param_url": "http://hl7.org/fhir/SearchParameter/individual-birthdate",
+            "value_date": mongodb::bson::DateTime::from_millis(0),
+            "value_date_precision": "day",
+        })
+        .await
+        .expect("failed to insert stale search_index row");
+
+    let mut ghost_sorted = SearchQuery::new("Patient")
+        .with_sort(SortDirective::parse("birthdate").with_param_type(Some(SearchParamType::Date)))
+        .with_count(2);
+    ghost_sorted.total = Some(TotalMode::Accurate);
+    let result = backend.search(&tenant, &ghost_sorted).await.unwrap();
+    assert_eq!(ids(&result), vec!["patient-psors-1", "patient-psors-2"]);
+    assert!(result.resources.page_info.has_next);
+    assert_eq!(result.total, Some(5));
+}
+
+/// #1040: `_sort` used to order by running an aggregation (`$group`, sorted
+/// server-side) over every search-index row of the *whole resource type*,
+/// then a second type-wide `distinct` pass to drop stale rows, and only
+/// after both of those filter by the query's matched ids. On a large type
+/// that never returns even when the filtered result is tiny. The ordering
+/// aggregation must instead be bounded to the candidate set the query
+/// already matched: chunked `$in` on the composite index, ordered
+/// client-side, with the unkeyed tail drawn from the candidate set itself
+/// rather than a type-wide `distinct`.
+#[tokio::test]
+async fn mongodb_integration_param_sort_is_bounded_by_the_candidate_set() {
+    let Some(backend) = create_backend_with_full_registry("param_sort_bounded").await else {
+        eprintln!(
+            "Skipping mongodb_integration_param_sort_is_bounded_by_the_candidate_set (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+
+    let tenant = create_tenant("tenant-bps");
+
+    for n in 1..=40u32 {
+        let id = format!("patient-bps-{n:02}");
+        let gender = if matches!(n, 5 | 17 | 29 | 33) {
+            "female"
+        } else {
+            "male"
+        };
+        let mut resource = json!({
+            "resourceType": "Patient",
+            "id": id,
+            "name": [{"family": format!("Bps-{n}")}],
+            "gender": gender,
+        });
+        if n != 33 {
+            let birth_year = 1950 + n;
+            resource["birthDate"] = json!(format!("{birth_year}-01-01"));
+        }
+        backend
+            .create(&tenant, "Patient", resource, FhirVersion::default())
+            .await
+            .unwrap();
+    }
+
+    let ids = |result: &helios_persistence::core::SearchResult| {
+        result
+            .resources
+            .items
+            .iter()
+            .map(|r| r.id().to_string())
+            .collect::<Vec<_>>()
+    };
+
+    let gender_filter = || SearchParameter {
+        name: "gender".to_string(),
+        param_type: SearchParamType::Token,
+        modifier: None,
+        values: vec![SearchValue::eq("female")],
+        chain: vec![],
+        components: vec![],
+    };
+
+    let mut ascending = SearchQuery::new("Patient")
+        .with_parameter(gender_filter())
+        .with_sort(SortDirective::parse("birthdate").with_param_type(Some(SearchParamType::Date)))
+        .with_count(2);
+    ascending.total = Some(TotalMode::Accurate);
+
+    let page1 = backend.search(&tenant, &ascending).await.unwrap();
+    assert_eq!(ids(&page1), vec!["patient-bps-05", "patient-bps-17"]);
+    assert!(page1.resources.page_info.has_next);
+    assert_eq!(page1.total, Some(4));
+
+    ascending.offset = Some(2);
+    let page2 = backend.search(&tenant, &ascending).await.unwrap();
+    assert_eq!(ids(&page2), vec!["patient-bps-29", "patient-bps-33"]);
+    assert!(!page2.resources.page_info.has_next);
+    assert_eq!(page2.total, Some(4));
+
+    let mut descending = SearchQuery::new("Patient")
+        .with_parameter(gender_filter())
+        .with_sort(SortDirective::parse("-birthdate").with_param_type(Some(SearchParamType::Date)))
+        .with_count(10);
+    descending.total = Some(TotalMode::Accurate);
+    let result = backend.search(&tenant, &descending).await.unwrap();
+    assert_eq!(
+        ids(&result),
+        vec![
+            "patient-bps-29",
+            "patient-bps-17",
+            "patient-bps-05",
+            "patient-bps-33",
+        ]
+    );
+    assert_eq!(result.total, Some(4));
+
+    // Ghost rows: write two orphan search_index entries for a resource that
+    // was never created. If `allowed` were still taken straight from
+    // `distinct` over `search_index` (pre-fix), the gender row would make
+    // this dead id match the filter, take a page slot ahead of a live one,
+    // get dropped by the page fetch, and inflate `total` by one (#1056's
+    // failure mode reopened on the filtered sorted path, #1040). Resolving
+    // `allowed` through `resource_level_ids` (is_deleted: false) must keep
+    // both ghost rows out of the candidate set entirely.
+    let raw_client = raw_test_client(&backend.config().connection_string)
+        .await
+        .expect("failed to connect raw MongoDB client");
+    let raw_db = raw_client.database(&backend.config().database_name);
+    let search_index: Collection<Document> = raw_db.collection("search_index");
+    search_index
+        .insert_many(vec![
+            doc! {
+                "tenant_id": tenant.tenant_id().as_str(),
+                "resource_type": "Patient",
+                "resource_id": "patient-bps-ghost",
+                "param_name": "gender",
+                "param_url": "http://hl7.org/fhir/SearchParameter/individual-gender",
+                "value_token_system": "http://hl7.org/fhir/administrative-gender",
+                "value_token_code": "female",
+            },
+            doc! {
+                "tenant_id": tenant.tenant_id().as_str(),
+                "resource_type": "Patient",
+                "resource_id": "patient-bps-ghost",
+                "param_name": "birthdate",
+                "param_url": "http://hl7.org/fhir/SearchParameter/individual-birthdate",
+                "value_date": mongodb::bson::DateTime::from_millis(0),
+                "value_date_precision": "day",
+            },
+        ])
+        .await
+        .expect("failed to insert ghost search_index rows");
+
+    ascending.offset = None;
+    let page1_with_ghost = backend.search(&tenant, &ascending).await.unwrap();
+    assert_eq!(
+        ids(&page1_with_ghost),
+        vec!["patient-bps-05", "patient-bps-17"]
+    );
+    assert!(page1_with_ghost.resources.page_info.has_next);
+    assert_eq!(page1_with_ghost.total, Some(4));
+
+    let result_with_ghost = backend.search(&tenant, &descending).await.unwrap();
+    assert_eq!(
+        ids(&result_with_ghost),
+        vec![
+            "patient-bps-29",
+            "patient-bps-17",
+            "patient-bps-05",
+            "patient-bps-33",
+        ]
+    );
+    assert_eq!(result_with_ghost.total, Some(4));
+
+    // Plan guard: the ordering aggregation over `search_index` must be a
+    // bounded index walk over the candidate set (`idx_search_composite`,
+    // hinted, `resource_id: {$in: [...]}`), not a type-wide scan, and the
+    // type-wide `distinct` pass over `resources` must not run at all.
+    let client = raw_test_client(&backend.config().connection_string)
+        .await
+        .expect("failed to connect raw MongoDB client");
+    let db_name = backend.config().database_name.clone();
+    let database = client.database(&db_name);
+
+    if let Err(e) = database.run_command(doc! { "profile": 2_i32 }).await {
+        eprintln!(
+            "Skipping mongodb_integration_param_sort_is_bounded_by_the_candidate_set plan assertions: \
+             {{profile: 2}} was refused ({e})"
+        );
+        return;
+    }
+
+    let _ = backend.search(&tenant, &descending).await.unwrap();
+
+    let _ = database.run_command(doc! { "profile": 0_i32 }).await;
+
+    let profile: Collection<Document> = database.collection("system.profile");
+    let opts = mongodb::options::FindOptions::builder()
+        .sort(doc! { "ts": -1_i32 })
+        .limit(20)
+        .build();
+    let mut cursor = profile
+        .find(doc! {
+            "ns": format!("{db_name}.search_index"),
+            "command.aggregate": "search_index",
+        })
+        .with_options(opts)
+        .await
+        .expect("failed to query system.profile");
+
+    // Only the newest matching entry is of interest, so advance once rather
+    // than looping (a `while` with an unconditional `break` trips
+    // `clippy::never_loop`, which CI denies).
+    let entry: Option<Document> = if cursor
+        .advance()
+        .await
+        .expect("failed to advance profile cursor")
+    {
+        Some(
+            cursor
+                .deserialize_current()
+                .expect("failed to deserialize profile entry"),
+        )
+    } else {
+        None
+    };
+    let entry = entry.expect("expected a profiled aggregate on search_index");
+
+    let plan_summary = entry.get_str("planSummary").unwrap_or_default();
+    assert!(
+        plan_summary.contains("resource_id: 1"),
+        "expected the composite index (naming resource_id) in the plan, got: {plan_summary}"
+    );
+
+    let keys_examined = entry
+        .get_i64("keysExamined")
+        .or_else(|_| entry.get_i32("keysExamined").map(i64::from))
+        .expect("profile entry missing keysExamined");
+    assert!(
+        keys_examined <= 12,
+        "keysExamined {keys_examined} exceeds the bounded-candidate-set budget (<=12)"
+    );
+
+    let command = entry
+        .get_document("command")
+        .expect("profile entry missing command");
+    let pipeline = command
+        .get_array("pipeline")
+        .expect("profile entry missing pipeline");
+    let first_stage = pipeline
+        .first()
+        .and_then(mongodb::bson::Bson::as_document)
+        .expect("pipeline[0] is not a document");
+    let match_stage = first_stage
+        .get_document("$match")
+        .expect("pipeline[0] missing $match");
+    assert!(
+        match_stage.contains_key("resource_id"),
+        "expected $match to filter by resource_id, got: {match_stage:?}"
+    );
+
+    let distinct_on_resources = profile
+        .count_documents(doc! { "command.distinct": "resources" })
+        .await
+        .expect("failed to count distinct-on-resources profile entries");
+    assert_eq!(
+        distinct_on_resources, 0,
+        "the bounded path must not run a type-wide distinct on resources"
+    );
+}
+
+/// #1040: the parameter-sort aggregation mapped `Quantity` sorts to
+/// `value_number`, but the search-index writer stores quantity values in
+/// `value_quantity_value` — so `_sort=value-quantity` matched nothing and
+/// silently degraded to id order.
+#[tokio::test]
+async fn mongodb_integration_param_sort_by_quantity_orders_by_value() {
+    let Some(backend) = create_backend_with_full_registry("param_sort_quantity").await else {
+        eprintln!(
+            "Skipping mongodb_integration_param_sort_by_quantity_orders_by_value (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+
+    let tenant = create_tenant("tenant-psqty");
+
+    for (id, value) in [
+        ("obs-qty-a", 150.0),
+        ("obs-qty-b", 5.0),
+        ("obs-qty-c", 42.0),
+    ] {
+        backend
+            .create(
+                &tenant,
+                "Observation",
+                json!({
+                    "resourceType": "Observation",
+                    "id": id,
+                    "status": "final",
+                    "code": { "coding": [{ "system": "http://loinc.org", "code": "29463-7" }] },
+                    "valueQuantity": {
+                        "value": value,
+                        "unit": "kg",
+                        "system": "http://unitsofmeasure.org",
+                        "code": "kg"
+                    }
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+    }
+
+    let ids = |result: &helios_persistence::core::SearchResult| {
+        result
+            .resources
+            .items
+            .iter()
+            .map(|r| r.id().to_string())
+            .collect::<Vec<_>>()
+    };
+
+    let ascending = SearchQuery::new("Observation")
+        .with_sort(
+            SortDirective::parse("value-quantity").with_param_type(Some(SearchParamType::Quantity)),
+        )
+        .with_count(10);
+    let result = backend.search(&tenant, &ascending).await.unwrap();
+    assert_eq!(ids(&result), vec!["obs-qty-b", "obs-qty-c", "obs-qty-a"]);
+
+    let descending = SearchQuery::new("Observation")
+        .with_sort(
+            SortDirective::parse("-value-quantity")
+                .with_param_type(Some(SearchParamType::Quantity)),
+        )
+        .with_count(10);
+    let result = backend.search(&tenant, &descending).await.unwrap();
+    assert_eq!(ids(&result), vec!["obs-qty-a", "obs-qty-c", "obs-qty-b"]);
+
+    // The bounded path (a candidate set from a `code` filter) must honour
+    // the same quantity mapping.
+    let filtered_ascending = SearchQuery::new("Observation")
+        .with_parameter(SearchParameter {
+            name: "code".to_string(),
+            param_type: SearchParamType::Token,
+            modifier: None,
+            values: vec![SearchValue::eq("29463-7")],
+            chain: vec![],
+            components: vec![],
+        })
+        .with_sort(
+            SortDirective::parse("value-quantity").with_param_type(Some(SearchParamType::Quantity)),
+        )
+        .with_count(10);
+    let result = backend.search(&tenant, &filtered_ascending).await.unwrap();
+    assert_eq!(ids(&result), vec!["obs-qty-b", "obs-qty-c", "obs-qty-a"]);
+}
+
 /// #1055: `_id`/`_lastUpdated` used to bypass the generic modifier dispatch
 /// entirely, so `:not` returned the exact inverse of the request and
 /// `:missing` compared the boolean literal against the id/date fields
@@ -5570,6 +6204,399 @@ async fn mongodb_include_iterate_follows_the_second_hop() {
     );
     assert!(all_included.contains(&format!("Patient/{}", patient.id())));
     assert!(all_included.contains(&format!("Organization/{}", org.id())));
+}
+
+// ============================================================================
+// _include delegation to the shared registry-driven resolver (#1075)
+// ============================================================================
+
+/// Sorted `(resource_type, id)` pairs, for exact-set assertions regardless of
+/// the order resources were fetched in. Excludes the synthetic truncation
+/// marker, which carries no meaningful `(type, id)` pair for this comparison.
+fn include_type_ids(
+    resources: &[helios_persistence::types::StoredResource],
+) -> Vec<(String, String)> {
+    let mut pairs: Vec<(String, String)> = resources
+        .iter()
+        .filter(|r| !helios_persistence::core::is_include_truncation_marker(r))
+        .map(|r| (r.resource_type().to_string(), r.id().to_string()))
+        .collect();
+    pairs.sort();
+    pairs
+}
+
+/// Seeds the fixture shared by the `_include` delegation tests: `org-1`,
+/// `pat-1` (managed by `org-1`), an Encounter with a real `serviceProvider`
+/// reference (`enc-org`) and one with a conditional reference (`enc-cond`),
+/// both referencing `pat-1` via `subject`.
+async fn seed_include_fixture(backend: &MongoBackend, tenant: &TenantContext) {
+    backend
+        .create_or_update(
+            tenant,
+            "Organization",
+            "org-1",
+            json!({
+                "resourceType": "Organization",
+                "id": "org-1",
+                "name": "Include Org"
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+
+    backend
+        .create_or_update(
+            tenant,
+            "Patient",
+            "pat-1",
+            json!({
+                "resourceType": "Patient",
+                "id": "pat-1",
+                "name": [{"family": "Include"}],
+                "managingOrganization": {"reference": "Organization/org-1"}
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+
+    backend
+        .create_or_update(
+            tenant,
+            "Encounter",
+            "enc-cond",
+            json!({
+                "resourceType": "Encounter",
+                "id": "enc-cond",
+                "status": "finished",
+                "class": {"code": "AMB"},
+                "subject": {"reference": "Patient/pat-1"},
+                "serviceProvider": {
+                    "reference": "Organization?identifier=http://example.org/org|dept-9"
+                }
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+
+    backend
+        .create_or_update(
+            tenant,
+            "Encounter",
+            "enc-org",
+            json!({
+                "resourceType": "Encounter",
+                "id": "enc-org",
+                "status": "finished",
+                "class": {"code": "AMB"},
+                "subject": {"reference": "Patient/pat-1"},
+                "serviceProvider": {"reference": "Organization/org-1"}
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+}
+
+/// `IncludeProvider::resolve_includes` delegates to the shared,
+/// registry-driven resolver: a conditional `serviceProvider` reference never
+/// resolves to an included resource, a real one resolves to exactly its
+/// target, and resolving the same target from two source resources dedupes
+/// it (#1075). This is the behaviour the previous inline extractor got wrong,
+/// since it looked `service-provider` up as a literal `service-provider` JSON
+/// field instead of the actual `serviceProvider` element.
+#[tokio::test]
+async fn mongodb_include_service_provider_returns_only_targets() {
+    let Some(backend) = create_backend_with_full_registry("include_service_provider_targets").await
+    else {
+        eprintln!(
+            "Skipping mongodb_include_service_provider_returns_only_targets (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+
+    let tenant = create_tenant("tenant-include-service-provider");
+    seed_include_fixture(&backend, &tenant).await;
+
+    let enc_cond = backend
+        .read(&tenant, "Encounter", "enc-cond")
+        .await
+        .unwrap()
+        .expect("enc-cond must exist");
+    let enc_org = backend
+        .read(&tenant, "Encounter", "enc-org")
+        .await
+        .unwrap()
+        .expect("enc-org must exist");
+
+    let service_provider = IncludeDirective {
+        include_type: IncludeType::Include,
+        source_type: "Encounter".to_string(),
+        search_param: "service-provider".to_string(),
+        target_type: None,
+        iterate: false,
+    };
+
+    let both = backend
+        .resolve_includes(
+            &tenant,
+            &[enc_cond.clone(), enc_org.clone()],
+            std::slice::from_ref(&service_provider),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        include_type_ids(&both),
+        vec![("Organization".to_string(), "org-1".to_string())]
+    );
+
+    let cond_only = backend
+        .resolve_includes(
+            &tenant,
+            std::slice::from_ref(&enc_cond),
+            std::slice::from_ref(&service_provider),
+        )
+        .await
+        .unwrap();
+    assert!(cond_only.is_empty());
+
+    let subject = IncludeDirective {
+        include_type: IncludeType::Include,
+        source_type: "Encounter".to_string(),
+        search_param: "subject".to_string(),
+        target_type: None,
+        iterate: false,
+    };
+
+    let subjects = backend
+        .resolve_includes(&tenant, &[enc_cond, enc_org], &[subject])
+        .await
+        .unwrap();
+    assert_eq!(
+        include_type_ids(&subjects),
+        vec![("Patient".to_string(), "pat-1".to_string())]
+    );
+}
+
+/// `IncludeProvider::resolve_includes` honors `target_type`: a filter that
+/// doesn't match the reference's actual type resolves to nothing, and one
+/// that does resolves to exactly the target.
+#[tokio::test]
+async fn mongodb_include_target_type_filters_included() {
+    let Some(backend) = create_backend_with_full_registry("include_target_type_filters").await
+    else {
+        eprintln!(
+            "Skipping mongodb_include_target_type_filters_included (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+
+    let tenant = create_tenant("tenant-include-target-type");
+    seed_include_fixture(&backend, &tenant).await;
+
+    let enc_org = backend
+        .read(&tenant, "Encounter", "enc-org")
+        .await
+        .unwrap()
+        .expect("enc-org must exist");
+
+    let wrong_target = IncludeDirective {
+        include_type: IncludeType::Include,
+        source_type: "Encounter".to_string(),
+        search_param: "service-provider".to_string(),
+        target_type: Some("Patient".to_string()),
+        iterate: false,
+    };
+    let filtered_out = backend
+        .resolve_includes(
+            &tenant,
+            std::slice::from_ref(&enc_org),
+            std::slice::from_ref(&wrong_target),
+        )
+        .await
+        .unwrap();
+    assert!(filtered_out.is_empty());
+
+    let right_target = IncludeDirective {
+        include_type: IncludeType::Include,
+        source_type: "Encounter".to_string(),
+        search_param: "service-provider".to_string(),
+        target_type: Some("Organization".to_string()),
+        iterate: false,
+    };
+    let matched = backend
+        .resolve_includes(
+            &tenant,
+            std::slice::from_ref(&enc_org),
+            std::slice::from_ref(&right_target),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        include_type_ids(&matched),
+        vec![("Organization".to_string(), "org-1".to_string())]
+    );
+}
+
+/// `search()`'s hop-1 inline contract (#1063) is preserved by the delegated
+/// resolver: the primary page still contains both Encounters and `included`
+/// is exactly the resolved Organization, with no truncation marker.
+#[tokio::test]
+async fn mongodb_search_resolves_first_hop_include_inline() {
+    let Some(backend) = create_backend_with_full_registry("include_search_hop1_inline").await
+    else {
+        eprintln!(
+            "Skipping mongodb_search_resolves_first_hop_include_inline (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+
+    let tenant = create_tenant("tenant-include-search-hop1");
+    seed_include_fixture(&backend, &tenant).await;
+
+    let service_provider = IncludeDirective {
+        include_type: IncludeType::Include,
+        source_type: "Encounter".to_string(),
+        search_param: "service-provider".to_string(),
+        target_type: None,
+        iterate: false,
+    };
+    let query = SearchQuery::new("Encounter").with_include(service_provider);
+
+    let result = backend
+        .search(&tenant, &query)
+        .await
+        .expect("search with _include must succeed");
+
+    let mut ids: Vec<String> = result
+        .resources
+        .items
+        .iter()
+        .map(|r| r.id().to_string())
+        .collect();
+    ids.sort();
+    assert_eq!(ids, vec!["enc-cond".to_string(), "enc-org".to_string()]);
+
+    assert_eq!(
+        include_type_ids(&result.included),
+        vec![("Organization".to_string(), "org-1".to_string())]
+    );
+    assert!(
+        !result
+            .included
+            .iter()
+            .any(helios_persistence::core::is_include_truncation_marker),
+        "no truncation marker expected when the cap was never hit"
+    );
+}
+
+/// The per-directive cap (#1061) still applies through the delegated
+/// resolver: `search()` returns exactly `max_included_resources` real
+/// Organizations plus one truncation marker naming the directive and the
+/// MongoDB-specific env var to raise it.
+#[tokio::test]
+async fn mongodb_include_caps_included_and_signals_truncation() {
+    let Some(backend) =
+        create_backend_with_full_registry_and_cap("include_caps_truncation", 2).await
+    else {
+        eprintln!(
+            "Skipping mongodb_include_caps_included_and_signals_truncation (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+
+    let tenant = create_tenant("tenant-include-caps");
+
+    for suffix in ["a", "b", "c", "d"] {
+        let org_id = format!("org-cap-{suffix}");
+        backend
+            .create_or_update(
+                &tenant,
+                "Organization",
+                &org_id,
+                json!({
+                    "resourceType": "Organization",
+                    "id": org_id,
+                    "name": format!("Cap Org {suffix}")
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+
+        let enc_id = format!("enc-cap-{suffix}");
+        backend
+            .create_or_update(
+                &tenant,
+                "Encounter",
+                &enc_id,
+                json!({
+                    "resourceType": "Encounter",
+                    "id": enc_id,
+                    "status": "finished",
+                    "class": {"code": "AMB"},
+                    "serviceProvider": {"reference": format!("Organization/org-cap-{suffix}")}
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+    }
+
+    let service_provider = IncludeDirective {
+        include_type: IncludeType::Include,
+        source_type: "Encounter".to_string(),
+        search_param: "service-provider".to_string(),
+        target_type: None,
+        iterate: false,
+    };
+    let query = SearchQuery::new("Encounter").with_include(service_provider);
+
+    let result = backend
+        .search(&tenant, &query)
+        .await
+        .expect("search with _include must succeed");
+
+    let organization_count = result
+        .included
+        .iter()
+        .filter(|r| r.resource_type() == "Organization")
+        .count();
+    assert_eq!(
+        organization_count, 2,
+        "included Organizations must be capped at max_included_resources (2), not all 4"
+    );
+
+    let markers: Vec<_> = result
+        .included
+        .iter()
+        .filter(|r| helios_persistence::core::is_include_truncation_marker(r))
+        .collect();
+    assert_eq!(
+        markers.len(),
+        1,
+        "exactly one truncation marker, got: {:?}",
+        result
+            .included
+            .iter()
+            .map(|r| format!("{}/{}", r.resource_type(), r.id()))
+            .collect::<Vec<_>>()
+    );
+
+    let diagnostics = markers[0].content()["issue"][0]["diagnostics"]
+        .as_str()
+        .expect("diagnostics text")
+        .to_string();
+    assert!(
+        diagnostics.contains("_include=Encounter:service-provider"),
+        "diagnostics should name the truncated directive: {diagnostics}"
+    );
+    assert!(
+        diagnostics.contains("HFS_MONGODB_MAX_INCLUDED_RESOURCES"),
+        "diagnostics should name the env var: {diagnostics}"
+    );
 }
 
 // The unreachable-server test that used to live here now sits alongside the same
@@ -9024,6 +10051,7 @@ async fn mongodb_integration_if_none_exist_multi_param_and_semantics() {
         result.entries[0].status, 200,
         "both params match the active patient — should not create a duplicate"
     );
+    assert_eq!(result.entries[0].effect, BundleEntryEffect::NoOp);
 
     let count = backend.count(&tenant, Some("Patient")).await.unwrap();
     assert_eq!(count, 2, "no third patient should have been created");
@@ -9072,6 +10100,7 @@ async fn mongodb_integration_if_none_exist_same_transaction_read_your_writes() {
         result.entries[1].status, 200,
         "second entry must see the first entry's write via session"
     );
+    assert_eq!(result.entries[1].effect, BundleEntryEffect::NoOp);
     assert_eq!(
         result.entries[1].location, result.entries[0].location,
         "second entry must resolve to the same resource as the first"

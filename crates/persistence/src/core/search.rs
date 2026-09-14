@@ -542,16 +542,21 @@ pub const MAX_ITERATE_INCLUDED: usize = 1000;
 /// found (bounded by [`MAX_INCLUDE_ITERATE_DEPTH`]). Included resources are
 /// deduplicated by `type/id` and never include a primary match.
 ///
-/// This is the single, backend-agnostic include-resolution path used by the
-/// REST layer for backends whose `search()` does not resolve includes inline
-/// (SQLite, Postgres). References are extracted via the search-parameter
-/// registry's FHIRPath expression — so parameters whose name differs from the
-/// JSON field (e.g. Patient `organization` → `managingOrganization`) resolve
-/// correctly — and the referenced resources are fetched with `search()`. Only
-/// references the extractor has already resolved to a `resource_type` +
-/// `resource_id` pair are followed; conditional references
-/// (`Type?param=value`), `urn:` references, and contained (`#`) references
-/// have no resolvable id and therefore never produce an included resource.
+/// This is the single, backend-agnostic include-resolution path: every
+/// backend's `IncludeProvider` implementation delegates here. SQLite,
+/// Postgres and Elasticsearch call it directly from the REST layer, since
+/// their `search()` does not resolve includes inline. MongoDB calls it inline
+/// from within its own `search()` for hop 1 only (see
+/// [`resolve_includes_iterate_continuation`] for how the REST layer finishes
+/// any remaining `:iterate` hops in that case). References are extracted via
+/// the search-parameter registry's FHIRPath expression — so parameters whose
+/// name differs from the JSON field (e.g. Patient `organization` →
+/// `managingOrganization`) resolve correctly — and the referenced resources
+/// are fetched with `search()`. Only references the extractor has already
+/// resolved to a `resource_type` + `resource_id` pair are followed;
+/// conditional references (`Type?param=value`), `urn:` references, and
+/// contained (`#`) references have no resolvable id and therefore never
+/// produce an included resource.
 ///
 /// Runs hop 1 (every directive) then `:iterate`-only hops, exactly as before
 /// #1063 — unbounded budget, so SQLite/Postgres see no behaviour change. For a
@@ -570,7 +575,8 @@ where
 }
 
 /// Continues transitive `:iterate` resolution for a backend whose `search()`
-/// already resolved hop 1 inline (MongoDB, Elasticsearch — #1063).
+/// already resolved hop 1 inline (only MongoDB does, through
+/// [`resolve_includes_iterative`] with `iterate` cleared — #1063).
 ///
 /// `already_included` is what the backend's own `search()` returned in
 /// `SearchResult::included` (any [`is_include_truncation_marker`] entries are

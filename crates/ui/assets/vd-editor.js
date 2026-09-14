@@ -740,7 +740,11 @@
        * whatever this held before that pass started, not a half-finished
        * one - there is no reliable "pass in progress" signal to block on
        * instead, and the previous pass's result is the closest
-       * approximation available without delaying the click on the network. */
+       * approximation available without delaying the click on the network.
+       * #1014: the Save guard takes the larger of this count and the guided
+       * form's validity chip (`chipErrorCount` below) - both are "the most
+       * recently completed" analysis of their own kind, the chip settling
+       * about 600ms after the last keystroke via `editor-form.js`. */
       var lastLintDiagnostics = [];
 
       var recordLintResult = function (diagnostics) {
@@ -1380,6 +1384,19 @@
         return count;
       };
 
+      /* #1014: the guided form's validity chip (`editor-form-pane.html`,
+       * re-rendered by editor-form.js after every settled edit) carries the
+       * server's own error count - FHIR schema + required-binding findings
+       * the lint endpoint never reports. Missing chip or attribute (no
+       * editor-pair.js, a fragment without the pane) reads as 0. */
+      var chipErrorCount = function () {
+        if (!grid) return 0;
+        var chip = grid.querySelector(".editor-validity");
+        if (!chip || !chip.dataset || chip.dataset.errorCount == null) return 0;
+        var n = parseInt(chip.dataset.errorCount, 10);
+        return isNaN(n) || n < 0 ? 0 : n;
+      };
+
       /* `data-msg-save-errors-one`/`-other` on `#vd-editor-grid` (Fluent
        * `vd-save-with-errors-one`/`-other`, rendered server-side with the
        * literal placeholder text `{count}` standing in for `$count` - the
@@ -1399,7 +1416,7 @@
 
       form.addEventListener("submit", function (event) {
         if (isDuplicateSubmit(event.submitter)) return;
-        var errorCount = errorCountFrom(lastLintDiagnostics);
+        var errorCount = Math.max(errorCountFrom(lastLintDiagnostics), chipErrorCount());
         if (errorCount === 0) return;
         var message = saveConfirmMessage(errorCount);
         if (!message) return;

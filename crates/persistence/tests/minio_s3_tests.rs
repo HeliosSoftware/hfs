@@ -35,7 +35,7 @@ use testcontainers::{GenericImage, ImageExt};
 use tokio::sync::OnceCell;
 use uuid::Uuid;
 
-const DEFAULT_MINIO_IMAGE: &str = "minio/minio";
+const DEFAULT_MINIO_IMAGE: &str = "quay.io/minio/minio";
 const DEFAULT_MINIO_TAG: &str = "RELEASE.2025-02-28T09-55-16Z";
 const DEFAULT_MINIO_ROOT_USER: &str = "minioadmin";
 const DEFAULT_MINIO_ROOT_PASSWORD: &str = "minioadmin";

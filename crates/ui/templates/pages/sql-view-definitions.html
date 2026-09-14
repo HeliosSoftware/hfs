@@ -86,7 +86,7 @@
       <input type="search" name="filter" value="{{ filter }}"
              placeholder="{{ i18n.t("vd-filter") }}" aria-label="{{ i18n.t("vd-filter") }}">
     </form>
-    {% call recent::group("vd-rail-recent", "vd-rail-list", rail_page, max_recent, i18n.t("sp-rail-recent"), recent_entries) %}{% endcall %}
+    {% call recent::group("vd-rail-recent", "vd-rail-list", rail_page, max_recent, i18n.t("sp-rail-recent"), recent_entries, false) %}{% endcall %}
     <div class="filter-rail__divider" aria-hidden="true"></div>
     <div class="filter-rail__heading filter-rail__heading--group">{{ i18n.t("vd-rail-all-heading") }}</div>
     <div class="filter-rail__list" id="vd-rail-list">

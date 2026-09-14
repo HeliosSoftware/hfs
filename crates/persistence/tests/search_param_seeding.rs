@@ -40,7 +40,7 @@ async fn seeding_is_idempotent_and_discoverable() {
     let backend = create_backend();
     let data_dir = workspace_data_dir();
 
-    let first = seed_spec_search_parameters(&backend, FhirVersion::R4, &data_dir, "default")
+    let first = seed_spec_search_parameters(&backend, FhirVersion::R4, &data_dir, "default", None)
         .await
         .expect("first seed");
     assert!(
@@ -59,7 +59,7 @@ async fn seeding_is_idempotent_and_discoverable() {
     assert_eq!(stored as usize, first.created);
 
     // A second boot takes the fast path and writes nothing.
-    let second = seed_spec_search_parameters(&backend, FhirVersion::R4, &data_dir, "default")
+    let second = seed_spec_search_parameters(&backend, FhirVersion::R4, &data_dir, "default", None)
         .await
         .expect("second seed");
     assert_eq!(second.created, 0);
@@ -101,9 +101,10 @@ async fn seeding_completes_a_partial_set_without_clobbering() {
         .await
         .expect("pre-existing custom parameter");
 
-    let outcome = seed_spec_search_parameters(&backend, FhirVersion::R4, &data_dir, "default")
-        .await
-        .expect("seed over partial set");
+    let outcome =
+        seed_spec_search_parameters(&backend, FhirVersion::R4, &data_dir, "default", None)
+            .await
+            .expect("seed over partial set");
     assert!(outcome.created > 1300);
     assert_eq!(outcome.failed, 0);
 
@@ -149,9 +150,10 @@ async fn seeding_reports_existing_for_present_spec_ids() {
         .await
         .expect("pre-create under a spec id");
 
-    let outcome = seed_spec_search_parameters(&backend, FhirVersion::R4, &data_dir, "default")
-        .await
-        .expect("seed over a present spec id");
+    let outcome =
+        seed_spec_search_parameters(&backend, FhirVersion::R4, &data_dir, "default", None)
+            .await
+            .expect("seed over a present spec id");
     assert!(
         outcome.existing >= 1,
         "the pre-existing spec id should be reported existing, got {outcome:?}"
@@ -178,7 +180,7 @@ async fn seeding_with_missing_spec_bundle_seeds_only_fallbacks() {
     let empty_dir = tempfile::tempdir().expect("temp data dir");
 
     let outcome =
-        seed_spec_search_parameters(&backend, FhirVersion::R4, empty_dir.path(), "default")
+        seed_spec_search_parameters(&backend, FhirVersion::R4, empty_dir.path(), "default", None)
             .await
             .expect("seed fallbacks");
     // Only the embedded fallbacks are seeded — no spec set. Derived from

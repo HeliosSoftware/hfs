@@ -316,6 +316,52 @@ impl std::fmt::Display for BundleMethod {
     }
 }
 
+/// What a bundle entry actually did to stored state, independent of its HTTP
+/// `status` (#1078).
+///
+/// The status alone cannot say it: a `200` is both a read and an update, and a
+/// `204` is both a delete and — on some backends — a delete of a resource that
+/// was not there. Consumers that count live resources read this instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum BundleEntryEffect {
+    /// A new live resource was stored.
+    Created,
+    /// A new version of an existing live resource was stored.
+    Updated,
+    /// A live resource was deleted.
+    Deleted,
+    /// A delete found nothing to delete (absent or already deleted, or a
+    /// conditional delete without a match).
+    NotFound,
+    /// Nothing was written: a conditional create matched an existing resource.
+    NoOp,
+    /// The entry only read (a read or a search).
+    #[default]
+    Read,
+    /// The entry failed.
+    Failed,
+}
+
+impl BundleEntryEffect {
+    /// Net change in live resources: `+1` created, `-1` deleted, else `0`.
+    pub fn live_count_delta(self) -> i64 {
+        match self {
+            BundleEntryEffect::Created => 1,
+            BundleEntryEffect::Deleted => -1,
+            _ => 0,
+        }
+    }
+
+    /// Whether stored state changed.
+    pub fn is_write(self) -> bool {
+        matches!(
+            self,
+            BundleEntryEffect::Created | BundleEntryEffect::Updated | BundleEntryEffect::Deleted
+        )
+    }
+}
+
 /// Result of a bundle entry execution.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BundleEntryResult {
@@ -331,6 +377,9 @@ pub struct BundleEntryResult {
     pub resource: Option<Value>,
     /// OperationOutcome for errors.
     pub outcome: Option<Value>,
+    /// What the entry actually did to stored state; see [`BundleEntryEffect`].
+    #[serde(default)]
+    pub effect: BundleEntryEffect,
 }
 
 impl BundleEntryResult {
@@ -343,6 +392,7 @@ impl BundleEntryResult {
             last_modified: Some(resource.last_modified().to_rfc3339()),
             resource: Some(resource.content_with_meta()),
             outcome: None,
+            effect: BundleEntryEffect::Created,
         }
     }
 
@@ -355,10 +405,38 @@ impl BundleEntryResult {
             last_modified: Some(resource.last_modified().to_rfc3339()),
             resource: Some(resource.content_with_meta()),
             outcome: None,
+            effect: BundleEntryEffect::Read,
         }
     }
 
-    /// Creates a result for a delete operation.
+    /// Creates a successful result for an update that stored a new version of
+    /// an existing live resource.
+    ///
+    /// Same `200` shape as [`ok`](Self::ok); only the effect differs.
+    pub fn updated(resource: StoredResource) -> Self {
+        Self {
+            effect: BundleEntryEffect::Updated,
+            ..Self::ok(resource)
+        }
+    }
+
+    /// Creates the result for a conditional create (`ifNoneExist`) that
+    /// matched exactly one existing resource, so nothing was written.
+    ///
+    /// Answers `200` with the match, and sets `location` to its versioned URL
+    /// even though nothing was created: transaction loops map a POST entry's
+    /// `fullUrl` to `Type/id` from `location`, and references to a
+    /// conditionally created entry must resolve to the match.
+    pub fn matched_existing(resource: StoredResource) -> Self {
+        let location = resource.versioned_url();
+        Self {
+            location: Some(location),
+            effect: BundleEntryEffect::NoOp,
+            ..Self::ok(resource)
+        }
+    }
+
+    /// Creates a result for a delete operation that removed a live resource.
     pub fn deleted() -> Self {
         Self {
             status: 204,
@@ -367,6 +445,19 @@ impl BundleEntryResult {
             last_modified: None,
             resource: None,
             outcome: None,
+            effect: BundleEntryEffect::Deleted,
+        }
+    }
+
+    /// Creates the result for a delete that found nothing to delete (the
+    /// resource is absent or already deleted).
+    ///
+    /// Same `204` as [`deleted`](Self::deleted) — deletes are idempotent on
+    /// the wire — but the effect records that no live resource went away.
+    pub fn delete_not_found() -> Self {
+        Self {
+            effect: BundleEntryEffect::NotFound,
+            ..Self::deleted()
         }
     }
 
@@ -379,6 +470,7 @@ impl BundleEntryResult {
             last_modified: None,
             resource: None,
             outcome: Some(outcome),
+            effect: BundleEntryEffect::Failed,
         }
     }
 }
@@ -535,5 +627,111 @@ mod tests {
         assert_eq!(result.status, 404);
         assert!(result.outcome.is_some());
         assert!(result.resource.is_none());
+        assert_eq!(result.effect, BundleEntryEffect::Failed);
+    }
+
+    fn stored_patient() -> StoredResource {
+        StoredResource::new(
+            "Patient",
+            "123",
+            crate::tenant::TenantId::new("t1"),
+            serde_json::json!({"resourceType": "Patient", "id": "123"}),
+            FhirVersion::default(),
+        )
+    }
+
+    #[test]
+    fn test_bundle_entry_result_constructor_effects() {
+        let created = BundleEntryResult::created(stored_patient());
+        assert_eq!(
+            (created.status, created.effect),
+            (201, BundleEntryEffect::Created)
+        );
+
+        let read = BundleEntryResult::ok(stored_patient());
+        assert_eq!((read.status, read.effect), (200, BundleEntryEffect::Read));
+        assert!(read.location.is_none());
+
+        let deleted = BundleEntryResult::deleted();
+        assert_eq!(
+            (deleted.status, deleted.effect),
+            (204, BundleEntryEffect::Deleted)
+        );
+
+        let failed = BundleEntryResult::error(412, serde_json::json!({}));
+        assert_eq!(
+            (failed.status, failed.effect),
+            (412, BundleEntryEffect::Failed)
+        );
+    }
+
+    #[test]
+    fn test_bundle_entry_result_updated_matches_ok_shape() {
+        let read = BundleEntryResult::ok(stored_patient());
+        let updated = BundleEntryResult::updated(stored_patient());
+        assert_eq!(updated.status, 200);
+        assert_eq!(updated.effect, BundleEntryEffect::Updated);
+        assert!(updated.location.is_none());
+        assert_eq!(updated.etag, read.etag);
+        assert_eq!(updated.resource, read.resource);
+        assert!(updated.last_modified.is_some());
+        assert!(updated.outcome.is_none());
+    }
+
+    #[test]
+    fn test_bundle_entry_result_matched_existing() {
+        let resource = stored_patient();
+        let expected_location = resource.versioned_url();
+        let matched = BundleEntryResult::matched_existing(resource);
+        assert_eq!(matched.status, 200);
+        assert_eq!(matched.effect, BundleEntryEffect::NoOp);
+        assert_eq!(matched.location, Some(expected_location));
+        assert!(matched.etag.is_some());
+        assert!(matched.resource.is_some());
+        assert!(matched.outcome.is_none());
+    }
+
+    #[test]
+    fn test_bundle_entry_result_delete_not_found() {
+        let result = BundleEntryResult::delete_not_found();
+        assert_eq!(result.status, 204);
+        assert_eq!(result.effect, BundleEntryEffect::NotFound);
+        assert!(result.location.is_none());
+        assert!(result.etag.is_none());
+        assert!(result.last_modified.is_none());
+        assert!(result.resource.is_none());
+        assert!(result.outcome.is_none());
+    }
+
+    #[test]
+    fn test_bundle_entry_effect_delta_and_is_write() {
+        let table = [
+            (BundleEntryEffect::Created, 1, true),
+            (BundleEntryEffect::Updated, 0, true),
+            (BundleEntryEffect::Deleted, -1, true),
+            (BundleEntryEffect::NotFound, 0, false),
+            (BundleEntryEffect::NoOp, 0, false),
+            (BundleEntryEffect::Read, 0, false),
+            (BundleEntryEffect::Failed, 0, false),
+        ];
+        for (effect, delta, is_write) in table {
+            assert_eq!(effect.live_count_delta(), delta, "{effect:?} delta");
+            assert_eq!(effect.is_write(), is_write, "{effect:?} is_write");
+        }
+        assert_eq!(BundleEntryEffect::default(), BundleEntryEffect::Read);
+    }
+
+    #[test]
+    fn test_bundle_entry_result_effect_defaults_when_absent() {
+        let result: BundleEntryResult = serde_json::from_value(serde_json::json!({
+            "status": 200,
+            "location": null,
+            "etag": null,
+            "last_modified": null,
+            "resource": null,
+            "outcome": null
+        }))
+        .unwrap();
+        assert_eq!(result.effect, BundleEntryEffect::Read);
     }
 }

@@ -7,15 +7,48 @@
 
 {#
   Everything derived from the dashboard snapshot lives in one swappable
-  region (#956). While the snapshot is still being computed the page renders
-  a waiting state and — with JavaScript — re-requests just this region a
-  bounded number of times, so the figures appear without a manual reload and
-  without ever standing in for them with invented ones.
+  region (#956). While no figure is known yet the page renders a waiting
+  state and, with JavaScript, re-requests just this region a bounded number
+  of times, so the figures appear without a manual reload and without ever
+  standing in for them with invented ones.
+
+  Figures that are here follow themselves the same way (#1078): every few
+  seconds while they are still moving — counted from recent writes and not yet
+  reconciled, or with an import running (data-dash-moving) — and slower once
+  they settle, so a tab opened before an import starts still notices it.
+
+  The region is the `dash_live` block and the chart card inside it the
+  `chart_card` block: an htmx request whose HX-Target is `dash-live` or
+  `dash-chart` gets just that block back, anything else (plain navigation,
+  history restore) the whole page. A settled tick may send `state` (the
+  data-dash-state it shows); when the figures are unchanged the server answers
+  204 and nothing is swapped. The tick also sends what the user has open as
+  `open=pick,table`, and the render keeps it: an open type picker comes back
+  `open hx-preserve` (the very node stays, mid-use), an open table `open`.
+  The type picker's options re-request the chart card through htmx
+  (#555, #599), always rendered open, and the server pushes that selection's
+  own link (HX-Push-Url). hx-sync lets a picker click abort a tick in flight
+  and drops a tick while a click is.
+
+  A waiting page whose provider did answer (still seeding the tenant, #1078)
+  keeps a slow watch once its fast retries are spent
+  (data-dash-waiting), so it still picks up its figures; the cache's own cold
+  state does not. A backend that cannot count shows that fact and never polls.
+  data-dash-ctx names the tenant, FHIR version and locale of this render;
+  every request the region makes sends it back, and the server answers a
+  mismatch with HX-Refresh so contexts never mix on one page.
 #}
-<div id="dash-live"
+{% block dash_live -%}
+<div id="dash-live" data-dash-ctx="{{ dash_ctx }}"
   {% if let Some(href) = auto_retry_href %}
      hx-get="{{ href }}" hx-trigger="load delay:1200ms"
-     hx-target="this" hx-select="#dash-live" hx-swap="outerHTML"
+     hx-target="this" hx-select="#dash-live" hx-swap="outerHTML" hx-sync="this:drop"
+  {% else if let Some(href) = refresh_href %}
+     hx-get="{{ href }}" hx-trigger="every {{ refresh_secs }}s [hfsDashCanRefresh()]"
+     hx-target="this" hx-select="#dash-live" hx-swap="outerHTML" hx-sync="this:drop"
+     data-dash-refresh="{{ refresh_secs }}" data-dash-state="{{ refresh_state }}"
+     {% if refresh_moving %}data-dash-moving="1"{% endif %}
+     {% if refresh_waiting %}data-dash-waiting="1"{% endif %}
   {% endif %}
 >
 
@@ -25,7 +58,7 @@
     {% if let Some(value) = metrics.resource_types %}
     <span class="stat__value">{{ value }}</span>
     {% else %}
-    <span class="stat__value stat__value--unavailable" aria-label="{{ i18n.t("chart-pending-empty") }}">&mdash;</span>
+    <span class="stat__value stat__value--unavailable" aria-label="{{ i18n.t(figures_unknown_key) }}">&mdash;</span>
     {% endif %}
     {# The effective request version, same source as the sidebar selector —
        never the snapshot's boot-time default (#553). #}
@@ -36,7 +69,7 @@
     {% if let Some(value) = metrics.stored_resources %}
     <span class="stat__value">{{ value }}</span>
     {% else %}
-    <span class="stat__value stat__value--unavailable" aria-label="{{ i18n.t("chart-pending-empty") }}">&mdash;</span>
+    <span class="stat__value stat__value--unavailable" aria-label="{{ i18n.t(figures_unknown_key) }}">&mdash;</span>
     {% endif %}
     <span class="stat__sub">{{ i18n.t("card-stored-resources-sub") }}</span>
   </article>
@@ -72,14 +105,15 @@
   </article>
 </section>
 
-<section class="card chart-card">
+{% block chart_card -%}
+<section class="card chart-card" id="dash-chart">
   <header class="chart-card__head">
     <div>
       <span class="stat__label">{{ i18n.t("chart-title") }}</span>
       {% if let Some(value) = metrics.chart_total %}
       <span class="stat__value">{{ value }}</span>
       {% else %}
-      <span class="stat__value stat__value--unavailable" aria-label="{{ i18n.t("chart-pending-empty") }}">&mdash;</span>
+      <span class="stat__value stat__value--unavailable" aria-label="{{ i18n.t(figures_unknown_key) }}">&mdash;</span>
       {% endif %}
       <span class="stat__sub">{{ chart.types_label }}</span>
     </div>
@@ -87,7 +121,8 @@
       <!--
         Time-window selector. Each option is a plain link that re-renders the page
         with the chart sampled over that window (keeping the charted set), so it
-        works without JavaScript. Window spans and bucket widths are paired in
+        works without JavaScript (no htmx here: a window switch is a
+        navigation). Window spans and bucket widths are paired in
         helios_observability::dashboard::DashboardWindow.
       -->
       <nav class="window-picker" aria-label="{{ i18n.t("chart-window") }}">
@@ -103,9 +138,11 @@
         The type picker (#555, mockup resPick): every stored type, as checkbox
         rows. Each option is a plain link that toggles the type in or out of
         the charted set — the same progressive-enhancement contract as the
-        window selector.
+        window selector. With JavaScript the same link re-requests only this
+        chart card (hx-get = href, target #dash-chart), which comes back with
+        the picker open and the pushed URL of the new selection.
       -->
-      <details class="menu chart-pick">
+      <details class="menu chart-pick" id="chart-pick"{% if pick_open %} open{% endif %}{% if pick_preserve %} hx-preserve{% endif %}>
         <!-- The aria-label keeps the summary named even when pick_label is
              empty (a backend with no count read path offers zero types). -->
         <summary class="pill" aria-label="{{ i18n.t("chart-pick-heading") }}">
@@ -123,21 +160,37 @@
             a real `<input type="checkbox">` since it has no enclosing form.
           -->
           <a class="menu__option chart-pick__option chart-pick__option--all{% if all_types %} chart-pick__option--on{% endif %}"
-             href="{{ all_types_href }}" aria-pressed="{% if all_types %}true{% else %}false{% endif %}">
+             href="{{ all_types_href }}"
+             hx-get="{{ all_types_href }}" hx-target="#dash-chart" hx-select="#dash-chart"
+             hx-swap="outerHTML" hx-sync="#dash-live:replace"
+             aria-pressed="{% if all_types %}true{% else %}false{% endif %}">
             <span class="chart-pick__box" aria-hidden="true">{% if all_types %}✓{% endif %}</span>
             <span class="chart-pick__name">{{ i18n.t("chart-pick-all") }}</span>
           </a>
           <div class="menu__search">
-            <input type="search" placeholder="{{ i18n.t("chart-pick-filter") }}"
+            {# hx-preserve keeps typed text and focus across both swaps. Never
+               nested in a preserved picker: htmx (with moveBefore) would pull
+               the input out of the very picker it keeps, and the picker
+               carries the input along anyway. #}
+            <input type="search" id="chart-pick-filter"{% if !pick_preserve %} hx-preserve{% endif %} placeholder="{{ i18n.t("chart-pick-filter") }}"
                    aria-label="{{ i18n.t("chart-pick-filter") }}" data-pick-filter>
           </div>
           <div class="chart-pick__list">
-            {% if picker.is_empty() %}
+            {% if picker.is_empty() && chart_unsupported %}
+            <p class="chart-pick__none">{{ i18n.t("chart-counts-unsupported") }}</p>
+            {% else if picker.is_empty() && chart_waiting %}
+            {# Waiting is not emptiness: "nothing to chart yet" would read as an
+               empty tenant while its figures are still on their way (#1078). #}
+            <p class="chart-pick__none">{{ i18n.t("chart-pending-empty") }}</p>
+            {% else if picker.is_empty() %}
             <p class="chart-pick__none">{{ i18n.t("chart-empty") }}</p>
             {% endif %}
             {% for option in picker %}
             <a class="menu__option chart-pick__option{% if option.selected %} chart-pick__option--on{% endif %}"
-               href="{{ option.href }}" data-pick-name="{{ option.resource_type }}">
+               href="{{ option.href }}"
+               hx-get="{{ option.href }}" hx-target="#dash-chart" hx-select="#dash-chart"
+               hx-swap="outerHTML" hx-sync="#dash-live:replace"
+               data-pick-name="{{ option.resource_type }}">
               <span class="chart-pick__box" aria-hidden="true">{% if option.selected %}✓{% endif %}</span>
               <span class="chart-pick__name">{{ option.resource_type }}</span>
               <span class="chart-pick__count">{{ option.total }}</span>
@@ -150,22 +203,29 @@
   </header>
 
   {#
-    Whatever is short of a complete live reading is named here, and named
-    precisely: waiting is not "no provider", and a half-failed snapshot is
-    not a measurement (#956). `aria-live` so the swap announces itself.
+    Where the figures come from is named here, and named precisely: waiting
+    is not "no provider" (#956), and a figure counted from recent writes is
+    not an exact storage read (#1078). One line, mapped from the figures as
+    `DashboardNotice` documents; a line for measured figures says when they
+    were read. `aria-live` so the swap announces itself.
   #}
-  {% if let Some(key) = notice.key() %}
-  <p class="notice notice--warn" aria-live="polite">
-    {{ i18n.t(key) }}
-    {% if notice.is_pending() %}
+  <p class="notice{% if notice.kind.is_warning() %} notice--warn{% endif %}" aria-live="{{ self.notice_aria_live(notice.kind) }}" data-dash-notice="{{ notice.kind.slug() }}">
+    {% if let Some(key) = notice.kind.key() %}{{ i18n.t(key) }}{% endif %}
+    {% if let Some(as_of) = notice.as_of %}
+    <time datetime="{{ as_of.datetime }}">{{ i18n.t_arg("chart-as-of", "time", as_of.label.clone()) }}</time>
+    {% endif %}
+    {% if notice.kind.is_waiting() %}
     {# Always present, auto-refresh or not: the page stays recoverable
        without JavaScript, and after the poll budget it is the only way on. #}
     <a href="{{ retry_href }}">{{ i18n.t("chart-pending-retry") }}</a>
     {% endif %}
   </p>
-  {% endif %}
 
-  {% if notice.is_pending() %}
+  {% if chart_unsupported %}
+  {# #1078: this backend cannot count, so there is nothing to wait for and
+     no empty chart to show — only the fact. #}
+  <div class="chart-empty">{{ i18n.t("chart-counts-unsupported") }}</div>
+  {% else if chart_waiting %}
   <div class="chart-empty">{{ i18n.t("chart-pending-empty") }}</div>
   {% else if !chart.has_data %}
   <div class="chart-empty">{{ i18n.t("chart-empty") }}</div>
@@ -220,7 +280,7 @@
   <script type="application/json" id="chart-data">{{ chart.tip_json|safe }}</script>
 
   <!-- The same numbers as text: the sampled buckets, one column per series. -->
-  <details class="chart-table">
+  <details class="chart-table" id="chart-table"{% if table_open %} open{% endif %}>
     <summary>{{ i18n.t("chart-table-toggle") }}</summary>
     <div class="table-wrap">
       <table class="data-table">
@@ -273,6 +333,8 @@
     {% endfor %}
   </ul>
 </section>
+{%- endblock chart_card %}
 
 </div>{# /#dash-live #}
+{%- endblock dash_live %}
 {% endblock %}

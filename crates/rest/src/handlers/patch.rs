@@ -143,17 +143,17 @@ where
         "Resource patched"
     );
 
-    // Emit subscription event
-    #[cfg(feature = "subscriptions")]
-    if let Some(engine) = state.subscription_engine() {
-        super::subscription_event::emit_subscription_event(
-            engine,
-            tenant.context(),
+    super::write_event::report(
+        &state,
+        tenant.context(),
+        stored.fhir_version(),
+        &resource_type,
+        0,
+        Some(super::write_event::stored_notice(
+            helios_persistence::core::WriteKind::Update,
             &stored,
-            stored.fhir_version(),
-            helios_subscriptions::ResourceEventType::Update,
-        );
-    }
+        )),
+    );
 
     build_patch_response(&stored, headers, &prefer).map(|mut response| {
         response
@@ -219,6 +219,15 @@ where
     use helios_persistence::core::ConditionalPatchResult;
     match result {
         ConditionalPatchResult::Patched(stored) => {
+            // Conditional writes announce nothing.
+            super::write_event::report(
+                &state,
+                tenant.context(),
+                stored.fhir_version(),
+                &resource_type,
+                0,
+                None,
+            );
             let headers = ResourceHeaders::from_stored(&stored, &state);
             build_patch_response(&stored, headers, &prefer).map(|mut response| {
                 response

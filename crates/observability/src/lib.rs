@@ -12,6 +12,14 @@
 //!   (feature `otel`).
 //! - [`dashboard`] — process-global provider of storage-count snapshots for the
 //!   web UI's "FHIR resources over time" chart, registered by the server.
+//! - [`dashboard_counters`] — process-local per-tenant, per-type live resource
+//!   counters fed by the server's post-commit write observer and reconciled
+//!   from storage, so the chart stays readable while storage aggregates are too
+//!   slow (#1078). The server owns and injects the instance; there is no global.
+//! - [`dashboard_metrics`] — process-level Prometheus metrics for the
+//!   dashboard's background counter reconcile (pass timing, storage query
+//!   latency and errors, seed queue depth, corrections). No tenant or
+//!   resource-type labels.
 //!
 //! ## Typical wiring
 //!
@@ -37,6 +45,8 @@
 //!   scraping `/metrics`; the app itself only pushes OTLP *traces*.
 
 pub mod dashboard;
+pub mod dashboard_counters;
+pub mod dashboard_metrics;
 pub mod metrics;
 pub mod middleware;
 pub mod mode;
