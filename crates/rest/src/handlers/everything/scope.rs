@@ -272,6 +272,7 @@ mod tests {
     /// (and that `date` param must itself be resolvable by the registry)
     /// rather than resolving to a param that yields zero search results.
     #[test]
+    #[allow(clippy::vec_init_then_push)]
     fn clinical_date_overrides_resolve_against_every_enabled_version() {
         #[allow(unused_mut)]
         let mut versions: Vec<FhirVersion> = Vec::new();
