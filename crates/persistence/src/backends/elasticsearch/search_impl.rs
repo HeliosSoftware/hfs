@@ -372,7 +372,10 @@ impl SearchProvider for ElasticsearchBackend {
                 }
             }
         } else {
-            let has_next = hits_with_sort.len() >= count;
+            let has_next = hits_with_sort.len() > count;
+            if has_next {
+                hits_with_sort.truncate(count);
+            }
             let has_previous = query.cursor.is_some() || query.offset.unwrap_or(0) > 0;
             let next_cursor = if has_next {
                 hits_with_sort

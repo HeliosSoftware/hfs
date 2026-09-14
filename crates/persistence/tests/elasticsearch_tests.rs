@@ -180,8 +180,8 @@ mod query_builder_tests {
         let sort = sort.as_array().unwrap();
         assert_eq!(sort.len(), 2);
 
-        // Default size
-        assert_eq!(es_query.body["size"], 20);
+        // Default size: the default count (20) plus one over-fetched hit (#1079)
+        assert_eq!(es_query.body["size"], 21);
 
         // track_total_hits
         assert_eq!(es_query.body["track_total_hits"], true);
@@ -333,7 +333,8 @@ mod query_builder_tests {
         query.count = Some(50);
 
         let es_query = builder.build(&query);
-        assert_eq!(es_query.body["size"], 50);
+        // The query over-fetches by one hit beyond the requested count (#1079)
+        assert_eq!(es_query.body["size"], 51);
     }
 
     #[test]
@@ -4187,6 +4188,134 @@ mod es_integration {
             .unwrap();
         assert_eq!(page_ids(&back1), vec!["cp-1", "cp-2", "cp-3"]);
         assert!(back1.resources.page_info.previous_cursor.is_none());
+    }
+
+    /// #1079: a result set whose size is an exact multiple of `_count` must
+    /// not emit a `next` link on the last page, forward via cursor.
+    #[tokio::test]
+    async fn es_integration_cursor_paging_no_phantom_next_when_last_page_full() {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::types::{SearchQuery, SortDirection, SortDirective};
+
+        let backend = create_backend_with("1ms", WriteRefreshPolicy::WaitFor).await;
+        let tenant = create_tenant("cursor-full-page");
+        create_cursor_paging_patients(&backend, &tenant, 6).await;
+
+        let query = SearchQuery::new("Patient")
+            .with_count(3)
+            .with_sort(SortDirective {
+                parameter: "_id".to_string(),
+                direction: SortDirection::Ascending,
+                param_type: None,
+            });
+
+        let page1 = backend.search(&tenant, &query).await.unwrap();
+        assert_eq!(page_ids(&page1), vec!["cp-1", "cp-2", "cp-3"]);
+        assert!(page1.resources.page_info.has_next);
+
+        let page2 = backend
+            .search(
+                &tenant,
+                &query
+                    .clone()
+                    .with_cursor(page1.resources.page_info.next_cursor.clone().unwrap()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(page_ids(&page2), vec!["cp-4", "cp-5", "cp-6"]);
+        assert!(!page2.resources.page_info.has_next);
+        assert!(page2.resources.page_info.next_cursor.is_none());
+        assert!(page2.resources.page_info.has_previous);
+        assert!(page2.resources.page_info.previous_cursor.is_some());
+
+        let back1 = backend
+            .search(
+                &tenant,
+                &query
+                    .clone()
+                    .with_cursor(page2.resources.page_info.previous_cursor.clone().unwrap()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(page_ids(&back1), vec!["cp-1", "cp-2", "cp-3"]);
+        assert!(!back1.resources.page_info.has_previous);
+        assert!(back1.resources.page_info.has_next);
+    }
+
+    /// #1079: the same exact-multiple scenario via `_offset` instead of a
+    /// cursor must also avoid a phantom `next` link on the last page.
+    #[tokio::test]
+    async fn es_integration_offset_paging_no_phantom_next_when_last_page_full() {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::types::{SearchQuery, SortDirection, SortDirective};
+
+        let backend = create_backend_with("1ms", WriteRefreshPolicy::WaitFor).await;
+        let tenant = create_tenant("offset-full-page");
+        create_cursor_paging_patients(&backend, &tenant, 6).await;
+
+        let mut query = SearchQuery::new("Patient")
+            .with_count(3)
+            .with_sort(SortDirective {
+                parameter: "_id".to_string(),
+                direction: SortDirection::Ascending,
+                param_type: None,
+            });
+        query.offset = Some(3);
+
+        let page = backend.search(&tenant, &query).await.unwrap();
+        assert_eq!(page_ids(&page), vec!["cp-4", "cp-5", "cp-6"]);
+        assert!(!page.resources.page_info.has_next);
+        assert!(page.resources.page_info.next_cursor.is_none());
+        assert!(page.resources.page_info.has_previous);
+    }
+
+    /// #1079: when more rows remain beyond the requested count, the page
+    /// still contains exactly `_count` items (the extra over-fetched hit is
+    /// dropped) and `has_next` stays true.
+    #[tokio::test]
+    async fn es_integration_forward_page_with_more_rows_keeps_next() {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::types::{SearchQuery, SortDirection, SortDirective};
+
+        let backend = create_backend_with("1ms", WriteRefreshPolicy::WaitFor).await;
+        let tenant = create_tenant("forward-more-rows");
+        create_cursor_paging_patients(&backend, &tenant, 7).await;
+
+        let query = SearchQuery::new("Patient")
+            .with_count(3)
+            .with_sort(SortDirective {
+                parameter: "_id".to_string(),
+                direction: SortDirection::Ascending,
+                param_type: None,
+            });
+
+        let page1 = backend.search(&tenant, &query).await.unwrap();
+        assert_eq!(page_ids(&page1), vec!["cp-1", "cp-2", "cp-3"]);
+        assert!(page1.resources.page_info.has_next);
+
+        let page2 = backend
+            .search(
+                &tenant,
+                &query
+                    .clone()
+                    .with_cursor(page1.resources.page_info.next_cursor.clone().unwrap()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(page_ids(&page2), vec!["cp-4", "cp-5", "cp-6"]);
+        assert!(page2.resources.page_info.has_next);
+
+        let page3 = backend
+            .search(
+                &tenant,
+                &query
+                    .clone()
+                    .with_cursor(page2.resources.page_info.next_cursor.clone().unwrap()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(page_ids(&page3), vec!["cp-7"]);
+        assert!(!page3.resources.page_info.has_next);
     }
 
     // ========================================================================

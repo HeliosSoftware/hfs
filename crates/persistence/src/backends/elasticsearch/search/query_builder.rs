@@ -147,14 +147,10 @@ impl<'a> EsQueryBuilder<'a> {
 
         // Add pagination
         let count = query.count.unwrap_or(20);
-        // `Previous` requests one extra hit so the results layer can tell
-        // whether an earlier page exists beyond the ones returned (#1015).
-        let size = if paging == CursorDirection::Previous {
-            count + 1
-        } else {
-            count
-        };
-        body["size"] = json!(size);
+        // Both directions over-fetch by one hit so the results layer can tell
+        // whether another page exists: forward it proves a next page, backward
+        // (#1015) it proves a previous page. The extra hit is dropped there.
+        body["size"] = json!(count + 1);
 
         if query.cursor.is_some() {
             if let Some(cursor) = cursor.as_ref() {
@@ -797,9 +793,10 @@ mod tests {
         assert_eq!(sort[0], json!({ "_score": { "order": "asc" } }));
     }
 
-    /// #1015 regression: a `Next` cursor leaves sort and size untouched.
+    /// #1015 regression + #1079: a Next cursor leaves the sort untouched and
+    /// over-fetches by one hit like Previous does.
     #[test]
-    fn test_next_cursor_keeps_sort_and_size() {
+    fn test_next_cursor_keeps_sort_and_overfetches() {
         let query = SearchQuery::new("Patient")
             .with_count(5)
             .with_cursor(next_cursor("p-5"));
@@ -813,7 +810,34 @@ mod tests {
                 { "resource_id": { "order": "asc" } }
             ])
         );
-        assert_eq!(body["size"], json!(5));
+        assert_eq!(body["size"], json!(6));
         assert_eq!(body["search_after"], json!([1_700_000_000_000i64, "p-5"]));
+    }
+
+    /// #1079: a first page with neither a cursor nor an offset over-fetches
+    /// by one hit and adds neither `from` nor `search_after`.
+    #[test]
+    fn test_first_page_overfetches_by_one() {
+        let query = SearchQuery::new("Patient").with_count(5);
+        let builder = EsQueryBuilder::new("acme", "Patient", "hfs_acme_patient".to_string());
+        let body = builder.build(&query).body;
+
+        assert_eq!(body["size"], json!(6));
+        assert!(body.get("from").is_none());
+        assert!(body.get("search_after").is_none());
+    }
+
+    /// #1079: an offset page over-fetches by one hit, keeps `from` set to the
+    /// requested offset, and adds no `search_after`.
+    #[test]
+    fn test_offset_page_overfetches_by_one_and_keeps_from() {
+        let mut query = SearchQuery::new("Patient").with_count(5);
+        query.offset = Some(10);
+        let builder = EsQueryBuilder::new("acme", "Patient", "hfs_acme_patient".to_string());
+        let body = builder.build(&query).body;
+
+        assert_eq!(body["size"], json!(6));
+        assert_eq!(body["from"], json!(10));
+        assert!(body.get("search_after").is_none());
     }
 }
