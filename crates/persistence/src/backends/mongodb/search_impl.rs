@@ -749,9 +749,10 @@ impl MongoBackend {
     /// restores the order. Offset-paginated; no page cursors are issued —
     /// cursor pagination with a custom sort is rejected at the entry point.
     ///
-    /// `_id`/`_lastUpdated` filters still apply at the resource fetch, so a
-    /// page combining them with a parameter sort can come back short; the
-    /// ordering itself is unaffected.
+    /// The rows, `has_next` and `total` of one page all derive from a single
+    /// id sequence: the ordering, narrowed by the search-index matches and by
+    /// the resource-level predicates (`_id`, `_lastUpdated`, live-only) that
+    /// `resource_level_ids` resolves (#1056).
     async fn search_param_sorted(
         &self,
         tenant: &TenantContext,
@@ -761,12 +762,37 @@ impl MongoBackend {
         matched_ids: Option<HashSet<String>>,
         directive: &crate::types::SortDirective,
     ) -> StorageResult<SearchResult> {
-        let ordered = self
-            .param_sorted_ids(db, tenant_id, &query.resource_type, directive)
-            .await?;
-        let ordered: Vec<String> = match &matched_ids {
-            Some(set) => ordered.into_iter().filter(|id| set.contains(id)).collect(),
-            None => ordered,
+        // Resource-level predicates (`_id`, `_lastUpdated`) are not in the
+        // search index, so `matched_ids` cannot carry them. Resolve them
+        // here, against the resources collection, into the id set that the
+        // page, `has_next` and `total` all draw from (#1056). Without them
+        // the matched set is already that sequence.
+        let allowed: Option<HashSet<String>> = if Self::has_resource_level_params(query) {
+            Some(
+                self.resource_level_ids(
+                    db,
+                    tenant_id,
+                    &query.resource_type,
+                    query,
+                    matched_ids.as_ref(),
+                )
+                .await?,
+            )
+        } else {
+            matched_ids
+        };
+
+        // Nothing can match: skip the type-wide ordering aggregation.
+        let ordered: Vec<String> = if allowed.as_ref().is_some_and(|set| set.is_empty()) {
+            Vec::new()
+        } else {
+            let ordered = self
+                .param_sorted_ids(db, tenant_id, &query.resource_type, directive)
+                .await?;
+            match &allowed {
+                Some(set) => ordered.into_iter().filter(|id| set.contains(id)).collect(),
+                None => ordered,
+            }
         };
 
         let page_size = query.count.unwrap_or(100).max(1) as usize;
@@ -808,8 +834,10 @@ impl MongoBackend {
         let resources: Vec<StoredResource> =
             page_ids.iter().filter_map(|id| by_id.remove(id)).collect();
 
-        let total = if query.total.is_some() {
-            Some(self.search_count(tenant, query).await?)
+        // `ordered` is exactly the sequence the page was cut from, so its
+        // length is the total by construction — no second resolution.
+        let total = if query.wants_total() {
+            Some(ordered.len() as u64)
         } else {
             None
         };
@@ -854,6 +882,42 @@ impl MongoBackend {
             total,
             scores: Default::default(),
         })
+    }
+
+    /// True when the query carries a predicate that lives on the resource
+    /// document rather than in the search index.
+    fn has_resource_level_params(query: &SearchQuery) -> bool {
+        query
+            .parameters
+            .iter()
+            .any(|p| matches!(p.name.as_str(), "_id" | "_lastUpdated"))
+    }
+
+    /// Ids of the live resources that satisfy the resource-level predicates
+    /// (`_id`, `_lastUpdated`) within `matched_ids`. This is the same
+    /// predicate `search_count` counts, so a page cut from this set and its
+    /// `total` agree by construction (#1056).
+    async fn resource_level_ids(
+        &self,
+        db: &mongodb::Database,
+        tenant_id: &str,
+        resource_type: &str,
+        query: &SearchQuery,
+        matched_ids: Option<&HashSet<String>>,
+    ) -> StorageResult<HashSet<String>> {
+        let filter =
+            self.build_resource_filter(tenant_id, resource_type, query, matched_ids, None)?;
+        let resources = db.collection::<Document>(MongoBackend::RESOURCES_COLLECTION);
+        let cursor = resources
+            .find(filter)
+            .projection(doc! { "_id": 0, "id": 1 })
+            .await
+            .or_query_error("Failed to resolve _id/_lastUpdated filters")?;
+        let docs = collect_documents(cursor).await?;
+        Ok(docs
+            .into_iter()
+            .filter_map(|d| d.get_str("id").ok().map(ToString::to_string))
+            .collect())
     }
 
     /// Distinct `resource_id`s in the search index matching `filter`.
@@ -948,14 +1012,15 @@ impl MongoBackend {
             .filter_map(|d| d.get_str("_id").ok().map(ToString::to_string))
             .collect();
 
+        // A search-index row whose resource is gone (deleted, or a stale
+        // entry) must not occupy a slot in the sequence: the page fetch would
+        // drop it and the page would come back short (#1056).
+        let live = self.all_resource_ids(db, tenant_id, resource_type).await?;
+        ordered.retain(|id| live.contains(id));
+
         // Resources without a value for the parameter sort last.
         let keyed: HashSet<String> = ordered.iter().cloned().collect();
-        let mut unkeyed: Vec<String> = self
-            .all_resource_ids(db, tenant_id, resource_type)
-            .await?
-            .into_iter()
-            .filter(|id| !keyed.contains(id))
-            .collect();
+        let mut unkeyed: Vec<String> = live.into_iter().filter(|id| !keyed.contains(id)).collect();
         unkeyed.sort();
         ordered.extend(unkeyed);
         Ok(ordered)
