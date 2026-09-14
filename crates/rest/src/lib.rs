@@ -184,11 +184,19 @@ pub(crate) mod test_support {
     /// search parameter bundle, for tests that need real parameter
     /// definitions (types, targets) rather than a hand-rolled subset.
     pub(crate) fn spec_registry_r4() -> SearchParameterRegistry {
-        let loader = SearchParameterLoader::new(FhirVersion::R4);
+        spec_registry(FhirVersion::R4)
+    }
+
+    /// Builds a `SearchParameterRegistry` populated with the full spec
+    /// search parameter bundle for `version`, for tests that need real
+    /// parameter definitions (types, targets) rather than a hand-rolled
+    /// subset.
+    pub(crate) fn spec_registry(version: FhirVersion) -> SearchParameterRegistry {
+        let loader = SearchParameterLoader::new(version);
         let mut registry = SearchParameterRegistry::new();
         for param in loader
             .load_from_spec_file(&workspace_data_dir())
-            .expect("load R4 spec search parameters")
+            .unwrap_or_else(|e| panic!("load {version:?} spec search parameters: {e}"))
         {
             registry
                 .register(param)

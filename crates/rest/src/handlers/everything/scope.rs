@@ -46,11 +46,19 @@ pub(crate) fn clinical_date_param(
     registry: &SearchParameterRegistry,
     resource_type: &str,
 ) -> Option<String> {
+    // The override is only valid if the active FHIR version's registry
+    // actually defines it — e.g. `MedicationAdministration.effective-time`
+    // exists in R4/R4B but was renamed to `date` in R5/R6, so an R5/R6
+    // registry has no `effective-time` param and the override must fall
+    // through to the generic `date` lookup instead of silently matching
+    // nothing.
     if let Some((_, p)) = CLINICAL_DATE_OVERRIDES
         .iter()
         .find(|(t, _)| *t == resource_type)
     {
-        return Some((*p).to_string());
+        if registry.get_param(resource_type, p).is_some() {
+            return Some((*p).to_string());
+        }
     }
     registry
         .get_param(resource_type, "date")
@@ -237,6 +245,42 @@ mod tests {
             Some("date")
         );
         assert_eq!(clinical_date_param(&reg, "Coverage"), None);
+    }
+
+    /// The override map is hand-maintained and must not silently go stale
+    /// against a version's actual search parameter registry —
+    /// `MedicationAdministration.effective-time` exists in R4/R4B but was
+    /// renamed to `date` in R5/R6, so a version whose registry doesn't
+    /// define the overridden param name must fall through to `date`
+    /// (and that `date` param must itself be resolvable by the registry)
+    /// rather than resolving to a param that yields zero search results.
+    #[test]
+    fn clinical_date_overrides_resolve_against_every_enabled_version() {
+        #[allow(unused_mut)]
+        let mut versions: Vec<FhirVersion> = Vec::new();
+        #[cfg(feature = "R4")]
+        versions.push(FhirVersion::R4);
+        #[cfg(feature = "R4B")]
+        versions.push(FhirVersion::R4B);
+        #[cfg(feature = "R5")]
+        versions.push(FhirVersion::R5);
+        #[cfg(feature = "R6")]
+        versions.push(FhirVersion::R6);
+        assert!(!versions.is_empty(), "no FHIR version feature enabled");
+
+        for version in versions {
+            let reg = crate::test_support::spec_registry(version);
+            let resolved = clinical_date_param(&reg, "MedicationAdministration");
+            assert!(
+                resolved.is_some(),
+                "{version:?}: MedicationAdministration must resolve a clinical date param"
+            );
+            let name = resolved.unwrap();
+            assert!(
+                reg.get_param("MedicationAdministration", &name).is_some(),
+                "{version:?}: resolved param '{name}' must exist in the {version:?} registry"
+            );
+        }
     }
 
     #[test]
