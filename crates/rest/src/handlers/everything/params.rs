@@ -105,15 +105,27 @@ impl EverythingParams {
     }
 
     /// Canonical string of the scope-defining inputs; hashed into the cursor.
-    pub fn fingerprint_input(&self, patient_id: Option<&str>) -> String {
+    ///
+    /// Binds the cursor to the tenant and FHIR version of the request that
+    /// issued it: a cursor decoded under a different tenant or version would
+    /// otherwise resume a walk against the wrong compartment data or the
+    /// wrong version's segment/search-parameter shape.
+    pub fn fingerprint_input(
+        &self,
+        patient_id: Option<&str>,
+        tenant_id: &str,
+        version: FhirVersion,
+    ) -> String {
         format!(
-            "pid={}|start={}|end={}|since={}|types={}|count={}",
+            "pid={}|start={}|end={}|since={}|types={}|count={}|tenant={}|ver={:?}",
             patient_id.unwrap_or(""),
             self.start.as_deref().unwrap_or(""),
             self.end.as_deref().unwrap_or(""),
             self.since.as_deref().unwrap_or(""),
             self.types.as_ref().map(|t| t.join(",")).unwrap_or_default(),
             self.count.map(|c| c.to_string()).unwrap_or_default(),
+            tenant_id,
+            version,
         )
     }
 }
@@ -251,13 +263,27 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            a.fingerprint_input(Some("p1")),
-            b.fingerprint_input(Some("p1"))
+            a.fingerprint_input(Some("p1"), "acme", FhirVersion::R4),
+            b.fingerprint_input(Some("p1"), "acme", FhirVersion::R4)
         );
         assert_ne!(
-            a.fingerprint_input(Some("p1")),
-            a.fingerprint_input(Some("p2"))
+            a.fingerprint_input(Some("p1"), "acme", FhirVersion::R4),
+            a.fingerprint_input(Some("p2"), "acme", FhirVersion::R4)
         );
-        assert_ne!(a.fingerprint_input(Some("p1")), a.fingerprint_input(None));
+        assert_ne!(
+            a.fingerprint_input(Some("p1"), "acme", FhirVersion::R4),
+            a.fingerprint_input(None, "acme", FhirVersion::R4)
+        );
+        assert_ne!(
+            a.fingerprint_input(Some("p1"), "acme", FhirVersion::R4),
+            a.fingerprint_input(Some("p1"), "other-tenant", FhirVersion::R4),
+            "a different tenant must change the fingerprint"
+        );
+        #[cfg(feature = "R4B")]
+        assert_ne!(
+            a.fingerprint_input(Some("p1"), "acme", FhirVersion::R4),
+            a.fingerprint_input(Some("p1"), "acme", FhirVersion::R4B),
+            "a different FHIR version must change the fingerprint"
+        );
     }
 }

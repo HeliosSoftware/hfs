@@ -171,7 +171,7 @@ where
     S: ResourceStorage + SearchProvider + Send + Sync,
 {
     let segments = build_segments(version, params.types.as_deref());
-    let fp_input = params.fingerprint_input(Some(patient_id));
+    let fp_input = params.fingerprint_input(Some(patient_id), tenant.tenant_id().as_str(), version);
     let pos = match resume {
         Some(c) => Position {
             seg: c.seg,
@@ -224,7 +224,7 @@ where
     S: ResourceStorage + SearchProvider + Send + Sync,
 {
     let segments = build_segments(version, params.types.as_deref());
-    let fp_input = params.fingerprint_input(None);
+    let fp_input = params.fingerprint_input(None, tenant.tenant_id().as_str(), version);
     let target = limits.target();
 
     // `pat` is the backend cursor that yields the NEXT patient; `pid`/`pos`

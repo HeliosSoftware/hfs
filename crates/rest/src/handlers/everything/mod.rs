@@ -92,7 +92,7 @@ where
     let fhir_version = version.storage_version_or(state.config().default_fhir_version);
     let pairs = decode_pairs(request).await?;
     let params = EverythingParams::from_pairs(&pairs, fhir_version, state.max_page_size())?;
-    let fp_input = params.fingerprint_input(patient_id.as_deref());
+    let fp_input = params.fingerprint_input(patient_id.as_deref(), tenant.tenant_id(), fhir_version);
     let resume = match &params.cursor {
         Some(token) => Some(EverythingCursor::decode(token, &fp_input)?),
         None => None,
