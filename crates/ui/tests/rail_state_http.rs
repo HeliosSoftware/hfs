@@ -495,7 +495,9 @@ fn rail_list_html<'a>(html: &'a str, list_id: &str) -> &'a str {
 /// For View Definitions, a stored `last` is restored whether it names an
 /// entry on the rail's current page or one that has to be read directly
 /// (#741) — and, when it names nothing real at all, the page falls back to
-/// the rail's first visible entry, silently (no write).
+/// the rail's first visible entry; the render then also sweeps the now-gone
+/// id off the registry, since the static source genuinely has no such id
+/// (#1014).
 #[tokio::test]
 async fn view_definitions_restores_a_stored_last_on_or_off_the_visible_page_or_falls_back() {
     let vds: Vec<Value> = (1..=51)
@@ -529,7 +531,8 @@ async fn view_definitions_restores_a_stored_last_on_or_off_the_visible_page_or_f
     assert!(html.contains(r#"<h2 class="page-head__title">vd_051</h2>"#));
 
     // Names nothing real anywhere: falls back to the rail's first visible
-    // entry (name-sorted), and the stale value is left untouched.
+    // entry (name-sorted); the existence sweep then prunes "ghost" for good,
+    // since the static source has no such id (#1014).
     let store = Arc::new(InMemorySettingsStore::new());
     seed_rail(
         &store,
@@ -540,11 +543,13 @@ async fn view_definitions_restores_a_stored_last_on_or_off_the_visible_page_or_f
     let html = get_ok_html(vd_app_with(store.clone(), vds), "/ui/sql/view-definitions").await;
     assert!(html.contains(r#"<h2 class="page-head__title">vd_001</h2>"#));
     let doc = store.peek("l2:").expect("settings stored");
+    let rail = stored_rail(&doc, "viewDefinitions");
     assert_eq!(
-        stored_rail(&doc, "viewDefinitions")["last"],
-        "ghost",
-        "a silent fallback must not overwrite the stale value"
+        rail["last"],
+        Value::Null,
+        "ghost does not exist on the server, so the sweep prunes it"
     );
+    assert_eq!(rail["recent"], json!([]));
 }
 
 /// For View Definitions, an explicit `?vd=` selection that resolves is
@@ -688,6 +693,70 @@ async fn view_definitions_recent_group_ignores_the_filter_and_falls_back_to_the_
     assert!(group.contains("stale_other_name"));
     assert!(group.contains(r#"class="filter-rail__meta">Patient<"#));
     assert!(group.contains(r#"href="/ui/sql/view-definitions?vd=other""#));
+}
+
+/// For View Definitions, a recent entry absent from the live rail page is
+/// checked against the server on render; a source that genuinely lacks it
+/// (a definitive 404/410 in the real HTTP source) prunes it from both the
+/// rendered group and the stored registry (#1014).
+#[tokio::test]
+async fn view_definitions_recent_group_drops_a_gone_entry_on_render() {
+    let vds = vec![
+        json!({"resourceType": "ViewDefinition", "id": "vd1", "name": "active_patients", "resource": "Patient"}),
+    ];
+    let store = Arc::new(InMemorySettingsStore::new());
+    seed_rail(
+        &store,
+        "viewDefinitions",
+        json!({
+            "last": "gone",
+            "recent": [
+                {"id": "gone", "name": "gone", "meta": "Patient"},
+                {"id": "vd1", "name": "active_patients", "meta": "Patient"}
+            ]
+        }),
+    )
+    .await;
+
+    let html = get_ok_html(vd_app_with(store.clone(), vds), "/ui/sql/view-definitions").await;
+    let group = recent_group_html(&html, "vd-rail-recent");
+    assert!(!group.contains(r#"data-type="gone""#));
+    assert!(group.contains(r#"data-type="vd1""#));
+
+    let doc = store.peek("l2:").expect("settings stored");
+    let rail = stored_rail(&doc, "viewDefinitions");
+    assert_eq!(
+        rail["recent"],
+        json!([{"id": "vd1", "name": "active_patients", "meta": "Patient"}]),
+        "the gone entry is pruned from the persisted registry"
+    );
+    assert_eq!(rail["last"], Value::Null);
+}
+
+/// For View Definitions, a recent entry already on the live rail page needs
+/// no existence check at all — the render skips the lookup, and the stored
+/// registry is left untouched (#1014).
+#[tokio::test]
+async fn view_definitions_recent_group_skips_the_lookup_for_live_entries() {
+    let vds = vec![
+        json!({"resourceType": "ViewDefinition", "id": "vd1", "name": "active_patients", "resource": "Patient"}),
+    ];
+    let store = Arc::new(InMemorySettingsStore::new());
+    seed_rail(
+        &store,
+        "viewDefinitions",
+        json!({"last": "vd1", "recent": [{"id": "vd1", "name": "active_patients", "meta": "Patient"}]}),
+    )
+    .await;
+    let before = store.peek("l2:").expect("settings stored");
+
+    get_ok_html(vd_app_with(store.clone(), vds), "/ui/sql/view-definitions").await;
+
+    let after = store.peek("l2:").expect("settings stored");
+    assert_eq!(
+        before, after,
+        "a recent entry already live needs no lookup and no rewrite"
+    );
 }
 
 /// Libraries (SQL Queries/SQL Views) show the same restore/record/prune

@@ -383,6 +383,22 @@ pub trait ConformanceSource: Send + Sync {
         let _ = (resource_type, id, version, tenant);
         Err("reading a resource by id is not available from this source".to_string())
     }
+
+    /// Whether `{resource_type}/{id}` currently exists on the server:
+    /// `Ok(true)` on a 2xx, `Ok(false)` only on a definitive `404` or
+    /// `410`, and `Err` for anything else (network failure, 5xx, auth, a
+    /// non-default FHIR version) — so a caller can never mistake an outage
+    /// for a deletion (#1014).
+    async fn resource_exists(
+        &self,
+        resource_type: &str,
+        id: &str,
+        version: FhirVersion,
+        tenant: &str,
+    ) -> Result<bool, String> {
+        let _ = (resource_type, id, version, tenant);
+        Err("checking a resource by id is not available from this source".to_string())
+    }
 }
 
 /// One page of a server-side search (#741): the resources that page holds,
@@ -839,6 +855,48 @@ impl ConformanceSource for HttpConformanceSource {
             .json()
             .await
             .map_err(|e| format!("parsing {resource_type}/{id} failed: {e}"))
+    }
+
+    /// `GET {base}/{resource_type}/{id}` on the loopback base, without
+    /// parsing the body — a definitive `404`/`410` answers `Ok(false)`,
+    /// success answers `Ok(true)`, and anything else (including the same
+    /// non-default-version degradation [`read_resource`](Self::read_resource)
+    /// applies) is an `Err` so the caller never confuses an outage with a
+    /// deletion (#1014).
+    async fn resource_exists(
+        &self,
+        resource_type: &str,
+        id: &str,
+        version: FhirVersion,
+        tenant: &str,
+    ) -> Result<bool, String> {
+        if version != self.default_version {
+            return Err(format!(
+                "checking {resource_type}/{id} reads stored data, which holds the server default (FHIR {}); switch the sidebar back to check this resource",
+                self.default_version.as_str(),
+            ));
+        }
+        let url = format!("{}/{resource_type}/{id}", self.base_url);
+        let request = self.client.get(&url).header(
+            "Accept",
+            format!(
+                "application/fhir+json; fhirVersion={}",
+                version.as_mime_param()
+            ),
+        );
+        let request = self.authorized(request, tenant).await?;
+        let response = request
+            .send()
+            .await
+            .map_err(|e| format!("request to {url} failed: {e}"))?;
+        let status = response.status();
+        if status.is_success() {
+            Ok(true)
+        } else if status == reqwest::StatusCode::NOT_FOUND || status == reqwest::StatusCode::GONE {
+            Ok(false)
+        } else {
+            Err(format!("{url} returned {status}"))
+        }
     }
 
     async fn save_resource(
@@ -1506,6 +1564,26 @@ impl ConformanceSource for StaticConformanceSource {
             .ok_or_else(|| format!("no {resource_type} with id {id}"))
     }
 
+    /// Whether a seeded resource with matching `id` exists in `self.map`
+    /// (#1014) — the static double's equivalent of the HTTP source's
+    /// 404/410 distinction, without any request to make.
+    async fn resource_exists(
+        &self,
+        resource_type: &str,
+        id: &str,
+        version: FhirVersion,
+        _tenant: &str,
+    ) -> Result<bool, String> {
+        Ok(self
+            .map
+            .get(&(resource_type.to_string(), version))
+            .is_some_and(|resources| {
+                resources
+                    .iter()
+                    .any(|r| r.get("id").and_then(Value::as_str) == Some(id))
+            }))
+    }
+
     /// Echoes the resource back with an id, so the save handler's redirect
     /// (and a test's assertion on it) has something stable to point at.
     /// Also records the exact resource that was posted (post-id) in
@@ -1876,6 +1954,110 @@ mod tests {
             .await
             .expect_err("404 surfaces as an Err");
         assert!(missing.contains("404"), "{missing}");
+    }
+
+    /// #1014: `resource_exists` maps a 2xx to `Ok(true)`, a definitive
+    /// 404/410 to `Ok(false)`, and anything else (a 500 here) to `Err` —
+    /// the distinction the "Recently used" existence sweep relies on to
+    /// never mistake an outage for a deletion.
+    #[tokio::test]
+    async fn resource_exists_maps_2xx_404_410_and_failures() {
+        use axum::extract::Path;
+        use axum::http::StatusCode;
+        use axum::response::IntoResponse;
+        use axum::{Router, routing::get};
+
+        async fn get_one(Path(id): Path<String>) -> axum::response::Response {
+            match id.as_str() {
+                "vd-1" => axum::Json(serde_json::json!({
+                    "resourceType": "ViewDefinition",
+                    "id": "vd-1"
+                }))
+                .into_response(),
+                "gone-404" => StatusCode::NOT_FOUND.into_response(),
+                "gone-410" => StatusCode::GONE.into_response(),
+                _ => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+            }
+        }
+
+        let app = Router::new().route("/ViewDefinition/{id}", get(get_one));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let source = HttpConformanceSource::new(
+            format!("http://{addr}"),
+            std::sync::Arc::new(helios_auth::outbound::NoOpOutboundAuthProvider),
+            FhirVersion::R4,
+            None,
+        );
+
+        assert_eq!(
+            source
+                .resource_exists("ViewDefinition", "vd-1", FhirVersion::R4, "")
+                .await,
+            Ok(true)
+        );
+        assert_eq!(
+            source
+                .resource_exists("ViewDefinition", "gone-404", FhirVersion::R4, "")
+                .await,
+            Ok(false)
+        );
+        assert_eq!(
+            source
+                .resource_exists("ViewDefinition", "gone-410", FhirVersion::R4, "")
+                .await,
+            Ok(false)
+        );
+        let err = source
+            .resource_exists("ViewDefinition", "broken", FhirVersion::R4, "")
+            .await
+            .expect_err("a 500 is not a definitive answer");
+        assert!(err.contains("500"), "{err}");
+    }
+
+    /// #1014: a non-default version degrades the same way `read_resource`
+    /// does — no request is made, storage only holds the server default.
+    #[cfg(feature = "R4B")]
+    #[tokio::test]
+    async fn resource_exists_refuses_a_non_default_version() {
+        let source = HttpConformanceSource::new(
+            "http://127.0.0.1:1".to_string(),
+            std::sync::Arc::new(helios_auth::outbound::NoOpOutboundAuthProvider),
+            FhirVersion::R4,
+            None,
+        );
+
+        let err = source
+            .resource_exists("ViewDefinition", "vd-1", FhirVersion::R4B, "")
+            .await
+            .expect_err("non-default version has no stored data to check");
+        assert!(err.contains(FhirVersion::R4.as_str()), "{err}");
+    }
+
+    /// #1014: the static double reports a seeded id as existing and an
+    /// unseeded one as gone, without ever erroring.
+    #[tokio::test]
+    async fn static_source_resource_exists_reports_seeded_ids() {
+        let source = StaticConformanceSource::empty().with(
+            "ViewDefinition",
+            FhirVersion::R4,
+            vec![serde_json::json!({ "resourceType": "ViewDefinition", "id": "vd-1" })],
+        );
+
+        assert_eq!(
+            source
+                .resource_exists("ViewDefinition", "vd-1", FhirVersion::R4, "")
+                .await,
+            Ok(true)
+        );
+        assert_eq!(
+            source
+                .resource_exists("ViewDefinition", "missing", FhirVersion::R4, "")
+                .await,
+            Ok(false)
+        );
     }
 
     /// #741: the static double's `name:contains` filter is case-insensitive,
