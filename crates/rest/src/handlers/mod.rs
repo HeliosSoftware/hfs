@@ -29,6 +29,7 @@ pub mod console_metrics;
 pub mod create;
 pub mod dashboard_counts;
 pub mod delete;
+pub mod everything;
 pub mod health;
 pub mod history;
 pub mod nl_search;
