@@ -28,7 +28,7 @@ pub(crate) struct WalkLimits {
 
 impl WalkLimits {
     fn target(&self) -> usize {
-        self.page.unwrap_or(self.unpaged_ceiling)
+        self.page.unwrap_or(self.unpaged_ceiling).max(1)
     }
 }
 
@@ -275,6 +275,9 @@ where
                 };
                 if pat.is_none() {
                     exhausted = true;
+                    break;
+                }
+                if matches.len() >= target {
                     break;
                 }
             }
