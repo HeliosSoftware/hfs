@@ -236,7 +236,10 @@ impl SqliteTransaction {
         }
 
         // Build the resource with id and resourceType
-        let mut data = resource.clone();
+        let mut data = {
+            let _span = perf::span(Phase::EntryClone);
+            resource.clone()
+        };
         if let Some(obj) = data.as_object_mut() {
             obj.insert("id".to_string(), Value::String(id.clone()));
             obj.insert(
