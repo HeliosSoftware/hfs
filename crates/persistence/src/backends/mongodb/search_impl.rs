@@ -1110,6 +1110,12 @@ impl MongoBackend {
                 .collect();
             unkeyed.sort();
             ordered.extend(unkeyed);
+            // No separate #1056 liveness pass here: `allowed` is already
+            // live-only by construction (its positive-match arms `distinct`
+            // over `search_index`, and `MongoBackend::delete` removes the
+            // matching rows via `delete_search_index`), and re-adding a
+            // type-wide liveness check would reintroduce the type-wide scan
+            // this bounded path exists to avoid (#1040).
             return Ok(ordered);
         }
 
