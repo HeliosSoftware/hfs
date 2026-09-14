@@ -1,6 +1,3 @@
-// Consumed by the $everything handler (Task 7).
-#![allow(dead_code)]
-
 use helios_fhir::FhirVersion;
 use helios_persistence::core::{ResourceStorage, SearchProvider};
 use helios_persistence::tenant::TenantContext;

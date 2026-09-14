@@ -1,6 +1,3 @@
-// Consumed by the $everything handler (Task 7).
-#![allow(dead_code)]
-
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::{Deserialize, Serialize};

@@ -1,6 +1,3 @@
-// Consumed by the $everything handler (Task 7).
-#![allow(dead_code)]
-
 use std::collections::HashSet;
 
 use helios_fhir::FhirVersion;
