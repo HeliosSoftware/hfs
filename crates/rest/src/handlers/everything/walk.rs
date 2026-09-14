@@ -411,19 +411,29 @@ mod tests {
 
         // Cap below the number of distinct refs: resolution stops early and
         // truncation is reported.
-        let (included, truncated) =
-            resolve_supporting(&state, &t, FhirVersion::R4, std::slice::from_ref(&patient), 2)
-                .await
-                .unwrap();
+        let (included, truncated) = resolve_supporting(
+            &state,
+            &t,
+            FhirVersion::R4,
+            std::slice::from_ref(&patient),
+            2,
+        )
+        .await
+        .unwrap();
         assert_eq!(included.len(), 2, "{included:?}");
         assert!(truncated);
 
         // Cap at (or above) the number of distinct refs: nothing is
         // truncated.
-        let (included, truncated) =
-            resolve_supporting(&state, &t, FhirVersion::R4, std::slice::from_ref(&patient), 3)
-                .await
-                .unwrap();
+        let (included, truncated) = resolve_supporting(
+            &state,
+            &t,
+            FhirVersion::R4,
+            std::slice::from_ref(&patient),
+            3,
+        )
+        .await
+        .unwrap();
         assert_eq!(included.len(), 3, "{included:?}");
         assert!(!truncated);
     }

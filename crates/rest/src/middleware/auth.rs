@@ -412,7 +412,10 @@ fn extract_operation(path: &str, method: &str) -> Option<(String, FhirOperation)
     // method — checked before the method-based fallthrough below so a POST
     // is not misclassified as Create. Covers both `/{type}/$op` and
     // `/{type}/{id}/$op`.
-    if segments.last().is_some_and(|s| READ_SHAPED_OPERATIONS.contains(s)) {
+    if segments
+        .last()
+        .is_some_and(|s| READ_SHAPED_OPERATIONS.contains(s))
+    {
         return Some((resource_type, FhirOperation::Read));
     }
 

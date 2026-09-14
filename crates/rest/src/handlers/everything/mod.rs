@@ -92,7 +92,8 @@ where
     let fhir_version = version.storage_version_or(state.config().default_fhir_version);
     let pairs = decode_pairs(request).await?;
     let params = EverythingParams::from_pairs(&pairs, fhir_version, state.max_page_size())?;
-    let fp_input = params.fingerprint_input(patient_id.as_deref(), tenant.tenant_id(), fhir_version);
+    let fp_input =
+        params.fingerprint_input(patient_id.as_deref(), tenant.tenant_id(), fhir_version);
     let resume = match &params.cursor {
         Some(token) => Some(EverythingCursor::decode(token, &fp_input)?),
         None => None,
@@ -167,17 +168,19 @@ where
         })));
     }
     if out.includes_truncated {
-        bundle.entry.push(BundleEntry::outcome_entry(serde_json::json!({
-            "resourceType": "OperationOutcome",
-            "issue": [{
-                "severity": "information",
-                "code": "informational",
-                "diagnostics": format!(
-                    "Supporting resources exceeded the server's limit of {} and were truncated",
-                    state.everything_max_unpaged()
-                )
-            }]
-        })));
+        bundle
+            .entry
+            .push(BundleEntry::outcome_entry(serde_json::json!({
+                "resourceType": "OperationOutcome",
+                "issue": [{
+                    "severity": "information",
+                    "code": "informational",
+                    "diagnostics": format!(
+                        "Supporting resources exceeded the server's limit of {} and were truncated",
+                        state.everything_max_unpaged()
+                    )
+                }]
+            })));
     }
     crate::public_url::rewrite_bundle_full_urls(&mut bundle, |resource_type, id| {
         state.public_url_for_request(&tenant, [resource_type, id])
