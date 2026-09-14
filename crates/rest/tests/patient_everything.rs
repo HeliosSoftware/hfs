@@ -104,10 +104,27 @@ async fn paging_walks_to_exhaustion_without_gaps_or_duplicates() {
         "expected several pages, got {}",
         pages.len()
     );
-    for p in &pages {
+    let last = pages.len() - 1;
+    let mut any_include = false;
+    for (i, p) in pages.iter().enumerate() {
         assert!(p["total"].is_null(), "paged responses omit total");
-        assert!(entries(p, "match").len() <= 2);
+        let m = entries(p, "match").len();
+        if i == last {
+            assert!(m <= 2);
+        } else {
+            assert_eq!(
+                m, 2,
+                "non-last page must be filled to _count=2; includes must not count against it"
+            );
+        }
+        if !entries(p, "include").is_empty() {
+            any_include = true;
+        }
     }
+    assert!(
+        any_include,
+        "expected at least one page to carry include entries (Patient/p1's managingOrganization -> Organization/org1)"
+    );
     let mut sorted_a = unpaged.clone();
     sorted_a.sort();
     let mut sorted_b = paged.clone();
