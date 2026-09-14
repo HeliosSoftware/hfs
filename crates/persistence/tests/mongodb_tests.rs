@@ -5792,6 +5792,399 @@ async fn mongodb_include_iterate_follows_the_second_hop() {
     assert!(all_included.contains(&format!("Organization/{}", org.id())));
 }
 
+// ============================================================================
+// _include delegation to the shared registry-driven resolver (#1075)
+// ============================================================================
+
+/// Sorted `(resource_type, id)` pairs, for exact-set assertions regardless of
+/// the order resources were fetched in. Excludes the synthetic truncation
+/// marker, which carries no meaningful `(type, id)` pair for this comparison.
+fn include_type_ids(
+    resources: &[helios_persistence::types::StoredResource],
+) -> Vec<(String, String)> {
+    let mut pairs: Vec<(String, String)> = resources
+        .iter()
+        .filter(|r| !helios_persistence::core::is_include_truncation_marker(r))
+        .map(|r| (r.resource_type().to_string(), r.id().to_string()))
+        .collect();
+    pairs.sort();
+    pairs
+}
+
+/// Seeds the fixture shared by the `_include` delegation tests: `org-1`,
+/// `pat-1` (managed by `org-1`), an Encounter with a real `serviceProvider`
+/// reference (`enc-org`) and one with a conditional reference (`enc-cond`),
+/// both referencing `pat-1` via `subject`.
+async fn seed_include_fixture(backend: &MongoBackend, tenant: &TenantContext) {
+    backend
+        .create_or_update(
+            tenant,
+            "Organization",
+            "org-1",
+            json!({
+                "resourceType": "Organization",
+                "id": "org-1",
+                "name": "Include Org"
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+
+    backend
+        .create_or_update(
+            tenant,
+            "Patient",
+            "pat-1",
+            json!({
+                "resourceType": "Patient",
+                "id": "pat-1",
+                "name": [{"family": "Include"}],
+                "managingOrganization": {"reference": "Organization/org-1"}
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+
+    backend
+        .create_or_update(
+            tenant,
+            "Encounter",
+            "enc-cond",
+            json!({
+                "resourceType": "Encounter",
+                "id": "enc-cond",
+                "status": "finished",
+                "class": {"code": "AMB"},
+                "subject": {"reference": "Patient/pat-1"},
+                "serviceProvider": {
+                    "reference": "Organization?identifier=http://example.org/org|dept-9"
+                }
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+
+    backend
+        .create_or_update(
+            tenant,
+            "Encounter",
+            "enc-org",
+            json!({
+                "resourceType": "Encounter",
+                "id": "enc-org",
+                "status": "finished",
+                "class": {"code": "AMB"},
+                "subject": {"reference": "Patient/pat-1"},
+                "serviceProvider": {"reference": "Organization/org-1"}
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+}
+
+/// `IncludeProvider::resolve_includes` delegates to the shared,
+/// registry-driven resolver: a conditional `serviceProvider` reference never
+/// resolves to an included resource, a real one resolves to exactly its
+/// target, and resolving the same target from two source resources dedupes
+/// it (#1075). This is the behaviour the previous inline extractor got wrong,
+/// since it looked `service-provider` up as a literal `service-provider` JSON
+/// field instead of the actual `serviceProvider` element.
+#[tokio::test]
+async fn mongodb_include_service_provider_returns_only_targets() {
+    let Some(backend) = create_backend_with_full_registry("include_service_provider_targets").await
+    else {
+        eprintln!(
+            "Skipping mongodb_include_service_provider_returns_only_targets (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+
+    let tenant = create_tenant("tenant-include-service-provider");
+    seed_include_fixture(&backend, &tenant).await;
+
+    let enc_cond = backend
+        .read(&tenant, "Encounter", "enc-cond")
+        .await
+        .unwrap()
+        .expect("enc-cond must exist");
+    let enc_org = backend
+        .read(&tenant, "Encounter", "enc-org")
+        .await
+        .unwrap()
+        .expect("enc-org must exist");
+
+    let service_provider = IncludeDirective {
+        include_type: IncludeType::Include,
+        source_type: "Encounter".to_string(),
+        search_param: "service-provider".to_string(),
+        target_type: None,
+        iterate: false,
+    };
+
+    let both = backend
+        .resolve_includes(
+            &tenant,
+            &[enc_cond.clone(), enc_org.clone()],
+            std::slice::from_ref(&service_provider),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        include_type_ids(&both),
+        vec![("Organization".to_string(), "org-1".to_string())]
+    );
+
+    let cond_only = backend
+        .resolve_includes(
+            &tenant,
+            std::slice::from_ref(&enc_cond),
+            std::slice::from_ref(&service_provider),
+        )
+        .await
+        .unwrap();
+    assert!(cond_only.is_empty());
+
+    let subject = IncludeDirective {
+        include_type: IncludeType::Include,
+        source_type: "Encounter".to_string(),
+        search_param: "subject".to_string(),
+        target_type: None,
+        iterate: false,
+    };
+
+    let subjects = backend
+        .resolve_includes(&tenant, &[enc_cond, enc_org], &[subject])
+        .await
+        .unwrap();
+    assert_eq!(
+        include_type_ids(&subjects),
+        vec![("Patient".to_string(), "pat-1".to_string())]
+    );
+}
+
+/// `IncludeProvider::resolve_includes` honors `target_type`: a filter that
+/// doesn't match the reference's actual type resolves to nothing, and one
+/// that does resolves to exactly the target.
+#[tokio::test]
+async fn mongodb_include_target_type_filters_included() {
+    let Some(backend) = create_backend_with_full_registry("include_target_type_filters").await
+    else {
+        eprintln!(
+            "Skipping mongodb_include_target_type_filters_included (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+
+    let tenant = create_tenant("tenant-include-target-type");
+    seed_include_fixture(&backend, &tenant).await;
+
+    let enc_org = backend
+        .read(&tenant, "Encounter", "enc-org")
+        .await
+        .unwrap()
+        .expect("enc-org must exist");
+
+    let wrong_target = IncludeDirective {
+        include_type: IncludeType::Include,
+        source_type: "Encounter".to_string(),
+        search_param: "service-provider".to_string(),
+        target_type: Some("Patient".to_string()),
+        iterate: false,
+    };
+    let filtered_out = backend
+        .resolve_includes(
+            &tenant,
+            std::slice::from_ref(&enc_org),
+            std::slice::from_ref(&wrong_target),
+        )
+        .await
+        .unwrap();
+    assert!(filtered_out.is_empty());
+
+    let right_target = IncludeDirective {
+        include_type: IncludeType::Include,
+        source_type: "Encounter".to_string(),
+        search_param: "service-provider".to_string(),
+        target_type: Some("Organization".to_string()),
+        iterate: false,
+    };
+    let matched = backend
+        .resolve_includes(
+            &tenant,
+            std::slice::from_ref(&enc_org),
+            std::slice::from_ref(&right_target),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        include_type_ids(&matched),
+        vec![("Organization".to_string(), "org-1".to_string())]
+    );
+}
+
+/// `search()`'s hop-1 inline contract (#1063) is preserved by the delegated
+/// resolver: the primary page still contains both Encounters and `included`
+/// is exactly the resolved Organization, with no truncation marker.
+#[tokio::test]
+async fn mongodb_search_resolves_first_hop_include_inline() {
+    let Some(backend) = create_backend_with_full_registry("include_search_hop1_inline").await
+    else {
+        eprintln!(
+            "Skipping mongodb_search_resolves_first_hop_include_inline (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+
+    let tenant = create_tenant("tenant-include-search-hop1");
+    seed_include_fixture(&backend, &tenant).await;
+
+    let service_provider = IncludeDirective {
+        include_type: IncludeType::Include,
+        source_type: "Encounter".to_string(),
+        search_param: "service-provider".to_string(),
+        target_type: None,
+        iterate: false,
+    };
+    let query = SearchQuery::new("Encounter").with_include(service_provider);
+
+    let result = backend
+        .search(&tenant, &query)
+        .await
+        .expect("search with _include must succeed");
+
+    let mut ids: Vec<String> = result
+        .resources
+        .items
+        .iter()
+        .map(|r| r.id().to_string())
+        .collect();
+    ids.sort();
+    assert_eq!(ids, vec!["enc-cond".to_string(), "enc-org".to_string()]);
+
+    assert_eq!(
+        include_type_ids(&result.included),
+        vec![("Organization".to_string(), "org-1".to_string())]
+    );
+    assert!(
+        !result
+            .included
+            .iter()
+            .any(helios_persistence::core::is_include_truncation_marker),
+        "no truncation marker expected when the cap was never hit"
+    );
+}
+
+/// The per-directive cap (#1061) still applies through the delegated
+/// resolver: `search()` returns exactly `max_included_resources` real
+/// Organizations plus one truncation marker naming the directive and the
+/// MongoDB-specific env var to raise it.
+#[tokio::test]
+async fn mongodb_include_caps_included_and_signals_truncation() {
+    let Some(backend) =
+        create_backend_with_full_registry_and_cap("include_caps_truncation", 2).await
+    else {
+        eprintln!(
+            "Skipping mongodb_include_caps_included_and_signals_truncation (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+
+    let tenant = create_tenant("tenant-include-caps");
+
+    for suffix in ["a", "b", "c", "d"] {
+        let org_id = format!("org-cap-{suffix}");
+        backend
+            .create_or_update(
+                &tenant,
+                "Organization",
+                &org_id,
+                json!({
+                    "resourceType": "Organization",
+                    "id": org_id,
+                    "name": format!("Cap Org {suffix}")
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+
+        let enc_id = format!("enc-cap-{suffix}");
+        backend
+            .create_or_update(
+                &tenant,
+                "Encounter",
+                &enc_id,
+                json!({
+                    "resourceType": "Encounter",
+                    "id": enc_id,
+                    "status": "finished",
+                    "class": {"code": "AMB"},
+                    "serviceProvider": {"reference": format!("Organization/org-cap-{suffix}")}
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+    }
+
+    let service_provider = IncludeDirective {
+        include_type: IncludeType::Include,
+        source_type: "Encounter".to_string(),
+        search_param: "service-provider".to_string(),
+        target_type: None,
+        iterate: false,
+    };
+    let query = SearchQuery::new("Encounter").with_include(service_provider);
+
+    let result = backend
+        .search(&tenant, &query)
+        .await
+        .expect("search with _include must succeed");
+
+    let organization_count = result
+        .included
+        .iter()
+        .filter(|r| r.resource_type() == "Organization")
+        .count();
+    assert_eq!(
+        organization_count, 2,
+        "included Organizations must be capped at max_included_resources (2), not all 4"
+    );
+
+    let markers: Vec<_> = result
+        .included
+        .iter()
+        .filter(|r| helios_persistence::core::is_include_truncation_marker(r))
+        .collect();
+    assert_eq!(
+        markers.len(),
+        1,
+        "exactly one truncation marker, got: {:?}",
+        result
+            .included
+            .iter()
+            .map(|r| format!("{}/{}", r.resource_type(), r.id()))
+            .collect::<Vec<_>>()
+    );
+
+    let diagnostics = markers[0].content()["issue"][0]["diagnostics"]
+        .as_str()
+        .expect("diagnostics text")
+        .to_string();
+    assert!(
+        diagnostics.contains("_include=Encounter:service-provider"),
+        "diagnostics should name the truncated directive: {diagnostics}"
+    );
+    assert!(
+        diagnostics.contains("HFS_MONGODB_MAX_INCLUDED_RESOURCES"),
+        "diagnostics should name the env var: {diagnostics}"
+    );
+}
+
 // The unreachable-server test that used to live here now sits alongside the same
 // contract for every other backend, in `tests/backend_error_handling.rs`. It needs
 // no server, so it did not belong in a suite whose tests all skip without one —

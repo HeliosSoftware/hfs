@@ -347,7 +347,9 @@ impl SearchProvider for MongoBackend {
                 .cloned()
                 .collect();
             if !forward.is_empty() {
-                let resolved = self.resolve_includes(tenant, &page.items, &forward).await?;
+                let resolved = self
+                    .resolve_forward_includes_capped(tenant, &page.items, &forward)
+                    .await?;
                 Self::merge_unique(&mut included, resolved);
             }
 
@@ -859,7 +861,9 @@ impl MongoBackend {
                 .cloned()
                 .collect();
             if !forward.is_empty() {
-                let resolved = self.resolve_includes(tenant, &page.items, &forward).await?;
+                let resolved = self
+                    .resolve_forward_includes_capped(tenant, &page.items, &forward)
+                    .await?;
                 Self::merge_unique(&mut included, resolved);
             }
             let reverse: Vec<IncludeDirective> = query
@@ -1904,56 +1908,75 @@ impl MongoBackend {
         }
     }
 
-    fn extract_references(content: &Value, search_param: &str) -> Vec<String> {
-        let mut refs = Vec::new();
-        if let Some(value) = content.get(search_param) {
-            Self::collect_references_from_value(value, &mut refs);
-        }
-        refs
-    }
+    /// Resolves forward `_include` directives for `search()`/`search_param_sorted()`,
+    /// one directive at a time, capped at `self.config().max_included_resources`
+    /// per directive.
+    ///
+    /// `search()` only resolves hop 1 of `_include` inline — `:iterate`
+    /// continuation is the REST layer's job against
+    /// [`crate::core::resolve_includes_iterate_continuation`] (#1063), so each
+    /// directive is copied with `iterate: false` before delegating to
+    /// [`IncludeProvider::resolve_includes`] and only its own hop-1 result is
+    /// counted against the cap. The cap is applied per directive rather than as
+    /// one shared budget so that an earlier directive exhausting its cap cannot
+    /// starve a later, unrelated one (#1061) — this mirrors the per-directive
+    /// cap the previous inline extractor enforced, and lives here (a `search()`
+    /// contract) rather than on the `IncludeProvider` trait itself, which has no
+    /// concept of a resource-count budget.
+    async fn resolve_forward_includes_capped(
+        &self,
+        tenant: &TenantContext,
+        matches: &[StoredResource],
+        forward: &[IncludeDirective],
+    ) -> StorageResult<Vec<StoredResource>> {
+        let limit = self.config().max_included_resources.max(1);
 
-    fn collect_references_from_value(value: &Value, refs: &mut Vec<String>) {
-        match value {
-            Value::Object(obj) => {
-                if let Some(Value::String(reference)) = obj.get("reference") {
-                    refs.push(reference.clone());
+        let mut included: Vec<StoredResource> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut truncated_labels: Vec<String> = Vec::new();
+
+        for directive in forward {
+            let hop1 = IncludeDirective {
+                iterate: false,
+                ..directive.clone()
+            };
+            let resolved = self
+                .resolve_includes(tenant, matches, std::slice::from_ref(&hop1))
+                .await?;
+
+            let mut directive_count = 0usize;
+            for resource in resolved {
+                let key = format!("{}/{}", resource.resource_type(), resource.id());
+                if seen.contains(&key) {
+                    continue;
                 }
-                for v in obj.values() {
-                    Self::collect_references_from_value(v, refs);
+                if directive_count >= limit {
+                    truncated_labels.push(format!(
+                        "_include={}:{}",
+                        directive.source_type, directive.search_param
+                    ));
+                    break;
                 }
+                seen.insert(key);
+                directive_count += 1;
+                included.push(resource);
             }
-            Value::Array(arr) => {
-                for item in arr {
-                    Self::collect_references_from_value(item, refs);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    fn parse_reference(reference: &str) -> Option<(String, String)> {
-        let trimmed = reference
-            .strip_prefix("http://")
-            .or_else(|| reference.strip_prefix("https://"))
-            .unwrap_or(reference);
-
-        let mut segments: Vec<&str> = trimmed.split('/').filter(|s| !s.is_empty()).collect();
-        if segments.len() < 2 {
-            return None;
         }
 
-        let id = segments.pop()?.to_string();
-        let resource_type = segments.pop()?.to_string();
-
-        if !resource_type
-            .chars()
-            .next()
-            .is_some_and(|c| c.is_ascii_uppercase())
-        {
-            return None;
+        if !truncated_labels.is_empty() {
+            included.push(crate::core::include_truncation_outcome(
+                tenant,
+                matches
+                    .first()
+                    .map(|r| r.fhir_version())
+                    .unwrap_or_else(FhirVersion::default_enabled),
+                limit,
+                &truncated_labels.join(","),
+                "increase HFS_MONGODB_MAX_INCLUDED_RESOURCES to raise the limit",
+            ));
         }
 
-        Some((resource_type, id))
+        Ok(included)
     }
 
     /// Streams the `resource_id`s in `search_index` matching `filter`, capped
@@ -2015,115 +2038,20 @@ impl MongoBackend {
 
 #[async_trait]
 impl IncludeProvider for MongoBackend {
+    /// Delegates to the shared, registry-driven resolver so `_include` (and
+    /// `:iterate`) follows the same search-parameter definitions (with
+    /// FHIRPath expression evaluation) used to build the index, instead of a
+    /// backend-specific reference extractor that looked the search parameter
+    /// up as a literal JSON field name and disagreed with it whenever the
+    /// parameter name differed from the element (e.g.
+    /// `Encounter:service-provider` -> `serviceProvider`).
     async fn resolve_includes(
         &self,
         tenant: &TenantContext,
         resources: &[StoredResource],
         includes: &[IncludeDirective],
     ) -> StorageResult<Vec<StoredResource>> {
-        if resources.is_empty() || includes.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let db = self.get_database().await?;
-        let resources_collection = db.collection::<Document>(MongoBackend::RESOURCES_COLLECTION);
-        let tenant_id = tenant.tenant_id().as_str();
-        // Applied per directive, not as one budget shared across every
-        // directive: a shared budget would let an earlier `_include`/
-        // `_revinclude` directive exhaust the cap and starve every later one
-        // (#1061 review). The Bundle can therefore reach directives × limit,
-        // documented on the config field.
-        let limit = self.config().max_included_resources.max(1);
-
-        let mut included: Vec<StoredResource> = Vec::new();
-        let mut seen: HashSet<String> = HashSet::new();
-        let mut truncated_labels: Vec<String> = Vec::new();
-
-        for include in includes {
-            // Batch into one `find` per referenced type instead of one
-            // `find_one` per reference (previously N+1 round trips).
-            let mut wanted_by_type: std::collections::HashMap<String, Vec<String>> =
-                std::collections::HashMap::new();
-            let mut wanted_seen: HashSet<String> = HashSet::new();
-            for resource in resources {
-                if resource.resource_type() != include.source_type {
-                    continue;
-                }
-
-                let refs = Self::extract_references(resource.content(), &include.search_param);
-                for reference in refs {
-                    let Some((ref_type, ref_id)) = Self::parse_reference(&reference) else {
-                        continue;
-                    };
-
-                    if let Some(target) = include.target_type.as_ref() {
-                        if ref_type != *target {
-                            continue;
-                        }
-                    }
-
-                    if wanted_seen.insert(format!("{}/{}", ref_type, ref_id)) {
-                        wanted_by_type.entry(ref_type).or_default().push(ref_id);
-                    }
-                }
-            }
-
-            let mut directive_count = 0usize;
-            let mut directive_truncated = false;
-            'directive: for (ref_type, ids) in wanted_by_type {
-                let id_bson: Vec<Bson> = ids.into_iter().map(Bson::String).collect();
-                let filter = doc! {
-                    "tenant_id": tenant_id,
-                    "resource_type": &ref_type,
-                    "is_deleted": false,
-                    "id": { "$in": Bson::Array(id_bson) },
-                };
-                let docs = collect_documents(
-                    resources_collection
-                        .find(filter)
-                        .await
-                        .or_query_error("Failed to fetch included resources")?,
-                )
-                .await?;
-
-                for doc in docs {
-                    let stored = self.document_to_stored_resource(tenant, &ref_type, doc)?;
-                    let key = format!("{}/{}", stored.resource_type(), stored.id());
-                    if seen.contains(&key) {
-                        continue;
-                    }
-                    if directive_count >= limit {
-                        directive_truncated = true;
-                        break 'directive;
-                    }
-                    seen.insert(key);
-                    directive_count += 1;
-                    included.push(stored);
-                }
-            }
-
-            if directive_truncated {
-                truncated_labels.push(format!(
-                    "_include={}:{}",
-                    include.source_type, include.search_param
-                ));
-            }
-        }
-
-        if !truncated_labels.is_empty() {
-            included.push(crate::core::include_truncation_outcome(
-                tenant,
-                resources
-                    .first()
-                    .map(|r| r.fhir_version())
-                    .unwrap_or_else(FhirVersion::default_enabled),
-                limit,
-                &truncated_labels.join(","),
-                "increase HFS_MONGODB_MAX_INCLUDED_RESOURCES to raise the limit",
-            ));
-        }
-
-        Ok(included)
+        crate::core::resolve_includes_iterative(self, tenant, resources, includes).await
     }
 }
 
