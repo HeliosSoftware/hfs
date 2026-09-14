@@ -1198,6 +1198,33 @@ async fn queries_param_catalog_is_a_registry_fed_fragment() {
     assert!(gp.contains("Practitioner"), "targets in data-targets: {gp}");
 }
 
+/// The column hint names JSON elements, not the generated structs' Rust
+/// fields: Claim's `type` and `use` are raw identifiers (`r#type`, `r#use`)
+/// in Rust, and the browser indexes `resource[col]` with the hinted string
+/// verbatim, so any leak renders `R#TYPE` / `R#USE` headers over empty
+/// columns (#1107).
+#[tokio::test]
+async fn queries_param_catalog_column_hint_uses_json_element_names() {
+    let response = app()
+        .oneshot(
+            Request::get("/ui/queries/params?type=Claim")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(
+        html.contains(
+            r#"<datalist id="param-options" data-columns="status,type,use,patient,billablePeriod">"#
+        ),
+        "{html}"
+    );
+    assert!(!html.contains("r#"), "raw identifier leaked: {html}");
+}
+
 /* Natural-language search (#255) has three states, and the difference between
  * them is the whole point of the feature's configuration: off means gone. */
 
