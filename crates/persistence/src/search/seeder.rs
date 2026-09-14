@@ -627,11 +627,16 @@ mod tests {
         assert_eq!(outcome.failed, 2);
     }
 
+    /// One recorded `Counts` event: tenant, resource type, created, updated,
+    /// deleted and origin.
+    #[cfg(feature = "sqlite")]
+    type RecordedCount = (String, String, u64, u64, u64, WriteOrigin);
+
     /// Records the `Counts` events a seeding pass reports.
     #[cfg(feature = "sqlite")]
     #[derive(Default)]
     struct RecordingObserver {
-        counts: std::sync::Mutex<Vec<(String, String, u64, u64, u64, WriteOrigin)>>,
+        counts: std::sync::Mutex<Vec<RecordedCount>>,
         other: AtomicUsize,
     }
 
