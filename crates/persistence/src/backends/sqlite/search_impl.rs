@@ -569,62 +569,17 @@ impl MultiTypeSearchProvider for SqliteBackend {
 
 #[async_trait]
 impl IncludeProvider for SqliteBackend {
+    /// Delegates to the shared, registry-driven resolver so `_include` (and
+    /// `:iterate`) follows the same search-parameter definitions (with FHIRPath
+    /// expression evaluation) used elsewhere; SQLite does not resolve includes
+    /// inline in `search()`.
     async fn resolve_includes(
         &self,
         tenant: &TenantContext,
         resources: &[StoredResource],
         includes: &[IncludeDirective],
     ) -> StorageResult<Vec<StoredResource>> {
-        if resources.is_empty() || includes.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let conn = self.get_connection()?;
-        let tenant_id = tenant.tenant_id().as_str();
-
-        let mut included = Vec::new();
-        let mut seen_refs: HashSet<String> = HashSet::new();
-
-        for include in includes {
-            // For each resource, extract references for the include parameter
-            for resource in resources {
-                // Skip if source type doesn't match
-                if resource.resource_type() != include.source_type {
-                    continue;
-                }
-
-                // Extract references from the resource based on the search parameter
-                let refs = self.extract_references(resource.content(), &include.search_param);
-
-                for reference in refs {
-                    // Parse the reference (e.g., "Patient/123")
-                    if let Some((ref_type, ref_id)) = self.parse_reference(&reference) {
-                        // Apply target type filter if specified
-                        if let Some(ref target) = include.target_type {
-                            if ref_type != *target {
-                                continue;
-                            }
-                        }
-
-                        // Skip if we've already included this resource
-                        let ref_key = format!("{}/{}", ref_type, ref_id);
-                        if seen_refs.contains(&ref_key) {
-                            continue;
-                        }
-                        seen_refs.insert(ref_key);
-
-                        // Fetch the referenced resource
-                        if let Some(included_resource) =
-                            self.fetch_resource(&conn, tenant_id, &ref_type, &ref_id)?
-                        {
-                            included.push(included_resource);
-                        }
-                    }
-                }
-            }
-        }
-
-        Ok(included)
+        crate::core::resolve_includes_iterative(self, tenant, resources, includes).await
     }
 }
 
@@ -1134,56 +1089,6 @@ impl SqliteBackend {
             }
         } else {
             None
-        }
-    }
-
-    /// Fetch a single resource by type and ID.
-    fn fetch_resource(
-        &self,
-        conn: &rusqlite::Connection,
-        tenant_id: &str,
-        resource_type: &str,
-        id: &str,
-    ) -> StorageResult<Option<StoredResource>> {
-        let result = conn.query_row(
-            "SELECT version_id, data, last_updated, fhir_version FROM resources
-             WHERE tenant_id = ?1 AND resource_type = ?2 AND id = ?3 AND is_deleted = 0",
-            params![tenant_id, resource_type, id],
-            |row| {
-                let version_id: String = row.get(0)?;
-                let data: Vec<u8> = row.get(1)?;
-                let last_updated: String = row.get(2)?;
-                let fhir_version: String = row.get(3)?;
-                Ok((version_id, data, last_updated, fhir_version))
-            },
-        );
-
-        match result {
-            Ok((version_id, data, last_updated_str, fhir_version_str)) => {
-                let json_data: serde_json::Value = serde_json::from_slice(&data)
-                    .map_err(|e| internal_error(format!("Failed to deserialize: {}", e)))?;
-
-                let last_updated = chrono::DateTime::parse_from_rfc3339(&last_updated_str)
-                    .map_err(|e| internal_error(format!("Failed to parse last_updated: {}", e)))?
-                    .with_timezone(&Utc);
-
-                let fhir_version = FhirVersion::from_storage(&fhir_version_str)
-                    .unwrap_or_else(helios_fhir::FhirVersion::default_enabled);
-
-                Ok(Some(StoredResource::from_storage(
-                    resource_type,
-                    id,
-                    version_id,
-                    crate::tenant::TenantId::new(tenant_id),
-                    json_data,
-                    last_updated,
-                    last_updated,
-                    None,
-                    fhir_version,
-                )))
-            }
-            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(internal_error(format!("Failed to fetch resource: {}", e))),
         }
     }
 
@@ -1847,6 +1752,74 @@ mod tests {
         // Should NOT include the patient from tenant 1
         let included = backend
             .resolve_includes(&tenant2, &[observation], &[include])
+            .await
+            .unwrap();
+
+        assert!(included.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_resolve_includes_renamed_param_uses_registry() {
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+
+        // The `organization` search parameter maps to `managingOrganization`,
+        // not a field literally named `organization` — only the registry-
+        // driven resolver (FHIRPath expression, not `content.get(search_param)`)
+        // can follow it.
+        backend
+            .create_or_update(
+                &tenant,
+                "Organization",
+                "org-1",
+                json!({"id": "org-1", "name": "Acme Clinic"}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        let (patient, _) = backend
+            .create_or_update(
+                &tenant,
+                "Patient",
+                "p1",
+                json!({
+                    "id": "p1",
+                    "managingOrganization": {"reference": "Organization/org-1"}
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+
+        let include = IncludeDirective {
+            include_type: crate::types::IncludeType::Include,
+            source_type: "Patient".to_string(),
+            search_param: "organization".to_string(),
+            target_type: None,
+            iterate: false,
+        };
+
+        let included = backend
+            .resolve_includes(&tenant, std::slice::from_ref(&patient), &[include])
+            .await
+            .unwrap();
+
+        assert_eq!(included.len(), 1);
+        assert_eq!(included[0].resource_type(), "Organization");
+        assert_eq!(included[0].id(), "org-1");
+
+        // A target-type filter that doesn't match the referenced type yields
+        // nothing.
+        let include_wrong_target = IncludeDirective {
+            include_type: crate::types::IncludeType::Include,
+            source_type: "Patient".to_string(),
+            search_param: "organization".to_string(),
+            target_type: Some("Practitioner".to_string()),
+            iterate: false,
+        };
+
+        let included = backend
+            .resolve_includes(&tenant, &[patient], &[include_wrong_target])
             .await
             .unwrap();
 

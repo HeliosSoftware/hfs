@@ -8998,4 +8998,74 @@ mod postgres_integration {
         )
         .await;
     }
+
+    /// The `organization` search parameter maps to `managingOrganization`, not
+    /// a field literally named `organization` — only the registry-driven
+    /// resolver (FHIRPath expression, not a literal JSON field lookup) can
+    /// follow it. Same fixture and assertions as SQLite's
+    /// `test_resolve_includes_renamed_param_uses_registry`.
+    #[tokio::test]
+    async fn postgres_include_renamed_param_resolves_via_registry() {
+        use helios_persistence::core::IncludeProvider;
+        use helios_persistence::types::{IncludeDirective, IncludeType};
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("include_renamed_param");
+
+        backend
+            .create_or_update(
+                &tenant,
+                "Organization",
+                "org-1",
+                json!({"id": "org-1", "name": "Acme Clinic"}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        let (patient, _) = backend
+            .create_or_update(
+                &tenant,
+                "Patient",
+                "p1",
+                json!({
+                    "id": "p1",
+                    "managingOrganization": {"reference": "Organization/org-1"}
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+
+        let include = IncludeDirective {
+            include_type: IncludeType::Include,
+            source_type: "Patient".to_string(),
+            search_param: "organization".to_string(),
+            target_type: None,
+            iterate: false,
+        };
+
+        let included = backend
+            .resolve_includes(&tenant, std::slice::from_ref(&patient), &[include])
+            .await
+            .unwrap();
+
+        assert_eq!(included.len(), 1);
+        assert_eq!(included[0].resource_type(), "Organization");
+        assert_eq!(included[0].id(), "org-1");
+
+        let include_wrong_target = IncludeDirective {
+            include_type: IncludeType::Include,
+            source_type: "Patient".to_string(),
+            search_param: "organization".to_string(),
+            target_type: Some("Practitioner".to_string()),
+            iterate: false,
+        };
+
+        let included = backend
+            .resolve_includes(&tenant, &[patient], &[include_wrong_target])
+            .await
+            .unwrap();
+
+        assert!(included.is_empty());
+    }
 }
