@@ -44,6 +44,26 @@ async fn instance_level_returns_patient_members_and_supporting_resources() {
 }
 
 #[tokio::test]
+async fn deleted_supporting_resource_is_skipped_not_410() {
+    let server = server_with(10_000).await;
+    seed(&server).await;
+    let del = server.delete("/Practitioner/dr1").await;
+    assert!(del.status_code().is_success(), "{}", del.text());
+    let resp = server.get("/Patient/p1/$everything").await;
+    assert_eq!(resp.status_code(), StatusCode::OK, "{}", resp.text());
+    let b: Value = resp.json();
+    let inc = entries(&b, "include");
+    assert!(
+        !inc.contains(&"Practitioner/dr1".to_string()),
+        "deleted supporting resource must be skipped: {inc:?}"
+    );
+    assert!(
+        inc.contains(&"Organization/org1".to_string()),
+        "live supporting resource must still be included: {inc:?}"
+    );
+}
+
+#[tokio::test]
 async fn type_filter_restricts_members_but_keeps_patient() {
     let server = server_with(10_000).await;
     seed(&server).await;

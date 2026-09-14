@@ -1,5 +1,6 @@
 use helios_fhir::FhirVersion;
 use helios_persistence::core::{ResourceStorage, SearchProvider};
+use helios_persistence::error::{ResourceError, StorageError};
 use helios_persistence::tenant::TenantContext;
 use helios_persistence::types::{SearchQuery, StoredResource};
 
@@ -126,8 +127,15 @@ where
 {
     let mut included = Vec::new();
     for (rt, id) in collect_supporting_refs(version, matches) {
-        if let Some(res) = state.storage().read(tenant, &rt, &id).await? {
-            included.push(res);
+        match state.storage().read(tenant, &rt, &id).await {
+            Ok(Some(res)) => included.push(res),
+            Ok(None) => {}
+            // A supporting resource that has been soft-deleted since the
+            // matching resource referenced it is simply omitted, mirroring
+            // how a missing reference target is handled — not surfaced as a
+            // 410 for the whole $everything response.
+            Err(StorageError::Resource(ResourceError::Gone { .. })) => {}
+            Err(e) => return Err(e.into()),
         }
     }
     Ok(included)
