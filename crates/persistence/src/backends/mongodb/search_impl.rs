@@ -135,6 +135,8 @@ fn parse_date_for_query(value: &str) -> Option<DateTime<Utc>> {
 }
 
 const CANDIDATE_BATCH_SIZE: usize = 512;
+const PROBE_ROW_LIMIT: u64 = 100_000;
+// 300k × ~45 bytes/UUID ≈ 13.5 MB — safely under the 16 MB BSON document cap.
 const MAX_RESULT_ID_SET: usize = 300_000;
 
 async fn collect_documents(mut cursor: Cursor<Document>) -> StorageResult<Vec<Document>> {
@@ -1236,39 +1238,20 @@ impl MongoBackend {
                 .await;
         }
 
-        // Probe each normal param to estimate how many distinct resource_ids it
-        // covers in the first CANDIDATE_BATCH_SIZE+1 raw index rows. Using
-        // [$match, $limit, $group, $count] keeps the per-probe scan bounded
-        // regardless of how many rows the param matches globally.
-        let driver_idx = {
-            let probe_limit = (CANDIDATE_BATCH_SIZE + 1) as i32;
-            let mut best: Option<(usize, i64)> = None;
+        let driver_idx = if normal.len() == 1 {
+            0
+        } else {
+            let mut best: Option<(usize, u64)> = None;
             for (i, param) in normal.iter().enumerate() {
                 let filter = self.build_search_index_filter(tenant_id, resource_type, param)?;
-                let pipeline = vec![
-                    doc! { "$match": filter },
-                    doc! { "$limit": probe_limit },
-                    doc! { "$group": { "_id": "$resource_id" } },
-                    doc! { "$count": "n" },
-                ];
-                let cursor = search_index
-                    .aggregate(pipeline)
+                let count = search_index
+                    .count_documents(filter)
+                    .limit(PROBE_ROW_LIMIT)
                     .await
                     .or_query_error("Failed to probe search_index for driver selection")?;
-                let docs = collect_documents(cursor).await?;
-                if docs.is_empty() {
+                if count == 0 {
                     return Ok(Some(HashSet::new()));
                 }
-                let count = docs
-                    .first()
-                    .and_then(|d| {
-                        d.get_i64("n")
-                            .ok()
-                            .or_else(|| d.get_i32("n").ok().map(|v| v as i64))
-                    })
-                    .ok_or_else(|| {
-                        internal_error("probe count field 'n' missing or unreadable".to_string())
-                    })?;
                 if best.is_none_or(|(_, prev)| count < prev) {
                     best = Some((i, count));
                 }
