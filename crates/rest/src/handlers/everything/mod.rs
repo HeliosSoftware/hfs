@@ -7,3 +7,4 @@
 pub(crate) mod cursor;
 pub(crate) mod params;
 pub(crate) mod scope;
+pub(crate) mod walk;
