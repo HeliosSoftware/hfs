@@ -28,8 +28,21 @@
       entirely). Gated on `needs_js` too: no other consumer of this partial
       reads it, and the Resource Editor keeps rendering exactly the markup
       it always has.
+
+      `data-error-count` (#1014): the server's own count — FHIR schema,
+      required bindings, and lint findings — read by `vd-editor.js`'s Save
+      guard as a second source alongside the last completed lint pass, so a
+      validator-only error (one the lint endpoint never reports) still
+      confirms before saving silently. Rendered unconditionally, unlike
+      `data-msg-invalid-json` below: `editor-form.js` calls `POST
+      /ui/editor/render` (`pane=form`) after every settled edit and always
+      gets `needs_js: false` back (`editor.rs`), then swaps this whole card
+      in — a gate here would drop the attribute on the very first edit and
+      leave the Save guard permanently blind. It is inert without the JS
+      that reads it, so the Resource Editor gains only this one attribute.
     -->
     <div class="editor-validity{% if error_count == 0 %} editor-validity--ok{% endif %}"
+         data-error-count="{{ error_count }}"
          {%- if needs_js %} data-msg-invalid-json="{{ i18n.t("vd-form-invalid-chip") }}"{% endif %}>
       {% if error_count == 0 %}{{ i18n.t("editor-valid") }}{% else %}{{ i18n.t_arg("editor-issues", "count", error_count) }}{% endif %}
     </div>
