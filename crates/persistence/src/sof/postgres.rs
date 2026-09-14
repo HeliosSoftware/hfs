@@ -10,7 +10,10 @@
 //! through a bounded `tokio::sync::mpsc` channel (buffer: 256) so the HTTP
 //! layer can begin flushing before the full result set has been transferred.
 //! The async fetch loop runs in a `tokio::spawn` task that holds the pooled
-//! connection open until the consumer drops the receiver.
+//! connection open until the consumer drops the receiver. That task's
+//! `JoinHandle` is watched by [`watch_row_producer`](crate::core::sof_runner::watch_row_producer)
+//! so a panic or cancellation reaches the consumer as an `Err` item instead
+//! of a silent end of stream.
 
 use deadpool_postgres::Pool;
 use futures::StreamExt as _;
@@ -19,7 +22,9 @@ use serde_json::{Map, Value};
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::debug;
 
-use crate::core::sof_runner::{RowStream, SofError, SofRunner, ViewFilters, ViewRow};
+use crate::core::sof_runner::{
+    RowStream, SofError, SofRunner, ViewFilters, ViewRow, watch_row_producer,
+};
 use crate::tenant::TenantContext;
 
 use super::compiler::{SqlDialect, compile_view_definition_dialect};
@@ -115,10 +120,12 @@ impl SofRunner for PgInDbRunner {
         );
 
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<ViewRow, SofError>>(CHANNEL_BUFFER);
+        let guard_tx = tx.clone();
 
-        tokio::spawn(async move {
+        let producer = tokio::spawn(async move {
             stream_pg_rows(pool, sql, params, columns, limit, tx).await;
         });
+        watch_row_producer(self.runner_name(), guard_tx, producer);
 
         Ok(Box::pin(ReceiverStream::new(rx)))
     }
