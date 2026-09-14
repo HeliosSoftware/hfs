@@ -111,6 +111,12 @@ where
         if has_next && next_cursor.is_some() {
             pos.inner = next_cursor;
         } else {
+            if has_next {
+                tracing::warn!(
+                    resource_type = %segments[pos.seg],
+                    "backend reported has_next without a cursor; $everything segment truncated"
+                );
+            }
             pos = Position {
                 seg: pos.seg + 1,
                 inner: None,
@@ -259,6 +265,12 @@ where
                 exhausted = true;
                 break;
             };
+            if page_info.has_next && page_info.next_cursor.is_none() {
+                tracing::warn!(
+                    resource_type = "Patient",
+                    "backend reported has_next without a cursor; $everything segment truncated"
+                );
+            }
             pat = page_info.next_cursor.filter(|_| page_info.has_next);
             pid = Some(next_patient.id().to_string());
             pos = Position {
