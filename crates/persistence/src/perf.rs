@@ -104,11 +104,15 @@ pub enum Phase {
     ReindexCommit,
     /// Retry a failed PostgreSQL reindex page through the individual path.
     ReindexFallback,
+    /// Wall clock of one batch's parallel extraction (`prepare_index_batch`),
+    /// as opposed to `extract`, which sums the CPU time across the pool's
+    /// threads. The gap between the two is the parallel speed-up.
+    PrepareBatch,
 }
 
 impl Phase {
     /// All phases, in report order.
-    pub const ALL: [Phase; 29] = [
+    pub const ALL: [Phase; 30] = [
         Phase::NdjsonParse,
         Phase::Entry,
         Phase::EntryRead,
@@ -138,6 +142,7 @@ impl Phase {
         Phase::ReindexFts,
         Phase::ReindexCommit,
         Phase::ReindexFallback,
+        Phase::PrepareBatch,
     ];
 
     /// The phase this one is measured inside of, if any. Drives the report's
@@ -204,11 +209,12 @@ impl Phase {
             Phase::ReindexFts => "reindex_fts",
             Phase::ReindexCommit => "reindex_commit",
             Phase::ReindexFallback => "reindex_fallback",
+            Phase::PrepareBatch => "prepare_batch (wall)",
         }
     }
 }
 
-const PHASE_COUNT: usize = 29;
+const PHASE_COUNT: usize = 30;
 
 #[allow(clippy::declare_interior_mutable_const)]
 const ZERO: AtomicU64 = AtomicU64::new(0);

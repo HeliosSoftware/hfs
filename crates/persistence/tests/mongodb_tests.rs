@@ -33,7 +33,7 @@ use helios_persistence::search::SearchParameterStatus;
 use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
 use helios_persistence::types::{
     IncludeDirective, IncludeType, SearchModifier, SearchParamType, SearchParameter, SearchPrefix,
-    SearchQuery, SearchValue, SortDirective,
+    SearchQuery, SearchValue, SortDirective, TotalMode,
 };
 use mongodb::Client;
 use mongodb::bson::{Document, doc};
@@ -263,7 +263,16 @@ mod shared_mongo {
                     // suite's tiny datasets. `--bind_ip_all` matches the stock
                     // image default and keeps the mapped port reachable once we
                     // supply our own command.
-                    .with_cmd(["mongod", "--bind_ip_all", "--wiredTigerCacheSizeGB", "0.25"])
+                    .with_cmd([
+                        "mongod",
+                        "--bind_ip_all",
+                        "--wiredTigerCacheSizeGB",
+                        "0.25",
+                        // `failCommand` (used by the bulk-submit retry tests)
+                        // is only registered when test commands are enabled.
+                        "--setParameter",
+                        "enableTestCommands=1",
+                    ])
                     // Every test creates its own uniquely-named database, and
                     // WiredTiger holds file handles open per collection/index
                     // across all of them. With 50+ test databases the stock
@@ -649,6 +658,33 @@ async fn create_backend_with_search_offloaded(
     };
 
     build_backend(config).await
+}
+
+/// A backend whose driver connections carry `app_name`, so a `failCommand`
+/// failpoint configured with `data.appName` hits only this backend.
+async fn create_backend_with_app_name(test_name: &str, app_name: &str) -> Option<MongoBackend> {
+    let connection_string = shared_mongo::connection_string().await?;
+    let config = MongoBackendConfig {
+        connection_string,
+        database_name: build_test_database_name(test_name),
+        app_name: app_name.to_string(),
+        ..Default::default()
+    };
+    build_backend(config).await
+}
+
+/// Counts documents in one of a test database's collections, through a plain
+/// driver client (no failpoint `appName`, so never subject to one).
+async fn count_docs(backend: &MongoBackend, collection: &str, filter: Document) -> u64 {
+    let client = raw_test_client(&backend.config().connection_string)
+        .await
+        .expect("failed to connect MongoDB client for count_docs");
+    client
+        .database(&backend.config().database_name)
+        .collection::<Document>(collection)
+        .count_documents(filter)
+        .await
+        .unwrap()
 }
 
 /// Creates a backend whose registry is loaded from the repo's spec files, so
@@ -3741,6 +3777,226 @@ async fn mongodb_integration_search_missing_not_and_param_sort() {
     assert!(page2.resources.page_info.has_previous);
 }
 
+/// #1056: a MongoDB parameter-sorted page's rows, `has_next` and `total` must
+/// all derive from one id sequence. `_id`/`_lastUpdated` are resource-level
+/// predicates that never reach the search index, so before the fix they
+/// narrowed the page fetch but not the ordering/count `has_next`/`total` were
+/// computed from — a page could come back short, or even empty, while
+/// `has_next`/`total` still reflected the wider, unfiltered set. A stale
+/// search-index row (a deleted resource's leftover entry, or an orphan row)
+/// produced the same symptom by occupying a slot in the ordering that the
+/// page fetch would then drop.
+#[tokio::test]
+async fn mongodb_integration_param_sorted_page_is_one_result_set() {
+    let Some(backend) = create_backend_with_full_registry("param_sorted_page_one_result_set").await
+    else {
+        eprintln!(
+            "Skipping mongodb_integration_param_sorted_page_is_one_result_set (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+
+    let tenant = create_tenant("tenant-psors");
+
+    for n in 1..=6u32 {
+        let birth_date = format!("199{}-01-01", n - 1);
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({
+                    "resourceType": "Patient",
+                    "id": format!("patient-psors-{n}"),
+                    "name": [{"family": format!("Psors-{n}")}],
+                    "birthDate": birth_date,
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+    }
+
+    let ids = |result: &helios_persistence::core::SearchResult| {
+        result
+            .resources
+            .items
+            .iter()
+            .map(|r| r.id().to_string())
+            .collect::<Vec<_>>()
+    };
+
+    // A. `_id` subset — the issue's exact symptom. `_id` narrows the
+    // resource-level fetch but `matched_ids` (search-index derived) never
+    // saw it, so the ordering/count `has_next`/`total` were computed from
+    // stayed at all six patients.
+    let mut id_subset = SearchQuery::new("Patient")
+        .with_parameter(SearchParameter {
+            name: "_id".to_string(),
+            param_type: SearchParamType::Token,
+            modifier: None,
+            values: vec![
+                SearchValue::eq("patient-psors-3"),
+                SearchValue::eq("patient-psors-4"),
+                SearchValue::eq("patient-psors-5"),
+                SearchValue::eq("patient-psors-6"),
+            ],
+            chain: vec![],
+            components: vec![],
+        })
+        .with_sort(SortDirective::parse("birthdate").with_param_type(Some(SearchParamType::Date)))
+        .with_count(2);
+    id_subset.total = Some(TotalMode::Accurate);
+
+    let page1 = backend.search(&tenant, &id_subset).await.unwrap();
+    assert_eq!(ids(&page1), vec!["patient-psors-3", "patient-psors-4"]);
+    assert!(page1.resources.page_info.has_next);
+    assert!(!page1.resources.page_info.has_previous);
+    assert_eq!(page1.total, Some(4));
+    assert_eq!(page1.resources.page_info.total, Some(4));
+
+    id_subset.offset = Some(2);
+    let page2 = backend.search(&tenant, &id_subset).await.unwrap();
+    assert_eq!(ids(&page2), vec!["patient-psors-5", "patient-psors-6"]);
+    assert!(!page2.resources.page_info.has_next);
+    assert!(page2.resources.page_info.has_previous);
+    assert_eq!(page2.total, Some(4));
+
+    id_subset.offset = None;
+    id_subset.total = Some(TotalMode::None);
+    let page_no_total = backend.search(&tenant, &id_subset).await.unwrap();
+    assert_eq!(page_no_total.total, None);
+
+    // B. `_lastUpdated` window — same defect, reached via a date range
+    // instead of explicit ids. `cut` is compared with second precision
+    // (`SecondsFormat::Secs`, per the resource-level date filter's implied-
+    // period semantics for a value with no fractional seconds), so it must
+    // land in a whole second strictly after the six creates above — this
+    // sleep guarantees that regardless of how fast setup ran.
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    let cut = chrono::Utc::now();
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+
+    let p2 = backend
+        .read(&tenant, "Patient", "patient-psors-2")
+        .await
+        .unwrap()
+        .unwrap();
+    backend
+        .update(
+            &tenant,
+            &p2,
+            json!({
+                "resourceType": "Patient",
+                "id": "patient-psors-2",
+                "name": [{"family": "Psors-2-Updated"}],
+                "birthDate": "1991-01-01",
+            }),
+        )
+        .await
+        .unwrap();
+
+    let p5 = backend
+        .read(&tenant, "Patient", "patient-psors-5")
+        .await
+        .unwrap()
+        .unwrap();
+    backend
+        .update(
+            &tenant,
+            &p5,
+            json!({
+                "resourceType": "Patient",
+                "id": "patient-psors-5",
+                "name": [{"family": "Psors-5-Updated"}],
+                "birthDate": "1994-01-01",
+            }),
+        )
+        .await
+        .unwrap();
+
+    let mut last_updated_window = SearchQuery::new("Patient")
+        .with_parameter(SearchParameter {
+            name: "_lastUpdated".to_string(),
+            param_type: SearchParamType::Date,
+            modifier: None,
+            values: vec![SearchValue::new(
+                SearchPrefix::Gt,
+                cut.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            )],
+            chain: vec![],
+            components: vec![],
+        })
+        .with_sort(SortDirective::parse("birthdate").with_param_type(Some(SearchParamType::Date)))
+        .with_count(1);
+    last_updated_window.total = Some(TotalMode::Accurate);
+
+    let page1 = backend.search(&tenant, &last_updated_window).await.unwrap();
+    assert_eq!(ids(&page1), vec!["patient-psors-2"]);
+    assert!(page1.resources.page_info.has_next);
+    assert_eq!(page1.total, Some(2));
+
+    last_updated_window.offset = Some(1);
+    let page2 = backend.search(&tenant, &last_updated_window).await.unwrap();
+    assert_eq!(ids(&page2), vec!["patient-psors-5"]);
+    assert!(!page2.resources.page_info.has_next);
+    assert_eq!(page2.total, Some(2));
+
+    // C. Deleted resource — `delete` removes the resource's search-index
+    // rows and `all_resource_ids` excludes it, so this pins that a deleted
+    // resource neither occupies a page slot nor counts toward `total`.
+    backend
+        .delete(&tenant, "Patient", "patient-psors-6")
+        .await
+        .unwrap();
+
+    let mut all_sorted = SearchQuery::new("Patient")
+        .with_sort(SortDirective::parse("birthdate").with_param_type(Some(SearchParamType::Date)))
+        .with_count(10);
+    all_sorted.total = Some(TotalMode::Accurate);
+    let result = backend.search(&tenant, &all_sorted).await.unwrap();
+    assert_eq!(
+        ids(&result),
+        vec![
+            "patient-psors-1",
+            "patient-psors-2",
+            "patient-psors-3",
+            "patient-psors-4",
+            "patient-psors-5",
+        ]
+    );
+    assert!(!result.resources.page_info.has_next);
+    assert_eq!(result.total, Some(5));
+
+    // D. Stale search-index row — an orphan row (no matching live resource)
+    // sorts first (epoch value) but must not shorten the page.
+    let client = raw_test_client(&backend.config().connection_string)
+        .await
+        .expect("failed to connect MongoDB client for search_index fixture");
+    let database = client.database(&backend.config().database_name);
+    let search_index = database.collection::<Document>("search_index");
+    search_index
+        .insert_one(doc! {
+            "tenant_id": tenant.tenant_id().as_str(),
+            "resource_type": "Patient",
+            "resource_id": "patient-psors-ghost",
+            "param_name": "birthdate",
+            "param_url": "http://hl7.org/fhir/SearchParameter/individual-birthdate",
+            "value_date": mongodb::bson::DateTime::from_millis(0),
+            "value_date_precision": "day",
+        })
+        .await
+        .expect("failed to insert stale search_index row");
+
+    let mut ghost_sorted = SearchQuery::new("Patient")
+        .with_sort(SortDirective::parse("birthdate").with_param_type(Some(SearchParamType::Date)))
+        .with_count(2);
+    ghost_sorted.total = Some(TotalMode::Accurate);
+    let result = backend.search(&tenant, &ghost_sorted).await.unwrap();
+    assert_eq!(ids(&result), vec!["patient-psors-1", "patient-psors-2"]);
+    assert!(result.resources.page_info.has_next);
+    assert_eq!(result.total, Some(5));
+}
+
 /// #1055: `_id`/`_lastUpdated` used to bypass the generic modifier dispatch
 /// entirely, so `:not` returned the exact inverse of the request and
 /// `:missing` compared the boolean literal against the id/date fields
@@ -6035,11 +6291,11 @@ mod bulk_submit {
 
     use helios_persistence::core::bulk_submit::{CANCELLED_ABORT_REASON, CancelToken};
     use helios_persistence::core::{
-        BulkProcessingOptions, BulkSubmitProvider, BulkSubmitRollbackProvider, ChangeType,
-        DefaultSubmitWorker, IMPORT_MODE_PARAMETER_URL, LeaseError, ManifestFetchParams,
-        ManifestPublicationStatus, ManifestStatus, NdjsonEntry, RemoteFile, RemoteManifest,
-        StreamingBulkSubmitProvider, SubmissionId, SubmissionStatus, SubmitClaimStrategy,
-        SubmitFileRecord, SubmitInputFetcher, SubmitWorkerStorage, WorkerId,
+        BulkEntryOutcome, BulkProcessingOptions, BulkSubmitProvider, BulkSubmitRollbackProvider,
+        ChangeType, DefaultSubmitWorker, IMPORT_MODE_PARAMETER_URL, LeaseError,
+        ManifestFetchParams, ManifestPublicationStatus, ManifestStatus, NdjsonEntry, RemoteFile,
+        RemoteManifest, StreamingBulkSubmitProvider, SubmissionId, SubmissionStatus,
+        SubmitClaimStrategy, SubmitFileRecord, SubmitInputFetcher, SubmitWorkerStorage, WorkerId,
     };
     use helios_persistence::error::StorageResult;
     use std::collections::HashMap;
@@ -6099,6 +6355,127 @@ mod bulk_submit {
                 Some(len),
             ))
         }
+    }
+
+    /// `failCommand` is one server-global failpoint: every `configureFailPoint`
+    /// replaces its configuration. Tests that use it hold this lock for their
+    /// whole duration; `data.appName` keeps them from touching the rest of the
+    /// suite, which keeps running in parallel.
+    static FAILPOINT_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// A `failCommand` failpoint scoped to one client's `appName`.
+    struct FailPoint {
+        admin: mongodb::Database,
+        _lock: tokio::sync::MutexGuard<'static, ()>,
+    }
+
+    impl FailPoint {
+        /// Configures `failCommand` for connections whose `appName` is `app_name`.
+        /// Returns `None`, after printing why, when no Mongo is available or
+        /// the server was not started with `enableTestCommands=1` (an
+        /// external `HFS_TEST_MONGODB_URL`).
+        async fn enable(app_name: &str, mut data: Document, mode: Document) -> Option<FailPoint> {
+            let lock = FAILPOINT_LOCK.lock().await;
+            let Some(connection_string) = shared_mongo::connection_string().await else {
+                eprintln!("Skipping failpoint test (requires Docker or HFS_TEST_MONGODB_URL)");
+                return None;
+            };
+            let admin = Client::with_uri_str(&connection_string)
+                .await
+                .unwrap()
+                .database("admin");
+            let enabled = admin
+                .run_command(doc! { "getParameter": 1, "enableTestCommands": 1 })
+                .await
+                .ok()
+                .and_then(|r| r.get_bool("enableTestCommands").ok())
+                .unwrap_or(false);
+            if !enabled {
+                eprintln!(
+                    "Skipping failpoint test: mongod was not started with \
+                     --setParameter enableTestCommands=1"
+                );
+                return None;
+            }
+            data.insert("appName", app_name);
+            admin
+                .run_command(doc! {
+                    "configureFailPoint": "failCommand",
+                    "mode": mode,
+                    "data": data,
+                })
+                .await
+                .expect("configureFailPoint failCommand");
+            Some(FailPoint { admin, _lock: lock })
+        }
+
+        /// Turns the failpoint off and releases the lock. Call at the end of
+        /// every test; a `times`-bounded failpoint that is never turned off
+        /// still only affects its own `appName`.
+        async fn off(self) {
+            let _ = self
+                .admin
+                .run_command(doc! { "configureFailPoint": "failCommand", "mode": "off" })
+                .await;
+        }
+    }
+
+    /// Pins the failpoint plumbing every retry test relies on: it fires for the
+    /// scoped `appName`, is spent after `times`, and does not touch another client.
+    #[tokio::test]
+    async fn failpoint_hits_only_the_scoped_app_name() {
+        let Some(connection_string) = shared_mongo::connection_string().await else {
+            eprintln!(
+                "Skipping failpoint_hits_only_the_scoped_app_name (requires Docker or HFS_TEST_MONGODB_URL)"
+            );
+            return;
+        };
+        let Some(fail_point) = FailPoint::enable(
+            "fp-smoke-target",
+            doc! { "failCommands": ["insert"], "closeConnection": true },
+            doc! { "times": 1 },
+        )
+        .await
+        else {
+            return;
+        };
+
+        let client_for = |app_name: &str| {
+            let connection_string = connection_string.clone();
+            let app_name = app_name.to_string();
+            async move {
+                let mut options = mongodb::options::ClientOptions::parse(&connection_string)
+                    .await
+                    .unwrap();
+                options.app_name = Some(app_name);
+                Client::with_options(options).unwrap()
+            }
+        };
+        let db_name = build_test_database_name("failpoint_smoke");
+
+        let target = client_for("fp-smoke-target").await;
+        let coll = target.database(&db_name).collection::<Document>("smoke");
+        let first = coll.insert_one(doc! { "n": 1 }).await;
+        assert!(
+            matches!(
+                first.as_ref().map_err(|e| e.kind.as_ref()),
+                Err(mongodb::error::ErrorKind::Io(_))
+            ),
+            "the scoped client's first insert is dropped: {first:?}"
+        );
+        coll.insert_one(doc! { "n": 2 })
+            .await
+            .expect("the failpoint is spent after one use");
+
+        let other = client_for("fp-smoke-other").await;
+        other
+            .database(&db_name)
+            .collection::<Document>("smoke")
+            .insert_one(doc! { "n": 3 })
+            .await
+            .expect("a client with another appName is unaffected");
+
+        fail_point.off().await;
     }
 
     #[tokio::test]
@@ -7885,6 +8262,844 @@ mod bulk_submit {
         assert_eq!(preserved_legacy_rows.len(), 1);
         assert!(preserved_legacy_rows[0].manifest_id.is_none());
         assert!(preserved_legacy_rows[0].legacy_locator);
+    }
+
+    fn three_patients(prefix: &str) -> Vec<NdjsonEntry> {
+        (1..=3)
+            .map(|i| {
+                NdjsonEntry::new(
+                    i,
+                    "Patient",
+                    json!({"resourceType": "Patient", "id": format!("{prefix}-{i}")}),
+                )
+            })
+            .collect()
+    }
+
+    /// The manifest bookkeeping around a batch — the `processing` promotion,
+    /// the counters and `touch_submission` — is retried like the batch itself.
+    /// On a standalone server the driver adds no retry, so two dropped
+    /// `update`s are exactly two of ours.
+    #[tokio::test]
+    async fn bookkeeping_updates_survive_dropped_connections() {
+        let app = "fp-bookkeeping-update";
+        let Some(backend) = create_backend_with_app_name("submit_fp_bookkeeping_update", app).await
+        else {
+            return;
+        };
+        let tenant = create_tenant("submit-tenant");
+        let (id, manifest_id) = seed(&backend, &tenant).await;
+        let Some(fail_point) = FailPoint::enable(
+            app,
+            doc! { "failCommands": ["update"], "closeConnection": true },
+            doc! { "times": 2 },
+        )
+        .await
+        else {
+            return;
+        };
+
+        let results = backend
+            .process_entries(
+                &tenant,
+                &id,
+                &manifest_id,
+                three_patients("bk"),
+                &BulkProcessingOptions::new(),
+            )
+            .await
+            .unwrap();
+        fail_point.off().await;
+
+        assert!(results.iter().all(|r| r.is_success()));
+        let counts = backend
+            .get_entry_counts(&tenant, &id, &manifest_id)
+            .await
+            .unwrap();
+        assert_eq!(counts.total, 3);
+        assert_eq!(counts.success, 3);
+    }
+
+    /// The manifest existence check before a batch is a `find`; the driver may
+    /// retry a read once on its own, so this asserts recovery, not attempts.
+    #[tokio::test]
+    async fn manifest_check_survives_dropped_connections() {
+        let app = "fp-bookkeeping-find";
+        let Some(backend) = create_backend_with_app_name("submit_fp_bookkeeping_find", app).await
+        else {
+            return;
+        };
+        let tenant = create_tenant("submit-tenant");
+        let (id, manifest_id) = seed(&backend, &tenant).await;
+        let Some(fail_point) = FailPoint::enable(
+            app,
+            doc! { "failCommands": ["find"], "closeConnection": true },
+            doc! { "times": 3 },
+        )
+        .await
+        else {
+            return;
+        };
+
+        let results = backend
+            .process_entries(
+                &tenant,
+                &id,
+                &manifest_id,
+                three_patients("bkf"),
+                &BulkProcessingOptions::new(),
+            )
+            .await
+            .unwrap();
+        fail_point.off().await;
+
+        assert!(results.iter().all(|r| r.is_success()));
+    }
+
+    /// Asserts each id has exactly one resource, history and rollback row.
+    async fn assert_one_row_each(backend: &MongoBackend, tenant: &TenantContext, ids: &[&str]) {
+        let tenant_id = tenant.tenant_id().as_str();
+        for id in ids {
+            let by_id = doc! { "tenant_id": tenant_id, "resource_type": "Patient", "id": *id };
+            assert_eq!(
+                count_docs(backend, "resources", by_id.clone()).await,
+                1,
+                "resources {id}"
+            );
+            assert_eq!(
+                count_docs(backend, "resource_history", by_id).await,
+                1,
+                "history {id}"
+            );
+            let change =
+                doc! { "tenant_id": tenant_id, "resource_type": "Patient", "resource_id": *id };
+            assert_eq!(
+                count_docs(backend, "bulk_submission_changes", change).await,
+                1,
+                "changes {id}"
+            );
+        }
+    }
+
+    /// Spec §5.2 case 1: a dropped `insert` is retried and every entry lands once.
+    #[tokio::test]
+    async fn dropped_insert_is_retried_and_lands_once() {
+        let test = "submit_fp_dropped_insert";
+        let app = "fp-dropped-insert";
+        let Some(backend) = create_backend_with_app_name(test, app).await else {
+            return;
+        };
+        let tenant = create_tenant("submit-tenant");
+        let (id, manifest_id) = seed(&backend, &tenant).await;
+        let Some(fail_point) = FailPoint::enable(
+            app,
+            doc! { "failCommands": ["insert"], "closeConnection": true },
+            doc! { "times": 2 },
+        )
+        .await
+        else {
+            return;
+        };
+
+        let results = backend
+            .process_entries(
+                &tenant,
+                &id,
+                &manifest_id,
+                three_patients("drop"),
+                &BulkProcessingOptions::new(),
+            )
+            .await
+            .unwrap();
+        fail_point.off().await;
+
+        assert!(results.iter().all(|r| r.is_success()), "{results:?}");
+        assert_one_row_each(&backend, &tenant, &["drop-1", "drop-2", "drop-3"]).await;
+    }
+
+    /// Spec §5.2 case 2: the server executes the insert, then reports a
+    /// retryable write-concern error. The retry finds its own rows (dup-key)
+    /// and `confirm_landed` recognises them by version, timestamp and content.
+    /// `times: 2` = the first insert (landed + error) and the retry (dup-key +
+    /// error, which is attributed, not retried).
+    #[tokio::test]
+    async fn unacknowledged_insert_is_confirmed_not_duplicated() {
+        let test = "submit_fp_unacked_insert";
+        let app = "fp-unacked-insert";
+        let Some(backend) = create_backend_with_app_name(test, app).await else {
+            return;
+        };
+        let tenant = create_tenant("submit-tenant");
+        let (id, manifest_id) = seed(&backend, &tenant).await;
+        let Some(fail_point) = FailPoint::enable(
+            app,
+            doc! {
+                "failCommands": ["insert"],
+                "writeConcernError": {
+                    "code": 91,
+                    "errmsg": "Replication is being shut down",
+                    "errorLabels": ["RetryableWriteError"],
+                },
+            },
+            doc! { "times": 2 },
+        )
+        .await
+        else {
+            return;
+        };
+
+        let results = backend
+            .process_entries(
+                &tenant,
+                &id,
+                &manifest_id,
+                three_patients("unack"),
+                &BulkProcessingOptions::new(),
+            )
+            .await
+            .unwrap();
+        fail_point.off().await;
+
+        assert!(results.iter().all(|r| r.is_success()), "{results:?}");
+        assert_one_row_each(&backend, &tenant, &["unack-1", "unack-2", "unack-3"]).await;
+    }
+
+    /// The update path: one `update_one` per existing id, each its own retry unit.
+    /// Scoped to the `resources` namespace so the manifest's own
+    /// processing-promotion `update` (a different collection) never spends the
+    /// failpoint budget; `times: 1` drops exactly one of the three concurrent
+    /// `update_one` calls, forcing its retry.
+    #[tokio::test]
+    async fn dropped_update_is_retried_and_versions_once() {
+        let test = "submit_fp_dropped_update";
+        let app = "fp-dropped-update";
+        let Some(backend) = create_backend_with_app_name(test, app).await else {
+            return;
+        };
+        let tenant = create_tenant("submit-tenant");
+        let (id, manifest_id) = seed(&backend, &tenant).await;
+        backend
+            .process_entries(
+                &tenant,
+                &id,
+                &manifest_id,
+                three_patients("upd"),
+                &BulkProcessingOptions::new(),
+            )
+            .await
+            .unwrap();
+
+        let Some(fail_point) = FailPoint::enable(
+            app,
+            doc! {
+                "failCommands": ["update"],
+                "closeConnection": true,
+                "namespace": format!("{}.resources", backend.config().database_name),
+            },
+            doc! { "times": 1 },
+        )
+        .await
+        else {
+            return;
+        };
+        let updates: Vec<NdjsonEntry> = (1..=3)
+            .map(|i| {
+                NdjsonEntry::new(
+                    i,
+                    "Patient",
+                    json!({"resourceType": "Patient", "id": format!("upd-{i}"), "active": true}),
+                )
+            })
+            .collect();
+        let results = backend
+            .process_entries(
+                &tenant,
+                &id,
+                &manifest_id,
+                updates,
+                &BulkProcessingOptions::new(),
+            )
+            .await
+            .unwrap();
+        fail_point.off().await;
+
+        assert!(results.iter().all(|r| r.is_success()), "{results:?}");
+        for i in 1..=3 {
+            let versions = backend
+                .list_versions(&tenant, "Patient", &format!("upd-{i}"))
+                .await
+                .unwrap();
+            assert_eq!(versions.len(), 2, "upd-{i} has exactly versions 1 and 2");
+        }
+    }
+
+    /// Spec §3.2: history and rollback-log inserts whose acknowledgement was
+    /// lost find their own rows on retry (both collections have a unique key)
+    /// and treat the duplicates as landed. `times: 4` = resources (landed +
+    /// error, then dup-key) and history (landed + error, then dup-key).
+    #[tokio::test]
+    async fn unacknowledged_history_insert_is_not_duplicated() {
+        let test = "submit_fp_unacked_history";
+        let app = "fp-unacked-history";
+        let Some(backend) = create_backend_with_app_name(test, app).await else {
+            return;
+        };
+        let tenant = create_tenant("submit-tenant");
+        let (id, manifest_id) = seed(&backend, &tenant).await;
+        let Some(fail_point) = FailPoint::enable(
+            app,
+            doc! {
+                "failCommands": ["insert"],
+                "writeConcernError": {
+                    "code": 91,
+                    "errmsg": "Replication is being shut down",
+                    "errorLabels": ["RetryableWriteError"],
+                },
+            },
+            doc! { "times": 4 },
+        )
+        .await
+        else {
+            return;
+        };
+
+        let results = backend
+            .process_entries(
+                &tenant,
+                &id,
+                &manifest_id,
+                three_patients("hist"),
+                &BulkProcessingOptions::new().with_defer_indexing(true),
+            )
+            .await
+            .unwrap();
+        fail_point.off().await;
+
+        assert!(results.iter().all(|r| r.is_success()), "{results:?}");
+        assert_one_row_each(&backend, &tenant, &["hist-1", "hist-2", "hist-3"]).await;
+    }
+
+    /// Same for the rollback log: `times: 6` reaches the third insert stage
+    /// (resources, history, changes — indexing deferred so no search insert).
+    #[tokio::test]
+    async fn unacknowledged_rollback_log_insert_is_not_duplicated() {
+        let test = "submit_fp_unacked_changes";
+        let app = "fp-unacked-changes";
+        let Some(backend) = create_backend_with_app_name(test, app).await else {
+            return;
+        };
+        let tenant = create_tenant("submit-tenant");
+        let (id, manifest_id) = seed(&backend, &tenant).await;
+        let Some(fail_point) = FailPoint::enable(
+            app,
+            doc! {
+                "failCommands": ["insert"],
+                "writeConcernError": {
+                    "code": 91,
+                    "errmsg": "Replication is being shut down",
+                    "errorLabels": ["RetryableWriteError"],
+                },
+            },
+            doc! { "times": 6 },
+        )
+        .await
+        else {
+            return;
+        };
+
+        let results = backend
+            .process_entries(
+                &tenant,
+                &id,
+                &manifest_id,
+                three_patients("chg"),
+                &BulkProcessingOptions::new().with_defer_indexing(true),
+            )
+            .await
+            .unwrap();
+        fail_point.off().await;
+
+        assert!(results.iter().all(|r| r.is_success()), "{results:?}");
+        assert_one_row_each(&backend, &tenant, &["chg-1", "chg-2", "chg-3"]).await;
+    }
+
+    /// The pre-read is a `find` against `resources`; recovery only (the driver
+    /// may retry reads). Scoped to that namespace so the manifest-existence
+    /// check (a different collection) is unaffected; `times: 2` survives the
+    /// driver's own possible single retry and still forces this module's
+    /// bounded retry to recover the connection drop.
+    #[tokio::test]
+    async fn dropped_pre_read_is_retried() {
+        let test = "submit_fp_dropped_find";
+        let app = "fp-dropped-find";
+        let Some(backend) = create_backend_with_app_name(test, app).await else {
+            return;
+        };
+        let tenant = create_tenant("submit-tenant");
+        let (id, manifest_id) = seed(&backend, &tenant).await;
+        let Some(fail_point) = FailPoint::enable(
+            app,
+            doc! {
+                "failCommands": ["find"],
+                "closeConnection": true,
+                "namespace": format!("{}.resources", backend.config().database_name),
+            },
+            doc! { "times": 2 },
+        )
+        .await
+        else {
+            return;
+        };
+
+        let results = backend
+            .process_entries(
+                &tenant,
+                &id,
+                &manifest_id,
+                three_patients("find"),
+                &BulkProcessingOptions::new(),
+            )
+            .await
+            .unwrap();
+        fail_point.off().await;
+
+        assert!(results.iter().all(|r| r.is_success()), "{results:?}");
+    }
+
+    /// Spec §5.2 case 5: the receipt upsert is a raw `update` command with no
+    /// driver retry at all, sent as one command for the whole batch. Scoped to
+    /// the `bulk_entry_results` namespace so the manifest's own
+    /// processing-promotion `update` never spends the failpoint budget;
+    /// `times: 1` drops that single command once, forcing its retry.
+    #[tokio::test]
+    async fn dropped_receipt_write_is_retried() {
+        let test = "submit_fp_dropped_receipts";
+        let app = "fp-dropped-receipts";
+        let Some(backend) = create_backend_with_app_name(test, app).await else {
+            return;
+        };
+        let tenant = create_tenant("submit-tenant");
+        let (id, manifest_id) = seed(&backend, &tenant).await;
+        let Some(fail_point) = FailPoint::enable(
+            app,
+            doc! {
+                "failCommands": ["update"],
+                "closeConnection": true,
+                "namespace": format!("{}.bulk_entry_results", backend.config().database_name),
+            },
+            doc! { "times": 1 },
+        )
+        .await
+        else {
+            return;
+        };
+
+        let results = backend
+            .process_entries(
+                &tenant,
+                &id,
+                &manifest_id,
+                three_patients("rcpt"),
+                &BulkProcessingOptions::new(),
+            )
+            .await
+            .unwrap();
+        fail_point.off().await;
+
+        assert!(results.iter().all(|r| r.is_success()), "{results:?}");
+        let counts = backend
+            .get_entry_counts(&tenant, &id, &manifest_id)
+            .await
+            .unwrap();
+        assert_eq!(counts.total, 3, "every receipt landed");
+        assert_eq!(counts.success, 3);
+    }
+
+    /// The search-index delete is a multi-document `delete`, which the driver
+    /// never retries. Updates with inline indexing issue it; `times: 2`.
+    #[tokio::test]
+    async fn dropped_search_index_delete_is_retried() {
+        let test = "submit_fp_dropped_delete";
+        let app = "fp-dropped-delete";
+        let Some(backend) = create_backend_with_app_name(test, app).await else {
+            return;
+        };
+        let tenant = create_tenant("submit-tenant");
+        let (id, manifest_id) = seed(&backend, &tenant).await;
+        backend
+            .process_entries(
+                &tenant,
+                &id,
+                &manifest_id,
+                three_patients("del"),
+                &BulkProcessingOptions::new(),
+            )
+            .await
+            .unwrap();
+
+        let Some(fail_point) = FailPoint::enable(
+            app,
+            doc! { "failCommands": ["delete"], "closeConnection": true },
+            doc! { "times": 2 },
+        )
+        .await
+        else {
+            return;
+        };
+        let updates: Vec<NdjsonEntry> = (1..=3)
+            .map(|i| {
+                NdjsonEntry::new(
+                    i,
+                    "Patient",
+                    json!({"resourceType": "Patient", "id": format!("del-{i}"), "name": [{"family": "Retried"}]}),
+                )
+            })
+            .collect();
+        let results = backend
+            .process_entries(
+                &tenant,
+                &id,
+                &manifest_id,
+                updates,
+                &BulkProcessingOptions::new(),
+            )
+            .await
+            .unwrap();
+        fail_point.off().await;
+
+        assert!(results.iter().all(|r| r.is_success()), "{results:?}");
+        let expected = search_index_entry_count(&backend, &tenant, "Patient", "del-1").await;
+        assert!(expected > 0);
+        for i in 2..=3 {
+            assert_eq!(
+                search_index_entry_count(&backend, &tenant, "Patient", &format!("del-{i}")).await,
+                expected,
+                "del-{i} indexed exactly once"
+            );
+        }
+    }
+
+    /// Spec §3.2 search index: `search_index` has no unique key, so a replayed
+    /// insert would duplicate rows. The retry deletes every batch id's rows
+    /// first. `times: 6` with inline indexing = resources (2), history (2),
+    /// then the search-index insert lands + errors twice before succeeding.
+    #[tokio::test]
+    async fn unacknowledged_search_index_insert_is_not_duplicated() {
+        let test = "submit_fp_unacked_search";
+        let app = "fp-unacked-search";
+        let Some(backend) = create_backend_with_app_name(test, app).await else {
+            return;
+        };
+        let tenant = create_tenant("submit-tenant");
+        let (id, manifest_id) = seed(&backend, &tenant).await;
+        // Control: the same shape ingested without a failpoint.
+        backend
+            .process_entries(
+                &tenant,
+                &id,
+                &manifest_id,
+                vec![NdjsonEntry::new(
+                    1,
+                    "Patient",
+                    json!({"resourceType": "Patient", "id": "control", "name": [{"family": "Indexed"}]}),
+                )],
+                &BulkProcessingOptions::new(),
+            )
+            .await
+            .unwrap();
+        let expected = search_index_entry_count(&backend, &tenant, "Patient", "control").await;
+        assert!(expected > 0);
+
+        let Some(fail_point) = FailPoint::enable(
+            app,
+            doc! {
+                "failCommands": ["insert"],
+                "writeConcernError": {
+                    "code": 91,
+                    "errmsg": "Replication is being shut down",
+                    "errorLabels": ["RetryableWriteError"],
+                },
+            },
+            doc! { "times": 6 },
+        )
+        .await
+        else {
+            return;
+        };
+        let entries: Vec<NdjsonEntry> = (1..=3)
+            .map(|i| {
+                NdjsonEntry::new(
+                    i,
+                    "Patient",
+                    json!({"resourceType": "Patient", "id": format!("sidx-{i}"), "name": [{"family": "Indexed"}]}),
+                )
+            })
+            .collect();
+        let results = backend
+            .process_entries(
+                &tenant,
+                &id,
+                &manifest_id,
+                entries,
+                &BulkProcessingOptions::new(),
+            )
+            .await
+            .unwrap();
+        fail_point.off().await;
+
+        assert!(results.iter().all(|r| r.is_success()), "{results:?}");
+        for i in 1..=3 {
+            assert_eq!(
+                search_index_entry_count(&backend, &tenant, "Patient", &format!("sidx-{i}")).await,
+                expected,
+                "sidx-{i} indexed exactly once"
+            );
+        }
+        assert_one_row_each(&backend, &tenant, &["sidx-1", "sidx-2", "sidx-3"]).await;
+    }
+
+    fn six_lines(prefix: &str) -> Vec<u8> {
+        (1..=6)
+            .map(|i| format!("{{\"resourceType\":\"Patient\",\"id\":\"{prefix}-{i}\"}}\n"))
+            .collect::<String>()
+            .into_bytes()
+    }
+
+    fn cursor_reader(bytes: Vec<u8>) -> Box<dyn tokio::io::AsyncBufRead + Send + Unpin> {
+        Box::new(tokio::io::BufReader::new(std::io::Cursor::new(bytes)))
+    }
+
+    /// Spec §5.2 case 3. `times: 6` is exact: batch 1 is one chunk, so its
+    /// resources insert is one `insert` per attempt; the policy allows six;
+    /// the standalone server adds no driver retry; and the exhausted error
+    /// short-circuits `write_batch` before history or the rollback log issue
+    /// any further `insert`. The failpoint is spent exactly when batch 1
+    /// gives up, and batch 2's first insert succeeds.
+    #[tokio::test]
+    async fn exhausted_retries_contain_to_the_batch() {
+        let test = "submit_fp_exhausted";
+        let app = "fp-exhausted";
+        let Some(backend) = create_backend_with_app_name(test, app).await else {
+            return;
+        };
+        let tenant = create_tenant("submit-tenant");
+        let (id, manifest_id) = seed(&backend, &tenant).await;
+        let Some(fail_point) = FailPoint::enable(
+            app,
+            doc! { "failCommands": ["insert"], "closeConnection": true },
+            doc! { "times": 6 },
+        )
+        .await
+        else {
+            return;
+        };
+
+        let options = BulkProcessingOptions::new().with_batch_size(3);
+        let result = backend
+            .process_ndjson_stream(
+                &tenant,
+                &id,
+                &manifest_id,
+                "Patient",
+                cursor_reader(six_lines("ex")),
+                &options,
+            )
+            .await
+            .unwrap();
+        fail_point.off().await;
+
+        assert!(!result.aborted, "{result:?}");
+        assert_eq!(result.counts.processing_error, 3);
+        assert_eq!(result.counts.success, 3);
+        assert_eq!(result.lines_processed, 6, "the file was read to the end");
+
+        let page = backend
+            .get_entry_results_page(&tenant, &id, &manifest_id, None, 10, None)
+            .await
+            .unwrap();
+        let mut by_line: Vec<_> = page.entries.iter().map(|e| &e.result).collect();
+        by_line.sort_by_key(|r| r.line_number);
+        for r in &by_line[..3] {
+            assert_eq!(r.outcome, BulkEntryOutcome::ProcessingError, "{r:?}");
+            let issue = &r.operation_outcome.as_ref().unwrap()["issue"][0];
+            assert_eq!(issue["code"], "transient");
+            let diagnostics = issue["diagnostics"].as_str().unwrap();
+            assert!(diagnostics.contains("(after 6 attempts)"), "{diagnostics}");
+            assert!(
+                diagnostics.contains("re-ingesting this file"),
+                "{diagnostics}"
+            );
+        }
+        for r in &by_line[3..] {
+            assert_eq!(r.outcome, BulkEntryOutcome::Success, "{r:?}");
+        }
+        assert!(
+            backend
+                .read(&tenant, "Patient", "ex-1")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            backend
+                .read(&tenant, "Patient", "ex-6")
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        let manifest = backend
+            .get_manifest(&tenant, &id, &manifest_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(manifest.total_entries, 6);
+        assert_eq!(manifest.failed_entries, 3);
+        assert_eq!(manifest.processed_entries, 3);
+    }
+
+    /// Spec §5.2 case 4: with strict options the stream aborts on the failed
+    /// batch and never attempts the next one.
+    #[tokio::test]
+    async fn max_errors_now_sees_backend_failures() {
+        let test = "submit_fp_max_errors";
+        let app = "fp-max-errors";
+        let Some(backend) = create_backend_with_app_name(test, app).await else {
+            return;
+        };
+        let tenant = create_tenant("submit-tenant");
+        let (id, manifest_id) = seed(&backend, &tenant).await;
+        let Some(fail_point) = FailPoint::enable(
+            app,
+            doc! { "failCommands": ["insert"], "closeConnection": true },
+            doc! { "times": 6 },
+        )
+        .await
+        else {
+            return;
+        };
+
+        let options = BulkProcessingOptions {
+            continue_on_error: false,
+            max_errors: 3,
+            ..BulkProcessingOptions::new().with_batch_size(3)
+        };
+        let result = backend
+            .process_ndjson_stream(
+                &tenant,
+                &id,
+                &manifest_id,
+                "Patient",
+                cursor_reader(six_lines("me")),
+                &options,
+            )
+            .await
+            .unwrap();
+        fail_point.off().await;
+
+        assert!(result.aborted);
+        assert_eq!(result.abort_reason.as_deref(), Some("max errors exceeded"));
+        assert_eq!(result.counts.processing_error, 3);
+        assert!(
+            backend
+                .read(&tenant, "Patient", "me-4")
+                .await
+                .unwrap()
+                .is_none(),
+            "batch 2 never ran"
+        );
+    }
+
+    /// Spec §5.2 case 6. Proves cancellation ends the retry loop before its
+    /// 6-attempt budget: the in-flight batch's receipts carry an attempt count
+    /// under 6. 150 ms is after attempt 1 fails and inside the first sleep.
+    /// Wall-clock elapsed is not asserted beyond a loose hang guard — a
+    /// `closeConnection` failpoint costs a real reconnect per attempt, and how
+    /// long that takes is environment-dependent, not something cancellation
+    /// controls.
+    #[tokio::test]
+    async fn cancel_during_backoff_returns_promptly() {
+        let test = "submit_fp_cancel_backoff";
+        let app = "fp-cancel-backoff";
+        let Some(backend) = create_backend_with_app_name(test, app).await else {
+            return;
+        };
+        let backend = std::sync::Arc::new(backend);
+        let tenant = create_tenant("submit-tenant");
+        let (id, manifest_id) = seed(&backend, &tenant).await;
+        let Some(fail_point) = FailPoint::enable(
+            app,
+            doc! { "failCommands": ["insert"], "closeConnection": true },
+            doc! { "times": 100 },
+        )
+        .await
+        else {
+            return;
+        };
+
+        let cancel = CancelToken::new();
+        let options = BulkProcessingOptions::new()
+            .with_batch_size(3)
+            .with_cancel(cancel.clone());
+        let started = std::time::Instant::now();
+        let run = {
+            let backend = backend.clone();
+            let tenant = tenant.clone();
+            let id = id.clone();
+            let manifest_id = manifest_id.clone();
+            tokio::spawn(async move {
+                backend
+                    .process_ndjson_stream(
+                        &tenant,
+                        &id,
+                        &manifest_id,
+                        "Patient",
+                        cursor_reader(six_lines("cb")),
+                        &options,
+                    )
+                    .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        cancel.cancel();
+        let result = run.await.unwrap().unwrap();
+        let elapsed = started.elapsed();
+        fail_point.off().await;
+
+        assert!(elapsed < Duration::from_secs(10), "hung: took {elapsed:?}");
+        assert!(result.aborted);
+        assert_eq!(result.abort_reason.as_deref(), Some(CANCELLED_ABORT_REASON));
+        assert_eq!(
+            result.counts.processing_error, 3,
+            "the batch in flight was recorded before the cancel check"
+        );
+        let counts = backend
+            .get_entry_counts(&tenant, &id, &manifest_id)
+            .await
+            .unwrap();
+        assert_eq!(counts.processing_error, 3);
+
+        let page = backend
+            .get_entry_results_page(&tenant, &id, &manifest_id, None, 10, None)
+            .await
+            .unwrap();
+        assert_eq!(page.entries.len(), 3);
+        for entry in &page.entries {
+            let r = &entry.result;
+            assert_eq!(r.outcome, BulkEntryOutcome::ProcessingError, "{r:?}");
+            let issue = &r.operation_outcome.as_ref().unwrap()["issue"][0];
+            let diagnostics = issue["diagnostics"].as_str().unwrap();
+            let attempts: u32 = diagnostics
+                .split("(after ")
+                .nth(1)
+                .and_then(|s| s.split(' ').next())
+                .and_then(|s| s.parse().ok())
+                .unwrap_or_else(|| panic!("no attempt count in {diagnostics}"));
+            assert!(
+                attempts < 6,
+                "cancellation should stop the retry loop short of its budget: {diagnostics}"
+            );
+        }
     }
 }
 

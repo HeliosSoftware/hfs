@@ -573,7 +573,11 @@ impl FilterSqlGenerator {
                 // Contains - use LIKE with wildcards on both sides
                 (
                     column,
-                    format!("{} LIKE ?{}", column, param_num),
+                    format!(
+                        "{col} IS NOT NULL AND {col} LIKE ?{}",
+                        param_num,
+                        col = column
+                    ),
                     format!("%{}%", Self::escape_like(value)),
                 )
             }
@@ -581,7 +585,11 @@ impl FilterSqlGenerator {
                 // Starts with - use LIKE with wildcard at end
                 (
                     column,
-                    format!("{} LIKE ?{}", column, param_num),
+                    format!(
+                        "{col} IS NOT NULL AND {col} LIKE ?{}",
+                        param_num,
+                        col = column
+                    ),
                     format!("{}%", Self::escape_like(value)),
                 )
             }
@@ -589,7 +597,11 @@ impl FilterSqlGenerator {
                 // Ends with - use LIKE with wildcard at start
                 (
                     column,
-                    format!("{} LIKE ?{}", column, param_num),
+                    format!(
+                        "{col} IS NOT NULL AND {col} LIKE ?{}",
+                        param_num,
+                        col = column
+                    ),
                     format!("%{}", Self::escape_like(value)),
                 )
             }
@@ -598,7 +610,11 @@ impl FilterSqlGenerator {
                 // Simple implementation: treat as contains for strings
                 (
                     column,
-                    format!("{} LIKE ?{}", column, param_num),
+                    format!(
+                        "{col} IS NOT NULL AND {col} LIKE ?{}",
+                        param_num,
+                        col = column
+                    ),
                     format!("%{}%", Self::escape_like(value)),
                 )
             }

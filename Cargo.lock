@@ -3661,6 +3661,7 @@ dependencies = [
  "postgres-types",
  "r2d2",
  "r2d2_sqlite",
+ "rayon",
  "regex",
  "rusqlite",
  "rust_decimal",

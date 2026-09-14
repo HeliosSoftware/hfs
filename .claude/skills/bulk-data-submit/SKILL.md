@@ -67,6 +67,7 @@ status-only kick-off (no `manifestUrl`) they have nothing to attach to and are i
 | `HFS_BULK_SUBMIT_MAX_CONCURRENT_PER_TENANT` | `4` | Per-tenant active submission cap; returns `429` |
 | `HFS_BULK_SUBMIT_BATCH_SIZE` | `1000` | Ingestion batch size |
 | `HFS_BULK_SUBMIT_DEFER_INDEXING` | `true` | Bulk fast-load (#903): ingest without search-index/FTS writes, then rebuild with an automatic per-type reindex when each manifest finishes. Default since #946; honoured on MongoDB only since #1000, where it was silently inert. Read once at startup, not per submission. A restart before that rebuild lands leaves the data stored but unsearchable; set `false` to close that window — see Ingest performance |
+| `HFS_BULK_SUBMIT_BULK_INDEX_REBUILD` | `false` | SQLite: the deferred rebuild drops the `search_index` value indexes for its duration and builds them once, sorted, at the end. 1.3x at 72k resources, 1.6x at 312k, widening with size — but search on that database is unindexed for every tenant while a rebuild runs, and the final build holds the write lock. For the initial load of a large corpus on a server not serving traffic. Self-heals at startup if a process died inside the window |
 | `HFS_BULK_SUBMIT_LEASE_DURATION` | `60` | Manifest lease length in seconds; must exceed heartbeat |
 | `HFS_BULK_SUBMIT_HEARTBEAT_INTERVAL` | `20` | Worker heartbeat cadence in seconds |
 | `HFS_BULK_SUBMIT_CLEANUP_INTERVAL` | `300` | Cleanup scan interval in seconds |
@@ -116,11 +117,45 @@ The backend capability splits into `BulkSubmitIngest` (the synchronous `BulkSubm
 - File fan-out is backend-aware. `HFS_BULK_SUBMIT_FILE_CONCURRENCY` is honoured as configured on the concurrent-writer backends (PostgreSQL, MongoDB, S3), but file fan-out is **not supported on SQLite**: `effective_file_concurrency` returns `1` there whatever the operator configured, and a `WARN` at startup names the configured and effective values. SQLite serialises writers, so any fan-out above one queues each batch's writes behind a single exclusive lock until they outlast `busy_timeout` and abort the manifest outright. Any file fan-out at all requires PostgreSQL.
 - The manifest bookkeeping and resource writes retry with bounded exponential backoff when SQLite reports the database busy or locked, instead of failing the ingest. The retry budget is an elapsed-time deadline bounded by the manifest lease, so a retrying write can never outlive the lease it holds. Every other error still surfaces on the first attempt.
 - With `HFS_BULK_SUBMIT_DEFER_INDEXING=true` (bulk fast-load, #903 — **the default since #946**) ingestion skips the search-index and FTS writes and an automatic per-type reindex rebuilds them when each manifest finishes. Reads and history are complete throughout; search sees a manifest's resources once its reindex lands. That rebuild is started *after* the manifest is already terminal and is fire-and-forget (`bulk_submit_worker.rs` → `reindex.rs`, `tokio::spawn`), so `$bulk-submit-status` answers `200` while search is still incomplete, and the job lives only in an in-memory map — no column on `bulk_manifests` records that indexing is outstanding and nothing re-fires it at startup. A restart in that window is not recoverable on its own.
-- MongoDB ingests a batch, not an entry: one `find` resolves which of the batch's ids already exist, then one `insert` or `update` command per collection writes the whole batch (`backends/mongodb/bulk_ingest.rs`). Before #1000 each entry cost ~9 round trips of its own — a `read`, `create`'s second existence probe, the resource and history inserts, a search-index delete and insert, a transaction commit, the rollback record and the receipt — which pinned ingest at ~60–76 resources/s with `mongod` two-thirds idle. The batch flush is a sequence of commands rather than one transaction, on purpose: the per-entry path was not atomic across a batch either, and a batch-wide transaction would turn one transient error into a whole batch of lost entries (#1001). Commands are ordered resources → history → search index → rollback log → receipts, so an interrupted batch is re-processed rather than falsely reported done.
+- MongoDB ingests a batch, not an entry: one `find` resolves which of the batch's ids already exist, then one `insert` or `update` command per collection writes the whole batch (`backends/mongodb/bulk_ingest.rs`). Before #1000 each entry cost ~9 round trips of its own — a `read`, `create`'s second existence probe, the resource and history inserts, a search-index delete and insert, a transaction commit, the rollback record and the receipt — which pinned ingest at ~60–76 resources/s with `mongod` two-thirds idle. The batch flush is a sequence of commands rather than one transaction. Every command is retried on a transient driver error (`RetryableError`/`RetryableWriteError` label, I/O error, cleared pool — not a server-selection timeout) with 100 ms doubling backoff capped at 1 s over six attempts, checking the submission's cancel token before each sleep; a retry never duplicates what an earlier attempt landed (resources are re-read and matched on version + the batch's own `last_updated` + content, history and rollback rows dedupe on their unique keys, the search index is cleared before re-insert). When a stage outlives its retries the batch's entries get `processing-error` receipts with issue code `transient` and the file continues with its next batch, so `max_errors`/`continue_on_error` govern backend failures too (#1001); re-submitting the file converges. Only a receipt write that itself fails after retries still aborts the file. The manifest counters are a `$inc` and may over-count one batch if a retried attempt had actually landed — the receipts are authoritative.
 - **On a composite deployment (primary + Elasticsearch), the ingest engine does not reach the secondary by itself.** Ingestion runs on the *primary's* engine, and the primary deliberately skips its own indexing when search is offloaded — so `main.rs` wraps the primary's job store in `CompositeSubmitJobs`, which syncs each manifest's ingested resources into the secondary. Every composite mode must call `composite_submit_jobs(...)`; `mongo-es` and `s3-es` did not, and a completed import there was readable by id and invisible to every search — 15.27M of 15.28M resources on the reported deployment, with `GET` by id passing every smoke test (#1021). `crates/hfs/tests/bulk_submit/run_composite_es_index_check.sh` asserts the searchable count, not just readability, and is the guard against a fourth composite backend repeating it.
 - The sync itself runs *before* the manifest's receipt is written (#1007), as an explicit worker step — not at `finish_manifest`, which no longer syncs by itself, so a manifest that already reached a terminal state is never re-synced by a restart; repair it with `$reindex`. A resource the secondary still rejects after its retries gets an entry result of `processing-error` in the receipt, carrying an OperationOutcome (`incomplete`) that names the `Type/id`, the rejecting backend, and `POST /{type}/$reindex` as the repair; the resource itself stays stored and readable by id, and the status's `failed_entries` counts it.
 - After that copy, for every resource type the manifest ingested, the worker compares the primary's tenant-wide resource count against each secondary's. A mismatch is recorded as a `warning` OperationOutcome (also `incomplete`, naming both counts) in the manifest's `error` artifact and logged on the server. This check only runs when `HFS_COMPOSITE_SYNC_MODE` is `synchronous` or `hybrid`; under the default `asynchronous` mode the secondary's count reflects whatever had already drained from its queue rather than this manifest's own sync, so the check is skipped and the receipt then guarantees only that the resources committed on the primary.
 - Without `HFS_ELASTICSEARCH_WRITE_REFRESH=wait_for`, a small count difference can be a write that has not become visible yet rather than a real gap; reconfirm with `GET /{type}?_summary=count` before treating it as drift. See "Verifying and repairing search drift" below.
+- **Under deferred indexing the rebuild is the import.** On SQLite the fast-load
+  ingest of a 72k-resource Synthea mix takes ~3s and the rebuild that follows
+  took ~42s, so the rebuild is where import time goes, and it is the path the
+  SQLite ingest work targets. What it does now (`storage.rs`,
+  `prepare_index` / `write_prepared_index`): each page's FHIRPath extraction,
+  value normalisation and parameter marshalling run on a thread pool
+  (`HFS_INDEX_THREADS`, default: the machine's parallelism) *before* the
+  page's transaction opens, so the single SQLite writer runs statements only;
+  `search_index` rows go eight per INSERT as on the inline path; the page is
+  1,000 resources (`DEFERRED_REINDEX_BATCH_SIZE`), not `$reindex`'s 100, since
+  each page is one COMMIT; `idx_search_string_folded` is partial (schema v28)
+  so 87% of rows skip a b-tree it never found them by; and `param_url` is no
+  longer written (11% of a bulk-loaded database, read by nothing). The inline
+  path (`HFS_BULK_SUBMIT_DEFER_INDEXING=false`) prepares each batch the same
+  way. Measured with `bulk_submit_bench` on the same 72k mix, three
+  interleaved rounds against `main`, medians: fast-load + rebuild 41.8s ->
+  21.5s end to end (1.94x, 3 of 3 rounds), inline ingest 36.4s -> 25.0s
+  (1.45x, 3 of 3), database 15% smaller; at 312k resources of the same mix,
+  180.7s -> 110.1s (1.64x) — the gain narrows as the b-trees outgrow the page
+  cache, which is the regime the full 19M-resource corpus lives in. Two
+  later additions: composite groups missing a component are no longer
+  written (`drop_incomplete_composites`; they were 46% of composite rows and
+  can never match — PostgreSQL already skipped them), and the opt-in
+  `HFS_BULK_SUBMIT_BULK_INDEX_REBUILD` above, which is the lever for that
+  regime: with it, 72k resources went 21.0s -> 16.3s and 312k went 110.1s ->
+  69.7s end to end (2.6x over the pre-work numbers at both sizes), because
+  `CREATE INDEX` builds each index from one sort instead of one random
+  b-tree insertion per row per index. Priced and rejected on the same
+  harness: narrowing `idx_search_composite`, FTS5 `automerge`/`pgsz`
+  tuning, `wal_autocheckpoint=0`, `synchronous=OFF` (4%), dropping the two
+  display-text indexes (5%, at a search cost). `perf_phases`
+  says what is left is SQLite b-tree maintenance of `search_index` and its
+  indexes plus the `search_index_fts` triggers (~20% of the rebuild, priced by
+  dropping them; kept, since `:text-advanced` needs the FTS index).
 - **`HFS_BULK_SUBMIT_DEFER_INDEXING` is read once, at startup, not per submission.** `spawn_submit_workers` hands the configured value to each worker, and the worker applies it to every manifest it ingests from then on; nothing about the flag is persisted on a submission or manifest record. Restarting with a different value changes only manifests ingested *after* the restart.
 - Cleanup periodically removes status artifacts for submissions whose `updated_at` exceeds `HFS_BULK_SUBMIT_OUTPUT_TTL`.
 - Abort (`submissionStatus=stopped`) means **stop soon** — neither "stop this instant" nor "stop after the current file". It marks the submission `aborted`, moves its `pending`/`processing` manifests to `failed`, and bars further claims. A manifest already being ingested is stopped cooperatively: the lease keeper re-reads the submission's status on its flush cadence (a few seconds) and trips a cancel token the streaming engine checks between persisted batches, so the worst case is one keeper tick plus one batch, never mid-transaction (#968).
@@ -181,11 +216,13 @@ reindex and is by far the biggest lever on ingestion alone; the stored resources
 history, receipts and rollback records are identical either way.
 
 Which number you quote depends on where you stop the clock, and the two differ by
-a lot. The `bulk_submit_bench` example runs **no reindex at all**, so its ~6.7x is
-the cost of ingestion with the indexing work removed, not the cost of arriving at
-a searchable database. Measured end to end against a running server — kick-off
-until a search returns the full count — the gain is far smaller, because the
-deferred arm still has to pay for the rebuild:
+a lot. The `bulk_submit_bench` example without `--reindex` runs **no reindex at
+all**, so its ~6.7x is the cost of ingestion with the indexing work removed, not
+the cost of arriving at a searchable database (`--batch 1000 --defer-index
+--reindex` is the server's default path end to end, and it reports the two stages
+separately). Measured end to end against a running server — kick-off until a
+search returns the full count — the gain is far smaller, because the deferred arm
+still has to pay for the rebuild:
 
 | stop the clock at | `false` | `true` | ratio | rounds won by `true` |
 |---|---|---|---|---|

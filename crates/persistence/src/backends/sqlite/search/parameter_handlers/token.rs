@@ -36,10 +36,15 @@ impl TokenHandler {
 
         // Handle :text modifier - search on display text (Coding.display, CodeableConcept.text)
         if matches!(modifier, Some(SearchModifier::Text)) {
-            // Search on the display text column for human-readable text matching
+            // Search on the display text column for human-readable text
+            // matching. `IS NOT NULL` first: SQLite cannot infer it from
+            // `LIKE`, and it is what lets the partial
+            // `idx_search_token_display` serve the scan instead of a
+            // type-wide walk of `idx_search_composite`.
             return SqlFragment::with_params(
                 format!(
-                    "value_token_display COLLATE NOCASE LIKE '%' || ?{} || '%'",
+                    "value_token_display IS NOT NULL AND \
+                     value_token_display COLLATE NOCASE LIKE '%' || ?{} || '%'",
                     param_num
                 ),
                 vec![SqlParam::string(value.value.to_lowercase())],
@@ -52,7 +57,8 @@ impl TokenHandler {
         if matches!(modifier, Some(SearchModifier::CodeText)) {
             return SqlFragment::with_params(
                 format!(
-                    "value_token_display COLLATE NOCASE LIKE ?{} || '%'",
+                    "value_token_display IS NOT NULL AND \
+                     value_token_display COLLATE NOCASE LIKE ?{} || '%'",
                     param_num
                 ),
                 vec![SqlParam::string(value.value.to_lowercase())],
