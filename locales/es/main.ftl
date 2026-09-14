@@ -191,6 +191,8 @@ chart-counts-unsupported-note = Este backend de almacenamiento no puede contar l
 # #1078: cuándo se leyeron las cifras de la página. $time es una hora UTC,
 # precedida de la fecha cuando no es de hoy (p. ej. "14:02:31 UTC").
 chart-as-of = Última lectura: { $time }.
+search-index-rebuilding = Reconstruyendo el índice de búsqueda: { $percent } % ({ $processed } de { $total } recursos). Las búsquedas pueden omitir recursos almacenados hasta que termine.
+search-index-rebuilding-counting = Reconstruyendo el índice de búsqueda. Las búsquedas pueden omitir recursos almacenados hasta que termine.
 chart-table-toggle = Ver como tabla
 chart-table-when = Momento
 chart-focus-series = Enfocar esta serie

@@ -196,6 +196,12 @@ chart-counts-unsupported-note = This storage backend cannot count stored resourc
 # #1078: when the figures on the page were read. $time is a UTC time,
 # prefixed with the date when it is not today (e.g. "14:02:31 UTC").
 chart-as-of = As of { $time }.
+# #1065: a search-index rebuild ($reindex) is running for this tenant. Stored
+# resources stay readable by id, but searches can miss them until it finishes.
+# $percent is a whole number; $processed and $total are resource counts.
+search-index-rebuilding = Search index rebuilding — { $percent }% ({ $processed } of { $total } resources). Searches may miss stored resources until it finishes.
+# The same, before the rebuild has counted the resources it will process.
+search-index-rebuilding-counting = Search index rebuilding. Searches may miss stored resources until it finishes.
 chart-table-toggle = View as Table
 chart-table-when = Time
 chart-focus-series = Focus this series

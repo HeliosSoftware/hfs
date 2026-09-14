@@ -616,7 +616,8 @@ where
             .with_job_stores(
                 bulk_export.as_ref().map(|b| Arc::clone(&b.jobs)),
                 bulk_submit.as_ref().map(|b| Arc::clone(&b.jobs)),
-            ),
+            )
+            .with_reindex(ops_reindex.clone()),
     );
     helios_observability::dashboard::set_provider(dashboard_provider.clone());
     // The provider never awaits storage on a page load (#1078): it serves

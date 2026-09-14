@@ -96,7 +96,7 @@ use axum_htmx::{AutoVaryLayer, HxHistoryRestoreRequest, HxRequest, HxTarget};
 use chrono::{DateTime, Datelike, Duration, Utc};
 use helios_observability::dashboard::{
     DashboardPoint, DashboardSeries, DashboardSnapshot, DashboardWindow, ExportJobCounts, Figures,
-    SnapshotState, TypeCount,
+    ReindexActivity, SnapshotState, TypeCount,
 };
 use helios_persistence::core::{BulkProviderStore, ResourceStorage, SettingsStore};
 use rust_embed::RustEmbed;
@@ -809,6 +809,26 @@ fn dashboard_notice(state: &SnapshotState, now: DateTime<Utc>) -> NoticeLine {
     }
 }
 
+/// `data-dash-notice` slug of the rebuild line (#1065).
+const REBUILD_NOTICE: &str = "rebuilding";
+
+/// The "search index rebuilding" sentence for a running rebuild (#1065):
+/// with its percentage once the rebuild has counted its resources, without
+/// one before, so it never shows a fabricated "0%".
+fn rebuild_text(i18n: &I18n, activity: &ReindexActivity) -> String {
+    match activity.percent() {
+        Some(percent) => i18n.t_args(
+            "search-index-rebuilding",
+            &std::collections::BTreeMap::from([
+                ("percent".to_string(), percent.to_string()),
+                ("processed".to_string(), grouped(activity.processed)),
+                ("total".to_string(), grouped(activity.total)),
+            ]),
+        ),
+        None => i18n.t("search-index-rebuilding-counting"),
+    }
+}
+
 /// The landing page. `dash_live` (`#dash-live`) and `chart_card`
 /// (`#dash-chart`) are also rendered alone, as the htmx fragments [`index`]
 /// answers a request targeting either region with.
@@ -834,6 +854,9 @@ struct IndexPage {
     /// Whether the page renders its waiting state: no figure is known yet
     /// (#1078).
     chart_waiting: bool,
+    /// A search-index rebuild running for the tenant (#1065), rendered as a
+    /// warning line inside the live region so each refresh keeps it current.
+    rebuild: Option<ReindexActivity>,
     /// Whether the storage backend cannot count at all
     /// ([`Figures::Unsupported`]): the chart area says so
     /// instead of waiting or charting, and nothing polls.
@@ -898,6 +921,21 @@ struct IndexPage {
 }
 
 impl IndexPage {
+    /// The rebuild line's wording (see [`rebuild_text`]).
+    fn rebuild_text(&self, activity: &ReindexActivity) -> String {
+        rebuild_text(&self.i18n, activity)
+    }
+
+    /// The rebuild line's `aria-live`: announced when it appears, then quiet
+    /// on the refreshes that only move its percentage.
+    fn rebuild_aria_live(&self) -> &'static str {
+        if self.quiet_notices.iter().any(|seen| seen == REBUILD_NOTICE) {
+            "off"
+        } else {
+            "polite"
+        }
+    }
+
     /// The `aria-live` politeness of a notice line of `kind` (#1078).
     fn notice_aria_live(&self, kind: &DashboardNotice) -> &'static str {
         if self.quiet_notices.iter().any(|seen| seen == kind.slug()) {
@@ -972,6 +1010,9 @@ struct ResourcesPage {
     create_advertised_types: String,
     create_schema_types: String,
     create_metadata_available: bool,
+    /// A search-index rebuild running for the tenant (#1065): results may miss
+    /// stored resources until it finishes, so the page head says so.
+    rebuild: Option<ReindexActivity>,
     /// The search-builder partial's save controls are the Saved Queries page's
     /// job, not this one's.
     show_save: bool,
@@ -991,6 +1032,13 @@ struct ResourcesPage {
     /// No-JS prefill for the builder's URL input (#605): `GET /{selected_type}`,
     /// so the form already shows the query the client JS runs on load.
     builder_url: Option<String>,
+}
+
+impl ResourcesPage {
+    /// The rebuild line's wording (see [`rebuild_text`]).
+    fn rebuild_text(&self, activity: &ReindexActivity) -> String {
+        rebuild_text(&self.i18n, activity)
+    }
 }
 
 /// Explains how to configure terminology navigation, or why the configured
@@ -2536,6 +2584,7 @@ async fn resources(
             .map(capability::CreateTargets::schema_resources_csv)
             .unwrap_or_default(),
         create_metadata_available: targets.is_some(),
+        rebuild: live.as_ref().and_then(|snapshot| snapshot.reindex_active),
         show_save: false,
         rail_counts_approximate,
         rail_entries,
@@ -7946,6 +7995,7 @@ fn dash_state(
         .map(|jobs| (jobs.running, jobs.queued))
         .hash(&mut hasher);
     snapshot.import_jobs_active.hash(&mut hasher);
+    snapshot.reindex_active.hash(&mut hasher);
     std::mem::discriminant(&snapshot.figures).hash(&mut hasher);
     (now.timestamp() / 60).hash(&mut hasher);
     format!("{:016x}", hasher.finish())
@@ -8070,7 +8120,8 @@ async fn build_index_page(
     let live_refresh = ready && !chart_waiting && !unsupported;
     let refresh_moving = live_refresh
         && (snapshot.figures.is_approximate()
-            || snapshot.import_jobs_active.is_some_and(|n| n > 0));
+            || snapshot.import_jobs_active.is_some_and(|n| n > 0)
+            || snapshot.reindex_active.is_some());
     let refresh_href = if slow_watch {
         Some(format!("{retry_base}&retry={DASH_PENDING_RETRIES}"))
     } else {
@@ -8089,6 +8140,7 @@ async fn build_index_page(
         all_types: dash.all_types,
         all_types_href: dash.all_types_href,
         notice,
+        rebuild: snapshot.reindex_active,
         chart_waiting,
         chart_unsupported: unsupported,
         figures_unknown_key: if unsupported {
@@ -8680,6 +8732,7 @@ fn sample_snapshot(window: DashboardWindow) -> DashboardSnapshot {
         available,
         export_jobs: None,
         import_jobs_active: None,
+        reindex_active: None,
         // Invented figures take the same rendering path as measured ones, so
         // they carry figures. Nothing reads this time: a no-provider render's
         // notice is the undated sample-data line, which says the figures are
@@ -8864,6 +8917,7 @@ mod tests {
             None,
         );
         IndexPage {
+            rebuild: None,
             status: Status {
                 version,
                 checked_at,
@@ -9522,6 +9576,7 @@ mod tests {
             available: Vec::new(),
             export_jobs: None,
             import_jobs_active: None,
+            reindex_active: None,
             figures: Figures::Exact {
                 read_at: DateTime::from_timestamp(1_752_451_200, 0).expect("valid instant"),
             },
@@ -9571,6 +9626,7 @@ mod tests {
             }],
             export_jobs: None,
             import_jobs_active: None,
+            reindex_active: None,
             figures: Figures::Exact {
                 read_at: DateTime::from_timestamp(1_752_451_200, 0).expect("valid instant"),
             },

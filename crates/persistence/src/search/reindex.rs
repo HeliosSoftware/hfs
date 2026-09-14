@@ -358,6 +358,13 @@ pub struct ReindexProgress {
     /// Unique job identifier.
     pub job_id: String,
 
+    /// The tenant the job rebuilds, so a per-tenant view (the dashboard's
+    /// rebuild banner, #1065) can pick out its own jobs. `None` only on
+    /// progress built without a tenant, such as one deserialized from before
+    /// the field existed.
+    #[serde(default)]
+    pub tenant_id: Option<String>,
+
     /// Current status.
     pub status: ReindexStatus,
 
@@ -438,6 +445,7 @@ impl ReindexProgress {
     pub fn new(job_id: impl Into<String>) -> Self {
         Self {
             job_id: job_id.into(),
+            tenant_id: None,
             status: ReindexStatus::Queued,
             total_resources: 0,
             processed_resources: 0,
@@ -837,7 +845,8 @@ impl ReindexOperation {
         self.ensure_cleanup_task();
         self.cleanup_old_jobs(REINDEX_STATUS_RETENTION_SECONDS);
         let job_id = Uuid::new_v4().to_string();
-        let progress = ReindexProgress::new(&job_id);
+        let mut progress = ReindexProgress::new(&job_id);
+        progress.tenant_id = Some(tenant.tenant_id().as_str().to_string());
 
         // Store the job
         self.jobs.write().insert(job_id.clone(), progress);
@@ -2791,6 +2800,7 @@ mod tests {
         assert_eq!(jobs[0].errors.len(), 1);
         assert!(!jobs[0].errors[0].retryable);
         assert_eq!(jobs[0].errors[0].resource_id, "controlled-1");
+        assert_eq!(jobs[0].tenant_id.as_deref(), Some("permanent-errors"));
     }
 
     #[test]

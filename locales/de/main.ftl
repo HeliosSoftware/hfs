@@ -191,6 +191,8 @@ chart-counts-unsupported-note = Dieses Speicher-Backend kann gespeicherte Ressou
 # #1078: wann die Zahlen auf der Seite gelesen wurden. $time ist eine UTC-Uhrzeit,
 # mit vorangestelltem Datum, wenn sie nicht von heute ist (z. B. "14:02:31 UTC").
 chart-as-of = Stand: { $time }.
+search-index-rebuilding = Suchindex wird neu aufgebaut — { $percent } % ({ $processed } von { $total } Ressourcen). Suchen können gespeicherte Ressourcen übersehen, bis der Aufbau abgeschlossen ist.
+search-index-rebuilding-counting = Suchindex wird neu aufgebaut. Suchen können gespeicherte Ressourcen übersehen, bis der Aufbau abgeschlossen ist.
 chart-table-toggle = Als Tabelle anzeigen
 chart-table-when = Zeitpunkt
 chart-focus-series = Diese Serie fokussieren
