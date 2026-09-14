@@ -8934,7 +8934,8 @@ mod bulk_submit {
 
     /// Reconstructs the pre-v8 Mongo artifact shape, migrates it through the
     /// public backend migration, and verifies manifest-aware v8 identity for
-    /// two generations under one submission.
+    /// two generations under one submission. The same migration also carries
+    /// the v7 receipt outcome index to its v10 replacement (#1046).
     #[tokio::test]
     async fn test_v7_to_v8_manifest_aware_submit_file_identity() {
         use futures::TryStreamExt;
@@ -8968,6 +8969,32 @@ mod bulk_submit {
                         mongodb::options::IndexOptions::builder()
                             .name(Some("idx_bulk_submit_files_part".to_string()))
                             .unique(Some(true))
+                            .build(),
+                    )
+                    .build(),
+            )
+            .await
+            .unwrap();
+        // Before v10, outcome-filtered receipt pages had only this index, which
+        // cannot serve their `(file_url, line_number)` order.
+        let entry_results = db.collection::<Document>("bulk_entry_results");
+        entry_results
+            .drop_index("idx_bulk_entry_results_outcome_line")
+            .await
+            .unwrap();
+        entry_results
+            .create_index(
+                mongodb::IndexModel::builder()
+                    .keys(doc! {
+                        "tenant_id": 1_i32,
+                        "submitter": 1_i32,
+                        "submission_id": 1_i32,
+                        "manifest_id": 1_i32,
+                        "outcome": 1_i32,
+                    })
+                    .options(
+                        mongodb::options::IndexOptions::builder()
+                            .name(Some("idx_bulk_entry_results_outcome".to_string()))
                             .build(),
                     )
                     .build(),
@@ -9008,7 +9035,39 @@ mod bulk_submit {
             .await
             .unwrap()
             .expect("schema version document");
-        assert_eq!(schema_version.get_i32("version").unwrap(), 9_i32);
+        assert_eq!(schema_version.get_i32("version").unwrap(), 10_i32);
+
+        let receipt_indexes: Vec<_> = entry_results
+            .list_indexes()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter_map(|index| Some((index.options?.name?, index.keys)))
+            .collect();
+        assert!(
+            receipt_indexes
+                .iter()
+                .all(|(name, _)| name != "idx_bulk_entry_results_outcome"),
+            "the v7 receipt outcome index must be dropped, got {receipt_indexes:?}"
+        );
+        assert!(
+            receipt_indexes.contains(&(
+                "idx_bulk_entry_results_outcome_line".to_string(),
+                doc! {
+                    "tenant_id": 1_i32,
+                    "submitter": 1_i32,
+                    "submission_id": 1_i32,
+                    "manifest_id": 1_i32,
+                    "outcome": 1_i32,
+                    "file_url": 1_i32,
+                    "line_number": 1_i32,
+                }
+            )),
+            "v10 receipt outcome index must exist, got {receipt_indexes:?}"
+        );
 
         let indexes = files
             .list_indexes()
