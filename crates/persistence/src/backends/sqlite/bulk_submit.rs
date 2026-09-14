@@ -1378,6 +1378,7 @@ impl StreamingBulkSubmitProvider for SqliteBackend {
         // `ingest_progress` call covers exactly the lines read, parsed and
         // written since the last one.
         let mut batch_started = std::time::Instant::now();
+        crate::perf::mark_ingest_start();
 
         // An ingest cancelled before it read anything persists nothing.
         if options.is_cancelled() {

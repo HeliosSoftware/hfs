@@ -364,6 +364,29 @@ static INGESTED: AtomicU64 = AtomicU64::new(0);
 /// the gaps between files (manifest fetch, download, lease bookkeeping) and
 /// dilute every phase's share of a number the phases were never inside of.
 static INGEST_WALL_NANOS: AtomicU64 = AtomicU64::new(0);
+/// Counter values when the first streaming ingest began. Every phase counter
+/// is process-global and the server has usually done indexed writes before
+/// the first manifest arrives — seeding the spec SearchParameters alone is
+/// ~1,400 autocommitted, indexed creates — so a report against the raw totals
+/// charges that start-up work to the ingest, and a phase can show more time
+/// than the ingest wall it is supposed to be a share of. Reports subtract
+/// this baseline instead.
+static INGEST_BASELINE: parking_lot::Mutex<Option<Vec<PhaseTotals>>> =
+    parking_lot::Mutex::new(None);
+
+/// Marks the start of the streaming ingest: the first call snapshots the
+/// counters as the baseline that [`ingest_progress`] reports against; later
+/// calls are no-ops, so concurrent or successive files share one baseline
+/// and the report stays cumulative over the run. [`reset`] clears it.
+pub fn mark_ingest_start() {
+    if !enabled() {
+        return;
+    }
+    let mut baseline = INGEST_BASELINE.lock();
+    if baseline.is_none() {
+        *baseline = Some(snapshot());
+    }
+}
 
 /// Records one ingested batch — `resources` entries walked, `wall` the time
 /// from the end of the previous batch (or the start of the stream) to the end
@@ -387,7 +410,12 @@ pub fn ingest_progress(resources: u64, wall: Duration) -> Option<String> {
     if after / PROGRESS_INTERVAL == before / PROGRESS_INTERVAL {
         return None;
     }
-    Some(report(after, Duration::from_nanos(wall_total)))
+    let wall_total = Duration::from_nanos(wall_total);
+    let baseline = INGEST_BASELINE.lock();
+    Some(match baseline.as_ref() {
+        Some(before) => report_since(before, after, wall_total),
+        None => report(after, wall_total),
+    })
 }
 
 /// One phase's totals.
@@ -429,6 +457,7 @@ pub fn reset() {
     }
     INGESTED.store(0, Ordering::Relaxed);
     INGEST_WALL_NANOS.store(0, Ordering::Relaxed);
+    *INGEST_BASELINE.lock() = None;
 }
 
 /// Renders the snapshot as a table: per-resource cost and share of `wall` for
@@ -649,6 +678,30 @@ mod tests {
         assert!(ingest_progress(PROGRESS_INTERVAL * 3, step).is_some());
         set_enabled(false);
         reset();
+    }
+
+    #[cfg(perf_phases)]
+    #[test]
+    fn ingest_progress_reports_against_the_baseline() {
+        let _guard = SWITCH.lock();
+        set_enabled(true);
+        reset();
+        // Start-up work before the ingest: must not appear in the report.
+        {
+            let _span = span(Phase::ReindexFtsDelete);
+            add_rows(Phase::ReindexFtsDelete, 5);
+        }
+        mark_ingest_start();
+        {
+            let _span = span(Phase::ReindexFtsDelete);
+            add_rows(Phase::ReindexFtsDelete, 2);
+        }
+        let report =
+            ingest_progress(PROGRESS_INTERVAL, Duration::from_secs(1)).expect("boundary crossed");
+        set_enabled(false);
+        reset();
+        assert!(report.contains("rows=2 "), "{report}");
+        assert!(!report.contains("rows=7 "), "{report}");
     }
 
     #[cfg(not(perf_phases))]
