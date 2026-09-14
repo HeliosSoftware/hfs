@@ -30,12 +30,14 @@ pub(crate) fn build_segments(version: FhirVersion, types: Option<&[String]>) -> 
     match types {
         None => segments.extend(members.map(|t| t.to_string())),
         Some(wanted) => {
-            let members: Vec<&str> = members.copied().collect();
+            // Table order, not `wanted`'s order: `_type` is a filter on
+            // which compartment members to walk, not a request to reorder
+            // the walk — clients that pass `_type=B,A` still get results in
+            // the server's stable segment order.
             segments.extend(
-                wanted
-                    .iter()
-                    .filter(|w| members.contains(&w.as_str()))
-                    .cloned(),
+                members
+                    .filter(|t| wanted.iter().any(|w| w == *t))
+                    .map(|t| t.to_string()),
             );
         }
     }
@@ -212,11 +214,26 @@ mod tests {
 
     #[test]
     fn type_filter_restricts_members_but_keeps_patient() {
-        let segs = build_segments(
-            FhirVersion::R4,
-            Some(&["Encounter".to_string(), "Observation".to_string()]),
+        // Requested in the *reverse* of table order, to prove `_type`
+        // filters which members are walked without dictating the walk's
+        // order — the output must still follow the compartment table.
+        let wanted = ["Observation".to_string(), "Encounter".to_string()];
+        let segs = build_segments(FhirVersion::R4, Some(&wanted));
+
+        // Expected order is computed from the unfiltered walk (table
+        // order), not hardcoded, so this test doesn't silently bitrot if
+        // the table order changes.
+        let expected: Vec<String> = build_segments(FhirVersion::R4, None)
+            .into_iter()
+            .filter(|t| t == "Patient" || wanted.contains(t))
+            .collect();
+        assert_eq!(segs, expected);
+        assert_eq!(segs[0], "Patient");
+        assert_ne!(
+            segs,
+            vec!["Patient", "Observation", "Encounter"],
+            "must be table order, not `_type`'s request order"
         );
-        assert_eq!(segs, vec!["Patient", "Encounter", "Observation"]);
     }
 
     #[test]
