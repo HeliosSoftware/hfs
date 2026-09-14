@@ -4,4 +4,5 @@
 //! and the query-time compartment predicate that `GET /Patient/{id}/*` uses.
 //! See `docs/superpowers/specs/2026-09-14-patient-everything-design.md`.
 
+pub(crate) mod cursor;
 pub(crate) mod params;
