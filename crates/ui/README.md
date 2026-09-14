@@ -998,6 +998,13 @@ falls through to the normal REST surface.
   tenants' in-memory state is evicted and rebuilt on the next view, and a
   backend that cannot count (e.g. an S3 primary) shows "not available" rather
   than zeros.
+  The page refreshes itself with plain htmx (#1078): `/ui` answers
+  `HX-Target: dash-live` with only the `dash_live` block of `pages/index.html`
+  and `HX-Target: dash-chart` (a type-picker option) with only the
+  `chart_card` block plus `HX-Push-Url` (askama `blocks = [...]`, no duplicated
+  markup); a history restore or plain load gets the full page. A settled tick
+  sending an unchanged `state` digest gets `204`, and `open=pick,table` renders
+  what the user had open.
 - **Per-user preferences** (theme, nav state, FHIR version, tenant, saved and
   recent queries, and — since #754/#755 — every sidebar rail's `rails.<page>`
   record of `last`/`recent`, tenant-scoped, see `rail_state`) roam in the

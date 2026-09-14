@@ -109,9 +109,10 @@ export class DashboardPage {
   /** `#dash-live` on any ready page: it polls itself (#1078) — every 5s
    * while the figures are moving ({@link movingRefresh}), every 10s once they
    * settle ({@link settledRefresh}). The tick only stands down while the tab
-   * is hidden, a picker fetch is in flight, or keyboard focus sits inside the
-   * region outside the type picker; an open picker or data table, the tooltip
-   * and a mouse click do not stop it. */
+   * is hidden or keyboard focus sits inside the region outside the type
+   * picker (a picker request in flight aborts or drops it through `hx-sync`);
+   * an open picker or data table, the tooltip and a mouse click do not stop
+   * it. Its requests carry `HX-Target: dash-live`. */
   get liveRefresh(): Locator {
     return this.page.locator("#dash-live[data-dash-refresh]");
   }
@@ -121,8 +122,9 @@ export class DashboardPage {
     return this.page.locator("#dash-live[data-dash-moving]");
   }
   /** `#dash-live` on a ready page whose figures have settled: still polling
-   * (10s), so a later write reaches it, but a tick whose `data-dash-state`
-   * did not change is dropped by assets/dashboard.js instead of swapped. */
+   * (10s), so a later write reaches it, but the tick sends its
+   * `data-dash-state` as `?state=` and the server answers `204` (nothing
+   * swapped) while the figures are unchanged. */
   get settledRefresh(): Locator {
     return this.page.locator("#dash-live[data-dash-refresh]:not([data-dash-moving])");
   }
@@ -189,7 +191,8 @@ export class DashboardPage {
     return this.page.locator(".chart-legend__item");
   }
   /** The type picker, `<details class="menu chart-pick" id="chart-pick">`.
-   * While it is open a refresh keeps this very node (#1078). */
+   * While it is open a refresh keeps this very node (#1078: the request says
+   * `open=pick`, the server renders it `hx-preserve`). */
   get picker(): Locator {
     return this.page.locator("details.chart-pick");
   }
@@ -261,7 +264,9 @@ export class DashboardPage {
 }
 
 /** Reads a dashboard response body into a {@link FirstRender}. The markup
- * hooks are the template's own (crates/ui/templates/pages/index.html). */
+ * hooks are the template's own (crates/ui/templates/pages/index.html). Feed
+ * it a `200` body only: a refresh answered `204` (figures unchanged) has no
+ * body to read. */
 export function parseFirstRender(html: string): FirstRender {
   const statGrid = /<section class="stat-grid[^"]*">([\s\S]*?)<\/section>/.exec(html)?.[1] ?? "";
   const liveOpen = /<div id="dash-live"[^>]*>/.exec(html)?.[0] ?? "";

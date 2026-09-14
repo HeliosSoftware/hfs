@@ -92,7 +92,7 @@ use axum::{
     routing::get,
 };
 use axum_embed::ServeEmbed;
-use axum_htmx::{AutoVaryLayer, HxRequest};
+use axum_htmx::{AutoVaryLayer, HxHistoryRestoreRequest, HxRequest, HxTarget};
 use chrono::{DateTime, Datelike, Duration, Utc};
 use helios_observability::dashboard::{
     DashboardPoint, DashboardSeries, DashboardSnapshot, DashboardWindow, ExportJobCounts, Figures,
@@ -809,8 +809,11 @@ fn dashboard_notice(state: &SnapshotState, now: DateTime<Utc>) -> NoticeLine {
     }
 }
 
+/// The landing page. `dash_live` (`#dash-live`) and `chart_card`
+/// (`#dash-chart`) are also rendered alone, as the htmx fragments [`index`]
+/// answers a request targeting either region with.
 #[derive(Template)]
-#[template(path = "pages/index.html")]
+#[template(path = "pages/index.html", blocks = ["dash_live", "chart_card"])]
 struct IndexPage {
     status: Status,
     metrics: DashboardMetrics,
@@ -857,9 +860,8 @@ struct IndexPage {
     refresh_href: Option<String>,
     /// Whether [`Self::refresh_href`] is the slow watch of a page still
     /// waiting for its figures (`data-dash-waiting`): its href keeps the spent
-    /// retry count, and assets/dashboard.js carries that count when it
-    /// re-aims the request, so the server keeps watching slowly instead of
-    /// restarting the fast retries.
+    /// retry count, and every watch request carries it, so the server keeps
+    /// watching slowly instead of restarting the fast retries.
     refresh_waiting: bool,
     /// `tenant|FHIR version|locale` this render was made for
     /// (`data-dash-ctx`). Every live-region request sends it back as `ctx`; a
@@ -872,14 +874,24 @@ struct IndexPage {
     /// running — which is what the fast poll follows; settled figures are only
     /// watched (#1078).
     refresh_moving: bool,
-    /// A digest of the figures this render shows (see [`dash_state`]). A watch
-    /// tick that brings back the same digest is not swapped in.
+    /// A digest of the figures this render shows (see [`dash_state`]). A
+    /// settled tick that sends it back as `state` while it still matches is
+    /// answered `204 No Content`, so nothing is swapped.
     refresh_state: String,
     /// Notice kinds (slugs) the requesting page already shows, sent by a
     /// periodic refresh. Their lines render with `aria-live="off"`, so a
     /// swap every few seconds does not re-announce an unchanged notice; a
     /// notice whose kind changed is still announced.
     quiet_notices: Vec<String>,
+    /// Whether the type picker (`#chart-pick`) renders open: the requesting
+    /// page had it open (`open=pick`), or the request is the picker's own.
+    pick_open: bool,
+    /// Whether the open picker also carries `hx-preserve`: a refresh keeps the
+    /// node the user is in as-is, while the picker's own request must replace
+    /// it so its checkboxes follow the new selection.
+    pick_preserve: bool,
+    /// Whether the data table (`#chart-table`) renders open (`open=table`).
+    table_open: bool,
     i18n: I18n,
     /// Which sidebar entry carries `aria-current="page"` (see base.html).
     active_page: &'static str,
@@ -1901,18 +1913,37 @@ async fn revalidate_assets(request: axum::extract::Request, next: middleware::Ne
 /// the ones the tenant stores, and a type with no data can be charted as a
 /// flat zero line.
 ///
-/// An htmx request from the live region carries `ctx` (see [`dash_ctx`]). When
+/// With htmx the page answers its two live regions (#1078) by `HX-Target`:
+///
+/// - `dash-live` (the bounded retry, slow watch or periodic refresh) gets
+///   only the `#dash-live` fragment. When that request sends `state` equal to
+///   the fresh render's [`dash_state`] digest and the figures are settled —
+///   polled, neither moving nor a waiting page's slow watch — the answer is
+///   `204 No Content` and htmx swaps nothing. `open=pick,table` names what
+///   the page has open; the fragment renders the picker `open hx-preserve`
+///   and the table `open` to match.
+/// - `dash-chart` (a type-picker option, #555/#599) gets only the chart card,
+///   picker open, with `HX-Push-Url` set to the selection's own link — never
+///   carrying `ctx`, `open`, `state`, `notices` or `retry`.
+///
+/// Anything else — a plain navigation, a history restore, another target —
+/// gets the whole page, so every link works without JavaScript.
+///
+/// Every request either region makes carries `ctx` (see [`dash_ctx`]). When
 /// it no longer matches the tenant, FHIR version and locale this request
 /// resolves to — switched in another tab — the answer is an empty `200` with
 /// `HX-Refresh: true`, so htmx reloads the whole page (sidebar, selector and
 /// figures together) instead of swapping one context's region into another's
 /// page. A request without `ctx` renders as usual.
+#[allow(clippy::too_many_arguments)]
 async fn index(
     State(state): State<WebState>,
     locale: RequestLocale,
     rv: RequestVersion,
     rt: RequestTenant,
     HxRequest(is_htmx): HxRequest,
+    HxTarget(hx_target): HxTarget,
+    HxHistoryRestoreRequest(history_restore): HxHistoryRestoreRequest,
     RawQuery(query): RawQuery,
 ) -> Response {
     if is_htmx
@@ -1929,6 +1960,14 @@ async fn index(
         )
             .into_response();
     }
+    // Which block of the page this request asks for. A history restore
+    // always rebuilds the whole page, whatever element it names.
+    let region = match hx_target.as_deref() {
+        _ if !is_htmx || history_restore => DashRegion::Page,
+        Some("dash-live") => DashRegion::Live,
+        Some("dash-chart") => DashRegion::Chart,
+        _ => DashRegion::Page,
+    };
     let types: Vec<String> = query_value(query.as_deref(), "types")
         .or_else(|| query_value(query.as_deref(), "type"))
         .map(|csv| {
@@ -1972,12 +2011,61 @@ async fn index(
                 .collect()
         })
         .unwrap_or_default();
+    // `?open=pick,table`: what a refreshing page has open, kept open by the
+    // render instead of by the client. Unknown tokens are ignored.
+    let open = query_value(query.as_deref(), "open").unwrap_or_default();
+    let open = |token: &str| open.split(',').any(|t| t.trim() == token);
+    // `?state=<digest>`: the figures the refreshing page shows. Anything that
+    // is not a plausible digest is ignored rather than compared.
+    let sent_state = query_value(query.as_deref(), "state")
+        .filter(|s| !s.is_empty() && s.len() <= 32 && s.chars().all(|c| c.is_ascii_hexdigit()));
+    // The selection's own link, pushed by a picker request.
+    let canonical_href = dash_href(&types, window, all_types, focus.as_deref());
     let mut page = build_index_page(
         &state, locale, types, window, all_types, spec_types, focus, retry, rv.0, &rt,
     )
     .await;
     page.quiet_notices = quiet_notices;
-    render(page)
+    page.table_open = open("table");
+    match region {
+        DashRegion::Page => {
+            page.pick_open = open("pick");
+            page.pick_preserve = page.pick_open;
+            render(page)
+        }
+        DashRegion::Live => {
+            let unchanged = sent_state.as_deref() == Some(page.refresh_state.as_str())
+                && page.refresh_href.is_some()
+                && !page.refresh_moving
+                && !page.refresh_waiting;
+            if unchanged {
+                return StatusCode::NO_CONTENT.into_response();
+            }
+            page.pick_open = open("pick");
+            page.pick_preserve = page.pick_open;
+            render(page.as_dash_live())
+        }
+        DashRegion::Chart => {
+            page.pick_open = true;
+            let mut response = render(page.as_chart_card());
+            if let Ok(value) = axum::http::HeaderValue::from_str(&canonical_href) {
+                response
+                    .headers_mut()
+                    .insert(axum::http::HeaderName::from_static("hx-push-url"), value);
+            }
+            response
+        }
+    }
+}
+
+/// The part of the landing page a request asks for (see [`index`]).
+enum DashRegion {
+    /// The whole page, layout included.
+    Page,
+    /// The `#dash-live` region alone (`HX-Target: dash-live`).
+    Live,
+    /// The chart card alone (`HX-Target: dash-chart`).
+    Chart,
 }
 
 /// One resource-type rail item â€” the primitive Resources, Search, and Saved
@@ -7839,8 +7927,8 @@ async fn build_index_page(
     // Settled figures are watched too, only slower: a tab opened before an
     // import starts must notice it without a reload, and the server alone
     // knows when that happens. A watch tick whose figures did not change is
-    // dropped by assets/dashboard.js (same `refresh_state`), so an idle page
-    // is not re-rendered under the user.
+    // answered `204` by [`index`] (same `refresh_state`), so an idle page is
+    // not re-rendered under the user.
     //
     // A backend that cannot count has nothing to follow at all, so it is
     // neither retried nor watched.
@@ -7886,6 +7974,9 @@ async fn build_index_page(
         refresh_moving,
         refresh_state,
         quiet_notices: Vec::new(),
+        pick_open: false,
+        pick_preserve: false,
+        table_open: false,
         i18n,
         active_page: "home",
     }
@@ -8671,6 +8762,9 @@ mod tests {
             refresh_moving: false,
             refresh_state: String::new(),
             quiet_notices: Vec::new(),
+            pick_open: false,
+            pick_preserve: false,
+            table_open: false,
             i18n,
             active_page: "home",
         }

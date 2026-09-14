@@ -794,3 +794,317 @@ async fn a_live_region_request_from_another_context_reloads_the_page() {
     assert!(not_htmx.headers().get("HX-Refresh").is_none());
     assert!(body_text(not_htmx).await.contains(r#"id="dash-live""#));
 }
+
+/// Sends `uri` under `tenant` with the given request headers.
+async fn send_with(tenant: &str, uri: &str, headers: &[(&str, &str)]) -> axum::response::Response {
+    let mut request = Request::get(uri);
+    for (name, value) in headers {
+        request = request.header(*name, *value);
+    }
+    app(tenant)
+        .oneshot(request.body(Body::empty()).unwrap())
+        .await
+        .unwrap()
+}
+
+/// The headers of a live-region (`#dash-live`) htmx request.
+const LIVE: &[(&str, &str)] = &[("HX-Request", "true"), ("HX-Target", "dash-live")];
+/// The headers of a type-picker (`#dash-chart`) htmx request.
+const CHART: &[(&str, &str)] = &[("HX-Request", "true"), ("HX-Target", "dash-chart")];
+
+/// The opening tag of the element carrying `id="{id}"`.
+fn tag_with_id<'a>(html: &'a str, id: &str) -> &'a str {
+    let at = html
+        .find(&format!(r#"id="{id}""#))
+        .unwrap_or_else(|| panic!("an element #{id}"));
+    let start = html[..at].rfind('<').expect("its tag opens");
+    let end = at + html[at..].find('>').expect("its tag closes");
+    &html[start..=end]
+}
+
+/// Whether the rendered body is the whole page, layout and sidebar included.
+fn is_full_page(html: &str) -> bool {
+    html.contains("<html") && html.contains(r#"id="sidebar""#)
+}
+
+/// #1078 phase 5: the dashboard answers by `HX-Target`. A plain load and a
+/// history restore get the whole page; the live region's request gets just
+/// `#dash-live`; the picker's request gets just the chart card and pushes the
+/// selection's own link, free of every request-only parameter.
+#[tokio::test]
+async fn the_dashboard_answers_each_region_with_its_own_block() {
+    let uri = "/ui?types=Patient&window=30d";
+
+    let plain = body_text(send_with(IMPORT_IDLE_TENANT, uri, &[]).await).await;
+    assert!(is_full_page(&plain), "a plain load is the whole page");
+
+    let restore = send_with(
+        IMPORT_IDLE_TENANT,
+        uri,
+        &[
+            ("HX-Request", "true"),
+            ("HX-Target", "dash-live"),
+            ("HX-History-Restore-Request", "true"),
+        ],
+    )
+    .await;
+    assert!(restore.headers().get("HX-Push-Url").is_none());
+    assert!(
+        is_full_page(&body_text(restore).await),
+        "a history restore rebuilds the whole page"
+    );
+
+    let other = send_with(
+        IMPORT_IDLE_TENANT,
+        uri,
+        &[("HX-Request", "true"), ("HX-Target", "main")],
+    )
+    .await;
+    assert!(is_full_page(&body_text(other).await), "another target");
+
+    let live = send_with(IMPORT_IDLE_TENANT, uri, LIVE).await;
+    assert_eq!(live.status(), 200);
+    assert!(live.headers().get("HX-Push-Url").is_none());
+    let live = body_text(live).await;
+    assert!(
+        live.trim_start().starts_with(r#"<div id="dash-live""#),
+        "{live}"
+    );
+    assert!(!is_full_page(&live) && !live.contains("<html"), "no layout");
+    assert!(live.contains(r#"id="dash-chart""#), "the card is inside it");
+    assert!(live.trim_end().ends_with("</div>"), "the region closes");
+    assert_watches_settled(&live, "30d");
+
+    let chart = send_with(
+        IMPORT_IDLE_TENANT,
+        "/ui?types=Patient&window=30d&ctx=dash-import-idle%7CR4%7Cen&open=pick,table\
+         &state=0123456789abcdef&notices=live&retry=2",
+        CHART,
+    )
+    .await;
+    assert_eq!(chart.status(), 200);
+    let pushed = chart
+        .headers()
+        .get("HX-Push-Url")
+        .and_then(|v| v.to_str().ok())
+        .expect("the picker pushes its selection")
+        .to_string();
+    assert_eq!(pushed, "/ui?types=Patient&window=30d");
+    let chart = body_text(chart).await;
+    let root = chart.trim_start();
+    assert!(root.starts_with("<section "), "{chart}");
+    assert!(
+        root[..root.find('>').unwrap()].contains(r#"id="dash-chart""#),
+        "{chart}"
+    );
+    assert!(root.contains(r#"class="card chart-card""#));
+    assert!(!chart.contains(r#"id="dash-live""#), "only the card");
+    assert!(!chart.contains("<html") && !chart.contains(r#"id="sidebar""#));
+    assert!(chart.trim_end().ends_with("</section>"));
+}
+
+/// The link a picker request pushes keeps the whole chart state — the "View
+/// all resources" toggle and a still-charted focus included.
+#[tokio::test]
+async fn the_pushed_url_is_the_selections_own_link() {
+    let response = send_with(
+        IMPORT_IDLE_TENANT,
+        "/ui?types=Patient&window=24h&all=1&focus=Patient&ctx=dash-import-idle%7CR4%7Cen",
+        CHART,
+    )
+    .await;
+    let pushed = response
+        .headers()
+        .get("HX-Push-Url")
+        .and_then(|v| v.to_str().ok())
+        .unwrap();
+    assert_eq!(pushed, "/ui?types=Patient&window=24h&all=1&focus=Patient");
+    assert!(!pushed.contains("ctx"));
+}
+
+/// Fetches the live region with `state` set to what a fresh render shows,
+/// retrying once so a digest crossing a minute boundary cannot flake.
+async fn live_with_matching_state(tenant: &str, uri: &str) -> axum::response::Response {
+    let mut last = None;
+    for _ in 0..2 {
+        let state = dash_state(&body_text(send_with(tenant, uri, LIVE).await).await);
+        let response = send_with(tenant, &format!("{uri}&state={state}"), LIVE).await;
+        if response.status() == 204 {
+            return response;
+        }
+        last = Some(response);
+    }
+    last.unwrap()
+}
+
+/// #1078 phase 5: a settled tick whose figures are unchanged is answered
+/// `204` with no body, so htmx swaps nothing; a different digest gets the
+/// region.
+#[tokio::test]
+async fn an_unchanged_settled_tick_is_answered_no_content() {
+    let uri = "/ui?types=Patient&window=30d";
+    let same = live_with_matching_state(IMPORT_IDLE_TENANT, uri).await;
+    assert_eq!(same.status(), 204);
+    assert!(body_text(same).await.is_empty());
+
+    let differs = send_with(
+        IMPORT_IDLE_TENANT,
+        &format!("{uri}&state=0000000000000000"),
+        LIVE,
+    )
+    .await;
+    assert_eq!(differs.status(), 200);
+    assert!(
+        body_text(differs)
+            .await
+            .starts_with(r#"<div id="dash-live""#)
+    );
+
+    // Not a digest: ignored, so never a match.
+    let junk = send_with(IMPORT_IDLE_TENANT, &format!("{uri}&state=not-hex"), LIVE).await;
+    assert_eq!(junk.status(), 200);
+
+    // A plain load with a matching digest is still the page.
+    let state = dash_state(&get_as(IMPORT_IDLE_TENANT, uri).await);
+    let plain = send_with(IMPORT_IDLE_TENANT, &format!("{uri}&state={state}"), &[]).await;
+    assert_eq!(plain.status(), 200);
+}
+
+/// Figures that can still move, and a waiting page's slow watch, always get
+/// the region back, even when the digest matches.
+#[tokio::test]
+async fn moving_or_waiting_figures_are_never_answered_no_content() {
+    for (tenant, uri) in [
+        (APPROXIMATE_TENANT, "/ui?window=30d"),
+        (IMPORT_ACTIVE_TENANT, "/ui?window=30d"),
+        (FIGURES_PENDING_TENANT, "/ui?window=30d&retry=3"),
+    ] {
+        let response = live_with_matching_state(tenant, uri).await;
+        assert_eq!(response.status(), 200, "{tenant}");
+        assert!(
+            body_text(response)
+                .await
+                .starts_with(r#"<div id="dash-live""#),
+            "{tenant}"
+        );
+    }
+}
+
+/// #1078 phase 5: what the page has open comes back open from the server —
+/// the picker preserved as-is on a refresh, rendered open (and replaced) on
+/// its own request — and unknown tokens are ignored.
+#[tokio::test]
+async fn open_controls_are_rendered_open() {
+    let uri = "/ui?types=Patient&window=30d";
+
+    let html =
+        body_text(send_with(IMPORT_IDLE_TENANT, &format!("{uri}&open=pick,table"), LIVE).await)
+            .await;
+    assert!(
+        tag_with_id(&html, "chart-pick").contains(r#"id="chart-pick" open hx-preserve"#),
+        "{}",
+        tag_with_id(&html, "chart-pick")
+    );
+    assert!(tag_with_id(&html, "chart-table").contains(r#"id="chart-table" open"#));
+    // Never a preserved element inside a preserved one: the kept picker
+    // carries its filter along.
+    assert!(
+        !tag_with_id(&html, "chart-pick-filter").contains("hx-preserve"),
+        "{}",
+        tag_with_id(&html, "chart-pick-filter")
+    );
+
+    let html =
+        body_text(send_with(IMPORT_IDLE_TENANT, &format!("{uri}&open=table,bogus"), LIVE).await)
+            .await;
+    assert!(!tag_with_id(&html, "chart-pick").contains(" open"));
+    assert!(!tag_with_id(&html, "chart-pick").contains("hx-preserve"));
+    assert!(tag_with_id(&html, "chart-pick-filter").contains(" hx-preserve"));
+    assert!(tag_with_id(&html, "chart-table").contains(" open"));
+
+    let html = body_text(
+        send_with(
+            IMPORT_IDLE_TENANT,
+            &format!("{uri}&open=picker,tables"),
+            LIVE,
+        )
+        .await,
+    )
+    .await;
+    assert!(!tag_with_id(&html, "chart-pick").contains(" open"));
+    assert!(!tag_with_id(&html, "chart-table").contains(" open"));
+
+    let plain = get_as(IMPORT_IDLE_TENANT, uri).await;
+    assert!(!tag_with_id(&plain, "chart-pick").contains(" open"));
+    assert!(!tag_with_id(&plain, "chart-table").contains(" open"));
+
+    let chart = body_text(send_with(IMPORT_IDLE_TENANT, uri, CHART).await).await;
+    let pick = tag_with_id(&chart, "chart-pick");
+    assert!(pick.contains(" open"), "{pick}");
+    assert!(
+        !pick.contains("hx-preserve"),
+        "its checkboxes must update: {pick}"
+    );
+}
+
+/// A picker request from another context reloads the page like a refresh.
+#[tokio::test]
+async fn a_picker_request_from_another_context_reloads_the_page() {
+    let response = send_with(
+        IMPORT_IDLE_TENANT,
+        "/ui?types=Patient&window=30d&ctx=another-tenant%7CR4%7Cen",
+        CHART,
+    )
+    .await;
+    assert_eq!(
+        response
+            .headers()
+            .get("HX-Refresh")
+            .and_then(|v| v.to_str().ok()),
+        Some("true")
+    );
+    assert!(response.headers().get("HX-Push-Url").is_none());
+    assert!(body_text(response).await.is_empty());
+}
+
+/// The htmx wiring the client relies on: each picker option (and "View all
+/// resources") re-requests its own link into `#dash-chart`, the live region's
+/// polls drop while a picker request is in flight, and the filter survives
+/// both swaps.
+#[tokio::test]
+async fn the_picker_and_region_carry_their_htmx_wiring() {
+    for (tenant, uri) in [
+        (IMPORT_IDLE_TENANT, "/ui?types=Patient&window=30d"),
+        ("default", "/ui?window=1h"),
+    ] {
+        let html = get_as(tenant, uri).await;
+        let live = dash_live_tag(&html);
+        assert!(live.contains(r#"hx-sync="this:drop""#), "{uri}: {live}");
+        assert!(live.contains("hx-select=\"#dash-live\""), "{uri}: {live}");
+
+        let mut options = 0;
+        for chunk in html
+            .split(r#"<a class="menu__option chart-pick__option"#)
+            .skip(1)
+        {
+            let tag = &chunk[..chunk.find('>').unwrap()];
+            let href = attr(tag, "href").expect("a no-JS link");
+            assert_eq!(attr(tag, "hx-get"), Some(href), "{tag}");
+            assert_eq!(attr(tag, "hx-target"), Some("#dash-chart"), "{tag}");
+            assert_eq!(attr(tag, "hx-select"), Some("#dash-chart"), "{tag}");
+            assert_eq!(attr(tag, "hx-swap"), Some("outerHTML"), "{tag}");
+            assert_eq!(attr(tag, "hx-sync"), Some("#dash-live:replace"), "{tag}");
+            options += 1;
+        }
+        assert!(options >= 1, "{uri}: at least the view-all link");
+
+        let filter = tag_with_id(&html, "chart-pick-filter");
+        assert!(filter.contains(" hx-preserve"), "{filter}");
+        assert!(filter.contains("data-pick-filter"), "{filter}");
+
+        // Window and legend links stay plain navigations.
+        for chunk in html.split(r#"class="window-picker__option"#).skip(1) {
+            assert!(!chunk[..chunk.find('>').unwrap()].contains("hx-"), "{uri}");
+        }
+    }
+}

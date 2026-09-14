@@ -6,8 +6,8 @@ import { parseFirstRender, type DashboardPage, type FirstRender } from "../pages
 // The landing dashboard (/ui) and its functional chart (#555): the type
 // picker and the window selector are plain links (they work without JS —
 // see the nojs project); the hover tooltip, the picker filter, and the
-// picker's in-place chart-card swap (#599 — every option row, not just
-// "view all") are the layered enhancements. Seeding rides through the
+// picker's in-place htmx swap of the chart card (#599 — every option row, not
+// just "view all") are the layered enhancements. Seeding rides through the
 // ordinary FHIR API. The older tests below outlast the snapshot cache with
 // DashboardPage.waitForSeries; the "first view" tests (#1078) at the bottom
 // deliberately do not — they assert on what the first response rendered.
@@ -153,12 +153,12 @@ test("\"View all resources\" offers empty types, charts a flat line at 0, and ke
   await expect(dashboard.pickerOption("Condition")).toHaveCount(0);
 
   // The toggle is a plain link (works without JS) that flips `?all=1`; with
-  // JS it swaps the chart card in place instead of navigating (#599 follow-
-  // up), so the picker menu it lives in stays open and there is no full
+  // JS htmx swaps the chart card in place instead of navigating (#599 follow-
+  // up), so the picker menu it lives in comes back open and there is no full
   // page load. A marker set on `window` before the click only survives a
   // same-document swap, not a hard reload — a simpler tell than watching
-  // for navigation events, which also fire for the `history.pushState`
-  // call the swap makes.
+  // for navigation events, which also fire for the URL htmx pushes from the
+  // response's HX-Push-Url.
   await page.evaluate(() => {
     (window as unknown as { __e2eNavMarker: boolean }).__e2eNavMarker = true;
   });
@@ -170,7 +170,7 @@ test("\"View all resources\" offers empty types, charts a flat line at 0, and ke
   ).toBe(true);
 
   // The chart's hover tooltip (#555) still works on the freshly swapped-in
-  // nodes — dashboard.js re-binds it via the "hfs:chart-swapped" event.
+  // nodes — dashboard.js re-binds it on htmx:afterSettle.
   const swappedBox = await dashboard.chart.boundingBox();
   if (!swappedBox) throw new Error("chart has no box");
   await page.mouse.move(swappedBox.x + swappedBox.width * 0.6, swappedBox.y + swappedBox.height * 0.5);
@@ -185,7 +185,7 @@ test("\"View all resources\" offers empty types, charts a flat line at 0, and ke
 
   // Picking it charts a flat zero line — a real plotted series, not absent.
   // This click is also swapped in place (#599 follow-up covers every picker
-  // option, not just the toggle), so the menu stays open here too.
+  // option, not just the toggle), so the menu comes back open here too.
   await empty.click();
   await expect(page).toHaveURL(/types=.*Condition/);
   await expect(page).toHaveURL(/all=1/);
@@ -196,6 +196,47 @@ test("\"View all resources\" offers empty types, charts a flat line at 0, and ke
   await dashboard.windowOption(/24h/i).first().click();
   await expect(page).toHaveURL(/window=24h/);
   await expect(page).toHaveURL(/all=1/);
+});
+
+test("Back after two picks restores the previous selection", async ({ page, dashboard }) => {
+  test.skip(noChartData, "no count read path on this backend");
+  // `all=1` offers every type of the FHIR version, so there are always types
+  // that are not charted yet to pick.
+  await dashboard.goto("?all=1");
+  await dashboard.waitForSeries();
+  await dashboard.openPicker();
+
+  const onNames = () =>
+    page
+      .locator(".chart-pick__option--on[data-pick-name]")
+      .evaluateAll((els) => els.map((el) => el.getAttribute("data-pick-name") ?? "").sort());
+  const offNames = await page
+    .locator(".chart-pick__option:not(.chart-pick__option--on)[data-pick-name]")
+    .evaluateAll((els) => els.map((el) => el.getAttribute("data-pick-name") ?? ""));
+  test.skip(offNames.length < 2, "two uncharted types to pick");
+  const [first, second] = offNames;
+
+  // Each pick is an htmx swap of the chart card whose response pushes the
+  // selection's own URL (HX-Push-Url).
+  const pick = async (type: string, url: string) => {
+    await dashboard.pickerOption(type).click();
+    await expect(page).toHaveURL(new RegExp(`[?&]types=[^&]*${type}`));
+    await expect.poll(() => page.url()).not.toBe(url);
+    await expect(dashboard.pickerOption(type)).toHaveClass(/chart-pick__option--on/);
+    await expect(dashboard.picker).toHaveAttribute("open", "");
+  };
+
+  await pick(first, page.url());
+  const firstUrl = page.url();
+  const firstOn = await onNames();
+  await pick(second, firstUrl);
+
+  // Back is the previous selection: its URL, and its picker's checkmarks.
+  await page.goBack();
+  await expect(page).toHaveURL(firstUrl);
+  await expect(dashboard.pickerOption(first)).toHaveClass(/chart-pick__option--on/);
+  await expect(dashboard.pickerOption(second)).not.toHaveClass(/chart-pick__option--on/);
+  await expect.poll(onNames).toEqual(firstOn);
 });
 
 test("the picker filter narrows the offered types", async ({ dashboard }) => {
@@ -343,21 +384,22 @@ test.describe("first view of a window (#1078)", () => {
       await expect(dashboard.chart).toBeVisible();
     }
 
-    // A picker toggle swaps only the chart card (#599). A waiting page's
-    // still-scheduled bounded auto-retry of the whole #dash-live region would
-    // overwrite that swap with the previous selection (a known race, out of
-    // scope here), so let that retry settle first — it is not a reload loop,
-    // and a ready render has none to settle. A ready page's periodic refresh
+    // A picker toggle swaps only the chart card (#599): an htmx GET with
+    // `HX-Target: dash-chart`. A waiting page's still-scheduled bounded
+    // auto-retry of the whole #dash-live region would overwrite that swap
+    // with the previous selection (a known race, out of scope here), so let
+    // that retry settle first — it is not a reload loop, and a ready render
+    // has none to settle. A ready page's periodic refresh
     // (`data-dash-refresh`) is deliberately not waited on: every ready page
-    // polls for as long as it is open, it follows the picker's URL, it stands
-    // down while a picker fetch is in flight, and it keeps the open picker's
-    // own node (covered below).
+    // polls for as long as it is open, it follows the picker's URL, a picker
+    // request aborts a tick in flight (`hx-sync`), and it keeps the open
+    // picker's own node (covered below).
     await expect(dashboard.pendingAutoRetry).toHaveCount(0, { timeout: 15_000 });
     await dashboard.openPicker();
     const option = dashboard.pickerOption("Encounter");
     await expect(option).not.toHaveClass(/chart-pick__option--on/);
     const swapped = page.waitForResponse(
-      (r) => r.request().resourceType() === "fetch" && /[?&]types=[^&]*Encounter/.test(r.url()),
+      (r) => r.request().headers()["hx-target"] === "dash-chart" && /[?&]types=[^&]*Encounter/.test(r.url()),
     );
     await option.click();
     const toggled = parseFirstRender(await (await swapped).text());
@@ -411,16 +453,19 @@ test.describe("first view of a window (#1078)", () => {
 // writes, not yet reconciled with storage; or an import running), marked
 // `data-dash-moving`, and every 10s once they settle — so an operator watching
 // an import sees the figures rise without reloading, and a tab opened before
-// the import started notices it too. While both the region on screen and the
-// response are settled with the same `data-dash-state`, the response is
-// dropped: an idle page is not re-rendered under the user. The poll follows
-// the URL the picker pushed and drops a response whose URL went stale. It
-// stands down only while the tab is hidden, a picker fetch is in flight, or
-// keyboard focus sits inside the region outside the type picker: an open type
-// picker (kept as the very same node across the swap), an open data table
-// (reopened), a visible tooltip (re-shown for the pointer) and focus left by a
-// mouse click all let the refresh through, since figures that froze until the
-// user moved or closed something were the bug.
+// the import started notices it too. Each tick is an htmx GET with
+// `HX-Target: dash-live`. A settled region sends its `data-dash-state` as
+// `?state=`, and while the figures are unchanged and still settled the server
+// answers `204` and htmx swaps nothing: an idle page is not re-rendered under
+// the user. The poll follows the URL the picker pushed and drops a response
+// whose URL went stale. It stands down only while the tab is hidden or
+// keyboard focus sits inside the region outside the type picker (a picker
+// request aborts a tick in flight through `hx-sync`): an open type picker
+// (`?open=pick`, rendered `hx-preserve`, so the very same node is kept), an
+// open data table (`?open=table`, rendered open), a visible tooltip (re-shown
+// for the pointer) and focus left by a mouse click all let the refresh
+// through, since figures that froze until the user moved or closed something
+// were the bug.
 //
 // Timing: a seeded tenant's snapshot is cached for at most 2s and a refresh
 // waits up to 500ms for the fresh value, so a write reaches an open page on the
@@ -453,16 +498,21 @@ test.describe("live refresh (#1078)", () => {
     await createResource(request, "Medication", { code: { text: "live refresh (#1078)" } });
   });
 
-  /** Every periodic-refresh request the page sends from now on: htmx's own
-   * `HX-Request` GETs of `/ui` (the picker's swap is a plain fetch, and a
+  /** Whether `r` is a periodic-refresh request: htmx's own GET of `/ui` aimed
+   * at `#dash-live` (a picker option's GET targets `dash-chart`, and a
    * navigation is not an htmx request). */
+  function isRefreshRequest(r: { url(): string; headers(): Record<string, string> }): boolean {
+    const headers = r.headers();
+    return (
+      new URL(r.url()).pathname === "/ui" && headers["hx-request"] === "true" && headers["hx-target"] === "dash-live"
+    );
+  }
+
+  /** Every periodic-refresh request the page sends from now on. */
   function recordRefreshes(page: Page): URL[] {
     const seen: URL[] = [];
     page.on("request", (r) => {
-      const url = new URL(r.url());
-      if (url.pathname === "/ui" && r.headers()["hx-request"] === "true" && !r.isNavigationRequest()) {
-        seen.push(url);
-      }
+      if (isRefreshRequest(r) && !r.isNavigationRequest()) seen.push(new URL(r.url()));
     });
     return seen;
   }
@@ -510,19 +560,27 @@ test.describe("live refresh (#1078)", () => {
       .toBe(true);
   }
 
-  /** Every refresh request (`/ui?…&notices=…`, htmx's own GET) the page sends
-   * from now on, with the response's own `data-dash-state` and whether it was
-   * moving once it arrives. */
-  function recordRefreshResponses(page: Page): { url: URL; response: Promise<FirstRender | null> }[] {
-    const seen: { url: URL; response: Promise<FirstRender | null> }[] = [];
+  /** How the server answered one refresh: `204` (figures unchanged, nothing
+   * to swap, no body) or a `200` region read into a {@link FirstRender}. */
+  type RefreshAnswer = { status: number; render: FirstRender | null };
+
+  /** Every refresh request (`/ui?…&notices=…`, `HX-Target: dash-live`) the
+   * page sends from now on, with how it was answered once it arrives. */
+  function recordRefreshResponses(page: Page): { url: URL; response: Promise<RefreshAnswer | null> }[] {
+    const seen: { url: URL; response: Promise<RefreshAnswer | null> }[] = [];
     page.on("request", (r) => {
       const url = new URL(r.url());
-      if (url.pathname !== "/ui" || !url.searchParams.has("notices") || r.headers()["hx-request"] !== "true") return;
+      if (!isRefreshRequest(r) || !url.searchParams.has("notices")) return;
       seen.push({
         url,
         response: r
           .response()
-          .then(async (res) => (res ? parseFirstRender(await res.text()) : null))
+          .then(async (res) => {
+            if (!res) return null;
+            const status = res.status();
+            // A 204 has no body to parse.
+            return { status, render: status === 200 ? parseFirstRender(await res.text()) : null };
+          })
           .catch(() => null),
       });
     });
@@ -677,6 +735,11 @@ test.describe("live refresh (#1078)", () => {
     await expect(dashboard.pickerFilter).toBeFocused();
     await expect(dashboard.pickerOption("Medication")).toBeVisible();
     await expect(dashboard.pickerOption("Location")).toBeHidden();
+    // Kept because the refresh said so: the server renders it hx-preserve.
+    expect(
+      refreshes.some((sent) => (sent.searchParams.get("open") ?? "").split(",").includes("pick")),
+      "the refresh names the open picker (?open=pick)",
+    ).toBe(true);
   });
 
   test("a refresh lands while the mouse rests on the chart", async ({ page, request, dashboard }) => {
@@ -720,6 +783,11 @@ test.describe("live refresh (#1078)", () => {
 
     await expect(dashboard.dataTable).toHaveAttribute("open", "");
     await expect(dashboard.dataTable.locator("table.data-table")).toBeVisible();
+    // Reopened because the refresh said so: the server renders it open.
+    expect(
+      refreshes.some((sent) => (sent.searchParams.get("open") ?? "").split(",").includes("table")),
+      "the refresh names the open data table (?open=table)",
+    ).toBe(true);
   });
 
   test("a mouse click inside the chart does not stop the refresh", async ({ page, request, dashboard }) => {
@@ -758,13 +826,14 @@ test.describe("live refresh (#1078)", () => {
     await expect(dashboard.liveRefresh).toHaveCount(1);
     const refreshes = recordRefreshes(page);
 
-    // Toggle Location on: the chart card is swapped in place and the URL
-    // pushed; #dash-live itself (and its hx-get) is not replaced.
+    // Toggle Location on: htmx swaps the chart card in place and pushes the
+    // URL the response names; #dash-live itself (and its hx-get) is not
+    // replaced.
     await dashboard.openPicker();
     const option = dashboard.pickerOption("Location");
     await expect(option).not.toHaveClass(/chart-pick__option--on/);
     const swapped = page.waitForResponse(
-      (r) => r.request().resourceType() === "fetch" && /[?&]types=[^&]*Location/.test(r.url()),
+      (r) => r.request().headers()["hx-target"] === "dash-chart" && /[?&]types=[^&]*Location/.test(r.url()),
     );
     await option.click();
     await swapped;
@@ -781,8 +850,8 @@ test.describe("live refresh (#1078)", () => {
     // Mark the region on screen; the refresh's outerHTML swap replaces it
     // with a node that has no such mark. A write right after the mark makes
     // sure the next refresh brings different figures: a region that settled
-    // in the meantime would otherwise drop an unchanged settled response and
-    // keep the mark.
+    // in the meantime would otherwise be answered 204 (unchanged) and keep
+    // the mark.
     await dashboard.markLive();
     await createResource(request, "Medication", { code: { text: "live refresh (#1078)" } });
     await expect(dashboard.unrefreshedLive, "the next refresh swaps the region").toHaveCount(0, {
@@ -906,10 +975,8 @@ test.describe("live refresh (#1078)", () => {
     await waitSettled(dashboard, query);
 
     const OBSERVE_MS = 2 * SETTLED_SECS * 1000 + 2_000;
-    const isRefresh = (r: { url(): string; headers(): Record<string, string> }) => {
-      const url = new URL(r.url());
-      return url.pathname === "/ui" && url.searchParams.has("notices") && r.headers()["hx-request"] === "true";
-    };
+    const isRefresh = (r: { url(): string; headers(): Record<string, string> }) =>
+      isRefreshRequest(r) && new URL(r.url()).searchParams.has("notices");
     // Start early enough in a UTC minute that one tick lands, and the whole
     // observation ends, before the minute rolls over.
     let aligned = false;
@@ -938,13 +1005,21 @@ test.describe("live refresh (#1078)", () => {
     // legitimately moves the figures; the no-re-render contract only holds
     // for a quiet page, so stand down rather than assert on moving figures.
     test.skip(
-      movingOnScreen || responses.some((r) => r?.moving),
+      movingOnScreen || responses.some((r) => r?.render?.moving),
       "the default tenant's figures moved during the observation window",
     );
-    for (const render of responses) {
-      expect(render, "each refresh was answered with a ready region").not.toBeNull();
-      expect(render?.state, "a quiet page answers with the same digest").toBe(stateOnScreen);
+    for (const refresh of responses) {
+      expect(refresh, "each refresh was answered").not.toBeNull();
+      // The settled region sent its digest (?state=), so an unchanged page is
+      // answered 204; a 200 must at least carry the digest on screen.
+      if (refresh?.status === 204) continue;
+      expect(refresh?.status, "a quiet page is answered 204, or 200 with a ready region").toBe(200);
+      expect(refresh?.render?.state, "a quiet page answers with the same digest").toBe(stateOnScreen);
     }
+    expect(
+      refreshes.every((r) => r.url.searchParams.get("state") === stateOnScreen),
+      "each settled tick sends the digest on screen (?state=)",
+    ).toBe(true);
     await expect(dashboard.unrefreshedLive, "no response was swapped in").toHaveCount(1);
     await expect(dashboard.settledRefresh).toHaveCount(1);
     expect(navigations, "no navigation, reload included").toEqual([]);
