@@ -141,11 +141,20 @@ pub(crate) fn collect_supporting_refs(
         let mut raw = Vec::new();
         walk_references(res.content(), &mut raw);
         for r in raw {
-            // Relative literal references only: "Type/id".
-            let Some((rt, id)) = r.split_once('/') else {
+            // Relative literal references: "Type/id" or "Type/id/_history/vid".
+            // Anything else with a further '/' (absolute URLs, other nested
+            // paths) is rejected.
+            let Some((rt, rest)) = r.split_once('/') else {
                 continue;
             };
-            if id.is_empty() || id.contains('/') || !known.contains(&rt) {
+            let id = match rest.split_once('/') {
+                None => rest,
+                Some((bare_id, tail)) => match tail.strip_prefix("_history/") {
+                    Some(version) if !version.is_empty() => bare_id,
+                    _ => continue,
+                },
+            };
+            if id.is_empty() || !known.contains(&rt) {
                 continue;
             }
             if !helios_fhir::get_compartment_params(version, "Patient", rt).is_empty() {
@@ -289,7 +298,9 @@ mod tests {
                 "subject": { "reference": "Patient/p1" },
                 "performer": [{ "reference": "Practitioner/dr1" }, { "reference": "Organization/org1" }],
                 "encounter": { "reference": "Encounter/e1" },
-                "note": [{ "authorReference": { "reference": "Practitioner/dr1" } }]
+                "note": [{ "authorReference": { "reference": "Practitioner/dr1" } }],
+                "device": { "reference": "Device/dev1/_history/1" },
+                "reasonReference": [{ "reference": "Organization/org2/extra" }]
             }),
         );
         let enc = stored(
@@ -298,6 +309,7 @@ mod tests {
             json!({
                 "resourceType": "Encounter", "id": "e1",
                 "serviceProvider": { "reference": "Organization/org1" },
+                "participant": [{ "individual": { "reference": "Practitioner/dr1/_history/2" } }],
                 "location": [{ "location": { "reference": "Location/l1" } }],
                 "partOf": { "reference": "http://other.example/fhir/Encounter/abs" }
             }),
@@ -308,6 +320,7 @@ mod tests {
             vec![
                 ("Practitioner".to_string(), "dr1".to_string()),
                 ("Organization".to_string(), "org1".to_string()),
+                ("Device".to_string(), "dev1".to_string()),
                 ("Location".to_string(), "l1".to_string()),
             ]
         );
