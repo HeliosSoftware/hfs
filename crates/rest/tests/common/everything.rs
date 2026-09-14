@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use axum::http::StatusCode;
 use axum_test::TestServer;
+#[cfg(feature = "sqlite")]
 use helios_persistence::backends::sqlite::{SqliteBackend, SqliteBackendConfig};
 use helios_rest::ServerConfig;
 use serde_json::{Value, json};
@@ -14,6 +15,7 @@ fn data_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data")
 }
 
+#[cfg(feature = "sqlite")]
 pub async fn server_with(max_unpaged: usize) -> TestServer {
     let backend = SqliteBackend::with_config(
         ":memory:",
