@@ -1003,6 +1003,44 @@ test("an abbreviated id shows the full id on hover and on keyboard focus", async
   await expect(link).toHaveAttribute("aria-describedby", "filter-rail-tooltip");
 });
 
+// #1106: the pointer resting on a cell with nothing to show must not hide the
+// keyboard tooltip of a still-focused, abbreviated id (refresh() must fall
+// back to the focused item when the hovered one has no tooltip to show).
+test("an abbreviated id keeps its focus tooltip while the pointer rests on a short cell", async ({
+  resources,
+  page,
+  request,
+}) => {
+  const id = crypto.randomUUID();
+  await updateResource(request, "Patient", id, {
+    name: [{ family: "IdlePointer" }],
+    gender: "male",
+  });
+  await waitSearchable(request, "Patient", id);
+
+  await resources.goto("Patient");
+  await page.locator("input.query-builder__url[name=url]").fill(`Patient?_id=${id}`);
+  await page.locator("[data-intent='run']").click();
+  await resources.results.waitShown();
+
+  const genderCell = resources.results.rows.first().locator(".result-cell").nth(1);
+  await expect(genderCell).toHaveText("male");
+  const genderBox = await genderCell.boundingBox();
+  if (!genderBox) throw new Error("gender cell has no layout box");
+  await page.mouse.move(
+    genderBox.x + genderBox.width / 2,
+    genderBox.y + genderBox.height / 2,
+  );
+
+  const link = page.locator(`#query-results-body a.result-id[data-resource-id='${id}']`);
+  const tooltip = page.locator("#filter-rail-tooltip");
+  await link.focus();
+
+  await expect(tooltip).toBeVisible();
+  await expect(tooltip).toHaveText(id);
+  await expect(link).toHaveAttribute("aria-describedby", "filter-rail-tooltip");
+});
+
 test("rows with short and long values have the same height", async ({
   resources,
   page,

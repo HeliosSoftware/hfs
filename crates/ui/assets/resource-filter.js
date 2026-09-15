@@ -94,7 +94,7 @@
       || !(item.hasAttribute("data-tooltip-abbreviated") || isClipped(label))
     ) {
       hide();
-      return;
+      return false;
     }
 
     var itemRect = item.getBoundingClientRect();
@@ -105,7 +105,7 @@
       || itemRect.left >= window.innerWidth
     ) {
       hide();
-      return;
+      return false;
     }
 
     if (activeTrigger && activeTrigger !== trigger) {
@@ -148,6 +148,7 @@
 
     tooltip.style.left = left + "px";
     tooltip.style.top = top + "px";
+    return true;
   }
 
   function closestItem(target) {
@@ -173,11 +174,12 @@
     ) {
       hoveredItem = null;
     }
-    /* Pointer intent wins while it is over an item; when it leaves, the
-       still-focused control resumes its keyboard tooltip. */
-    var item = hoveredItem || focusedItem;
-    if (item) show(item);
-    else hide();
+    /* Pointer intent wins while it is over an item that has a tooltip to
+       show; otherwise the still-focused control keeps its keyboard
+       tooltip. */
+    if (hoveredItem && show(hoveredItem)) return;
+    if (focusedItem && show(focusedItem)) return;
+    hide();
   }
 
   document.addEventListener("mouseover", function (event) {
