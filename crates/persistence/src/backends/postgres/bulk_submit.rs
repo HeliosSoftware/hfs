@@ -31,6 +31,8 @@ use crate::tenant::{TenantContext, TenantId, TenantPermissions};
 
 use super::PostgresBackend;
 
+const BOOKKEEPING_FLUSH_SIZE: usize = 1000;
+
 fn internal_error(message: String) -> StorageError {
     StorageError::Backend(BackendError::Internal {
         backend_name: "postgres".to_string(),
@@ -685,6 +687,8 @@ impl BulkSubmitProvider for PostgresBackend {
         }
 
         let mut results = Vec::new();
+        let mut unflushed_result_start = 0;
+        let mut pending_changes = Vec::with_capacity(BOOKKEEPING_FLUSH_SIZE);
         let mut error_count = 0u32;
         let mut aborted_on_max_errors = false;
         let file_url = options.file_url.as_deref().unwrap_or("");
@@ -719,16 +723,20 @@ impl BulkSubmitProvider for PostgresBackend {
                     &entry.resource_type,
                     "max errors exceeded",
                 );
-                Self::write_entry_rows_tx(
-                    &txn,
-                    submission_id,
-                    manifest_id,
-                    file_url,
-                    &skip_result,
-                    None,
-                )
-                .await?;
                 results.push(skip_result);
+                if results.len() - unflushed_result_start == BOOKKEEPING_FLUSH_SIZE {
+                    Self::flush_entry_rows_tx(
+                        &txn,
+                        submission_id,
+                        manifest_id,
+                        file_url,
+                        &results[unflushed_result_start..],
+                        &pending_changes,
+                    )
+                    .await?;
+                    unflushed_result_start = results.len();
+                    pending_changes.clear();
+                }
                 continue;
             }
 
@@ -771,18 +779,34 @@ impl BulkSubmitProvider for PostgresBackend {
                 error_count += 1;
             }
 
-            Self::write_entry_rows_tx(
-                &txn,
-                submission_id,
-                manifest_id,
-                file_url,
-                &entry_result,
-                change.as_ref(),
-            )
-            .await?;
+            if let Some(change) = change {
+                pending_changes.push(change);
+            }
             results.push(entry_result);
+            if results.len() - unflushed_result_start == BOOKKEEPING_FLUSH_SIZE {
+                Self::flush_entry_rows_tx(
+                    &txn,
+                    submission_id,
+                    manifest_id,
+                    file_url,
+                    &results[unflushed_result_start..],
+                    &pending_changes,
+                )
+                .await?;
+                unflushed_result_start = results.len();
+                pending_changes.clear();
+            }
         }
 
+        Self::flush_entry_rows_tx(
+            &txn,
+            submission_id,
+            manifest_id,
+            file_url,
+            &results[unflushed_result_start..],
+            &pending_changes,
+        )
+        .await?;
         crate::core::Transaction::commit(Box::new(txn)).await?;
         // Durable now: report it before the max-errors return and the separate
         // counter statement below, so neither can lose committed work (#1078).
@@ -802,9 +826,9 @@ impl BulkSubmitProvider for PostgresBackend {
         // Every column here accumulates: these counters are cumulative across
         // all runs of the manifest (including resumes) and are the ones the
         // submit status endpoint reports (#969). `processed_entries` counts the
-        // entries that did not fail — successes plus deliberate skips — so that
-        // `processed_entries + failed_entries` equals the entries walked, and
-        // `last_processed_line` advances by the entries this batch consumed.
+        // entries that succeeded. `total_entries` and `last_processed_line`
+        // advance by every entry this batch consumed, including errors and
+        // deliberate skips.
         let now = Utc::now();
         let client = self.get_client().await?;
         client
@@ -1149,79 +1173,121 @@ impl PostgresBackend {
         }
     }
 
-    /// Writes an entry's rollback record and per-line receipt on the batch
-    /// transaction's client, so both commit (or vanish) with the entry writes.
-    async fn write_entry_rows_tx(
+    /// Flushes rollback records and per-line receipts on the batch transaction's
+    /// client, so they commit (or vanish) with the entry writes.
+    async fn flush_entry_rows_tx(
         txn: &super::transaction::PostgresTransaction,
         submission_id: &SubmissionId,
         manifest_id: &str,
         file_url: &str,
-        result: &BulkEntryResult,
-        change: Option<&SubmissionChange>,
+        results: &[BulkEntryResult],
+        changes: &[SubmissionChange],
     ) -> StorageResult<()> {
         use crate::core::Transaction;
+
+        if results.is_empty() && changes.is_empty() {
+            return Ok(());
+        }
 
         let client = txn.raw_client()?;
         let tenant_id = txn.tenant().tenant_id().as_str().to_string();
 
-        let previous_content_json: Option<Value> = change
-            .map(|c| c.previous_content.clone())
-            .unwrap_or_default();
-        let outcome_json: Option<Value> = result.operation_outcome.clone();
-
         // The two bookkeeping inserts are independent: pipelined on the
         // transaction's connection they cost one round trip, not two.
         let record_change = async {
-            let Some(change) = change else {
+            if changes.is_empty() {
                 return Ok(0);
-            };
+            }
+            let change_ids: Vec<String> = changes.iter().map(|c| c.change_id.clone()).collect();
+            let change_manifest_ids: Vec<String> =
+                changes.iter().map(|c| c.manifest_id.clone()).collect();
+            let change_types: Vec<String> =
+                changes.iter().map(|c| c.change_type.to_string()).collect();
+            let change_resource_types: Vec<String> =
+                changes.iter().map(|c| c.resource_type.clone()).collect();
+            let change_resource_ids: Vec<String> =
+                changes.iter().map(|c| c.resource_id.clone()).collect();
+            let previous_versions: Vec<Option<String>> =
+                changes.iter().map(|c| c.previous_version.clone()).collect();
+            let new_versions: Vec<String> = changes.iter().map(|c| c.new_version.clone()).collect();
+            let previous_contents: Vec<Option<Value>> =
+                changes.iter().map(|c| c.previous_content.clone()).collect();
+            let changed_at: Vec<DateTime<Utc>> = changes.iter().map(|c| c.changed_at).collect();
             client
                 .execute(
                     "INSERT INTO bulk_submission_changes
                      (tenant_id, submitter, submission_id, change_id, manifest_id, change_type, resource_type, resource_id, previous_version, new_version, previous_content, changed_at)
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
+                     SELECT $1, $2, $3, *
+                     FROM UNNEST(
+                         $4::text[], $5::text[], $6::text[], $7::text[],
+                         $8::text[], $9::text[], $10::text[], $11::jsonb[],
+                         $12::timestamptz[]
+                     )",
                     &[
                         &tenant_id,
                         &submission_id.submitter.as_str(),
                         &submission_id.submission_id.as_str(),
-                        &change.change_id.as_str(),
-                        &change.manifest_id.as_str(),
-                        &change.change_type.to_string().as_str(),
-                        &change.resource_type.as_str(),
-                        &change.resource_id.as_str(),
-                        &change.previous_version,
-                        &change.new_version.as_str(),
-                        &previous_content_json,
-                        &change.changed_at,
+                        &change_ids,
+                        &change_manifest_ids,
+                        &change_types,
+                        &change_resource_types,
+                        &change_resource_ids,
+                        &previous_versions,
+                        &new_versions,
+                        &previous_contents,
+                        &changed_at,
                     ],
                 )
                 .await
         };
-        let submitter = submission_id.submitter.as_str();
-        let sub_id_str = submission_id.submission_id.as_str();
-        let line_number = result.line_number as i32;
-        let result_type = result.resource_type.as_str();
-        let outcome_code = result.outcome.to_string();
+        let line_numbers: Vec<i32> = results.iter().map(|r| r.line_number as i32).collect();
+        let result_types: Vec<String> = results.iter().map(|r| r.resource_type.clone()).collect();
+        let resource_ids: Vec<Option<String>> =
+            results.iter().map(|r| r.resource_id.clone()).collect();
+        let created: Vec<bool> = results.iter().map(|r| r.created).collect();
+        let outcome_codes: Vec<String> = results.iter().map(|r| r.outcome.to_string()).collect();
+        let outcome_json: Vec<Option<Value>> = results
+            .iter()
+            .map(|r| r.operation_outcome.clone())
+            .collect();
         let receipt_params: [&(dyn tokio_postgres::types::ToSql + Sync); 11] = [
             &tenant_id,
-            &submitter,
-            &sub_id_str,
+            &submission_id.submitter.as_str(),
+            &submission_id.submission_id.as_str(),
             &manifest_id,
             &file_url,
-            &line_number,
-            &result_type,
-            &result.resource_id,
-            &result.created,
-            &outcome_code,
+            &line_numbers,
+            &result_types,
+            &resource_ids,
+            &created,
+            &outcome_codes,
             &outcome_json,
         ];
         let store_receipt = client.execute(
             // Upsert: the worker re-fetches a whole file after a transient
             // failure, and the retry must overwrite its own earlier rows
             // instead of colliding with them (#457).
-            "INSERT INTO bulk_entry_results
+            "WITH receipt_rows AS (
+                 SELECT $5::text AS file_url, rows.*
+                 FROM UNNEST(
+                     $6::integer[], $7::text[], $8::text[], $9::boolean[],
+                     $10::text[], $11::jsonb[]
+                 ) WITH ORDINALITY AS rows(
+                     line_number, resource_type, resource_id, created,
+                     outcome, operation_outcome, ordinal
+                 )
+             ), latest_receipts AS (
+                 SELECT DISTINCT ON (file_url, line_number)
+                     file_url, line_number, resource_type, resource_id,
+                     created, outcome, operation_outcome
+                 FROM receipt_rows
+                 ORDER BY file_url, line_number, ordinal DESC
+             )
+             INSERT INTO bulk_entry_results
              (tenant_id, submitter, submission_id, manifest_id, file_url, line_number, resource_type, resource_id, created, outcome, operation_outcome)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+             SELECT $1, $2, $3, $4, file_url, line_number, resource_type,
+                    resource_id, created, outcome, operation_outcome
+             FROM latest_receipts
              ON CONFLICT (tenant_id, submitter, submission_id, manifest_id, file_url, line_number)
              DO UPDATE SET resource_type = EXCLUDED.resource_type,
                            resource_id = EXCLUDED.resource_id,
