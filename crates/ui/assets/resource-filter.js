@@ -21,13 +21,16 @@
    keyboard user. Replace that fallback with one body-level tooltip whenever
    a rail or resource-grid label is genuinely clipped (#634, #793). Keeping
    the tooltip outside scrolling and grid containers avoids overflow clipping,
-   and delegation means dynamically added items follow the same path. */
+   and delegation means dynamically added items follow the same path. The
+   same tooltip also covers the search-results table's clipped cells and
+   abbreviated ids (#1106). */
 (function () {
   "use strict";
 
   var ITEM_SELECTOR = [
     "a.filter-rail__item[data-full-name]",
     "label.typegrid__item[data-full-name]",
+    "#query-results-body td[data-full-name]",
   ].join(", ");
   var tooltip = document.createElement("div");
   var activeItem = null;
@@ -67,17 +70,29 @@
   }
 
   function show(item) {
-    var label = item && item.querySelector(".filter-rail__label, .typegrid__label");
+    var label = item && item.querySelector(
+      ".filter-rail__label, .typegrid__label, .result-cell, .result-id"
+    );
     var fullName = item && item.getAttribute("data-full-name");
     var trigger = focusedItem === item && focusedTrigger
       ? focusedTrigger
       : item && item.matches("a.filter-rail__item")
         ? item
-        : item && item.querySelector('input[type="checkbox"]');
+        : item && item.matches("td")
+          ? item.querySelector("a.result-id") || item
+          : item && item.querySelector('input[type="checkbox"]');
     /* HTMX can replace Search Parameters rail items after the initial sweep;
        remove their fallback lazily as well. */
     if (item) item.removeAttribute("title");
-    if (!label || !fullName || !trigger || !isClipped(label)) {
+    /* Result-table ids can be clipped both by the shared ellipsis check and
+       by the deliberate 8-character abbreviation, which the label's own
+       geometry never reveals (#1106). */
+    if (
+      !label
+      || !fullName
+      || !trigger
+      || !(item.hasAttribute("data-tooltip-abbreviated") || isClipped(label))
+    ) {
       hide();
       return;
     }

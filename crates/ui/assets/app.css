@@ -3271,6 +3271,26 @@ tr:hover .result-id__copy,
   font-weight: 600;
 }
 
+/* Single-line result cells (#1106): every data cell clips at the same width
+   as `.data-table .col-name` so rows stay a uniform height regardless of
+   content length; the full value surfaces in the shared tooltip
+   (resource-filter.js) on hover and, for the id, on keyboard focus. */
+.query-results__table td {
+  vertical-align: middle;
+}
+
+.query-results__table .result-cell {
+  display: block;
+  max-width: 240px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.query-results__table .result-cell.url {
+  overflow-wrap: normal;
+}
+
 .table-foot {
   display: flex;
   flex-wrap: wrap;

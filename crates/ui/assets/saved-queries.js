@@ -2497,17 +2497,17 @@
     return columns;
   }
 
+  /* Every result cell stays on one line, clipped with an ellipsis, and the
+   * clipped-or-not full value lives on the `td` for the shared tooltip
+   * (resource-filter.js) to read (#1106). */
   function cell(row, text, mono) {
     var td = document.createElement("td");
-    if (mono) {
-      var span = document.createElement("span");
-      span.className = "url";
-      span.textContent = text;
-      td.appendChild(span);
-    } else {
-      td.textContent = text;
-    }
+    var span = document.createElement("span");
+    span.className = mono ? "result-cell url" : "result-cell";
+    span.textContent = text;
+    td.appendChild(span);
     row.appendChild(td);
+    if (text) td.dataset.fullName = text;
     return td;
   }
 
@@ -2601,7 +2601,6 @@
       link.target = "_blank";
       link.rel = "noopener";
       var id = resource.id || "";
-      link.title = id;
       /* `.result-id` is `display: inline-flex` (#1106): Chromium's accessible
        * name computation inserts a space between the text of two flex-item
        * children, splitting "98f3fa36" and "-95ec-…" apart even though they
@@ -2624,6 +2623,10 @@
       idGroup.appendChild(link);
       if (id && supportsClipboard()) idGroup.appendChild(copyIdButton(id));
       idCell.appendChild(idGroup);
+      /* The shared tooltip (resource-filter.js) reads these from the `td`,
+       * not the link, so the copy button never interferes with it (#1106). */
+      idCell.dataset.fullName = id;
+      if (abbreviateId(id) !== id) idCell.dataset.tooltipAbbreviated = "";
       row.appendChild(idCell);
       columns.forEach(function (col) {
         cell(row, fmt(resource[col]));

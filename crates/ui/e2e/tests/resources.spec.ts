@@ -923,3 +923,106 @@ test("the copy label is translated", async ({ page, request }) => {
   );
   await expect(copyButton).toHaveAttribute("aria-label", "Copiar id");
 });
+
+// #1106: every result cell stays on one line, clipped with an ellipsis at
+// the same 240px width as the rail label, and the clipped value reveals
+// itself in the shared tooltip on hover.
+test("a long result value stays on one line and reveals itself in the shared tooltip", async ({
+  resources,
+  page,
+  request,
+}) => {
+  const longFamily = "A".repeat(90);
+  const id = await createResource(request, "Patient", { name: [{ family: longFamily }] });
+  await waitSearchable(request, "Patient", id);
+
+  await resources.goto("Patient");
+  await page.locator("input.query-builder__url[name=url]").fill(`Patient?_id=${id}`);
+  await page.locator("[data-intent='run']").click();
+  await resources.results.waitShown();
+
+  const nameCell = resources.results.rows.first().locator(".result-cell").nth(0);
+  expect(await nameCell.evaluate((el) => el.scrollWidth > el.clientWidth)).toBe(true);
+  expect(await nameCell.evaluate((el) => el.getClientRects().length)).toBe(1);
+
+  const tooltip = page.locator("#filter-rail-tooltip");
+  await nameCell.hover();
+  await expect(tooltip).toBeVisible();
+  await expect(tooltip).toHaveText(longFamily);
+
+  await page.mouse.move(0, 0);
+  await expect(tooltip).toBeHidden();
+});
+
+test("a short result value shows no tooltip", async ({ resources, page, request }) => {
+  const id = await createResource(request, "Patient", {
+    name: [{ family: "Short" }],
+    gender: "male",
+  });
+  await waitSearchable(request, "Patient", id);
+
+  await resources.goto("Patient");
+  await page.locator("input.query-builder__url[name=url]").fill(`Patient?_id=${id}`);
+  await page.locator("[data-intent='run']").click();
+  await resources.results.waitShown();
+
+  const genderCell = resources.results.rows.first().locator(".result-cell").nth(1);
+  await expect(genderCell).toHaveText("male");
+  await genderCell.hover();
+  await page.waitForTimeout(200);
+  await expect(page.locator("#filter-rail-tooltip")).toBeHidden();
+});
+
+test("an abbreviated id shows the full id on hover and on keyboard focus", async ({
+  resources,
+  page,
+  request,
+}) => {
+  const id = crypto.randomUUID();
+  await updateResource(request, "Patient", id, { name: [{ family: "AbbrevTooltip" }] });
+  await waitSearchable(request, "Patient", id);
+
+  await resources.goto("Patient");
+  await page.locator("input.query-builder__url[name=url]").fill(`Patient?_id=${id}`);
+  await page.locator("[data-intent='run']").click();
+  await resources.results.waitShown();
+
+  const link = page.locator(`#query-results-body a.result-id[data-resource-id='${id}']`);
+  const tooltip = page.locator("#filter-rail-tooltip");
+
+  await link.hover();
+  await expect(tooltip).toBeVisible();
+  await expect(tooltip).toHaveText(id);
+
+  await page.mouse.move(0, 0);
+  await expect(tooltip).toBeHidden();
+
+  await link.focus();
+  await expect(tooltip).toBeVisible();
+  await expect(tooltip).toHaveText(id);
+  await expect(link).toHaveAttribute("aria-describedby", "filter-rail-tooltip");
+});
+
+test("rows with short and long values have the same height", async ({
+  resources,
+  page,
+  request,
+}) => {
+  const shortId = await createResource(request, "Patient", { name: [{ family: "Short" }] });
+  const longId = await createResource(request, "Patient", { name: [{ family: "B".repeat(90) }] });
+  await waitSearchable(request, "Patient", shortId);
+  await waitSearchable(request, "Patient", longId);
+
+  await resources.goto("Patient");
+  await page
+    .locator("input.query-builder__url[name=url]")
+    .fill(`Patient?_id=${shortId},${longId}`);
+  await page.locator("[data-intent='run']").click();
+  await resources.results.waitShown();
+  await expect(resources.results.rows).toHaveCount(2);
+
+  const heights = await resources.results.rows.evaluateAll((rows) =>
+    rows.map((row) => row.getBoundingClientRect().height),
+  );
+  expect(Math.abs(heights[0] - heights[1])).toBeLessThanOrEqual(1);
+});
