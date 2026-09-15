@@ -1033,6 +1033,136 @@ async fn mongodb_integration_string_exact_is_case_sensitive() {
     );
 }
 
+/// #1083: a bare-id reference search (`subject=123`) must be index-bounded
+/// (an `$in`/anchored-regex filter, every branch bounded — no unanchored
+/// `$regex` scan) and the qualified form (`subject=Patient/123`) must keep
+/// matching its own `_history` versions. Parity with SQLite's
+/// `test_search_by_reference_does_not_match_extended_sibling_ids`
+/// (`sqlite_tests.rs`), extended with a `Group/123` sibling target type, an
+/// absolute-URL reference, and a `Practitioner/123` reference (Practitioner
+/// is NOT a declared target of `Observation.subject` in R4) so the bare
+/// form's declared-target widening, its anchored absolute-URL arm, and its
+/// exclusion of undeclared target types are all exercised. Uses
+/// `create_backend_with_full_registry` so `Observation.subject`'s real
+/// declared target list (`Group`, `Device`, `Patient`, `Location`, per the
+/// R4 spec bundle) is active.
+#[tokio::test]
+async fn mongodb_integration_reference_search_does_not_match_extended_sibling_ids() {
+    let Some(backend) = create_backend_with_full_registry("reference_sibling_ids").await else {
+        eprintln!(
+            "Skipping mongodb_integration_reference_search_does_not_match_extended_sibling_ids (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+
+    let tenant = create_tenant("tenant-ref-siblings");
+
+    // Every stored reference shares the "123" id fragment; only the first two
+    // are the same resource (`Patient/123`, versioned).
+    let refs = [
+        ("obs-base", "Patient/123"),
+        ("obs-versioned", "Patient/123/_history/2"),
+        ("obs-dash", "Patient/123-4"),
+        ("obs-dot", "Patient/123.5"),
+        ("obs-digit", "Patient/1234"),
+        ("obs-zero", "Patient/1230"),
+        ("obs-short", "Patient/12"),
+        ("obs-group", "Group/123"),
+        ("obs-absolute", "http://example.org/fhir/Patient/123"),
+        (
+            "obs-absolute-versioned",
+            "http://example.org/fhir/Patient/123/_history/3",
+        ),
+        ("obs-practitioner", "Practitioner/123"),
+    ];
+    for (id, reference) in refs {
+        backend
+            .create(
+                &tenant,
+                "Observation",
+                json!({
+                    "resourceType": "Observation",
+                    "id": id,
+                    "status": "final",
+                    "subject": {"reference": reference},
+                    "code": {"coding": [{"code": "8867-4"}]}
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+    }
+
+    let search = |value: &str| {
+        SearchQuery::new("Observation").with_parameter(SearchParameter {
+            name: "subject".to_string(),
+            param_type: SearchParamType::Reference,
+            modifier: None,
+            values: vec![SearchValue::eq(value)],
+            chain: vec![],
+            components: vec![],
+        })
+    };
+
+    // Bare id: matches every declared target type (Patient, Group) and the
+    // absolute-URL reference and its `_history` version (via the anchored
+    // `^https?://` arms), plus the qualified match's own `_history` version
+    // — but none of the extended sibling ids (123-4, 123.5, 1234, 1230, 12),
+    // and not `Practitioner/123` (Practitioner is not a declared target of
+    // Observation.subject).
+    let result = backend.search(&tenant, &search("123")).await.unwrap();
+    let mut ids: Vec<&str> = result.resources.items.iter().map(|r| r.id()).collect();
+    ids.sort_unstable();
+    assert_eq!(
+        ids,
+        vec![
+            "obs-absolute",
+            "obs-absolute-versioned",
+            "obs-base",
+            "obs-group",
+            "obs-versioned"
+        ],
+        "subject=123 must match every declared target type and the absolute-URL \
+         reference (versioned and unversioned), plus _history versions, but not \
+         extended sibling ids or undeclared target types (Practitioner)"
+    );
+
+    // Qualified `Patient/123`: exact type/id, plus its own `_history`
+    // version — not `Group/123` and not either absolute-URL reference.
+    let result = backend
+        .search(&tenant, &search("Patient/123"))
+        .await
+        .unwrap();
+    let mut ids: Vec<&str> = result.resources.items.iter().map(|r| r.id()).collect();
+    ids.sort_unstable();
+    assert_eq!(
+        ids,
+        vec!["obs-base", "obs-versioned"],
+        "subject=Patient/123 must match only Patient/123 and its _history versions"
+    );
+
+    // Qualified `Group/123`: the other target type, exactly.
+    let result = backend.search(&tenant, &search("Group/123")).await.unwrap();
+    let ids: Vec<&str> = result.resources.items.iter().map(|r| r.id()).collect();
+    assert_eq!(ids, vec!["obs-group"]);
+
+    // The dash/dot siblings are themselves searchable, exactly, and don't
+    // bleed into each other or into Patient/123.
+    let result = backend
+        .search(&tenant, &search("Patient/123-4"))
+        .await
+        .unwrap();
+    let ids: Vec<&str> = result.resources.items.iter().map(|r| r.id()).collect();
+    assert_eq!(ids, vec!["obs-dash"]);
+
+    let result = backend
+        .search(&tenant, &search("Patient/123.5"))
+        .await
+        .unwrap();
+    let ids: Vec<&str> = result.resources.items.iter().map(|r| r.id()).collect();
+    assert_eq!(ids, vec!["obs-dot"]);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn mongodb_integration_reuses_client_pool_under_concurrent_read_search() {
     let Some(connection_string) = shared_mongo::connection_string().await else {
