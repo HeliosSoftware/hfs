@@ -39,6 +39,45 @@ test("selecting a row opens its detail", async ({ page, searchParameters }) => {
   await expect(searchParameters.detailTitle).toBeVisible();
 });
 
+// #1106: row-navigation.js delegates the click from `document`, so the whole
+// row — not just its own link cell — opens the detail.
+test("clicking a non-link cell of a row opens its detail", async ({ page, searchParameters }) => {
+  await searchParameters.goto();
+  await searchParameters.rows.first().locator("td:last-child").click();
+  await page.waitForLoadState("networkidle");
+  await expect(page).toHaveURL(/sel=/);
+  await expect(searchParameters.detailTitle).toBeVisible();
+});
+
+test("selecting text inside a row does not navigate", async ({ page, searchParameters }) => {
+  await searchParameters.goto();
+  const before = page.url();
+  const cell = searchParameters.rows.first().locator("td").nth(1);
+  // In Chromium a synthesized pointer click collapses a pre-existing selection
+  // before the click event fires, which would defeat the point of this test.
+  // Build the selection programmatically and dispatch the click directly: a
+  // click that lands while the row still holds a live selection, as after a
+  // drag-select.
+  await cell.evaluate((el) => {
+    const range = document.createRange();
+    range.selectNodeContents(el);
+    const selection = window.getSelection();
+    selection?.removeAllRanges();
+    selection?.addRange(range);
+    el.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true, button: 0 }));
+  });
+  await page.waitForTimeout(200);
+  expect(page.url()).toBe(before);
+});
+
+test("a modifier click on a non-link cell does not navigate", async ({ page, searchParameters }) => {
+  await searchParameters.goto();
+  const before = page.url();
+  await searchParameters.rows.first().locator("td:last-child").click({ modifiers: ["Shift"] });
+  await page.waitForTimeout(200);
+  expect(page.url()).toBe(before);
+});
+
 // #754/#755: the server remembers a chosen base type, and "All types" is
 // its own explicit, remembered state — never masked by a real
 // type recorded earlier — reachable in one click no matter what.
