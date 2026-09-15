@@ -32,6 +32,17 @@
 //!   (nanos, hits) indexed by phase, so instrumented code can sit inside a
 //!   `&self` method on a shared backend without threading a profiler handle
 //!   through every signature.
+//! * **Periodic, cumulative dumps.** The SQLite streaming ingest calls
+//!   [`ingest_progress`] after every batch and logs the table it returns —
+//!   once per [`PROGRESS_INTERVAL`] resources, cumulative since process start
+//!   — as an `info` event on the `hfs_perf` target, so a server run can be
+//!   read without a bench harness:
+//!
+//!   ```text
+//!   RUSTFLAGS='--cfg perf_phases' cargo build --release --bin hfs
+//!   HFS_PERF_PHASES=1 HFS_BULK_SUBMIT_DEFER_INDEXING=false ./target/release/hfs
+//!   ```
+//!
 //! * **Explicit nesting.** Phases are recorded as measured, so a phase that
 //!   encloses another double-counts by design. [`Phase::nested_in`] declares
 //!   the containment, and the report renders children indented under their
@@ -40,6 +51,10 @@
 use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
+
+/// How many ingested resources between two periodic reports from
+/// [`ingest_progress`].
+pub const PROGRESS_INTERVAL: u64 = 1_000;
 
 /// One measured step of the ingest write path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,6 +70,12 @@ pub enum Phase {
     Create,
     /// The `SELECT 1 FROM resources` existence probe inside `create`.
     CreateExists,
+    /// Deep clones of the parsed `serde_json::Value` on the create path: the
+    /// entry's copy handed to `create`, and `create`'s own copy that receives
+    /// `id`/`resourceType`. The SQLite ingest path never round-trips through
+    /// the typed FHIR model (#947 item 5), so this is the whole cost of
+    /// "re-materialising" the resource between parse and serialize.
+    EntryClone,
     /// `serde_json::to_vec` of the resource being stored.
     Serialize,
     /// `INSERT INTO resources`.
@@ -78,8 +99,12 @@ pub enum Phase {
     IndexMarshal,
     /// FTS content extraction plus the `resource_fts` insert.
     Fts,
-    /// The two bulk bookkeeping rows per entry.
+    /// The two bulk bookkeeping rows per entry, together.
     Bookkeeping,
+    /// `INSERT INTO bulk_submission_changes` — the rollback record.
+    BookkeepingChange,
+    /// `INSERT OR REPLACE INTO bulk_entry_results` — the per-line receipt.
+    BookkeepingResult,
     /// `COMMIT` of one batch transaction.
     Commit,
     /// Per-batch overhead outside the entry loop (BEGIN, manifest counters).
@@ -112,12 +137,13 @@ pub enum Phase {
 
 impl Phase {
     /// All phases, in report order.
-    pub const ALL: [Phase; 30] = [
+    pub const ALL: [Phase; 33] = [
         Phase::NdjsonParse,
         Phase::Entry,
         Phase::EntryRead,
         Phase::Create,
         Phase::CreateExists,
+        Phase::EntryClone,
         Phase::Serialize,
         Phase::ResourceInsert,
         Phase::HistoryInsert,
@@ -130,6 +156,8 @@ impl Phase {
         Phase::IndexMarshal,
         Phase::Fts,
         Phase::Bookkeeping,
+        Phase::BookkeepingChange,
+        Phase::BookkeepingResult,
         Phase::Commit,
         Phase::BatchOverhead,
         Phase::ReindexFetch,
@@ -153,6 +181,8 @@ impl Phase {
                 Some(Phase::Entry)
             }
             Phase::ResourceUpdate => Some(Phase::Update),
+            Phase::BookkeepingChange | Phase::BookkeepingResult => Some(Phase::Bookkeeping),
+            Phase::EntryClone => Some(Phase::Create),
             // Indentation shows the create path, which is what a bulk load
             // runs. `serialize` and `index` are also reached from `update`,
             // and their counters cover both.
@@ -196,7 +226,10 @@ impl Phase {
             Phase::IndexInsert => "search_index_insert",
             Phase::IndexMarshal => "  (of which: marshal)",
             Phase::Fts => "fts",
-            Phase::Bookkeeping => "bookkeeping",
+            Phase::Bookkeeping => "bookkeeping (total)",
+            Phase::BookkeepingChange => "submission_changes_insert",
+            Phase::BookkeepingResult => "entry_results_insert",
+            Phase::EntryClone => "entry_clone",
             Phase::Commit => "commit",
             Phase::BatchOverhead => "batch_overhead",
             Phase::ReindexFetch => "reindex_fetch",
@@ -214,7 +247,7 @@ impl Phase {
     }
 }
 
-const PHASE_COUNT: usize = 30;
+const PHASE_COUNT: usize = 33;
 
 #[allow(clippy::declare_interior_mutable_const)]
 const ZERO: AtomicU64 = AtomicU64::new(0);
@@ -323,6 +356,68 @@ pub fn add_rows(phase: Phase, rows: u64) {
     ROWS[phase as usize].fetch_add(rows, Ordering::Relaxed);
 }
 
+/// Resources the streaming ingest has reported through [`ingest_progress`],
+/// process-wide and cumulative like every other counter here.
+static INGESTED: AtomicU64 = AtomicU64::new(0);
+/// Wall-clock nanoseconds spent inside the streaming ingest, summed over the
+/// batches reported so far. Not "time since the first batch": that would count
+/// the gaps between files (manifest fetch, download, lease bookkeeping) and
+/// dilute every phase's share of a number the phases were never inside of.
+static INGEST_WALL_NANOS: AtomicU64 = AtomicU64::new(0);
+/// Counter values when the first streaming ingest began. Every phase counter
+/// is process-global and the server has usually done indexed writes before
+/// the first manifest arrives — seeding the spec SearchParameters alone is
+/// ~1,400 autocommitted, indexed creates — so a report against the raw totals
+/// charges that start-up work to the ingest, and a phase can show more time
+/// than the ingest wall it is supposed to be a share of. Reports subtract
+/// this baseline instead.
+static INGEST_BASELINE: parking_lot::Mutex<Option<Vec<PhaseTotals>>> =
+    parking_lot::Mutex::new(None);
+
+/// Marks the start of the streaming ingest: the first call snapshots the
+/// counters as the baseline that [`ingest_progress`] reports against; later
+/// calls are no-ops, so concurrent or successive files share one baseline
+/// and the report stays cumulative over the run. [`reset`] clears it.
+pub fn mark_ingest_start() {
+    if !enabled() {
+        return;
+    }
+    let mut baseline = INGEST_BASELINE.lock();
+    if baseline.is_none() {
+        *baseline = Some(snapshot());
+    }
+}
+
+/// Records one ingested batch — `resources` entries walked, `wall` the time
+/// from the end of the previous batch (or the start of the stream) to the end
+/// of this one, so that it covers line reading and parsing as well as the
+/// batch transaction. Returns the cumulative [`report`] whenever the running
+/// total crosses a multiple of [`PROGRESS_INTERVAL`], for the caller to log;
+/// `None` otherwise, and always `None` when collection is off.
+///
+/// Cumulative by design: the number an operator reads at 50k resources is the
+/// average over the whole run, which is what the issue-body tables in #947
+/// quote, and a phase that is quadratic in the import (the FTS delete scan
+/// was) shows up as a share that keeps climbing between dumps.
+pub fn ingest_progress(resources: u64, wall: Duration) -> Option<String> {
+    if !enabled() {
+        return None;
+    }
+    let wall_total = INGEST_WALL_NANOS.fetch_add(wall.as_nanos() as u64, Ordering::Relaxed)
+        + wall.as_nanos() as u64;
+    let before = INGESTED.fetch_add(resources, Ordering::Relaxed);
+    let after = before + resources;
+    if after / PROGRESS_INTERVAL == before / PROGRESS_INTERVAL {
+        return None;
+    }
+    let wall_total = Duration::from_nanos(wall_total);
+    let baseline = INGEST_BASELINE.lock();
+    Some(match baseline.as_ref() {
+        Some(before) => report_since(before, after, wall_total),
+        None => report(after, wall_total),
+    })
+}
+
 /// One phase's totals.
 #[derive(Debug, Clone, Copy)]
 pub struct PhaseTotals {
@@ -352,13 +447,17 @@ pub fn snapshot() -> Vec<PhaseTotals> {
         .collect()
 }
 
-/// Zeroes every counter (between benchmark phases).
+/// Zeroes every counter (between benchmark phases), including the ingest
+/// progress behind [`ingest_progress`].
 pub fn reset() {
     for idx in 0..PHASE_COUNT {
         NANOS[idx].store(0, Ordering::Relaxed);
         HITS[idx].store(0, Ordering::Relaxed);
         ROWS[idx].store(0, Ordering::Relaxed);
     }
+    INGESTED.store(0, Ordering::Relaxed);
+    INGEST_WALL_NANOS.store(0, Ordering::Relaxed);
+    *INGEST_BASELINE.lock() = None;
 }
 
 /// Renders the snapshot as a table: per-resource cost and share of `wall` for
@@ -556,6 +655,60 @@ mod tests {
                 .all(|t| t.hits == 0 && t.rows == 0 && t.elapsed == Duration::ZERO),
             "a build without --cfg perf_phases must record nothing"
         );
+    }
+
+    #[cfg(perf_phases)]
+    #[test]
+    fn ingest_progress_reports_once_per_interval() {
+        let _guard = SWITCH.lock();
+        set_enabled(true);
+        reset();
+        let step = Duration::from_millis(10);
+        assert!(ingest_progress(PROGRESS_INTERVAL / 2, step).is_none());
+        // Crosses the first boundary: cumulative resources and wall.
+        let report = ingest_progress(PROGRESS_INTERVAL / 2, step).expect("boundary crossed");
+        assert!(
+            report.contains(&format!("{:>10}", PROGRESS_INTERVAL)),
+            "{report}"
+        );
+        assert!(report.contains("0.02s"), "{report}");
+        // Inside the next interval: nothing.
+        assert!(ingest_progress(1, step).is_none());
+        // A batch larger than the interval still reports exactly once.
+        assert!(ingest_progress(PROGRESS_INTERVAL * 3, step).is_some());
+        set_enabled(false);
+        reset();
+    }
+
+    #[cfg(perf_phases)]
+    #[test]
+    fn ingest_progress_reports_against_the_baseline() {
+        let _guard = SWITCH.lock();
+        set_enabled(true);
+        reset();
+        // Start-up work before the ingest: must not appear in the report.
+        {
+            let _span = span(Phase::ReindexFtsDelete);
+            add_rows(Phase::ReindexFtsDelete, 5);
+        }
+        mark_ingest_start();
+        {
+            let _span = span(Phase::ReindexFtsDelete);
+            add_rows(Phase::ReindexFtsDelete, 2);
+        }
+        let report =
+            ingest_progress(PROGRESS_INTERVAL, Duration::from_secs(1)).expect("boundary crossed");
+        set_enabled(false);
+        reset();
+        assert!(report.contains("rows=2 "), "{report}");
+        assert!(!report.contains("rows=7 "), "{report}");
+    }
+
+    #[cfg(not(perf_phases))]
+    #[test]
+    fn ingest_progress_is_silent_without_the_cfg() {
+        set_enabled(true);
+        assert!(ingest_progress(PROGRESS_INTERVAL * 10, Duration::from_secs(1)).is_none());
     }
 
     #[test]
