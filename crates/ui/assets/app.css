@@ -4280,6 +4280,14 @@ details.json-fold[open] > summary .icon {
   padding: 16px 20px 4px;
 }
 
+/* The heading reuses .query-group__type, whose bottom margin spaces the
+   stacked query groups it was written for. Here the row is centred with
+   align-items, which centres each child's margin box — so that margin lifted
+   the heading ~2px above the count beside it (#994). */
+.query-results__head .query-group__type {
+  margin-bottom: 0;
+}
+
 .query-results__meta {
   flex: 1;
   font-size: 12px;
