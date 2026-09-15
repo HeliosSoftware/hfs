@@ -8869,10 +8869,17 @@ mod postgres_integration {
         );
     }
 
+    #[derive(Clone)]
+    struct RecordedBulkEntry {
+        line_number: u64,
+        resource_type: String,
+        resource_id: Option<String>,
+        created: bool,
+        outcome: String,
+    }
+
     #[derive(Default)]
-    struct RecordingBulkSubmitBatches(
-        std::sync::Mutex<Vec<Vec<(u64, String, Option<String>, bool, String)>>>,
-    );
+    struct RecordingBulkSubmitBatches(std::sync::Mutex<Vec<Vec<RecordedBulkEntry>>>);
 
     impl helios_persistence::core::BatchCommitObserver for RecordingBulkSubmitBatches {
         fn batch_committed(&self, batch: &helios_persistence::core::BatchCommitted<'_>) {
@@ -8880,14 +8887,12 @@ mod postgres_integration {
                 batch
                     .results
                     .iter()
-                    .map(|result| {
-                        (
-                            result.line_number,
-                            result.resource_type.clone(),
-                            result.resource_id.clone(),
-                            result.created,
-                            result.outcome.to_string(),
-                        )
+                    .map(|result| RecordedBulkEntry {
+                        line_number: result.line_number,
+                        resource_type: result.resource_type.clone(),
+                        resource_id: result.resource_id.clone(),
+                        created: result.created,
+                        outcome: result.outcome.to_string(),
                     })
                     .collect(),
             );
@@ -8992,11 +8997,11 @@ mod postgres_integration {
         for (index, observed) in batches[0].iter().enumerate() {
             let line = (index + 1) as u64;
             let id = format!("fresh-{line:03}");
-            assert_eq!(observed.0, line);
-            assert_eq!(observed.1, "Patient");
-            assert_eq!(observed.2.as_deref(), Some(id.as_str()));
-            assert!(observed.3);
-            assert_eq!(observed.4, "success");
+            assert_eq!(observed.line_number, line);
+            assert_eq!(observed.resource_type, "Patient");
+            assert_eq!(observed.resource_id.as_deref(), Some(id.as_str()));
+            assert!(observed.created);
+            assert_eq!(observed.outcome, "success");
         }
 
         let stored = backend
@@ -9683,7 +9688,7 @@ mod postgres_integration {
             let observed = observer.0.lock().unwrap().clone();
             assert_eq!(observed.len(), 1);
             assert_eq!(observed[0].len(), 2);
-            assert_eq!(observed[0][0].2.as_deref(), Some("before-race"));
+            assert_eq!(observed[0][0].resource_id.as_deref(), Some("before-race"));
 
             let before_history: i64 = client
                 .query_one(
