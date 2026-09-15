@@ -3655,6 +3655,119 @@ mod postgres_integration {
     }
 
     #[tokio::test]
+    async fn postgres_integration_quantity_ne_uses_canonical_values() {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::types::{
+            SearchParamType, SearchParameter, SearchPrefix, SearchQuery, SearchValue,
+        };
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("test-tenant");
+
+        // Issue #1011 (gate follow-up): `ne60|...|kg` must exclude resources
+        // whose value equals 60 kg *by unit conversion*, not only resources
+        // stored literally as kg. Mixed kg/g dataset around the 60 kg / 60000 g
+        // boundary.
+        let weights = [
+            ("obs-ne-55-4-kg", 55.4, "kg"),
+            ("obs-ne-60-2-kg", 60.2, "kg"),
+            ("obs-ne-55000-g", 55000.0, "g"),
+            ("obs-ne-60000-g", 60000.0, "g"),
+            ("obs-ne-64500-g", 64500.0, "g"),
+        ];
+        for (id, value, unit) in weights {
+            backend
+                .create(
+                    &tenant,
+                    "Observation",
+                    json!({
+                        "resourceType": "Observation",
+                        "id": id,
+                        "status": "final",
+                        "code": { "coding": [{ "system": "http://loinc.org", "code": "29463-7" }] },
+                        "valueQuantity": {
+                            "value": value,
+                            "unit": unit,
+                            "system": "http://unitsofmeasure.org",
+                            "code": unit
+                        }
+                    }),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+
+        async fn search_ids(
+            backend: &PostgresBackend,
+            tenant: &TenantContext,
+            prefix: SearchPrefix,
+            value: &str,
+        ) -> Vec<String> {
+            let query = SearchQuery::new("Observation").with_parameter(SearchParameter {
+                name: "value-quantity".to_string(),
+                param_type: SearchParamType::Quantity,
+                modifier: None,
+                values: vec![SearchValue::new(prefix, value)],
+                chain: vec![],
+                components: vec![],
+            });
+            let result = backend.search(tenant, &query).await.unwrap();
+            let mut ids: Vec<String> = result
+                .resources
+                .items
+                .iter()
+                .map(|r| r.id().to_string())
+                .collect();
+            ids.sort();
+            ids
+        }
+
+        let ne60_kg = search_ids(
+            &backend,
+            &tenant,
+            SearchPrefix::Ne,
+            "60|http://unitsofmeasure.org|kg",
+        )
+        .await;
+        assert_eq!(
+            ne60_kg,
+            vec!["obs-ne-55-4-kg", "obs-ne-55000-g", "obs-ne-64500-g"],
+            "ne60|...|kg must exclude 60.2 kg and its canonical equivalent 60000 g"
+        );
+
+        let ne60000_g = search_ids(
+            &backend,
+            &tenant,
+            SearchPrefix::Ne,
+            "60000|http://unitsofmeasure.org|g",
+        )
+        .await;
+        assert_eq!(
+            ne60000_g,
+            vec![
+                "obs-ne-55-4-kg",
+                "obs-ne-55000-g",
+                "obs-ne-60-2-kg",
+                "obs-ne-64500-g"
+            ],
+            "ne60000|...|g must exclude 60000 g and its canonical equivalent 60.2 kg"
+        );
+
+        let ne60_raw = search_ids(&backend, &tenant, SearchPrefix::Ne, "60").await;
+        assert_eq!(
+            ne60_raw,
+            vec![
+                "obs-ne-55-4-kg",
+                "obs-ne-55000-g",
+                "obs-ne-60000-g",
+                "obs-ne-64500-g"
+            ],
+            "ne60 without a unit only excludes the raw value 60.2, regardless of unit"
+        );
+    }
+
+    #[tokio::test]
     async fn postgres_integration_search_by_token() {
         use helios_persistence::core::SearchProvider;
         use helios_persistence::types::{

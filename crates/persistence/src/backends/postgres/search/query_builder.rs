@@ -1810,79 +1810,95 @@ impl PostgresQueryBuilder {
 
             // Canonical branch on the canonical columns so unit equivalents
             // match (g ⇄ mg). Bounds are canonicalized in the search unit before
-            // comparison. Skipped for `ne` and non-convertible units.
+            // comparison. Skipped for non-convertible units; `ne` also uses this
+            // branch (negated range) so it matches the raw-OR-canonical `eq`
+            // semantics inverted, same as SQLite's `build_canonical_condition`.
             let mut predicate = format!("({raw})");
             if let Some(c) = code {
-                if !matches!(value.prefix, SearchPrefix::Ne) {
-                    if let Some((_, cunit)) = helios_fhirpath::ucum::canonicalize_quantity(num, c) {
-                        let canon = |x: f64| {
-                            helios_fhirpath::ucum::canonicalize_quantity(x, c).map(|(v, _)| v)
-                        };
-                        let col = "value_quantity_canonical_value";
-                        // Comparators match the exact canonicalized value:
-                        // gt/sa → > canon(num), lt/eb → < canon(num),
-                        // ge → ≥ canon(num), le → ≤ canon(num). Precision
-                        // only bounds `eq` (default arm below).
-                        let range: Option<String> = match value.prefix {
-                            SearchPrefix::Gt | SearchPrefix::Sa => canon(num).map(|b| {
-                                next += 1;
-                                params.push(SqlParam::Float(b));
-                                format!("{col} > ${next}")
-                            }),
-                            SearchPrefix::Lt | SearchPrefix::Eb => canon(num).map(|b| {
-                                next += 1;
-                                params.push(SqlParam::Float(b));
-                                format!("{col} < ${next}")
-                            }),
-                            SearchPrefix::Ge => canon(num).map(|b| {
-                                next += 1;
-                                params.push(SqlParam::Float(b));
-                                format!("{col} >= ${next}")
-                            }),
-                            SearchPrefix::Le => canon(num).map(|b| {
-                                next += 1;
-                                params.push(SqlParam::Float(b));
-                                format!("{col} <= ${next}")
-                            }),
-                            SearchPrefix::Ap => {
-                                let margin = (num.abs() * 0.1).max(0.0001);
-                                match (canon(num - margin), canon(num + margin)) {
-                                    (Some(a), Some(b)) => {
-                                        let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
-                                        next += 1;
-                                        params.push(SqlParam::Float(lo));
-                                        let lo_p = next;
-                                        next += 1;
-                                        params.push(SqlParam::Float(hi));
-                                        Some(format!("{col} BETWEEN ${lo_p} AND ${next}"))
-                                    }
-                                    _ => None,
-                                }
-                            }
-                            // Eq + default: implicit-precision range.
-                            _ => {
-                                let half = quantity_implicit_precision(num_str) / 2.0;
-                                match (canon(num - half), canon(num + half)) {
-                                    (Some(a), Some(b)) => {
-                                        let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
-                                        next += 1;
-                                        params.push(SqlParam::Float(lo));
-                                        let lo_p = next;
-                                        next += 1;
-                                        params.push(SqlParam::Float(hi));
-                                        Some(format!("{col} >= ${lo_p} AND {col} < ${next}"))
-                                    }
-                                    _ => None,
-                                }
-                            }
-                        };
-                        if let Some(range) = range {
+                if let Some((_, cunit)) = helios_fhirpath::ucum::canonicalize_quantity(num, c) {
+                    let canon =
+                        |x: f64| helios_fhirpath::ucum::canonicalize_quantity(x, c).map(|(v, _)| v);
+                    let col = "value_quantity_canonical_value";
+                    // Comparators match the exact canonicalized value:
+                    // gt/sa → > canon(num), lt/eb → < canon(num),
+                    // ge → ≥ canon(num), le → ≤ canon(num). Precision
+                    // only bounds `eq`/`ne` (below).
+                    let range: Option<String> = match value.prefix {
+                        SearchPrefix::Gt | SearchPrefix::Sa => canon(num).map(|b| {
                             next += 1;
-                            params.push(SqlParam::text(&cunit));
-                            predicate = format!(
-                                "(({raw}) OR ({range} AND value_quantity_canonical_unit = ${next}))"
-                            );
+                            params.push(SqlParam::Float(b));
+                            format!("{col} > ${next}")
+                        }),
+                        SearchPrefix::Lt | SearchPrefix::Eb => canon(num).map(|b| {
+                            next += 1;
+                            params.push(SqlParam::Float(b));
+                            format!("{col} < ${next}")
+                        }),
+                        SearchPrefix::Ge => canon(num).map(|b| {
+                            next += 1;
+                            params.push(SqlParam::Float(b));
+                            format!("{col} >= ${next}")
+                        }),
+                        SearchPrefix::Le => canon(num).map(|b| {
+                            next += 1;
+                            params.push(SqlParam::Float(b));
+                            format!("{col} <= ${next}")
+                        }),
+                        SearchPrefix::Ap => {
+                            let margin = (num.abs() * 0.1).max(0.0001);
+                            match (canon(num - margin), canon(num + margin)) {
+                                (Some(a), Some(b)) => {
+                                    let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+                                    next += 1;
+                                    params.push(SqlParam::Float(lo));
+                                    let lo_p = next;
+                                    next += 1;
+                                    params.push(SqlParam::Float(hi));
+                                    Some(format!("{col} BETWEEN ${lo_p} AND ${next}"))
+                                }
+                                _ => None,
+                            }
                         }
+                        // Ne: negated implicit-precision range, mirroring the raw
+                        // branch's `numeric_predicate` shape for `Ne`.
+                        SearchPrefix::Ne => {
+                            let half = quantity_implicit_precision(num_str) / 2.0;
+                            match (canon(num - half), canon(num + half)) {
+                                (Some(a), Some(b)) => {
+                                    let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+                                    next += 1;
+                                    params.push(SqlParam::Float(lo));
+                                    let lo_p = next;
+                                    next += 1;
+                                    params.push(SqlParam::Float(hi));
+                                    Some(format!("({col} < ${lo_p} OR {col} >= ${next})"))
+                                }
+                                _ => None,
+                            }
+                        }
+                        // Eq + default: implicit-precision range.
+                        _ => {
+                            let half = quantity_implicit_precision(num_str) / 2.0;
+                            match (canon(num - half), canon(num + half)) {
+                                (Some(a), Some(b)) => {
+                                    let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+                                    next += 1;
+                                    params.push(SqlParam::Float(lo));
+                                    let lo_p = next;
+                                    next += 1;
+                                    params.push(SqlParam::Float(hi));
+                                    Some(format!("{col} >= ${lo_p} AND {col} < ${next}"))
+                                }
+                                _ => None,
+                            }
+                        }
+                    };
+                    if let Some(range) = range {
+                        next += 1;
+                        params.push(SqlParam::text(&cunit));
+                        predicate = format!(
+                            "(({raw}) OR ({range} AND value_quantity_canonical_unit = ${next}))"
+                        );
                     }
                 }
             }
@@ -2650,6 +2666,52 @@ mod tests {
             })
             .expect("the canonical bound must be bound as the exact canonical value");
         assert_eq!(canonical_param, expected);
+    }
+
+    #[test]
+    fn quantity_ne_includes_canonical_branch() {
+        // `ne` must also negate the canonical range, so a resource stored in
+        // an equivalent unit (55000 g vs 60 kg) is correctly excluded/included
+        // by unit conversion rather than only by the raw stored unit.
+        let query = SearchQuery::new("Observation").with_parameter(quantity_param(
+            SearchPrefix::Ne,
+            "60|http://unitsofmeasure.org|kg",
+        ));
+        let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("condition");
+
+        assert!(
+            frag.sql.contains(
+                "(value_quantity_canonical_value < $7 OR value_quantity_canonical_value >= $8)"
+            ),
+            "expected a negated canonical range: {}",
+            frag.sql
+        );
+        assert!(
+            !frag
+                .sql
+                .contains("value_quantity_canonical_value >= $7 AND"),
+            "the canonical branch must not use the eq inclusive-range shape: {}",
+            frag.sql
+        );
+
+        let (expected_lo, _) =
+            helios_fhirpath::ucum::canonicalize_quantity(59.5, "kg").expect("kg must canonicalize");
+        let (expected_hi, _) =
+            helios_fhirpath::ucum::canonicalize_quantity(60.5, "kg").expect("kg must canonicalize");
+        let has_lo = frag
+            .params
+            .iter()
+            .any(|p| matches!(p, SqlParam::Float(f) if (*f - expected_lo).abs() < 1e-9));
+        let has_hi = frag
+            .params
+            .iter()
+            .any(|p| matches!(p, SqlParam::Float(f) if (*f - expected_hi).abs() < 1e-9));
+        assert!(
+            has_lo && has_hi,
+            "expected canonical bounds canon(59.5, \"kg\") = {expected_lo} and \
+             canon(60.5, \"kg\") = {expected_hi}, got {:?}",
+            frag.params
+        );
     }
 
     #[test]
