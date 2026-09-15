@@ -34,7 +34,7 @@ use std::time::Duration;
 use helios_fhir::FhirVersion;
 use parking_lot::RwLock;
 use serde_json::Value;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio::time::sleep;
 use tracing::{debug, error, warn};
 
@@ -162,7 +162,7 @@ pub struct SyncManager {
     config: SyncConfig,
 
     /// Event queue for async mode.
-    event_sender: Option<mpsc::Sender<QueuedEvent>>,
+    event_sender: Option<mpsc::Sender<Queued>>,
 
     /// Sync status per backend.
     status: Arc<RwLock<HashMap<String, BackendSyncStatus>>>,
@@ -195,6 +195,15 @@ struct QueuedEvent {
     created_at: std::time::Instant,
 }
 
+/// An item on the asynchronous sync queue.
+enum Queued {
+    /// A sync event bound for the named backends.
+    Event(QueuedEvent),
+    /// A barrier, resolved once every item queued ahead of it has been
+    /// processed. See [`SyncManager::barrier`].
+    Barrier(oneshot::Sender<()>),
+}
+
 impl SyncManager {
     /// Creates a new sync manager.
     pub fn new(config: SyncConfig) -> Self {
@@ -210,7 +219,7 @@ impl SyncManager {
         &mut self,
         backends: HashMap<String, Arc<dyn ResourceStorage + Send + Sync>>,
     ) -> tokio::task::JoinHandle<()> {
-        let (sender, receiver) = mpsc::channel::<QueuedEvent>(1000);
+        let (sender, receiver) = mpsc::channel::<Queued>(1000);
         self.event_sender = Some(sender);
 
         let config = self.config.clone();
@@ -223,7 +232,7 @@ impl SyncManager {
 
     /// Async worker that processes queued events.
     async fn async_worker(
-        mut receiver: mpsc::Receiver<QueuedEvent>,
+        mut receiver: mpsc::Receiver<Queued>,
         backends: HashMap<String, Arc<dyn ResourceStorage + Send + Sync>>,
         config: SyncConfig,
         status: Arc<RwLock<HashMap<String, BackendSyncStatus>>>,
@@ -242,7 +251,16 @@ impl SyncManager {
                 }
 
                 match tokio::time::timeout(remaining, receiver.recv()).await {
-                    Ok(Some(event)) => batch.push(event),
+                    Ok(Some(item)) => {
+                        // A barrier means someone is waiting on everything
+                        // ahead of it: process what is collected now rather
+                        // than holding it for the rest of the batch window.
+                        let flush = matches!(item, Queued::Barrier(_));
+                        batch.push(item);
+                        if flush {
+                            break;
+                        }
+                    }
                     Ok(None) => return, // Channel closed
                     Err(_) => break,    // Timeout
                 }
@@ -253,9 +271,19 @@ impl SyncManager {
             }
 
             // Process batch
-            let events: Vec<_> = std::mem::take(&mut batch);
+            let items: Vec<_> = std::mem::take(&mut batch);
 
-            for queued in events {
+            for item in items {
+                let queued = match item {
+                    Queued::Event(queued) => queued,
+                    Queued::Barrier(done) => {
+                        // Everything queued ahead of this point has been
+                        // handed to its backends. The waiter may have given
+                        // up; that is its business.
+                        let _ = done.send(());
+                        continue;
+                    }
+                };
                 for backend_id in &queued.backend_ids {
                     if let Some(backend) = backends.get(backend_id) {
                         let result = Self::sync_event_to_backend(
@@ -556,11 +584,11 @@ impl SyncManager {
             }
 
             sender
-                .send(QueuedEvent {
+                .send(Queued::Event(QueuedEvent {
                     event: event.clone(),
                     backend_ids: backend_ids.clone(),
                     created_at: std::time::Instant::now(),
-                })
+                }))
                 .await
                 .map_err(|e| {
                     StorageError::Backend(crate::error::BackendError::ConnectionFailed {
@@ -730,6 +758,38 @@ impl SyncManager {
         }
 
         true
+    }
+
+    /// Waits until every event queued for asynchronous sync before this
+    /// call has been handed to its backends.
+    ///
+    /// Unlike [`wait_for_sync`](Self::wait_for_sync), which waits for the
+    /// queue to be *empty* and so never returns under a steady write stream,
+    /// this rides the queue as an item of its own: it resolves as soon as the
+    /// worker reaches it, whatever arrives behind it. A search issued after
+    /// it returns sees every write acknowledged before it was called — the
+    /// read-your-writes a transaction's conditional-reference resolution
+    /// needs (#1047).
+    ///
+    /// Without an asynchronous worker (synchronous mode, or no worker
+    /// started) nothing is ever queued, so there is nothing to wait for.
+    pub async fn barrier(&self) -> StorageResult<()> {
+        let Some(sender) = self.event_sender.as_ref() else {
+            return Ok(());
+        };
+        let (done, reached) = oneshot::channel();
+        sender.send(Queued::Barrier(done)).await.map_err(|e| {
+            StorageError::Backend(BackendError::ConnectionFailed {
+                backend_name: "sync".to_string(),
+                message: format!("Failed to queue sync barrier: {}", e),
+            })
+        })?;
+        reached.await.map_err(|_| {
+            StorageError::Backend(BackendError::ConnectionFailed {
+                backend_name: "sync".to_string(),
+                message: "Async sync worker stopped before reaching the barrier".to_string(),
+            })
+        })
     }
 
     /// Waits for sync lag to be below threshold.
