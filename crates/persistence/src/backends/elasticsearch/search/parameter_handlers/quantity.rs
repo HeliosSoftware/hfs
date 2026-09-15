@@ -77,15 +77,15 @@ fn range_condition(
     num_str: &str,
     map: impl Fn(f64) -> Option<f64>,
 ) -> Option<Value> {
-    // Half-precision of the search value (e.g. "100" → 0.5); comparators match
-    // the implicit range boundaries: gt/sa → ≥ hi, lt/eb → < lo, ge → ≥ lo,
-    // le → < hi (per the FHIR spec).
+    // gt/lt/ge/le/sa/eb ignore the implicit precision and compare against the
+    // exact search value (FHIR spec). Only eq/ap below use the half-precision
+    // `p` of the search value (e.g. "100" → 0.5).
     let p = super::number::implicit_range(num_str);
     let range = match prefix {
-        SearchPrefix::Gt | SearchPrefix::Sa => json!({ "gte": map(num + p)? }),
-        SearchPrefix::Lt | SearchPrefix::Eb => json!({ "lt": map(num - p)? }),
-        SearchPrefix::Ge => json!({ "gte": map(num - p)? }),
-        SearchPrefix::Le => json!({ "lt": map(num + p)? }),
+        SearchPrefix::Gt | SearchPrefix::Sa => json!({ "gt": map(num)? }),
+        SearchPrefix::Lt | SearchPrefix::Eb => json!({ "lt": map(num)? }),
+        SearchPrefix::Ge => json!({ "gte": map(num)? }),
+        SearchPrefix::Le => json!({ "lte": map(num)? }),
         SearchPrefix::Ap => {
             let margin = (num * 0.1).abs().max(0.5);
             let (lo, hi) = ordered(map(num - margin)?, map(num + margin)?);
@@ -162,5 +162,59 @@ mod tests {
         let s = serde_json::to_string(&clause).unwrap();
         assert!(s.contains("search_params.quantity"));
         assert!(s.contains("mm[Hg]"));
+    }
+
+    /// Recursively finds the `range` clause for `field` anywhere in `value`,
+    /// regardless of how deeply it is nested inside the raw/canonical
+    /// `bool.should` wrapping.
+    fn find_range<'a>(value: &'a Value, field: &str) -> Option<&'a Value> {
+        if let Some(range) = value.get("range").and_then(|r| r.get(field)) {
+            return Some(range);
+        }
+        match value {
+            Value::Object(map) => map.values().find_map(|v| find_range(v, field)),
+            Value::Array(arr) => arr.iter().find_map(|v| find_range(v, field)),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn raw_comparators_use_exact_value() {
+        // gt/lt/ge/le/sa/eb ignore implicit precision and compare against the
+        // exact search value on the raw (stored-unit) field.
+        let clause = build_clause("value-quantity", "60|kg", SearchPrefix::Gt).unwrap();
+        let range = find_range(&clause, "search_params.quantity.value")
+            .expect("raw range clause must be present");
+        assert_eq!(range, &json!({ "gt": 60.0 }));
+    }
+
+    #[test]
+    fn canonical_comparator_uses_exact_canonical_value() {
+        // Same rule on the canonical (UCUM-converted) field.
+        let clause = build_clause(
+            "value-quantity",
+            "60|http://unitsofmeasure.org|kg",
+            SearchPrefix::Gt,
+        )
+        .unwrap();
+        let expected = helios_fhirpath::ucum::canonicalize_quantity(60.0, "kg")
+            .expect("kg must canonicalize")
+            .0;
+        let range = find_range(&clause, "search_params.quantity.canonical_value")
+            .expect("canonical range clause must be present");
+        assert_eq!(range, &json!({ "gt": expected }));
+    }
+
+    #[test]
+    fn eq_keeps_text_precision_range() {
+        // eq is unaffected by this change: it still ranges over the
+        // implicit-precision window derived from the value as written.
+        let clause = build_clause("value-quantity", "60.0", SearchPrefix::Eq).unwrap();
+        let range = find_range(&clause, "search_params.quantity.value")
+            .expect("raw range clause must be present");
+        let gte = range["gte"].as_f64().expect("gte must be a number");
+        let lt = range["lt"].as_f64().expect("lt must be a number");
+        assert!((gte - 59.95).abs() < 1e-9);
+        assert!((lt - 60.05).abs() < 1e-9);
     }
 }

@@ -3198,6 +3198,139 @@ mod es_integration {
     }
 
     #[tokio::test]
+    async fn elasticsearch_integration_quantity_comparators_ignore_search_precision() {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::types::{
+            SearchParamType, SearchParameter, SearchPrefix, SearchQuery, SearchValue,
+        };
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("test-tenant");
+
+        // Issue #1011: `value-quantity=gt60` must exclude 60.2 kg exactly at
+        // the boundary while still matching every value strictly above 60,
+        // regardless of how the search value's own precision is written.
+        let weights = [
+            ("obs-weight-55-4", 55.4),
+            ("obs-weight-58-5", 58.5),
+            ("obs-weight-60-2", 60.2),
+            ("obs-weight-64-5", 64.5),
+        ];
+        for (id, value) in weights {
+            backend
+                .create(
+                    &tenant,
+                    "Observation",
+                    json!({
+                        "resourceType": "Observation",
+                        "id": id,
+                        "status": "final",
+                        "code": { "coding": [{ "system": "http://loinc.org", "code": "29463-7" }] },
+                        "valueQuantity": {
+                            "value": value,
+                            "unit": "kg",
+                            "system": "http://unitsofmeasure.org",
+                            "code": "kg"
+                        }
+                    }),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+
+        // Wait for index refresh
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+        async fn search_ids(
+            backend: &ElasticsearchBackend,
+            tenant: &TenantContext,
+            prefix: SearchPrefix,
+            value: &str,
+        ) -> Vec<String> {
+            let query = SearchQuery::new("Observation").with_parameter(SearchParameter {
+                name: "value-quantity".to_string(),
+                param_type: SearchParamType::Quantity,
+                modifier: None,
+                values: vec![SearchValue::new(prefix, value)],
+                chain: vec![],
+                components: vec![],
+            });
+            let result = backend.search(tenant, &query).await.unwrap();
+            let mut ids: Vec<String> = result
+                .resources
+                .items
+                .iter()
+                .map(|r| r.id().to_string())
+                .collect();
+            ids.sort();
+            ids
+        }
+
+        let gt60 = search_ids(&backend, &tenant, SearchPrefix::Gt, "60").await;
+        assert_eq!(gt60, vec!["obs-weight-60-2", "obs-weight-64-5"], "gt60");
+
+        let gt60_0 = search_ids(&backend, &tenant, SearchPrefix::Gt, "60.0").await;
+        assert_eq!(
+            gt60_0,
+            vec!["obs-weight-60-2", "obs-weight-64-5"],
+            "gt60.0 must match gt60 exactly: implicit precision is ignored"
+        );
+
+        let le60_2 = search_ids(&backend, &tenant, SearchPrefix::Le, "60.2").await;
+        assert_eq!(
+            le60_2,
+            vec!["obs-weight-55-4", "obs-weight-58-5", "obs-weight-60-2"],
+            "le60.2"
+        );
+
+        let lt58_5 = search_ids(&backend, &tenant, SearchPrefix::Lt, "58.5").await;
+        assert_eq!(lt58_5, vec!["obs-weight-55-4"], "lt58.5");
+
+        let eq60 = search_ids(&backend, &tenant, SearchPrefix::Eq, "60").await;
+        assert_eq!(
+            eq60,
+            vec!["obs-weight-60-2"],
+            "eq60 ranges over [59.5, 60.5), which contains 60.2"
+        );
+
+        let eq60_0 = search_ids(&backend, &tenant, SearchPrefix::Eq, "60.0").await;
+        assert!(
+            eq60_0.is_empty(),
+            "eq60.0 ranges over [59.95, 60.05), which excludes 60.2: got {eq60_0:?}"
+        );
+
+        let gt60_kg = search_ids(
+            &backend,
+            &tenant,
+            SearchPrefix::Gt,
+            "60|http://unitsofmeasure.org|kg",
+        )
+        .await;
+        assert_eq!(
+            gt60_kg,
+            vec!["obs-weight-60-2", "obs-weight-64-5"],
+            "gt60|...|kg (raw branch)"
+        );
+
+        // Cross-unit boundary: 60.2 kg canonicalizes to exactly 60200 g, so
+        // `ge60200|...|g` must match it (and everything above) through the
+        // canonical branch.
+        let ge60200_g = search_ids(
+            &backend,
+            &tenant,
+            SearchPrefix::Ge,
+            "60200|http://unitsofmeasure.org|g",
+        )
+        .await;
+        assert_eq!(
+            ge60200_g,
+            vec!["obs-weight-60-2", "obs-weight-64-5"],
+            "ge60200|...|g (canonical branch, cross-unit exact boundary)"
+        );
+    }
+
+    #[tokio::test]
     async fn es_integration_search_uri() {
         use helios_persistence::core::SearchProvider;
         use helios_persistence::types::{
