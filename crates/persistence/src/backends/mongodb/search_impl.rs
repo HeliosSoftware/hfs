@@ -1232,7 +1232,6 @@ impl MongoBackend {
                     resource_type,
                     &missing,
                     &not_params,
-                    has_compartment,
                     query,
                 )
                 .await;
@@ -1380,7 +1379,7 @@ impl MongoBackend {
                             "$or": [
                                 { "value_reference": &base },
                                 { "value_reference": {
-                                    "$regex": format!("^{}/_history/", regex_escape(&base))
+                                    "$regex": format!("^{}/_history/", regex_escape(base))
                                 }},
                             ],
                         };
@@ -1413,6 +1412,7 @@ impl MongoBackend {
         Ok(Some(confirmed))
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn matching_resource_ids_complement_only(
         &self,
         db: &mongodb::Database,
@@ -1421,9 +1421,12 @@ impl MongoBackend {
         resource_type: &str,
         missing: &[&SearchParameter],
         not_params: &[&SearchParameter],
-        has_compartment: bool,
         query: &SearchQuery,
     ) -> StorageResult<Option<HashSet<String>>> {
+        let has_compartment = query
+            .compartment
+            .as_ref()
+            .is_some_and(|c| !c.params.is_empty() && !c.reference.is_empty());
         let mut matched: Option<HashSet<String>> = None;
 
         for param in missing {
