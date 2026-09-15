@@ -338,6 +338,17 @@ fn extract_operation_for_routing(
 /// `handlers::reindex`.
 const HANDLER_AUTHORIZED_OPS: [&str; 3] = ["$purge", "$reindex", "$reindex-status"];
 
+/// Operations that are read-shaped regardless of HTTP method: both
+/// `GET /{type}/$op` and `POST /{type}/{id}/$op` (and their instance-level
+/// equivalents) return data and must be authorized as `FhirOperation::Read`,
+/// never as the method-based fallthrough (`POST` → `Create`) would produce.
+///
+/// This MUST stay a narrow, explicit allowlist — do not add `$export` or any
+/// other operation without confirming it is read-only and does not need its
+/// own scope (e.g. a destructive or write-shaped `$`-operation belongs in
+/// `HANDLER_AUTHORIZED_OPS` instead, with its own handler-level check).
+const READ_SHAPED_OPERATIONS: &[&str] = &["$everything"];
+
 /// Extract the FHIR resource type and operation from a request path and method.
 ///
 /// Returns `None` for system-level operations (batch, history) where
@@ -394,6 +405,18 @@ fn extract_operation(path: &str, method: &str) -> Option<(String, FhirOperation)
         .any(|s| HANDLER_AUTHORIZED_OPS.contains(s))
     {
         return None;
+    }
+
+    // Read-shaped operations (e.g. `$everything`) are authorized as Read
+    // against the resource type in the first path segment, for any HTTP
+    // method — checked before the method-based fallthrough below so a POST
+    // is not misclassified as Create. Covers both `/{type}/$op` and
+    // `/{type}/{id}/$op`.
+    if segments
+        .last()
+        .is_some_and(|s| READ_SHAPED_OPERATIONS.contains(s))
+    {
+        return Some((resource_type, FhirOperation::Read));
     }
 
     // Detect compartment search: GET /{compartment_type}/{id}/{target_type}
@@ -567,6 +590,24 @@ mod tests {
     #[test]
     fn test_extract_operation_metadata() {
         assert!(extract_operation("/metadata", "GET").is_none());
+    }
+
+    #[test]
+    fn test_extract_operation_everything_type_level() {
+        for method in ["GET", "POST"] {
+            let (rt, op) = extract_operation("/Patient/$everything", method).unwrap();
+            assert_eq!(rt, "Patient", "method={method}");
+            assert_eq!(op, FhirOperation::Read, "method={method}");
+        }
+    }
+
+    #[test]
+    fn test_extract_operation_everything_instance_level() {
+        for method in ["GET", "POST"] {
+            let (rt, op) = extract_operation("/Patient/123/$everything", method).unwrap();
+            assert_eq!(rt, "Patient", "method={method}");
+            assert_eq!(op, FhirOperation::Read, "method={method}");
+        }
     }
 
     #[test]

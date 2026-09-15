@@ -49,6 +49,7 @@ HFS_SERVER_PORT=3000 HFS_LOG_LEVEL=debug cargo run --bin hfs
 | `HFS_REQUEST_TIMEOUT` | `30` | Request timeout in seconds |
 | `HFS_DEFAULT_PAGE_SIZE` | `20` | Default search result page size |
 | `HFS_MAX_PAGE_SIZE` | `1000` | Maximum search result page size |
+| `HFS_EVERYTHING_MAX_UNPAGED` | `10000` | Ceiling on `match` entries for an unpaged `Patient/$everything`; when reached the response is paged and carries a `next` link. |
 
 ## Compression
 
@@ -261,6 +262,8 @@ StructureDefinition writes since process start (no startup warm-load yet).
 | purge, type | POST | `/[type]/$purge` |
 | reindex | POST | `/$reindex`, `/[type]/$reindex` |
 | reindex status / cancel | GET/DELETE | `/$reindex-status/[job_id]` |
+| everything, instance | GET/POST | `/Patient/[id]/$everything` |
+| everything, type | GET/POST | `/Patient/$everything` |
 
 `$purge` (permanent, irreversible deletion including history) and `$reindex`
 (rebuild the search index) are administrative, non-FHIR operations. They require
