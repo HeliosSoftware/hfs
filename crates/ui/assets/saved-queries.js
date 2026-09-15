@@ -2386,6 +2386,12 @@
     return json.length > 60 ? json.slice(0, 60) + "…" : json;
   }
 
+  /* Keep long ids on one line as an 8-character chip; short ids stay whole
+   * (#1106). The full id is always the link's accessible name. */
+  function abbreviateId(id) {
+    return id.length <= 12 ? id : id.slice(0, 8);
+  }
+
   /* Typed default columns (#416): common fields per resource type when the
    * query names no _elements; unknown types keep the compact id/updated view. */
   var DEFAULT_COLUMNS = {
@@ -2486,6 +2492,7 @@
     var head = document.createDocumentFragment();
     var headRow = document.createElement("tr");
     var th = document.createElement("th");
+    th.className = "col-id";
     th.textContent = "id";
     headRow.appendChild(th);
     columns.forEach(function (col) {
@@ -2503,14 +2510,33 @@
       var resource = entry.resource;
       var row = document.createElement("tr");
       var idCell = document.createElement("td");
+      idCell.className = "col-id";
       var link = document.createElement("a");
-      link.className = "url";
+      link.className = "result-id row-link";
       link.href = safeResourceHref(entry, context, resource);
       link.dataset.resourceType = context.type;
       link.dataset.resourceId = resource.id || "";
       link.target = "_blank";
       link.rel = "noopener";
-      link.textContent = resource.id || "";
+      var id = resource.id || "";
+      link.title = id;
+      /* `.result-id` is `display: inline-flex` (#1106): Chromium's accessible
+       * name computation inserts a space between the text of two flex-item
+       * children, splitting "98f3fa36" and "-95ec-…" apart even though they
+       * are adjacent in the DOM with no whitespace between them. `aria-label`
+       * bypasses that name-from-content join and pins the accessible name to
+       * the exact full id; the hidden span stays for in-page find (Ctrl+F). */
+      link.setAttribute("aria-label", id);
+      var idText = document.createElement("span");
+      idText.className = "result-id__text";
+      idText.textContent = abbreviateId(id);
+      link.appendChild(idText);
+      if (id.length > 12) {
+        var idRest = document.createElement("span");
+        idRest.className = "visually-hidden";
+        idRest.textContent = id.slice(8);
+        link.appendChild(idRest);
+      }
       idCell.appendChild(link);
       row.appendChild(idCell);
       columns.forEach(function (col) {

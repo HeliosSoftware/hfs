@@ -261,7 +261,7 @@ test.describe("query builder", () => {
     await queries.results.next.click();
     await expect(queries.results.rows).toHaveCount(1);
     await expect(queries.results.rows.first()).toContainText("patient-page-two");
-    await expect(queries.results.rows.first().locator("a.url")).toHaveAttribute(
+    await expect(queries.results.rows.first().locator("a.result-id")).toHaveAttribute(
       "href",
       `${paginationOrigin}/public/fhir/acme/Patient/patient-page-two`,
     );
@@ -273,6 +273,27 @@ test.describe("query builder", () => {
         (window as typeof window & { __hfsFetchInputs?: string[] }).__hfsFetchInputs || [],
     );
     expect(fetchInputs.filter((input) => input === paginationUrl)).toHaveLength(4);
+  });
+
+  // #1106: row-navigation.js delegates the click from `document`, so a click
+  // anywhere in the row opens the resource, same as clicking the id link.
+  test("clicking a non-id cell opens the resource in a new tab", async ({
+    queries,
+    context,
+    request,
+  }) => {
+    const id = await createResource(request, "Patient", { name: [{ family: "QueriesRowClick" }] });
+    await waitSearchable(request, "Patient", id);
+
+    await queries.goto();
+    await queries.builder.run(`Patient?_id=${id}`);
+    await queries.results.waitShown();
+
+    const cell = queries.results.rows.first().locator("td:last-child");
+    const [opened] = await Promise.all([context.waitForEvent("page"), cell.click()]);
+    await opened.waitForLoadState();
+    expect(opened.url()).toMatch(new RegExp(`/Patient/${id}$`));
+    await opened.close();
   });
 
   /// Chained search end to end (#406): the two chain directions meet on the

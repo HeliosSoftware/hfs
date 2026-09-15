@@ -1,5 +1,5 @@
 import { test, expect } from "../pages/fixtures";
-import { createResource, waitSearchable } from "../pages/api";
+import { createResource, updateResource, waitSearchable } from "../pages/api";
 import type { ResourcesPage } from "../pages/resources";
 
 // The Resources workspace beyond the edit flows: the type rail (filter + live
@@ -274,7 +274,7 @@ test("a conflicting Resources bookmark uses the query URL type everywhere after 
     await expect(page.locator("#query-plain-text")).toContainText("NavAlpha");
     await resources.results.waitShown();
     const resultLink = page.locator(
-      `#query-results-body a.url[data-resource-type='Patient'][data-resource-id='${patientId}']`,
+      `#query-results-body a.result-id[data-resource-type='Patient'][data-resource-id='${patientId}']`,
     );
     await expect(resultLink).toBeVisible();
     await expect(resultLink).toHaveAttribute(
@@ -704,13 +704,88 @@ test("a result under a public path prefix still opens in the modal", async ({
   await page.locator("input.query-builder__url[name=url]").fill(queryPath.slice(1));
   await page.locator("[data-intent='run']").click();
 
-  const resultLink = page.locator("#query-results-body a.url").first();
+  const resultLink = page.locator("#query-results-body a.result-id").first();
   await expect(resultLink).toHaveAttribute("href", publicUrl);
   await expect(resultLink).toHaveAttribute("data-resource-type", "Patient");
   await expect(resultLink).toHaveAttribute("data-resource-id", id);
   await resultLink.click();
   await resources.modal.waitOpen();
   await expect(resources.modal.subject).toContainText(id);
+});
+
+// #1106: ids past 12 characters show only an 8-character prefix, on one line,
+// while the full id stays the link's accessible name and Ctrl+F target.
+test("a long result id shows an 8-character chip on one line and a short id stays whole", async ({
+  resources,
+  page,
+  request,
+}) => {
+  const longId = crypto.randomUUID();
+  const shortId = "short-1106";
+  await updateResource(request, "Patient", longId, { name: [{ family: "LongId" }] });
+  await updateResource(request, "Patient", shortId, { name: [{ family: "ShortId" }] });
+  await waitSearchable(request, "Patient", longId);
+  await waitSearchable(request, "Patient", shortId);
+
+  await resources.goto("Patient");
+  await page.locator("input.query-builder__url[name=url]").fill(`Patient?_id=${longId},${shortId}`);
+  await page.locator("[data-intent='run']").click();
+  await resources.results.waitShown();
+
+  const longLink = page.locator(`#query-results-body a.result-id[data-resource-id='${longId}']`);
+  await expect(longLink.locator(".result-id__text")).toHaveText(longId.slice(0, 8));
+  await expect(longLink).toHaveAccessibleName(longId);
+  expect(await longLink.evaluate((el) => el.getClientRects().length)).toBe(1);
+
+  const shortLink = page.locator(`#query-results-body a.result-id[data-resource-id='${shortId}']`);
+  await expect(shortLink.locator(".result-id__text")).toHaveText(shortId);
+});
+
+// #1106: row-navigation.js delegates the click from `document`, so a click on
+// any cell of the row — not just the id link — opens the modal.
+test("clicking a non-id cell opens the result in the modal", async ({ resources, page, request }) => {
+  const id = await createResource(request, "Patient", { name: [{ family: "RowClick" }] });
+  await waitSearchable(request, "Patient", id);
+
+  await resources.goto("Patient");
+  await page.locator("input.query-builder__url[name=url]").fill(`Patient?_id=${id}`);
+  await page.locator("[data-intent='run']").click();
+  await resources.results.waitShown();
+
+  await resources.results.rows.first().locator("td:last-child").click();
+  await resources.modal.waitOpen();
+  await expect(resources.modal.subject).toContainText(id);
+});
+
+test("selecting text in a result row does not open the modal", async ({
+  resources,
+  page,
+  request,
+}) => {
+  const id = await createResource(request, "Patient", { name: [{ family: "RowSelect" }] });
+  await waitSearchable(request, "Patient", id);
+
+  await resources.goto("Patient");
+  await page.locator("input.query-builder__url[name=url]").fill(`Patient?_id=${id}`);
+  await page.locator("[data-intent='run']").click();
+  await resources.results.waitShown();
+
+  const cell = resources.results.rows.first().locator("td:last-child");
+  // In Chromium a synthesized pointer click collapses a pre-existing selection
+  // before the click event fires, which would defeat the point of this test.
+  // Build the selection programmatically and dispatch the click directly: a
+  // click that lands while the row still holds a live selection, as after a
+  // drag-select.
+  await cell.evaluate((el) => {
+    const range = document.createRange();
+    range.selectNodeContents(el);
+    const selection = window.getSelection();
+    selection?.removeAllRanges();
+    selection?.addRange(range);
+    el.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true, button: 0 }));
+  });
+  await page.waitForTimeout(200);
+  await expect(resources.modal.root).toBeHidden();
 });
 
 test("a created resource can be deleted from its modal", async ({ resources, page, request }) => {
@@ -721,7 +796,7 @@ test("a created resource can be deleted from its modal", async ({ resources, pag
   await resources.goto("Patient");
   await page.locator("input.query-builder__url[name=url]").fill(`Patient?_id=${id}`);
   await page.locator("[data-intent='run']").click();
-  await page.locator(`#query-results-body a.url`).first().click();
+  await page.locator(`#query-results-body a.result-id`).first().click();
   await resources.modal.waitOpen();
   await expect(resources.modal.subject).toContainText(id);
 
@@ -746,7 +821,7 @@ test("the dialog stays put across tab switches and status messages", async ({
   await resources.goto("Patient");
   await page.locator("input.query-builder__url[name=url]").fill(`Patient?_id=${id}`);
   await page.locator("[data-intent='run']").click();
-  await page.locator("#query-results-body a.url").first().click();
+  await page.locator("#query-results-body a.result-id").first().click();
   await resources.modal.waitOpen();
 
   // The dialog occupies a fixed rectangle (#607): switching panes or a
