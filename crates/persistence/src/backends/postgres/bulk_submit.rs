@@ -1175,8 +1175,8 @@ impl PostgresBackend {
             let Some(change) = change else {
                 return Ok(0);
             };
-            client
-                .execute(
+            super::cached::execute_cached(
+                client,
                     "INSERT INTO bulk_submission_changes
                      (tenant_id, submitter, submission_id, change_id, manifest_id, change_type, resource_type, resource_id, previous_version, new_version, previous_content, changed_at)
                      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
@@ -1215,7 +1215,8 @@ impl PostgresBackend {
             &outcome_code,
             &outcome_json,
         ];
-        let store_receipt = client.execute(
+        let store_receipt = super::cached::execute_cached(
+            client,
             // Upsert: the worker re-fetches a whole file after a transient
             // failure, and the retry must overwrite its own earlier rows
             // instead of colliding with them (#457).
