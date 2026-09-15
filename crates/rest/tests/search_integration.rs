@@ -353,8 +353,8 @@ mod basic_search {
         let patient_count = get_bundle_entries(&baseline).len() as i64;
         assert!(patient_count > 0, "fixture should seed patients");
         assert!(
-            baseline["total"].is_null(),
-            "Bundle.total should be absent without _total"
+            baseline.get("total").is_none(),
+            "Bundle.total should be absent (not null) without _total: {baseline}"
         );
 
         // _total=accurate -> Bundle.total present and equal to the match count.
@@ -3039,7 +3039,10 @@ mod summary_count {
             .await;
         response.assert_status_ok();
         let body: Value = response.json();
-        assert!(body["total"].is_null(), "explicit _total=none wins: {body}");
+        assert!(
+            body.get("total").is_none(),
+            "explicit _total=none wins and total is absent, not null: {body}"
+        );
     }
 }
 
@@ -3312,5 +3315,72 @@ mod server_meta {
         let entry = &get_bundle_entries(&search)[0]["resource"];
         assert_eq!(entry["meta"]["versionId"], "2");
         assert!(entry["meta"]["lastUpdated"].is_string());
+    }
+}
+
+// ============================================================================
+// Bundle.total on a resource type with no stored rows (#990)
+// ============================================================================
+
+mod empty_type_total {
+    use super::*;
+
+    /// `Bundle.total` is either a number or absent. A resource type with no
+    /// stored rows is a known-empty set: `_summary=count` and `_total=accurate`
+    /// report `0`, and a plain search that computes no total omits the key.
+    /// The literal `null` is never valid FHIR JSON for a primitive.
+    async fn get_json(server: &TestServer, path: &str) -> Value {
+        let response = server
+            .get(path)
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+        response.assert_status_ok();
+        response.json()
+    }
+
+    fn assert_total_is_number_or_absent(body: &Value) {
+        match body.get("total") {
+            None => {}
+            Some(total) => assert!(
+                total.is_u64(),
+                "Bundle.total must be a number or absent, never {total}: {body}"
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_empty_type_summary_count_reports_zero() {
+        let (server, backend) = create_test_server().await;
+        seed_search_test_data(&backend).await;
+
+        let body = get_json(&server, "/Group?_summary=count").await;
+        assert_eq!(body["total"], serde_json::json!(0), "{body}");
+        assert!(body.get("entry").is_none(), "{body}");
+    }
+
+    #[tokio::test]
+    async fn test_empty_type_total_accurate_reports_zero() {
+        let (server, backend) = create_test_server().await;
+        seed_search_test_data(&backend).await;
+
+        let body = get_json(&server, "/Group?_total=accurate").await;
+        assert_eq!(body["total"], serde_json::json!(0), "{body}");
+        assert_eq!(body["entry"], serde_json::json!([]), "{body}");
+    }
+
+    #[tokio::test]
+    async fn test_empty_type_plain_search_never_serializes_null_total() {
+        let (server, backend) = create_test_server().await;
+        seed_search_test_data(&backend).await;
+
+        let body = get_json(&server, "/Group").await;
+        assert_eq!(body["resourceType"], "Bundle");
+        assert_eq!(body["type"], "searchset");
+        assert_total_is_number_or_absent(&body);
+        assert_eq!(body["entry"], serde_json::json!([]), "{body}");
+
+        // Explicitly opting out of a total omits the key rather than nulling it.
+        let body = get_json(&server, "/Group?_summary=count&_total=none").await;
+        assert_total_is_number_or_absent(&body);
     }
 }

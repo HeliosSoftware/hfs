@@ -2216,6 +2216,58 @@ mod es_integration {
         }
     }
 
+    /// #990: a resource type that has never been written has no index (indices
+    /// are created lazily on first write), so Elasticsearch answers the search
+    /// with `index_not_found_exception`. That is a known-empty set, and the
+    /// result must say so with `total = Some(0)` — a missing total made the
+    /// REST layer emit `"total": null` for `GET /Group` and fail closed on
+    /// `GET /Group?_summary=count`.
+    #[tokio::test]
+    async fn es_integration_search_unindexed_type_reports_zero_total() {
+        use helios_persistence::core::{SearchProvider, TextSearchProvider};
+        use helios_persistence::types::{ContainedMode, Pagination, SearchQuery, TotalMode};
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("unindexed-type-tenant");
+
+        // Plain search: the ES search path always reports a total.
+        let result = backend
+            .search(&tenant, &SearchQuery::new("Group"))
+            .await
+            .expect("searching an unindexed type is not an error");
+        assert!(result.resources.items.is_empty());
+        assert_eq!(
+            result.total,
+            Some(0),
+            "an unindexed type is a known-empty set"
+        );
+        assert_eq!(result.resources.page_info.total, Some(0));
+
+        // `_total=accurate` (what `_summary=count` implies, #254).
+        let mut query = SearchQuery::new("Group");
+        query.total = Some(TotalMode::Accurate);
+        let result = backend.search(&tenant, &query).await.unwrap();
+        assert_eq!(result.total, Some(0));
+
+        // The count path already agreed; the two must not diverge.
+        assert_eq!(backend.search_count(&tenant, &query).await.unwrap(), 0);
+
+        // `_contained` and full-text searches take their own request paths and
+        // hit the same missing index.
+        let mut contained = SearchQuery::new("Group");
+        contained.contained = ContainedMode::On;
+        contained.total = Some(TotalMode::Accurate);
+        let result = backend.search(&tenant, &contained).await.unwrap();
+        assert_eq!(result.total, Some(0));
+
+        let result = backend
+            .search_text(&tenant, "Group", "anything", &Pagination::default())
+            .await
+            .unwrap();
+        assert!(result.resources.items.is_empty());
+        assert_eq!(result.total, Some(0));
+    }
+
     #[tokio::test]
     async fn es_integration_search_by_name() {
         use helios_persistence::core::SearchProvider;
