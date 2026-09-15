@@ -9675,11 +9675,12 @@ mod postgres_integration {
             ),
             "expected MaxErrorsExceeded, got {outcome:?}"
         );
-        let stopped_batches = stop_observer.batches.lock().unwrap();
-        assert_eq!(stopped_batches.len(), 1);
-        assert_eq!(stopped_batches[0].len(), 1);
-        assert!(stopped_batches[0][0].is_error());
-        drop(stopped_batches);
+        {
+            let stopped_batches = stop_observer.batches.lock().unwrap();
+            assert_eq!(stopped_batches.len(), 1);
+            assert_eq!(stopped_batches[0].len(), 1);
+            assert!(stopped_batches[0][0].is_error());
+        }
         let receipt_counts = backend
             .get_entry_counts(&tenant, &submission, &manifest)
             .await
@@ -9755,10 +9756,11 @@ mod postgres_integration {
                 .iter()
                 .all(|result| result.outcome == BulkEntryOutcome::Skipped)
         );
-        let continued_batches = continue_observer.batches.lock().unwrap();
-        assert_eq!(continued_batches.len(), 1);
-        assert_eq!(continued_batches[0].len(), 3);
-        drop(continued_batches);
+        {
+            let continued_batches = continue_observer.batches.lock().unwrap();
+            assert_eq!(continued_batches.len(), 1);
+            assert_eq!(continued_batches[0].len(), 3);
+        }
         let receipt_counts = backend
             .get_entry_counts(&tenant, &submission, &manifest)
             .await
