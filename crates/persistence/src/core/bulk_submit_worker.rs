@@ -1393,6 +1393,15 @@ where
         // manifest's persisted counters are cumulative across runs and belong
         // to the ingestion engine's per-batch bookkeeping (#969).
         let failed_at = AtomicU64::new(0);
+        // The share of `failed_at` that is *file*-level: a file that never
+        // opened, or one whose stream broke part-way. Each already writes its
+        // own `failed to fetch/ingest file ...` artifact and produces no entry
+        // receipts, so it must not also be counted into the summary
+        // OperationOutcome `write_result_artifact_pages` writes for entries the
+        // engine counted but never persisted (#1127). Kept separate rather than
+        // held out of `failed_at`, because the manifest counters and the
+        // terminal status still have to see these failures.
+        let file_level_at = AtomicU64::new(0);
         // File-level fetch/ingest failures write their own finalized artifacts.
         // No staged row exists; all finalized records are collected and handed
         // to one publication call after the whole run.
@@ -1407,6 +1416,7 @@ where
         // future it returns can borrow `manifest.output[i]` for the manifest's
         // lifetime without a higher-ranked-lifetime bound the closure can't name.
         let failed_ref = &failed_at;
+        let file_level_ref = &file_level_at;
         let opened_ref = &opened;
         let totals_ref = &totals_known;
         let progress_ref = &progress;
@@ -1468,6 +1478,7 @@ where
                         push_failure(file_failures_ref, url, cause);
                         error_records_ref.lock().await.push(file_error);
                         failed_ref.fetch_add(1, Ordering::Relaxed);
+                        file_level_ref.fetch_add(1, Ordering::Relaxed);
                         // No batch ran for a file that never opened, so this
                         // failure is the worker's to add.
                         if let Err(e) = self.jobs.add_manifest_progress(lease_ref, 0, 1, 0).await {
@@ -1552,6 +1563,7 @@ where
                         push_failure(file_failures_ref, url, cause);
                         error_records_ref.lock().await.push(file_error);
                         failed_ref.fetch_add(1, Ordering::Relaxed);
+                        file_level_ref.fetch_add(1, Ordering::Relaxed);
                         // Every entry this file did commit was already counted
                         // by its own batch; the file-level failure was not.
                         if let Err(e) = self.jobs.add_manifest_progress(lease_ref, 0, 1, 0).await {
@@ -1619,6 +1631,9 @@ where
             return Ok(());
         }
         let mut failed = failed_at.load(Ordering::Relaxed);
+        // Carried to the receipt step so the summary OperationOutcome can
+        // discount the failures that already have an artifact of their own.
+        let file_level_failures = file_level_at.load(Ordering::Relaxed);
 
         // 2b. Process `deleted` files — transaction Bundles / resource refs to
         // remove. Successful deletions across every deleted file share one
@@ -1770,6 +1785,7 @@ where
                 &manifest_url,
                 view.fhir_version,
                 failed,
+                file_level_failures,
                 &sync.drift,
             ) => Some(receipts?),
         };
@@ -1832,12 +1848,18 @@ where
     /// `error` artifact, naming the `$reindex` repair. A drift is a tenant-wide
     /// count disagreement, not a failed entry: it does not affect
     /// `failed_count` or any `output` line.
+    ///
+    /// `file_level_failures` is the part of `failed_count` contributed by whole
+    /// input files that could not be fetched or could not be read to their end.
+    /// Those already carry their own error artifact and never produce entry
+    /// receipts, so they are excluded from the uncaptured-entry summary (#1127).
     async fn write_result_artifacts(
         &self,
         lease: &ManifestLease,
         manifest_url: &str,
         _fhir_version: FhirVersion,
         failed_count: u64,
+        file_level_failures: u64,
         drift: &[IndexDrift],
     ) -> StorageResult<Vec<SubmitFileRecord>> {
         let pages = entry_result_pages(|continuation| async move {
@@ -1853,20 +1875,30 @@ where
                 .await
         });
         let spools = ReceiptSpools::new()?;
-        self.write_result_artifact_pages(spools, lease, manifest_url, failed_count, drift, pages)
-            .await
+        self.write_result_artifact_pages(
+            spools,
+            lease,
+            manifest_url,
+            failed_count.saturating_sub(file_level_failures),
+            drift,
+            pages,
+        )
+        .await
     }
 
     /// Streams the entry-result pages into spools, then replays them into parts.
     ///
     /// The spools are owned by the caller so a test can watch the directory a
     /// run spools into; production callers hand in a fresh temp directory.
+    ///
+    /// `entry_failure_count` counts *entry*-level failures only; whole-file
+    /// failures are netted out by the caller (see [`Self::write_result_artifacts`]).
     async fn write_result_artifact_pages(
         &self,
         mut spools: ReceiptSpools,
         lease: &ManifestLease,
         manifest_url: &str,
-        failed_count: u64,
+        entry_failure_count: u64,
         drift: &[IndexDrift],
         pages: impl futures::Stream<Item = StorageResult<EntryResultPage>>,
     ) -> StorageResult<Vec<SubmitFileRecord>> {
@@ -1909,9 +1941,17 @@ where
         // persist them as per-line entry results. Surface any such uncaptured
         // failures as a summary OperationOutcome so the status manifest's `error`
         // array reflects them (partial success).
+        //
+        // Whole-file failures are already out of `entry_failure_count`: each has
+        // its own `failed to fetch/ingest file ...` artifact and no entry
+        // receipts to match against, so counting them here produced a second,
+        // misleading "could not be parsed" artifact for a file that simply broke
+        // mid-body (#1127). Only their own share is netted out, so a file that
+        // failed part-way after committing batches still reports whatever
+        // genuine entry failures the engine did not persist.
         let recorded_errors = spools.error_rows();
-        if failed_count > recorded_errors {
-            let uncaptured = failed_count - recorded_errors;
+        if entry_failure_count > recorded_errors {
+            let uncaptured = entry_failure_count - recorded_errors;
             let oo = json!({
                 "resourceType": "OperationOutcome",
                 "issue": [{
@@ -4587,15 +4627,36 @@ mod tests {
         )));
 
         let observer = Arc::new(RecordingWriteObserver::default());
-        run_observed_manifest(
-            &backend,
+        // Inlined instead of `run_observed_manifest` so the output store — and
+        // with it the published artifacts — outlives the run and can be read
+        // back below.
+        backend
+            .add_manifest(
+                &tenant,
+                &sub_id,
+                Some("http://provider/manifest.json"),
+                None,
+            )
+            .await
+            .unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let output = Arc::new(LocalFsOutputStore::new(
+            tmp.path().to_path_buf(),
+            "http://localhost:8080",
+        ));
+        let worker = DefaultSubmitWorker::new(
+            backend.clone(),
             fetcher,
-            &tenant,
-            &sub_id,
-            "http://provider/manifest.json",
-            observer.clone(),
+            output.clone(),
+            WorkerId::new("test-worker"),
         )
-        .await;
+        .with_write_observer(Some(observer.clone()));
+        let lease = backend
+            .claim_next_manifest(&WorkerId::new("test-worker"), StdDuration::from_secs(60))
+            .await
+            .unwrap()
+            .expect("claimable manifest");
+        worker.run_job(lease).await.unwrap();
 
         let t = || "t1".to_string();
         let p = || "Patient".to_string();
@@ -4642,6 +4703,38 @@ mod tests {
             rows.iter().any(|row| row.file_type == "output"),
             "the committed batches' receipts are still published"
         );
+
+        // #1127: the broken file is *one* error artifact. It used to also be
+        // summarized as an uncaptured entry failure, so the status manifest
+        // showed two outcomes for a single broken file — the second of them
+        // claiming a resource "could not be parsed" when none had been.
+        let errors = rows
+            .iter()
+            .filter(|row| row.file_type == "error")
+            .collect::<Vec<_>>();
+        assert_eq!(errors.len(), 1, "one broken file, one error artifact");
+        let error = errors[0];
+        assert_eq!(error.count_severity, Some(json!({"error": 1})));
+        let key = ExportPartKey {
+            tenant_id: tenant.tenant_id().as_str().to_string(),
+            job_id: submission_output_job_id(&sub_id),
+            resource_type: error.file_path.clone(),
+            file_type: error.file_type.clone(),
+            part_index: error.part_index,
+            fencing_token: error.fencing_token,
+        };
+        let mut reader = output.open_reader(&key).await.unwrap();
+        let mut bytes = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut reader, &mut bytes)
+            .await
+            .unwrap();
+        let outcome: Value = serde_json::from_str(std::str::from_utf8(&bytes).unwrap()).unwrap();
+        let diagnostics = outcome["issue"][0]["diagnostics"].as_str().unwrap();
+        assert!(
+            diagnostics.starts_with("failed to ingest file "),
+            "{diagnostics}"
+        );
+        assert!(diagnostics.contains("connection reset"), "{diagnostics}");
     }
 
     /// A `deleted` file whose stream breaks mid-body fails the manifest instead
@@ -6029,7 +6122,11 @@ mod tests {
             .unwrap()
             .into_iter()
             .collect::<Vec<_>>();
-        assert_eq!(errors.len(), 5);
+        // One artifact per failed file and nothing else: no line was ever read,
+        // so there is no uncaptured *entry* failure to summarize. The part-0
+        // summary these failures used to also produce claimed they "could not
+        // be parsed", which was never true of a file that failed to open (#1127).
+        assert_eq!(errors.len(), 4);
         assert!(errors.iter().all(|row| row.file_type == "error"
             && row.resource_type.as_deref() == Some("OperationOutcome")
             && row.line_count == 1));
@@ -6039,17 +6136,17 @@ mod tests {
             .collect::<std::collections::BTreeSet<_>>();
         assert_eq!(
             part_indexes.into_iter().collect::<Vec<_>>(),
-            vec![0, 2, 3, 4, 5]
+            vec![2, 3, 4, 5],
+            "the per-file artifacts keep their deterministic source indexes"
         );
         let locators = errors
             .iter()
             .map(|row| row.file_path.as_str())
             .collect::<std::collections::BTreeSet<_>>();
-        assert_eq!(locators.len(), 5);
+        assert_eq!(locators.len(), 4);
 
         for row in errors {
             let expected_url = match row.part_index {
-                0 => "",
                 2 => "http://provider/fail-0.ndjson",
                 3 => "http://provider/fail-1.ndjson",
                 4 => "http://provider/fail-2.ndjson",
@@ -6073,13 +6170,8 @@ mod tests {
             let outcome: Value =
                 serde_json::from_str(std::str::from_utf8(&bytes).unwrap()).unwrap();
             let diagnostic = outcome["issue"][0]["diagnostics"].as_str().unwrap();
-            if row.part_index == 0 {
-                assert!(diagnostic.contains("3 submitted resource(s)"));
-                assert!(diagnostic.contains("could not be parsed"));
-            } else {
-                assert!(diagnostic.contains(expected_url));
-                assert!(diagnostic.contains("unavailable input"));
-            }
+            assert!(diagnostic.contains(expected_url));
+            assert!(diagnostic.contains("unavailable input"));
         }
     }
 

@@ -1358,10 +1358,15 @@ impl StreamingBulkSubmitProvider for PostgresBackend {
 
         loop {
             let mut line = String::new();
-            let bytes_read = reader
-                .read_line(&mut line)
-                .await
-                .map_err(|e| internal_error(format!("Failed to read line: {}", e)))?;
+            let bytes_read = reader.read_line(&mut line).await.map_err(|e| {
+                // #1127: surface the reader's own message (e.g. the
+                // fetcher's give-up text) unprefixed so it reaches the
+                // manifest's error artifact intact.
+                StorageError::BulkSubmit(BulkSubmitError::InputStream {
+                    message: e.to_string(),
+                    source: Some(Box::new(e)),
+                })
+            })?;
 
             if bytes_read == 0 {
                 break;

@@ -151,10 +151,21 @@ pub fn redact_url(url: &str) -> String {
     out
 }
 
+/// Punctuation that ends a sentence rather than a URL. A message reads
+/// `reading file {url}: {cause}`, and the `:` belongs to the message: without
+/// this, redacting the URL swallowed it and the cause ran into the URL
+/// (#1127). Everything after the `?` is replaced regardless, so keeping these
+/// characters cannot leak a query.
+const URL_TRAILING_PUNCTUATION: [char; 4] = [':', ',', ';', '.'];
+
 /// Applies [`redact_url`] to every `http://` / `https://` URL embedded in
 /// free text — an error message from an HTTP client, for instance, which
 /// quotes the URL it failed on. A URL ends at whitespace, a quote, `<`, `>`
-/// or `)`.
+/// or `)`, and trailing [`URL_TRAILING_PUNCTUATION`] is left in the text.
+///
+/// Idempotent: re-redacting a message that already carries `?[redacted]`
+/// leaves it, and the punctuation after it, unchanged — the worker redacts a
+/// cause the fetcher had already redacted.
 pub fn redact_urls_in(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
@@ -172,7 +183,9 @@ pub fn redact_urls_in(text: &str) -> String {
         let end = candidate
             .find(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | '<' | '>' | ')'))
             .unwrap_or(candidate.len());
-        out.push_str(&redact_url(&candidate[..end]));
+        let url = candidate[..end].trim_end_matches(URL_TRAILING_PUNCTUATION);
+        out.push_str(&redact_url(url));
+        out.push_str(&candidate[url.len()..end]);
         rest = &candidate[end..];
     }
 }
@@ -257,6 +270,22 @@ mod tests {
             "error sending request for url (https://h/f.ndjson?[redacted]): also http://[redacted]@g/x?[redacted]"
         );
         assert_eq!(redact_urls_in("no urls here"), "no urls here");
+    }
+
+    /// #1127: the `:` that separates a URL from the cause after it is part of
+    /// the message, not of the URL, and redacting twice changes nothing.
+    #[test]
+    fn redact_urls_in_keeps_the_punctuation_after_a_url() {
+        let once = redact_urls_in("reading file http://h/f.ndjson?sig=SECRET: connection reset");
+        assert_eq!(
+            once,
+            "reading file http://h/f.ndjson?[redacted]: connection reset"
+        );
+        assert_eq!(redact_urls_in(&once), once);
+        assert_eq!(
+            redact_urls_in("fetched http://h/a?k=1, then http://h/b?k=2."),
+            "fetched http://h/a?[redacted], then http://h/b?[redacted]."
+        );
     }
 
     #[derive(Debug)]

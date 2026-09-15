@@ -574,9 +574,12 @@ impl StreamingBulkSubmitProvider for S3Backend {
         loop {
             let mut line = String::new();
             let bytes_read = reader.read_line(&mut line).await.map_err(|e| {
-                StorageError::BulkSubmit(BulkSubmitError::ParseError {
-                    line: line_number,
-                    message: format!("failed to read line: {e}"),
+                // #1127: surface the reader's own message (e.g. the fetcher's
+                // give-up text) unprefixed so it reaches the manifest's error
+                // artifact intact.
+                StorageError::BulkSubmit(BulkSubmitError::InputStream {
+                    message: e.to_string(),
+                    source: Some(Box::new(e)),
                 })
             })?;
 

@@ -2179,6 +2179,64 @@ async fn a_completion_manifest_with_errors_fails_the_submission() {
     assert!(detail.contains("marked failed"), "{detail}");
 }
 
+/// #1127: HFS's own status handler serialises `countSeverity` as the STU4
+/// array of `{"code":…,"count":…}` objects, not as a severity-keyed object.
+/// The UI used to read only the object shape, so every manifest produced by
+/// a real HFS recipient scored zero errors and a failed ingest was shown as
+/// Completed with "Error files 0".
+#[tokio::test]
+async fn a_server_shaped_count_severity_array_fails_the_submission() {
+    let recipient = mock_recipient_finishing_with(Some(serde_json::json!({
+        "output": [{"type": "Patient", "url": "http://x/1.ndjson"}],
+        "outcome": [{
+            "type": "OperationOutcome",
+            "url": "http://x/e.ndjson",
+            "countSeverity": [{"code": "error", "count": 1}]
+        }]
+    })))
+    .await;
+    let (ctx, detail_path, detail) = run_one_manifest_to_poll(&recipient).await;
+    assert!(
+        detail.contains(r#"<div id="submission-status">Failed</div>"#),
+        "{detail}"
+    );
+    assert!(
+        detail.contains(
+            "Status: got 200 OK — processing finished with 1 error file(s) \
+             (1 outputs); submission marked failed."
+        ),
+        "{detail}"
+    );
+    // The result card counts the one output and the one error file.
+    let (_, fragment) = get(&ctx, &format!("{detail_path}/status")).await;
+    assert!(fragment.contains("<div>1</div>"), "{fragment}");
+    assert!(!fragment.contains("<div>0</div>"), "{fragment}");
+}
+
+/// The array shape's counterpart to the clean-completion case: an `outcome`
+/// entry reporting only warnings carries no error or fatal count, so the
+/// submission still completes.
+#[tokio::test]
+async fn a_warning_only_count_severity_array_completes_the_submission() {
+    let recipient = mock_recipient_finishing_with(Some(serde_json::json!({
+        "output": [{"type": "Patient", "url": "http://x/1.ndjson"}],
+        "outcome": [{
+            "type": "OperationOutcome",
+            "url": "http://x/oo.ndjson",
+            "countSeverity": [{"code": "warning", "count": 2}]
+        }],
+        "error": []
+    })))
+    .await;
+    let (_ctx, _path, detail) = run_one_manifest_to_poll(&recipient).await;
+    assert!(
+        detail.contains(r#"<div id="submission-status">Completed</div>"#),
+        "{detail}"
+    );
+    assert!(detail.contains("submission completed"), "{detail}");
+    assert!(!detail.contains("marked failed"), "{detail}");
+}
+
 /// The export-manifest vocabulary (`error[]`) still counts for recipients
 /// that answer with it.
 #[tokio::test]

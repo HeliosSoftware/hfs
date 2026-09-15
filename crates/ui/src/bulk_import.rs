@@ -994,6 +994,48 @@ fn retry_after_seconds(response: &reqwest::Response) -> Option<u64> {
         .and_then(|v| v.trim().parse().ok())
 }
 
+/// Totals the counts recorded for `codes` in one `outcome` entry's
+/// `countSeverity`, which reaches us in two shapes.
+///
+/// HFS's own status handler emits the STU4 array of `{"code":…,"count":…}`
+/// objects (`severity_array` in `crates/rest/src/handlers/bulk_submit.rs`),
+/// while other recipients — and the older fixtures written against them —
+/// send a plain object keyed by severity (`{"error":1}`). Reading only the
+/// object shape scored every manifest HFS itself produces as zero errors,
+/// because `Value::get("error")` on an array is always `None`: a manifest
+/// that really failed showed up in the UI as a clean completion with no
+/// error files (#1127). Both shapes are accepted so neither recipient is
+/// misread.
+///
+/// Anything else yields `None`. An unrecognised `countSeverity` says nothing
+/// about the file, so the caller treats it exactly like a missing one and
+/// counts the entry as an error rather than assuming it was clean.
+fn severity_total(cs: &Value, codes: [&str; 2]) -> Option<u64> {
+    if let Some(entries) = cs.as_array() {
+        return Some(
+            entries
+                .iter()
+                .filter(|entry| {
+                    entry
+                        .get("code")
+                        .and_then(Value::as_str)
+                        .is_some_and(|code| codes.contains(&code))
+                })
+                .filter_map(|entry| entry.get("count").and_then(Value::as_u64))
+                .sum(),
+        );
+    }
+    if cs.is_object() {
+        return Some(
+            codes
+                .iter()
+                .filter_map(|code| cs.get(code).and_then(Value::as_u64))
+                .sum(),
+        );
+    }
+    None
+}
+
 /// One poll of the recipient's status URL: `202` records `X-Progress`, `200`
 /// records the status manifest as the submission's result, anything else is
 /// logged and polling stops (the poll URL is cleared). Neither `200` nor a
@@ -1061,11 +1103,9 @@ async fn poll_status(submission: &mut Submission, tenant: &str) {
                     files
                         .iter()
                         .filter(|file| {
-                            file.get("countSeverity").is_none_or(|cs| {
-                                cs.get("error").and_then(Value::as_u64).unwrap_or(0)
-                                    + cs.get("fatal").and_then(Value::as_u64).unwrap_or(0)
-                                    > 0
-                            })
+                            file.get("countSeverity")
+                                .and_then(|cs| severity_total(cs, ["error", "fatal"]))
+                                .is_none_or(|count| count > 0)
                         })
                         .count()
                 })
