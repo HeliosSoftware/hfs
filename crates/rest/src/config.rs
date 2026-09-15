@@ -956,8 +956,15 @@ impl BulkSubmitConfig {
 /// This struct can be constructed from environment variables using [`ServerConfig::from_env`],
 /// from command line arguments using [`ServerConfig::parse`], or programmatically.
 #[derive(Debug, Clone, Parser)]
-#[command(name = "rest-server")]
-#[command(about = "FHIR RESTful API Server")]
+// `long_about = None` keeps `--help` on the one-line `about`: clap would
+// otherwise print this struct's Rust doc comment (a note about constructors
+// that means nothing to an operator) at the top of the help text.
+#[command(name = "hfs", long_about = None)]
+#[command(about = "Helios FHIR Server — FHIR RESTful API")]
+// `-V`/`--version` prints `hfs <version> (git <sha>)` — the only way to
+// identify a downloaded release binary (#992). The string is assembled at
+// compile time in `build_info`.
+#[command(version = crate::build_info::VERSION_STRING)]
 pub struct ServerConfig {
     /// Port to listen on.
     #[arg(short, long, env = "HFS_SERVER_PORT", default_value = "8080")]
