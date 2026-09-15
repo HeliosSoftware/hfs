@@ -89,7 +89,8 @@ pub use registry::{
 };
 pub use reindex::{
     DEFERRED_REINDEX_BATCH_SIZE, ReindexOnFinish, ReindexOperation, ReindexProgress,
-    ReindexRequest, ReindexSource, ReindexStatus, ReindexTarget, ReindexableStorage, ResourcePage,
+    ReindexProgressError, ReindexRequest, ReindexSource, ReindexStatus, ReindexTarget,
+    ReindexableStorage, ResourcePage, ResourceRef, SkippedResource,
 };
 pub use seeder::{
     SeedOutcome, seed_spec_compartment_definitions, seed_spec_search_parameters,

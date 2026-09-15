@@ -1180,6 +1180,273 @@ mod es_integration {
         );
     }
 
+    /// A backend whose `_bulk` bodies are capped at `bulk_max_bytes`, so a test
+    /// can cross the byte cap without megabytes of fixtures.
+    async fn create_backend_with_bulk_max_bytes(bulk_max_bytes: usize) -> ElasticsearchBackend {
+        let es = shared_es().await;
+        let config = ElasticsearchConfig {
+            nodes: vec![format!("http://{}:{}", es.host, es.port)],
+            index_prefix: format!("hfs_{}", uuid::Uuid::new_v4().simple()),
+            number_of_replicas: 0,
+            refresh_interval: "1ms".to_string(),
+            bulk_max_bytes,
+            ..Default::default()
+        };
+        let backend = ElasticsearchBackend::with_shared_registry(config, build_search_registry())
+            .expect("Failed to create ElasticsearchBackend");
+        backend
+            .initialize()
+            .await
+            .expect("Failed to initialize ES backend");
+        backend
+    }
+
+    /// Polls until Elasticsearch counts exactly `expected` resources of
+    /// `resource_type` for `tenant`, so a refresh lag cannot fail the test.
+    async fn await_es_count(
+        backend: &ElasticsearchBackend,
+        tenant: &TenantContext,
+        resource_type: &str,
+        expected: u64,
+    ) {
+        let mut counted = 0;
+        for _ in 0..100 {
+            counted = backend.count(tenant, Some(resource_type)).await.unwrap();
+            if counted == expected {
+                return;
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        }
+        panic!("Elasticsearch counted {counted} {resource_type} resources, expected {expected}");
+    }
+
+    /// #1125: `_bulk` was chunked by 500 operations with no byte cap, so a page
+    /// of large resources became one oversized request that failed as a whole
+    /// at the transport level. A page above both the operation count and the
+    /// byte cap must index every resource, including one document that alone
+    /// is larger than the cap and therefore has to travel in its own request.
+    #[tokio::test]
+    async fn es_integration_reindex_page_over_op_and_byte_caps_indexes_entirely() {
+        use helios_persistence::search::ReindexTarget;
+        use helios_persistence::types::StoredResource;
+
+        const BULK_MAX_BYTES: usize = 64 * 1024;
+        const PATIENTS: usize = 1200;
+
+        let backend = create_backend_with_bulk_max_bytes(BULK_MAX_BYTES).await;
+        let tenant = create_tenant("reindex-bulk-caps");
+        let padding = "x".repeat(512);
+        let now = chrono::Utc::now();
+
+        let mut page: Vec<StoredResource> = (0..PATIENTS)
+            .map(|n| {
+                StoredResource::from_storage(
+                    "Patient",
+                    format!("capped-{n}"),
+                    "1",
+                    tenant.tenant_id().clone(),
+                    json!({
+                        "resourceType": "Patient",
+                        "id": format!("capped-{n}"),
+                        "name": [{"family": format!("Capped{n}")}],
+                        "text": {
+                            "status": "generated",
+                            "div": format!("<div xmlns=\"http://www.w3.org/1999/xhtml\">{padding}</div>")
+                        }
+                    }),
+                    now,
+                    now,
+                    None,
+                    FhirVersion::default(),
+                )
+            })
+            .collect();
+        let oversized = oversized_provenance(&tenant, "over-the-cap", 4_000);
+        assert!(
+            serde_json::to_vec(oversized.content()).unwrap().len() > BULK_MAX_BYTES,
+            "precondition: the Provenance alone exceeds the byte cap"
+        );
+        page.insert(PATIENTS / 2, oversized);
+
+        let page_bytes: usize = page
+            .iter()
+            .map(|r| serde_json::to_vec(r.content()).unwrap().len())
+            .sum();
+        assert!(
+            page.len() > 500,
+            "precondition: more operations than one count-capped request"
+        );
+        assert!(
+            page_bytes > 4 * BULK_MAX_BYTES,
+            "precondition: the page spans several byte-capped requests ({page_bytes} bytes)"
+        );
+
+        let outcomes = backend.write_search_entries_page(&tenant, &page).await;
+        assert_eq!(
+            outcomes.len(),
+            page.len(),
+            "one outcome per resource, in page order"
+        );
+        let failed: Vec<String> = outcomes
+            .iter()
+            .zip(&page)
+            .filter_map(|(outcome, resource)| {
+                outcome
+                    .as_ref()
+                    .err()
+                    .map(|e| format!("{}/{}: {e}", resource.resource_type(), resource.id()))
+            })
+            .collect();
+        assert!(
+            failed.is_empty(),
+            "{} of {} resources failed to index, first: {:?}",
+            failed.len(),
+            page.len(),
+            failed.first()
+        );
+
+        await_es_count(&backend, &tenant, "Patient", PATIENTS as u64).await;
+        for n in [0, PATIENTS / 2, PATIENTS - 1] {
+            assert!(
+                backend
+                    .read(&tenant, "Patient", &format!("capped-{n}"))
+                    .await
+                    .unwrap()
+                    .is_some(),
+                "capped-{n} must be indexed"
+            );
+        }
+        assert!(
+            backend
+                .read(&tenant, "Provenance", "over-the-cap")
+                .await
+                .unwrap()
+                .is_some(),
+            "a document larger than the cap must be sent alone, not dropped"
+        );
+    }
+
+    /// #1125: `sqlite-es` offloads SQLite's search to Elasticsearch, yet the
+    /// rebuild wrote a `search_index`/FTS pair into SQLite that no query reads,
+    /// and — the delete side being guarded — accumulated it on every rerun.
+    /// With the real offloaded SQLite primary still wired as a writer next to a
+    /// real Elasticsearch, a rebuild (plain, then with `clearExisting`) must put
+    /// every resource in Elasticsearch and leave both SQLite tables empty.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn es_integration_sqlite_es_reindex_writes_only_elasticsearch() {
+        use helios_persistence::backends::sqlite::{SqliteBackend, SqliteBackendConfig};
+        use helios_persistence::search::{ReindexOperation, ReindexRequest, ReindexStatus};
+
+        const RESOURCES: usize = 25;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fhir.db");
+        let data_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .map(|p| p.join("data"))
+            .unwrap_or_else(|| PathBuf::from("data"));
+        let count_rows = |table: &str| -> i64 {
+            rusqlite::Connection::open(&path)
+                .unwrap()
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap()
+        };
+
+        let sqlite = SqliteBackend::with_config(
+            &path,
+            SqliteBackendConfig {
+                data_dir: Some(data_dir),
+                search_offloaded: true,
+                ..Default::default()
+            },
+        )
+        .expect("Failed to create SQLite backend");
+        sqlite.init_schema().expect("Failed to initialize schema");
+        let sqlite = Arc::new(sqlite);
+        let es = Arc::new(create_backend().await);
+        let tenant = create_tenant("sqlite-es-reindex");
+
+        for n in 0..RESOURCES {
+            sqlite
+                .create(
+                    &tenant,
+                    "Patient",
+                    json!({
+                        "resourceType": "Patient",
+                        "id": format!("sqlite-es-{n}"),
+                        "name": [{"family": "Offloaded"}]
+                    }),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            count_rows("search_index"),
+            0,
+            "precondition: an offloaded create indexes nothing locally"
+        );
+        assert_eq!(count_rows("resource_fts"), 0);
+
+        let op = ReindexOperation::with_parts(
+            sqlite.clone(),
+            vec![sqlite.clone(), es.clone()],
+            sqlite.tenant_registries().clone(),
+        );
+
+        for (run, clear_existing) in [(1, false), (2, true)] {
+            let mut request = ReindexRequest::for_types(vec!["Patient"]).with_batch_size(10);
+            if clear_existing {
+                request = request.clear_existing();
+            }
+            let job_id = op.start(tenant.clone(), request, None).await.unwrap();
+            let mut finished = None;
+            for _ in 0..600 {
+                let progress = op.get_progress(&job_id).await.unwrap();
+                if progress.status.is_finished() {
+                    finished = Some(progress);
+                    break;
+                }
+                tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+            }
+            let progress = finished.unwrap_or_else(|| panic!("run {run}: reindex timed out"));
+            assert_eq!(
+                progress.status,
+                ReindexStatus::Completed,
+                "run {run}: {:?}",
+                progress.error_message
+            );
+            assert!(
+                progress.errors.is_empty(),
+                "run {run}: {:?}",
+                progress.errors
+            );
+            assert_eq!(progress.processed_resources, RESOURCES as u64, "run {run}");
+
+            assert_eq!(
+                count_rows("search_index"),
+                0,
+                "run {run}: the rebuild must not write SQLite's dead search_index"
+            );
+            assert_eq!(
+                count_rows("resource_fts"),
+                0,
+                "run {run}: the rebuild must not write SQLite's dead FTS table"
+            );
+            await_es_count(&es, &tenant, "Patient", RESOURCES as u64).await;
+        }
+        assert!(
+            es.read(&tenant, "Patient", "sqlite-es-0")
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
     #[tokio::test]
     async fn es_integration_create_with_id() {
         let backend = create_backend().await;

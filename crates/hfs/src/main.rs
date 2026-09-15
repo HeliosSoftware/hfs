@@ -158,6 +158,51 @@ fn es_write_refresh_from_config(
         .map_err(|e: String| anyhow::anyhow!("{} (from HFS_ELASTICSEARCH_WRITE_REFRESH)", e))
 }
 
+/// The refresh policy `$reindex` and the deferred rebuild use, or `None` to
+/// follow `HFS_ELASTICSEARCH_WRITE_REFRESH` (unset or blank).
+#[cfg(feature = "elasticsearch")]
+fn es_reindex_refresh_from_config(
+    config: &ServerConfig,
+) -> anyhow::Result<Option<helios_persistence::backends::elasticsearch::WriteRefreshPolicy>> {
+    match config
+        .elasticsearch_reindex_refresh
+        .as_deref()
+        .map(str::trim)
+    {
+        None | Some("") => Ok(None),
+        Some(value) => value
+            .parse()
+            .map(Some)
+            .map_err(|e: String| anyhow::anyhow!("{} (from HFS_ELASTICSEARCH_REINDEX_REFRESH)", e)),
+    }
+}
+
+/// The indexes `$reindex` rebuilds on `sqlite-elasticsearch`.
+///
+/// Elasticsearch always, because it serves every search here. The SQLite
+/// primary only when it still indexes locally: once search is offloaded no
+/// query reads its `search_index`/FTS tables (the composite routes the whole
+/// query to Elasticsearch, #1012), so rebuilding them is a second FHIRPath
+/// extraction, a write transaction on the ingest file, and rows that pile up on
+/// every rerun because the matching delete is a no-op (#1125).
+#[cfg(all(feature = "sqlite", feature = "elasticsearch"))]
+fn sqlite_es_reindex_targets(
+    sqlite: &Arc<SqliteBackend>,
+    es: &Arc<helios_persistence::backends::elasticsearch::ElasticsearchBackend>,
+) -> (
+    Vec<Arc<dyn helios_persistence::search::ReindexTarget>>,
+    &'static [&'static str],
+) {
+    if sqlite.is_search_offloaded() {
+        (vec![es.clone()], &["elasticsearch"])
+    } else {
+        (
+            vec![sqlite.clone(), es.clone()],
+            &["sqlite", "elasticsearch"],
+        )
+    }
+}
+
 #[cfg(feature = "mongodb")]
 fn build_mongodb_config(config: &ServerConfig, search_offloaded: bool) -> MongoBackendConfig {
     build_mongodb_config_with_env(config, search_offloaded, |name| std::env::var(name).ok())
@@ -1697,6 +1742,7 @@ fn automatic_reindex_hook(
             op,
             config.bulk_submit.worker_concurrency as usize,
         )
+        .with_batch_size(config.reindex_batch_size)
         .with_bulk_index_rebuild(config.bulk_submit.bulk_index_rebuild),
     )
 }
@@ -2192,6 +2238,9 @@ async fn start_sqlite_elasticsearch(
         refresh_interval: config.elasticsearch_refresh_interval.clone(),
         write_refresh: es_write_refresh_from_config(&config)?,
         nested_objects_limit: config.elasticsearch_nested_objects_limit,
+        request_timeout_ms: config.elasticsearch_request_timeout_ms,
+        bulk_max_bytes: config.elasticsearch_bulk_max_bytes,
+        reindex_refresh: es_reindex_refresh_from_config(&config)?,
         ..Default::default()
     };
 
@@ -2271,13 +2320,14 @@ async fn start_sqlite_elasticsearch(
     // so a `_typeFilter` runs against Elasticsearch, the index that actually
     // serves search in this deployment.
     let export_bundle = build_bulk_export(&config, composite.clone(), sqlite.clone()).await?;
-    // Reindex reads from the SQLite primary and rebuilds BOTH indexes: SQLite's
-    // own search_index table and the Elasticsearch index that actually serves
-    // search here.
+    // Reindex reads from the SQLite primary and writes only the indexes a query
+    // can read: Elasticsearch, plus SQLite's own index while it is not offloaded.
+    let (reindex_targets, reindex_target_names) = sqlite_es_reindex_targets(&sqlite, &es);
+    info!(targets = ?reindex_target_names, "Reindex writes to search targets");
     let ops = composite_ops(
         composite.clone(),
         sqlite.clone(),
-        vec![sqlite.clone(), es.clone()],
+        reindex_targets,
         sqlite.tenant_registries().clone(),
         audit_state.as_ref(),
         observability.clone(),
@@ -2487,6 +2537,9 @@ async fn start_postgres_elasticsearch(
         refresh_interval: config.elasticsearch_refresh_interval.clone(),
         write_refresh: es_write_refresh_from_config(&config)?,
         nested_objects_limit: config.elasticsearch_nested_objects_limit,
+        request_timeout_ms: config.elasticsearch_request_timeout_ms,
+        bulk_max_bytes: config.elasticsearch_bulk_max_bytes,
+        reindex_refresh: es_reindex_refresh_from_config(&config)?,
         ..Default::default()
     };
 
@@ -2699,6 +2752,9 @@ async fn start_mongodb_elasticsearch(
         refresh_interval: config.elasticsearch_refresh_interval.clone(),
         write_refresh: es_write_refresh_from_config(&config)?,
         nested_objects_limit: config.elasticsearch_nested_objects_limit,
+        request_timeout_ms: config.elasticsearch_request_timeout_ms,
+        bulk_max_bytes: config.elasticsearch_bulk_max_bytes,
+        reindex_refresh: es_reindex_refresh_from_config(&config)?,
         ..Default::default()
     };
 
@@ -2968,6 +3024,7 @@ async fn start_s3(
             ops.reindex.clone().map(|op| {
                 Arc::new(
                     helios_persistence::search::ReindexOnFinish::new(op)
+                        .with_batch_size(config.reindex_batch_size)
                         .with_bulk_index_rebuild(config.bulk_submit.bulk_index_rebuild),
                 ) as Arc<dyn helios_persistence::core::DeferredReindexHook>
             }),
@@ -3112,6 +3169,9 @@ async fn start_s3_elasticsearch(
         refresh_interval: config.elasticsearch_refresh_interval.clone(),
         write_refresh: es_write_refresh_from_config(&config)?,
         nested_objects_limit: config.elasticsearch_nested_objects_limit,
+        request_timeout_ms: config.elasticsearch_request_timeout_ms,
+        bulk_max_bytes: config.elasticsearch_bulk_max_bytes,
+        reindex_refresh: es_reindex_refresh_from_config(&config)?,
         ..Default::default()
     };
 
@@ -3326,6 +3386,78 @@ mod tests {
     use super::*;
     use helios_audit::AuditConfig;
     use helios_rest::ServerConfig;
+
+    // ── Elasticsearch rebuild wiring (#1125) ──────────────────────
+
+    #[cfg(feature = "elasticsearch")]
+    #[test]
+    fn test_es_reindex_refresh_follows_write_refresh_when_unset() {
+        use helios_persistence::backends::elasticsearch::WriteRefreshPolicy;
+
+        for unset in [None, Some(String::new()), Some("  ".to_string())] {
+            let config = ServerConfig {
+                elasticsearch_reindex_refresh: unset,
+                ..Default::default()
+            };
+            assert_eq!(es_reindex_refresh_from_config(&config).unwrap(), None);
+        }
+        let config = ServerConfig {
+            elasticsearch_write_refresh: "wait_for".to_string(),
+            elasticsearch_reindex_refresh: Some("false".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            es_write_refresh_from_config(&config).unwrap(),
+            WriteRefreshPolicy::WaitFor
+        );
+        assert_eq!(
+            es_reindex_refresh_from_config(&config).unwrap(),
+            Some(WriteRefreshPolicy::False)
+        );
+        let config = ServerConfig {
+            elasticsearch_reindex_refresh: Some("sometimes".to_string()),
+            ..Default::default()
+        };
+        let error = es_reindex_refresh_from_config(&config).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("HFS_ELASTICSEARCH_REINDEX_REFRESH"),
+            "{error}"
+        );
+    }
+
+    #[cfg(all(feature = "sqlite", feature = "elasticsearch"))]
+    #[test]
+    fn test_sqlite_es_reindex_skips_an_offloaded_primary() {
+        use helios_persistence::backends::elasticsearch::{
+            ElasticsearchBackend, ElasticsearchConfig,
+        };
+
+        // Never contacted: building the client does not connect.
+        let es = Arc::new(
+            ElasticsearchBackend::new(ElasticsearchConfig {
+                nodes: vec!["http://127.0.0.1:1".to_string()],
+                ..Default::default()
+            })
+            .expect("ES backend builds without a cluster"),
+        );
+        let config = ServerConfig {
+            database_url: Some(":memory:".to_string()),
+            ..Default::default()
+        };
+
+        let mut offloaded = create_sqlite_backend(&config).unwrap();
+        offloaded.set_search_offloaded(true);
+        let (targets, names) = sqlite_es_reindex_targets(&Arc::new(offloaded), &es);
+        assert_eq!(names, &["elasticsearch"]);
+        assert_eq!(targets.len(), 1);
+
+        let local = Arc::new(create_sqlite_backend(&config).unwrap());
+        let (targets, names) = sqlite_es_reindex_targets(&local, &es);
+        assert_eq!(names, &["sqlite", "elasticsearch"]);
+        assert_eq!(targets.len(), 2);
+    }
 
     // ── create_sqlite_backend() ───────────────────────────────────
 
