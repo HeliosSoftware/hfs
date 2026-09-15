@@ -528,11 +528,15 @@ fn replace_only_body() -> Value {
 }
 
 fn status_body() -> Value {
+    status_body_for("it-1")
+}
+
+fn status_body_for(submission_id: &str) -> Value {
     json!({
         "resourceType": "Parameters",
         "parameter": [
             {"name": "submitter", "valueIdentifier": {"system": "http://ehr", "value": "ehr-1"}},
-            {"name": "submissionId", "valueString": "it-1"}
+            {"name": "submissionId", "valueString": submission_id}
         ]
     })
 }
@@ -745,6 +749,79 @@ async fn test_kickoff_returns_200() {
     let (server, ..) = create_submit_server().await;
     let resp = server.post("/$bulk-submit").json(&kickoff_body()).await;
     assert_eq!(resp.status_code(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn test_status_kickoff_returns_404_for_missing_submission() {
+    let (server, ..) = create_submit_server().await;
+
+    let response = server
+        .post("/$bulk-submit-status")
+        .json(&status_body())
+        .await;
+
+    assert_eq!(response.status_code(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn test_poll_reports_an_aborted_submission() {
+    let (server, ..) = create_submit_server().await;
+    let submission_id = "poll-aborted";
+    assert_eq!(
+        server
+            .post("/$bulk-submit")
+            .json(&kickoff_body_with_status(submission_id, "stopped"))
+            .await
+            .status_code(),
+        StatusCode::OK
+    );
+
+    let status = server
+        .post("/$bulk-submit-status")
+        .json(&status_body_for(submission_id))
+        .await;
+    assert_eq!(status.status_code(), StatusCode::ACCEPTED);
+    let poll_path = status
+        .headers()
+        .get("content-location")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .trim_start_matches("http://localhost:8080");
+
+    assert_eq!(server.get(poll_path).await.status_code(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn test_status_getter_internal_error_maps_to_500() {
+    let (server, _backend, _output, db_path, _tmp) =
+        create_file_submit_server(BulkSubmitConfig::default()).await;
+    assert_eq!(
+        server
+            .post("/$bulk-submit")
+            .json(&kickoff_body())
+            .await
+            .status_code(),
+        StatusCode::OK
+    );
+
+    rusqlite::Connection::open(db_path)
+        .unwrap()
+        .execute(
+            "UPDATE bulk_submissions SET status = 'invalid-status'
+             WHERE tenant_id = ?1 AND submitter = ?2 AND submission_id = ?3",
+            rusqlite::params!["test-tenant", "http://ehr|ehr-1", "it-1"],
+        )
+        .unwrap();
+
+    assert_eq!(
+        server
+            .post("/$bulk-submit-status")
+            .json(&status_body())
+            .await
+            .status_code(),
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
 }
 
 #[tokio::test]

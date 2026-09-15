@@ -2014,6 +2014,192 @@ mod postgres_integration {
     }
 
     #[tokio::test]
+    async fn postgres_bulk_submit_status_uses_the_complete_identity_and_preserves_summary() {
+        use std::collections::HashMap;
+        use std::sync::Arc;
+
+        use helios_persistence::composite::{
+            CompositeConfig, CompositeStorage, CompositeSubmitJobs, DynStorage,
+        };
+        use helios_persistence::core::{
+            BulkSubmitJobStore, BulkSubmitProvider, SubmissionId, SubmissionStatus,
+        };
+
+        let _guard = BULK_SUBMIT_TEST_LOCK.lock().await;
+        let backend = Arc::new(create_backend().await);
+        let tenant = create_tenant("bulk-submit-status");
+        let other_tenant = create_tenant("bulk-submit-status-other-tenant");
+        let submission = SubmissionId::new("status-submitter", "status-id");
+        let other_submitter = SubmissionId::new("other-submitter", "status-id");
+        let other_submission = SubmissionId::new("status-submitter", "other-status-id");
+        let metadata = json!({"source": "status-test"});
+
+        backend
+            .create_submission(&tenant, &submission, Some(metadata.clone()))
+            .await
+            .unwrap();
+        backend
+            .create_submission(&other_tenant, &submission, None)
+            .await
+            .unwrap();
+        backend
+            .create_submission(&tenant, &other_submitter, None)
+            .await
+            .unwrap();
+        backend
+            .create_submission(&tenant, &other_submission, None)
+            .await
+            .unwrap();
+
+        let client = backend.get_client().await.unwrap();
+        for (row_tenant, id, status) in [
+            (&other_tenant, &submission, "complete"),
+            (&tenant, &other_submitter, "aborted"),
+            (&tenant, &other_submission, "complete"),
+        ] {
+            let tenant_id = row_tenant.tenant_id().as_str();
+            client
+                .execute(
+                    "UPDATE bulk_submissions SET status = $4
+                     WHERE tenant_id = $1 AND submitter = $2 AND submission_id = $3",
+                    &[
+                        &tenant_id,
+                        &id.submitter.as_str(),
+                        &id.submission_id.as_str(),
+                        &status,
+                    ],
+                )
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(
+            backend
+                .get_submission_status(&tenant, &submission)
+                .await
+                .unwrap(),
+            Some(SubmissionStatus::InProgress)
+        );
+        assert_eq!(
+            backend
+                .get_submission_status(&other_tenant, &submission)
+                .await
+                .unwrap(),
+            Some(SubmissionStatus::Complete)
+        );
+        assert_eq!(
+            backend
+                .get_submission_status(&tenant, &other_submitter)
+                .await
+                .unwrap(),
+            Some(SubmissionStatus::Aborted)
+        );
+        assert_eq!(
+            backend
+                .get_submission_status(&tenant, &other_submission)
+                .await
+                .unwrap(),
+            Some(SubmissionStatus::Complete)
+        );
+        assert_eq!(
+            backend
+                .get_submission_status(&tenant, &SubmissionId::new("status-submitter", "missing"),)
+                .await
+                .unwrap(),
+            None
+        );
+
+        let manifest = backend
+            .add_manifest(
+                &tenant,
+                &submission,
+                Some("https://provider/status.json"),
+                None,
+            )
+            .await
+            .unwrap();
+        let tenant_id = tenant.tenant_id().as_str();
+        for (line, outcome) in [
+            (1_i32, "success"),
+            (2, "validation-error"),
+            (3, "processing-error"),
+            (4, "skipped"),
+        ] {
+            let file_url = format!("https://provider/status-{line}.ndjson");
+            let resource_id = format!("status-{line}");
+            client
+                .execute(
+                    "INSERT INTO bulk_entry_results
+                     (tenant_id, submitter, submission_id, manifest_id, file_url,
+                      line_number, resource_type, resource_id, outcome)
+                     VALUES ($1, $2, $3, $4, $5, $6, 'Patient', $7, $8)",
+                    &[
+                        &tenant_id,
+                        &submission.submitter.as_str(),
+                        &submission.submission_id.as_str(),
+                        &manifest.manifest_id.as_str(),
+                        &file_url,
+                        &line,
+                        &resource_id,
+                        &outcome,
+                    ],
+                )
+                .await
+                .unwrap();
+        }
+        let summary = backend
+            .get_submission(&tenant, &submission)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(summary.metadata, Some(metadata));
+        assert_eq!(summary.manifest_count, 1);
+        assert_eq!(summary.total_entries, 4);
+        assert_eq!(summary.success_count, 1);
+        assert_eq!(summary.error_count, 2);
+        assert_eq!(summary.skipped_count, 1);
+
+        let config = CompositeConfig::builder()
+            .primary("postgres", BackendKind::Postgres)
+            .build()
+            .unwrap();
+        let mut backends = HashMap::new();
+        backends.insert("postgres".to_string(), backend.clone() as DynStorage);
+        let composite = Arc::new(CompositeStorage::new(config, backends).unwrap());
+        let jobs =
+            CompositeSubmitJobs::new(backend.clone() as Arc<dyn BulkSubmitJobStore>, composite);
+        assert_eq!(
+            jobs.get_submission_status(&tenant, &submission)
+                .await
+                .unwrap(),
+            Some(SubmissionStatus::InProgress)
+        );
+
+        let corrupt = SubmissionId::generate("corrupt-status");
+        backend
+            .create_submission(&tenant, &corrupt, None)
+            .await
+            .unwrap();
+        client
+            .execute(
+                "UPDATE bulk_submissions SET status = 'invalid-status'
+                 WHERE tenant_id = $1 AND submitter = $2 AND submission_id = $3",
+                &[
+                    &tenant_id,
+                    &corrupt.submitter.as_str(),
+                    &corrupt.submission_id.as_str(),
+                ],
+            )
+            .await
+            .unwrap();
+        let error = backend
+            .get_submission_status(&tenant, &corrupt)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("Invalid status: invalid-status"));
+    }
+
+    #[tokio::test]
     async fn statement_timeout_applies_to_every_pooled_connection() {
         let pg = shared_pg().await;
         let data_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
