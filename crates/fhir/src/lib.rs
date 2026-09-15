@@ -1476,6 +1476,59 @@ pub fn compartment_params(
     }
 }
 
+/// Returns the JSON element names (camelCase — `billablePeriod`, `type`,
+/// `use`) of every element the FHIR specification marks `isSummary: true`
+/// on `resource_type`, for the specified FHIR version: the set `_summary=true`
+/// keeps. An unknown resource type gets the generated lookup's minimal
+/// `resourceType`, `id`, `meta` set.
+///
+/// Thin version-dispatching wrapper around the per-version code-generated
+/// `get_summary_fields`, which reports the *Rust* field names of the
+/// generated structs — snake_case, and a raw identifier (`r#type`, `r#use`,
+/// `r#abstract`, `r#for`) wherever a FHIR element name collides with a Rust
+/// keyword. The conversion back to element names lives here, once, so every
+/// consumer agrees on it: REST `_summary` subsetting and the UI results table
+/// each used to carry their own copy, and the UI's missed the `r#` prefix,
+/// rendering `R#TYPE` / `R#USE` headers over empty columns for Claim and
+/// ~50 other types (#1107).
+#[allow(unreachable_patterns)]
+pub fn summary_elements(version: FhirVersion, resource_type: &str) -> Vec<String> {
+    let fields: &[&str] = match version {
+        #[cfg(feature = "R4")]
+        FhirVersion::R4 => r4::get_summary_fields(resource_type),
+        #[cfg(feature = "R4B")]
+        FhirVersion::R4B => r4b::get_summary_fields(resource_type),
+        #[cfg(feature = "R5")]
+        FhirVersion::R5 => r5::get_summary_fields(resource_type),
+        #[cfg(feature = "R6")]
+        FhirVersion::R6 => r6::get_summary_fields(resource_type),
+        _ => &[],
+    };
+    fields.iter().map(|f| field_to_element_name(f)).collect()
+}
+
+/// Maps a generated struct's Rust field name back to the FHIR element name it
+/// serializes as: drops the raw-identifier prefix the generator adds for
+/// keyword collisions (`r#type` → `type`) and converts snake_case to
+/// camelCase (`birth_date` → `birthDate`). Exactly inverts the generator's
+/// `make_rust_safe`.
+fn field_to_element_name(field: &str) -> String {
+    let field = field.strip_prefix("r#").unwrap_or(field);
+    let mut out = String::with_capacity(field.len());
+    let mut upper_next = false;
+    for c in field.chars() {
+        if c == '_' {
+            upper_next = true;
+        } else if upper_next {
+            out.push(c.to_ascii_uppercase());
+            upper_next = false;
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 // Internal helpers used by the derive macro; not part of the public API
 #[doc(hidden)]
 /// Multi-version FHIR resource container supporting version-agnostic operations.
@@ -3149,6 +3202,72 @@ impl IntoEvaluationResult for FhirResource {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn field_to_element_name_inverts_the_generator() {
+        assert_eq!(field_to_element_name("birth_date"), "birthDate");
+        assert_eq!(
+            field_to_element_name("managing_organization"),
+            "managingOrganization"
+        );
+        assert_eq!(field_to_element_name("id"), "id");
+        assert_eq!(field_to_element_name("implicit_rules"), "implicitRules");
+        // Every raw identifier `make_rust_safe` can emit (#1107).
+        assert_eq!(field_to_element_name("r#type"), "type");
+        assert_eq!(field_to_element_name("r#use"), "use");
+        assert_eq!(field_to_element_name("r#abstract"), "abstract");
+        assert_eq!(field_to_element_name("r#for"), "for");
+    }
+
+    /// The raw identifiers `make_rust_safe` emits reach every consumer as
+    /// plain element names — no `r#` may survive for any resource type in
+    /// any enabled version (#1107).
+    #[test]
+    fn summary_elements_never_leak_raw_identifiers() {
+        let checks: &[(FhirVersion, &str, &[&str])] = &[
+            #[cfg(feature = "R4")]
+            (FhirVersion::R4, "Claim", &["type", "use", "billablePeriod"]),
+            #[cfg(feature = "R4")]
+            (
+                FhirVersion::R4,
+                "StructureDefinition",
+                &["abstract", "type"],
+            ),
+            #[cfg(feature = "R4")]
+            (FhirVersion::R4, "Task", &["for", "status"]),
+            #[cfg(feature = "R4B")]
+            (
+                FhirVersion::R4B,
+                "Claim",
+                &["type", "use", "billablePeriod"],
+            ),
+            #[cfg(feature = "R5")]
+            (FhirVersion::R5, "Claim", &["type", "use", "billablePeriod"]),
+            #[cfg(feature = "R6")]
+            (FhirVersion::R6, "Claim", &["type", "use", "billablePeriod"]),
+        ];
+        for (version, resource_type, expected) in checks {
+            let elements = summary_elements(*version, resource_type);
+            for e in *expected {
+                assert!(
+                    elements.iter().any(|x| x == e),
+                    "{version:?} {resource_type} summary {elements:?} lacks {e}"
+                );
+            }
+            assert!(
+                elements
+                    .iter()
+                    .all(|e| !e.contains("r#") && !e.contains('_')),
+                "{version:?} {resource_type}: {elements:?}"
+            );
+        }
+        #[cfg(feature = "R4")]
+        assert_eq!(
+            summary_elements(FhirVersion::R4, "NotAResource"),
+            ["resourceType", "id", "meta"],
+            "unknown types get the generated lookup's minimal set"
+        );
+    }
 
     #[test]
     fn test_integer_string_deserialization() {

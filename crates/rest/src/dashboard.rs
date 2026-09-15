@@ -126,7 +126,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
 use helios_observability::dashboard::{
     DashboardPoint, DashboardProvider, DashboardSeries, DashboardSnapshot, DashboardWindow,
-    ExportJobCounts, Figures, TypeCount,
+    ExportJobCounts, Figures, ReindexActivity, TypeCount,
 };
 use helios_observability::dashboard_counters::{
     CountersSeries, DashboardCounters, ReconcileOutcome, StorageMarker,
@@ -612,6 +612,23 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Sums `tenant`'s queued and in-progress rebuilds among `jobs`, or `None`
+/// when it has none running.
+fn reindex_activity_of(
+    jobs: &[helios_persistence::search::ReindexProgress],
+    tenant: &str,
+) -> Option<ReindexActivity> {
+    let running: Vec<_> = jobs
+        .iter()
+        .filter(|job| job.status.is_running() && job.tenant_id.as_deref() == Some(tenant))
+        .collect();
+    (!running.is_empty()).then(|| ReindexActivity {
+        jobs: running.len() as u64,
+        processed: running.iter().map(|job| job.processed_resources).sum(),
+        total: running.iter().map(|job| job.total_resources).sum(),
+    })
+}
+
 /// A tenant's last read job counts (see [`JOB_COUNTS_TTL`]).
 #[derive(Clone, Copy, Default)]
 struct JobCountsEntry {
@@ -927,6 +944,9 @@ pub(crate) struct StorageDashboardProvider<S> {
     export_jobs: Option<Arc<dyn BulkExportJobStore>>,
     /// Bulk-submit job store, when the active backend provides one.
     submit_jobs: Option<Arc<dyn BulkSubmitJobStore>>,
+    /// The server's `$reindex` operation, when wired: its in-memory job
+    /// registry is where a running search-index rebuild shows up (#1065).
+    reindex: Option<Arc<helios_persistence::search::ReindexOperation>>,
     /// The live write counters every figure is served from (#1078): the set
     /// the server's write observer feeds, injected by `build_app`.
     counters: Arc<DashboardCounters>,
@@ -960,6 +980,7 @@ impl<S> StorageDashboardProvider<S> {
             ),
             export_jobs: None,
             submit_jobs: None,
+            reindex: None,
             counters: Arc::new(DashboardCounters::new()),
             job_counts: Mutex::new(HashMap::new()),
             viewed: Mutex::new(HashMap::new()),
@@ -980,6 +1001,24 @@ impl<S> StorageDashboardProvider<S> {
         self.export_jobs = export_jobs;
         self.submit_jobs = submit_jobs;
         self
+    }
+
+    /// Attaches the `$reindex` operation, whose running jobs become each
+    /// snapshot's [`DashboardSnapshot::reindex_active`] (#1065). `None` leaves
+    /// that field `None`, so no rebuild banner is ever shown.
+    pub(crate) fn with_reindex(
+        mut self,
+        reindex: Option<Arc<helios_persistence::search::ReindexOperation>>,
+    ) -> Self {
+        self.reindex = reindex;
+        self
+    }
+
+    /// The tenant's running search-index rebuilds. Reads the operation's
+    /// in-memory job registry, never storage, so a page load stays
+    /// constant-time (#1078).
+    fn reindex_activity(&self, tenant: &str) -> Option<ReindexActivity> {
+        reindex_activity_of(&self.reindex.as_ref()?.list_jobs(), tenant)
     }
 
     /// Replaces the write counters this provider reads and seeds — the set the
@@ -1467,6 +1506,7 @@ where
             available,
             export_jobs,
             import_jobs_active,
+            reindex_active: self.reindex_activity(tenant_key),
             figures,
         })
     }
@@ -1508,6 +1548,7 @@ where
             available: Vec::new(),
             export_jobs,
             import_jobs_active,
+            reindex_active: self.reindex_activity(tenant_key),
             figures,
         }
     }
@@ -2217,6 +2258,40 @@ mod tests {
     use helios_persistence::types::StoredResource;
     use serde_json::Value;
     use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+
+    #[test]
+    fn reindex_activity_sums_only_the_tenants_running_jobs() {
+        use helios_persistence::search::{ReindexProgress, ReindexStatus};
+
+        let job = |tenant: &str, status, processed, total| {
+            let mut job = ReindexProgress::new(format!("{tenant}-{processed}-{total}"));
+            job.tenant_id = Some(tenant.to_string());
+            job.status = status;
+            job.processed_resources = processed;
+            job.total_resources = total;
+            job
+        };
+        let jobs = [
+            job("acme", ReindexStatus::InProgress, 250, 1_000),
+            job("acme", ReindexStatus::Queued, 0, 0),
+            job("acme", ReindexStatus::Completed, 500, 500),
+            job("other", ReindexStatus::InProgress, 9, 10),
+        ];
+        assert_eq!(
+            reindex_activity_of(&jobs, "acme"),
+            Some(ReindexActivity {
+                jobs: 2,
+                processed: 250,
+                total: 1_000,
+            })
+        );
+        assert_eq!(reindex_activity_of(&jobs, "idle"), None);
+        assert_eq!(
+            reindex_activity_of(&jobs[2..3], "acme"),
+            None,
+            "a finished rebuild is not running"
+        );
+    }
 
     /// A private counter set per test.
     fn isolated_counters() -> Arc<DashboardCounters> {

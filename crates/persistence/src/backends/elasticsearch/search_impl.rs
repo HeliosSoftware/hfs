@@ -269,8 +269,10 @@ impl SearchProvider for ElasticsearchBackend {
         let index = self.index_name(tenant_id, resource_type);
 
         // Build ES query
-        let builder = EsQueryBuilder::new(tenant_id, resource_type, index.clone());
+        let builder = EsQueryBuilder::new(tenant_id, resource_type, index.clone())
+            .with_max_result_window(self.config().max_result_window);
         let es_query = builder.build(query);
+        let over_fetched = es_query.over_fetched;
 
         // Execute search (with retry on transient shard-availability errors)
         let body = match send_search_with_retry(self, &index, es_query.body).await? {
@@ -338,8 +340,12 @@ impl SearchProvider for ElasticsearchBackend {
             .is_some_and(|c| c.direction() == CursorDirection::Previous);
 
         let page_info = if backward {
-            let has_previous = hits_with_sort.len() > count;
-            if has_previous {
+            let has_previous = if over_fetched {
+                hits_with_sort.len() > count
+            } else {
+                hits_with_sort.len() >= count
+            };
+            if hits_with_sort.len() > count {
                 hits_with_sort.truncate(count);
             }
             hits_with_sort.reverse();
@@ -372,7 +378,15 @@ impl SearchProvider for ElasticsearchBackend {
                 }
             }
         } else {
-            let has_next = hits_with_sort.len() >= count;
+            // Without the extra hit (window boundary) fall back to "page is full" — a possible phantom next beats losing a page.
+            let has_next = if over_fetched {
+                hits_with_sort.len() > count
+            } else {
+                hits_with_sort.len() >= count
+            };
+            if hits_with_sort.len() > count {
+                hits_with_sort.truncate(count);
+            }
             let has_previous = query.cursor.is_some() || query.offset.unwrap_or(0) > 0;
             let next_cursor = if has_next {
                 hits_with_sort

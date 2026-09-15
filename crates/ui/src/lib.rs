@@ -96,7 +96,7 @@ use axum_htmx::{AutoVaryLayer, HxHistoryRestoreRequest, HxRequest, HxTarget};
 use chrono::{DateTime, Datelike, Duration, Utc};
 use helios_observability::dashboard::{
     DashboardPoint, DashboardSeries, DashboardSnapshot, DashboardWindow, ExportJobCounts, Figures,
-    SnapshotState, TypeCount,
+    ReindexActivity, SnapshotState, TypeCount,
 };
 use helios_persistence::core::{BulkProviderStore, ResourceStorage, SettingsStore};
 use rust_embed::RustEmbed;
@@ -809,6 +809,26 @@ fn dashboard_notice(state: &SnapshotState, now: DateTime<Utc>) -> NoticeLine {
     }
 }
 
+/// `data-dash-notice` slug of the rebuild line (#1065).
+const REBUILD_NOTICE: &str = "rebuilding";
+
+/// The "search index rebuilding" sentence for a running rebuild (#1065):
+/// with its percentage once the rebuild has counted its resources, without
+/// one before, so it never shows a fabricated "0%".
+fn rebuild_text(i18n: &I18n, activity: &ReindexActivity) -> String {
+    match activity.percent() {
+        Some(percent) => i18n.t_args(
+            "search-index-rebuilding",
+            &std::collections::BTreeMap::from([
+                ("percent".to_string(), percent.to_string()),
+                ("processed".to_string(), grouped(activity.processed)),
+                ("total".to_string(), grouped(activity.total)),
+            ]),
+        ),
+        None => i18n.t("search-index-rebuilding-counting"),
+    }
+}
+
 /// The landing page. `dash_live` (`#dash-live`) and `chart_card`
 /// (`#dash-chart`) are also rendered alone, as the htmx fragments [`index`]
 /// answers a request targeting either region with.
@@ -834,6 +854,9 @@ struct IndexPage {
     /// Whether the page renders its waiting state: no figure is known yet
     /// (#1078).
     chart_waiting: bool,
+    /// A search-index rebuild running for the tenant (#1065), rendered as a
+    /// warning line inside the live region so each refresh keeps it current.
+    rebuild: Option<ReindexActivity>,
     /// Whether the storage backend cannot count at all
     /// ([`Figures::Unsupported`]): the chart area says so
     /// instead of waiting or charting, and nothing polls.
@@ -898,6 +921,21 @@ struct IndexPage {
 }
 
 impl IndexPage {
+    /// The rebuild line's wording (see [`rebuild_text`]).
+    fn rebuild_text(&self, activity: &ReindexActivity) -> String {
+        rebuild_text(&self.i18n, activity)
+    }
+
+    /// The rebuild line's `aria-live`: announced when it appears, then quiet
+    /// on the refreshes that only move its percentage.
+    fn rebuild_aria_live(&self) -> &'static str {
+        if self.quiet_notices.iter().any(|seen| seen == REBUILD_NOTICE) {
+            "off"
+        } else {
+            "polite"
+        }
+    }
+
     /// The `aria-live` politeness of a notice line of `kind` (#1078).
     fn notice_aria_live(&self, kind: &DashboardNotice) -> &'static str {
         if self.quiet_notices.iter().any(|seen| seen == kind.slug()) {
@@ -972,6 +1010,9 @@ struct ResourcesPage {
     create_advertised_types: String,
     create_schema_types: String,
     create_metadata_available: bool,
+    /// A search-index rebuild running for the tenant (#1065): results may miss
+    /// stored resources until it finishes, so the page head says so.
+    rebuild: Option<ReindexActivity>,
     /// The search-builder partial's save controls are the Saved Queries page's
     /// job, not this one's.
     show_save: bool,
@@ -991,6 +1032,13 @@ struct ResourcesPage {
     /// No-JS prefill for the builder's URL input (#605): `GET /{selected_type}`,
     /// so the form already shows the query the client JS runs on load.
     builder_url: Option<String>,
+}
+
+impl ResourcesPage {
+    /// The rebuild line's wording (see [`rebuild_text`]).
+    fn rebuild_text(&self, activity: &ReindexActivity) -> String {
+        rebuild_text(&self.i18n, activity)
+    }
 }
 
 /// Explains how to configure terminology navigation, or why the configured
@@ -2536,6 +2584,7 @@ async fn resources(
             .map(capability::CreateTargets::schema_resources_csv)
             .unwrap_or_default(),
         create_metadata_available: targets.is_some(),
+        rebuild: live.as_ref().and_then(|snapshot| snapshot.reindex_active),
         show_save: false,
         rail_counts_approximate,
         rail_entries,
@@ -2678,19 +2727,14 @@ async fn query_params_catalog(
 /// elements minus resource infrastructure, capped so the table stays
 /// scannable. Replaces the six-type hardcoded map in the browser — every
 /// type the spec defines summary elements for now gets real columns.
+///
+/// The names are JSON element names straight from
+/// [`helios_fhir::summary_elements`] — the browser uses each one as both the
+/// header text and the `resource[col]` lookup key, so they must match the
+/// resource's keys exactly. This function used to convert the generated Rust
+/// field names itself and missed the raw-identifier prefix, so Claim and ~50
+/// other types got `R#TYPE` / `R#USE` headers over empty columns (#1107).
 fn default_result_columns(version: helios_fhir::FhirVersion, resource_type: &str) -> Vec<String> {
-    let summary_fields: &[&str] = match version {
-        #[cfg(feature = "R4")]
-        helios_fhir::FhirVersion::R4 => helios_fhir::r4::get_summary_fields(resource_type),
-        #[cfg(feature = "R4B")]
-        helios_fhir::FhirVersion::R4B => helios_fhir::r4b::get_summary_fields(resource_type),
-        #[cfg(feature = "R5")]
-        helios_fhir::FhirVersion::R5 => helios_fhir::r5::get_summary_fields(resource_type),
-        #[cfg(feature = "R6")]
-        helios_fhir::FhirVersion::R6 => helios_fhir::r6::get_summary_fields(resource_type),
-        #[allow(unreachable_patterns)]
-        _ => &[],
-    };
     const INFRASTRUCTURE: [&str; 9] = [
         "resourceType",
         "id",
@@ -2702,30 +2746,11 @@ fn default_result_columns(version: helios_fhir::FhirVersion, resource_type: &str
         "extension",
         "modifierExtension",
     ];
-    summary_fields
-        .iter()
-        .map(|f| snake_to_camel(f))
+    helios_fhir::summary_elements(version, resource_type)
+        .into_iter()
         .filter(|f| !INFRASTRUCTURE.contains(&f.as_str()))
         .take(5)
         .collect()
-}
-
-/// `get_summary_fields` returns Rust field names; resources carry camelCase
-/// JSON keys, which is what the results table indexes by.
-fn snake_to_camel(field: &str) -> String {
-    let mut out = String::with_capacity(field.len());
-    let mut upper_next = false;
-    for c in field.chars() {
-        if c == '_' {
-            upper_next = true;
-        } else if upper_next {
-            out.extend(c.to_uppercase());
-            upper_next = false;
-        } else {
-            out.push(c);
-        }
-    }
-    out
 }
 
 /// Query string for the SearchParameter viewer. Every filter is a link and
@@ -7946,6 +7971,7 @@ fn dash_state(
         .map(|jobs| (jobs.running, jobs.queued))
         .hash(&mut hasher);
     snapshot.import_jobs_active.hash(&mut hasher);
+    snapshot.reindex_active.hash(&mut hasher);
     std::mem::discriminant(&snapshot.figures).hash(&mut hasher);
     (now.timestamp() / 60).hash(&mut hasher);
     format!("{:016x}", hasher.finish())
@@ -8070,7 +8096,8 @@ async fn build_index_page(
     let live_refresh = ready && !chart_waiting && !unsupported;
     let refresh_moving = live_refresh
         && (snapshot.figures.is_approximate()
-            || snapshot.import_jobs_active.is_some_and(|n| n > 0));
+            || snapshot.import_jobs_active.is_some_and(|n| n > 0)
+            || snapshot.reindex_active.is_some());
     let refresh_href = if slow_watch {
         Some(format!("{retry_base}&retry={DASH_PENDING_RETRIES}"))
     } else {
@@ -8089,6 +8116,7 @@ async fn build_index_page(
         all_types: dash.all_types,
         all_types_href: dash.all_types_href,
         notice,
+        rebuild: snapshot.reindex_active,
         chart_waiting,
         chart_unsupported: unsupported,
         figures_unknown_key: if unsupported {
@@ -8680,6 +8708,7 @@ fn sample_snapshot(window: DashboardWindow) -> DashboardSnapshot {
         available,
         export_jobs: None,
         import_jobs_active: None,
+        reindex_active: None,
         // Invented figures take the same rendering path as measured ones, so
         // they carry figures. Nothing reads this time: a no-provider render's
         // notice is the undated sample-data line, which says the figures are
@@ -8864,6 +8893,7 @@ mod tests {
             None,
         );
         IndexPage {
+            rebuild: None,
             status: Status {
                 version,
                 checked_at,
@@ -9332,6 +9362,24 @@ mod tests {
     }
 
     /// The builder's datalist fragment is fed by the SearchParameter
+    /// The column hint carries JSON element names, never the generated
+    /// structs' raw identifiers: Claim's `type` and `use` fields are `r#type`
+    /// and `r#use` in Rust, and the browser indexes `resource[col]` with the
+    /// hinted string verbatim (#1107).
+    #[cfg(feature = "R4")]
+    #[test]
+    fn default_result_columns_use_json_element_names() {
+        assert_eq!(
+            default_result_columns(helios_fhir::FhirVersion::R4, "Claim"),
+            ["status", "type", "use", "patient", "billablePeriod"]
+        );
+        assert_eq!(
+            default_result_columns(helios_fhir::FhirVersion::R4, "Patient"),
+            ["identifier", "active", "name", "telecom", "gender"]
+        );
+        assert!(default_result_columns(helios_fhir::FhirVersion::R4, "Nope").is_empty());
+    }
+
     /// registry and scoped to the requested resource type.
     #[test]
     fn param_options_partial_renders_datalist() {
@@ -9522,6 +9570,7 @@ mod tests {
             available: Vec::new(),
             export_jobs: None,
             import_jobs_active: None,
+            reindex_active: None,
             figures: Figures::Exact {
                 read_at: DateTime::from_timestamp(1_752_451_200, 0).expect("valid instant"),
             },
@@ -9571,6 +9620,7 @@ mod tests {
             }],
             export_jobs: None,
             import_jobs_active: None,
+            reindex_active: None,
             figures: Figures::Exact {
                 read_at: DateTime::from_timestamp(1_752_451_200, 0).expect("valid instant"),
             },

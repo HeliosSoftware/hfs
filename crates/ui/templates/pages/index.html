@@ -220,6 +220,14 @@
     <a href="{{ retry_href }}">{{ i18n.t("chart-pending-retry") }}</a>
     {% endif %}
   </p>
+  {#
+    #1065: a search-index rebuild is running. Stored resources stay readable
+    by id, but searches can miss them until it finishes. Inside the live
+    region, so the refresh a running rebuild keeps going updates it.
+  #}
+  {% if let Some(activity) = rebuild %}
+  <p class="notice notice--warn" aria-live="{{ self.rebuild_aria_live() }}" data-dash-notice="rebuilding" data-rebuild-notice>{{ self.rebuild_text(activity) }}</p>
+  {% endif %}
 
   {% if chart_unsupported %}
   {# #1078: this backend cannot count, so there is nothing to wait for and

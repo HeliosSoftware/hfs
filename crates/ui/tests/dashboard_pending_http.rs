@@ -168,6 +168,7 @@ impl DashboardProvider for WindowScriptedProvider {
                 running: 0,
                 queued: 0,
             }),
+            reindex_active: None,
             import_jobs_active: match tenant {
                 IMPORT_ACTIVE_TENANT => Some(2),
                 IMPORT_IDLE_TENANT | FIRST_VIEW_TENANT => Some(0),

@@ -162,6 +162,28 @@ pub struct ExportJobCounts {
     pub queued: u64,
 }
 
+/// A search-index rebuild (`$reindex`) in progress for one tenant (#1065).
+///
+/// Carried by [`DashboardSnapshot::reindex_active`]. While it runs, stored
+/// resources stay readable by id but searches can miss them, so the UI says so
+/// rather than letting an empty result read as lost data.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct ReindexActivity {
+    /// Rebuild jobs running (queued or in progress).
+    pub jobs: u64,
+    /// Resources processed so far, across those jobs.
+    pub processed: u64,
+    /// Resources to process, across those jobs; `0` while still being counted.
+    pub total: u64,
+}
+
+impl ReindexActivity {
+    /// Whole percent done, `None` while the total is still being counted.
+    pub fn percent(&self) -> Option<u64> {
+        (self.total > 0).then(|| self.processed.min(self.total) * 100 / self.total)
+    }
+}
+
 /// A snapshot of the figures the dashboard renders. Plain data — no storage or
 /// FHIR types — so this crate stays dependency-light.
 #[derive(Clone, Debug, Default)]
@@ -195,6 +217,10 @@ pub struct DashboardSnapshot {
     /// Non-terminal bulk-submit (import) jobs for the tenant. `None` under the
     /// same conditions as [`Self::export_jobs`].
     pub import_jobs_active: Option<u64>,
+    /// Search-index rebuilds running for the tenant (#1065). `None` when none
+    /// is running or the deployment has no `$reindex` operation: the rebuild
+    /// banner is then simply absent, never a fabricated "0%".
+    pub reindex_active: Option<ReindexActivity>,
     /// Where the figures come from and how far they can be trusted (#1078).
     /// Only [`Figures::Exact`] and [`Figures::Approximate`] carry figures; the
     /// other variants leave totals, `available` and `series` empty, and those
@@ -709,6 +735,20 @@ mod tests {
         cond()
     }
 
+    #[test]
+    fn reindex_activity_percent_is_whole_and_unknown_until_counted() {
+        let activity = |processed, total| ReindexActivity {
+            jobs: 1,
+            processed,
+            total,
+        };
+        assert_eq!(activity(0, 0).percent(), None);
+        assert_eq!(activity(1, 3).percent(), Some(33));
+        assert_eq!(activity(18_957_456, 18_957_914).percent(), Some(99));
+        // A counter that overshoots its total never reads above 100%.
+        assert_eq!(activity(12, 10).percent(), Some(100));
+    }
+
     #[tokio::test]
     async fn cold_load_fills_the_cache_and_fresh_hits_reuse_it() {
         let cache = SnapCache::default();
@@ -935,6 +975,7 @@ mod tests {
                 available: Vec::new(),
                 export_jobs: None,
                 import_jobs_active: None,
+                reindex_active: None,
                 figures: Figures::Exact {
                     read_at: DateTime::from_timestamp(FIXED_READ_AT, 0).unwrap(),
                 },

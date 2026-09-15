@@ -290,24 +290,6 @@ impl SearchResult {
     }
 }
 
-/// Returns `url` with any existing `_cursor=…` query parameter replaced by the
-/// supplied opaque `cursor` value. Used to build pagination links from the
-/// request's self URL.
-///
-/// Cursors are base64-url-safe so they don't need percent-encoding; the only
-/// surgery required is splitting on the first `?`, dropping any pre-existing
-/// `_cursor` pair, and re-joining with `&`. This is what makes the difference
-/// between
-///
-/// ```text
-/// .../Patient?_count=3&_elements=id?_cursor=…   // wrong: literal `?` mid-query
-/// ```
-///
-/// and the spec-compliant
-///
-/// ```text
-/// .../Patient?_count=3&_elements=id&_cursor=…
-/// ```
 /// Returns `url` with any `_cursor=…` and `_offset=…` query parameters removed,
 /// yielding the first-page URL for a paginated search.
 fn strip_paging_params(url: &str) -> String {
@@ -329,20 +311,35 @@ fn strip_paging_params(url: &str) -> String {
     }
 }
 
+/// Returns `url` with any existing `_cursor=…` and `_offset=…` query parameters
+/// removed and the supplied opaque `cursor` value appended as `_cursor=…`. Used
+/// to build `next`/`previous` pagination links from the request's self URL.
+///
+/// `_offset` and `_cursor` are mutually exclusive pagination modes: a link that
+/// carries both is misleading (backends give the cursor precedence, but a
+/// backend that honoured `_offset` too would skip rows), so any inherited
+/// `_offset` is dropped before the new cursor is added. This reuses
+/// [`strip_paging_params`] to keep the two functions' notion of "paging
+/// parameters" in sync.
+///
+/// Cursors are base64-url-safe so they don't need percent-encoding; the only
+/// surgery required is stripping the old paging parameters and re-joining with
+/// `&` (or `?` if the base URL has no remaining query parameters). This is
+/// what makes the difference between
+///
+/// ```text
+/// .../Patient?_count=3&_elements=id?_cursor=…   // wrong: literal `?` mid-query
+/// ```
+///
+/// and the spec-compliant
+///
+/// ```text
+/// .../Patient?_count=3&_elements=id&_cursor=…
+/// ```
 fn replace_cursor_param(url: &str, cursor: &str) -> String {
-    let (base, query) = match url.find('?') {
-        Some(pos) => (&url[..pos], &url[pos + 1..]),
-        None => (url, ""),
-    };
-
-    let mut parts: Vec<String> = query
-        .split('&')
-        .filter(|p| !p.is_empty() && !p.starts_with("_cursor="))
-        .map(str::to_string)
-        .collect();
-    parts.push(format!("_cursor={}", cursor));
-
-    format!("{}?{}", base, parts.join("&"))
+    let base = strip_paging_params(url);
+    let sep = if base.contains('?') { '&' } else { '?' };
+    format!("{base}{sep}_cursor={cursor}")
 }
 
 /// Basic search provider for single resource type queries.
@@ -1091,6 +1088,27 @@ mod tests {
         assert_eq!(url.matches("_cursor=").count(), 1);
     }
 
+    /// An inherited `_offset` from the request URL must not survive into a
+    /// cursor-based link: `_offset` and `_cursor` are mutually exclusive
+    /// pagination modes, and a link carrying both is misleading.
+    #[test]
+    fn test_replace_cursor_param_drops_offset() {
+        let url =
+            replace_cursor_param("http://example.com/fhir/Patient?_offset=10&_count=3", "abc");
+        assert!(url.contains("_count=3"));
+        assert!(url.contains("_cursor=abc"));
+        assert!(!url.contains("_offset="));
+        assert_eq!(url.matches("_cursor=").count(), 1);
+    }
+
+    /// When the only inherited paging parameter is `_offset`, dropping it must
+    /// not leave a stray `&` or `?`: the result is exactly `?_cursor=…`.
+    #[test]
+    fn test_replace_cursor_param_only_offset_yields_single_param() {
+        let url = replace_cursor_param("http://example.com/fhir/Patient?_offset=10", "abc");
+        assert_eq!(url, "http://example.com/fhir/Patient?_cursor=abc");
+    }
+
     /// `to_bundle` should produce a `next` link whose URL contains exactly one
     /// `_cursor` and uses `&` between query params.
     #[test]
@@ -1126,6 +1144,59 @@ mod tests {
             1,
             "exactly one '?' delimiter"
         );
+    }
+
+    /// A request made with `_offset` must not leak into the cursor-based
+    /// `next`/`previous` links: those carry `_cursor` only. The `first` link
+    /// (built via `strip_paging_params`) must carry neither `_offset` nor
+    /// `_cursor`.
+    #[test]
+    fn test_to_bundle_links_from_offset_request_carry_no_offset() {
+        let page = Page::new(
+            Vec::<StoredResource>::new(),
+            PageInfo {
+                next_cursor: Some("N".to_string()),
+                previous_cursor: Some("P".to_string()),
+                total: None,
+                has_next: true,
+                has_previous: true,
+            },
+        );
+        let result = SearchResult::new(page);
+
+        let bundle = result.to_bundle(
+            "http://example.com/fhir",
+            "http://example.com/fhir/Patient?_count=3&_offset=3",
+        );
+
+        let next = bundle
+            .link
+            .iter()
+            .find(|l| l.relation == "next")
+            .expect("next link present");
+        let previous = bundle
+            .link
+            .iter()
+            .find(|l| l.relation == "previous")
+            .expect("previous link present");
+        let first = bundle
+            .link
+            .iter()
+            .find(|l| l.relation == "first")
+            .expect("first link present");
+
+        assert!(!next.url.contains("_offset="));
+        assert!(next.url.contains("_count=3"));
+        assert_eq!(next.url.matches("_cursor=").count(), 1);
+        assert!(next.url.contains("_cursor=N"));
+
+        assert!(!previous.url.contains("_offset="));
+        assert!(previous.url.contains("_count=3"));
+        assert_eq!(previous.url.matches("_cursor=").count(), 1);
+        assert!(previous.url.contains("_cursor=P"));
+
+        assert!(!first.url.contains("_offset="));
+        assert!(!first.url.contains("_cursor="));
     }
 
     fn test_tenant() -> TenantContext {

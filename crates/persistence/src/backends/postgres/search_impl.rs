@@ -345,6 +345,7 @@ impl PostgresBackend {
                         dir = if asc { "DESC" } else { "ASC" },
                         lim = count + 1,
                     );
+                    // Placeholder: the backward branch derives has_previous from the extra row.
                     (sql, false)
                 }
             }
@@ -431,20 +432,30 @@ impl PostgresBackend {
             parsed.push((resource, sort_key));
         }
 
-        // Backward pagination fetched in reverse order — restore sort order.
-        if cursor
+        let backward = cursor
             .as_ref()
-            .map(|c| c.direction() == CursorDirection::Previous)
-            .unwrap_or(false)
-        {
-            parsed.reverse();
-        }
+            .is_some_and(|c| c.direction() == CursorDirection::Previous);
 
         // We fetched one extra to detect a further page.
-        let has_next = parsed.len() > count;
-        if has_next {
-            parsed.pop();
-        }
+        // Backward: rows arrive in reversed order, so the extra row is also the
+        // last one fetched but it is the *farthest* from the cursor — it belongs to
+        // page N-2, not to the page we return — and it proves a previous page. It
+        // must be dropped before `reverse()` restores the sort order. See #1079
+        // and the Elasticsearch `backward` branch (#1015).
+        let (has_next, has_previous) = if backward {
+            let has_previous = parsed.len() > count;
+            if has_previous {
+                parsed.pop();
+            }
+            parsed.reverse();
+            (!parsed.is_empty(), has_previous)
+        } else {
+            let has_next = parsed.len() > count;
+            if has_next {
+                parsed.pop();
+            }
+            (has_next, has_previous)
+        };
 
         let next_cursor = if has_next {
             parsed.last().map(|(r, sk)| {

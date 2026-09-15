@@ -358,6 +358,13 @@ pub struct ReindexProgress {
     /// Unique job identifier.
     pub job_id: String,
 
+    /// The tenant the job rebuilds, so a per-tenant view (the dashboard's
+    /// rebuild banner, #1065) can pick out its own jobs. `None` only on
+    /// progress built without a tenant, such as one deserialized from before
+    /// the field existed.
+    #[serde(default)]
+    pub tenant_id: Option<String>,
+
     /// Current status.
     pub status: ReindexStatus,
 
@@ -395,6 +402,42 @@ pub struct ReindexProgressError {
     pub resource_id: String,
     /// Error message.
     pub error: String,
+    /// Whether the failure was transient — the writer was unavailable, timed
+    /// out, or asked to back off — so running the same work again may succeed.
+    /// A permanent failure (a document the search backend rejects outright,
+    /// such as one over Elasticsearch's nested-object limit, #1050) fails the
+    /// same way on every rerun.
+    #[serde(default = "retryable_by_default")]
+    pub retryable: bool,
+}
+
+/// An error recorded without a classification keeps the retry it always had.
+fn retryable_by_default() -> bool {
+    true
+}
+
+/// Per-resource errors listed in [`ReindexProgress::to_parameters`]. The
+/// status response stays bounded however many resources fail; `errorCount`
+/// is always the full total.
+const MAX_REPORTED_RESOURCE_ERRORS: usize = 100;
+
+/// Failing `Type/id`s named in the log line of an automatic generation that
+/// ended with permanent errors.
+const MAX_LOGGED_RESOURCE_ERRORS: usize = 5;
+
+/// Whether a writer's error is transient: the conditions the REST layer answers
+/// with `503` or `504`, where the backend never judged the resource itself.
+fn is_transient_error(error: &crate::error::StorageError) -> bool {
+    use crate::error::{BackendError, StorageError};
+    matches!(
+        error,
+        StorageError::Backend(
+            BackendError::Unavailable { .. }
+                | BackendError::ConnectionFailed { .. }
+                | BackendError::PoolExhausted { .. }
+                | BackendError::Timeout { .. }
+        )
+    )
 }
 
 impl ReindexProgress {
@@ -402,6 +445,7 @@ impl ReindexProgress {
     pub fn new(job_id: impl Into<String>) -> Self {
         Self {
             job_id: job_id.into(),
+            tenant_id: None,
             status: ReindexStatus::Queued,
             total_resources: 0,
             processed_resources: 0,
@@ -428,20 +472,51 @@ impl ReindexProgress {
         !self.errors.is_empty() || self.error_message.is_some()
     }
 
+    /// Returns true if the job recorded per-resource errors, every one of them
+    /// permanent, and did not fail as a whole.
+    pub fn has_only_permanent_errors(&self) -> bool {
+        self.error_message.is_none()
+            && !self.errors.is_empty()
+            && self.errors.iter().all(|error| !error.retryable)
+    }
+
     /// Converts to FHIR Parameters resource.
+    ///
+    /// Besides the counters, lists the job's failure message and the first
+    /// [`MAX_REPORTED_RESOURCE_ERRORS`] failing resources, each with its error
+    /// and whether it is retryable, so an operator can find the resources that
+    /// are stored but not searchable without reading server logs.
     pub fn to_parameters(&self) -> serde_json::Value {
-        serde_json::json!({
-            "resourceType": "Parameters",
-            "parameter": [
-                {"name": "jobId", "valueString": self.job_id},
-                {"name": "status", "valueCode": format!("{:?}", self.status).to_lowercase()},
-                {"name": "total", "valueInteger": self.total_resources},
-                {"name": "processed", "valueInteger": self.processed_resources},
-                {"name": "entriesCreated", "valueInteger": self.entries_created},
-                {"name": "errorCount", "valueInteger": self.errors.len()},
-                {"name": "percentage", "valueDecimal": self.percentage()}
-            ]
-        })
+        let mut parameter = vec![
+            serde_json::json!({"name": "jobId", "valueString": self.job_id}),
+            serde_json::json!({"name": "status", "valueCode": format!("{:?}", self.status).to_lowercase()}),
+            serde_json::json!({"name": "total", "valueInteger": self.total_resources}),
+            serde_json::json!({"name": "processed", "valueInteger": self.processed_resources}),
+            serde_json::json!({"name": "entriesCreated", "valueInteger": self.entries_created}),
+            serde_json::json!({"name": "errorCount", "valueInteger": self.errors.len()}),
+            serde_json::json!({"name": "percentage", "valueDecimal": self.percentage()}),
+        ];
+        if let Some(message) = &self.error_message {
+            parameter.push(serde_json::json!({"name": "errorMessage", "valueString": message}));
+        }
+        for error in self.errors.iter().take(MAX_REPORTED_RESOURCE_ERRORS) {
+            parameter.push(serde_json::json!({
+                "name": "error",
+                "part": [
+                    {"name": "resourceType", "valueCode": error.resource_type},
+                    {"name": "resourceId", "valueId": error.resource_id},
+                    {"name": "message", "valueString": error.error},
+                    {"name": "retryable", "valueBoolean": error.retryable}
+                ]
+            }));
+        }
+        if self.errors.len() > MAX_REPORTED_RESOURCE_ERRORS {
+            parameter.push(serde_json::json!({
+                "name": "errorsOmitted",
+                "valueInteger": self.errors.len() - MAX_REPORTED_RESOURCE_ERRORS
+            }));
+        }
+        serde_json::json!({"resourceType": "Parameters", "parameter": parameter})
     }
 }
 
@@ -770,7 +845,8 @@ impl ReindexOperation {
         self.ensure_cleanup_task();
         self.cleanup_old_jobs(REINDEX_STATUS_RETENTION_SECONDS);
         let job_id = Uuid::new_v4().to_string();
-        let progress = ReindexProgress::new(&job_id);
+        let mut progress = ReindexProgress::new(&job_id);
+        progress.tenant_id = Some(tenant.tenant_id().as_str().to_string());
 
         // Store the job
         self.jobs.write().insert(job_id.clone(), progress);
@@ -946,7 +1022,55 @@ impl std::fmt::Debug for ReindexOperation {
 enum AutomaticGenerationOutcome {
     Clean,
     Cancelled,
+    /// The job completed, but every resource error it recorded is permanent.
+    /// A rerun would be rejected the same way, so it is reported, not retried.
+    PermanentErrors {
+        count: usize,
+        resources: String,
+        first_error: String,
+    },
     Failed(String),
+}
+
+/// Decides what an automatic generation's finished job means for retry policy.
+fn automatic_outcome(progress: Option<ReindexProgress>) -> AutomaticGenerationOutcome {
+    match progress {
+        Some(progress) if progress.status == ReindexStatus::Completed && !progress.has_errors() => {
+            AutomaticGenerationOutcome::Clean
+        }
+        Some(progress) if progress.status == ReindexStatus::Cancelled => {
+            AutomaticGenerationOutcome::Cancelled
+        }
+        Some(progress)
+            if progress.status == ReindexStatus::Completed
+                && progress.has_only_permanent_errors() =>
+        {
+            AutomaticGenerationOutcome::PermanentErrors {
+                count: progress.errors.len(),
+                resources: progress
+                    .errors
+                    .iter()
+                    .take(MAX_LOGGED_RESOURCE_ERRORS)
+                    .map(|error| format!("{}/{}", error.resource_type, error.resource_id))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                first_error: progress.errors[0].error.clone(),
+            }
+        }
+        Some(progress) => AutomaticGenerationOutcome::Failed(format!(
+            "status {:?}, {} resource errors{}",
+            progress.status,
+            progress.errors.len(),
+            progress
+                .error_message
+                .as_deref()
+                .map(|message| format!(", error: {message}"))
+                .unwrap_or_default()
+        )),
+        None => {
+            AutomaticGenerationOutcome::Failed("job status disappeared after task exit".to_string())
+        }
+    }
 }
 
 impl AutomaticReindexCoordinator {
@@ -1120,30 +1244,7 @@ impl AutomaticReindexCoordinator {
                         "deferred reindex generation started"
                     );
                     let _ = task_exit.await;
-                    let outcome = match op.get_progress(&job_id).await {
-                        Some(progress)
-                            if progress.status == ReindexStatus::Completed
-                                && !progress.has_errors() =>
-                        {
-                            AutomaticGenerationOutcome::Clean
-                        }
-                        Some(progress) if progress.status == ReindexStatus::Cancelled => {
-                            AutomaticGenerationOutcome::Cancelled
-                        }
-                        Some(progress) => AutomaticGenerationOutcome::Failed(format!(
-                            "status {:?}, {} resource errors{}",
-                            progress.status,
-                            progress.errors.len(),
-                            progress
-                                .error_message
-                                .as_deref()
-                                .map(|message| format!(", error: {message}"))
-                                .unwrap_or_default()
-                        )),
-                        None => AutomaticGenerationOutcome::Failed(
-                            "job status disappeared after task exit".to_string(),
-                        ),
-                    };
+                    let outcome = automatic_outcome(op.get_progress(&job_id).await);
                     (Some(job_id), outcome)
                 }
                 Err(error) => (
@@ -1166,6 +1267,9 @@ impl AutomaticReindexCoordinator {
                         state.consecutive_failures = 0;
                     }
                     AutomaticGenerationOutcome::Cancelled => {
+                        state.consecutive_failures = 0;
+                    }
+                    AutomaticGenerationOutcome::PermanentErrors { .. } => {
                         state.consecutive_failures = 0;
                     }
                     AutomaticGenerationOutcome::Failed(_) => {
@@ -1216,6 +1320,20 @@ impl AutomaticReindexCoordinator {
                     job_id = ?job_id,
                     types = ?resource_types,
                     "deferred reindex generation was cancelled"
+                ),
+                AutomaticGenerationOutcome::PermanentErrors {
+                    count,
+                    resources,
+                    first_error,
+                } => tracing::error!(
+                    tenant = %tenant_id,
+                    generation,
+                    job_id = ?job_id,
+                    types = ?resource_types,
+                    errors = count,
+                    resources = %resources,
+                    first_error = %first_error,
+                    "deferred reindex completed, but resources were rejected permanently and are stored but not searchable; not retrying because a rerun fails the same way (every failure is listed by $reindex-status for this job)"
                 ),
                 AutomaticGenerationOutcome::Failed(error) if retry => tracing::warn!(
                     tenant = %tenant_id,
@@ -1279,6 +1397,7 @@ fn push_error(
     resource_type: &str,
     resource_id: &str,
     error: String,
+    retryable: bool,
 ) {
     let mut jobs_guard = jobs.write();
     if let Some(progress) = jobs_guard.get_mut(job_id) {
@@ -1286,6 +1405,7 @@ fn push_error(
             resource_type: resource_type.to_string(),
             resource_id: resource_id.to_string(),
             error,
+            retryable,
         });
     }
 }
@@ -1465,6 +1585,7 @@ async fn run_reindex(
                                 resource_type,
                                 page.resources[i].id(),
                                 format!("Failed to rebuild index entries: {e}"),
+                                is_transient_error(&e),
                             ),
                         }
                     }
@@ -1715,6 +1836,7 @@ mod tests {
         active_writes: std::sync::atomic::AtomicUsize,
         max_active_writes: std::sync::atomic::AtomicUsize,
         failing_writes: std::sync::atomic::AtomicUsize,
+        permanent_failing_writes: std::sync::atomic::AtomicUsize,
     }
 
     impl ControlledBackend {
@@ -1736,6 +1858,7 @@ mod tests {
                     active_writes: std::sync::atomic::AtomicUsize::new(0),
                     max_active_writes: std::sync::atomic::AtomicUsize::new(0),
                     failing_writes: std::sync::atomic::AtomicUsize::new(failing_writes),
+                    permanent_failing_writes: std::sync::atomic::AtomicUsize::new(0),
                 }),
                 receiver,
             )
@@ -1839,6 +1962,11 @@ mod tests {
                 .expect("controlled write gate remains open");
             permit.forget();
             self.active_writes.fetch_sub(1, Ordering::SeqCst);
+            // `fetch_update` was deprecated in Rust 1.98 in favour of
+            // `try_update`, but the new name is still unstable
+            // (`atomic_try_update`) on the workspace's 1.90 MSRV, so the old
+            // one stays until the MSRV catches up.
+            #[allow(deprecated)]
             if self
                 .failing_writes
                 .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
@@ -1849,6 +1977,20 @@ mod tests {
                 return Err(crate::error::BackendError::Unavailable {
                     backend_name: "controlled".into(),
                     message: "injected write failure".into(),
+                }
+                .into());
+            }
+            if self
+                .permanent_failing_writes
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok()
+            {
+                return Err(crate::error::BackendError::Internal {
+                    backend_name: "controlled".into(),
+                    message: "injected permanent write failure".into(),
+                    source: None,
                 }
                 .into());
             }
@@ -2618,8 +2760,8 @@ mod tests {
             assert_eq!(backend.count_calls.load(Ordering::SeqCst), 2);
         }
 
-        // Per-resource write errors leave the physical job Completed but are
-        // still failures for automatic retry policy.
+        // Per-resource transient write errors leave the physical job Completed
+        // but are still failures for automatic retry policy.
         let (backend, mut events) = ControlledBackend::new(Vec::new(), 2);
         let op = controlled_operation(backend.clone());
         let hook = ReindexOnFinish::new(op.clone());
@@ -2635,6 +2777,122 @@ mod tests {
         await_automatic_idle(&op).await;
         assert_eq!(backend.count_calls.load(Ordering::SeqCst), 2);
         assert_eq!(backend.write_calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn automatic_reindex_does_not_retry_a_completion_with_only_permanent_errors() {
+        let (backend, mut events) = ControlledBackend::new(Vec::new(), 0);
+        backend.permanent_failing_writes.store(1, Ordering::SeqCst);
+        let op = controlled_operation(backend.clone());
+        let hook = ReindexOnFinish::new(op.clone());
+
+        hook.reindex_types(
+            &named_tenant("permanent-errors"),
+            vec!["Patient".to_string()],
+        )
+        .await;
+        await_controlled_write(&mut events, "permanent-errors", "Patient").await;
+        // Enough permits for a retry, so a wrongly retried job shows up as a
+        // second count and write instead of a hang.
+        backend.write_gate.add_permits(2);
+        await_automatic_idle(&op).await;
+
+        assert_eq!(backend.count_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(backend.write_calls.load(Ordering::SeqCst), 1);
+        let jobs = op.list_jobs();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].status, ReindexStatus::Completed);
+        assert_eq!(jobs[0].errors.len(), 1);
+        assert!(!jobs[0].errors[0].retryable);
+        assert_eq!(jobs[0].errors[0].resource_id, "controlled-1");
+        assert_eq!(jobs[0].tenant_id.as_deref(), Some("permanent-errors"));
+    }
+
+    #[test]
+    fn automatic_outcome_retries_unless_every_resource_error_is_permanent() {
+        let error = |id: &str, retryable| ReindexProgressError {
+            resource_type: "Provenance".to_string(),
+            resource_id: id.to_string(),
+            error: format!("rejected {id}"),
+            retryable,
+        };
+        let mut progress = ReindexProgress::new("job");
+        progress.status = ReindexStatus::Completed;
+        assert!(matches!(
+            automatic_outcome(Some(progress.clone())),
+            AutomaticGenerationOutcome::Clean
+        ));
+
+        progress.errors.push(error("big", false));
+        match automatic_outcome(Some(progress.clone())) {
+            AutomaticGenerationOutcome::PermanentErrors {
+                count,
+                resources,
+                first_error,
+            } => {
+                assert_eq!(count, 1);
+                assert_eq!(resources, "Provenance/big");
+                assert_eq!(first_error, "rejected big");
+            }
+            other => panic!("expected permanent errors, got {other:?}"),
+        }
+
+        // One transient error among permanent ones earns the retry.
+        progress.errors.push(error("flaky", true));
+        assert!(matches!(
+            automatic_outcome(Some(progress.clone())),
+            AutomaticGenerationOutcome::Failed(_)
+        ));
+
+        // A job that failed as a whole is retried whatever its resource errors.
+        progress.errors.truncate(1);
+        progress.status = ReindexStatus::Failed;
+        progress.error_message = Some("Failed to fetch resources".to_string());
+        assert!(matches!(
+            automatic_outcome(Some(progress)),
+            AutomaticGenerationOutcome::Failed(_)
+        ));
+        assert!(matches!(
+            automatic_outcome(None),
+            AutomaticGenerationOutcome::Failed(_)
+        ));
+    }
+
+    #[test]
+    fn transient_errors_are_the_ones_rest_answers_with_503_or_504() {
+        use crate::error::BackendError;
+        let backend_name = || "test".to_string();
+        let message = || "detail".to_string();
+        for transient in [
+            BackendError::Unavailable {
+                backend_name: backend_name(),
+                message: message(),
+            },
+            BackendError::ConnectionFailed {
+                backend_name: backend_name(),
+                message: message(),
+            },
+            BackendError::PoolExhausted {
+                backend_name: backend_name(),
+            },
+            BackendError::Timeout {
+                backend_name: backend_name(),
+                message: message(),
+            },
+        ] {
+            assert!(is_transient_error(&transient.into()));
+        }
+        for permanent in [
+            BackendError::Internal {
+                backend_name: backend_name(),
+                message: message(),
+                source: None,
+            },
+            BackendError::QueryError { message: message() },
+            BackendError::SerializationError { message: message() },
+        ] {
+            assert!(!is_transient_error(&permanent.into()));
+        }
     }
 
     #[tokio::test]
@@ -2749,9 +3007,20 @@ mod tests {
             resource_type: "Patient".to_string(),
             resource_id: "1".to_string(),
             error: "test error".to_string(),
+            retryable: true,
         });
 
         assert!(progress.has_errors());
+        assert!(!progress.has_only_permanent_errors());
+
+        // Errors recorded before classification existed keep their retry.
+        let unclassified: ReindexProgressError = serde_json::from_value(serde_json::json!({
+            "resource_type": "Patient",
+            "resource_id": "1",
+            "error": "test error"
+        }))
+        .unwrap();
+        assert!(unclassified.retryable);
     }
 
     #[test]
@@ -2761,5 +3030,59 @@ mod tests {
 
         assert_eq!(params["resourceType"], "Parameters");
         assert!(params["parameter"].is_array());
+    }
+
+    #[test]
+    fn test_progress_to_parameters_lists_bounded_resource_errors() {
+        let named = |params: &serde_json::Value, name: &str| -> Vec<serde_json::Value> {
+            params["parameter"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|parameter| parameter["name"] == name)
+                .cloned()
+                .collect()
+        };
+        let mut progress = ReindexProgress::new("job-123");
+        progress.status = ReindexStatus::Completed;
+        progress.errors.push(ReindexProgressError {
+            resource_type: "Provenance".to_string(),
+            resource_id: "oversized".to_string(),
+            error: "nested documents exceeded the allowed limit".to_string(),
+            retryable: false,
+        });
+        let params = progress.to_parameters();
+        assert!(named(&params, "errorMessage").is_empty());
+        assert!(named(&params, "errorsOmitted").is_empty());
+        let errors = named(&params, "error");
+        assert_eq!(errors.len(), 1);
+        assert_eq!(
+            errors[0]["part"],
+            serde_json::json!([
+                {"name": "resourceType", "valueCode": "Provenance"},
+                {"name": "resourceId", "valueId": "oversized"},
+                {"name": "message", "valueString": "nested documents exceeded the allowed limit"},
+                {"name": "retryable", "valueBoolean": false}
+            ])
+        );
+
+        for n in 0..MAX_REPORTED_RESOURCE_ERRORS + 4 {
+            progress.errors.push(ReindexProgressError {
+                resource_type: "Patient".to_string(),
+                resource_id: format!("p{n}"),
+                error: "unavailable".to_string(),
+                retryable: true,
+            });
+        }
+        progress.error_message = Some("Failed to fetch resources".to_string());
+        let params = progress.to_parameters();
+        let total = MAX_REPORTED_RESOURCE_ERRORS + 5;
+        assert_eq!(named(&params, "errorCount")[0]["valueInteger"], total);
+        assert_eq!(named(&params, "error").len(), MAX_REPORTED_RESOURCE_ERRORS);
+        assert_eq!(named(&params, "errorsOmitted")[0]["valueInteger"], 5);
+        assert_eq!(
+            named(&params, "errorMessage")[0]["valueString"],
+            "Failed to fetch resources"
+        );
     }
 }

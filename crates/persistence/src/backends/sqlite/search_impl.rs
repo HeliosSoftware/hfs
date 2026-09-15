@@ -195,6 +195,7 @@ impl SqliteBackend {
                         dir = if asc { "DESC" } else { "ASC" },
                         lim = count + 1,
                     );
+                    // Placeholder: the backward branch derives has_previous from the extra row.
                     (sql, false)
                 }
             }
@@ -297,20 +298,30 @@ impl SqliteBackend {
             parsed.push((resource, sort_key));
         }
 
-        // Backward pagination fetched in reverse order — restore sort order.
-        if cursor
+        let backward = cursor
             .as_ref()
-            .map(|c| c.direction() == CursorDirection::Previous)
-            .unwrap_or(false)
-        {
-            parsed.reverse();
-        }
+            .is_some_and(|c| c.direction() == CursorDirection::Previous);
 
-        // We fetched one extra to detect a further page.
-        let has_next = parsed.len() > count;
-        if has_next {
-            parsed.pop();
-        }
+        // Forward: the extra row (if any) is the *last* one and proves a next page.
+        // Backward: rows arrive in reversed order, so the extra row is also the
+        // last one fetched but it is the *farthest* from the cursor — it belongs to
+        // page N-2, not to the page we return — and it proves a previous page. It
+        // must be dropped before `reverse()` restores the sort order. See #1079
+        // and the Elasticsearch `backward` branch (#1015).
+        let (has_next, has_previous) = if backward {
+            let has_previous = parsed.len() > count;
+            if has_previous {
+                parsed.pop();
+            }
+            parsed.reverse();
+            (!parsed.is_empty(), has_previous)
+        } else {
+            let has_next = parsed.len() > count;
+            if has_next {
+                parsed.pop();
+            }
+            (has_next, has_previous)
+        };
 
         let next_cursor = if has_next {
             parsed.last().map(|(r, sk)| {
@@ -1428,6 +1439,277 @@ mod tests {
         for id in &page2_ids {
             assert!(!page3_ids.contains(id), "Page 2 and 3 should not overlap");
         }
+    }
+
+    /// Creates Patients `cp-1..cp-n` (inclusive) in the given tenant.
+    async fn create_cursor_paging_patients(
+        backend: &SqliteBackend,
+        tenant: &TenantContext,
+        n: u32,
+    ) {
+        for i in 1..=n {
+            backend
+                .create(
+                    tenant,
+                    "Patient",
+                    json!({
+                        "resourceType": "Patient",
+                        "id": format!("cp-{i}"),
+                        "name": [{"family": "CursorPaging"}]
+                    }),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+    }
+
+    /// Collects the resource ids of a search result's page, in page order.
+    fn page_ids(result: &SearchResult) -> Vec<String> {
+        result
+            .resources
+            .items
+            .iter()
+            .map(|r| r.id().to_string())
+            .collect()
+    }
+
+    /// Walks forward through 7 Patients 3 at a time (no explicit `_sort`),
+    /// then walks all the way back via `previous_cursor` and confirms every
+    /// page is reproduced exactly, including the page-3-to-page-2 hop that a
+    /// naive truncate-after-reverse implementation gets wrong (#1079).
+    #[tokio::test]
+    async fn test_cursor_paging_round_trip_previous() {
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+        create_cursor_paging_patients(&backend, &tenant, 7).await;
+
+        let query = SearchQuery::new("Patient").with_count(3);
+
+        let page1 = backend.search(&tenant, &query).await.unwrap();
+        assert_eq!(page1.resources.items.len(), 3);
+        assert!(!page1.resources.page_info.has_previous);
+        assert!(page1.resources.page_info.previous_cursor.is_none());
+        assert!(page1.resources.page_info.has_next);
+        assert!(page1.resources.page_info.next_cursor.is_some());
+
+        let page2 = backend
+            .search(
+                &tenant,
+                &query
+                    .clone()
+                    .with_cursor(page1.resources.page_info.next_cursor.clone().unwrap()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(page2.resources.items.len(), 3);
+        assert!(page2.resources.page_info.has_previous);
+        assert!(page2.resources.page_info.previous_cursor.is_some());
+        assert!(page2.resources.page_info.has_next);
+
+        let page3 = backend
+            .search(
+                &tenant,
+                &query
+                    .clone()
+                    .with_cursor(page2.resources.page_info.next_cursor.clone().unwrap()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(page3.resources.items.len(), 1);
+        assert!(!page3.resources.page_info.has_next);
+        assert!(page3.resources.page_info.next_cursor.is_none());
+        assert!(page3.resources.page_info.previous_cursor.is_some());
+
+        let page1_ids = page_ids(&page1);
+        let page2_ids = page_ids(&page2);
+        let page3_ids = page_ids(&page3);
+        let mut all_ids = page1_ids.clone();
+        all_ids.extend(page2_ids.clone());
+        all_ids.extend(page3_ids.clone());
+        let mut unique_ids = all_ids.clone();
+        unique_ids.sort();
+        unique_ids.dedup();
+        assert_eq!(unique_ids.len(), 7, "all 7 ids must be distinct");
+
+        // Walk back: page 3 -> page 2 must be exact, including order. This is
+        // the case a naive truncate-after-reverse gets wrong: it drops the
+        // nearest hit instead of the farthest one.
+        let back2 = backend
+            .search(
+                &tenant,
+                &query
+                    .clone()
+                    .with_cursor(page3.resources.page_info.previous_cursor.clone().unwrap()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(page_ids(&back2), page2_ids);
+        assert!(back2.resources.page_info.has_previous);
+        assert!(back2.resources.page_info.has_next);
+        assert!(back2.resources.page_info.next_cursor.is_some());
+
+        let back1 = backend
+            .search(
+                &tenant,
+                &query
+                    .clone()
+                    .with_cursor(back2.resources.page_info.previous_cursor.clone().unwrap()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(page_ids(&back1), page1_ids);
+        assert!(!back1.resources.page_info.has_previous);
+        assert!(back1.resources.page_info.previous_cursor.is_none());
+        assert!(back1.resources.page_info.has_next);
+
+        let again2 = backend
+            .search(
+                &tenant,
+                &query
+                    .clone()
+                    .with_cursor(back1.resources.page_info.next_cursor.clone().unwrap()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(page_ids(&again2), page2_ids);
+    }
+
+    /// Same round trip, but with an explicit `_sort=_id` ascending so the
+    /// exact page contents (not just their distinctness) can be asserted.
+    #[tokio::test]
+    async fn test_cursor_paging_round_trip_previous_with_sort() {
+        use crate::types::{SortDirection, SortDirective};
+
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+        create_cursor_paging_patients(&backend, &tenant, 7).await;
+
+        let query = SearchQuery::new("Patient")
+            .with_count(3)
+            .with_sort(SortDirective {
+                parameter: "_id".to_string(),
+                direction: SortDirection::Ascending,
+                param_type: None,
+            });
+
+        let page1 = backend.search(&tenant, &query).await.unwrap();
+        assert_eq!(page_ids(&page1), vec!["cp-1", "cp-2", "cp-3"]);
+        assert!(!page1.resources.page_info.has_previous);
+        assert!(page1.resources.page_info.previous_cursor.is_none());
+        assert!(page1.resources.page_info.has_next);
+
+        let page2 = backend
+            .search(
+                &tenant,
+                &query
+                    .clone()
+                    .with_cursor(page1.resources.page_info.next_cursor.clone().unwrap()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(page_ids(&page2), vec!["cp-4", "cp-5", "cp-6"]);
+        assert!(page2.resources.page_info.has_previous);
+        assert!(page2.resources.page_info.has_next);
+
+        let page3 = backend
+            .search(
+                &tenant,
+                &query
+                    .clone()
+                    .with_cursor(page2.resources.page_info.next_cursor.clone().unwrap()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(page_ids(&page3), vec!["cp-7"]);
+        assert!(!page3.resources.page_info.has_next);
+        assert!(page3.resources.page_info.next_cursor.is_none());
+        assert!(page3.resources.page_info.previous_cursor.is_some());
+
+        let back2 = backend
+            .search(
+                &tenant,
+                &query
+                    .clone()
+                    .with_cursor(page3.resources.page_info.previous_cursor.clone().unwrap()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(page_ids(&back2), vec!["cp-4", "cp-5", "cp-6"]);
+        assert!(back2.resources.page_info.has_previous);
+        assert!(back2.resources.page_info.has_next);
+        assert!(back2.resources.page_info.next_cursor.is_some());
+
+        let back1 = backend
+            .search(
+                &tenant,
+                &query
+                    .clone()
+                    .with_cursor(back2.resources.page_info.previous_cursor.clone().unwrap()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(page_ids(&back1), vec!["cp-1", "cp-2", "cp-3"]);
+        assert!(!back1.resources.page_info.has_previous);
+        assert!(back1.resources.page_info.previous_cursor.is_none());
+        assert!(back1.resources.page_info.has_next);
+
+        let again2 = backend
+            .search(
+                &tenant,
+                &query
+                    .clone()
+                    .with_cursor(back1.resources.page_info.next_cursor.clone().unwrap()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(page_ids(&again2), vec!["cp-4", "cp-5", "cp-6"]);
+    }
+
+    /// Backward from page 2 of a 4-item, count-3 listing has no extra row
+    /// beyond page 1, so `has_previous` must be false and no
+    /// `previous_cursor` is produced.
+    #[tokio::test]
+    async fn test_cursor_paging_backward_from_page_two_has_no_previous() {
+        use crate::types::{SortDirection, SortDirective};
+
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+        create_cursor_paging_patients(&backend, &tenant, 4).await;
+
+        let query = SearchQuery::new("Patient")
+            .with_count(3)
+            .with_sort(SortDirective {
+                parameter: "_id".to_string(),
+                direction: SortDirection::Ascending,
+                param_type: None,
+            });
+
+        let page1 = backend.search(&tenant, &query).await.unwrap();
+        let page2 = backend
+            .search(
+                &tenant,
+                &query
+                    .clone()
+                    .with_cursor(page1.resources.page_info.next_cursor.clone().unwrap()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(page_ids(&page2), vec!["cp-4"]);
+
+        let back1 = backend
+            .search(
+                &tenant,
+                &query
+                    .clone()
+                    .with_cursor(page2.resources.page_info.previous_cursor.clone().unwrap()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(page_ids(&back1), vec!["cp-1", "cp-2", "cp-3"]);
+        assert!(!back1.resources.page_info.has_previous);
+        assert!(back1.resources.page_info.has_next);
+        assert!(back1.resources.page_info.next_cursor.is_some());
     }
 
     #[tokio::test]

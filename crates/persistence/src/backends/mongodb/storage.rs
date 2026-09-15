@@ -3722,8 +3722,8 @@ impl MongoBackend {
                 let filter = self.build_search_index_filter(tenant_id, resource_type, param)?;
                 let pipeline = vec![
                     doc! { "$match": filter },
-                    doc! { "$group": { "_id": "$resource_id" } },
                     doc! { "$limit": PROBE_LIMIT },
+                    doc! { "$group": { "_id": "$resource_id" } },
                     doc! { "$count": "n" },
                 ];
                 let cursor = search_index

@@ -29,6 +29,22 @@ use super::schema;
 /// making a load pay one refresh wait per handful of documents.
 const BULK_OPS_PER_REQUEST: usize = 500;
 
+/// Why a resource's documents did not index in a `_bulk` request.
+struct BulkFailure {
+    message: String,
+    /// The cluster never judged the document — the request did not arrive, or
+    /// the cluster pushed back (`429`) or failed (`5xx`) — so a rerun may
+    /// succeed. A `4xx` rejection of the document itself (for example the
+    /// nested-object limit, #1050) is permanent.
+    transient: bool,
+}
+
+/// Whether a `_bulk` request or item status asks for a retry rather than
+/// rejecting the document.
+fn is_transient_bulk_status(status: u64) -> bool {
+    status == 429 || (500..600).contains(&status)
+}
+
 fn internal_error(message: String) -> StorageError {
     StorageError::Backend(BackendError::Internal {
         backend_name: "elasticsearch".to_string(),
@@ -732,7 +748,7 @@ impl ResourceStorage for ElasticsearchBackend {
             .into_iter()
             .zip(failures)
             .map(|(p, failure)| match failure {
-                Some(message) => Err(internal_error(message)),
+                Some(failure) => Err(internal_error(failure.message)),
                 None => Ok(StoredResource::from_storage(
                     resource_type,
                     &p.id,
@@ -1337,15 +1353,19 @@ impl ElasticsearchBackend {
         &self,
         ops: &[(usize, &str, &str, &Value)],
         owners: usize,
-    ) -> Vec<Option<String>> {
-        let mut failures: Vec<Option<String>> = vec![None; owners];
+    ) -> Vec<Option<BulkFailure>> {
+        let mut failures: Vec<Option<BulkFailure>> = (0..owners).map(|_| None).collect();
         fn fail_chunk(
-            failures: &mut [Option<String>],
+            failures: &mut [Option<BulkFailure>],
             chunk: &[(usize, &str, &str, &Value)],
             message: String,
+            transient: bool,
         ) {
             for (i, ..) in chunk {
-                failures[*i].get_or_insert_with(|| message.clone());
+                failures[*i].get_or_insert_with(|| BulkFailure {
+                    message: message.clone(),
+                    transient,
+                });
             }
         }
         for chunk in ops.chunks(BULK_OPS_PER_REQUEST) {
@@ -1369,6 +1389,7 @@ impl ElasticsearchBackend {
                         &mut failures,
                         chunk,
                         format!("Failed to send bulk index request: {e}"),
+                        true,
                     );
                     continue;
                 }
@@ -1381,6 +1402,7 @@ impl ElasticsearchBackend {
                         &mut failures,
                         chunk,
                         format!("Bulk index request failed (status {status}): {payload}"),
+                        is_transient_bulk_status(u64::from(status.as_u16())),
                     );
                     continue;
                 }
@@ -1389,6 +1411,7 @@ impl ElasticsearchBackend {
                         &mut failures,
                         chunk,
                         format!("Failed to read bulk index response: {e}"),
+                        true,
                     );
                     continue;
                 }
@@ -1409,8 +1432,13 @@ impl ElasticsearchBackend {
                         .and_then(|v| v.get("error"))
                         .map(|v| v.to_string())
                         .unwrap_or_else(|| "no item in bulk response".to_string());
-                    failures[*i].get_or_insert_with(|| {
-                        format!("Failed to index document (status {item_status}): {error}")
+                    // A missing item (status 0) means the response did not
+                    // account for the document, not that it was rejected.
+                    failures[*i].get_or_insert_with(|| BulkFailure {
+                        message: format!(
+                            "Failed to index document (status {item_status}): {error}"
+                        ),
+                        transient: item_status == 0 || is_transient_bulk_status(item_status),
                     });
                 }
             }
@@ -1560,9 +1588,15 @@ impl ReindexTarget for ElasticsearchBackend {
         prepared
             .into_iter()
             .zip(failures)
-            .map(|(p, failure)| match p.failure.or(failure) {
-                Some(message) => Err(internal_error(message)),
-                None => Ok(p.values),
+            .map(|(p, failure)| match (p.failure, failure) {
+                (Some(message), _) => Err(internal_error(message)),
+                // `$reindex` retries a run only for transient failures, so a
+                // rejection must not pass for an outage or the reverse.
+                (None, Some(failure)) if failure.transient => {
+                    Err(unavailable_error(failure.message))
+                }
+                (None, Some(failure)) => Err(internal_error(failure.message)),
+                (None, None) => Ok(p.values),
             })
             .collect()
     }
@@ -1836,4 +1870,21 @@ async fn delete_by_query_scoped(
 
     let payload: Value = response.json().await.unwrap_or_default();
     Ok(payload.get("deleted").and_then(|d| d.as_u64()).unwrap_or(0))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_transient_bulk_status;
+
+    #[test]
+    fn bulk_statuses_that_ask_for_a_retry_are_transient() {
+        for status in [429, 500, 502, 503, 504] {
+            assert!(is_transient_bulk_status(status), "{status}");
+        }
+        // 400 is how Elasticsearch rejects a document over the nested-object
+        // limit (#1050); rerunning it changes nothing.
+        for status in [200, 201, 400, 404, 409, 413] {
+            assert!(!is_transient_bulk_status(status), "{status}");
+        }
+    }
 }

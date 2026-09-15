@@ -47,10 +47,10 @@ use crate::core::bulk_export_worker::{LeaseError, WorkerId};
 use crate::core::bulk_submit::{
     BulkEntryOutcome, BulkEntryResult, BulkProcessingOptions, BulkSubmitProvider,
     BulkSubmitRollbackProvider, CANCELLED_ABORT_REASON, ChangeType, EntryCountSummary,
-    EntryResultContinuation, EntryResultPage, ManifestPhase, ManifestStatus, NdjsonEntry,
-    PagedEntryResult, StreamProcessingResult, StreamingBulkSubmitProvider, SubmissionChange,
-    SubmissionId, SubmissionManifest, SubmissionStatus, SubmissionSummary, UnindexedEntry,
-    invalid_entry_result_page,
+    EntryResultContinuation, EntryResultCursor, EntryResultPage, ManifestPhase, ManifestStatus,
+    NdjsonEntry, PagedEntryResult, StreamProcessingResult, StreamingBulkSubmitProvider,
+    SubmissionChange, SubmissionId, SubmissionManifest, SubmissionStatus, SubmissionSummary,
+    UnindexedEntry, invalid_entry_result_page,
 };
 use crate::core::bulk_submit_publication::{
     ManifestPublicationResult, ManifestPublicationStatus, canonical_publication_files,
@@ -237,6 +237,34 @@ fn decode_entry_result(doc: &Document) -> BulkEntryResult {
         outcome,
         operation_outcome: opt_json(doc, "operation_outcome"),
     }
+}
+
+/// Decodes a receipt together with its stored `(file_url, line_number)`
+/// identity, the key receipt pages continue from.
+///
+/// Every receipt has carried both fields since MongoDB hosted `$bulk-submit`
+/// (#521), so one without them — or with a negative line — is corrupt. It is an
+/// error rather than a default: a keyset cursor built from an invented identity
+/// would silently skip or repeat receipts.
+fn decode_paged_entry_result(doc: &Document) -> StorageResult<PagedEntryResult> {
+    let file_url = doc
+        .get_str("file_url")
+        .map_err(|e| internal_error(format!("entry result missing file_url: {e}")))?
+        .to_string();
+    let line = doc
+        .get_i64("line_number")
+        .map_err(|e| internal_error(format!("entry result missing line_number: {e}")))?;
+    let line_number = u64::try_from(line)
+        .map_err(|_| internal_error("Negative stored receipt line number".to_string()))?;
+    let mut result = decode_entry_result(doc);
+    result.line_number = line_number;
+    Ok(PagedEntryResult {
+        result,
+        stored_identity: Some(EntryResultCursor {
+            file_url,
+            line_number,
+        }),
+    })
 }
 
 fn decode_change(doc: &Document) -> SubmissionChange {
@@ -953,12 +981,17 @@ impl BulkSubmitProvider for MongoBackend {
                 "Receipt page limit must be greater than zero",
             ));
         }
-        let offset = match continuation {
-            None => 0,
-            Some(EntryResultContinuation::Offset(offset)) => *offset,
-            Some(EntryResultContinuation::Keyset(_)) => {
+        let after = match continuation {
+            None => None,
+            Some(EntryResultContinuation::Keyset(cursor)) => Some((
+                cursor.file_url.as_str(),
+                i64::try_from(cursor.line_number).map_err(|_| {
+                    invalid_entry_result_page("Receipt cursor line exceeds MongoDB int64 range")
+                })?,
+            )),
+            Some(EntryResultContinuation::Offset(_)) => {
                 return Err(invalid_entry_result_page(
-                    "mongodb receipt pages require an offset continuation",
+                    "MongoDB receipt pages require a keyset continuation",
                 ));
             }
         };
@@ -966,10 +999,25 @@ impl BulkSubmitProvider for MongoBackend {
         if let Some(outcome) = outcome_filter {
             filter.insert("outcome", outcome.to_string());
         }
+        // Strictly after the last stored identity. Each branch is a bounded
+        // range on an index ending in `(file_url, line_number)`, so a page costs
+        // the same at any depth — unlike `skip`, which rescanned every earlier
+        // receipt on every page (#1046).
+        if let Some((file_url, line)) = after {
+            filter.insert(
+                "$or",
+                vec![
+                    doc! { "file_url": { "$gt": file_url } },
+                    doc! { "file_url": file_url, "line_number": { "$gt": line } },
+                ],
+            );
+        }
+        // The key order both receipt indexes end in, so no page needs a blocking
+        // in-memory sort. The old `{line_number, file_url}` order could not use
+        // either index.
         let options = FindOptions::builder()
-            .sort(doc! { "line_number": 1_i32, "file_url": 1_i32 })
-            .skip(Some(offset as u64))
-            .limit(Some(limit as i64))
+            .sort(doc! { "file_url": 1_i32, "line_number": 1_i32 })
+            .limit(Some(i64::from(limit)))
             .build();
         let cursor = self
             .entry_results()
@@ -978,30 +1026,20 @@ impl BulkSubmitProvider for MongoBackend {
             .with_options(options)
             .await
             .map_err(|e| internal_error(format!("query entry results: {e}")))?;
-        let results: Vec<_> = collect(cursor)
+        let entries = collect(cursor)
             .await?
             .iter()
-            .map(decode_entry_result)
-            .collect();
-        let next = if results.len() == limit as usize {
-            Some(EntryResultContinuation::Offset(
-                offset
-                    .checked_add(limit)
-                    .ok_or_else(|| invalid_entry_result_page("Receipt offset exceeds u32 range"))?,
-            ))
+            .map(decode_paged_entry_result)
+            .collect::<StorageResult<Vec<_>>>()?;
+        let next = if entries.len() == limit as usize {
+            entries
+                .last()
+                .and_then(|entry| entry.stored_identity.clone())
+                .map(EntryResultContinuation::Keyset)
         } else {
             None
         };
-        Ok(EntryResultPage {
-            entries: results
-                .into_iter()
-                .map(|result| PagedEntryResult {
-                    result,
-                    stored_identity: None,
-                })
-                .collect(),
-            next,
-        })
+        Ok(EntryResultPage { entries, next })
     }
 
     async fn get_entry_counts(

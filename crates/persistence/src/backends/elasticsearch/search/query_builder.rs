@@ -21,6 +21,10 @@ pub struct EsQuery {
     pub body: Value,
     /// The index to search.
     pub index: String,
+    /// Whether `size` includes one extra hit beyond `count`. False only when
+    /// `from + count + 1` would exceed `max_result_window`, in which case the
+    /// results layer cannot prove a further page from an extra hit (#1079).
+    pub over_fetched: bool,
 }
 
 /// Returns true if the query contains a relevance-scoring (full-text) clause:
@@ -60,6 +64,9 @@ pub struct EsQueryBuilder<'a> {
     #[allow(dead_code)]
     resource_type: &'a str,
     index: String,
+    /// The index's `index.max_result_window` setting, used to clamp the
+    /// over-fetched `size` so `from + size` never exceeds it (#1079).
+    max_result_window: u32,
 }
 
 impl<'a> EsQueryBuilder<'a> {
@@ -69,7 +76,18 @@ impl<'a> EsQueryBuilder<'a> {
             tenant_id,
             resource_type,
             index,
+            // Same default as `ElasticsearchConfig::max_result_window`
+            // (`backend.rs`); overridden via `with_max_result_window` when
+            // the caller knows the actual configured window.
+            max_result_window: 10_000,
         }
+    }
+
+    /// Overrides the index's `max_result_window`, used to clamp the
+    /// over-fetched `size` so `from + size` stays within the window (#1079).
+    pub fn with_max_result_window(mut self, window: u32) -> Self {
+        self.max_result_window = window;
+        self
     }
 
     /// Builds a complete ES query from a FHIR SearchQuery.
@@ -147,13 +165,20 @@ impl<'a> EsQueryBuilder<'a> {
 
         // Add pagination
         let count = query.count.unwrap_or(20);
-        // `Previous` requests one extra hit so the results layer can tell
-        // whether an earlier page exists beyond the ones returned (#1015).
-        let size = if paging == CursorDirection::Previous {
-            count + 1
+        // Both directions over-fetch by one hit so the results layer can tell
+        // whether another page exists: forward it proves a next page, backward
+        // (#1015) it proves a previous page. The extra hit is dropped there.
+        // Elasticsearch rejects `from + size > index.max_result_window`, and
+        // internal include queries already ask for exactly that window, so the
+        // extra hit is only requested when it fits (#1079).
+        let from = if query.cursor.is_some() {
+            0
         } else {
-            count
+            query.offset.unwrap_or(0)
         };
+        let room = self.max_result_window.saturating_sub(from);
+        let size = (count + 1).min(room.max(1));
+        let over_fetched = size > count;
         body["size"] = json!(size);
 
         if query.cursor.is_some() {
@@ -178,6 +203,7 @@ impl<'a> EsQueryBuilder<'a> {
         EsQuery {
             body,
             index: self.index.clone(),
+            over_fetched,
         }
     }
 
@@ -797,9 +823,10 @@ mod tests {
         assert_eq!(sort[0], json!({ "_score": { "order": "asc" } }));
     }
 
-    /// #1015 regression: a `Next` cursor leaves sort and size untouched.
+    /// #1015 regression + #1079: a Next cursor leaves the sort untouched and
+    /// over-fetches by one hit like Previous does.
     #[test]
-    fn test_next_cursor_keeps_sort_and_size() {
+    fn test_next_cursor_keeps_sort_and_overfetches() {
         let query = SearchQuery::new("Patient")
             .with_count(5)
             .with_cursor(next_cursor("p-5"));
@@ -813,7 +840,89 @@ mod tests {
                 { "resource_id": { "order": "asc" } }
             ])
         );
-        assert_eq!(body["size"], json!(5));
+        assert_eq!(body["size"], json!(6));
         assert_eq!(body["search_after"], json!([1_700_000_000_000i64, "p-5"]));
+    }
+
+    /// #1079: a first page with neither a cursor nor an offset over-fetches
+    /// by one hit and adds neither `from` nor `search_after`.
+    #[test]
+    fn test_first_page_overfetches_by_one() {
+        let query = SearchQuery::new("Patient").with_count(5);
+        let builder = EsQueryBuilder::new("acme", "Patient", "hfs_acme_patient".to_string());
+        let body = builder.build(&query).body;
+
+        assert_eq!(body["size"], json!(6));
+        assert!(body.get("from").is_none());
+        assert!(body.get("search_after").is_none());
+    }
+
+    /// #1079: an offset page over-fetches by one hit, keeps `from` set to the
+    /// requested offset, and adds no `search_after`.
+    #[test]
+    fn test_offset_page_overfetches_by_one_and_keeps_from() {
+        let mut query = SearchQuery::new("Patient").with_count(5);
+        query.offset = Some(10);
+        let builder = EsQueryBuilder::new("acme", "Patient", "hfs_acme_patient".to_string());
+        let body = builder.build(&query).body;
+
+        assert_eq!(body["size"], json!(6));
+        assert_eq!(body["from"], json!(10));
+        assert!(body.get("search_after").is_none());
+    }
+
+    /// #1079: requesting a full window (`count == max_result_window`) leaves
+    /// no room for the extra hit, so `size` is clamped to `count` and
+    /// `over_fetched` is false.
+    #[test]
+    fn test_size_is_clamped_to_max_result_window() {
+        let query = SearchQuery::new("Patient").with_count(10_000);
+        let builder = EsQueryBuilder::new("acme", "Patient", "hfs_acme_patient".to_string());
+        let es_query = builder.build(&query);
+
+        assert_eq!(es_query.body["size"], json!(10_000));
+        assert!(!es_query.over_fetched);
+    }
+
+    /// #1079: when the extra hit still fits under `max_result_window`, it is
+    /// requested as usual.
+    #[test]
+    fn test_size_keeps_extra_hit_when_it_fits_the_window() {
+        let query = SearchQuery::new("Patient").with_count(9_999);
+        let builder = EsQueryBuilder::new("acme", "Patient", "hfs_acme_patient".to_string());
+        let es_query = builder.build(&query);
+
+        assert_eq!(es_query.body["size"], json!(10_000));
+        assert!(es_query.over_fetched);
+    }
+
+    /// #1079: an offset page near the end of the window clamps `size` to the
+    /// remaining room instead of over-fetching past `max_result_window`.
+    #[test]
+    fn test_offset_page_clamps_size_to_remaining_window() {
+        let mut query = SearchQuery::new("Patient").with_count(20);
+        query.offset = Some(9_990);
+        let builder = EsQueryBuilder::new("acme", "Patient", "hfs_acme_patient".to_string());
+        let es_query = builder.build(&query);
+
+        assert_eq!(es_query.body["from"], json!(9_990));
+        assert_eq!(es_query.body["size"], json!(10));
+        assert!(!es_query.over_fetched);
+    }
+
+    /// #1079: `with_max_result_window` overrides the default window for both
+    /// the exact-fit and the room-to-spare cases.
+    #[test]
+    fn test_with_max_result_window_overrides_default() {
+        let builder = EsQueryBuilder::new("acme", "Patient", "hfs_acme_patient".to_string())
+            .with_max_result_window(50);
+
+        let full = builder.build(&SearchQuery::new("Patient").with_count(50));
+        assert_eq!(full.body["size"], json!(50));
+        assert!(!full.over_fetched);
+
+        let room = builder.build(&SearchQuery::new("Patient").with_count(10));
+        assert_eq!(room.body["size"], json!(11));
+        assert!(room.over_fetched);
     }
 }

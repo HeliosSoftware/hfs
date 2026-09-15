@@ -109,7 +109,11 @@ pub trait FhirResourceMetadata {
     ///
     /// These are fields marked with `isSummary: true` in the FHIR specification.
     /// The returned slice contains Rust field names (snake_case) for elements
-    /// that should be included when `_summary=true` is requested.
+    /// that should be included when `_summary=true` is requested — including
+    /// raw identifiers (`r#type`, `r#use`, `r#abstract`, `r#for`) where the
+    /// FHIR element name is a Rust keyword. Consumers that need the JSON
+    /// element names should go through `helios_fhir::summary_elements` rather
+    /// than convert these themselves (#1107).
     ///
     /// The default implementation returns an empty slice for backward compatibility
     /// with types that don't have summary metadata.

@@ -137,6 +137,14 @@ the background and is polled via `/$reindex-status/[job_id]`.
   per minute. Under high job volume, the count limit can evict a status earlier;
   an evicted status returns `404`. Tasks still executing, including cancellation
   in progress, are protected. Cancellation channels are released when tasks exit.
+- A resource a search index rejects does not fail the job: it is counted in
+  `errorCount`, stays stored and readable by id, and is listed as an `error`
+  parameter (`resourceType`, `resourceId`, `message`, `retryable`) for the first
+  100 failures, with `errorsOmitted` counting the rest. `retryable` is `true`
+  when the index was unavailable, timed out or pushed back, and `false` when it
+  rejected the document itself — for Elasticsearch, a resource over
+  `HFS_ELASTICSEARCH_NESTED_OBJECTS_LIMIT` (#1050) — which a rerun cannot fix.
+  A job that fails as a whole also carries `errorMessage`.
 - The `s3` backend standalone has no search index of any kind, so `$reindex`
   there returns `501`. Every other backend and composite supports it.
 - The same applies after a **server upgrade that adds a parameter to the
