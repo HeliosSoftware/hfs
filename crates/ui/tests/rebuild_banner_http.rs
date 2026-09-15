@@ -2,6 +2,10 @@
 //! say so — stored resources stay readable by id, but searches can miss them
 //! until it finishes — and neither page shows the line otherwise.
 //!
+//! #1125: when the tenant's last rebuild left resources unindexed, the line
+//! stays — naming how many and the `$reindex-status` job that lists them —
+//! instead of vanishing the moment the job stops running.
+//!
 //! #1082 stopped the rail showing placeholder zeros during a rebuild; this is
 //! the other half it left: the explicit "search index rebuilding" line.
 //!
@@ -29,6 +33,12 @@ const REBUILDING_TENANT: &str = "rebuild-running";
 const COUNTING_TENANT: &str = "rebuild-counting";
 /// A tenant with no rebuild running.
 const IDLE_TENANT: &str = "rebuild-idle";
+/// A tenant whose last rebuild completed with 11,704 resources unindexed.
+const FAILED_TENANT: &str = "rebuild-failed";
+/// A tenant whose last rebuild failed as a whole, naming no resource.
+const FAILED_JOB_TENANT: &str = "rebuild-failed-job";
+/// The failed rebuilds' job id.
+const FAILED_JOB_ID: &str = "job-1125";
 
 const REBUILD_LINE: &str = "[data-rebuild-notice]";
 
@@ -92,15 +102,23 @@ impl DashboardProvider for Rebuilding {
                 read_at: chrono::Utc::now(),
             },
             reindex_active: match tenant {
-                REBUILDING_TENANT => Some(ReindexActivity {
+                REBUILDING_TENANT => Some(ReindexActivity::Running {
                     jobs: 1,
                     processed: 8_000,
                     total: 19_000,
                 }),
-                COUNTING_TENANT => Some(ReindexActivity {
+                COUNTING_TENANT => Some(ReindexActivity::Running {
                     jobs: 1,
                     processed: 0,
                     total: 0,
+                }),
+                FAILED_TENANT => Some(ReindexActivity::Failed {
+                    job_id: FAILED_JOB_ID.to_string(),
+                    errors: 11_704,
+                }),
+                FAILED_JOB_TENANT => Some(ReindexActivity::Failed {
+                    job_id: FAILED_JOB_ID.to_string(),
+                    errors: 0,
                 }),
                 _ => None,
             },
@@ -155,4 +173,61 @@ async fn home_and_resources_say_when_the_search_index_is_rebuilding() {
     assert_eq!(live.attr("data-dash-moving"), Some("1"));
     let idle = get_as(IDLE_TENANT, "/ui").await;
     assert_eq!(idle.one("#dash-live").attr("data-dash-moving"), None);
+}
+
+#[tokio::test]
+async fn home_and_resources_keep_saying_when_the_last_rebuild_left_resources_unindexed() {
+    set_provider(Arc::new(Rebuilding));
+
+    for path in ["/ui", "/ui/resources"] {
+        let dom = get_as(FAILED_TENANT, path).await;
+        let line = rebuild_line(&dom);
+        assert!(
+            line.contains("The last search index rebuild left 11,704 resources unindexed."),
+            "{path}: the line says the rebuild ended incomplete, and by how much: {line:?}"
+        );
+        assert!(
+            line.contains("$reindex-status/job-1125"),
+            "{path}: and where to find which resources: {line:?}"
+        );
+        assert!(
+            !line.contains('%'),
+            "{path}: a failed rebuild has no progress"
+        );
+        let notice = dom.one(REBUILD_LINE);
+        assert!(
+            notice
+                .attr("class")
+                .is_some_and(|class| class.contains("notice--warn")),
+            "{path}: it is a warning"
+        );
+        assert_eq!(notice.attr("data-rebuild-state"), Some("failed"), "{path}");
+
+        // A job that failed as a whole has no resource count to give.
+        let dom = get_as(FAILED_JOB_TENANT, path).await;
+        let line = rebuild_line(&dom);
+        assert!(
+            line.contains("The last search index rebuild failed before it finished.")
+                && line.contains("$reindex-status/job-1125")
+                && !line.contains("0 resources"),
+            "{path}: {line:?}"
+        );
+
+        let dom = get_as(REBUILDING_TENANT, path).await;
+        assert_eq!(
+            dom.one(REBUILD_LINE).attr("data-rebuild-state"),
+            Some("running"),
+            "{path}"
+        );
+    }
+
+    // On Home the failed line has its own notice slug, so the switch from
+    // "rebuilding" is announced, and it does not keep the region on the fast
+    // cadence: nothing is moving any more.
+    let failed = get_as(FAILED_TENANT, "/ui").await;
+    let live = failed.one("#dash-live");
+    let line = live.one(REBUILD_LINE);
+    assert_eq!(line.attr("data-dash-notice"), Some("rebuild-failed"));
+    assert_eq!(line.attr("aria-live"), Some("polite"));
+    assert_eq!(live.attr("data-dash-moving"), None);
 }

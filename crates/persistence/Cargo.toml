@@ -139,6 +139,9 @@ paste = "1.0"
 # `#[ctor::dtor]` exit hook that removes testcontainers held in `static`s
 # (tests/common/container_cleanup.rs).
 ctor = "0.2"
+# In-process HTTP stub for Elasticsearch `_bulk` failure paths (413, 429,
+# timeouts) that a real cluster cannot be made to produce on demand (#1125).
+wiremock = "0.6"
 
 # `watchdog` pulls in `signal_hook::iterator`/`SIGQUIT`, which only compile on Unix.
 # Windows test runs don't need SIGTERM cleanup, so drop the feature there.

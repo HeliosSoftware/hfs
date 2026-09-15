@@ -1143,6 +1143,41 @@ pub struct ServerConfig {
     )]
     pub elasticsearch_nested_objects_limit: u32,
 
+    /// Per-request timeout, in milliseconds, of the Elasticsearch HTTP client.
+    /// Applies to every request, including each `_bulk` request of a rebuild;
+    /// a request that outlives it fails as a transient error (#1125).
+    #[arg(
+        long,
+        env = "HFS_ELASTICSEARCH_REQUEST_TIMEOUT_MS",
+        default_value = "30000"
+    )]
+    pub elasticsearch_request_timeout_ms: u64,
+
+    /// Upper bound, in bytes, on the documents one Elasticsearch `_bulk`
+    /// request carries, on top of the per-request operation count. Keeps a page
+    /// of large resources (Synthea `Provenance` averages ~108 KB) from becoming
+    /// one oversized request that outlives the client timeout (#1125). A single
+    /// document larger than the cap is still sent, alone.
+    #[arg(
+        long,
+        env = "HFS_ELASTICSEARCH_BULK_MAX_BYTES",
+        default_value = "10485760"
+    )]
+    pub elasticsearch_bulk_max_bytes: usize,
+
+    /// Refresh behavior for `$reindex` and the deferred post-import rebuild:
+    /// "false", "wait_for" or "true". Unset follows
+    /// `HFS_ELASTICSEARCH_WRITE_REFRESH`, so "false" lets a rebuild skip the
+    /// per-request refresh wait while ordinary writes keep `wait_for`.
+    #[arg(long, env = "HFS_ELASTICSEARCH_REINDEX_REFRESH")]
+    pub elasticsearch_reindex_refresh: Option<String>,
+
+    /// Page size of the automatic search-index rebuild that runs after a
+    /// deferred-indexing bulk import. `POST $reindex` keeps its own
+    /// `batchSize` parameter.
+    #[arg(long, env = "HFS_REINDEX_BATCH_SIZE", default_value = "1000")]
+    pub reindex_batch_size: u32,
+
     /// Enable SQL-on-FHIR operations ($sql-run, $sql-export).
     /// When enabled, the configured storage backend MUST provide an in-DB
     /// SOF runner (sqlite or postgres) — there is no in-process fallback.
@@ -1411,6 +1446,10 @@ impl Default for ServerConfig {
             elasticsearch_refresh_interval: "1s".to_string(),
             elasticsearch_write_refresh: "false".to_string(),
             elasticsearch_nested_objects_limit: 50_000,
+            elasticsearch_request_timeout_ms: 30_000,
+            elasticsearch_bulk_max_bytes: 10 * 1024 * 1024,
+            elasticsearch_reindex_refresh: None,
+            reindex_batch_size: 1000,
             sof_enabled: true,
             ui_enabled: true,
             dashboard_reconcile_interval_secs: 30,
@@ -1553,6 +1592,18 @@ impl ServerConfig {
             errors.push("Elasticsearch nested objects limit cannot be 0".to_string());
         }
 
+        if self.elasticsearch_request_timeout_ms == 0 {
+            errors.push("Elasticsearch request timeout cannot be 0".to_string());
+        }
+
+        if self.elasticsearch_bulk_max_bytes == 0 {
+            errors.push("Elasticsearch bulk max bytes cannot be 0".to_string());
+        }
+
+        if self.reindex_batch_size == 0 {
+            errors.push("Reindex batch size cannot be 0".to_string());
+        }
+
         if self.dashboard_reconcile_interval_secs == 0 {
             errors.push("Dashboard reconcile interval cannot be 0".to_string());
         }
@@ -1659,6 +1710,10 @@ impl ServerConfig {
             elasticsearch_refresh_interval: "1s".to_string(),
             elasticsearch_write_refresh: "false".to_string(),
             elasticsearch_nested_objects_limit: 50_000,
+            elasticsearch_request_timeout_ms: 30_000,
+            elasticsearch_bulk_max_bytes: 10 * 1024 * 1024,
+            elasticsearch_reindex_refresh: None,
+            reindex_batch_size: 1000,
             sof_enabled: true,
             ui_enabled: true,
             dashboard_reconcile_interval_secs: 30,
@@ -2242,6 +2297,97 @@ mod tests {
         let errors = result.unwrap_err();
         // At least the three errors above should be present
         assert!(errors.len() >= 3);
+    }
+
+    // ── Elasticsearch client / rebuild knobs (#1125) ──────────────
+
+    /// Every default reproduces today's behavior: a 30 s client timeout, the
+    /// 1000-row deferred rebuild page, and a rebuild refresh that follows
+    /// `HFS_ELASTICSEARCH_WRITE_REFRESH`.
+    #[test]
+    fn test_elasticsearch_rebuild_knob_defaults() {
+        let parsed = ServerConfig::try_parse_from(["rest-server"]).unwrap();
+        for config in [parsed, ServerConfig::default(), ServerConfig::for_testing()] {
+            assert_eq!(config.elasticsearch_request_timeout_ms, 30_000);
+            assert_eq!(config.elasticsearch_bulk_max_bytes, 10 * 1024 * 1024);
+            assert_eq!(config.elasticsearch_reindex_refresh, None);
+            assert_eq!(config.reindex_batch_size, 1000);
+        }
+    }
+
+    /// The CLI default of the rebuild page is the persistence constant the
+    /// deferred rebuild used before it was configurable.
+    #[test]
+    fn test_reindex_batch_size_default_matches_the_deferred_rebuild_page() {
+        assert_eq!(
+            ServerConfig::default().reindex_batch_size,
+            helios_persistence::search::DEFERRED_REINDEX_BATCH_SIZE
+        );
+    }
+
+    #[test]
+    fn test_cli_elasticsearch_rebuild_knobs_parse() {
+        let parsed = ServerConfig::try_parse_from([
+            "rest-server",
+            "--elasticsearch-request-timeout-ms",
+            "120000",
+            "--elasticsearch-bulk-max-bytes",
+            "1048576",
+            "--elasticsearch-reindex-refresh",
+            "false",
+            "--reindex-batch-size",
+            "250",
+        ])
+        .unwrap();
+        assert_eq!(parsed.elasticsearch_request_timeout_ms, 120_000);
+        assert_eq!(parsed.elasticsearch_bulk_max_bytes, 1_048_576);
+        assert_eq!(
+            parsed.elasticsearch_reindex_refresh.as_deref(),
+            Some("false")
+        );
+        assert_eq!(parsed.reindex_batch_size, 250);
+        assert!(parsed.validate().is_ok());
+
+        for (flag, value) in [
+            ("--elasticsearch-request-timeout-ms", "soon"),
+            ("--elasticsearch-bulk-max-bytes", "-1"),
+            ("--reindex-batch-size", "many"),
+        ] {
+            assert!(
+                ServerConfig::try_parse_from(["rest-server", flag, value]).is_err(),
+                "{flag} {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_rejects_zero_elasticsearch_rebuild_knobs() {
+        for (config, message) in [
+            (
+                ServerConfig {
+                    elasticsearch_request_timeout_ms: 0,
+                    ..Default::default()
+                },
+                "Elasticsearch request timeout cannot be 0",
+            ),
+            (
+                ServerConfig {
+                    elasticsearch_bulk_max_bytes: 0,
+                    ..Default::default()
+                },
+                "Elasticsearch bulk max bytes cannot be 0",
+            ),
+            (
+                ServerConfig {
+                    reindex_batch_size: 0,
+                    ..Default::default()
+                },
+                "Reindex batch size cannot be 0",
+            ),
+        ] {
+            let errors = config.validate().unwrap_err();
+            assert!(errors.iter().any(|e| e == message), "{errors:?}");
+        }
     }
 
     // ── full_base_url() ───────────────────────────────────────────
