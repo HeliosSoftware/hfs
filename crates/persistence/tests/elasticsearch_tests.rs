@@ -4318,6 +4318,27 @@ mod es_integration {
         assert!(!page3.resources.page_info.has_next);
     }
 
+    /// #1079: a page whose `count` exactly fills `index.max_result_window`
+    /// leaves no room for the over-fetched extra hit. The query builder must
+    /// clamp `size` instead of asking Elasticsearch for `from + size =
+    /// max_result_window + 1`, which it rejects.
+    #[tokio::test]
+    async fn es_integration_full_window_page_is_accepted() {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::types::SearchQuery;
+
+        let backend = create_backend_with("1ms", WriteRefreshPolicy::WaitFor).await;
+        let tenant = create_tenant("full-window-page");
+        create_cursor_paging_patients(&backend, &tenant, 3).await;
+
+        let query = SearchQuery::new("Patient").with_count(10_000);
+        let result = backend.search(&tenant, &query).await.unwrap();
+
+        assert_eq!(result.resources.items.len(), 3);
+        assert!(!result.resources.page_info.has_next);
+        assert!(result.resources.page_info.next_cursor.is_none());
+    }
+
     // ========================================================================
     // Backend Info Tests
     // ========================================================================
