@@ -2727,19 +2727,14 @@ async fn query_params_catalog(
 /// elements minus resource infrastructure, capped so the table stays
 /// scannable. Replaces the six-type hardcoded map in the browser — every
 /// type the spec defines summary elements for now gets real columns.
+///
+/// The names are JSON element names straight from
+/// [`helios_fhir::summary_elements`] — the browser uses each one as both the
+/// header text and the `resource[col]` lookup key, so they must match the
+/// resource's keys exactly. This function used to convert the generated Rust
+/// field names itself and missed the raw-identifier prefix, so Claim and ~50
+/// other types got `R#TYPE` / `R#USE` headers over empty columns (#1107).
 fn default_result_columns(version: helios_fhir::FhirVersion, resource_type: &str) -> Vec<String> {
-    let summary_fields: &[&str] = match version {
-        #[cfg(feature = "R4")]
-        helios_fhir::FhirVersion::R4 => helios_fhir::r4::get_summary_fields(resource_type),
-        #[cfg(feature = "R4B")]
-        helios_fhir::FhirVersion::R4B => helios_fhir::r4b::get_summary_fields(resource_type),
-        #[cfg(feature = "R5")]
-        helios_fhir::FhirVersion::R5 => helios_fhir::r5::get_summary_fields(resource_type),
-        #[cfg(feature = "R6")]
-        helios_fhir::FhirVersion::R6 => helios_fhir::r6::get_summary_fields(resource_type),
-        #[allow(unreachable_patterns)]
-        _ => &[],
-    };
     const INFRASTRUCTURE: [&str; 9] = [
         "resourceType",
         "id",
@@ -2751,30 +2746,11 @@ fn default_result_columns(version: helios_fhir::FhirVersion, resource_type: &str
         "extension",
         "modifierExtension",
     ];
-    summary_fields
-        .iter()
-        .map(|f| snake_to_camel(f))
+    helios_fhir::summary_elements(version, resource_type)
+        .into_iter()
         .filter(|f| !INFRASTRUCTURE.contains(&f.as_str()))
         .take(5)
         .collect()
-}
-
-/// `get_summary_fields` returns Rust field names; resources carry camelCase
-/// JSON keys, which is what the results table indexes by.
-fn snake_to_camel(field: &str) -> String {
-    let mut out = String::with_capacity(field.len());
-    let mut upper_next = false;
-    for c in field.chars() {
-        if c == '_' {
-            upper_next = true;
-        } else if upper_next {
-            out.extend(c.to_uppercase());
-            upper_next = false;
-        } else {
-            out.push(c);
-        }
-    }
-    out
 }
 
 /// Query string for the SearchParameter viewer. Every filter is a link and
@@ -9386,6 +9362,24 @@ mod tests {
     }
 
     /// The builder's datalist fragment is fed by the SearchParameter
+    /// The column hint carries JSON element names, never the generated
+    /// structs' raw identifiers: Claim's `type` and `use` fields are `r#type`
+    /// and `r#use` in Rust, and the browser indexes `resource[col]` with the
+    /// hinted string verbatim (#1107).
+    #[cfg(feature = "R4")]
+    #[test]
+    fn default_result_columns_use_json_element_names() {
+        assert_eq!(
+            default_result_columns(helios_fhir::FhirVersion::R4, "Claim"),
+            ["status", "type", "use", "patient", "billablePeriod"]
+        );
+        assert_eq!(
+            default_result_columns(helios_fhir::FhirVersion::R4, "Patient"),
+            ["identifier", "active", "name", "telecom", "gender"]
+        );
+        assert!(default_result_columns(helios_fhir::FhirVersion::R4, "Nope").is_empty());
+    }
+
     /// registry and scoped to the requested resource type.
     #[test]
     fn param_options_partial_renders_datalist() {
