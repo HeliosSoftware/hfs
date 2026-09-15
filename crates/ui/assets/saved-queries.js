@@ -185,6 +185,20 @@
 
   var CONTROL_KEYS = ["_count", "_sort", "_total", "_summary", "_elements"];
   var INCLUDE_KEYS = ["_include", "_revinclude"];
+  /* Resource infrastructure fields, excluded from the derived result columns
+   * (#1105). Mirrors the server's `default_result_columns` (lib.rs), which
+   * uses the same list to build the catalog's empty-page fallback. */
+  var INFRASTRUCTURE = [
+    "resourceType",
+    "id",
+    "meta",
+    "implicitRules",
+    "language",
+    "text",
+    "contained",
+    "extension",
+    "modifierExtension",
+  ];
   var COLON_MODIFIERS = [
     "exact", "contains", "missing", "not", "text",
     "above", "below", "in", "not-in", "identifier", "of-type",
@@ -2474,17 +2488,6 @@
     }, 2000);
   }
 
-  /* Typed default columns (#416): common fields per resource type when the
-   * query names no _elements; unknown types keep the compact id/updated view. */
-  var DEFAULT_COLUMNS = {
-    Patient: ["name", "gender", "birthDate", "managingOrganization"],
-    Practitioner: ["name", "gender"],
-    Organization: ["name", "type"],
-    Observation: ["code", "status", "subject"],
-    Encounter: ["status", "class", "subject"],
-    Condition: ["code", "clinicalStatus", "subject"],
-  };
-
   function elementColumns(query) {
     var columns = [];
     splitQuery(query).forEach(function (part) {
@@ -2492,6 +2495,23 @@
       part.value.split(",").forEach(function (el) {
         el = el.trim();
         if (el && el !== "id" && columns.indexOf(el) < 0) columns.push(el);
+      });
+    });
+    return columns;
+  }
+
+  /* One column per top-level attribute actually present in the returned
+   * resources, in order of first appearance across `primary` (#1105). Used
+   * when the query names no _elements, so _summary=true and full payloads
+   * each show what the server sent instead of a fixed hint. */
+  function resultColumns(primary) {
+    var columns = [];
+    primary.forEach(function (entry) {
+      var resource = entry.resource;
+      if (!resource) return;
+      Object.keys(resource).forEach(function (key) {
+        if (INFRASTRUCTURE.indexOf(key) >= 0) return;
+        if (columns.indexOf(key) < 0) columns.push(key);
       });
     });
     return columns;
@@ -2567,8 +2587,10 @@
         results.card.dataset.msgIncluded.replace("{count}", included);
 
     var columns = elementColumns(context.query);
-    if (!columns.length) columns = DEFAULT_COLUMNS[context.type] || [];
-    /* Every other type: summary elements from the catalog hint (#958). */
+    /* No _elements: one column per attribute the server actually returned, so
+     * _summary=true lists the summary elements and a full payload lists
+     * everything (#1105). The catalog hint only covers an empty page. */
+    if (!columns.length) columns = resultColumns(primary);
     if (!columns.length) columns = TYPE_COLUMNS[context.type] || [];
 
     var head = document.createDocumentFragment();
