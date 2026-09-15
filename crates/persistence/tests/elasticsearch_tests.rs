@@ -3331,6 +3331,110 @@ mod es_integration {
     }
 
     #[tokio::test]
+    async fn elasticsearch_integration_quantity_ne_excludes_precision_range() {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::types::{
+            SearchParamType, SearchParameter, SearchPrefix, SearchQuery, SearchValue,
+        };
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("test-tenant");
+
+        // Issue #1011: `value-quantity=ne60` must exclude 60.2 kg (inside the
+        // implicit-precision range [59.5, 60.5)) while still matching every
+        // other value, regardless of how the search value's own precision is
+        // written.
+        let weights = [
+            ("obs-weight-55-4", 55.4),
+            ("obs-weight-58-5", 58.5),
+            ("obs-weight-60-2", 60.2),
+            ("obs-weight-64-5", 64.5),
+        ];
+        for (id, value) in weights {
+            backend
+                .create(
+                    &tenant,
+                    "Observation",
+                    json!({
+                        "resourceType": "Observation",
+                        "id": id,
+                        "status": "final",
+                        "code": { "coding": [{ "system": "http://loinc.org", "code": "29463-7" }] },
+                        "valueQuantity": {
+                            "value": value,
+                            "unit": "kg",
+                            "system": "http://unitsofmeasure.org",
+                            "code": "kg"
+                        }
+                    }),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+
+        // Wait for index refresh
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+        async fn search_ids(
+            backend: &ElasticsearchBackend,
+            tenant: &TenantContext,
+            prefix: SearchPrefix,
+            value: &str,
+        ) -> Vec<String> {
+            let query = SearchQuery::new("Observation").with_parameter(SearchParameter {
+                name: "value-quantity".to_string(),
+                param_type: SearchParamType::Quantity,
+                modifier: None,
+                values: vec![SearchValue::new(prefix, value)],
+                chain: vec![],
+                components: vec![],
+            });
+            let result = backend.search(tenant, &query).await.unwrap();
+            let mut ids: Vec<String> = result
+                .resources
+                .items
+                .iter()
+                .map(|r| r.id().to_string())
+                .collect();
+            ids.sort();
+            ids
+        }
+
+        let ne60 = search_ids(&backend, &tenant, SearchPrefix::Ne, "60").await;
+        assert_eq!(
+            ne60,
+            vec!["obs-weight-55-4", "obs-weight-58-5", "obs-weight-64-5"],
+            "ne60 excludes 60.2, which lies in [59.5, 60.5)"
+        );
+
+        let ne60_0 = search_ids(&backend, &tenant, SearchPrefix::Ne, "60.0").await;
+        assert_eq!(
+            ne60_0,
+            vec![
+                "obs-weight-55-4",
+                "obs-weight-58-5",
+                "obs-weight-60-2",
+                "obs-weight-64-5"
+            ],
+            "ne60.0 ranges over [59.95, 60.05), which excludes 60.2, so nothing is excluded"
+        );
+
+        let ne60_kg = search_ids(
+            &backend,
+            &tenant,
+            SearchPrefix::Ne,
+            "60|http://unitsofmeasure.org|kg",
+        )
+        .await;
+        assert_eq!(
+            ne60_kg,
+            vec!["obs-weight-55-4", "obs-weight-58-5", "obs-weight-64-5"],
+            "ne60|...|kg excludes 60.2 through the raw and canonical branches"
+        );
+    }
+
+    #[tokio::test]
     async fn es_integration_search_uri() {
         use helios_persistence::core::SearchProvider;
         use helios_persistence::types::{
