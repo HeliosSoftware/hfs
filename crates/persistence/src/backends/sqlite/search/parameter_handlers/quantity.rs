@@ -21,14 +21,14 @@ impl QuantityHandler {
         let quantity_str = &value.value;
         let parts: Vec<&str> = quantity_str.split('|').collect();
 
-        let (num_value, system, code) = match parts.len() {
+        let (num_str, num_value, system, code) = match parts.len() {
             1 => {
                 // Just a number
                 let num: f64 = match parts[0].parse() {
                     Ok(v) => v,
                     Err(_) => return SqlFragment::new("1 = 0"),
                 };
-                (num, None, None)
+                (parts[0], num, None, None)
             }
             2 => {
                 // number|code
@@ -36,7 +36,7 @@ impl QuantityHandler {
                     Ok(v) => v,
                     Err(_) => return SqlFragment::new("1 = 0"),
                 };
-                (num, None, Some(parts[1]))
+                (parts[0], num, None, Some(parts[1]))
             }
             3 => {
                 // number|system|code
@@ -54,7 +54,7 @@ impl QuantityHandler {
                 } else {
                     Some(parts[2])
                 };
-                (num, system, code)
+                (parts[0], num, system, code)
             }
             _ => return SqlFragment::new("1 = 0"),
         };
@@ -64,6 +64,7 @@ impl QuantityHandler {
             let num = Self::build_numeric_condition(
                 "value_quantity_value",
                 num_value,
+                num_str,
                 value.prefix,
                 param_num,
             );
@@ -90,7 +91,7 @@ impl QuantityHandler {
         if let Some(c) = code {
             let start = param_num + raw.params.len();
             if let Some((canon_sql, canon_params)) =
-                Self::build_canonical_condition(c, num_value, value.prefix, start)
+                Self::build_canonical_condition(c, num_value, num_str, value.prefix, start)
             {
                 let mut params = raw.params;
                 params.extend(canon_params);
@@ -104,25 +105,29 @@ impl QuantityHandler {
         raw
     }
 
-    /// Builds the canonical-column predicate by canonicalizing the search value's
-    /// numeric *bounds* (range endpoints) with the supplied UCUM code, so unit
+    /// Builds the canonical-column predicate. For `eq`/`ne` the search value's
+    /// implicit-precision *bounds* (range endpoints, derived from `num_str`)
+    /// are each canonicalized with the supplied UCUM code, so unit
     /// equivalence is honored without losing implicit-precision semantics to
-    /// float rounding. Returns `None` if the unit cannot be canonicalized.
+    /// float rounding. For every other comparator the exact search value is
+    /// canonicalized and compared with a single boundary, since the FHIR spec
+    /// says those prefixes ignore implicit precision. Returns `None` if the
+    /// unit cannot be canonicalized.
     fn build_canonical_condition(
         code: &str,
         value: f64,
+        num_str: &str,
         prefix: SearchPrefix,
         param_num: usize,
     ) -> Option<(String, Vec<SqlParam>)> {
         use helios_fhirpath::ucum::canonicalize_quantity as canon;
         let col = "value_quantity_canonical_value";
 
-        // Canonicalize one bound, returning (canonical_value, canonical_unit).
         let (sql, mut params, unit) = match prefix {
             SearchPrefix::Eq | SearchPrefix::Ne => {
-                let half = Self::get_implicit_precision(value) / 2.0;
-                let (lo, unit) = canon(value - half, code)?;
-                let (hi, _) = canon(value + half, code)?;
+                let (lo, hi) = crate::search::implicit_range(value, num_str);
+                let (lo, unit) = canon(lo, code)?;
+                let (hi, _) = canon(hi, code)?;
                 let (lo, hi) = if lo <= hi { (lo, hi) } else { (hi, lo) };
                 let sql = if matches!(prefix, SearchPrefix::Eq) {
                     format!("{col} >= ?{} AND {col} < ?{}", param_num, param_num + 1)
@@ -131,21 +136,19 @@ impl QuantityHandler {
                 };
                 (sql, vec![SqlParam::float(lo), SqlParam::float(hi)], unit)
             }
-            // Comparators match against the canonicalized range boundaries:
-            // gt/sa → ≥ canon(hi), lt/eb → < canon(lo), ge → ≥ canon(lo),
-            // le → < canon(hi).
+            // gt/lt/ge/le/sa/eb compare against the exact canonicalized
+            // value: per the FHIR spec, the implicit precision is ignored
+            // for these prefixes.
             SearchPrefix::Gt | SearchPrefix::Sa => {
-                let hi = value + Self::get_implicit_precision(value) / 2.0;
-                let (b, unit) = canon(hi, code)?;
+                let (b, unit) = canon(value, code)?;
                 (
-                    format!("{col} >= ?{}", param_num),
+                    format!("{col} > ?{}", param_num),
                     vec![SqlParam::float(b)],
                     unit,
                 )
             }
             SearchPrefix::Lt | SearchPrefix::Eb => {
-                let lo = value - Self::get_implicit_precision(value) / 2.0;
-                let (b, unit) = canon(lo, code)?;
+                let (b, unit) = canon(value, code)?;
                 (
                     format!("{col} < ?{}", param_num),
                     vec![SqlParam::float(b)],
@@ -153,8 +156,7 @@ impl QuantityHandler {
                 )
             }
             SearchPrefix::Ge => {
-                let lo = value - Self::get_implicit_precision(value) / 2.0;
-                let (b, unit) = canon(lo, code)?;
+                let (b, unit) = canon(value, code)?;
                 (
                     format!("{col} >= ?{}", param_num),
                     vec![SqlParam::float(b)],
@@ -162,10 +164,9 @@ impl QuantityHandler {
                 )
             }
             SearchPrefix::Le => {
-                let hi = value + Self::get_implicit_precision(value) / 2.0;
-                let (b, unit) = canon(hi, code)?;
+                let (b, unit) = canon(value, code)?;
                 (
-                    format!("{col} < ?{}", param_num),
+                    format!("{col} <= ?{}", param_num),
                     vec![SqlParam::float(b)],
                     unit,
                 )
@@ -192,68 +193,57 @@ impl QuantityHandler {
     }
 
     /// Builds the numeric comparison part of the condition against `column`.
+    /// `num_str` is the search value's textual form (used only by `eq`/`ne`
+    /// to derive the implicit-precision range).
     fn build_numeric_condition(
         column: &str,
         value: f64,
+        num_str: &str,
         prefix: SearchPrefix,
         param_num: usize,
     ) -> SqlFragment {
         match prefix {
             SearchPrefix::Eq => {
-                // Implicit precision range
-                let precision = Self::get_implicit_precision(value);
-                let half = precision / 2.0;
+                let (lo, hi) = crate::search::implicit_range(value, num_str);
                 SqlFragment::with_params(
                     format!(
                         "{column} >= ?{} AND {column} < ?{}",
                         param_num,
                         param_num + 1
                     ),
-                    vec![SqlParam::float(value - half), SqlParam::float(value + half)],
+                    vec![SqlParam::float(lo), SqlParam::float(hi)],
                 )
             }
             SearchPrefix::Ne => {
-                let precision = Self::get_implicit_precision(value);
-                let half = precision / 2.0;
+                let (lo, hi) = crate::search::implicit_range(value, num_str);
                 SqlFragment::with_params(
                     format!(
                         "({column} < ?{} OR {column} >= ?{})",
                         param_num,
                         param_num + 1
                     ),
-                    vec![SqlParam::float(value - half), SqlParam::float(value + half)],
+                    vec![SqlParam::float(lo), SqlParam::float(hi)],
                 )
             }
-            // Comparators match against the implicit-precision range boundaries
-            // (FHIR spec): gt/sa → ≥ hi, lt/eb → < lo, ge → ≥ lo, le → < hi.
-            SearchPrefix::Gt | SearchPrefix::Sa => {
-                let hi = value + Self::get_implicit_precision(value) / 2.0;
-                SqlFragment::with_params(
-                    format!("{column} >= ?{}", param_num),
-                    vec![SqlParam::float(hi)],
-                )
-            }
-            SearchPrefix::Lt | SearchPrefix::Eb => {
-                let lo = value - Self::get_implicit_precision(value) / 2.0;
-                SqlFragment::with_params(
-                    format!("{column} < ?{}", param_num),
-                    vec![SqlParam::float(lo)],
-                )
-            }
-            SearchPrefix::Ge => {
-                let lo = value - Self::get_implicit_precision(value) / 2.0;
-                SqlFragment::with_params(
-                    format!("{column} >= ?{}", param_num),
-                    vec![SqlParam::float(lo)],
-                )
-            }
-            SearchPrefix::Le => {
-                let hi = value + Self::get_implicit_precision(value) / 2.0;
-                SqlFragment::with_params(
-                    format!("{column} < ?{}", param_num),
-                    vec![SqlParam::float(hi)],
-                )
-            }
+            // gt/lt/ge/le/sa/eb compare against the exact search value: per
+            // the FHIR spec, the implicit precision is ignored for these
+            // prefixes.
+            SearchPrefix::Gt | SearchPrefix::Sa => SqlFragment::with_params(
+                format!("{column} > ?{}", param_num),
+                vec![SqlParam::float(value)],
+            ),
+            SearchPrefix::Lt | SearchPrefix::Eb => SqlFragment::with_params(
+                format!("{column} < ?{}", param_num),
+                vec![SqlParam::float(value)],
+            ),
+            SearchPrefix::Ge => SqlFragment::with_params(
+                format!("{column} >= ?{}", param_num),
+                vec![SqlParam::float(value)],
+            ),
+            SearchPrefix::Le => SqlFragment::with_params(
+                format!("{column} <= ?{}", param_num),
+                vec![SqlParam::float(value)],
+            ),
             SearchPrefix::Ap => {
                 // +/- 10%
                 let margin = (value.abs() * 0.1).max(0.0001);
@@ -265,17 +255,6 @@ impl QuantityHandler {
                     ],
                 )
             }
-        }
-    }
-
-    /// Gets the implicit precision of a number.
-    fn get_implicit_precision(value: f64) -> f64 {
-        let s = value.to_string();
-        if let Some(dot_pos) = s.find('.') {
-            let decimal_places = s.len() - dot_pos - 1;
-            10_f64.powi(-(decimal_places as i32))
-        } else {
-            1.0
         }
     }
 }
@@ -313,12 +292,56 @@ mod tests {
     }
 
     #[test]
-    fn test_quantity_gt() {
-        // gt matches strictly above the search range → `value_quantity_value >= hi`.
-        let value = SearchValue::new(SearchPrefix::Gt, "5.4|mg");
+    fn raw_comparators_use_exact_value() {
+        // gt/le ignore implicit precision and compare against the exact
+        // search value, per the FHIR spec.
+        let gt = QuantityHandler::build_sql(&SearchValue::new(SearchPrefix::Gt, "60|kg"), 0);
+        assert!(gt.sql.contains("value_quantity_value > ?1"));
+        match &gt.params[0] {
+            SqlParam::Float(f) => assert!((*f - 60.0).abs() < 1e-9),
+            _ => panic!("expected float param"),
+        }
+
+        let le = QuantityHandler::build_sql(&SearchValue::new(SearchPrefix::Le, "60"), 0);
+        assert!(le.sql.contains("value_quantity_value <= ?1"));
+    }
+
+    #[test]
+    fn eq_range_follows_search_text_precision() {
+        // "60.0" has one decimal of precision → [59.95, 60.05).
+        let eq = QuantityHandler::build_sql(&SearchValue::new(SearchPrefix::Eq, "60.0"), 0);
+
+        assert!(eq.params.len() >= 2);
+        match (&eq.params[0], &eq.params[1]) {
+            (SqlParam::Float(lo), SqlParam::Float(hi)) => {
+                assert!((*lo - 59.95).abs() < 1e-9);
+                assert!((*hi - 60.05).abs() < 1e-9);
+            }
+            _ => panic!("expected float params"),
+        }
+    }
+
+    #[test]
+    fn canonical_comparator_uses_exact_canonical_value() {
+        use helios_fhirpath::ucum::canonicalize_quantity as canon;
+
+        let value = SearchValue::new(SearchPrefix::Gt, "60|http://unitsofmeasure.org|kg");
         let frag = QuantityHandler::build_sql(&value, 0);
 
-        assert!(frag.sql.contains(">= ?1"));
+        assert!(frag.sql.contains("value_quantity_canonical_value > ?"));
+
+        // The canonical bound must equal canon(60.0, "kg") exactly, not a
+        // value widened by half the implicit precision (e.g. 60.5).
+        let (expected, _) = canon(60.0, "kg").expect("kg canonicalizes");
+        let has_exact_canonical_param = frag
+            .params
+            .iter()
+            .any(|p| matches!(p, SqlParam::Float(f) if (*f - expected).abs() < 1e-9));
+        assert!(
+            has_exact_canonical_param,
+            "expected a float param equal to canon(60.0, \"kg\") = {expected}, got {:?}",
+            frag.params
+        );
     }
 
     #[test]
