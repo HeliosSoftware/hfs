@@ -83,7 +83,7 @@ use crate::{EvaluationResult, evaluate_expression};
 use helios_fhir::{FhirResource, FhirVersion};
 
 #[derive(Parser, Debug)]
-#[command(name = "fhirpath-cli")]
+#[command(name = "fhirpath-cli", version)]
 #[command(about = "FHIRPath CLI tool for evaluating expressions against FHIR resources")]
 #[command(
     long_about = "Evaluate FHIRPath expressions against FHIR resources with support for context expressions, variables, and debug output"
