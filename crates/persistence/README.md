@@ -1407,6 +1407,23 @@ immediate follow-up search misses the write. The `hfs` binary exposes these as
 `HFS_ELASTICSEARCH_WRITE_REFRESH` (see the
 [hfs README](../hfs/README.md#environment-variables)).
 
+#### Very large resources on Elasticsearch-backed composites
+
+Every indexed search-parameter value is a nested object in the resource's
+Elasticsearch document, and Elasticsearch rejects the **whole document** once it
+holds more than `index.mapping.nested_objects.limit` of them. The resource stays
+stored in the primary and readable by id, but is absent from every search.
+Elasticsearch's own default of 10000 is exceeded by real data: 458 of the 11,704
+Synthea `Provenance` resources carry more than 10000 `target` references (the
+largest, 28,192).
+
+`ElasticsearchConfig::nested_objects_limit` (default 50000) is written into the
+index template, so new indices get it, and is raised during backend
+initialization on existing indices that are below it. The setting is dynamic,
+so resources that already indexed need no reindex; resources rejected before the
+raise are repaired with `POST /{type}/$reindex`. The `hfs` binary exposes it as
+`HFS_ELASTICSEARCH_NESTED_OBJECTS_LIMIT`.
+
 ### Cost-Based Optimization
 
 The cost estimator uses benchmark-derived costs to make routing decisions:

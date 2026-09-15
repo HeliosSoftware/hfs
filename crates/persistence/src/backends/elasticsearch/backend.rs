@@ -120,6 +120,18 @@ pub struct ElasticsearchConfig {
     #[serde(default = "default_max_result_window")]
     pub max_result_window: u32,
 
+    /// Maximum nested objects one document may contain, summed across every
+    /// `nested` search-parameter field (default: 50000).
+    ///
+    /// Elasticsearch's own default of 10000 rejects the whole document, so a
+    /// resource with more indexed values than that — a Synthea `Provenance`
+    /// whose `target` array alone holds 13,554 references — is stored but
+    /// never searchable (#1050). The setting is dynamic: new indices take it
+    /// from the index template, existing ones are raised in
+    /// [`Backend::initialize`].
+    #[serde(default = "default_nested_objects_limit")]
+    pub nested_objects_limit: u32,
+
     /// Request timeout in milliseconds (default: 30000).
     #[serde(default = "default_request_timeout_ms")]
     pub request_timeout_ms: u64,
@@ -158,6 +170,10 @@ fn default_max_result_window() -> u32 {
     10000
 }
 
+fn default_nested_objects_limit() -> u32 {
+    50_000
+}
+
 fn default_request_timeout_ms() -> u64 {
     30000
 }
@@ -172,6 +188,7 @@ impl Default for ElasticsearchConfig {
             refresh_interval: default_refresh_interval(),
             write_refresh: WriteRefreshPolicy::default(),
             max_result_window: default_max_result_window(),
+            nested_objects_limit: default_nested_objects_limit(),
             request_timeout_ms: default_request_timeout_ms(),
             auth: None,
             disable_certificate_validation: false,
@@ -540,7 +557,29 @@ impl Backend for ElasticsearchBackend {
                 backend_name: "elasticsearch".to_string(),
                 message: format!("Failed to create index template: {}", e),
                 source: None,
-            })
+            })?;
+
+        // The template only reaches indices created from now on. Indices that
+        // already exist keep Elasticsearch's 10000 nested-object limit until
+        // raised here (#1050). Not fatal: a missing `manage` privilege must not
+        // stop the server, and every resource under the old limit still
+        // indexes.
+        let limit = self.config().nested_objects_limit;
+        match super::schema::raise_nested_objects_limit(self).await {
+            Ok(0) => {}
+            Ok(raised) => tracing::info!(
+                indices = raised,
+                limit,
+                "raised the Elasticsearch nested-object limit on existing indices"
+            ),
+            Err(e) => tracing::warn!(
+                error = %e,
+                limit,
+                "could not raise the Elasticsearch nested-object limit on existing indices; \
+                 resources with more nested values than an index's current limit stay unsearchable"
+            ),
+        }
+        Ok(())
     }
 
     async fn migrate(&self) -> Result<(), BackendError> {

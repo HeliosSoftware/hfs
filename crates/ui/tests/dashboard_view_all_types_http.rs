@@ -86,6 +86,7 @@ impl DashboardProvider for FakeProvider {
             available,
             export_jobs: None,
             import_jobs_active: None,
+            reindex_active: None,
             figures: Figures::Exact {
                 read_at: chrono::Utc::now(),
             },

@@ -2191,6 +2191,7 @@ async fn start_sqlite_elasticsearch(
         fhir_version: config.default_fhir_version,
         refresh_interval: config.elasticsearch_refresh_interval.clone(),
         write_refresh: es_write_refresh_from_config(&config)?,
+        nested_objects_limit: config.elasticsearch_nested_objects_limit,
         ..Default::default()
     };
 
@@ -2485,6 +2486,7 @@ async fn start_postgres_elasticsearch(
         fhir_version: config.default_fhir_version,
         refresh_interval: config.elasticsearch_refresh_interval.clone(),
         write_refresh: es_write_refresh_from_config(&config)?,
+        nested_objects_limit: config.elasticsearch_nested_objects_limit,
         ..Default::default()
     };
 
@@ -2696,6 +2698,7 @@ async fn start_mongodb_elasticsearch(
         fhir_version: config.default_fhir_version,
         refresh_interval: config.elasticsearch_refresh_interval.clone(),
         write_refresh: es_write_refresh_from_config(&config)?,
+        nested_objects_limit: config.elasticsearch_nested_objects_limit,
         ..Default::default()
     };
 
@@ -3108,6 +3111,7 @@ async fn start_s3_elasticsearch(
         fhir_version: config.default_fhir_version,
         refresh_interval: config.elasticsearch_refresh_interval.clone(),
         write_refresh: es_write_refresh_from_config(&config)?,
+        nested_objects_limit: config.elasticsearch_nested_objects_limit,
         ..Default::default()
     };
 

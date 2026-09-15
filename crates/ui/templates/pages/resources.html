@@ -19,6 +19,10 @@
   <div>
     <h1 class="page-head__title">{{ i18n.t("resources-heading") }}</h1>
     <p class="page-head__lede" id="resources-subtitle">{{ i18n.t("resources-lede") }}</p>
+    {# #1065: results may miss stored resources while the search index rebuilds. #}
+    {% if let Some(activity) = rebuild %}
+    <p class="notice notice--warn" role="status" data-rebuild-notice>{{ self.rebuild_text(activity) }}</p>
+    {% endif %}
   </div>
   <div class="resources-create-wrap">
     <button type="button" class="btn btn--primary resources-create" id="resource-create"

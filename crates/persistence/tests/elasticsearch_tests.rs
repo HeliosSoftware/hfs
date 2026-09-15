@@ -25,6 +25,7 @@ fn test_elasticsearch_config_defaults() {
     assert_eq!(config.number_of_shards, 1);
     assert_eq!(config.number_of_replicas, 1);
     assert!(config.auth.is_none());
+    assert_eq!(config.nested_objects_limit, 50_000);
 }
 
 #[test]
@@ -51,6 +52,17 @@ fn test_write_refresh_policy_default_is_false() {
     let json = r#"{"nodes": ["http://localhost:9200"]}"#;
     let config: ElasticsearchConfig = serde_json::from_str(json).unwrap();
     assert_eq!(config.write_refresh, WriteRefreshPolicy::False);
+}
+
+/// #1050: a config that omits the field must not fall back to
+/// Elasticsearch's own limit of 10000, which drops large resources from search.
+#[test]
+fn test_nested_objects_limit_defaults_above_elasticsearch_default() {
+    assert_eq!(ElasticsearchConfig::default().nested_objects_limit, 50_000);
+
+    let json = r#"{"nodes": ["http://localhost:9200"]}"#;
+    let config: ElasticsearchConfig = serde_json::from_str(json).unwrap();
+    assert_eq!(config.nested_objects_limit, 50_000);
 }
 
 #[test]
@@ -854,6 +866,60 @@ mod es_integration {
         TenantContext::new(TenantId::new(id), TenantPermissions::full_access())
     }
 
+    /// A backend on `index_prefix` with the given nested-object limit, so the
+    /// #1050 tests can put two backends on the same indices.
+    async fn create_backend_with_nested_limit(
+        index_prefix: &str,
+        nested_objects_limit: u32,
+    ) -> ElasticsearchBackend {
+        let es = shared_es().await;
+        let config = ElasticsearchConfig {
+            nodes: vec![format!("http://{}:{}", es.host, es.port)],
+            index_prefix: index_prefix.to_string(),
+            number_of_replicas: 0,
+            refresh_interval: "1ms".to_string(),
+            nested_objects_limit,
+            ..Default::default()
+        };
+        let backend = ElasticsearchBackend::with_shared_registry(config, build_search_registry())
+            .expect("Failed to create ElasticsearchBackend");
+        backend
+            .initialize()
+            .await
+            .expect("Failed to initialize ES backend");
+        backend
+    }
+
+    /// A Synthea-shaped `Provenance` whose `target` array alone holds more
+    /// nested reference values than Elasticsearch's default limit of 10000 —
+    /// the shape of the 458 resources #1050 found stored but unsearchable.
+    fn oversized_provenance(
+        tenant: &TenantContext,
+        id: &str,
+        targets: usize,
+    ) -> helios_persistence::types::StoredResource {
+        let target: Vec<serde_json::Value> = (0..targets)
+            .map(|n| json!({ "reference": format!("Observation/obs-{n}") }))
+            .collect();
+        helios_persistence::types::StoredResource::from_storage(
+            "Provenance",
+            id.to_string(),
+            "1",
+            tenant.tenant_id().clone(),
+            json!({
+                "resourceType": "Provenance",
+                "id": id,
+                "target": target,
+                "recorded": "2009-02-28T07:56:45.469-05:00",
+                "agent": [{ "who": { "reference": "Practitioner/p1" } }]
+            }),
+            chrono::Utc::now(),
+            chrono::Utc::now(),
+            None,
+            FhirVersion::default(),
+        )
+    }
+
     /// #519: the #456 boundary table over the real ES search path.
     #[tokio::test]
     async fn es_day_precision_date_boundaries() {
@@ -884,6 +950,99 @@ mod es_integration {
         assert_eq!(created.resource_type(), "Patient");
         assert!(!created.id().is_empty());
         assert_eq!(created.version_id(), "1");
+    }
+
+    /// #1050: Elasticsearch's default nested-object limit of 10000 rejects the
+    /// whole document, so a resource with more indexed values than that was
+    /// stored but never searchable. With the raised default it indexes through
+    /// the `$reindex` page writer.
+    #[tokio::test]
+    async fn es_integration_resource_over_elasticsearch_default_nested_limit_indexes() {
+        use helios_persistence::search::ReindexTarget;
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("nested-limit-default");
+        let provenance = oversized_provenance(&tenant, "oversized", 12_000);
+
+        let outcomes = backend
+            .write_search_entries_page(&tenant, std::slice::from_ref(&provenance))
+            .await;
+        assert!(
+            outcomes[0].is_ok(),
+            "a Provenance with 12000 targets must index: {:?}",
+            outcomes[0]
+        );
+        assert!(
+            backend
+                .read(&tenant, "Provenance", "oversized")
+                .await
+                .unwrap()
+                .is_some(),
+            "the document must be in the index"
+        );
+    }
+
+    /// #1050: the index template only reaches indices created after it, so an
+    /// index that already existed at Elasticsearch's limit of 10000 kept
+    /// rejecting large resources. Starting a backend with the raised limit must
+    /// raise it on that existing index. `ensure_index` never touches an index
+    /// that exists, so only the startup pass can explain the second write
+    /// succeeding.
+    #[tokio::test]
+    async fn es_integration_startup_raises_nested_limit_on_existing_index() {
+        use helios_persistence::search::ReindexTarget;
+
+        let prefix = format!("hfs_{}", uuid::Uuid::new_v4().simple());
+        let tenant = create_tenant("nested-limit-existing");
+        let provenance = oversized_provenance(&tenant, "oversized", 12_000);
+
+        // An index created under Elasticsearch's own limit rejects it.
+        let before = create_backend_with_nested_limit(&prefix, 10_000).await;
+        let rejected = before
+            .write_search_entries_page(&tenant, std::slice::from_ref(&provenance))
+            .await;
+        let error = rejected[0]
+            .as_ref()
+            .expect_err("a limit of 10000 must reject 12000 nested objects");
+        assert!(
+            error.to_string().contains("nested"),
+            "the rejection must be the nested-object limit, got: {error}"
+        );
+        // A rejection, not an outage: `$reindex` must not retry it (#1050).
+        assert!(
+            matches!(
+                error,
+                helios_persistence::error::StorageError::Backend(
+                    helios_persistence::error::BackendError::Internal { .. }
+                )
+            ),
+            "the nested-object rejection must be permanent, got: {error:?}"
+        );
+        assert!(
+            before
+                .read(&tenant, "Provenance", "oversized")
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        // A backend started with the raised limit fixes the existing index.
+        let after = create_backend_with_nested_limit(&prefix, 50_000).await;
+        let outcomes = after
+            .write_search_entries_page(&tenant, std::slice::from_ref(&provenance))
+            .await;
+        assert!(
+            outcomes[0].is_ok(),
+            "the raised index must accept it: {:?}",
+            outcomes[0]
+        );
+        assert!(
+            after
+                .read(&tenant, "Provenance", "oversized")
+                .await
+                .unwrap()
+                .is_some()
+        );
     }
 
     /// `$reindex` walks a page at a time and, before #1021, Elasticsearch used

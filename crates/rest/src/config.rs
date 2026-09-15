@@ -1130,6 +1130,19 @@ pub struct ServerConfig {
     #[arg(long, env = "HFS_ELASTICSEARCH_WRITE_REFRESH", default_value = "false")]
     pub elasticsearch_write_refresh: String,
 
+    /// Maximum nested objects one Elasticsearch document may contain, summed
+    /// across every nested search-parameter field. Elasticsearch's default of
+    /// 10000 rejects larger documents outright, leaving those resources stored
+    /// but unsearchable (#1050). New indices take the value from the index
+    /// template; existing indices below it are raised at startup (the setting
+    /// is dynamic, so no reindex of already-indexed resources is needed).
+    #[arg(
+        long,
+        env = "HFS_ELASTICSEARCH_NESTED_OBJECTS_LIMIT",
+        default_value = "50000"
+    )]
+    pub elasticsearch_nested_objects_limit: u32,
+
     /// Enable SQL-on-FHIR operations ($sql-run, $sql-export).
     /// When enabled, the configured storage backend MUST provide an in-DB
     /// SOF runner (sqlite or postgres) — there is no in-process fallback.
@@ -1397,6 +1410,7 @@ impl Default for ServerConfig {
             elasticsearch_password: None,
             elasticsearch_refresh_interval: "1s".to_string(),
             elasticsearch_write_refresh: "false".to_string(),
+            elasticsearch_nested_objects_limit: 50_000,
             sof_enabled: true,
             ui_enabled: true,
             dashboard_reconcile_interval_secs: 30,
@@ -1535,6 +1549,10 @@ impl ServerConfig {
             errors.push("Batch max concurrency cannot be 0".to_string());
         }
 
+        if self.elasticsearch_nested_objects_limit == 0 {
+            errors.push("Elasticsearch nested objects limit cannot be 0".to_string());
+        }
+
         if self.dashboard_reconcile_interval_secs == 0 {
             errors.push("Dashboard reconcile interval cannot be 0".to_string());
         }
@@ -1640,6 +1658,7 @@ impl ServerConfig {
             elasticsearch_password: None,
             elasticsearch_refresh_interval: "1s".to_string(),
             elasticsearch_write_refresh: "false".to_string(),
+            elasticsearch_nested_objects_limit: 50_000,
             sof_enabled: true,
             ui_enabled: true,
             dashboard_reconcile_interval_secs: 30,

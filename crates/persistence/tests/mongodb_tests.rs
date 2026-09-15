@@ -8005,17 +8005,27 @@ mod bulk_submit {
             counts.total, 2,
             "both files' line 1 must survive as separate results"
         );
+        let line_one = |file: &str| helios_persistence::core::EntryResultCursor {
+            file_url: file.to_string(),
+            line_number: 1,
+        };
         let mut next = None;
         let mut ids = Vec::new();
-        for page_index in 0..3 {
+        for expected_file in [Some("a.ndjson"), Some("b.ndjson"), None] {
             let page = backend
                 .get_entry_results_page(&tenant, &id, &manifest_id, None, 1, next.as_ref())
                 .await
                 .unwrap();
-            assert!(
+            assert_eq!(
                 page.entries
                     .iter()
-                    .all(|entry| entry.stored_identity.is_none())
+                    .map(|entry| entry.stored_identity.clone())
+                    .collect::<Vec<_>>(),
+                expected_file
+                    .map(|file| Some(line_one(file)))
+                    .into_iter()
+                    .collect::<Vec<_>>(),
+                "each receipt carries its stored identity"
             );
             ids.extend(
                 page.entries
@@ -8023,15 +8033,14 @@ mod bulk_submit {
                     .map(|entry| entry.result.resource_id.unwrap()),
             );
             next = page.next;
-            if page_index < 2 {
-                assert_eq!(
+            match expected_file {
+                Some(file) => assert_eq!(
                     next,
-                    Some(helios_persistence::core::EntryResultContinuation::Offset(
-                        page_index + 1
+                    Some(helios_persistence::core::EntryResultContinuation::Keyset(
+                        line_one(file)
                     ))
-                );
-            } else {
-                assert!(next.is_none(), "exact multiple must terminate");
+                ),
+                None => assert!(next.is_none(), "exact multiple must terminate"),
             }
         }
         assert_eq!(ids, ["pa", "pb"]);
@@ -8049,11 +8058,8 @@ mod bulk_submit {
                     &manifest_id,
                     None,
                     1,
-                    Some(&helios_persistence::core::EntryResultContinuation::Keyset(
-                        helios_persistence::core::EntryResultCursor {
-                            file_url: String::new(),
-                            line_number: 0,
-                        }
+                    Some(&helios_persistence::core::EntryResultContinuation::Offset(
+                        0
                     ))
                 )
                 .await
@@ -8080,12 +8086,206 @@ mod bulk_submit {
             .get_entry_results_page(&tenant, &id, &manifest_id, None, 1, None)
             .await
             .unwrap();
-        assert!(delegated.entries[0].stored_identity.is_none());
+        assert_eq!(
+            delegated.entries[0].stored_identity,
+            Some(line_one("a.ndjson"))
+        );
         assert_eq!(
             delegated.next,
-            Some(helios_persistence::core::EntryResultContinuation::Offset(1))
+            Some(helios_persistence::core::EntryResultContinuation::Keyset(
+                line_one("a.ndjson")
+            ))
         );
         eprintln!("Verified MongoDB bulk-submit receipt pagination and Composite delegation");
+    }
+
+    mod receipt_paging_contract {
+        use helios_persistence as persistence;
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/bulk_submit/paging_contract.rs"
+        ));
+    }
+
+    #[async_trait::async_trait]
+    impl receipt_paging_contract::ReceiptFixture for MongoBackend {
+        async fn seed_receipts(
+            &self,
+            tenant: &TenantContext,
+            submission: &SubmissionId,
+            manifest: &str,
+            rows: &[receipt_paging_contract::ReceiptRow],
+        ) {
+            // The fields `entry_result_statement` writes, minus `created`: an
+            // absent flag must keep meaning "not created".
+            let documents: Vec<Document> = rows
+                .iter()
+                .map(|row| {
+                    doc! {
+                        "tenant_id": tenant.tenant_id().as_str(),
+                        "submitter": &submission.submitter,
+                        "submission_id": &submission.submission_id,
+                        "manifest_id": manifest,
+                        "file_url": &row.file,
+                        "line_number": row.line,
+                        "resource_type": "Patient",
+                        "resource_id": &row.id,
+                        "outcome": row.outcome,
+                    }
+                })
+                .collect();
+            self.get_database()
+                .await
+                .unwrap()
+                .collection::<Document>("bulk_entry_results")
+                .insert_many(documents)
+                .await
+                .unwrap();
+        }
+    }
+
+    /// The receipt paging contract SQLite and PostgreSQL already run: exact
+    /// keyset traversal in `(file_url, line_number)` order under every outcome
+    /// filter and page size, scope isolation, and range errors. Before #1046
+    /// MongoDB paged with `skip` in `{line_number, file_url}` order, which no
+    /// index could serve.
+    #[tokio::test]
+    async fn test_receipt_paging_contract() {
+        let Some(backend) = create_backend("submit_receipt_paging").await else {
+            return;
+        };
+        receipt_paging_contract::exact_keyset_pages(
+            &backend,
+            &create_tenant("receipt-paging"),
+            i64::MAX,
+        )
+        .await;
+        eprintln!("Verified MongoDB receipt keyset paging contract");
+    }
+
+    /// #1046's acceptance criterion as a plan guard: the composite sync's
+    /// outcome-filtered receipt pages — the first, and one past a keyset
+    /// cursor — are index walks with no blocking in-memory sort and no `skip`.
+    /// The old `{line_number, file_url}` order could not use any index, so
+    /// every page sorted the whole manifest in memory.
+    #[tokio::test]
+    async fn test_receipt_pages_are_index_walks_without_a_blocking_sort() {
+        use receipt_paging_contract::{ReceiptFixture, ReceiptRow};
+
+        let Some(backend) = create_backend("submit_receipt_plan").await else {
+            eprintln!(
+                "Skipping test_receipt_pages_are_index_walks_without_a_blocking_sort (requires Docker or HFS_TEST_MONGODB_URL)"
+            );
+            return;
+        };
+        let tenant = create_tenant("receipt-plan");
+        let submission = SubmissionId::generate("receipt-plan");
+        let rows: Vec<_> = ["a.ndjson", "b.ndjson"]
+            .into_iter()
+            .flat_map(|file| {
+                (0..50).map(move |line| ReceiptRow {
+                    file: file.to_string(),
+                    line,
+                    id: format!("{file}-{line}"),
+                    outcome: if line % 10 == 0 {
+                        "validation-error"
+                    } else {
+                        "success"
+                    },
+                })
+            })
+            .collect();
+        backend
+            .seed_receipts(&tenant, &submission, "manifest", &rows)
+            .await;
+
+        let database = backend.get_database().await.unwrap();
+        if let Err(e) = database.run_command(doc! { "profile": 2_i32 }).await {
+            eprintln!(
+                "Skipping test_receipt_pages_are_index_walks_without_a_blocking_sort plan assertions: \
+                 {{profile: 2}} was refused ({e})"
+            );
+            return;
+        }
+        let first = backend
+            .get_entry_results_page(
+                &tenant,
+                &submission,
+                "manifest",
+                Some(BulkEntryOutcome::Success),
+                10,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(first.next.is_some(), "the first page must continue");
+        backend
+            .get_entry_results_page(
+                &tenant,
+                &submission,
+                "manifest",
+                Some(BulkEntryOutcome::Success),
+                10,
+                first.next.as_ref(),
+            )
+            .await
+            .unwrap();
+        let _ = database.run_command(doc! { "profile": 0_i32 }).await;
+
+        let options = mongodb::options::FindOptions::builder()
+            .sort(doc! { "ts": 1_i32 })
+            .build();
+        let mut cursor = database
+            .collection::<Document>("system.profile")
+            .find(doc! {
+                "ns": format!("{}.bulk_entry_results", backend.config().database_name),
+                "op": "query",
+                "command.find": "bulk_entry_results",
+            })
+            .with_options(options)
+            .await
+            .expect("failed to query system.profile");
+        let mut entries = Vec::new();
+        while cursor
+            .advance()
+            .await
+            .expect("failed to advance profile cursor")
+        {
+            entries.push(
+                cursor
+                    .deserialize_current()
+                    .expect("failed to deserialize profile entry"),
+            );
+        }
+        assert_eq!(
+            entries.len(),
+            2,
+            "expected both receipt pages to be profiled"
+        );
+        for entry in &entries {
+            // Absent, not false, when there is no sort stage.
+            assert!(
+                !entry.get_bool("hasSortStage").unwrap_or(false),
+                "receipt page must not sort in memory: {entry}"
+            );
+            let plan = entry.get_str("planSummary").unwrap_or_default();
+            assert!(
+                plan.contains("IXSCAN"),
+                "expected an index walk, got {plan}"
+            );
+            let command = entry
+                .get_document("command")
+                .expect("profile entry missing command");
+            assert!(
+                command.get("skip").is_none(),
+                "receipt pages must not skip: {command}"
+            );
+            assert_eq!(
+                command.get_document("sort").ok(),
+                Some(&doc! { "file_url": 1_i32, "line_number": 1_i32 })
+            );
+        }
+        eprintln!("Verified MongoDB receipt pages walk an index without a blocking sort");
     }
 
     /// The manifest counters are cumulative across every run of a manifest, so
@@ -8734,7 +8934,8 @@ mod bulk_submit {
 
     /// Reconstructs the pre-v8 Mongo artifact shape, migrates it through the
     /// public backend migration, and verifies manifest-aware v8 identity for
-    /// two generations under one submission.
+    /// two generations under one submission. The same migration also carries
+    /// the v7 receipt outcome index to its v10 replacement (#1046).
     #[tokio::test]
     async fn test_v7_to_v8_manifest_aware_submit_file_identity() {
         use futures::TryStreamExt;
@@ -8768,6 +8969,32 @@ mod bulk_submit {
                         mongodb::options::IndexOptions::builder()
                             .name(Some("idx_bulk_submit_files_part".to_string()))
                             .unique(Some(true))
+                            .build(),
+                    )
+                    .build(),
+            )
+            .await
+            .unwrap();
+        // Before v10, outcome-filtered receipt pages had only this index, which
+        // cannot serve their `(file_url, line_number)` order.
+        let entry_results = db.collection::<Document>("bulk_entry_results");
+        entry_results
+            .drop_index("idx_bulk_entry_results_outcome_line")
+            .await
+            .unwrap();
+        entry_results
+            .create_index(
+                mongodb::IndexModel::builder()
+                    .keys(doc! {
+                        "tenant_id": 1_i32,
+                        "submitter": 1_i32,
+                        "submission_id": 1_i32,
+                        "manifest_id": 1_i32,
+                        "outcome": 1_i32,
+                    })
+                    .options(
+                        mongodb::options::IndexOptions::builder()
+                            .name(Some("idx_bulk_entry_results_outcome".to_string()))
                             .build(),
                     )
                     .build(),
@@ -8808,7 +9035,39 @@ mod bulk_submit {
             .await
             .unwrap()
             .expect("schema version document");
-        assert_eq!(schema_version.get_i32("version").unwrap(), 9_i32);
+        assert_eq!(schema_version.get_i32("version").unwrap(), 10_i32);
+
+        let receipt_indexes: Vec<_> = entry_results
+            .list_indexes()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter_map(|index| Some((index.options?.name?, index.keys)))
+            .collect();
+        assert!(
+            receipt_indexes
+                .iter()
+                .all(|(name, _)| name != "idx_bulk_entry_results_outcome"),
+            "the v7 receipt outcome index must be dropped, got {receipt_indexes:?}"
+        );
+        assert!(
+            receipt_indexes.contains(&(
+                "idx_bulk_entry_results_outcome_line".to_string(),
+                doc! {
+                    "tenant_id": 1_i32,
+                    "submitter": 1_i32,
+                    "submission_id": 1_i32,
+                    "manifest_id": 1_i32,
+                    "outcome": 1_i32,
+                    "file_url": 1_i32,
+                    "line_number": 1_i32,
+                }
+            )),
+            "v10 receipt outcome index must exist, got {receipt_indexes:?}"
+        );
 
         let indexes = files
             .list_indexes()

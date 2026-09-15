@@ -1,4 +1,5 @@
-// Included by the SQLite unit tests and PostgreSQL integration tests.
+// Included by the SQLite unit tests and the PostgreSQL and MongoDB integration
+// tests: every backend with a stored receipt identity pages by keyset.
 // The including module supplies `persistence` as an alias for the library.
 use persistence::core::bulk_submit::{
     BulkEntryOutcome, BulkSubmitProvider, EntryResultContinuation, EntryResultCursor,
@@ -45,7 +46,7 @@ async fn collect_pages<B: BulkSubmitProvider>(
         assert!(page.entries.len() <= limit as usize);
         if let Some(token) = &page.next {
             let EntryResultContinuation::Keyset(cursor) = token else {
-                panic!("SQL returned an OFFSET continuation");
+                panic!("backend returned an OFFSET continuation");
             };
             assert_eq!(
                 Some(cursor),
@@ -68,7 +69,7 @@ async fn collect_pages<B: BulkSubmitProvider>(
     panic!("receipt traversal did not terminate");
 }
 
-pub async fn exact_sql_pages<B: ReceiptFixture>(
+pub async fn exact_keyset_pages<B: ReceiptFixture>(
     backend: &B,
     tenant: &TenantContext,
     max_line: i64,
