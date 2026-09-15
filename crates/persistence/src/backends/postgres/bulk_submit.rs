@@ -31,6 +31,14 @@ use crate::tenant::{TenantContext, TenantId, TenantPermissions};
 
 use super::PostgresBackend;
 
+/// One ingested entry: its receipt, the rollback record its write warrants,
+/// and the resource as committed (absent when nothing was written).
+type IngestedEntry = (
+    BulkEntryResult,
+    Option<SubmissionChange>,
+    Option<crate::types::StoredResource>,
+);
+
 fn internal_error(message: String) -> StorageError {
     StorageError::Backend(BackendError::Internal {
         backend_name: "postgres".to_string(),
@@ -148,11 +156,28 @@ impl BulkSubmitProvider for PostgresBackend {
         let client = self.get_client().await?;
         let tenant_id = tenant.tenant_id().as_str();
 
+        // The summary comes from the manifests' own counters, which every
+        // committed batch maintains in its transaction. It used to aggregate
+        // `bulk_entry_results`, one row per ingested resource, on every status
+        // poll — a cost that grew with the import and competed with the ingest
+        // for the same tables (#1127, #998).
         let rows = client
             .query(
-                "SELECT status, created_at, updated_at, completed_at, metadata
-                 FROM bulk_submissions
-                 WHERE tenant_id = $1 AND submitter = $2 AND submission_id = $3",
+                "SELECT s.status, s.created_at, s.updated_at, s.completed_at, s.metadata,
+                        m.manifest_count, m.total_entries, m.processed_entries,
+                        m.failed_entries, m.skipped_entries
+                 FROM bulk_submissions s
+                 CROSS JOIN LATERAL (
+                     SELECT COUNT(*) AS manifest_count,
+                            COALESCE(SUM(total_entries), 0)::BIGINT AS total_entries,
+                            COALESCE(SUM(processed_entries), 0)::BIGINT AS processed_entries,
+                            COALESCE(SUM(failed_entries), 0)::BIGINT AS failed_entries,
+                            COALESCE(SUM(skipped_entries), 0)::BIGINT AS skipped_entries
+                     FROM bulk_manifests
+                     WHERE tenant_id = s.tenant_id AND submitter = s.submitter
+                       AND submission_id = s.submission_id
+                 ) m
+                 WHERE s.tenant_id = $1 AND s.submitter = $2 AND s.submission_id = $3",
                 &[
                     &tenant_id,
                     &id.submitter.as_str(),
@@ -162,56 +187,23 @@ impl BulkSubmitProvider for PostgresBackend {
             .await
             .map_err(|e| internal_error(format!("Failed to get submission: {}", e)))?;
 
-        if rows.is_empty() {
+        let Some(row) = rows.first() else {
             return Ok(None);
-        }
-
-        let row = &rows[0];
+        };
         let status_str: String = row.get(0);
         let created_at: chrono::DateTime<Utc> = row.get(1);
         let updated_at: chrono::DateTime<Utc> = row.get(2);
         let completed_at: Option<chrono::DateTime<Utc>> = row.get(3);
         let metadata: Option<Value> = row.get(4);
+        let manifest_count: i64 = row.get(5);
+        let total: i64 = row.get(6);
+        let processed: i64 = row.get(7);
+        let failed: i64 = row.get(8);
+        let skipped: i64 = row.get(9);
 
         let status: SubmissionStatus = status_str
             .parse()
             .map_err(|_| internal_error(format!("Invalid status: {}", status_str)))?;
-
-        // Get manifest count
-        let manifest_row = client
-            .query_one(
-                "SELECT COUNT(*) FROM bulk_manifests
-                 WHERE tenant_id = $1 AND submitter = $2 AND submission_id = $3",
-                &[
-                    &tenant_id,
-                    &id.submitter.as_str(),
-                    &id.submission_id.as_str(),
-                ],
-            )
-            .await
-            .map_err(|e| internal_error(format!("Failed to count manifests: {}", e)))?;
-
-        let manifest_count: i64 = manifest_row.get(0);
-
-        // Get aggregated counts from entry results
-        let counts_row = client
-            .query_one(
-                "SELECT
-                    COUNT(*),
-                    SUM(CASE WHEN outcome = 'success' THEN 1 ELSE 0 END),
-                    SUM(CASE WHEN outcome IN ('validation-error', 'processing-error') THEN 1 ELSE 0 END),
-                    SUM(CASE WHEN outcome = 'skipped' THEN 1 ELSE 0 END)
-                 FROM bulk_entry_results
-                 WHERE tenant_id = $1 AND submitter = $2 AND submission_id = $3",
-                &[&tenant_id, &id.submitter.as_str(), &id.submission_id.as_str()],
-            )
-            .await
-            .map_err(|e| internal_error(format!("Failed to count entries: {}", e)))?;
-
-        let total: i64 = counts_row.get(0);
-        let success: Option<i64> = counts_row.get(1);
-        let errors: Option<i64> = counts_row.get(2);
-        let skipped: Option<i64> = counts_row.get(3);
 
         Ok(Some(SubmissionSummary {
             id: id.clone(),
@@ -219,11 +211,13 @@ impl BulkSubmitProvider for PostgresBackend {
             created_at,
             updated_at,
             completed_at,
-            manifest_count: manifest_count as u32,
-            total_entries: total as u64,
-            success_count: success.unwrap_or(0) as u64,
-            error_count: errors.unwrap_or(0) as u64,
-            skipped_count: skipped.unwrap_or(0) as u64,
+            manifest_count: manifest_count.max(0) as u32,
+            total_entries: total.max(0) as u64,
+            // `processed_entries` counts successes only; skips have their own
+            // counter and errors include what the worker charged per file.
+            success_count: processed.max(0) as u64,
+            error_count: failed.max(0) as u64,
+            skipped_count: skipped.max(0) as u64,
             metadata,
         }))
     }
@@ -707,6 +701,10 @@ impl BulkSubmitProvider for PostgresBackend {
             },
         )
         .await?;
+        // The committed resources, for observers that index them (#1127);
+        // collected only when one asked, so counting-only runs hold nothing.
+        let want_resources = options.wants_committed_resources();
+        let mut committed_resources = Vec::new();
 
         for entry in entries {
             if options.max_errors > 0 && error_count >= options.max_errors {
@@ -742,11 +740,11 @@ impl BulkSubmitProvider for PostgresBackend {
                 .ingest_entry_in_tx(&mut txn, manifest_id, &entry, options)
                 .await
             {
-                Ok(pair) => txn.release_savepoint("bulk_entry").await.map(|_| pair),
+                Ok(ingested) => txn.release_savepoint("bulk_entry").await.map(|_| ingested),
                 Err(e) => Err(e),
             };
-            let (entry_result, change) = match outcome {
-                Ok(pair) => pair,
+            let (entry_result, change, stored) = match outcome {
+                Ok(ingested) => ingested,
                 Err(e) => {
                     txn.rollback_to_savepoint("bulk_entry")
                         .await
@@ -763,7 +761,7 @@ impl BulkSubmitProvider for PostgresBackend {
                             }]
                         }),
                     );
-                    (failed, None)
+                    (failed, None, None)
                 }
             };
 
@@ -781,12 +779,121 @@ impl BulkSubmitProvider for PostgresBackend {
             )
             .await?;
             results.push(entry_result);
+            if want_resources && let Some(stored) = stored {
+                committed_resources.push(stored);
+            }
+        }
+
+        // Charge the batch to the manifest's counters inside the batch
+        // transaction, so they commit (or vanish) with the rows they describe.
+        //
+        // Counters accumulate across runs and never move backwards (#969), but
+        // a line of a file is charged only once: `bulk_manifest_file_progress`
+        // remembers the highest line already counted per file, and a re-walk
+        // of that file (lost lease, reclaim, whole-file retry) adds only the
+        // lines beyond it. Without that, every pass added the whole file again
+        // and `total_entries` reported a multiple of the manifest (#1127).
+        // Callers without a file URL have no line identity to key on and keep
+        // plain accumulation.
+        //
+        // Last before the commit on purpose: the manifest row lock taken here is
+        // held only for the commit, not for the batch's entry writes, so the
+        // lease heartbeat never waits behind a batch.
+        {
+            let client = txn.raw_client()?;
+            let submitter = submission_id.submitter.as_str();
+            let sub_id_str = submission_id.submission_id.as_str();
+            let tally = match options.file_url.as_deref() {
+                Some(url) => {
+                    // Creates the file's row or locks the existing one, and
+                    // returns what earlier passes already counted.
+                    let row = client
+                        .query_one(
+                            "INSERT INTO bulk_manifest_file_progress
+                                (tenant_id, submitter, submission_id, manifest_id, file_url)
+                             VALUES ($1, $2, $3, $4, $5)
+                             ON CONFLICT (tenant_id, submitter, submission_id, manifest_id, file_url)
+                             DO UPDATE SET max_line = bulk_manifest_file_progress.max_line
+                             RETURNING max_line",
+                            &[&tenant_id, &submitter, &sub_id_str, &manifest_id, &url],
+                        )
+                        .await
+                        .map_err(|e| {
+                            internal_error(format!("Failed to lock file progress: {}", e))
+                        })?;
+                    let counted: i64 = row.get(0);
+                    let tally = BatchTally::beyond(&results, Some(counted.max(0) as u64));
+                    client
+                        .execute(
+                            "UPDATE bulk_manifest_file_progress SET
+                                max_line = GREATEST(max_line, $1::BIGINT),
+                                total_entries = total_entries + $2::BIGINT,
+                                processed_entries = processed_entries + $3::BIGINT,
+                                failed_entries = failed_entries + $4::BIGINT,
+                                skipped_entries = skipped_entries + $5::BIGINT
+                             WHERE tenant_id = $6 AND submitter = $7 AND submission_id = $8
+                               AND manifest_id = $9 AND file_url = $10",
+                            &[
+                                &tally.last_line,
+                                &tally.entries,
+                                &tally.succeeded,
+                                &tally.failed,
+                                &tally.skipped,
+                                &tenant_id,
+                                &submitter,
+                                &sub_id_str,
+                                &manifest_id,
+                                &url,
+                            ],
+                        )
+                        .await
+                        .map_err(|e| {
+                            internal_error(format!("Failed to update file progress: {}", e))
+                        })?;
+                    tally
+                }
+                None => BatchTally::beyond(&results, None),
+            };
+            // `processed_entries` counts successes, `skipped_entries` the
+            // deliberate skips, and `last_processed_line` advances by the
+            // entries newly charged (#969, #954).
+            client
+                .execute(
+                    "UPDATE bulk_manifests SET
+                        total_entries = total_entries + $1,
+                        processed_entries = processed_entries + $2,
+                        failed_entries = failed_entries + $3,
+                        skipped_entries = skipped_entries + $4,
+                        last_processed_line = last_processed_line + $5
+                     WHERE tenant_id = $6 AND submitter = $7 AND submission_id = $8 AND manifest_id = $9",
+                    &[
+                        &(tally.entries as i32),
+                        &(tally.succeeded as i32),
+                        &(tally.failed as i32),
+                        &(tally.skipped as i32),
+                        &tally.entries,
+                        &tenant_id,
+                        &submitter,
+                        &sub_id_str,
+                        &manifest_id,
+                    ],
+                )
+                .await
+                .map_err(|e| internal_error(format!("Failed to update manifest counts: {}", e)))?;
         }
 
         crate::core::Transaction::commit(Box::new(txn)).await?;
-        // Durable now: report it before the max-errors return and the separate
-        // counter statement below, so neither can lose committed work (#1078).
-        options.notify_batch_committed(tenant, submission_id, manifest_id, &results);
+        // Durable now: report it before the max-errors return, so it cannot
+        // lose committed work (#1078).
+        options
+            .notify_batch_committed(
+                tenant,
+                submission_id,
+                manifest_id,
+                &results,
+                &committed_resources,
+            )
+            .await;
 
         if aborted_on_max_errors {
             return Err(StorageError::BulkSubmit(
@@ -797,38 +904,8 @@ impl BulkSubmitProvider for PostgresBackend {
             ));
         }
 
-        // Update manifest counts, on a fresh client for the tail statements.
-        //
-        // Every column here accumulates: these counters are cumulative across
-        // all runs of the manifest (including resumes) and are the ones the
-        // submit status endpoint reports (#969). `processed_entries` counts the
-        // entries that did not fail — successes plus deliberate skips — so that
-        // `processed_entries + failed_entries` equals the entries walked, and
-        // `last_processed_line` advances by the entries this batch consumed.
         let now = Utc::now();
         let client = self.get_client().await?;
-        client
-            .execute(
-                "UPDATE bulk_manifests SET
-                    total_entries = total_entries + $1,
-                    processed_entries = processed_entries + $2,
-                    failed_entries = failed_entries + $3,
-                    last_processed_line = last_processed_line + $4
-                 WHERE tenant_id = $5 AND submitter = $6 AND submission_id = $7 AND manifest_id = $8",
-                &[
-                    &(results.len() as i32),
-                    &(results.iter().filter(|r| r.is_success()).count() as i32),
-                    &(error_count as i32),
-                    &(results.len() as i64),
-                    &tenant_id,
-                    &submission_id.submitter.as_str(),
-                    &submission_id.submission_id.as_str(),
-                    &manifest_id,
-                ],
-            )
-            .await
-            .map_err(|e| internal_error(format!("Failed to update manifest counts: {}", e)))?;
-
         // Update submission updated_at
         client
             .execute(
@@ -941,6 +1018,7 @@ impl BulkSubmitProvider for PostgresBackend {
                         resource_type,
                         resource_id,
                         created: created.unwrap_or(false),
+                        unchanged: false,
                         outcome,
                         operation_outcome,
                     },
@@ -1064,7 +1142,7 @@ impl PostgresBackend {
         manifest_id: &str,
         entry: &NdjsonEntry,
         options: &BulkProcessingOptions,
-    ) -> StorageResult<(BulkEntryResult, Option<SubmissionChange>)> {
+    ) -> StorageResult<IngestedEntry> {
         use crate::core::Transaction;
 
         if let Some(id) = entry.resource_id.as_ref() {
@@ -1078,6 +1156,26 @@ impl PostgresBackend {
                                 "updates not allowed",
                             ),
                             None,
+                            None,
+                        ));
+                    }
+
+                    // Update the resource, honoring the submission's import mode.
+                    let content = options.content_for_update(current.content(), &entry.resource);
+
+                    // Opt-in (#1127): a replayed manifest re-sends byte-identical
+                    // resources; writing them again only adds a history version
+                    // and index churn. Nothing is written, so there is nothing
+                    // to roll back and nothing new to index.
+                    if options.skip_unchanged && content_unchanged(current.content(), &content) {
+                        return Ok((
+                            BulkEntryResult::success_unchanged(
+                                entry.line_number,
+                                &entry.resource_type,
+                                current.id(),
+                            ),
+                            None,
+                            None,
                         ));
                     }
 
@@ -1089,9 +1187,6 @@ impl PostgresBackend {
                         (current.version_id().parse::<i32>().unwrap_or(0) + 1).to_string(),
                         current.content().clone(),
                     );
-
-                    // Update the resource, honoring the submission's import mode.
-                    let content = options.content_for_update(current.content(), &entry.resource);
                     let updated = txn.update(&current, content).await?;
 
                     Ok((
@@ -1102,6 +1197,7 @@ impl PostgresBackend {
                             false,
                         ),
                         Some(change),
+                        Some(updated),
                     ))
                 }
                 None => {
@@ -1123,6 +1219,7 @@ impl PostgresBackend {
                             true,
                         ),
                         Some(change),
+                        Some(created),
                     ))
                 }
             }
@@ -1145,6 +1242,7 @@ impl PostgresBackend {
                     true,
                 ),
                 Some(change),
+                Some(created),
             ))
         }
     }
@@ -2793,4 +2891,165 @@ async fn insert_publication_files(
         .map_err(|e| internal_error(format!("insert publication file: {e}")))?;
     }
     Ok(())
+}
+
+/// What one committed batch adds to its manifest's counters.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct BatchTally {
+    entries: i64,
+    succeeded: i64,
+    failed: i64,
+    skipped: i64,
+    /// The highest line charged so far, this batch included.
+    last_line: i64,
+}
+
+impl BatchTally {
+    /// Tallies the entries of `results` whose line lies beyond `counted`, the
+    /// highest line an earlier pass over the same file already charged.
+    /// `None` charges every entry.
+    fn beyond(results: &[BulkEntryResult], counted: Option<u64>) -> Self {
+        let floor = counted.unwrap_or(0);
+        let mut tally = Self {
+            last_line: floor as i64,
+            ..Self::default()
+        };
+        for result in results
+            .iter()
+            .filter(|r| counted.is_none_or(|c| r.line_number > c))
+        {
+            tally.entries += 1;
+            match result.outcome {
+                BulkEntryOutcome::Success => tally.succeeded += 1,
+                BulkEntryOutcome::Skipped => tally.skipped += 1,
+                _ if result.is_error() => tally.failed += 1,
+                _ => {}
+            }
+            tally.last_line = tally.last_line.max(result.line_number as i64);
+        }
+        tally
+    }
+}
+
+/// Resource fields that change on every write without changing the resource.
+const VOLATILE_META: [&str; 2] = ["versionId", "lastUpdated"];
+
+/// True when writing `next` over `stored` would change nothing but the
+/// server-assigned `meta.versionId` / `meta.lastUpdated`.
+///
+/// Compared as parsed JSON, so key order does not matter. A false "changed"
+/// (for instance a number the store re-renders) only costs the write that
+/// would have happened anyway; it never drops a real change.
+fn content_unchanged(stored: &Value, next: &Value) -> bool {
+    let (Some(stored), Some(next)) = (stored.as_object(), next.as_object()) else {
+        return stored == next;
+    };
+    let body = |fields: &serde_json::Map<String, Value>| {
+        fields
+            .iter()
+            .filter(|(key, _)| key.as_str() != "meta")
+            .count()
+    };
+    body(stored) == body(next)
+        && stored
+            .iter()
+            .filter(|(key, _)| key.as_str() != "meta")
+            .all(|(key, value)| next.get(key) == Some(value))
+        && stable_meta(stored.get("meta")) == stable_meta(next.get("meta"))
+}
+
+/// `meta` without its volatile fields; `None` when nothing else is left.
+fn stable_meta(meta: Option<&Value>) -> Option<Value> {
+    match meta? {
+        Value::Object(fields) => {
+            let kept: serde_json::Map<String, Value> = fields
+                .iter()
+                .filter(|(key, _)| !VOLATILE_META.contains(&key.as_str()))
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect();
+            (!kept.is_empty()).then_some(Value::Object(kept))
+        }
+        other => Some(other.clone()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn a_rewalked_file_charges_only_lines_beyond_what_was_counted() {
+        let results = vec![
+            BulkEntryResult::success(3, "Patient", "p3", false),
+            BulkEntryResult::success(4, "Patient", "p4", true),
+            BulkEntryResult::skipped(5, "Patient", "updates not allowed"),
+            BulkEntryResult::validation_error(6, "Patient", json!({})),
+        ];
+
+        let first_pass = BatchTally::beyond(&results, Some(2));
+        assert_eq!(
+            first_pass,
+            BatchTally {
+                entries: 4,
+                succeeded: 2,
+                failed: 1,
+                skipped: 1,
+                last_line: 6,
+            }
+        );
+
+        let rewalk = BatchTally::beyond(&results, Some(6));
+        assert_eq!(rewalk.entries, 0, "every line was already charged");
+        assert_eq!(rewalk.last_line, 6, "the high-water mark never moves back");
+
+        let partial = BatchTally::beyond(&results, Some(4));
+        assert_eq!(
+            (partial.entries, partial.skipped, partial.failed),
+            (2, 1, 1)
+        );
+    }
+
+    #[test]
+    fn a_batch_without_a_file_charges_every_entry() {
+        let results = vec![
+            BulkEntryResult::success(1, "Patient", "a", true),
+            BulkEntryResult::success(1, "Patient", "b", true),
+        ];
+        let tally = BatchTally::beyond(&results, None);
+        assert_eq!((tally.entries, tally.succeeded), (2, 2));
+    }
+
+    #[test]
+    fn identical_content_ignores_only_server_assigned_meta() {
+        let stored = json!({
+            "resourceType": "Patient",
+            "id": "p1",
+            "meta": {"versionId": "3", "lastUpdated": "2026-01-01T00:00:00Z"},
+            "name": [{"family": "Doe"}],
+        });
+        let replay = json!({
+            "name": [{"family": "Doe"}],
+            "id": "p1",
+            "resourceType": "Patient",
+        });
+        assert!(content_unchanged(&stored, &replay));
+
+        let renamed = json!({"resourceType": "Patient", "id": "p1", "name": [{"family": "Roe"}]});
+        assert!(!content_unchanged(&stored, &renamed));
+
+        let extra = json!({"resourceType": "Patient", "id": "p1", "name": [{"family": "Doe"}], "gender": "male"});
+        assert!(!content_unchanged(&stored, &extra));
+
+        let tagged = json!({
+            "resourceType": "Patient",
+            "id": "p1",
+            "meta": {"versionId": "9", "tag": [{"code": "x"}]},
+            "name": [{"family": "Doe"}],
+        });
+        assert!(
+            !content_unchanged(&stored, &tagged),
+            "a tag is part of the resource, not server bookkeeping"
+        );
+    }
 }

@@ -406,7 +406,11 @@ impl BulkSubmitProvider for S3Backend {
             Ok(())
         }
         .await;
-        options.notify_batch_committed(tenant, submission_id, manifest_id, &results);
+        // Entries are written one by one and not kept, so observers that need
+        // the resources re-read the ids from the primary (#1127).
+        options
+            .notify_batch_committed(tenant, submission_id, manifest_id, &results, &[])
+            .await;
         walked?;
 
         let success_count = results.iter().filter(|r| r.is_success()).count() as u64;

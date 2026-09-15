@@ -1838,7 +1838,17 @@ fn spawn_export_workers<Dp>(
 /// raw primary is used instead. Fast-load without a reindex hook still needs
 /// the wrapper, otherwise the data never reaches Elasticsearch.
 ///
+/// With `HFS_BULK_SUBMIT_INDEX_DURING_INGEST=true` (#1127) the wrapper is
+/// itself wrapped in [`IndexingSubmitJobs`]: every committed batch is handed to
+/// an [`IngestIndexSink`] writing into `search_targets` (the Elasticsearch
+/// secondary, not the primary's own offloaded index), and the manifest's sync
+/// drains that sink instead of re-reading the manifest. The deferred reindex
+/// then rebuilds only the types the sink rejected. `source` is the primary the
+/// sink reads resources back from for engines that do not hand them over.
+///
 /// [`CompositeSubmitJobs`]: helios_persistence::composite::CompositeSubmitJobs
+/// [`IndexingSubmitJobs`]: helios_persistence::composite::IndexingSubmitJobs
+/// [`IngestIndexSink`]: helios_persistence::composite::IngestIndexSink
 #[cfg(all(
     feature = "elasticsearch",
     any(
@@ -1850,16 +1860,39 @@ fn spawn_export_workers<Dp>(
 ))]
 fn composite_submit_jobs(
     primary: Arc<dyn BulkSubmitJobStore>,
+    source: Arc<dyn ResourceStorage>,
     composite: Arc<helios_persistence::composite::CompositeStorage>,
-    defer_indexing: bool,
+    search_targets: Vec<Arc<dyn helios_persistence::search::ReindexTarget>>,
+    cfg: &helios_rest::config::BulkSubmitConfig,
     has_reindex_hook: bool,
 ) -> Arc<dyn BulkSubmitJobStore> {
-    if defer_indexing && has_reindex_hook {
+    use helios_persistence::composite::{
+        CompositeSubmitJobs, IndexingSubmitJobs, IngestIndexSink, IngestIndexSinkConfig,
+    };
+
+    if cfg.index_during_ingest {
+        let sink_config = IngestIndexSinkConfig {
+            queue: cfg.index_queue as usize,
+            concurrency: cfg.index_concurrency as usize,
+            coalesce: cfg.index_coalesce as usize,
+            max_wait: std::time::Duration::from_secs(cfg.index_max_wait_secs),
+        };
+        info!(
+            queue = sink_config.queue,
+            concurrency = sink_config.concurrency,
+            coalesce = sink_config.coalesce,
+            max_wait_secs = cfg.index_max_wait_secs,
+            "Bulk submit indexes into Elasticsearch during ingest; the deferred \
+             reindex runs only for types the search index rejected"
+        );
+        let sink = Arc::new(IngestIndexSink::new(source, search_targets, sink_config));
+        let inner: Arc<dyn BulkSubmitJobStore> =
+            Arc::new(CompositeSubmitJobs::new(primary, composite));
+        Arc::new(IndexingSubmitJobs::new(inner, sink))
+    } else if cfg.defer_indexing && has_reindex_hook {
         primary
     } else {
-        Arc::new(helios_persistence::composite::CompositeSubmitJobs::new(
-            primary, composite,
-        ))
+        Arc::new(CompositeSubmitJobs::new(primary, composite))
     }
 }
 
@@ -1983,6 +2016,7 @@ async fn build_bulk_submit(
             token_provider,
             cfg.outbound_scope.clone(),
         )
+        .with_read_timeout(std::time::Duration::from_secs(cfg.fetch_read_timeout_secs))
         .with_decryption_keys(decryption_keys),
     );
 
@@ -2049,6 +2083,11 @@ fn spawn_submit_workers(
     if defer_indexing {
         info!("Bulk submit fast-load: search indexing deferred to post-manifest reindex");
     }
+    let batch_size = cfg.batch_size;
+    let skip_unchanged = cfg.skip_unchanged;
+    if skip_unchanged {
+        info!("Bulk submit skips resources whose content is identical to the stored version");
+    }
     let file_concurrency = file_concurrency.max(1) as usize;
     if file_concurrency > 1 {
         info!(
@@ -2067,7 +2106,9 @@ fn spawn_submit_workers(
             let worker = DefaultSubmitWorker::new(jobs.clone(), fetcher, output, worker_id.clone())
                 .with_deferred_indexing(defer_indexing, reindex_hook.clone())
                 .with_write_observer(Some(write_observer))
-                .with_file_concurrency(file_concurrency);
+                .with_file_concurrency(file_concurrency)
+                .with_batch_size(batch_size)
+                .with_skip_unchanged(skip_unchanged);
             loop {
                 match jobs.claim_next_manifest(&worker_id, lease).await {
                     Ok(Some(claimed)) => {
@@ -2294,8 +2335,10 @@ async fn start_sqlite_elasticsearch(
     // so the per-resource sync is skipped rather than done twice (#903).
     let submit_jobs = composite_submit_jobs(
         sqlite.clone(),
+        sqlite.clone(),
         composite.clone(),
-        config.bulk_submit.defer_indexing,
+        vec![es.clone()],
+        &config.bulk_submit,
         reindex_hook.is_some(),
     );
     let submit_bundle = build_bulk_submit(
@@ -2581,8 +2624,10 @@ async fn start_postgres_elasticsearch(
     // unless fast-load's post-manifest reindex covers it (#903).
     let submit_jobs = composite_submit_jobs(
         pg.clone(),
+        pg.clone(),
         composite.clone(),
-        config.bulk_submit.defer_indexing,
+        vec![es.clone()],
+        &config.bulk_submit,
         reindex_hook.is_some(),
     );
     let submit_bundle = build_bulk_submit(
@@ -2809,8 +2854,10 @@ async fn start_mongodb_elasticsearch(
     // was readable by id and invisible to every search (#1021).
     let submit_jobs = composite_submit_jobs(
         mongo.clone(),
+        mongo.clone(),
         composite.clone(),
-        config.bulk_submit.defer_indexing,
+        vec![es.clone()],
+        &config.bulk_submit,
         reindex_hook.is_some(),
     );
     let submit_bundle = build_bulk_submit(
@@ -3255,8 +3302,10 @@ async fn start_s3_elasticsearch(
     let bulk_submit = if s3.supports_bulk_submit_worker() {
         let submit_jobs = composite_submit_jobs(
             s3.clone(),
+            s3.clone(),
             composite.clone(),
-            config.bulk_submit.defer_indexing,
+            vec![es.clone()],
+            &config.bulk_submit,
             reindex_hook.is_some(),
         );
         build_bulk_submit(

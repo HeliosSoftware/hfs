@@ -29,6 +29,70 @@ use super::schema;
 /// making a load pay one refresh wait per handful of documents.
 const BULK_OPS_PER_REQUEST: usize = 500;
 
+/// Upper bound on the NDJSON body of one `_bulk` request, in bytes.
+///
+/// The operation cap alone does not bound the body: 500 large documents (a
+/// Provenance page with many nested targets, #1127) made requests big enough to
+/// outlast the client's request timeout, and every document in the chunk then
+/// failed as "backend unavailable". Chunks close at whichever cap is hit first.
+const BULK_BYTES_PER_REQUEST: usize = 10 * 1024 * 1024;
+
+/// Splits a run of `_bulk` operations into consecutive request chunks.
+///
+/// `op_bytes[i]` is the serialized size of operation `i` (action line plus
+/// document, newlines included). A chunk closes before it would exceed
+/// `max_ops` operations or `max_bytes` bytes. An operation larger than
+/// `max_bytes` on its own still goes out, alone in its chunk — it cannot be
+/// split, and Elasticsearch, not the planner, decides whether it is too big.
+/// Every operation lands in exactly one chunk, in order.
+fn plan_bulk_chunks(
+    op_bytes: &[usize],
+    max_ops: usize,
+    max_bytes: usize,
+) -> Vec<std::ops::Range<usize>> {
+    let max_ops = max_ops.max(1);
+    let mut chunks = Vec::new();
+    let mut start = 0;
+    let mut bytes = 0usize;
+    for (i, &size) in op_bytes.iter().enumerate() {
+        let len = i - start;
+        if len > 0 && (len >= max_ops || bytes.saturating_add(size) > max_bytes) {
+            chunks.push(start..i);
+            start = i;
+            bytes = 0;
+        }
+        bytes = bytes.saturating_add(size);
+    }
+    if start < op_bytes.len() {
+        chunks.push(start..op_bytes.len());
+    }
+    chunks
+}
+
+/// Bytes one `index` operation adds to a `_bulk` body: the action line
+/// `{"index":{"_index":"…","_id":"…"}}` and the document, each newline-terminated.
+///
+/// The document is measured by serializing into a counter, so nothing is
+/// allocated. Index names and ids are counted unescaped; the planner needs a
+/// bound, not an exact figure, and FHIR ids never need JSON escaping.
+fn bulk_index_op_bytes(index: &str, doc_id: &str, doc: &Value) -> usize {
+    struct Counter(usize);
+    impl std::io::Write for Counter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0 += buf.len();
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    const ACTION_OVERHEAD: usize = r#"{"index":{"_index":"","_id":""}}"#.len() + 2;
+    let mut counter = Counter(0);
+    // Serializing a `Value` into an infallible writer cannot fail.
+    let _ = serde_json::to_writer(&mut counter, doc);
+    ACTION_OVERHEAD + index.len() + doc_id.len() + counter.0
+}
+
 /// Why a resource's documents did not index in a `_bulk` request.
 struct BulkFailure {
     message: String,
@@ -1347,8 +1411,9 @@ impl ElasticsearchBackend {
     /// Shared by [`ResourceStorage::create_many`] and
     /// [`ReindexTarget::write_search_entries_page`] so a rebuild and a bulk
     /// create put the same documents on the wire the same way — one request per
-    /// [`BULK_OPS_PER_REQUEST`] operations, and one write-refresh wait per
-    /// request rather than per document.
+    /// [`BULK_OPS_PER_REQUEST`] operations or [`BULK_BYTES_PER_REQUEST`] bytes,
+    /// whichever comes first (see [`plan_bulk_chunks`]), and one write-refresh
+    /// wait per request rather than per document.
     async fn send_bulk_index(
         &self,
         ops: &[(usize, &str, &str, &Value)],
@@ -1368,7 +1433,12 @@ impl ElasticsearchBackend {
                 });
             }
         }
-        for chunk in ops.chunks(BULK_OPS_PER_REQUEST) {
+        let op_bytes: Vec<usize> = ops
+            .iter()
+            .map(|(_, index, doc_id, doc)| bulk_index_op_bytes(index, doc_id, doc))
+            .collect();
+        for range in plan_bulk_chunks(&op_bytes, BULK_OPS_PER_REQUEST, BULK_BYTES_PER_REQUEST) {
+            let chunk = &ops[range];
             let body: Vec<BulkOperation<Value>> = chunk
                 .iter()
                 .map(|(_, index, doc_id, doc)| {
@@ -1874,7 +1944,70 @@ async fn delete_by_query_scoped(
 
 #[cfg(test)]
 mod tests {
-    use super::is_transient_bulk_status;
+    use super::{bulk_index_op_bytes, is_transient_bulk_status, plan_bulk_chunks};
+    use serde_json::json;
+
+    /// Every operation appears exactly once, in order, and no chunk is empty.
+    fn assert_covers(chunks: &[std::ops::Range<usize>], n: usize) {
+        let mut next = 0;
+        for chunk in chunks {
+            assert_eq!(chunk.start, next, "chunks must be contiguous: {chunks:?}");
+            assert!(chunk.end > chunk.start, "empty chunk in {chunks:?}");
+            next = chunk.end;
+        }
+        assert_eq!(next, n, "chunks must cover all {n} ops: {chunks:?}");
+    }
+
+    #[test]
+    fn small_operations_chunk_by_count() {
+        let sizes = vec![100; 1_201];
+        let chunks = plan_bulk_chunks(&sizes, 500, 10 * 1024 * 1024);
+        assert_eq!(chunks, vec![0..500, 500..1_000, 1_000..1_201]);
+        assert_covers(&chunks, sizes.len());
+    }
+
+    #[test]
+    fn large_operations_chunk_by_bytes_before_the_count_cap() {
+        // 500 documents of 64 KiB is ~30 MiB: the op cap alone would send it as
+        // one request; the byte cap splits it into requests of at most 1 MiB.
+        let sizes = vec![64 * 1024; 500];
+        let max_bytes = 1024 * 1024;
+        let chunks = plan_bulk_chunks(&sizes, 500, max_bytes);
+        assert_covers(&chunks, sizes.len());
+        assert_eq!(chunks[0], 0..16, "16 × 64 KiB fills 1 MiB exactly");
+        for chunk in &chunks {
+            let bytes: usize = sizes[chunk.clone()].iter().sum();
+            assert!(bytes <= max_bytes, "{chunk:?} carries {bytes} bytes");
+        }
+    }
+
+    #[test]
+    fn an_operation_over_the_byte_cap_goes_alone() {
+        let sizes = [10, 2_000, 10, 10];
+        let chunks = plan_bulk_chunks(&sizes, 500, 1_000);
+        assert_eq!(chunks, vec![0..1, 1..2, 2..4]);
+        assert_covers(&chunks, sizes.len());
+    }
+
+    #[test]
+    fn edge_cases_never_drop_or_empty_a_chunk() {
+        assert!(plan_bulk_chunks(&[], 500, 1_000).is_empty());
+        assert_eq!(plan_bulk_chunks(&[1_000], 500, 1_000), vec![0..1]);
+        assert_eq!(
+            plan_bulk_chunks(&[600, 400, 1], 500, 1_000),
+            vec![0..2, 2..3]
+        );
+        // A zero op cap is treated as one op per request rather than looping.
+        assert_eq!(plan_bulk_chunks(&[1, 1], 0, 1_000), vec![0..1, 1..2]);
+    }
+
+    #[test]
+    fn op_bytes_match_the_ndjson_the_client_sends() {
+        let doc = json!({"resourceType": "Patient", "id": "p1", "name": [{"family": "Doe"}]});
+        let action = r#"{"index":{"_index":"hfs-patient","_id":"p1"}}"#;
+        let expected = action.len() + 1 + serde_json::to_vec(&doc).unwrap().len() + 1;
+        assert_eq!(bulk_index_op_bytes("hfs-patient", "p1", &doc), expected);
+    }
 
     #[test]
     fn bulk_statuses_that_ask_for_a_retry_are_transient() {

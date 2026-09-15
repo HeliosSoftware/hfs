@@ -9226,6 +9226,179 @@ mod postgres_integration {
         );
     }
 
+    /// #1127, PostgreSQL: re-walking a file — what a reclaimed manifest or a
+    /// whole-file retry does — must not add the file to the manifest's
+    /// counters a second time. The submission summary reads those counters, so
+    /// it must equal the manifest, not a multiple of it.
+    #[tokio::test]
+    async fn postgres_bulk_submit_rewalk_does_not_multiply_manifest_counters() {
+        use helios_persistence::core::{
+            BulkProcessingOptions, BulkSubmitProvider, StreamingBulkSubmitProvider, SubmissionId,
+        };
+
+        let _guard = BULK_SUBMIT_TEST_LOCK.lock().await;
+        let backend = create_backend().await;
+        let tenant = create_tenant("bulk_submit_rewalk");
+        let sub_id = SubmissionId::generate("pg-rewalk-test");
+        backend
+            .create_submission(&tenant, &sub_id, None)
+            .await
+            .unwrap();
+        let manifest = backend
+            .add_manifest(&tenant, &sub_id, Some("https://provider/rewalk.json"), None)
+            .await
+            .unwrap();
+
+        let patients = |n: u32| -> Vec<u8> {
+            (1..=n)
+                .map(|i| format!("{{\"resourceType\":\"Patient\",\"id\":\"pg-rewalk-{i}\"}}\n"))
+                .collect::<String>()
+                .into_bytes()
+        };
+        let options = BulkProcessingOptions::new()
+            .with_batch_size(2)
+            .with_file_url("https://provider/patient.ndjson");
+        // Two full passes over five lines, then a pass over a longer copy of
+        // the same file: only its two new lines are new work.
+        for lines in [patients(5), patients(5), patients(7)] {
+            let reader = Box::new(tokio::io::BufReader::new(std::io::Cursor::new(lines)));
+            backend
+                .process_ndjson_stream(
+                    &tenant,
+                    &sub_id,
+                    &manifest.manifest_id,
+                    "Patient",
+                    reader,
+                    &options,
+                )
+                .await
+                .unwrap();
+        }
+
+        let current = backend
+            .get_manifest(&tenant, &sub_id, &manifest.manifest_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let summary = backend
+            .get_submission(&tenant, &sub_id)
+            .await
+            .unwrap()
+            .unwrap();
+        backend
+            .abort_submission(&tenant, &sub_id, "test cleanup")
+            .await
+            .unwrap();
+
+        assert_eq!(current.total_entries, 7, "each line is charged once");
+        assert_eq!(current.processed_entries, 7);
+        assert_eq!(current.failed_entries, 0);
+        assert_eq!(summary.manifest_count, 1);
+        assert_eq!(
+            summary.total_entries, 7,
+            "the summary reads the manifest counters"
+        );
+        assert_eq!(summary.success_count, 7);
+        assert_eq!(summary.error_count, 0);
+        assert_eq!(summary.skipped_count, 0);
+    }
+
+    /// #1127, PostgreSQL: with `skip_unchanged`, replaying a resource whose
+    /// content is identical writes nothing — no new version, no history row,
+    /// no rollback record — while a changed resource is still updated. Without
+    /// the option the replay keeps today's behaviour.
+    #[tokio::test]
+    async fn postgres_bulk_submit_skip_unchanged_leaves_identical_resources_alone() {
+        use helios_persistence::core::{
+            BulkProcessingOptions, BulkSubmitProvider, NdjsonEntry, SubmissionId,
+        };
+
+        let _guard = BULK_SUBMIT_TEST_LOCK.lock().await;
+        let backend = create_backend().await;
+        let tenant = create_tenant("bulk_submit_skip_unchanged");
+        let sub_id = SubmissionId::generate("pg-skip-unchanged-test");
+        backend
+            .create_submission(&tenant, &sub_id, None)
+            .await
+            .unwrap();
+        let manifest = backend
+            .add_manifest(&tenant, &sub_id, Some("https://provider/skip.json"), None)
+            .await
+            .unwrap();
+
+        let entries = |second_family: &str| {
+            vec![
+                NdjsonEntry::new(
+                    1,
+                    "Patient",
+                    json!({"resourceType":"Patient","id":"pg-same","name":[{"family":"Same"}]}),
+                ),
+                NdjsonEntry::new(
+                    2,
+                    "Patient",
+                    json!({"resourceType":"Patient","id":"pg-edit","name":[{"family":second_family}]}),
+                ),
+            ]
+        };
+        let skipping = BulkProcessingOptions::new().with_skip_unchanged(true);
+        let ingest = |batch, options| {
+            let backend = &backend;
+            let tenant = &tenant;
+            let sub_id = &sub_id;
+            let manifest_id = manifest.manifest_id.clone();
+            async move {
+                backend
+                    .process_entries(tenant, sub_id, &manifest_id, batch, &options)
+                    .await
+                    .unwrap()
+            }
+        };
+
+        let first = ingest(entries("Before"), skipping.clone()).await;
+        assert!(first.iter().all(|r| r.is_success() && r.created));
+
+        let replay = ingest(entries("After"), skipping.clone()).await;
+        let version = |id: &'static str| {
+            let backend = &backend;
+            let tenant = &tenant;
+            async move {
+                backend
+                    .read(tenant, "Patient", id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .version_id()
+                    .to_string()
+            }
+        };
+        let same_version = version("pg-same").await;
+        let edit_version = version("pg-edit").await;
+        let same_history = backend
+            .history_instance(&tenant, "Patient", "pg-same", &HistoryParams::default())
+            .await
+            .unwrap()
+            .items
+            .len();
+
+        let plain = ingest(entries("After"), BulkProcessingOptions::new()).await;
+        let same_after_plain = version("pg-same").await;
+        backend
+            .abort_submission(&tenant, &sub_id, "test cleanup")
+            .await
+            .unwrap();
+
+        assert!(replay[0].is_success() && replay[0].unchanged && !replay[0].created);
+        assert!(replay[1].is_success() && !replay[1].unchanged);
+        assert_eq!(same_version, "1", "an identical replay adds no version");
+        assert_eq!(same_history, 1, "an identical replay adds no history row");
+        assert_eq!(edit_version, "2", "a changed resource is still updated");
+        assert!(!plain[0].unchanged, "the option is opt-in");
+        assert_eq!(
+            same_after_plain, "2",
+            "without it the replay writes as before"
+        );
+    }
+
     /// #968, PostgreSQL: `abort_submission` fails in-flight manifests without
     /// clearing the lease, so the worker's late verdict must lose rather than
     /// resurrect the manifest as `completed`. Postgres enforces this with an
