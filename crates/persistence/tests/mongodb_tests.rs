@@ -3407,6 +3407,105 @@ async fn mongodb_integration_search_quantity() {
     assert!(result.resources.items.is_empty(), "wrong unit → no hit");
 }
 
+/// #1011: `eq`/`ne` on quantity use the implicit-precision range derived
+/// from the value's textual form, while `gt` compares against the exact
+/// value — same weights (kg) as the SQLite/PostgreSQL/Elasticsearch
+/// counterparts of this test.
+#[tokio::test]
+async fn mongodb_quantity_eq_ne_use_implicit_precision() {
+    let Some(backend) = create_backend_with_full_registry("quantity_eq_ne_precision").await else {
+        eprintln!(
+            "Skipping mongodb_quantity_eq_ne_use_implicit_precision (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+
+    let tenant = create_tenant("tenant-quantity-eq-ne");
+
+    const WEIGHTS: [(&str, f64); 4] = [
+        ("obs-55-4", 55.4),
+        ("obs-58-5", 58.5),
+        ("obs-60-2", 60.2),
+        ("obs-64-5", 64.5),
+    ];
+    for (id, weight) in WEIGHTS {
+        backend
+            .create(
+                &tenant,
+                "Observation",
+                json!({
+                    "resourceType": "Observation",
+                    "id": id,
+                    "status": "final",
+                    "code": { "coding": [{ "system": "http://loinc.org", "code": "29463-7" }] },
+                    "valueQuantity": { "value": weight, "unit": "kg", "system": "http://unitsofmeasure.org" }
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+    }
+
+    let query = |prefix: SearchPrefix, value: &str| {
+        SearchQuery::new("Observation").with_parameter(SearchParameter {
+            name: "value-quantity".to_string(),
+            param_type: SearchParamType::Quantity,
+            modifier: None,
+            values: vec![SearchValue::new(prefix, value)],
+            chain: vec![],
+            components: vec![],
+        })
+    };
+
+    async fn ids_for(
+        backend: &MongoBackend,
+        tenant: &TenantContext,
+        query: SearchQuery,
+    ) -> Vec<String> {
+        let mut ids: Vec<String> = backend
+            .search(tenant, &query)
+            .await
+            .unwrap()
+            .resources
+            .items
+            .iter()
+            .map(|r| r.id().to_string())
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    // eq60 -> [59.5, 60.5): only 60.2.
+    let ids = ids_for(&backend, &tenant, query(SearchPrefix::Eq, "60")).await;
+    assert_eq!(ids, vec!["obs-60-2"], "eq60 -> {{60.2}}");
+
+    // eq60.0 -> [59.95, 60.05): empty, 60.2 falls outside the tighter range.
+    let ids = ids_for(&backend, &tenant, query(SearchPrefix::Eq, "60.0")).await;
+    assert!(ids.is_empty(), "eq60.0 -> {{}}, got {ids:?}");
+
+    // eq60.2 -> [60.15, 60.25): only 60.2.
+    let ids = ids_for(&backend, &tenant, query(SearchPrefix::Eq, "60.2")).await;
+    assert_eq!(ids, vec!["obs-60-2"], "eq60.2 -> {{60.2}}");
+
+    // ne60 -> outside [59.5, 60.5): everything but 60.2.
+    let ids = ids_for(&backend, &tenant, query(SearchPrefix::Ne, "60")).await;
+    assert_eq!(
+        ids,
+        vec!["obs-55-4", "obs-58-5", "obs-64-5"],
+        "ne60 -> {{55.4, 58.5, 64.5}}"
+    );
+
+    // gt60 and gt60.0 compare against the exact value 60: both match 60.2 and 64.5.
+    let ids = ids_for(&backend, &tenant, query(SearchPrefix::Gt, "60")).await;
+    assert_eq!(ids, vec!["obs-60-2", "obs-64-5"], "gt60 -> {{60.2, 64.5}}");
+    let ids = ids_for(&backend, &tenant, query(SearchPrefix::Gt, "60.0")).await;
+    assert_eq!(
+        ids,
+        vec!["obs-60-2", "obs-64-5"],
+        "gt60.0 -> {{60.2, 64.5}}"
+    );
+}
+
 #[tokio::test]
 async fn mongodb_integration_compartment_search() {
     // Compartment membership: a resource joins the Patient compartment if it
