@@ -7,11 +7,13 @@
 //! - [`content_type`] - Content negotiation
 //! - [`conditional`] - Conditional request headers (If-Match, etc.)
 //! - [`prefer`] - Prefer header handling
+//! - [`resource_type`] - Refuses paths whose type segment is not a resource type
 
 pub mod auth;
 pub mod conditional;
 pub mod content_type;
 pub mod prefer;
+pub mod resource_type;
 pub mod tenant;
 pub mod tenant_prefix;
 

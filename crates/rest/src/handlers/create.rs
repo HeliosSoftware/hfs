@@ -70,11 +70,7 @@ where
     // Determine FHIR version from header or use server default
     let fhir_version = version.storage_version_or(state.config().default_fhir_version);
 
-    admit_resource_type(&resource_type, &resource, fhir_version).map_err(|error| {
-        RestError::BadRequest {
-            message: error.to_string(),
-        }
-    })?;
+    admit_resource_type(&resource_type, &resource, fhir_version)?;
 
     // AuditEvent resources are immutable — block write operations
     if resource_type == "AuditEvent" {

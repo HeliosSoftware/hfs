@@ -185,6 +185,20 @@ pub(crate) async fn execute_search_bundle<S>(
 where
     S: ResourceStorage + SearchProvider + IncludeProvider + RevincludeProvider + Send + Sync,
 {
+    // Direct requests were already judged by the router's resource-type gate
+    // (`middleware::resource_type`); a `GET [type]?[params]` entry inside a
+    // batch or transaction Bundle arrives here without passing through it, and
+    // must not answer an unknown type with an empty `200` searchset either
+    // (#989). Searches resolve against the server default version (see the
+    // subsetting below), so the type is judged against that same version.
+    let fhir_version = state.config().default_fhir_version;
+    if !crate::fhir_types::is_valid_resource_type_for_version(resource_type, fhir_version) {
+        return Err(RestError::UnknownResourceType {
+            resource_type: resource_type.to_string(),
+            version: fhir_version,
+        });
+    }
+
     // Reject known-but-unimplemented control parameters instead of silently
     // ignoring them (which returns an unfiltered, misleading `200`). `_query`
     // (named queries) is not implemented by any backend. (`_list` is implemented
