@@ -3223,6 +3223,54 @@ details.json-fold[open] > summary .icon {
   outline-offset: 2px;
 }
 
+/* Copy-id button and its "Copied" confirmation pill (#1106), clipboard-gated
+   so a browser without the Clipboard API never renders either. */
+.result-id-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.result-id__copy {
+  width: 22px;
+  height: 22px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+}
+
+tr:hover .result-id__copy,
+.result-id__copy:hover,
+.result-id__copy:focus-visible {
+  border-color: var(--surface-border);
+  background: var(--surface);
+  color: var(--text);
+}
+
+.result-id__copy:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.result-id__copied {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: 20px;
+  padding: 0 7px;
+  border-radius: 999px;
+  background: var(--ok-soft);
+  color: var(--ok);
+  font-size: 11px;
+  font-weight: 600;
+}
+
 .table-foot {
   display: flex;
   flex-wrap: wrap;

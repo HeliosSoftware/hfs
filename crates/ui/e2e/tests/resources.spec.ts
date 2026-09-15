@@ -844,3 +844,82 @@ test("the dialog stays put across tab switches and status messages", async ({
   const withStatus = await head.boundingBox();
   expect(withStatus?.y).toBe(before.y);
 });
+
+// #1106: the copy button beside the id chip writes the full id (not the
+// 8-character prefix shown on screen) to the clipboard, and confirms with a
+// short-lived "Copied" pill without opening the row's modal.
+test("the copy button puts the full id on the clipboard and confirms", async ({
+  resources,
+  page,
+  context,
+  request,
+}) => {
+  const id = crypto.randomUUID();
+  await updateResource(request, "Patient", id, { name: [{ family: "CopyId" }] });
+  await waitSearchable(request, "Patient", id);
+  await context.grantPermissions(["clipboard-read", "clipboard-write"]);
+
+  await resources.goto("Patient");
+  await page.locator("input.query-builder__url[name=url]").fill(`Patient?_id=${id}`);
+  await page.locator("[data-intent='run']").click();
+  await resources.results.waitShown();
+
+  const copyButton = page.locator(
+    `#query-results-body .result-id-group:has(a.result-id[data-resource-id='${id}']) .result-id__copy`,
+  );
+  await expect(copyButton).toBeVisible();
+  await copyButton.click();
+
+  await expect
+    .poll(async () => page.evaluate(() => navigator.clipboard.readText()))
+    .toBe(id);
+  const pill = page.locator(
+    `#query-results-body .result-id-group:has(a.result-id[data-resource-id='${id}']) .result-id__copied`,
+  );
+  await expect(pill).toBeVisible();
+  await expect(pill).toHaveText("Copied");
+  await expect(resources.modal.root).toBeHidden();
+
+  // #1106 regression: the pill sits exactly where the (now-hidden) button
+  // just was, so a fast second click lands on the pill. It must not fall
+  // through to row-navigation.js and open the modal.
+  await pill.click();
+  await expect(resources.modal.root).toBeHidden();
+
+  await expect(copyButton).toBeVisible({ timeout: 3000 });
+  await expect(pill).toBeHidden();
+});
+
+// #1106: the button is Clipboard-API-gated progressive enhancement, like
+// sql-export.js's Copy job id — a browser without it never renders a control
+// that cannot work.
+test("without the Clipboard API no copy button is rendered", async ({ resources, page, request }) => {
+  await page.addInitScript(() => {
+    Object.defineProperty(window.navigator, "clipboard", { value: undefined });
+  });
+  const id = await createResource(request, "Patient", { name: [{ family: "NoClipboard" }] });
+  await waitSearchable(request, "Patient", id);
+
+  await resources.goto("Patient");
+  await page.locator("input.query-builder__url[name=url]").fill(`Patient?_id=${id}`);
+  await page.locator("[data-intent='run']").click();
+  await resources.results.waitShown();
+
+  await expect(resources.results.rows).toHaveCount(1);
+  await expect(page.locator(".result-id__copy")).toHaveCount(0);
+});
+
+test("the copy label is translated", async ({ page, request }) => {
+  const id = await createResource(request, "Patient", { name: [{ family: "CopyLabelEs" }] });
+  await waitSearchable(request, "Patient", id);
+
+  await page.goto("/ui/resources?type=Patient&lang=es", { waitUntil: "networkidle" });
+  await page.locator("input.query-builder__url[name=url]").fill(`Patient?_id=${id}`);
+  await page.locator("[data-intent='run']").click();
+  await page.locator("#query-results").waitFor({ state: "visible" });
+
+  const copyButton = page.locator(
+    `#query-results-body .result-id-group:has(a.result-id[data-resource-id='${id}']) .result-id__copy`,
+  );
+  await expect(copyButton).toHaveAttribute("aria-label", "Copiar id");
+});

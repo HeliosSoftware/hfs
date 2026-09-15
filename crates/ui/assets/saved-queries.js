@@ -2392,6 +2392,88 @@
     return id.length <= 12 ? id : id.slice(0, 8);
   }
 
+  /* Copy-id button beside the id chip (#1106); gated on the Clipboard API so
+   * a browser without it never renders a control that cannot work. */
+  function supportsClipboard() {
+    return Boolean(
+      window.navigator && navigator.clipboard && navigator.clipboard.writeText,
+    );
+  }
+
+  var SVG_NS = "http://www.w3.org/2000/svg";
+
+  function svgIcon(attrs, pathD) {
+    var svg = document.createElementNS(SVG_NS, "svg");
+    svg.setAttribute("viewBox", "0 0 16 16");
+    svg.setAttribute("width", attrs.size);
+    svg.setAttribute("height", attrs.size);
+    svg.setAttribute("fill", "none");
+    svg.setAttribute("stroke", "currentColor");
+    svg.setAttribute("stroke-width", "1.5");
+    svg.setAttribute("aria-hidden", "true");
+    if (attrs.rect) {
+      var rect = document.createElementNS(SVG_NS, "rect");
+      rect.setAttribute("width", "8");
+      rect.setAttribute("height", "8");
+      rect.setAttribute("x", "5.5");
+      rect.setAttribute("y", "5.5");
+      rect.setAttribute("rx", "1.5");
+      svg.appendChild(rect);
+    }
+    var path = document.createElementNS(SVG_NS, "path");
+    path.setAttribute("d", pathD);
+    svg.appendChild(path);
+    return svg;
+  }
+
+  function copyIcon() {
+    return svgIcon(
+      { size: "16", rect: true },
+      "M10.5 3.5v-.5a1.5 1.5 0 0 0-1.5-1.5H4A1.5 1.5 0 0 0 2.5 3v5A1.5 1.5 0 0 0 4 9.5h.5",
+    );
+  }
+
+  function checkIcon() {
+    return svgIcon({ size: "12", rect: false }, "M3 8.5l3.2 3L13 4.5");
+  }
+
+  function copyIdButton(id) {
+    var button = document.createElement("button");
+    button.type = "button";
+    button.className = "result-id__copy";
+    button.dataset.copyId = id;
+    button.setAttribute("aria-label", results.card.dataset.msgCopyId);
+    button.appendChild(copyIcon());
+    return button;
+  }
+
+  /* Swaps the copy button for a "Copied" pill for 2s, then restores it,
+   * returning focus only if it was on the pill or (the realistic case, since
+   * a focused element that becomes hidden loses focus to the document) on
+   * the body. Re-clicking within the window resets the timer (sql-export.js
+   * pattern). */
+  function showCopiedPill(button) {
+    if (button.copyResetTimer) window.clearTimeout(button.copyResetTimer);
+    var stalePill = button.nextElementSibling;
+    if (stalePill && stalePill.classList.contains("result-id__copied"))
+      stalePill.remove();
+    button.hidden = true;
+    var pill = document.createElement("span");
+    pill.className = "result-id__copied";
+    pill.setAttribute("role", "status");
+    pill.appendChild(checkIcon());
+    pill.appendChild(document.createTextNode(results.card.dataset.msgCopied));
+    button.insertAdjacentElement("afterend", pill);
+    button.copyResetTimer = window.setTimeout(function () {
+      var active = document.activeElement;
+      var refocus = active === pill || active === document.body;
+      pill.remove();
+      button.hidden = false;
+      button.copyResetTimer = null;
+      if (refocus) button.focus();
+    }, 2000);
+  }
+
   /* Typed default columns (#416): common fields per resource type when the
    * query names no _elements; unknown types keep the compact id/updated view. */
   var DEFAULT_COLUMNS = {
@@ -2537,7 +2619,11 @@
         idRest.textContent = id.slice(8);
         link.appendChild(idRest);
       }
-      idCell.appendChild(link);
+      var idGroup = document.createElement("span");
+      idGroup.className = "result-id-group";
+      idGroup.appendChild(link);
+      if (id && supportsClipboard()) idGroup.appendChild(copyIdButton(id));
+      idCell.appendChild(idGroup);
       row.appendChild(idCell);
       columns.forEach(function (col) {
         cell(row, fmt(resource[col]));
@@ -2715,6 +2801,38 @@
         urlInput.dispatchEvent(new Event("input", { bubbles: true }));
       }
       runSearch(path, false);
+    });
+
+  /* Delegated on `results.body` (not replaced between renders, unlike the
+   * rows it holds) so every re-rendered page's copy buttons work without
+   * re-attaching a listener per row (#1106). */
+  results.body &&
+    results.body.addEventListener("click", function (event) {
+      /* The "Copied" pill sits exactly where the button just was, so a
+       * second, fast click in that spot lands on the pill rather than a
+       * (hidden) button. Left unhandled, that click would fall through to
+       * row-navigation.js's document-level listener and open the modal
+       * (#1106). `results.body` (the `tbody`) sits between the click target
+       * and `document` in the bubble path, so this listener always runs
+       * first; row-navigation.js already backs off once `defaultPrevented`
+       * is set. */
+      if (event.target.closest(".result-id__copied")) {
+        event.preventDefault();
+        return;
+      }
+      var button = event.target.closest(".result-id__copy");
+      if (!button) return;
+      event.preventDefault();
+      if (!supportsClipboard()) return;
+      navigator.clipboard
+        .writeText(button.dataset.copyId || "")
+        .then(function () {
+          showCopiedPill(button);
+        })
+        .catch(function () {
+          // Clipboard permission denied or unavailable: stay silent, as
+          // sql-export.js's Copy job id button does.
+        });
     });
 
   /* ---- Recent searches & the saved list -------------------------------- */
