@@ -1505,10 +1505,10 @@ impl StreamingBulkSubmitProvider for SqliteBackend {
     }
 }
 
-/// Feeds one finished batch to the phase counters and logs the cumulative
-/// breakdown when [`crate::perf::ingest_progress`] says it is time (#947).
-/// Free in a build without `--cfg perf_phases`: `ingest_progress` folds to
-/// `None`, and the clock reset is the only thing left.
+/// Times one finished batch and hands it to the phase reporter (#947). The
+/// clock read and reset run in every build; the reporting itself lives behind
+/// [`crate::perf::log_ingest_progress`], which is a no-op without
+/// `--cfg perf_phases`, so this stays a single unconditional call here.
 fn report_ingest_progress(
     resource_type: &str,
     entries: usize,
@@ -1516,14 +1516,7 @@ fn report_ingest_progress(
 ) {
     let wall = batch_started.elapsed();
     *batch_started = std::time::Instant::now();
-    if let Some(report) = crate::perf::ingest_progress(entries as u64, wall) {
-        tracing::info!(
-            target: "hfs_perf",
-            resource_type,
-            process_global = true,
-            "ingest phase breakdown (cumulative)\n{report}"
-        );
-    }
+    crate::perf::log_ingest_progress(resource_type, entries as u64, wall);
 }
 
 #[async_trait]
