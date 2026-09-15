@@ -233,6 +233,26 @@ pub enum ResourceTypeAdmissionError {
     },
 }
 
+impl From<ResourceTypeAdmissionError> for crate::error::RestError {
+    /// An unsupported URL type is a `404` like every other interaction on such
+    /// a path (#989); a body that is missing its type, or disagrees with the
+    /// URL, is a malformed request and stays a `400`.
+    fn from(error: ResourceTypeAdmissionError) -> Self {
+        match error {
+            ResourceTypeAdmissionError::UnsupportedForVersion {
+                resource_type,
+                version,
+            } => Self::UnknownResourceType {
+                resource_type,
+                version,
+            },
+            other => Self::BadRequest {
+                message: other.to_string(),
+            },
+        }
+    }
+}
+
 impl fmt::Display for ResourceTypeAdmissionError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
