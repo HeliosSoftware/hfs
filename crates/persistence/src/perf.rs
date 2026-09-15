@@ -378,6 +378,12 @@ static INGEST_BASELINE: parking_lot::Mutex<Option<Vec<PhaseTotals>>> =
 /// counters as the baseline that [`ingest_progress`] reports against; later
 /// calls are no-ops, so concurrent or successive files share one baseline
 /// and the report stays cumulative over the run. [`reset`] clears it.
+///
+/// Split on the cfg rather than guarded with `if !enabled()` so that a build
+/// without `--cfg perf_phases` compiles only the empty stub: there is then no
+/// baseline snapshot in the binary, and nothing for a coverage run to see as
+/// an unreachable, never-hit body.
+#[cfg(perf_phases)]
 pub fn mark_ingest_start() {
     if !enabled() {
         return;
@@ -387,6 +393,10 @@ pub fn mark_ingest_start() {
         *baseline = Some(snapshot());
     }
 }
+
+/// No-op without `--cfg perf_phases`.
+#[cfg(not(perf_phases))]
+pub fn mark_ingest_start() {}
 
 /// Records one ingested batch — `resources` entries walked, `wall` the time
 /// from the end of the previous batch (or the start of the stream) to the end
@@ -399,6 +409,11 @@ pub fn mark_ingest_start() {
 /// average over the whole run, which is what the issue-body tables in #947
 /// quote, and a phase that is quadratic in the import (the FTS delete scan
 /// was) shows up as a share that keeps climbing between dumps.
+///
+/// Split on the cfg (like [`mark_ingest_start`]) so a non-profiling build
+/// carries only the `None` stub, keeping the boundary arithmetic and the
+/// report render out of a coverage build that could never reach them.
+#[cfg(perf_phases)]
 pub fn ingest_progress(resources: u64, wall: Duration) -> Option<String> {
     if !enabled() {
         return None;
@@ -417,6 +432,32 @@ pub fn ingest_progress(resources: u64, wall: Duration) -> Option<String> {
         None => report(after, wall_total),
     })
 }
+
+/// Always `None` without `--cfg perf_phases`.
+#[cfg(not(perf_phases))]
+pub fn ingest_progress(_resources: u64, _wall: Duration) -> Option<String> {
+    None
+}
+
+/// Feeds one finished batch to [`ingest_progress`] and logs the breakdown it
+/// returns on the `hfs_perf` target. Kept here, cfg-split, so the caller in
+/// the ingest loop is one unconditional call with no `perf`-only branch of its
+/// own for a coverage build to leave unhit.
+#[cfg(perf_phases)]
+pub fn log_ingest_progress(resource_type: &str, resources: u64, wall: Duration) {
+    if let Some(report) = ingest_progress(resources, wall) {
+        tracing::info!(
+            target: "hfs_perf",
+            resource_type,
+            process_global = true,
+            "ingest phase breakdown (cumulative)\n{report}"
+        );
+    }
+}
+
+/// No-op without `--cfg perf_phases`.
+#[cfg(not(perf_phases))]
+pub fn log_ingest_progress(_resource_type: &str, _resources: u64, _wall: Duration) {}
 
 /// One phase's totals.
 #[derive(Debug, Clone, Copy)]
@@ -717,6 +758,24 @@ mod tests {
         // up with the discriminants or every row would be mislabelled.
         for (i, phase) in Phase::ALL.iter().enumerate() {
             assert_eq!(*phase as usize, i, "{} out of order", phase.label());
+        }
+    }
+
+    #[test]
+    fn every_phase_has_a_label_and_a_terminating_nesting_chain() {
+        // Exercises `label()` and `nested_in()` for every variant (the assert
+        // message in the test above only formats `label()` on failure, so it
+        // never actually runs those arms). Also guards the nesting chain
+        // against a cycle, which would hang `report_totals`.
+        for phase in Phase::ALL {
+            assert!(!phase.label().is_empty(), "{phase:?} has an empty label");
+            let mut p = phase;
+            let mut depth = 0;
+            while let Some(parent) = p.nested_in() {
+                p = parent;
+                depth += 1;
+                assert!(depth < PHASE_COUNT, "{phase:?} nests without terminating");
+            }
         }
     }
 
