@@ -1149,6 +1149,33 @@ The SQLite backend includes a complete FHIR search implementation using pre-comp
 - [x] Cursor-based and offset pagination
 - [x] Single-field sorting
 
+**Number and quantity prefix semantics:**
+
+- `eq`/`ne` bound the *implicit-precision range* of the search value as
+  written: the number of significant decimals sets the range's width, so
+  `value=100` matches `[99.5, 100.5)` while `value=100.0` matches the
+  narrower `[99.95, 100.05)`. `ne` matches everything outside that range.
+- `gt`, `lt`, `ge`, `le`, `sa`, `eb` compare against the exact search value
+  and ignore its written precision, per the [FHIR number search
+  spec](https://hl7.org/fhir/R4/search.html#number): *"When a comparison
+  prefix in the set gt, lt, ge, le, sa & eb is provided, the implicit
+  precision of the number is ignored, and they are treated as if they have
+  arbitrarily high precision."* So `value-quantity=gt60` and
+  `value-quantity=gt60.0` are equivalent. On SQLite, PostgreSQL, and
+  Elasticsearch, quantity comparators additionally apply the rule after UCUM
+  unit conversion (e.g. `gt60|http://unitsofmeasure.org|kg` and
+  `gt60000|http://unitsofmeasure.org|g` are equivalent). MongoDB does not
+  perform UCUM conversion: it compares the raw stored quantity value against
+  the search value as written, and filters on the unit code verbatim, so on
+  MongoDB `gt60000|http://unitsofmeasure.org|g` matches nothing against data
+  stored as `kg`.
+- The eq/ne-vs-comparator precision rule itself (implicit-precision range for
+  `eq`/`ne`, exact value for the other comparators) is unified across
+  SQLite, PostgreSQL, Elasticsearch, and MongoDB. The exception is `ap`
+  (approximately equal), whose tolerance is not unified across backends.
+- Date parameters are unaffected by this rule and keep their own
+  calendar-precision range comparison.
+
 **Full-Text Search (FTS5):**
 
 - [x] `resource_fts` FTS5 virtual table for full-text indexing
