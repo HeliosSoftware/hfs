@@ -576,6 +576,14 @@ impl BulkSubmitProvider for CompositeSubmitJobs {
         self.primary.get_submission(tenant, id).await
     }
 
+    async fn get_submission_status(
+        &self,
+        tenant: &TenantContext,
+        id: &SubmissionId,
+    ) -> StorageResult<Option<SubmissionStatus>> {
+        self.primary.get_submission_status(tenant, id).await
+    }
+
     async fn list_submissions(
         &self,
         tenant: &TenantContext,

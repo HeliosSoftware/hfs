@@ -561,16 +561,16 @@ where
     let ctx = tenant.context();
 
     // Reject further submissions for a terminal submitter+submissionId.
-    if let Some(existing) = jobs
-        .get_submission(ctx, &sub_id)
+    if let Some(existing_status) = jobs
+        .get_submission_status(ctx, &sub_id)
         .await
         .map_err(RestError::from)?
     {
-        if existing.status.is_terminal() {
+        if existing_status.is_terminal() {
             return Err(RestError::Conflict {
                 message: format!(
                     "submission {} is already {} — no further submissions allowed",
-                    sub_id, existing.status
+                    sub_id, existing_status
                 ),
             });
         }
@@ -738,15 +738,13 @@ where
     let sub_id = SubmissionId::new(req.0, req.1);
     let ctx = tenant.context();
 
-    let summary = jobs
-        .get_submission(ctx, &sub_id)
+    jobs.get_submission_status(ctx, &sub_id)
         .await
         .map_err(RestError::from)?
         .ok_or_else(|| RestError::NotFound {
             resource_type: "Submission".to_string(),
             id: sub_id.to_string(),
         })?;
-    let _ = summary;
 
     let token = jobs
         .ensure_poll_token(ctx, &sub_id)
@@ -877,8 +875,8 @@ where
     let sub_id = &target.submission_id;
     let page = parse_page_param(request.uri().query())?;
 
-    let summary = jobs
-        .get_submission(ctx, sub_id)
+    let status = jobs
+        .get_submission_status(ctx, sub_id)
         .await
         .map_err(RestError::from)?
         .ok_or_else(|| RestError::NotFound {
@@ -891,7 +889,7 @@ where
         .await
         .map_err(RestError::from)?;
     let all_terminal = manifests.iter().all(|m| m.status.is_terminal());
-    let stopped = summary.status == SubmissionStatus::Aborted;
+    let stopped = status == SubmissionStatus::Aborted;
 
     if !all_terminal && !stopped {
         // Byte-level progress when the workers know every file's size: the
