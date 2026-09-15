@@ -112,3 +112,81 @@ async fn test_number_search_gt() {
 
     let _result = backend.search(&tenant, &query.with_count(100)).await;
 }
+
+/// Boundary matrix for the number prefix semantics fixed by #1011: `gt`,
+/// `lt`, `ge`, `le` compare against the exact search value regardless of how
+/// many decimals it was written with, while `eq` bounds the implicit-
+/// precision range of the value as written (see the module doc of
+/// `helios_persistence::search::range` for the full rule).
+///
+/// Seeds four `RiskAssessment` resources with fixed ids and
+/// `prediction[].probabilityDecimal` 0.25 / 0.5 / 0.52 / 0.75, then asserts
+/// the exact id set each case in the table returns.
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn test_number_prefix_boundary_matrix() {
+    let backend = create_sqlite_backend();
+    let tenant = TenantContext::new(
+        TenantId::new("number-prefix-boundary"),
+        TenantPermissions::full_access(),
+    );
+
+    let seeds: [(&str, f64); 4] = [
+        ("r-25", 0.25),
+        ("r-50", 0.5),
+        ("r-52", 0.52),
+        ("r-75", 0.75),
+    ];
+    for (id, probability) in seeds {
+        backend
+            .create(
+                &tenant,
+                "RiskAssessment",
+                json!({
+                    "id": id,
+                    "resourceType": "RiskAssessment",
+                    "status": "final",
+                    "prediction": [{"probabilityDecimal": probability}]
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .expect("seed RiskAssessment");
+    }
+
+    // (search value including prefix, expected matching ids)
+    let cases: [(&str, &[&str]); 7] = [
+        ("gt0.5", &["r-52", "r-75"]),
+        ("gt0.50", &["r-52", "r-75"]),
+        ("ge0.5", &["r-50", "r-52", "r-75"]),
+        ("lt0.5", &["r-25"]),
+        ("le0.5", &["r-25", "r-50"]),
+        ("eq0.5", &["r-50", "r-52"]),
+        ("eq0.50", &["r-50"]),
+    ];
+
+    for (value, expected) in cases {
+        let query = SearchQuery::new("RiskAssessment").with_parameter(SearchParameter {
+            name: "probability".to_string(),
+            param_type: SearchParamType::Number,
+            modifier: None,
+            values: vec![SearchValue::parse(value)],
+            chain: vec![],
+            components: vec![],
+        });
+
+        let result = backend
+            .search(&tenant, &query.with_count(100))
+            .await
+            .unwrap_or_else(|e| panic!("search probability={value} failed: {e}"));
+
+        let mut ids: Vec<&str> = result.resources.items.iter().map(|r| r.id()).collect();
+        ids.sort();
+        let mut expected_sorted = expected.to_vec();
+        expected_sorted.sort();
+        assert_eq!(
+            ids, expected_sorted,
+            "probability={value} must match {expected:?}"
+        );
+    }
+}
