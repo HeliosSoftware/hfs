@@ -236,7 +236,7 @@ fn server_with_principal(scopes: &str) -> (TestServer, Arc<SqliteBackend>) {
 /// when the search index is dropped.
 ///
 /// Counts `Bundle.entry` rather than reading `Bundle.total`: `total` is only
-/// populated when the caller asks for it (`_total`), and is `null` otherwise —
+/// populated when the caller asks for it (`_total`), and absent otherwise —
 /// which would read as "no matches" for every search and make this helper
 /// useless as an assertion.
 async fn search_matches(server: &TestServer) -> usize {

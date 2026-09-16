@@ -321,6 +321,9 @@ across every storage backend.
   on — killing the UI — by `--all-features`, the selection that builds the
   released binaries (#975). Never add a negative feature here.
 - When the UI is not served (feature off, or `HFS_UI_ENABLED=false`), `/ui`
-  returns **404 + OperationOutcome** from `ui_absent_routes`. It must never fall
-  through to the FHIR router, which reads `ui` as a resource type and answers
-  `200` with an empty searchset.
+  returns **404 + OperationOutcome** from `ui_absent_routes`, whose diagnostics
+  say the UI is absent and why. Before #989 a fall-through to the FHIR router
+  read `ui` as a resource type and answered `200` with an empty searchset; the
+  router's resource-type gate (`helios_rest::middleware::resource_type`) now
+  refuses any unknown type with `404` + `not-supported`, so the stubs exist for
+  the specific message, not for the status.

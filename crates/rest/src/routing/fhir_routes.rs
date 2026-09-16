@@ -18,6 +18,7 @@ use tower::ServiceExt;
 
 use crate::config::TenantRoutingMode;
 use crate::handlers;
+use crate::middleware::resource_type::reject_unknown_resource_type;
 use crate::middleware::tenant_prefix::{
     ExtractedTenantFromUrl, OriginalPath, extract_tenant_from_path,
 };
@@ -53,6 +54,11 @@ use crate::state::AppState;
 /// - `DELETE /{type}/{id}` - Delete
 /// - `GET /{type}/{id}/_history` - Instance history
 /// - `GET /{type}/{id}/_history/{vid}` - Version read
+///
+/// Every `{type}` route is gated by
+/// [`reject_unknown_resource_type`](crate::middleware::resource_type::reject_unknown_resource_type):
+/// a type segment that is not a resource type for the request's effective FHIR
+/// version answers `404` + OperationOutcome before any handler runs (#989).
 pub fn create_routes<S>(state: AppState<S>) -> Router
 where
     S: ResourceStorage
@@ -97,7 +103,7 @@ where
         + Sync
         + 'static,
 {
-    create_fhir_router().with_state(state)
+    build_fhir_router(state)
 }
 
 /// Creates routes with URL-based tenant identification.
@@ -122,7 +128,7 @@ where
         + Sync
         + 'static,
 {
-    let router = create_fhir_router().with_state(state);
+    let router = build_fhir_router(state);
 
     // Use tower's map_request to modify the request BEFORE routing
     let service = router.map_request(strip_tenant_prefix);
@@ -152,7 +158,7 @@ where
         + Sync
         + 'static,
 {
-    let router = create_fhir_router().with_state(state);
+    let router = build_fhir_router(state);
 
     // Use tower's map_request to modify the request BEFORE routing
     let service = router.map_request(strip_tenant_prefix);
@@ -200,6 +206,40 @@ fn build_uri_with_new_path(original: &axum::http::Uri, new_path: &str) -> axum::
     );
 
     axum::http::Uri::from_parts(parts).unwrap_or_else(|_| original.clone())
+}
+
+/// Builds the core FHIR router, installs the resource-type gate, and binds
+/// the state.
+///
+/// The gate is a router layer rather than a check in each handler so that
+/// every current and future `{resource_type}` route — read, search, history,
+/// write, `$operation`, compartment — refuses an unknown type identically. It
+/// is installed here, on the FHIR router alone, so routes merged later (the
+/// web UI, console, admin API) are never judged as resource types.
+fn build_fhir_router<S>(state: AppState<S>) -> Router
+where
+    S: ResourceStorage
+        + ConditionalStorage
+        + SearchProvider
+        + IncludeProvider
+        + RevincludeProvider
+        + InstanceHistoryProvider
+        + TypeHistoryProvider
+        + SystemHistoryProvider
+        + BundleProvider
+        + helios_persistence::core::ExportDataProvider
+        + helios_persistence::core::PatientExportProvider
+        + helios_persistence::core::GroupExportProvider
+        + Send
+        + Sync
+        + 'static,
+{
+    create_fhir_router()
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            reject_unknown_resource_type::<S>,
+        ))
+        .with_state(state)
 }
 
 /// Creates the core FHIR router with all endpoints.

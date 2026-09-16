@@ -2543,6 +2543,11 @@ mod tests {
             Ok(0)
         }
 
+        // `fetch_update` was deprecated in Rust 1.98 in favour of
+        // `try_update`, but the new name is still unstable
+        // (`atomic_try_update`) on the workspace's 1.90 MSRV, so the old
+        // one stays until the MSRV catches up.
+        #[allow(deprecated)]
         async fn write_search_entries(
             &self,
             tenant: &TenantContext,
@@ -2561,11 +2566,6 @@ mod tests {
                 .expect("controlled write gate remains open");
             permit.forget();
             self.active_writes.fetch_sub(1, Ordering::SeqCst);
-            // `fetch_update` was deprecated in Rust 1.98 in favour of
-            // `try_update`, but the new name is still unstable
-            // (`atomic_try_update`) on the workspace's 1.90 MSRV, so the old
-            // one stays until the MSRV catches up.
-            #[allow(deprecated)]
             if self
                 .failing_writes
                 .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {

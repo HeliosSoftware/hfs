@@ -54,6 +54,7 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
+use helios_fhir::FhirVersion;
 use helios_persistence::error::{
     BackendError, ConcurrencyError, ResourceError, SearchError, StorageError, TenantError,
     TransactionError, ValidationError,
@@ -278,6 +279,20 @@ pub enum RestError {
         feature: String,
     },
 
+    /// The request path names a resource type this server does not serve
+    /// for the request's effective FHIR version (HTTP 404 + `not-supported`).
+    ///
+    /// Covers a misspelling (`Patinet`), wrong case (`observation`), and a
+    /// type from another FHIR version (`ActorDefinition` under R4). Per
+    /// `http.html`, "resource type not supported" is a `404 Not Found` for
+    /// every interaction, read and write alike (#989).
+    UnknownResourceType {
+        /// The type segment as it appeared in the request URL.
+        resource_type: String,
+        /// The FHIR version the request was resolved against.
+        version: FhirVersion,
+    },
+
     /// Internal server error (HTTP 500).
     InternalError {
         /// Error message.
@@ -395,6 +410,16 @@ impl fmt::Display for RestError {
             }
             RestError::NotSupported { feature } => {
                 write!(f, "Not supported: {}", feature)
+            }
+            RestError::UnknownResourceType {
+                resource_type,
+                version,
+            } => {
+                write!(
+                    f,
+                    "Unknown resource type: {} (FHIR {})",
+                    resource_type, version
+                )
             }
             RestError::InternalError { message } => {
                 write!(f, "Internal error: {}", message)
@@ -561,6 +586,19 @@ impl RestError {
             RestError::NotSupported { feature } => {
                 (StatusCode::BAD_REQUEST, "not-supported", feature.clone())
             }
+            RestError::UnknownResourceType {
+                resource_type,
+                version,
+            } => (
+                StatusCode::NOT_FOUND,
+                "not-supported",
+                format!(
+                    "'{}' is not a resource type this server supports for FHIR {}. \
+                     Resource type names are case-sensitive; see the CapabilityStatement \
+                     at [base]/metadata for the supported types.",
+                    resource_type, version
+                ),
+            ),
             RestError::InternalError { message } => {
                 // Log the full underlying detail server-side so operators keep it,
                 // but never leak backend/driver/SQL detail (table and column names,

@@ -220,8 +220,12 @@ where
         "kind": "instance",
         "fhirVersion": version.full_version(),
         "format": formats,
+        // `software` names the build a client is talking to; `implementation`
+        // names this deployment of it. Without `software` the only place the
+        // version appeared was `/health`, which FHIR clients do not read (#992).
+        "software": crate::build_info::capability_software(),
         "implementation": {
-            "description": "Helios FHIR Server",
+            "description": crate::build_info::SOFTWARE_NAME,
             "url": base_url
         },
         "rest": [rest_entry]
@@ -635,6 +639,50 @@ mod tests {
             reindex["definition"],
             format!("/OperationDefinition/{REINDEX_DEFINITION_ID}")
         );
+    }
+
+    /// `CapabilityStatement.software` identifies the build for every FHIR
+    /// version the server can describe: the same binary answers `/metadata`
+    /// for each of them, so the version must not depend on which one was
+    /// asked for (#992).
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn software_names_the_build_for_every_enabled_fhir_version() {
+        use crate::build_info::{PKG_VERSION, SOFTWARE_NAME, git_sha};
+        use crate::config::ServerConfig;
+        use helios_persistence::backends::sqlite::SqliteBackend;
+        use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
+        use std::sync::Arc;
+
+        let backend = Arc::new(SqliteBackend::in_memory().expect("in-memory sqlite"));
+        backend.init_schema().expect("init schema");
+        let state = AppState::new(backend, ServerConfig::default());
+        let tenant = TenantContext::new(
+            TenantId::new("test-tenant"),
+            TenantPermissions::full_access(),
+        );
+
+        assert!(!FhirVersion::enabled_versions().is_empty());
+        for version in FhirVersion::enabled_versions() {
+            let statement =
+                build_capability_statement(&state, &tenant, *version, "http://localhost:8080");
+            let software = &statement["software"];
+            assert_eq!(
+                software["name"], SOFTWARE_NAME,
+                "software.name for {version:?}"
+            );
+            assert_eq!(
+                software["version"], PKG_VERSION,
+                "software.version must be the crate version for {version:?}"
+            );
+            assert_eq!(
+                software["extension"][0]["valueString"].as_str(),
+                git_sha(),
+                "git sha rides as an extension exactly when the build knows it"
+            );
+            assert_eq!(statement["implementation"]["description"], SOFTWARE_NAME);
+            assert_eq!(statement["fhirVersion"], version.full_version());
+        }
     }
 
     fn operation_names(ops: &[serde_json::Value]) -> Vec<String> {
