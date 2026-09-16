@@ -9,7 +9,7 @@ use super::query_builder::SqlFragment;
 /// Handles the :missing modifier for any parameter type.
 pub fn build_missing_condition(param: &SearchParameter, is_missing: bool) -> SqlFragment {
     // Projects the integer resource_key (resources.rowid / search_index.resource_key)
-    // so it composes with the v30 base wrapper, which selects resource_key.
+    // so it composes with the v31 base wrapper, which selects resource_key.
     let indexed_resources = match param.name.as_str() {
         "_id" => "SELECT rowid FROM resources WHERE tenant_id = ?1 AND resource_type = ?2 AND id IS NOT NULL".to_string(),
         "_lastUpdated" => "SELECT rowid FROM resources WHERE tenant_id = ?1 AND resource_type = ?2 AND last_updated IS NOT NULL".to_string(),

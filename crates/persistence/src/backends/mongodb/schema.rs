@@ -10,6 +10,7 @@ use tokio::runtime::RuntimeFlavor;
 use crate::error::{BackendError, StorageError, StorageResult};
 
 use super::backend::MongoBackendConfig;
+use super::search_index_catalog::{IndexBuild, SEARCH_INDEX_COLLECTION, generation2_specs};
 
 /// Current MongoDB schema version.
 ///
@@ -20,6 +21,10 @@ use super::backend::MongoBackendConfig;
 /// with `idx_bulk_entry_results_outcome_line`, which also carries the receipt
 /// keyset order, so outcome-filtered receipt pages need no in-memory sort
 /// (#1046).
+///
+/// `search_index` indexes are versioned separately by `search_indexes.generation`
+/// on the same document (see `search_index_catalog.rs`); `SCHEMA_VERSION` does
+/// not change for them.
 pub const SCHEMA_VERSION: i32 = 10;
 
 /// Initialize MongoDB collections/indexes required by the backend.
@@ -157,7 +162,10 @@ async fn ensure_resources_indexes(database: &Database) -> StorageResult<()> {
 /// Used for indexes a later schema version supersedes: a fresh deployment never
 /// created them, and an upgraded one must not keep paying for them on every
 /// write.
-async fn drop_index_if_present(collection: &Collection<Document>, name: &str) -> StorageResult<()> {
+pub(super) async fn drop_index_if_present(
+    collection: &Collection<Document>,
+    name: &str,
+) -> StorageResult<()> {
     match collection.drop_index(name).await {
         Ok(()) => {
             tracing::info!(index = name, "dropped superseded MongoDB index");
@@ -236,97 +244,17 @@ async fn ensure_history_indexes(database: &Database) -> StorageResult<()> {
     Ok(())
 }
 
+/// Creates the `search_index` indexes whose build is cheap enough to await at
+/// boot. Everything else (the generation-2 value indexes and the contained
+/// index) is built by `SearchIndexBuilder` after boot; see the catalog.
 async fn ensure_search_indexes(database: &Database) -> StorageResult<()> {
-    let search_index = database.collection::<Document>("search_index");
-
-    create_index(
-        &search_index,
-        doc! { "tenant_id": 1_i32, "resource_type": 1_i32, "param_name": 1_i32, "value_string": 1_i32 },
-        "idx_search_string",
-        false,
-    )
-    .await?;
-
-    create_index(
-        &search_index,
-        doc! { "tenant_id": 1_i32, "resource_type": 1_i32, "param_name": 1_i32, "value_token_system": 1_i32, "value_token_code": 1_i32 },
-        "idx_search_token",
-        false,
-    )
-    .await?;
-
-    create_index(
-        &search_index,
-        doc! { "tenant_id": 1_i32, "resource_type": 1_i32, "param_name": 1_i32, "value_date": 1_i32 },
-        "idx_search_date",
-        false,
-    )
-    .await?;
-
-    create_index(
-        &search_index,
-        doc! { "tenant_id": 1_i32, "resource_type": 1_i32, "param_name": 1_i32, "value_number": 1_i32 },
-        "idx_search_number",
-        false,
-    )
-    .await?;
-
-    create_index(
-        &search_index,
-        doc! { "tenant_id": 1_i32, "resource_type": 1_i32, "param_name": 1_i32, "value_quantity_value": 1_i32, "value_quantity_unit": 1_i32 },
-        "idx_search_quantity",
-        false,
-    )
-    .await?;
-
-    create_index(
-        &search_index,
-        doc! { "tenant_id": 1_i32, "resource_type": 1_i32, "param_name": 1_i32, "value_reference": 1_i32 },
-        "idx_search_reference",
-        false,
-    )
-    .await?;
-
-    create_index(
-        &search_index,
-        doc! { "tenant_id": 1_i32, "resource_type": 1_i32, "param_name": 1_i32, "value_uri": 1_i32 },
-        "idx_search_uri",
-        false,
-    )
-    .await?;
-
-    create_index(
-        &search_index,
-        doc! { "tenant_id": 1_i32, "resource_type": 1_i32, "resource_id": 1_i32, "param_name": 1_i32, "composite_group": 1_i32 },
-        "idx_search_composite",
-        false,
-    )
-    .await?;
-
-    create_index(
-        &search_index,
-        doc! { "tenant_id": 1_i32, "resource_type": 1_i32, "resource_id": 1_i32 },
-        "idx_search_resource",
-        false,
-    )
-    .await?;
-
-    create_index(
-        &search_index,
-        doc! { "tenant_id": 1_i32, "resource_type": 1_i32, "param_name": 1_i32, "value_token_display": 1_i32 },
-        "idx_search_token_display",
-        false,
-    )
-    .await?;
-
-    create_index(
-        &search_index,
-        doc! { "tenant_id": 1_i32, "resource_type": 1_i32, "param_name": 1_i32, "value_identifier_type_system": 1_i32, "value_identifier_type_code": 1_i32 },
-        "idx_search_identifier_type",
-        false,
-    )
-    .await?;
-
+    let search_index = database.collection::<Document>(SEARCH_INDEX_COLLECTION);
+    for spec in generation2_specs()
+        .iter()
+        .filter(|s| s.build == IndexBuild::Inline)
+    {
+        search_index.create_index(spec.index_model()).await?;
+    }
     Ok(())
 }
 
@@ -537,16 +465,50 @@ async fn get_schema_version(database: &Database) -> StorageResult<i32> {
     Ok(version)
 }
 
+/// Upserts `version` on the singleton document. Uses `$set` rather than
+/// delete-and-insert so sibling fields written by other bootstrap steps
+/// (`search_indexes`, see `set_search_index_generation`) survive every boot.
 async fn set_schema_version(database: &Database, version: i32) -> StorageResult<()> {
     let collection = database.collection::<Document>("schema_version");
     collection
-        .delete_many(doc! { "_id": "schema_version" })
+        .update_one(
+            doc! { "_id": "schema_version" },
+            doc! { "$set": { "version": version } },
+        )
+        .upsert(true)
         .await?;
-    collection
-        .insert_one(doc! {
-            "_id": "schema_version",
-            "version": version,
-        })
+    Ok(())
+}
+
+/// The recorded `search_index` generation, `None` before the builder has
+/// ever completed on this database.
+pub(super) async fn get_search_index_generation(database: &Database) -> StorageResult<Option<i32>> {
+    let doc = database
+        .collection::<Document>("schema_version")
+        .find_one(doc! { "_id": "schema_version" })
+        .await?;
+    Ok(doc
+        .as_ref()
+        .and_then(|d| d.get_document("search_indexes").ok())
+        .and_then(|s| s.get_i32("generation").ok()))
+}
+
+/// Records that every background spec of `generation` is present and the
+/// superseded indexes are gone.
+pub(super) async fn set_search_index_generation(
+    database: &Database,
+    generation: i32,
+) -> StorageResult<()> {
+    database
+        .collection::<Document>("schema_version")
+        .update_one(
+            doc! { "_id": "schema_version" },
+            doc! { "$set": { "search_indexes": {
+                "generation": generation,
+                "completed_at": mongodb::bson::DateTime::now(),
+            } } },
+        )
+        .upsert(true)
         .await?;
     Ok(())
 }

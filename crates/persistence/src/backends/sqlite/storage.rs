@@ -1836,7 +1836,7 @@ impl SqliteBackend {
 
         // Delete from main search index, keyed on the integer `resource_key`
         // so the delete rides `idx_search_composite` (rekeyed to resource_key
-        // in v30) instead of scanning the type. Every caller of this method
+        // in v31) instead of scanning the type. Every caller of this method
         // deletes while the `resources` row still exists (update, re-index,
         // soft-delete), so the subquery resolves; the purge path, which removes
         // the `resources` row first, deletes by `resource_id` inline instead.
