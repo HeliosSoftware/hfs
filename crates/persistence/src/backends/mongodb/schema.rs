@@ -21,6 +21,10 @@ use super::search_index_catalog::{IndexBuild, SEARCH_INDEX_COLLECTION, generatio
 /// with `idx_bulk_entry_results_outcome_line`, which also carries the receipt
 /// keyset order, so outcome-filtered receipt pages need no in-memory sort
 /// (#1046).
+///
+/// `search_index` indexes are versioned separately by `search_indexes.generation`
+/// on the same document (see `search_index_catalog.rs`); `SCHEMA_VERSION` does
+/// not change for them.
 pub const SCHEMA_VERSION: i32 = 10;
 
 /// Initialize MongoDB collections/indexes required by the backend.
