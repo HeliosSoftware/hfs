@@ -9,7 +9,7 @@ use crate::core::bulk_submit_legacy::{
 use crate::error::{BackendError, StorageResult};
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 39;
+pub const SCHEMA_VERSION: i32 = 40;
 
 /// Advisory-lock key serializing schema migration across HFS instances sharing
 /// one database. Arbitrary but must stay stable across releases.
@@ -374,6 +374,7 @@ async fn migrate_schema(
             }
             37 => migrate_v37_to_v38(client).await?,
             38 => migrate_v38_to_v39(client).await?,
+            39 => migrate_v39_to_v40(client).await?,
             _ => {
                 return Err(pg_error(format!("Unknown schema version: {}", version)));
             }
@@ -3648,7 +3649,48 @@ async fn migrate_v37_to_v38(client: &deadpool_postgres::Client) -> StorageResult
     Ok(())
 }
 
-/// v38 -> v39: `attempts` on `bulk_export_jobs` (#1041).
+/// v38 -> v39: bulk-submit progress that a re-walk cannot inflate (#1127).
+///
+/// `bulk_manifest_file_progress` keeps, per input file of a manifest, the
+/// highest line whose entry has already been charged to the manifest's
+/// counters. A worker that re-reads a file — after a lost lease, a reclaim or
+/// a whole-file retry — re-ingests those lines but no longer adds them to
+/// `total_entries` a second time, so the counters describe the manifest
+/// rather than the sum over passes, and they still never move backwards
+/// (#969). `skipped_entries` gives the submission summary a skip count without
+/// scanning `bulk_entry_results`.
+async fn migrate_v38_to_v39(client: &deadpool_postgres::Client) -> StorageResult<()> {
+    let stmts = [
+        "ALTER TABLE bulk_manifests ADD COLUMN IF NOT EXISTS skipped_entries INTEGER NOT NULL DEFAULT 0",
+        "CREATE TABLE IF NOT EXISTS bulk_manifest_file_progress (
+            tenant_id TEXT NOT NULL,
+            submitter TEXT NOT NULL,
+            submission_id TEXT NOT NULL,
+            manifest_id TEXT NOT NULL,
+            file_url TEXT NOT NULL,
+            max_line BIGINT NOT NULL DEFAULT 0,
+            total_entries BIGINT NOT NULL DEFAULT 0,
+            processed_entries BIGINT NOT NULL DEFAULT 0,
+            failed_entries BIGINT NOT NULL DEFAULT 0,
+            skipped_entries BIGINT NOT NULL DEFAULT 0,
+            PRIMARY KEY (tenant_id, submitter, submission_id, manifest_id, file_url),
+            FOREIGN KEY (tenant_id, submitter, submission_id, manifest_id)
+                REFERENCES bulk_manifests(tenant_id, submitter, submission_id, manifest_id)
+                ON DELETE CASCADE
+        )",
+    ];
+
+    for sql in stmts {
+        client
+            .execute(sql, &[])
+            .await
+            .map_err(|e| pg_error(format!("Migration v38->v39 failed: {}", e)))?;
+    }
+
+    Ok(())
+}
+
+/// v39 -> v40: `attempts` on `bulk_export_jobs` (#1041).
 ///
 /// Counts how many times the job has been claimed by a worker. A job whose
 /// lease expires mid-run is reclaimable, so without a count of past claims a
@@ -3656,14 +3698,14 @@ async fn migrate_v37_to_v38(client: &deadpool_postgres::Client) -> StorageResult
 /// never reaching a terminal state and never giving its tenant's concurrency
 /// slot back. `claim_next` bumps the column on every claim and retires the job
 /// once the count would exceed the configured cap.
-async fn migrate_v38_to_v39(client: &deadpool_postgres::Client) -> StorageResult<()> {
+async fn migrate_v39_to_v40(client: &deadpool_postgres::Client) -> StorageResult<()> {
     client
         .execute(
             "ALTER TABLE bulk_export_jobs ADD COLUMN IF NOT EXISTS attempts INTEGER NOT NULL DEFAULT 0",
             &[],
         )
         .await
-        .map_err(|e| pg_error(format!("Migration v38->v39 failed: {}", e)))?;
+        .map_err(|e| pg_error(format!("Migration v39->v40 failed: {}", e)))?;
 
     Ok(())
 }
@@ -4894,6 +4936,15 @@ mod postgres_integration_v37_migration {
         assert_eq!(
             column_type(&client, "bulk_submit_files", "publication_excluded_reason").await,
             Some("text".to_string())
+        );
+        // v39 (#1127): re-walk-proof per-file progress and a skip counter.
+        assert_eq!(
+            column_type(&client, "bulk_manifests", "skipped_entries").await,
+            Some("integer".to_string())
+        );
+        assert_eq!(
+            column_type(&client, "bulk_manifest_file_progress", "max_line").await,
+            Some("bigint".to_string())
         );
         assert_eq!(
             classification(&client, completed).await,
