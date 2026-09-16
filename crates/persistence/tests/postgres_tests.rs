@@ -9862,6 +9862,7 @@ mod postgres_integration {
     async fn reindex_page_fts_trigger_case(
         target_id: &str,
         target_is_oversized: bool,
+        leading_is_oversized: bool,
         trigger_message: &str,
     ) -> (
         Vec<helios_persistence::types::StoredResource>,
@@ -9878,8 +9879,13 @@ mod postgres_integration {
             .map(|index| format!("lexeme{index:08x}"))
             .collect::<Vec<_>>()
             .join(" ");
+        let leading_id = if leading_is_oversized {
+            "a-oversized"
+        } else {
+            "a-normal"
+        };
         let entries = [
-            ("a-normal", false),
+            (leading_id, leading_is_oversized),
             (target_id, target_is_oversized),
             ("c-normal", false),
         ];
@@ -9980,7 +9986,8 @@ mod postgres_integration {
     #[tokio::test]
     async fn postgres_integration_reindex_page_unexpected_fts_error_falls_back_per_resource() {
         let (resources, results, search_rows, fts_rows) =
-            reindex_page_fts_trigger_case("b-normal", false, "unexpected FTS page failure").await;
+            reindex_page_fts_trigger_case("b-normal", false, false, "unexpected FTS page failure")
+                .await;
 
         assert_eq!(
             resources
@@ -10017,9 +10024,60 @@ mod postgres_integration {
     }
 
     #[tokio::test]
+    async fn postgres_integration_reindex_page_unexpected_fts_error_during_oversized_recovery_falls_back_per_resource()
+     {
+        let (resources, results, search_rows, fts_rows) = reindex_page_fts_trigger_case(
+            "b-normal",
+            false,
+            true,
+            "unexpected FTS recovery failure",
+        )
+        .await;
+
+        assert_eq!(
+            resources
+                .iter()
+                .map(|resource| resource.id())
+                .collect::<Vec<_>>(),
+            vec!["a-oversized", "b-normal", "c-normal"]
+        );
+        assert_eq!(results.len(), 3);
+        for (resource, result) in resources.iter().zip(&results) {
+            if resource.id() == "b-normal" {
+                let error = result
+                    .as_ref()
+                    .expect_err("recovery trigger target must fail");
+                assert_eq!(
+                    error.to_string(),
+                    "internal error in postgres: Failed to insert FTS content: db error"
+                );
+            } else {
+                assert!(result.is_ok(), "{} should be reindexed", resource.id());
+            }
+        }
+        assert_eq!(
+            search_rows,
+            vec![
+                ("a-oversized".to_string(), 1),
+                ("b-normal".to_string(), 1),
+                ("c-normal".to_string(), 1),
+            ]
+        );
+        assert_eq!(
+            fts_rows,
+            vec![("a-oversized".to_string(), 1), ("c-normal".to_string(), 1),]
+        );
+    }
+
+    #[tokio::test]
     async fn postgres_integration_reindex_page_truncated_fts_retry_error_falls_back_per_resource() {
-        let (resources, results, search_rows, fts_rows) =
-            reindex_page_fts_trigger_case("b-oversized", true, "truncated FTS retry failure").await;
+        let (resources, results, search_rows, fts_rows) = reindex_page_fts_trigger_case(
+            "b-oversized",
+            true,
+            false,
+            "truncated FTS retry failure",
+        )
+        .await;
 
         assert_eq!(
             resources
