@@ -1717,10 +1717,48 @@ impl crate::sof::in_process::ResourceScan for S3Backend {
         &self,
         tenant: &TenantContext,
         resource_type: &str,
-    ) -> Result<Vec<Value>, crate::core::sof_runner::SofError> {
-        self.scan_live_resources(tenant, resource_type)
+    ) -> Result<crate::sof::in_process::ResourceStream, crate::core::sof_runner::SofError> {
+        use crate::core::sof_runner::SofError;
+        use futures::stream::{self, StreamExt};
+
+        let location = self
+            .tenant_location(tenant)
+            .map_err(|e| SofError::Storage(e.to_string()))?;
+
+        // S3 LIST is key-only (cheap strings), so collecting keys upfront is
+        // unavoidable. The expensive per-object GETs are pipelined via
+        // buffer_unordered and yielded one at a time rather than accumulated.
+        let keys = self
+            .list_current_keys(&location, Some(resource_type))
             .await
-            .map_err(|e| crate::core::sof_runner::SofError::Storage(e.to_string()))
+            .map_err(|e| SofError::Storage(e.to_string()))?;
+
+        let backend = self.clone();
+        let bucket = location.bucket.clone();
+        let concurrency = self.bulk_write_concurrency();
+
+        let scan_stream = stream::iter(keys)
+            .map(move |key| {
+                let backend = backend.clone();
+                let bucket = bucket.clone();
+                async move {
+                    backend
+                        .get_json_object::<StoredResource>(&bucket, &key)
+                        .await
+                        .map_err(|e| SofError::Storage(e.to_string()))
+                }
+            })
+            .buffer_unordered(concurrency)
+            .filter_map(|result| async move {
+                match result {
+                    Err(e) => Some(Err(e)),
+                    Ok(None) => None,
+                    Ok(Some((resource, _))) if resource.is_deleted() => None,
+                    Ok(Some((resource, _))) => Some(Ok(resource.into_content_with_meta())),
+                }
+            });
+
+        Ok(Box::pin(scan_stream))
     }
 }
 
