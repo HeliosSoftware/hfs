@@ -656,10 +656,15 @@ impl ResourceStorage for SqliteBackend {
         )
         .map_err(|e| internal_error(format!("Failed to insert deletion history: {}", e)))?;
 
-        // Delete search index entries (skip when search is offloaded)
+        // Delete search index entries (skip when search is offloaded). Keyed on
+        // resource_key so it rides idx_search_composite; the soft-delete keeps
+        // the resources row, so the subquery resolves.
         if !self.is_search_offloaded() {
             conn.execute(
-                "DELETE FROM search_index WHERE tenant_id = ?1 AND resource_type = ?2 AND resource_id = ?3",
+                "DELETE FROM search_index WHERE resource_key = (
+                     SELECT rowid FROM resources
+                      WHERE tenant_id = ?1 AND resource_type = ?2 AND id = ?3
+                 )",
                 params![tenant_id, resource_type, id],
             )
             .map_err(|e| internal_error(format!("Failed to delete search index: {}", e)))?;
@@ -1829,10 +1834,18 @@ impl SqliteBackend {
             return Ok(0);
         }
 
-        // Delete from main search index
+        // Delete from main search index, keyed on the integer `resource_key`
+        // so the delete rides `idx_search_composite` (rekeyed to resource_key
+        // in v30) instead of scanning the type. Every caller of this method
+        // deletes while the `resources` row still exists (update, re-index,
+        // soft-delete), so the subquery resolves; the purge path, which removes
+        // the `resources` row first, deletes by `resource_id` inline instead.
         let deleted = conn
             .prepare_cached(
-                "DELETE FROM search_index WHERE tenant_id = ?1 AND resource_type = ?2 AND resource_id = ?3",
+                "DELETE FROM search_index WHERE resource_key = (
+                     SELECT rowid FROM resources
+                      WHERE tenant_id = ?1 AND resource_type = ?2 AND id = ?3
+                 )",
             )
             .map_err(|e| internal_error(format!("Failed to prepare search index delete: {}", e)))?
             .execute(params![tenant_id, resource_type, resource_id])

@@ -911,7 +911,7 @@ impl QueryBuilder {
                     crate::types::SortDirection::Descending => "MAX",
                 };
                 format!(
-                    "(SELECT {}({}) FROM search_index si WHERE si.tenant_id = ?1 AND si.resource_type = ?2 AND si.resource_id = resources.id AND si.param_name = '{}')",
+                    "(SELECT {}({}) FROM search_index si WHERE si.tenant_id = ?1 AND si.resource_type = ?2 AND si.resource_key = resources.rowid AND si.param_name = '{}')",
                     agg, col, directive.parameter
                 )
             }
