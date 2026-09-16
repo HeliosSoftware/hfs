@@ -478,9 +478,6 @@ async fn set_schema_version(database: &Database, version: i32) -> StorageResult<
 
 /// The recorded `search_index` generation, `None` before the builder has
 /// ever completed on this database.
-///
-/// Its only caller lands in Task 4 (`SearchIndexBuilder`).
-#[allow(dead_code)]
 pub(super) async fn get_search_index_generation(database: &Database) -> StorageResult<Option<i32>> {
     let doc = database
         .collection::<Document>("schema_version")
@@ -494,9 +491,6 @@ pub(super) async fn get_search_index_generation(database: &Database) -> StorageR
 
 /// Records that every background spec of `generation` is present and the
 /// superseded indexes are gone.
-///
-/// Its only caller lands in Task 4 (`SearchIndexBuilder`).
-#[allow(dead_code)]
 pub(super) async fn set_search_index_generation(
     database: &Database,
     generation: i32,

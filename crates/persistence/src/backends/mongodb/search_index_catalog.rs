@@ -6,11 +6,6 @@
 //! changed keys: MongoDB refuses a different key spec under an existing name
 //! (`IndexKeySpecsConflict`, 86), which would fail every deployed boot.
 
-// This catalog is consumed by the schema bootstrap and the post-boot
-// `SearchIndexBuilder` added in later tasks of #1059/#1084; until that wiring
-// lands, every item here is only reachable from this module's own tests.
-#![allow(dead_code)]
-
 use mongodb::{
     IndexModel,
     bson::{Bson, Document, doc},
@@ -212,6 +207,9 @@ pub(crate) fn create_indexes_command(specs: &[&SearchIndexSpec]) -> Document {
 /// The operator script: the same `createIndexes` command as relaxed extended
 /// JSON, wrapped for `mongosh`. `docs/mongodb/*.mongosh.js` are generated
 /// from this and a unit test keeps them equal.
+// Only this module's tests call it (to check the checked-in mongosh scripts
+// are up to date); a normal build never generates the scripts at runtime.
+#[allow(dead_code)]
 pub(crate) fn mongosh_script(specs: &[SearchIndexSpec]) -> String {
     let refs: Vec<&SearchIndexSpec> = specs.iter().collect();
     let cmd = Bson::Document(create_indexes_command(&refs)).into_relaxed_extjson();

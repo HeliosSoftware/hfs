@@ -29,4 +29,4 @@ mod storage;
 mod user_settings;
 
 pub use backend::{MongoBackend, MongoBackendConfig};
-pub use search_index_builder::IndexBuildMode;
+pub use search_index_builder::{BuildOutcome, IndexBuildMode};

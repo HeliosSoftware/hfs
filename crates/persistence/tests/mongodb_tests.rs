@@ -18,7 +18,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use helios_fhir::FhirVersion;
-use helios_persistence::backends::mongodb::{IndexBuildMode, MongoBackend, MongoBackendConfig};
+use helios_persistence::backends::mongodb::{
+    BuildOutcome, IndexBuildMode, MongoBackend, MongoBackendConfig,
+};
 use helios_persistence::core::{
     Backend, BackendCapability, BackendKind, BundleEntry, BundleEntryEffect, BundleMethod,
     BundleProvider, BundleResult, ConditionalCreateResult, ConditionalDeleteResult,
@@ -10957,4 +10959,330 @@ async fn search_index_names(db: &mongodb::Database) -> Vec<String> {
         .collect();
     names.sort();
     names
+}
+
+/// The nine generation-1 value indexes, created the way pre-generation-2
+/// binaries created them, so a test can stage an "upgraded from v1" database.
+async fn seed_generation1_indexes(db: &mongodb::Database) {
+    let v1 = [
+        (
+            "idx_search_string",
+            doc! { "tenant_id": 1, "resource_type": 1, "param_name": 1, "value_string": 1 },
+        ),
+        (
+            "idx_search_token",
+            doc! { "tenant_id": 1, "resource_type": 1, "param_name": 1, "value_token_system": 1, "value_token_code": 1 },
+        ),
+        (
+            "idx_search_date",
+            doc! { "tenant_id": 1, "resource_type": 1, "param_name": 1, "value_date": 1 },
+        ),
+        (
+            "idx_search_number",
+            doc! { "tenant_id": 1, "resource_type": 1, "param_name": 1, "value_number": 1 },
+        ),
+        (
+            "idx_search_quantity",
+            doc! { "tenant_id": 1, "resource_type": 1, "param_name": 1, "value_quantity_value": 1, "value_quantity_unit": 1 },
+        ),
+        (
+            "idx_search_reference",
+            doc! { "tenant_id": 1, "resource_type": 1, "param_name": 1, "value_reference": 1 },
+        ),
+        (
+            "idx_search_uri",
+            doc! { "tenant_id": 1, "resource_type": 1, "param_name": 1, "value_uri": 1 },
+        ),
+        (
+            "idx_search_token_display",
+            doc! { "tenant_id": 1, "resource_type": 1, "param_name": 1, "value_token_display": 1 },
+        ),
+        (
+            "idx_search_identifier_type",
+            doc! { "tenant_id": 1, "resource_type": 1, "param_name": 1, "value_identifier_type_system": 1, "value_identifier_type_code": 1 },
+        ),
+    ];
+    let indexes: Vec<Document> = v1
+        .iter()
+        .map(|(name, key)| doc! { "key": key.clone(), "name": *name })
+        .collect();
+    db.run_command(doc! { "createIndexes": "search_index", "indexes": indexes })
+        .await
+        .expect("seed v1 indexes");
+}
+
+const GENERATION2_BACKGROUND_NAMES: [&str; 10] = [
+    "idx_search_contained",
+    "idx_search_date_v2",
+    "idx_search_identifier_type_v2",
+    "idx_search_number_v2",
+    "idx_search_quantity_v2",
+    "idx_search_reference_v2",
+    "idx_search_string_v2",
+    "idx_search_token_display_v2",
+    "idx_search_token_v2",
+    "idx_search_uri_v2",
+];
+
+fn expected_generation2_names() -> Vec<String> {
+    let mut all: Vec<String> = GENERATION2_BACKGROUND_NAMES
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    all.extend(["_id_", "idx_search_composite", "idx_search_resource"].map(String::from));
+    all.sort();
+    all
+}
+
+async fn boot_with_mode(
+    connection_string: &str,
+    database_name: &str,
+    mode: IndexBuildMode,
+) -> MongoBackend {
+    // Full registry (not just the minimal embedded fallback), so ordinary
+    // resource-level search parameters like `Patient.gender` are active for
+    // the builder tests that search after boot.
+    let data_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|p| p.parent())
+        .map(|p| p.join("data"));
+    let backend = MongoBackend::new(MongoBackendConfig {
+        connection_string: connection_string.to_string(),
+        database_name: database_name.to_string(),
+        index_build: mode,
+        max_connections: TEST_BACKEND_MAX_POOL,
+        data_dir,
+        ..Default::default()
+    })
+    .unwrap();
+    backend.initialize().await.expect("boot");
+    backend
+}
+
+#[tokio::test]
+async fn mongodb_integration_builder_fresh_database_ends_with_generation2_set() {
+    let Some(cs) = shared_mongo::connection_string().await else {
+        eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
+        return;
+    };
+    let db_name = build_test_database_name("builder_fresh");
+    let backend = boot_with_mode(&cs, &db_name, IndexBuildMode::Inline).await;
+    let outcome = backend
+        .wait_for_search_index_build()
+        .await
+        .expect("builder ran");
+    match outcome {
+        BuildOutcome::Built { created, dropped } => {
+            let mut created = created;
+            created.sort();
+            assert_eq!(
+                created,
+                GENERATION2_BACKGROUND_NAMES.map(String::from).to_vec()
+            );
+            assert!(
+                dropped.is_empty(),
+                "nothing to drop on a fresh database: {dropped:?}"
+            );
+        }
+        other => panic!("expected Built, got {other:?}"),
+    }
+    let db = raw_test_client(&cs).await.unwrap().database(&db_name);
+    assert_eq!(search_index_names(&db).await, expected_generation2_names());
+    let record = db
+        .collection::<Document>("schema_version")
+        .find_one(doc! { "_id": "schema_version" })
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        record
+            .get_document("search_indexes")
+            .unwrap()
+            .get_i32("generation"),
+        Ok(2)
+    );
+}
+
+#[tokio::test]
+async fn mongodb_integration_builder_upgrades_a_generation1_database_and_drops_v1() {
+    let Some(cs) = shared_mongo::connection_string().await else {
+        eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
+        return;
+    };
+    let db_name = build_test_database_name("builder_upgrade");
+    let db = raw_test_client(&cs).await.unwrap().database(&db_name);
+    seed_generation1_indexes(&db).await;
+    // Some data, so the build has rows to index.
+    let staged = boot_with_mode(&cs, &db_name, IndexBuildMode::Off).await;
+    let tenant = create_tenant("tenant-builder");
+    for i in 0..5 {
+        staged
+            .create(
+                &tenant,
+                "Patient",
+                json!({ "resourceType": "Patient", "id": format!("p{i}"), "gender": "female" }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+    }
+    let backend = boot_with_mode(&cs, &db_name, IndexBuildMode::Inline).await;
+    let outcome = backend
+        .wait_for_search_index_build()
+        .await
+        .expect("builder ran");
+    let BuildOutcome::Built { dropped, .. } = outcome else {
+        panic!("expected Built, got {outcome:?}")
+    };
+    let mut dropped = dropped;
+    dropped.sort();
+    assert_eq!(
+        dropped,
+        vec![
+            "idx_search_date",
+            "idx_search_identifier_type",
+            "idx_search_number",
+            "idx_search_quantity",
+            "idx_search_reference",
+            "idx_search_string",
+            "idx_search_token",
+            "idx_search_token_display",
+            "idx_search_uri",
+        ]
+    );
+    assert_eq!(search_index_names(&db).await, expected_generation2_names());
+    // Data still searchable on the new indexes.
+    let q = SearchQuery::new("Patient").with_parameter(SearchParameter {
+        name: "gender".into(),
+        param_type: SearchParamType::Token,
+        modifier: None,
+        values: vec![SearchValue::eq("female")],
+        chain: vec![],
+        components: vec![],
+    });
+    assert_eq!(
+        backend
+            .search(&tenant, &q)
+            .await
+            .unwrap()
+            .resources
+            .items
+            .len(),
+        5
+    );
+}
+
+#[tokio::test]
+async fn mongodb_integration_builder_refuses_to_touch_a_conflicting_v2_name() {
+    let Some(cs) = shared_mongo::connection_string().await else {
+        eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
+        return;
+    };
+    let db_name = build_test_database_name("builder_conflict");
+    let db = raw_test_client(&cs).await.unwrap().database(&db_name);
+    seed_generation1_indexes(&db).await;
+    // A person built something under our name with different keys.
+    db.run_command(doc! { "createIndexes": "search_index", "indexes": [
+        { "key": { "tenant_id": 1, "value_date": 1 }, "name": "idx_search_date_v2" }
+    ]})
+    .await
+    .unwrap();
+    // In `inline` mode a failed build fails boot, so the conflict surfaces as
+    // the initialize() error rather than through wait_for_search_index_build.
+    let backend = MongoBackend::new(MongoBackendConfig {
+        connection_string: cs.clone(),
+        database_name: db_name.clone(),
+        index_build: IndexBuildMode::Inline,
+        max_connections: TEST_BACKEND_MAX_POOL,
+        ..Default::default()
+    })
+    .unwrap();
+    let err = backend
+        .initialize()
+        .await
+        .expect_err("a conflicting v2 index must fail inline boot");
+    let message = format!("{err}");
+    assert!(message.contains("idx_search_date_v2"), "{message}");
+    let names = search_index_names(&db).await;
+    assert!(
+        names.contains(&"idx_search_string".to_string()),
+        "v1 must be untouched: {names:?}"
+    );
+    assert!(
+        !names.contains(&"idx_search_string_v2".to_string()),
+        "nothing must be built: {names:?}"
+    );
+}
+
+#[tokio::test]
+async fn mongodb_integration_builder_off_mode_warns_and_changes_nothing() {
+    let Some(cs) = shared_mongo::connection_string().await else {
+        eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
+        return;
+    };
+    let db_name = build_test_database_name("builder_off");
+    let db = raw_test_client(&cs).await.unwrap().database(&db_name);
+    seed_generation1_indexes(&db).await;
+    let before = search_index_names(&db).await;
+    let backend = boot_with_mode(&cs, &db_name, IndexBuildMode::Off).await;
+    let outcome = backend
+        .wait_for_search_index_build()
+        .await
+        .expect("builder ran");
+    let BuildOutcome::Skipped { missing } = outcome else {
+        panic!("expected Skipped, got {outcome:?}")
+    };
+    let mut missing = missing;
+    missing.sort();
+    assert_eq!(
+        missing,
+        GENERATION2_BACKGROUND_NAMES.map(String::from).to_vec()
+    );
+    // `off` mode changes nothing about the background (generation-2/v1)
+    // indexes the builder is responsible for; the two inline-class specs
+    // (`idx_search_composite`, `idx_search_resource`) are still created by
+    // `initialize_schema_async` on every boot regardless of build mode (Task 3).
+    let mut expected = before;
+    expected.extend([
+        "idx_search_composite".to_string(),
+        "idx_search_resource".to_string(),
+    ]);
+    expected.sort();
+    assert_eq!(search_index_names(&db).await, expected);
+}
+
+#[tokio::test]
+async fn mongodb_integration_builder_second_boot_issues_no_create_indexes() {
+    let Some(cs) = shared_mongo::connection_string().await else {
+        eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
+        return;
+    };
+    let db_name = build_test_database_name("builder_second_boot");
+    let first = boot_with_mode(&cs, &db_name, IndexBuildMode::Inline).await;
+    assert!(matches!(
+        first.wait_for_search_index_build().await,
+        Some(BuildOutcome::Built { .. })
+    ));
+    let db = raw_test_client(&cs).await.unwrap().database(&db_name);
+    // Profile every command, boot again, then look for createIndexes.
+    if db.run_command(doc! { "profile": 2_i32 }).await.is_err() {
+        eprintln!("Skipping second-boot assertion: profiling not permitted");
+        return;
+    }
+    let second = boot_with_mode(&cs, &db_name, IndexBuildMode::Inline).await;
+    let outcome = second
+        .wait_for_search_index_build()
+        .await
+        .expect("builder ran");
+    let _ = db.run_command(doc! { "profile": 0_i32 }).await;
+    assert_eq!(outcome, BuildOutcome::UpToDate);
+    let created = db
+        .collection::<Document>("system.profile")
+        .count_documents(doc! { "command.createIndexes": "search_index" })
+        .await
+        .unwrap();
+    assert_eq!(
+        created, 0,
+        "second boot must not issue createIndexes on search_index"
+    );
 }

@@ -13,7 +13,7 @@ use tokio::sync::OnceCell;
 
 use helios_fhir::FhirVersion;
 
-use super::search_index_builder::IndexBuildMode;
+use super::search_index_builder::{BuildOutcome, IndexBuildMode, SearchIndexBuilder};
 use crate::core::{Backend, BackendCapability, BackendKind};
 use crate::error::{BackendError, StorageError, StorageResult};
 use crate::search::{
@@ -69,6 +69,14 @@ pub(crate) async fn connect_client(config: &MongoBackendConfig) -> StorageResult
 /// connection silently dropped by a NAT/firewall is never handed to a request.
 const MAX_CONNECTION_IDLE_TIME: Duration = Duration::from_secs(60);
 
+/// Where the post-boot search_index build is, for `wait_for_search_index_build`.
+#[derive(Debug)]
+enum SearchIndexBuildState {
+    NotStarted,
+    Running(tokio::task::JoinHandle<BuildOutcome>),
+    Done(BuildOutcome),
+}
+
 /// MongoDB backend for FHIR resource storage.
 ///
 /// The Phase 4 implementation provides backend wiring, schema bootstrap,
@@ -88,6 +96,8 @@ pub struct MongoBackend {
     registries: Arc<TenantSearchRegistries>,
     /// Sync cache of each tenant's stored params, read by the registry loader.
     stored_by_tenant: StoredByTenant,
+    /// Post-boot generation-2 index build, spawned by `init_schema`.
+    search_index_build: Arc<tokio::sync::Mutex<SearchIndexBuildState>>,
 }
 
 impl Debug for MongoBackend {
@@ -294,6 +304,9 @@ impl MongoBackend {
             client: Arc::new(OnceCell::new()),
             registries,
             stored_by_tenant,
+            search_index_build: Arc::new(tokio::sync::Mutex::new(
+                SearchIndexBuildState::NotStarted,
+            )),
         })
     }
 
@@ -486,13 +499,68 @@ impl MongoBackend {
     }
 
     /// Initializes the MongoDB schema/index bootstrap for this backend.
+    ///
+    /// Inline-class indexes are created before this returns. The
+    /// generation-2 `search_index` indexes are built by `SearchIndexBuilder`:
+    /// spawned and left running in `background` mode, awaited in `inline`
+    /// mode, and only inspected in `off` mode (see `IndexBuildMode`).
     pub async fn init_schema(&self) -> StorageResult<()> {
         let db = self.get_database().await?;
         schema::initialize_schema_async(&db).await?;
+
+        let builder = SearchIndexBuilder::new(db.clone(), self.config.index_build);
+        let handle = tokio::spawn(builder.run());
+        match self.config.index_build {
+            IndexBuildMode::Inline => {
+                let outcome = handle.await.map_err(|e| {
+                    StorageError::Backend(BackendError::Internal {
+                        backend_name: "mongodb".to_string(),
+                        message: format!("search_index build task panicked: {e}"),
+                        source: None,
+                    })
+                })?;
+                if let BuildOutcome::Failed { message } = &outcome {
+                    return Err(StorageError::Backend(BackendError::Internal {
+                        backend_name: "mongodb".to_string(),
+                        message: message.clone(),
+                        source: None,
+                    }));
+                }
+                *self.search_index_build.lock().await = SearchIndexBuildState::Done(outcome);
+            }
+            IndexBuildMode::Background | IndexBuildMode::Off => {
+                *self.search_index_build.lock().await = SearchIndexBuildState::Running(handle);
+            }
+        }
+
         // Populate the per-tenant stored-param cache so the registries can build
         // each tenant's overlay lazily.
         self.reload_stored_cache().await?;
         Ok(())
+    }
+
+    /// Waits for the post-boot `search_index` build started by `init_schema`
+    /// and returns its outcome; `None` if `init_schema` has not run. Safe to
+    /// call repeatedly: the outcome is kept.
+    pub async fn wait_for_search_index_build(&self) -> Option<BuildOutcome> {
+        let mut state = self.search_index_build.lock().await;
+        match std::mem::replace(&mut *state, SearchIndexBuildState::NotStarted) {
+            SearchIndexBuildState::NotStarted => None,
+            SearchIndexBuildState::Done(outcome) => {
+                *state = SearchIndexBuildState::Done(outcome.clone());
+                Some(outcome)
+            }
+            SearchIndexBuildState::Running(handle) => {
+                let outcome = match handle.await {
+                    Ok(outcome) => outcome,
+                    Err(e) => BuildOutcome::Failed {
+                        message: format!("search_index build task panicked: {e}"),
+                    },
+                };
+                *state = SearchIndexBuildState::Done(outcome.clone());
+                Some(outcome)
+            }
+        }
     }
 
     /// Reloads every tenant's stored active SearchParameters into the sync
