@@ -44,12 +44,6 @@ pub const GIT_SHA_EXTENSION_URL: &str =
 
 /// The git commit the build was cut from, when the build script could
 /// determine one.
-///
-/// `GIT_SHA_RAW` is a build-time constant, so on a build where the script
-/// found no commit clippy sees `"".is_empty()` and reports the check as
-/// always-false (`const_is_empty`). The emptiness genuinely varies per
-/// build, so the check stays.
-#[allow(clippy::const_is_empty)]
 pub fn git_sha() -> Option<&'static str> {
     // `build.rs` never emits an empty value, but the variable can also come
     // straight from the build environment, so an empty one still means
