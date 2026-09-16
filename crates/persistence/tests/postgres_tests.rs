@@ -1897,6 +1897,450 @@ mod postgres_integration {
         .await;
     }
 
+    /// #1144: `list_manifests` returns every manifest of the requested scope,
+    /// with the same fields and conversions as `get_manifest`, from one query
+    /// and one connection checkout. The previous shape held the id query's
+    /// client while calling `get_manifest` per row, so on a one-connection
+    /// pool the list stalled until the pool wait timed out.
+    #[tokio::test]
+    async fn postgres_list_manifests_uses_one_connection_and_preserves_scope_order_and_values() {
+        use chrono::SubsecRound;
+        use helios_persistence::core::{
+            BulkSubmitProvider, ManifestPhase, ManifestStatus, SubmissionId,
+        };
+
+        let _guard = BULK_SUBMIT_TEST_LOCK.lock().await;
+        // A pool of one: the list must fit in a single checkout. The shared
+        // container already ran `init_schema`; this backend must not.
+        let backend = create_backend_with_max_connections(1).await;
+        let tenant = create_tenant("list-manifests-one-query");
+        let submission = SubmissionId::new("list-manifests-submitter", "list-manifests-submission");
+        let tenant_id = tenant.tenant_id().as_str();
+
+        // Scope neighbours sharing one identifier each with the target scope:
+        // the same submitter and submission under another tenant, another
+        // submitter under this tenant, and another submission of this
+        // submitter.
+        let other_tenant = create_tenant("list-manifests-one-query-neighbour");
+        let other_submitter = SubmissionId::new(
+            "list-manifests-other-submitter",
+            "list-manifests-submission",
+        );
+        let other_submission = SubmissionId::new(
+            "list-manifests-submitter",
+            "list-manifests-other-submission",
+        );
+        for (neighbour_tenant, neighbour_submission) in [
+            (&other_tenant, &submission),
+            (&tenant, &other_submitter),
+            (&tenant, &other_submission),
+        ] {
+            backend
+                .create_submission(neighbour_tenant, neighbour_submission, None)
+                .await
+                .unwrap();
+            backend
+                .add_manifest(
+                    neighbour_tenant,
+                    neighbour_submission,
+                    Some("https://provider/neighbour.json"),
+                    None,
+                )
+                .await
+                .unwrap();
+            // The neighbour rows only have to prove the scope filters, so
+            // finish them right away: a `pending` manifest left in a scope
+            // that can be claimed again would contaminate later claim tests
+            // once this test releases the lock.
+            assert_eq!(
+                backend
+                    .abort_submission(neighbour_tenant, neighbour_submission, "test cleanup")
+                    .await
+                    .unwrap(),
+                1,
+                "the neighbour manifest must end terminal"
+            );
+        }
+
+        // Empty scope.
+        let listed = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            backend.list_manifests(&tenant, &submission),
+        )
+        .await
+        .expect("an empty scope must not stall a one-connection pool")
+        .unwrap();
+        assert!(listed.is_empty());
+
+        backend
+            .create_submission(&tenant, &submission, None)
+            .await
+            .unwrap();
+
+        // One manifest with every field set.
+        let one = backend
+            .add_manifest(
+                &tenant,
+                &submission,
+                Some("https://provider/one.json"),
+                None,
+            )
+            .await
+            .unwrap();
+        // Postgres `TIMESTAMPTZ` keeps microseconds, so pin every expectation
+        // at that precision instead of comparing against the nanosecond clock.
+        let base = chrono::Utc::now().trunc_subsecs(6);
+        let one_added_at = base + chrono::Duration::seconds(30);
+        let one_lease_expiry = base + chrono::Duration::seconds(120);
+        {
+            let client = backend.get_client().await.unwrap();
+            client
+                .execute(
+                    "UPDATE bulk_manifests
+                     SET manifest_url = $5, replaces_manifest_url = $6, status = $7, added_at = $8,
+                         total_entries = $9, processed_entries = $10, failed_entries = $11,
+                         lease_expiry = $12, bytes_processed = $13, bytes_total = $14,
+                         phase = $15, files_done = $16, files_total = $17
+                     WHERE tenant_id = $1 AND submitter = $2 AND submission_id = $3 AND manifest_id = $4",
+                    &[
+                        &tenant_id,
+                        &submission.submitter,
+                        &submission.submission_id,
+                        &one.manifest_id,
+                        &Some("https://provider/one.json"),
+                        &Some("https://provider/replaced.json"),
+                        &"processing",
+                        &one_added_at,
+                        &7_i32,
+                        &5_i32,
+                        &2_i32,
+                        &Some(one_lease_expiry),
+                        &512_i64,
+                        &4096_i64,
+                        &Some("downloading"),
+                        &1_i64,
+                        &3_i64,
+                    ],
+                )
+                .await
+                .unwrap();
+        }
+
+        let listed = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            backend.list_manifests(&tenant, &submission),
+        )
+        .await
+        .expect("one manifest must not stall a one-connection pool")
+        .unwrap();
+        assert_eq!(
+            listed.len(),
+            1,
+            "only the target scope's manifests are listed"
+        );
+        let manifest = &listed[0];
+        assert_eq!(manifest.manifest_id, one.manifest_id);
+        assert_eq!(
+            manifest.manifest_url.as_deref(),
+            Some("https://provider/one.json")
+        );
+        assert_eq!(
+            manifest.replaces_manifest_url.as_deref(),
+            Some("https://provider/replaced.json")
+        );
+        assert_eq!(manifest.status, ManifestStatus::Processing);
+        assert_eq!(manifest.added_at, one_added_at);
+        assert_eq!(manifest.total_entries, 7);
+        assert_eq!(manifest.processed_entries, 5);
+        assert_eq!(manifest.failed_entries, 2);
+        assert_eq!(manifest.lease_expiry, Some(one_lease_expiry));
+        assert_eq!(manifest.bytes_processed, 512);
+        assert_eq!(manifest.bytes_total, 4096);
+        assert_eq!(manifest.phase, Some(ManifestPhase::Downloading));
+        assert_eq!(manifest.files_done, 1);
+        assert_eq!(manifest.files_total, 3);
+
+        // Several manifests, with timestamps whose order is not insertion
+        // order, plus the conversion edges: i32 totals sign-extend, byte and
+        // file counts clamp at zero.
+        let middle = backend
+            .add_manifest(
+                &tenant,
+                &submission,
+                None,
+                Some("https://provider/old.json"),
+            )
+            .await
+            .unwrap();
+        let negative = backend
+            .add_manifest(
+                &tenant,
+                &submission,
+                Some("https://provider/negative.json"),
+                None,
+            )
+            .await
+            .unwrap();
+        let middle_added_at = base + chrono::Duration::seconds(20);
+        let negative_added_at = base + chrono::Duration::seconds(10);
+        let middle_lease_expiry = base + chrono::Duration::seconds(60);
+        {
+            let client = backend.get_client().await.unwrap();
+            client
+                .execute(
+                    "UPDATE bulk_manifests
+                     SET manifest_url = NULL, status = $5, added_at = $6, total_entries = $7,
+                         processed_entries = $8, failed_entries = $9, lease_expiry = $10,
+                         bytes_total = $11, phase = $12, files_total = $13
+                     WHERE tenant_id = $1 AND submitter = $2 AND submission_id = $3 AND manifest_id = $4",
+                    &[
+                        &tenant_id,
+                        &submission.submitter,
+                        &submission.submission_id,
+                        &middle.manifest_id,
+                        &"failed",
+                        &middle_added_at,
+                        &0_i32,
+                        &0_i32,
+                        &1_i32,
+                        &Some(middle_lease_expiry),
+                        &-1_i64,
+                        &Some("sizing"),
+                        &2_i64,
+                    ],
+                )
+                .await
+                .unwrap();
+            client
+                .execute(
+                    "UPDATE bulk_manifests
+                     SET replaces_manifest_url = NULL, status = $5, added_at = $6,
+                         total_entries = $7, processed_entries = $8, failed_entries = $9,
+                         lease_expiry = NULL, bytes_processed = $10, bytes_total = $11,
+                         phase = $12, files_done = $13, files_total = $14
+                     WHERE tenant_id = $1 AND submitter = $2 AND submission_id = $3 AND manifest_id = $4",
+                    &[
+                        &tenant_id,
+                        &submission.submitter,
+                        &submission.submission_id,
+                        &negative.manifest_id,
+                        &"replaced",
+                        &negative_added_at,
+                        &-1_i32,
+                        &-2_i32,
+                        &0_i32,
+                        &-5_i64,
+                        &0_i64,
+                        &None::<String>,
+                        &-3_i64,
+                        &-4_i64,
+                    ],
+                )
+                .await
+                .unwrap();
+        }
+
+        let listed = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            backend.list_manifests(&tenant, &submission),
+        )
+        .await
+        .expect("several manifests must not stall a one-connection pool")
+        .unwrap();
+        let ids: Vec<&str> = listed.iter().map(|m| m.manifest_id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec![
+                negative.manifest_id.as_str(),
+                middle.manifest_id.as_str(),
+                one.manifest_id.as_str(),
+            ],
+            "ORDER BY added_at, not insertion order"
+        );
+
+        let negative_row = &listed[0];
+        assert_eq!(
+            negative_row.manifest_url.as_deref(),
+            Some("https://provider/negative.json")
+        );
+        assert_eq!(negative_row.replaces_manifest_url, None);
+        assert_eq!(negative_row.status, ManifestStatus::Replaced);
+        assert_eq!(negative_row.added_at, negative_added_at);
+        assert_eq!(
+            negative_row.total_entries,
+            u64::MAX,
+            "-1i32 as u64 sign-extends, exactly as get_manifest converts it"
+        );
+        assert_eq!(negative_row.processed_entries, u64::MAX - 1);
+        assert_eq!(negative_row.failed_entries, 0);
+        assert_eq!(negative_row.lease_expiry, None);
+        assert_eq!(
+            negative_row.bytes_processed, 0,
+            "negative byte counts clamp to zero"
+        );
+        assert_eq!(negative_row.bytes_total, 0);
+        assert_eq!(negative_row.phase, None);
+        assert_eq!(negative_row.files_done, 0);
+        assert_eq!(negative_row.files_total, 0);
+
+        let middle_row = &listed[1];
+        assert_eq!(middle_row.manifest_url, None);
+        assert_eq!(
+            middle_row.replaces_manifest_url.as_deref(),
+            Some("https://provider/old.json")
+        );
+        assert_eq!(middle_row.status, ManifestStatus::Failed);
+        assert_eq!(middle_row.added_at, middle_added_at);
+        assert_eq!(middle_row.failed_entries, 1);
+        assert_eq!(middle_row.lease_expiry, Some(middle_lease_expiry));
+        assert_eq!(middle_row.bytes_total, 0, "a -1 byte total clamps to zero");
+        assert_eq!(middle_row.phase, Some(ManifestPhase::Sizing));
+        assert_eq!(middle_row.files_total, 2);
+
+        // Every listed row must decode exactly like a sequential read taken
+        // after the list has finished.
+        for listed_manifest in &listed {
+            let sequential = backend
+                .get_manifest(&tenant, &submission, &listed_manifest.manifest_id)
+                .await
+                .unwrap()
+                .expect("every listed manifest is individually readable");
+            assert_eq!(
+                serde_json::to_value(listed_manifest).unwrap(),
+                serde_json::to_value(&sequential).unwrap(),
+                "list_manifests decoded {} differently from get_manifest",
+                listed_manifest.manifest_id
+            );
+        }
+
+        // Leave no unleased `processing` row for a later claim test to pick up.
+        assert_eq!(
+            backend
+                .abort_submission(&tenant, &submission, "test cleanup")
+                .await
+                .unwrap(),
+            1
+        );
+    }
+
+    /// #1144: the row decoder keeps the per-field semantics `get_manifest`
+    /// always had — an unknown `phase` degrades to `None` because it is a
+    /// cosmetic hint (#953), while an unknown `status` stays an error.
+    #[tokio::test]
+    async fn postgres_list_manifests_preserves_unknown_status_and_phase_semantics() {
+        use helios_persistence::core::{BulkSubmitProvider, ManifestStatus, SubmissionId};
+
+        fn internal_message(error: &StorageError) -> &str {
+            match error {
+                StorageError::Backend(BackendError::Internal { message, .. }) => message,
+                other => panic!("expected an internal backend error, got {other:?}"),
+            }
+        }
+
+        let _guard = BULK_SUBMIT_TEST_LOCK.lock().await;
+        let backend = create_backend_with_max_connections(1).await;
+        let tenant = create_tenant("list-manifests-unknown-values");
+        let submission = SubmissionId::new(
+            "list-manifests-unknown",
+            "list-manifests-unknown-submission",
+        );
+        let tenant_id = tenant.tenant_id().as_str();
+
+        backend
+            .create_submission(&tenant, &submission, None)
+            .await
+            .unwrap();
+        let manifest = backend
+            .add_manifest(
+                &tenant,
+                &submission,
+                Some("https://provider/unknown-phase.json"),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // A hand-edited phase from a newer HFS must not fail the read.
+        {
+            let client = backend.get_client().await.unwrap();
+            client
+                .execute(
+                    "UPDATE bulk_manifests SET status = 'processing', phase = 'hand-edited-phase'
+                     WHERE tenant_id = $1 AND submitter = $2 AND submission_id = $3 AND manifest_id = $4",
+                    &[
+                        &tenant_id,
+                        &submission.submitter,
+                        &submission.submission_id,
+                        &manifest.manifest_id,
+                    ],
+                )
+                .await
+                .unwrap();
+        }
+
+        let listed = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            backend.list_manifests(&tenant, &submission),
+        )
+        .await
+        .expect("an unknown phase must not stall the list")
+        .unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].status, ManifestStatus::Processing);
+        assert_eq!(
+            listed[0].phase, None,
+            "an unknown phase degrades to no phase"
+        );
+        assert_eq!(
+            backend
+                .get_manifest(&tenant, &submission, &manifest.manifest_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .phase,
+            None,
+            "list_manifests and get_manifest agree on an unknown phase"
+        );
+
+        // An unreadable status stays an error: a corrupt row must not turn
+        // into a listed manifest.
+        {
+            let client = backend.get_client().await.unwrap();
+            client
+                .execute(
+                    "UPDATE bulk_manifests SET status = 'frozen'
+                     WHERE tenant_id = $1 AND submitter = $2 AND submission_id = $3 AND manifest_id = $4",
+                    &[
+                        &tenant_id,
+                        &submission.submitter,
+                        &submission.submission_id,
+                        &manifest.manifest_id,
+                    ],
+                )
+                .await
+                .unwrap();
+        }
+
+        let list_error = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            backend.list_manifests(&tenant, &submission),
+        )
+        .await
+        .expect("an unknown status must fail the list, not stall it")
+        .unwrap_err();
+        let get_error = backend
+            .get_manifest(&tenant, &submission, &manifest.manifest_id)
+            .await
+            .unwrap_err();
+        for error in [&list_error, &get_error] {
+            assert_eq!(
+                internal_message(error),
+                "Invalid manifest status: frozen",
+                "the status error must be reported verbatim by both reads"
+            );
+        }
+    }
+
     /// Shared PostgreSQL container reused across all tests in this module.
     struct SharedPg {
         host: String,
