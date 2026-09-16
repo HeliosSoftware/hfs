@@ -10,7 +10,7 @@ use crate::core::bulk_submit_legacy::{
 use crate::error::StorageResult;
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 29;
+pub const SCHEMA_VERSION: i32 = 30;
 
 /// The `search_index` value indexes. Excludes `idx_search_composite`, which the
 /// delete-by-resource path needs at all times, and `idx_search_token_display`,
@@ -440,6 +440,7 @@ fn migrate_schema(conn: &Connection, from_version: i32) -> StorageResult<()> {
             26 => migrate_v26_to_v27(conn)?,
             27 => migrate_v27_to_v28(conn)?,
             28 => migrate_v28_to_v29(conn)?,
+            29 => migrate_v29_to_v30(conn)?,
             _ => {
                 return Err(crate::error::StorageError::Backend(
                     crate::error::BackendError::Internal {
@@ -1358,12 +1359,12 @@ fn migrate_v9_to_v10(conn: &Connection) -> StorageResult<()> {
 /// scan to the parameter's rows. That is a better plan than the old one,
 /// which for the reference, token-display and uri shapes was already a
 /// type-wide walk of `idx_search_composite`, folded index or not.
-/// v29: `bulk_manifests.index_pending` — a manifest whose resources were
+/// v30: `bulk_manifests.index_pending` — a manifest whose resources were
 /// ingested with indexing deferred owes a search-index rebuild. Set in the same
 /// transaction that publishes the manifest, cleared when the rebuild finishes,
 /// so a restart mid-rebuild can find the outstanding work instead of losing it
 /// with the in-process job map (#1125).
-fn migrate_v28_to_v29(conn: &Connection) -> StorageResult<()> {
+fn migrate_v29_to_v30(conn: &Connection) -> StorageResult<()> {
     let has_column = conn
         .prepare("SELECT 1 FROM pragma_table_info('bulk_manifests') WHERE name = 'index_pending'")
         .and_then(|mut stmt| stmt.exists([]))
@@ -1373,7 +1374,7 @@ fn migrate_v28_to_v29(conn: &Connection) -> StorageResult<()> {
             "ALTER TABLE bulk_manifests ADD COLUMN index_pending INTEGER NOT NULL DEFAULT 0",
             [],
         )
-        .map_err(|e| migration_err(format!("v29 index_pending column: {e}")))?;
+        .map_err(|e| migration_err(format!("v30 index_pending column: {e}")))?;
     }
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_bulk_manifests_index_pending
@@ -1381,7 +1382,7 @@ fn migrate_v28_to_v29(conn: &Connection) -> StorageResult<()> {
          WHERE index_pending = 1",
         [],
     )
-    .map_err(|e| migration_err(format!("v29 index_pending index: {e}")))?;
+    .map_err(|e| migration_err(format!("v30 index_pending index: {e}")))?;
     Ok(())
 }
 

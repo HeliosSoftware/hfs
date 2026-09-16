@@ -243,6 +243,11 @@ impl I18n {
     /// Three named placeables — the shape a message needs when one value
     /// selects the plural form and another carries its localized rendering
     /// (`{ $errors -> [one] … *[other] { $count } … }`, #1125).
+    ///
+    /// Three `(name, value)` pairs are six parameters by construction, like
+    /// [`Self::t_arg2`] above; they are not an argument list that wants
+    /// grouping into a struct.
+    #[allow(clippy::too_many_arguments)]
     pub fn t_arg3(
         &self,
         key: &str,

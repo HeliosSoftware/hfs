@@ -1503,7 +1503,7 @@ resource). A SQLite row `fetch_resources_page` cannot parse is reported as a
 per-resource error and no longer ends the rebuild of its type.
 
 A manifest ingested with indexing deferred records that it still owes a
-rebuild, in `bulk_manifests.index_pending` (SQLite schema v29), inside the
+rebuild, in `bulk_manifests.index_pending` (SQLite schema v30), inside the
 transaction that publishes it. `SubmitWorkerStorage::list_manifests_awaiting_reindex`
 is what a restarted server scans to re-fire those rebuilds, and the marker is
 cleared once a generation finishes; backends that do not implement the three

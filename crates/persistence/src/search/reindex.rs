@@ -796,6 +796,19 @@ pub trait DeferredReindexLedger: Send + Sync {
     async fn rebuild_finished(&self, tenant: &TenantContext, manifest_id: &str);
 }
 
+/// What [`AutomaticReindexCoordinator::enqueue`] needs to start, or merge
+/// into, a tenant's pending generation.
+struct EnqueueGeneration {
+    op: Arc<ReindexOperation>,
+    tenant: TenantContext,
+    resource_types: Vec<String>,
+    context: DeferredReindexContext,
+    options: AutomaticRunOptions,
+    max_concurrency: usize,
+    /// Where the "still owes a rebuild" marker is cleared (#1125).
+    ledger: Option<Arc<dyn DeferredReindexLedger>>,
+}
+
 /// Shape of the `ReindexRequest` an automatic generation starts with.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct AutomaticRunOptions {
@@ -1456,16 +1469,16 @@ impl AutomaticReindexCoordinator {
         limits.clone()
     }
 
-    async fn enqueue(
-        self: Arc<Self>,
-        op: Arc<ReindexOperation>,
-        tenant: TenantContext,
-        resource_types: Vec<String>,
-        context: DeferredReindexContext,
-        options: AutomaticRunOptions,
-        max_concurrency: usize,
-        ledger: Option<Arc<dyn DeferredReindexLedger>>,
-    ) {
+    async fn enqueue(self: Arc<Self>, request: EnqueueGeneration) {
+        let EnqueueGeneration {
+            op,
+            tenant,
+            resource_types,
+            context,
+            options,
+            max_concurrency,
+            ledger,
+        } = request;
         let requested_types: BTreeSet<_> = resource_types.into_iter().collect();
         if requested_types.is_empty() {
             return;
@@ -2327,15 +2340,15 @@ impl ReindexOnFinish {
         self.op
             .automatic
             .clone()
-            .enqueue(
-                self.op.clone(),
-                tenant.clone(),
+            .enqueue(EnqueueGeneration {
+                op: self.op.clone(),
+                tenant: tenant.clone(),
                 resource_types,
                 context,
-                self.options,
-                self.max_concurrency,
-                self.ledger.clone(),
-            )
+                options: self.options,
+                max_concurrency: self.max_concurrency,
+                ledger: self.ledger.clone(),
+            })
             .await;
     }
 }
