@@ -1947,6 +1947,34 @@ async fn write_resource_batch(
     }
 }
 
+/// How long the driver stands back between two page writes.
+///
+/// Pages are written back-to-back, and on the SQLite backend each one is an
+/// `IMMEDIATE` transaction: without a gap the rebuild re-takes the write lock
+/// before any foreground writer that is parked on it gets to run, so a single
+/// small insert can wait out the whole `busy_timeout` and fail with "database
+/// is locked" (#1185). See [`DEFERRED_REINDEX_BATCH_SIZE`] for the other half
+/// of this trade-off — page size sets how long each lock hold lasts, this sets
+/// how long the gap between them is.
+///
+/// Milliseconds, not microseconds: SQLite's busy handler backs off on a
+/// millisecond granularity, so a shorter window would close again before a
+/// waiting writer is retried. At the deferred page size of 1,000 resources a
+/// page takes roughly half a second to write, so this costs about 1% of the
+/// rebuild's wall clock.
+const REINDEX_PAGE_YIELD: Duration = Duration::from_millis(5);
+
+/// Yields the runtime and the storage write lock between two page writes.
+///
+/// [`tokio::task::yield_now`] alone only returns the tokio worker to the
+/// scheduler; the SQLite write lock is released by the `COMMIT` that already
+/// happened, so what a parked foreground writer actually needs is wall-clock
+/// time in which this task is not asking for the lock again. Hence the sleep.
+async fn yield_between_pages() {
+    tokio::task::yield_now().await;
+    tokio::time::sleep(REINDEX_PAGE_YIELD).await;
+}
+
 /// Drives a reindex job to completion in the background.
 ///
 /// Reads resources from `source` and rewrites the search entries for each one
@@ -2105,9 +2133,18 @@ async fn run_reindex(
                 .as_ref()
                 .and_then(|named| named.get(resource_type))
             {
-                for batch in ids.chunks(request.batch_size.max(1) as usize) {
+                for (batch_index, batch) in
+                    ids.chunks(request.batch_size.max(1) as usize).enumerate()
+                {
                     if cancel_rx.try_recv().is_ok() {
                         return Err(RunExit::Cancelled);
+                    }
+                    // Between two batches only, never before the first or
+                    // after the last: the gap exists to let a foreground
+                    // writer take the lock, and there is nothing to yield to
+                    // once this run has stopped writing.
+                    if batch_index > 0 {
+                        yield_between_pages().await;
                     }
                     let fetch_span = crate::perf::span(crate::perf::Phase::ReindexFetch);
                     let fetched = source
@@ -2193,7 +2230,13 @@ async fn run_reindex(
 
                 // Check if there are more pages
                 match page.next_cursor {
-                    Some(next) => cursor = Some(next),
+                    Some(next) => {
+                        cursor = Some(next);
+                        // Stand back before re-taking the write lock for the
+                        // next page. Only between pages: the last page has no
+                        // successor to hold the lock against.
+                        yield_between_pages().await;
+                    }
                     None => break,
                 }
             }
@@ -3803,6 +3846,101 @@ mod tests {
                 .is_empty()
         );
         assert_eq!(source.pages.load(Ordering::SeqCst), 0);
+    }
+
+    /// A source holding `Patient/p0..p{n}` that pages by position and records
+    /// when each page was served, so a test can measure the gap the driver
+    /// leaves between two page writes.
+    struct TimedPageSource {
+        ids: Vec<String>,
+        fetched_at: parking_lot::Mutex<Vec<Instant>>,
+    }
+
+    impl TimedPageSource {
+        fn new(n: usize) -> Self {
+            Self {
+                ids: (0..n).map(|i| format!("p{i}")).collect(),
+                fetched_at: parking_lot::Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ReindexSource for TimedPageSource {
+        async fn list_resource_types(&self, _: &TenantContext) -> StorageResult<Vec<String>> {
+            Ok(vec!["Patient".to_string()])
+        }
+
+        async fn count_resources(&self, _: &TenantContext, _: &str) -> StorageResult<u64> {
+            Ok(self.ids.len() as u64)
+        }
+
+        async fn fetch_resources_page(
+            &self,
+            tenant: &TenantContext,
+            resource_type: &str,
+            cursor: Option<&str>,
+            limit: u32,
+        ) -> StorageResult<ResourcePage> {
+            self.fetched_at.lock().push(Instant::now());
+            let start: usize = cursor.map_or(0, |c| c.parse().unwrap());
+            let end = (start + limit as usize).min(self.ids.len());
+            Ok(ResourcePage {
+                resources: self.ids[start..end]
+                    .iter()
+                    .map(|id| {
+                        StoredResource::new(
+                            resource_type,
+                            id,
+                            tenant.tenant_id().clone(),
+                            serde_json::json!({"resourceType": resource_type, "id": id}),
+                            helios_fhir::FhirVersion::default(),
+                        )
+                    })
+                    .collect(),
+                next_cursor: (end < self.ids.len()).then(|| end.to_string()),
+                skipped: Vec::new(),
+            })
+        }
+    }
+
+    /// The driver must not re-take the storage write lock the instant it let
+    /// go of it. Page writes are back-to-back `IMMEDIATE` transactions on the
+    /// SQLite backend, and with no gap between them a foreground writer parked
+    /// on the write lock waits out its whole `busy_timeout` and fails with
+    /// "database is locked" (#1185).
+    ///
+    /// The mirror property — no pause after the *last* page — is structural
+    /// rather than timed: the `None` arm of the cursor match breaks out of the
+    /// loop before the yield is reached.
+    #[tokio::test]
+    async fn pages_are_written_with_a_gap_a_foreground_writer_can_use() {
+        let source = Arc::new(TimedPageSource::new(3));
+        let target = Arc::new(RecordingTarget::default());
+        let op = recording_operation(source.clone(), target.clone());
+
+        let job = op
+            .start(
+                named_tenant("page-yield"),
+                ReindexRequest::default().with_batch_size(1),
+                None,
+            )
+            .await
+            .unwrap();
+        let progress = await_finished(&op, &job).await;
+        assert_eq!(progress.status, ReindexStatus::Completed);
+
+        let fetched_at = source.fetched_at.lock().clone();
+        assert_eq!(fetched_at.len(), 3, "expected one fetch per page");
+        for pair in fetched_at.windows(2) {
+            let gap = pair[1].duration_since(pair[0]);
+            assert!(
+                gap >= REINDEX_PAGE_YIELD,
+                "consecutive pages must be separated by at least \
+                 {REINDEX_PAGE_YIELD:?} so a foreground writer can take the \
+                 lock, got {gap:?}"
+            );
+        }
     }
 
     /// Records the ids it is asked to write, failing some of them.
