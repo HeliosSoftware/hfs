@@ -682,7 +682,9 @@ test("a result under a public path prefix still opens in the modal", async ({
   const queryPath = `/Patient?_id=${id}`;
   const publicUrl = `https://fhir.example.test/public/fhir/acme/Patient/${id}`;
 
-  await page.route(`**${queryPath}`, async (route) => {
+  // The page appends `_total=accurate` to every search it sends (#1003);
+  // match the wire request, not the typed path.
+  await page.route(`**${queryPath}&_total=accurate`, async (route) => {
     await route.fulfill({
       status: 200,
       contentType: "application/fhir+json",
