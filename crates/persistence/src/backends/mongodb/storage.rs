@@ -4167,10 +4167,11 @@ impl MongoBackend {
 // ============================================================================
 // PurgableStorage
 //
-// MongoDB stores resources across three collections — `resources`,
-// `resource_history`, and `search_index` — the same shape SQLite uses, so purge
-// is the same three deletes keyed by (tenant_id, resource_type, id). Note that
-// the ordinary `delete` is a *soft* delete: it flips `is_deleted` and writes a
+// MongoDB stores resources across four collections — `resources`,
+// `resource_history`, `search_index`, and `search_index_contained` — the same
+// shape SQLite uses (plus the #1160 contained-rows split), so purge is the
+// same four deletes keyed by (tenant_id, resource_type, id). Note that the
+// ordinary `delete` is a *soft* delete: it flips `is_deleted` and writes a
 // tombstone. Purge is the only path that removes the bytes.
 // ============================================================================
 
@@ -4423,17 +4424,34 @@ impl ReindexTarget for MongoBackend {
         }
 
         let db = self.get_database().await?;
+        let filter = doc! {
+            "tenant_id": tenant.tenant_id().as_str(),
+            "resource_type": resource_type,
+            "resource_id": resource_id,
+        };
+
         let result = db
             .collection::<Document>(MongoBackend::SEARCH_INDEX_COLLECTION)
-            .delete_many(doc! {
-                "tenant_id": tenant.tenant_id().as_str(),
-                "resource_type": resource_type,
-                "resource_id": resource_id,
-            })
+            .delete_many(filter.clone())
             .await
             .map_err(|e| internal_error(format!("Failed to delete search entries: {e}")))?;
 
-        Ok(result.deleted_count)
+        // Contained rows key the same way (#1160 Task 4), so this default
+        // `ReindexTarget` per-resource delete clears both collections too —
+        // keeping the invariant intact even though `write_search_entries_page`
+        // below overrides the page-level caller, making this single-resource
+        // path unreachable on MongoDB today.
+        let contained_result = db
+            .collection::<Document>(MongoBackend::SEARCH_INDEX_CONTAINED_COLLECTION)
+            .delete_many(filter)
+            .await
+            .map_err(|e| {
+                internal_error(format!(
+                    "Failed to delete search_index_contained entries: {e}"
+                ))
+            })?;
+
+        Ok(result.deleted_count + contained_result.deleted_count)
     }
 
     async fn write_search_entries(
@@ -4458,13 +4476,24 @@ impl ReindexTarget for MongoBackend {
         }
 
         let db = self.get_database().await?;
+        let tenant_id = tenant.tenant_id().as_str();
         let result = db
             .collection::<Document>(MongoBackend::SEARCH_INDEX_COLLECTION)
-            .delete_many(doc! { "tenant_id": tenant.tenant_id().as_str() })
+            .delete_many(doc! { "tenant_id": tenant_id })
             .await
             .or_query_error("Failed to clear search index")?;
 
-        Ok(result.deleted_count)
+        // A reindex scoped by `resource_types`/`resource_ids` never rewrites
+        // out-of-scope containers, so a `clear_existing` run that skipped
+        // this would leave their contained rows behind as orphans (#1160
+        // Task 4) — same tenant-wide scope as the `search_index` clear above.
+        let contained_result = db
+            .collection::<Document>(MongoBackend::SEARCH_INDEX_CONTAINED_COLLECTION)
+            .delete_many(doc! { "tenant_id": tenant_id })
+            .await
+            .or_query_error("Failed to clear contained search index")?;
+
+        Ok(result.deleted_count + contained_result.deleted_count)
     }
 
     /// Rebuilds a whole page in one `delete_many` plus one (possibly chunked)

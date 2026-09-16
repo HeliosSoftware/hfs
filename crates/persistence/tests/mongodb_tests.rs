@@ -2498,8 +2498,17 @@ async fn mongodb_integration_update_with_match_and_delete_with_match() {
 /// `PurgableStorage::purge`/`purge_all` straight off the backend — there is
 /// no existing `.purge(`/`.purge_all(` test in this file to model a sibling
 /// on, so this is that coverage).
+///
+/// And `ReindexTarget::clear_search_index` and `delete_search_entries`: a
+/// fourth holder is cleared via a tenant-wide `clear_search_index` (the path
+/// `reindex.rs` drives for `clear_existing: true`), and a fifth via a direct
+/// `delete_search_entries` call (the default per-resource delete, otherwise
+/// unreachable on MongoDB because `write_search_entries_page` overrides it,
+/// but which must still keep the two-collection invariant).
 #[tokio::test]
 async fn mongodb_integration_update_and_delete_leave_no_orphan_contained_rows() {
+    use helios_persistence::search::ReindexTarget;
+
     let Some(backend) = create_backend_with_full_registry("contained_orphans").await else {
         eprintln!(
             "Skipping mongodb_integration_update_and_delete_leave_no_orphan_contained_rows (requires Docker or HFS_TEST_MONGODB_URL)"
@@ -2643,6 +2652,66 @@ async fn mongodb_integration_update_and_delete_leave_no_orphan_contained_rows() 
         0
     );
     assert_eq!(search_index.count_documents(type_key).await.unwrap(), 0);
+
+    // `ReindexTarget::clear_search_index`: clears the tenant's contained
+    // rows too, not just `search_index` (#1160 Task 4). This is the path
+    // `reindex.rs` drives when a reindex runs with `clear_existing: true`;
+    // a reindex scoped by `resource_types`/`resource_ids` never rewrites
+    // out-of-scope containers, so their contained rows would otherwise be
+    // left as orphans.
+    backend
+        .create(
+            &tenant,
+            "Observation",
+            with_contained("holder-clear", "ClearMe"),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    let tenant_key = doc! { "tenant_id": "tenant-contained-orphans" };
+    assert!(
+        contained.count_documents(tenant_key.clone()).await.unwrap() > 0,
+        "precondition: a contained row must exist before clear_search_index"
+    );
+    backend.clear_search_index(&tenant).await.unwrap();
+    assert_eq!(
+        contained.count_documents(tenant_key.clone()).await.unwrap(),
+        0
+    );
+    assert_eq!(search_index.count_documents(tenant_key).await.unwrap(), 0);
+
+    // `ReindexTarget::delete_search_entries`: the default per-resource
+    // delete — unreachable on MongoDB today because
+    // `write_search_entries_page` is overridden, but still expected to keep
+    // the two-collection invariant (#1160 Task 4) — clears both collections
+    // for the id.
+    backend
+        .create(
+            &tenant,
+            "Observation",
+            with_contained("holder-per-entry", "PerEntryMe"),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    let entry_key = doc! {
+        "tenant_id": "tenant-contained-orphans",
+        "resource_type": "Observation",
+        "resource_id": "holder-per-entry",
+    };
+    assert!(
+        contained.count_documents(entry_key.clone()).await.unwrap() > 0,
+        "precondition: the per-entry holder's contained row must exist before delete_search_entries"
+    );
+    backend
+        .delete_search_entries(&tenant, "Observation", "holder-per-entry")
+        .await
+        .unwrap();
+    assert_eq!(
+        contained.count_documents(entry_key.clone()).await.unwrap(),
+        0
+    );
+    assert_eq!(search_index.count_documents(entry_key).await.unwrap(), 0);
 }
 
 /// #1160 Task 4: the transaction-bundle delete path
