@@ -23,7 +23,10 @@ mod bulk_submit;
 mod retry;
 pub(crate) mod schema;
 mod search_impl;
+pub(crate) mod search_index_builder;
+pub(crate) mod search_index_catalog;
 mod storage;
 mod user_settings;
 
 pub use backend::{MongoBackend, MongoBackendConfig};
+pub use search_index_builder::{BuildOutcome, IndexBuildMode};
