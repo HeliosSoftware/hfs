@@ -496,7 +496,7 @@ impl FilterSqlGenerator {
         // so reusing it adds no binding and does not disturb `param_offset`.
         SqlFragment::with_params(
             format!(
-                "resource_id IN (SELECT resource_id FROM search_index WHERE tenant_id = ?1 AND param_name = '{}' AND {})",
+                "resource_key IN (SELECT resource_key FROM search_index WHERE tenant_id = ?1 AND param_name = '{}' AND {})",
                 param, condition
             ),
             vec![SqlParam::string(&sql_value)],

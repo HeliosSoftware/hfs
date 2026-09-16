@@ -6,6 +6,13 @@ use crate::search::{converters::IndexValue, extractor::ExtractedValue};
 pub struct SqliteSearchIndexWriter;
 
 impl SqliteSearchIndexWriter {
+    /// Zero-based position of the `resource_key` value in the parameter vectors
+    /// produced by [`Self::to_sql_params`] (both the base and contained shapes
+    /// place it here, before the trailing contained columns). The write path
+    /// patches this slot with the resolved `resources.rowid` — `to_sql_params`
+    /// runs on a thread pool with no connection, so it emits a placeholder here.
+    pub const RESOURCE_KEY_PARAM_IX: usize = 24;
+
     /// Creates a new SQLite search index writer.
     pub fn new() -> Self {
         Self
@@ -23,7 +30,8 @@ impl SqliteSearchIndexWriter {
             value_identifier_type_system, value_identifier_type_code,
             value_reference_display,
             value_quantity_canonical_value, value_quantity_canonical_unit,
-            value_string_folded
+            value_string_folded,
+            resource_key
         ) VALUES (
             ?1, ?2, ?3, ?4, ?5,
             ?6, ?7, ?8, ?9,
@@ -33,16 +41,17 @@ impl SqliteSearchIndexWriter {
             ?19, ?20,
             ?21,
             ?22, ?23,
-            ?24
+            ?24,
+            ?25
         )
         "#
     }
 
-    /// INSERT SQL for a contained index entry: the same 24 base columns as
+    /// INSERT SQL for a contained index entry: the same 25 base columns as
     /// [`Self::insert_sql`] plus `is_contained`, `contained_type`, and
-    /// `contained_local_id` (`?25..?27`). The base columns' `resource_type` /
-    /// `resource_id` identify the *container*; `contained_type` is the nested
-    /// resource's type. Bind the base params from
+    /// `contained_local_id` (`?26..?28`). The base columns' `resource_type` /
+    /// `resource_id` / `resource_key` identify the *container*; `contained_type`
+    /// is the nested resource's type. Bind the base params from
     /// [`Self::to_sql_params`] followed by `1`, the contained type, and the
     /// contained local id.
     pub fn insert_contained_sql() -> &'static str {
@@ -57,6 +66,7 @@ impl SqliteSearchIndexWriter {
             value_reference_display,
             value_quantity_canonical_value, value_quantity_canonical_unit,
             value_string_folded,
+            resource_key,
             is_contained, contained_type, contained_local_id
         ) VALUES (
             ?1, ?2, ?3, ?4, ?5,
@@ -68,7 +78,8 @@ impl SqliteSearchIndexWriter {
             ?21,
             ?22, ?23,
             ?24,
-            ?25, ?26, ?27
+            ?25,
+            ?26, ?27, ?28
         )
         "#
     }
@@ -84,14 +95,14 @@ impl SqliteSearchIndexWriter {
     }
 
     /// Multi-row variant of [`Self::insert_sql`]: one INSERT carrying eight
-    /// rows (8 x 24 positional parameters). Bulk indexing executes this once
+    /// rows (8 x 25 positional parameters). Bulk indexing executes this once
     /// per chunk instead of stepping the single-row statement eight times.
     pub fn insert_sql_rows8() -> &'static str {
         static SQL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
         SQL.get_or_init(|| {
             let base = Self::insert_sql();
             let cols = &base[..base.find("VALUES").expect("insert_sql has VALUES")];
-            let group = format!("({})", ["?"; 24].join(", "));
+            let group = format!("({})", ["?"; 25].join(", "));
             format!("{cols}VALUES {}", vec![group; 8].join(", "))
         })
     }
@@ -103,6 +114,7 @@ impl SqliteSearchIndexWriter {
         tenant_id: &str,
         resource_type: &str,
         resource_id: &str,
+        resource_key: i64,
         extracted: &ExtractedValue,
     ) -> Vec<SqlValue> {
         let mut params = vec![
@@ -170,6 +182,7 @@ impl SqliteSearchIndexWriter {
                 params.push(SqlValue::Null); // value_quantity_canonical_value
                 params.push(SqlValue::Null); // value_quantity_canonical_unit
                 params.push(SqlValue::Null); // value_string_folded
+                params.push(SqlValue::Int(resource_key)); // resource_key
                 return params;
             }
             IndexValue::Date { value, precision } => {
@@ -279,6 +292,7 @@ impl SqliteSearchIndexWriter {
         }); // value_quantity_canonical_value
         params.push(SqlValue::OptString(canonical_unit)); // value_quantity_canonical_unit
         params.push(SqlValue::OptString(string_folded)); // value_string_folded
+        params.push(SqlValue::Int(resource_key)); // resource_key
 
         params
     }
@@ -347,9 +361,9 @@ mod tests {
         };
 
         let params =
-            SqliteSearchIndexWriter::to_sql_params("tenant1", "Patient", "123", &extracted);
+            SqliteSearchIndexWriter::to_sql_params("tenant1", "Patient", "123", 1, &extracted);
 
-        assert_eq!(params.len(), 24); // Updated for new columns
+        assert_eq!(params.len(), 25); // Updated for new columns
         assert!(matches!(&params[0], SqlValue::String(s) if s == "tenant1"));
         assert!(matches!(&params[5], SqlValue::OptString(Some(s)) if s == "Smith"));
     }
@@ -373,9 +387,9 @@ mod tests {
         };
 
         let params =
-            SqliteSearchIndexWriter::to_sql_params("tenant1", "Patient", "123", &extracted);
+            SqliteSearchIndexWriter::to_sql_params("tenant1", "Patient", "123", 1, &extracted);
 
-        assert_eq!(params.len(), 24); // Updated for new columns
+        assert_eq!(params.len(), 25); // Updated for new columns
         assert!(matches!(&params[6], SqlValue::OptString(Some(s)) if s == "http://example.org"));
         assert!(matches!(&params[7], SqlValue::String(s) if s == "12345"));
     }
@@ -399,9 +413,9 @@ mod tests {
         };
 
         let params =
-            SqliteSearchIndexWriter::to_sql_params("tenant1", "Observation", "123", &extracted);
+            SqliteSearchIndexWriter::to_sql_params("tenant1", "Observation", "123", 1, &extracted);
 
-        assert_eq!(params.len(), 24);
+        assert_eq!(params.len(), 25);
         assert!(matches!(&params[8], SqlValue::OptString(Some(s)) if s == "Test Display")); // value_token_display
     }
 
@@ -426,9 +440,9 @@ mod tests {
         };
 
         let params =
-            SqliteSearchIndexWriter::to_sql_params("tenant1", "Patient", "123", &extracted);
+            SqliteSearchIndexWriter::to_sql_params("tenant1", "Patient", "123", 1, &extracted);
 
-        assert_eq!(params.len(), 24);
+        assert_eq!(params.len(), 25);
         // value_identifier_type_system is at index 18
         assert!(
             matches!(&params[18], SqlValue::OptString(Some(s)) if s == "http://terminology.hl7.org/CodeSystem/v2-0203")
@@ -453,7 +467,7 @@ mod tests {
         };
 
         let params =
-            SqliteSearchIndexWriter::to_sql_params("tenant1", "Patient", "123", &extracted);
+            SqliteSearchIndexWriter::to_sql_params("tenant1", "Patient", "123", 1, &extracted);
 
         assert!(matches!(&params[9], SqlValue::String(s) if s == "2024-01-15")); // Updated index for new column
     }
@@ -476,7 +490,7 @@ mod tests {
         };
 
         let params =
-            SqliteSearchIndexWriter::to_sql_params("tenant1", "Observation", "456", &extracted);
+            SqliteSearchIndexWriter::to_sql_params("tenant1", "Observation", "456", 1, &extracted);
 
         assert!(matches!(&params[12], SqlValue::Float(f) if (*f - 5.4).abs() < 0.001)); // Updated index
         assert!(matches!(&params[13], SqlValue::OptString(Some(s)) if s == "mg")); // Updated index

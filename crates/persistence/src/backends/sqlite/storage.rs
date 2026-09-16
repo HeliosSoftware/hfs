@@ -656,10 +656,15 @@ impl ResourceStorage for SqliteBackend {
         )
         .map_err(|e| internal_error(format!("Failed to insert deletion history: {}", e)))?;
 
-        // Delete search index entries (skip when search is offloaded)
+        // Delete search index entries (skip when search is offloaded). Keyed on
+        // resource_key so it rides idx_search_composite; the soft-delete keeps
+        // the resources row, so the subquery resolves.
         if !self.is_search_offloaded() {
             conn.execute(
-                "DELETE FROM search_index WHERE tenant_id = ?1 AND resource_type = ?2 AND resource_id = ?3",
+                "DELETE FROM search_index WHERE resource_key = (
+                     SELECT rowid FROM resources
+                      WHERE tenant_id = ?1 AND resource_type = ?2 AND id = ?3
+                 )",
                 params![tenant_id, resource_type, id],
             )
             .map_err(|e| internal_error(format!("Failed to delete search index: {}", e)))?;
@@ -1461,10 +1466,13 @@ impl SqliteBackend {
                             }
                             _ => v,
                         };
+                        // `resource_key` is patched in by `write_prepared_index`
+                        // (this half is connection-free); pass a placeholder.
                         SqliteSearchIndexWriter::to_sql_params(
                             tenant_id,
                             resource_type,
                             resource_id,
+                            0,
                             &normalized,
                         )
                     })
@@ -1500,6 +1508,7 @@ impl SqliteBackend {
                     tenant_id,
                     resource_type,
                     resource_id,
+                    0, // resource_key patched in by write_prepared_index
                     normalized.as_ref().unwrap_or(value),
                 );
                 params.push(SqlValue::Int(1));
@@ -1567,6 +1576,30 @@ impl SqliteBackend {
         prepared: PreparedIndex,
     ) -> StorageResult<usize> {
         let mut count = 0;
+        // The connection-free prepare step left `resource_key` as a placeholder
+        // (see RESOURCE_KEY_PARAM_IX); resolve the owning resource's rowid here,
+        // where we hold the connection, and patch every row before binding. The
+        // resource has already been written by the time indexing runs.
+        let resource_key: i64 = conn
+            .query_row(
+                "SELECT rowid FROM resources WHERE tenant_id = ?1 AND resource_type = ?2 AND id = ?3",
+                rusqlite::params![tenant_id, resource_type, resource_id],
+                |r| r.get(0),
+            )
+            .map_err(|e| {
+                internal_error(format!(
+                    "resolve resource_key for {resource_type}/{resource_id}: {e}"
+                ))
+            })?;
+        let mut prepared = prepared;
+        if let Ok(rows) = prepared.rows.as_mut() {
+            for row in rows.iter_mut() {
+                row[SqliteSearchIndexWriter::RESOURCE_KEY_PARAM_IX] = SqlValue::Int(resource_key);
+            }
+        }
+        for row in prepared.contained_rows.iter_mut() {
+            row[SqliteSearchIndexWriter::RESOURCE_KEY_PARAM_IX] = SqlValue::Int(resource_key);
+        }
         match prepared.rows {
             Ok(rows) => {
                 // Rows are written eight at a time: a single-row INSERT stepped
@@ -1801,10 +1834,18 @@ impl SqliteBackend {
             return Ok(0);
         }
 
-        // Delete from main search index
+        // Delete from main search index, keyed on the integer `resource_key`
+        // so the delete rides `idx_search_composite` (rekeyed to resource_key
+        // in v30) instead of scanning the type. Every caller of this method
+        // deletes while the `resources` row still exists (update, re-index,
+        // soft-delete), so the subquery resolves; the purge path, which removes
+        // the `resources` row first, deletes by `resource_id` inline instead.
         let deleted = conn
             .prepare_cached(
-                "DELETE FROM search_index WHERE tenant_id = ?1 AND resource_type = ?2 AND resource_id = ?3",
+                "DELETE FROM search_index WHERE resource_key = (
+                     SELECT rowid FROM resources
+                      WHERE tenant_id = ?1 AND resource_type = ?2 AND id = ?3
+                 )",
             )
             .map_err(|e| internal_error(format!("Failed to prepare search index delete: {}", e)))?
             .execute(params![tenant_id, resource_type, resource_id])
@@ -1875,8 +1916,8 @@ impl SqliteBackend {
         code: &str,
     ) -> StorageResult<()> {
         conn.execute(
-            "INSERT INTO search_index (tenant_id, resource_type, resource_id, param_name, value_token_system, value_token_code)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO search_index (tenant_id, resource_type, resource_id, resource_key, param_name, value_token_system, value_token_code)
+             VALUES (?1, ?2, ?3, (SELECT rowid FROM resources WHERE tenant_id = ?1 AND resource_type = ?2 AND id = ?3), ?4, ?5, ?6)",
             params![tenant_id, resource_type, resource_id, param_name, system, code],
         )
         .map_err(|e| internal_error(format!("Failed to insert token index: {}", e)))?;
@@ -1911,8 +1952,8 @@ impl SqliteBackend {
         };
 
         conn.execute(
-            "INSERT INTO search_index (tenant_id, resource_type, resource_id, param_name, value_date)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT INTO search_index (tenant_id, resource_type, resource_id, resource_key, param_name, value_date)
+             VALUES (?1, ?2, ?3, (SELECT rowid FROM resources WHERE tenant_id = ?1 AND resource_type = ?2 AND id = ?3), ?4, ?5)",
             params![tenant_id, resource_type, resource_id, param_name, normalized],
         )
         .map_err(|e| internal_error(format!("Failed to insert date index: {}", e)))?;

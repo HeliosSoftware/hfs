@@ -1413,6 +1413,79 @@ fn migrate_v28_to_v29(conn: &Connection) -> StorageResult<()> {
     Ok(())
 }
 
+/// Migrate from schema version 29 to version 30.
+///
+/// Introduces an integer surrogate for the owning resource on `search_index`
+/// (#945). `resource_key` mirrors `resources.rowid`; `idx_search_composite` is
+/// rekeyed to carry that 3–4 byte varint in place of the 36-byte `resource_id`
+/// UUID it repeated on every row, which was ~44% of the table's index bytes and
+/// the dominant per-batch write during bulk ingest.
+///
+/// `resource_id` stays on the table: the chained-search / `_has` / `:identifier`
+/// paths concatenate `Type/resource_id` to match `value_reference` and cannot
+/// use the key, so only the composite index and the equality read paths move to
+/// `resource_key` in this step.
+///
+/// Backfill is a single-pass `UPDATE ... FROM resources` (a JOIN, not a
+/// correlated subquery per row) with the FTS triggers dropped for the duration.
+/// A full table rebuild is deliberately avoided: the FTS triggers key on
+/// `search_index.rowid`, so renumbering rowids would orphan every FTS row. The
+/// backfill only sets a new column — no rowid and no FTS-indexed column changes
+/// — so the existing FTS content stays valid and the triggers are restored
+/// verbatim afterwards.
+fn migrate_v29_to_v30(conn: &Connection) -> StorageResult<()> {
+    // SQLite has no `ADD COLUMN IF NOT EXISTS`; ignore a duplicate-column error
+    // so the ladder is replay-safe (see `migrate_v10_to_v11`).
+    let _ = conn.execute(
+        "ALTER TABLE search_index ADD COLUMN resource_key INTEGER",
+        [],
+    );
+
+    // The FTS triggers fire on every UPDATE of a row carrying `value_string` /
+    // `value_token_display` (their `WHEN` matches the column's presence, not
+    // which column changed), so the backfill would re-run the full-text
+    // delete+reinsert on most rows. Capture their exact DDL from the catalog,
+    // drop them across the backfill, and restore verbatim — drift-proof, and a
+    // no-op on an FTS5-less build that has none.
+    let saved_triggers: Vec<String> = {
+        let mut stmt = conn
+            .prepare(
+                "SELECT sql FROM sqlite_master
+                  WHERE type = 'trigger'
+                    AND name IN ('search_index_fts_insert', 'search_index_fts_delete', 'search_index_fts_update')
+                    AND sql IS NOT NULL",
+            )
+            .map_err(|e| migration_err(format!("v30 read FTS triggers: {e}")))?;
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .map_err(|e| migration_err(format!("v30 read FTS triggers: {e}")))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| migration_err(format!("v30 read FTS triggers: {e}")))?
+    };
+
+    conn.execute_batch(
+        "DROP TRIGGER IF EXISTS search_index_fts_insert;
+         DROP TRIGGER IF EXISTS search_index_fts_delete;
+         DROP TRIGGER IF EXISTS search_index_fts_update;
+         UPDATE search_index
+            SET resource_key = r.rowid
+            FROM resources r
+            WHERE r.tenant_id = search_index.tenant_id
+              AND r.resource_type = search_index.resource_type
+              AND r.id = search_index.resource_id;
+         DROP INDEX IF EXISTS idx_search_composite;
+         CREATE INDEX idx_search_composite
+            ON search_index(tenant_id, resource_type, resource_key, param_name, composite_group);",
+    )
+    .map_err(|e| migration_err(format!("v30 resource_key surrogate: {e}")))?;
+
+    for sql in &saved_triggers {
+        conn.execute(sql, [])
+            .map_err(|e| migration_err(format!("v30 restore FTS trigger: {e}")))?;
+    }
+    Ok(())
+}
+
 /// Migrate from schema version 10 to version 11.
 ///
 /// Adds columns supporting `_contained` search: index rows extracted from a
@@ -2689,6 +2762,9 @@ mod tests {
     /// `idx_search_string_folded` joined the partial set in v28; the
     /// `LIKE`-shaped searches that used to depend on it being full now carry
     /// their own `IS NOT NULL` (see [`migrate_v27_to_v28`]).
+    ///
+    /// In v30 (#945) the composite index swapped the 36-byte `resource_id` UUID
+    /// for the integer `resource_key` (see [`migrate_v29_to_v30`]).
     #[test]
     fn search_index_carries_no_redundant_or_full_value_indexes() {
         let conn = Connection::open_in_memory().unwrap();
@@ -2711,8 +2787,9 @@ mod tests {
         assert!(
             index_sql("idx_search_composite")
                 .expect("composite index")
-                .contains("resource_id"),
-            "idx_search_composite must still lead with the resource key"
+                .contains("resource_key"),
+            "idx_search_composite must carry the integer resource_key (v30, #945), \
+             not the resource_id UUID it replaced"
         );
 
         for (name, predicate) in [
