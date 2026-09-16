@@ -4363,6 +4363,261 @@ async fn mongodb_integration_search_cursor_pagination_roundtrip() {
     assert_eq!(page_back.resources.items[0].id(), first_id.as_str());
 }
 
+/// Creates Patients `cp-1..cp-n` (inclusive, `n <= 9`) in the given tenant.
+///
+/// The backend's default sort is `last_updated desc, id desc` and the ids are
+/// created in ascending order, so the listing is `cp-n .. cp-1` even when two
+/// creates share a millisecond.
+async fn create_cursor_paging_patients(backend: &MongoBackend, tenant: &TenantContext, n: usize) {
+    assert!(
+        n <= 9,
+        "single-digit ids keep lexical and creation order aligned"
+    );
+    for i in 1..=n {
+        backend
+            .create(
+                tenant,
+                "Patient",
+                json!({
+                    "resourceType": "Patient",
+                    "id": format!("cp-{i}"),
+                    "name": [{"family": "CursorPaging"}]
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+    }
+}
+
+/// Collects the resource ids of a search result's page, in page order.
+fn page_ids(result: &helios_persistence::core::SearchResult) -> Vec<String> {
+    result
+        .resources
+        .items
+        .iter()
+        .map(|r| r.id().to_string())
+        .collect()
+}
+
+/// Follows `cursor` with the same query.
+async fn follow(
+    backend: &MongoBackend,
+    tenant: &TenantContext,
+    query: &SearchQuery,
+    cursor: &Option<String>,
+) -> helios_persistence::core::SearchResult {
+    backend
+        .search(
+            tenant,
+            &query
+                .clone()
+                .with_cursor(cursor.clone().expect("cursor should be present")),
+        )
+        .await
+        .unwrap()
+}
+
+/// #1057: the issue's repro. Five Patients at `_count=2`, paged forward twice
+/// and then back. The backward hop over-fetches a probe row, and dropping it
+/// after the reverse (instead of before) shifted the window by one.
+#[tokio::test]
+async fn mongodb_integration_cursor_paging_backward_keeps_adjacent_rows() {
+    let Some(backend) = create_backend("cursor_backward_adjacent").await else {
+        eprintln!(
+            "Skipping mongodb_integration_cursor_paging_backward_keeps_adjacent_rows (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+
+    let tenant = create_tenant("tenant-cursor-backward-adjacent");
+    create_cursor_paging_patients(&backend, &tenant, 5).await;
+
+    let query = SearchQuery::new("Patient").with_count(2);
+
+    let page1 = backend.search(&tenant, &query).await.unwrap();
+    assert_eq!(page_ids(&page1), vec!["cp-5", "cp-4"]);
+
+    let page2 = follow(
+        &backend,
+        &tenant,
+        &query,
+        &page1.resources.page_info.next_cursor,
+    )
+    .await;
+    assert_eq!(page_ids(&page2), vec!["cp-3", "cp-2"]);
+
+    let page3 = follow(
+        &backend,
+        &tenant,
+        &query,
+        &page2.resources.page_info.next_cursor,
+    )
+    .await;
+    assert_eq!(page_ids(&page3), vec!["cp-1"]);
+    assert!(!page3.resources.page_info.has_next);
+
+    // The buggy code returned ["cp-4", "cp-3"] here.
+    let back2 = follow(
+        &backend,
+        &tenant,
+        &query,
+        &page3.resources.page_info.previous_cursor,
+    )
+    .await;
+    assert_eq!(page_ids(&back2), vec!["cp-3", "cp-2"]);
+    assert!(back2.resources.page_info.has_previous);
+    assert!(back2.resources.page_info.has_next);
+
+    let back1 = follow(
+        &backend,
+        &tenant,
+        &query,
+        &back2.resources.page_info.previous_cursor,
+    )
+    .await;
+    assert_eq!(page_ids(&back1), vec!["cp-5", "cp-4"]);
+    assert!(!back1.resources.page_info.has_previous);
+    assert!(back1.resources.page_info.previous_cursor.is_none());
+    assert!(back1.resources.page_info.has_next);
+}
+
+/// Walks forward through 7 Patients 3 at a time, then all the way back via
+/// `previous_cursor` and forward again (1 -> 2 -> 3 -> 2 -> 1 -> 2), asserting
+/// identical page contents and flags on every hop. Mirrors the SQLite and
+/// PostgreSQL round trips from #1079 (#1057).
+#[tokio::test]
+async fn mongodb_integration_cursor_paging_round_trip_previous() {
+    let Some(backend) = create_backend("cursor_round_trip_previous").await else {
+        eprintln!(
+            "Skipping mongodb_integration_cursor_paging_round_trip_previous (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+
+    let tenant = create_tenant("tenant-cursor-round-trip");
+    create_cursor_paging_patients(&backend, &tenant, 7).await;
+
+    let query = SearchQuery::new("Patient").with_count(3);
+
+    let page1 = backend.search(&tenant, &query).await.unwrap();
+    assert_eq!(page_ids(&page1), vec!["cp-7", "cp-6", "cp-5"]);
+    assert!(!page1.resources.page_info.has_previous);
+    assert!(page1.resources.page_info.previous_cursor.is_none());
+    assert!(page1.resources.page_info.has_next);
+    assert!(page1.resources.page_info.next_cursor.is_some());
+
+    let page2 = follow(
+        &backend,
+        &tenant,
+        &query,
+        &page1.resources.page_info.next_cursor,
+    )
+    .await;
+    assert_eq!(page_ids(&page2), vec!["cp-4", "cp-3", "cp-2"]);
+    assert!(page2.resources.page_info.has_previous);
+    assert!(page2.resources.page_info.previous_cursor.is_some());
+    assert!(page2.resources.page_info.has_next);
+
+    let page3 = follow(
+        &backend,
+        &tenant,
+        &query,
+        &page2.resources.page_info.next_cursor,
+    )
+    .await;
+    assert_eq!(page_ids(&page3), vec!["cp-1"]);
+    assert!(page3.resources.page_info.has_previous);
+    assert!(page3.resources.page_info.previous_cursor.is_some());
+    assert!(!page3.resources.page_info.has_next);
+    assert!(page3.resources.page_info.next_cursor.is_none());
+
+    // Page 3 -> page 2 must be exact, including order. This is the hop a
+    // pop-after-reverse implementation gets wrong: it drops the nearest row
+    // and keeps the farthest one.
+    let back2 = follow(
+        &backend,
+        &tenant,
+        &query,
+        &page3.resources.page_info.previous_cursor,
+    )
+    .await;
+    assert_eq!(page_ids(&back2), page_ids(&page2));
+    assert!(back2.resources.page_info.has_previous);
+    assert!(back2.resources.page_info.previous_cursor.is_some());
+    assert!(back2.resources.page_info.has_next);
+    assert!(back2.resources.page_info.next_cursor.is_some());
+
+    let back1 = follow(
+        &backend,
+        &tenant,
+        &query,
+        &back2.resources.page_info.previous_cursor,
+    )
+    .await;
+    assert_eq!(page_ids(&back1), page_ids(&page1));
+    assert!(!back1.resources.page_info.has_previous);
+    assert!(back1.resources.page_info.previous_cursor.is_none());
+    assert!(back1.resources.page_info.has_next);
+    assert!(back1.resources.page_info.next_cursor.is_some());
+
+    let again2 = follow(
+        &backend,
+        &tenant,
+        &query,
+        &back1.resources.page_info.next_cursor,
+    )
+    .await;
+    assert_eq!(page_ids(&again2), page_ids(&page2));
+    assert!(again2.resources.page_info.has_previous);
+    assert!(again2.resources.page_info.has_next);
+}
+
+/// Backward from page 2 of a 4-item, count-3 listing has no probe row beyond
+/// page 1, so `has_previous` must be false and no `previous_cursor` is
+/// produced — it is no longer hardcoded from "a cursor was supplied" (#1057).
+#[tokio::test]
+async fn mongodb_integration_cursor_paging_backward_from_page_two_has_no_previous() {
+    let Some(backend) = create_backend("cursor_backward_no_previous").await else {
+        eprintln!(
+            "Skipping mongodb_integration_cursor_paging_backward_from_page_two_has_no_previous (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+
+    let tenant = create_tenant("tenant-cursor-backward-no-previous");
+    create_cursor_paging_patients(&backend, &tenant, 4).await;
+
+    let query = SearchQuery::new("Patient").with_count(3);
+
+    let page1 = backend.search(&tenant, &query).await.unwrap();
+    assert_eq!(page_ids(&page1), vec!["cp-4", "cp-3", "cp-2"]);
+
+    let page2 = follow(
+        &backend,
+        &tenant,
+        &query,
+        &page1.resources.page_info.next_cursor,
+    )
+    .await;
+    assert_eq!(page_ids(&page2), vec!["cp-1"]);
+    assert!(page2.resources.page_info.has_previous);
+    assert!(!page2.resources.page_info.has_next);
+
+    let back1 = follow(
+        &backend,
+        &tenant,
+        &query,
+        &page2.resources.page_info.previous_cursor,
+    )
+    .await;
+    assert_eq!(page_ids(&back1), vec!["cp-4", "cp-3", "cp-2"]);
+    assert!(!back1.resources.page_info.has_previous);
+    assert!(back1.resources.page_info.previous_cursor.is_none());
+    assert!(back1.resources.page_info.has_next);
+    assert!(back1.resources.page_info.next_cursor.is_some());
+}
+
 #[tokio::test]
 async fn mongodb_integration_search_missing_not_and_param_sort() {
     let Some(backend) = create_backend_with_full_registry("search_missing_not_sort").await else {
