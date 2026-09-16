@@ -12,6 +12,9 @@
 
 mod common;
 
+#[path = "common/container_cleanup.rs"]
+mod container_cleanup;
+
 mod patient_everything_postgres_tests {
     use axum_test::TestServer;
     use helios_persistence::backends::postgres::{PostgresBackend, PostgresConfig};
@@ -34,6 +37,8 @@ mod patient_everything_postgres_tests {
     struct SharedPg {
         host: String,
         port: u16,
+        /// Kept alive for the duration of the test binary; the
+        /// `container_cleanup` exit hook removes it at process exit.
         _container: testcontainers::ContainerAsync<Postgres>,
     }
 
@@ -47,12 +52,16 @@ mod patient_everything_postgres_tests {
                 // postgres:11, which is EOL and predates `plan_cache_mode` — a GUC
                 // the backend sends as a startup option, so PG 11 rejects every
                 // connection FATAL. The rest of the repo runs 16.
-                let container = Postgres::default()
-                    .with_tag("16-alpine")
-                    .with_label("github.run_id", &run_id)
-                    .start()
-                    .await
-                    .expect("failed to start PostgreSQL container");
+                // `SHARED_PG` is a static and never dropped; the cleanup label
+                // lets the exit hook remove the container.
+                let container = super::container_cleanup::with_cleanup_label(
+                    Postgres::default()
+                        .with_tag("16-alpine")
+                        .with_label("github.run_id", &run_id),
+                )
+                .start()
+                .await
+                .expect("failed to start PostgreSQL container");
 
                 let port = container
                     .get_host_port_ipv4(5432)

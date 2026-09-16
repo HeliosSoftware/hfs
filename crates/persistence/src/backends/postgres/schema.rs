@@ -4278,10 +4278,14 @@ mod postgres_integration_v37_migration {
     };
     use crate::error::StorageResult;
 
+    #[path = "../../../../../tests/common/container_cleanup.rs"]
+    mod container_cleanup;
+
     struct SharedPg {
         host: String,
         port: u16,
-        /// Kept alive for the test binary; CI cleanup uses the run label.
+        /// Kept alive for the test binary; the `container_cleanup` exit hook
+        /// removes it at process exit.
         _container: testcontainers::ContainerAsync<Postgres>,
     }
 
@@ -4292,12 +4296,16 @@ mod postgres_integration_v37_migration {
         SHARED_PG
             .get_or_init(|| async {
                 let run_id = std::env::var("GITHUB_RUN_ID").unwrap_or_default();
-                let container = Postgres::default()
-                    .with_tag("16-alpine")
-                    .with_label("github.run_id", &run_id)
-                    .start()
-                    .await
-                    .expect("start PostgreSQL container");
+                // `SHARED_PG` is a static and never dropped; the cleanup label
+                // lets the exit hook remove the container.
+                let container = container_cleanup::with_cleanup_label(
+                    Postgres::default()
+                        .with_tag("16-alpine")
+                        .with_label("github.run_id", &run_id),
+                )
+                .start()
+                .await
+                .expect("start PostgreSQL container");
                 let host = container
                     .get_host()
                     .await

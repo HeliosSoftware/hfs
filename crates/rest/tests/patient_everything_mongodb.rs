@@ -14,6 +14,9 @@
 
 mod common;
 
+#[path = "common/container_cleanup.rs"]
+mod container_cleanup;
+
 mod patient_everything_mongodb_tests {
     use axum_test::TestServer;
     use helios_persistence::backends::mongodb::{MongoBackend, MongoBackendConfig};
@@ -59,12 +62,16 @@ mod patient_everything_mongodb_tests {
                 }
 
                 let run_id = std::env::var("GITHUB_RUN_ID").unwrap_or_default();
-                let container = Mongo::default()
-                    .with_label("github.run_id", &run_id)
-                    .with_startup_timeout(std::time::Duration::from_secs(120))
-                    .start()
-                    .await
-                    .ok()?;
+                // `SHARED_MONGO` is a static and never dropped; the cleanup
+                // label lets the exit hook remove the container.
+                let container = super::container_cleanup::with_cleanup_label(
+                    Mongo::default()
+                        .with_label("github.run_id", &run_id)
+                        .with_startup_timeout(std::time::Duration::from_secs(120)),
+                )
+                .start()
+                .await
+                .ok()?;
                 let port = container.get_host_port_ipv4(27017).await.ok()?;
                 let host = container.get_host().await.ok()?.to_string();
                 Some(SharedMongo {

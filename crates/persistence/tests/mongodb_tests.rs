@@ -232,9 +232,9 @@ mod shared_mongo {
 
     struct SharedMongo {
         connection_string: String,
-        /// Kept alive for the duration of the test binary; reaped by the
-        /// testcontainers watchdog and the CI cleanup step (by `github.run_id`
-        /// label). `None` when an external `HFS_TEST_MONGODB_URL` is used.
+        /// Kept alive for the duration of the test binary; the
+        /// `container_cleanup` exit hook removes it at process exit.
+        /// `None` when an external `HFS_TEST_MONGODB_URL` is used.
         _container: Option<testcontainers::ContainerAsync<Mongo>>,
     }
 
@@ -253,39 +253,43 @@ mod shared_mongo {
                 // Otherwise start an ephemeral standalone Mongo container; if
                 // Docker is unavailable, `start()` errors and the suite skips.
                 let run_id = std::env::var("GITHUB_RUN_ID").unwrap_or_default();
-                let container = Mongo::default()
-                    .with_label("github.run_id", &run_id)
-                    // Cap WiredTiger's cache. By default mongod sizes it to
-                    // ~50% of *host* RAM (ignoring container limits), so on CI
-                    // — where this container runs alongside ES/Postgres plus
-                    // coverage-instrumented test binaries — it balloons and the
-                    // host OOM-kills mongod mid-run (observed as connections
-                    // refused / "unexpected end of file" on the last wave of
-                    // tests). 0.25 GB is WiredTiger's floor and ample for the
-                    // suite's tiny datasets. `--bind_ip_all` matches the stock
-                    // image default and keeps the mapped port reachable once we
-                    // supply our own command.
-                    .with_cmd([
-                        "mongod",
-                        "--bind_ip_all",
-                        "--wiredTigerCacheSizeGB",
-                        "0.25",
-                        // `failCommand` (used by the bulk-submit retry tests)
-                        // is only registered when test commands are enabled.
-                        "--setParameter",
-                        "enableTestCommands=1",
-                    ])
-                    // Every test creates its own uniquely-named database, and
-                    // WiredTiger holds file handles open per collection/index
-                    // across all of them. With 50+ test databases the stock
-                    // container nofile limit is exhausted and index builds die
-                    // with TooManyFilesOpen (error 264) late in the run. 64000
-                    // is mongod's own recommended minimum.
-                    .with_ulimit("nofile", 64000, Some(64000))
-                    .with_startup_timeout(std::time::Duration::from_secs(120))
-                    .start()
-                    .await
-                    .ok()?;
+                // `SHARED` is a static and never dropped; the cleanup label
+                // lets the exit hook remove the container.
+                let container = super::container_cleanup::with_cleanup_label(
+                    Mongo::default()
+                        .with_label("github.run_id", &run_id)
+                        // Cap WiredTiger's cache. By default mongod sizes it to
+                        // ~50% of *host* RAM (ignoring container limits), so on CI
+                        // — where this container runs alongside ES/Postgres plus
+                        // coverage-instrumented test binaries — it balloons and the
+                        // host OOM-kills mongod mid-run (observed as connections
+                        // refused / "unexpected end of file" on the last wave of
+                        // tests). 0.25 GB is WiredTiger's floor and ample for the
+                        // suite's tiny datasets. `--bind_ip_all` matches the stock
+                        // image default and keeps the mapped port reachable once we
+                        // supply our own command.
+                        .with_cmd([
+                            "mongod",
+                            "--bind_ip_all",
+                            "--wiredTigerCacheSizeGB",
+                            "0.25",
+                            // `failCommand` (used by the bulk-submit retry tests)
+                            // is only registered when test commands are enabled.
+                            "--setParameter",
+                            "enableTestCommands=1",
+                        ])
+                        // Every test creates its own uniquely-named database, and
+                        // WiredTiger holds file handles open per collection/index
+                        // across all of them. With 50+ test databases the stock
+                        // container nofile limit is exhausted and index builds die
+                        // with TooManyFilesOpen (error 264) late in the run. 64000
+                        // is mongod's own recommended minimum.
+                        .with_ulimit("nofile", 64000, Some(64000))
+                        .with_startup_timeout(std::time::Duration::from_secs(120)),
+                )
+                .start()
+                .await
+                .ok()?;
                 let host = container.get_host().await.ok()?;
                 let port = container.get_host_port_ipv4(27017).await.ok()?;
                 Some(SharedMongo {
@@ -303,6 +307,9 @@ mod shared_mongo {
         Some(shared().await?.connection_string.clone())
     }
 }
+
+#[path = "common/container_cleanup.rs"]
+mod container_cleanup;
 
 /// The backend-agnostic tenant-id fidelity scenarios (issue #447), shared
 /// verbatim with the SQLite and PostgreSQL suites.
