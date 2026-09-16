@@ -398,6 +398,20 @@ impl BulkSubmitProvider for IndexingSubmitJobs {
         self.inner.get_submission(tenant, id).await
     }
 
+    /// Forwarded rather than left to the trait default, which would answer it
+    /// with a whole [`Self::get_submission`]. The lease keeper polls this on
+    /// every heartbeat (#1138), so falling through would put a manifest-wide
+    /// aggregate on the path that keeps the lease alive — the one #1127 exists
+    /// to protect. Backends that answer it with a single-row read, as
+    /// PostgreSQL does, only do so if the call reaches them.
+    async fn get_submission_status(
+        &self,
+        tenant: &TenantContext,
+        id: &SubmissionId,
+    ) -> StorageResult<Option<SubmissionStatus>> {
+        self.inner.get_submission_status(tenant, id).await
+    }
+
     async fn list_submissions(
         &self,
         tenant: &TenantContext,

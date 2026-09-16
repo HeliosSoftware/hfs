@@ -1302,8 +1302,10 @@ impl BulkSubmitProvider for SqliteBackend {
                     )
                 })
                 .unwrap_or((0, 0));
-            // `last_processed_line` is a line cursor, not an outcome tally, so it
-            // advances by every entry the batch walked (#969).
+            // `last_processed_line` advances by the entries this batch newly
+            // charged (#969), which after #1127 is what the file's watermark
+            // let through: a re-walk of lines already counted advances neither
+            // the tally nor the cursor.
             txn.with_connection(|conn| {
                 let add = match options.file_url.as_deref() {
                     Some(url) => advance_file_progress(
