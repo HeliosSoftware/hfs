@@ -258,6 +258,7 @@ removes trailing slashes at startup. HFS does not derive this value from
 | `HFS_REQUEST_TIMEOUT` | `30` | Request timeout (seconds) |
 | `HFS_DEFAULT_PAGE_SIZE` | `20` | Default search result page size |
 | `HFS_MAX_PAGE_SIZE` | `1000` | Maximum search result page size |
+| `HFS_EVERYTHING_MAX_UNPAGED` | `10000` | Ceiling on `match` entries for an unpaged `Patient/$everything`; when reached the response is paged and carries a `next` link. |
 | `HFS_ENABLE_REQUEST_ID` | `true` | Enable request ID tracking |
 | `HFS_ENABLE_VERSIONING` | `true` | Enable ETag versioning |
 | `HFS_RETURN_GONE` | `true` | Return `410 Gone` for deleted resources (vs `404`) |

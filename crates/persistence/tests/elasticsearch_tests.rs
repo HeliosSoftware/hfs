@@ -2458,6 +2458,143 @@ mod es_integration {
         assert_eq!(result.resources.items[0].id(), "raw-composite-1");
     }
 
+    /// #1047: a lookup that resolves a write against existing content (a
+    /// transaction's conditional reference, an `If-None-Exist` create) must
+    /// see every write the composite has already acknowledged, whatever the
+    /// Elasticsearch write-refresh policy. This is the default policy
+    /// (`false`) with a refresh interval long enough that the index cannot
+    /// catch up on its own during the test: the lookup has to ask.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn es_integration_composite_conditional_lookups_see_unrefreshed_writes() {
+        use std::collections::HashMap;
+
+        use helios_persistence::backends::sqlite::SqliteBackend;
+        use helios_persistence::composite::{
+            CompositeConfig, CompositeStorage, DynSearchProvider, DynStorage, SyncMode,
+        };
+        use helios_persistence::core::{
+            ConditionalCreateResult, ConditionalStorage, SearchProvider,
+        };
+        use helios_persistence::types::{
+            SearchParamType, SearchParameter, SearchQuery, SearchValue,
+        };
+
+        let es = shared_es().await;
+        let unique_prefix = format!("hfs_{}", uuid::Uuid::new_v4().simple());
+        let es_config = ElasticsearchConfig {
+            nodes: vec![format!("http://{}:{}", es.host, es.port)],
+            index_prefix: unique_prefix,
+            number_of_replicas: 0,
+            refresh_interval: "30s".to_string(),
+            write_refresh: WriteRefreshPolicy::False,
+            ..Default::default()
+        };
+        let es_backend = Arc::new(
+            ElasticsearchBackend::with_shared_registry(es_config, build_search_registry())
+                .expect("create ES backend"),
+        );
+        es_backend
+            .initialize()
+            .await
+            .expect("initialize ES backend");
+
+        // The production shape: the primary's own index is offloaded to ES.
+        let mut sqlite = SqliteBackend::in_memory().expect("create SQLite backend");
+        sqlite.set_search_offloaded(true);
+        let sqlite = Arc::new(sqlite);
+        sqlite.init_schema().expect("init SQLite schema");
+
+        let composite_config = CompositeConfig::builder()
+            .primary("sqlite", BackendKind::Sqlite)
+            .search_backend("es", BackendKind::Elasticsearch)
+            .sync_mode(SyncMode::Synchronous)
+            .build()
+            .expect("build composite config");
+
+        let mut backends: HashMap<String, DynStorage> = HashMap::new();
+        backends.insert("sqlite".to_string(), sqlite.clone() as DynStorage);
+        backends.insert("es".to_string(), es_backend.clone() as DynStorage);
+
+        let mut search_providers: HashMap<String, DynSearchProvider> = HashMap::new();
+        search_providers.insert("sqlite".to_string(), sqlite.clone() as DynSearchProvider);
+        search_providers.insert("es".to_string(), es_backend.clone() as DynSearchProvider);
+
+        let composite = CompositeStorage::new(composite_config, backends)
+            .expect("create composite storage")
+            .with_search_providers(search_providers)
+            .with_full_primary(sqlite);
+
+        let tenant = create_tenant("unrefreshed-composite-tenant");
+        let organization = json!({
+            "resourceType": "Organization",
+            "identifier": [{"system": "urn:zzz:probe", "value": "ORG-PROBE-1047"}],
+            "name": "ZZZ Probe Org"
+        });
+        let created = composite
+            .create(
+                &tenant,
+                "Organization",
+                organization.clone(),
+                FhirVersion::default(),
+            )
+            .await
+            .expect("create through composite");
+
+        // `If-None-Exist` right after the create: the same criteria a
+        // transaction's conditional reference carries.
+        let outcome = composite
+            .conditional_create(
+                &tenant,
+                "Organization",
+                organization,
+                "identifier=urn:zzz:probe|ORG-PROBE-1047",
+                FhirVersion::default(),
+            )
+            .await
+            .expect("conditional create through composite");
+        match outcome {
+            ConditionalCreateResult::Exists(existing) => {
+                assert_eq!(existing.id(), created.id());
+            }
+            ConditionalCreateResult::Created(_) => {
+                panic!("conditional create missed the Organization created moments earlier")
+            }
+            ConditionalCreateResult::MultipleMatches(n) => panic!("unexpected {n} matches"),
+        }
+
+        // The primitive the transaction path uses, then the lookup it runs.
+        composite
+            .ensure_writes_visible(&tenant, &["Organization"])
+            .await
+            .expect("ensure_writes_visible through composite");
+        let query = SearchQuery::new("Organization").with_parameter(SearchParameter {
+            name: "identifier".to_string(),
+            param_type: SearchParamType::Token,
+            modifier: None,
+            values: vec![SearchValue::token(Some("urn:zzz:probe"), "ORG-PROBE-1047")],
+            chain: vec![],
+            components: vec![],
+        });
+        let result = composite
+            .search(&tenant, &query)
+            .await
+            .expect("search through composite");
+        assert_eq!(
+            result.resources.items.len(),
+            1,
+            "an acknowledged write must be searchable after ensure_writes_visible, \
+             without waiting for the refresh interval"
+        );
+        assert_eq!(result.resources.items[0].id(), created.id());
+
+        // A type with no index yet is not an error: nothing was written to it.
+        composite
+            .ensure_writes_visible(&tenant, &["Location"])
+            .await
+            .expect("refreshing a type with no index yet is a no-op");
+    }
+
     /// `create_many` is one `_bulk` request per batch, so under
     /// `refresh=wait_for` a batch pays one refresh wait — not one per
     /// document. With a 5s refresh interval, 40 per-document writes would
@@ -4636,6 +4773,95 @@ mod es_integration {
             .unwrap();
         assert_eq!(page_ids(&back1), vec!["cp-1", "cp-2", "cp-3"]);
         assert!(back1.resources.page_info.previous_cursor.is_none());
+    }
+
+    /// The three backend primitives `Patient/$everything`'s compartment walk
+    /// composes — compartment membership (OR across `subject`/`performer`,
+    /// see `es_integration_compartment_search`), cursor-paged results (see
+    /// `es_integration_cursor_paging_round_trip_previous`), and a
+    /// `_lastUpdated ge` filter — pinned together the way the handler uses
+    /// them, since ES has no REST-level `$everything` fixture.
+    #[tokio::test]
+    async fn es_compartment_query_pages_with_cursor_and_since() {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::types::{
+            CompartmentMembership, SearchParamType, SearchParameter, SearchPrefix, SearchQuery,
+            SearchValue,
+        };
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("everything-compartment-paging");
+
+        for i in 1..=5 {
+            backend
+                .create(
+                    &tenant,
+                    "Observation",
+                    json!({
+                        "resourceType": "Observation",
+                        "status": "final",
+                        "code": {"text": "x"},
+                        "id": format!("o{i}"),
+                        "subject": {"reference": "Patient/p1"}
+                    }),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+        backend
+            .create(
+                &tenant,
+                "Observation",
+                json!({
+                    "resourceType": "Observation",
+                    "status": "final",
+                    "code": {"text": "x"},
+                    "id": "other",
+                    "subject": {"reference": "Patient/p2"}
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+
+        // Wait for index refresh
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+        let mut q = SearchQuery::new("Observation");
+        q.compartment = Some(CompartmentMembership {
+            params: vec!["subject".to_string(), "performer".to_string()],
+            reference: "Patient/p1".to_string(),
+        });
+        q.count = Some(2);
+
+        let mut seen = Vec::new();
+        let mut cursor = None;
+        loop {
+            q.cursor = cursor.take();
+            let page = backend.search(&tenant, &q).await.unwrap();
+            seen.extend(page.resources.items.iter().map(|r| r.id().to_string()));
+            if page.resources.page_info.has_next {
+                cursor = page.resources.page_info.next_cursor.clone();
+                assert!(cursor.is_some());
+            } else {
+                break;
+            }
+        }
+        seen.sort();
+        assert_eq!(seen, vec!["o1", "o2", "o3", "o4", "o5"]);
+
+        q.cursor = None;
+        q.parameters.push(SearchParameter {
+            name: "_lastUpdated".to_string(),
+            param_type: SearchParamType::Date,
+            modifier: None,
+            values: vec![SearchValue::new(SearchPrefix::Ge, "2999-01-01T00:00:00Z")],
+            chain: vec![],
+            components: vec![],
+        });
+        let page = backend.search(&tenant, &q).await.unwrap();
+        assert!(page.resources.items.is_empty());
     }
 
     /// #1079: a result set whose size is an exact multiple of `_count` must

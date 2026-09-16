@@ -168,6 +168,25 @@ Both operations emit BALP `AuditEvent`s — purge on completion or failure,
 reindex at start and at its terminal state (complete / cancel / fail, outcome
 `0` / `4` / `8`) — each attributed to the requesting principal.
 
+### `Patient/$everything`
+
+`GET|POST /Patient/{id}/$everything` and `GET|POST /Patient/$everything`.
+
+Returns a `searchset` Bundle with the Patient, every resource in the
+patient's compartment (membership from the spec `CompartmentDefinition`, the
+same table `GET /Patient/{id}/*` uses), and the supporting resources those
+reference (Practitioner, Organization, Location, Medication, …) as
+`search.mode = include`.
+
+Parameters: `start`, `end` (clinical dates, applied to each member type's
+clinical date search parameter), `_since` (`meta.lastUpdated`), `_type`
+(comma-separated, repeatable), `_count`, `_cursor` (server-issued). Without
+`_count` the whole result is returned in one bundle up to
+`HFS_EVERYTHING_MAX_UNPAGED`, after which it is paged. Paging is forward-only.
+
+Supported on every backend that supports search (SQLite, PostgreSQL,
+MongoDB, Elasticsearch, and composites); S3 standalone returns 501.
+
 ## Configuration
 
 The server is configured via environment variables:
@@ -183,6 +202,7 @@ The server is configured via environment variables:
 | `HFS_DASHBOARD_REFRESH_SECS` | 5 | Seconds between refreshes of a Home dashboard whose figures are moving (whole seconds, > 0, <= `HFS_DASHBOARD_IDLE_REFRESH_SECS`) |
 | `HFS_DASHBOARD_IDLE_REFRESH_SECS` | 10 | Seconds between watch ticks of a Home dashboard whose figures are settled (whole seconds, > 0, >= `HFS_DASHBOARD_REFRESH_SECS`) |
 | `HFS_BATCH_MAX_CONCURRENCY` | 16 | Ceiling on concurrent entries within one `batch` Bundle (see below) |
+| `HFS_EVERYTHING_MAX_UNPAGED` | 10000 | Ceiling on `match` entries for an unpaged `Patient/$everything`; when reached the response is paged and carries a `next` link. |
 | `HFS_ENABLE_CORS` | true | Enable CORS |
 | `HFS_DEFAULT_TENANT` | default | Default tenant ID |
 | `HFS_DATABASE_URL` | - | Database connection string |

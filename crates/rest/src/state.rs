@@ -573,6 +573,11 @@ impl<S: ResourceStorage> AppState<S> {
         self.config.max_page_size
     }
 
+    /// Ceiling on `match` entries for an unpaged `Patient/$everything`.
+    pub fn everything_max_unpaged(&self) -> usize {
+        self.config.everything_max_unpaged
+    }
+
     /// Returns whether deleted resources should return 410 Gone.
     pub fn return_gone(&self) -> bool {
         self.config.return_gone

@@ -4,6 +4,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use helios_fhir::FhirVersion;
 use serde_json::Value;
+use std::collections::HashSet;
 use std::time::Duration as StdDuration;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt};
 use uuid::Uuid;
@@ -14,10 +15,10 @@ use crate::core::bulk_export_worker::{LeaseError, WorkerId};
 use crate::core::bulk_submit::{
     BulkEntryOutcome, BulkEntryResult, BulkProcessingOptions, BulkSubmitProvider,
     BulkSubmitRollbackProvider, CANCELLED_ABORT_REASON, ChangeType, EntryCountSummary,
-    EntryResultContinuation, EntryResultCursor, EntryResultPage, ManifestPhase, ManifestStatus,
-    NdjsonEntry, PagedEntryResult, StreamProcessingResult, StreamingBulkSubmitProvider,
-    SubmissionChange, SubmissionId, SubmissionManifest, SubmissionStatus, SubmissionSummary,
-    UnindexedEntry, invalid_entry_result_page,
+    EntryResultContinuation, EntryResultCursor, EntryResultPage, ImportMode, ManifestPhase,
+    ManifestStatus, NdjsonEntry, PagedEntryResult, StreamProcessingResult,
+    StreamingBulkSubmitProvider, SubmissionChange, SubmissionId, SubmissionManifest,
+    SubmissionStatus, SubmissionSummary, UnindexedEntry, invalid_entry_result_page,
 };
 use crate::core::bulk_submit_publication::{
     ManifestPublicationResult, ManifestPublicationStatus, canonical_publication_files,
@@ -30,6 +31,25 @@ use crate::error::{BackendError, BulkSubmitError, StorageError, StorageResult};
 use crate::tenant::{TenantContext, TenantId, TenantPermissions};
 
 use super::PostgresBackend;
+use super::cached::query_opt_cached;
+
+const MAX_GROUPED_FRESH_CREATES: usize = 100;
+
+const FRESH_CREATE_CANDIDATES_SQL: &str = "\
+SELECT 1
+FROM resources AS resource
+JOIN unnest($2::text[], $3::text[]) AS candidate(resource_type, id)
+  ON resource.resource_type = candidate.resource_type AND resource.id = candidate.id
+WHERE resource.tenant_id = $1
+LIMIT 1";
+
+struct ProcessedEntryBatch {
+    results: Vec<BulkEntryResult>,
+    aborted_on_max_errors: bool,
+    /// The resources as committed, for observers that index them (#1127);
+    /// collected only when one asked, so counting-only runs hold nothing.
+    committed_resources: Vec<crate::types::StoredResource>,
+}
 
 /// One ingested entry: its receipt, the rollback record its write warrants,
 /// and the resource as committed (absent when nothing was written).
@@ -44,6 +64,46 @@ fn internal_error(message: String) -> StorageError {
         backend_name: "postgres".to_string(),
         message,
         source: None,
+    })
+}
+
+fn is_grouped_fresh_create_eligible(
+    entries: &[NdjsonEntry],
+    options: &BulkProcessingOptions,
+    search_offloaded: bool,
+) -> bool {
+    if entries.is_empty()
+        || entries.len() > MAX_GROUPED_FRESH_CREATES
+        || search_offloaded
+        // Grouped creates yield receipts and rollback records, not the
+        // resources as committed, so an observer that indexes them (#1127)
+        // would silently miss this batch. Today `search_offloaded` already
+        // excludes every wiring that attaches one; this keeps the invariant
+        // true if that ever changes.
+        || options.wants_committed_resources()
+        || !options.defer_indexing
+        || options.import_mode != ImportMode::Replace
+        || !options.continue_on_error
+        || options.max_errors != 0
+    {
+        return false;
+    }
+
+    let mut keys = HashSet::with_capacity(entries.len());
+    entries.iter().all(|entry| {
+        let Some(cached_id) = entry.resource_id.as_deref() else {
+            return false;
+        };
+        let Some(payload_id) = entry.resource.get("id").and_then(Value::as_str) else {
+            return false;
+        };
+        let Some(payload_type) = entry.resource.get("resourceType").and_then(Value::as_str) else {
+            return false;
+        };
+
+        cached_id == payload_id
+            && entry.resource_type == payload_type
+            && keys.insert((entry.resource_type.as_str(), cached_id))
     })
 }
 
@@ -678,9 +738,6 @@ impl BulkSubmitProvider for PostgresBackend {
                 .map_err(|e| internal_error(format!("Failed to update manifest status: {}", e)))?;
         }
 
-        let mut results = Vec::new();
-        let mut error_count = 0u32;
-        let mut aborted_on_max_errors = false;
         let file_url = options.file_url.as_deref().unwrap_or("");
 
         // One transaction per batch (#872, mirroring the SQLite batch ingest
@@ -691,98 +748,110 @@ impl BulkSubmitProvider for PostgresBackend {
         // Each entry runs under a savepoint: on Postgres a failed statement
         // aborts the whole transaction, and the savepoint contains a failure
         // to its one entry the way SQLite's per-statement independence does.
+        let transaction_options = crate::core::TransactionOptions {
+            fhir_version: Some(FhirVersion::default_enabled()),
+            defer_search_indexing: options.defer_indexing,
+            ..Default::default()
+        };
         let mut txn = <Self as crate::core::TransactionProvider>::begin_transaction(
             self,
             tenant,
-            crate::core::TransactionOptions {
-                fhir_version: Some(FhirVersion::default_enabled()),
-                defer_search_indexing: options.defer_indexing,
-                ..Default::default()
-            },
+            transaction_options.clone(),
         )
         .await?;
-        // The committed resources, for observers that index them (#1127);
-        // collected only when one asked, so counting-only runs hold nothing.
-        let want_resources = options.wants_committed_resources();
-        let mut committed_resources = Vec::new();
-
-        for entry in entries {
-            if options.max_errors > 0 && error_count >= options.max_errors {
-                if !options.continue_on_error {
-                    aborted_on_max_errors = true;
-                    break;
-                }
-                let skip_result = BulkEntryResult::skipped(
-                    entry.line_number,
-                    &entry.resource_type,
-                    "max errors exceeded",
-                );
-                Self::write_entry_rows_tx(
-                    &txn,
-                    submission_id,
-                    manifest_id,
-                    file_url,
-                    &skip_result,
-                    None,
-                )
-                .await?;
-                results.push(skip_result);
-                continue;
-            }
-
-            // The transaction buffers creates and sends them in batches, so
-            // an entry's conflict can surface after its `create` returned.
-            // The savepoint methods flush at the savepoint boundaries: the
-            // release raises this entry's conflict inside its own savepoint,
-            // and the rollback undoes only this entry's rows.
-            txn.savepoint("bulk_entry").await?;
-            let outcome = match self
-                .ingest_entry_in_tx(&mut txn, manifest_id, &entry, options)
+        let processed = if is_grouped_fresh_create_eligible(
+            &entries,
+            options,
+            self.is_search_offloaded(),
+        ) {
+            match self
+                .try_grouped_fresh_creates(&mut txn, manifest_id, &entries)
                 .await
             {
-                Ok(ingested) => txn.release_savepoint("bulk_entry").await.map(|_| ingested),
-                Err(e) => Err(e),
-            };
-            let (entry_result, change, stored) = match outcome {
-                Ok(ingested) => ingested,
-                Err(e) => {
-                    txn.rollback_to_savepoint("bulk_entry")
-                        .await
-                        .map_err(|se| internal_error(format!("{se} after '{e}'")))?;
-                    let failed = BulkEntryResult::processing_error(
-                        entry.line_number,
-                        &entry.resource_type,
-                        serde_json::json!({
-                            "resourceType": "OperationOutcome",
-                            "issue": [{
-                                "severity": "error",
-                                "code": "exception",
-                                "diagnostics": e.to_string()
-                            }]
-                        }),
-                    );
-                    (failed, None, None)
+                Ok(Some(provisional)) => {
+                    let mut results = Vec::with_capacity(provisional.len());
+                    // Resource and history rows are durable within the
+                    // transaction now. Only at this point may their receipts
+                    // and rollback records be staged: a grouped-write failure
+                    // must leave no bookkeeping that could be replayed.
+                    for (entry_result, change) in provisional {
+                        Self::write_entry_rows_tx(
+                            &txn,
+                            submission_id,
+                            manifest_id,
+                            file_url,
+                            &entry_result,
+                            Some(&change),
+                        )
+                        .await?;
+                        results.push(entry_result);
+                    }
+                    ProcessedEntryBatch {
+                        results,
+                        aborted_on_max_errors: false,
+                        // Grouped creates never run while an observer wants
+                        // the committed resources; see
+                        // `is_grouped_fresh_create_eligible`.
+                        committed_resources: Vec::new(),
+                    }
                 }
-            };
-
-            if entry_result.is_error() {
-                error_count += 1;
+                Ok(None) => {
+                    self.process_entries_individually(
+                        &mut txn,
+                        submission_id,
+                        manifest_id,
+                        &entries,
+                        options,
+                    )
+                    .await?
+                }
+                Err(grouped_error) => {
+                    // The tentative transaction may contain buffered creates
+                    // or a partially executed grouped statement. Await its
+                    // rollback before trying to acquire the replacement
+                    // connection; this is required for a pool of size one.
+                    crate::core::Transaction::rollback(Box::new(txn))
+                        .await
+                        .map_err(|rollback_error| {
+                            internal_error(format!(
+                                "Failed to roll back grouped fresh-create attempt after '{grouped_error}': {rollback_error}"
+                            ))
+                        })?;
+                    tracing::debug!(
+                        "grouped PostgreSQL bulk-submit create failed; replaying entries individually: {grouped_error}"
+                    );
+                    txn = <Self as crate::core::TransactionProvider>::begin_transaction(
+                        self,
+                        tenant,
+                        transaction_options,
+                    )
+                    .await?;
+                    self.process_entries_individually(
+                        &mut txn,
+                        submission_id,
+                        manifest_id,
+                        &entries,
+                        options,
+                    )
+                    .await?
+                }
             }
-
-            Self::write_entry_rows_tx(
-                &txn,
+        } else {
+            self.process_entries_individually(
+                &mut txn,
                 submission_id,
                 manifest_id,
-                file_url,
-                &entry_result,
-                change.as_ref(),
+                &entries,
+                options,
             )
-            .await?;
-            results.push(entry_result);
-            if want_resources && let Some(stored) = stored {
-                committed_resources.push(stored);
-            }
-        }
+            .await?
+        };
+
+        let ProcessedEntryBatch {
+            results,
+            aborted_on_max_errors,
+            committed_resources,
+        } = processed;
 
         // Charge the batch to the manifest's counters inside the batch
         // transaction, so they commit (or vanish) with the rows they describe.
@@ -1128,6 +1197,179 @@ impl BulkSubmitProvider for PostgresBackend {
 }
 
 impl PostgresBackend {
+    /// Attempts the fast path for a batch whose payload shape guarantees only
+    /// explicit, unique creates. `Ok(None)` means one of those keys already
+    /// exists and the caller should use the individual path in this untouched
+    /// transaction. Errors are limited to the candidate query, `create`, and
+    /// grouped `flush`, so the caller may roll the whole attempt back and replay
+    /// once. Bookkeeping deliberately happens after this helper returns.
+    async fn try_grouped_fresh_creates(
+        &self,
+        txn: &mut super::transaction::PostgresTransaction,
+        manifest_id: &str,
+        entries: &[NdjsonEntry],
+    ) -> StorageResult<Option<Vec<(BulkEntryResult, SubmissionChange)>>> {
+        use crate::core::Transaction;
+
+        let resource_types: Vec<&str> = entries
+            .iter()
+            .map(|entry| entry.resource_type.as_str())
+            .collect();
+        let resource_ids: Vec<&str> = entries
+            .iter()
+            .map(|entry| {
+                entry
+                    .resource_id
+                    .as_deref()
+                    .expect("grouped-create eligibility requires an explicit id")
+            })
+            .collect();
+        let tenant_id = txn.tenant().tenant_id().as_str();
+        let candidate = query_opt_cached(
+            txn.raw_client()?,
+            FRESH_CREATE_CANDIDATES_SQL,
+            &[&tenant_id, &resource_types, &resource_ids],
+        )
+        .await
+        .map_err(|error| {
+            internal_error(format!(
+                "Failed to query grouped fresh-create candidates: {error}"
+            ))
+        })?;
+        if candidate.is_some() {
+            return Ok(None);
+        }
+
+        let mut provisional = Vec::with_capacity(entries.len());
+        for entry in entries {
+            let created = txn
+                .create(&entry.resource_type, entry.resource.clone())
+                .await?;
+            let result = BulkEntryResult::success(
+                entry.line_number,
+                &entry.resource_type,
+                created.id(),
+                true,
+            );
+            let change = SubmissionChange::create(
+                manifest_id,
+                &entry.resource_type,
+                created.id(),
+                created.version_id(),
+            );
+            provisional.push((result, change));
+        }
+
+        txn.flush().await?;
+        Ok(Some(provisional))
+    }
+
+    /// Runs the original per-entry path inside one batch transaction. Each
+    /// entry keeps its own savepoint, point read, conflict containment,
+    /// bookkeeping, and max-error behavior.
+    async fn process_entries_individually(
+        &self,
+        txn: &mut super::transaction::PostgresTransaction,
+        submission_id: &SubmissionId,
+        manifest_id: &str,
+        entries: &[NdjsonEntry],
+        options: &BulkProcessingOptions,
+    ) -> StorageResult<ProcessedEntryBatch> {
+        let mut results = Vec::with_capacity(entries.len());
+        let mut error_count = 0u32;
+        let mut aborted_on_max_errors = false;
+        let file_url = options.file_url.as_deref().unwrap_or("");
+        // Collected only when an observer asked for them (#1127).
+        let want_resources = options.wants_committed_resources();
+        let mut committed_resources = Vec::new();
+
+        for entry in entries {
+            if options.max_errors > 0 && error_count >= options.max_errors {
+                if !options.continue_on_error {
+                    aborted_on_max_errors = true;
+                    break;
+                }
+                let skip_result = BulkEntryResult::skipped(
+                    entry.line_number,
+                    &entry.resource_type,
+                    "max errors exceeded",
+                );
+                Self::write_entry_rows_tx(
+                    txn,
+                    submission_id,
+                    manifest_id,
+                    file_url,
+                    &skip_result,
+                    None,
+                )
+                .await?;
+                results.push(skip_result);
+                continue;
+            }
+
+            // The transaction buffers creates and sends them in batches, so
+            // an entry's conflict can surface after its `create` returned.
+            // The savepoint methods flush at the savepoint boundaries: the
+            // release raises this entry's conflict inside its own savepoint,
+            // and the rollback undoes only this entry's rows.
+            txn.savepoint("bulk_entry").await?;
+            let outcome = match self
+                .ingest_entry_in_tx(txn, manifest_id, entry, options)
+                .await
+            {
+                Ok(pair) => txn.release_savepoint("bulk_entry").await.map(|_| pair),
+                Err(error) => Err(error),
+            };
+            let (entry_result, change, stored) = match outcome {
+                Ok(ingested) => ingested,
+                Err(error) => {
+                    txn.rollback_to_savepoint("bulk_entry")
+                        .await
+                        .map_err(|savepoint_error| {
+                            internal_error(format!("{savepoint_error} after '{error}'"))
+                        })?;
+                    let failed = BulkEntryResult::processing_error(
+                        entry.line_number,
+                        &entry.resource_type,
+                        serde_json::json!({
+                            "resourceType": "OperationOutcome",
+                            "issue": [{
+                                "severity": "error",
+                                "code": "exception",
+                                "diagnostics": error.to_string()
+                            }]
+                        }),
+                    );
+                    (failed, None, None)
+                }
+            };
+
+            if entry_result.is_error() {
+                error_count += 1;
+            }
+
+            Self::write_entry_rows_tx(
+                txn,
+                submission_id,
+                manifest_id,
+                file_url,
+                &entry_result,
+                change.as_ref(),
+            )
+            .await?;
+            results.push(entry_result);
+            if want_resources && let Some(stored) = stored {
+                committed_resources.push(stored);
+            }
+        }
+
+        Ok(ProcessedEntryBatch {
+            results,
+            aborted_on_max_errors,
+            committed_resources,
+        })
+    }
+
     /// Applies one NDJSON entry inside the batch transaction, returning the
     /// entry's result plus the rollback record to write with it.
     ///
@@ -1273,8 +1515,8 @@ impl PostgresBackend {
             let Some(change) = change else {
                 return Ok(0);
             };
-            client
-                .execute(
+            super::cached::execute_cached(
+                client,
                     "INSERT INTO bulk_submission_changes
                      (tenant_id, submitter, submission_id, change_id, manifest_id, change_type, resource_type, resource_id, previous_version, new_version, previous_content, changed_at)
                      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
@@ -1313,7 +1555,8 @@ impl PostgresBackend {
             &outcome_code,
             &outcome_json,
         ];
-        let store_receipt = client.execute(
+        let store_receipt = super::cached::execute_cached(
+            client,
             // Upsert: the worker re-fetches a whole file after a transient
             // failure, and the retry must overwrite its own earlier rows
             // instead of colliding with them (#457).
@@ -3056,5 +3299,192 @@ mod tests {
             !content_unchanged(&stored, &tagged),
             "a tag is part of the resource, not server bookkeeping"
         );
+    }
+
+    fn eligible_options() -> BulkProcessingOptions {
+        BulkProcessingOptions {
+            defer_indexing: true,
+            ..BulkProcessingOptions::default()
+        }
+    }
+
+    fn entry(line_number: u64, resource_type: &str, id: &str) -> NdjsonEntry {
+        NdjsonEntry::new(
+            line_number,
+            resource_type,
+            json!({"resourceType": resource_type, "id": id}),
+        )
+    }
+
+    #[test]
+    fn grouped_fresh_create_eligibility_accepts_supported_batch_sizes() {
+        let options = eligible_options();
+        assert!(!is_grouped_fresh_create_eligible(&[], &options, false));
+        assert!(is_grouped_fresh_create_eligible(
+            &[entry(1, "Patient", "p-1")],
+            &options,
+            false
+        ));
+
+        let hundred: Vec<_> = (1..=100)
+            .map(|line| entry(line, "Patient", &format!("p-{line}")))
+            .collect();
+        assert!(is_grouped_fresh_create_eligible(&hundred, &options, false));
+
+        let hundred_and_one: Vec<_> = (1..=101)
+            .map(|line| entry(line, "Patient", &format!("p-{line}")))
+            .collect();
+        assert!(!is_grouped_fresh_create_eligible(
+            &hundred_and_one,
+            &options,
+            false
+        ));
+    }
+
+    #[test]
+    fn grouped_fresh_create_eligibility_requires_matching_explicit_ids() {
+        let options = eligible_options();
+
+        let mut missing_cached = entry(1, "Patient", "p-1");
+        missing_cached.resource_id = None;
+        assert!(!is_grouped_fresh_create_eligible(
+            &[missing_cached],
+            &options,
+            false
+        ));
+
+        let mut missing_payload = entry(1, "Patient", "p-1");
+        missing_payload
+            .resource
+            .as_object_mut()
+            .expect("test resource is an object")
+            .remove("id");
+        assert!(!is_grouped_fresh_create_eligible(
+            &[missing_payload],
+            &options,
+            false
+        ));
+
+        let mut non_string_payload = entry(1, "Patient", "p-1");
+        non_string_payload.resource["id"] = json!(1);
+        assert!(!is_grouped_fresh_create_eligible(
+            &[non_string_payload],
+            &options,
+            false
+        ));
+
+        let mut mismatched = entry(1, "Patient", "p-1");
+        mismatched.resource_id = Some("cached-id".to_string());
+        assert!(!is_grouped_fresh_create_eligible(
+            &[mismatched],
+            &options,
+            false
+        ));
+    }
+
+    #[test]
+    fn grouped_fresh_create_eligibility_requires_matching_resource_types() {
+        let options = eligible_options();
+
+        let mut missing = entry(1, "Patient", "p-1");
+        missing
+            .resource
+            .as_object_mut()
+            .expect("test resource is an object")
+            .remove("resourceType");
+        assert!(!is_grouped_fresh_create_eligible(
+            &[missing],
+            &options,
+            false
+        ));
+
+        let mut non_string = entry(1, "Patient", "p-1");
+        non_string.resource["resourceType"] = json!(1);
+        assert!(!is_grouped_fresh_create_eligible(
+            &[non_string],
+            &options,
+            false
+        ));
+
+        let mut mismatched = entry(1, "Patient", "p-1");
+        mismatched.resource["resourceType"] = json!("Observation");
+        assert!(!is_grouped_fresh_create_eligible(
+            &[mismatched],
+            &options,
+            false
+        ));
+    }
+
+    #[test]
+    fn grouped_fresh_create_eligibility_requires_unique_type_and_id_pairs() {
+        let options = eligible_options();
+        assert!(!is_grouped_fresh_create_eligible(
+            &[entry(1, "Patient", "shared"), entry(2, "Patient", "shared")],
+            &options,
+            false
+        ));
+        assert!(is_grouped_fresh_create_eligible(
+            &[
+                entry(1, "Patient", "shared"),
+                entry(2, "Observation", "shared")
+            ],
+            &options,
+            false
+        ));
+    }
+
+    #[test]
+    fn grouped_fresh_create_eligibility_requires_fast_path_options() {
+        let entries = [entry(1, "Patient", "p-1")];
+
+        for allow_updates in [false, true] {
+            let options = BulkProcessingOptions {
+                allow_updates,
+                ..eligible_options()
+            };
+            assert!(is_grouped_fresh_create_eligible(&entries, &options, false));
+        }
+
+        let merge = BulkProcessingOptions {
+            import_mode: ImportMode::Merge,
+            ..eligible_options()
+        };
+        assert!(!is_grouped_fresh_create_eligible(&entries, &merge, false));
+
+        let stop_on_error = BulkProcessingOptions {
+            continue_on_error: false,
+            ..eligible_options()
+        };
+        assert!(!is_grouped_fresh_create_eligible(
+            &entries,
+            &stop_on_error,
+            false
+        ));
+
+        let bounded_errors = BulkProcessingOptions {
+            max_errors: 1,
+            ..eligible_options()
+        };
+        assert!(!is_grouped_fresh_create_eligible(
+            &entries,
+            &bounded_errors,
+            false
+        ));
+
+        let inline_indexing = BulkProcessingOptions {
+            defer_indexing: false,
+            ..eligible_options()
+        };
+        assert!(!is_grouped_fresh_create_eligible(
+            &entries,
+            &inline_indexing,
+            false
+        ));
+
+        assert!(!is_grouped_fresh_create_eligible(
+            &entries,
+            &eligible_options(),
+            true
+        ));
     }
 }

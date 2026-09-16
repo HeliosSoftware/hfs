@@ -1563,10 +1563,25 @@ impl MongoBackend {
             "param_name": &param.name,
         };
 
+        // #1083: resolve the parameter's declared reference target types once,
+        // up front, so `build_reference_filter` can emit index-bounded `$in`/
+        // anchored-regex arms for the bare-id form instead of an unanchored
+        // scan. Only the bare-id branch (no modifier) needs this — every other
+        // reference modifier (`:contains`, `:text`, ...) never reaches it. The
+        // read lock is dropped here (the `Vec` is owned) before the value loop.
+        let targets: Vec<String> =
+            if param.param_type == SearchParamType::Reference && param.modifier.is_none() {
+                let registry = self.tenant_registry(tenant_id);
+                let registry = registry.read();
+                crate::search::resolve_param_targets(&registry, resource_type, &param.name)
+            } else {
+                Vec::new()
+            };
+
         let value_filters = param
             .values
             .iter()
-            .map(|value| self.build_index_value_filter(param, value))
+            .map(|value| self.build_index_value_filter(param, value, &targets))
             .collect::<StorageResult<Vec<_>>>()?;
 
         if value_filters.len() == 1 {
@@ -1606,6 +1621,7 @@ impl MongoBackend {
         &self,
         param: &SearchParameter,
         value: &SearchValue,
+        reference_targets: &[String],
     ) -> StorageResult<Document> {
         match param.name.as_str() {
             "_text" | "_content" => {
@@ -1627,7 +1643,9 @@ impl MongoBackend {
             SearchParamType::Token => self.build_token_filter(param, value),
             SearchParamType::Date => self.build_date_filter(value, "value_date"),
             SearchParamType::Number => self.build_number_filter(value),
-            SearchParamType::Reference => self.build_reference_filter(param, value),
+            SearchParamType::Reference => {
+                self.build_reference_filter(param, value, reference_targets)
+            }
             SearchParamType::Uri => self.build_uri_filter(param, value),
             SearchParamType::Quantity => self.build_quantity_filter(value),
             SearchParamType::Composite => {
@@ -1737,10 +1755,30 @@ impl MongoBackend {
         }
     }
 
+    /// Builds the `search_index` filter for a `Reference`-typed parameter.
+    ///
+    /// #1083: bare-id search (`subject=123`) used to emit a single
+    /// unanchored `$regex: "/123$"`, forcing MongoDB to scan every key in
+    /// the index. When the registry declares target types
+    /// (`reference_targets`, resolved once by the caller), this builds an
+    /// index-bounded `$or` instead: an `$in` of the bare id plus each
+    /// `Target/id`; one anchored `^Target/id/_history/` regex per target;
+    /// and anchored `^https?://.*/id$` / `^https?://.*/id/_history/`
+    /// regexes for absolute-URL references. Every branch must stay
+    /// bounded, or MongoDB abandons the index for the whole `$or`
+    /// (measured: 827,985 keys+docs / 263s with one unanchored arm vs. 53
+    /// keys / 11ms with all bounded). With no declared targets, this falls
+    /// back to today's unchanged two-branch filter. The qualified form
+    /// (`subject=Patient/123`) also grows an anchored `_history` arm.
+    ///
+    /// Divergence from SQLite: SQLite's bare form matches any `Type/id`;
+    /// Mongo's matches only declared target types, by design, since an
+    /// unbounded per-any-type arm can't be index-bounded.
     fn build_reference_filter(
         &self,
         param: &SearchParameter,
         value: &SearchValue,
+        reference_targets: &[String],
     ) -> StorageResult<Document> {
         if value.prefix != SearchPrefix::Eq {
             return Err(StorageError::Search(SearchError::QueryParseError {
@@ -1785,19 +1823,63 @@ impl MongoBackend {
         }
 
         if value.value.contains('/') {
-            return Ok(doc! { "value_reference": &value.value });
+            return Ok(doc! {
+                "$or": [
+                    { "value_reference": &value.value },
+                    {
+                        "value_reference": {
+                            "$regex": format!("^{}/_history/", regex_escape(&value.value))
+                        }
+                    }
+                ]
+            });
         }
 
-        Ok(doc! {
-            "$or": [
-                { "value_reference": &value.value },
-                {
-                    "value_reference": {
-                        "$regex": format!("/{}$", regex_escape(&value.value))
+        if reference_targets.is_empty() {
+            return Ok(doc! {
+                "$or": [
+                    { "value_reference": &value.value },
+                    {
+                        "value_reference": {
+                            "$regex": format!("/{}$", regex_escape(&value.value))
+                        }
                     }
+                ]
+            });
+        }
+
+        let escaped_id = regex_escape(&value.value);
+        let mut in_values: Vec<Bson> = vec![Bson::String(value.value.clone())];
+        let mut history_arms: Vec<Bson> = Vec::new();
+        let mut seen_targets: HashSet<&str> = HashSet::new();
+        for target in reference_targets {
+            if !seen_targets.insert(target.as_str()) {
+                continue;
+            }
+            in_values.push(Bson::String(format!("{target}/{}", value.value)));
+            history_arms.push(Bson::Document(doc! {
+                "value_reference": {
+                    "$regex": format!("^{}/{escaped_id}/_history/", regex_escape(target))
                 }
-            ]
-        })
+            }));
+        }
+
+        let mut or_arms: Vec<Bson> = vec![Bson::Document(doc! {
+            "value_reference": { "$in": in_values }
+        })];
+        or_arms.extend(history_arms);
+        // Anchored absolute-URL arms: still match `http://.../Patient/123`
+        // and its `_history` versions, which the bounded `Target/id` arms
+        // above cannot express. The `^https?://` prefix keeps both branches
+        // index-bounded (see the doc comment above).
+        or_arms.push(Bson::Document(doc! {
+            "value_reference": { "$regex": format!("^https?://.*/{escaped_id}$") }
+        }));
+        or_arms.push(Bson::Document(doc! {
+            "value_reference": { "$regex": format!("^https?://.*/{escaped_id}/_history/") }
+        }));
+
+        Ok(doc! { "$or": or_arms })
     }
 
     fn build_uri_filter(
@@ -3052,6 +3134,189 @@ mod number_quantity_precision_tests {
                 .contains_key("$not"),
             "ne is a value_number-scoped $not, sitting alongside the tenant/resource/param keys: {filter:?}"
         );
+    }
+}
+
+/// #1083: bare-id reference search must be index-bounded, and the qualified
+/// form must keep matching its own `_history` versions (parity with SQLite's
+/// `test_search_by_reference_does_not_match_extended_sibling_ids`). These
+/// pins target the exact filter document `build_search_index_filter` sends
+/// to `distinct_resource_ids`, the same way `value_list_tests` above does.
+///
+/// The `backend()` helper's registry (embedded fallback params only — the
+/// spec bundle at `<workspace root>/data` is not reachable from this crate's
+/// `./data`-relative default `data_dir` under `cargo test`) has no declared
+/// targets for `Observation.subject`, so tests that need targets seed the
+/// base registry explicitly via `SearchParameterDefinition::with_targets`,
+/// the same builder `resolve_param_targets_returns_declared_targets` in
+/// `helios_fhir::search::registry` uses.
+#[cfg(test)]
+mod reference_filter_tests {
+    use super::*;
+    use crate::backends::mongodb::MongoBackendConfig;
+    use crate::search::SearchParameterDefinition;
+
+    fn backend() -> MongoBackend {
+        MongoBackend::new(MongoBackendConfig::default()).unwrap()
+    }
+
+    /// A backend whose base registry declares `Observation.subject` targets
+    /// `["Patient", "Group"]`, registry order preserved.
+    fn backend_with_subject_targets() -> MongoBackend {
+        let backend = backend();
+        backend
+            .tenant_registries()
+            .base()
+            .write()
+            .register(
+                SearchParameterDefinition::new(
+                    "http://hl7.org/fhir/SearchParameter/Observation-subject",
+                    "subject",
+                    SearchParamType::Reference,
+                    "Observation.subject",
+                )
+                .with_base(vec!["Observation"])
+                .with_targets(vec!["Patient", "Group"]),
+            )
+            .expect("registering Observation.subject must not collide with a fallback param");
+        backend
+    }
+
+    fn subject_param(value: &str) -> SearchParameter {
+        SearchParameter {
+            name: "subject".to_string(),
+            param_type: SearchParamType::Reference,
+            modifier: None,
+            values: vec![SearchValue::eq(value)],
+            chain: vec![],
+            components: vec![],
+        }
+    }
+
+    fn or_arms(filter: &Document) -> Vec<Document> {
+        filter
+            .get_array("$or")
+            .expect("$or array")
+            .iter()
+            .map(|b| b.as_document().expect("$or arm is a document").clone())
+            .collect()
+    }
+
+    fn arm_regex(arm: &Document) -> &str {
+        arm.get_document("value_reference")
+            .expect("value_reference field")
+            .get_str("$regex")
+            .expect("$regex field")
+    }
+
+    /// Bare `subject=123`: `$in` first (bare id + `Target/123` per declared
+    /// target, registry order, deduplicated), one anchored `_history` regex
+    /// per target, and an anchored `^https?://.*/123$` absolute-URL regex
+    /// last — every branch index-bounded, per #1083 (a plain unanchored
+    /// `/123$` last arm makes MongoDB abandon the index for the whole `$or`).
+    #[test]
+    fn bare_id_with_registry_targets_is_index_bounded() {
+        let backend = backend_with_subject_targets();
+        let filter = backend
+            .build_search_index_filter("t1", "Observation", &subject_param("123"))
+            .expect("valid filter");
+
+        let arms = or_arms(&filter);
+        // $in arm + one history-regex arm per target ["Patient", "Group"] +
+        // the trailing absolute-URL regex + the trailing absolute-URL
+        // _history regex.
+        assert_eq!(arms.len(), 5, "unexpected arm count: {arms:?}");
+
+        let in_values: Vec<&str> = arms[0]
+            .get_document("value_reference")
+            .expect("value_reference field")
+            .get_array("$in")
+            .expect("$in array")
+            .iter()
+            .map(|b| b.as_str().expect("$in entry is a string"))
+            .collect();
+        assert_eq!(in_values, vec!["123", "Patient/123", "Group/123"]);
+
+        assert_eq!(arm_regex(&arms[1]), "^Patient/123/_history/");
+        assert_eq!(arm_regex(&arms[2]), "^Group/123/_history/");
+
+        // Anchored absolute-URL arms, last.
+        assert_eq!(arm_regex(&arms[3]), "^https?://.*/123$");
+        assert_eq!(arm_regex(&arms[4]), "^https?://.*/123/_history/");
+    }
+
+    /// No declared targets (unknown parameter): the bare form is byte-for-byte
+    /// today's two-branch `$or` — the match set must not shrink or grow.
+    #[test]
+    fn bare_id_without_registry_targets_is_unchanged() {
+        let backend = backend();
+        let param = SearchParameter {
+            name: "nonexistent-ref".to_string(),
+            param_type: SearchParamType::Reference,
+            modifier: None,
+            values: vec![SearchValue::eq("123")],
+            chain: vec![],
+            components: vec![],
+        };
+
+        let filter = backend
+            .build_search_index_filter("t1", "Observation", &param)
+            .expect("valid filter");
+
+        let arms = or_arms(&filter);
+        assert_eq!(
+            arms.len(),
+            2,
+            "today's filter has exactly two arms: {arms:?}"
+        );
+        assert_eq!(
+            arms[0].get_str("value_reference").expect("exact-match arm"),
+            "123"
+        );
+        assert_eq!(arm_regex(&arms[1]), "/123$");
+    }
+
+    /// Qualified `subject=Patient/123`: exact match plus an anchored
+    /// `_history` regex, so `Patient/123/_history/2` keeps matching
+    /// (parity with SQLite).
+    #[test]
+    fn qualified_reference_matches_its_own_history() {
+        let backend = backend();
+        let filter = backend
+            .build_search_index_filter("t1", "Observation", &subject_param("Patient/123"))
+            .expect("valid filter");
+
+        let arms = or_arms(&filter);
+        assert_eq!(arms.len(), 2);
+        assert_eq!(
+            arms[0].get_str("value_reference").expect("exact-match arm"),
+            "Patient/123"
+        );
+        assert_eq!(arm_regex(&arms[1]), "^Patient/123/_history/");
+    }
+
+    /// Regex metacharacters in the id (`.`) must be escaped in every arm:
+    /// the qualified form's `_history` regex, each target's `_history`
+    /// regex in the bare form, and both trailing absolute-URL regexes.
+    #[test]
+    fn regex_metacharacters_are_escaped_in_every_arm() {
+        let backend = backend_with_subject_targets();
+
+        let qualified = backend
+            .build_search_index_filter("t1", "Observation", &subject_param("Patient/123.5"))
+            .expect("valid filter");
+        let arms = or_arms(&qualified);
+        assert_eq!(arm_regex(&arms[1]), "^Patient/123\\.5/_history/");
+
+        let bare = backend
+            .build_search_index_filter("t1", "Observation", &subject_param("123.5"))
+            .expect("valid filter");
+        let arms = or_arms(&bare);
+        assert_eq!(arms.len(), 5);
+        assert_eq!(arm_regex(&arms[1]), "^Patient/123\\.5/_history/");
+        assert_eq!(arm_regex(&arms[2]), "^Group/123\\.5/_history/");
+        assert_eq!(arm_regex(&arms[3]), "^https?://.*/123\\.5$");
+        assert_eq!(arm_regex(&arms[4]), "^https?://.*/123\\.5/_history/");
     }
 }
 

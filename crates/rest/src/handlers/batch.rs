@@ -2207,6 +2207,25 @@ where
         return Ok(());
     }
 
+    // Each lookup below is a search, and a search reads the index — which
+    // on a composite backend is a secondary that lags the store the server
+    // has already returned `201` from. Resolving against that lag rejected
+    // transactions naming resources committed seconds earlier, with a
+    // diagnostic that said the resource did not exist (#1047). Ask storage
+    // to make its acknowledged writes visible first, for exactly the types
+    // the references name; consistent backends answer this for free.
+    let mut referenced_types: Vec<&str> = conditionals
+        .keys()
+        .filter_map(|reference| reference.split_once('?').map(|(head, _)| head))
+        .collect();
+    referenced_types.sort_unstable();
+    referenced_types.dedup();
+    state
+        .storage()
+        .ensure_writes_visible(tenant.context(), &referenced_types)
+        .await
+        .map_err(RestError::from)?;
+
     for (reference, resolved) in conditionals.iter_mut() {
         let (resource_type, query_string) =
             reference.split_once('?').expect("collected with a '?'");

@@ -49,6 +49,7 @@ HFS_SERVER_PORT=3000 HFS_LOG_LEVEL=debug cargo run --bin hfs
 | `HFS_REQUEST_TIMEOUT` | `30` | Request timeout in seconds |
 | `HFS_DEFAULT_PAGE_SIZE` | `20` | Default search result page size |
 | `HFS_MAX_PAGE_SIZE` | `1000` | Maximum search result page size |
+| `HFS_EVERYTHING_MAX_UNPAGED` | `10000` | Ceiling on `match` entries for an unpaged `Patient/$everything`; when reached the response is paged and carries a `next` link. |
 
 ## Compression
 
@@ -78,7 +79,7 @@ HFS_SERVER_PORT=3000 HFS_LOG_LEVEL=debug cargo run --bin hfs
 | `HFS_ELASTICSEARCH_NESTED_OBJECTS_LIMIT` | `50000` | Index `mapping.nested_objects.limit`: max nested objects per document across all nested search-parameter fields. Set on new indices; raised at startup on existing indices below it |
 | `HFS_COMPOSITE_SYNC_MODE` | `asynchronous` | ES-backed composite write sync mode: asynchronous, synchronous, or hybrid |
 
-Use `HFS_COMPOSITE_SYNC_MODE=synchronous` **and** `HFS_ELASTICSEARCH_WRITE_REFRESH=wait_for` when callers need read-your-write search semantics, such as integration tests or bulk loads that immediately search. Either alone still leaves a window: synchronous mode only guarantees the document reached Elasticsearch, and it is not searchable until the next index refresh. See `crates/persistence/README.md` (Search visibility on Elasticsearch-backed composites).
+Use `HFS_COMPOSITE_SYNC_MODE=synchronous` **and** `HFS_ELASTICSEARCH_WRITE_REFRESH=wait_for` when callers need read-your-write search semantics, such as integration tests or bulk loads that immediately search. Either alone still leaves a window: synchronous mode only guarantees the document reached Elasticsearch, and it is not searchable until the next index refresh. See `crates/persistence/README.md` (Search visibility on Elasticsearch-backed composites). Transaction conditional references (`Organization?identifier=…` in a resource body) and `If-None-Exist` creates are exempt: they make acknowledged writes visible before resolving, on any setting (#1047).
 
 ## Storage Backends
 
@@ -261,6 +262,8 @@ StructureDefinition writes since process start (no startup warm-load yet).
 | purge, type | POST | `/[type]/$purge` |
 | reindex | POST | `/$reindex`, `/[type]/$reindex` |
 | reindex status / cancel | GET/DELETE | `/$reindex-status/[job_id]` |
+| everything, instance | GET/POST | `/Patient/[id]/$everything` |
+| everything, type | GET/POST | `/Patient/$everything` |
 
 `$purge` (permanent, irreversible deletion including history) and `$reindex`
 (rebuild the search index) are administrative, non-FHIR operations. They require

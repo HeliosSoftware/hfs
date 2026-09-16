@@ -1166,6 +1166,12 @@ pub struct ServerConfig {
     #[arg(long, env = "HFS_MAX_PAGE_SIZE", default_value = "1000")]
     pub max_page_size: usize,
 
+    /// Ceiling on `match` entries returned by an unpaged `Patient/$everything`
+    /// (no `_count`). When reached, the response switches to paged mode and
+    /// carries a `next` link plus an informational `OperationOutcome`.
+    #[arg(long, env = "HFS_EVERYTHING_MAX_UNPAGED", default_value = "10000")]
+    pub everything_max_unpaged: usize,
+
     /// Storage backend mode: sqlite (default), sqlite-elasticsearch, postgres,
     /// postgres-elasticsearch, mongodb, mongodb-elasticsearch, s3, or s3-elasticsearch.
     #[arg(long, env = "HFS_STORAGE_BACKEND", default_value = "sqlite")]
@@ -1479,6 +1485,7 @@ impl Default for ServerConfig {
             search_param_cache_ttl: 3600,
             default_page_size: 20,
             max_page_size: 1000,
+            everything_max_unpaged: 10000,
             storage_backend: "sqlite".to_string(),
             elasticsearch_nodes: "http://localhost:9200".to_string(),
             elasticsearch_index_prefix: "hfs".to_string(),
@@ -1727,6 +1734,7 @@ impl ServerConfig {
             search_param_cache_ttl: 3600,
             default_page_size: 10,
             max_page_size: 100,
+            everything_max_unpaged: 10000,
             storage_backend: "sqlite".to_string(),
             elasticsearch_nodes: "http://localhost:9200".to_string(),
             elasticsearch_index_prefix: "hfs".to_string(),
@@ -1871,6 +1879,12 @@ mod tests {
         assert_eq!(config.port, 0);
         assert!(!config.enable_cors);
         assert_eq!(config.default_tenant, "test-tenant");
+    }
+
+    #[test]
+    fn everything_max_unpaged_defaults_to_10000() {
+        let config = ServerConfig::for_testing();
+        assert_eq!(config.everything_max_unpaged, 10000);
     }
 
     #[test]
