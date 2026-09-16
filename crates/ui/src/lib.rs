@@ -860,12 +860,17 @@ fn rebuild_text(i18n: &I18n, activity: &ReindexActivity) -> String {
             "search-index-rebuild-failed-job",
             &std::collections::BTreeMap::from([("job".to_string(), job_id.clone())]),
         ),
-        ReindexActivity::Failed { job_id, errors } => i18n.t_args(
+        // `errors` goes in as a number, not a pre-grouped string: Fluent then
+        // groups it for the locale (11.704 in German) and the catalog can
+        // select the plural form (#1125).
+        ReindexActivity::Failed { job_id, errors } => i18n.t_arg3(
             "search-index-rebuild-failed",
-            &std::collections::BTreeMap::from([
-                ("errors".to_string(), grouped(*errors)),
-                ("job".to_string(), job_id.clone()),
-            ]),
+            "errors",
+            *errors,
+            "count",
+            grouped_in(*errors, &i18n.lang()),
+            "job",
+            job_id.clone(),
         ),
     }
 }
@@ -8675,6 +8680,19 @@ fn compact_count(n: u64) -> String {
 }
 
 /// Thousands-separated integer for prominent totals: `1204 -> "1,204"`.
+/// [`grouped`], with the thousands separator the locale uses: a comma in
+/// English, a period in German and Spanish (#1125). Fluent does not group
+/// numbers itself, so the grouped text travels as its own placeable while the
+/// raw number selects the plural form.
+pub(crate) fn grouped_in(n: u64, lang: &str) -> String {
+    let separator = if lang.starts_with("de") || lang.starts_with("es") {
+        "."
+    } else {
+        ","
+    };
+    grouped(n).replace(',', separator)
+}
+
 pub(crate) fn grouped(n: u64) -> String {
     let digits = n.to_string();
     let bytes = digits.as_bytes();

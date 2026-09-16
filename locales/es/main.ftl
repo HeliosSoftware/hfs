@@ -193,7 +193,10 @@ chart-counts-unsupported-note = Este backend de almacenamiento no puede contar l
 chart-as-of = Última lectura: { $time }.
 search-index-rebuilding = Reconstruyendo el índice de búsqueda: { $percent } % ({ $processed } de { $total } recursos). Las búsquedas pueden omitir recursos almacenados hasta que termine.
 search-index-rebuilding-counting = Reconstruyendo el índice de búsqueda. Las búsquedas pueden omitir recursos almacenados hasta que termine.
-search-index-rebuild-failed = La última reconstrucción del índice de búsqueda dejó { $errors } recursos sin indexar. Las búsquedas no los encuentran hasta que una reconstrucción termine bien; GET $reindex-status/{ $job } indica cuáles.
+search-index-rebuild-failed = { $errors ->
+    [one] La última reconstrucción del índice de búsqueda dejó un recurso sin indexar. Las búsquedas no lo encuentran hasta que una reconstrucción termine bien; GET $reindex-status/{ $job } indica cuál.
+   *[other] La última reconstrucción del índice de búsqueda dejó { $count } recursos sin indexar. Las búsquedas no los encuentran hasta que una reconstrucción termine bien; GET $reindex-status/{ $job } indica cuáles.
+  }
 search-index-rebuild-failed-job = La última reconstrucción del índice de búsqueda falló antes de terminar. Las búsquedas pueden omitir recursos almacenados hasta que una reconstrucción termine bien; GET $reindex-status/{ $job } indica el motivo.
 chart-table-toggle = Ver como tabla
 chart-table-when = Momento

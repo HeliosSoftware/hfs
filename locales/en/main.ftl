@@ -204,7 +204,10 @@ search-index-rebuilding = Search index rebuilding — { $percent }% ({ $processe
 search-index-rebuilding-counting = Search index rebuilding. Searches may miss stored resources until it finishes.
 # #1125: the tenant's most recent search-index rebuild ended with resources
 # left unindexed. $errors is a resource count; $job is the rebuild job id.
-search-index-rebuild-failed = The last search index rebuild left { $errors } resources unindexed. Searches miss them until a rebuild succeeds; GET $reindex-status/{ $job } lists which ones.
+search-index-rebuild-failed = { $errors ->
+    [one] The last search index rebuild left one resource unindexed. Searches miss it until a rebuild succeeds; GET $reindex-status/{ $job } says which one.
+   *[other] The last search index rebuild left { $count } resources unindexed. Searches miss them until a rebuild succeeds; GET $reindex-status/{ $job } lists which ones.
+  }
 # The same, when the rebuild failed as a whole before naming any resource.
 search-index-rebuild-failed-job = The last search index rebuild failed before it finished. Searches may miss stored resources until a rebuild succeeds; GET $reindex-status/{ $job } says why.
 chart-table-toggle = View as Table
