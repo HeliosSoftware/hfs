@@ -7604,6 +7604,530 @@ mod postgres_integration {
     }
 
     #[tokio::test]
+    async fn postgres_integration_reindex_page_recovers_oversized_fts_without_replaying_search_parameters()
+     {
+        use helios_persistence::search::{ReindexSource, ReindexTarget};
+
+        // Keep the page well below MULTI_BATCH_ROWS: each Observation contributes
+        // one ordinary `status` SearchParameter row, so this probes recovery from
+        // an FTS failure without also splitting the multi-row search insert.
+        let (backend, dbname) = isolated_reindex_backend().await;
+        let first_tenant = create_tenant("reindex-page-fts-recovery-first");
+        let second_tenant = create_tenant("reindex-page-fts-recovery-second");
+        let first_tenant_id = first_tenant.tenant_id().as_str().to_string();
+        let second_tenant_id = second_tenant.tenant_id().as_str().to_string();
+
+        let text = (0..100_000)
+            .map(|index| format!("lexeme{index:08x}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        for (tenant, entries) in [
+            (
+                &first_tenant,
+                [
+                    ("a-normal", false),
+                    ("b-oversized", true),
+                    ("c-normal", false),
+                ],
+            ),
+            (
+                &second_tenant,
+                [
+                    ("a-oversized", true),
+                    ("b-normal", false),
+                    ("c-oversized", true),
+                ],
+            ),
+        ] {
+            for (id, oversized) in entries {
+                let resource = if oversized {
+                    json!({
+                        "resourceType": "Observation",
+                        "id": id,
+                        "status": id,
+                        "text": {"status": "generated", "div": format!("<div>{text}</div>")}
+                    })
+                } else {
+                    json!({
+                        "resourceType": "Observation",
+                        "id": id,
+                        "status": id
+                    })
+                };
+                // Seed through create so the ordinary writer establishes the
+                // approved truncated FTS result for every oversized resource.
+                backend
+                    .create(tenant, "Observation", resource, FhirVersion::default())
+                    .await
+                    .unwrap();
+            }
+        }
+
+        let first_page = backend
+            .fetch_resources_page(&first_tenant, "Observation", None, 3)
+            .await
+            .unwrap();
+        let second_page = backend
+            .fetch_resources_page(&second_tenant, "Observation", None, 3)
+            .await
+            .unwrap();
+        assert_eq!(
+            first_page
+                .resources
+                .iter()
+                .map(|resource| resource.id())
+                .collect::<Vec<_>>(),
+            vec!["a-normal", "b-oversized", "c-normal"]
+        );
+        assert_eq!(
+            second_page
+                .resources
+                .iter()
+                .map(|resource| resource.id())
+                .collect::<Vec<_>>(),
+            vec!["a-oversized", "b-normal", "c-oversized"]
+        );
+
+        let client = reindex_test_client_for(&dbname).await;
+        let first_ids = vec!["a-normal", "b-oversized", "c-normal"];
+        let second_ids = vec!["a-oversized", "b-normal", "c-oversized"];
+        let first_search_before: Vec<(String, String, Option<String>, Option<String>)> = client
+            .query(
+                "SELECT resource_id, param_name, value_string, value_string_folded
+                 FROM search_index
+                 WHERE tenant_id = $1 AND resource_type = 'Observation'
+                   AND resource_id = ANY($2::text[])
+                 ORDER BY array_position($2::text[], resource_id), param_name, value_string",
+                &[&first_tenant_id, &first_ids],
+            )
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| (row.get(0), row.get(1), row.get(2), row.get(3)))
+            .collect();
+        let second_search_before: Vec<(String, String, Option<String>, Option<String>)> = client
+            .query(
+                "SELECT resource_id, param_name, value_string, value_string_folded
+                 FROM search_index
+                 WHERE tenant_id = $1 AND resource_type = 'Observation'
+                   AND resource_id = ANY($2::text[])
+                 ORDER BY array_position($2::text[], resource_id), param_name, value_string",
+                &[&second_tenant_id, &second_ids],
+            )
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| (row.get(0), row.get(1), row.get(2), row.get(3)))
+            .collect();
+        let first_fts_before: Vec<(String, Vec<String>, Vec<String>)> = client
+            .query(
+                "SELECT resource_id, tsvector_to_array(narrative_tsvector),
+                        tsvector_to_array(content_tsvector)
+                 FROM resource_fts
+                 WHERE tenant_id = $1 AND resource_type = 'Observation'
+                   AND resource_id = ANY($2::text[])
+                 ORDER BY array_position($2::text[], resource_id)",
+                &[&first_tenant_id, &first_ids],
+            )
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| (row.get(0), row.get(1), row.get(2)))
+            .collect();
+        let second_fts_before: Vec<(String, Vec<String>, Vec<String>)> = client
+            .query(
+                "SELECT resource_id, tsvector_to_array(narrative_tsvector),
+                        tsvector_to_array(content_tsvector)
+                 FROM resource_fts
+                 WHERE tenant_id = $1 AND resource_type = 'Observation'
+                   AND resource_id = ANY($2::text[])
+                 ORDER BY array_position($2::text[], resource_id)",
+                &[&second_tenant_id, &second_ids],
+            )
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| (row.get(0), row.get(1), row.get(2)))
+            .collect();
+
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let sequence_name = format!("reindex_fts_search_attempts_{suffix}");
+        let function_name = format!("count_reindex_fts_search_attempts_{suffix}");
+        let trigger_name = format!("count_reindex_fts_search_attempts_{suffix}");
+        client
+            .batch_execute(&format!(
+                "CREATE SEQUENCE {sequence_name};
+                 CREATE FUNCTION {function_name}() RETURNS trigger LANGUAGE plpgsql AS $$
+                 BEGIN
+                   PERFORM nextval('{sequence_name}');
+                   RETURN NEW;
+                 END $$;
+                 CREATE TRIGGER {trigger_name} AFTER INSERT ON search_index
+                 FOR EACH ROW EXECUTE FUNCTION {function_name}();"
+            ))
+            .await
+            .unwrap();
+
+        let first_results = backend
+            .write_search_entries_page(&first_tenant, &first_page.resources)
+            .await;
+        let second_results = backend
+            .write_search_entries_page(&second_tenant, &second_page.resources)
+            .await;
+
+        let first_search_after: Vec<(String, String, Option<String>, Option<String>)> = client
+            .query(
+                "SELECT resource_id, param_name, value_string, value_string_folded
+                 FROM search_index
+                 WHERE tenant_id = $1 AND resource_type = 'Observation'
+                   AND resource_id = ANY($2::text[])
+                 ORDER BY array_position($2::text[], resource_id), param_name, value_string",
+                &[&first_tenant_id, &first_ids],
+            )
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| (row.get(0), row.get(1), row.get(2), row.get(3)))
+            .collect();
+        let second_search_after: Vec<(String, String, Option<String>, Option<String>)> = client
+            .query(
+                "SELECT resource_id, param_name, value_string, value_string_folded
+                 FROM search_index
+                 WHERE tenant_id = $1 AND resource_type = 'Observation'
+                   AND resource_id = ANY($2::text[])
+                 ORDER BY array_position($2::text[], resource_id), param_name, value_string",
+                &[&second_tenant_id, &second_ids],
+            )
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| (row.get(0), row.get(1), row.get(2), row.get(3)))
+            .collect();
+        let first_fts_after: Vec<(String, Vec<String>, Vec<String>)> = client
+            .query(
+                "SELECT resource_id, tsvector_to_array(narrative_tsvector),
+                        tsvector_to_array(content_tsvector)
+                 FROM resource_fts
+                 WHERE tenant_id = $1 AND resource_type = 'Observation'
+                   AND resource_id = ANY($2::text[])
+                 ORDER BY array_position($2::text[], resource_id)",
+                &[&first_tenant_id, &first_ids],
+            )
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| (row.get(0), row.get(1), row.get(2)))
+            .collect();
+        let second_fts_after: Vec<(String, Vec<String>, Vec<String>)> = client
+            .query(
+                "SELECT resource_id, tsvector_to_array(narrative_tsvector),
+                        tsvector_to_array(content_tsvector)
+                 FROM resource_fts
+                 WHERE tenant_id = $1 AND resource_type = 'Observation'
+                   AND resource_id = ANY($2::text[])
+                 ORDER BY array_position($2::text[], resource_id)",
+                &[&second_tenant_id, &second_ids],
+            )
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| (row.get(0), row.get(1), row.get(2)))
+            .collect();
+
+        let first_fts_terms: Vec<(String, bool, bool)> = client
+            .query(
+                "SELECT resource_id,
+                        content_tsvector @@ plainto_tsquery('english', $2),
+                        content_tsvector @@ plainto_tsquery('english', $3)
+                 FROM resource_fts
+                 WHERE tenant_id = $1 AND resource_id = ANY($4::text[])
+                 ORDER BY array_position($4::text[], resource_id)",
+                &[
+                    &first_tenant_id,
+                    &"lexeme00000000",
+                    &"lexeme000186a0",
+                    &first_ids,
+                ],
+            )
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| (row.get(0), row.get(1), row.get(2)))
+            .collect();
+        let second_fts_terms: Vec<(String, bool, bool)> = client
+            .query(
+                "SELECT resource_id,
+                        content_tsvector @@ plainto_tsquery('english', $2),
+                        content_tsvector @@ plainto_tsquery('english', $3)
+                 FROM resource_fts
+                 WHERE tenant_id = $1 AND resource_id = ANY($4::text[])
+                 ORDER BY array_position($4::text[], resource_id)",
+                &[
+                    &second_tenant_id,
+                    &"lexeme00000000",
+                    &"lexeme000186a0",
+                    &second_ids,
+                ],
+            )
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| (row.get(0), row.get(1), row.get(2)))
+            .collect();
+        let search_attempts: i64 = client
+            .query_one(&format!("SELECT last_value FROM {sequence_name}"), &[])
+            .await
+            .unwrap()
+            .get(0);
+
+        client
+            .batch_execute(&format!(
+                "DROP TRIGGER {trigger_name} ON search_index;
+                 DROP FUNCTION {function_name}();
+                 DROP SEQUENCE {sequence_name};"
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(first_results.len(), 3);
+        for (resource, result) in first_page.resources.iter().zip(&first_results) {
+            assert!(
+                result.is_ok(),
+                "reindex failed for first-page resource {}: {:?}",
+                resource.id(),
+                result.as_ref().err()
+            );
+        }
+        assert_eq!(second_results.len(), 3);
+        for (resource, result) in second_page.resources.iter().zip(&second_results) {
+            assert!(
+                result.is_ok(),
+                "reindex failed for second-page resource {}: {:?}",
+                resource.id(),
+                result.as_ref().err()
+            );
+        }
+        assert_eq!(first_search_after, first_search_before);
+        assert_eq!(second_search_after, second_search_before);
+        assert_eq!(first_fts_after, first_fts_before);
+        assert_eq!(second_fts_after, second_fts_before);
+        assert_eq!(
+            first_fts_terms,
+            vec![
+                ("a-normal".to_string(), false, false),
+                ("b-oversized".to_string(), true, false),
+                ("c-normal".to_string(), false, false),
+            ]
+        );
+        assert_eq!(
+            second_fts_terms,
+            vec![
+                ("a-oversized".to_string(), true, false),
+                ("b-normal".to_string(), false, false),
+                ("c-oversized".to_string(), true, false),
+            ]
+        );
+        // One search-index insert per resource is the single-pass contract.
+        // The current implementation reaches 12: three rows per page in the
+        // aborted batch plus three rows per page in the full-page fallback.
+        assert_eq!(search_attempts, 6);
+    }
+
+    async fn reindex_page_fts_trigger_case(
+        target_id: &str,
+        target_is_oversized: bool,
+        trigger_message: &str,
+    ) -> (
+        Vec<helios_persistence::types::StoredResource>,
+        Vec<Result<usize, StorageError>>,
+        Vec<(String, i64)>,
+        Vec<(String, i64)>,
+    ) {
+        use helios_persistence::search::{ReindexSource, ReindexTarget};
+
+        let (backend, dbname) = isolated_reindex_backend_with_max_connections(1).await;
+        let tenant = create_tenant("reindex-page-fts-error");
+        let tenant_id = tenant.tenant_id().as_str().to_string();
+        let text = (0..100_000)
+            .map(|index| format!("lexeme{index:08x}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let entries = [
+            ("a-normal", false),
+            (target_id, target_is_oversized),
+            ("c-normal", false),
+        ];
+        for (id, oversized) in entries {
+            let resource = if oversized {
+                json!({
+                    "resourceType": "Observation",
+                    "id": id,
+                    "status": id,
+                    "text": {"status": "generated", "div": format!("<div>{text}</div>")}
+                })
+            } else {
+                json!({"resourceType": "Observation", "id": id, "status": id})
+            };
+            backend
+                .create(&tenant, "Observation", resource, FhirVersion::default())
+                .await
+                .unwrap();
+        }
+
+        let page = backend
+            .fetch_resources_page(&tenant, "Observation", None, 3)
+            .await
+            .unwrap();
+        let ids: Vec<&str> = page
+            .resources
+            .iter()
+            .map(|resource| resource.id())
+            .collect();
+        let client = reindex_test_client_for(&dbname).await;
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let function_name = format!("reject_reindex_fts_{suffix}");
+        let trigger_name = format!("reject_reindex_fts_{suffix}");
+        client
+            .batch_execute(&format!(
+                "CREATE FUNCTION {function_name}() RETURNS trigger LANGUAGE plpgsql AS $$
+                 BEGIN
+                   IF NEW.tenant_id = '{tenant_id}' AND NEW.resource_id = '{target_id}' THEN
+                     RAISE EXCEPTION '{trigger_message}';
+                   END IF;
+                   RETURN NEW;
+                 END $$;
+                 CREATE TRIGGER {trigger_name} BEFORE INSERT ON resource_fts
+                 FOR EACH ROW EXECUTE FUNCTION {function_name}();"
+            ))
+            .await
+            .unwrap();
+
+        let results = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            backend.write_search_entries_page(&tenant, &page.resources),
+        )
+        .await
+        .expect("FTS page fallback must not deadlock a one-connection pool");
+
+        client
+            .batch_execute(&format!(
+                "DROP TRIGGER {trigger_name} ON resource_fts;
+                 DROP FUNCTION {function_name}();"
+            ))
+            .await
+            .unwrap();
+
+        let search_rows: Vec<(String, i64)> = client
+            .query(
+                "SELECT resource_id, COUNT(*)::bigint
+                 FROM search_index
+                 WHERE tenant_id = $1 AND resource_type = 'Observation'
+                   AND resource_id = ANY($2::text[])
+                 GROUP BY resource_id
+                 ORDER BY array_position($2::text[], resource_id)",
+                &[&tenant_id, &ids],
+            )
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| (row.get(0), row.get(1)))
+            .collect();
+        let fts_rows: Vec<(String, i64)> = client
+            .query(
+                "SELECT resource_id, COUNT(*)::bigint
+                 FROM resource_fts
+                 WHERE tenant_id = $1 AND resource_type = 'Observation'
+                   AND resource_id = ANY($2::text[])
+                 GROUP BY resource_id
+                 ORDER BY array_position($2::text[], resource_id)",
+                &[&tenant_id, &ids],
+            )
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| (row.get(0), row.get(1)))
+            .collect();
+
+        (page.resources, results, search_rows, fts_rows)
+    }
+
+    #[tokio::test]
+    async fn postgres_integration_reindex_page_unexpected_fts_error_falls_back_per_resource() {
+        let (resources, results, search_rows, fts_rows) =
+            reindex_page_fts_trigger_case("b-normal", false, "unexpected FTS page failure").await;
+
+        assert_eq!(
+            resources
+                .iter()
+                .map(|resource| resource.id())
+                .collect::<Vec<_>>(),
+            vec!["a-normal", "b-normal", "c-normal"]
+        );
+        for (resource, result) in resources.iter().zip(&results) {
+            if resource.id() == "b-normal" {
+                let error = result.as_ref().expect_err("trigger target must fail");
+                assert_eq!(
+                    error.to_string(),
+                    "internal error in postgres: Failed to insert FTS content: db error"
+                );
+            } else {
+                assert!(result.is_ok(), "{} should be reindexed", resource.id());
+            }
+        }
+        // The ordinary fallback writes search_index before the target FTS
+        // failure, so the failed resource's search rows are not assumed absent.
+        assert_eq!(
+            search_rows,
+            vec![
+                ("a-normal".to_string(), 1),
+                ("b-normal".to_string(), 1),
+                ("c-normal".to_string(), 1),
+            ]
+        );
+        assert_eq!(
+            fts_rows,
+            vec![("a-normal".to_string(), 1), ("c-normal".to_string(), 1)]
+        );
+    }
+
+    #[tokio::test]
+    async fn postgres_integration_reindex_page_truncated_fts_retry_error_falls_back_per_resource() {
+        let (resources, results, search_rows, fts_rows) =
+            reindex_page_fts_trigger_case("b-oversized", true, "truncated FTS retry failure").await;
+
+        assert_eq!(
+            resources
+                .iter()
+                .map(|resource| resource.id())
+                .collect::<Vec<_>>(),
+            vec!["a-normal", "b-oversized", "c-normal"]
+        );
+        for (resource, result) in resources.iter().zip(&results) {
+            if resource.id() == "b-oversized" {
+                let error = result.as_ref().expect_err("retry trigger target must fail");
+                assert_eq!(
+                    error.to_string(),
+                    "internal error in postgres: Failed to insert FTS content: db error"
+                );
+            } else {
+                assert!(result.is_ok(), "{} should be reindexed", resource.id());
+            }
+        }
+        assert_eq!(
+            search_rows,
+            vec![
+                ("a-normal".to_string(), 1),
+                ("b-oversized".to_string(), 1),
+                ("c-normal".to_string(), 1),
+            ]
+        );
+        assert_eq!(
+            fts_rows,
+            vec![("a-normal".to_string(), 1), ("c-normal".to_string(), 1)]
+        );
+    }
+
+    #[tokio::test]
     async fn postgres_integration_reindex_clear_rolls_back_when_fts_delete_fails() {
         use helios_persistence::search::ReindexTarget;
 
