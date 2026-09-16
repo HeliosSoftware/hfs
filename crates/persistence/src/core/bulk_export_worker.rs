@@ -170,6 +170,14 @@ pub trait ExportClaimStrategy: Send + Sync {
     /// restarts would retire a perfectly healthy export. A caller must first
     /// make `release` decrement `attempts` — fenced on `worker_id` +
     /// `fencing_token`, so a zombie cannot spend another worker's attempt.
+    ///
+    /// The same caller also has to deal with the released job's half-written
+    /// rows: it goes back as `accepted`, which is the one status
+    /// [`Self::claim_next`] does *not* wipe, so the next attempt would resume
+    /// from the cursor and overwrite the parts already recorded — the very
+    /// loss the wipe exists to prevent (#1041). `release` must therefore clear
+    /// the job's progress and file rows itself, or leave the job
+    /// `in_progress` with a lapsed lease.
     async fn release(&self, lease: ExportJobLease) -> StorageResult<()>;
 }
 

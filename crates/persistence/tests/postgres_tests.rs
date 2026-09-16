@@ -8663,6 +8663,476 @@ mod postgres_integration {
         assert_eq!(export_attempts(&backend, &job_id).await, 1);
     }
 
+    use helios_persistence::core::bulk_export_output::{ExportPartKey, FinalizedPart};
+
+    /// Counts a job's rows in the two tables a re-claim wipes; no trait
+    /// surfaces them as raw counts.
+    async fn export_row_counts(
+        backend: &PostgresBackend,
+        job_id: &helios_persistence::core::bulk_export::ExportJobId,
+    ) -> (i64, i64) {
+        let client = backend.get_client().await.unwrap();
+        let progress: i64 = client
+            .query_one(
+                "SELECT COUNT(*) FROM bulk_export_progress WHERE job_id = $1",
+                &[&job_id.as_str()],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        let files: i64 = client
+            .query_one(
+                "SELECT COUNT(*) FROM bulk_export_files WHERE job_id = $1",
+                &[&job_id.as_str()],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        (progress, files)
+    }
+
+    /// Records one finalized output part the way the worker does after a flush.
+    #[allow(clippy::too_many_arguments)]
+    async fn record_output_part(
+        backend: &PostgresBackend,
+        tenant: &TenantContext,
+        job_id: &helios_persistence::core::bulk_export::ExportJobId,
+        worker: &WorkerId,
+        fencing_token: u64,
+        resource_type: &str,
+        part_index: u32,
+        line_count: u64,
+    ) {
+        let part = FinalizedPart {
+            key: ExportPartKey::output(
+                tenant.tenant_id().as_str(),
+                job_id.clone(),
+                resource_type,
+                part_index,
+                fencing_token,
+            ),
+            resource_type: resource_type.to_string(),
+            line_count,
+            size_bytes: line_count * 120,
+        };
+        backend
+            .record_export_file(tenant, job_id, worker, fencing_token, &part, "output")
+            .await
+            .unwrap();
+    }
+
+    /// Persists per-type progress the way the worker does between batches.
+    async fn record_type_progress(
+        backend: &PostgresBackend,
+        tenant: &TenantContext,
+        job_id: &helios_persistence::core::bulk_export::ExportJobId,
+        worker: &WorkerId,
+        fencing_token: u64,
+        progress: TypeExportProgress,
+    ) {
+        backend
+            .update_export_type_progress(tenant, job_id, worker, fencing_token, &progress)
+            .await
+            .unwrap();
+    }
+
+    /// Re-claiming a job whose lease expired mid-run drops everything the dead
+    /// worker wrote, in the same transaction that bumps the fencing token, so
+    /// the new lease starts from a clean slate (#1041).
+    #[tokio::test]
+    async fn postgres_integration_export_reclaim_discards_the_previous_attempts_rows() {
+        let _guard = BULK_EXPORT_TEST_LOCK.lock().await;
+        let backend = create_backend().await;
+        let tenant = create_tenant("export-reclaim-wipe");
+
+        let job_id = backend
+            .start_export(&tenant, export_input(ExportRequest::system()))
+            .await
+            .unwrap();
+
+        let worker_a = WorkerId::new(format!("pg-wipe-a-{}", uuid::Uuid::new_v4()));
+        let lease_a =
+            claim_specific(&backend, &worker_a, &job_id, StdDuration::from_millis(1)).await;
+        backend
+            .mark_export_in_progress(&tenant, &job_id, &worker_a, lease_a.fencing_token)
+            .await
+            .unwrap();
+        let mut patient = TypeExportProgress::new("Patient");
+        patient.exported_count = 200;
+        patient.cursor_state = Some("page-3".to_string());
+        record_type_progress(
+            &backend,
+            &tenant,
+            &job_id,
+            &worker_a,
+            lease_a.fencing_token,
+            patient,
+        )
+        .await;
+        for part_index in 0..2 {
+            record_output_part(
+                &backend,
+                &tenant,
+                &job_id,
+                &worker_a,
+                lease_a.fencing_token,
+                "Patient",
+                part_index,
+                100,
+            )
+            .await;
+        }
+        assert_eq!(
+            export_row_counts(&backend, &job_id).await,
+            (1, 2),
+            "the first attempt wrote progress and file rows"
+        );
+
+        // The lease lapses and worker B takes over.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let worker_b = WorkerId::new(format!("pg-wipe-b-{}", uuid::Uuid::new_v4()));
+        let lease_b =
+            claim_specific(&backend, &worker_b, &job_id, StdDuration::from_secs(60)).await;
+        assert!(
+            lease_b.fencing_token > lease_a.fencing_token,
+            "the re-claim still bumps the fencing token"
+        );
+
+        assert_eq!(
+            export_row_counts(&backend, &job_id).await,
+            (0, 0),
+            "the re-claim wipes the previous attempt's progress and file rows"
+        );
+        let view = backend
+            .get_export_job_for_worker(&tenant, &job_id, &worker_b, lease_b.fencing_token)
+            .await
+            .unwrap();
+        assert!(
+            view.type_progress.is_empty(),
+            "the new attempt resumes from nothing, not from a cursor whose parts are gone"
+        );
+        assert!(
+            backend
+                .get_export_manifest(&tenant, &job_id)
+                .await
+                .unwrap()
+                .output
+                .is_empty(),
+            "no part of the abandoned attempt survives into the manifest"
+        );
+
+        backend
+            .finish_export_job(&tenant, &job_id, &worker_b, lease_b.fencing_token)
+            .await
+            .unwrap();
+    }
+
+    /// The wipe is only for re-claims: an `accepted` job never wrote anything,
+    /// and its first claim goes through the same code path untouched.
+    #[tokio::test]
+    async fn postgres_integration_export_first_claim_has_nothing_to_discard() {
+        let _guard = BULK_EXPORT_TEST_LOCK.lock().await;
+        let backend = create_backend().await;
+        let tenant = create_tenant("export-first-claim");
+
+        let job_id = backend
+            .start_export(&tenant, export_input(ExportRequest::system()))
+            .await
+            .unwrap();
+        assert_eq!(export_row_counts(&backend, &job_id).await, (0, 0));
+
+        let worker = WorkerId::new(format!("pg-first-claim-{}", uuid::Uuid::new_v4()));
+        let lease = claim_specific(&backend, &worker, &job_id, StdDuration::from_secs(60)).await;
+        assert!(lease.fencing_token >= 1);
+        assert_eq!(export_attempts(&backend, &job_id).await, 1);
+
+        // Rows written under the fresh lease stay put — the wipe runs before
+        // them, not after.
+        record_type_progress(
+            &backend,
+            &tenant,
+            &job_id,
+            &worker,
+            lease.fencing_token,
+            TypeExportProgress::new("Patient"),
+        )
+        .await;
+        record_output_part(
+            &backend,
+            &tenant,
+            &job_id,
+            &worker,
+            lease.fencing_token,
+            "Patient",
+            0,
+            10,
+        )
+        .await;
+        assert_eq!(export_row_counts(&backend, &job_id).await, (1, 1));
+
+        backend
+            .finish_export_job(&tenant, &job_id, &worker, lease.fencing_token)
+            .await
+            .unwrap();
+        let manifest = backend.get_export_manifest(&tenant, &job_id).await.unwrap();
+        assert_eq!(manifest.output.len(), 1);
+    }
+
+    /// The reason the wipe exists. The worker resumes *within* a type from
+    /// `cursor_state` but always restarts `part_index` at 0, and
+    /// `record_export_file` upserts on `(job, file_type, resource_type,
+    /// part_index)`. Keeping the first attempt's rows would therefore let the
+    /// second attempt's parts overwrite them row by row: the manifest would
+    /// list attempt 2's post-cursor parts under attempt 1's indexes, the
+    /// pre-cursor resources would vanish, and the job would still end
+    /// `complete` — silent data loss (#1041). After the wipe a manifest can
+    /// only ever describe one attempt.
+    #[tokio::test]
+    async fn postgres_integration_export_reclaim_cannot_mix_parts_from_two_attempts() {
+        let _guard = BULK_EXPORT_TEST_LOCK.lock().await;
+        let backend = create_backend().await;
+        let tenant = create_tenant("export-reclaim-manifest");
+
+        let job_id = backend
+            .start_export(&tenant, export_input(ExportRequest::system()))
+            .await
+            .unwrap();
+
+        // Attempt 1: Observation runs to the end, Patient stops mid-type with
+        // two parts written and a cursor pointing past them.
+        let worker_a = WorkerId::new(format!("pg-mix-a-{}", uuid::Uuid::new_v4()));
+        let lease_a =
+            claim_specific(&backend, &worker_a, &job_id, StdDuration::from_millis(1)).await;
+        backend
+            .mark_export_in_progress(&tenant, &job_id, &worker_a, lease_a.fencing_token)
+            .await
+            .unwrap();
+        let mut observation = TypeExportProgress::new("Observation");
+        observation.exported_count = 50;
+        record_type_progress(
+            &backend,
+            &tenant,
+            &job_id,
+            &worker_a,
+            lease_a.fencing_token,
+            observation,
+        )
+        .await;
+        record_output_part(
+            &backend,
+            &tenant,
+            &job_id,
+            &worker_a,
+            lease_a.fencing_token,
+            "Observation",
+            0,
+            50,
+        )
+        .await;
+        let mut patient = TypeExportProgress::new("Patient");
+        patient.exported_count = 200;
+        patient.cursor_state = Some("after-patient-200".to_string());
+        record_type_progress(
+            &backend,
+            &tenant,
+            &job_id,
+            &worker_a,
+            lease_a.fencing_token,
+            patient,
+        )
+        .await;
+        for part_index in 0..2 {
+            record_output_part(
+                &backend,
+                &tenant,
+                &job_id,
+                &worker_a,
+                lease_a.fencing_token,
+                "Patient",
+                part_index,
+                100,
+            )
+            .await;
+        }
+
+        // Worker A dies; worker B re-claims the job.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let worker_b = WorkerId::new(format!("pg-mix-b-{}", uuid::Uuid::new_v4()));
+        let lease_b =
+            claim_specific(&backend, &worker_b, &job_id, StdDuration::from_secs(60)).await;
+
+        // Nothing of attempt 1 is left for attempt 2's part 0 to overwrite.
+        assert_eq!(
+            export_row_counts(&backend, &job_id).await,
+            (0, 0),
+            "attempt 2 must not inherit attempt 1's rows"
+        );
+        let view = backend
+            .get_export_job_for_worker(&tenant, &job_id, &worker_b, lease_b.fencing_token)
+            .await
+            .unwrap();
+        assert!(
+            view.type_progress.is_empty(),
+            "no surviving cursor, so attempt 2 re-exports Patient from the start"
+        );
+
+        // Attempt 2 re-exports both types from scratch and finishes.
+        record_output_part(
+            &backend,
+            &tenant,
+            &job_id,
+            &worker_b,
+            lease_b.fencing_token,
+            "Patient",
+            0,
+            300,
+        )
+        .await;
+        record_output_part(
+            &backend,
+            &tenant,
+            &job_id,
+            &worker_b,
+            lease_b.fencing_token,
+            "Observation",
+            0,
+            50,
+        )
+        .await;
+        backend
+            .finish_export_job(&tenant, &job_id, &worker_b, lease_b.fencing_token)
+            .await
+            .unwrap();
+
+        let manifest = backend.get_export_manifest(&tenant, &job_id).await.unwrap();
+        assert_eq!(manifest.status, ExportStatus::Complete);
+        assert_eq!(
+            manifest.output.len(),
+            2,
+            "one part per type, all from attempt 2"
+        );
+        assert!(
+            manifest
+                .output
+                .iter()
+                .all(|entry| entry.key.fencing_token == lease_b.fencing_token),
+            "every manifest entry belongs to the attempt that finished the job"
+        );
+        let patient_entry = manifest
+            .output
+            .iter()
+            .find(|entry| entry.resource_type == "Patient")
+            .expect("Patient part present");
+        assert_eq!(
+            patient_entry.count, 300,
+            "the manifest reports attempt 2's whole Patient export, not a post-cursor remainder \
+             sitting on top of attempt 1's rows"
+        );
+    }
+
+    /// The wipe is scoped to the job being re-claimed: another job of the same
+    /// tenant keeps its progress and file rows, however the DELETEs are
+    /// written.
+    #[tokio::test]
+    async fn postgres_integration_export_reclaim_leaves_other_jobs_rows_alone() {
+        let _guard = BULK_EXPORT_TEST_LOCK.lock().await;
+        let backend = create_backend().await;
+        let tenant = create_tenant("export-reclaim-neighbour");
+
+        let bystander = backend
+            .start_export(&tenant, export_input(ExportRequest::system()))
+            .await
+            .unwrap();
+        let reclaimed = backend
+            .start_export(&tenant, export_input(ExportRequest::system()))
+            .await
+            .unwrap();
+
+        // The bystander holds a long lease, so it is never eligible for the
+        // re-claim below; only its rows can prove the DELETEs are job-scoped.
+        let worker_a = WorkerId::new(format!("pg-bystander-{}", uuid::Uuid::new_v4()));
+        let lease_bystander =
+            claim_specific(&backend, &worker_a, &bystander, StdDuration::from_secs(60)).await;
+        record_type_progress(
+            &backend,
+            &tenant,
+            &bystander,
+            &worker_a,
+            lease_bystander.fencing_token,
+            TypeExportProgress::new("Patient"),
+        )
+        .await;
+        record_output_part(
+            &backend,
+            &tenant,
+            &bystander,
+            &worker_a,
+            lease_bystander.fencing_token,
+            "Patient",
+            0,
+            7,
+        )
+        .await;
+
+        let worker_b = WorkerId::new(format!("pg-neighbour-b-{}", uuid::Uuid::new_v4()));
+        let lease_b =
+            claim_specific(&backend, &worker_b, &reclaimed, StdDuration::from_millis(1)).await;
+        record_type_progress(
+            &backend,
+            &tenant,
+            &reclaimed,
+            &worker_b,
+            lease_b.fencing_token,
+            TypeExportProgress::new("Patient"),
+        )
+        .await;
+        record_output_part(
+            &backend,
+            &tenant,
+            &reclaimed,
+            &worker_b,
+            lease_b.fencing_token,
+            "Patient",
+            0,
+            9,
+        )
+        .await;
+
+        // Only `reclaimed` has an expired lease, so only its rows go.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let worker_c = WorkerId::new(format!("pg-neighbour-c-{}", uuid::Uuid::new_v4()));
+        let lease_c =
+            claim_specific(&backend, &worker_c, &reclaimed, StdDuration::from_secs(60)).await;
+        assert!(lease_c.fencing_token > lease_b.fencing_token);
+
+        assert_eq!(export_row_counts(&backend, &reclaimed).await, (0, 0));
+        assert_eq!(
+            export_row_counts(&backend, &bystander).await,
+            (1, 1),
+            "a concurrent job's rows are not collateral damage"
+        );
+        let bystander_manifest = backend
+            .get_export_manifest(&tenant, &bystander)
+            .await
+            .unwrap();
+        assert_eq!(bystander_manifest.output.len(), 1);
+        assert_eq!(bystander_manifest.output[0].count, 7);
+
+        backend
+            .finish_export_job(&tenant, &reclaimed, &worker_c, lease_c.fencing_token)
+            .await
+            .unwrap();
+        backend
+            .finish_export_job(
+                &tenant,
+                &bystander,
+                &worker_a,
+                lease_bystander.fencing_token,
+            )
+            .await
+            .unwrap();
+    }
+
     #[tokio::test]
     async fn postgres_integration_export_set_current_type_persists_and_is_fenced() {
         let _guard = BULK_EXPORT_TEST_LOCK.lock().await;
