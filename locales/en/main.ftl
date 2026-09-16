@@ -664,6 +664,10 @@ bulk-import-status-failed = Failed
 # button can simply be pressed again. { $detail } is the recipient's own
 # untranslated diagnosis — an HTTP status and reason, or a transport error.
 bulk-import-status-error = The last status change did not reach the Data Recipient, so this submission is unchanged — try again. ({ $detail })
+# The same banner while the change is still queued (#998): the recipient
+# never answered (as opposed to refusing), so the request is kept and re-sent
+# from the status card's own refresh for as long as this page stays open.
+bulk-import-status-pending = The last status change did not reach the Data Recipient; it is kept and will be re-sent automatically while this page is open. ({ $detail })
 bulk-import-detail-recipient = Data Recipient
 bulk-import-detail-id = Submission ID
 bulk-import-detail-submitter = Submitter

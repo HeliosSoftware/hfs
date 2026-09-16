@@ -634,6 +634,7 @@ bulk-import-status-stopped = Detenida
 bulk-import-status-completed = Completada
 bulk-import-status-failed = Fallido
 bulk-import-status-error = El último cambio de estado no llegó al receptor de datos, así que esta submission sigue igual: inténtelo de nuevo. ({ $detail })
+bulk-import-status-pending = El último cambio de estado no llegó al receptor de datos; se conserva y se reenviará automáticamente mientras esta página siga abierta. ({ $detail })
 bulk-import-detail-recipient = Receptor de datos
 bulk-import-detail-id = ID de submission
 bulk-import-detail-submitter = Remitente

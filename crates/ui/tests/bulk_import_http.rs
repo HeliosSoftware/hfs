@@ -2357,3 +2357,292 @@ async fn a_non_ascii_progress_report_still_reaches_the_operator() {
     // And the percentage still parses, so the bar stays determinate.
     assert!(html.contains(r#"aria-valuenow="35""#), "{html}");
 }
+
+// ---------------------------------------------------------------------------
+// #998 — a status change must land, be queued, or be refused; never dropped.
+// ---------------------------------------------------------------------------
+
+/// A provider store that answers the first versioned put with the optimistic
+/// lock failure a status poll landing in between causes, then behaves — the
+/// shape of a *Mark completed* pressed during a live ingest (#998).
+struct ConflictNextPutStore {
+    inner: Arc<dyn BulkProviderStore>,
+    conflict: std::sync::atomic::AtomicBool,
+}
+
+#[async_trait::async_trait]
+impl BulkProviderStore for ConflictNextPutStore {
+    async fn list_provider_submissions(
+        &self,
+        tenant: &helios_persistence::tenant::TenantContext,
+    ) -> StorageResult<Vec<helios_persistence::core::StoredProviderSubmission>> {
+        self.inner.list_provider_submissions(tenant).await
+    }
+
+    async fn get_provider_submission(
+        &self,
+        tenant: &helios_persistence::tenant::TenantContext,
+        id: &str,
+    ) -> StorageResult<Option<helios_persistence::core::StoredProviderSubmission>> {
+        self.inner.get_provider_submission(tenant, id).await
+    }
+
+    async fn put_provider_submission(
+        &self,
+        tenant: &helios_persistence::tenant::TenantContext,
+        id: &str,
+        document: serde_json::Value,
+        if_match_version: Option<i64>,
+    ) -> StorageResult<helios_persistence::core::StoredProviderSubmission> {
+        if self
+            .conflict
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(helios_persistence::error::StorageError::Concurrency(
+                helios_persistence::error::ConcurrencyError::OptimisticLockFailure {
+                    resource_type: "BulkProviderSubmission".to_string(),
+                    id: id.to_string(),
+                    expected_etag: format!("W/\"{}\"", if_match_version.unwrap_or(0)),
+                    actual_etag: Some(format!("W/\"{}\"", if_match_version.unwrap_or(0) + 1)),
+                },
+            ));
+        }
+        self.inner
+            .put_provider_submission(tenant, id, document, if_match_version)
+            .await
+    }
+
+    async fn delete_provider_submission(
+        &self,
+        tenant: &helios_persistence::tenant::TenantContext,
+        id: &str,
+    ) -> StorageResult<bool> {
+        self.inner.delete_provider_submission(tenant, id).await
+    }
+}
+
+fn default_tenant() -> helios_persistence::tenant::TenantContext {
+    helios_persistence::tenant::TenantContext::new(
+        helios_persistence::tenant::TenantId::new("default"),
+        helios_persistence::tenant::TenantPermissions::full_access(),
+    )
+}
+
+/// The stored submission document behind a detail path.
+async fn read_document(ctx: &Ctx, detail_path: &str) -> serde_json::Value {
+    let id = detail_path.rsplit('/').next().expect("submission id");
+    ctx.bulk_provider
+        .get_provider_submission(&default_tenant(), id)
+        .await
+        .expect("read submission")
+        .expect("submission exists")
+        .document
+}
+
+/// Rewrites the stored submission document in place, the way
+/// [`set_submission_status`] does for one field.
+async fn rewrite_document(
+    ctx: &Ctx,
+    detail_path: &str,
+    rewrite: impl FnOnce(&mut serde_json::Value),
+) {
+    let id = detail_path.rsplit('/').next().expect("submission id");
+    let stored = ctx
+        .bulk_provider
+        .get_provider_submission(&default_tenant(), id)
+        .await
+        .expect("read submission")
+        .expect("submission exists");
+    let mut document = stored.document;
+    rewrite(&mut document);
+    ctx.bulk_provider
+        .put_provider_submission(&default_tenant(), id, document, Some(stored.version))
+        .await
+        .expect("rewrite submission state");
+}
+
+/// #998 (3): the status fragment rewrites the submission every 5s, so the
+/// operator's own write lost the compare-and-swap more often than not during
+/// a live ingest — `optimistic lock failure ... BulkProviderSubmission/...`
+/// and the press gone. The write is now re-derived on a fresh copy; the
+/// kick-off itself is not repeated.
+#[tokio::test]
+async fn a_status_change_that_loses_the_write_race_is_re_applied() {
+    let (recipient_url, received) = mock_recipient(StatusCode::OK).await;
+    let (settings, backing) = backing_stores();
+    let setup = Ctx {
+        settings: Arc::clone(&settings),
+        bulk_provider: Arc::clone(&backing),
+        recipient: recipient_url.clone(),
+    };
+    let detail_path = create_submission(&setup).await;
+    set_submission_status(&setup, &detail_path, "in-progress").await;
+    let ctx = Ctx {
+        settings,
+        bulk_provider: Arc::new(ConflictNextPutStore {
+            inner: backing,
+            conflict: std::sync::atomic::AtomicBool::new(true),
+        }),
+        recipient: recipient_url,
+    };
+
+    let before = received.lock().unwrap().len();
+    let (status, location, _) = post_form(&ctx, &format!("{detail_path}/complete"), "").await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(location, detail_path);
+    assert_eq!(
+        received.lock().unwrap().len(),
+        before + 1,
+        "the kick-off goes out once; only the write is retried"
+    );
+
+    let (_, html) = get(&ctx, &detail_path).await;
+    assert!(
+        html.contains(r#"<div id="submission-status">Completed</div>"#),
+        "{html}"
+    );
+    assert!(html.contains("Recipient acknowledged (200)"), "{html}");
+    assert!(!html.contains(BANNER), "{html}");
+    let stored = read_document(&ctx, &detail_path).await;
+    assert_eq!(stored["status"], "completed");
+}
+
+/// #998 (2): a kick-off the recipient never answers — a timeout, a refused
+/// connection — used to leave the status untouched and the press as one log
+/// line. The change is now queued on the submission, shown as such, and
+/// re-sent by the status card once its hold has passed; the re-send is what
+/// lands it.
+#[tokio::test]
+async fn an_unanswered_status_change_is_queued_and_re_sent_from_the_status_card() {
+    let ctx = ctx("http://localhost:9/");
+    let detail_path = create_submission(&ctx).await;
+    set_submission_status(&ctx, &detail_path, "in-progress").await;
+    post_form(&ctx, &format!("{detail_path}/complete"), "").await;
+
+    let (_, html) = get(&ctx, &detail_path).await;
+    assert!(html.contains("In Progress"), "{html}");
+    assert!(html.contains(BANNER), "{html}");
+    assert!(html.contains("re-sent automatically"), "{html}");
+    assert!(
+        html.contains("attempt 1 of"),
+        "the log counts the attempt: {html}"
+    );
+    let stored = read_document(&ctx, &detail_path).await;
+    assert_eq!(stored["pendingStatus"], "completed", "{stored}");
+    assert_eq!(stored["pendingStatusAttempts"], 1, "{stored}");
+    assert!(
+        stored["pendingStatusRetryAt"]
+            .as_str()
+            .is_some_and(|t| !t.is_empty()),
+        "{stored}"
+    );
+
+    // The hold has not passed: the status card leaves the queue alone (and
+    // does not spend another kick-off budget on a recipient that just went
+    // quiet).
+    let (status, fragment) = get(&ctx, &format!("{detail_path}/status")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(fragment.contains(BANNER), "{fragment}");
+    let stored = read_document(&ctx, &detail_path).await;
+    assert_eq!(
+        stored["pendingStatusAttempts"], 1,
+        "no early re-send: {stored}"
+    );
+
+    // The recipient comes back and the hold passes.
+    let (recipient_url, received) = mock_recipient(StatusCode::OK).await;
+    rewrite_document(&ctx, &detail_path, |doc| {
+        doc["recipientBaseUrl"] = serde_json::json!(recipient_url);
+        doc["pendingStatusRetryAt"] = serde_json::json!("2000-01-01T00:00:00.000Z");
+    })
+    .await;
+    let (status, fragment) = get(&ctx, &format!("{detail_path}/status")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        fragment.contains(r#"<div id="submission-status" hx-swap-oob="true">Completed</div>"#),
+        "{fragment}"
+    );
+    assert!(
+        fragment.contains(r#"<div id="submission-error" hx-swap-oob="true"></div>"#),
+        "the banner clears once the change lands: {fragment}"
+    );
+    assert!(
+        fragment.contains("Re-sending: marking submission completed"),
+        "{fragment}"
+    );
+    assert!(
+        fragment.contains("Recipient acknowledged (200)"),
+        "{fragment}"
+    );
+    let sent = received.lock().unwrap();
+    assert_eq!(sent.len(), 1, "exactly one re-send: {sent:?}");
+    let code = sent[0]["parameter"]
+        .as_array()
+        .and_then(|params| {
+            params
+                .iter()
+                .find(|p| p["name"] == "submissionStatus")
+                .map(|p| p["valueCoding"]["code"].clone())
+        })
+        .unwrap_or_default();
+    assert_eq!(code, "completed");
+    drop(sent);
+    let stored = read_document(&ctx, &detail_path).await;
+    assert_eq!(stored["status"], "completed", "{stored}");
+    assert!(stored.get("pendingStatus").is_none(), "{stored}");
+    assert!(stored.get("statusError").is_none(), "{stored}");
+}
+
+/// A refusal is an answer: the recipient said no, and only another press can
+/// change that. Nothing is queued and the banner is the "try again" one.
+#[tokio::test]
+async fn a_refused_status_change_is_not_queued() {
+    let (recipient_url, _) = mock_recipient(StatusCode::INTERNAL_SERVER_ERROR).await;
+    let ctx = ctx(&recipient_url);
+    let detail_path = create_submission(&ctx).await;
+    set_submission_status(&ctx, &detail_path, "in-progress").await;
+    post_form(&ctx, &format!("{detail_path}/abort"), "").await;
+
+    let stored = read_document(&ctx, &detail_path).await;
+    assert!(stored.get("pendingStatus").is_none(), "{stored}");
+    assert_eq!(stored["status"], "in-progress");
+    let (_, html) = get(&ctx, &detail_path).await;
+    assert!(html.contains(BANNER), "{html}");
+    assert!(html.contains("try again"), "{html}");
+    assert!(!html.contains("re-sent automatically"), "{html}");
+}
+
+/// A queued change is moot once the submission is closed out by other means
+/// — a poll that answered a clean `200`, say — and no kick-off can be sent
+/// for it any more: the status card drops the queue and clears the banner.
+#[tokio::test]
+async fn a_queued_status_change_is_dropped_once_the_submission_is_closed_out() {
+    let ctx = ctx("http://localhost:9/");
+    let detail_path = create_submission(&ctx).await;
+    set_submission_status(&ctx, &detail_path, "in-progress").await;
+    post_form(&ctx, &format!("{detail_path}/abort"), "").await;
+    assert_eq!(
+        read_document(&ctx, &detail_path).await["pendingStatus"],
+        "stopped"
+    );
+
+    rewrite_document(&ctx, &detail_path, |doc| {
+        doc["status"] = serde_json::json!("completed");
+        doc["pendingStatusRetryAt"] = serde_json::json!("2000-01-01T00:00:00.000Z");
+    })
+    .await;
+    let (_, fragment) = get(&ctx, &format!("{detail_path}/status")).await;
+    assert!(
+        fragment.contains(
+            "Queued status change (stopped) dropped: the submission is already completed."
+        ),
+        "{fragment}"
+    );
+    assert!(
+        fragment.contains(r#"<div id="submission-error" hx-swap-oob="true"></div>"#),
+        "{fragment}"
+    );
+    let stored = read_document(&ctx, &detail_path).await;
+    assert!(stored.get("pendingStatus").is_none(), "{stored}");
+    assert_eq!(stored["status"], "completed");
+}
