@@ -232,9 +232,6 @@ impl MongoBackend {
     pub(crate) const RESOURCES_COLLECTION: &'static str = "resources";
     pub(crate) const RESOURCE_HISTORY_COLLECTION: &'static str = "resource_history";
     pub(crate) const SEARCH_INDEX_COLLECTION: &'static str = "search_index";
-    // Not yet read outside the catalog: the reader/writer paths that use it
-    // land in later #1160 tasks.
-    #[allow(dead_code)]
     pub(crate) const SEARCH_INDEX_CONTAINED_COLLECTION: &'static str =
         super::search_index_catalog::SEARCH_INDEX_CONTAINED_COLLECTION;
     pub(crate) const TENANTS_COLLECTION: &'static str = "tenants";

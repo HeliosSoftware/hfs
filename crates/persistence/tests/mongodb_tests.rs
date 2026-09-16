@@ -3464,6 +3464,59 @@ async fn mongodb_integration_contained_search() {
     assert_eq!(both_urls, vec!["Observation/obs1", "Patient/top1"]);
 }
 
+#[tokio::test]
+async fn mongodb_integration_contained_rows_are_written_to_their_own_collection() {
+    let Some(backend) = create_backend_with_full_registry("contained_rows_split").await else {
+        eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
+        return;
+    };
+    let tenant = create_tenant("tenant-contained-split");
+    backend
+        .create(
+            &tenant,
+            "Observation",
+            json!({
+                "resourceType": "Observation", "id": "holder", "status": "final",
+                "code": { "coding": [{ "system": "http://loinc.org", "code": "OWN" }] },
+                "subject": { "reference": "#p" },
+                "contained": [{ "resourceType": "Patient", "id": "p", "name": [{ "family": "Inner" }] }]
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    let db = raw_test_client(&backend.config().connection_string)
+        .await
+        .unwrap()
+        .database(&backend.config().database_name);
+    let own = db.collection::<Document>("search_index");
+    let contained = db.collection::<Document>("search_index_contained");
+    let key = doc! { "tenant_id": "tenant-contained-split", "resource_type": "Observation", "resource_id": "holder" };
+    assert!(
+        own.count_documents(key.clone()).await.unwrap() > 0,
+        "own rows in search_index"
+    );
+    assert_eq!(
+        own.count_documents(doc! { "is_contained": true })
+            .await
+            .unwrap(),
+        0,
+        "no contained row may land in search_index"
+    );
+    let inner = contained
+        .find_one(doc! { "tenant_id": "tenant-contained-split", "contained_type": "Patient", "param_name": "name" })
+        .await
+        .unwrap()
+        .expect("contained row in search_index_contained");
+    assert_eq!(inner.get_str("resource_type"), Ok("Observation"));
+    assert_eq!(inner.get_str("resource_id"), Ok("holder"));
+    assert_eq!(inner.get_str("contained_local_id"), Ok("p"));
+    assert!(
+        !inner.contains_key("is_contained"),
+        "is_contained is implied by the collection"
+    );
+}
+
 /// Seeds `n` Observations, each containing a Patient named Smith, under ids
 /// `obs-<i>` with contained local id `p`.
 async fn seed_contained_smiths(backend: &MongoBackend, tenant: &TenantContext, n: usize) {
@@ -6217,29 +6270,36 @@ async fn mongodb_integration_reindex_page_counts_contained_entries() {
         .as_ref()
         .unwrap_or_else(|e| panic!("reindex failed: {e:?}"));
 
-    let actual = search_index_entry_count(&backend, &tenant, "Observation", "obs-contained").await;
-    assert_eq!(
-        *reported as u64, actual,
-        "reported entry count must match rows actually written, including _contained rows"
-    );
+    // Own rows land in `search_index`; contained rows now land in their own
+    // collection, `search_index_contained` (#1160), so the reported total —
+    // which still counts both, per the doc comment on
+    // `write_search_entries_page` — is checked against the sum of both
+    // collections rather than `search_index` alone.
+    let own_actual =
+        search_index_entry_count(&backend, &tenant, "Observation", "obs-contained").await;
 
     let client = raw_test_client(&backend.config().connection_string)
         .await
         .expect("failed to connect MongoDB client for search_index assertions");
     let database = client.database(&backend.config().database_name);
     let contained_rows = database
-        .collection::<Document>("search_index")
+        .collection::<Document>("search_index_contained")
         .count_documents(doc! {
             "tenant_id": tenant.tenant_id().as_str(),
             "resource_type": "Observation",
             "resource_id": "obs-contained",
-            "is_contained": true,
         })
         .await
-        .expect("failed to count contained search_index rows");
+        .expect("failed to count search_index_contained rows");
     assert!(
         contained_rows > 0,
         "the contained Patient's values must be indexed alongside the container"
+    );
+
+    assert_eq!(
+        *reported as u64,
+        own_actual + contained_rows,
+        "reported entry count must match rows actually written, including _contained rows"
     );
 }
 
