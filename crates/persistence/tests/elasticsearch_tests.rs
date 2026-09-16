@@ -2216,6 +2216,58 @@ mod es_integration {
         }
     }
 
+    /// #990: a resource type that has never been written has no index (indices
+    /// are created lazily on first write), so Elasticsearch answers the search
+    /// with `index_not_found_exception`. That is a known-empty set, and the
+    /// result must say so with `total = Some(0)` — a missing total made the
+    /// REST layer emit `"total": null` for `GET /Group` and fail closed on
+    /// `GET /Group?_summary=count`.
+    #[tokio::test]
+    async fn es_integration_search_unindexed_type_reports_zero_total() {
+        use helios_persistence::core::{SearchProvider, TextSearchProvider};
+        use helios_persistence::types::{ContainedMode, Pagination, SearchQuery, TotalMode};
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("unindexed-type-tenant");
+
+        // Plain search: the ES search path always reports a total.
+        let result = backend
+            .search(&tenant, &SearchQuery::new("Group"))
+            .await
+            .expect("searching an unindexed type is not an error");
+        assert!(result.resources.items.is_empty());
+        assert_eq!(
+            result.total,
+            Some(0),
+            "an unindexed type is a known-empty set"
+        );
+        assert_eq!(result.resources.page_info.total, Some(0));
+
+        // `_total=accurate` (what `_summary=count` implies, #254).
+        let mut query = SearchQuery::new("Group");
+        query.total = Some(TotalMode::Accurate);
+        let result = backend.search(&tenant, &query).await.unwrap();
+        assert_eq!(result.total, Some(0));
+
+        // The count path already agreed; the two must not diverge.
+        assert_eq!(backend.search_count(&tenant, &query).await.unwrap(), 0);
+
+        // `_contained` and full-text searches take their own request paths and
+        // hit the same missing index.
+        let mut contained = SearchQuery::new("Group");
+        contained.contained = ContainedMode::On;
+        contained.total = Some(TotalMode::Accurate);
+        let result = backend.search(&tenant, &contained).await.unwrap();
+        assert_eq!(result.total, Some(0));
+
+        let result = backend
+            .search_text(&tenant, "Group", "anything", &Pagination::default())
+            .await
+            .unwrap();
+        assert!(result.resources.items.is_empty());
+        assert_eq!(result.total, Some(0));
+    }
+
     #[tokio::test]
     async fn es_integration_search_by_name() {
         use helios_persistence::core::SearchProvider;
@@ -2404,6 +2456,143 @@ mod es_integration {
             "synchronous sync + wait_for must give read-after-write search"
         );
         assert_eq!(result.resources.items[0].id(), "raw-composite-1");
+    }
+
+    /// #1047: a lookup that resolves a write against existing content (a
+    /// transaction's conditional reference, an `If-None-Exist` create) must
+    /// see every write the composite has already acknowledged, whatever the
+    /// Elasticsearch write-refresh policy. This is the default policy
+    /// (`false`) with a refresh interval long enough that the index cannot
+    /// catch up on its own during the test: the lookup has to ask.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn es_integration_composite_conditional_lookups_see_unrefreshed_writes() {
+        use std::collections::HashMap;
+
+        use helios_persistence::backends::sqlite::SqliteBackend;
+        use helios_persistence::composite::{
+            CompositeConfig, CompositeStorage, DynSearchProvider, DynStorage, SyncMode,
+        };
+        use helios_persistence::core::{
+            ConditionalCreateResult, ConditionalStorage, SearchProvider,
+        };
+        use helios_persistence::types::{
+            SearchParamType, SearchParameter, SearchQuery, SearchValue,
+        };
+
+        let es = shared_es().await;
+        let unique_prefix = format!("hfs_{}", uuid::Uuid::new_v4().simple());
+        let es_config = ElasticsearchConfig {
+            nodes: vec![format!("http://{}:{}", es.host, es.port)],
+            index_prefix: unique_prefix,
+            number_of_replicas: 0,
+            refresh_interval: "30s".to_string(),
+            write_refresh: WriteRefreshPolicy::False,
+            ..Default::default()
+        };
+        let es_backend = Arc::new(
+            ElasticsearchBackend::with_shared_registry(es_config, build_search_registry())
+                .expect("create ES backend"),
+        );
+        es_backend
+            .initialize()
+            .await
+            .expect("initialize ES backend");
+
+        // The production shape: the primary's own index is offloaded to ES.
+        let mut sqlite = SqliteBackend::in_memory().expect("create SQLite backend");
+        sqlite.set_search_offloaded(true);
+        let sqlite = Arc::new(sqlite);
+        sqlite.init_schema().expect("init SQLite schema");
+
+        let composite_config = CompositeConfig::builder()
+            .primary("sqlite", BackendKind::Sqlite)
+            .search_backend("es", BackendKind::Elasticsearch)
+            .sync_mode(SyncMode::Synchronous)
+            .build()
+            .expect("build composite config");
+
+        let mut backends: HashMap<String, DynStorage> = HashMap::new();
+        backends.insert("sqlite".to_string(), sqlite.clone() as DynStorage);
+        backends.insert("es".to_string(), es_backend.clone() as DynStorage);
+
+        let mut search_providers: HashMap<String, DynSearchProvider> = HashMap::new();
+        search_providers.insert("sqlite".to_string(), sqlite.clone() as DynSearchProvider);
+        search_providers.insert("es".to_string(), es_backend.clone() as DynSearchProvider);
+
+        let composite = CompositeStorage::new(composite_config, backends)
+            .expect("create composite storage")
+            .with_search_providers(search_providers)
+            .with_full_primary(sqlite);
+
+        let tenant = create_tenant("unrefreshed-composite-tenant");
+        let organization = json!({
+            "resourceType": "Organization",
+            "identifier": [{"system": "urn:zzz:probe", "value": "ORG-PROBE-1047"}],
+            "name": "ZZZ Probe Org"
+        });
+        let created = composite
+            .create(
+                &tenant,
+                "Organization",
+                organization.clone(),
+                FhirVersion::default(),
+            )
+            .await
+            .expect("create through composite");
+
+        // `If-None-Exist` right after the create: the same criteria a
+        // transaction's conditional reference carries.
+        let outcome = composite
+            .conditional_create(
+                &tenant,
+                "Organization",
+                organization,
+                "identifier=urn:zzz:probe|ORG-PROBE-1047",
+                FhirVersion::default(),
+            )
+            .await
+            .expect("conditional create through composite");
+        match outcome {
+            ConditionalCreateResult::Exists(existing) => {
+                assert_eq!(existing.id(), created.id());
+            }
+            ConditionalCreateResult::Created(_) => {
+                panic!("conditional create missed the Organization created moments earlier")
+            }
+            ConditionalCreateResult::MultipleMatches(n) => panic!("unexpected {n} matches"),
+        }
+
+        // The primitive the transaction path uses, then the lookup it runs.
+        composite
+            .ensure_writes_visible(&tenant, &["Organization"])
+            .await
+            .expect("ensure_writes_visible through composite");
+        let query = SearchQuery::new("Organization").with_parameter(SearchParameter {
+            name: "identifier".to_string(),
+            param_type: SearchParamType::Token,
+            modifier: None,
+            values: vec![SearchValue::token(Some("urn:zzz:probe"), "ORG-PROBE-1047")],
+            chain: vec![],
+            components: vec![],
+        });
+        let result = composite
+            .search(&tenant, &query)
+            .await
+            .expect("search through composite");
+        assert_eq!(
+            result.resources.items.len(),
+            1,
+            "an acknowledged write must be searchable after ensure_writes_visible, \
+             without waiting for the refresh interval"
+        );
+        assert_eq!(result.resources.items[0].id(), created.id());
+
+        // A type with no index yet is not an error: nothing was written to it.
+        composite
+            .ensure_writes_visible(&tenant, &["Location"])
+            .await
+            .expect("refreshing a type with no index yet is a no-op");
     }
 
     /// `create_many` is one `_bulk` request per batch, so under
@@ -3195,6 +3384,243 @@ mod es_integration {
         // Note: number search depends on SearchParameter extraction for RiskAssessment
         // This verifies the query doesn't error
         assert!(result.resources.items.len() <= 1);
+    }
+
+    #[tokio::test]
+    async fn elasticsearch_integration_quantity_comparators_ignore_search_precision() {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::types::{
+            SearchParamType, SearchParameter, SearchPrefix, SearchQuery, SearchValue,
+        };
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("test-tenant");
+
+        // Issue #1011: `value-quantity=gt60` must exclude 60.2 kg exactly at
+        // the boundary while still matching every value strictly above 60,
+        // regardless of how the search value's own precision is written.
+        let weights = [
+            ("obs-weight-55-4", 55.4),
+            ("obs-weight-58-5", 58.5),
+            ("obs-weight-60-2", 60.2),
+            ("obs-weight-64-5", 64.5),
+        ];
+        for (id, value) in weights {
+            backend
+                .create(
+                    &tenant,
+                    "Observation",
+                    json!({
+                        "resourceType": "Observation",
+                        "id": id,
+                        "status": "final",
+                        "code": { "coding": [{ "system": "http://loinc.org", "code": "29463-7" }] },
+                        "valueQuantity": {
+                            "value": value,
+                            "unit": "kg",
+                            "system": "http://unitsofmeasure.org",
+                            "code": "kg"
+                        }
+                    }),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+
+        // Wait for index refresh
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+        async fn search_ids(
+            backend: &ElasticsearchBackend,
+            tenant: &TenantContext,
+            prefix: SearchPrefix,
+            value: &str,
+        ) -> Vec<String> {
+            let query = SearchQuery::new("Observation").with_parameter(SearchParameter {
+                name: "value-quantity".to_string(),
+                param_type: SearchParamType::Quantity,
+                modifier: None,
+                values: vec![SearchValue::new(prefix, value)],
+                chain: vec![],
+                components: vec![],
+            });
+            let result = backend.search(tenant, &query).await.unwrap();
+            let mut ids: Vec<String> = result
+                .resources
+                .items
+                .iter()
+                .map(|r| r.id().to_string())
+                .collect();
+            ids.sort();
+            ids
+        }
+
+        let gt60 = search_ids(&backend, &tenant, SearchPrefix::Gt, "60").await;
+        assert_eq!(gt60, vec!["obs-weight-60-2", "obs-weight-64-5"], "gt60");
+
+        let gt60_0 = search_ids(&backend, &tenant, SearchPrefix::Gt, "60.0").await;
+        assert_eq!(
+            gt60_0,
+            vec!["obs-weight-60-2", "obs-weight-64-5"],
+            "gt60.0 must match gt60 exactly: implicit precision is ignored"
+        );
+
+        let le60_2 = search_ids(&backend, &tenant, SearchPrefix::Le, "60.2").await;
+        assert_eq!(
+            le60_2,
+            vec!["obs-weight-55-4", "obs-weight-58-5", "obs-weight-60-2"],
+            "le60.2"
+        );
+
+        let lt58_5 = search_ids(&backend, &tenant, SearchPrefix::Lt, "58.5").await;
+        assert_eq!(lt58_5, vec!["obs-weight-55-4"], "lt58.5");
+
+        let eq60 = search_ids(&backend, &tenant, SearchPrefix::Eq, "60").await;
+        assert_eq!(
+            eq60,
+            vec!["obs-weight-60-2"],
+            "eq60 ranges over [59.5, 60.5), which contains 60.2"
+        );
+
+        let eq60_0 = search_ids(&backend, &tenant, SearchPrefix::Eq, "60.0").await;
+        assert!(
+            eq60_0.is_empty(),
+            "eq60.0 ranges over [59.95, 60.05), which excludes 60.2: got {eq60_0:?}"
+        );
+
+        let gt60_kg = search_ids(
+            &backend,
+            &tenant,
+            SearchPrefix::Gt,
+            "60|http://unitsofmeasure.org|kg",
+        )
+        .await;
+        assert_eq!(
+            gt60_kg,
+            vec!["obs-weight-60-2", "obs-weight-64-5"],
+            "gt60|...|kg (raw branch)"
+        );
+
+        // Cross-unit boundary: 60.2 kg canonicalizes to exactly 60200 g, so
+        // `ge60200|...|g` must match it (and everything above) through the
+        // canonical branch.
+        let ge60200_g = search_ids(
+            &backend,
+            &tenant,
+            SearchPrefix::Ge,
+            "60200|http://unitsofmeasure.org|g",
+        )
+        .await;
+        assert_eq!(
+            ge60200_g,
+            vec!["obs-weight-60-2", "obs-weight-64-5"],
+            "ge60200|...|g (canonical branch, cross-unit exact boundary)"
+        );
+    }
+
+    #[tokio::test]
+    async fn elasticsearch_integration_quantity_ne_excludes_precision_range() {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::types::{
+            SearchParamType, SearchParameter, SearchPrefix, SearchQuery, SearchValue,
+        };
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("test-tenant");
+
+        // Issue #1011: `value-quantity=ne60` must exclude 60.2 kg (inside the
+        // implicit-precision range [59.5, 60.5)) while still matching every
+        // other value, regardless of how the search value's own precision is
+        // written.
+        let weights = [
+            ("obs-weight-55-4", 55.4),
+            ("obs-weight-58-5", 58.5),
+            ("obs-weight-60-2", 60.2),
+            ("obs-weight-64-5", 64.5),
+        ];
+        for (id, value) in weights {
+            backend
+                .create(
+                    &tenant,
+                    "Observation",
+                    json!({
+                        "resourceType": "Observation",
+                        "id": id,
+                        "status": "final",
+                        "code": { "coding": [{ "system": "http://loinc.org", "code": "29463-7" }] },
+                        "valueQuantity": {
+                            "value": value,
+                            "unit": "kg",
+                            "system": "http://unitsofmeasure.org",
+                            "code": "kg"
+                        }
+                    }),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+
+        // Wait for index refresh
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+        async fn search_ids(
+            backend: &ElasticsearchBackend,
+            tenant: &TenantContext,
+            prefix: SearchPrefix,
+            value: &str,
+        ) -> Vec<String> {
+            let query = SearchQuery::new("Observation").with_parameter(SearchParameter {
+                name: "value-quantity".to_string(),
+                param_type: SearchParamType::Quantity,
+                modifier: None,
+                values: vec![SearchValue::new(prefix, value)],
+                chain: vec![],
+                components: vec![],
+            });
+            let result = backend.search(tenant, &query).await.unwrap();
+            let mut ids: Vec<String> = result
+                .resources
+                .items
+                .iter()
+                .map(|r| r.id().to_string())
+                .collect();
+            ids.sort();
+            ids
+        }
+
+        let ne60 = search_ids(&backend, &tenant, SearchPrefix::Ne, "60").await;
+        assert_eq!(
+            ne60,
+            vec!["obs-weight-55-4", "obs-weight-58-5", "obs-weight-64-5"],
+            "ne60 excludes 60.2, which lies in [59.5, 60.5)"
+        );
+
+        let ne60_0 = search_ids(&backend, &tenant, SearchPrefix::Ne, "60.0").await;
+        assert_eq!(
+            ne60_0,
+            vec![
+                "obs-weight-55-4",
+                "obs-weight-58-5",
+                "obs-weight-60-2",
+                "obs-weight-64-5"
+            ],
+            "ne60.0 ranges over [59.95, 60.05), which excludes 60.2, so nothing is excluded"
+        );
+
+        let ne60_kg = search_ids(
+            &backend,
+            &tenant,
+            SearchPrefix::Ne,
+            "60|http://unitsofmeasure.org|kg",
+        )
+        .await;
+        assert_eq!(
+            ne60_kg,
+            vec!["obs-weight-55-4", "obs-weight-58-5", "obs-weight-64-5"],
+            "ne60|...|kg excludes 60.2 through the raw and canonical branches"
+        );
     }
 
     #[tokio::test]
@@ -4347,6 +4773,95 @@ mod es_integration {
             .unwrap();
         assert_eq!(page_ids(&back1), vec!["cp-1", "cp-2", "cp-3"]);
         assert!(back1.resources.page_info.previous_cursor.is_none());
+    }
+
+    /// The three backend primitives `Patient/$everything`'s compartment walk
+    /// composes — compartment membership (OR across `subject`/`performer`,
+    /// see `es_integration_compartment_search`), cursor-paged results (see
+    /// `es_integration_cursor_paging_round_trip_previous`), and a
+    /// `_lastUpdated ge` filter — pinned together the way the handler uses
+    /// them, since ES has no REST-level `$everything` fixture.
+    #[tokio::test]
+    async fn es_compartment_query_pages_with_cursor_and_since() {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::types::{
+            CompartmentMembership, SearchParamType, SearchParameter, SearchPrefix, SearchQuery,
+            SearchValue,
+        };
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("everything-compartment-paging");
+
+        for i in 1..=5 {
+            backend
+                .create(
+                    &tenant,
+                    "Observation",
+                    json!({
+                        "resourceType": "Observation",
+                        "status": "final",
+                        "code": {"text": "x"},
+                        "id": format!("o{i}"),
+                        "subject": {"reference": "Patient/p1"}
+                    }),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+        backend
+            .create(
+                &tenant,
+                "Observation",
+                json!({
+                    "resourceType": "Observation",
+                    "status": "final",
+                    "code": {"text": "x"},
+                    "id": "other",
+                    "subject": {"reference": "Patient/p2"}
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+
+        // Wait for index refresh
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+        let mut q = SearchQuery::new("Observation");
+        q.compartment = Some(CompartmentMembership {
+            params: vec!["subject".to_string(), "performer".to_string()],
+            reference: "Patient/p1".to_string(),
+        });
+        q.count = Some(2);
+
+        let mut seen = Vec::new();
+        let mut cursor = None;
+        loop {
+            q.cursor = cursor.take();
+            let page = backend.search(&tenant, &q).await.unwrap();
+            seen.extend(page.resources.items.iter().map(|r| r.id().to_string()));
+            if page.resources.page_info.has_next {
+                cursor = page.resources.page_info.next_cursor.clone();
+                assert!(cursor.is_some());
+            } else {
+                break;
+            }
+        }
+        seen.sort();
+        assert_eq!(seen, vec!["o1", "o2", "o3", "o4", "o5"]);
+
+        q.cursor = None;
+        q.parameters.push(SearchParameter {
+            name: "_lastUpdated".to_string(),
+            param_type: SearchParamType::Date,
+            modifier: None,
+            values: vec![SearchValue::new(SearchPrefix::Ge, "2999-01-01T00:00:00Z")],
+            chain: vec![],
+            components: vec![],
+        });
+        let page = backend.search(&tenant, &q).await.unwrap();
+        assert!(page.resources.items.is_empty());
     }
 
     /// #1079: a result set whose size is an exact multiple of `_count` must

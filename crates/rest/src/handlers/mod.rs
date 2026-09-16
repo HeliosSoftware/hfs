@@ -29,6 +29,7 @@ pub mod console_metrics;
 pub mod create;
 pub mod dashboard_counts;
 pub mod delete;
+pub mod everything;
 pub mod health;
 pub mod history;
 pub mod nl_search;
@@ -79,6 +80,7 @@ pub use capabilities::capabilities_handler;
 pub use compartment::compartment_search_handler;
 pub use create::create_handler;
 pub use delete::{conditional_delete_handler, delete_handler};
+pub use everything::{patient_everything_instance_handler, patient_everything_type_handler};
 pub use health::health_handler;
 pub use history::{
     delete_instance_history_handler, delete_version_handler, history_instance_handler,

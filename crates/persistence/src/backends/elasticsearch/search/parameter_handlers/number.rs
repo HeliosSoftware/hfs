@@ -45,26 +45,28 @@ pub fn build_clause(name: &str, value: &str, prefix: SearchPrefix) -> Option<Val
                 }
             }));
         }
-        // Comparators match the implicit-precision range boundaries (FHIR spec):
-        // gt/sa → ≥ hi, lt/eb → < lo, ge → ≥ lo, le → < hi.
+        // gt/lt/ge/le/sa/eb ignore the implicit precision and compare against
+        // the exact search value (FHIR spec): "the implicit precision of the
+        // number is ignored, and they are treated as if they have arbitrarily
+        // high precision."
         SearchPrefix::Gt | SearchPrefix::Sa => {
             json!({
-                "range": { "search_params.number.value": { "gte": num + implicit_precision } }
+                "range": { "search_params.number.value": { "gt": num } }
             })
         }
         SearchPrefix::Lt | SearchPrefix::Eb => {
             json!({
-                "range": { "search_params.number.value": { "lt": num - implicit_precision } }
+                "range": { "search_params.number.value": { "lt": num } }
             })
         }
         SearchPrefix::Ge => {
             json!({
-                "range": { "search_params.number.value": { "gte": num - implicit_precision } }
+                "range": { "search_params.number.value": { "gte": num } }
             })
         }
         SearchPrefix::Le => {
             json!({
-                "range": { "search_params.number.value": { "lt": num + implicit_precision } }
+                "range": { "search_params.number.value": { "lte": num } }
             })
         }
         SearchPrefix::Ap => {
@@ -130,10 +132,35 @@ mod tests {
     }
 
     #[test]
-    fn test_gt() {
-        // gt matches strictly above the search range; for "100" that is >= 100.5.
-        let clause = build_clause("length", "100", SearchPrefix::Gt).unwrap();
-        let s = serde_json::to_string(&clause).unwrap();
-        assert!(s.contains("\"gte\":100.5"));
+    fn comparators_use_exact_value() {
+        // gt/lt/ge/le/sa/eb ignore implicit precision and compare against the
+        // exact search value, per the FHIR spec.
+        let cases = [
+            (SearchPrefix::Gt, "gt"),
+            (SearchPrefix::Sa, "gt"),
+            (SearchPrefix::Lt, "lt"),
+            (SearchPrefix::Eb, "lt"),
+            (SearchPrefix::Ge, "gte"),
+            (SearchPrefix::Le, "lte"),
+        ];
+
+        for (prefix, expected_key) in cases {
+            let clause = build_clause("length", "100", prefix).unwrap();
+            let range = &clause["nested"]["query"]["bool"]["must"][1]["range"]["search_params.number.value"];
+            assert_eq!(
+                range,
+                &json!({ expected_key: 100.0 }),
+                "{prefix:?} must emit {{\"{expected_key}\": 100.0}}"
+            );
+        }
+    }
+
+    #[test]
+    fn comparator_ignores_trailing_zero_precision() {
+        // "60" and "60.0" have different implicit precision, but gt ignores
+        // it entirely: both must produce identical JSON.
+        let plain = build_clause("length", "60", SearchPrefix::Gt).unwrap();
+        let trailing_zero = build_clause("length", "60.0", SearchPrefix::Gt).unwrap();
+        assert_eq!(plain, trailing_zero);
     }
 }

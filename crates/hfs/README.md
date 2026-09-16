@@ -71,6 +71,13 @@ Options:
   -V, --version                  Print version
 ```
 
+`hfs --version` prints the crate version and, when the binary was built from a
+git checkout, the commit it was cut from — `hfs 0.2.1 (git 1a2b3c4d5)`. The
+same identity is advertised to FHIR clients as `CapabilityStatement.software`
+on `GET /metadata` (the commit as an extension on `software`) and reported by
+`GET /health`. When building from a source archive with no `.git`, set
+`HFS_GIT_SHA=<sha>` in the build environment to record the commit.
+
 ## Configuration
 
 ### Environment Variables

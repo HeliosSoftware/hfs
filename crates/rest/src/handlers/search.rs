@@ -185,6 +185,20 @@ pub(crate) async fn execute_search_bundle<S>(
 where
     S: ResourceStorage + SearchProvider + IncludeProvider + RevincludeProvider + Send + Sync,
 {
+    // Direct requests were already judged by the router's resource-type gate
+    // (`middleware::resource_type`); a `GET [type]?[params]` entry inside a
+    // batch or transaction Bundle arrives here without passing through it, and
+    // must not answer an unknown type with an empty `200` searchset either
+    // (#989). Searches resolve against the server default version (see the
+    // subsetting below), so the type is judged against that same version.
+    let fhir_version = state.config().default_fhir_version;
+    if !crate::fhir_types::is_valid_resource_type_for_version(resource_type, fhir_version) {
+        return Err(RestError::UnknownResourceType {
+            resource_type: resource_type.to_string(),
+            version: fhir_version,
+        });
+    }
+
     // Reject known-but-unimplemented control parameters instead of silently
     // ignoring them (which returns an unfiltered, misleading `200`). `_query`
     // (named queries) is not implemented by any backend. (`_list` is implemented
@@ -786,8 +800,10 @@ fn encode_query(params: &SearchParams) -> String {
 /// requested explicitly via `_total=accurate`) and the backend did not
 /// compute one, this returns `Err(RestError::InternalError)` instead of
 /// silently emitting `"total": null`. If the client explicitly opted out of
-/// an accurate total (e.g. `_total=none`), a missing total still serializes
-/// as `null`, since that is the behavior the client asked for.
+/// an accurate total (e.g. `_total=none`), a missing total is omitted from
+/// the Bundle, since that is the behavior the client asked for. `total` is
+/// never serialized as `null`: FHIR JSON primitives are present with a value
+/// or absent (#990).
 fn bundle_to_json_with_subsetting(
     bundle: SearchBundle,
     summary_mode: Option<SummaryMode>,
@@ -812,13 +828,16 @@ fn bundle_to_json_with_subsetting(
         }
         // An explicit `_total` other than `accurate` (e.g. `_total=none`) wins
         // over the `_summary=count` implication (#254); a missing total here
-        // reflects that explicit choice, not a server fault, so it passes
-        // through unchanged.
-        return Ok(serde_json::json!({
+        // reflects that explicit choice, not a server fault. It is omitted
+        // rather than emitted as `null`, which is not valid FHIR JSON (#990).
+        let mut json = serde_json::json!({
             "resourceType": "Bundle",
             "type": bundle.bundle_type,
-            "total": bundle.total
-        }));
+        });
+        if let Some(total) = bundle.total {
+            json["total"] = serde_json::json!(total);
+        }
+        return Ok(json);
     }
 
     Ok(crate::responses::bundle::searchset_to_json(
@@ -1474,10 +1493,10 @@ mod tests {
     }
 
     /// The fail-closed behavior is exclusive to `_summary=count`: a normal
-    /// FHIR search is allowed to omit `total`, so it still serializes today
-    /// as `"total": null` via `searchset_to_json`.
+    /// FHIR search is allowed to omit `total`, and `searchset_to_json` then
+    /// leaves the key out entirely — never `"total": null` (#990).
     #[test]
-    fn test_non_count_summary_without_total_still_serializes() {
+    fn test_non_count_summary_without_total_omits_the_key() {
         use helios_persistence::types::{BundleEntry, SearchBundle};
 
         let bundle = SearchBundle::new().with_entry(BundleEntry::match_entry(
@@ -1488,16 +1507,19 @@ mod tests {
         let json = bundle_to_json_with_subsetting(bundle, None, false, None, FhirVersion::R4)
             .expect("a missing total is not an error outside of _summary=count");
 
-        assert!(json["total"].is_null());
+        assert!(
+            json.get("total").is_none(),
+            "a missing total must be absent, not null: {json}"
+        );
         assert_eq!(json["entry"][0]["resource"]["id"], "1");
     }
 
     /// An explicit `_total` other than `accurate` (e.g. `_total=none`) wins
     /// over the `_summary=count` implication (#254): the caller signals this
-    /// by passing `total_required = false`, and a missing total then
-    /// serializes as `null` instead of failing closed.
+    /// by passing `total_required = false`, and a missing total is then
+    /// omitted (not `null`, #990) instead of failing closed.
     #[test]
-    fn test_count_summary_with_total_not_required_serializes_null_without_error() {
+    fn test_count_summary_with_total_not_required_omits_total_without_error() {
         use helios_persistence::types::SearchBundle;
 
         let bundle = SearchBundle::new();
@@ -1512,7 +1534,31 @@ mod tests {
         .expect("total_required = false opts out of the fail-closed check");
 
         assert_eq!(json["resourceType"], "Bundle");
-        assert!(json["total"].is_null());
+        assert!(
+            json.get("total").is_none(),
+            "a missing total must be absent, not null: {json}"
+        );
+        assert!(json.get("entry").is_none());
+    }
+
+    /// A known-empty result (`total = Some(0)`, e.g. a resource type with no
+    /// stored rows) serializes `_summary=count` as the number `0` (#990).
+    #[test]
+    fn test_count_summary_with_zero_total_emits_zero() {
+        use helios_persistence::types::SearchBundle;
+
+        let bundle = SearchBundle::new().with_total(0);
+
+        let json = bundle_to_json_with_subsetting(
+            bundle,
+            Some(SummaryMode::Count),
+            true,
+            None,
+            FhirVersion::R4,
+        )
+        .expect("a zero total is a value, not a missing total");
+
+        assert_eq!(json["total"], serde_json::json!(0));
         assert!(json.get("entry").is_none());
     }
 }

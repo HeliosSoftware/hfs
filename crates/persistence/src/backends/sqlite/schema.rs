@@ -10,17 +10,21 @@ use crate::core::bulk_submit_legacy::{
 use crate::error::StorageResult;
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 28;
+pub const SCHEMA_VERSION: i32 = 29;
 
-/// The `search_index` value indexes: every index on the table except
-/// `idx_search_composite`, which the delete-by-resource path needs at all
-/// times. This is the canonical set — a test asserts a fresh schema carries
-/// exactly these — and the list the bulk index rebuild drops and recreates
-/// (see [`drop_search_value_indexes`] / [`ensure_search_value_indexes`]).
+/// The `search_index` value indexes. Excludes `idx_search_composite`, which the
+/// delete-by-resource path needs at all times, and `idx_search_token_display`,
+/// dropped in v29 for write volume (#945): `value_token_display` is populated on
+/// most Coding rows but its only reader is the uncommon token `:text` /
+/// `:code-text` modifier, which is a `COLLATE NOCASE` scan rather than an index
+/// seek — `:text-advanced` uses the FTS table instead. This is the canonical set
+/// — a test asserts a fresh schema carries exactly these — and the list the bulk
+/// index rebuild drops and recreates (see [`drop_search_value_indexes`] /
+/// [`ensure_search_value_indexes`]).
 ///
 /// Keep each entry's SQL byte-for-byte what the migration ladder creates,
 /// normalised to one line, so the self-heal on startup and the ladder agree.
-pub(crate) const SEARCH_VALUE_INDEXES: [(&str, &str); 13] = [
+pub(crate) const SEARCH_VALUE_INDEXES: [(&str, &str); 12] = [
     (
         "idx_search_string",
         "CREATE INDEX IF NOT EXISTS idx_search_string ON search_index(tenant_id, resource_type, param_name, value_string) WHERE value_string IS NOT NULL",
@@ -48,10 +52,6 @@ pub(crate) const SEARCH_VALUE_INDEXES: [(&str, &str); 13] = [
     (
         "idx_search_uri",
         "CREATE INDEX IF NOT EXISTS idx_search_uri ON search_index(tenant_id, resource_type, param_name, value_uri) WHERE value_uri IS NOT NULL",
-    ),
-    (
-        "idx_search_token_display",
-        "CREATE INDEX IF NOT EXISTS idx_search_token_display ON search_index(tenant_id, resource_type, param_name, value_token_display) WHERE value_token_display IS NOT NULL",
     ),
     (
         "idx_search_identifier_type",
@@ -439,6 +439,7 @@ fn migrate_schema(conn: &Connection, from_version: i32) -> StorageResult<()> {
             25 => migrate_v25_to_v26(conn)?,
             26 => migrate_v26_to_v27(conn)?,
             27 => migrate_v27_to_v28(conn)?,
+            28 => migrate_v28_to_v29(conn)?,
             _ => {
                 return Err(crate::error::StorageError::Backend(
                     crate::error::BackendError::Internal {
@@ -1367,6 +1368,19 @@ fn migrate_v27_to_v28(conn: &Connection) -> StorageResult<()> {
         conn.execute(sql, [])
             .map_err(|e| migration_err(format!("v28 partial folded index: {e}")))?;
     }
+    Ok(())
+}
+
+/// Migrate from schema version 28 to version 29.
+///
+/// Drops `idx_search_token_display` (#945). The column stays and keeps feeding
+/// the FTS trigger; only the b-tree index goes. Token `:text` / `:code-text`
+/// (the index's only readers, and already `COLLATE NOCASE` scans rather than
+/// seeks) fall back to a partition scan over the parameter's rows, while every
+/// bulk-ingested Coding-with-display row stops paying an index insertion.
+fn migrate_v28_to_v29(conn: &Connection) -> StorageResult<()> {
+    conn.execute("DROP INDEX IF EXISTS idx_search_token_display", [])
+        .map_err(|e| migration_err(format!("v29 drop token_display index: {e}")))?;
     Ok(())
 }
 

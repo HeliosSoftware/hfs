@@ -848,7 +848,13 @@ mod resource_type_admission {
         .await;
 
         assert_eq!(body["entry"][0]["response"]["status"], "201 Created");
-        assert_eq!(body["entry"][1]["response"]["status"], "400 Bad Request");
+        // "Resource type not supported" is a `404` inside a Bundle exactly as
+        // it is at `PUT [base]/NoLongerValid/bad` (#504, #989).
+        assert_eq!(body["entry"][1]["response"]["status"], "404 Not Found");
+        assert_eq!(
+            body["entry"][1]["response"]["outcome"]["issue"][0]["code"],
+            "not-supported"
+        );
         assert!(
             backend
                 .read(&test_tenant(), "Patient", "good")
@@ -939,9 +945,12 @@ mod resource_type_admission {
             }))
             .await;
 
-        response.assert_status(StatusCode::BAD_REQUEST);
+        // The transaction is declined whole with the failing entry's own
+        // status: an unsupported resource type is a `404` (#989).
+        response.assert_status(StatusCode::NOT_FOUND);
         let outcome: Value = response.json();
         assert_eq!(outcome["resourceType"], "OperationOutcome");
+        assert_eq!(outcome["issue"][0]["code"], "not-supported");
         assert!(
             backend
                 .read(&test_tenant(), "Patient", "sibling")

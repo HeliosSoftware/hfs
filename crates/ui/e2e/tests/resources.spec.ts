@@ -117,6 +117,30 @@ test("opening Resources with no type shows Patient results without interaction",
   await expect(resources.results.rows.first()).toBeVisible();
 });
 
+// The results header is a centred flex row whose heading reuses the stacked
+// query-group heading class. Flex centres each child's margin box, so the
+// heading's own bottom margin used to lift "RESULTS" ~2px above the count
+// beside it (#994). Guard the box centres, not the text: that is the property
+// the layout promises, and the one the margin was breaking.
+test("the results heading sits on the same row as its count", async ({ resources, page }) => {
+  await resources.goto("Patient");
+  await resources.results.waitShown();
+  await expect(resources.results.meta).not.toBeEmpty();
+
+  const geometry = await page.locator("#query-results > .query-results__head").evaluate((head) => {
+    const heading = head.querySelector<HTMLElement>(":scope > h2")!;
+    const meta = head.querySelector<HTMLElement>("#query-results-meta")!;
+    const headingBox = heading.getBoundingClientRect();
+    const metaBox = meta.getBoundingClientRect();
+    return {
+      headingMarginBottom: getComputedStyle(heading).marginBottom,
+      centreOffset: (headingBox.top + headingBox.bottom) / 2 - (metaBox.top + metaBox.bottom) / 2,
+    };
+  });
+  expect(Math.abs(geometry.centreOffset)).toBeLessThanOrEqual(0.5);
+  expect(geometry.headingMarginBottom).toBe("0px");
+});
+
 test("selecting a type updates the Create label and the URL", async ({ resources, page }) => {
   await resources.goto("Patient");
   await expect(resources.createLabel).toHaveText("Create new Patient");

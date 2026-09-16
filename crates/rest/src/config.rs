@@ -956,8 +956,15 @@ impl BulkSubmitConfig {
 /// This struct can be constructed from environment variables using [`ServerConfig::from_env`],
 /// from command line arguments using [`ServerConfig::parse`], or programmatically.
 #[derive(Debug, Clone, Parser)]
-#[command(name = "rest-server")]
-#[command(about = "FHIR RESTful API Server")]
+// `long_about = None` keeps `--help` on the one-line `about`: clap would
+// otherwise print this struct's Rust doc comment (a note about constructors
+// that means nothing to an operator) at the top of the help text.
+#[command(name = "hfs", long_about = None)]
+#[command(about = "Helios FHIR Server — FHIR RESTful API")]
+// `-V`/`--version` prints `hfs <version> (git <sha>)` — the only way to
+// identify a downloaded release binary (#992). The string is assembled at
+// compile time in `build_info`.
+#[command(version = crate::build_info::VERSION_STRING)]
 pub struct ServerConfig {
     /// Port to listen on.
     #[arg(short, long, env = "HFS_SERVER_PORT", default_value = "8080")]
@@ -1089,6 +1096,12 @@ pub struct ServerConfig {
     /// Maximum page size for search results.
     #[arg(long, env = "HFS_MAX_PAGE_SIZE", default_value = "1000")]
     pub max_page_size: usize,
+
+    /// Ceiling on `match` entries returned by an unpaged `Patient/$everything`
+    /// (no `_count`). When reached, the response switches to paged mode and
+    /// carries a `next` link plus an informational `OperationOutcome`.
+    #[arg(long, env = "HFS_EVERYTHING_MAX_UNPAGED", default_value = "10000")]
+    pub everything_max_unpaged: usize,
 
     /// Storage backend mode: sqlite (default), sqlite-elasticsearch, postgres,
     /// postgres-elasticsearch, mongodb, mongodb-elasticsearch, s3, or s3-elasticsearch.
@@ -1403,6 +1416,7 @@ impl Default for ServerConfig {
             search_param_cache_ttl: 3600,
             default_page_size: 20,
             max_page_size: 1000,
+            everything_max_unpaged: 10000,
             storage_backend: "sqlite".to_string(),
             elasticsearch_nodes: "http://localhost:9200".to_string(),
             elasticsearch_index_prefix: "hfs".to_string(),
@@ -1651,6 +1665,7 @@ impl ServerConfig {
             search_param_cache_ttl: 3600,
             default_page_size: 10,
             max_page_size: 100,
+            everything_max_unpaged: 10000,
             storage_backend: "sqlite".to_string(),
             elasticsearch_nodes: "http://localhost:9200".to_string(),
             elasticsearch_index_prefix: "hfs".to_string(),
@@ -1795,6 +1810,12 @@ mod tests {
         assert_eq!(config.port, 0);
         assert!(!config.enable_cors);
         assert_eq!(config.default_tenant, "test-tenant");
+    }
+
+    #[test]
+    fn everything_max_unpaged_defaults_to_10000() {
+        let config = ServerConfig::for_testing();
+        assert_eq!(config.everything_max_unpaged, 10000);
     }
 
     #[test]
