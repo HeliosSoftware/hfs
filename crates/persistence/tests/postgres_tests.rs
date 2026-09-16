@@ -12195,6 +12195,155 @@ mod postgres_integration {
         assert_eq!(continued_manifest.failed_entries, 1);
     }
 
+    /// Isolated probe counting row-level writes of `bulk_manifests.status`, so
+    /// "promote once" is observable at the SQL level rather than through a
+    /// value that reads `processing` either way.
+    ///
+    /// `FOR EACH ROW` plus `UPDATE OF status` keeps the batch's counter update
+    /// (which names the counter columns and never `status`) out of the count.
+    async fn install_bulk_status_write_probe(dbname: &str) -> (tokio_postgres::Client, String) {
+        let client = reindex_test_client_for(dbname).await;
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let probe = format!("bulk_status_probe_{suffix}");
+        let function = format!("record_bulk_status_write_{suffix}");
+        let trigger = format!("record_bulk_status_write_{suffix}_trigger");
+        client
+            .batch_execute(&format!(
+                "CREATE TABLE {probe} (target text PRIMARY KEY, writes bigint NOT NULL);
+                 INSERT INTO {probe} VALUES ('bulk_manifests.status', 0);
+                 CREATE FUNCTION {function}() RETURNS trigger LANGUAGE plpgsql AS $$
+                 BEGIN
+                   UPDATE {probe} SET writes = writes + 1
+                     WHERE target = 'bulk_manifests.status';
+                   RETURN NULL;
+                 END $$;
+                 CREATE TRIGGER {trigger} AFTER UPDATE OF status ON bulk_manifests
+                   FOR EACH ROW EXECUTE FUNCTION {function}();"
+            ))
+            .await
+            .expect("install bulk manifest status write probe");
+        (client, probe)
+    }
+
+    async fn bulk_status_write_count(client: &tokio_postgres::Client, probe: &str) -> i64 {
+        client
+            .query_one(
+                &format!("SELECT writes FROM {probe} WHERE target = 'bulk_manifests.status'"),
+                &[],
+            )
+            .await
+            .unwrap()
+            .get(0)
+    }
+
+    /// #1141: the first batch of a pending manifest promotes it to
+    /// `processing`; later batches leave `status` alone while their counters
+    /// keep accumulating. A batch that promotes nothing is still successful,
+    /// and a missing manifest is still the lookup's `ManifestNotFound`; an
+    /// empty promotion never becomes an error.
+    #[tokio::test]
+    async fn postgres_bulk_submit_promotes_manifest_status_once() {
+        use helios_persistence::core::{BulkProcessingOptions, BulkSubmitProvider, ManifestStatus};
+        use helios_persistence::error::{BulkSubmitError, StorageError};
+
+        let (backend, dbname) = isolated_reindex_backend().await;
+        let (client, probe) = install_bulk_status_write_probe(&dbname).await;
+        let (tenant, submission, manifest) =
+            seed_isolated_bulk_submit(&backend, "bulk-status-promote").await;
+
+        let first = backend
+            .process_entries(
+                &tenant,
+                &submission,
+                &manifest,
+                mutation_entries("status-promote-a", 2),
+                &BulkProcessingOptions::new()
+                    .with_file_url("status-promote-a.ndjson")
+                    .with_defer_indexing(true),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.len(), 2);
+        assert!(first.iter().all(|result| result.is_success()));
+
+        let promoted = backend
+            .get_manifest(&tenant, &submission, &manifest)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(promoted.status, ManifestStatus::Processing);
+        assert_eq!(
+            bulk_status_write_count(&client, &probe).await,
+            1,
+            "the first batch promotes the pending manifest with one status write"
+        );
+
+        let second = backend
+            .process_entries(
+                &tenant,
+                &submission,
+                &manifest,
+                mutation_entries("status-promote-b", 2),
+                &BulkProcessingOptions::new()
+                    .with_file_url("status-promote-b.ndjson")
+                    .with_defer_indexing(true),
+            )
+            .await
+            .expect("a batch on an already-promoted manifest is still a successful batch");
+        assert_eq!(second.len(), 2);
+        assert!(second.iter().all(|result| result.is_success()));
+
+        assert_eq!(
+            bulk_status_write_count(&client, &probe).await,
+            1,
+            "a later batch must not rewrite the already-promoted manifest status"
+        );
+        let after_second = backend
+            .get_manifest(&tenant, &submission, &manifest)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(after_second.status, ManifestStatus::Processing);
+        assert_eq!(after_second.total_entries, 4);
+        assert_eq!(after_second.processed_entries, 4);
+        assert_eq!(after_second.failed_entries, 0);
+        let receipts = backend
+            .get_entry_counts(&tenant, &submission, &manifest)
+            .await
+            .unwrap();
+        assert_eq!(receipts.total, 4);
+        assert_eq!(receipts.success, 4);
+        assert_eq!(receipts.processing_error, 0);
+
+        // A manifest that does not exist is still reported by the manifest
+        // lookup, and its zero matching status rows are never reached.
+        let missing = backend
+            .process_entries(
+                &tenant,
+                &submission,
+                "status-promote-missing",
+                mutation_entries("status-promote-missing", 1),
+                &BulkProcessingOptions::new()
+                    .with_file_url("status-promote-missing.ndjson")
+                    .with_defer_indexing(true),
+            )
+            .await;
+        assert!(
+            matches!(
+                &missing,
+                Err(StorageError::BulkSubmit(
+                    BulkSubmitError::ManifestNotFound { .. }
+                ))
+            ),
+            "expected ManifestNotFound, got {missing:?}"
+        );
+        assert_eq!(
+            bulk_status_write_count(&client, &probe).await,
+            1,
+            "a missing manifest never reaches a status write"
+        );
+    }
+
     /// #1007: `mark_entries_unindexed` flips only the named `(type, id)`
     /// entry results to `processing-error`, leaving the rest untouched, and
     /// is a no-op on an empty entry list.
