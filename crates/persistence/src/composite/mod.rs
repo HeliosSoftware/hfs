@@ -94,6 +94,8 @@ pub mod bulk_submit;
 pub mod config;
 pub mod cost;
 pub mod health;
+pub mod indexing_submit_jobs;
+pub mod ingest_index_sink;
 pub mod merger;
 pub mod router;
 pub mod storage;
@@ -103,11 +105,13 @@ pub mod sync;
 pub use analyzer::{
     QueryAnalysis, QueryAnalyzer, QueryFeature, detect_query_features, features_to_capabilities,
 };
-pub use bulk_submit::CompositeSubmitJobs;
+pub use bulk_submit::{CompositeSubmitJobs, DEFAULT_SYNC_PAGE_TIMEOUT};
 pub use config::{
     BackendEntry, BackendRole, CompositeConfig, CompositeConfigBuilder, ConfigError, ConfigWarning,
     CostConfig, CostWeights, HealthConfig, RetryConfig, RoutingRule, SyncConfig, SyncMode,
 };
+pub use indexing_submit_jobs::IndexingSubmitJobs;
+pub use ingest_index_sink::{IngestIndexSink, IngestIndexSinkConfig, RejectedResource, SinkDrain};
 pub use merger::{MergeOptions, RelevanceMerger, ResultMerger, WeightedResult};
 pub use router::{
     BackendType, ExecutionStep, MergeStrategy, QueryPart, QueryRouter, QueryRouting,

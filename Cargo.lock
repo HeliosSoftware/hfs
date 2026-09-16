@@ -3680,6 +3680,7 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-subscriber",
+ "tracing-test",
  "unicode-normalization",
  "uuid",
  "wiremock",
@@ -3693,15 +3694,18 @@ dependencies = [
  "aes-gcm",
  "aes-kw",
  "anyhow",
+ "async-compression",
  "async-trait",
  "aws-config",
  "aws-sdk-s3",
  "axum",
  "axum-test",
  "base64 0.22.1",
+ "bytes",
  "cbc",
  "chrono",
  "clap",
+ "ctor",
  "dashmap",
  "flate2",
  "futures",
@@ -8480,6 +8484,27 @@ dependencies = [
  "tracing",
  "tracing-core",
  "tracing-log",
+]
+
+[[package]]
+name = "tracing-test"
+version = "0.2.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "19a4c448db514d4f24c5ddb9f73f2ee71bfb24c526cf0c570ba142d1119e0051"
+dependencies = [
+ "tracing-core",
+ "tracing-subscriber",
+ "tracing-test-macro",
+]
+
+[[package]]
+name = "tracing-test-macro"
+version = "0.2.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ad06847b7afb65c7866a36664b75c40b895e318cea4f71299f013fb22965329d"
+dependencies = [
+ "quote",
+ "syn 2.0.117",
 ]
 
 [[package]]

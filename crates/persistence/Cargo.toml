@@ -139,6 +139,9 @@ paste = "1.0"
 # `#[ctor::dtor]` exit hook that removes testcontainers held in `static`s
 # (tests/common/container_cleanup.rs).
 ctor = "0.2"
+# Asserts that lease loss, heartbeat timeouts, and broken input streams are
+# logged at `warn` (#1127).
+tracing-test = "0.2"
 # In-process HTTP stub for Elasticsearch `_bulk` failure paths (413, 429,
 # timeouts) that a real cluster cannot be made to produce on demand (#1125).
 wiremock = "0.6"

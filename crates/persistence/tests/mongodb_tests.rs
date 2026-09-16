@@ -232,9 +232,9 @@ mod shared_mongo {
 
     struct SharedMongo {
         connection_string: String,
-        /// Kept alive for the duration of the test binary; reaped by the
-        /// testcontainers watchdog and the CI cleanup step (by `github.run_id`
-        /// label). `None` when an external `HFS_TEST_MONGODB_URL` is used.
+        /// Kept alive for the duration of the test binary; the
+        /// `container_cleanup` exit hook removes it at process exit.
+        /// `None` when an external `HFS_TEST_MONGODB_URL` is used.
         _container: Option<testcontainers::ContainerAsync<Mongo>>,
     }
 
@@ -253,39 +253,43 @@ mod shared_mongo {
                 // Otherwise start an ephemeral standalone Mongo container; if
                 // Docker is unavailable, `start()` errors and the suite skips.
                 let run_id = std::env::var("GITHUB_RUN_ID").unwrap_or_default();
-                let container = Mongo::default()
-                    .with_label("github.run_id", &run_id)
-                    // Cap WiredTiger's cache. By default mongod sizes it to
-                    // ~50% of *host* RAM (ignoring container limits), so on CI
-                    // — where this container runs alongside ES/Postgres plus
-                    // coverage-instrumented test binaries — it balloons and the
-                    // host OOM-kills mongod mid-run (observed as connections
-                    // refused / "unexpected end of file" on the last wave of
-                    // tests). 0.25 GB is WiredTiger's floor and ample for the
-                    // suite's tiny datasets. `--bind_ip_all` matches the stock
-                    // image default and keeps the mapped port reachable once we
-                    // supply our own command.
-                    .with_cmd([
-                        "mongod",
-                        "--bind_ip_all",
-                        "--wiredTigerCacheSizeGB",
-                        "0.25",
-                        // `failCommand` (used by the bulk-submit retry tests)
-                        // is only registered when test commands are enabled.
-                        "--setParameter",
-                        "enableTestCommands=1",
-                    ])
-                    // Every test creates its own uniquely-named database, and
-                    // WiredTiger holds file handles open per collection/index
-                    // across all of them. With 50+ test databases the stock
-                    // container nofile limit is exhausted and index builds die
-                    // with TooManyFilesOpen (error 264) late in the run. 64000
-                    // is mongod's own recommended minimum.
-                    .with_ulimit("nofile", 64000, Some(64000))
-                    .with_startup_timeout(std::time::Duration::from_secs(120))
-                    .start()
-                    .await
-                    .ok()?;
+                // `SHARED` is a static and never dropped; the cleanup label
+                // lets the exit hook remove the container.
+                let container = super::container_cleanup::with_cleanup_label(
+                    Mongo::default()
+                        .with_label("github.run_id", &run_id)
+                        // Cap WiredTiger's cache. By default mongod sizes it to
+                        // ~50% of *host* RAM (ignoring container limits), so on CI
+                        // — where this container runs alongside ES/Postgres plus
+                        // coverage-instrumented test binaries — it balloons and the
+                        // host OOM-kills mongod mid-run (observed as connections
+                        // refused / "unexpected end of file" on the last wave of
+                        // tests). 0.25 GB is WiredTiger's floor and ample for the
+                        // suite's tiny datasets. `--bind_ip_all` matches the stock
+                        // image default and keeps the mapped port reachable once we
+                        // supply our own command.
+                        .with_cmd([
+                            "mongod",
+                            "--bind_ip_all",
+                            "--wiredTigerCacheSizeGB",
+                            "0.25",
+                            // `failCommand` (used by the bulk-submit retry tests)
+                            // is only registered when test commands are enabled.
+                            "--setParameter",
+                            "enableTestCommands=1",
+                        ])
+                        // Every test creates its own uniquely-named database, and
+                        // WiredTiger holds file handles open per collection/index
+                        // across all of them. With 50+ test databases the stock
+                        // container nofile limit is exhausted and index builds die
+                        // with TooManyFilesOpen (error 264) late in the run. 64000
+                        // is mongod's own recommended minimum.
+                        .with_ulimit("nofile", 64000, Some(64000))
+                        .with_startup_timeout(std::time::Duration::from_secs(120)),
+                )
+                .start()
+                .await
+                .ok()?;
                 let host = container.get_host().await.ok()?;
                 let port = container.get_host_port_ipv4(27017).await.ok()?;
                 Some(SharedMongo {
@@ -303,6 +307,9 @@ mod shared_mongo {
         Some(shared().await?.connection_string.clone())
     }
 }
+
+#[path = "common/container_cleanup.rs"]
+mod container_cleanup;
 
 /// The backend-agnostic tenant-id fidelity scenarios (issue #447), shared
 /// verbatim with the SQLite and PostgreSQL suites.
@@ -4363,6 +4370,261 @@ async fn mongodb_integration_search_cursor_pagination_roundtrip() {
     assert_eq!(page_back.resources.items[0].id(), first_id.as_str());
 }
 
+/// Creates Patients `cp-1..cp-n` (inclusive, `n <= 9`) in the given tenant.
+///
+/// The backend's default sort is `last_updated desc, id desc` and the ids are
+/// created in ascending order, so the listing is `cp-n .. cp-1` even when two
+/// creates share a millisecond.
+async fn create_cursor_paging_patients(backend: &MongoBackend, tenant: &TenantContext, n: usize) {
+    assert!(
+        n <= 9,
+        "single-digit ids keep lexical and creation order aligned"
+    );
+    for i in 1..=n {
+        backend
+            .create(
+                tenant,
+                "Patient",
+                json!({
+                    "resourceType": "Patient",
+                    "id": format!("cp-{i}"),
+                    "name": [{"family": "CursorPaging"}]
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+    }
+}
+
+/// Collects the resource ids of a search result's page, in page order.
+fn page_ids(result: &helios_persistence::core::SearchResult) -> Vec<String> {
+    result
+        .resources
+        .items
+        .iter()
+        .map(|r| r.id().to_string())
+        .collect()
+}
+
+/// Follows `cursor` with the same query.
+async fn follow(
+    backend: &MongoBackend,
+    tenant: &TenantContext,
+    query: &SearchQuery,
+    cursor: &Option<String>,
+) -> helios_persistence::core::SearchResult {
+    backend
+        .search(
+            tenant,
+            &query
+                .clone()
+                .with_cursor(cursor.clone().expect("cursor should be present")),
+        )
+        .await
+        .unwrap()
+}
+
+/// #1057: the issue's repro. Five Patients at `_count=2`, paged forward twice
+/// and then back. The backward hop over-fetches a probe row, and dropping it
+/// after the reverse (instead of before) shifted the window by one.
+#[tokio::test]
+async fn mongodb_integration_cursor_paging_backward_keeps_adjacent_rows() {
+    let Some(backend) = create_backend("cursor_backward_adjacent").await else {
+        eprintln!(
+            "Skipping mongodb_integration_cursor_paging_backward_keeps_adjacent_rows (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+
+    let tenant = create_tenant("tenant-cursor-backward-adjacent");
+    create_cursor_paging_patients(&backend, &tenant, 5).await;
+
+    let query = SearchQuery::new("Patient").with_count(2);
+
+    let page1 = backend.search(&tenant, &query).await.unwrap();
+    assert_eq!(page_ids(&page1), vec!["cp-5", "cp-4"]);
+
+    let page2 = follow(
+        &backend,
+        &tenant,
+        &query,
+        &page1.resources.page_info.next_cursor,
+    )
+    .await;
+    assert_eq!(page_ids(&page2), vec!["cp-3", "cp-2"]);
+
+    let page3 = follow(
+        &backend,
+        &tenant,
+        &query,
+        &page2.resources.page_info.next_cursor,
+    )
+    .await;
+    assert_eq!(page_ids(&page3), vec!["cp-1"]);
+    assert!(!page3.resources.page_info.has_next);
+
+    // The buggy code returned ["cp-4", "cp-3"] here.
+    let back2 = follow(
+        &backend,
+        &tenant,
+        &query,
+        &page3.resources.page_info.previous_cursor,
+    )
+    .await;
+    assert_eq!(page_ids(&back2), vec!["cp-3", "cp-2"]);
+    assert!(back2.resources.page_info.has_previous);
+    assert!(back2.resources.page_info.has_next);
+
+    let back1 = follow(
+        &backend,
+        &tenant,
+        &query,
+        &back2.resources.page_info.previous_cursor,
+    )
+    .await;
+    assert_eq!(page_ids(&back1), vec!["cp-5", "cp-4"]);
+    assert!(!back1.resources.page_info.has_previous);
+    assert!(back1.resources.page_info.previous_cursor.is_none());
+    assert!(back1.resources.page_info.has_next);
+}
+
+/// Walks forward through 7 Patients 3 at a time, then all the way back via
+/// `previous_cursor` and forward again (1 -> 2 -> 3 -> 2 -> 1 -> 2), asserting
+/// identical page contents and flags on every hop. Mirrors the SQLite and
+/// PostgreSQL round trips from #1079 (#1057).
+#[tokio::test]
+async fn mongodb_integration_cursor_paging_round_trip_previous() {
+    let Some(backend) = create_backend("cursor_round_trip_previous").await else {
+        eprintln!(
+            "Skipping mongodb_integration_cursor_paging_round_trip_previous (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+
+    let tenant = create_tenant("tenant-cursor-round-trip");
+    create_cursor_paging_patients(&backend, &tenant, 7).await;
+
+    let query = SearchQuery::new("Patient").with_count(3);
+
+    let page1 = backend.search(&tenant, &query).await.unwrap();
+    assert_eq!(page_ids(&page1), vec!["cp-7", "cp-6", "cp-5"]);
+    assert!(!page1.resources.page_info.has_previous);
+    assert!(page1.resources.page_info.previous_cursor.is_none());
+    assert!(page1.resources.page_info.has_next);
+    assert!(page1.resources.page_info.next_cursor.is_some());
+
+    let page2 = follow(
+        &backend,
+        &tenant,
+        &query,
+        &page1.resources.page_info.next_cursor,
+    )
+    .await;
+    assert_eq!(page_ids(&page2), vec!["cp-4", "cp-3", "cp-2"]);
+    assert!(page2.resources.page_info.has_previous);
+    assert!(page2.resources.page_info.previous_cursor.is_some());
+    assert!(page2.resources.page_info.has_next);
+
+    let page3 = follow(
+        &backend,
+        &tenant,
+        &query,
+        &page2.resources.page_info.next_cursor,
+    )
+    .await;
+    assert_eq!(page_ids(&page3), vec!["cp-1"]);
+    assert!(page3.resources.page_info.has_previous);
+    assert!(page3.resources.page_info.previous_cursor.is_some());
+    assert!(!page3.resources.page_info.has_next);
+    assert!(page3.resources.page_info.next_cursor.is_none());
+
+    // Page 3 -> page 2 must be exact, including order. This is the hop a
+    // pop-after-reverse implementation gets wrong: it drops the nearest row
+    // and keeps the farthest one.
+    let back2 = follow(
+        &backend,
+        &tenant,
+        &query,
+        &page3.resources.page_info.previous_cursor,
+    )
+    .await;
+    assert_eq!(page_ids(&back2), page_ids(&page2));
+    assert!(back2.resources.page_info.has_previous);
+    assert!(back2.resources.page_info.previous_cursor.is_some());
+    assert!(back2.resources.page_info.has_next);
+    assert!(back2.resources.page_info.next_cursor.is_some());
+
+    let back1 = follow(
+        &backend,
+        &tenant,
+        &query,
+        &back2.resources.page_info.previous_cursor,
+    )
+    .await;
+    assert_eq!(page_ids(&back1), page_ids(&page1));
+    assert!(!back1.resources.page_info.has_previous);
+    assert!(back1.resources.page_info.previous_cursor.is_none());
+    assert!(back1.resources.page_info.has_next);
+    assert!(back1.resources.page_info.next_cursor.is_some());
+
+    let again2 = follow(
+        &backend,
+        &tenant,
+        &query,
+        &back1.resources.page_info.next_cursor,
+    )
+    .await;
+    assert_eq!(page_ids(&again2), page_ids(&page2));
+    assert!(again2.resources.page_info.has_previous);
+    assert!(again2.resources.page_info.has_next);
+}
+
+/// Backward from page 2 of a 4-item, count-3 listing has no probe row beyond
+/// page 1, so `has_previous` must be false and no `previous_cursor` is
+/// produced — it is no longer hardcoded from "a cursor was supplied" (#1057).
+#[tokio::test]
+async fn mongodb_integration_cursor_paging_backward_from_page_two_has_no_previous() {
+    let Some(backend) = create_backend("cursor_backward_no_previous").await else {
+        eprintln!(
+            "Skipping mongodb_integration_cursor_paging_backward_from_page_two_has_no_previous (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+
+    let tenant = create_tenant("tenant-cursor-backward-no-previous");
+    create_cursor_paging_patients(&backend, &tenant, 4).await;
+
+    let query = SearchQuery::new("Patient").with_count(3);
+
+    let page1 = backend.search(&tenant, &query).await.unwrap();
+    assert_eq!(page_ids(&page1), vec!["cp-4", "cp-3", "cp-2"]);
+
+    let page2 = follow(
+        &backend,
+        &tenant,
+        &query,
+        &page1.resources.page_info.next_cursor,
+    )
+    .await;
+    assert_eq!(page_ids(&page2), vec!["cp-1"]);
+    assert!(page2.resources.page_info.has_previous);
+    assert!(!page2.resources.page_info.has_next);
+
+    let back1 = follow(
+        &backend,
+        &tenant,
+        &query,
+        &page2.resources.page_info.previous_cursor,
+    )
+    .await;
+    assert_eq!(page_ids(&back1), vec!["cp-4", "cp-3", "cp-2"]);
+    assert!(!back1.resources.page_info.has_previous);
+    assert!(back1.resources.page_info.previous_cursor.is_none());
+    assert!(back1.resources.page_info.has_next);
+    assert!(back1.resources.page_info.next_cursor.is_some());
+}
+
 #[tokio::test]
 async fn mongodb_integration_search_missing_not_and_param_sort() {
     let Some(backend) = create_backend_with_full_registry("search_missing_not_sort").await else {
@@ -4497,6 +4759,169 @@ async fn mongodb_integration_search_missing_not_and_param_sort() {
     assert_eq!(ids(&page2), vec!["patient-mns-4"]);
     assert!(!page2.resources.page_info.has_next);
     assert!(page2.resources.page_info.has_previous);
+}
+
+/// #1002: `url:below`/`url:above` on MongoDB must be segment-aware, the same
+/// way SQLite and Elasticsearch already are — a `:below=http://example.org/fhir`
+/// must not match `http://example.org/fhirx/...` just because it shares the
+/// literal prefix.
+#[tokio::test]
+async fn mongodb_integration_uri_below_and_above_are_segment_aware() {
+    let Some(backend) = create_backend_with_full_registry("uri_below_above").await else {
+        eprintln!(
+            "Skipping mongodb_integration_uri_below_and_above_are_segment_aware (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+
+    let tenant = create_tenant("tenant-uri-below-above");
+
+    for (id, url) in [
+        ("vs-root", "http://example.org/fhir"),
+        ("vs-a", "http://example.org/fhir/ValueSet/a"),
+        ("vs-x", "http://example.org/fhirx/ValueSet/b"),
+    ] {
+        backend
+            .create(
+                &tenant,
+                "ValueSet",
+                json!({
+                    "resourceType": "ValueSet",
+                    "id": id,
+                    "status": "active",
+                    "url": url,
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+    }
+
+    let ids = |result: &helios_persistence::core::SearchResult| {
+        let mut ids = result
+            .resources
+            .items
+            .iter()
+            .map(|r| r.id().to_string())
+            .collect::<Vec<_>>();
+        ids.sort();
+        ids
+    };
+
+    // `:below=http://example.org/fhir` — the value itself, and anything
+    // under `.../fhir/`. `vs-x` shares the literal prefix but is under
+    // `.../fhirx/`, a different path segment, so it must NOT match.
+    let mut below = SearchQuery::new("ValueSet").with_parameter(SearchParameter {
+        name: "url".to_string(),
+        param_type: SearchParamType::Uri,
+        modifier: Some(SearchModifier::Below),
+        values: vec![SearchValue::eq("http://example.org/fhir")],
+        chain: vec![],
+        components: vec![],
+    });
+    below.total = Some(TotalMode::Accurate);
+    let result = backend.search(&tenant, &below).await.unwrap();
+    assert_eq!(ids(&result), vec!["vs-a", "vs-root"]);
+    assert_eq!(result.total, Some(2));
+
+    // `:above=http://example.org/fhir/ValueSet/a` — the value and its
+    // path-segment parents down to the authority; `vs-root` is one of those
+    // parents, `vs-x` is not.
+    let above_a = SearchQuery::new("ValueSet").with_parameter(SearchParameter {
+        name: "url".to_string(),
+        param_type: SearchParamType::Uri,
+        modifier: Some(SearchModifier::Above),
+        values: vec![SearchValue::eq("http://example.org/fhir/ValueSet/a")],
+        chain: vec![],
+        components: vec![],
+    });
+    let result = backend.search(&tenant, &above_a).await.unwrap();
+    assert_eq!(ids(&result), vec!["vs-a", "vs-root"]);
+
+    // `:above=http://example.org/fhirx/ValueSet/b` — only `vs-x` and its own
+    // parents; `vs-root` (a different scheme+authority path) never matches.
+    let above_x = SearchQuery::new("ValueSet").with_parameter(SearchParameter {
+        name: "url".to_string(),
+        param_type: SearchParamType::Uri,
+        modifier: Some(SearchModifier::Above),
+        values: vec![SearchValue::eq("http://example.org/fhirx/ValueSet/b")],
+        chain: vec![],
+        components: vec![],
+    });
+    let result = backend.search(&tenant, &above_x).await.unwrap();
+    assert_eq!(ids(&result), vec!["vs-x"]);
+
+    // No modifier: exact match only.
+    let exact = SearchQuery::new("ValueSet").with_parameter(SearchParameter {
+        name: "url".to_string(),
+        param_type: SearchParamType::Uri,
+        modifier: None,
+        values: vec![SearchValue::eq("http://example.org/fhir")],
+        chain: vec![],
+        components: vec![],
+    });
+    let result = backend.search(&tenant, &exact).await.unwrap();
+    assert_eq!(ids(&result), vec!["vs-root"]);
+}
+
+/// #1002: `:below` must stay a single anchored regex so `idx_search_uri_v2`
+/// stays bounded rather than falling back to a full collection scan.
+#[tokio::test]
+async fn mongodb_integration_uri_below_search_is_a_covered_v2_scan() {
+    let Some(backend) = create_backend_with_full_registry("covered_uri_below").await else {
+        eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
+        return;
+    };
+    let tenant = create_tenant("tenant-covered-uri-below");
+    for i in 0..20 {
+        backend
+            .create(
+                &tenant,
+                "ValueSet",
+                json!({
+                    "resourceType": "ValueSet", "id": format!("vs{i}"), "status": "active",
+                    "url": format!("http://example.org/fhir/ValueSet/{i}")
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+    }
+    for i in 0..5 {
+        backend
+            .create(
+                &tenant,
+                "ValueSet",
+                json!({
+                    "resourceType": "ValueSet", "id": format!("other{i}"), "status": "active",
+                    "url": format!("http://example.org/other/ValueSet/{i}")
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+    }
+    let db = raw_test_client(&backend.config().connection_string)
+        .await
+        .unwrap()
+        .database(&backend.config().database_name);
+    let q = SearchQuery::new("ValueSet").with_parameter(SearchParameter {
+        name: "url".into(),
+        param_type: SearchParamType::Uri,
+        modifier: Some(SearchModifier::Below),
+        values: vec![SearchValue::eq("http://example.org/fhir")],
+        chain: vec![],
+        components: vec![],
+    });
+    assert_search_index_ops_are_covered(
+        &db,
+        async {
+            let r = backend.search(&tenant, &q).await.unwrap();
+            assert_eq!(r.resources.items.len(), 20);
+        },
+        "idx_search_uri_v2",
+    )
+    .await;
 }
 
 /// #1056: a MongoDB parameter-sorted page's rows, `has_next` and `total` must

@@ -26,7 +26,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::i18n::{I18n, RequestLocale};
-use crate::{RequestTenant, RequestVersion, WebState, current_status, render};
+use crate::{
+    RequestTenant, RequestVersion, WebState, current_status, render, upstream_failure_detail,
+};
 
 fn public_url_with_segments<'a>(
     public_base_url: &str,
@@ -942,24 +944,15 @@ fn with_tenant(request: reqwest::RequestBuilder, tenant: &str) -> reqwest::Reque
     request.header("X-Tenant-ID", tenant)
 }
 
-/// Renders a poll transport failure with its cause. `reqwest::Error`'s
-/// `Display` stops at the URL and hides the reason in `source()`, which made
-/// a timeout, a refused connection, and a reset log byte-identically (#957).
+/// Renders a poll transport failure with its cause (#957). The rendering
+/// itself is shared with the export workspace's kick-off (#1185); what is
+/// specific here is the cap and why a status poll can sit at it.
 fn poll_failure_detail(e: &reqwest::Error) -> String {
-    if e.is_timeout() {
-        return format!(
-            "timed out after {STATUS_POLL_TIMEOUT_SECS}s — the recipient's status \
-             endpoint can be slow while it is ingesting"
-        );
-    }
-    let mut detail = e.to_string();
-    let mut src = std::error::Error::source(e);
-    while let Some(cause) = src {
-        detail.push_str(": ");
-        detail.push_str(&cause.to_string());
-        src = cause.source();
-    }
-    detail
+    upstream_failure_detail(
+        e,
+        STATUS_POLL_TIMEOUT_SECS,
+        "the recipient's status endpoint can be slow while it is ingesting",
+    )
 }
 
 /// Whether the recipient asked us to hold off: a stored `next_poll_at` still
@@ -992,6 +985,48 @@ fn retry_after_seconds(response: &reqwest::Response) -> Option<u64> {
         .get("retry-after")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.trim().parse().ok())
+}
+
+/// Totals the counts recorded for `codes` in one `outcome` entry's
+/// `countSeverity`, which reaches us in two shapes.
+///
+/// HFS's own status handler emits the STU4 array of `{"code":…,"count":…}`
+/// objects (`severity_array` in `crates/rest/src/handlers/bulk_submit.rs`),
+/// while other recipients — and the older fixtures written against them —
+/// send a plain object keyed by severity (`{"error":1}`). Reading only the
+/// object shape scored every manifest HFS itself produces as zero errors,
+/// because `Value::get("error")` on an array is always `None`: a manifest
+/// that really failed showed up in the UI as a clean completion with no
+/// error files (#1127). Both shapes are accepted so neither recipient is
+/// misread.
+///
+/// Anything else yields `None`. An unrecognised `countSeverity` says nothing
+/// about the file, so the caller treats it exactly like a missing one and
+/// counts the entry as an error rather than assuming it was clean.
+fn severity_total(cs: &Value, codes: [&str; 2]) -> Option<u64> {
+    if let Some(entries) = cs.as_array() {
+        return Some(
+            entries
+                .iter()
+                .filter(|entry| {
+                    entry
+                        .get("code")
+                        .and_then(Value::as_str)
+                        .is_some_and(|code| codes.contains(&code))
+                })
+                .filter_map(|entry| entry.get("count").and_then(Value::as_u64))
+                .sum(),
+        );
+    }
+    if cs.is_object() {
+        return Some(
+            codes
+                .iter()
+                .filter_map(|code| cs.get(code).and_then(Value::as_u64))
+                .sum(),
+        );
+    }
+    None
 }
 
 /// One poll of the recipient's status URL: `202` records `X-Progress`, `200`
@@ -1061,11 +1096,9 @@ async fn poll_status(submission: &mut Submission, tenant: &str) {
                     files
                         .iter()
                         .filter(|file| {
-                            file.get("countSeverity").is_none_or(|cs| {
-                                cs.get("error").and_then(Value::as_u64).unwrap_or(0)
-                                    + cs.get("fatal").and_then(Value::as_u64).unwrap_or(0)
-                                    > 0
-                            })
+                            file.get("countSeverity")
+                                .and_then(|cs| severity_total(cs, ["error", "fatal"]))
+                                .is_none_or(|count| count > 0)
                         })
                         .count()
                 })

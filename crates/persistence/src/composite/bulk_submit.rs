@@ -45,8 +45,16 @@
 //! disagreement does not fail the manifest or any entry — it is surfaced as
 //! a `warning` in the receipt's `error` artifact (see
 //! [`crate::core::bulk_submit_worker::DefaultSubmitWorker`]).
+//!
+//! Each page's secondary sync is bounded by a timeout
+//! ([`CompositeSubmitJobs::with_sync_page_timeout`], #1127): a secondary that
+//! stops answering degrades that page's resources to unindexed instead of
+//! holding the manifest open indefinitely. Deployments that want search to be
+//! complete when the ingest ends, without this post-ingest pass, index during
+//! ingest instead ([`super::indexing_submit_jobs::IndexingSubmitJobs`]).
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -87,12 +95,30 @@ type SyncGroup = ((String, FhirVersion), Vec<(String, Value)>);
 pub struct CompositeSubmitJobs {
     primary: Arc<dyn BulkSubmitJobStore>,
     composite: Arc<CompositeStorage>,
+    sync_page_timeout: Duration,
 }
+
+/// How long one page of [`SubmitWorkerStorage::sync_ingested`] may wait on the
+/// secondaries — retries included — before its resources count as unindexed.
+/// A page is up to a thousand resources, several `_bulk` requests on
+/// Elasticsearch, each bounded by the client's own request timeout.
+pub const DEFAULT_SYNC_PAGE_TIMEOUT: Duration = Duration::from_secs(120);
 
 impl CompositeSubmitJobs {
     /// Wraps the primary's job store with the composite's secondary sync.
     pub fn new(primary: Arc<dyn BulkSubmitJobStore>, composite: Arc<CompositeStorage>) -> Self {
-        Self { primary, composite }
+        Self {
+            primary,
+            composite,
+            sync_page_timeout: DEFAULT_SYNC_PAGE_TIMEOUT,
+        }
+    }
+
+    /// Bounds each page of the post-ingest secondary sync (#1127); a page
+    /// that takes longer is abandoned and its resources are marked unindexed.
+    pub fn with_sync_page_timeout(mut self, timeout: Duration) -> Self {
+        self.sync_page_timeout = timeout;
+        self
     }
 
     /// Consumes a stream of successfully-ingested receipt pages — built by
@@ -163,15 +189,38 @@ impl CompositeSubmitJobs {
             }
             for ((resource_type, fhir_version), resources) in by_type {
                 attempted += resources.len() as u64;
-                let statuses = self
-                    .composite
-                    .sync_creates_to_secondaries(
+                let ids: Vec<String> = resources.iter().map(|(id, _)| id.clone()).collect();
+                let Ok(statuses) = tokio::time::timeout(
+                    self.sync_page_timeout,
+                    self.composite.sync_creates_to_secondaries(
                         &lease.tenant,
                         &resource_type,
                         fhir_version,
                         resources,
-                    )
-                    .await;
+                    ),
+                )
+                .await
+                else {
+                    warn!(
+                        submission = %lease.submission_id,
+                        manifest = %lease.manifest_id,
+                        resource_type,
+                        resources = ids.len(),
+                        timeout = ?self.sync_page_timeout,
+                        "bulk-submit: secondary sync of an ingested page timed out; its \
+                         resources will be reported unindexed"
+                    );
+                    let error = format!(
+                        "secondary sync timed out after {:?}",
+                        self.sync_page_timeout
+                    );
+                    for resource_id in ids {
+                        rejected
+                            .entry((resource_type.clone(), resource_id))
+                            .or_insert_with(|| ("secondaries".to_string(), error.clone()));
+                    }
+                    continue;
+                };
                 for status in statuses {
                     for resource_id in status.failed_resource_ids {
                         rejected
@@ -191,6 +240,12 @@ impl CompositeSubmitJobs {
         }
 
         let unindexed = rejected.len() as u64;
+        let mut rejected_types: Vec<String> = rejected
+            .keys()
+            .map(|(resource_type, _)| resource_type.clone())
+            .collect();
+        rejected_types.sort();
+        rejected_types.dedup();
         if unindexed > 0 {
             let entries: Vec<UnindexedEntry> = rejected
                 .into_iter()
@@ -297,6 +352,8 @@ impl CompositeSubmitJobs {
             synced: attempted.saturating_sub(unindexed),
             unindexed,
             drift,
+            rejected_types,
+            indexed_during_ingest: false,
         })
     }
 
@@ -899,6 +956,12 @@ impl SubmitWorkerStorage for CompositeSubmitJobs {
         self.primary.finish_manifest(lease).await
     }
 
+    async fn checkpoint_after_file(&self) {
+        // The primary may keep a WAL to fold back between files (#978); the
+        // trait's no-op default would silently drop that here (#1127).
+        self.primary.checkpoint_after_file().await;
+    }
+
     async fn fail_manifest(
         &self,
         lease: &ManifestLease,
@@ -1054,6 +1117,8 @@ mod tests {
         reject: std::collections::HashSet<String>,
         received: Arc<Mutex<HashMap<String, HashSet<String>>>>,
         count_override: Option<u64>,
+        /// Answers every `create` only after this long, for the page timeout.
+        delay: Option<std::time::Duration>,
     }
 
     #[async_trait]
@@ -1069,6 +1134,9 @@ mod tests {
             resource: Value,
             fhir_version: FhirVersion,
         ) -> StorageResult<StoredResource> {
+            if let Some(delay) = self.delay {
+                tokio::time::sleep(delay).await;
+            }
             let id = resource
                 .get("id")
                 .and_then(|v| v.as_str())
@@ -1223,6 +1291,23 @@ mod tests {
     ) {
         let sqlite = Arc::new(SqliteBackend::in_memory().unwrap());
         sqlite.init_schema().unwrap();
+        harness_over(sqlite, reject, count_override, sync_mode, None)
+    }
+
+    /// The composite + spy-secondary wiring of [`harness_with`] over a
+    /// caller-built primary (a file-backed one for the WAL test), with the
+    /// secondary's `create` optionally slowed down.
+    fn harness_over(
+        sqlite: Arc<SqliteBackend>,
+        reject: std::collections::HashSet<String>,
+        count_override: Option<u64>,
+        sync_mode: crate::composite::config::SyncMode,
+        delay: Option<std::time::Duration>,
+    ) -> (
+        Arc<SqliteBackend>,
+        CompositeSubmitJobs,
+        Arc<Mutex<Vec<String>>>,
+    ) {
         let events = Arc::new(Mutex::new(Vec::new()));
         let config = CompositeConfig::builder()
             .primary("sqlite", BackendKind::Sqlite)
@@ -1239,6 +1324,7 @@ mod tests {
                 reject,
                 received: Arc::new(Mutex::new(HashMap::new())),
                 count_override,
+                delay,
             }) as DynStorage,
         );
         // No sync worker started: events apply synchronously, which is what
@@ -1427,6 +1513,7 @@ mod tests {
                 synced: 2,
                 unindexed: 0,
                 drift: Vec::new(),
+                ..Default::default()
             }
         );
 
@@ -1507,6 +1594,8 @@ mod tests {
                 synced: 1,
                 unindexed: 1,
                 drift: Vec::new(),
+                rejected_types: vec!["Patient".to_string()],
+                indexed_during_ingest: false,
             }
         );
 
@@ -1726,6 +1815,123 @@ mod tests {
         assert!(
             seen.contains(&"delete Patient/p-rb-1".to_string()),
             "a rolled-back create must delete from the secondary, got {seen:?}"
+        );
+    }
+
+    /// #1127: a secondary that stops answering must not hold the manifest
+    /// open — the page times out and its resources are reported unindexed,
+    /// with their type named for the deferred rebuild.
+    #[tokio::test]
+    async fn a_page_the_secondary_does_not_answer_in_time_is_marked_unindexed() {
+        let sqlite = Arc::new(SqliteBackend::in_memory().unwrap());
+        sqlite.init_schema().unwrap();
+        let (sqlite, jobs, events) = harness_over(
+            sqlite,
+            HashSet::new(),
+            None,
+            crate::composite::config::SyncMode::Synchronous,
+            Some(std::time::Duration::from_secs(30)),
+        );
+        let jobs = jobs.with_sync_page_timeout(std::time::Duration::from_millis(100));
+        let tenant = tenant();
+        let sub = SubmissionId::generate("page-timeout");
+        sqlite.create_submission(&tenant, &sub, None).await.unwrap();
+        sqlite
+            .add_manifest(&tenant, &sub, Some("http://provider/m.json"), None)
+            .await
+            .unwrap();
+        let lease = sqlite
+            .claim_next_manifest(&WorkerId::new("w-slow"), std::time::Duration::from_secs(60))
+            .await
+            .unwrap()
+            .expect("claimable manifest");
+        sqlite
+            .process_entries(
+                &tenant,
+                &sub,
+                &lease.manifest_id,
+                vec![
+                    NdjsonEntry::new(
+                        1,
+                        "Patient",
+                        json!({"resourceType": "Patient", "id": "slow-1"}),
+                    ),
+                    NdjsonEntry::new(
+                        2,
+                        "Patient",
+                        json!({"resourceType": "Patient", "id": "slow-2"}),
+                    ),
+                ],
+                &BulkProcessingOptions::new(),
+            )
+            .await
+            .unwrap();
+
+        let started = std::time::Instant::now();
+        let report = jobs.sync_ingested(&lease).await.unwrap();
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "the page timeout bounds the sync: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(report.synced, 0);
+        assert_eq!(report.unindexed, 2);
+        assert_eq!(report.rejected_types, vec!["Patient".to_string()]);
+        assert!(!report.indexed_during_ingest);
+        assert!(events.lock().is_empty(), "nothing reached the secondary");
+
+        let page = sqlite
+            .get_entry_results_page(&tenant, &sub, &lease.manifest_id, None, 10, None)
+            .await
+            .unwrap();
+        for entry in page.entries {
+            assert_eq!(entry.result.outcome, BulkEntryOutcome::ProcessingError);
+            let diagnostics =
+                entry.result.operation_outcome.as_ref().unwrap()["issue"][0]["diagnostics"]
+                    .as_str()
+                    .unwrap()
+                    .to_string();
+            assert!(diagnostics.contains("timed out"), "{diagnostics}");
+        }
+    }
+
+    /// #1127: the WAL checkpoint the worker asks for at every file boundary
+    /// must reach the SQLite primary through the composite wrapper.
+    #[tokio::test]
+    async fn checkpoint_after_file_reaches_the_primary() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("composite.db");
+        let sqlite = Arc::new(SqliteBackend::open(&db_path).unwrap());
+        sqlite.init_schema().unwrap();
+        let (sqlite, jobs, _events) = harness_over(
+            sqlite,
+            HashSet::new(),
+            None,
+            crate::composite::config::SyncMode::Synchronous,
+            None,
+        );
+        let tenant = tenant();
+        for i in 0..300 {
+            ResourceStorage::create(
+                sqlite.as_ref(),
+                &tenant,
+                "Patient",
+                json!({"resourceType": "Patient", "id": format!("wal-{i}")}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        }
+        let wal = db_path.with_extension("db-wal");
+        let before = std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0);
+        assert!(before > 0, "the writes grew the WAL");
+
+        jobs.checkpoint_after_file().await;
+
+        let after = std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0);
+        assert!(
+            after < before,
+            "the checkpoint must reach the primary: before={before} after={after}"
         );
     }
 }

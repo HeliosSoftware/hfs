@@ -45,6 +45,17 @@ fn unavailable_error(message: String) -> crate::error::StorageError {
     })
 }
 
+/// Rejects `_id` modifiers the `_id` query builder cannot honour (#1092).
+/// `_id` is dispatched by name in `build_parameter_clause`, bypassing the
+/// generic per-type `:not` handling, so this must run before every path that
+/// can reach it. Elasticsearch has no `ConditionalStorage`/`ifNoneExist`
+/// path of its own (conditional-create criteria are resolved against the
+/// primary backend), so `search` and `search_count` below are the only
+/// entry points.
+fn reject_unsupported_id_modifier(query: &SearchQuery) -> StorageResult<()> {
+    crate::search::reject_unsupported_id_modifier(query)
+}
+
 /// Maximum retry attempts for transient ES search failures (in addition to the
 /// initial attempt). Transient failures observed in CI: shard allocation
 /// flapping during recovery/relocation, brief master-node hiccups.
@@ -328,9 +339,13 @@ impl SearchProvider for ElasticsearchBackend {
         tenant: &TenantContext,
         query: &SearchQuery,
     ) -> StorageResult<SearchResult> {
+        reject_unsupported_id_modifier(query)?;
+
         // `_contained` search post-processes contained-doc hits into containers or
         // contained resources; standard search excludes contained docs via the
-        // query builder's `must_not is_contained`.
+        // query builder's `must_not is_contained`. This is the only entry point
+        // into that path, so the gate above is not repeated inside
+        // `search_contained` itself.
         if query.contained != crate::types::ContainedMode::Off {
             return self.search_contained(tenant, query).await;
         }
@@ -502,6 +517,8 @@ impl SearchProvider for ElasticsearchBackend {
         tenant: &TenantContext,
         query: &SearchQuery,
     ) -> StorageResult<u64> {
+        reject_unsupported_id_modifier(query)?;
+
         let tenant_id = tenant.tenant_id().as_str();
         let resource_type = &query.resource_type;
         let index = self.index_name(tenant_id, resource_type);

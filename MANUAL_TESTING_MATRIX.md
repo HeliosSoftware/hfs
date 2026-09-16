@@ -28,7 +28,7 @@ issue and replace the `☐` cells.
 | `sqlite-es` (SQLite + Elasticsearch) | ☐ | ☐ | ☐ | ☐ | ☐ | ☐ | ☐ | ☐ | ☐ | ☐ |
 | `postgres` | ☐ | ☐ | ☐ | ☐ | ☐ | ☐ | ☐ | ☐ | ☐ | ☐ |
 | `pg-es` (PostgreSQL + Elasticsearch) | ☐ | ☐ | ☐ | ☐ | ☐ | ☐ | ☐ | ☐ | ☐ | ☐ |
-| `mongodb` | ☐ | ☐ | ☐ | ☐ | ☐ (4.10, 4.11 N/A) | N/A (501) | ☐ | ☐ | ☐ | ☐ |
+| `mongodb` | ☐ | ☐ | ☐ | ☐ | ☐ (4.8, 4.10, 4.11 N/A) | N/A (501) | ☐ | ☐ | ☐ | ☐ |
 | `mongo-es` (MongoDB + Elasticsearch) | ☐ | ☐ | ☐ | ☐ | ☐ | N/A (501) | ☐ | ☐ | ☐ | ☐ |
 | `s3` (MinIO) | ☐ | ☐ | ☐ (batch only) | ☐ | N/A (no search) | N/A (501) | ☐ | ☐ | ☐ | ☐ |
 | `s3-es` (MinIO + Elasticsearch) | ☐ | ☐ | ☐ (batch only) | ☐ | ☐ | N/A (501) | ☐ | ☐ | ☐ | ☐ |
@@ -488,13 +488,15 @@ the import; the optional duplicate-reference upload is rejected without side eff
 
 ## 8. T4 — One manual search per FHIR search type
 
-All searches are typed into the **QUERY** box on **Resources** (`/ui/resources`).
-The box accepts a raw FHIR search (`GET /Patient?name=Parker433&_count=5`) and
-**Run** (or Enter) executes it and renders the Bundle in the **Results** card. The
-results header shows **N results** taken from `Bundle.total` and, when the Bundle
-carries `_include`/`_revinclude` entries, **· M included**. The **Open in New Tab**
-link is the exact path that ran — hover it to confirm the URL the UI built, or click
-it to see the raw Bundle.
+All searches are typed into the **QUERY** box on **Resources** (`/ui/resources`). The
+box accepts a raw FHIR search (`GET /Patient?name=Parker433&_count=5`) and **Run**
+(or Enter) executes it and renders the Bundle in the **Results** card. The results
+header shows **N results** taken from `Bundle.total` (the page adds `_total=accurate`
+to the request it sends, so the count is the match count, not the page size; a query
+that opts out with `_total=none` reads **N+ results** while more pages remain) and,
+when the Bundle carries `_include`/`_revinclude` entries, **· M included**. The
+**Open in New Tab** link is the exact path that ran — hover it to confirm the URL the
+UI built, or click it to see the raw Bundle.
 
 Expected counts assume the full corpus plus the T2 transaction (11,705 patients).
 `PID` is the anchor patient `7d24f7a0-6f2e-ce3b-5568-db7b14695583`.
@@ -534,7 +536,7 @@ issues a `PUT` and the ids are known in advance.
 | 4.5 | **quantity** | `GET /Observation?code=8302-2&value-quantity=gt150` · `GET /Observation?code=8302-2&value-quantity=gt150\|\|cm` · `GET /Observation?code=8302-2&value-quantity=lt50\|http://unitsofmeasure.org\|cm` | first two > 0 and equal (every corpus height is in cm); open a row and check `valueQuantity.value` > 150; the third is a strict subset (infant heights) |
 | 4.6 | **reference** | `GET /Observation?subject=Patient/PID` · `GET /Condition?patient=PID` · `GET /Encounter?subject=PID&_include=Encounter:subject` | **165** · **15** · **24 results · 1 included** (the included Patient is not shown as a row; the raw Bundle via **Open in New Tab** has one entry with `search.mode = include`) |
 | 4.7 | **uri** | `GET /ValueSet?url=http://example.org/fhir/ValueSet/manual-test` · `GET /ValueSet?url:below=http://example.org/fhir` | **1 result** · ≥ 1 |
-| 4.8 | **composite** | `GET /Observation?code-value-quantity=http://loinc.org\|8302-2$gt150` | > 0; equals the first count in 4.5; every row is a Body Height with value > 150 |
+| 4.8 | **composite** | `GET /Observation?code-value-quantity=http://loinc.org\|8302-2$gt150` | > 0; equals the first count in 4.5; every row is a Body Height with value > 150 **N/A on `mongodb`** (composite search is not implemented there; expect a clear 400, not a 500) |
 | 4.9 | **special** (`_id`) | `GET /Patient?_id=PID` · `GET /Patient?_id=PID,<LPID from T2>` | **1** · **2** |
 | 4.10 | **chained** | `GET /Observation?subject.identifier=http://hl7.org/fhir/sid/us-ssn\|999-33-3920` · `GET /Observation?subject:Patient.family=Parker433&_count=5` | **165 results** (same as 4.6) · > 165, every row's `subject.display` ends in Parker433. **N/A on `mongodb`** (forward chains unsupported; expect a clear error, not a 500) |
 | 4.11 | **reverse chained** | `GET /Patient?_has:Observation:patient:code=http://loinc.org\|8302-2&_count=5` | > 0; pick a row, then `GET /Observation?patient=<that id>&code=8302-2` is > 0. **N/A on `mongodb`** |
@@ -557,7 +559,7 @@ shows up twice, while the patient and everything under it exist only once.
 | 4.18 | **reference + `_include`** through references the transaction resolved | `GET /Encounter?patient=LPID&_include=Encounter:service-provider` · `GET /Encounter?patient=LPID&_include=Encounter:participant` | **49 results · 4 included** (the four batch Organizations) · **49 results · 4 included** (the four batch Practitioners). In the raw Bundle (**Open in New Tab**) every `serviceProvider.reference` is a literal `Organization/<id>` |
 | 4.19 | **chained** through the batch reference data | `GET /Encounter?patient=LPID&service-provider.name=ENCOMPASS` · `GET /Encounter?patient=LPID&participant.identifier=http://hl7.org/fhir/sid/us-npi\|9999989798` | **38** · **38** (38 of the 49 encounters are at ENCOMPASS HEALTH BRAINTREE with Dr. Nickolas58 Schumm995). **N/A on `mongodb`** |
 | 4.20 | **batch reference data**, duplicated by the corpus | `GET /Organization?name=TIMOTHY DANIELS HOUSE` · `GET /Organization?address-city=HOLLISTON` · `GET /Practitioner?identifier=http://hl7.org/fhir/sid/us-npi\|9999888693` · `GET /Practitioner?family=Torphy630&given=Laine739&gender=female` · `GET /Location?name=A&A HEALTHCARE LLC` | **2 results** each (one created by the T2 batch with a server-assigned id, one imported by T3 with the Synthea id) |
-| 4.21 | **clinical data** under the patient | `GET /Condition?patient=LPID&clinical-status=active` · `GET /Condition?patient=LPID&code=http://snomed.info/sct\|72892002` · `GET /Observation?patient=LPID&code=29463-7&value-quantity=gt60` · `GET /Observation?patient=LPID&code-value-quantity=http://loinc.org\|8302-2$gt160` · `GET /Immunization?patient=LPID&vaccine-code=http://hl7.org/fhir/sid/cvx\|140` · `GET /MedicationRequest?patient=LPID&status=stopped` · `GET /MedicationRequest?patient=LPID&code=http://www.nlm.nih.gov/research/umls/rxnorm\|757594` | **6** · **3** (Normal pregnancy) · **2** (60.2 kg and 64.5 kg) · **3** (all 164.1 cm) · **3** (seasonal influenza) · **9** · **4** (Jolivette 28 Day Pack) |
+| 4.21 | **clinical data** under the patient | `GET /Condition?patient=LPID&clinical-status=active` · `GET /Condition?patient=LPID&code=http://snomed.info/sct\|72892002` · `GET /Observation?patient=LPID&code=29463-7&value-quantity=gt60` · `GET /Observation?patient=LPID&code-value-quantity=http://loinc.org\|8302-2$gt160` · `GET /Immunization?patient=LPID&vaccine-code=http://hl7.org/fhir/sid/cvx\|140` · `GET /MedicationRequest?patient=LPID&status=stopped` · `GET /MedicationRequest?patient=LPID&code=http://www.nlm.nih.gov/research/umls/rxnorm\|757594` | **6** · **3** (Normal pregnancy) · **2** (60.2 kg and 64.5 kg) · **3** (all 164.1 cm; **N/A on `mongodb`**, composite) · **3** (seasonal influenza) · **9** · **4** (Jolivette 28 Day Pack) |
 | 4.22 | **`_revinclude` / `_has` / `_sort`** | `GET /Patient?_id=LPID&_revinclude=Immunization:patient` · `GET /Patient?_has:Condition:patient:code=http://snomed.info/sct\|706893006&_count=50` · `GET /Observation?patient=LPID&code=29463-7&_sort=date` | **1 result · 8 included** · `LPID` is among the rows · **4 results** whose values read 55.4, 58.5, 60.2, 64.5 from top to bottom (open each row). **`_has` is N/A on `mongodb`** |
 
 ### 8.4 Searches over the data loaded by the bulk import (T3)

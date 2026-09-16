@@ -58,6 +58,11 @@ tokio = { version = "1", features = ["full"] }
 # `io` provides StreamReader, bridging the reqwest byte stream for bulk-submit
 # NDJSON files into the AsyncBufRead the ingestion engine consumes.
 tokio-util = { version = "0.7", features = ["io"] }
+# Bulk-submit file bodies are fetched without reqwest's transparent gzip so the
+# fetcher knows the wire offset a `Range` resume must start from; it decodes
+# gzip itself with the same decoder reqwest uses. `bytes` names the body chunks.
+async-compression = { version = "0.4", features = ["tokio", "gzip"] }
+bytes = "1"
 async-trait = "0.1"
 
 # Web framework
@@ -171,6 +176,10 @@ regex = "1"
 # `helios-persistence`'s integration tests for binary-version parity.
 testcontainers = "0.27"
 testcontainers-modules = { version = "0.15", features = ["postgres", "mongo"] }
+
+# `#[ctor::dtor]` exit hook that removes testcontainers held in `static`s
+# (tests/common/container_cleanup.rs).
+ctor = "0.2"
 
 [package.metadata.docs.rs]
 features = ["R4", "sqlite"]

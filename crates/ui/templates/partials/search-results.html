@@ -5,6 +5,7 @@
 -->
 <section class="card query-results" id="query-results" hidden
          data-msg-total="{{ i18n.t_arg("queries-results-total", "count", "{count}".to_string()) }}"
+         data-msg-total-partial="{{ i18n.t_arg("queries-results-total-partial", "count", "{count}".to_string()) }}"
          data-msg-included="{{ i18n.t_arg("queries-results-included", "count", "{count}".to_string()) }}"
          data-msg-empty="{{ i18n.t("queries-results-empty") }}"
          data-msg-updated="{{ i18n.t("queries-col-updated") }}"
@@ -26,7 +27,7 @@
       </select>
     </label>
   </div>
-  <div class="table-wrap">
+  <div class="table-wrap" tabindex="0" role="region" aria-label="{{ i18n.t("queries-results") }}">
     <table class="data-table query-results__table" data-row-navigation>
       <thead id="query-results-head"></thead>
       <tbody id="query-results-body"></tbody>

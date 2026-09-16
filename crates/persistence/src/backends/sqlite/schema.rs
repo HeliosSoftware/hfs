@@ -10,7 +10,7 @@ use crate::core::bulk_submit_legacy::{
 use crate::error::StorageResult;
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 31;
+pub const SCHEMA_VERSION: i32 = 32;
 
 /// The `search_index` value indexes. Excludes `idx_search_composite`, which the
 /// delete-by-resource path needs at all times, and `idx_search_token_display`,
@@ -442,6 +442,7 @@ fn migrate_schema(conn: &Connection, from_version: i32) -> StorageResult<()> {
             28 => migrate_v28_to_v29(conn)?,
             29 => migrate_v29_to_v30(conn)?,
             30 => migrate_v30_to_v31(conn)?,
+            31 => migrate_v31_to_v32(conn)?,
             _ => {
                 return Err(crate::error::StorageError::Backend(
                     crate::error::BackendError::Internal {
@@ -1489,6 +1490,58 @@ fn migrate_v30_to_v31(conn: &Connection) -> StorageResult<()> {
     Ok(())
 }
 
+/// Migrate from schema version 31 to version 32 (#1127).
+///
+/// Makes the bulk-submit manifest counters describe the manifest rather than
+/// the sum over every pass that walked it:
+///
+/// - `bulk_manifest_file_progress`: one row per input file of a manifest, with
+///   the highest line already charged to the manifest counters (`max_line`)
+///   and what that file contributed. A batch charges only the lines beyond
+///   `max_line`, so a reclaimed manifest re-walking a file neither
+///   double-counts it nor reports less progress than it had (#969).
+/// - `bulk_manifests.skipped_entries`: deliberate skips, so the submission
+///   summary can be served from the manifest counters instead of aggregating
+///   one receipt row per ingested resource on every status poll.
+///
+/// Replay-safe: the column is added only when missing and the table is
+/// `IF NOT EXISTS`. Manifests counted before this version have no file rows,
+/// so a later re-walk of one of their files counts it once more.
+fn migrate_v31_to_v32(conn: &Connection) -> StorageResult<()> {
+    if !table_columns(conn, "bulk_manifests")?
+        .iter()
+        .any(|column| column == "skipped_entries")
+    {
+        conn.execute(
+            "ALTER TABLE bulk_manifests ADD COLUMN skipped_entries INTEGER NOT NULL DEFAULT 0",
+            [],
+        )
+        .map_err(|e| migration_err(format!("v32 add skipped_entries: {e}")))?;
+    }
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS bulk_manifest_file_progress (
+            tenant_id TEXT NOT NULL,
+            submitter TEXT NOT NULL,
+            submission_id TEXT NOT NULL,
+            manifest_id TEXT NOT NULL,
+            file_url TEXT NOT NULL,
+            max_line INTEGER NOT NULL DEFAULT 0,
+            total_entries INTEGER NOT NULL DEFAULT 0,
+            processed_entries INTEGER NOT NULL DEFAULT 0,
+            failed_entries INTEGER NOT NULL DEFAULT 0,
+            skipped_entries INTEGER NOT NULL DEFAULT 0,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (tenant_id, submitter, submission_id, manifest_id, file_url),
+            FOREIGN KEY (tenant_id, submitter, submission_id, manifest_id)
+                REFERENCES bulk_manifests(tenant_id, submitter, submission_id, manifest_id)
+                ON DELETE CASCADE
+        )",
+        [],
+    )
+    .map_err(|e| migration_err(format!("v32 create bulk_manifest_file_progress: {e}")))?;
+    Ok(())
+}
+
 /// Migrate from schema version 10 to version 11.
 ///
 /// Adds columns supporting `_contained` search: index rows extracted from a
@@ -2357,6 +2410,7 @@ pub fn drop_all_tables(conn: &Connection) -> StorageResult<()> {
     // Drop bulk tables (order matters due to foreign keys)
     let _ = conn.execute("DROP TABLE IF EXISTS bulk_submission_changes", []);
     let _ = conn.execute("DROP TABLE IF EXISTS bulk_entry_results", []);
+    let _ = conn.execute("DROP TABLE IF EXISTS bulk_manifest_file_progress", []);
     let _ = conn.execute("DROP TABLE IF EXISTS bulk_manifests", []);
     let _ = conn.execute("DROP TABLE IF EXISTS bulk_submissions", []);
     let _ = conn.execute("DROP TABLE IF EXISTS bulk_export_files", []);
@@ -2816,6 +2870,42 @@ mod tests {
                 "{name} must be partial on `{predicate}`, got: {sql}"
             );
         }
+    }
+
+    /// Delete-by-resource must seek `idx_search_composite`, never full-scan
+    /// `search_index`. The composite leads with `(tenant_id, resource_type,
+    /// resource_key, …)`, so the DELETE has to carry the `tenant_id` /
+    /// `resource_type` equality prefix; a predicate on `resource_key` alone
+    /// scans the whole table — O(rows) on every resource UPDATE and re-index
+    /// (#1197). This guards against dropping the prefix again.
+    #[test]
+    fn delete_by_resource_key_seeks_the_composite_index() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+        let plan: Vec<String> = conn
+            .prepare(
+                "EXPLAIN QUERY PLAN
+                 DELETE FROM search_index
+                  WHERE tenant_id = ?1 AND resource_type = ?2
+                    AND resource_key = (
+                        SELECT rowid FROM resources
+                         WHERE tenant_id = ?1 AND resource_type = ?2 AND id = ?3
+                    )",
+            )
+            .unwrap()
+            .query_map(["t1", "Patient", "p1"], |r| r.get::<_, String>(3))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        let joined = plan.join(" | ");
+        assert!(
+            joined.contains("idx_search_composite"),
+            "delete-by-resource must seek idx_search_composite; plan was: {joined}"
+        );
+        assert!(
+            !joined.contains("SCAN search_index"),
+            "delete-by-resource must not full-scan search_index; plan was: {joined}"
+        );
     }
 
     /// The canonical value-index list must be exactly what a fresh schema
@@ -3683,6 +3773,25 @@ mod tests {
                 .unwrap_or_else(|e| panic!("replay from v{from} failed: {e:?}"));
             assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
         }
+    }
+
+    /// #1127: the v32 file-progress table and skipped counter exist on a fresh
+    /// database, and replaying the migration on one that has them is a no-op.
+    #[test]
+    fn test_v32_adds_file_progress_and_skipped_entries() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+        assert!(
+            table_columns(&conn, "bulk_manifests")
+                .unwrap()
+                .iter()
+                .any(|column| column == "skipped_entries")
+        );
+        let file_columns = table_columns(&conn, "bulk_manifest_file_progress").unwrap();
+        for column in ["file_url", "max_line", "total_entries", "skipped_entries"] {
+            assert!(file_columns.iter().any(|c| c == column), "missing {column}");
+        }
+        migrate_v31_to_v32(&conn).unwrap();
     }
 
     #[test]
