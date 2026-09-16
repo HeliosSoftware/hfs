@@ -3478,6 +3478,95 @@ async fn mongodb_integration_contained_search_pages_on_the_server() {
     assert_eq!(no_total.total, None);
 }
 
+/// #1059 review F1: `_containedType=container` (the default) groups by the
+/// container alone, so a container with multiple internal matches is one
+/// slot in the page and one count in the total — not one per internal match.
+#[tokio::test]
+async fn mongodb_integration_contained_container_with_two_matches_counts_once() {
+    use helios_persistence::types::{ContainedMode, ContainedReturn};
+    let Some(backend) = create_backend_with_full_registry("contained_container_counts_once").await
+    else {
+        eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
+        return;
+    };
+    let tenant = create_tenant("tenant-contained-counts-once");
+
+    // Two contained Patients named Smith in one Observation.
+    backend
+        .create(
+            &tenant,
+            "Observation",
+            json!({
+                "resourceType": "Observation", "id": "obs-two", "status": "final",
+                "subject": { "reference": "#p1" },
+                "contained": [
+                    { "resourceType": "Patient", "id": "p1", "name": [{ "family": "Smith" }] },
+                    { "resourceType": "Patient", "id": "p2", "name": [{ "family": "Smith" }] }
+                ]
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    // One contained Patient named Smith in a second Observation.
+    backend
+        .create(
+            &tenant,
+            "Observation",
+            json!({
+                "resourceType": "Observation", "id": "obs-one", "status": "final",
+                "subject": { "reference": "#p3" },
+                "contained": [
+                    { "resourceType": "Patient", "id": "p3", "name": [{ "family": "Smith" }] }
+                ]
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+
+    // _containedType=container (default): one slot per container, total counts containers.
+    let page0 = backend
+        .search(
+            &tenant,
+            &contained_name_query(ContainedMode::On, 1, 0, true),
+        )
+        .await
+        .unwrap();
+    let urls: Vec<String> = page0.resources.items.iter().map(|x| x.url()).collect();
+    assert_eq!(urls, vec!["Observation/obs-one"]);
+    assert_eq!(page0.total, Some(2));
+
+    let page1 = backend
+        .search(
+            &tenant,
+            &contained_name_query(ContainedMode::On, 1, 1, true),
+        )
+        .await
+        .unwrap();
+    let urls: Vec<String> = page1.resources.items.iter().map(|x| x.url()).collect();
+    assert_eq!(
+        urls,
+        vec!["Observation/obs-two"],
+        "offset 1 returns the other container"
+    );
+
+    // _containedType=contained: one slot per contained entity (3: p1, p2, p3).
+    let mut q = contained_name_query(ContainedMode::On, 10, 0, true);
+    q.contained_return = ContainedReturn::Contained;
+    let contained = backend.search(&tenant, &q).await.unwrap();
+    assert_eq!(contained.resources.items.len(), 3);
+    assert_eq!(contained.total, Some(3));
+    let mut ids: Vec<String> = contained
+        .resources
+        .items
+        .iter()
+        .map(|x| x.id().to_string())
+        .collect();
+    ids.sort();
+    assert_eq!(ids, vec!["p1", "p2", "p3"]);
+}
+
 #[tokio::test]
 async fn mongodb_integration_contained_both_pages_across_the_top_level_boundary() {
     use helios_persistence::types::ContainedMode;
@@ -3574,43 +3663,52 @@ async fn mongodb_integration_contained_both_dedupes_a_container_that_is_also_a_t
         return;
     };
     let tenant = create_tenant("tenant-contained-dedupe");
-    // An Observation with code X that also contains an Observation with code X:
-    // it is a top-level match AND the container of a contained match.
+    // (a) A top-level Patient match that is ALSO the container of a
+    // contained match (it contains another Patient named Smith).
     backend
         .create(
             &tenant,
-            "Observation",
+            "Patient",
             json!({
-                "resourceType": "Observation", "id": "outer", "status": "final",
-                "code": { "coding": [{ "system": "http://loinc.org", "code": "X" }] },
-                "contained": [{ "resourceType": "Observation", "id": "inner", "status": "final",
-                                "code": { "coding": [{ "system": "http://loinc.org", "code": "X" }] } }]
+                "resourceType": "Patient", "id": "dual", "name": [{ "family": "Smith" }],
+                "contained": [{ "resourceType": "Patient", "id": "inner", "name": [{ "family": "Smith" }] }]
             }),
             FhirVersion::default(),
         )
         .await
         .unwrap();
-    // A second container whose only match is contained.
+    // (b) An Observation that matches only through the contained path: the
+    // top-level search is for type Patient and never sees Observation-typed
+    // index rows, so this container is invisible to the top-level portion.
     backend
         .create(
             &tenant,
             "Observation",
             json!({
-                "resourceType": "Observation", "id": "holder", "status": "final",
-                "code": { "coding": [{ "system": "http://loinc.org", "code": "Y" }] },
-                "contained": [{ "resourceType": "Observation", "id": "inner2", "status": "final",
-                                "code": { "coding": [{ "system": "http://loinc.org", "code": "X" }] } }]
+                "resourceType": "Observation", "id": "obs-holder", "status": "final",
+                "subject": { "reference": "#p" },
+                "contained": [{ "resourceType": "Patient", "id": "p", "name": [{ "family": "Smith" }] }]
             }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    // (c) A non-match, to prove filtering.
+    backend
+        .create(
+            &tenant,
+            "Patient",
+            json!({ "resourceType": "Patient", "id": "plain", "name": [{ "family": "Jones" }] }),
             FhirVersion::default(),
         )
         .await
         .unwrap();
 
-    let mut q = SearchQuery::new("Observation").with_parameter(SearchParameter {
-        name: "code".into(),
-        param_type: SearchParamType::Token,
+    let mut q = SearchQuery::new("Patient").with_parameter(SearchParameter {
+        name: "name".into(),
+        param_type: SearchParamType::String,
         modifier: None,
-        values: vec![SearchValue::eq("X")],
+        values: vec![SearchValue::eq("Smith")],
         chain: vec![],
         components: vec![],
     });
@@ -3620,13 +3718,18 @@ async fn mongodb_integration_contained_both_dedupes_a_container_that_is_also_a_t
     q.total = Some(TotalMode::Accurate);
     let r = backend.search(&tenant, &q).await.unwrap();
     let urls: Vec<String> = r.resources.items.iter().map(|x| x.url()).collect();
-    // Top-level order is the standard search's newest-first default:
-    // `holder` was created second, so it sorts before `outer`.
+    // `dual` appears once (top-level first, deduped out of the contained
+    // portion); `obs-holder` only ever surfaces via the contained portion.
     assert_eq!(
         urls,
-        vec!["Observation/holder", "Observation/outer"],
-        "outer must appear once"
+        vec!["Patient/dual", "Observation/obs-holder"],
+        "dual must appear once, top-level first"
     );
+    // total = top_total (1: dual) + contained_total (2: dual and
+    // obs-holder, both matched as containers before de-duplication) = 3.
+    // A dual match is counted in both sources — this is the documented
+    // trade-off of paging each source on the server independently.
+    assert_eq!(r.total, Some(3));
 }
 
 #[tokio::test]

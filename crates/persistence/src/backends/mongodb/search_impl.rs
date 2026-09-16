@@ -648,13 +648,20 @@ impl MongoBackend {
             ContainedMode::Both => {
                 // Top-level matches come first, contained matches second. The
                 // standard search is asked for its total so the boundary is
-                // known, and each source is paged on the server.
+                // known, and each source is paged on the server. Dedupe below
+                // is against the current top-level *page* only, as before
+                // this change, so a container that was a top-level match on
+                // an earlier page can still appear in a later contained page.
                 let mut top_query = query.clone();
                 top_query.contained = ContainedMode::Off;
                 top_query.contained_return = ContainedReturn::Container;
                 top_query.total = Some(TotalMode::Accurate);
                 let top = self.search(tenant, &top_query).await?;
-                let top_total = top.total.unwrap_or(top.resources.items.len() as u64) as usize;
+                let top_total = top.total.ok_or_else(|| {
+                    internal_error(
+                        "standard search returned no total for _contained=both".to_string(),
+                    )
+                })? as usize;
                 let mut items = top.resources.items;
                 let top_urls: HashSet<String> = items.iter().map(|r| r.url()).collect();
 
@@ -664,57 +671,52 @@ impl MongoBackend {
                     (offset - top_total, count)
                 };
                 let mut contained_total = None;
-                if c_limit > 0 || want_total {
+                if c_limit > 0 {
                     let page = self
                         .matching_contained(
                             &db,
                             tenant_id,
                             contained_type,
+                            query.contained_return,
                             query,
                             c_offset,
-                            c_limit.max(1),
+                            c_limit,
                             want_total,
                         )
                         .await?;
                     contained_total = page.total;
                     let mut contained = self
                         .materialize_contained(
+                            &db,
                             tenant,
                             contained_type,
                             query.contained_return,
                             &page.keys,
                         )
                         .await?;
+                    // Containers already on the top-level page are dropped
+                    // here rather than refilled: they are still within
+                    // [c_offset, c_offset + c_limit), so an offset-based
+                    // refill would just re-fetch the same keys on a later
+                    // page. The page may come back short by that many items.
                     contained.retain(|r| !top_urls.contains(&r.url()));
-                    let dropped = page.keys.len().saturating_sub(contained.len());
-                    // Containers already on the top-level page were removed;
-                    // fetch that many more, once, so the page stays full.
-                    if dropped > 0 && page.keys.len() == c_limit.max(1) {
-                        let more = self
-                            .matching_contained(
-                                &db,
-                                tenant_id,
-                                contained_type,
-                                query,
-                                c_offset + page.keys.len(),
-                                dropped,
-                                false,
-                            )
-                            .await?;
-                        let mut extra = self
-                            .materialize_contained(
-                                tenant,
-                                contained_type,
-                                query.contained_return,
-                                &more.keys,
-                            )
-                            .await?;
-                        extra.retain(|r| !top_urls.contains(&r.url()));
-                        contained.extend(extra);
-                    }
-                    if c_limit > 0 {
-                        items.extend(contained);
-                    }
+                    items.extend(contained);
+                } else if want_total {
+                    // No room left on this page for contained items, but the
+                    // caller still wants a total: fetch the count only.
+                    let page = self
+                        .matching_contained(
+                            &db,
+                            tenant_id,
+                            contained_type,
+                            query.contained_return,
+                            query,
+                            c_offset,
+                            1,
+                            true,
+                        )
+                        .await?;
+                    contained_total = page.total;
                 }
                 let total = if want_total {
                     Some(top_total as u64 + contained_total.unwrap_or(0))
@@ -729,6 +731,7 @@ impl MongoBackend {
                         &db,
                         tenant_id,
                         contained_type,
+                        query.contained_return,
                         query,
                         offset,
                         count,
@@ -737,6 +740,7 @@ impl MongoBackend {
                     .await?;
                 let items = self
                     .materialize_contained(
+                        &db,
                         tenant,
                         contained_type,
                         query.contained_return,
@@ -758,20 +762,26 @@ impl MongoBackend {
 
     /// Resolves one server-side page of `_contained` matches over
     /// `idx_search_contained` (#1059): `$match` in the index's key order,
-    /// `$group` by container and local id (read from the index keys),
-    /// `$sort` for a stable page order, then `$skip`/`$limit`, with a
-    /// `$facet` count alongside when `_total` is requested.
+    /// `$group` by the container and, for `_containedType=contained`, the
+    /// local id (read from the index keys) — grouping by container alone
+    /// for the default `_containedType=container` so one container is one
+    /// slot, `_total` counts containers, and a page cannot straddle a
+    /// container with multiple internal matches — then `$sort` for a stable
+    /// page order, then `$skip`/`$limit`, with a `$facet` count alongside
+    /// when `_total` is requested.
     #[allow(clippy::too_many_arguments)]
     async fn matching_contained(
         &self,
         db: &mongodb::Database,
         tenant_id: &str,
         contained_type: &str,
+        contained_return: crate::types::ContainedReturn,
         query: &SearchQuery,
         offset: usize,
         limit: usize,
         want_total: bool,
     ) -> StorageResult<ContainedPage> {
+        use crate::types::ContainedReturn;
         let search_index = db.collection::<Document>(MongoBackend::SEARCH_INDEX_COLLECTION);
 
         let mut branches: Vec<Bson> = Vec::new();
@@ -802,6 +812,17 @@ impl MongoBackend {
             });
         }
 
+        let group_id = match contained_return {
+            ContainedReturn::Container => doc! {
+                "rtype": "$resource_type",
+                "rid": "$resource_id",
+            },
+            ContainedReturn::Contained => doc! {
+                "rtype": "$resource_type",
+                "rid": "$resource_id",
+                "lid": "$contained_local_id",
+            },
+        };
         let mut pipeline = vec![
             doc! { "$match": {
                 "tenant_id": tenant_id,
@@ -810,11 +831,7 @@ impl MongoBackend {
                 "$or": branches,
             }},
             doc! { "$group": {
-                "_id": {
-                    "rtype": "$resource_type",
-                    "rid": "$resource_id",
-                    "lid": "$contained_local_id",
-                },
+                "_id": group_id,
                 "names": { "$addToSet": "$param_name" },
             }},
         ];
@@ -882,6 +899,7 @@ impl MongoBackend {
     /// missing containers are skipped.
     async fn materialize_contained(
         &self,
+        db: &mongodb::Database,
         tenant: &TenantContext,
         contained_type: &str,
         contained_return: crate::types::ContainedReturn,
@@ -891,7 +909,6 @@ impl MongoBackend {
         if keys.is_empty() {
             return Ok(Vec::new());
         }
-        let db = self.get_database().await?;
         let resources = db.collection::<Document>(MongoBackend::RESOURCES_COLLECTION);
 
         let mut pairs: Vec<(String, String)> = keys
