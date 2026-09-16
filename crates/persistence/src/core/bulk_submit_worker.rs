@@ -10,7 +10,7 @@
 //! [`BulkSubmitProvider`]: crate::core::bulk_submit::BulkSubmitProvider
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 
 use futures::stream::StreamExt;
 use std::time::Duration;
@@ -28,7 +28,7 @@ use crate::core::bulk_submit::{
     ImportMode, ManifestPhase, StreamingBulkSubmitProvider, SubmissionId, SubmissionStatus,
     entry_result_pages,
 };
-use crate::core::bulk_submit_input::{RemoteFile, SubmitInputFetcher};
+use crate::core::bulk_submit_input::{RemoteFile, SubmitInputFetcher, error_chain, redact_url};
 use crate::core::bulk_submit_output::submit_artifact_key;
 use crate::core::bulk_submit_publication::{ManifestPublicationResult, ManifestPublicationStatus};
 use crate::core::bulk_submit_receipts::{ReceiptSpools, SPOOL_BUFFER_BYTES, Spool};
@@ -51,6 +51,15 @@ pub struct IngestSyncReport {
     /// count taken then would not reflect this manifest's sync) or when a
     /// backend's `count` call itself failed.
     pub drift: Vec<IndexDrift>,
+    /// Resource types with at least one resource a secondary rejected, sorted
+    /// and deduplicated. When [`Self::indexed_during_ingest`] is set, these are
+    /// the only types the deferred reindex needs to rebuild (#1127).
+    pub rejected_types: Vec<String>,
+    /// Whether the secondaries were written batch by batch while the manifest
+    /// ingested (index-during-ingest, #1127) and this report closes that out.
+    /// When `false`, whatever deferred indexing the deployment uses still
+    /// covers every type the manifest ingested.
+    pub indexed_during_ingest: bool,
 }
 
 /// A resource type whose tenant-wide count on the primary and on a
@@ -319,11 +328,12 @@ pub trait SubmitWorkerStorage: Send + Sync {
     /// share one semantics and a resumed manifest never walks its progress
     /// backwards (#969).
     ///
-    /// Deltas are therefore *not* idempotent: re-ingesting an entry after a
-    /// worker restart adds to `processed_entries` a second time, so the counts
-    /// over-report on a resumed manifest until the re-walk is eliminated by a
-    /// per-line resume. Over-reporting is the safe direction — a status poller sees
-    /// progress that only ever moves forward.
+    /// A batch charges each line of a named file once, however many runs walk
+    /// it (#1127), so a resumed manifest's batch counts do not multiply. The
+    /// worker's own deltas carry no line identity and are *not* idempotent: a
+    /// file that fails again on a re-walk adds its failure again.
+    /// Over-reporting is the safe direction — a status poller sees progress
+    /// that only ever moves forward.
     async fn add_manifest_progress(
         &self,
         lease: &ManifestLease,
@@ -616,8 +626,9 @@ struct BatchCountsReporter {
     observer: Arc<dyn WriteObserver>,
 }
 
+#[async_trait]
 impl BatchCommitObserver for BatchCountsReporter {
-    fn batch_committed(&self, batch: &BatchCommitted<'_>) {
+    async fn batch_committed(&self, batch: &BatchCommitted<'_>) {
         // (created, updated) per resource type; only successes wrote.
         let mut per_type = std::collections::BTreeMap::<&str, (u64, u64)>::new();
         for result in batch.results.iter().filter(|r| r.is_success()) {
@@ -672,6 +683,12 @@ pub struct DefaultSubmitWorker<Js: ?Sized, Fetcher: ?Sized, Os: ?Sized> {
     /// (PostgreSQL) turns into near-linear throughput; SQLite's single writer
     /// caps the gain but still benefits from overlapped fetch and extraction.
     file_concurrency: usize,
+    /// Entries per ingest transaction (`HFS_BULK_SUBMIT_BATCH_SIZE`, #1127).
+    /// `None` keeps the engine's default.
+    batch_size: Option<u32>,
+    /// Leave content-identical resources untouched instead of writing a new
+    /// version (`HFS_BULK_SUBMIT_SKIP_UNCHANGED`, #1127).
+    skip_unchanged: bool,
 }
 
 /// A pass-through [`AsyncBufRead`] that adds every consumed byte to a shared
@@ -750,6 +767,9 @@ struct LeaseKeeper {
     /// lost too when a fenced write answers `LeaseLost`.
     lost: tokio::sync::watch::Sender<bool>,
     cancel: CancelToken,
+    /// Newest expiry the worker renewed to outside the keeper's task, in Unix
+    /// milliseconds (see [`LeaseKeeper::note_renewed`]).
+    renewed_until: Arc<AtomicI64>,
     handle: tokio::task::JoinHandle<()>,
 }
 
@@ -823,10 +843,13 @@ impl LeaseKeeper {
         let (lost, _) = tokio::sync::watch::channel(false);
         let flag = lost.clone();
         let watched = cancel.clone();
+        let renewed_until = Arc::new(AtomicI64::new(lease.lease_expiry.timestamp_millis()));
+        let renewed_elsewhere = Arc::clone(&renewed_until);
         let handle = tokio::spawn(async move {
             let mut expiry = lease.lease_expiry;
             let mut last_flushed: u64 = 0;
             loop {
+                expiry = latest_expiry(expiry, &renewed_elsewhere);
                 let remaining = (expiry - Utc::now())
                     .to_std()
                     .unwrap_or(Duration::from_secs(1));
@@ -859,6 +882,7 @@ impl LeaseKeeper {
                 // lost one: the manifest is claimable either way.
                 let mut renewed = None;
                 loop {
+                    expiry = latest_expiry(expiry, &renewed_elsewhere);
                     let left = (expiry - Utc::now())
                         .to_std()
                         .unwrap_or(Duration::from_secs(0));
@@ -870,9 +894,28 @@ impl LeaseKeeper {
                             renewed = Some(new_expiry);
                             break;
                         }
-                        // Already reclaimed by another worker — expected, and
-                        // the run aborts quietly.
+                        // Already reclaimed by another worker. The run aborts,
+                        // but never silently: a lost lease means the manifest is
+                        // re-walked from its first file (#1127).
                         Ok(Err(LeaseError::LeaseLost { .. })) => {
+                            if watched.is_cancelled() {
+                                // An abort moved the manifest out of
+                                // `processing`; that is not a reclaim.
+                                tracing::info!(
+                                    submission = %lease.submission_id,
+                                    manifest = %lease.manifest_id,
+                                    "bulk-submit lease released by abort"
+                                );
+                            } else {
+                                tracing::warn!(
+                                    submission = %lease.submission_id,
+                                    manifest = %lease.manifest_id,
+                                    worker = %lease.worker_id,
+                                    fencing_token = lease.fencing_token,
+                                    "bulk-submit lease lost: another worker reclaimed the \
+                                     manifest; abandoning this run"
+                                );
+                            }
                             let _ = flag.send(true);
                             return;
                         }
@@ -887,9 +930,25 @@ impl LeaseKeeper {
                         }
                         // Starved behind the ingest loop's writer for the rest
                         // of the lease.
-                        Err(_elapsed) => break,
+                        Err(_elapsed) => {
+                            tracing::warn!(
+                                submission = %lease.submission_id,
+                                manifest = %lease.manifest_id,
+                                worker = %lease.worker_id,
+                                waited_ms = u64::try_from(left.as_millis()).unwrap_or(u64::MAX),
+                                "bulk-submit lease heartbeat timed out: no answer before the \
+                                 lease expired"
+                            );
+                            break;
+                        }
                     }
                 }
+                // The worker may have renewed the lease itself meanwhile (before
+                // a WAL checkpoint, #1127); a renewal that landed there counts.
+                let renewed = renewed.or_else(|| {
+                    let latest = latest_expiry(expiry, &renewed_elsewhere);
+                    (latest > Utc::now()).then_some(latest)
+                });
                 let Some(new_expiry) = renewed else {
                     tracing::warn!(
                         submission = %lease.submission_id,
@@ -907,8 +966,17 @@ impl LeaseKeeper {
         Self {
             lost,
             cancel,
+            renewed_until,
             handle,
         }
+    }
+
+    /// Records a renewal the worker made outside the keeper's own task, so
+    /// the keeper measures its deadline from the newest expiry and does not
+    /// declare a freshly renewed lease lost (#1127).
+    fn note_renewed(&self, expiry: DateTime<Utc>) {
+        self.renewed_until
+            .fetch_max(expiry.timestamp_millis(), Ordering::Relaxed);
     }
 
     /// Whether the job in flight should wind down: either the lease is gone or
@@ -1010,7 +1078,30 @@ fn log_wind_down(lease: &ManifestLease, cancelled: bool) {
             manifest = %lease.manifest_id,
             "bulk-submit manifest stopped by abort; partial counts kept, no result artifacts written"
         );
+    } else {
+        warn_lease_lost(lease, "winding down between steps");
     }
+}
+
+/// Logs a run abandoned because its lease is gone. A lost lease is never
+/// silent: whoever reclaims the manifest walks it again from its first file,
+/// which on a large corpus costs hours (#1127).
+fn warn_lease_lost(lease: &ManifestLease, step: &str) {
+    tracing::warn!(
+        submission = %lease.submission_id,
+        manifest = %lease.manifest_id,
+        worker = %lease.worker_id,
+        fencing_token = lease.fencing_token,
+        step,
+        "bulk-submit run abandoned: its lease is no longer held"
+    );
+}
+
+/// The later of the keeper's own expiry and any renewal recorded through
+/// [`LeaseKeeper::note_renewed`].
+fn latest_expiry(expiry: DateTime<Utc>, renewed_until: &AtomicI64) -> DateTime<Utc> {
+    DateTime::from_timestamp_millis(renewed_until.load(Ordering::Relaxed))
+        .map_or(expiry, |renewed| renewed.max(expiry))
 }
 
 impl<Js, Fetcher, Os> DefaultSubmitWorker<Js, Fetcher, Os>
@@ -1030,7 +1121,27 @@ where
             reindex_hook: None,
             write_observer: None,
             file_concurrency: 1,
+            batch_size: None,
+            skip_unchanged: false,
         }
+    }
+
+    /// Sets how many entries each ingest transaction commits
+    /// (`HFS_BULK_SUBMIT_BATCH_SIZE`). Values below 1 are treated as 1.
+    ///
+    /// Before #1127 the server parsed the knob and never passed it on, so every
+    /// run used the engine default. Honouring it does not change that default.
+    pub fn with_batch_size(mut self, batch_size: u32) -> Self {
+        self.batch_size = Some(batch_size.max(1));
+        self
+    }
+
+    /// Makes a replayed manifest skip resources whose content is identical to
+    /// what is already stored, instead of writing them as new versions
+    /// (`HFS_BULK_SUBMIT_SKIP_UNCHANGED`, #1127). Off by default.
+    pub fn with_skip_unchanged(mut self, skip_unchanged: bool) -> Self {
+        self.skip_unchanged = skip_unchanged;
+        self
     }
 
     /// Sets how many of a manifest's `output` files ingest concurrently
@@ -1076,12 +1187,18 @@ where
     pub async fn run_job(&self, lease: ManifestLease) -> StorageResult<()> {
         let view = match self.jobs.get_manifest_for_worker(&lease).await {
             Ok(v) => v,
-            Err(LeaseError::LeaseLost { .. }) => return Ok(()),
+            Err(LeaseError::LeaseLost { .. }) => {
+                warn_lease_lost(&lease, "reading the claimed manifest");
+                return Ok(());
+            }
             Err(LeaseError::Storage(e)) => return Err(e),
         };
         match self.jobs.mark_manifest_processing(&lease).await {
             Ok(()) => {}
-            Err(LeaseError::LeaseLost { .. }) => return Ok(()),
+            Err(LeaseError::LeaseLost { .. }) => {
+                warn_lease_lost(&lease, "marking the manifest processing");
+                return Ok(());
+            }
             Err(LeaseError::Storage(e)) => return Err(e),
         }
 
@@ -1202,8 +1319,13 @@ where
         let opts = BulkProcessingOptions::new()
             .with_import_mode(import_mode)
             .with_defer_indexing(self.defer_indexing)
+            .with_skip_unchanged(self.skip_unchanged)
             .with_byte_progress(progress.clone())
             .with_cancel(cancel.clone());
+        let opts = match self.batch_size {
+            Some(batch_size) => opts.with_batch_size(batch_size),
+            None => opts,
+        };
         // Per-batch write reporting (#1078): the engine calls it the moment
         // each batch commits, independently of how the file or run ends.
         let opts = match &self.write_observer {
@@ -1329,15 +1451,30 @@ where
         // manifest's persisted counters are cumulative across runs and belong
         // to the ingestion engine's per-batch bookkeeping (#969).
         let failed_at = AtomicU64::new(0);
+        // The share of `failed_at` that is *file*-level: a file that never
+        // opened, or one whose stream broke part-way. Each already writes its
+        // own `failed to fetch/ingest file ...` artifact and produces no entry
+        // receipts, so it must not also be counted into the summary
+        // OperationOutcome `write_result_artifact_pages` writes for entries the
+        // engine counted but never persisted (#1127). Kept separate rather than
+        // held out of `failed_at`, because the manifest counters and the
+        // terminal status still have to see these failures.
+        let file_level_at = AtomicU64::new(0);
         // File-level fetch/ingest failures write their own finalized artifacts.
         // No staged row exists; all finalized records are collected and handed
         // to one publication call after the whole run.
         let error_records = Arc::new(tokio::sync::Mutex::new(Vec::<SubmitFileRecord>::new()));
+        // Every input file that could not be ingested to its end, as
+        // `(redacted url, cause)`. Any entry fails the manifest (#1127): a file
+        // cut short mid-stream leaves its committed batches in storage and
+        // silently drops the rest, which must never read `completed`.
+        let file_failures = Arc::new(std::sync::Mutex::new(Vec::<(String, String)>::new()));
         // Shared borrows for the concurrent per-file futures. Iterating by
         // index keeps the map closure's argument owned (a `usize`), so the
         // future it returns can borrow `manifest.output[i]` for the manifest's
         // lifetime without a higher-ranked-lifetime bound the closure can't name.
         let failed_ref = &failed_at;
+        let file_level_ref = &file_level_at;
         let opened_ref = &opened;
         let totals_ref = &totals_known;
         let progress_ref = &progress;
@@ -1348,6 +1485,7 @@ where
         let manifest_ref = &manifest;
         let manifest_url_ref = &manifest_url;
         let error_records_ref = &error_records;
+        let file_failures_ref = &file_failures;
 
         let mut ingest = futures::stream::iter(0..manifest.output.len())
             .map(|i| async move {
@@ -1378,16 +1516,27 @@ where
                 {
                     Ok(s) => s,
                     Err(e) => {
+                        let cause = error_chain(&e);
+                        let url = redact_url(&file.url);
+                        tracing::warn!(
+                            submission = %lease_ref.submission_id,
+                            manifest = %lease_ref.manifest_id,
+                            url = %url,
+                            error = %cause,
+                            "bulk-submit could not open an input file; the manifest will fail"
+                        );
                         let file_error = self
                             .write_manifest_error(
                                 lease_ref,
                                 manifest_url_ref,
                                 i as u32 + 2,
-                                &format!("failed to fetch file {}: {e}", file.url),
+                                &format!("failed to fetch file {url}: {cause}"),
                             )
                             .await?;
+                        push_failure(file_failures_ref, url, cause);
                         error_records_ref.lock().await.push(file_error);
                         failed_ref.fetch_add(1, Ordering::Relaxed);
+                        file_level_ref.fetch_add(1, Ordering::Relaxed);
                         // No batch ran for a file that never opened, so this
                         // failure is the worker's to add.
                         if let Err(e) = self.jobs.add_manifest_progress(lease_ref, 0, 1, 0).await {
@@ -1451,16 +1600,28 @@ where
                         }
                     }
                     Err(e) => {
+                        let cause = error_chain(&e);
+                        let url = redact_url(&file.url);
+                        tracing::warn!(
+                            submission = %lease_ref.submission_id,
+                            manifest = %lease_ref.manifest_id,
+                            url = %url,
+                            error = %cause,
+                            "bulk-submit input file failed part-way; its committed batches stay, \
+                             the rest of the file was not ingested and the manifest will fail"
+                        );
                         let file_error = self
                             .write_manifest_error(
                                 lease_ref,
                                 manifest_url_ref,
                                 i as u32 + 2,
-                                &format!("failed to ingest file {}: {e}", file.url),
+                                &format!("failed to ingest file {url}: {cause}"),
                             )
                             .await?;
+                        push_failure(file_failures_ref, url, cause);
                         error_records_ref.lock().await.push(file_error);
                         failed_ref.fetch_add(1, Ordering::Relaxed);
+                        file_level_ref.fetch_add(1, Ordering::Relaxed);
                         // Every entry this file did commit was already counted
                         // by its own batch; the file-level failure was not.
                         if let Err(e) = self.jobs.add_manifest_progress(lease_ref, 0, 1, 0).await {
@@ -1471,6 +1632,17 @@ where
 
                 // File boundary: no batch holds the write lock here, so fold
                 // the WAL back into the database before the next file (#978).
+                // Renew first, so the checkpoint — which can hold the write
+                // lock for minutes on a large WAL — starts with a full lease
+                // in hand instead of whatever the keeper last left (#1127).
+                // Skipped once the run is winding down: an aborted manifest has
+                // already left `processing`, so a renewal would only report a
+                // lease "lost" to the abort itself.
+                if !keeper_ref.should_stop()
+                    && !self.renew_before_checkpoint(lease_ref, keeper_ref).await
+                {
+                    return Ok(());
+                }
                 self.jobs.checkpoint_after_file().await;
 
                 let total = progress_ref.total.load(Ordering::Relaxed);
@@ -1517,6 +1689,9 @@ where
             return Ok(());
         }
         let mut failed = failed_at.load(Ordering::Relaxed);
+        // Carried to the receipt step so the summary OperationOutcome can
+        // discount the failures that already have an artifact of their own.
+        let file_level_failures = file_level_at.load(Ordering::Relaxed);
 
         // 2b. Process `deleted` files — transaction Bundles / resource refs to
         // remove. Successful deletions across every deleted file share one
@@ -1541,19 +1716,51 @@ where
                 .await
             {
                 Ok((reader, _)) => {
-                    self.process_deleted_stream(&lease, reader, &mut deleted_refs)
-                        .await;
+                    if let Err(e) = self
+                        .process_deleted_stream(&lease, reader, &mut deleted_refs)
+                        .await
+                    {
+                        let cause = error_chain(&e);
+                        let url = redact_url(&file.url);
+                        tracing::warn!(
+                            submission = %lease.submission_id,
+                            manifest = %lease.manifest_id,
+                            url = %url,
+                            error = %cause,
+                            "bulk-submit deleted file failed part-way; the manifest will fail"
+                        );
+                        let deleted_error = self
+                            .write_manifest_error(
+                                &lease,
+                                &manifest_url,
+                                manifest.output.len() as u32 + input_index as u32 + 2,
+                                &format!("failed to read deleted file {url}: {cause}"),
+                            )
+                            .await?;
+                        records.push(deleted_error);
+                        push_failure(&file_failures, url, cause);
+                    }
                 }
                 Err(e) => {
+                    let cause = error_chain(&e);
+                    let url = redact_url(&file.url);
+                    tracing::warn!(
+                        submission = %lease.submission_id,
+                        manifest = %lease.manifest_id,
+                        url = %url,
+                        error = %cause,
+                        "bulk-submit could not open a deleted file; the manifest will fail"
+                    );
                     let deleted_error = self
                         .write_manifest_error(
                             &lease,
                             &manifest_url,
                             manifest.output.len() as u32 + input_index as u32 + 2,
-                            &format!("failed to fetch deleted file {}: {e}", file.url),
+                            &format!("failed to fetch deleted file {url}: {cause}"),
                         )
                         .await?;
                     records.push(deleted_error);
+                    push_failure(&file_failures, url, cause);
                 }
             }
         }
@@ -1576,7 +1783,10 @@ where
         }
         let sync = match self.jobs.sync_ingested(&lease).await {
             Ok(report) => report,
-            Err(LeaseError::LeaseLost { .. }) => return Ok(()),
+            Err(LeaseError::LeaseLost { .. }) => {
+                warn_lease_lost(&lease, "syncing ingested resources to search");
+                return Ok(());
+            }
             Err(LeaseError::Storage(e)) => return Err(e),
         };
         if sync.unindexed > 0 {
@@ -1633,6 +1843,7 @@ where
                 &manifest_url,
                 view.fhir_version,
                 failed,
+                file_level_failures,
                 &sync.drift,
             ) => Some(receipts?),
         };
@@ -1649,22 +1860,40 @@ where
         records.extend(receipts);
 
         // 4. Publish all finalized artifacts and the terminal state together
-        // where the storage engine supports it.
+        // where the storage engine supports it. A manifest with any input file
+        // that could not be read to its end is `failed`, never `completed`
+        // (#1127): its receipts and error artifacts are published all the same,
+        // so what did commit stays visible, but the status must not tell the
+        // operator the import succeeded.
+        let file_failures = std::mem::take(
+            &mut *file_failures
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        let terminal = match manifest_failure_message(&file_failures, input_file_count(&manifest)) {
+            Some(error_message) => {
+                tracing::warn!(
+                    submission = %lease.submission_id,
+                    manifest = %lease.manifest_id,
+                    failed_files = file_failures.len(),
+                    error = %error_message,
+                    "bulk-submit manifest failed: not every input file could be ingested"
+                );
+                ManifestPublicationStatus::Failed { error_message }
+            }
+            None => ManifestPublicationStatus::Completed,
+        };
         let published = self
-            .publish_collected_artifacts(
-                &lease,
-                keeper,
-                records,
-                ManifestPublicationStatus::Completed,
-            )
+            .publish_collected_artifacts(&lease, keeper, records, terminal)
             .await?;
 
         // 5. Fast-load (#903): the manifest ingested without search indexing —
         // rebuild the indexes for its resource types now. Fire-and-forget:
         // the manifest is already terminal, and the hook drives the same
-        // machinery $reindex does.
+        // machinery $reindex does. A failed manifest still reindexes: what it
+        // did commit must be searchable.
         if published {
-            self.reindex_deferred(&lease, &manifest.output).await;
+            self.reindex_deferred(&lease, &manifest.output, &sync).await;
         }
         Ok(())
     }
@@ -1677,12 +1906,18 @@ where
     /// `error` artifact, naming the `$reindex` repair. A drift is a tenant-wide
     /// count disagreement, not a failed entry: it does not affect
     /// `failed_count` or any `output` line.
+    ///
+    /// `file_level_failures` is the part of `failed_count` contributed by whole
+    /// input files that could not be fetched or could not be read to their end.
+    /// Those already carry their own error artifact and never produce entry
+    /// receipts, so they are excluded from the uncaptured-entry summary (#1127).
     async fn write_result_artifacts(
         &self,
         lease: &ManifestLease,
         manifest_url: &str,
         _fhir_version: FhirVersion,
         failed_count: u64,
+        file_level_failures: u64,
         drift: &[IndexDrift],
     ) -> StorageResult<Vec<SubmitFileRecord>> {
         let pages = entry_result_pages(|continuation| async move {
@@ -1698,20 +1933,30 @@ where
                 .await
         });
         let spools = ReceiptSpools::new()?;
-        self.write_result_artifact_pages(spools, lease, manifest_url, failed_count, drift, pages)
-            .await
+        self.write_result_artifact_pages(
+            spools,
+            lease,
+            manifest_url,
+            failed_count.saturating_sub(file_level_failures),
+            drift,
+            pages,
+        )
+        .await
     }
 
     /// Streams the entry-result pages into spools, then replays them into parts.
     ///
     /// The spools are owned by the caller so a test can watch the directory a
     /// run spools into; production callers hand in a fresh temp directory.
+    ///
+    /// `entry_failure_count` counts *entry*-level failures only; whole-file
+    /// failures are netted out by the caller (see [`Self::write_result_artifacts`]).
     async fn write_result_artifact_pages(
         &self,
         mut spools: ReceiptSpools,
         lease: &ManifestLease,
         manifest_url: &str,
-        failed_count: u64,
+        entry_failure_count: u64,
         drift: &[IndexDrift],
         pages: impl futures::Stream<Item = StorageResult<EntryResultPage>>,
     ) -> StorageResult<Vec<SubmitFileRecord>> {
@@ -1754,9 +1999,17 @@ where
         // persist them as per-line entry results. Surface any such uncaptured
         // failures as a summary OperationOutcome so the status manifest's `error`
         // array reflects them (partial success).
+        //
+        // Whole-file failures are already out of `entry_failure_count`: each has
+        // its own `failed to fetch/ingest file ...` artifact and no entry
+        // receipts to match against, so counting them here produced a second,
+        // misleading "could not be parsed" artifact for a file that simply broke
+        // mid-body (#1127). Only their own share is netted out, so a file that
+        // failed part-way after committing batches still reports whatever
+        // genuine entry failures the engine did not persist.
         let recorded_errors = spools.error_rows();
-        if failed_count > recorded_errors {
-            let uncaptured = failed_count - recorded_errors;
+        if entry_failure_count > recorded_errors {
+            let uncaptured = entry_failure_count - recorded_errors;
             let oo = json!({
                 "resourceType": "OperationOutcome",
                 "issue": [{
@@ -1925,10 +2178,12 @@ where
         lease: &ManifestLease,
         reader: Box<dyn tokio::io::AsyncBufRead + Send + Unpin>,
         refs: &mut Vec<String>,
-    ) {
+    ) -> std::io::Result<()> {
         use tokio::io::AsyncBufReadExt;
         let mut lines = reader.lines();
-        while let Ok(Some(line)) = lines.next_line().await {
+        // A read error used to end the loop exactly like end-of-file, so a
+        // deleted file cut short mid-stream went unnoticed (#1127).
+        while let Some(line) = lines.next_line().await? {
             let line = line.trim();
             if line.is_empty() {
                 continue;
@@ -1960,6 +2215,7 @@ where
                 refs.push(format!("{ty}/{id}"));
             }
         }
+        Ok(())
     }
 
     /// Reports one live resource of `resource_type` removed by a `deleted`
@@ -2115,23 +2371,72 @@ where
             Ok(ManifestPublicationResult::Published) => Ok(true),
             Ok(ManifestPublicationResult::AlreadyPublished) => Ok(false),
             Err(LeaseError::Storage(e)) => Err(e),
-            Err(LeaseError::LeaseLost { .. }) => Ok(false),
+            Err(LeaseError::LeaseLost { .. }) => {
+                warn_lease_lost(lease, "publishing the manifest's terminal state");
+                Ok(false)
+            }
+        }
+    }
+
+    /// Renews the lease right before a file-boundary WAL checkpoint and tells
+    /// the keeper about the new expiry (#1127). Returns `false` when the lease
+    /// turned out to be lost, in which case the keeper has been told and the
+    /// file ends quietly; a storage error or a renewal that does not answer in
+    /// time is only logged, since the keeper keeps renewing on its own.
+    async fn renew_before_checkpoint(&self, lease: &ManifestLease, keeper: &LeaseKeeper) -> bool {
+        match tokio::time::timeout(lease.lease_duration, self.jobs.heartbeat(lease)).await {
+            Ok(Ok(expiry)) => {
+                keeper.note_renewed(expiry);
+                true
+            }
+            Ok(Err(LeaseError::LeaseLost { .. })) => {
+                warn_lease_lost(lease, "renewing before a WAL checkpoint");
+                keeper.declare_lost();
+                false
+            }
+            Ok(Err(LeaseError::Storage(e))) => {
+                tracing::warn!(
+                    submission = %lease.submission_id,
+                    manifest = %lease.manifest_id,
+                    error = %e,
+                    "bulk-submit could not renew the lease before a WAL checkpoint; \
+                     the keeper keeps renewing"
+                );
+                true
+            }
+            Err(_elapsed) => {
+                tracing::warn!(
+                    submission = %lease.submission_id,
+                    manifest = %lease.manifest_id,
+                    waited_ms = u64::try_from(lease.lease_duration.as_millis()).unwrap_or(u64::MAX),
+                    "bulk-submit lease renewal before a WAL checkpoint timed out; \
+                     the keeper keeps renewing"
+                );
+                true
+            }
         }
     }
 
     /// Rebuilds search indexes for the manifest's resource types after
     /// deferred ingestion. Fire-and-forget: only publication storage errors
     /// may affect the run.
-    async fn reindex_deferred(&self, lease: &ManifestLease, output_files: &[RemoteFile]) {
-        if !self.defer_indexing {
+    async fn reindex_deferred(
+        &self,
+        lease: &ManifestLease,
+        output_files: &[RemoteFile],
+        sync: &IngestSyncReport,
+    ) {
+        let Some(types) = deferred_reindex_types(self.defer_indexing, output_files, sync) else {
+            return;
+        };
+        if sync.indexed_during_ingest && types.is_empty() {
+            tracing::info!(
+                submission = %lease.submission_id,
+                manifest = %lease.manifest_id,
+                "bulk-submit indexed every resource during ingest; no deferred reindex needed"
+            );
             return;
         }
-        let mut types: Vec<String> = output_files
-            .iter()
-            .filter_map(|file| file.resource_type.clone())
-            .collect();
-        types.sort();
-        types.dedup();
         match (&self.reindex_hook, types.is_empty()) {
             (Some(hook), false) => {
                 // Recorded before the hook runs: a crash between here and the
@@ -2184,6 +2489,65 @@ fn fenced_write_outcome(keeper: &LeaseKeeper, e: LeaseError) -> StorageResult<()
             Ok(())
         }
     }
+}
+
+/// Which resource types a finished manifest still owes a search reindex, or
+/// `None` when it owes none at all.
+///
+/// With index-during-ingest (#1127) the sink already wrote every batch, so
+/// only the types a secondary rejected are rebuilt — possibly none. Otherwise
+/// deferred indexing (#903) rebuilds every type the manifest ingested, and a
+/// deployment that indexes inline owes nothing.
+fn deferred_reindex_types(
+    defer_indexing: bool,
+    output_files: &[RemoteFile],
+    sync: &IngestSyncReport,
+) -> Option<Vec<String>> {
+    let mut types: Vec<String> = if sync.indexed_during_ingest {
+        sync.rejected_types.clone()
+    } else if defer_indexing {
+        output_files
+            .iter()
+            .filter_map(|file| file.resource_type.clone())
+            .collect()
+    } else {
+        return None;
+    };
+    types.sort();
+    types.dedup();
+    Some(types)
+}
+
+/// Records one input file that could not be ingested to its end.
+fn push_failure(failures: &std::sync::Mutex<Vec<(String, String)>>, url: String, cause: String) {
+    failures
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push((url, cause));
+}
+
+/// How many input files a manifest lists, `output` and `deleted` together.
+fn input_file_count(manifest: &crate::core::bulk_submit_input::RemoteManifest) -> usize {
+    manifest.output.len() + manifest.deleted.len()
+}
+
+/// The terminal error message for a manifest whose input files did not all
+/// ingest, or `None` when every file did (#1127).
+///
+/// Names the first failed file (already redacted) and its cause, so the
+/// manifest's status carries the reason without opening the error artifacts,
+/// which list every file.
+fn manifest_failure_message(failures: &[(String, String)], file_count: usize) -> Option<String> {
+    let (url, cause) = failures.first()?;
+    let more = match failures.len() {
+        1 => String::new(),
+        n => format!(" (and {} more)", n - 1),
+    };
+    Some(format!(
+        "{} of {file_count} input file(s) could not be ingested completely; the import is \
+         partial. First: {url}: {cause}{more}",
+        failures.len()
+    ))
 }
 
 fn internal_error(message: impl Into<String>) -> StorageError {
@@ -2544,6 +2908,7 @@ mod tests {
             resource_type: "Observation".to_string(),
             resource_id: None,
             created: false,
+            unchanged: false,
             outcome: BulkEntryOutcome::ValidationError,
             operation_outcome: None,
         };
@@ -2552,6 +2917,7 @@ mod tests {
             resource_type: "Patient".to_string(),
             resource_id: None,
             created: false,
+            unchanged: false,
             outcome: BulkEntryOutcome::Success,
             operation_outcome: None,
         };
@@ -2839,6 +3205,7 @@ mod tests {
             resource_type: "Observation".to_string(),
             resource_id: None,
             created: false,
+            unchanged: false,
             outcome: BulkEntryOutcome::ValidationError,
             operation_outcome: None,
         };
@@ -4319,22 +4686,45 @@ mod tests {
             .unwrap();
         // Two full batches commit; the third is still filling when the read
         // error surfaces and fails the file.
+        // A presigned URL: its signature must not reach the manifest (#1127).
+        let url = "http://provider/patient.ndjson?X-Amz-Signature=secret";
         let fetcher = Arc::new(BrokenTailFetcher(observed_manifest(
-            vec![("http://provider/patient.ndjson", patient_lines("b", 250))],
-            vec![("Patient", "http://provider/patient.ndjson")],
+            vec![(url, patient_lines("b", 250))],
+            vec![("Patient", url)],
             None,
         )));
 
         let observer = Arc::new(RecordingWriteObserver::default());
-        run_observed_manifest(
-            &backend,
+        // Inlined instead of `run_observed_manifest` so the output store — and
+        // with it the published artifacts — outlives the run and can be read
+        // back below.
+        backend
+            .add_manifest(
+                &tenant,
+                &sub_id,
+                Some("http://provider/manifest.json"),
+                None,
+            )
+            .await
+            .unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let output = Arc::new(LocalFsOutputStore::new(
+            tmp.path().to_path_buf(),
+            "http://localhost:8080",
+        ));
+        let worker = DefaultSubmitWorker::new(
+            backend.clone(),
             fetcher,
-            &tenant,
-            &sub_id,
-            "http://provider/manifest.json",
-            observer.clone(),
+            output.clone(),
+            WorkerId::new("test-worker"),
         )
-        .await;
+        .with_write_observer(Some(observer.clone()));
+        let lease = backend
+            .claim_next_manifest(&WorkerId::new("test-worker"), StdDuration::from_secs(60))
+            .await
+            .unwrap()
+            .expect("claimable manifest");
+        worker.run_job(lease).await.unwrap();
 
         let t = || "t1".to_string();
         let p = || "Patient".to_string();
@@ -4347,6 +4737,218 @@ mod tests {
             backend.count(&tenant, Some("Patient")).await.unwrap(),
             200,
             "and they are exactly what storage holds"
+        );
+
+        // #1127: 50 of the file's 250 Patients never reached storage, so the
+        // manifest must not read `completed`, and its message says why without
+        // leaking the URL's signature.
+        let manifests = backend.list_manifests(&tenant, &sub_id).await.unwrap();
+        assert_eq!(manifests[0].status, ManifestStatus::Failed);
+        let message: Option<String> = backend
+            .get_connection()
+            .unwrap()
+            .query_row(
+                "SELECT publication_error_message FROM bulk_manifests
+                 WHERE tenant_id = ?1 AND submitter = ?2 AND submission_id = ?3",
+                params![
+                    tenant.tenant_id().as_str(),
+                    sub_id.submitter,
+                    sub_id.submission_id
+                ],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let message = message.expect("a failed manifest carries its error message");
+        assert!(message.contains("1 of 1 input file(s)"), "{message}");
+        assert!(message.contains("connection reset"), "{message}");
+        assert!(
+            message.contains("http://provider/patient.ndjson?[redacted]"),
+            "{message}"
+        );
+        assert!(!message.contains("secret"), "{message}");
+        let rows = backend.list_submit_files(&tenant, &sub_id).await.unwrap();
+        assert!(
+            rows.iter().any(|row| row.file_type == "output"),
+            "the committed batches' receipts are still published"
+        );
+
+        // #1127: the broken file is *one* error artifact. It used to also be
+        // summarized as an uncaptured entry failure, so the status manifest
+        // showed two outcomes for a single broken file — the second of them
+        // claiming a resource "could not be parsed" when none had been.
+        let errors = rows
+            .iter()
+            .filter(|row| row.file_type == "error")
+            .collect::<Vec<_>>();
+        assert_eq!(errors.len(), 1, "one broken file, one error artifact");
+        let error = errors[0];
+        assert_eq!(error.count_severity, Some(json!({"error": 1})));
+        let key = ExportPartKey {
+            tenant_id: tenant.tenant_id().as_str().to_string(),
+            job_id: submission_output_job_id(&sub_id),
+            resource_type: error.file_path.clone(),
+            file_type: error.file_type.clone(),
+            part_index: error.part_index,
+            fencing_token: error.fencing_token,
+        };
+        let mut reader = output.open_reader(&key).await.unwrap();
+        let mut bytes = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut reader, &mut bytes)
+            .await
+            .unwrap();
+        let outcome: Value = serde_json::from_str(std::str::from_utf8(&bytes).unwrap()).unwrap();
+        let diagnostics = outcome["issue"][0]["diagnostics"].as_str().unwrap();
+        assert!(
+            diagnostics.starts_with("failed to ingest file "),
+            "{diagnostics}"
+        );
+        assert!(diagnostics.contains("connection reset"), "{diagnostics}");
+    }
+
+    /// A `deleted` file whose stream breaks mid-body fails the manifest instead
+    /// of ending as if the file were complete (#1127).
+    #[tokio::test]
+    async fn test_worker_fails_the_manifest_when_a_deleted_file_breaks() {
+        let backend = Arc::new(SqliteBackend::in_memory().unwrap());
+        backend.init_schema().unwrap();
+        let tenant = tenant();
+        let sub_id = SubmissionId::generate("mock-system");
+        backend
+            .create_submission(&tenant, &sub_id, None)
+            .await
+            .unwrap();
+        let fetcher = Arc::new(BrokenTailFetcher(observed_manifest(
+            vec![(
+                "http://provider/deleted.ndjson",
+                "{\"resourceType\":\"Patient\",\"id\":\"gone\"}\n".to_string(),
+            )],
+            vec![],
+            Some("http://provider/deleted.ndjson"),
+        )));
+        run_observed_manifest(
+            &backend,
+            fetcher,
+            &tenant,
+            &sub_id,
+            "http://provider/manifest.json",
+            Arc::new(RecordingWriteObserver::default()),
+        )
+        .await;
+
+        let manifests = backend.list_manifests(&tenant, &sub_id).await.unwrap();
+        assert_eq!(manifests[0].status, ManifestStatus::Failed);
+    }
+
+    /// `HFS_BULK_SUBMIT_BATCH_SIZE` reaches the ingest (#1127): it was parsed
+    /// and then dropped, so every run committed batches of the engine default.
+    #[tokio::test]
+    async fn test_worker_honours_its_batch_size() {
+        let backend = Arc::new(SqliteBackend::in_memory().unwrap());
+        backend.init_schema().unwrap();
+        let tenant = tenant();
+        let sub_id = SubmissionId::generate("mock-system");
+        backend
+            .create_submission(&tenant, &sub_id, None)
+            .await
+            .unwrap();
+        backend
+            .add_manifest(
+                &tenant,
+                &sub_id,
+                Some("http://provider/manifest.json"),
+                None,
+            )
+            .await
+            .unwrap();
+        let fetcher = Arc::new(observed_manifest(
+            vec![("http://provider/patient.ndjson", patient_lines("bs", 120))],
+            vec![("Patient", "http://provider/patient.ndjson")],
+            None,
+        ));
+        let tmp = tempfile::tempdir().unwrap();
+        let output = Arc::new(LocalFsOutputStore::new(
+            tmp.path().to_path_buf(),
+            "http://localhost:8080",
+        ));
+        let observer = Arc::new(RecordingWriteObserver::default());
+        let worker = DefaultSubmitWorker::new(
+            backend.clone(),
+            fetcher,
+            output,
+            WorkerId::new("batch-size-worker"),
+        )
+        .with_write_observer(Some(observer.clone()))
+        .with_batch_size(50);
+        let lease = backend
+            .claim_next_manifest(
+                &WorkerId::new("batch-size-worker"),
+                StdDuration::from_secs(60),
+            )
+            .await
+            .unwrap()
+            .expect("claimable manifest");
+        worker.run_job(lease).await.unwrap();
+
+        let batches: Vec<u64> = observer.counts().iter().map(|c| c.2).collect();
+        assert_eq!(batches, vec![50, 50, 20]);
+        let manifests = backend.list_manifests(&tenant, &sub_id).await.unwrap();
+        assert_eq!(manifests[0].status, ManifestStatus::Completed);
+    }
+
+    #[test]
+    fn test_manifest_failure_message_names_the_first_file_and_the_rest() {
+        assert_eq!(manifest_failure_message(&[], 3), None);
+        let one = vec![("http://p/a.ndjson".to_string(), "reset".to_string())];
+        assert_eq!(
+            manifest_failure_message(&one, 3).unwrap(),
+            "1 of 3 input file(s) could not be ingested completely; the import is partial. \
+             First: http://p/a.ndjson: reset"
+        );
+        let two = vec![
+            ("http://p/a.ndjson".to_string(), "reset".to_string()),
+            ("http://p/b.ndjson".to_string(), "timeout".to_string()),
+        ];
+        let message = manifest_failure_message(&two, 3).unwrap();
+        assert!(message.starts_with("2 of 3 input file(s)"), "{message}");
+        assert!(message.ends_with("reset (and 1 more)"), "{message}");
+    }
+
+    #[test]
+    fn test_deferred_reindex_types_follow_how_the_manifest_was_indexed() {
+        let files = vec![
+            RemoteFile {
+                resource_type: Some("Patient".to_string()),
+                url: "http://p/a".to_string(),
+                count: None,
+            },
+            RemoteFile {
+                resource_type: Some("Observation".to_string()),
+                url: "http://p/b".to_string(),
+                count: None,
+            },
+        ];
+        let inline = IngestSyncReport::default();
+        assert_eq!(deferred_reindex_types(false, &files, &inline), None);
+        assert_eq!(
+            deferred_reindex_types(true, &files, &inline),
+            Some(vec!["Observation".to_string(), "Patient".to_string()])
+        );
+        let clean_sink = IngestSyncReport {
+            indexed_during_ingest: true,
+            ..IngestSyncReport::default()
+        };
+        assert_eq!(
+            deferred_reindex_types(true, &files, &clean_sink),
+            Some(vec![])
+        );
+        let rejecting_sink = IngestSyncReport {
+            indexed_during_ingest: true,
+            rejected_types: vec!["Patient".to_string()],
+            ..IngestSyncReport::default()
+        };
+        assert_eq!(
+            deferred_reindex_types(false, &files, &rejecting_sink),
+            Some(vec!["Patient".to_string()])
         );
     }
 
@@ -5578,15 +6180,21 @@ mod tests {
         .with_file_concurrency(3);
         worker.run_job(lease.clone()).await.unwrap();
 
+        // Every input file failed to open: the manifest is failed (#1127), and
+        // its error artifacts are still published below.
         let manifests = backend.list_manifests(&tenant, &sub_id).await.unwrap();
-        assert_eq!(manifests[0].status, ManifestStatus::Completed);
+        assert_eq!(manifests[0].status, ManifestStatus::Failed);
         let errors = backend
             .list_submit_files(&tenant, &sub_id)
             .await
             .unwrap()
             .into_iter()
             .collect::<Vec<_>>();
-        assert_eq!(errors.len(), 5);
+        // One artifact per failed file and nothing else: no line was ever read,
+        // so there is no uncaptured *entry* failure to summarize. The part-0
+        // summary these failures used to also produce claimed they "could not
+        // be parsed", which was never true of a file that failed to open (#1127).
+        assert_eq!(errors.len(), 4);
         assert!(errors.iter().all(|row| row.file_type == "error"
             && row.resource_type.as_deref() == Some("OperationOutcome")
             && row.line_count == 1));
@@ -5596,17 +6204,17 @@ mod tests {
             .collect::<std::collections::BTreeSet<_>>();
         assert_eq!(
             part_indexes.into_iter().collect::<Vec<_>>(),
-            vec![0, 2, 3, 4, 5]
+            vec![2, 3, 4, 5],
+            "the per-file artifacts keep their deterministic source indexes"
         );
         let locators = errors
             .iter()
             .map(|row| row.file_path.as_str())
             .collect::<std::collections::BTreeSet<_>>();
-        assert_eq!(locators.len(), 5);
+        assert_eq!(locators.len(), 4);
 
         for row in errors {
             let expected_url = match row.part_index {
-                0 => "",
                 2 => "http://provider/fail-0.ndjson",
                 3 => "http://provider/fail-1.ndjson",
                 4 => "http://provider/fail-2.ndjson",
@@ -5630,13 +6238,8 @@ mod tests {
             let outcome: Value =
                 serde_json::from_str(std::str::from_utf8(&bytes).unwrap()).unwrap();
             let diagnostic = outcome["issue"][0]["diagnostics"].as_str().unwrap();
-            if row.part_index == 0 {
-                assert!(diagnostic.contains("3 submitted resource(s)"));
-                assert!(diagnostic.contains("could not be parsed"));
-            } else {
-                assert!(diagnostic.contains(expected_url));
-                assert!(diagnostic.contains("unavailable input"));
-            }
+            assert!(diagnostic.contains(expected_url));
+            assert!(diagnostic.contains("unavailable input"));
         }
     }
 
@@ -6341,6 +6944,8 @@ mod tests {
         Fails,
         /// Renews normally.
         Lands,
+        /// Answers that another worker holds the lease now.
+        Lost,
     }
 
     struct StubRenewal {
@@ -6362,6 +6967,11 @@ mod tests {
                     },
                 ))),
                 Renewal::Lands => Ok(lease.renewed_expiry()),
+                Renewal::Lost => Err(LeaseError::LeaseLost {
+                    job_id: crate::core::bulk_export::ExportJobId::from_string(
+                        lease.manifest_id.clone(),
+                    ),
+                }),
             }
         }
 
@@ -6515,6 +7125,77 @@ mod tests {
 
     /// The converse: a lease that is being renewed is never declared lost, so
     /// the new expiry check cannot abort a healthy run.
+    /// A renewal the worker makes itself (before a WAL checkpoint, #1127)
+    /// keeps the lease alive even while the keeper's own heartbeat is starved.
+    #[tokio::test]
+    async fn test_lease_keeper_honours_a_renewal_made_by_the_worker() {
+        let keeper = LeaseKeeper::spawn(
+            Arc::new(StubRenewal {
+                renewal: Renewal::Hangs,
+                status: SubmissionStatus::InProgress,
+            }),
+            keeper_lease(),
+            ByteProgress::default(),
+            CancelToken::new(),
+        );
+        let deadline = tokio::time::Instant::now() + StdDuration::from_secs(6);
+        while tokio::time::Instant::now() < deadline {
+            keeper.note_renewed(Utc::now() + chrono::Duration::seconds(2));
+            let lost = tokio::time::timeout(StdDuration::from_millis(500), keeper.lost()).await;
+            assert!(
+                lost.is_err(),
+                "a lease renewed by the worker was declared lost"
+            );
+        }
+    }
+
+    /// A lost lease is declared lost and logged at `warn` (#1127); it used to
+    /// take a silent exit.
+    #[tokio::test]
+    async fn test_lease_keeper_warns_when_the_lease_was_reclaimed() {
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let _guard = tracing::subscriber::set_default(CaptureWarnings(Arc::clone(&events)));
+        assert!(keeper_loses_lease(Renewal::Lost, StdDuration::from_secs(15)).await);
+        let events = events.lock().unwrap();
+        assert!(
+            events.iter().any(|e: &String| e.contains("lease lost")),
+            "no warn for a reclaimed lease: {events:?}"
+        );
+    }
+
+    /// Records the text of every `warn` or `error` event on the current thread.
+    struct CaptureWarnings(Arc<std::sync::Mutex<Vec<String>>>);
+
+    impl tracing::Subscriber for CaptureWarnings {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            struct Text(String);
+            impl tracing::field::Visit for Text {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    self.0.push_str(&format!("{}={:?} ", field.name(), value));
+                }
+            }
+            if *event.metadata().level() <= tracing::Level::WARN {
+                let mut text = Text(String::new());
+                event.record(&mut text);
+                self.0.lock().unwrap().push(text.0);
+            }
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
     #[tokio::test]
     async fn test_lease_keeper_holds_a_renewable_lease() {
         assert!(!keeper_loses_lease(Renewal::Lands, StdDuration::from_secs(5)).await);

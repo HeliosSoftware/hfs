@@ -406,7 +406,11 @@ impl BulkSubmitProvider for S3Backend {
             Ok(())
         }
         .await;
-        options.notify_batch_committed(tenant, submission_id, manifest_id, &results);
+        // Entries are written one by one and not kept, so observers that need
+        // the resources re-read the ids from the primary (#1127).
+        options
+            .notify_batch_committed(tenant, submission_id, manifest_id, &results, &[])
+            .await;
         walked?;
 
         let success_count = results.iter().filter(|r| r.is_success()).count() as u64;
@@ -570,9 +574,12 @@ impl StreamingBulkSubmitProvider for S3Backend {
         loop {
             let mut line = String::new();
             let bytes_read = reader.read_line(&mut line).await.map_err(|e| {
-                StorageError::BulkSubmit(BulkSubmitError::ParseError {
-                    line: line_number,
-                    message: format!("failed to read line: {e}"),
+                // #1127: surface the reader's own message (e.g. the fetcher's
+                // give-up text) unprefixed so it reaches the manifest's error
+                // artifact intact.
+                StorageError::BulkSubmit(BulkSubmitError::InputStream {
+                    message: e.to_string(),
+                    source: Some(Box::new(e)),
                 })
             })?;
 

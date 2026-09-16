@@ -319,6 +319,26 @@ them, and exposes results through a status manifest.
   entry and every other manifest field repeats identically on each page. Pages are
   fetched from the same status URL with `?page=N` (1-based); an out-of-range page is
   `404` and a malformed one `400`. Set the page size to `0` to disable pagination.
+- **Incomplete files fail the manifest**: a body that breaks mid-stream is resumed
+  with `Range: bytes=<n>-` and `If-Range`, at most 3 times with 1/2/4 s backoff, and
+  each break is logged at `WARN` with its full error chain. A file that still cannot
+  be read to its end, or cannot be fetched at all, publishes the manifest as `failed`
+  rather than `completed`; the batches committed before the break stay stored and
+  the receipts and `error` artifact are still published. Per-entry errors stay
+  partial success. Input URLs are redacted (query, fragment, credentials) in every
+  error message, artifact and log line.
+- **Replays and status polls**: manifest counters are kept per file, so a re-walked
+  file counts its entries once, and the submission summary is read from those
+  counters rather than by scanning every receipt, so a status poll costs the same at
+  any import size. `HFS_BULK_SUBMIT_SKIP_UNCHANGED` makes a replay write no new
+  versions.
+- **Index during ingest**: on an `-elasticsearch` composite,
+  `HFS_BULK_SUBMIT_INDEX_DURING_INGEST=true` indexes each batch right after it commits,
+  through bounded writer queues, and drains them before writing receipts, so a
+  `success` receipt is searchable when the manifest ends. A rejected or timed-out
+  batch is marked unindexed and only its types are reindexed. Measured on 228,580
+  Synthea resources: search complete at 225 s, against a deferred rebuild that gave up
+  at 995 s with 2,500 resources unindexed.
 
 Configured via `HFS_BULK_SUBMIT_*` environment variables:
 
@@ -340,7 +360,14 @@ Configured via `HFS_BULK_SUBMIT_*` environment variables:
 | `HFS_BULK_SUBMIT_FILE_CONCURRENCY` | `1` | How many of a single manifest's files one worker ingests at once (fan-out). **SQLite always runs at `1` regardless of the configured value** — it serialises writers, so a higher fan-out queues batch writes behind one lock until they outlast `busy_timeout` and abort the import (#942). A higher value only helps on a concurrent-writer backend such as PostgreSQL. |
 | `HFS_BULK_SUBMIT_DISABLE_LOCAL_WORKER` | `false` | Disable in-pod workers. |
 | `HFS_BULK_SUBMIT_MAX_CONCURRENT_PER_TENANT` | `4` | Per-tenant active-submission cap (kick-off returns `429` if exceeded). |
-| `HFS_BULK_SUBMIT_BATCH_SIZE` | `1000` | Resources per ingestion batch. |
+| `HFS_BULK_SUBMIT_BATCH_SIZE` | `100` | Resources per ingestion batch, one database transaction each. Honoured by the worker since #1127 (before, every run used `100` whatever this said). With index-during-ingest on, `1000` measured slower than `100`. |
+| `HFS_BULK_SUBMIT_FETCH_READ_TIMEOUT` | `60` | Seconds the input-file fetcher waits for the next bytes before treating the body as broken and resuming it with `Range`. Connecting is capped at 10 s. |
+| `HFS_BULK_SUBMIT_SKIP_UNCHANGED` | `false` | SQLite and PostgreSQL: leave a stored resource untouched when the submitted one is identical apart from `meta.versionId`/`meta.lastUpdated`, so replaying a manifest writes no new versions. |
+| `HFS_BULK_SUBMIT_INDEX_DURING_INGEST` | `false` | Composites with Elasticsearch: index each committed batch into the secondary during ingest instead of rebuilding after the manifest; the deferred reindex then runs only for types with rejected entries. No effect without a search secondary. |
+| `HFS_BULK_SUBMIT_INDEX_QUEUE` | `16` | Committed batches each index-during-ingest writer may hold queued. |
+| `HFS_BULK_SUBMIT_INDEX_CONCURRENCY` | `4` | Index-during-ingest writer tasks; a resource always goes to the same writer, so its versions are indexed in order. |
+| `HFS_BULK_SUBMIT_INDEX_COALESCE` | `4` | Queued batches one writer merges into a single write to the secondary. Raising it to `16` measured 34 % slower. |
+| `HFS_BULK_SUBMIT_INDEX_MAX_WAIT` | `30` | Seconds the ingest waits for room in a writer queue; past it the batch is marked unindexed and repaired by the deferred reindex, so a slow secondary never stalls the ingest or its lease. |
 | `HFS_BULK_SUBMIT_DEFER_INDEXING` | `true` | Bulk fast-load (#903): ingest without search-index/FTS writes, then rebuild them after each manifest. Compatible automatic requests for one tenant share one active generation and one pending type set (#1087), so manifest overlap does not start concurrent full-type scans. The coordination is process-local and does not include explicit `$reindex`; a restart can still leave stored resources unsearchable until manual repair. See [`docs/deferred-reindex-coordination-benchmark.md`](../../docs/deferred-reindex-coordination-benchmark.md) for the exact lifecycle, limits, and PostgreSQL measurement protocol. Set `false` to close the post-publication window at the cost measured by `crates/hfs/tests/bulk_submit/run_defer_indexing_benchmark.sh`. |
 | `HFS_BULK_SUBMIT_LEASE_DURATION` | `60` | Initial manifest lease length, seconds. Must exceed the heartbeat interval. |
 | `HFS_BULK_SUBMIT_HEARTBEAT_INTERVAL` | `20` | Worker heartbeat cadence, seconds. |
