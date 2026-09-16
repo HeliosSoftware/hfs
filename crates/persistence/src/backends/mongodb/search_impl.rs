@@ -1088,13 +1088,20 @@ impl MongoBackend {
         }
 
         for param in &query.parameters {
-            if matches!(
+            // `:in`/`:not-in` are unsupported for every parameter type.
+            // `:above`/`:below` are served for `uri` by `build_uri_filter`
+            // (segment-aware, mirroring SQLite/Elasticsearch, #1002) but stay
+            // rejected for token/reference: token `:above`/`:below` need
+            // terminology subsumption and reference `:above`/`:below` need
+            // hierarchy resolution, neither of which is implemented here.
+            let modifier_unsupported = matches!(
                 param.modifier,
-                Some(SearchModifier::Above)
-                    | Some(SearchModifier::Below)
-                    | Some(SearchModifier::In)
-                    | Some(SearchModifier::NotIn)
-            ) {
+                Some(SearchModifier::In) | Some(SearchModifier::NotIn)
+            ) || (matches!(
+                param.modifier,
+                Some(SearchModifier::Above) | Some(SearchModifier::Below)
+            ) && param.param_type != SearchParamType::Uri);
+            if modifier_unsupported {
                 return Err(StorageError::Search(SearchError::UnsupportedModifier {
                     modifier: param
                         .modifier
@@ -2198,6 +2205,25 @@ impl MongoBackend {
                     "$regex": regex_escape(&value.value)
                 }
             }),
+            // `:below`: the value itself or anything under `value/`. One
+            // anchored regex, no `$or`: MongoDB takes the literal prefix
+            // for the index bounds on idx_search_uri_v2 and applies the
+            // `(/|$)` tail as a filter on the keys it walks (#1002).
+            Some(SearchModifier::Below) => Ok(doc! {
+                "value_uri": {
+                    "$regex": format!(
+                        "^{}(/|$)",
+                        regex_escape(value.value.trim_end_matches('/'))
+                    )
+                }
+            }),
+            // `:above`: the value or any path-segment parent of it, as a
+            // point lookup per candidate (#1002).
+            Some(SearchModifier::Above) => Ok(doc! {
+                "value_uri": {
+                    "$in": crate::search::compute_parent_uris(&value.value)
+                }
+            }),
             Some(other) => Err(StorageError::Search(SearchError::UnsupportedModifier {
                 modifier: other.to_string(),
                 param_type: "uri".to_string(),
@@ -3108,6 +3134,63 @@ mod query_support_tests {
                 ..
             }) if modifier == "below"
         ));
+    }
+
+    #[test]
+    fn uri_below_and_above_pass_the_gate() {
+        let backend = MongoBackend::new(MongoBackendConfig::default()).unwrap();
+        for modifier in [SearchModifier::Below, SearchModifier::Above] {
+            let query = SearchQuery::new("ValueSet").with_parameter(SearchParameter {
+                name: "url".to_string(),
+                param_type: SearchParamType::Uri,
+                modifier: Some(modifier),
+                values: vec![SearchValue::eq("http://example.org/fhir")],
+                chain: vec![],
+                components: vec![],
+            });
+            assert!(backend.validate_query_support(&query).is_ok());
+        }
+    }
+
+    #[test]
+    fn uri_below_is_one_anchored_regex() {
+        let backend = MongoBackend::new(MongoBackendConfig::default()).unwrap();
+        let param = SearchParameter {
+            name: "url".to_string(),
+            param_type: SearchParamType::Uri,
+            modifier: Some(SearchModifier::Below),
+            values: vec![SearchValue::eq("http://example.org/fhir")],
+            chain: vec![],
+            components: vec![],
+        };
+        let filter = backend.build_uri_filter(&param, &param.values[0]).unwrap();
+        assert_eq!(
+            filter,
+            doc! { "value_uri": { "$regex": "^http://example\\.org/fhir(/|$)" } }
+        );
+    }
+
+    #[test]
+    fn uri_above_is_a_point_lookup_over_the_parents() {
+        let backend = MongoBackend::new(MongoBackendConfig::default()).unwrap();
+        let param = SearchParameter {
+            name: "url".to_string(),
+            param_type: SearchParamType::Uri,
+            modifier: Some(SearchModifier::Above),
+            values: vec![SearchValue::eq("http://example.org/fhir/ValueSet/a")],
+            chain: vec![],
+            components: vec![],
+        };
+        let filter = backend.build_uri_filter(&param, &param.values[0]).unwrap();
+        assert_eq!(
+            filter,
+            doc! { "value_uri": { "$in": [
+                "http://example.org/fhir/ValueSet/a",
+                "http://example.org/fhir/ValueSet",
+                "http://example.org/fhir",
+                "http://example.org",
+            ] } }
+        );
     }
 }
 

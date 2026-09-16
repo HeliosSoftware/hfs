@@ -14476,7 +14476,7 @@ mod postgres_integration {
         assert_eq!(stopped_manifest.processed_entries, 0);
         assert_eq!(stopped_manifest.failed_entries, 1);
         assert_eq!(
-            stopped_manifest.total_entries as u64, receipt_counts.total,
+            stopped_manifest.total_entries, receipt_counts.total,
             "the manifest counts exactly the receipts it committed"
         );
 

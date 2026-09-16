@@ -12,8 +12,10 @@
 //!    a source tarball (no `.git`) inject the commit it was cut from.
 //! 2. `git rev-parse --short HEAD`, when `git` is on `PATH` and the source
 //!    tree is a checkout (a linked worktree counts).
-//! 3. Empty string. This is never an error: a tarball build with no `git` in
-//!    it must still compile, and the consumers treat "" as "unknown".
+//! 3. Nothing at all: `HFS_BUILD_GIT_SHA` is left unset. This is never an
+//!    error — a tarball build with no `git` in it must still compile — and
+//!    `src/build_info.rs` reads the variable with `option_env!`, so "unknown"
+//!    is its absence rather than an empty-string sentinel.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -25,15 +27,20 @@ fn main() {
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
-        .or_else(git_short_sha)
-        .unwrap_or_default();
+        .or_else(git_short_sha);
 
-    let suffix = if sha.is_empty() {
-        String::new()
-    } else {
-        format!(" (git {sha})")
+    // Emitted only when a commit is known. With an empty-string sentinel the
+    // consumer had to ask `!GIT_SHA_RAW.is_empty()`, and clippy const-folds
+    // `is_empty()` on anything reachable through `env!` — so that question
+    // had a constant answer in every build, which `clippy::const_is_empty`
+    // fails under `-D warnings` (#1185 CI).
+    let suffix = match &sha {
+        Some(sha) => {
+            println!("cargo:rustc-env=HFS_BUILD_GIT_SHA={sha}");
+            format!(" (git {sha})")
+        }
+        None => String::new(),
     };
-    println!("cargo:rustc-env=HFS_BUILD_GIT_SHA={sha}");
     println!("cargo:rustc-env=HFS_BUILD_VERSION_SUFFIX={suffix}");
 }
 

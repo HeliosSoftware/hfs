@@ -8918,6 +8918,34 @@ pub(crate) fn render_not_found(
     (StatusCode::NOT_FOUND, render(page)).into_response()
 }
 
+/// Renders a failed self-call to HFS with its cause. `reqwest::Error`'s
+/// `Display` stops at the URL — `error sending request for url (...)` — and
+/// hides the reason in `source()`, which made a timeout, a refused
+/// connection, and a reset read byte-identically (#957).
+///
+/// A timeout is the one cause worth naming outright, because it is the only
+/// one the user can act on by waiting: `timeout_secs` is the cap this
+/// particular call gave the server, and `timeout_hint` says why that call can
+/// legitimately run long. Every other cause is the `Display` text with its
+/// `source()` chain appended, colon-separated (#1185).
+pub(crate) fn upstream_failure_detail(
+    e: &reqwest::Error,
+    timeout_secs: u64,
+    timeout_hint: &str,
+) -> String {
+    if e.is_timeout() {
+        return format!("timed out after {timeout_secs}s — {timeout_hint}");
+    }
+    let mut detail = e.to_string();
+    let mut src = std::error::Error::source(e);
+    while let Some(cause) = src {
+        detail.push_str(": ");
+        detail.push_str(&cause.to_string());
+        src = cause.source();
+    }
+    detail
+}
+
 fn unix_timestamp_seconds() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
