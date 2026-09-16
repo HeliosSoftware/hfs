@@ -3764,6 +3764,93 @@ mod tests {
         }
     }
 
+    /// A cancelled run stops at the *page boundary*: the page that was in
+    /// flight when the cancellation arrived is written in full, and no
+    /// following page is fetched — so none of its resources reaches a
+    /// statement.
+    ///
+    /// `ReindexOperation::cancel` marks the job `Cancelled` synchronously, so
+    /// that status is terminal while the page it interrupted is still running;
+    /// the signal that the task itself has stopped is its cancellation channel
+    /// being released, which is what this waits for before counting the
+    /// source's pages.
+    #[tokio::test]
+    async fn cancellation_during_a_page_finishes_it_and_stops_before_the_next_fetch() {
+        let (backend, mut events) = ControlledBackend::new(Vec::new(), 0);
+        let source = Arc::new(PagedSource::new(9));
+        let source_port: Arc<dyn ReindexSource> = source.clone();
+        let writers: Vec<Arc<dyn ReindexTarget>> = vec![backend.clone()];
+        let op = Arc::new(ReindexOperation::with_parts(
+            source_port,
+            writers,
+            Arc::new(crate::search::TenantSearchRegistries::base_only()),
+        ));
+        let tenant = named_tenant("cancelled-page");
+        let tenant_id = tenant.tenant_id().to_string();
+
+        let job_id = op
+            .start(
+                tenant.clone(),
+                ReindexRequest::for_types(vec!["Patient".to_string()]).with_batch_size(2),
+                None,
+            )
+            .await
+            .expect("start the reindex");
+
+        // Page one is in flight and blocked inside its first resource's write.
+        assert_eq!(
+            next_controlled_event(&mut events).await,
+            ControlledEvent::Write {
+                tenant: tenant_id.clone(),
+                resource_type: "Patient".to_string(),
+            }
+        );
+        assert_eq!(source.pages.load(Ordering::SeqCst), 1);
+
+        op.cancel(&job_id).await.expect("cancel the job");
+        assert_eq!(
+            op.get_progress(&job_id).await.expect("progress").status,
+            ReindexStatus::Cancelled
+        );
+        assert!(
+            op.cancel_channels.read().contains_key(&job_id),
+            "`cancel` writes terminal status, not task exit: the page is still running"
+        );
+        assert_eq!(
+            backend.write_calls.load(Ordering::SeqCst),
+            1,
+            "the page in flight is mid-way through its resources"
+        );
+
+        // Let the in-flight page finish — two resources, two gated writes.
+        backend.write_gate.add_permits(2);
+
+        // The task releases its cancellation channel when it returns, which is
+        // the only signal that it has stopped for good.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while op.cancel_channels.read().contains_key(&job_id) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the cancelled reindex task did not return");
+
+        assert_eq!(
+            backend.write_calls.load(Ordering::SeqCst),
+            2,
+            "the page that was in flight when the cancellation arrived finished"
+        );
+        assert_eq!(
+            source.pages.load(Ordering::SeqCst),
+            1,
+            "the driver fetched a page after cancellation"
+        );
+        assert_eq!(
+            op.get_progress(&job_id).await.expect("progress").status,
+            ReindexStatus::Cancelled
+        );
+    }
+
     #[tokio::test]
     async fn fetch_resources_by_ids_default_scans_pages_and_stops_when_all_found() {
         let tenant = named_tenant("by-ids");
