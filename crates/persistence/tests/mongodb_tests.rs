@@ -4020,7 +4020,10 @@ async fn mongodb_integration_contained_search_pages_on_the_server() {
         );
         let agg = db
             .collection::<Document>("system.profile")
-            .find(doc! { "ns": format!("{}.search_index", db.name()), "command.aggregate": "search_index" })
+            .find(doc! {
+                "ns": format!("{}.search_index_contained", db.name()),
+                "command.aggregate": "search_index_contained",
+            })
             .await
             .unwrap()
             .try_collect::<Vec<Document>>()
@@ -4028,7 +4031,7 @@ async fn mongodb_integration_contained_search_pages_on_the_server() {
             .unwrap();
         assert!(
             !agg.is_empty(),
-            "the contained pipeline must run as an aggregate on search_index"
+            "the contained pipeline must run as an aggregate on search_index_contained"
         );
         // `planSummary` on this server carries only the winning plan's key
         // pattern, never the index name (see `mongodb_history_type_plan_is_a_bounded_index_walk`),
@@ -4352,6 +4355,130 @@ async fn mongodb_integration_contained_both_pages_across_the_top_level_boundary(
     );
 }
 
+/// #1160: a standard search must not match a container through a same-type
+/// contained resource; `_contained=true` must, and `both` must return it once.
+#[tokio::test]
+async fn mongodb_integration_standard_search_ignores_same_type_contained_values() {
+    use helios_persistence::types::{ContainedMode, ContainedReturn};
+    let Some(backend) = create_backend_with_full_registry("same_type_contained").await else {
+        eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
+        return;
+    };
+    let tenant = create_tenant("tenant-same-type-contained");
+    // The holder's only `code = X` lives inside a contained Observation.
+    backend
+        .create(
+            &tenant,
+            "Observation",
+            json!({
+                "resourceType": "Observation", "id": "holder", "status": "final",
+                "code": { "coding": [{ "system": "http://loinc.org", "code": "OUTER" }] },
+                "contained": [{
+                    "resourceType": "Observation", "id": "inner", "status": "final",
+                    "code": { "coding": [{ "system": "http://loinc.org", "code": "X" }] }
+                }]
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    let mut q = SearchQuery::new("Observation").with_parameter(SearchParameter {
+        name: "code".into(),
+        param_type: SearchParamType::Token,
+        modifier: None,
+        values: vec![SearchValue::eq("X")],
+        chain: vec![],
+        components: vec![],
+    });
+    let r = backend.search(&tenant, &q).await.unwrap();
+    assert!(
+        r.resources.items.is_empty(),
+        "standard search matched through a contained value: {:?}",
+        r.resources
+            .items
+            .iter()
+            .map(|x| x.url())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(backend.search_count(&tenant, &q).await.unwrap(), 0);
+
+    q.contained = ContainedMode::On;
+    q.contained_return = ContainedReturn::Container;
+    let r = backend.search(&tenant, &q).await.unwrap();
+    assert_eq!(
+        r.resources
+            .items
+            .iter()
+            .map(|x| x.url())
+            .collect::<Vec<_>>(),
+        vec!["Observation/holder"]
+    );
+
+    q.contained = ContainedMode::Both;
+    let r = backend.search(&tenant, &q).await.unwrap();
+    assert_eq!(
+        r.resources
+            .items
+            .iter()
+            .map(|x| x.url())
+            .collect::<Vec<_>>(),
+        vec!["Observation/holder"]
+    );
+}
+
+/// Cross-type containment is unchanged: the Observation is found as the
+/// container of a Patient match only under `_contained`.
+#[tokio::test]
+async fn mongodb_integration_cross_type_contained_search_still_returns_the_container() {
+    use helios_persistence::types::{ContainedMode, ContainedReturn};
+    let Some(backend) = create_backend_with_full_registry("cross_type_contained").await else {
+        eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
+        return;
+    };
+    let tenant = create_tenant("tenant-cross-type-contained");
+    backend
+        .create(
+            &tenant,
+            "Observation",
+            json!({
+                "resourceType": "Observation", "id": "obs", "status": "final",
+                "subject": { "reference": "#p" },
+                "contained": [{ "resourceType": "Patient", "id": "p", "name": [{ "family": "Crosstype" }] }]
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    let mut q = SearchQuery::new("Patient").with_parameter(SearchParameter {
+        name: "name".into(),
+        param_type: SearchParamType::String,
+        modifier: None,
+        values: vec![SearchValue::eq("Crosstype")],
+        chain: vec![],
+        components: vec![],
+    });
+    assert!(
+        backend
+            .search(&tenant, &q)
+            .await
+            .unwrap()
+            .resources
+            .items
+            .is_empty()
+    );
+    q.contained = ContainedMode::On;
+    q.contained_return = ContainedReturn::Container;
+    let r = backend.search(&tenant, &q).await.unwrap();
+    assert_eq!(
+        r.resources
+            .items
+            .iter()
+            .map(|x| x.url())
+            .collect::<Vec<_>>(),
+        vec!["Observation/obs"]
+    );
+}
+
 #[tokio::test]
 async fn mongodb_integration_contained_both_dedupes_a_container_that_is_also_a_top_level_match() {
     use helios_persistence::types::{ContainedMode, ContainedReturn};
@@ -4361,7 +4488,10 @@ async fn mongodb_integration_contained_both_dedupes_a_container_that_is_also_a_t
     };
     let tenant = create_tenant("tenant-contained-dedupe");
     // (a) A top-level Patient match that is ALSO the container of a
-    // contained match (it contains another Patient named Smith).
+    // contained match: its own name is Smith and it contains another
+    // Patient named Smith. Before #1160 every same-type container was a
+    // top-level match through its contained rows, so this case was not a
+    // real dedupe.
     backend
         .create(
             &tenant,

@@ -845,8 +845,9 @@ impl MongoBackend {
         Ok(result)
     }
 
-    /// Resolves one server-side page of `_contained` matches over
-    /// `idx_search_contained` (#1059): `$match` in the index's key order,
+    /// Resolves one server-side page of `_contained` matches over the
+    /// `search_index_contained` collection (#1160), via its `idx_search_contained`
+    /// index (#1059): `$match` in the index's key order,
     /// then a two-stage grouping (#1059 review N1). The first `$group` is
     /// always per contained *entity* — `{ rtype, rid, lid }` — because a
     /// multi-parameter AND (the `names: $all` `$match` that follows it) must
@@ -875,7 +876,8 @@ impl MongoBackend {
         want_total: bool,
     ) -> StorageResult<ContainedPage> {
         use crate::types::ContainedReturn;
-        let search_index = db.collection::<Document>(MongoBackend::SEARCH_INDEX_COLLECTION);
+        let contained_rows =
+            db.collection::<Document>(MongoBackend::SEARCH_INDEX_CONTAINED_COLLECTION);
 
         let mut branches: Vec<Bson> = Vec::new();
         let mut distinct_names: Vec<String> = Vec::new();
@@ -909,7 +911,6 @@ impl MongoBackend {
             doc! { "$match": {
                 "tenant_id": tenant_id,
                 "contained_type": contained_type,
-                "is_contained": true,
                 "$or": branches,
             }},
             // Always per entity: the AND below must hold within one
@@ -949,7 +950,7 @@ impl MongoBackend {
             pipeline.extend(page_stages);
         }
 
-        let cursor = search_index
+        let cursor = contained_rows
             .aggregate(pipeline)
             .await
             .or_query_error("Failed to aggregate contained search")?;
