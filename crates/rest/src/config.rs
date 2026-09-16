@@ -2786,6 +2786,16 @@ mod tests {
     }
 
     #[test]
+    fn test_bulk_export_config_zero_heartbeat_interval() {
+        let cfg = BulkExportConfig {
+            heartbeat_interval_secs: 0,
+            ..BulkExportConfig::default()
+        };
+        let errs = cfg.validate().unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("HEARTBEAT_INTERVAL")));
+    }
+
+    #[test]
     fn test_bulk_export_config_lease_must_exceed_heartbeat() {
         let cfg = BulkExportConfig {
             lease_duration_secs: 10,

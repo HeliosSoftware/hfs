@@ -8,6 +8,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -67,6 +68,23 @@ pub struct ExportJobLease {
     pub lease_expiry: DateTime<Utc>,
     /// Monotonically increasing token, bumped on every claim.
     pub fencing_token: u64,
+    /// How long a renewal extends the lease for.
+    ///
+    /// Carried on the lease so a heartbeat extends it by the duration the job
+    /// was claimed under, rather than by a constant the backend picked: a
+    /// deployment that raises `HFS_BULK_EXPORT_LEASE_DURATION` for slow
+    /// batches would otherwise see every renewal silently shrink the lease
+    /// back to the hardcoded value (#1152).
+    pub lease_duration: Duration,
+}
+
+impl ExportJobLease {
+    /// The expiry a renewal issued now should set.
+    pub fn renewed_expiry(&self) -> DateTime<Utc> {
+        Utc::now()
+            + chrono::Duration::from_std(self.lease_duration)
+                .unwrap_or_else(|_| chrono::Duration::seconds(60))
+    }
 }
 
 /// Error returned by fenced worker-storage operations.
@@ -317,7 +335,12 @@ pub struct DefaultExportWorker<Js: ?Sized, Dp: ?Sized, Os: ?Sized> {
     pub exclude_since_newly_added: bool,
     /// Optional audit sink for the job's terminal lifecycle events.
     audit: Option<WorkerAudit>,
+    /// How often the lease keeper renews the lease while a job runs.
+    heartbeat_interval: Duration,
 }
+
+/// Fallback renewal cadence when the caller does not configure one.
+const DEFAULT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(20);
 
 /// Where the worker's `AuditEvent`s are sent.
 #[derive(Clone)]
@@ -326,9 +349,257 @@ struct WorkerAudit {
     source_observer: String,
 }
 
+/// Renews an [`ExportJobLease`] from a dedicated task for as long as it is alive.
+///
+/// The renewal must not share a future with the export itself. Until #1041 the
+/// only heartbeat was inline, at the *end* of each batch: nothing renewed the
+/// lease while a batch was being fetched, type-filtered and written. On a slow
+/// type (millions of Observations, a `_typeFilter` that pages through the
+/// search provider, an output store on S3) one batch outlives the lease, a
+/// second worker reclaims the job, and the export restarts from zero — over and
+/// over, because every attempt is just as slow as the last one. A separately
+/// spawned task renews on schedule no matter how long a batch takes.
+///
+/// A lease that cannot be renewed before it expires is fatal to the run holding
+/// it: once `lease_expiry` passes unrenewed the job is claimable, so continuing
+/// to write would mean two workers producing parts for the same job. Each
+/// renewal attempt is therefore bounded by what is left of the lease, and when
+/// the window closes the keeper declares the lease lost, which the run notices
+/// at its next batch boundary or mid-read through [`LeaseKeeper::lost`].
+///
+/// Dropping the keeper stops the renewal task.
+struct LeaseKeeper {
+    /// Held rather than only subscribed to, so the run can declare the lease
+    /// lost too when a fenced write answers `LeaseLost`.
+    lost: tokio::sync::watch::Sender<bool>,
+    /// Newest expiry renewed to outside the keeper's task, in Unix
+    /// milliseconds (see [`LeaseKeeper::note_renewed`]).
+    renewed_until: Arc<AtomicI64>,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+/// The slice of a job store the [`LeaseKeeper`] uses.
+///
+/// Narrow on purpose: a keeper that must be handed a whole
+/// [`BulkExportJobStore`] can only be exercised against a real backend, and the
+/// failure this guards — a heartbeat that never lands — is exactly the one a
+/// real backend will not reproduce on demand.
+#[async_trait]
+trait ExportLeaseRenewal: Send + Sync {
+    /// Renews the lease, returning its new expiry.
+    async fn heartbeat(&self, lease: &ExportJobLease) -> Result<DateTime<Utc>, LeaseError>;
+}
+
+/// Adapts a job store to the keeper's narrow surface.
+struct JobStoreRenewal<Js: ?Sized>(Arc<Js>);
+
+#[async_trait]
+impl<Js> ExportLeaseRenewal for JobStoreRenewal<Js>
+where
+    Js: BulkExportJobStore + ?Sized + 'static,
+{
+    async fn heartbeat(&self, lease: &ExportJobLease) -> Result<DateTime<Utc>, LeaseError> {
+        self.0.heartbeat(lease).await
+    }
+}
+
+impl LeaseKeeper {
+    /// Spawns the renewal task for `lease`.
+    ///
+    /// `heartbeat_interval` is the configured cadence
+    /// (`HFS_BULK_EXPORT_HEARTBEAT_INTERVAL`); the keeper never waits longer
+    /// than a third of the lease's remaining life regardless, so a deployment
+    /// that raises the interval above the lease duration cannot starve itself.
+    fn spawn<R>(jobs: Arc<R>, lease: ExportJobLease, heartbeat_interval: Duration) -> Self
+    where
+        R: ExportLeaseRenewal + ?Sized + 'static,
+    {
+        /// Pause between renewal attempts after a storage error. Short, because
+        /// the whole retry window is capped by the lease's remaining life.
+        const RETRY_AFTER: Duration = Duration::from_millis(500);
+        let (lost, _) = tokio::sync::watch::channel(false);
+        let flag = lost.clone();
+        let renewed_until = Arc::new(AtomicI64::new(lease.lease_expiry.timestamp_millis()));
+        let renewed_elsewhere = Arc::clone(&renewed_until);
+        let handle = tokio::spawn(async move {
+            let mut expiry = lease.lease_expiry;
+            loop {
+                expiry = latest_expiry(expiry, &renewed_elsewhere);
+                let remaining = (expiry - Utc::now())
+                    .to_std()
+                    .unwrap_or(Duration::from_secs(1));
+                // Honour the configured cadence, but never sleep past a third
+                // of what is left: a 20 s interval under a 10 s lease would
+                // hand the job away while this worker is still writing.
+                let wait = heartbeat_interval
+                    .min((remaining / 3).clamp(Duration::from_secs(1), Duration::from_secs(60)));
+                tokio::time::sleep(wait).await;
+
+                // Renew, retrying only for as long as the lease still covers
+                // the writes the export loop is making in parallel. A renewal
+                // that has not landed by `expiry` is indistinguishable from a
+                // lost one: the job is claimable either way.
+                let mut renewed = None;
+                loop {
+                    expiry = latest_expiry(expiry, &renewed_elsewhere);
+                    let left = (expiry - Utc::now()).to_std().unwrap_or(Duration::ZERO);
+                    if left.is_zero() {
+                        break;
+                    }
+                    match tokio::time::timeout(left, jobs.heartbeat(&lease)).await {
+                        Ok(Ok(new_expiry)) => {
+                            renewed = Some(new_expiry);
+                            break;
+                        }
+                        // Already reclaimed by another worker.
+                        Ok(Err(LeaseError::LeaseLost { .. })) => {
+                            warn_lease_lost(&lease, "heartbeat");
+                            flag.send_replace(true);
+                            return;
+                        }
+                        Ok(Err(LeaseError::Storage(e))) => {
+                            tracing::debug!(
+                                job_id = %lease.job_id,
+                                error = %e,
+                                "bulk-export lease heartbeat failed; retrying"
+                            );
+                            tokio::time::sleep(RETRY_AFTER.min(left)).await;
+                        }
+                        // Starved behind whatever the job store is doing for
+                        // the rest of the lease.
+                        Err(_elapsed) => {
+                            tracing::warn!(
+                                job_id = %lease.job_id,
+                                worker = %lease.worker_id,
+                                waited_ms = u64::try_from(left.as_millis()).unwrap_or(u64::MAX),
+                                "bulk-export lease heartbeat timed out: no answer before the \
+                                 lease expired"
+                            );
+                            break;
+                        }
+                    }
+                }
+                // The run may have renewed the lease itself meanwhile; a
+                // renewal that landed there counts just as much as ours.
+                let renewed = renewed.or_else(|| {
+                    let latest = latest_expiry(expiry, &renewed_elsewhere);
+                    (latest > Utc::now()).then_some(latest)
+                });
+                let Some(new_expiry) = renewed else {
+                    tracing::warn!(
+                        job_id = %lease.job_id,
+                        worker = %lease.worker_id,
+                        fencing_token = lease.fencing_token,
+                        "bulk-export lease could not be renewed before it expired; \
+                         abandoning the job so it can be reclaimed"
+                    );
+                    flag.send_replace(true);
+                    return;
+                };
+                expiry = new_expiry;
+            }
+        });
+        Self {
+            lost,
+            renewed_until,
+            handle,
+        }
+    }
+
+    /// Records a renewal made outside the keeper's own task, so the keeper
+    /// measures its deadline from the newest expiry and does not declare a
+    /// freshly renewed lease lost.
+    ///
+    /// Nothing on the export path renews out of band today — the inline
+    /// per-batch heartbeat this replaced is gone — but the rescue it feeds is
+    /// what keeps a starved keeper from tearing down a lease somebody else
+    /// just extended, so it stays wired up and tested.
+    #[allow(dead_code)]
+    fn note_renewed(&self, expiry: DateTime<Utc>) {
+        self.renewed_until
+            .fetch_max(expiry.timestamp_millis(), Ordering::Relaxed);
+    }
+
+    /// Whether the run in flight should wind down because the lease is gone.
+    fn should_stop(&self) -> bool {
+        *self.lost.borrow()
+    }
+
+    /// Marks the lease lost from outside the renewal task — used when a fenced
+    /// write answers `LeaseLost`, which is as conclusive as a failed heartbeat.
+    ///
+    /// `send_replace`, not `send`: `send` refuses to store the value when no
+    /// receiver happens to be subscribed, and the run only subscribes for the
+    /// duration of a read (see [`Self::lost`]). A loss declared while the run
+    /// was between reads — writing a part, say — would be dropped on the floor
+    /// and [`Self::should_stop`] would keep answering `false` forever.
+    fn declare_lost(&self) {
+        self.lost.send_replace(true);
+    }
+
+    /// Resolves once the lease is lost, and never otherwise. Raced against the
+    /// batch reads so a loss abandons the run almost immediately rather than
+    /// only after the current (possibly very long) fetch returns.
+    async fn lost(&self) {
+        let mut rx = self.lost.subscribe();
+        while !*rx.borrow_and_update() {
+            if rx.changed().await.is_err() {
+                // Only reachable if the sender is dropped, which cannot happen
+                // while `self` is alive.
+                return;
+            }
+        }
+    }
+}
+
+impl Drop for LeaseKeeper {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
+
+/// The later of the keeper's own expiry and any renewal recorded through
+/// [`LeaseKeeper::note_renewed`].
+fn latest_expiry(expiry: DateTime<Utc>, renewed_until: &AtomicI64) -> DateTime<Utc> {
+    DateTime::from_timestamp_millis(renewed_until.load(Ordering::Relaxed))
+        .map_or(expiry, |renewed| renewed.max(expiry))
+}
+
+/// Logs a run abandoned because its lease is gone.
+///
+/// A lost lease is never silent: whoever reclaims the job starts it again from
+/// scratch — `claim_next` wipes the previous attempt's progress and file rows —
+/// so everything this worker exported is thrown away, and on a large corpus
+/// that is hours of work (#1041).
+fn warn_lease_lost(lease: &ExportJobLease, step: &str) {
+    tracing::warn!(
+        job_id = %lease.job_id,
+        worker = %lease.worker_id,
+        fencing_token = lease.fencing_token,
+        step,
+        "bulk-export run abandoned: its lease is no longer held; the job will be \
+         re-claimed and this attempt's work discarded"
+    );
+}
+
+/// Resolves what a failed fenced write means for the run.
+///
+/// A storage error fails the job, as it always has. A lost lease is not an
+/// error at all: the job belongs to someone else now, so the keeper is told —
+/// which stops the reads racing against it — and this run ends quietly.
+fn fenced_outcome(keeper: &LeaseKeeper, e: LeaseError) -> Result<JobOutcome, LeaseError> {
+    match e {
+        LeaseError::Storage(e) => Err(LeaseError::Storage(e)),
+        LeaseError::LeaseLost { .. } => {
+            keeper.declare_lost();
+            Ok(JobOutcome::Abandoned)
+        }
+    }
+}
+
 impl<Js, Dp, Os> DefaultExportWorker<Js, Dp, Os>
 where
-    Js: BulkExportJobStore + ?Sized,
+    Js: BulkExportJobStore + ?Sized + 'static,
     Dp: ExportResourceProvider + ?Sized,
     Os: ExportOutputStore + ?Sized,
 {
@@ -341,7 +612,14 @@ where
             worker_id,
             exclude_since_newly_added: false,
             audit: None,
+            heartbeat_interval: DEFAULT_HEARTBEAT_INTERVAL,
         }
+    }
+
+    /// Sets how often the lease keeper renews the lease while a job runs.
+    pub fn with_heartbeat_interval(mut self, interval: Duration) -> Self {
+        self.heartbeat_interval = interval;
+        self
     }
 
     /// Sets the `since_newly_added=exclude` toggle for Group exports.
@@ -405,25 +683,51 @@ where
     /// `lease.fencing_token`; any `LeaseError::LeaseLost` aborts the run
     /// silently (the worker that reclaimed the job now owns it).
     pub async fn run_job(&self, lease: ExportJobLease) -> StorageResult<()> {
+        let keeper = LeaseKeeper::spawn(
+            Arc::new(JobStoreRenewal(Arc::clone(&self.jobs))),
+            lease.clone(),
+            self.heartbeat_interval,
+        );
+        self.run_job_with_keeper(lease, keeper).await
+    }
+
+    /// The body of [`Self::run_job`], with the lease keeper handed in.
+    ///
+    /// Split out so the tests can drive a whole run under a keeper whose
+    /// renewals are stubbed — a lease genuinely expiring mid-run is, by
+    /// construction, what the keeper exists to prevent, so it cannot be
+    /// provoked through a real job store.
+    async fn run_job_with_keeper(
+        &self,
+        lease: ExportJobLease,
+        keeper: LeaseKeeper,
+    ) -> StorageResult<()> {
         // Captured by `run_job_inner` as soon as it loads the job, so a failure
         // partway through can still attribute its audit event to the principal
         // that requested the export.
         let mut view: Option<WorkerJobView> = None;
 
-        match self.run_job_inner(&lease, &mut view).await {
+        match self.run_job_inner(&lease, &keeper, &mut view).await {
+            // Another worker owns the job now — stop, and emit nothing: the
+            // worker that reclaimed the job will record its terminal event, and
+            // a second one here would double-count. Not silently, though: this
+            // attempt's output is about to be thrown away.
+            Ok(JobOutcome::Abandoned) => {
+                warn_lease_lost(&lease, "running the export");
+                Ok(())
+            }
             Ok(outcome) => {
                 let (phase, code) = match outcome {
                     JobOutcome::Completed => ("complete", "0"),
                     JobOutcome::Cancelled => ("cancelled", "4"),
+                    JobOutcome::Abandoned => unreachable!("handled above"),
                 };
                 self.emit_audit(&lease.job_id, view.as_ref(), phase, code, None)
                     .await;
                 Ok(())
             }
             Err(LeaseError::LeaseLost { .. }) => {
-                // Another worker owns the job now — stop silently, and emit
-                // nothing: the worker that reclaimed the job will record its
-                // terminal event, and a second one here would double-count.
+                warn_lease_lost(&lease, "fenced job-state write");
                 Ok(())
             }
             Err(LeaseError::Storage(e)) => {
@@ -456,6 +760,7 @@ where
     async fn run_job_inner(
         &self,
         lease: &ExportJobLease,
+        keeper: &LeaseKeeper,
         captured_view: &mut Option<WorkerJobView>,
     ) -> Result<JobOutcome, LeaseError> {
         let tenant = &lease.tenant;
@@ -548,7 +853,8 @@ where
         let types_total = types.len() as u32;
 
         for (type_index, resource_type) in types.iter().enumerate() {
-            self.jobs
+            if let Err(e) = self
+                .jobs
                 .set_export_current_type(
                     tenant,
                     job_id,
@@ -558,7 +864,10 @@ where
                     type_index as u32,
                     types_total,
                 )
-                .await?;
+                .await
+            {
+                return fenced_outcome(keeper, e);
+            }
 
             // Resume from any persisted cursor for this type.
             let mut cursor: Option<String> = view
@@ -575,6 +884,13 @@ where
             let mut part_index: u32 = 0;
 
             loop {
+                // The clean abandonment point: the lease keeper has given up on
+                // renewing, so the job is claimable and another worker may
+                // already be writing parts for it. Stop before opening a writer.
+                if keeper.should_stop() {
+                    return Ok(JobOutcome::Abandoned);
+                }
+
                 // Cooperative cancellation check.
                 if let Ok(progress) = self.jobs.get_export_status(tenant, job_id).await {
                     if progress.status == ExportStatus::Cancelled {
@@ -582,77 +898,89 @@ where
                     }
                 }
 
-                let batch = match &group_patient_ids {
-                    Some(pids) => self
-                        .data
-                        .fetch_patient_compartment_batch(
-                            tenant,
-                            request,
-                            resource_type,
-                            pids,
-                            cursor.as_deref(),
-                            batch_size,
-                        )
-                        .await
-                        .map_err(LeaseError::Storage)?,
-                    None if matches!(view.level, ExportLevel::Patient)
-                        && !request.patient_refs.is_empty() =>
-                    {
-                        // Patient-level with specific patient filter: scope to
-                        // exactly the requested patients' compartments.
-                        let patient_ids: Vec<String> = request
-                            .patient_refs
-                            .iter()
-                            .map(|r| r.strip_prefix("Patient/").unwrap_or(r).to_string())
-                            .collect();
-                        self.data
-                            .fetch_patient_compartment_batch(
-                                tenant,
-                                request,
-                                resource_type,
-                                &patient_ids,
-                                cursor.as_deref(),
-                                batch_size,
-                            )
-                            .await
-                            .map_err(LeaseError::Storage)?
-                    }
-                    None if matches!(view.level, ExportLevel::Patient) => {
+                let fetch = async {
+                    match &group_patient_ids {
+                        Some(pids) => {
+                            self.data
+                                .fetch_patient_compartment_batch(
+                                    tenant,
+                                    request,
+                                    resource_type,
+                                    pids,
+                                    cursor.as_deref(),
+                                    batch_size,
+                                )
+                                .await
+                        }
+                        None if matches!(view.level, ExportLevel::Patient)
+                            && !request.patient_refs.is_empty() =>
+                        {
+                            // Patient-level with specific patient filter: scope
+                            // to exactly the requested patients' compartments.
+                            let patient_ids: Vec<String> = request
+                                .patient_refs
+                                .iter()
+                                .map(|r| r.strip_prefix("Patient/").unwrap_or(r).to_string())
+                                .collect();
+                            self.data
+                                .fetch_patient_compartment_batch(
+                                    tenant,
+                                    request,
+                                    resource_type,
+                                    &patient_ids,
+                                    cursor.as_deref(),
+                                    batch_size,
+                                )
+                                .await
+                        }
                         // Patient-level without a patient filter: export all
                         // resources of this type across the patient compartment.
-                        self.data
-                            .fetch_export_batch(
-                                tenant,
-                                request,
-                                resource_type,
-                                cursor.as_deref(),
-                                batch_size,
-                            )
-                            .await
-                            .map_err(LeaseError::Storage)?
+                        None => {
+                            self.data
+                                .fetch_export_batch(
+                                    tenant,
+                                    request,
+                                    resource_type,
+                                    cursor.as_deref(),
+                                    batch_size,
+                                )
+                                .await
+                        }
                     }
-                    None => self
-                        .data
-                        .fetch_export_batch(
-                            tenant,
-                            request,
-                            resource_type,
-                            cursor.as_deref(),
-                            batch_size,
-                        )
-                        .await
-                        .map_err(LeaseError::Storage)?,
+                };
+
+                // Race the read against the lease. The reads are where a big
+                // type spends nearly all of its time, and dropping one costs
+                // nothing — no part is open, no row has been written — so this
+                // is both the cheapest and the most effective place to notice
+                // that the job is no longer ours (#1041). The write block below
+                // is deliberately *outside* the race: cancelling between
+                // `finalize_part` and `record_export_file` would publish an
+                // artifact with no manifest row behind it.
+                let batch = tokio::select! {
+                    biased;
+                    _ = keeper.lost() => return Ok(JobOutcome::Abandoned),
+                    fetched = fetch => fetched.map_err(LeaseError::Storage)?,
                 };
 
                 // Intersect the batch with the compiled `_typeFilter` for this
-                // type, if any. `cursor`, `is_last`, progress and the
-                // heartbeat below all keep coming from `batch` — the traversal
-                // itself is unaffected by filtering; only what gets written is.
+                // type, if any. `cursor`, `is_last` and progress all keep coming
+                // from `batch` — the traversal itself is unaffected by
+                // filtering; only what gets written is.
                 let lines = match filters.get(resource_type.as_str()) {
-                    Some(filter) => self
-                        .filter_batch_lines(tenant, resource_type, filter, batch.lines.clone())
-                        .await
-                        .map_err(LeaseError::Storage)?,
+                    Some(filter) => {
+                        let filtering = self.filter_batch_lines(
+                            tenant,
+                            resource_type,
+                            filter,
+                            batch.lines.clone(),
+                        );
+                        tokio::select! {
+                            biased;
+                            _ = keeper.lost() => return Ok(JobOutcome::Abandoned),
+                            filtered = filtering => filtered.map_err(LeaseError::Storage)?,
+                        }
+                    }
                     None => batch.lines.clone(),
                 };
 
@@ -687,22 +1015,32 @@ where
                         .await
                         .map_err(LeaseError::Storage)?;
                     exported += finalized.line_count;
-                    self.jobs
+                    if let Err(e) = self
+                        .jobs
                         .record_export_file(tenant, job_id, wid, token, &finalized, "output")
-                        .await?;
+                        .await
+                    {
+                        return fenced_outcome(keeper, e);
+                    }
                     part_index += 1;
                 }
 
                 cursor = batch.next_cursor.clone();
 
-                // Persist progress + heartbeat after each batch.
+                // Persist progress after each batch. The lease is renewed by the
+                // keeper's own task, not here: an inline heartbeat only ever
+                // fires *between* batches, which is exactly the gap a slow type
+                // falls through (#1041).
                 let mut progress = TypeExportProgress::new(resource_type.clone());
                 progress.exported_count = exported;
                 progress.cursor_state = cursor.clone();
-                self.jobs
+                if let Err(e) = self
+                    .jobs
                     .update_export_type_progress(tenant, job_id, wid, token, &progress)
-                    .await?;
-                self.jobs.heartbeat(lease).await?;
+                    .await
+                {
+                    return fenced_outcome(keeper, e);
+                }
 
                 if batch.is_last {
                     break;
@@ -710,12 +1048,26 @@ where
             }
         }
 
-        self.jobs
+        // Publishing the job as complete is the one write that must not happen
+        // under a lost lease: the reclaiming worker's own run would then finish
+        // a job already advertised as complete with a different set of parts.
+        if keeper.should_stop() {
+            return Ok(JobOutcome::Abandoned);
+        }
+        if let Err(e) = self
+            .jobs
             .set_export_current_type(tenant, job_id, wid, token, None, types_total, types_total)
-            .await?;
-        self.jobs
+            .await
+        {
+            return fenced_outcome(keeper, e);
+        }
+        if let Err(e) = self
+            .jobs
             .finish_export_job(tenant, job_id, wid, token)
-            .await?;
+            .await
+        {
+            return fenced_outcome(keeper, e);
+        }
         Ok(JobOutcome::Completed)
     }
 
@@ -798,6 +1150,9 @@ enum JobOutcome {
     Completed,
     /// A cooperative cancellation check saw the job cancelled and stopped.
     Cancelled,
+    /// The lease was lost mid-run, so the worker stopped without touching the
+    /// job's state at all: the worker that reclaimed it owns its outcome now.
+    Abandoned,
 }
 
 /// The failure text stored on the job and shown to the export's owner.
@@ -921,6 +1276,249 @@ mod tests {
         let message = public_failure_message(&err);
         assert_eq!(message, "export failed: internal storage error");
         assert!(!message.contains("SELECT"));
+    }
+
+    /// How a stubbed heartbeat behaves, for the [`LeaseKeeper`] tests.
+    enum Renewal {
+        /// Never answers — a heartbeat starved behind a long batch, which is
+        /// what let the lease expire mid-type in #1041.
+        Hangs,
+        /// Answers, but always with a storage error.
+        Fails,
+        /// Renews normally.
+        Lands,
+        /// Answers that another worker holds the lease now.
+        Lost,
+    }
+
+    struct StubRenewal {
+        renewal: Renewal,
+        /// How many times the keeper asked for a renewal.
+        calls: Arc<std::sync::atomic::AtomicU32>,
+    }
+
+    impl StubRenewal {
+        fn new(renewal: Renewal) -> Arc<Self> {
+            Arc::new(Self {
+                renewal,
+                calls: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl ExportLeaseRenewal for StubRenewal {
+        async fn heartbeat(&self, lease: &ExportJobLease) -> Result<DateTime<Utc>, LeaseError> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            match self.renewal {
+                Renewal::Hangs => std::future::pending().await,
+                Renewal::Fails => Err(LeaseError::Storage(StorageError::Backend(
+                    crate::error::BackendError::Internal {
+                        backend_name: "stub".to_string(),
+                        message: "job store busy".to_string(),
+                        source: None,
+                    },
+                ))),
+                Renewal::Lands => Ok(lease.renewed_expiry()),
+                Renewal::Lost => Err(LeaseError::LeaseLost {
+                    job_id: lease.job_id.clone(),
+                }),
+            }
+        }
+    }
+
+    fn keeper_tenant() -> TenantContext {
+        use crate::tenant::{TenantId, TenantPermissions};
+        TenantContext::new(TenantId::new("t1"), TenantPermissions::full_access())
+    }
+
+    /// A two-second lease, short enough that a keeper's timings play out inside
+    /// a test.
+    fn keeper_lease() -> ExportJobLease {
+        ExportJobLease {
+            job_id: ExportJobId::from_string("job-keeper"),
+            tenant: keeper_tenant(),
+            worker_id: WorkerId::new("w"),
+            lease_expiry: Utc::now() + chrono::Duration::seconds(2),
+            fencing_token: 1,
+            lease_duration: Duration::from_secs(2),
+        }
+    }
+
+    /// Spawns a keeper over a two-second lease and reports whether it declared
+    /// that lease lost within `wait`.
+    async fn keeper_loses_lease(renewal: Renewal, wait: Duration) -> bool {
+        let keeper = LeaseKeeper::spawn(
+            StubRenewal::new(renewal),
+            keeper_lease(),
+            DEFAULT_HEARTBEAT_INTERVAL,
+        );
+        tokio::time::timeout(wait, keeper.lost()).await.is_ok()
+    }
+
+    /// A heartbeat that cannot land before the lease expires is fatal (#1041).
+    ///
+    /// This is the shape of the bug: the only heartbeat used to run inline at
+    /// the end of each batch, so a type whose batch takes longer than the lease
+    /// never renewed at all — the job was reclaimed and restarted from zero,
+    /// forever. A keeper that hangs must declare the lease lost rather than let
+    /// the run keep writing under it.
+    #[tokio::test]
+    async fn test_lease_keeper_gives_up_on_a_starved_heartbeat() {
+        assert!(keeper_loses_lease(Renewal::Hangs, Duration::from_secs(15)).await);
+    }
+
+    #[tokio::test]
+    async fn test_lease_keeper_gives_up_when_heartbeats_keep_failing() {
+        assert!(keeper_loses_lease(Renewal::Fails, Duration::from_secs(15)).await);
+    }
+
+    /// The converse: a lease that is being renewed is never declared lost, so
+    /// the keeper cannot abort a healthy run.
+    #[tokio::test]
+    async fn test_lease_keeper_holds_a_renewable_lease() {
+        assert!(!keeper_loses_lease(Renewal::Lands, Duration::from_secs(5)).await);
+    }
+
+    /// A renewal recorded from outside the keeper's task keeps the lease alive
+    /// even while the keeper's own heartbeat is starved.
+    #[tokio::test]
+    async fn test_lease_keeper_honours_a_renewal_made_elsewhere() {
+        let keeper = LeaseKeeper::spawn(
+            StubRenewal::new(Renewal::Hangs),
+            keeper_lease(),
+            DEFAULT_HEARTBEAT_INTERVAL,
+        );
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(6);
+        while tokio::time::Instant::now() < deadline {
+            keeper.note_renewed(Utc::now() + chrono::Duration::seconds(2));
+            let lost = tokio::time::timeout(Duration::from_millis(500), keeper.lost()).await;
+            assert!(
+                lost.is_err(),
+                "a lease renewed outside the keeper was declared lost"
+            );
+        }
+    }
+
+    /// A lost lease is declared lost *and* logged at `warn`: whoever reclaims
+    /// the job restarts it from zero, so an operator has to be able to see it
+    /// happen (#1041).
+    #[tokio::test]
+    async fn test_lease_keeper_warns_when_the_lease_was_reclaimed() {
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let _guard = tracing::subscriber::set_default(CaptureWarnings(Arc::clone(&events)));
+        assert!(keeper_loses_lease(Renewal::Lost, Duration::from_secs(15)).await);
+        let events = events.lock().unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|e: &String| e.contains("lease is no longer held")),
+            "no warn for a reclaimed lease: {events:?}"
+        );
+    }
+
+    /// The renewal cadence follows the lease's own life, not a constant.
+    ///
+    /// A deployment that raises `HFS_BULK_EXPORT_HEARTBEAT_INTERVAL` above the
+    /// lease duration would otherwise starve itself: here a two-second lease is
+    /// still heartbeated inside its first second even though the configured
+    /// interval is a minute.
+    #[tokio::test]
+    async fn test_lease_keeper_renews_within_the_lease_not_the_configured_interval() {
+        let stub = StubRenewal::new(Renewal::Lands);
+        let calls = Arc::clone(&stub.calls);
+        let keeper = LeaseKeeper::spawn(stub, keeper_lease(), Duration::from_secs(60));
+        tokio::time::sleep(Duration::from_millis(1_500)).await;
+        assert!(
+            calls.load(Ordering::Relaxed) >= 1,
+            "a 2 s lease must be renewed inside its first third, not after 60 s"
+        );
+        assert!(!keeper.should_stop(), "the renewed lease is still held");
+    }
+
+    /// And the configured interval is honoured when it is the tighter of the
+    /// two — it was dead configuration before #1041.
+    #[tokio::test]
+    async fn test_lease_keeper_honours_a_shorter_configured_interval() {
+        let stub = StubRenewal::new(Renewal::Lands);
+        let calls = Arc::clone(&stub.calls);
+        let lease = ExportJobLease {
+            lease_expiry: Utc::now() + chrono::Duration::seconds(300),
+            lease_duration: Duration::from_secs(300),
+            ..keeper_lease()
+        };
+        let _keeper = LeaseKeeper::spawn(stub, lease, Duration::from_millis(200));
+        tokio::time::sleep(Duration::from_millis(1_200)).await;
+        let seen = calls.load(Ordering::Relaxed);
+        assert!(
+            seen >= 3,
+            "a 200 ms interval under a 300 s lease should renew repeatedly, saw {seen}"
+        );
+    }
+
+    /// A fenced write that answers `LeaseLost` ends the run quietly and tells
+    /// the keeper, so the reads racing against it stop too. A storage error
+    /// still fails the job.
+    #[tokio::test]
+    async fn test_fenced_outcome_declares_lost_but_propagates_storage_errors() {
+        let keeper = LeaseKeeper::spawn(
+            StubRenewal::new(Renewal::Lands),
+            keeper_lease(),
+            DEFAULT_HEARTBEAT_INTERVAL,
+        );
+        let outcome = fenced_outcome(
+            &keeper,
+            LeaseError::LeaseLost {
+                job_id: ExportJobId::from_string("job-keeper"),
+            },
+        );
+        assert!(matches!(outcome, Ok(JobOutcome::Abandoned)));
+        assert!(keeper.should_stop(), "the keeper must be told");
+
+        let storage = fenced_outcome(
+            &keeper,
+            LeaseError::Storage(StorageError::Backend(
+                crate::error::BackendError::Internal {
+                    backend_name: "stub".to_string(),
+                    message: "disk full".to_string(),
+                    source: None,
+                },
+            )),
+        );
+        assert!(matches!(storage, Err(LeaseError::Storage(_))));
+    }
+
+    /// Records the text of every `warn` or `error` event on the current thread.
+    struct CaptureWarnings(Arc<std::sync::Mutex<Vec<String>>>);
+
+    impl tracing::Subscriber for CaptureWarnings {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            struct Text(String);
+            impl tracing::field::Visit for Text {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    self.0.push_str(&format!("{}={:?} ", field.name(), value));
+                }
+            }
+            if *event.metadata().level() <= tracing::Level::WARN {
+                let mut text = Text(String::new());
+                event.record(&mut text);
+                self.0.lock().unwrap().push(text.0);
+            }
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
     }
 
     #[cfg(feature = "sqlite")]
@@ -1377,6 +1975,171 @@ mod tests {
             assert!(
                 manifest.output.is_empty(),
                 "no output files should be recorded when the filter check fails before writing"
+            );
+        }
+
+        /// Wraps [`LocalFsOutputStore`], making every part take `delay` to
+        /// finalize so a run spans several lease lifetimes.
+        struct SlowOutput {
+            inner: Arc<LocalFsOutputStore>,
+            delay: Duration,
+        }
+
+        #[async_trait::async_trait]
+        impl ExportOutputStore for SlowOutput {
+            async fn open_writer(
+                &self,
+                key: &ExportPartKey,
+            ) -> StorageResult<crate::core::bulk_export_output::ExportPartWriter> {
+                self.inner.open_writer(key).await
+            }
+
+            async fn finalize_part(
+                &self,
+                key: &ExportPartKey,
+                writer: crate::core::bulk_export_output::ExportPartWriter,
+            ) -> StorageResult<FinalizedPart> {
+                tokio::time::sleep(self.delay).await;
+                self.inner.finalize_part(key, writer).await
+            }
+
+            async fn download_url(
+                &self,
+                key: &ExportPartKey,
+                ttl: Duration,
+            ) -> StorageResult<crate::core::bulk_export_output::DownloadUrl> {
+                self.inner.download_url(key, ttl).await
+            }
+
+            async fn open_reader(
+                &self,
+                key: &ExportPartKey,
+            ) -> StorageResult<std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send>>> {
+                self.inner.open_reader(key).await
+            }
+
+            async fn delete_job_outputs(
+                &self,
+                tenant: &TenantContext,
+                job_id: &ExportJobId,
+            ) -> StorageResult<()> {
+                self.inner.delete_job_outputs(tenant, job_id).await
+            }
+        }
+
+        /// A run whose lease is lost mid-export stops without recording a
+        /// terminal state for the job and without emitting a terminal audit
+        /// event: the worker that reclaimed the job owns its outcome now, and
+        /// two terminal events for one job would double-count (#1041).
+        ///
+        /// The keeper is stubbed rather than driven through the real job store
+        /// on purpose — a lease genuinely lapsing under a live keeper is exactly
+        /// what the keeper prevents, so it cannot be provoked from outside.
+        #[tokio::test]
+        async fn test_run_job_abandons_mid_export_when_the_lease_is_lost() {
+            use crate::test_audit::CollectorSink;
+
+            let backend = Arc::new(SqliteBackend::in_memory().unwrap());
+            backend.init_schema().unwrap();
+            let tenant = tenant();
+
+            for i in 0..10 {
+                backend
+                    .create(
+                        &tenant,
+                        "Patient",
+                        serde_json::json!({"resourceType": "Patient", "id": format!("p{i}")}),
+                        helios_fhir::FhirVersion::default(),
+                    )
+                    .await
+                    .unwrap();
+            }
+
+            let tmp = tempfile::tempdir().unwrap();
+            let output = Arc::new(SlowOutput {
+                inner: Arc::new(LocalFsOutputStore::new(tmp.path(), "http://localhost:8080")),
+                // One part per batch, so ten batches take ~4 s — twice the
+                // stubbed lease's life.
+                delay: Duration::from_millis(400),
+            });
+
+            let job_id = backend
+                .start_export(
+                    &tenant,
+                    StartExportInput {
+                        request: ExportRequest::system()
+                            .with_types(vec!["Patient".to_string()])
+                            .with_batch_size(1),
+                        transaction_time: Utc::now(),
+                        request_url: "http://localhost/$export".to_string(),
+                        owner_subject: Some("sub".to_string()),
+                        fhir_version: helios_fhir::FhirVersion::default(),
+                    },
+                )
+                .await
+                .unwrap();
+
+            let sink = Arc::new(CollectorSink::new());
+            let worker_id = WorkerId::new("w-lost");
+            let worker = DefaultExportWorker::new(
+                Arc::clone(&backend),
+                Arc::clone(&backend),
+                Arc::clone(&output),
+                worker_id.clone(),
+            )
+            .with_audit(sink.clone(), "Device/hfs");
+
+            let lease = backend
+                .claim_next(&worker_id, Duration::from_secs(60), TEST_MAX_ATTEMPTS)
+                .await
+                .unwrap()
+                .expect("job claimable");
+
+            // A keeper whose heartbeat never answers: it gives up two seconds
+            // in, part-way through the ten batches.
+            let keeper = LeaseKeeper::spawn(
+                StubRenewal::new(Renewal::Hangs),
+                ExportJobLease {
+                    lease_expiry: Utc::now() + chrono::Duration::seconds(2),
+                    lease_duration: Duration::from_secs(2),
+                    ..lease.clone()
+                },
+                DEFAULT_HEARTBEAT_INTERVAL,
+            );
+
+            let warnings = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let guard = tracing::subscriber::set_default(CaptureWarnings(Arc::clone(&warnings)));
+            worker
+                .run_job_with_keeper(lease, keeper)
+                .await
+                .expect("a lost lease is not an error for this worker");
+            drop(guard);
+
+            let progress = backend.get_export_status(&tenant, &job_id).await.unwrap();
+            assert_eq!(
+                progress.status,
+                ExportStatus::InProgress,
+                "an abandoned run must not mark the job terminal"
+            );
+            assert!(
+                sink.events().is_empty(),
+                "an abandoned run must emit no terminal audit event; the worker \
+                 that reclaims the job records one"
+            );
+
+            let manifest = backend.get_export_manifest(&tenant, &job_id).await.unwrap();
+            assert!(
+                manifest.output.len() < 10,
+                "the run should have stopped before exporting every batch, got {} parts",
+                manifest.output.len()
+            );
+
+            let warnings = warnings.lock().unwrap();
+            assert!(
+                warnings
+                    .iter()
+                    .any(|e: &String| e.contains("lease is no longer held")),
+                "an abandoned run must say so in the log: {warnings:?}"
             );
         }
 

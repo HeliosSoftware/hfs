@@ -9133,6 +9133,203 @@ mod postgres_integration {
             .unwrap();
     }
 
+    /// Reads a job's persisted lease columns, which no trait surfaces.
+    async fn export_lease_row(
+        backend: &PostgresBackend,
+        job_id: &helios_persistence::core::bulk_export::ExportJobId,
+    ) -> (DateTime<Utc>, DateTime<Utc>) {
+        let client = backend.get_client().await.unwrap();
+        let row = client
+            .query_one(
+                "SELECT lease_expiry, heartbeat_at FROM bulk_export_jobs WHERE id = $1",
+                &[&job_id.as_str()],
+            )
+            .await
+            .unwrap();
+        let expiry: Option<DateTime<Utc>> = row.get(0);
+        let heartbeat_at: Option<DateTime<Utc>> = row.get(1);
+        (
+            expiry.expect("a claimed job has a lease expiry"),
+            heartbeat_at.expect("a claimed job has a heartbeat timestamp"),
+        )
+    }
+
+    /// A heartbeat used to write a hardcoded `now + 60s`, so a deployment that
+    /// raised `HFS_BULK_EXPORT_LEASE_DURATION` for slow batches saw the very
+    /// first renewal shrink the lease back to a minute — and the job got
+    /// reclaimed mid-run anyway (#1152). The renewal now extends by the
+    /// duration the job was claimed under.
+    #[tokio::test]
+    async fn postgres_integration_export_heartbeat_extends_by_a_short_lease_duration() {
+        let _guard = BULK_EXPORT_TEST_LOCK.lock().await;
+        let backend = create_backend().await;
+        let tenant = create_tenant("export-heartbeat-short");
+
+        let job_id = backend
+            .start_export(&tenant, export_input(ExportRequest::system()))
+            .await
+            .unwrap();
+        let worker = WorkerId::new(format!("pg-hb-short-{}", uuid::Uuid::new_v4()));
+        let lease = claim_specific(&backend, &worker, &job_id, StdDuration::from_secs(5)).await;
+
+        let before = Utc::now();
+        let returned = backend.heartbeat(&lease).await.unwrap();
+        let (persisted, heartbeat_at) = export_lease_row(&backend, &job_id).await;
+
+        assert!(
+            (returned - persisted).num_milliseconds().abs() < 1,
+            "the heartbeat returns exactly the expiry it wrote: {returned} vs {persisted}"
+        );
+        let extension = persisted - before;
+        assert!(
+            extension >= chrono::Duration::seconds(4),
+            "a 5s lease is renewed for about 5s, got {extension}"
+        );
+        assert!(
+            extension < chrono::Duration::seconds(30),
+            "a 5s lease must not be stretched toward the old hardcoded 60s, got {extension}"
+        );
+        assert!(
+            heartbeat_at >= before - chrono::Duration::seconds(1),
+            "the heartbeat timestamp moves with the renewal"
+        );
+
+        backend
+            .finish_export_job(&tenant, &job_id, &worker, lease.fencing_token)
+            .await
+            .unwrap();
+    }
+
+    /// The other half of #1152: a lease longer than the old hardcoded minute
+    /// keeps its length across renewals, which is the whole point of raising
+    /// `HFS_BULK_EXPORT_LEASE_DURATION` for exports whose batches take minutes.
+    #[tokio::test]
+    async fn postgres_integration_export_heartbeat_honors_a_long_lease_duration() {
+        let _guard = BULK_EXPORT_TEST_LOCK.lock().await;
+        let backend = create_backend().await;
+        let tenant = create_tenant("export-heartbeat-long");
+
+        let job_id = backend
+            .start_export(&tenant, export_input(ExportRequest::system()))
+            .await
+            .unwrap();
+        let worker = WorkerId::new(format!("pg-hb-long-{}", uuid::Uuid::new_v4()));
+        let lease = claim_specific(&backend, &worker, &job_id, StdDuration::from_secs(300)).await;
+
+        let before = Utc::now();
+        backend.heartbeat(&lease).await.unwrap();
+        let (persisted, _) = export_lease_row(&backend, &job_id).await;
+
+        let extension = persisted - before;
+        assert!(
+            extension > chrono::Duration::seconds(120),
+            "a 300s lease must not be shrunk to the old hardcoded 60s, got {extension}"
+        );
+        assert!(
+            extension >= chrono::Duration::seconds(299)
+                && extension <= chrono::Duration::seconds(330),
+            "a 300s lease is renewed for about 300s, got {extension}"
+        );
+
+        backend
+            .finish_export_job(&tenant, &job_id, &worker, lease.fencing_token)
+            .await
+            .unwrap();
+    }
+
+    /// Round trip: the duration passed to `claim_next` rides on the lease it
+    /// returns, and that is what every later renewal extends by — so repeated
+    /// heartbeats keep pushing the expiry out by the configured duration
+    /// instead of converging on a backend constant (#1152).
+    #[tokio::test]
+    async fn postgres_integration_export_claim_lease_duration_round_trips_into_heartbeats() {
+        let _guard = BULK_EXPORT_TEST_LOCK.lock().await;
+        let backend = create_backend().await;
+        let tenant = create_tenant("export-heartbeat-roundtrip");
+
+        let job_id = backend
+            .start_export(&tenant, export_input(ExportRequest::system()))
+            .await
+            .unwrap();
+        let worker = WorkerId::new(format!("pg-hb-rt-{}", uuid::Uuid::new_v4()));
+        let configured = StdDuration::from_secs(180);
+        let lease = claim_specific(&backend, &worker, &job_id, configured).await;
+
+        assert_eq!(
+            lease.lease_duration, configured,
+            "the claim carries the configured lease duration back to the worker"
+        );
+        let (claimed_expiry, _) = export_lease_row(&backend, &job_id).await;
+        assert!(
+            claimed_expiry - Utc::now() > chrono::Duration::seconds(120),
+            "the claim itself already honours the configured duration"
+        );
+
+        let first = backend.heartbeat(&lease).await.unwrap();
+        assert!(
+            first >= claimed_expiry,
+            "a renewal never moves the expiry backwards: {first} vs {claimed_expiry}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let second = backend.heartbeat(&lease).await.unwrap();
+        assert!(
+            second > first,
+            "each renewal pushes the expiry further out: {second} vs {first}"
+        );
+        let (persisted, _) = export_lease_row(&backend, &job_id).await;
+        assert!(
+            persisted - Utc::now() > chrono::Duration::seconds(120),
+            "after two renewals the lease is still the configured 180s, not 60s"
+        );
+
+        backend
+            .finish_export_job(&tenant, &job_id, &worker, lease.fencing_token)
+            .await
+            .unwrap();
+    }
+
+    /// Renewing by the lease's own duration must not weaken the fence: a
+    /// worker whose job was re-claimed still learns it lost the lease, and
+    /// writes nothing to the row now owned by someone else.
+    #[tokio::test]
+    async fn postgres_integration_export_heartbeat_on_a_stolen_lease_is_lost() {
+        let _guard = BULK_EXPORT_TEST_LOCK.lock().await;
+        let backend = create_backend().await;
+        let tenant = create_tenant("export-heartbeat-stolen");
+
+        let job_id = backend
+            .start_export(&tenant, export_input(ExportRequest::system()))
+            .await
+            .unwrap();
+        let worker_a = WorkerId::new(format!("pg-hb-stolen-a-{}", uuid::Uuid::new_v4()));
+        let lease_a =
+            claim_specific(&backend, &worker_a, &job_id, StdDuration::from_millis(1)).await;
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let worker_b = WorkerId::new(format!("pg-hb-stolen-b-{}", uuid::Uuid::new_v4()));
+        let lease_b =
+            claim_specific(&backend, &worker_b, &job_id, StdDuration::from_secs(60)).await;
+        assert!(lease_b.fencing_token > lease_a.fencing_token);
+        let (expiry_after_steal, _) = export_lease_row(&backend, &job_id).await;
+
+        assert!(matches!(
+            backend.heartbeat(&lease_a).await,
+            Err(LeaseError::LeaseLost { job_id: lost }) if lost == job_id
+        ));
+        let (expiry_now, _) = export_lease_row(&backend, &job_id).await;
+        assert_eq!(
+            expiry_now, expiry_after_steal,
+            "the fenced-out heartbeat left the new owner's lease untouched"
+        );
+
+        // The new owner's own heartbeat still works.
+        backend.heartbeat(&lease_b).await.unwrap();
+        backend
+            .finish_export_job(&tenant, &job_id, &worker_b, lease_b.fencing_token)
+            .await
+            .unwrap();
+    }
+
     #[tokio::test]
     async fn postgres_integration_export_set_current_type_persists_and_is_fenced() {
         let _guard = BULK_EXPORT_TEST_LOCK.lock().await;

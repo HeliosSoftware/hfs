@@ -593,6 +593,11 @@ impl ExportClaimStrategy for PostgresBackend {
     ) -> StorageResult<Option<ExportJobLease>> {
         let mut client = self.get_client().await?;
         let now = Utc::now();
+        // The 60s here is a `std -> chrono` conversion fallback, not a lease
+        // policy: it only fires for a configured duration too large for
+        // `chrono::Duration` (hundreds of millions of years). It stays, and it
+        // deliberately matches `ExportJobLease::renewed_expiry`, so an absurd
+        // configuration degrades to the same value on claim and on renewal.
         let lease_expiry = now
             + chrono::Duration::from_std(lease_duration)
                 .unwrap_or_else(|_| chrono::Duration::seconds(60));
@@ -738,6 +743,7 @@ impl ExportClaimStrategy for PostgresBackend {
                 worker_id: worker_id.clone(),
                 lease_expiry,
                 fencing_token: new_token as u64,
+                lease_duration,
             }));
         }
     }
@@ -745,7 +751,12 @@ impl ExportClaimStrategy for PostgresBackend {
     async fn heartbeat(&self, lease: &ExportJobLease) -> Result<DateTime<Utc>, LeaseError> {
         let client = self.get_client().await.map_err(LeaseError::Storage)?;
         let now = Utc::now();
-        let new_expiry = now + chrono::Duration::seconds(60);
+        // Renew by the duration the job was claimed under, not by a constant
+        // this backend picked. A hardcoded 60s here made
+        // `HFS_BULK_EXPORT_LEASE_DURATION` inert: the first heartbeat shrank
+        // every lease back to a minute, so a slow batch still outlived its
+        // lease and the job got reclaimed in a loop (#1152, #1041).
+        let new_expiry = lease.renewed_expiry();
         let affected = client
             .execute(
                 "UPDATE bulk_export_jobs
