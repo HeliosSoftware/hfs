@@ -13,6 +13,7 @@ use tokio::sync::OnceCell;
 
 use helios_fhir::FhirVersion;
 
+use super::search_index_builder::IndexBuildMode;
 use crate::core::{Backend, BackendCapability, BackendKind};
 use crate::error::{BackendError, StorageError, StorageResult};
 use crate::search::{
@@ -163,6 +164,13 @@ pub struct MongoBackendConfig {
     /// client in tests.
     #[serde(default = "default_app_name")]
     pub app_name: String,
+
+    /// When the generation-2 `search_index` indexes are built relative to
+    /// boot: `background` (default) spawns the builder and serves at once,
+    /// `inline` awaits it, `off` only warns about missing indexes so an
+    /// operator can build them out of band (`HFS_MONGODB_INDEX_BUILD`).
+    #[serde(default)]
+    pub index_build: IndexBuildMode,
 }
 
 fn default_connection_string() -> String {
@@ -206,6 +214,7 @@ impl Default for MongoBackendConfig {
             search_offloaded: false,
             max_included_resources: default_max_included_resources(),
             app_name: default_app_name(),
+            index_build: IndexBuildMode::default(),
         }
     }
 }
@@ -307,6 +316,7 @@ impl MongoBackend {
     /// - `HFS_MONGODB_MAX_CONNECTIONS` (default: `10`)
     /// - `HFS_MONGODB_CONNECT_TIMEOUT_MS` (default: `5000`)
     /// - `HFS_MONGODB_MAX_INCLUDED_RESOURCES` (default: `1000`)
+    /// - `HFS_MONGODB_INDEX_BUILD` (default: `background`; `inline` | `off`)
     pub fn from_env() -> StorageResult<Self> {
         let connection_string = std::env::var("HFS_MONGODB_URL")
             .or_else(|_| std::env::var("HFS_MONGODB_URI"))
@@ -332,12 +342,24 @@ impl MongoBackend {
             .unwrap_or_else(default_max_included_resources)
             .max(1);
 
+        let index_build = match std::env::var("HFS_MONGODB_INDEX_BUILD") {
+            Ok(raw) => raw.parse::<IndexBuildMode>().map_err(|message| {
+                StorageError::Backend(BackendError::Internal {
+                    backend_name: "mongodb".to_string(),
+                    message,
+                    source: None,
+                })
+            })?,
+            Err(_) => IndexBuildMode::default(),
+        };
+
         let config = MongoBackendConfig {
             connection_string,
             database_name,
             max_connections,
             connect_timeout_ms,
             max_included_resources,
+            index_build,
             ..Default::default()
         };
 
@@ -1037,5 +1059,26 @@ mod tests {
     #[test]
     fn app_name_defaults_to_the_historical_constant() {
         assert_eq!(MongoBackendConfig::default().app_name, "helios-persistence");
+    }
+
+    #[test]
+    fn config_index_build_defaults_to_background_and_reads_env() {
+        assert_eq!(
+            MongoBackendConfig::default().index_build,
+            IndexBuildMode::Background
+        );
+        // from_env is process-global; guard the variable.
+        //
+        // SAFETY: this is the only test in this module that touches the
+        // environment; it runs single-threaded relative to itself and
+        // restores the variable before returning, so there is no
+        // cross-test data race on the process environment.
+        unsafe { std::env::set_var("HFS_MONGODB_INDEX_BUILD", "inline") };
+        let backend = MongoBackend::from_env().expect("from_env");
+        assert_eq!(backend.config().index_build, IndexBuildMode::Inline);
+        unsafe { std::env::set_var("HFS_MONGODB_INDEX_BUILD", "nonsense") };
+        let err = MongoBackend::from_env().expect_err("invalid mode must be rejected");
+        assert!(format!("{err}").contains("HFS_MONGODB_INDEX_BUILD"));
+        unsafe { std::env::remove_var("HFS_MONGODB_INDEX_BUILD") };
     }
 }

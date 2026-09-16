@@ -18,7 +18,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use helios_fhir::FhirVersion;
-use helios_persistence::backends::mongodb::{MongoBackend, MongoBackendConfig};
+use helios_persistence::backends::mongodb::{IndexBuildMode, MongoBackend, MongoBackendConfig};
 use helios_persistence::core::{
     Backend, BackendCapability, BackendKind, BundleEntry, BundleEntryEffect, BundleMethod,
     BundleProvider, BundleResult, ConditionalCreateResult, ConditionalDeleteResult,
@@ -615,6 +615,9 @@ fn storage_err_is_mongo_unavailable(err: &StorageError) -> bool {
 async fn build_backend(mut config: MongoBackendConfig) -> Option<MongoBackend> {
     const MAX_ATTEMPTS: u32 = 3;
     config.max_connections = config.max_connections.min(TEST_BACKEND_MAX_POOL);
+    // Generation-2 indexes are built after boot by default; tests assert
+    // winning plans right after boot, so they wait for the build.
+    config.index_build = IndexBuildMode::Inline;
     let mut attempt = 1;
     loop {
         let backend = MongoBackend::new(config.clone())
