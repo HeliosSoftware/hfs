@@ -124,15 +124,17 @@ Nothing. The planner chooses between v1 and v2 while both exist. The single hint
 
 ```text
 $match  { tenant_id, contained_type, is_contained: true, $or: [ <per-parameter branch> ... ] }
-$group  { _id: { rtype: $resource_type, rid: $resource_id, lid: $contained_local_id },
-          names: { $addToSet: $param_name } }
+$group  { _id: <key>, names: { $addToSet: $param_name } }
+        # key = { rtype, rid } for container return (one slot per container, so
+        #       _total and page boundaries count containers);
+        #       { rtype, rid, lid } for contained return (one slot per contained entity)
 $match  { names: { $all: [<distinct parameter names>] } }        # only when more than one parameter
 $sort   { _id.rtype: 1, _id.rid: 1, _id.lid: 1 }
 $facet  { page:  [ { $skip: offset }, { $limit: count } ],
           total: [ { $count: n } ] }                              # total branch only when _total is requested
 ```
 
-The `$match` fields are written in the index key order so the prefix `tenant_id, contained_type, is_contained` binds, and each `$or` branch carries `param_name` plus its value predicate as today (`build_search_index_filter("", "", param)` minus the tenant and type fields). `$group` reads `resource_type`, `resource_id` and `contained_local_id` from the index keys. `offset` and `count` come from `_offset` and `_count`, defaulting as they do in `search()`.
+The `$match` fields are written in the index key order so the prefix `tenant_id, contained_type, is_contained` binds, and each `$or` branch carries `param_name` plus its value predicate as today (`build_search_index_filter("", "", param)` minus the tenant and type fields). `$group` reads `resource_type`, `resource_id` and `contained_local_id` from the index keys. The group key depends on the return mode (implementation ruling 2026-09-15): grouping by local id in container-return mode would make one container occupy several page slots and count several times in `_total`, while rendering once after deduplication. `offset` and `count` come from `_offset` and `_count`, defaulting as they do in `search()`.
 
 ### 5.2 Container fetch
 
@@ -154,7 +156,7 @@ else:
 total (when requested) = top_total + contained_total
 ```
 
-Contained results whose container already appears in the top-level page are dropped from the contained page, as today (`top_urls` check), and the contained pipeline is asked for `remaining + dropped` when that happens, up to one extra round trip. `top_total` reuses the standard search's `_total` path, so the standard search runs once with `_total=accurate` semantics rather than a separate count.
+Contained results whose container already appears in the top-level page are dropped from the contained page, as today (`top_urls` check). There is no refill (implementation ruling 2026-09-15): an offset-based refill would fetch exactly the next page's first keys and re-emit them there, so a page may instead come back short by the number of dual matches. Dedupe is against the current top-level page only, as before; and `total` counts a dual-match container in both sources. `top_total` reuses the standard search's `_total` path, so the standard search runs once with `_total=accurate` semantics rather than a separate count; a missing total there is an internal error. The top-level portion keeps the standard search's default order (newest first); the contained portion is sorted by its group key.
 
 ### 5.4 Unchanged
 
