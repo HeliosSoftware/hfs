@@ -7492,9 +7492,137 @@ mod postgres_integration {
         assert_eq!(fts_rows, 1, "the follow-up generation duplicated FTS rows");
     }
 
-    #[tokio::test]
+    /// The narrative token a page fixture carries: one indexable word, unique
+    /// per resource, so a full-text hit can only be that resource.
+    fn page_batch_term(index: usize) -> String {
+        format!("Pagebatch{index:02}marker")
+    }
+
+    /// Every `search_index` row a tenant owns, as JSON text, ordered — a
+    /// fingerprint the page path and the per-resource path must agree on.
+    async fn index_snapshot(client: &tokio_postgres::Client, tenant_id: &str) -> Vec<String> {
+        client
+            .query(
+                "SELECT to_jsonb(t)::text FROM search_index t
+                 WHERE tenant_id = $1 ORDER BY 1",
+                &[&tenant_id],
+            )
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.get(0))
+            .collect()
+    }
+
+    /// Every `resource_fts` row a tenant owns, ordered, the same way.
+    async fn fts_snapshot(client: &tokio_postgres::Client, tenant_id: &str) -> Vec<String> {
+        client
+            .query(
+                "SELECT resource_id || '|' || narrative_tsvector::text
+                        || '|' || content_tsvector::text
+                 FROM resource_fts WHERE tenant_id = $1 ORDER BY 1",
+                &[&tenant_id],
+            )
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.get(0))
+            .collect()
+    }
+
+    /// The ids a search parameter answers for in this tenant, sorted.
+    async fn search_hits(
+        backend: &PostgresBackend,
+        tenant: &TenantContext,
+        param_name: &str,
+        param_type: helios_persistence::types::SearchParamType,
+        value: &str,
+    ) -> Vec<String> {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::types::{SearchParameter, SearchQuery, SearchValue};
+
+        let mut hits: Vec<String> = backend
+            .search(
+                tenant,
+                &SearchQuery::new("Patient").with_parameter(SearchParameter {
+                    name: param_name.to_string(),
+                    param_type,
+                    modifier: None,
+                    values: vec![SearchValue::eq(value)],
+                    chain: vec![],
+                    components: vec![],
+                }),
+            )
+            .await
+            .expect("search should succeed")
+            .resources
+            .items
+            .iter()
+            .map(|r| r.id().to_string())
+            .collect();
+        hits.sort();
+        hits
+    }
+
+    async fn text_hits(
+        backend: &PostgresBackend,
+        tenant: &TenantContext,
+        term: &str,
+    ) -> Vec<String> {
+        search_hits(
+            backend,
+            tenant,
+            "_text",
+            helios_persistence::types::SearchParamType::Special,
+            term,
+        )
+        .await
+    }
+
+    async fn content_hits(
+        backend: &PostgresBackend,
+        tenant: &TenantContext,
+        term: &str,
+    ) -> Vec<String> {
+        search_hits(
+            backend,
+            tenant,
+            "_content",
+            helios_persistence::types::SearchParamType::Special,
+            term,
+        )
+        .await
+    }
+
+    /// The exact error a page item produces when its document's `resourceType`
+    /// disagrees with the type it is declared as: the extractor's own message,
+    /// wrapped the way `write_search_entries` has always wrapped it. Asserting
+    /// the whole string is what keeps the prepared page reporting the same
+    /// error the sequential path reported before pages were pooled.
+    fn extraction_failure_text() -> String {
+        concat!(
+            "internal error in postgres: Search parameter extraction failed: ",
+            "Invalid resource: Resource type mismatch: expected Patient, got Observation"
+        )
+        .to_string()
+    }
+
+    /// Multi-threaded on purpose: the page path only spreads its preparation
+    /// across the pool inside a multi-thread runtime, so this is the run that
+    /// exercises the parallel branch wherever the host has the cores, while
+    /// the per-resource pass below is the sequential preparation of the same
+    /// resources.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn postgres_integration_reindex_page_batches_and_scopes_writes() {
         use helios_persistence::search::{ReindexSource, ReindexTarget};
+        use helios_persistence::types::StoredResource;
+
+        /// One item of the page — neither first nor last — whose extraction
+        /// fails outright: its document is an `Observation` while the page
+        /// declares it a `Patient`, which the extractor rejects before any
+        /// statement runs. A page that lost or reordered its per-item
+        /// outcomes cannot place the error here.
+        const FAILING_INDEX: usize = 9;
 
         let backend = create_backend().await;
         let tenant = create_tenant("reindex-page-batch");
@@ -7502,11 +7630,13 @@ mod postgres_integration {
         let tenant_id = tenant.tenant_id().as_str();
         let other_tenant_id = other_tenant.tenant_id().as_str();
 
-        for (id, family) in [
-            ("page-a", "Able"),
-            ("page-b", "Baker"),
-            ("outside", "Clark"),
-        ] {
+        // One full page: 18 resources, past the 16-item preparation threshold,
+        // so a host with cores prepares this page on the prepare pool and a
+        // host without falls back to the calling thread. Every assertion below
+        // holds either way, which is the parity requirement of #1142.
+        let ids: Vec<String> = (0..18).map(|i| format!("page-{i:02}")).collect();
+        let page_ids: Vec<&str> = ids.iter().map(String::as_str).collect();
+        for (index, id) in ids.iter().enumerate() {
             backend
                 .create(
                     &tenant,
@@ -7514,11 +7644,28 @@ mod postgres_integration {
                     json!({
                         "resourceType": "Patient",
                         "id": id,
-                        "name": [{"family": family}],
+                        // A varying number of identifiers per resource, so
+                        // each produces a different number of index rows: a
+                        // page that loses its input order cannot pass the
+                        // per-resource row-count comparison below.
+                        "identifier": (0..=(index % 3))
+                            .map(|n| json!({
+                                "system": "http://hospital.example.org/mrn",
+                                "value": format!("MRN-{index}-{n}")
+                            }))
+                            .collect::<Vec<_>>(),
+                        "name": [{"family": format!("Family{index}")}],
+                        "text": {
+                            "status": "generated",
+                            "div": format!(
+                                "<div xmlns=\"http://www.w3.org/1999/xhtml\"><p>{}.</p></div>",
+                                page_batch_term(index)
+                            )
+                        },
                         "contained": [{
                             "resourceType": "Practitioner",
                             "id": format!("contained-{id}"),
-                            "name": [{"family": format!("Contained {family}")}]
+                            "name": [{"family": format!("Contained {index}")}]
                         }]
                     }),
                     FhirVersion::default(),
@@ -7526,13 +7673,30 @@ mod postgres_integration {
                 .await
                 .unwrap();
         }
+
+        // One resource outside the page, so "the page did not touch it" is
+        // observable, and the same id under another tenant, so "the page did
+        // not touch another tenant" is too.
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({
+                    "resourceType": "Patient",
+                    "id": "outside",
+                    "name": [{"family": "Clark"}]
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
         backend
             .create(
                 &other_tenant,
                 "Patient",
                 json!({
                     "resourceType": "Patient",
-                    "id": "page-a",
+                    "id": "page-00",
                     "name": [{"family": "Bystander"}]
                 }),
                 FhirVersion::default(),
@@ -7541,30 +7705,60 @@ mod postgres_integration {
             .unwrap();
 
         let client = reindex_test_client().await;
-        for (scoped_tenant, id) in [
-            (tenant_id, "page-a"),
-            (tenant_id, "page-b"),
-            (tenant_id, "outside"),
-            (other_tenant_id, "page-a"),
-        ] {
+        for id in page_ids.iter().copied().chain(["outside"]) {
             client
                 .execute(
                     "INSERT INTO search_index
                      (tenant_id, resource_type, resource_id, param_name, value_string)
                      VALUES ($1, 'Patient', $2, 'obsolete-batch-probe', 'stale')",
-                    &[&scoped_tenant, &id],
+                    &[&tenant_id, &id],
                 )
                 .await
                 .unwrap();
         }
+        client
+            .execute(
+                "INSERT INTO search_index
+                 (tenant_id, resource_type, resource_id, param_name, value_string)
+                 VALUES ($1, 'Patient', 'page-00', 'obsolete-batch-probe', 'stale')",
+                &[&other_tenant_id],
+            )
+            .await
+            .unwrap();
+
+        // The bystander tenant's rows must survive both paths byte for byte.
+        let bystander_before = index_snapshot(&client, other_tenant_id).await;
+        let bystander_fts_before = fts_snapshot(&client, other_tenant_id).await;
 
         let page = backend
-            .fetch_resources_page(&tenant, "Patient", None, 2)
+            .fetch_resources_page(&tenant, "Patient", None, ids.len() as u32)
             .await
             .unwrap();
         assert_eq!(
-            page.resources.iter().map(|r| r.id()).collect::<Vec<_>>(),
-            vec!["page-a", "page-b"]
+            page.resources
+                .iter()
+                .map(|r| r.id().to_string())
+                .collect::<Vec<_>>(),
+            ids,
+            "the page is the tenant's resources in (last_updated, id) order"
+        );
+
+        // Substituting the item keeps the page's ids and input order and adds
+        // the one page item the extractor rejects. The stored resource is left
+        // alone — this is a page whose *content* fails, not a store that was
+        // touched.
+        let mut page_resources = page.resources.clone();
+        page_resources[FAILING_INDEX] = StoredResource::new(
+            "Patient",
+            ids[FAILING_INDEX].clone(),
+            tenant.tenant_id().clone(),
+            json!({
+                "resourceType": "Observation",
+                "id": ids[FAILING_INDEX],
+                "status": "final",
+                "code": {"text": "not a patient"}
+            }),
+            FhirVersion::default(),
         );
 
         let before: Vec<(String, serde_json::Value)> = client
@@ -7572,7 +7766,7 @@ mod postgres_integration {
                 "SELECT version_id, data FROM resources
                  WHERE tenant_id = $1 AND resource_type = 'Patient'
                    AND id = ANY($2::text[]) ORDER BY id",
-                &[&tenant_id, &vec!["page-a", "page-b"]],
+                &[&tenant_id, &page_ids],
             )
             .await
             .unwrap()
@@ -7584,29 +7778,51 @@ mod postgres_integration {
                 "SELECT COUNT(*) FROM resource_history
                  WHERE tenant_id = $1 AND resource_type = 'Patient'
                    AND id = ANY($2::text[])",
-                &[&tenant_id, &vec!["page-a", "page-b"]],
+                &[&tenant_id, &page_ids],
             )
             .await
             .unwrap()
             .get(0);
 
         let results = backend
-            .write_search_entries_page(&tenant, &page.resources)
+            .write_search_entries_page(&tenant, &page_resources)
             .await;
-        assert_eq!(results.len(), 2);
-        assert!(results.iter().all(Result::is_ok));
-        assert!(results.iter().all(|result| *result.as_ref().unwrap() > 0));
+        assert_eq!(results.len(), page_resources.len());
+        let page_outcomes: Vec<Result<usize, String>> = results
+            .into_iter()
+            .map(|result| result.map_err(|error| error.to_string()))
+            .collect();
+        for (index, outcome) in page_outcomes.iter().enumerate() {
+            if index == FAILING_INDEX {
+                assert_eq!(
+                    outcome,
+                    &Err(extraction_failure_text()),
+                    "the page must report the extraction failure of {} verbatim, in place",
+                    ids[index]
+                );
+            } else {
+                assert!(
+                    matches!(outcome, Ok(rows) if *rows > 0),
+                    "{} should have been reindexed, got {outcome:?}",
+                    ids[index]
+                );
+            }
+        }
 
         let remaining_stale: Vec<(String, String)> = client
             .query(
                 "SELECT tenant_id, resource_id FROM search_index
                  WHERE param_name = 'obsolete-batch-probe'
                    AND ((tenant_id = $1 AND resource_id = ANY($2::text[]))
-                     OR (tenant_id = $3 AND resource_id = 'page-a'))
+                     OR (tenant_id = $3 AND resource_id = 'page-00'))
                  ORDER BY tenant_id, resource_id",
                 &[
                     &tenant_id,
-                    &vec!["page-a", "page-b", "outside"],
+                    &page_ids
+                        .iter()
+                        .copied()
+                        .chain(["outside"])
+                        .collect::<Vec<_>>(),
                     &other_tenant_id,
                 ],
             )
@@ -7615,11 +7831,19 @@ mod postgres_integration {
             .into_iter()
             .map(|row| (row.get(0), row.get(1)))
             .collect();
-        assert_eq!(remaining_stale.len(), 2);
-        assert!(remaining_stale.contains(&(tenant_id.to_string(), "outside".to_string())));
-        assert!(remaining_stale.contains(&(other_tenant_id.to_string(), "page-a".to_string())));
+        assert_eq!(
+            remaining_stale,
+            vec![
+                (tenant_id.to_string(), "outside".to_string()),
+                (other_tenant_id.to_string(), "page-00".to_string()),
+            ],
+            "only the resource outside the page and the other tenant's row keep their stale row"
+        );
 
-        for resource in &page.resources {
+        for (index, resource) in page_resources.iter().enumerate() {
+            if index == FAILING_INDEX {
+                continue;
+            }
             let contained_count: i64 = client
                 .query_one(
                     "SELECT COUNT(*) FROM search_index
@@ -7633,12 +7857,118 @@ mod postgres_integration {
             assert!(contained_count > 0);
         }
 
+        // Full-text coverage: every resource of the page has a rebuilt
+        // `resource_fts` row, and both `_text` and `_content` reach a page
+        // resource through the narrative the batched path indexed.
+        let fts_rows: i64 = client
+            .query_one(
+                "SELECT COUNT(*) FROM resource_fts
+                 WHERE tenant_id = $1 AND resource_id = ANY($2::text[])",
+                &[&tenant_id, &page_ids],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(
+            fts_rows,
+            (ids.len() - 1) as i64,
+            "every resource of the page but the extraction failure must have a full-text row"
+        );
+        let failed_fts: i64 = client
+            .query_one(
+                "SELECT COUNT(*) FROM resource_fts
+                 WHERE tenant_id = $1 AND resource_id = $2",
+                &[&tenant_id, &ids[FAILING_INDEX]],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(
+            failed_fts, 0,
+            "the page must leave no full-text row behind for the failed item"
+        );
+        for index in [0usize, 7, ids.len() - 1] {
+            let term = page_batch_term(index);
+            assert_eq!(
+                text_hits(&backend, &tenant, &term).await,
+                vec![ids[index].clone()],
+                "`_text` must find the page's narrative for {}",
+                ids[index]
+            );
+            assert_eq!(
+                content_hits(&backend, &tenant, &term).await,
+                vec![ids[index].clone()],
+                "`_content` must find the page's narrative for {}",
+                ids[index]
+            );
+        }
+        // The rebuilt `search_index` rows answer an ordinary search too.
+        let token_hits = search_hits(
+            &backend,
+            &tenant,
+            "identifier",
+            helios_persistence::types::SearchParamType::Token,
+            "http://hospital.example.org/mrn|MRN-7-0",
+        )
+        .await;
+        assert_eq!(token_hits, vec!["page-07".to_string()]);
+
+        // Parity: the per-resource path prepares and writes one resource at a
+        // time, the page path prepared all of them (on the pool where the host
+        // has the cores) and wrote them in one transaction. The persisted rows
+        // must be identical, and the per-resource outcomes must line up with
+        // the page's in input order — success with its row count, failure with
+        // the same error text — so a page that lost its order, its error, or
+        // its count could not match. Each successful resource here produces a
+        // different number of rows, which pins the order further.
+        let page_index = index_snapshot(&client, tenant_id).await;
+        let page_fts = fts_snapshot(&client, tenant_id).await;
+        assert!(!page_index.is_empty());
+
+        let mut individual_outcomes = Vec::with_capacity(page_outcomes.len());
+        for resource in &page_resources {
+            backend
+                .delete_search_entries(&tenant, resource.resource_type(), resource.id())
+                .await
+                .unwrap();
+            individual_outcomes.push(
+                backend
+                    .write_search_entries(&tenant, resource)
+                    .await
+                    .map_err(|error| error.to_string()),
+            );
+        }
+        assert_eq!(
+            individual_outcomes, page_outcomes,
+            "the per-resource path must report the page's ordered outcomes, error text included"
+        );
+        assert_eq!(
+            individual_outcomes[FAILING_INDEX],
+            Err(extraction_failure_text()),
+            "the per-resource path must report the same extraction failure as the page path"
+        );
+        assert_eq!(
+            index_snapshot(&client, tenant_id).await,
+            page_index,
+            "the per-resource path must persist exactly what the page path did"
+        );
+        assert_eq!(fts_snapshot(&client, tenant_id).await, page_fts);
+        assert_eq!(
+            index_snapshot(&client, other_tenant_id).await,
+            bystander_before,
+            "the page and per-resource paths must not touch another tenant"
+        );
+        assert_eq!(
+            fts_snapshot(&client, other_tenant_id).await,
+            bystander_fts_before
+        );
+
         let after: Vec<(String, serde_json::Value)> = client
             .query(
                 "SELECT version_id, data FROM resources
                  WHERE tenant_id = $1 AND resource_type = 'Patient'
                    AND id = ANY($2::text[]) ORDER BY id",
-                &[&tenant_id, &vec!["page-a", "page-b"]],
+                &[&tenant_id, &page_ids],
             )
             .await
             .unwrap()
@@ -7650,7 +7980,7 @@ mod postgres_integration {
                 "SELECT COUNT(*) FROM resource_history
                  WHERE tenant_id = $1 AND resource_type = 'Patient'
                    AND id = ANY($2::text[])",
-                &[&tenant_id, &vec!["page-a", "page-b"]],
+                &[&tenant_id, &page_ids],
             )
             .await
             .unwrap()
