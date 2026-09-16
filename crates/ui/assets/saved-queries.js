@@ -2559,8 +2559,17 @@
     });
     var included = entries.length - primary.length;
 
-    var total = typeof body.total === "number" ? body.total : primary.length;
-    var meta = results.card.dataset.msgTotal.replace("{count}", total);
+    /* No `Bundle.total` (the user opted out with `_total=none`, or the
+     * backend could not count): the page count is exact only when there is
+     * no next page; otherwise say so instead of reading as a total (#1003). */
+    var hasTotal = typeof body.total === "number";
+    var hasNext = !!pagerLink(body, "next");
+    var total = hasTotal ? body.total : primary.length;
+    var meta = (
+      !hasTotal && hasNext
+        ? results.card.dataset.msgTotalPartial
+        : results.card.dataset.msgTotal
+    ).replace("{count}", total);
     if (included > 0)
       meta +=
         " · " +
@@ -2751,6 +2760,21 @@
     if (results.sort) results.sort.disabled = busy;
   }
 
+  /* The results header needs `Bundle.total`, which the server only computes
+   * when the request asks for it (#1003). Ask on the wire only: the typed
+   * query, the URL box, and Recent keep the user's exact text. An explicit
+   * `_total=` (including `none`) or `_summary=count` is left alone. */
+  function withTotal(path) {
+    var q = path.indexOf("?");
+    var query = q === -1 ? "" : path.slice(q + 1);
+    var parts = query ? query.split("&") : [];
+    for (var i = 0; i < parts.length; i++) {
+      if (parts[i].indexOf("_total=") === 0) return path;
+      if (parts[i] === "_summary=count") return path;
+    }
+    return path + (query ? "&" : q === -1 ? "?" : "") + "_total=accurate";
+  }
+
   function runSearch(path, record, context) {
     var requestedContext = context || resultContext(path);
     if (!results.card) {
@@ -2758,7 +2782,7 @@
     } else {
       var ticket = ++searchTicket;
       setResultsBusy(true);
-      fetch(path, {
+      fetch(withTotal(path), {
         headers: fhirHeaders(),
         credentials: "same-origin",
       })
