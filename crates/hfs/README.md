@@ -107,12 +107,42 @@ on `GET /metadata` (the commit as an extension on `software`) and reported by
 | `HFS_ELASTICSEARCH_REFRESH_INTERVAL` | `1s` | Elasticsearch index `refresh_interval` for ES-backed backends. Controls how quickly indexed documents become searchable when no per-write refresh is requested. `-1` disables periodic refresh entirely. Applied when an index is created; indices that already exist keep their current setting. |
 | `HFS_ELASTICSEARCH_WRITE_REFRESH` | `false` | The `refresh` parameter applied to Elasticsearch index/delete operations. One of `false` (no per-write refresh), `wait_for` (block each write until the affected shards refresh), or `true` (force a refresh per write; expensive, low-volume deployments only). |
 | `HFS_ELASTICSEARCH_NESTED_OBJECTS_LIMIT` | `50000` | Elasticsearch `index.mapping.nested_objects.limit`: the maximum nested objects a single document may contain, summed across every nested search-parameter field. Elasticsearch's own default of 10000 rejects larger documents, so a resource with very many indexed values (for example a Synthea `Provenance` with 13,554 `target` references) is stored but never searchable. Applied to new indices through the index template, and raised at startup on existing indices that are below it; the setting is dynamic, so no reindex is needed for resources that already indexed. |
+| `HFS_ELASTICSEARCH_REQUEST_TIMEOUT_MS` | `30000` | Timeout of every Elasticsearch HTTP request, in milliseconds, including `_bulk`. A `_bulk` request that times out is split in half and resent, down to a single document, so raise this only when one large document still times out on its own. |
+| `HFS_ELASTICSEARCH_BULK_MAX_BYTES` | `10485760` (10 MiB) | Byte cap on one `_bulk` request body, applied together with the 500-operation cap, for bulk creates and every rebuild. Without it, 500 Synthea `Provenance` resources (~108 KB each) made a ~54 MB request that exceeded the request timeout. A single document larger than the cap is sent alone. |
+| `HFS_ELASTICSEARCH_BULK_CONCURRENCY` | `1` | How many `_bulk` requests of one page are in flight at once. `1` sends them one at a time, as before #1125. Raising it shortens a rebuild when the cluster is not the bottleneck; splitting after a `413` or a timeout, and `429` back-off, stay sequential within the request that caused them. |
+| `HFS_REINDEX_BATCH_BYTES` | `0` | Byte cap on one page of the automatic rebuild, on top of `HFS_REINDEX_BATCH_SIZE`. `0` means count only. With a cap set, a page of ~108 KB `Provenance` resources ends at the first one that crosses it instead of holding ~108 MB in memory. Honoured by the SQLite source; other sources page by count only. |
+| `HFS_ELASTICSEARCH_REINDEX_REFRESH` | *(unset)* | The `refresh` parameter for the `_bulk` writes of `$reindex` and of the deferred post-import rebuild: `false`, `wait_for`, or `true`. Unset follows `HFS_ELASTICSEARCH_WRITE_REFRESH`. Set `false` to let a rebuild skip the per-request refresh wait while ordinary writes keep `wait_for`. |
+| `HFS_REINDEX_BATCH_SIZE` | `1000` | Page size of the automatic deferred rebuild that follows a bulk import, on every backend. `POST $reindex` keeps its own `batchSize` parameter (default 100). |
 
 Read-after-write search on an ES-backed composite needs **both**
 `HFS_COMPOSITE_SYNC_MODE=synchronous` and
 `HFS_ELASTICSEARCH_WRITE_REFRESH=wait_for`. See
 [Search visibility on Elasticsearch-backed composites](../persistence/README.md#search-visibility-on-elasticsearch-backed-composites)
 in the persistence crate for why either setting alone still leaves a window.
+
+Elasticsearch `_bulk` failures are handled per shape. A request that times out,
+or is answered `413`, `408` or `504`, is split in half and each half resent,
+down to a single document; once a single document times out, the rest of the
+page fails as transient instead of being split further. A `429`, for the whole
+request or for single items, is retried with bounded exponential back-off for
+the rejected items only. A per-document `4xx` is permanent and not retried. A
+connection error, a whole-request `5xx`, or a `429` that outlasts its retries
+fails every document of that request as transient. Every failed document is
+recorded by `Type/id`, with Elasticsearch's `error.type` and `reason` when it
+gave one, in `GET /$reindex-status/{job_id}`. See
+[Bulk writes and rebuilds on Elasticsearch-backed composites](../persistence/README.md#bulk-writes-and-rebuilds-on-elasticsearch-backed-composites).
+
+On `sqlite-elasticsearch`, the recommended pair for a bulk import is
+`HFS_ELASTICSEARCH_WRITE_REFRESH=wait_for` with
+`HFS_ELASTICSEARCH_REINDEX_REFRESH=false`: ordinary writes stay
+read-your-write, while the rebuild skips the per-request refresh wait.
+Measured on a 228,580-resource cut, that took the deferred rebuild from 806 s
+to 145 s (1,576 resources/s) with the same result.
+
+A manifest ingested with indexing deferred records that it still owes a
+rebuild, on its own row. If the server stops mid-rebuild, the next start
+re-fires it and logs `resuming search-index rebuilds left outstanding by an
+earlier run`; the marker is cleared once the rebuild has run.
 
 Set `HFS_BASE_URL` to the public address clients can reach. The value may
 contain a path prefix. It must be an absolute `http` or `https` URL without

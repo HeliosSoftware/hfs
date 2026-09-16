@@ -378,6 +378,20 @@ fn settings_error(message: String) -> crate::error::StorageError {
     })
 }
 
+/// The cluster could not be reached, timed out, or asked to be retried (`429`,
+/// `5xx`) while an index was checked or created.
+///
+/// Distinct from a rejection because `ensure_index` runs before every page a
+/// rebuild writes: reported as `Internal`, a network blip here failed the whole
+/// page as *permanently* rejected resources, and the rebuild never retried them
+/// (#1125).
+fn index_unavailable(message: String) -> crate::error::StorageError {
+    crate::error::StorageError::Backend(BackendError::Unavailable {
+        backend_name: "elasticsearch".to_string(),
+        message,
+    })
+}
+
 pub async fn ensure_index(
     backend: &ElasticsearchBackend,
     tenant_id: &str,
@@ -393,15 +407,19 @@ pub async fn ensure_index(
         .send()
         .await
         .map_err(|e| {
-            crate::error::StorageError::Backend(BackendError::Internal {
-                backend_name: "elasticsearch".to_string(),
-                message: format!("Failed to check index existence: {}", e),
-                source: None,
-            })
+            index_unavailable(format!("Failed to check index existence for {index}: {e}"))
         })?;
 
-    if exists_response.status_code().is_success() {
+    let exists_status = exists_response.status_code();
+    if exists_status.is_success() {
         return Ok(());
+    }
+    // A throttled or failing cluster says nothing about whether the index
+    // exists; creating it now would only fail the same way, or worse, race.
+    if super::storage::is_transient_bulk_status(u64::from(exists_status.as_u16())) {
+        return Err(index_unavailable(format!(
+            "Failed to check index existence for {index} (status {exists_status})"
+        )));
     }
 
     // Create the index with mappings
@@ -414,13 +432,7 @@ pub async fn ensure_index(
         .body(mapping)
         .send()
         .await
-        .map_err(|e| {
-            crate::error::StorageError::Backend(BackendError::Internal {
-                backend_name: "elasticsearch".to_string(),
-                message: format!("Failed to create index {}: {}", index, e),
-                source: None,
-            })
-        })?;
+        .map_err(|e| index_unavailable(format!("Failed to create index {index}: {e}")))?;
 
     let status = response.status_code();
     if !status.is_success() {
@@ -429,13 +441,17 @@ pub async fn ensure_index(
         if body.contains("resource_already_exists_exception") {
             return Ok(());
         }
+        let message = format!(
+            "Failed to create index {} (status {}): {}",
+            index, status, body
+        );
+        if super::storage::is_transient_bulk_status(u64::from(status.as_u16())) {
+            return Err(index_unavailable(message));
+        }
         return Err(crate::error::StorageError::Backend(
             BackendError::Internal {
                 backend_name: "elasticsearch".to_string(),
-                message: format!(
-                    "Failed to create index {} (status {}): {}",
-                    index, status, body
-                ),
+                message,
                 source: None,
             },
         ));

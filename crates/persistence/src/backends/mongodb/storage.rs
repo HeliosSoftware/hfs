@@ -432,7 +432,7 @@ fn parse_simple_bundle_search_params(params: &str) -> Vec<(String, String)> {
         .collect()
 }
 
-fn document_to_stored_resource(
+pub(super) fn document_to_stored_resource(
     doc: &Document,
     tenant: &TenantContext,
     fallback_resource_type: &str,
@@ -4303,6 +4303,7 @@ impl ReindexSource for MongoBackend {
         Ok(ResourcePage {
             resources,
             next_cursor,
+            skipped: Vec::new(),
         })
     }
 }

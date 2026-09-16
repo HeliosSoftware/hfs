@@ -216,8 +216,12 @@ impl QueryBuilder {
 
         // Base conditions: tenant and resource type
         // These always use ?1 and ?2 since they're shared with the outer query
+        // Projects `resource_key` (the integer surrogate), not `resource_id`:
+        // with the v31 composite index `(tenant_id, resource_type, resource_key,
+        // …)`, selecting and filtering on `resource_key` keeps this wrapper a
+        // covering-index seek. The outer query compares it to `resources.rowid`.
         let mut base = SqlFragment::new(
-            "SELECT DISTINCT resource_id FROM search_index WHERE tenant_id = ?1 AND resource_type = ?2",
+            "SELECT DISTINCT resource_key FROM search_index WHERE tenant_id = ?1 AND resource_type = ?2",
         );
 
         // Only include base params if not skipping (i.e., not embedded in outer query)
@@ -369,7 +373,7 @@ impl QueryBuilder {
 
         Some(SqlFragment::with_params(
             format!(
-                "resource_id IN (SELECT resource_id FROM search_index \
+                "resource_key IN (SELECT resource_key FROM search_index \
                  WHERE tenant_id = ?1 AND resource_type = ?2 AND param_name IN ({in_list}) \
                  AND value_reference IS NOT NULL \
                  AND (value_reference = ?{p1} OR value_reference LIKE ?{p2} || '/_history/%'))"
@@ -496,7 +500,7 @@ impl QueryBuilder {
         };
         Some(SqlFragment::with_params(
             format!(
-                "resource_id {} (SELECT resource_id FROM search_index WHERE tenant_id = ?1 AND resource_type = ?2 AND param_name = '{}' AND ({}))",
+                "resource_key {} (SELECT resource_key FROM search_index WHERE tenant_id = ?1 AND resource_type = ?2 AND param_name = '{}' AND ({}))",
                 membership, param.name, combined.sql
             ),
             combined.params,
@@ -538,7 +542,7 @@ impl QueryBuilder {
                         params.extend(f.params);
                     }
                     or_conditions.push(format!(
-                        "resource_id IN (SELECT resource_id FROM search_index WHERE tenant_id = ?1 AND resource_type = ?2 AND param_name = '{}' GROUP BY resource_id, composite_group HAVING {})",
+                        "resource_key IN (SELECT resource_key FROM search_index WHERE tenant_id = ?1 AND resource_type = ?2 AND param_name = '{}' GROUP BY resource_key, composite_group HAVING {})",
                         param.name,
                         havings.join(" AND ")
                     ));
@@ -584,7 +588,7 @@ impl QueryBuilder {
 
                 Some(SqlFragment::with_params(
                     format!(
-                        "resource_id IN (SELECT id FROM resources WHERE tenant_id = ?1 AND resource_type = ?2 AND id IN ({}))",
+                        "resource_key IN (SELECT rowid FROM resources WHERE tenant_id = ?1 AND resource_type = ?2 AND id IN ({}))",
                         placeholders.join(", ")
                     ),
                     params,
@@ -659,7 +663,7 @@ impl QueryBuilder {
             // produces (see `with_param_offset`), so reusing it adds no binding.
             conditions.push(SqlFragment::with_params(
                 format!(
-                    "resource_id IN (SELECT resource_id FROM resource_fts WHERE tenant_id = ?1 AND {} MATCH ?{})",
+                    "resource_key IN (SELECT rowid FROM resources WHERE tenant_id = ?1 AND resource_type = ?2 AND id IN (SELECT resource_id FROM resource_fts WHERE tenant_id = ?1 AND {} MATCH ?{}))",
                     column, param_num
                 ),
                 vec![SqlParam::string(&search_term)],
@@ -708,7 +712,7 @@ impl QueryBuilder {
 
         Some(SqlFragment::with_params(
             format!(
-                "resource_id IN (SELECT id FROM resources WHERE tenant_id = ?1 AND resource_type = ?2 AND ({}))",
+                "resource_key IN (SELECT rowid FROM resources WHERE tenant_id = ?1 AND resource_type = ?2 AND ({}))",
                 combined.sql.replace("value_date", "last_updated")
             ),
             combined.params,
@@ -911,7 +915,7 @@ impl QueryBuilder {
                     crate::types::SortDirection::Descending => "MAX",
                 };
                 format!(
-                    "(SELECT {}({}) FROM search_index si WHERE si.tenant_id = ?1 AND si.resource_type = ?2 AND si.resource_id = resources.id AND si.param_name = '{}')",
+                    "(SELECT {}({}) FROM search_index si WHERE si.tenant_id = ?1 AND si.resource_type = ?2 AND si.resource_key = resources.rowid AND si.param_name = '{}')",
                     agg, col, directive.parameter
                 )
             }
@@ -1118,7 +1122,7 @@ mod tests {
             let fragment = builder.build(&query);
 
             assert!(
-                fragment.sql.contains(&format!("resource_id {membership}")),
+                fragment.sql.contains(&format!("resource_key {membership}")),
                 "{value}: {}",
                 fragment.sql
             );

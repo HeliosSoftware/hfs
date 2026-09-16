@@ -82,7 +82,7 @@ use helios_persistence::search::ReindexOperation;
 use helios_persistence::backends::sqlite::{SqliteBackend, SqliteBackendConfig};
 
 #[cfg(feature = "mongodb")]
-use helios_persistence::backends::mongodb::{MongoBackend, MongoBackendConfig};
+use helios_persistence::backends::mongodb::{IndexBuildMode, MongoBackend, MongoBackendConfig};
 fn is_database_audit_dedicated(config: &AuditConfig, backend_kind: BackendKind) -> bool {
     match backend_kind {
         BackendKind::Sqlite | BackendKind::Postgres => config.database_url.is_some(),
@@ -158,8 +158,56 @@ fn es_write_refresh_from_config(
         .map_err(|e: String| anyhow::anyhow!("{} (from HFS_ELASTICSEARCH_WRITE_REFRESH)", e))
 }
 
+/// The refresh policy `$reindex` and the deferred rebuild use, or `None` to
+/// follow `HFS_ELASTICSEARCH_WRITE_REFRESH` (unset or blank).
+#[cfg(feature = "elasticsearch")]
+fn es_reindex_refresh_from_config(
+    config: &ServerConfig,
+) -> anyhow::Result<Option<helios_persistence::backends::elasticsearch::WriteRefreshPolicy>> {
+    match config
+        .elasticsearch_reindex_refresh
+        .as_deref()
+        .map(str::trim)
+    {
+        None | Some("") => Ok(None),
+        Some(value) => value
+            .parse()
+            .map(Some)
+            .map_err(|e: String| anyhow::anyhow!("{} (from HFS_ELASTICSEARCH_REINDEX_REFRESH)", e)),
+    }
+}
+
+/// The indexes `$reindex` rebuilds on `sqlite-elasticsearch`.
+///
+/// Elasticsearch always, because it serves every search here. The SQLite
+/// primary only when it still indexes locally: once search is offloaded no
+/// query reads its `search_index`/FTS tables (the composite routes the whole
+/// query to Elasticsearch, #1012), so rebuilding them is a second FHIRPath
+/// extraction, a write transaction on the ingest file, and rows that pile up on
+/// every rerun because the matching delete is a no-op (#1125).
+#[cfg(all(feature = "sqlite", feature = "elasticsearch"))]
+fn sqlite_es_reindex_targets(
+    sqlite: &Arc<SqliteBackend>,
+    es: &Arc<helios_persistence::backends::elasticsearch::ElasticsearchBackend>,
+) -> (
+    Vec<Arc<dyn helios_persistence::search::ReindexTarget>>,
+    &'static [&'static str],
+) {
+    if sqlite.is_search_offloaded() {
+        (vec![es.clone()], &["elasticsearch"])
+    } else {
+        (
+            vec![sqlite.clone(), es.clone()],
+            &["sqlite", "elasticsearch"],
+        )
+    }
+}
+
 #[cfg(feature = "mongodb")]
-fn build_mongodb_config(config: &ServerConfig, search_offloaded: bool) -> MongoBackendConfig {
+fn build_mongodb_config(
+    config: &ServerConfig,
+    search_offloaded: bool,
+) -> anyhow::Result<MongoBackendConfig> {
     build_mongodb_config_with_env(config, search_offloaded, |name| std::env::var(name).ok())
 }
 
@@ -168,7 +216,7 @@ fn build_mongodb_config_with_env<F>(
     config: &ServerConfig,
     search_offloaded: bool,
     env: F,
-) -> MongoBackendConfig
+) -> anyhow::Result<MongoBackendConfig>
 where
     F: Fn(&str) -> Option<String>,
 {
@@ -200,8 +248,18 @@ where
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(1000)
         .max(1);
+    // The only way to reach `off` (the escape hatch that stops the builder
+    // touching the collection at all) or `inline`, so an invalid value must
+    // fail startup rather than silently fall back to `background` — same
+    // "bail with the invalid value" shape as HFS_BULK_EXPORT_OUTPUT_BACKEND.
+    let index_build = match env("HFS_MONGODB_INDEX_BUILD") {
+        Some(raw) => raw
+            .parse::<IndexBuildMode>()
+            .map_err(|message| anyhow::anyhow!(message))?,
+        None => IndexBuildMode::default(),
+    };
 
-    MongoBackendConfig {
+    Ok(MongoBackendConfig {
         connection_string,
         database_name,
         max_connections,
@@ -211,8 +269,9 @@ where
         data_dir: config.data_dir.clone(),
         search_offloaded,
         max_included_resources,
+        index_build,
         app_name: MongoBackendConfig::default().app_name,
-    }
+    })
 }
 
 #[cfg(feature = "sqlite")]
@@ -421,6 +480,12 @@ async fn create_audit_mongodb_storage(
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(15_000);
+        let index_build = match std::env::var("HFS_MONGODB_INDEX_BUILD") {
+            Ok(raw) => raw
+                .parse::<IndexBuildMode>()
+                .map_err(|message| anyhow::anyhow!(message))?,
+            Err(_) => IndexBuildMode::default(),
+        };
 
         let config = MongoBackendConfig {
             connection_string,
@@ -431,13 +496,14 @@ async fn create_audit_mongodb_storage(
             fhir_version: server_config.default_fhir_version,
             data_dir: server_config.data_dir.clone(),
             search_offloaded: false,
+            index_build,
             // Audit storage doesn't resolve _include/_revinclude; the default
             // (and any future new field) is fine here.
             ..Default::default()
         };
         MongoBackend::new(config)?
     } else {
-        MongoBackend::new(build_mongodb_config(server_config, false))?
+        MongoBackend::new(build_mongodb_config(server_config, false)?)?
     };
 
     backend.init_schema().await?;
@@ -590,7 +656,7 @@ async fn start_mongodb(
     auth_state: Option<Arc<AuthMiddlewareState>>,
     audit_state: Option<Arc<AuditMiddlewareState>>,
 ) -> anyhow::Result<()> {
-    let backend_config = build_mongodb_config(&config, false);
+    let backend_config = build_mongodb_config(&config, false)?;
     info!(
         url = %backend_config.connection_string,
         database = %backend_config.database_name,
@@ -1473,7 +1539,7 @@ async fn start_sqlite(
     let reindex_hook = ops
         .reindex
         .clone()
-        .map(|op| automatic_reindex_hook(op, &config));
+        .map(|op| automatic_reindex_hook_with_ledger(op, &config, Some(backend.clone())));
     let submit_bundle = build_bulk_submit(
         &config,
         backend.clone(),
@@ -1682,23 +1748,33 @@ fn wire_reindex(
 
 /// Builds the deferred bulk-submit hook using the existing submit-worker
 /// concurrency as the per-process automatic reindex limit.
-#[cfg(any(
-    feature = "sqlite",
-    feature = "postgres",
-    feature = "mongodb",
-    feature = "elasticsearch"
-))]
+#[cfg(feature = "mongodb")]
 fn automatic_reindex_hook(
     op: Arc<ReindexOperation>,
     config: &ServerConfig,
 ) -> Arc<dyn helios_persistence::core::DeferredReindexHook> {
-    Arc::new(
-        helios_persistence::search::ReindexOnFinish::with_max_concurrency(
-            op,
-            config.bulk_submit.worker_concurrency as usize,
-        )
-        .with_bulk_index_rebuild(config.bulk_submit.bulk_index_rebuild),
+    automatic_reindex_hook_with_ledger(op, config, None)
+}
+
+/// The deferred-rebuild hook, plus where to clear the persisted "this manifest
+/// still owes a rebuild" marker when a generation finishes (#1125). Without a
+/// ledger nothing is recorded and a restart cannot resume, as before.
+fn automatic_reindex_hook_with_ledger(
+    op: Arc<ReindexOperation>,
+    config: &ServerConfig,
+    ledger: Option<Arc<dyn helios_persistence::search::DeferredReindexLedger>>,
+) -> Arc<dyn helios_persistence::core::DeferredReindexHook> {
+    let hook = helios_persistence::search::ReindexOnFinish::with_max_concurrency(
+        op,
+        config.bulk_submit.worker_concurrency as usize,
     )
+    .with_batch_size(config.reindex_batch_size)
+    .with_batch_bytes(config.reindex_batch_bytes)
+    .with_bulk_index_rebuild(config.bulk_submit.bulk_index_rebuild);
+    Arc::new(match ledger {
+        Some(ledger) => hook.with_ledger(ledger),
+        None => hook,
+    })
 }
 
 /// Ops bundle for a backend that indexes itself — the standalone deployments
@@ -2088,6 +2164,41 @@ fn spawn_submit_workers(
     if skip_unchanged {
         info!("Bulk submit skips resources whose content is identical to the stored version");
     }
+    // #1125: manifests whose rebuild was still outstanding when the server
+    // stopped. The marker is on the manifest row, so it survived; re-firing
+    // the same hook the live path uses keeps one code path.
+    if defer_indexing && let Some(hook) = reindex_hook.clone() {
+        let jobs = jobs.clone();
+        tokio::spawn(async move {
+            match jobs.list_manifests_awaiting_reindex(256).await {
+                Ok(pending) if !pending.is_empty() => {
+                    info!(
+                        manifests = pending.len(),
+                        "resuming search-index rebuilds left outstanding by an earlier run"
+                    );
+                    for manifest in pending {
+                        if manifest.resource_types.is_empty() {
+                            continue;
+                        }
+                        hook.reindex_types_with_context(
+                            &manifest.tenant,
+                            manifest.resource_types,
+                            helios_persistence::core::DeferredReindexContext {
+                                submission_id: Some(manifest.submission.to_string()),
+                                manifest_id: Some(manifest.manifest_id),
+                            },
+                        )
+                        .await;
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    "could not look for search-index rebuilds left outstanding by an earlier run"
+                ),
+            }
+        });
+    }
     let file_concurrency = file_concurrency.max(1) as usize;
     if file_concurrency > 1 {
         info!(
@@ -2233,6 +2344,10 @@ async fn start_sqlite_elasticsearch(
         refresh_interval: config.elasticsearch_refresh_interval.clone(),
         write_refresh: es_write_refresh_from_config(&config)?,
         nested_objects_limit: config.elasticsearch_nested_objects_limit,
+        request_timeout_ms: config.elasticsearch_request_timeout_ms,
+        bulk_max_bytes: config.elasticsearch_bulk_max_bytes,
+        bulk_concurrency: config.elasticsearch_bulk_concurrency,
+        reindex_refresh: es_reindex_refresh_from_config(&config)?,
         ..Default::default()
     };
 
@@ -2312,13 +2427,14 @@ async fn start_sqlite_elasticsearch(
     // so a `_typeFilter` runs against Elasticsearch, the index that actually
     // serves search in this deployment.
     let export_bundle = build_bulk_export(&config, composite.clone(), sqlite.clone()).await?;
-    // Reindex reads from the SQLite primary and rebuilds BOTH indexes: SQLite's
-    // own search_index table and the Elasticsearch index that actually serves
-    // search here.
+    // Reindex reads from the SQLite primary and writes only the indexes a query
+    // can read: Elasticsearch, plus SQLite's own index while it is not offloaded.
+    let (reindex_targets, reindex_target_names) = sqlite_es_reindex_targets(&sqlite, &es);
+    info!(targets = ?reindex_target_names, "Reindex writes to search targets");
     let ops = composite_ops(
         composite.clone(),
         sqlite.clone(),
-        vec![sqlite.clone(), es.clone()],
+        reindex_targets,
         sqlite.tenant_registries().clone(),
         audit_state.as_ref(),
         observability.clone(),
@@ -2326,7 +2442,7 @@ async fn start_sqlite_elasticsearch(
     let reindex_hook = ops
         .reindex
         .clone()
-        .map(|op| automatic_reindex_hook(op, &config));
+        .map(|op| automatic_reindex_hook_with_ledger(op, &config, Some(sqlite.clone())));
     // Bulk ingestion runs on the SQLite primary's engine, but wrapped so that
     // finished manifests sync their resources into Elasticsearch — the raw
     // primary skips local indexing when search is offloaded, and without the
@@ -2530,6 +2646,10 @@ async fn start_postgres_elasticsearch(
         refresh_interval: config.elasticsearch_refresh_interval.clone(),
         write_refresh: es_write_refresh_from_config(&config)?,
         nested_objects_limit: config.elasticsearch_nested_objects_limit,
+        request_timeout_ms: config.elasticsearch_request_timeout_ms,
+        bulk_max_bytes: config.elasticsearch_bulk_max_bytes,
+        bulk_concurrency: config.elasticsearch_bulk_concurrency,
+        reindex_refresh: es_reindex_refresh_from_config(&config)?,
         ..Default::default()
     };
 
@@ -2694,7 +2814,7 @@ async fn start_mongodb_elasticsearch(
     use helios_persistence::core::BackendKind;
 
     // Create MongoDB backend
-    let backend_config = build_mongodb_config(&config, true);
+    let backend_config = build_mongodb_config(&config, true)?;
     info!(
         url = %backend_config.connection_string,
         database = %backend_config.database_name,
@@ -2744,6 +2864,10 @@ async fn start_mongodb_elasticsearch(
         refresh_interval: config.elasticsearch_refresh_interval.clone(),
         write_refresh: es_write_refresh_from_config(&config)?,
         nested_objects_limit: config.elasticsearch_nested_objects_limit,
+        request_timeout_ms: config.elasticsearch_request_timeout_ms,
+        bulk_max_bytes: config.elasticsearch_bulk_max_bytes,
+        bulk_concurrency: config.elasticsearch_bulk_concurrency,
+        reindex_refresh: es_reindex_refresh_from_config(&config)?,
         ..Default::default()
     };
 
@@ -3015,6 +3139,8 @@ async fn start_s3(
             ops.reindex.clone().map(|op| {
                 Arc::new(
                     helios_persistence::search::ReindexOnFinish::new(op)
+                        .with_batch_size(config.reindex_batch_size)
+                        .with_batch_bytes(config.reindex_batch_bytes)
                         .with_bulk_index_rebuild(config.bulk_submit.bulk_index_rebuild),
                 ) as Arc<dyn helios_persistence::core::DeferredReindexHook>
             }),
@@ -3159,6 +3285,10 @@ async fn start_s3_elasticsearch(
         refresh_interval: config.elasticsearch_refresh_interval.clone(),
         write_refresh: es_write_refresh_from_config(&config)?,
         nested_objects_limit: config.elasticsearch_nested_objects_limit,
+        request_timeout_ms: config.elasticsearch_request_timeout_ms,
+        bulk_max_bytes: config.elasticsearch_bulk_max_bytes,
+        bulk_concurrency: config.elasticsearch_bulk_concurrency,
+        reindex_refresh: es_reindex_refresh_from_config(&config)?,
         ..Default::default()
     };
 
@@ -3376,6 +3506,78 @@ mod tests {
     use helios_audit::AuditConfig;
     use helios_rest::ServerConfig;
 
+    // ── Elasticsearch rebuild wiring (#1125) ──────────────────────
+
+    #[cfg(feature = "elasticsearch")]
+    #[test]
+    fn test_es_reindex_refresh_follows_write_refresh_when_unset() {
+        use helios_persistence::backends::elasticsearch::WriteRefreshPolicy;
+
+        for unset in [None, Some(String::new()), Some("  ".to_string())] {
+            let config = ServerConfig {
+                elasticsearch_reindex_refresh: unset,
+                ..Default::default()
+            };
+            assert_eq!(es_reindex_refresh_from_config(&config).unwrap(), None);
+        }
+        let config = ServerConfig {
+            elasticsearch_write_refresh: "wait_for".to_string(),
+            elasticsearch_reindex_refresh: Some("false".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            es_write_refresh_from_config(&config).unwrap(),
+            WriteRefreshPolicy::WaitFor
+        );
+        assert_eq!(
+            es_reindex_refresh_from_config(&config).unwrap(),
+            Some(WriteRefreshPolicy::False)
+        );
+        let config = ServerConfig {
+            elasticsearch_reindex_refresh: Some("sometimes".to_string()),
+            ..Default::default()
+        };
+        let error = es_reindex_refresh_from_config(&config).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("HFS_ELASTICSEARCH_REINDEX_REFRESH"),
+            "{error}"
+        );
+    }
+
+    #[cfg(all(feature = "sqlite", feature = "elasticsearch"))]
+    #[test]
+    fn test_sqlite_es_reindex_skips_an_offloaded_primary() {
+        use helios_persistence::backends::elasticsearch::{
+            ElasticsearchBackend, ElasticsearchConfig,
+        };
+
+        // Never contacted: building the client does not connect.
+        let es = Arc::new(
+            ElasticsearchBackend::new(ElasticsearchConfig {
+                nodes: vec!["http://127.0.0.1:1".to_string()],
+                ..Default::default()
+            })
+            .expect("ES backend builds without a cluster"),
+        );
+        let config = ServerConfig {
+            database_url: Some(":memory:".to_string()),
+            ..Default::default()
+        };
+
+        let mut offloaded = create_sqlite_backend(&config).unwrap();
+        offloaded.set_search_offloaded(true);
+        let (targets, names) = sqlite_es_reindex_targets(&Arc::new(offloaded), &es);
+        assert_eq!(names, &["elasticsearch"]);
+        assert_eq!(targets.len(), 1);
+
+        let local = Arc::new(create_sqlite_backend(&config).unwrap());
+        let (targets, names) = sqlite_es_reindex_targets(&local, &es);
+        assert_eq!(names, &["sqlite", "elasticsearch"]);
+        assert_eq!(targets.len(), 2);
+    }
+
     // ── create_sqlite_backend() ───────────────────────────────────
 
     #[cfg(feature = "sqlite")]
@@ -3452,7 +3654,8 @@ mod tests {
             "HFS_MONGODB_CONNECT_TIMEOUT_MS" => Some("7500".to_string()),
             "HFS_MONGODB_SERVER_SELECTION_TIMEOUT_MS" => Some("2500".to_string()),
             _ => None,
-        });
+        })
+        .expect("valid config");
 
         assert_eq!(
             mongo_config.connection_string,
@@ -3465,6 +3668,7 @@ mod tests {
         assert_eq!(mongo_config.fhir_version, FhirVersion::R4);
         assert_eq!(mongo_config.data_dir, Some(data_dir));
         assert!(!mongo_config.search_offloaded);
+        assert_eq!(mongo_config.index_build, IndexBuildMode::Background);
     }
 
     #[cfg(feature = "mongodb")]
@@ -3479,11 +3683,39 @@ mod tests {
             "HFS_DATABASE_URL" => Some("postgres://localhost/hfs".to_string()),
             "HFS_MONGODB_DATABASE" => Some("mongo_db".to_string()),
             _ => None,
-        });
+        })
+        .expect("valid config");
 
         assert_eq!(mongo_config.connection_string, "mongodb://localhost:27017");
         assert_eq!(mongo_config.database_name, "mongo_db");
         assert!(mongo_config.search_offloaded);
+    }
+
+    #[cfg(feature = "mongodb")]
+    #[test]
+    fn test_build_mongodb_config_reads_index_build_and_rejects_invalid_values() {
+        let config = ServerConfig::default();
+
+        let mongo_config = build_mongodb_config_with_env(&config, false, |name| match name {
+            "HFS_MONGODB_INDEX_BUILD" => Some("off".to_string()),
+            _ => None,
+        })
+        .expect("valid config");
+        assert_eq!(mongo_config.index_build, IndexBuildMode::Off);
+
+        let mongo_config = build_mongodb_config_with_env(&config, false, |name| match name {
+            "HFS_MONGODB_INDEX_BUILD" => Some("inline".to_string()),
+            _ => None,
+        })
+        .expect("valid config");
+        assert_eq!(mongo_config.index_build, IndexBuildMode::Inline);
+
+        let err = build_mongodb_config_with_env(&config, false, |name| match name {
+            "HFS_MONGODB_INDEX_BUILD" => Some("nonsense".to_string()),
+            _ => None,
+        })
+        .expect_err("invalid mode must fail startup");
+        assert!(format!("{err}").contains("HFS_MONGODB_INDEX_BUILD"));
     }
 
     #[cfg(feature = "mongodb")]
@@ -3495,7 +3727,8 @@ mod tests {
             "HFS_MONGODB_URI" => Some("mongodb://mongo-specific:27017".to_string()),
             "HFS_DATABASE_URL" => Some("mongodb://database-url:27017".to_string()),
             _ => None,
-        });
+        })
+        .expect("valid config");
 
         assert_eq!(
             mongo_config.connection_string,

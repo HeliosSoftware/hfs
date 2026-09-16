@@ -140,7 +140,7 @@ impl SqliteBackend {
         };
         let filter_clause = search_filter
             .as_ref()
-            .map(|f| format!(" AND id IN ({})", f.sql))
+            .map(|f| format!(" AND rowid IN ({})", f.sql))
             .unwrap_or_default();
         let search_params = search_filter.map(|f| f.params).unwrap_or_default();
 
@@ -422,7 +422,7 @@ impl SearchProvider for SqliteBackend {
             }
 
             let sql = format!(
-                "SELECT COUNT(*) FROM resources WHERE tenant_id = ?1 AND resource_type = ?2 AND is_deleted = 0 AND id IN ({})",
+                "SELECT COUNT(*) FROM resources WHERE tenant_id = ?1 AND resource_type = ?2 AND is_deleted = 0 AND rowid IN ({})",
                 fragment.sql
             );
 

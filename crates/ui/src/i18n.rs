@@ -240,6 +240,34 @@ impl I18n {
             .unwrap_or_else(|| key.to_owned())
     }
 
+    /// Three named placeables — the shape a message needs when one value
+    /// selects the plural form and another carries its localized rendering
+    /// (`{ $errors -> [one] … *[other] { $count } … }`, #1125).
+    ///
+    /// Three `(name, value)` pairs are six parameters by construction, like
+    /// [`Self::t_arg2`] above; they are not an argument list that wants
+    /// grouping into a struct.
+    #[allow(clippy::too_many_arguments)]
+    pub fn t_arg3(
+        &self,
+        key: &str,
+        name1: &str,
+        value1: impl Into<FluentValue<'static>>,
+        name2: &str,
+        value2: impl Into<FluentValue<'static>>,
+        name3: &str,
+        value3: impl Into<FluentValue<'static>>,
+    ) -> String {
+        let args: HashMap<Cow<'static, str>, FluentValue<'static>> = HashMap::from([
+            (Cow::Owned(name1.to_owned()), value1.into()),
+            (Cow::Owned(name2.to_owned()), value2.into()),
+            (Cow::Owned(name3.to_owned()), value3.into()),
+        ]);
+        LOCALES
+            .try_lookup_with_args(self.locale, key, &args)
+            .unwrap_or_else(|| key.to_owned())
+    }
+
     /// Look up a message with an arbitrary, named-at-runtime set of string
     /// placeables — `t_arg`/`t_arg2` above cover the fixed 1- and 2-argument
     /// call sites everywhere else in this crate, but the ViewDefinition lint

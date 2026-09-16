@@ -22,7 +22,7 @@ use crate::error::TransactionError;
 use crate::error::{
     BackendError, ConcurrencyError, QueryErrorExt, ResourceError, StorageError, StorageResult,
 };
-use crate::search::reindex::{ReindexSource, ReindexTarget, ResourcePage};
+use crate::search::reindex::{ReindexSource, ReindexTarget, ResourcePage, SkippedResource};
 use crate::tenant::{Operation, TenantContext};
 use crate::types::Pagination;
 use crate::types::{CursorValue, Page, PageCursor, PageInfo, StoredResource};
@@ -656,10 +656,15 @@ impl ResourceStorage for SqliteBackend {
         )
         .map_err(|e| internal_error(format!("Failed to insert deletion history: {}", e)))?;
 
-        // Delete search index entries (skip when search is offloaded)
+        // Delete search index entries (skip when search is offloaded). Keyed on
+        // resource_key so it rides idx_search_composite; the soft-delete keeps
+        // the resources row, so the subquery resolves.
         if !self.is_search_offloaded() {
             conn.execute(
-                "DELETE FROM search_index WHERE tenant_id = ?1 AND resource_type = ?2 AND resource_id = ?3",
+                "DELETE FROM search_index WHERE resource_key = (
+                     SELECT rowid FROM resources
+                      WHERE tenant_id = ?1 AND resource_type = ?2 AND id = ?3
+                 )",
                 params![tenant_id, resource_type, id],
             )
             .map_err(|e| internal_error(format!("Failed to delete search index: {}", e)))?;
@@ -1461,10 +1466,13 @@ impl SqliteBackend {
                             }
                             _ => v,
                         };
+                        // `resource_key` is patched in by `write_prepared_index`
+                        // (this half is connection-free); pass a placeholder.
                         SqliteSearchIndexWriter::to_sql_params(
                             tenant_id,
                             resource_type,
                             resource_id,
+                            0,
                             &normalized,
                         )
                     })
@@ -1500,6 +1508,7 @@ impl SqliteBackend {
                     tenant_id,
                     resource_type,
                     resource_id,
+                    0, // resource_key patched in by write_prepared_index
                     normalized.as_ref().unwrap_or(value),
                 );
                 params.push(SqlValue::Int(1));
@@ -1567,6 +1576,30 @@ impl SqliteBackend {
         prepared: PreparedIndex,
     ) -> StorageResult<usize> {
         let mut count = 0;
+        // The connection-free prepare step left `resource_key` as a placeholder
+        // (see RESOURCE_KEY_PARAM_IX); resolve the owning resource's rowid here,
+        // where we hold the connection, and patch every row before binding. The
+        // resource has already been written by the time indexing runs.
+        let resource_key: i64 = conn
+            .query_row(
+                "SELECT rowid FROM resources WHERE tenant_id = ?1 AND resource_type = ?2 AND id = ?3",
+                rusqlite::params![tenant_id, resource_type, resource_id],
+                |r| r.get(0),
+            )
+            .map_err(|e| {
+                internal_error(format!(
+                    "resolve resource_key for {resource_type}/{resource_id}: {e}"
+                ))
+            })?;
+        let mut prepared = prepared;
+        if let Ok(rows) = prepared.rows.as_mut() {
+            for row in rows.iter_mut() {
+                row[SqliteSearchIndexWriter::RESOURCE_KEY_PARAM_IX] = SqlValue::Int(resource_key);
+            }
+        }
+        for row in prepared.contained_rows.iter_mut() {
+            row[SqliteSearchIndexWriter::RESOURCE_KEY_PARAM_IX] = SqlValue::Int(resource_key);
+        }
         match prepared.rows {
             Ok(rows) => {
                 // Rows are written eight at a time: a single-row INSERT stepped
@@ -1801,10 +1834,18 @@ impl SqliteBackend {
             return Ok(0);
         }
 
-        // Delete from main search index
+        // Delete from main search index, keyed on the integer `resource_key`
+        // so the delete rides `idx_search_composite` (rekeyed to resource_key
+        // in v31) instead of scanning the type. Every caller of this method
+        // deletes while the `resources` row still exists (update, re-index,
+        // soft-delete), so the subquery resolves; the purge path, which removes
+        // the `resources` row first, deletes by `resource_id` inline instead.
         let deleted = conn
             .prepare_cached(
-                "DELETE FROM search_index WHERE tenant_id = ?1 AND resource_type = ?2 AND resource_id = ?3",
+                "DELETE FROM search_index WHERE resource_key = (
+                     SELECT rowid FROM resources
+                      WHERE tenant_id = ?1 AND resource_type = ?2 AND id = ?3
+                 )",
             )
             .map_err(|e| internal_error(format!("Failed to prepare search index delete: {}", e)))?
             .execute(params![tenant_id, resource_type, resource_id])
@@ -1875,8 +1916,8 @@ impl SqliteBackend {
         code: &str,
     ) -> StorageResult<()> {
         conn.execute(
-            "INSERT INTO search_index (tenant_id, resource_type, resource_id, param_name, value_token_system, value_token_code)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO search_index (tenant_id, resource_type, resource_id, resource_key, param_name, value_token_system, value_token_code)
+             VALUES (?1, ?2, ?3, (SELECT rowid FROM resources WHERE tenant_id = ?1 AND resource_type = ?2 AND id = ?3), ?4, ?5, ?6)",
             params![tenant_id, resource_type, resource_id, param_name, system, code],
         )
         .map_err(|e| internal_error(format!("Failed to insert token index: {}", e)))?;
@@ -1911,8 +1952,8 @@ impl SqliteBackend {
         };
 
         conn.execute(
-            "INSERT INTO search_index (tenant_id, resource_type, resource_id, param_name, value_date)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT INTO search_index (tenant_id, resource_type, resource_id, resource_key, param_name, value_date)
+             VALUES (?1, ?2, ?3, (SELECT rowid FROM resources WHERE tenant_id = ?1 AND resource_type = ?2 AND id = ?3), ?4, ?5)",
             params![tenant_id, resource_type, resource_id, param_name, normalized],
         )
         .map_err(|e| internal_error(format!("Failed to insert date index: {}", e)))?;
@@ -3957,19 +3998,33 @@ impl ReindexSource for SqliteBackend {
         cursor: Option<&str>,
         limit: u32,
     ) -> StorageResult<ResourcePage> {
+        self.fetch_resources_page_capped(tenant, resource_type, cursor, limit, 0)
+            .await
+    }
+
+    /// Pages by resource count and, when `max_bytes` is set, by the bytes of
+    /// stored JSON the page carries: a page of ~108 KB `Provenance` resources
+    /// ends at the first one that crosses the cap instead of holding ~108 MB
+    /// before a single document is written (#1125). At least one resource is
+    /// always returned, so the page loop advances even on a resource larger
+    /// than the cap.
+    async fn fetch_resources_page_capped(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        cursor: Option<&str>,
+        limit: u32,
+        max_bytes: u64,
+    ) -> StorageResult<ResourcePage> {
         let conn = self.get_connection()?;
         let tenant_id = tenant.tenant_id().as_str().to_string();
 
         // Parse cursor if provided (format: "last_updated|id")
-        let (cursor_ts, cursor_id) = if let Some(c) = cursor {
-            let parts: Vec<&str> = c.split('|').collect();
-            if parts.len() == 2 {
-                (Some(parts[0].to_string()), Some(parts[1].to_string()))
-            } else {
-                (None, None)
-            }
-        } else {
-            (None, None)
+        // Split on the last `|`: an id cannot contain one, but the stored
+        // `last_updated` text of a corrupted row can.
+        let (cursor_ts, cursor_id) = match cursor.and_then(|c| c.rsplit_once('|')) {
+            Some((ts, id)) => (Some(ts.to_string()), Some(id.to_string())),
+            None => (None, None),
         };
 
         // Build query based on whether we have a cursor
@@ -4009,44 +4064,61 @@ impl ReindexSource for SqliteBackend {
 
         let param_refs: Vec<&dyn ToSql> = params.iter().map(|p| p.as_ref()).collect();
 
-        let resources: Vec<StoredResource> = stmt
-            .query_map(param_refs.as_slice(), |row| {
-                let id: String = row.get(0)?;
-                let version_id: String = row.get(1)?;
-                let data: Vec<u8> = row.get(2)?;
-                let last_updated: String = row.get(3)?;
-                let fhir_version: String = row.get(4)?;
+        let rows = stmt
+            .query_map(param_refs.as_slice(), RawReindexRow::read)
+            .map_err(|e| internal_error(format!("Failed to query resources: {}", e)))?;
 
-                Ok((id, version_id, data, last_updated, fhir_version))
-            })
-            .map_err(|e| internal_error(format!("Failed to query resources: {}", e)))?
-            .filter_map(|r| r.ok())
-            .filter_map(|(id, version_id, data, last_updated, fhir_version_str)| {
-                let content: Value = serde_json::from_slice(&data).ok()?;
-                let last_modified = chrono::DateTime::parse_from_rfc3339(&last_updated)
-                    .ok()?
-                    .with_timezone(&Utc);
-                let fhir_version = FhirVersion::from_storage(&fhir_version_str)
-                    .unwrap_or_else(helios_fhir::FhirVersion::default_enabled);
-                Some(StoredResource::from_storage(
-                    resource_type.to_string(),
-                    id,
-                    version_id,
-                    tenant.tenant_id().clone(),
-                    content,
-                    last_modified, // created_at (use last_modified as approximation)
-                    last_modified,
-                    None, // not deleted
-                    fhir_version,
+        let mut resources = Vec::with_capacity(limit as usize);
+        let mut skipped = Vec::new();
+        let mut scanned = 0usize;
+        let mut last_scanned: Option<String> = None;
+        let mut bytes = 0u64;
+        let mut capped = false;
+        for row in rows {
+            // A step error is the database failing, not one row being bad:
+            // surface it rather than guess where the next page starts.
+            let row =
+                row.map_err(|e| internal_error(format!("Failed to read resource row: {}", e)))?;
+            scanned += 1;
+            // The cursor follows every row the query returned, decodable or
+            // not, and uses the stored text so the keyset comparison in the
+            // SQL above sees exactly what it compares against (#1125).
+            if let (Some(last_updated), Some(id)) = (&row.last_updated, &row.id) {
+                last_scanned = Some(format!("{last_updated}|{id}"));
+            }
+            let row_bytes = row.data.as_ref().map_or(0, |data| data.len() as u64);
+            match row.decode(tenant, resource_type) {
+                Ok(resource) => resources.push(resource),
+                Err(skip) => {
+                    tracing::warn!(
+                        tenant = %tenant.tenant_id(),
+                        resource_type,
+                        resource_id = %skip.resource_id,
+                        reason = %skip.reason,
+                        "reindex source: stored resource row cannot be decoded; skipping it"
+                    );
+                    skipped.push(skip);
+                }
+            }
+            // Counted after the row is taken, so a page always carries at
+            // least one resource however large it is.
+            bytes = bytes.saturating_add(row_bytes);
+            if max_bytes > 0 && bytes >= max_bytes && scanned < limit as usize {
+                capped = true;
+                break;
+            }
+        }
+
+        // A full page, or one the byte cap ended early, means there may be
+        // more rows, however many of them decoded: deciding on
+        // `resources.len()` let one unreadable row end the pagination of its
+        // whole type silently.
+        let next_cursor = if limit > 0 && (capped || scanned == limit as usize) {
+            Some(last_scanned.ok_or_else(|| {
+                internal_error(format!(
+                    "Cannot page {resource_type}: no row in a full page has a readable id and lastUpdated"
                 ))
-            })
-            .collect();
-
-        // Determine next cursor
-        let next_cursor = if resources.len() == limit as usize {
-            resources
-                .last()
-                .map(|r| format!("{}|{}", r.last_modified().to_rfc3339(), r.id()))
+            })?)
         } else {
             None
         };
@@ -4054,7 +4126,164 @@ impl ReindexSource for SqliteBackend {
         Ok(ResourcePage {
             resources,
             next_cursor,
+            skipped,
         })
+    }
+
+    async fn fetch_resources_by_ids(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        ids: &[String],
+    ) -> StorageResult<Vec<StoredResource>> {
+        let mut unique: Vec<&str> = ids.iter().map(String::as_str).collect();
+        unique.sort_unstable();
+        unique.dedup();
+        if unique.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let conn = self.get_connection()?;
+        let tenant_id = tenant.tenant_id().as_str();
+        let mut found = Vec::with_capacity(unique.len());
+        for batch in unique.chunks(FETCH_BY_IDS_BATCH) {
+            let placeholders = (0..batch.len())
+                .map(|k| format!("?{}", k + 3))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                "SELECT id, version_id, data, last_updated, fhir_version FROM resources \
+                 WHERE tenant_id = ?1 AND resource_type = ?2 AND is_deleted = 0 \
+                 AND id IN ({placeholders})"
+            );
+            let mut params: Vec<&dyn ToSql> = Vec::with_capacity(batch.len() + 2);
+            params.push(&tenant_id);
+            params.push(&resource_type);
+            for id in batch {
+                params.push(id);
+            }
+            let mut stmt = conn
+                .prepare(&sql)
+                .map_err(|e| internal_error(format!("Failed to prepare statement: {}", e)))?;
+            let rows = stmt
+                .query_map(params.as_slice(), RawReindexRow::read)
+                .map_err(|e| internal_error(format!("Failed to query resources: {}", e)))?;
+            for row in rows {
+                let row =
+                    row.map_err(|e| internal_error(format!("Failed to read resource row: {}", e)))?;
+                match row.decode(tenant, resource_type) {
+                    Ok(resource) => found.push(resource),
+                    // The contract has no channel for these: the scan that
+                    // first met the row already reported it as skipped.
+                    Err(skip) => tracing::warn!(
+                        tenant = %tenant.tenant_id(),
+                        resource_type,
+                        resource_id = %skip.resource_id,
+                        reason = %skip.reason,
+                        "reindex source: stored resource row cannot be decoded; skipping it"
+                    ),
+                }
+            }
+        }
+        Ok(found)
+    }
+}
+
+/// Ids bound per `IN (...)` query in [`SqliteBackend::fetch_resources_by_ids`],
+/// far below SQLite's bound-parameter limit.
+const FETCH_BY_IDS_BATCH: usize = 500;
+
+/// One `resources` row as the reindex source reads it, before decoding.
+///
+/// Every column is read leniently so a bad value becomes a
+/// [`SkippedResource`] for that row instead of an error that ends the query
+/// (or, as before #1125, a row that silently vanished).
+struct RawReindexRow {
+    id: Option<String>,
+    version_id: Option<String>,
+    data: Option<Vec<u8>>,
+    last_updated: Option<String>,
+    fhir_version: Option<String>,
+}
+
+impl RawReindexRow {
+    /// Column order: `id, version_id, data, last_updated, fhir_version`.
+    fn read(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            id: column_text(row, 0),
+            version_id: column_text(row, 1),
+            data: match row.get_ref(2)? {
+                rusqlite::types::ValueRef::Blob(bytes) | rusqlite::types::ValueRef::Text(bytes) => {
+                    Some(bytes.to_vec())
+                }
+                _ => None,
+            },
+            last_updated: column_text(row, 3),
+            fhir_version: column_text(row, 4),
+        })
+    }
+
+    fn decode(
+        self,
+        tenant: &TenantContext,
+        resource_type: &str,
+    ) -> Result<StoredResource, SkippedResource> {
+        let resource_id = self.id.unwrap_or_default();
+        let skip = |reason: String| SkippedResource {
+            resource_id: resource_id.clone(),
+            reason,
+        };
+        if resource_id.is_empty() {
+            return Err(skip("row has no readable id".to_string()));
+        }
+        let version_id = self
+            .version_id
+            .ok_or_else(|| skip("row has no readable versionId".to_string()))?;
+        let data = self
+            .data
+            .ok_or_else(|| skip("row has no resource content".to_string()))?;
+        let content: Value = serde_json::from_slice(&data)
+            .map_err(|e| skip(format!("resource content is not valid JSON: {e}")))?;
+        let last_updated = self
+            .last_updated
+            .ok_or_else(|| skip("row has no readable lastUpdated".to_string()))?;
+        let last_modified = chrono::DateTime::parse_from_rfc3339(&last_updated)
+            .map_err(|e| {
+                skip(format!(
+                    "lastUpdated {last_updated:?} is not a timestamp: {e}"
+                ))
+            })?
+            .with_timezone(&Utc);
+        let fhir_version = self
+            .fhir_version
+            .as_deref()
+            .and_then(FhirVersion::from_storage)
+            .unwrap_or_else(helios_fhir::FhirVersion::default_enabled);
+        Ok(StoredResource::from_storage(
+            resource_type.to_string(),
+            resource_id.clone(),
+            version_id,
+            tenant.tenant_id().clone(),
+            content,
+            last_modified, // created_at (use last_modified as approximation)
+            last_modified,
+            None, // not deleted
+            fhir_version,
+        ))
+    }
+}
+
+/// A column as text whatever its storage class, or `None` for NULL or an
+/// out-of-range index.
+fn column_text(row: &rusqlite::Row<'_>, index: usize) -> Option<String> {
+    use rusqlite::types::ValueRef;
+    match row.get_ref(index).ok()? {
+        ValueRef::Null => None,
+        ValueRef::Integer(v) => Some(v.to_string()),
+        ValueRef::Real(v) => Some(v.to_string()),
+        ValueRef::Text(bytes) | ValueRef::Blob(bytes) => {
+            Some(String::from_utf8_lossy(bytes).into_owned())
+        }
     }
 }
 
@@ -4070,6 +4299,12 @@ impl SqliteBackend {
         tenant: &TenantContext,
         resource: &StoredResource,
     ) -> StorageResult<usize> {
+        // Nothing reads this index when search is offloaded, and the matching
+        // delete (`delete_search_index`) is already a no-op there, so writing
+        // would only accumulate dead rows on every rebuild (#1125).
+        if self.is_search_offloaded() {
+            return Ok(0);
+        }
         let resource_type = resource.resource_type();
         let resource_id = resource.id();
         let content = resource.content();
@@ -4151,6 +4386,13 @@ impl ReindexTarget for SqliteBackend {
         tenant: &TenantContext,
         resources: &[StoredResource],
     ) -> Vec<StorageResult<usize>> {
+        // Same guard as `write_search_entries_on` and
+        // `begin_bulk_index_rebuild`: when a secondary owns search, a
+        // composite still wires this backend as a reindex writer, and the
+        // page must neither extract, take the write lock, nor insert (#1125).
+        if self.is_search_offloaded() {
+            return resources.iter().map(|_| Ok(0)).collect();
+        }
         let conn = match self.get_connection() {
             Ok(conn) => conn,
             Err(e) => {
@@ -4249,6 +4491,12 @@ impl ReindexTarget for SqliteBackend {
     }
 
     async fn clear_search_index(&self, tenant: &TenantContext) -> StorageResult<u64> {
+        // Offloaded: the writes above are no-ops, so clearing must be one too
+        // or `$reindex` with `clearExisting` would be the only operation that
+        // still touches this index.
+        if self.is_search_offloaded() {
+            return Ok(0);
+        }
         let conn = self.get_connection()?;
         let tenant_id = tenant.tenant_id().as_str();
 
@@ -4508,6 +4756,289 @@ mod tests {
                 "{name}: must not sort, got {details:?}"
             );
         }
+    }
+
+    fn count_rows(backend: &SqliteBackend, table: &str, tenant: &TenantContext) -> i64 {
+        let conn = backend.get_connection().unwrap();
+        conn.query_row(
+            &format!("SELECT COUNT(*) FROM {table} WHERE tenant_id = ?1"),
+            params![tenant.tenant_id().as_str()],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    /// #1125: on `sqlite-es` the offloaded primary is still handed to the
+    /// reindex as a writer. Its delete was already a no-op there, so an
+    /// unguarded write added a full set of dead `search_index` and FTS rows on
+    /// every rebuild. Every write-side entry point must now leave the index
+    /// exactly as it found it — rows from before the offload included.
+    #[tokio::test]
+    async fn reindex_writes_are_no_ops_when_search_is_offloaded() {
+        let mut backend = create_test_backend();
+        let tenant = create_test_tenant();
+        for i in 1..=3 {
+            backend
+                .create(
+                    &tenant,
+                    "Patient",
+                    json!({
+                        "resourceType": "Patient",
+                        "id": format!("p{i}"),
+                        "name": [{"family": "Offload", "given": ["Ann"]}]
+                    }),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+        let index_rows = count_rows(&backend, "search_index", &tenant);
+        let fts_rows = count_rows(&backend, "resource_fts", &tenant);
+        assert!(index_rows > 0, "precondition: the resources were indexed");
+        assert!(fts_rows > 0, "precondition: the FTS rows exist");
+
+        backend.set_search_offloaded(true);
+        let page = backend
+            .fetch_resources_page(&tenant, "Patient", None, 100)
+            .await
+            .unwrap();
+        assert_eq!(page.resources.len(), 3);
+
+        for _ in 0..2 {
+            let results = backend
+                .write_search_entries_page(&tenant, &page.resources)
+                .await;
+            assert_eq!(results.len(), 3, "one result per resource");
+            assert!(results.iter().all(|r| matches!(r, Ok(0))), "{results:?}");
+        }
+        for resource in &page.resources {
+            assert_eq!(
+                backend
+                    .write_search_entries(&tenant, resource)
+                    .await
+                    .unwrap(),
+                0
+            );
+        }
+        assert_eq!(backend.clear_search_index(&tenant).await.unwrap(), 0);
+
+        assert_eq!(
+            count_rows(&backend, "search_index", &tenant),
+            index_rows,
+            "offloaded reindex writes must neither add nor clear search_index rows"
+        );
+        assert_eq!(
+            count_rows(&backend, "resource_fts", &tenant),
+            fts_rows,
+            "offloaded reindex writes must neither add nor clear FTS rows"
+        );
+    }
+
+    /// #1125: a row whose content or timestamp does not parse used to vanish
+    /// from its page, and because the cursor was only emitted for a page that
+    /// *decoded* to `limit` resources, it also ended the pagination of its
+    /// type. It is now reported and the scan carries on past it.
+    #[tokio::test]
+    async fn fetch_resources_page_reports_unparseable_rows_and_keeps_paginating() {
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+        for i in 1..=5 {
+            backend
+                .create(
+                    &tenant,
+                    "Patient",
+                    json!({"resourceType": "Patient", "id": format!("p{i}")}),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+        {
+            let conn = backend.get_connection().unwrap();
+            conn.execute(
+                "UPDATE resources SET data = CAST('{not json' AS BLOB) \
+                 WHERE tenant_id = ?1 AND resource_type = 'Patient' AND id = 'p1'",
+                params![tenant.tenant_id().as_str()],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE resources SET last_updated = 'not-a-date' \
+                 WHERE tenant_id = ?1 AND resource_type = 'Patient' AND id = 'p2'",
+                params![tenant.tenant_id().as_str()],
+            )
+            .unwrap();
+        }
+
+        let mut decoded = Vec::new();
+        let mut skipped = Vec::new();
+        let mut cursor: Option<String> = None;
+        let mut pages = 0;
+        loop {
+            let page = backend
+                .fetch_resources_page(&tenant, "Patient", cursor.as_deref(), 2)
+                .await
+                .unwrap();
+            pages += 1;
+            assert!(pages <= 5, "pagination must terminate");
+            decoded.extend(page.resources.iter().map(|r| r.id().to_string()));
+            skipped.extend(page.skipped);
+            match page.next_cursor {
+                Some(next) => cursor = Some(next),
+                None => break,
+            }
+        }
+
+        decoded.sort();
+        assert_eq!(
+            decoded,
+            ["p3", "p4", "p5"],
+            "every decodable resource after the bad rows must still be read"
+        );
+        skipped.sort_by(|a, b| a.resource_id.cmp(&b.resource_id));
+        let skipped_ids: Vec<&str> = skipped.iter().map(|s| s.resource_id.as_str()).collect();
+        assert_eq!(skipped_ids, ["p1", "p2"]);
+        assert!(skipped[0].reason.contains("JSON"), "{}", skipped[0].reason);
+        assert!(
+            skipped[1].reason.contains("lastUpdated"),
+            "{}",
+            skipped[1].reason
+        );
+    }
+
+    /// #1125: `HFS_REINDEX_BATCH_BYTES` bounds a reindex page by the bytes of
+    /// stored JSON it carries as well as by its resource count, so a page of
+    /// large resources is not one oversized read. Under a cap only one
+    /// resource fits beneath, the scan must still walk the whole type — every
+    /// resource once, no resource twice — and then stop.
+    #[tokio::test]
+    async fn fetch_resources_page_capped_pages_one_resource_at_a_time_under_a_byte_cap() {
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+        for i in 1..=5 {
+            backend
+                .create(
+                    &tenant,
+                    "Patient",
+                    json!({
+                        "resourceType": "Patient",
+                        "id": format!("p{i}"),
+                        "name": [{"family": "Capped"}]
+                    }),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+        // A cap the smallest stored row already reaches on its own: whichever
+        // resource a page starts with ends it.
+        let cap: u64 = {
+            let conn = backend.get_connection().unwrap();
+            conn.query_row(
+                "SELECT MIN(LENGTH(data)) FROM resources \
+                 WHERE tenant_id = ?1 AND resource_type = 'Patient' AND is_deleted = 0",
+                params![tenant.tenant_id().as_str()],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap() as u64
+        };
+        assert!(cap > 0, "precondition: the rows have stored bytes");
+
+        let mut seen = Vec::new();
+        let mut cursor: Option<String> = None;
+        let mut pages = 0;
+        loop {
+            let page = backend
+                .fetch_resources_page_capped(&tenant, "Patient", cursor.as_deref(), 100, cap)
+                .await
+                .unwrap();
+            pages += 1;
+            assert!(pages <= 10, "pagination must terminate");
+            assert!(
+                page.resources.len() <= 1,
+                "the cap admits one resource per page, got {}",
+                page.resources.len()
+            );
+            seen.extend(page.resources.iter().map(|r| r.id().to_string()));
+            match page.next_cursor {
+                Some(next) => cursor = Some(next),
+                None => break,
+            }
+        }
+
+        seen.sort();
+        assert_eq!(
+            seen,
+            ["p1", "p2", "p3", "p4", "p5"],
+            "every resource is returned exactly once across the capped pages"
+        );
+
+        // `0` is the cap switched off: the same rows come back as one page.
+        let whole = backend
+            .fetch_resources_page_capped(&tenant, "Patient", None, 100, 0)
+            .await
+            .unwrap();
+        assert_eq!(whole.resources.len(), 5);
+        assert!(whole.next_cursor.is_none());
+    }
+
+    /// #1125: the bytes are counted *after* the row is taken, so a resource
+    /// larger than the cap is still returned. A page that refused it would be
+    /// empty, and the reindex loop would either stop early or ask for the same
+    /// page forever.
+    #[tokio::test]
+    async fn fetch_resources_page_capped_returns_a_resource_larger_than_the_cap() {
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({
+                    "resourceType": "Patient",
+                    "id": "big",
+                    "name": [{"family": "X".repeat(20_000)}]
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType": "Patient", "id": "small"}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+
+        // Two bytes: below every row, the oversized one included.
+        let mut seen = Vec::new();
+        let mut cursor: Option<String> = None;
+        let mut pages = 0;
+        loop {
+            let page = backend
+                .fetch_resources_page_capped(&tenant, "Patient", cursor.as_deref(), 100, 2)
+                .await
+                .unwrap();
+            pages += 1;
+            assert!(pages <= 4, "pagination must terminate");
+            if seen.len() < 2 {
+                assert_eq!(
+                    page.resources.len(),
+                    1,
+                    "page {pages} is empty: a resource over the cap was refused"
+                );
+            }
+            seen.extend(page.resources.iter().map(|r| r.id().to_string()));
+            match page.next_cursor {
+                Some(next) => cursor = Some(next),
+                None => break,
+            }
+        }
+
+        seen.sort();
+        assert_eq!(seen, ["big", "small"]);
     }
 
     /// The SQLite writer drops its value indexes on `begin` and has every one

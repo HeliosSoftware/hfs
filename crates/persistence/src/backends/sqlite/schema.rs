@@ -10,7 +10,7 @@ use crate::core::bulk_submit_legacy::{
 use crate::error::StorageResult;
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 30;
+pub const SCHEMA_VERSION: i32 = 32;
 
 /// The `search_index` value indexes. Excludes `idx_search_composite`, which the
 /// delete-by-resource path needs at all times, and `idx_search_token_display`,
@@ -441,6 +441,8 @@ fn migrate_schema(conn: &Connection, from_version: i32) -> StorageResult<()> {
             27 => migrate_v27_to_v28(conn)?,
             28 => migrate_v28_to_v29(conn)?,
             29 => migrate_v29_to_v30(conn)?,
+            30 => migrate_v30_to_v31(conn)?,
+            31 => migrate_v31_to_v32(conn)?,
             _ => {
                 return Err(crate::error::StorageError::Backend(
                     crate::error::BackendError::Internal {
@@ -878,6 +880,7 @@ fn migrate_v5_to_v6(conn: &Connection) -> StorageResult<()> {
             total_entries INTEGER DEFAULT 0,
             processed_entries INTEGER DEFAULT 0,
             failed_entries INTEGER DEFAULT 0,
+            index_pending INTEGER NOT NULL DEFAULT 0,
             PRIMARY KEY (tenant_id, submitter, submission_id, manifest_id),
             FOREIGN KEY (tenant_id, submitter, submission_id)
                 REFERENCES bulk_submissions(tenant_id, submitter, submission_id) ON DELETE CASCADE
@@ -1385,7 +1388,109 @@ fn migrate_v28_to_v29(conn: &Connection) -> StorageResult<()> {
     Ok(())
 }
 
-/// Migrate from schema version 29 to version 30 (#1127).
+/// Migrate from schema version 29 to version 30.
+///
+/// Adds `bulk_manifests.index_pending` — a manifest whose resources were
+/// ingested with indexing deferred owes a search-index rebuild. Set in the same
+/// transaction that publishes the manifest, cleared when the rebuild finishes,
+/// so a restart mid-rebuild can find the outstanding work instead of losing it
+/// with the in-process job map (#1125).
+fn migrate_v29_to_v30(conn: &Connection) -> StorageResult<()> {
+    let has_column = conn
+        .prepare("SELECT 1 FROM pragma_table_info('bulk_manifests') WHERE name = 'index_pending'")
+        .and_then(|mut stmt| stmt.exists([]))
+        .unwrap_or(false);
+    if !has_column {
+        conn.execute(
+            "ALTER TABLE bulk_manifests ADD COLUMN index_pending INTEGER NOT NULL DEFAULT 0",
+            [],
+        )
+        .map_err(|e| migration_err(format!("v30 index_pending column: {e}")))?;
+    }
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_bulk_manifests_index_pending
+         ON bulk_manifests(tenant_id, submitter, submission_id, manifest_id)
+         WHERE index_pending = 1",
+        [],
+    )
+    .map_err(|e| migration_err(format!("v30 index_pending index: {e}")))?;
+    Ok(())
+}
+
+/// Migrate from schema version 30 to version 31.
+///
+/// Introduces an integer surrogate for the owning resource on `search_index`
+/// (#945). `resource_key` mirrors `resources.rowid`; `idx_search_composite` is
+/// rekeyed to carry that 3–4 byte varint in place of the 36-byte `resource_id`
+/// UUID it repeated on every row, which was ~44% of the table's index bytes and
+/// the dominant per-batch write during bulk ingest.
+///
+/// `resource_id` stays on the table: the chained-search / `_has` / `:identifier`
+/// paths concatenate `Type/resource_id` to match `value_reference` and cannot
+/// use the key, so only the composite index and the equality read paths move to
+/// `resource_key` in this step.
+///
+/// Backfill is a single-pass `UPDATE ... FROM resources` (a JOIN, not a
+/// correlated subquery per row) with the FTS triggers dropped for the duration.
+/// A full table rebuild is deliberately avoided: the FTS triggers key on
+/// `search_index.rowid`, so renumbering rowids would orphan every FTS row. The
+/// backfill only sets a new column — no rowid and no FTS-indexed column changes
+/// — so the existing FTS content stays valid and the triggers are restored
+/// verbatim afterwards.
+fn migrate_v30_to_v31(conn: &Connection) -> StorageResult<()> {
+    // SQLite has no `ADD COLUMN IF NOT EXISTS`; ignore a duplicate-column error
+    // so the ladder is replay-safe (see `migrate_v10_to_v11`).
+    let _ = conn.execute(
+        "ALTER TABLE search_index ADD COLUMN resource_key INTEGER",
+        [],
+    );
+
+    // The FTS triggers fire on every UPDATE of a row carrying `value_string` /
+    // `value_token_display` (their `WHEN` matches the column's presence, not
+    // which column changed), so the backfill would re-run the full-text
+    // delete+reinsert on most rows. Capture their exact DDL from the catalog,
+    // drop them across the backfill, and restore verbatim — drift-proof, and a
+    // no-op on an FTS5-less build that has none.
+    let saved_triggers: Vec<String> = {
+        let mut stmt = conn
+            .prepare(
+                "SELECT sql FROM sqlite_master
+                  WHERE type = 'trigger'
+                    AND name IN ('search_index_fts_insert', 'search_index_fts_delete', 'search_index_fts_update')
+                    AND sql IS NOT NULL",
+            )
+            .map_err(|e| migration_err(format!("v31 read FTS triggers: {e}")))?;
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .map_err(|e| migration_err(format!("v31 read FTS triggers: {e}")))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| migration_err(format!("v31 read FTS triggers: {e}")))?
+    };
+
+    conn.execute_batch(
+        "DROP TRIGGER IF EXISTS search_index_fts_insert;
+         DROP TRIGGER IF EXISTS search_index_fts_delete;
+         DROP TRIGGER IF EXISTS search_index_fts_update;
+         UPDATE search_index
+            SET resource_key = r.rowid
+            FROM resources r
+            WHERE r.tenant_id = search_index.tenant_id
+              AND r.resource_type = search_index.resource_type
+              AND r.id = search_index.resource_id;
+         DROP INDEX IF EXISTS idx_search_composite;
+         CREATE INDEX idx_search_composite
+            ON search_index(tenant_id, resource_type, resource_key, param_name, composite_group);",
+    )
+    .map_err(|e| migration_err(format!("v31 resource_key surrogate: {e}")))?;
+
+    for sql in &saved_triggers {
+        conn.execute(sql, [])
+            .map_err(|e| migration_err(format!("v31 restore FTS trigger: {e}")))?;
+    }
+    Ok(())
+}
+
+/// Migrate from schema version 31 to version 32 (#1127).
 ///
 /// Makes the bulk-submit manifest counters describe the manifest rather than
 /// the sum over every pass that walked it:
@@ -1402,7 +1507,7 @@ fn migrate_v28_to_v29(conn: &Connection) -> StorageResult<()> {
 /// Replay-safe: the column is added only when missing and the table is
 /// `IF NOT EXISTS`. Manifests counted before this version have no file rows,
 /// so a later re-walk of one of their files counts it once more.
-fn migrate_v29_to_v30(conn: &Connection) -> StorageResult<()> {
+fn migrate_v31_to_v32(conn: &Connection) -> StorageResult<()> {
     if !table_columns(conn, "bulk_manifests")?
         .iter()
         .any(|column| column == "skipped_entries")
@@ -1411,7 +1516,7 @@ fn migrate_v29_to_v30(conn: &Connection) -> StorageResult<()> {
             "ALTER TABLE bulk_manifests ADD COLUMN skipped_entries INTEGER NOT NULL DEFAULT 0",
             [],
         )
-        .map_err(|e| migration_err(format!("v30 add skipped_entries: {e}")))?;
+        .map_err(|e| migration_err(format!("v32 add skipped_entries: {e}")))?;
     }
     conn.execute(
         "CREATE TABLE IF NOT EXISTS bulk_manifest_file_progress (
@@ -1433,7 +1538,7 @@ fn migrate_v29_to_v30(conn: &Connection) -> StorageResult<()> {
         )",
         [],
     )
-    .map_err(|e| migration_err(format!("v30 create bulk_manifest_file_progress: {e}")))?;
+    .map_err(|e| migration_err(format!("v32 create bulk_manifest_file_progress: {e}")))?;
     Ok(())
 }
 
@@ -2305,6 +2410,7 @@ pub fn drop_all_tables(conn: &Connection) -> StorageResult<()> {
     // Drop bulk tables (order matters due to foreign keys)
     let _ = conn.execute("DROP TABLE IF EXISTS bulk_submission_changes", []);
     let _ = conn.execute("DROP TABLE IF EXISTS bulk_entry_results", []);
+    let _ = conn.execute("DROP TABLE IF EXISTS bulk_manifest_file_progress", []);
     let _ = conn.execute("DROP TABLE IF EXISTS bulk_manifests", []);
     let _ = conn.execute("DROP TABLE IF EXISTS bulk_submissions", []);
     let _ = conn.execute("DROP TABLE IF EXISTS bulk_export_files", []);
@@ -2713,6 +2819,9 @@ mod tests {
     /// `idx_search_string_folded` joined the partial set in v28; the
     /// `LIKE`-shaped searches that used to depend on it being full now carry
     /// their own `IS NOT NULL` (see [`migrate_v27_to_v28`]).
+    ///
+    /// In v31 (#945) the composite index swapped the 36-byte `resource_id` UUID
+    /// for the integer `resource_key` (see [`migrate_v30_to_v31`]).
     #[test]
     fn search_index_carries_no_redundant_or_full_value_indexes() {
         let conn = Connection::open_in_memory().unwrap();
@@ -2735,8 +2844,9 @@ mod tests {
         assert!(
             index_sql("idx_search_composite")
                 .expect("composite index")
-                .contains("resource_id"),
-            "idx_search_composite must still lead with the resource key"
+                .contains("resource_key"),
+            "idx_search_composite must carry the integer resource_key (v31, #945), \
+             not the resource_id UUID it replaced"
         );
 
         for (name, predicate) in [
@@ -3629,10 +3739,10 @@ mod tests {
         }
     }
 
-    /// #1127: the v30 file-progress table and skipped counter exist on a fresh
+    /// #1127: the v32 file-progress table and skipped counter exist on a fresh
     /// database, and replaying the migration on one that has them is a no-op.
     #[test]
-    fn test_v30_adds_file_progress_and_skipped_entries() {
+    fn test_v32_adds_file_progress_and_skipped_entries() {
         let conn = Connection::open_in_memory().unwrap();
         initialize_schema(&conn).unwrap();
         assert!(
@@ -3645,7 +3755,7 @@ mod tests {
         for column in ["file_url", "max_line", "total_entries", "skipped_entries"] {
             assert!(file_columns.iter().any(|c| c == column), "missing {column}");
         }
-        migrate_v29_to_v30(&conn).unwrap();
+        migrate_v31_to_v32(&conn).unwrap();
     }
 
     #[test]

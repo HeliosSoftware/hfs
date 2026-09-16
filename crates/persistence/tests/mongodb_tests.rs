@@ -18,7 +18,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use helios_fhir::FhirVersion;
-use helios_persistence::backends::mongodb::{MongoBackend, MongoBackendConfig};
+use helios_persistence::backends::mongodb::{
+    BuildOutcome, IndexBuildMode, MongoBackend, MongoBackendConfig,
+};
 use helios_persistence::core::{
     Backend, BackendCapability, BackendKind, BundleEntry, BundleEntryEffect, BundleMethod,
     BundleProvider, BundleResult, ConditionalCreateResult, ConditionalDeleteResult,
@@ -615,6 +617,9 @@ fn storage_err_is_mongo_unavailable(err: &StorageError) -> bool {
 async fn build_backend(mut config: MongoBackendConfig) -> Option<MongoBackend> {
     const MAX_ATTEMPTS: u32 = 3;
     config.max_connections = config.max_connections.min(TEST_BACKEND_MAX_POOL);
+    // Generation-2 indexes are built after boot by default; tests assert
+    // winning plans right after boot, so they wait for the build.
+    config.index_build = IndexBuildMode::Inline;
     let mut attempt = 1;
     loop {
         let backend = MongoBackend::new(config.clone())
@@ -3457,6 +3462,494 @@ async fn mongodb_integration_contained_search() {
     let mut both_urls: Vec<String> = both.resources.items.iter().map(|r| r.url()).collect();
     both_urls.sort();
     assert_eq!(both_urls, vec!["Observation/obs1", "Patient/top1"]);
+}
+
+/// Seeds `n` Observations, each containing a Patient named Smith, under ids
+/// `obs-<i>` with contained local id `p`.
+async fn seed_contained_smiths(backend: &MongoBackend, tenant: &TenantContext, n: usize) {
+    for i in 0..n {
+        backend
+            .create(
+                tenant,
+                "Observation",
+                json!({
+                    "resourceType": "Observation", "id": format!("obs-{i:02}"), "status": "final",
+                    "code": { "coding": [{ "code": "1234-5" }] },
+                    "subject": { "reference": "#p" },
+                    "contained": [{ "resourceType": "Patient", "id": "p", "name": [{ "family": "Smith" }] }]
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+    }
+}
+
+fn contained_name_query(
+    mode: helios_persistence::types::ContainedMode,
+    count: u32,
+    offset: u32,
+    total: bool,
+) -> SearchQuery {
+    use helios_persistence::types::ContainedReturn;
+    let mut q = SearchQuery::new("Patient").with_parameter(SearchParameter {
+        name: "name".into(),
+        param_type: SearchParamType::String,
+        modifier: None,
+        values: vec![SearchValue::eq("Smith")],
+        chain: vec![],
+        components: vec![],
+    });
+    q.contained = mode;
+    q.contained_return = ContainedReturn::Container;
+    q.count = Some(count);
+    q.offset = Some(offset);
+    q.total = if total {
+        Some(TotalMode::Accurate)
+    } else {
+        None
+    };
+    q
+}
+
+#[tokio::test]
+async fn mongodb_integration_contained_search_pages_on_the_server() {
+    use futures::stream::TryStreamExt;
+    use helios_persistence::types::ContainedMode;
+    let Some(backend) = create_backend_with_full_registry("contained_paging").await else {
+        eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
+        return;
+    };
+    let tenant = create_tenant("tenant-contained-paging");
+    seed_contained_smiths(&backend, &tenant, 7).await;
+
+    let page = |offset: u32| contained_name_query(ContainedMode::On, 3, offset, true);
+
+    let db = raw_test_client(&backend.config().connection_string)
+        .await
+        .unwrap()
+        .database(&backend.config().database_name);
+    if db.run_command(doc! { "profile": 2_i32 }).await.is_ok() {
+        let _ = backend.search(&tenant, &page(0)).await.unwrap();
+        let _ = db.run_command(doc! { "profile": 0_i32 }).await;
+        let reads = db
+            .collection::<Document>("system.profile")
+            .count_documents(doc! { "ns": format!("{}.resources", db.name()), "op": "query" })
+            .await
+            .unwrap();
+        assert_eq!(
+            reads, 1,
+            "containers for one page must be fetched in a single find, not one read() per match"
+        );
+        let agg = db
+            .collection::<Document>("system.profile")
+            .find(doc! { "ns": format!("{}.search_index", db.name()), "command.aggregate": "search_index" })
+            .await
+            .unwrap()
+            .try_collect::<Vec<Document>>()
+            .await
+            .unwrap();
+        assert!(
+            !agg.is_empty(),
+            "the contained pipeline must run as an aggregate on search_index"
+        );
+        // `planSummary` on this server carries only the winning plan's key
+        // pattern, never the index name (see `mongodb_history_type_plan_is_a_bounded_index_walk`),
+        // so the index name is confirmed via `explain` instead: rebuild the
+        // aggregate command from exactly what the server recorded (`command`
+        // also carries $db/lsid/$readPreference, which explain rejects) and
+        // look for `idx_search_contained` in the winning plan.
+        for op in &agg {
+            let command = op
+                .get_document("command")
+                .expect("profile entry missing command");
+            let mut inner = Document::new();
+            for key in ["aggregate", "pipeline", "cursor"] {
+                if let Some(v) = command.get(key) {
+                    inner.insert(key, v.clone());
+                }
+            }
+            let explain = db
+                .run_command(doc! { "explain": inner, "verbosity": "queryPlanner" })
+                .await
+                .expect("explain of the recorded aggregate command failed");
+            let mut index_names = Vec::new();
+            collect_index_names(&explain, &mut index_names);
+            assert!(
+                index_names.iter().any(|n| n == "idx_search_contained"),
+                "contained pipeline must use idx_search_contained, got: {index_names:?}"
+            );
+        }
+    }
+
+    let p0 = backend.search(&tenant, &page(0)).await.unwrap();
+    let p1 = backend.search(&tenant, &page(3)).await.unwrap();
+    let p2 = backend.search(&tenant, &page(6)).await.unwrap();
+    let ids = |r: &helios_persistence::core::SearchResult| {
+        r.resources
+            .items
+            .iter()
+            .map(|x| x.id().to_string())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(ids(&p0), vec!["obs-00", "obs-01", "obs-02"]);
+    assert_eq!(ids(&p1), vec!["obs-03", "obs-04", "obs-05"]);
+    assert_eq!(ids(&p2), vec!["obs-06"]);
+    assert_eq!(p0.total, Some(7));
+    assert_eq!(p2.total, Some(7));
+    // Without _total, no count is computed.
+    let no_total = backend
+        .search(
+            &tenant,
+            &contained_name_query(ContainedMode::On, 3, 0, false),
+        )
+        .await
+        .unwrap();
+    assert_eq!(no_total.total, None);
+}
+
+/// #1059 review F1: `_containedType=container` (the default) groups by the
+/// container alone, so a container with multiple internal matches is one
+/// slot in the page and one count in the total — not one per internal match.
+#[tokio::test]
+async fn mongodb_integration_contained_container_with_two_matches_counts_once() {
+    use helios_persistence::types::{ContainedMode, ContainedReturn};
+    let Some(backend) = create_backend_with_full_registry("contained_container_counts_once").await
+    else {
+        eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
+        return;
+    };
+    let tenant = create_tenant("tenant-contained-counts-once");
+
+    // Two contained Patients named Smith in one Observation.
+    backend
+        .create(
+            &tenant,
+            "Observation",
+            json!({
+                "resourceType": "Observation", "id": "obs-two", "status": "final",
+                "subject": { "reference": "#p1" },
+                "contained": [
+                    { "resourceType": "Patient", "id": "p1", "name": [{ "family": "Smith" }] },
+                    { "resourceType": "Patient", "id": "p2", "name": [{ "family": "Smith" }] }
+                ]
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    // One contained Patient named Smith in a second Observation.
+    backend
+        .create(
+            &tenant,
+            "Observation",
+            json!({
+                "resourceType": "Observation", "id": "obs-one", "status": "final",
+                "subject": { "reference": "#p3" },
+                "contained": [
+                    { "resourceType": "Patient", "id": "p3", "name": [{ "family": "Smith" }] }
+                ]
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+
+    // _containedType=container (default): one slot per container, total counts containers.
+    let page0 = backend
+        .search(
+            &tenant,
+            &contained_name_query(ContainedMode::On, 1, 0, true),
+        )
+        .await
+        .unwrap();
+    let urls: Vec<String> = page0.resources.items.iter().map(|x| x.url()).collect();
+    assert_eq!(urls, vec!["Observation/obs-one"]);
+    assert_eq!(page0.total, Some(2));
+
+    let page1 = backend
+        .search(
+            &tenant,
+            &contained_name_query(ContainedMode::On, 1, 1, true),
+        )
+        .await
+        .unwrap();
+    let urls: Vec<String> = page1.resources.items.iter().map(|x| x.url()).collect();
+    assert_eq!(
+        urls,
+        vec!["Observation/obs-two"],
+        "offset 1 returns the other container"
+    );
+
+    // _containedType=contained: one slot per contained entity (3: p1, p2, p3).
+    let mut q = contained_name_query(ContainedMode::On, 10, 0, true);
+    q.contained_return = ContainedReturn::Contained;
+    let contained = backend.search(&tenant, &q).await.unwrap();
+    assert_eq!(contained.resources.items.len(), 3);
+    assert_eq!(contained.total, Some(3));
+    let mut ids: Vec<String> = contained
+        .resources
+        .items
+        .iter()
+        .map(|x| x.id().to_string())
+        .collect();
+    ids.sort();
+    assert_eq!(ids, vec!["p1", "p2", "p3"]);
+}
+
+/// #1059 review N1: a multi-parameter AND must hold within one contained
+/// entity, not across every entity a container happens to hold.
+#[tokio::test]
+async fn mongodb_integration_contained_multi_parameter_and_is_per_contained_entity() {
+    use helios_persistence::types::{ContainedMode, ContainedReturn};
+    let Some(backend) = create_backend_with_full_registry("contained_multi_param_per_entity").await
+    else {
+        eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
+        return;
+    };
+    let tenant = create_tenant("tenant-contained-multi-param");
+
+    // `split`: the two conditions (name=Smith, gender=male) are each
+    // satisfied, but by DIFFERENT contained Patients — must NOT match.
+    backend
+        .create(
+            &tenant,
+            "Observation",
+            json!({
+                "resourceType": "Observation", "id": "split", "status": "final",
+                "subject": { "reference": "#a" },
+                "contained": [
+                    { "resourceType": "Patient", "id": "a", "name": [{ "family": "Smith" }], "gender": "female" },
+                    { "resourceType": "Patient", "id": "b", "name": [{ "family": "Jones" }], "gender": "male" }
+                ]
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    // `whole`: one contained Patient satisfies BOTH conditions — must match.
+    backend
+        .create(
+            &tenant,
+            "Observation",
+            json!({
+                "resourceType": "Observation", "id": "whole", "status": "final",
+                "subject": { "reference": "#c" },
+                "contained": [
+                    { "resourceType": "Patient", "id": "c", "name": [{ "family": "Smith" }], "gender": "male" }
+                ]
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+
+    let query = |contained_return: ContainedReturn| {
+        let mut q = SearchQuery::new("Patient")
+            .with_parameter(SearchParameter {
+                name: "name".into(),
+                param_type: SearchParamType::String,
+                modifier: None,
+                values: vec![SearchValue::eq("Smith")],
+                chain: vec![],
+                components: vec![],
+            })
+            .with_parameter(SearchParameter {
+                name: "gender".into(),
+                param_type: SearchParamType::Token,
+                modifier: None,
+                values: vec![SearchValue::eq("male")],
+                chain: vec![],
+                components: vec![],
+            });
+        q.contained = ContainedMode::On;
+        q.contained_return = contained_return;
+        q.total = Some(TotalMode::Accurate);
+        q
+    };
+
+    // Container return: only `whole`, never `split`.
+    let r = backend
+        .search(&tenant, &query(ContainedReturn::Container))
+        .await
+        .unwrap();
+    let urls: Vec<String> = r.resources.items.iter().map(|x| x.url()).collect();
+    assert_eq!(urls, vec!["Observation/whole"]);
+    assert_eq!(r.total, Some(1));
+
+    // Contained return: only Patient `c`, the one entity that actually
+    // matches both parameters.
+    let r = backend
+        .search(&tenant, &query(ContainedReturn::Contained))
+        .await
+        .unwrap();
+    assert_eq!(r.resources.items.len(), 1);
+    assert_eq!(r.resources.items[0].id(), "c");
+}
+
+#[tokio::test]
+async fn mongodb_integration_contained_both_pages_across_the_top_level_boundary() {
+    use helios_persistence::types::ContainedMode;
+    let Some(backend) = create_backend_with_full_registry("contained_both_paging").await else {
+        eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
+        return;
+    };
+    let tenant = create_tenant("tenant-contained-both");
+    for i in 0..2 {
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({ "resourceType": "Patient", "id": format!("top-{i}"), "name": [{ "family": "Smith" }] }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+    }
+    seed_contained_smiths(&backend, &tenant, 7).await;
+
+    let ids = |r: &helios_persistence::core::SearchResult| {
+        r.resources
+            .items
+            .iter()
+            .map(|x| x.url())
+            .collect::<Vec<_>>()
+    };
+    // Page of 5 from offset 0: both top-level Patients, then the first three containers.
+    // The top-level portion inherits the standard search's newest-first
+    // default (`last_updated`/`id` desc, so `top-1` before `top-0`) while the
+    // contained portion is sorted by container key (`obs-00`, `obs-01`, ...).
+    let r = backend
+        .search(
+            &tenant,
+            &contained_name_query(ContainedMode::Both, 5, 0, true),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        ids(&r),
+        vec![
+            "Patient/top-1",
+            "Patient/top-0",
+            "Observation/obs-00",
+            "Observation/obs-01",
+            "Observation/obs-02"
+        ]
+    );
+    assert_eq!(r.total, Some(9));
+    // Offset 5 lands inside the contained set: contained offset 3.
+    let r = backend
+        .search(
+            &tenant,
+            &contained_name_query(ContainedMode::Both, 5, 5, true),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        ids(&r),
+        vec![
+            "Observation/obs-03",
+            "Observation/obs-04",
+            "Observation/obs-05",
+            "Observation/obs-06"
+        ]
+    );
+    // Offset 1 straddles: one top-level, four containers. Skipping the first
+    // (newest-first) top-level item leaves `top-0`.
+    let r = backend
+        .search(
+            &tenant,
+            &contained_name_query(ContainedMode::Both, 5, 1, false),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        ids(&r),
+        vec![
+            "Patient/top-0",
+            "Observation/obs-00",
+            "Observation/obs-01",
+            "Observation/obs-02",
+            "Observation/obs-03"
+        ]
+    );
+}
+
+#[tokio::test]
+async fn mongodb_integration_contained_both_dedupes_a_container_that_is_also_a_top_level_match() {
+    use helios_persistence::types::{ContainedMode, ContainedReturn};
+    let Some(backend) = create_backend_with_full_registry("contained_both_dedupe").await else {
+        eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
+        return;
+    };
+    let tenant = create_tenant("tenant-contained-dedupe");
+    // (a) A top-level Patient match that is ALSO the container of a
+    // contained match (it contains another Patient named Smith).
+    backend
+        .create(
+            &tenant,
+            "Patient",
+            json!({
+                "resourceType": "Patient", "id": "dual", "name": [{ "family": "Smith" }],
+                "contained": [{ "resourceType": "Patient", "id": "inner", "name": [{ "family": "Smith" }] }]
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    // (b) An Observation that matches only through the contained path: the
+    // top-level search is for type Patient and never sees Observation-typed
+    // index rows, so this container is invisible to the top-level portion.
+    backend
+        .create(
+            &tenant,
+            "Observation",
+            json!({
+                "resourceType": "Observation", "id": "obs-holder", "status": "final",
+                "subject": { "reference": "#p" },
+                "contained": [{ "resourceType": "Patient", "id": "p", "name": [{ "family": "Smith" }] }]
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    // (c) A non-match, to prove filtering.
+    backend
+        .create(
+            &tenant,
+            "Patient",
+            json!({ "resourceType": "Patient", "id": "plain", "name": [{ "family": "Jones" }] }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+
+    let mut q = SearchQuery::new("Patient").with_parameter(SearchParameter {
+        name: "name".into(),
+        param_type: SearchParamType::String,
+        modifier: None,
+        values: vec![SearchValue::eq("Smith")],
+        chain: vec![],
+        components: vec![],
+    });
+    q.contained = ContainedMode::Both;
+    q.contained_return = ContainedReturn::Container;
+    q.count = Some(10);
+    q.total = Some(TotalMode::Accurate);
+    let r = backend.search(&tenant, &q).await.unwrap();
+    let urls: Vec<String> = r.resources.items.iter().map(|x| x.url()).collect();
+    // `dual` appears once (top-level first, deduped out of the contained
+    // portion); `obs-holder` only ever surfaces via the contained portion.
+    assert_eq!(
+        urls,
+        vec!["Patient/dual", "Observation/obs-holder"],
+        "dual must appear once, top-level first"
+    );
+    // total = top_total (1: dual) + contained_total (2: dual and
+    // obs-holder, both matched as containers before de-duplication) = 3.
+    // A dual match is counted in both sources — this is the documented
+    // trade-off of paging each source on the server independently.
+    assert_eq!(r.total, Some(3));
 }
 
 #[tokio::test]
@@ -11008,4 +11501,673 @@ async fn mongodb_integration_search_paged_intersection_correctness() {
         FEMALE_ACTIVE,
         "active=true&gender=female must return exactly the {FEMALE_ACTIVE} female patients"
     );
+}
+
+/// Task 3 of the generation-2 plan: boot creates only the inline
+/// `search_index` specs, and the schema-version document survives a second
+/// boot with its `search_indexes` record intact.
+#[tokio::test]
+async fn mongodb_integration_boot_creates_only_inline_search_indexes_and_keeps_generation_record() {
+    let Some(connection_string) = shared_mongo::connection_string().await else {
+        eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
+        return;
+    };
+    let config = MongoBackendConfig {
+        connection_string: connection_string.clone(),
+        database_name: build_test_database_name("inline_specs_only"),
+        // `off` so this test sees exactly what initialize_schema_async does.
+        index_build: IndexBuildMode::Off,
+        ..Default::default()
+    };
+    let backend = MongoBackend::new(config.clone()).unwrap();
+    backend.initialize().await.expect("first boot");
+
+    let client = raw_test_client(&connection_string).await.unwrap();
+    let db = client.database(&config.database_name);
+    let names = search_index_names(&db).await;
+    assert_eq!(
+        names,
+        vec!["_id_", "idx_search_composite", "idx_search_resource"]
+    );
+
+    // A record written by the builder must survive the next boot.
+    db.collection::<Document>("schema_version")
+        .update_one(
+            doc! { "_id": "schema_version" },
+            doc! { "$set": { "search_indexes": { "generation": 2_i32 } } },
+        )
+        .await
+        .unwrap();
+    let backend2 = MongoBackend::new(config.clone()).unwrap();
+    backend2.initialize().await.expect("second boot");
+    let doc = db
+        .collection::<Document>("schema_version")
+        .find_one(doc! { "_id": "schema_version" })
+        .await
+        .unwrap()
+        .expect("schema_version document");
+    assert!(doc.get_i32("version").unwrap() >= 10);
+    assert_eq!(
+        doc.get_document("search_indexes")
+            .unwrap()
+            .get_i32("generation"),
+        Ok(2)
+    );
+}
+
+/// Sorted index names on `search_index`, from a raw `listIndexes`.
+async fn search_index_names(db: &mongodb::Database) -> Vec<String> {
+    let reply = db
+        .run_command(doc! { "listIndexes": "search_index" })
+        .await
+        .expect("listIndexes");
+    let mut names: Vec<String> = reply
+        .get_document("cursor")
+        .unwrap()
+        .get_array("firstBatch")
+        .unwrap()
+        .iter()
+        .map(|b| {
+            b.as_document()
+                .unwrap()
+                .get_str("name")
+                .unwrap()
+                .to_string()
+        })
+        .collect();
+    names.sort();
+    names
+}
+
+/// The nine generation-1 value indexes, created the way pre-generation-2
+/// binaries created them, so a test can stage an "upgraded from v1" database.
+async fn seed_generation1_indexes(db: &mongodb::Database) {
+    let v1 = [
+        (
+            "idx_search_string",
+            doc! { "tenant_id": 1, "resource_type": 1, "param_name": 1, "value_string": 1 },
+        ),
+        (
+            "idx_search_token",
+            doc! { "tenant_id": 1, "resource_type": 1, "param_name": 1, "value_token_system": 1, "value_token_code": 1 },
+        ),
+        (
+            "idx_search_date",
+            doc! { "tenant_id": 1, "resource_type": 1, "param_name": 1, "value_date": 1 },
+        ),
+        (
+            "idx_search_number",
+            doc! { "tenant_id": 1, "resource_type": 1, "param_name": 1, "value_number": 1 },
+        ),
+        (
+            "idx_search_quantity",
+            doc! { "tenant_id": 1, "resource_type": 1, "param_name": 1, "value_quantity_value": 1, "value_quantity_unit": 1 },
+        ),
+        (
+            "idx_search_reference",
+            doc! { "tenant_id": 1, "resource_type": 1, "param_name": 1, "value_reference": 1 },
+        ),
+        (
+            "idx_search_uri",
+            doc! { "tenant_id": 1, "resource_type": 1, "param_name": 1, "value_uri": 1 },
+        ),
+        (
+            "idx_search_token_display",
+            doc! { "tenant_id": 1, "resource_type": 1, "param_name": 1, "value_token_display": 1 },
+        ),
+        (
+            "idx_search_identifier_type",
+            doc! { "tenant_id": 1, "resource_type": 1, "param_name": 1, "value_identifier_type_system": 1, "value_identifier_type_code": 1 },
+        ),
+    ];
+    let indexes: Vec<Document> = v1
+        .iter()
+        .map(|(name, key)| doc! { "key": key.clone(), "name": *name })
+        .collect();
+    db.run_command(doc! { "createIndexes": "search_index", "indexes": indexes })
+        .await
+        .expect("seed v1 indexes");
+}
+
+const GENERATION2_BACKGROUND_NAMES: [&str; 10] = [
+    "idx_search_contained",
+    "idx_search_date_v2",
+    "idx_search_identifier_type_v2",
+    "idx_search_number_v2",
+    "idx_search_quantity_v2",
+    "idx_search_reference_v2",
+    "idx_search_string_v2",
+    "idx_search_token_display_v2",
+    "idx_search_token_v2",
+    "idx_search_uri_v2",
+];
+
+fn expected_generation2_names() -> Vec<String> {
+    let mut all: Vec<String> = GENERATION2_BACKGROUND_NAMES
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    all.extend(["_id_", "idx_search_composite", "idx_search_resource"].map(String::from));
+    all.sort();
+    all
+}
+
+async fn boot_with_mode(
+    connection_string: &str,
+    database_name: &str,
+    mode: IndexBuildMode,
+) -> MongoBackend {
+    // Full registry (not just the minimal embedded fallback), so ordinary
+    // resource-level search parameters like `Patient.gender` are active for
+    // the builder tests that search after boot.
+    let data_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|p| p.parent())
+        .map(|p| p.join("data"));
+    let backend = MongoBackend::new(MongoBackendConfig {
+        connection_string: connection_string.to_string(),
+        database_name: database_name.to_string(),
+        index_build: mode,
+        max_connections: TEST_BACKEND_MAX_POOL,
+        data_dir,
+        ..Default::default()
+    })
+    .unwrap();
+    backend.initialize().await.expect("boot");
+    backend
+}
+
+#[tokio::test]
+async fn mongodb_integration_builder_fresh_database_ends_with_generation2_set() {
+    let Some(cs) = shared_mongo::connection_string().await else {
+        eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
+        return;
+    };
+    let db_name = build_test_database_name("builder_fresh");
+    let backend = boot_with_mode(&cs, &db_name, IndexBuildMode::Inline).await;
+    let outcome = backend
+        .wait_for_search_index_build()
+        .await
+        .expect("builder ran");
+    match outcome {
+        BuildOutcome::Built { created, dropped } => {
+            let mut created = created;
+            created.sort();
+            assert_eq!(
+                created,
+                GENERATION2_BACKGROUND_NAMES.map(String::from).to_vec()
+            );
+            assert!(
+                dropped.is_empty(),
+                "nothing to drop on a fresh database: {dropped:?}"
+            );
+        }
+        other => panic!("expected Built, got {other:?}"),
+    }
+    let db = raw_test_client(&cs).await.unwrap().database(&db_name);
+    assert_eq!(search_index_names(&db).await, expected_generation2_names());
+    let record = db
+        .collection::<Document>("schema_version")
+        .find_one(doc! { "_id": "schema_version" })
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        record
+            .get_document("search_indexes")
+            .unwrap()
+            .get_i32("generation"),
+        Ok(2)
+    );
+}
+
+#[tokio::test]
+async fn mongodb_integration_builder_upgrades_a_generation1_database_and_drops_v1() {
+    let Some(cs) = shared_mongo::connection_string().await else {
+        eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
+        return;
+    };
+    let db_name = build_test_database_name("builder_upgrade");
+    let db = raw_test_client(&cs).await.unwrap().database(&db_name);
+    seed_generation1_indexes(&db).await;
+    // Some data, so the build has rows to index.
+    let staged = boot_with_mode(&cs, &db_name, IndexBuildMode::Off).await;
+    let tenant = create_tenant("tenant-builder");
+    for i in 0..5 {
+        staged
+            .create(
+                &tenant,
+                "Patient",
+                json!({ "resourceType": "Patient", "id": format!("p{i}"), "gender": "female" }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+    }
+    let backend = boot_with_mode(&cs, &db_name, IndexBuildMode::Inline).await;
+    let outcome = backend
+        .wait_for_search_index_build()
+        .await
+        .expect("builder ran");
+    let BuildOutcome::Built { dropped, .. } = outcome else {
+        panic!("expected Built, got {outcome:?}")
+    };
+    let mut dropped = dropped;
+    dropped.sort();
+    assert_eq!(
+        dropped,
+        vec![
+            "idx_search_date",
+            "idx_search_identifier_type",
+            "idx_search_number",
+            "idx_search_quantity",
+            "idx_search_reference",
+            "idx_search_string",
+            "idx_search_token",
+            "idx_search_token_display",
+            "idx_search_uri",
+        ]
+    );
+    assert_eq!(search_index_names(&db).await, expected_generation2_names());
+    // Data still searchable on the new indexes.
+    let q = SearchQuery::new("Patient").with_parameter(SearchParameter {
+        name: "gender".into(),
+        param_type: SearchParamType::Token,
+        modifier: None,
+        values: vec![SearchValue::eq("female")],
+        chain: vec![],
+        components: vec![],
+    });
+    assert_eq!(
+        backend
+            .search(&tenant, &q)
+            .await
+            .unwrap()
+            .resources
+            .items
+            .len(),
+        5
+    );
+}
+
+#[tokio::test]
+async fn mongodb_integration_builder_refuses_to_touch_a_conflicting_v2_name() {
+    let Some(cs) = shared_mongo::connection_string().await else {
+        eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
+        return;
+    };
+    let db_name = build_test_database_name("builder_conflict");
+    let db = raw_test_client(&cs).await.unwrap().database(&db_name);
+    seed_generation1_indexes(&db).await;
+    // A person built something under our name with different keys.
+    db.run_command(doc! { "createIndexes": "search_index", "indexes": [
+        { "key": { "tenant_id": 1, "value_date": 1 }, "name": "idx_search_date_v2" }
+    ]})
+    .await
+    .unwrap();
+    // In `inline` mode a failed build fails boot, so the conflict surfaces as
+    // the initialize() error rather than through wait_for_search_index_build.
+    let backend = MongoBackend::new(MongoBackendConfig {
+        connection_string: cs.clone(),
+        database_name: db_name.clone(),
+        index_build: IndexBuildMode::Inline,
+        max_connections: TEST_BACKEND_MAX_POOL,
+        ..Default::default()
+    })
+    .unwrap();
+    let err = backend
+        .initialize()
+        .await
+        .expect_err("a conflicting v2 index must fail inline boot");
+    let message = format!("{err}");
+    assert!(message.contains("idx_search_date_v2"), "{message}");
+    let names = search_index_names(&db).await;
+    assert!(
+        names.contains(&"idx_search_string".to_string()),
+        "v1 must be untouched: {names:?}"
+    );
+    assert!(
+        !names.contains(&"idx_search_string_v2".to_string()),
+        "nothing must be built: {names:?}"
+    );
+}
+
+#[tokio::test]
+async fn mongodb_integration_builder_off_mode_warns_and_changes_nothing() {
+    let Some(cs) = shared_mongo::connection_string().await else {
+        eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
+        return;
+    };
+    let db_name = build_test_database_name("builder_off");
+    let db = raw_test_client(&cs).await.unwrap().database(&db_name);
+    seed_generation1_indexes(&db).await;
+    let before = search_index_names(&db).await;
+    let backend = boot_with_mode(&cs, &db_name, IndexBuildMode::Off).await;
+    let outcome = backend
+        .wait_for_search_index_build()
+        .await
+        .expect("builder ran");
+    let BuildOutcome::Skipped { missing } = outcome else {
+        panic!("expected Skipped, got {outcome:?}")
+    };
+    let mut missing = missing;
+    missing.sort();
+    assert_eq!(
+        missing,
+        GENERATION2_BACKGROUND_NAMES.map(String::from).to_vec()
+    );
+    // `off` mode changes nothing about the background (generation-2/v1)
+    // indexes the builder is responsible for; the two inline-class specs
+    // (`idx_search_composite`, `idx_search_resource`) are still created by
+    // `initialize_schema_async` on every boot regardless of build mode (Task 3).
+    let mut expected = before;
+    expected.extend([
+        "idx_search_composite".to_string(),
+        "idx_search_resource".to_string(),
+    ]);
+    expected.sort();
+    assert_eq!(search_index_names(&db).await, expected);
+}
+
+/// Off mode inspects and warns; it must never drop a leftover v1 index even
+/// though generation 2 is already complete — the exact state after an
+/// operator runs the pre-build script by hand and a superseded index happens
+/// to survive (or is rebuilt by mistake).
+#[tokio::test]
+async fn mongodb_integration_builder_off_mode_leaves_leftover_v1_in_place() {
+    let Some(cs) = shared_mongo::connection_string().await else {
+        eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
+        return;
+    };
+    let db_name = build_test_database_name("builder_off_leftover");
+    let db = raw_test_client(&cs).await.unwrap().database(&db_name);
+    seed_generation1_indexes(&db).await;
+    // Generation 2 fully built and v1 dropped.
+    let first = boot_with_mode(&cs, &db_name, IndexBuildMode::Inline).await;
+    assert!(matches!(
+        first.wait_for_search_index_build().await,
+        Some(BuildOutcome::Built { .. })
+    ));
+    // Re-create exactly one v1 index by hand, with its v1 keys.
+    db.run_command(doc! { "createIndexes": "search_index", "indexes": [
+        { "key": { "tenant_id": 1, "resource_type": 1, "param_name": 1, "value_string": 1 }, "name": "idx_search_string" }
+    ]})
+    .await
+    .unwrap();
+    let backend = boot_with_mode(&cs, &db_name, IndexBuildMode::Off).await;
+    let outcome = backend
+        .wait_for_search_index_build()
+        .await
+        .expect("builder ran");
+    assert_eq!(outcome, BuildOutcome::Skipped { missing: vec![] });
+    let names = search_index_names(&db).await;
+    assert!(
+        names.contains(&"idx_search_string".to_string()),
+        "off mode must not drop a leftover v1 index; only warn: {names:?}"
+    );
+}
+
+#[tokio::test]
+async fn mongodb_integration_builder_second_boot_issues_no_create_indexes() {
+    let Some(cs) = shared_mongo::connection_string().await else {
+        eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
+        return;
+    };
+    let db_name = build_test_database_name("builder_second_boot");
+    let first = boot_with_mode(&cs, &db_name, IndexBuildMode::Inline).await;
+    assert!(matches!(
+        first.wait_for_search_index_build().await,
+        Some(BuildOutcome::Built { .. })
+    ));
+    let db = raw_test_client(&cs).await.unwrap().database(&db_name);
+    // Profile every command, boot again, then look for createIndexes.
+    if db.run_command(doc! { "profile": 2_i32 }).await.is_err() {
+        eprintln!("Skipping second-boot assertion: profiling not permitted");
+        return;
+    }
+    let second = boot_with_mode(&cs, &db_name, IndexBuildMode::Inline).await;
+    let outcome = second
+        .wait_for_search_index_build()
+        .await
+        .expect("builder ran");
+    let _ = db.run_command(doc! { "profile": 0_i32 }).await;
+    assert_eq!(outcome, BuildOutcome::UpToDate);
+
+    // Sanity check first, that profiling captured *something* for this boot,
+    // before trusting a 0 count below.
+    //
+    // It cannot be "a createIndexes for one of the always-recreated inline
+    // specs" (`idx_search_composite`/`idx_search_resource`): MongoDB elides
+    // `createIndexes` from `system.profile` entirely when the requested index
+    // already exists with an identical spec — verified directly against this
+    // server by issuing the same `createIndexes` twice and observing only the
+    // first call profiled. Since those inline specs are themselves unchanged
+    // on the second boot, they are no-ops too and would *never* produce a
+    // profiler entry, making that check trivially fail under correct
+    // behavior. Use the builder's own `listIndexes` (with
+    // `includeBuildUUIDs`) instead: `inspect()` always runs at least once per
+    // `SearchIndexBuilder::run()`, so it reliably fires every boot regardless
+    // of outcome.
+    let profiling_worked = db
+        .collection::<Document>("system.profile")
+        .count_documents(doc! { "command.listIndexes": "search_index" })
+        .await
+        .unwrap();
+    assert!(
+        profiling_worked >= 1,
+        "profiling captured nothing for the second boot (no listIndexes entry on \
+         search_index); this assertion cannot be trusted until profiling is confirmed working"
+    );
+
+    let generation2_created = db
+        .collection::<Document>("system.profile")
+        .count_documents(doc! {
+            "command.createIndexes": "search_index",
+            "command.indexes.name": { "$regex": "_v2$|^idx_search_contained$" },
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        generation2_created, 0,
+        "second boot must not issue createIndexes for any generation-2 search_index index"
+    );
+}
+
+/// Every `search_index` operation a value-filtered search issues must be a
+/// covered index scan on a generation-2 index: `docsExamined == 0`.
+async fn assert_search_index_ops_are_covered(
+    db: &mongodb::Database,
+    search: impl std::future::Future<Output = ()>,
+    expected_index_fragment: &str,
+) {
+    use futures::stream::TryStreamExt;
+
+    if db.run_command(doc! { "profile": 2_i32 }).await.is_err() {
+        eprintln!("Skipping covered-plan assertion: profiling not permitted");
+        search.await;
+        return;
+    }
+    search.await;
+    let _ = db.run_command(doc! { "profile": 0_i32 }).await;
+    let ns = format!("{}.search_index", db.name());
+    let ops: Vec<Document> = db
+        .collection::<Document>("system.profile")
+        .find(doc! { "ns": &ns, "op": { "$in": ["query", "command"] } })
+        .await
+        .unwrap()
+        .try_collect::<Vec<Document>>()
+        .await
+        .unwrap();
+    assert!(
+        !ops.is_empty(),
+        "expected at least one profiled operation on {ns}"
+    );
+    for op in &ops {
+        let docs_examined = op
+            .get_i64("docsExamined")
+            .or_else(|_| op.get_i32("docsExamined").map(i64::from))
+            .unwrap_or(0);
+        let plan = op.get_str("planSummary").unwrap_or_default().to_string();
+        assert_eq!(
+            docs_examined, 0,
+            "not covered: planSummary={plan} op={op:?}"
+        );
+        // `planSummary` carries only the winning plan's key pattern (e.g.
+        // `IXSCAN { tenant_id: 1, ... }`), never the index's name — verified
+        // against this server: every other `planSummary` assertion already in
+        // this file (e.g. `mongodb_history_type_plan_is_a_bounded_index_walk`)
+        // only checks for the `IXSCAN` stage name, never a specific index. The
+        // chosen index's name is recorded deeper, at `execStats..indexName`;
+        // match there instead of substring-matching a field that structurally
+        // cannot carry it.
+        let op_repr = format!("{op:?}");
+        assert!(
+            op_repr.contains(&format!(
+                "\"indexName\": String(\"{expected_index_fragment}\")"
+            )),
+            "wrong index: planSummary={plan} op={op:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn mongodb_integration_date_range_search_is_a_covered_v2_scan() {
+    let Some(backend) = create_backend_with_full_registry("covered_date").await else {
+        eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
+        return;
+    };
+    let tenant = create_tenant("tenant-covered-date");
+    for i in 0..20 {
+        backend
+            .create(
+                &tenant,
+                "Observation",
+                json!({
+                    "resourceType": "Observation", "id": format!("o{i}"), "status": "final",
+                    "code": { "coding": [{ "system": "http://loinc.org", "code": "8302-2" }] },
+                    "effectiveDateTime": format!("2016-01-{:02}", i + 1)
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+    }
+    let db = raw_test_client(&backend.config().connection_string)
+        .await
+        .unwrap()
+        .database(&backend.config().database_name);
+    let q = SearchQuery::new("Observation").with_parameter(SearchParameter {
+        name: "date".into(),
+        param_type: SearchParamType::Date,
+        modifier: None,
+        values: vec![SearchValue::parse("ge2016-01-10")],
+        chain: vec![],
+        components: vec![],
+    });
+    assert_search_index_ops_are_covered(
+        &db,
+        async {
+            let r = backend.search(&tenant, &q).await.unwrap();
+            assert_eq!(r.resources.items.len(), 11);
+        },
+        "idx_search_date_v2",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn mongodb_integration_bare_token_search_is_a_covered_v2_scan() {
+    let Some(backend) = create_backend_with_full_registry("covered_token").await else {
+        eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
+        return;
+    };
+    let tenant = create_tenant("tenant-covered-token");
+    for i in 0..20 {
+        backend
+            .create(
+                &tenant,
+                "Observation",
+                json!({
+                    "resourceType": "Observation", "id": format!("o{i}"),
+                    "status": if i % 2 == 0 { "final" } else { "preliminary" },
+                    "code": { "coding": [{ "system": "http://loinc.org", "code": "8302-2" }] }
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+    }
+    let db = raw_test_client(&backend.config().connection_string)
+        .await
+        .unwrap()
+        .database(&backend.config().database_name);
+    let q = SearchQuery::new("Observation").with_parameter(SearchParameter {
+        name: "status".into(),
+        param_type: SearchParamType::Token,
+        modifier: None,
+        values: vec![SearchValue::eq("final")],
+        chain: vec![],
+        components: vec![],
+    });
+    assert_search_index_ops_are_covered(
+        &db,
+        async {
+            let r = backend.search(&tenant, &q).await.unwrap();
+            assert_eq!(r.resources.items.len(), 10);
+        },
+        "idx_search_token_v2",
+    )
+    .await;
+}
+
+/// Controller finding: `?gender:missing=false` used to be served by
+/// `matching_resource_ids_complement_only`'s envelope-only presence filter
+/// (`{tenant_id, resource_type, param_name}`), which no generation-2
+/// partial index has a prefix for (every partial index also requires its
+/// value field to exist), so the planner fell back to a full scan of the
+/// whole `(tenant, type)` slice on `idx_search_composite`. Adding the
+/// `value_token_code: {"$ne": null}` conjunct (`missing_presence_filter`)
+/// lets it use `idx_search_token_v2`'s partial filter instead, and since
+/// `distinct_resource_ids` reads only `resource_id` — the index's trailing
+/// key — the scan is fully covered.
+#[tokio::test]
+async fn mongodb_integration_missing_false_search_is_a_covered_v2_scan() {
+    let Some(backend) = create_backend_with_full_registry("missing_false").await else {
+        eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
+        return;
+    };
+    let tenant = create_tenant("tenant-missing-false");
+    for i in 0..20 {
+        let mut resource = json!({
+            "resourceType": "Patient", "id": format!("p{i}"),
+        });
+        if i % 2 == 0 {
+            resource["gender"] = json!("male");
+        }
+        backend
+            .create(&tenant, "Patient", resource, FhirVersion::default())
+            .await
+            .unwrap();
+    }
+    let db = raw_test_client(&backend.config().connection_string)
+        .await
+        .unwrap()
+        .database(&backend.config().database_name);
+    let q = SearchQuery::new("Patient").with_parameter(SearchParameter {
+        name: "gender".into(),
+        param_type: SearchParamType::Token,
+        modifier: Some(SearchModifier::Missing),
+        values: vec![SearchValue::eq("false")],
+        chain: vec![],
+        components: vec![],
+    });
+    assert_search_index_ops_are_covered(
+        &db,
+        async {
+            let r = backend.search(&tenant, &q).await.unwrap();
+            assert_eq!(r.resources.items.len(), 10);
+        },
+        "idx_search_token_v2",
+    )
+    .await;
 }

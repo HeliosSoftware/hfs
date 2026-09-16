@@ -1,16 +1,15 @@
 /*
- * SearchParameter result-row navigation (#610).
+ * Whole-row navigation for any table[data-row-navigation] (#610, generalized
+ * for #1106).
  *
- * The first cell keeps the row's only real link for keyboard, assistive
+ * The row's first cell keeps its own real link for keyboard, assistive
  * technology, and no-JavaScript navigation. This handler only extends that
- * link's pointer target to the rest of the row.
+ * link's pointer target to the rest of the row — for every such table on the
+ * page, including a tbody that is (re)rendered after load.
  */
 (function () {
   "use strict";
 
-  var table = document.querySelector("table[data-row-navigation]");
-  if (!table || !table.tBodies.length) return;
-  var body = table.tBodies[0];
   var interactive = [
     "a",
     "button",
@@ -33,11 +32,11 @@
     );
   }
 
-  body.addEventListener("click", function (event) {
+  document.addEventListener("click", function (event) {
     var target = event.target;
     if (!target || !target.closest) return;
-    var row = target.closest("tr");
-    if (!row || !body.contains(row)) return;
+    var row = target.closest("table[data-row-navigation] > tbody > tr");
+    if (!row) return;
 
     // A drag may end over the real link. Cancel its native activation too.
     if (rowContainsSelection(row)) {
