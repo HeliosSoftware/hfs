@@ -12577,7 +12577,7 @@ async fn mongodb_integration_boot_creates_only_inline_search_indexes_and_keeps_g
     db.collection::<Document>("schema_version")
         .update_one(
             doc! { "_id": "schema_version" },
-            doc! { "$set": { "search_indexes": { "generation": 2_i32 } } },
+            doc! { "$set": { "search_indexes": { "generation": 3_i32 } } },
         )
         .await
         .unwrap();
@@ -12594,7 +12594,7 @@ async fn mongodb_integration_boot_creates_only_inline_search_indexes_and_keeps_g
         doc.get_document("search_indexes")
             .unwrap()
             .get_i32("generation"),
-        Ok(2)
+        Ok(3)
     );
 }
 
@@ -12665,8 +12665,10 @@ async fn seed_generation1_indexes(db: &mongodb::Database) {
         .expect("seed v1 indexes");
 }
 
-const GENERATION2_BACKGROUND_NAMES: [&str; 10] = [
-    "idx_search_contained",
+/// Generation 3: `idx_search_contained` is no longer a `search_index`
+/// background spec (#1160) — it now lives inline on `search_index_contained`
+/// (see [`index_names`] calls against that collection instead).
+const CURRENT_BACKGROUND_NAMES: [&str; 9] = [
     "idx_search_date_v2",
     "idx_search_identifier_type_v2",
     "idx_search_number_v2",
@@ -12678,14 +12680,39 @@ const GENERATION2_BACKGROUND_NAMES: [&str; 10] = [
     "idx_search_uri_v2",
 ];
 
-fn expected_generation2_names() -> Vec<String> {
-    let mut all: Vec<String> = GENERATION2_BACKGROUND_NAMES
+fn expected_current_names() -> Vec<String> {
+    let mut all: Vec<String> = CURRENT_BACKGROUND_NAMES
         .iter()
         .map(|s| s.to_string())
         .collect();
     all.extend(["_id_", "idx_search_composite", "idx_search_resource"].map(String::from));
     all.sort();
     all
+}
+
+/// An `IndexModel` for the generation-2 partial index over contained rows on
+/// `search_index` (`idx_search_contained`, superseded by #1160), built the
+/// way pre-generation-3 binaries built it — mirrors [`seed_generation1_indexes`]
+/// but for the single contained-rows index rather than the nine value
+/// indexes. Used to stage a generation-2 database for the migration test.
+fn superseded_contained_spec_model() -> mongodb::IndexModel {
+    let keys = doc! {
+        "tenant_id": 1_i32,
+        "contained_type": 1_i32,
+        "is_contained": 1_i32,
+        "param_name": 1_i32,
+        "resource_type": 1_i32,
+        "resource_id": 1_i32,
+        "contained_local_id": 1_i32,
+    };
+    let options = mongodb::options::IndexOptions::builder()
+        .name(Some("idx_search_contained".to_string()))
+        .partial_filter_expression(Some(doc! { "is_contained": true }))
+        .build();
+    mongodb::IndexModel::builder()
+        .keys(keys)
+        .options(Some(options))
+        .build()
 }
 
 async fn boot_with_mode(
@@ -12729,10 +12756,7 @@ async fn mongodb_integration_builder_fresh_database_ends_with_generation2_set() 
         BuildOutcome::Built { created, dropped } => {
             let mut created = created;
             created.sort();
-            assert_eq!(
-                created,
-                GENERATION2_BACKGROUND_NAMES.map(String::from).to_vec()
-            );
+            assert_eq!(created, CURRENT_BACKGROUND_NAMES.map(String::from).to_vec());
             assert!(
                 dropped.is_empty(),
                 "nothing to drop on a fresh database: {dropped:?}"
@@ -12741,7 +12765,17 @@ async fn mongodb_integration_builder_fresh_database_ends_with_generation2_set() 
         other => panic!("expected Built, got {other:?}"),
     }
     let db = raw_test_client(&cs).await.unwrap().database(&db_name);
-    assert_eq!(search_index_names(&db).await, expected_generation2_names());
+    assert_eq!(search_index_names(&db).await, expected_current_names());
+    // The contained collection's two inline indexes, built by
+    // `initialize_schema_async` (Task 3), independent of the builder.
+    assert_eq!(
+        index_names(&db, "search_index_contained").await,
+        vec![
+            "_id_",
+            "idx_search_contained",
+            "idx_search_contained_resource"
+        ]
+    );
     let record = db
         .collection::<Document>("schema_version")
         .find_one(doc! { "_id": "schema_version" })
@@ -12753,7 +12787,7 @@ async fn mongodb_integration_builder_fresh_database_ends_with_generation2_set() 
             .get_document("search_indexes")
             .unwrap()
             .get_i32("generation"),
-        Ok(2)
+        Ok(3)
     );
 }
 
@@ -12804,7 +12838,7 @@ async fn mongodb_integration_builder_upgrades_a_generation1_database_and_drops_v
             "idx_search_uri",
         ]
     );
-    assert_eq!(search_index_names(&db).await, expected_generation2_names());
+    assert_eq!(search_index_names(&db).await, expected_current_names());
     // Data still searchable on the new indexes.
     let q = SearchQuery::new("Patient").with_parameter(SearchParameter {
         name: "gender".into(),
@@ -12823,6 +12857,112 @@ async fn mongodb_integration_builder_upgrades_a_generation1_database_and_drops_v
             .items
             .len(),
         5
+    );
+}
+
+/// #1160: a generation-2 database with contained rows still sitting in
+/// `search_index` (`is_contained: true`) must have them moved to
+/// `search_index_contained` and the old partial index dropped, whichever
+/// mode the builder runs in — this boots `inline`. The own (non-contained)
+/// row for the same holder resource must stay in `search_index` untouched.
+#[tokio::test]
+async fn mongodb_integration_builder_moves_contained_rows_and_drops_the_old_partial_index() {
+    let Some(cs) = shared_mongo::connection_string().await else {
+        eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
+        return;
+    };
+    let db_name = build_test_database_name("builder_contained_move");
+    let db = raw_test_client(&cs).await.unwrap().database(&db_name);
+    // A generation-2 database: the old partial index and two contained rows
+    // written the old way, plus one own row that must stay put.
+    let old = superseded_contained_spec_model();
+    db.collection::<Document>("search_index")
+        .create_index(old)
+        .await
+        .unwrap();
+    db.collection::<Document>("search_index")
+        .insert_many(vec![
+            doc! { "tenant_id": "t", "resource_type": "Observation", "resource_id": "holder", "param_name": "code", "param_type": "token", "value_token_code": "OUTER" },
+            doc! { "tenant_id": "t", "resource_type": "Observation", "resource_id": "holder", "param_name": "name", "param_type": "string", "value_string": "smith", "is_contained": true, "contained_type": "Patient", "contained_local_id": "p" },
+            doc! { "tenant_id": "t", "resource_type": "Observation", "resource_id": "holder", "param_name": "gender", "param_type": "token", "value_token_code": "female", "is_contained": true, "contained_type": "Patient", "contained_local_id": "p" },
+        ])
+        .await
+        .unwrap();
+    let backend = boot_with_mode(&cs, &db_name, IndexBuildMode::Inline).await;
+    let outcome = backend
+        .wait_for_search_index_build()
+        .await
+        .expect("builder ran");
+    let BuildOutcome::Built { dropped, .. } = outcome else {
+        panic!("expected Built, got {outcome:?}")
+    };
+    assert!(
+        dropped.contains(&"idx_search_contained".to_string()),
+        "{dropped:?}"
+    );
+    let own = db.collection::<Document>("search_index");
+    let contained = db.collection::<Document>("search_index_contained");
+    assert_eq!(
+        own.count_documents(doc! { "is_contained": true })
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        own.count_documents(doc! { "resource_id": "holder" })
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        contained
+            .count_documents(doc! { "resource_id": "holder" })
+            .await
+            .unwrap(),
+        2
+    );
+    let moved = contained
+        .find_one(doc! { "param_name": "name" })
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!moved.contains_key("is_contained"));
+    assert_eq!(moved.get_str("contained_local_id"), Ok("p"));
+    assert!(
+        !search_index_names(&db)
+            .await
+            .contains(&"idx_search_contained".to_string())
+    );
+    assert_eq!(
+        index_names(&db, "search_index_contained").await,
+        vec![
+            "_id_",
+            "idx_search_contained",
+            "idx_search_contained_resource"
+        ]
+    );
+    let sv = db
+        .collection::<Document>("schema_version")
+        .find_one(doc! { "_id": "schema_version" })
+        .await
+        .unwrap()
+        .unwrap();
+    let si = sv.get_document("search_indexes").unwrap();
+    assert_eq!(si.get_i32("generation"), Ok(3));
+    assert_eq!(si.get_bool("contained_rows_moved"), Ok(true));
+
+    // Second boot: nothing to move, nothing to build.
+    let backend = boot_with_mode(&cs, &db_name, IndexBuildMode::Inline).await;
+    assert_eq!(
+        backend.wait_for_search_index_build().await,
+        Some(BuildOutcome::UpToDate)
+    );
+    assert_eq!(
+        contained
+            .count_documents(doc! { "resource_id": "holder" })
+            .await
+            .unwrap(),
+        2
     );
 }
 
@@ -12888,10 +13028,7 @@ async fn mongodb_integration_builder_off_mode_warns_and_changes_nothing() {
     };
     let mut missing = missing;
     missing.sort();
-    assert_eq!(
-        missing,
-        GENERATION2_BACKGROUND_NAMES.map(String::from).to_vec()
-    );
+    assert_eq!(missing, CURRENT_BACKGROUND_NAMES.map(String::from).to_vec());
     // `off` mode changes nothing about the background (generation-2/v1)
     // indexes the builder is responsible for; the two inline-class specs
     // (`idx_search_composite`, `idx_search_resource`) are still created by

@@ -504,7 +504,9 @@ pub(super) async fn get_search_index_generation(database: &Database) -> StorageR
 }
 
 /// Records that every background spec of `generation` is present and the
-/// superseded indexes are gone.
+/// superseded indexes are gone. Uses dotted `$set` keys rather than
+/// replacing the whole `search_indexes` subdocument, so a sibling field
+/// (`contained_rows_moved`, see [`set_contained_rows_moved`]) survives.
 pub(super) async fn set_search_index_generation(
     database: &Database,
     generation: i32,
@@ -513,10 +515,38 @@ pub(super) async fn set_search_index_generation(
         .collection::<Document>("schema_version")
         .update_one(
             doc! { "_id": "schema_version" },
-            doc! { "$set": { "search_indexes": {
-                "generation": generation,
-                "completed_at": mongodb::bson::DateTime::now(),
-            } } },
+            doc! { "$set": {
+                "search_indexes.generation": generation,
+                "search_indexes.completed_at": mongodb::bson::DateTime::now(),
+            } },
+        )
+        .upsert(true)
+        .await?;
+    Ok(())
+}
+
+/// Whether the one-time move of contained rows out of `search_index` has
+/// completed on this database (#1160).
+pub(super) async fn contained_rows_moved(database: &Database) -> StorageResult<bool> {
+    let doc = database
+        .collection::<Document>("schema_version")
+        .find_one(doc! { "_id": "schema_version" })
+        .await?;
+    Ok(doc
+        .as_ref()
+        .and_then(|d| d.get_document("search_indexes").ok())
+        .and_then(|s| s.get_bool("contained_rows_moved").ok())
+        .unwrap_or(false))
+}
+
+/// Records that [`contained_rows_moved`] is now true. Uses a dotted `$set`
+/// key for the same reason as [`set_search_index_generation`].
+pub(super) async fn set_contained_rows_moved(database: &Database) -> StorageResult<()> {
+    database
+        .collection::<Document>("schema_version")
+        .update_one(
+            doc! { "_id": "schema_version" },
+            doc! { "$set": { "search_indexes.contained_rows_moved": true } },
         )
         .upsert(true)
         .await?;

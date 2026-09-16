@@ -1,10 +1,19 @@
-//! Declarative catalog of the `search_index` indexes (#1059, #1084).
+//! Declarative catalog of the `search_index` indexes (#1059, #1084, #1160).
 //!
 //! Generation 2 replaces the nine full value indexes with partial indexes that
 //! carry `resource_id` as their trailing key, so a value-filtered scan can be
-//! covered, and adds a partial index over contained rows. New names, never
-//! changed keys: MongoDB refuses a different key spec under an existing name
-//! (`IndexKeySpecsConflict`, 86), which would fail every deployed boot.
+//! covered, and adds a partial index over contained rows on `search_index`
+//! itself. New names, never changed keys: MongoDB refuses a different key
+//! spec under an existing name (`IndexKeySpecsConflict`, 86), which would
+//! fail every deployed boot.
+//!
+//! Generation 3 (#1160) moves contained rows off `search_index` entirely,
+//! into their own `search_index_contained` collection ([`contained_specs`]),
+//! so a standard search can never match through them by construction —
+//! standard search never reads that collection. Generation 2's partial index
+//! over contained rows on `search_index` ([`superseded_contained_spec`]) is
+//! superseded: the builder drops it once the rows it used to serve have
+//! moved (see `search_index_builder.rs`).
 
 use mongodb::{
     IndexModel,
@@ -214,9 +223,6 @@ pub(crate) fn contained_specs() -> Vec<SearchIndexSpec> {
 /// The generation-2 partial index over contained rows on `search_index`,
 /// dropped by the builder once the rows have moved. Exact keys, so the
 /// rollback script recreates what existed.
-// Only this module's tests call it in this task; the builder starts
-// dropping this index in a later #1160 task.
-#[allow(dead_code)]
 pub(crate) fn superseded_contained_spec() -> SearchIndexSpec {
     SearchIndexSpec {
         name: "idx_search_contained",
