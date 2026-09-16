@@ -10882,3 +10882,79 @@ async fn mongodb_integration_search_paged_intersection_correctness() {
         "active=true&gender=female must return exactly the {FEMALE_ACTIVE} female patients"
     );
 }
+
+/// Task 3 of the generation-2 plan: boot creates only the inline
+/// `search_index` specs, and the schema-version document survives a second
+/// boot with its `search_indexes` record intact.
+#[tokio::test]
+async fn mongodb_integration_boot_creates_only_inline_search_indexes_and_keeps_generation_record() {
+    let Some(connection_string) = shared_mongo::connection_string().await else {
+        eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
+        return;
+    };
+    let config = MongoBackendConfig {
+        connection_string: connection_string.clone(),
+        database_name: build_test_database_name("inline_specs_only"),
+        // `off` so this test sees exactly what initialize_schema_async does.
+        index_build: IndexBuildMode::Off,
+        ..Default::default()
+    };
+    let backend = MongoBackend::new(config.clone()).unwrap();
+    backend.initialize().await.expect("first boot");
+
+    let client = raw_test_client(&connection_string).await.unwrap();
+    let db = client.database(&config.database_name);
+    let names = search_index_names(&db).await;
+    assert_eq!(
+        names,
+        vec!["_id_", "idx_search_composite", "idx_search_resource"]
+    );
+
+    // A record written by the builder must survive the next boot.
+    db.collection::<Document>("schema_version")
+        .update_one(
+            doc! { "_id": "schema_version" },
+            doc! { "$set": { "search_indexes": { "generation": 2_i32 } } },
+        )
+        .await
+        .unwrap();
+    let backend2 = MongoBackend::new(config.clone()).unwrap();
+    backend2.initialize().await.expect("second boot");
+    let doc = db
+        .collection::<Document>("schema_version")
+        .find_one(doc! { "_id": "schema_version" })
+        .await
+        .unwrap()
+        .expect("schema_version document");
+    assert!(doc.get_i32("version").unwrap() >= 10);
+    assert_eq!(
+        doc.get_document("search_indexes")
+            .unwrap()
+            .get_i32("generation"),
+        Ok(2)
+    );
+}
+
+/// Sorted index names on `search_index`, from a raw `listIndexes`.
+async fn search_index_names(db: &mongodb::Database) -> Vec<String> {
+    let reply = db
+        .run_command(doc! { "listIndexes": "search_index" })
+        .await
+        .expect("listIndexes");
+    let mut names: Vec<String> = reply
+        .get_document("cursor")
+        .unwrap()
+        .get_array("firstBatch")
+        .unwrap()
+        .iter()
+        .map(|b| {
+            b.as_document()
+                .unwrap()
+                .get_str("name")
+                .unwrap()
+                .to_string()
+        })
+        .collect();
+    names.sort();
+    names
+}
