@@ -40,7 +40,7 @@ Windows 11 host with an NVMe SSD; treat them as orders of magnitude, not targets
 | §4 | Elasticsearch sized for T3: 8 GB heap, a named volume, a shard pre-flight, a per-run index prefix, replicas dropped on the live indices, and a cleanup step that deletes indices by name | 1 GiB is a T2 setting; with no volume, the prescribed `docker rm -fv` discarded the index silently. At ~1,000 shards every index creation is rejected and HFS **never becomes ready** — it looks exactly like an HFS startup bug |
 | §5 | One environment for the whole pass, with `HFS_ELASTICSEARCH_REINDEX_REFRESH=false` next to `HFS_ELASTICSEARCH_WRITE_REFRESH=wait_for` | v1 set `wait_for` for the whole pass, which is right for T4 and made every `_bulk` request of T3's rebuild block on a refresh nobody was waiting to read. #1156 separates the two policies, so the pass keeps read-your-write *and* a rebuild that does not wait: measured on a 1 % cut, 806 s → **145 s** (1,576 resources/s, 0 errors). No restart between T3 and T4 |
 | §5 | What the submission detail page's 5 s poll costs at corpus scale, and that the dashboard is safe | The poll's `COUNT(*)` scans a table that grows to one row per ingested resource, so it slows down as the import grows. That is expected, not a hang |
-| §2, §7.1 | `python3 -m http.server` is replaced by an HTTP/1.1 keep-alive static server, and a byte-for-byte check that the corpus is served whole | Measured: 4–8 files per run lost their last 20–130 KB **while the manifest still ended `completed`**. v1's pass criteria were satisfiable by a run whose database was missing thousands of resources |
+| §2, §7.1 | `python3 -m http.server` is replaced by an HTTP/1.1 keep-alive static server, and a byte-for-byte check that the corpus is served whole | Measured: 4–8 files per run lost their last 20–130 KB. In the campaign the manifest still ended `completed`, so v1's pass criteria were satisfiable by a database missing thousands of resources; since #1127 such a file makes the manifest **`failed`** instead, which turns the same defect into hours of wasted ingest. The check costs minutes either way |
 | §7.3 | Judge progress by the resource counter; expect `total_entries` to equal the corpus size; a list of log lines that are failures | The percentage is byte progress capped at 99, so it sits still for hours near the end. `total_entries` ended at 37,911,730 for 18,955,865 receipts — the import had silently run twice |
 | §7.4 (new; it pushes v1's count step down to §7.5) | Wait for the deferred search rebuild, confirm it with `$reindex-status`, and record its duration separately | Since #946 the rebuild is a separate unbounded phase that starts **after** the submission reports Completed. In the campaign the submission completed while the index was ~9 % built |
 | §7.5 | Counts compared per type against the corpus, a shortfall is a failure, and Elasticsearch counts come from `_count` excluding contained documents | `_cat/indices`'s `docs.count` includes Lucene's hidden nested documents and can never match a resource count (#991). Per-type comparison is the only check that catches a rebuild leaving one type behind, which is what happened to Provenance |
@@ -300,7 +300,7 @@ expensive false bug report in this pass.
 
 ```bash
 export ES_PREFIX=hfs_$(date +%Y%m%d_%H%M)          # e.g. hfs_20260916_1042
-export HFS_ELASTICSEARCH_INDEX_PREFIX=$ES_PREFIX   # crates/rest/src/config.rs:1122, default "hfs"
+export HFS_ELASTICSEARCH_INDEX_PREFIX=$ES_PREFIX   # crates/rest/src/config.rs:1191, default "hfs"
 ```
 
 HFS names every index `{prefix}_{tenant}_{type in lower case}`
@@ -345,7 +345,7 @@ cannot allocate it, so every index stays yellow forever. Only red is a failure.
 **3. Refresh interval and replicas.**
 
 `HFS_ELASTICSEARCH_REFRESH_INTERVAL=30s` from the environment in section 5
-(`crates/rest/src/config.rs:1136`, default `1s`) is enough **provided the prefix is
+(`crates/rest/src/config.rs:1205`, default `1s`) is enough **provided the prefix is
 fresh**: HFS creates each index explicitly with its own settings body
 (`crates/persistence/src/backends/elasticsearch/schema.rs:426`), so the value applies
 to indices created after the change and does not retrofit indices an earlier run
@@ -375,7 +375,7 @@ lowercase normalizer come from. The `_settings` call above is the supported rout
 
 **4. Do nothing about `index.mapping.nested_objects.limit`.** Since #1109 HFS writes
 50,000 into every index it creates and raises existing indices at startup
-(`HFS_ELASTICSEARCH_NESTED_OBJECTS_LIMIT`, `crates/rest/src/config.rs:1154`). Earlier
+(`HFS_ELASTICSEARCH_NESTED_OBJECTS_LIMIT`, `crates/rest/src/config.rs:1223`). Earlier
 revisions of this document asked for a manual settings call here; it is now wrong.
 
 **5. Clean up at the end of the row.**
@@ -450,7 +450,7 @@ its throughput — 806 s against 145 s, below. An earlier draft of this document
 therefore prescribed two profiles and a restart between them.
 
 **That is no longer necessary.** #1156 (merged, closing #1125) added
-`HFS_ELASTICSEARCH_REINDEX_REFRESH` (`crates/rest/src/config.rs:1193`), which sets the
+`HFS_ELASTICSEARCH_REINDEX_REFRESH` (`crates/rest/src/config.rs:1262`), which sets the
 refresh policy of `$reindex` and of the deferred post-import rebuild *separately* from
 ordinary writes, and follows `HFS_ELASTICSEARCH_WRITE_REFRESH` when it is unset or
 blank (`crates/persistence/src/backends/elasticsearch/backend.rs:436`). Set both and
@@ -488,12 +488,23 @@ Three details worth knowing before you debug it:
 
 `HFS_BULK_SUBMIT_LEASE_DURATION` is in **seconds** and must be greater than the
 heartbeat interval, 20 s by default; HFS refuses to start otherwise
-(`crates/rest/src/config.rs:927`). 600 s gives a saturated writer room to renew
+(`crates/rest/src/config.rs:996`). 600 s gives a saturated writer room to renew
 before the lease expires. Losing the lease mid-import is what makes the worker
 re-walk the manifest, which is what inflated `total_entries` in the campaign (7.3).
 
+**The rebuild phase can now be skipped entirely on `*-es` rows.** Since #1159 (#1127),
+`HFS_BULK_SUBMIT_INDEX_DURING_INGEST=true` (`crates/rest/src/config.rs:891`, default
+`false`) indexes each committed batch as it lands, so the post-import rebuild that
+7.4 waits for does not run. It is **off by default and this pass exercises the
+default**, so leave it unset unless the row under test is explicitly about it — but if
+T3 is otherwise unfinishable on your hardware, turning it on is the documented way
+through, and the matrix cell must then say so, because it changes what 7.4 and §14
+measure. Its tunables are `HFS_BULK_SUBMIT_INDEX_QUEUE` (16),
+`HFS_BULK_SUBMIT_INDEX_CONCURRENCY` (4), `HFS_BULK_SUBMIT_INDEX_COALESCE` (4) and
+`HFS_BULK_SUBMIT_INDEX_MAX_WAIT` (30 s).
+
 If the rebuild fails on oversized resources — the campaign's `Provenance` failure —
-`HFS_REINDEX_BATCH_BYTES` (`crates/rest/src/config.rs:1207`, default `0` = count
+`HFS_REINDEX_BATCH_BYTES` (`crates/rest/src/config.rs:1276`, default `0` = count
 only) caps a rebuild page by bytes on top of `HFS_REINDEX_BATCH_SIZE`, so a page of
 ~108 KB resources ends at the first one that crosses the cap. Record it if you needed
 it.
@@ -511,9 +522,9 @@ submission detail page stays open. What that costs at corpus scale:
 - **Keep the submission detail page open — that is the step — and expect its refresh
   to slow down as the import grows.** The status card polls every 5 s
   (`crates/ui/templates/partials/bulk_import_status.html:4`), and on SQLite each poll
-  runs `SELECT COUNT(*), SUM(CASE …) … FROM bulk_entry_results WHERE tenant_id=? AND
-  submitter=? AND submission_id=?`
-  (`crates/persistence/src/backends/sqlite/bulk_submit.rs:278`). That table grows to
+  runs `SELECT COUNT(*), SUM(CASE …) ×4 … FROM bulk_entry_results WHERE tenant_id=?1 AND
+  submitter=?2 AND submission_id=?3 AND manifest_id=?4`
+  (`crates/persistence/src/backends/sqlite/bulk_submit.rs:1495`). That table grows to
   one row per ingested resource — 19M by the end — so the poll gets steadily more
   expensive and competes with the ingest writer on the same database file. In the
   campaign the interval between successful status lines stretched from seconds to
@@ -724,10 +735,20 @@ connection after every response and HFS pays a fresh TCP connection per file. Un
 sustained multi-gigabyte transfers it also drops the tail of the body. Measured on
 this corpus, with the default HTTP/1.0 and with `-p HTTP/1.1`: **4–8 files per run
 lose their final 20–130 KB**. On the HFS side the stream dies with
-`hyper::Error(Body, Os { code: 10054, ConnectionReset })`, the rest of that file is
-abandoned, one file-level `error` artifact is written — **and the manifest still ends
-`completed`, with no WARN in the log**. The pass criteria in 7.3 are therefore
-satisfiable by a run whose database is missing thousands of resources. Throughput was
+`hyper::Error(Body, Os { code: 10054, ConnectionReset })`.
+
+**What that costs has changed, and for the better — but it still costs the run.** When
+the campaign hit this, the rest of the file was abandoned, one file-level `error`
+artifact was written, and **the manifest still ended `completed`**, so 7.3's pass
+criteria were satisfiable by a database missing thousands of resources. #1159 (#1127)
+fixed both halves of that: HFS now re-requests the remainder with a `Range` request
+(`bulk-submit file stream failed mid-body; re-requesting the rest`,
+`crates/rest/src/bulk_submit_fetcher.rs:731`), and if it still cannot finish the file,
+the manifest is **`failed`, never `completed`**
+(`crates/persistence/src/core/bulk_submit_worker.rs:1864`). So a truncating server no
+longer produces a silently incomplete database — it produces a T3 that **fails after
+hours of ingest**. That is why the byte check below is still a step and not a
+suggestion: it costs minutes and it fails before the import, not after. Throughput was
 also capped around 15 MB/s with a fixed 5–7 s of overhead per file; serving the
 identical corpus with an HTTP/1.1 keep-alive server gave **0 losses**, and on a 0.1 %
 smoke cut the ingest went from 104–176 s to 12 s (#1126). The "manifest completes
@@ -833,23 +854,30 @@ moving while the import is working normally. In the campaign the card sat at
 "Processing 99 %" for hours. The resource count next to it, and the NDJSON requests
 arriving in the corpus server's log, are the live signals.
 
-**`total_entries` must end equal to the corpus size.** The per-manifest entry
-counters accumulate across every run of a manifest
-(`crates/persistence/src/backends/sqlite/bulk_submit.rs:938`), so a manifest the
-worker had to re-walk reports a multiple of its real size. In the campaign the figure
-ended at **37,911,730** for 18,955,865 receipts: the import had silently run twice,
-after the server lost its bulk-submit lease halfway. Compare the final figure against
-the totals in `$WORK/corpus-counts.tsv`. A multiple of the corpus size is a re-walk
-to record and report, not a pass.
+**`total_entries` must end equal to the corpus size.** In the campaign it ended at
+**37,911,730** for 18,955,865 receipts — exactly twice — because the per-manifest
+counters added the whole file again on every pass, and the server had lost its
+bulk-submit lease halfway, forcing a re-walk. Schema v32 (#1127) fixed the counting
+half: `bulk_manifest_file_progress` keeps a per-file high-water mark and only lines
+beyond it are charged (`crates/persistence/src/backends/sqlite/bulk_submit.rs:1323`,
+fed from `:394`), so a re-walk no longer multiplies the figure. Compare the final
+value against the totals in `$WORK/corpus-counts.tsv`: it must **equal** them. A
+multiple is now a defect to report, not the known behaviour — with one exception,
+a manifest first counted before v32, which has no file rows and is charged once more
+on a re-walk (`crates/persistence/src/backends/sqlite/schema.rs:1508`).
 
 **These log lines are failures to record, not noise.** Watch
 `$WORK/hfs-<backend>.log`:
 
 | Line | What it means |
 |---|---|
-| `bulk-submit run abandoned mid-manifest: its lease is no longer held` | the worker lost its lease (`crates/persistence/src/core/bulk_submit_worker.rs:1515`); the manifest will be re-walked and `total_entries` will overshoot |
+| `bulk-submit run abandoned mid-manifest: its lease is no longer held` | the worker lost its lease (`crates/persistence/src/core/bulk_submit_worker.rs:1687`). Whoever reclaims the manifest walks it again **from its first file**, which on this corpus costs hours — record it. Since v32 the counters no longer overshoot, so the re-walk is visible in the clock, not in `total_entries` |
 | `bulk-submit ingestion appears stalled: a processing manifest's worker lease expired without renewal or reclaim` | no progress for three lease durations; the page shows `stalled at N%` (`crates/rest/src/handlers/bulk_submit.rs:925`, `:961`) |
 | any `error decoding response body` | a truncated or reset fetch from the corpus server — re-run the byte check in 7.1 |
+| `bulk-submit file stream failed mid-body; re-requesting the rest` | a fetch broke mid-body and HFS is resuming it with a `Range` request (`crates/rest/src/bulk_submit_fetcher.rs:731`). One is a hiccup; a stream of them means the corpus server is the problem — 7.1 |
+| `bulk-submit file stream failed mid-body; the file cannot be completed` | the resume gave up (`bulk_submit_fetcher.rs:748`). This file will fail the whole manifest |
+| `bulk-submit input file failed part-way; its committed batches stay, the rest of the file was not ingested and the manifest will fail` | since #1127 a file that cannot be read to its end fails the manifest (`crates/persistence/src/core/bulk_submit_worker.rs:1610`) |
+| `bulk-submit manifest failed: not every input file could be ingested` | the terminal verdict for the above (`bulk_submit_worker.rs:1880`). The submission ends **Failed**, not Completed |
 | `Sync attempt failed, retrying` | the composite could not write to Elasticsearch; repeated, check the shard budget (4.1) |
 | `deferred reindex generation failed; retrying once` | the automatic search rebuild lost a generation (`crates/persistence/src/search/reindex.rs:1797`) |
 | `deferred reindex failed twice; run $reindex manually (every failure is listed by $reindex-status for this job)` | the rebuild gave up. **The search index is incomplete and stays that way** (`reindex.rs:1807`) |
@@ -880,11 +908,27 @@ it — re-check `HFS_BASE_URL` against `HFS_SERVER_PORT` before filing.
 ### 7.4 Wait for the deferred search rebuild
 
 With `HFS_BULK_SUBMIT_DEFER_INDEXING=true` — the default since #946
-(`crates/rest/src/config.rs:831`) — the submission reports **Completed** once the
+(`crates/rest/src/config.rs:872`) — the submission reports **Completed** once the
 resources are stored, and the search index is built afterwards by a separate,
 unbounded job. In the campaign the submission reported Completed while the index was
 about 9 % built, and 7.5's counts would have "failed" for reasons that have nothing
 to do with the import. Every count check belongs after this step.
+
+**Unless you switched the new mode on.** Since #1159 (#1127) a composite with an
+Elasticsearch secondary can index each committed batch as it lands instead of
+rebuilding afterwards: `HFS_BULK_SUBMIT_INDEX_DURING_INGEST=true`
+(`crates/rest/src/config.rs:891`, default `false` at `:773`). The sink is drained
+before the receipts and the terminal status are written, so when the submission says
+Completed the index is already complete and **no rebuild runs at all** — the log says
+`bulk-submit indexed every resource during ingest; no deferred reindex needed`
+(`crates/persistence/src/core/bulk_submit_worker.rs:2436`). Only types the secondary
+*rejected* are left to a deferred rebuild
+(`crates/persistence/src/core/bulk_submit_worker.rs:2506`), and a rejected resource is
+receipted `processing-error` with an `OperationOutcome` whose code is `incomplete`
+rather than being silently missing. Two consequences for this pass: with the flag on,
+this step is a single `$reindex-status` check that should find nothing to wait for, and
+**whichever mode you ran, record it in the matrix cell** — the searchable time in §14
+means different things in the two modes. The rest of this step describes the default.
 
 1. **Watch the rebuild banner on `/ui`**: *"Search index rebuilding — N % (P of T
    resources). Searches may miss stored resources until it finishes."*
@@ -1650,8 +1694,10 @@ For each backend row, attach to the release issue:
   ran, and once the job's status is evicted (24 h). `$reindex-status` is the check
   (7.4).
 - **`python3 -m http.server` must not serve the corpus.** It truncates multi-gigabyte
-  bodies while the import still reports `completed` (7.1). The §12.1 rest-hook
-  receiver is a different case and is fine as written.
+  bodies (7.1). Since #1127 that no longer corrupts the result silently — HFS resumes
+  with a `Range` request and, failing that, ends the manifest **`failed`** — but it
+  does turn hours of ingest into a failed run, which the byte check in 7.1 catches in
+  minutes. The §12.1 rest-hook receiver is a different case and is fine as written.
 - **The submission detail page's 5 s poll gets slower as the import grows**, because
   its status query counts a table with one row per ingested resource (section 5). The
   dashboard is safe to leave open since #1081.

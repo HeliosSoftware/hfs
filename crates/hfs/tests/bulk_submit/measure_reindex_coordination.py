@@ -95,9 +95,10 @@ class FixtureHandler(http.server.SimpleHTTPRequestHandler):
     """Static handler pinned to HTTP/1.1.
 
     ``BaseHTTPRequestHandler`` defaults to ``HTTP/1.0``, which closes the socket
-    after every response; that was measured to truncate NDJSON bodies while the
-    submission still reported ``completed`` (#1126), so a scenario could be
-    scored against a corpus HFS never fully received.  ``Content-Length`` is
+    after every response; that was measured to truncate NDJSON bodies (#1126),
+    so a scenario could be scored against a corpus HFS never fully received.
+    (At the time the submission still reported ``completed``; since #1127 a file
+    that cannot be read to its end fails the manifest instead.)  ``Content-Length`` is
     always sent from ``os.stat``, so keep-alive is framed correctly.  The
     timeout reaps connections that now outlive their request.
     """

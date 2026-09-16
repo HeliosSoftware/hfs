@@ -910,9 +910,10 @@ class FixtureProvider:
     defaults to ``HTTP/1.0``, which sets ``close_connection`` after every
     response no matter what the client asked for, and that default was measured
     to **truncate bodies** on a multi-gigabyte corpus (#1126): 4-8 files per run
-    lost their final 20-130 KB, HFS reported a connection reset mid-stream, one
-    file-level error artifact was written, and the manifest still ended
-    ``completed``.  A benchmark run over a truncated corpus reports clean
+    lost their final 20-130 KB and HFS reported a connection reset mid-stream.
+    The manifest still ended ``completed`` then; since #1127 it ends ``failed``
+    instead, which is louder but still wastes the run.  A benchmark run over a
+    truncated corpus reports clean
     numbers for input that was never fully delivered, so every figure it
     produces — throughput, RSS, reindex coverage — is measuring something other
     than what it claims.  ``SimpleHTTPRequestHandler`` always sends an accurate
