@@ -69,14 +69,6 @@ pub(crate) async fn connect_client(config: &MongoBackendConfig) -> StorageResult
 /// connection silently dropped by a NAT/firewall is never handed to a request.
 const MAX_CONNECTION_IDLE_TIME: Duration = Duration::from_secs(60);
 
-/// Where the post-boot search_index build is, for `wait_for_search_index_build`.
-#[derive(Debug)]
-enum SearchIndexBuildState {
-    NotStarted,
-    Running(tokio::task::JoinHandle<BuildOutcome>),
-    Done(BuildOutcome),
-}
-
 /// MongoDB backend for FHIR resource storage.
 ///
 /// The Phase 4 implementation provides backend wiring, schema bootstrap,
@@ -96,8 +88,15 @@ pub struct MongoBackend {
     registries: Arc<TenantSearchRegistries>,
     /// Sync cache of each tenant's stored params, read by the registry loader.
     stored_by_tenant: StoredByTenant,
-    /// Post-boot generation-2 index build, spawned by `init_schema`.
-    search_index_build: Arc<tokio::sync::Mutex<SearchIndexBuildState>>,
+    /// Publishes the post-boot `search_index` build's outcome once, from the
+    /// task `init_schema` spawns. `None` until that task finishes.
+    search_index_rx: tokio::sync::watch::Receiver<Option<BuildOutcome>>,
+    /// The sending half, taken (leaving `None`) by `init_schema` the one time
+    /// it runs; `wait_for_search_index_build` reads "already taken" as
+    /// "`init_schema` has run". A `Mutex` only to make `take()` safe from
+    /// `&self`; never held across an `.await`.
+    search_index_tx:
+        Arc<tokio::sync::Mutex<Option<tokio::sync::watch::Sender<Option<BuildOutcome>>>>>,
 }
 
 impl Debug for MongoBackend {
@@ -299,14 +298,15 @@ impl MongoBackend {
         )));
         Self::initialize_search_registry(registries.base(), &config);
 
+        let (search_index_tx, search_index_rx) = tokio::sync::watch::channel(None::<BuildOutcome>);
+
         Ok(Self {
             config,
             client: Arc::new(OnceCell::new()),
             registries,
             stored_by_tenant,
-            search_index_build: Arc::new(tokio::sync::Mutex::new(
-                SearchIndexBuildState::NotStarted,
-            )),
+            search_index_rx,
+            search_index_tx: Arc::new(tokio::sync::Mutex::new(Some(search_index_tx))),
         })
     }
 
@@ -508,28 +508,33 @@ impl MongoBackend {
         let db = self.get_database().await?;
         schema::initialize_schema_async(&db).await?;
 
-        let builder = SearchIndexBuilder::new(db.clone(), self.config.index_build);
-        let handle = tokio::spawn(builder.run());
-        match self.config.index_build {
-            IndexBuildMode::Inline => {
-                let outcome = handle.await.map_err(|e| {
+        // Taken once: `init_schema` runs once per backend instance (boot). A
+        // second call finds `None` here and skips spawning another build —
+        // `search_index_rx` still carries the first build's outcome.
+        let tx = self.search_index_tx.lock().await.take();
+        if let Some(tx) = tx {
+            let builder = SearchIndexBuilder::new(db.clone(), self.config.index_build);
+            let handle = tokio::spawn(async move {
+                let outcome = builder.run().await;
+                let _ = tx.send(Some(outcome));
+            });
+            if self.config.index_build == IndexBuildMode::Inline {
+                handle.await.map_err(|e| {
                     StorageError::Backend(BackendError::Internal {
                         backend_name: "mongodb".to_string(),
                         message: format!("search_index build task panicked: {e}"),
                         source: None,
                     })
                 })?;
-                if let BuildOutcome::Failed { message } = &outcome {
+                if let Some(BuildOutcome::Failed { message }) =
+                    self.search_index_rx.borrow().clone()
+                {
                     return Err(StorageError::Backend(BackendError::Internal {
                         backend_name: "mongodb".to_string(),
-                        message: message.clone(),
+                        message,
                         source: None,
                     }));
                 }
-                *self.search_index_build.lock().await = SearchIndexBuildState::Done(outcome);
-            }
-            IndexBuildMode::Background | IndexBuildMode::Off => {
-                *self.search_index_build.lock().await = SearchIndexBuildState::Running(handle);
             }
         }
 
@@ -541,24 +546,27 @@ impl MongoBackend {
 
     /// Waits for the post-boot `search_index` build started by `init_schema`
     /// and returns its outcome; `None` if `init_schema` has not run. Safe to
-    /// call repeatedly: the outcome is kept.
+    /// call repeatedly: the outcome is kept. Holds no lock across an `.await`,
+    /// so it is safe to cancel (e.g. the caller's future is dropped mid-wait).
     pub async fn wait_for_search_index_build(&self) -> Option<BuildOutcome> {
-        let mut state = self.search_index_build.lock().await;
-        match std::mem::replace(&mut *state, SearchIndexBuildState::NotStarted) {
-            SearchIndexBuildState::NotStarted => None,
-            SearchIndexBuildState::Done(outcome) => {
-                *state = SearchIndexBuildState::Done(outcome.clone());
-                Some(outcome)
+        {
+            let sender = self.search_index_tx.lock().await;
+            if sender.is_some() {
+                // init_schema hasn't taken the sender yet, so it hasn't run.
+                return None;
             }
-            SearchIndexBuildState::Running(handle) => {
-                let outcome = match handle.await {
-                    Ok(outcome) => outcome,
-                    Err(e) => BuildOutcome::Failed {
-                        message: format!("search_index build task panicked: {e}"),
-                    },
-                };
-                *state = SearchIndexBuildState::Done(outcome.clone());
-                Some(outcome)
+        }
+        let mut rx = self.search_index_rx.clone();
+        loop {
+            if let Some(outcome) = rx.borrow().clone() {
+                return Some(outcome);
+            }
+            // `Err` means the sender was dropped without ever sending: the
+            // spawned task ended (e.g. panicked) before publishing an outcome.
+            if rx.changed().await.is_err() {
+                return Some(BuildOutcome::Failed {
+                    message: "search_index build task ended without reporting".to_string(),
+                });
             }
         }
     }

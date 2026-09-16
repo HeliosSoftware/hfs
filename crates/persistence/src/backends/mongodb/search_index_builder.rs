@@ -61,10 +61,10 @@ use std::time::Duration;
 
 use mongodb::{
     Database,
-    bson::{Document, doc},
+    bson::{Bson, Document, doc},
 };
 
-use crate::error::StorageResult;
+use crate::error::{BackendError, StorageError, StorageResult};
 
 use super::schema::{
     drop_index_if_present, get_search_index_generation, set_search_index_generation,
@@ -150,13 +150,13 @@ impl SearchIndexBuilder {
                 .map(|(n, _)| n.clone())
                 .collect();
             for (name, actual) in &inspection.conflicting {
-                let expected = generation2_specs()
-                    .into_iter()
-                    .find(|s| s.name == name)
-                    .map(|s| s.keys);
+                let expected_spec = generation2_specs().into_iter().find(|s| s.name == name);
+                let expected_keys = expected_spec.as_ref().map(|s| s.keys.clone());
+                let expected_partial = expected_spec.as_ref().and_then(|s| s.partial.clone());
                 tracing::error!(
                     index = %name,
-                    expected_keys = ?expected,
+                    expected_keys = ?expected_keys,
+                    expected_partial = ?expected_partial,
                     actual = ?actual,
                     "search_index index exists under a generation-2 name with a different spec; \
                      refusing to build or drop anything. Drop or rename it by hand."
@@ -184,6 +184,13 @@ impl SearchIndexBuilder {
                     index = spec.name,
                     "HFS_MONGODB_INDEX_BUILD=off: generation-2 search_index index is missing; \
                      build it with docs/mongodb/search-index-v2.mongosh.js"
+                );
+            }
+            for name in &inspection.superseded_present {
+                tracing::warn!(
+                    index = %name,
+                    "HFS_MONGODB_INDEX_BUILD=off: {name} is a superseded generation-1 \
+                     search_index index; drop it with db.search_index.dropIndex(\"{name}\")"
                 );
             }
             return Ok(BuildOutcome::Skipped { missing });
@@ -260,11 +267,7 @@ impl SearchIndexBuilder {
     /// has at most 21, well under the default batch, so `firstBatch` is
     /// complete.
     async fn inspect(&self) -> StorageResult<Inspection> {
-        let reply = match self
-            .database
-            .run_command(doc! { "listIndexes": SEARCH_INDEX_COLLECTION })
-            .await
-        {
+        let reply = match self.database.run_command(list_indexes_command()).await {
             Ok(reply) => reply,
             // NamespaceNotFound (26): the collection has never been written.
             // Every background spec is then "missing" and the build is instant.
@@ -279,17 +282,28 @@ impl SearchIndexBuilder {
             }
             Err(e) => return Err(e.into()),
         };
-        let existing: Vec<Document> = reply
+        let existing: Vec<Document> = match reply
             .get_document("cursor")
             .ok()
             .and_then(|c| c.get_array("firstBatch").ok())
-            .map(|batch| {
-                batch
-                    .iter()
-                    .filter_map(|b| b.as_document().cloned())
-                    .collect()
-            })
-            .unwrap_or_default();
+        {
+            Some(batch) => batch
+                .iter()
+                .filter_map(|b| b.as_document().cloned())
+                .collect(),
+            // A reply with no `cursor.firstBatch` is not "no indexes exist" —
+            // treating it that way would silently skip the conflict check and
+            // re-issue a full build. Fail loudly instead.
+            None => {
+                return Err(StorageError::Backend(BackendError::Internal {
+                    backend_name: "mongodb".to_string(),
+                    message: format!(
+                        "listIndexes reply for {SEARCH_INDEX_COLLECTION} had no cursor.firstBatch: {reply:?}"
+                    ),
+                    source: None,
+                }));
+            }
+        };
 
         let mut inspection = Inspection::default();
         for spec in generation2_specs()
@@ -299,9 +313,18 @@ impl SearchIndexBuilder {
             match existing.iter().find(|d| d.get_str("name") == Ok(spec.name)) {
                 None => inspection.missing.push(spec),
                 Some(actual) => {
-                    let same_keys = actual.get_document("key").ok() == Some(&spec.keys);
-                    let same_partial = actual.get_document("partialFilterExpression").ok().cloned()
-                        == spec.partial;
+                    // Numeric literals from mongosh land as doubles even when
+                    // the catalog spec's keys/partial filter are `1_i32`;
+                    // normalise before comparing so a pre-built database
+                    // (e.g. from the shipped mongosh script) is never
+                    // reported as a conflict.
+                    let same_keys = actual.get_document("key").ok().map(normalize_numbers)
+                        == Some(normalize_numbers(&spec.keys));
+                    let same_partial = actual
+                        .get_document("partialFilterExpression")
+                        .ok()
+                        .map(normalize_numbers)
+                        == spec.partial.as_ref().map(normalize_numbers);
                     if !(same_keys && same_partial) {
                         inspection
                             .conflicting
@@ -321,6 +344,56 @@ impl SearchIndexBuilder {
     }
 }
 
+/// The `listIndexes` command this module sends. `includeBuildUUIDs: true` is
+/// required for the server to report `buildUUID` on an index whose build is
+/// still running — without it, an in-progress build looks identical to a
+/// finished one and the wait loop in `run_inner` never fires.
+fn list_indexes_command() -> Document {
+    doc! { "listIndexes": SEARCH_INDEX_COLLECTION, "includeBuildUUIDs": true }
+}
+
+/// Recursively converts `Int32`/`Int64` values to `Double`, so a catalog spec
+/// built from `1_i32` literals compares equal to the same index as MongoDB
+/// (or mongosh) reports it back, which uses doubles for bare numeric
+/// literals. Used only for the conflict comparison in `inspect`; the actual
+/// `createIndexes` command still sends the catalog's native integer types.
+fn normalize_numbers(doc: &Document) -> Document {
+    let mut out = Document::new();
+    for (k, v) in doc.iter() {
+        out.insert(k, normalize_bson(v));
+    }
+    out
+}
+
+fn normalize_bson(value: &Bson) -> Bson {
+    match value {
+        Bson::Int32(i) => Bson::Double(f64::from(*i)),
+        Bson::Int64(i) => Bson::Double(*i as f64),
+        Bson::Document(d) => Bson::Document(normalize_numbers(d)),
+        Bson::Array(arr) => Bson::Array(arr.iter().map(normalize_bson).collect()),
+        other => other.clone(),
+    }
+}
+
 fn is_namespace_not_found(error: &mongodb::error::Error) -> bool {
     matches!(error.kind.as_ref(), mongodb::error::ErrorKind::Command(c) if c.code == 26)
+}
+
+#[cfg(test)]
+mod builder_tests {
+    use super::*;
+
+    #[test]
+    fn list_indexes_command_includes_build_uuids() {
+        let cmd = list_indexes_command();
+        assert_eq!(cmd.get_str("listIndexes"), Ok(SEARCH_INDEX_COLLECTION));
+        assert_eq!(cmd.get_bool("includeBuildUUIDs"), Ok(true));
+    }
+
+    #[test]
+    fn normalize_numbers_treats_ints_and_doubles_as_equal() {
+        let ints = doc! { "a": 1_i32, "b": { "c": 2_i64 } };
+        let doubles = doc! { "a": 1.0, "b": { "c": 2.0 } };
+        assert_eq!(normalize_numbers(&ints), normalize_numbers(&doubles));
+    }
 }

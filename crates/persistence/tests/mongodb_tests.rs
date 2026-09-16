@@ -11251,6 +11251,44 @@ async fn mongodb_integration_builder_off_mode_warns_and_changes_nothing() {
     assert_eq!(search_index_names(&db).await, expected);
 }
 
+/// Off mode inspects and warns; it must never drop a leftover v1 index even
+/// though generation 2 is already complete — the exact state after an
+/// operator runs the pre-build script by hand and a superseded index happens
+/// to survive (or is rebuilt by mistake).
+#[tokio::test]
+async fn mongodb_integration_builder_off_mode_leaves_leftover_v1_in_place() {
+    let Some(cs) = shared_mongo::connection_string().await else {
+        eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
+        return;
+    };
+    let db_name = build_test_database_name("builder_off_leftover");
+    let db = raw_test_client(&cs).await.unwrap().database(&db_name);
+    seed_generation1_indexes(&db).await;
+    // Generation 2 fully built and v1 dropped.
+    let first = boot_with_mode(&cs, &db_name, IndexBuildMode::Inline).await;
+    assert!(matches!(
+        first.wait_for_search_index_build().await,
+        Some(BuildOutcome::Built { .. })
+    ));
+    // Re-create exactly one v1 index by hand, with its v1 keys.
+    db.run_command(doc! { "createIndexes": "search_index", "indexes": [
+        { "key": { "tenant_id": 1, "resource_type": 1, "param_name": 1, "value_string": 1 }, "name": "idx_search_string" }
+    ]})
+    .await
+    .unwrap();
+    let backend = boot_with_mode(&cs, &db_name, IndexBuildMode::Off).await;
+    let outcome = backend
+        .wait_for_search_index_build()
+        .await
+        .expect("builder ran");
+    assert_eq!(outcome, BuildOutcome::Skipped { missing: vec![] });
+    let names = search_index_names(&db).await;
+    assert!(
+        names.contains(&"idx_search_string".to_string()),
+        "off mode must not drop a leftover v1 index; only warn: {names:?}"
+    );
+}
+
 #[tokio::test]
 async fn mongodb_integration_builder_second_boot_issues_no_create_indexes() {
     let Some(cs) = shared_mongo::connection_string().await else {
@@ -11276,13 +11314,43 @@ async fn mongodb_integration_builder_second_boot_issues_no_create_indexes() {
         .expect("builder ran");
     let _ = db.run_command(doc! { "profile": 0_i32 }).await;
     assert_eq!(outcome, BuildOutcome::UpToDate);
-    let created = db
+
+    // Sanity check first, that profiling captured *something* for this boot,
+    // before trusting a 0 count below.
+    //
+    // It cannot be "a createIndexes for one of the always-recreated inline
+    // specs" (`idx_search_composite`/`idx_search_resource`): MongoDB elides
+    // `createIndexes` from `system.profile` entirely when the requested index
+    // already exists with an identical spec — verified directly against this
+    // server by issuing the same `createIndexes` twice and observing only the
+    // first call profiled. Since those inline specs are themselves unchanged
+    // on the second boot, they are no-ops too and would *never* produce a
+    // profiler entry, making that check trivially fail under correct
+    // behavior. Use the builder's own `listIndexes` (with
+    // `includeBuildUUIDs`) instead: `inspect()` always runs at least once per
+    // `SearchIndexBuilder::run()`, so it reliably fires every boot regardless
+    // of outcome.
+    let profiling_worked = db
         .collection::<Document>("system.profile")
-        .count_documents(doc! { "command.createIndexes": "search_index" })
+        .count_documents(doc! { "command.listIndexes": "search_index" })
+        .await
+        .unwrap();
+    assert!(
+        profiling_worked >= 1,
+        "profiling captured nothing for the second boot (no listIndexes entry on \
+         search_index); this assertion cannot be trusted until profiling is confirmed working"
+    );
+
+    let generation2_created = db
+        .collection::<Document>("system.profile")
+        .count_documents(doc! {
+            "command.createIndexes": "search_index",
+            "command.indexes.name": { "$regex": "_v2$|^idx_search_contained$" },
+        })
         .await
         .unwrap();
     assert_eq!(
-        created, 0,
-        "second boot must not issue createIndexes on search_index"
+        generation2_created, 0,
+        "second boot must not issue createIndexes for any generation-2 search_index index"
     );
 }
