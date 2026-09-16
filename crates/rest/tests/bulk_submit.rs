@@ -2114,7 +2114,7 @@ async fn test_poll_reports_all_files_downloaded_beside_the_counters() {
         .expect("claim")
         .expect("a manifest to claim");
     backend
-        .update_manifest_bytes(&lease, 1_000, 1_000)
+        .update_manifest_bytes(&lease, 350, 1_000)
         .await
         .expect("bytes update");
     backend
@@ -2128,7 +2128,7 @@ async fn test_poll_reports_all_files_downloaded_beside_the_counters() {
         .await
         .expect("phase update");
     let progress = poll_progress(&server, &poll_path).await;
-    assert_eq!(progress, "Processing 100% - 1,234 Resources written");
+    assert_eq!(progress, "Processing 35% - 1,234 Resources written");
 
     // Fan-out drained: the counters keep the lead, the completion trails.
     backend
@@ -2137,7 +2137,7 @@ async fn test_poll_reports_all_files_downloaded_beside_the_counters() {
         .expect("phase update");
     let progress = poll_progress(&server, &poll_path).await;
     assert_eq!(
-        progress, "Processing 100% - 1,234 Resources written - Downloaded 24 of 24 files",
+        progress, "Processing 35% - 1,234 Resources written - Downloaded 24 of 24 files",
         "the poller must be told every file is in, got: {progress}"
     );
     assert!(
