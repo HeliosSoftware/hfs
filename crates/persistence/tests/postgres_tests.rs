@@ -2147,6 +2147,27 @@ mod postgres_integration {
                 .await
                 .unwrap();
         }
+        // #1127: the summary is served from the manifest counters, not from an
+        // aggregate over `bulk_entry_results` on every poll. The receipts above
+        // stay: they are the pagination surface, and leaving them proves the
+        // summary no longer reads them. These counters are what the batch that
+        // committed those receipts would have charged.
+        client
+            .execute(
+                "UPDATE bulk_manifests SET
+                    total_entries = 4, processed_entries = 1,
+                    failed_entries = 2, skipped_entries = 1
+                 WHERE tenant_id = $1 AND submitter = $2
+                   AND submission_id = $3 AND manifest_id = $4",
+                &[
+                    &tenant_id,
+                    &submission.submitter.as_str(),
+                    &submission.submission_id.as_str(),
+                    &manifest.manifest_id.as_str(),
+                ],
+            )
+            .await
+            .unwrap();
         let summary = backend
             .get_submission(&tenant, &submission)
             .await
@@ -9309,8 +9330,11 @@ mod postgres_integration {
     #[derive(Default)]
     struct RecordingBulkSubmitBatches(std::sync::Mutex<Vec<Vec<RecordedBulkEntry>>>);
 
+    // #1127 made the observer async, so it can bound its own wait instead of
+    // blocking the ingest task; this recorder only takes a lock.
+    #[async_trait::async_trait]
     impl helios_persistence::core::BatchCommitObserver for RecordingBulkSubmitBatches {
-        fn batch_committed(&self, batch: &helios_persistence::core::BatchCommitted<'_>) {
+        async fn batch_committed(&self, batch: &helios_persistence::core::BatchCommitted<'_>) {
             self.0.lock().unwrap().push(
                 batch
                     .results
@@ -10360,10 +10384,14 @@ mod postgres_integration {
         );
     }
 
-    /// The counter update runs after the resource transaction commits. Its
-    /// failure must preserve the durable batch and its single observer event.
+    /// #1127 moved the manifest counters into the batch transaction, so they
+    /// commit — or vanish — with the rows they describe. A counter failure
+    /// therefore takes the whole batch down with it: nothing durable, nothing
+    /// reported to the observer, and the error surfaced to the caller, which
+    /// re-walks the file. The per-file watermark keeps that re-walk from
+    /// charging the same lines twice.
     #[tokio::test]
-    async fn postgres_bulk_submit_tail_counter_failure_preserves_committed_batch() {
+    async fn postgres_bulk_submit_counter_failure_rolls_back_the_whole_batch() {
         use helios_persistence::core::{BulkSubmitProvider, NdjsonEntry};
 
         let (backend, dbname) = isolated_reindex_backend().await;
@@ -10413,7 +10441,11 @@ mod postgres_integration {
                 .await
                 .is_err()
         );
-        assert_eq!(observer.0.lock().unwrap().len(), 1);
+        // Nothing committed, so the observer is told about nothing: it must
+        // never see work the transaction rolled back.
+        assert_eq!(observer.0.lock().unwrap().len(), 0);
+        // The attempt counter is a sequence, so it survives the rollback and
+        // still proves both creates were flushed as one grouped statement.
         assert_eq!(grouped_resource_attempts(&client).await, 2);
         for table in [
             "resources",
@@ -10421,7 +10453,7 @@ mod postgres_integration {
             "bulk_entry_results",
             "bulk_submission_changes",
         ] {
-            assert_bulk_submit_table_count(&client, table, &tenant_id, 2).await;
+            assert_bulk_submit_table_count(&client, table, &tenant_id, 0).await;
         }
         let current = backend
             .get_manifest(&tenant, &submission, &manifest.manifest_id)
@@ -11449,8 +11481,11 @@ mod postgres_integration {
         batches: std::sync::Mutex<Vec<Vec<helios_persistence::core::BulkEntryResult>>>,
     }
 
+    // #1127 made the observer async so it can bound its own wait; this one
+    // only takes a lock.
+    #[async_trait::async_trait]
     impl helios_persistence::core::BatchCommitObserver for RecordingBatchCommitObserver {
-        fn batch_committed(&self, batch: &helios_persistence::core::BatchCommitted<'_>) {
+        async fn batch_committed(&self, batch: &helios_persistence::core::BatchCommitted<'_>) {
             self.batches.lock().unwrap().push(batch.results.to_vec());
         }
     }
@@ -11544,8 +11579,10 @@ mod postgres_integration {
         }
     }
 
-    /// #1137: the max-error paths flush and commit exactly the processed prefix,
-    /// notify only after commit, and retain the existing manifest-counter behavior.
+    /// #1137: the max-error paths flush and commit exactly the processed prefix
+    /// and notify only after commit. #1127 then moved the manifest counters into
+    /// the batch transaction, so the aborting entry is charged along with the
+    /// receipt it committed — the same result SQLite and MongoDB give.
     #[tokio::test]
     async fn postgres_bulk_submit_batched_bookkeeping_preserves_max_error_semantics() {
         use helios_persistence::core::{
@@ -11627,9 +11664,17 @@ mod postgres_integration {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(stopped_manifest.total_entries, 0);
+        // #1127: the aborting entry's receipt committed with the batch, so the
+        // manifest charges it too. Counters that disagreed with their own
+        // receipts is what the status endpoint used to paper over by
+        // aggregating them on every poll.
+        assert_eq!(stopped_manifest.total_entries, 1);
         assert_eq!(stopped_manifest.processed_entries, 0);
-        assert_eq!(stopped_manifest.failed_entries, 0);
+        assert_eq!(stopped_manifest.failed_entries, 1);
+        assert_eq!(
+            stopped_manifest.total_entries as u64, receipt_counts.total,
+            "the manifest counts exactly the receipts it committed"
+        );
 
         let (tenant, submission, manifest) =
             seed_isolated_bulk_submit(&backend, "bulk-max-errors-continue").await;
@@ -11913,6 +11958,179 @@ mod postgres_integration {
                 .unwrap()
                 .is_none(),
             "nothing after the cancellation point was ingested"
+        );
+    }
+
+    /// #1127, PostgreSQL: re-walking a file — what a reclaimed manifest or a
+    /// whole-file retry does — must not add the file to the manifest's
+    /// counters a second time. The submission summary reads those counters, so
+    /// it must equal the manifest, not a multiple of it.
+    #[tokio::test]
+    async fn postgres_bulk_submit_rewalk_does_not_multiply_manifest_counters() {
+        use helios_persistence::core::{
+            BulkProcessingOptions, BulkSubmitProvider, StreamingBulkSubmitProvider, SubmissionId,
+        };
+
+        let _guard = BULK_SUBMIT_TEST_LOCK.lock().await;
+        let backend = create_backend().await;
+        let tenant = create_tenant("bulk_submit_rewalk");
+        let sub_id = SubmissionId::generate("pg-rewalk-test");
+        backend
+            .create_submission(&tenant, &sub_id, None)
+            .await
+            .unwrap();
+        let manifest = backend
+            .add_manifest(&tenant, &sub_id, Some("https://provider/rewalk.json"), None)
+            .await
+            .unwrap();
+
+        let patients = |n: u32| -> Vec<u8> {
+            (1..=n)
+                .map(|i| format!("{{\"resourceType\":\"Patient\",\"id\":\"pg-rewalk-{i}\"}}\n"))
+                .collect::<String>()
+                .into_bytes()
+        };
+        let options = BulkProcessingOptions::new()
+            .with_batch_size(2)
+            .with_file_url("https://provider/patient.ndjson");
+        // Two full passes over five lines, then a pass over a longer copy of
+        // the same file: only its two new lines are new work.
+        for lines in [patients(5), patients(5), patients(7)] {
+            let reader = Box::new(tokio::io::BufReader::new(std::io::Cursor::new(lines)));
+            backend
+                .process_ndjson_stream(
+                    &tenant,
+                    &sub_id,
+                    &manifest.manifest_id,
+                    "Patient",
+                    reader,
+                    &options,
+                )
+                .await
+                .unwrap();
+        }
+
+        let current = backend
+            .get_manifest(&tenant, &sub_id, &manifest.manifest_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let summary = backend
+            .get_submission(&tenant, &sub_id)
+            .await
+            .unwrap()
+            .unwrap();
+        backend
+            .abort_submission(&tenant, &sub_id, "test cleanup")
+            .await
+            .unwrap();
+
+        assert_eq!(current.total_entries, 7, "each line is charged once");
+        assert_eq!(current.processed_entries, 7);
+        assert_eq!(current.failed_entries, 0);
+        assert_eq!(summary.manifest_count, 1);
+        assert_eq!(
+            summary.total_entries, 7,
+            "the summary reads the manifest counters"
+        );
+        assert_eq!(summary.success_count, 7);
+        assert_eq!(summary.error_count, 0);
+        assert_eq!(summary.skipped_count, 0);
+    }
+
+    /// #1127, PostgreSQL: with `skip_unchanged`, replaying a resource whose
+    /// content is identical writes nothing — no new version, no history row,
+    /// no rollback record — while a changed resource is still updated. Without
+    /// the option the replay keeps today's behaviour.
+    #[tokio::test]
+    async fn postgres_bulk_submit_skip_unchanged_leaves_identical_resources_alone() {
+        use helios_persistence::core::{
+            BulkProcessingOptions, BulkSubmitProvider, NdjsonEntry, SubmissionId,
+        };
+
+        let _guard = BULK_SUBMIT_TEST_LOCK.lock().await;
+        let backend = create_backend().await;
+        let tenant = create_tenant("bulk_submit_skip_unchanged");
+        let sub_id = SubmissionId::generate("pg-skip-unchanged-test");
+        backend
+            .create_submission(&tenant, &sub_id, None)
+            .await
+            .unwrap();
+        let manifest = backend
+            .add_manifest(&tenant, &sub_id, Some("https://provider/skip.json"), None)
+            .await
+            .unwrap();
+
+        let entries = |second_family: &str| {
+            vec![
+                NdjsonEntry::new(
+                    1,
+                    "Patient",
+                    json!({"resourceType":"Patient","id":"pg-same","name":[{"family":"Same"}]}),
+                ),
+                NdjsonEntry::new(
+                    2,
+                    "Patient",
+                    json!({"resourceType":"Patient","id":"pg-edit","name":[{"family":second_family}]}),
+                ),
+            ]
+        };
+        let skipping = BulkProcessingOptions::new().with_skip_unchanged(true);
+        let ingest = |batch, options| {
+            let backend = &backend;
+            let tenant = &tenant;
+            let sub_id = &sub_id;
+            let manifest_id = manifest.manifest_id.clone();
+            async move {
+                backend
+                    .process_entries(tenant, sub_id, &manifest_id, batch, &options)
+                    .await
+                    .unwrap()
+            }
+        };
+
+        let first = ingest(entries("Before"), skipping.clone()).await;
+        assert!(first.iter().all(|r| r.is_success() && r.created));
+
+        let replay = ingest(entries("After"), skipping.clone()).await;
+        let version = |id: &'static str| {
+            let backend = &backend;
+            let tenant = &tenant;
+            async move {
+                backend
+                    .read(tenant, "Patient", id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .version_id()
+                    .to_string()
+            }
+        };
+        let same_version = version("pg-same").await;
+        let edit_version = version("pg-edit").await;
+        let same_history = backend
+            .history_instance(&tenant, "Patient", "pg-same", &HistoryParams::default())
+            .await
+            .unwrap()
+            .items
+            .len();
+
+        let plain = ingest(entries("After"), BulkProcessingOptions::new()).await;
+        let same_after_plain = version("pg-same").await;
+        backend
+            .abort_submission(&tenant, &sub_id, "test cleanup")
+            .await
+            .unwrap();
+
+        assert!(replay[0].is_success() && replay[0].unchanged && !replay[0].created);
+        assert!(replay[1].is_success() && !replay[1].unchanged);
+        assert_eq!(same_version, "1", "an identical replay adds no version");
+        assert_eq!(same_history, 1, "an identical replay adds no history row");
+        assert_eq!(edit_version, "2", "a changed resource is still updated");
+        assert!(!plain[0].unchanged, "the option is opt-in");
+        assert_eq!(
+            same_after_plain, "2",
+            "without it the replay writes as before"
         );
     }
 
