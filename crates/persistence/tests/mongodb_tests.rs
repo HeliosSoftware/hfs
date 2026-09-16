@@ -3334,6 +3334,301 @@ async fn mongodb_integration_contained_search() {
     assert_eq!(both_urls, vec!["Observation/obs1", "Patient/top1"]);
 }
 
+/// Seeds `n` Observations, each containing a Patient named Smith, under ids
+/// `obs-<i>` with contained local id `p`.
+async fn seed_contained_smiths(backend: &MongoBackend, tenant: &TenantContext, n: usize) {
+    for i in 0..n {
+        backend
+            .create(
+                tenant,
+                "Observation",
+                json!({
+                    "resourceType": "Observation", "id": format!("obs-{i:02}"), "status": "final",
+                    "code": { "coding": [{ "code": "1234-5" }] },
+                    "subject": { "reference": "#p" },
+                    "contained": [{ "resourceType": "Patient", "id": "p", "name": [{ "family": "Smith" }] }]
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+    }
+}
+
+fn contained_name_query(
+    mode: helios_persistence::types::ContainedMode,
+    count: u32,
+    offset: u32,
+    total: bool,
+) -> SearchQuery {
+    use helios_persistence::types::ContainedReturn;
+    let mut q = SearchQuery::new("Patient").with_parameter(SearchParameter {
+        name: "name".into(),
+        param_type: SearchParamType::String,
+        modifier: None,
+        values: vec![SearchValue::eq("Smith")],
+        chain: vec![],
+        components: vec![],
+    });
+    q.contained = mode;
+    q.contained_return = ContainedReturn::Container;
+    q.count = Some(count);
+    q.offset = Some(offset);
+    q.total = if total {
+        Some(TotalMode::Accurate)
+    } else {
+        None
+    };
+    q
+}
+
+#[tokio::test]
+async fn mongodb_integration_contained_search_pages_on_the_server() {
+    use futures::stream::TryStreamExt;
+    use helios_persistence::types::ContainedMode;
+    let Some(backend) = create_backend_with_full_registry("contained_paging").await else {
+        eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
+        return;
+    };
+    let tenant = create_tenant("tenant-contained-paging");
+    seed_contained_smiths(&backend, &tenant, 7).await;
+
+    let page = |offset: u32| contained_name_query(ContainedMode::On, 3, offset, true);
+
+    let db = raw_test_client(&backend.config().connection_string)
+        .await
+        .unwrap()
+        .database(&backend.config().database_name);
+    if db.run_command(doc! { "profile": 2_i32 }).await.is_ok() {
+        let _ = backend.search(&tenant, &page(0)).await.unwrap();
+        let _ = db.run_command(doc! { "profile": 0_i32 }).await;
+        let reads = db
+            .collection::<Document>("system.profile")
+            .count_documents(doc! { "ns": format!("{}.resources", db.name()), "op": "query" })
+            .await
+            .unwrap();
+        assert_eq!(
+            reads, 1,
+            "containers for one page must be fetched in a single find, not one read() per match"
+        );
+        let agg = db
+            .collection::<Document>("system.profile")
+            .find(doc! { "ns": format!("{}.search_index", db.name()), "command.aggregate": "search_index" })
+            .await
+            .unwrap()
+            .try_collect::<Vec<Document>>()
+            .await
+            .unwrap();
+        assert!(
+            !agg.is_empty(),
+            "the contained pipeline must run as an aggregate on search_index"
+        );
+        // `planSummary` on this server carries only the winning plan's key
+        // pattern, never the index name (see `mongodb_history_type_plan_is_a_bounded_index_walk`),
+        // so the index name is confirmed via `explain` instead: rebuild the
+        // aggregate command from exactly what the server recorded (`command`
+        // also carries $db/lsid/$readPreference, which explain rejects) and
+        // look for `idx_search_contained` in the winning plan.
+        for op in &agg {
+            let command = op
+                .get_document("command")
+                .expect("profile entry missing command");
+            let mut inner = Document::new();
+            for key in ["aggregate", "pipeline", "cursor"] {
+                if let Some(v) = command.get(key) {
+                    inner.insert(key, v.clone());
+                }
+            }
+            let explain = db
+                .run_command(doc! { "explain": inner, "verbosity": "queryPlanner" })
+                .await
+                .expect("explain of the recorded aggregate command failed");
+            let mut index_names = Vec::new();
+            collect_index_names(&explain, &mut index_names);
+            assert!(
+                index_names.iter().any(|n| n == "idx_search_contained"),
+                "contained pipeline must use idx_search_contained, got: {index_names:?}"
+            );
+        }
+    }
+
+    let p0 = backend.search(&tenant, &page(0)).await.unwrap();
+    let p1 = backend.search(&tenant, &page(3)).await.unwrap();
+    let p2 = backend.search(&tenant, &page(6)).await.unwrap();
+    let ids = |r: &helios_persistence::core::SearchResult| {
+        r.resources
+            .items
+            .iter()
+            .map(|x| x.id().to_string())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(ids(&p0), vec!["obs-00", "obs-01", "obs-02"]);
+    assert_eq!(ids(&p1), vec!["obs-03", "obs-04", "obs-05"]);
+    assert_eq!(ids(&p2), vec!["obs-06"]);
+    assert_eq!(p0.total, Some(7));
+    assert_eq!(p2.total, Some(7));
+    // Without _total, no count is computed.
+    let no_total = backend
+        .search(
+            &tenant,
+            &contained_name_query(ContainedMode::On, 3, 0, false),
+        )
+        .await
+        .unwrap();
+    assert_eq!(no_total.total, None);
+}
+
+#[tokio::test]
+async fn mongodb_integration_contained_both_pages_across_the_top_level_boundary() {
+    use helios_persistence::types::ContainedMode;
+    let Some(backend) = create_backend_with_full_registry("contained_both_paging").await else {
+        eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
+        return;
+    };
+    let tenant = create_tenant("tenant-contained-both");
+    for i in 0..2 {
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({ "resourceType": "Patient", "id": format!("top-{i}"), "name": [{ "family": "Smith" }] }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+    }
+    seed_contained_smiths(&backend, &tenant, 7).await;
+
+    let ids = |r: &helios_persistence::core::SearchResult| {
+        r.resources
+            .items
+            .iter()
+            .map(|x| x.url())
+            .collect::<Vec<_>>()
+    };
+    // Page of 5 from offset 0: both top-level Patients, then the first three containers.
+    // The top-level portion inherits the standard search's newest-first
+    // default (`last_updated`/`id` desc, so `top-1` before `top-0`) while the
+    // contained portion is sorted by container key (`obs-00`, `obs-01`, ...).
+    let r = backend
+        .search(
+            &tenant,
+            &contained_name_query(ContainedMode::Both, 5, 0, true),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        ids(&r),
+        vec![
+            "Patient/top-1",
+            "Patient/top-0",
+            "Observation/obs-00",
+            "Observation/obs-01",
+            "Observation/obs-02"
+        ]
+    );
+    assert_eq!(r.total, Some(9));
+    // Offset 5 lands inside the contained set: contained offset 3.
+    let r = backend
+        .search(
+            &tenant,
+            &contained_name_query(ContainedMode::Both, 5, 5, true),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        ids(&r),
+        vec![
+            "Observation/obs-03",
+            "Observation/obs-04",
+            "Observation/obs-05",
+            "Observation/obs-06"
+        ]
+    );
+    // Offset 1 straddles: one top-level, four containers. Skipping the first
+    // (newest-first) top-level item leaves `top-0`.
+    let r = backend
+        .search(
+            &tenant,
+            &contained_name_query(ContainedMode::Both, 5, 1, false),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        ids(&r),
+        vec![
+            "Patient/top-0",
+            "Observation/obs-00",
+            "Observation/obs-01",
+            "Observation/obs-02",
+            "Observation/obs-03"
+        ]
+    );
+}
+
+#[tokio::test]
+async fn mongodb_integration_contained_both_dedupes_a_container_that_is_also_a_top_level_match() {
+    use helios_persistence::types::{ContainedMode, ContainedReturn};
+    let Some(backend) = create_backend_with_full_registry("contained_both_dedupe").await else {
+        eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
+        return;
+    };
+    let tenant = create_tenant("tenant-contained-dedupe");
+    // An Observation with code X that also contains an Observation with code X:
+    // it is a top-level match AND the container of a contained match.
+    backend
+        .create(
+            &tenant,
+            "Observation",
+            json!({
+                "resourceType": "Observation", "id": "outer", "status": "final",
+                "code": { "coding": [{ "system": "http://loinc.org", "code": "X" }] },
+                "contained": [{ "resourceType": "Observation", "id": "inner", "status": "final",
+                                "code": { "coding": [{ "system": "http://loinc.org", "code": "X" }] } }]
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    // A second container whose only match is contained.
+    backend
+        .create(
+            &tenant,
+            "Observation",
+            json!({
+                "resourceType": "Observation", "id": "holder", "status": "final",
+                "code": { "coding": [{ "system": "http://loinc.org", "code": "Y" }] },
+                "contained": [{ "resourceType": "Observation", "id": "inner2", "status": "final",
+                                "code": { "coding": [{ "system": "http://loinc.org", "code": "X" }] } }]
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+
+    let mut q = SearchQuery::new("Observation").with_parameter(SearchParameter {
+        name: "code".into(),
+        param_type: SearchParamType::Token,
+        modifier: None,
+        values: vec![SearchValue::eq("X")],
+        chain: vec![],
+        components: vec![],
+    });
+    q.contained = ContainedMode::Both;
+    q.contained_return = ContainedReturn::Container;
+    q.count = Some(10);
+    q.total = Some(TotalMode::Accurate);
+    let r = backend.search(&tenant, &q).await.unwrap();
+    let urls: Vec<String> = r.resources.items.iter().map(|x| x.url()).collect();
+    // Top-level order is the standard search's newest-first default:
+    // `holder` was created second, so it sorts before `outer`.
+    assert_eq!(
+        urls,
+        vec!["Observation/holder", "Observation/outer"],
+        "outer must appear once"
+    );
+}
+
 #[tokio::test]
 async fn mongodb_integration_search_quantity() {
     let Some(backend) = create_backend_with_full_registry("search_quantity").await else {
