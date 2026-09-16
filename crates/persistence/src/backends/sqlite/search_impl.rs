@@ -19,6 +19,7 @@ use crate::core::{
     RevincludeProvider, SearchProvider, SearchResult,
 };
 use crate::error::{BackendError, QueryErrorExt, SearchError, StorageError, StorageResult};
+use crate::search::reject_unhonoured_metadata_modifiers;
 use crate::tenant::TenantContext;
 use crate::types::{
     CursorDirection, CursorValue, IncludeDirective, Page, PageCursor, PageInfo,
@@ -101,6 +102,10 @@ impl SqliteBackend {
         query: &SearchQuery,
         total: Option<u64>,
     ) -> StorageResult<SearchResult> {
+        // Also the entry for in-transaction conditional criteria, which never
+        // pass through the REST modifier gate (#1092).
+        reject_unhonoured_metadata_modifiers(query)?;
+
         let tenant_id = tenant.tenant_id().as_str();
         let resource_type = &query.resource_type;
 
@@ -366,6 +371,7 @@ impl SearchProvider for SqliteBackend {
         query: &SearchQuery,
     ) -> StorageResult<SearchResult> {
         reject_contained_missing(query)?;
+        reject_unhonoured_metadata_modifiers(query)?;
 
         // `_contained` search uses a dedicated path (different index columns and
         // heterogeneous result types); standard search handles `_contained=false`.
@@ -392,6 +398,7 @@ impl SearchProvider for SqliteBackend {
         query: &SearchQuery,
     ) -> StorageResult<u64> {
         reject_contained_missing(query)?;
+        reject_unhonoured_metadata_modifiers(query)?;
 
         let conn = self.get_connection()?;
         let tenant_id = tenant.tenant_id().as_str();

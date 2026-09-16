@@ -6,6 +6,7 @@
 use serde_json::json;
 
 use helios_persistence::core::{ResourceStorage, SearchProvider};
+use helios_persistence::error::{SearchError, StorageError};
 use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
 use helios_persistence::types::{
     SearchModifier, SearchParamType, SearchParameter, SearchQuery, SearchValue,
@@ -436,6 +437,120 @@ async fn test_not_modifier() {
     // Should find female and unknown, not male
     for resource in &result.resources.items {
         assert_ne!(resource.content()["gender"], "male");
+    }
+}
+
+/// #1092: `_id` is answered from the `resources` table through a dedicated
+/// builder that used to read only the values, so `_id:not=abc` returned
+/// exactly `abc` — the precise inverse of the request — with a 200.
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn test_id_not_modifier_excludes_the_named_resources() {
+    let backend = create_sqlite_backend();
+    let tenant = create_tenant();
+
+    for id in ["patient-idn-1", "patient-idn-2", "patient-idn-3"] {
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({
+                    "resourceType": "Patient",
+                    "id": id,
+                    "name": [{"family": format!("Idn-{id}")}],
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+    }
+
+    let id_query = |modifier: Option<SearchModifier>, ids: &[&str]| {
+        SearchQuery::new("Patient").with_parameter(SearchParameter {
+            name: "_id".to_string(),
+            param_type: SearchParamType::Token,
+            modifier,
+            values: ids.iter().map(|id| SearchValue::eq(*id)).collect(),
+            chain: vec![],
+            components: vec![],
+        })
+    };
+    let ids = |result: &helios_persistence::core::SearchResult| {
+        let mut got: Vec<String> = result
+            .resources
+            .items
+            .iter()
+            .map(|r| r.id().to_string())
+            .collect();
+        got.sort();
+        got
+    };
+
+    // Control: plain `_id=patient-idn-1` is unaffected by the fix.
+    let plain = id_query(None, &["patient-idn-1"]);
+    let result = backend.search(&tenant, &plain).await.unwrap();
+    assert_eq!(ids(&result), vec!["patient-idn-1"]);
+    assert_eq!(backend.search_count(&tenant, &plain).await.unwrap(), 1);
+
+    // `_id:not=patient-idn-1` -> everyone EXCEPT patient-idn-1. Before the fix
+    // this returned ONLY patient-idn-1 with count 1.
+    let not_one = id_query(Some(SearchModifier::Not), &["patient-idn-1"]);
+    let result = backend.search(&tenant, &not_one).await.unwrap();
+    assert_eq!(ids(&result), vec!["patient-idn-2", "patient-idn-3"]);
+    assert_eq!(backend.search_count(&tenant, &not_one).await.unwrap(), 2);
+
+    // `_id:not=patient-idn-1,patient-idn-2` is NOT (1 OR 2) -> only 3.
+    let not_two = id_query(
+        Some(SearchModifier::Not),
+        &["patient-idn-1", "patient-idn-2"],
+    );
+    let result = backend.search(&tenant, &not_two).await.unwrap();
+    assert_eq!(ids(&result), vec!["patient-idn-3"]);
+    assert_eq!(backend.search_count(&tenant, &not_two).await.unwrap(), 1);
+}
+
+/// #1092: a modifier the `_id` builder does not honour must be refused, not
+/// silently dropped into a positive match. The REST gate lets `_id:text`
+/// through because `_id` is a token parameter and `:text` is spec-valid on
+/// tokens, so the backend has to say no itself.
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn test_unhonoured_id_modifier_is_rejected() {
+    let backend = create_sqlite_backend();
+    let tenant = create_tenant();
+
+    backend
+        .create(
+            &tenant,
+            "Patient",
+            json!({"resourceType": "Patient", "id": "patient-idt-1"}),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+
+    let query = SearchQuery::new("Patient").with_parameter(SearchParameter {
+        name: "_id".to_string(),
+        param_type: SearchParamType::Token,
+        modifier: Some(SearchModifier::Text),
+        values: vec![SearchValue::eq("patient-idt-1")],
+        chain: vec![],
+        components: vec![],
+    });
+
+    for outcome in [
+        backend.search(&tenant, &query).await.map(|_| ()),
+        backend.search_count(&tenant, &query).await.map(|_| ()),
+    ] {
+        let err = outcome.expect_err("_id:text must be rejected");
+        assert!(
+            matches!(
+                err,
+                StorageError::Search(SearchError::UnsupportedModifier { ref modifier, .. })
+                    if modifier == "text"
+            ),
+            "expected UnsupportedModifier, got {err:?}"
+        );
     }
 }
 

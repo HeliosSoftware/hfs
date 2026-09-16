@@ -14,6 +14,7 @@ use crate::core::search::{
     IncludeProvider, RevincludeProvider, SearchProvider, SearchResult, TextSearchProvider,
 };
 use crate::error::{BackendError, StorageResult};
+use crate::search::reject_unhonoured_metadata_modifiers;
 use crate::tenant::TenantContext;
 use crate::types::{
     CursorDirection, CursorValue, IncludeDirective, Page, PageCursor, PageInfo, Pagination,
@@ -328,6 +329,8 @@ impl SearchProvider for ElasticsearchBackend {
         tenant: &TenantContext,
         query: &SearchQuery,
     ) -> StorageResult<SearchResult> {
+        reject_unhonoured_metadata_modifiers(query)?;
+
         // `_contained` search post-processes contained-doc hits into containers or
         // contained resources; standard search excludes contained docs via the
         // query builder's `must_not is_contained`.
@@ -502,6 +505,8 @@ impl SearchProvider for ElasticsearchBackend {
         tenant: &TenantContext,
         query: &SearchQuery,
     ) -> StorageResult<u64> {
+        reject_unhonoured_metadata_modifiers(query)?;
+
         let tenant_id = tenant.tenant_id().as_str();
         let resource_type = &query.resource_type;
         let index = self.index_name(tenant_id, resource_type);

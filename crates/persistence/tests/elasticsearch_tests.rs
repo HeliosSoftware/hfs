@@ -3451,6 +3451,118 @@ mod es_integration {
         );
     }
 
+    /// #1092: `_id` is answered from the top-level `resource_id` field through
+    /// a dedicated clause builder that used to read only the values, so
+    /// `_id:not=abc` returned exactly `abc` — the precise inverse of the
+    /// request — with a 200. The clause shape is pinned by the builder's unit
+    /// tests; this confirms the page and the count agree against a live
+    /// cluster.
+    #[tokio::test]
+    async fn es_integration_search_id_not_modifier() {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::types::{
+            SearchModifier, SearchParamType, SearchParameter, SearchQuery, SearchValue,
+        };
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("id-not-tenant");
+
+        for id in ["patient-idn-1", "patient-idn-2", "patient-idn-3"] {
+            backend
+                .create(
+                    &tenant,
+                    "Patient",
+                    json!({
+                        "resourceType": "Patient",
+                        "id": id,
+                        "name": [{"family": format!("Idn-{id}")}],
+                    }),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+        backend
+            .refresh_index("id-not-tenant", "Patient")
+            .await
+            .unwrap();
+
+        let id_query = |modifier: Option<SearchModifier>, ids: &[&str]| {
+            SearchQuery::new("Patient")
+                .with_parameter(SearchParameter {
+                    name: "_id".to_string(),
+                    param_type: SearchParamType::Token,
+                    modifier,
+                    values: ids.iter().map(|id| SearchValue::eq(*id)).collect(),
+                    chain: vec![],
+                    components: vec![],
+                })
+                .with_count(100)
+        };
+        let ids = |result: &helios_persistence::core::SearchResult| {
+            let mut got: Vec<String> = result
+                .resources
+                .items
+                .iter()
+                .map(|r| r.id().to_string())
+                .collect();
+            got.sort();
+            got
+        };
+
+        // Control: plain `_id=patient-idn-1` is unaffected by the fix.
+        let plain = id_query(None, &["patient-idn-1"]);
+        let result = backend.search(&tenant, &plain).await.unwrap();
+        assert_eq!(ids(&result), vec!["patient-idn-1"]);
+        assert_eq!(backend.search_count(&tenant, &plain).await.unwrap(), 1);
+
+        // `_id:not=patient-idn-1` -> everyone EXCEPT patient-idn-1. Before the
+        // fix this returned ONLY patient-idn-1 with count 1.
+        let not_one = id_query(Some(SearchModifier::Not), &["patient-idn-1"]);
+        let result = backend.search(&tenant, &not_one).await.unwrap();
+        assert_eq!(ids(&result), vec!["patient-idn-2", "patient-idn-3"]);
+        assert_eq!(backend.search_count(&tenant, &not_one).await.unwrap(), 2);
+
+        // `_id:not=patient-idn-1,patient-idn-2` is NOT (1 OR 2) -> only 3.
+        let not_two = id_query(
+            Some(SearchModifier::Not),
+            &["patient-idn-1", "patient-idn-2"],
+        );
+        let result = backend.search(&tenant, &not_two).await.unwrap();
+        assert_eq!(ids(&result), vec!["patient-idn-3"]);
+        assert_eq!(backend.search_count(&tenant, &not_two).await.unwrap(), 1);
+
+        // A modifier the `_id` builder does not honour is refused rather than
+        // silently degraded to a positive match. The REST gate lets `_id:text`
+        // through (`_id` is a token parameter), so the backend must say no.
+        let id_text = SearchQuery::new("Patient").with_parameter(SearchParameter {
+            name: "_id".to_string(),
+            param_type: SearchParamType::Token,
+            modifier: Some(SearchModifier::Text),
+            values: vec![SearchValue::eq("patient-idn-1")],
+            chain: vec![],
+            components: vec![],
+        });
+        for outcome in [
+            backend.search(&tenant, &id_text).await.map(|_| ()),
+            backend.search_count(&tenant, &id_text).await.map(|_| ()),
+        ] {
+            let err = outcome.expect_err("_id:text must be rejected");
+            assert!(
+                matches!(
+                    err,
+                    StorageError::Search(
+                        helios_persistence::error::SearchError::UnsupportedModifier {
+                            ref modifier,
+                            ..
+                        }
+                    ) if modifier == "text"
+                ),
+                "expected UnsupportedModifier, got {err:?}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn es_integration_search_date() {
         use helios_persistence::core::SearchProvider;

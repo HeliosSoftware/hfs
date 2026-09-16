@@ -28,6 +28,7 @@ use super::PostgresBackend;
 use super::cached::{query_dyn_cached, query_one_dyn_cached};
 use super::search::chain_builder::ChainQueryBuilder;
 use super::search::query_builder::{PostgresQueryBuilder, SortValueKind, SqlParam};
+use crate::search::reject_unhonoured_metadata_modifiers;
 
 fn internal_error(message: String) -> StorageError {
     StorageError::Backend(BackendError::Internal {
@@ -211,6 +212,10 @@ impl PostgresBackend {
         query: &SearchQuery,
         total: Option<u64>,
     ) -> StorageResult<SearchResult> {
+        // Also the entry for in-transaction conditional criteria, which never
+        // pass through the REST modifier gate (#1092).
+        reject_unhonoured_metadata_modifiers(query)?;
+
         let tenant_id = tenant.tenant_id().as_str();
         let resource_type = &query.resource_type;
 
@@ -502,6 +507,7 @@ impl SearchProvider for PostgresBackend {
         query: &SearchQuery,
     ) -> StorageResult<SearchResult> {
         reject_contained_missing(query)?;
+        reject_unhonoured_metadata_modifiers(query)?;
 
         // `_contained` search uses a dedicated path (different index columns and
         // heterogeneous result types); standard search handles `_contained=false`.
@@ -528,6 +534,7 @@ impl SearchProvider for PostgresBackend {
         query: &SearchQuery,
     ) -> StorageResult<u64> {
         reject_contained_missing(query)?;
+        reject_unhonoured_metadata_modifiers(query)?;
 
         let client = self.get_client().await?;
         let tenant_id = tenant.tenant_id().as_str();

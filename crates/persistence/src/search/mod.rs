@@ -85,7 +85,8 @@ pub use loader::SearchParameterLoader;
 pub use range::{implicit_precision, implicit_range};
 pub use registry::{
     RegistryUpdate, SearchParameterDefinition, SearchParameterRegistry, SearchParameterSource,
-    SearchParameterStatus, fallback_param_type, resolve_param_targets, resolve_param_type,
+    SearchParameterStatus, fallback_param_type, reject_unhonoured_metadata_modifiers,
+    resolve_param_targets, resolve_param_type,
 };
 pub use reindex::{
     DEFERRED_REINDEX_BATCH_SIZE, DeferredReindexLedger, ReindexOnFinish, ReindexOperation,

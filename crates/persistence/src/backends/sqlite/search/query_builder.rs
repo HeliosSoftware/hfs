@@ -575,6 +575,20 @@ impl QueryBuilder {
                 if param.values.is_empty() {
                     return None;
                 }
+                // `:not` inverts the list membership — `id NOT IN (...)` —
+                // which is `NOT (a OR b)` for an OR-list, as FHIR defines it.
+                // This arm used to read only `param.values`, so `_id:not=abc`
+                // was consumed as a plain `id IN ('abc')` and returned exactly
+                // the resource the caller excluded (#1092). `:missing` is
+                // resolved before the special-parameter dispatch and never
+                // reaches here; every other modifier is rejected up front by
+                // `reject_unhonoured_metadata_modifiers`, so this arm only
+                // ever sees `None` or `Not`.
+                let membership = if matches!(param.modifier, Some(SearchModifier::Not)) {
+                    "NOT IN"
+                } else {
+                    "IN"
+                };
                 let mut params = Vec::with_capacity(param.values.len());
                 let placeholders: Vec<String> = param
                     .values
@@ -588,7 +602,8 @@ impl QueryBuilder {
 
                 Some(SqlFragment::with_params(
                     format!(
-                        "resource_key IN (SELECT rowid FROM resources WHERE tenant_id = ?1 AND resource_type = ?2 AND id IN ({}))",
+                        "resource_key IN (SELECT rowid FROM resources WHERE tenant_id = ?1 AND resource_type = ?2 AND id {} ({}))",
+                        membership,
                         placeholders.join(", ")
                     ),
                     params,
@@ -1153,6 +1168,70 @@ mod tests {
         };
 
         assert!(builder.build_parameter_condition(&param, 2).is_none());
+    }
+
+    fn id_param(modifier: Option<SearchModifier>, values: &[&str]) -> SearchParameter {
+        SearchParameter {
+            name: "_id".to_string(),
+            param_type: SearchParamType::Token,
+            modifier,
+            values: values.iter().map(|v| SearchValue::eq(*v)).collect(),
+            chain: vec![],
+            components: vec![],
+        }
+    }
+
+    fn string_params(fragment: &SqlFragment) -> Vec<&str> {
+        fragment
+            .params
+            .iter()
+            .map(|p| match p {
+                SqlParam::String(s) => s.as_str(),
+                other => panic!("expected a string param, got {other:?}"),
+            })
+            .collect()
+    }
+
+    /// Control for #1092: the no-modifier form is unchanged by the fix.
+    #[test]
+    fn id_without_modifier_is_a_positive_in_list() {
+        let builder = QueryBuilder::new("tenant1", "Patient");
+        let fragment = builder
+            .build_parameter_condition(&id_param(None, &["pat-a"]), 2)
+            .expect("_id must produce a condition");
+
+        assert_eq!(
+            fragment.sql,
+            "resource_key IN (SELECT rowid FROM resources WHERE tenant_id = ?1 AND resource_type = ?2 AND id IN (?3))"
+        );
+        assert_eq!(string_params(&fragment), vec!["pat-a"]);
+    }
+
+    /// #1092: `_id:not=a` must exclude `a`, not select it. The arm used to
+    /// read only `param.values`, so the modifier was silently dropped and the
+    /// search returned exactly the resource the caller asked to exclude.
+    #[test]
+    fn id_not_inverts_the_in_list() {
+        let builder = QueryBuilder::new("tenant1", "Patient");
+
+        let single = builder
+            .build_parameter_condition(&id_param(Some(SearchModifier::Not), &["pat-a"]), 2)
+            .expect("_id:not must produce a condition");
+        assert_eq!(
+            single.sql,
+            "resource_key IN (SELECT rowid FROM resources WHERE tenant_id = ?1 AND resource_type = ?2 AND id NOT IN (?3))"
+        );
+        assert_eq!(string_params(&single), vec!["pat-a"]);
+
+        // `:not=a,b` is `NOT (a OR b)`: one NOT IN over the whole OR-list.
+        let multi = builder
+            .build_parameter_condition(&id_param(Some(SearchModifier::Not), &["pat-a", "pat-b"]), 2)
+            .expect("_id:not must produce a condition");
+        assert_eq!(
+            multi.sql,
+            "resource_key IN (SELECT rowid FROM resources WHERE tenant_id = ?1 AND resource_type = ?2 AND id NOT IN (?3, ?4))"
+        );
+        assert_eq!(string_params(&multi), vec!["pat-a", "pat-b"]);
     }
 
     #[test]

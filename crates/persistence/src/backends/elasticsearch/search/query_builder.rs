@@ -322,12 +322,27 @@ impl<'a> EsQueryBuilder<'a> {
     }
 
     /// Builds a clause for the _id special parameter.
+    /// Builds the `_id` clause against the top-level `resource_id` field.
+    ///
+    /// `:not` wraps the positive clause in a `must_not`, once, around the
+    /// whole OR-list — `NOT (a OR b)` as FHIR defines it, the same shape the
+    /// generic token path produces (#473). This used to read only the values,
+    /// so `_id:not=abc` was consumed as a plain `term` and returned exactly
+    /// the resource the caller excluded (#1092). `:missing` is resolved before
+    /// the special-parameter dispatch and never reaches here; every other
+    /// modifier is rejected up front by `reject_unhonoured_metadata_modifiers`,
+    /// so only `None` and `Not` arrive.
     fn build_id_clause(&self, param: &SearchParameter) -> Option<Value> {
         let ids: Vec<&str> = param.values.iter().map(|v| v.value.as_str()).collect();
-        if ids.len() == 1 {
-            Some(json!({ "term": { "resource_id": ids[0] } }))
+        let positive = if ids.len() == 1 {
+            json!({ "term": { "resource_id": ids[0] } })
         } else {
-            Some(json!({ "terms": { "resource_id": ids } }))
+            json!({ "terms": { "resource_id": ids } })
+        };
+        if matches!(param.modifier, Some(SearchModifier::Not)) {
+            Some(json!({ "bool": { "must_not": [positive] } }))
+        } else {
+            Some(positive)
         }
     }
 
@@ -540,6 +555,61 @@ mod tests {
         let es_query = builder.build(&query);
         let body_str = serde_json::to_string(&es_query.body).unwrap();
         assert!(body_str.contains("resource_id"));
+    }
+
+    /// #1092: `_id` is lowered outside the generic modifier dispatch, so
+    /// `build_id_clause` must honour `:not` itself. Pinned at the clause
+    /// level, without a live cluster.
+    mod id_modifier {
+        use super::*;
+
+        fn id_param(modifier: Option<SearchModifier>, values: &[&str]) -> SearchParameter {
+            SearchParameter {
+                name: "_id".to_string(),
+                param_type: SearchParamType::Token,
+                modifier,
+                values: values.iter().map(|v| SearchValue::eq(*v)).collect(),
+                chain: vec![],
+                components: vec![],
+            }
+        }
+
+        /// The `_id` clause alone: with one parameter it is the only `must`.
+        fn clause(param: SearchParameter) -> Value {
+            let query = SearchQuery::new("Patient").with_parameter(param);
+            let builder = EsQueryBuilder::new("acme", "Patient", "hfs_acme_patient".to_string());
+            builder.build(&query).body["query"]["bool"]["must"][0].clone()
+        }
+
+        /// Control: the no-modifier form is unchanged by the fix.
+        #[test]
+        fn id_without_modifier_is_a_positive_term() {
+            assert_eq!(
+                clause(id_param(None, &["pat-a"])),
+                json!({ "term": { "resource_id": "pat-a" } })
+            );
+            assert_eq!(
+                clause(id_param(None, &["pat-a", "pat-b"])),
+                json!({ "terms": { "resource_id": ["pat-a", "pat-b"] } })
+            );
+        }
+
+        /// `_id:not=a` must exclude `a`, not select it — the builder used to
+        /// read only `param.values` and returned exactly the excluded resource.
+        #[test]
+        fn id_not_negates_instead_of_matching() {
+            assert_eq!(
+                clause(id_param(Some(SearchModifier::Not), &["pat-a"])),
+                json!({ "bool": { "must_not": [{ "term": { "resource_id": "pat-a" } }] } })
+            );
+            // `:not=a,b` is `NOT (a OR b)`: one must_not around the whole list.
+            assert_eq!(
+                clause(id_param(Some(SearchModifier::Not), &["pat-a", "pat-b"])),
+                json!({ "bool": { "must_not": [
+                    { "terms": { "resource_id": ["pat-a", "pat-b"] } }
+                ] } })
+            );
+        }
     }
 
     #[test]

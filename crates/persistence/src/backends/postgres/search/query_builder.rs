@@ -640,7 +640,7 @@ impl PostgresQueryBuilder {
 
         // Handle special parameters
         match param.name.as_str() {
-            "_id" => return Self::build_id_condition(&param.values, param_offset),
+            "_id" => return Self::build_id_condition(param, param_offset),
             "_lastUpdated" => {
                 return Self::build_last_updated_condition(&param.values, param_offset);
             }
@@ -677,17 +677,45 @@ impl PostgresQueryBuilder {
         }
     }
 
-    fn build_id_condition(values: &[SearchValue], offset: usize) -> Option<SqlFragment> {
+    /// Builds the `_id` condition against `resources.id`.
+    ///
+    /// `:not` inverts the match — `id <> $n` for one value, `id NOT IN (...)`
+    /// for an OR-list, which is `NOT (a OR b)` as FHIR defines it. This used to
+    /// read only the values, so `_id:not=abc` was consumed as a plain
+    /// `id = 'abc'` and returned exactly the resource the caller excluded
+    /// (#1092). `:missing` is resolved before the special-parameter dispatch
+    /// and never reaches here; every other modifier is rejected up front by
+    /// `reject_unhonoured_metadata_modifiers`, so only `None` and `Not` arrive.
+    /// The no-modifier form is byte-identical to what it was.
+    fn build_id_condition(param: &SearchParameter, offset: usize) -> Option<SqlFragment> {
+        if param.values.is_empty() {
+            return None;
+        }
+
+        if matches!(param.modifier, Some(SearchModifier::Not)) {
+            let params: Vec<SqlParam> = param
+                .values
+                .iter()
+                .map(|value| SqlParam::text(&value.value))
+                .collect();
+            let placeholders: Vec<String> = (0..param.values.len())
+                .map(|i| format!("${}", offset + i + 1))
+                .collect();
+            let sql = if placeholders.len() == 1 {
+                format!("id <> {}", placeholders[0])
+            } else {
+                format!("id NOT IN ({})", placeholders.join(", "))
+            };
+            return Some(SqlFragment::with_params(sql, params));
+        }
+
         let mut conditions = Vec::new();
-        for (i, value) in values.iter().enumerate() {
+        for (i, value) in param.values.iter().enumerate() {
             let param_num = offset + i + 1;
             conditions.push(SqlFragment::with_params(
                 format!("id = ${}", param_num),
                 vec![SqlParam::text(&value.value)],
             ));
-        }
-        if conditions.is_empty() {
-            return None;
         }
         let mut combined = conditions.remove(0);
         for cond in conditions {
@@ -4199,6 +4227,92 @@ mod tests {
             assert!(fragment.sql.contains("FROM resources"));
             assert!(fragment.sql.contains(&format!("{column} IS NOT NULL")));
             assert!(!fragment.sql.contains("FROM search_index"));
+        }
+    }
+
+    /// #1092: `_id` is lowered outside the generic modifier dispatch, so the
+    /// builder must honour `:not` itself. Pinned at the SQL level, without a
+    /// live database.
+    mod id_modifier {
+        use super::*;
+
+        fn id_param(modifier: Option<SearchModifier>, values: &[&str]) -> SearchParameter {
+            SearchParameter {
+                name: "_id".to_string(),
+                param_type: SearchParamType::Token,
+                modifier,
+                values: values.iter().map(|v| SearchValue::eq(*v)).collect(),
+                chain: vec![],
+                components: vec![],
+            }
+        }
+
+        fn text_params(fragment: &SqlFragment) -> Vec<&str> {
+            fragment
+                .params
+                .iter()
+                .map(|p| match p {
+                    SqlParam::Text(s) => s.as_str(),
+                    other => panic!("expected a text param, got {other:?}"),
+                })
+                .collect()
+        }
+
+        fn condition(param: SearchParameter) -> SqlFragment {
+            let query = SearchQuery::new("Patient").with_parameter(param);
+            PostgresQueryBuilder::build_search_query(&query, 2)
+                .expect("_id must produce a condition")
+        }
+
+        /// Control: the no-modifier form is byte-identical to what it was.
+        #[test]
+        fn id_without_modifier_is_a_positive_match() {
+            let single = condition(id_param(None, &["pat-a"]));
+            assert_eq!(single.sql, "id = $3");
+            assert_eq!(text_params(&single), vec!["pat-a"]);
+
+            let multi = condition(id_param(None, &["pat-a", "pat-b"]));
+            assert_eq!(multi.sql, "(id = $3) OR (id = $4)");
+            assert_eq!(text_params(&multi), vec!["pat-a", "pat-b"]);
+        }
+
+        /// `_id:not=a` must exclude `a`, not select it — the builder used to
+        /// read only `param.values` and returned exactly the excluded resource.
+        #[test]
+        fn id_not_negates_instead_of_matching() {
+            let single = condition(id_param(Some(SearchModifier::Not), &["pat-a"]));
+            assert_eq!(single.sql, "id <> $3");
+            assert_eq!(text_params(&single), vec!["pat-a"]);
+
+            // `:not=a,b` is `NOT (a OR b)`: one NOT IN over the whole OR-list.
+            let multi = condition(id_param(Some(SearchModifier::Not), &["pat-a", "pat-b"]));
+            assert_eq!(multi.sql, "id NOT IN ($3, $4)");
+            assert_eq!(text_params(&multi), vec!["pat-a", "pat-b"]);
+        }
+
+        /// The placeholder numbering must stay gap-free when `_id:not` is not
+        /// the first parameter: the caller advances the offset by
+        /// `params.len()`, and a stale number would bind past the end.
+        #[test]
+        fn id_not_respects_the_running_offset() {
+            let query = SearchQuery::new("Patient")
+                .with_parameter(SearchParameter {
+                    name: "gender".to_string(),
+                    param_type: SearchParamType::Token,
+                    modifier: None,
+                    values: vec![SearchValue::eq("female")],
+                    chain: vec![],
+                    components: vec![],
+                })
+                .with_parameter(id_param(Some(SearchModifier::Not), &["pat-a", "pat-b"]));
+            let fragment = PostgresQueryBuilder::build_search_query(&query, 2).unwrap();
+
+            assert!(
+                fragment.sql.ends_with("AND (id NOT IN ($4, $5))"),
+                "{}",
+                fragment.sql
+            );
+            assert_eq!(text_params(&fragment), vec!["female", "pat-a", "pat-b"]);
         }
     }
 }
