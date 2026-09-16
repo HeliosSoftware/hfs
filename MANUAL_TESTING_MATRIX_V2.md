@@ -38,7 +38,7 @@ Windows 11 host with an NVMe SSD; treat them as orders of magnitude, not targets
 | Intro, §3 | One build profile, `--release`, named in the build command and in every step that launches the binary | v1 built without `--release` at `:116` but ran `./target/release/hfs` at `:117` and `:224`. That build never writes `target/release/hfs`, so the tester ran a **stale** binary from an earlier build, or could not run the step, or switched to `target/debug/hfs` and recorded timings 10–25× off. All three happened |
 | §3 | A second, cheaper single-version build with its measured cold and incremental times, a one-cargo-at-a-time note, and an `sccache` caveat | The full `--all-features` build is ~70 min cold, which is why `--release` was dropped in the first place. A row like `sqlite-es` only needs one FHIR version |
 | §4 | Elasticsearch sized for T3: 8 GB heap, a named volume, a shard pre-flight, a per-run index prefix, replicas dropped on the live indices, and a cleanup step that deletes indices by name | 1 GiB is a T2 setting; with no volume, the prescribed `docker rm -fv` discarded the index silently. At ~1,000 shards every index creation is rejected and HFS **never becomes ready** — it looks exactly like an HFS startup bug |
-| §5 | Two environment profiles, load for T3 and search for T4, with a restart between them | v1 set `HFS_ELASTICSEARCH_WRITE_REFRESH=wait_for` for the whole pass. It is right for T4 and wrong for T3: every `_bulk` request blocks until the next refresh. Measured on a 1 % cut, removing it took the rebuild from 114 to 255 resources/s |
+| §5 | One environment for the whole pass, with `HFS_ELASTICSEARCH_REINDEX_REFRESH=false` next to `HFS_ELASTICSEARCH_WRITE_REFRESH=wait_for` | v1 set `wait_for` for the whole pass, which is right for T4 and made every `_bulk` request of T3's rebuild block on a refresh nobody was waiting to read. #1156 separates the two policies, so the pass keeps read-your-write *and* a rebuild that does not wait: measured on a 1 % cut, 806 s → **145 s** (1,576 resources/s, 0 errors). No restart between T3 and T4 |
 | §5 | What the submission detail page's 5 s poll costs at corpus scale, and that the dashboard is safe | The poll's `COUNT(*)` scans a table that grows to one row per ingested resource, so it slows down as the import grows. That is expected, not a hang |
 | §2, §7.1 | `python3 -m http.server` is replaced by an HTTP/1.1 keep-alive static server, and a byte-for-byte check that the corpus is served whole | Measured: 4–8 files per run lost their last 20–130 KB **while the manifest still ended `completed`**. v1's pass criteria were satisfiable by a run whose database was missing thousands of resources |
 | §7.3 | Judge progress by the resource counter; expect `total_entries` to equal the corpus size; a list of log lines that are failures | The percentage is byte progress capped at 99, so it sits still for hours near the end. `total_entries` ended at 37,911,730 for 18,955,865 receipts — the import had silently run twice |
@@ -344,7 +344,7 @@ cannot allocate it, so every index stays yellow forever. Only red is a failure.
 
 **3. Refresh interval and replicas.**
 
-`HFS_ELASTICSEARCH_REFRESH_INTERVAL=30s` from the T3 load profile in section 5
+`HFS_ELASTICSEARCH_REFRESH_INTERVAL=30s` from the environment in section 5
 (`crates/rest/src/config.rs:1136`, default `1s`) is enough **provided the prefix is
 fresh**: HFS creates each index explicitly with its own settings body
 (`crates/persistence/src/backends/elasticsearch/schema.rs:426`), so the value applies
@@ -415,10 +415,14 @@ export HFS_REQUEST_TIMEOUT=600            # large bundles on composite backends
 export HFS_SUBSCRIPTIONS_ENABLED=true
 export HFS_BULK_EXPORT_OUTPUT_DIR=$WORK/bulk-exports  # T5 local-fs output
 export HFS_EXPORT_DIR=$WORK/sql-exports               # T7 fs sink
-# composites: make searches read-your-write, so T2 and T4 are deterministic.
-# This is the *search* profile; T3 wants the opposite — see "Two environment
-# profiles" below. Do not leave this set during the import.
+# composites: make searches read-your-write, so T2 and T4 are deterministic...
 export HFS_COMPOSITE_SYNC_MODE=synchronous HFS_ELASTICSEARCH_WRITE_REFRESH=wait_for
+# ...and let the search-index rebuild skip that wait, which is pure cost while
+# nobody is reading the index. See "One environment for the whole pass" below.
+export HFS_ELASTICSEARCH_REINDEX_REFRESH=false
+# T3 load settings; harmless during the rest of the pass.
+export HFS_ELASTICSEARCH_REFRESH_INTERVAL=30s
+export HFS_BULK_SUBMIT_LEASE_DURATION=600 HFS_BULK_SUBMIT_WORKER_CONCURRENCY=1
 ```
 
 `HFS_BASE_URL` matters more than usual in this pass: the Import page makes HFS
@@ -435,37 +439,52 @@ startup (`HFS_BASE_URL '…' advertises a different port from listener …`), bu
 a `warn!`, not a fatal, and it is easy to miss in the startup log. The rest of this
 document writes `http://localhost:8080`; substitute your own base URL throughout.
 
-### Two environment profiles, and the restart between them
+### One environment for the whole pass
 
-T3 and T4 want opposite settings, and earlier revisions of this document set the T4
-ones for the whole pass. `HFS_ELASTICSEARCH_WRITE_REFRESH=wait_for` is exactly right
-for T4, where a search immediately after a write must see it. During T3 it makes
-every `_bulk` request block until the next Elasticsearch refresh: measured on a 1 %
-cut of the corpus, removing that one setting took the search rebuild from 114 to
-255 resources/s (#1126).
+T3 and T4 used to want opposite settings. `HFS_ELASTICSEARCH_WRITE_REFRESH=wait_for`
+is exactly right for T4, where a search immediately after a write must see it; during
+T3 it makes every `_bulk` request block until the next Elasticsearch refresh,
+including the rebuild's own, which is pure cost because nobody reads the index while
+it is being rebuilt. Measured on a 1 % cut, that one setting cost the rebuild most of
+its throughput — 806 s against 145 s, below. An earlier draft of this document
+therefore prescribed two profiles and a restart between them.
 
-| Setting | Search profile (T1, T2, T4 onward) | Load profile (T3 only) |
+**That is no longer necessary.** #1156 (merged, closing #1125) added
+`HFS_ELASTICSEARCH_REINDEX_REFRESH` (`crates/rest/src/config.rs:1193`), which sets the
+refresh policy of `$reindex` and of the deferred post-import rebuild *separately* from
+ordinary writes, and follows `HFS_ELASTICSEARCH_WRITE_REFRESH` when it is unset or
+blank (`crates/persistence/src/backends/elasticsearch/backend.rs:436`). Set both and
+the pass keeps read-your-write for T2 and T4 while the rebuild stops waiting:
+
+| Setting | Value for the whole pass | Why |
 |---|---|---|
-| `HFS_COMPOSITE_SYNC_MODE` | `synchronous` | unset (`asynchronous`, the default) |
-| `HFS_ELASTICSEARCH_WRITE_REFRESH` | `wait_for` | `false` (the default) |
-| `HFS_ELASTICSEARCH_REFRESH_INTERVAL` | unset (`1s`) | `30s` |
-| `HFS_BULK_SUBMIT_LEASE_DURATION` | unset (`60`) | `600` |
-| `HFS_BULK_SUBMIT_WORKER_CONCURRENCY` | unset (`2`) | `1` |
+| `HFS_COMPOSITE_SYNC_MODE` | `synchronous` | T2 and T4 see their own writes |
+| `HFS_ELASTICSEARCH_WRITE_REFRESH` | `wait_for` | same, for the Elasticsearch leg |
+| `HFS_ELASTICSEARCH_REINDEX_REFRESH` | `false` | the rebuild does not wait for refreshes |
+| `HFS_ELASTICSEARCH_REFRESH_INTERVAL` | `30s` | fewer refreshes during the load (default `1s`) |
+| `HFS_BULK_SUBMIT_LEASE_DURATION` | `600` | a saturated writer keeps its lease (default `60`) |
+| `HFS_BULK_SUBMIT_WORKER_CONCURRENCY` | `1` | one worker on one manifest (default `2`) |
 
-Start T1 and run T2 on the search profile. Then restart twice:
+Measured on the same 1 % cut (228,580 resources; Elasticsearch 8.15.0 with a 4 GB
+heap, release R4 build, recorded on #937): `wait_for` with the rebuild inheriting it
+takes **806 s**; adding `HFS_ELASTICSEARCH_REINDEX_REFRESH=false` takes **145 s**
+(1,576 resources/s), complete with **0 errors** — the same figures
+`crates/persistence/README.md:1535` records. **No restart between T3 and T4**, and T4
+stays deterministic: ordinary writes keep `wait_for`, and the rebuild has finished
+before T4 starts (7.4 is where you confirm that).
 
-```bash
-# after T2, before T3 — the load profile
-unset HFS_COMPOSITE_SYNC_MODE
-export HFS_ELASTICSEARCH_WRITE_REFRESH=false HFS_ELASTICSEARCH_REFRESH_INTERVAL=30s
-export HFS_BULK_SUBMIT_LEASE_DURATION=600 HFS_BULK_SUBMIT_WORKER_CONCURRENCY=1
-# ... stop hfs, start it again with the "Start and smoke" command below ...
+Three details worth knowing before you debug it:
 
-# after the counts in 7.5, before T4 — back to the search profile
-export HFS_COMPOSITE_SYNC_MODE=synchronous HFS_ELASTICSEARCH_WRITE_REFRESH=wait_for
-unset HFS_ELASTICSEARCH_REFRESH_INTERVAL HFS_BULK_SUBMIT_LEASE_DURATION HFS_BULK_SUBMIT_WORKER_CONCURRENCY
-# ... stop hfs, start it again ...
-```
+- The accepted values are `false`, `wait_for` and `true`, the same three
+  `HFS_ELASTICSEARCH_WRITE_REFRESH` takes; anything else is a **startup error**
+  naming the variable, not a warning. Blank counts as unset.
+- It only reaches the **Elasticsearch** rebuild writer
+  (`crates/persistence/src/backends/elasticsearch/storage.rs:1960`). On the
+  non-composite rows — `sqlite`, `postgres`, `mongodb`, `s3` — it does nothing, and
+  neither do `HFS_ELASTICSEARCH_WRITE_REFRESH`, `HFS_ELASTICSEARCH_REFRESH_INTERVAL`
+  or `HFS_COMPOSITE_SYNC_MODE`; those rows need only the two bulk-submit settings.
+- It does **not** change the refresh policy of the import's ordinary writes, only of
+  the rebuild's `_bulk` writes. The resources are still visible by id as they land.
 
 `HFS_BULK_SUBMIT_LEASE_DURATION` is in **seconds** and must be greater than the
 heartbeat interval, 20 s by default; HFS refuses to start otherwise
@@ -473,9 +492,11 @@ heartbeat interval, 20 s by default; HFS refuses to start otherwise
 before the lease expires. Losing the lease mid-import is what makes the worker
 re-walk the manifest, which is what inflated `total_entries` in the campaign (7.3).
 
-On the non-composite rows (`sqlite`, `postgres`, `mongodb`, `s3`) the two
-Elasticsearch settings do nothing and no restart is needed: export the two
-bulk-submit settings once before T3 and leave everything else alone.
+If the rebuild fails on oversized resources — the campaign's `Provenance` failure —
+`HFS_REINDEX_BATCH_BYTES` (`crates/rest/src/config.rs:1207`, default `0` = count
+only) caps a rebuild page by bytes on top of `HFS_REINDEX_BATCH_SIZE`, so a page of
+~108 KB resources ends at the first one that crosses the cap. Record it if you needed
+it.
 
 Nothing needs setting for SQLite durability. `synchronous=NORMAL` under WAL is the
 default since #1114 (`crates/persistence/src/backends/sqlite/backend.rs:363`); a
@@ -668,8 +689,10 @@ The corpus is a Bulk Data export of 11,704 Synthea patients (18,955,865 resource
 operation, driven from the **Import** page, which makes HFS fetch the manifest and
 every file from a static HTTP server you run on port 8000.
 
-Before starting, confirm HFS is running the **load profile** from section 5, and on
-`*-es` rows that `ES_PREFIX` is set and 4.1's pre-flight passed.
+Before starting, confirm HFS was started with the environment in section 5 — on
+`*-es` rows that includes `HFS_ELASTICSEARCH_REINDEX_REFRESH=false`, without which the
+rebuild in 7.4 takes several times as long — and that `ES_PREFIX` is set and 4.1's
+pre-flight passed.
 
 ### 7.1 Download, unpack, and serve the corpus
 
@@ -842,11 +865,11 @@ Note that instant: with the creation instant from 7.2 it is the **ingest time** 
 
 **Completed here means the resources are stored, not that they are searchable.** The
 search rebuild is a separate phase and it has its own step — 7.4 — and its own number
-in §14. Do not run the counts yet. And do not read the UI's "Search index
-rebuilding — N %" banner going away as the rebuild having worked: **it also clears
-when the job is cancelled**, and a rebuild that never started never showed it at all.
-`$reindex-status` is the check, and 7.4 is where it is run — together with the
-failure lines above, which are the only notice the log gives.
+in §14. Do not run the counts yet. As for the UI's "Search index rebuilding — N %"
+banner: since #1156 it **stays up when the rebuild left resources unindexed**, which
+makes it a real signal — but it shows nothing for a rebuild that was cancelled or that
+never started, so its absence still has to be confirmed. `$reindex-status` is the
+check, and 7.4 is where it is run, together with the failure lines above.
 
 If the status becomes **Failed**, the **Error files** count is non-zero, or the log
 shows `POST <your HFS_BASE_URL>/$bulk-submit → …` with an error, record the log text
@@ -866,13 +889,26 @@ to do with the import. Every count check belongs after this step.
 1. **Watch the rebuild banner on `/ui`**: *"Search index rebuilding — N % (P of T
    resources). Searches may miss stored resources until it finishes."*
    (`locales/en/main.ftl:202`, added by #1109 for #1065). It is the progress signal
-   for this phase.
-2. **The banner going away is not success.** It clears when the rebuild completes
-   cleanly *and* when it was cancelled. When it fails, or completes with resources
-   left unindexed, it stays and changes to *"The last search index rebuild left N
-   resources unindexed. Searches miss them until a rebuild succeeds; GET
-   $reindex-status/<job> lists which ones."*
-   (`crates/rest/src/dashboard.rs:667-678`). Either way, confirm with the job.
+   for this phase; before it has counted the work it reads *"Search index
+   rebuilding."* with no percentage (`:204`).
+2. **Since #1156 the banner stays up when the rebuild left resources unindexed**, so
+   it is a result and not only a progress bar. What each outcome shows
+   (`crates/rest/src/dashboard.rs:623`, `reindex_activity_of`):
+
+   | Rebuild outcome | Banner |
+   |---|---|
+   | completed, 0 errors | **none** — this is the pass |
+   | completed, N resources rejected | stays: *"The last search index rebuild left N resources unindexed … GET $reindex-status/<job> lists which ones."* (`locales/en/main.ftl:207`) |
+   | failed before naming a resource | stays: *"…failed before it finished … GET $reindex-status/<job> says why."* (`:212`) |
+   | **cancelled** | **none** — stopping it was the operator's decision |
+   | never ran | **none** |
+
+   So an absent banner means one of three different things, and only one of them is
+   success. If you or anyone else cancelled a rebuild, or you never saw the banner at
+   all, the absence tells you nothing — go to step 3. Two more reasons not to treat
+   the banner as the record: job state is in memory and per node, and it is evicted
+   after 24 h or 1,024 jobs (`crates/persistence/src/search/reindex.rs:760`), after
+   which even a failed rebuild's banner disappears.
 3. **Confirm with `$reindex-status`.** The job id is in the banner and in the log
    line that ends the rebuild.
 
@@ -901,6 +937,12 @@ In the #1126 re-measurement on a 1 % cut this is what actually happened: before 
 the rebuild failed twice and left 2,500 Provenance resources unindexed; on #1109's
 code it left **0 of 11,704** Provenance indexed after the first generation. Both are
 invisible unless this step and 7.5 are done.
+
+#1156 is the fix for that failure — on the same cut the rebuild now completes in one
+generation with every Provenance indexed
+(`crates/persistence/README.md:1531`) — so the expected result here is a clean
+`completed`. That is exactly why a shortfall is worth reporting rather than retrying
+quietly: it would be a regression against a measured baseline, not the known state.
 
 ### 7.5 Verify the data landed and is searchable
 
@@ -980,8 +1022,9 @@ Elasticsearch; the anchor patient is found by id; the dashboard reflects the imp
 the optional duplicate-reference upload is rejected without side effects. The ingest
 time, the searchable time and the final database size are recorded (§14).
 
-On `*-es` rows, switch back to the **search profile** and restart HFS before T4
-(section 5).
+No restart is needed before T4: one environment covers the whole pass (section 5),
+ordinary writes kept `wait_for` throughout, and the rebuild that did not wait for
+refreshes is finished as of 7.4.
 
 ---
 
@@ -1586,9 +1629,10 @@ For each backend row, attach to the release issue:
 - **`$reindex` on `s3` standalone** returns `501` (no search index). Expected.
 - **Elasticsearch composites** are eventually consistent unless
   `HFS_COMPOSITE_SYNC_MODE=synchronous` *and* `HFS_ELASTICSEARCH_WRITE_REFRESH=wait_for`
-  are set, as they are in the search profile in section 5. Without them T4 may lag —
-  which is why T3, where they cost more than they are worth, runs on the load profile
-  and the server is restarted between the two.
+  are set, as they are for the whole pass in section 5. What used to make that a
+  trade-off — the T3 rebuild inheriting the same wait — is settled by
+  `HFS_ELASTICSEARCH_REINDEX_REFRESH=false` (#1156), so there is no profile to switch
+  and no restart between T3 and T4.
 - **A full Elasticsearch looks exactly like an HFS startup bug.** At ~1,000 shards
   every index creation is rejected, HFS fails while seeding its SearchParameters and
   never becomes ready, and the log fills with `Sync attempt failed, retrying` without
@@ -1600,9 +1644,11 @@ For each backend row, attach to the release issue:
 - **Completed is not searchable.** Under the default deferred indexing the submission
   reports Completed when the resources are stored; the search index is built by a
   separate, unbounded job afterwards (7.4).
-- **The rebuild banner's absence is not success.** It clears both on a clean finish
-  and on a cancellation, and persists in a failed state otherwise. `$reindex-status`
-  is the check (7.4).
+- **The rebuild banner's absence is not by itself success.** Since #1156 it stays up
+  when the last rebuild left resources unindexed, so it is a result and not only a
+  progress bar — but it shows nothing for a *cancelled* rebuild, for one that never
+  ran, and once the job's status is evicted (24 h). `$reindex-status` is the check
+  (7.4).
 - **`python3 -m http.server` must not serve the corpus.** It truncates multi-gigabyte
   bodies while the import still reports `completed` (7.1). The §12.1 rest-hook
   receiver is a different case and is fine as written.
