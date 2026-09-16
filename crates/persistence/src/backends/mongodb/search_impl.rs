@@ -233,6 +233,46 @@ async fn read_cursor_batch(
     Ok(docs)
 }
 
+/// Drops the probe row a cursor page over-fetches (`limit(page_size + 1)`)
+/// and, on a backward page, restores the requested sort order. Returns
+/// `(has_next, has_previous)`.
+///
+/// Forward: the probe row is the last one fetched and proves a next page;
+/// `has_previous` is not knowable from the rows, so the caller's
+/// `forward_has_previous` (cursor present or offset > 0) is passed through.
+///
+/// Backward: the filter selects rows *newer* than the cursor with the sort
+/// flipped, so the driver returns nearest-newer first. The probe row is still
+/// the last one fetched, but it is the *farthest* from the cursor — it belongs
+/// to page N-2, not to the page being returned — and it proves a previous
+/// page. It must be dropped *before* `reverse()` restores the sort order:
+/// popping after the reverse discards the wanted adjacent row and keeps the
+/// unwanted one, shifting the window by one on every backward hop (#1057).
+/// A backward hop always has a next page (the one it came from) as long as it
+/// returned any row. Mirrors the SQLite and PostgreSQL backward branches
+/// (#1079).
+fn trim_probe_row<T>(
+    rows: &mut Vec<T>,
+    page_size: usize,
+    previous_mode: bool,
+    forward_has_previous: bool,
+) -> (bool, bool) {
+    if previous_mode {
+        let has_previous = rows.len() > page_size;
+        if has_previous {
+            rows.pop();
+        }
+        rows.reverse();
+        (!rows.is_empty(), has_previous)
+    } else {
+        let has_next = rows.len() > page_size;
+        if has_next {
+            rows.pop();
+        }
+        (has_next, forward_has_previous)
+    }
+}
+
 /// Finds the `contained[]` entry with the given local `id` in a container's
 /// content.
 fn extract_contained_resource(content: &Value, local_id: &str) -> Option<Value> {
@@ -441,16 +481,12 @@ impl SearchProvider for MongoBackend {
             .map(|doc| self.document_to_stored_resource(tenant, &query.resource_type, doc))
             .collect::<StorageResult<Vec<_>>>()?;
 
-        if previous_mode {
-            resources.reverse();
-        }
-
-        let has_next = resources.len() > page_size;
-        if has_next {
-            let _ = resources.pop();
-        }
-
-        let has_previous = cursor.is_some() || query.offset.unwrap_or(0) > 0;
+        let (has_next, has_previous) = trim_probe_row(
+            &mut resources,
+            page_size,
+            previous_mode,
+            cursor.is_some() || query.offset.unwrap_or(0) > 0,
+        );
 
         let next_cursor = if has_next {
             resources.last().map(|resource| {
@@ -3932,5 +3968,55 @@ mod sort_key_order_tests {
             order_sort_keys(keyed, SortDirection::Ascending),
             vec!["id-6.5", "id-7", "id-8"]
         );
+    }
+}
+
+/// #1057: the probe row of a cursor page is dropped in driver order, before a
+/// backward page is reversed back into sort order.
+#[cfg(test)]
+mod trim_probe_row_tests {
+    use super::trim_probe_row;
+
+    // Sort order is `last_updated desc, id desc`, so the listing is
+    // 7,6,5,4,3,2,1 and a page holds 3 rows.
+
+    #[test]
+    fn forward_drops_the_trailing_probe_and_reports_next() {
+        let mut rows = vec![7, 6, 5, 4];
+        assert_eq!(trim_probe_row(&mut rows, 3, false, false), (true, false));
+        assert_eq!(rows, vec![7, 6, 5]);
+    }
+
+    #[test]
+    fn forward_without_probe_has_no_next_and_passes_previous_through() {
+        let mut rows = vec![4, 3, 2];
+        assert_eq!(trim_probe_row(&mut rows, 3, false, true), (false, true));
+        assert_eq!(rows, vec![4, 3, 2]);
+    }
+
+    #[test]
+    fn backward_drops_the_farthest_row_before_restoring_order() {
+        // Back from page 3 (cursor at row 1): the driver returns the
+        // nearest-newer rows first, plus the probe row 5 from page 1.
+        let mut rows = vec![2, 3, 4, 5];
+        assert_eq!(trim_probe_row(&mut rows, 3, true, true), (true, true));
+        // Page 2 exactly — not [5, 4, 3], which is what popping after the
+        // reverse produced.
+        assert_eq!(rows, vec![4, 3, 2]);
+    }
+
+    #[test]
+    fn backward_without_probe_has_no_previous_but_still_has_next() {
+        // Back from page 2 (cursor at row 4): rows 5..7 are all that exist.
+        let mut rows = vec![5, 6, 7];
+        assert_eq!(trim_probe_row(&mut rows, 3, true, true), (true, false));
+        assert_eq!(rows, vec![7, 6, 5]);
+    }
+
+    #[test]
+    fn backward_with_no_rows_has_neither_link() {
+        let mut rows: Vec<i32> = Vec::new();
+        assert_eq!(trim_probe_row(&mut rows, 3, true, true), (false, false));
+        assert!(rows.is_empty());
     }
 }
