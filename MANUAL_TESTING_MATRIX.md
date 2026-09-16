@@ -488,13 +488,15 @@ the import; the optional duplicate-reference upload is rejected without side eff
 
 ## 8. T4 — One manual search per FHIR search type
 
-All searches are typed into the **QUERY** box on **Resources** (`/ui/resources`).
-The box accepts a raw FHIR search (`GET /Patient?name=Parker433&_count=5`) and
-**Run** (or Enter) executes it and renders the Bundle in the **Results** card. The
-results header shows **N results** taken from `Bundle.total` and, when the Bundle
-carries `_include`/`_revinclude` entries, **· M included**. The **Open in New Tab**
-link is the exact path that ran — hover it to confirm the URL the UI built, or click
-it to see the raw Bundle.
+All searches are typed into the **QUERY** box on **Resources** (`/ui/resources`). The
+box accepts a raw FHIR search (`GET /Patient?name=Parker433&_count=5`) and **Run**
+(or Enter) executes it and renders the Bundle in the **Results** card. The results
+header shows **N results** taken from `Bundle.total` (the page adds `_total=accurate`
+to the request it sends, so the count is the match count, not the page size; a query
+that opts out with `_total=none` reads **N+ results** while more pages remain) and,
+when the Bundle carries `_include`/`_revinclude` entries, **· M included**. The
+**Open in New Tab** link is the exact path that ran — hover it to confirm the URL the
+UI built, or click it to see the raw Bundle.
 
 Expected counts assume the full corpus plus the T2 transaction (11,705 patients).
 `PID` is the anchor patient `7d24f7a0-6f2e-ce3b-5568-db7b14695583`.
