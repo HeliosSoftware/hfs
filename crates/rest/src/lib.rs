@@ -168,6 +168,45 @@ pub mod tenant;
 pub mod terminology;
 pub mod validation;
 
+/// Test-only support helpers shared across the crate's unit tests.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::path::PathBuf;
+
+    use helios_fhir::FhirVersion;
+    use helios_persistence::search::{SearchParameterLoader, SearchParameterRegistry};
+
+    /// The workspace data directory holding `search-parameters-r4.json`.
+    fn workspace_data_dir() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data")
+    }
+
+    /// Builds a `SearchParameterRegistry` populated with the full R4 spec
+    /// search parameter bundle, for tests that need real parameter
+    /// definitions (types, targets) rather than a hand-rolled subset.
+    pub(crate) fn spec_registry_r4() -> SearchParameterRegistry {
+        spec_registry(FhirVersion::R4)
+    }
+
+    /// Builds a `SearchParameterRegistry` populated with the full spec
+    /// search parameter bundle for `version`, for tests that need real
+    /// parameter definitions (types, targets) rather than a hand-rolled
+    /// subset.
+    pub(crate) fn spec_registry(version: FhirVersion) -> SearchParameterRegistry {
+        let loader = SearchParameterLoader::new(version);
+        let mut registry = SearchParameterRegistry::new();
+        for param in loader
+            .load_from_spec_file(&workspace_data_dir())
+            .unwrap_or_else(|e| panic!("load {version:?} spec search parameters: {e}"))
+        {
+            registry
+                .register(param)
+                .expect("register spec search parameter");
+        }
+        registry
+    }
+}
+
 // Re-export commonly used types
 pub use config::{MultitenancyConfig, ServerConfig, StorageBackendMode, TenantRoutingMode};
 pub use error::{RestError, RestResult};

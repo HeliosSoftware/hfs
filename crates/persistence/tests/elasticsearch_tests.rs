@@ -4638,6 +4638,95 @@ mod es_integration {
         assert!(back1.resources.page_info.previous_cursor.is_none());
     }
 
+    /// The three backend primitives `Patient/$everything`'s compartment walk
+    /// composes — compartment membership (OR across `subject`/`performer`,
+    /// see `es_integration_compartment_search`), cursor-paged results (see
+    /// `es_integration_cursor_paging_round_trip_previous`), and a
+    /// `_lastUpdated ge` filter — pinned together the way the handler uses
+    /// them, since ES has no REST-level `$everything` fixture.
+    #[tokio::test]
+    async fn es_compartment_query_pages_with_cursor_and_since() {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::types::{
+            CompartmentMembership, SearchParamType, SearchParameter, SearchPrefix, SearchQuery,
+            SearchValue,
+        };
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("everything-compartment-paging");
+
+        for i in 1..=5 {
+            backend
+                .create(
+                    &tenant,
+                    "Observation",
+                    json!({
+                        "resourceType": "Observation",
+                        "status": "final",
+                        "code": {"text": "x"},
+                        "id": format!("o{i}"),
+                        "subject": {"reference": "Patient/p1"}
+                    }),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+        backend
+            .create(
+                &tenant,
+                "Observation",
+                json!({
+                    "resourceType": "Observation",
+                    "status": "final",
+                    "code": {"text": "x"},
+                    "id": "other",
+                    "subject": {"reference": "Patient/p2"}
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+
+        // Wait for index refresh
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+        let mut q = SearchQuery::new("Observation");
+        q.compartment = Some(CompartmentMembership {
+            params: vec!["subject".to_string(), "performer".to_string()],
+            reference: "Patient/p1".to_string(),
+        });
+        q.count = Some(2);
+
+        let mut seen = Vec::new();
+        let mut cursor = None;
+        loop {
+            q.cursor = cursor.take();
+            let page = backend.search(&tenant, &q).await.unwrap();
+            seen.extend(page.resources.items.iter().map(|r| r.id().to_string()));
+            if page.resources.page_info.has_next {
+                cursor = page.resources.page_info.next_cursor.clone();
+                assert!(cursor.is_some());
+            } else {
+                break;
+            }
+        }
+        seen.sort();
+        assert_eq!(seen, vec!["o1", "o2", "o3", "o4", "o5"]);
+
+        q.cursor = None;
+        q.parameters.push(SearchParameter {
+            name: "_lastUpdated".to_string(),
+            param_type: SearchParamType::Date,
+            modifier: None,
+            values: vec![SearchValue::new(SearchPrefix::Ge, "2999-01-01T00:00:00Z")],
+            chain: vec![],
+            components: vec![],
+        });
+        let page = backend.search(&tenant, &q).await.unwrap();
+        assert!(page.resources.items.is_empty());
+    }
+
     /// #1079: a result set whose size is an exact multiple of `_count` must
     /// not emit a `next` link on the last page, forward via cursor.
     #[tokio::test]

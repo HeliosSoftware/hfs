@@ -86,14 +86,22 @@ pub(crate) fn pairs_from_parameters(body: &serde_json::Value) -> Vec<(String, St
                 .or_else(|| p.get("valueInstant"))
                 .or_else(|| p.get("valueCode"))
                 .or_else(|| p.get("valueDateTime"))
+                .or_else(|| p.get("valueDate"))
                 .and_then(|v| v.as_str())
+                .map(str::to_string)
                 .or_else(|| {
                     p.get("valueReference")
                         .and_then(|r| r.get("reference"))
                         .and_then(|r| r.as_str())
+                        .map(str::to_string)
+                })
+                .or_else(|| {
+                    p.get("valueInteger")
+                        .and_then(|v| v.as_i64())
+                        .map(|v| v.to_string())
                 });
             if let Some(v) = value {
-                pairs.push((name.to_string(), v.to_string()));
+                pairs.push((name.to_string(), v));
             }
         }
     }
@@ -105,6 +113,27 @@ mod tests {
     use super::*;
     use axum::http::HeaderMap;
     use serde_json::json;
+
+    #[test]
+    fn pairs_from_parameters_reads_value_date_and_value_integer() {
+        let body = json!({
+            "resourceType": "Parameters",
+            "parameter": [
+                { "name": "start", "valueDate": "2020-01-01" },
+                { "name": "_count", "valueInteger": 25 },
+                { "name": "_since", "valueInstant": "2021-02-03T04:05:06Z" }
+            ]
+        });
+        let pairs = pairs_from_parameters(&body);
+        assert_eq!(
+            pairs,
+            vec![
+                ("start".to_string(), "2020-01-01".to_string()),
+                ("_count".to_string(), "25".to_string()),
+                ("_since".to_string(), "2021-02-03T04:05:06Z".to_string()),
+            ]
+        );
+    }
 
     #[test]
     fn test_parse_query_pairs_none_and_repeated() {
