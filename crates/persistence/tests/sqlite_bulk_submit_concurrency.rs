@@ -48,6 +48,34 @@ async fn seed(backend: &SqliteBackend, tag: &str) -> (SubmissionId, String) {
     (id, manifest.manifest_id)
 }
 
+/// Routes `helios_persistence` events at `info` and above into
+/// `tracing-test`'s in-memory buffer, once per test binary (#1127).
+///
+/// `#[traced_test]` is no use here: in an integration test it keeps only the
+/// test crate's own events, and only those inside the test's span — the lease
+/// keeper and the checkpoint log from spawned tasks in the library. So the
+/// subscriber is global and tests tell their lines apart by the unique worker
+/// ids they log.
+fn capture_logs() {
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(|| {
+        let writer = tracing_test::internal::MockWriter::new(tracing_test::internal::global_buf());
+        let dispatch = tracing_test::internal::get_subscriber(writer, "helios_persistence=info");
+        tracing::dispatcher::set_global_default(dispatch)
+            .expect("no other global tracing subscriber in this test binary");
+    });
+}
+
+/// Captured log lines that contain every one of `needles`.
+fn logged_lines(needles: &[&str]) -> Vec<String> {
+    let buf = tracing_test::internal::global_buf().lock().unwrap();
+    String::from_utf8_lossy(&buf)
+        .lines()
+        .filter(|line| needles.iter().all(|needle| line.contains(needle)))
+        .map(str::to_string)
+        .collect()
+}
+
 /// Two concurrent NDJSON streams — the two-worker shape that froze. The
 /// timeout turns a deadlock into a failure with a name.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -582,10 +610,14 @@ async fn a_ready_heavy_stream_still_renews_the_lease() {
 }
 
 /// The abort half of the mid-file heartbeat: a worker whose lease was
-/// genuinely taken over must notice at its next beat and stop quietly,
-/// ingesting nothing further under the stale fencing token.
+/// genuinely taken over must notice at its next beat and stop, ingesting
+/// nothing further under the stale fencing token. It stops without failing
+/// the run, but never silently (#1127): the reclaim and the stale worker's
+/// lost lease both reach the log at `warn`, because the manifest is walked
+/// again from its first file.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_lost_lease_aborts_the_run_quietly() {
+async fn a_lost_lease_aborts_the_run_and_is_logged_at_warn() {
+    capture_logs();
     use helios_persistence::backends::local_fs::LocalFsOutputStore;
     use helios_persistence::core::{
         BulkSubmitJobStore, DefaultSubmitWorker, ExportOutputStore, RemoteFile, RemoteManifest,
@@ -689,6 +721,26 @@ async fn a_lost_lease_aborts_the_run_quietly() {
     assert_eq!(
         total, 0,
         "the stale worker must not ingest under a lost lease"
+    );
+
+    // Field values are matched without their quoting: `fmt` prints a `&str`
+    // field with quotes and a `Display` one without.
+    let reclaims = logged_lines(&[
+        " WARN ",
+        "reclaimed from a worker whose lease expired",
+        "stale-worker",
+    ]);
+    assert!(
+        !reclaims.is_empty(),
+        "the rival's reclaim of an expired lease must be logged at warn"
+    );
+    let lost: Vec<String> = logged_lines(&[" WARN ", "stale-worker", "lease"])
+        .into_iter()
+        .filter(|line| !line.contains("reclaimed from a worker whose lease expired"))
+        .collect();
+    assert!(
+        !lost.is_empty(),
+        "the stale worker's lost lease must be logged at warn"
     );
 }
 
@@ -852,4 +904,229 @@ async fn a_reclaimed_manifest_reports_reingested_entries_as_updates() {
     );
     let total = backend.count(&tenant(), Some("Patient")).await.unwrap();
     assert_eq!(total, 250);
+}
+
+/// #1127, the adversarial lease: a 2 s lease, two workers polling for the
+/// same manifest, and a WAL that cannot be folded away. The real run lost its
+/// lease after ~7 h because the file-boundary `wal_checkpoint(TRUNCATE)` held
+/// the write lock for minutes over a multi-gigabyte WAL while the heartbeat
+/// queued behind it; the sibling worker then re-walked every file.
+///
+/// A test cannot afford gigabytes, so it makes the checkpoint as bad as it
+/// can get instead: tens of MiB of WAL that no checkpoint may reset, pinned by
+/// a reader that stays open for the whole ingest. `TRUNCATE` then waits out
+/// its whole busy timeout at every file boundary with the write lock held —
+/// with the pool's 30 s `busy_timeout` that is fifteen leases. The manifest
+/// spans several leases and several checkpoints, and must still be claimed
+/// exactly once, finish, and log no lost lease, while the checkpoints report
+/// the WAL they found and that they were kept busy.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_pinned_wal_checkpoint_never_lets_a_rival_reclaim_the_manifest() {
+    use helios_persistence::backends::local_fs::LocalFsOutputStore;
+    use helios_persistence::core::{
+        BulkSubmitJobStore, BulkSubmitProvider, DefaultSubmitWorker, ExportOutputStore,
+        ManifestStatus, RemoteFile, RemoteManifest, ResourceStorage, SubmitInputFetcher, WorkerId,
+    };
+    use helios_persistence::error::StorageResult;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    const FILES: usize = 4;
+    const LINES: usize = 25;
+    /// Per line: a file takes 1.5 s to stream, the manifest ~6 s — three
+    /// leases before counting the checkpoints.
+    const LINE_PAUSE: Duration = Duration::from_millis(60);
+    const LEASE: Duration = Duration::from_secs(2);
+    const WAL_BALLAST_MIB: usize = 32;
+
+    /// Streams every file slowly, so the run outlives its lease many times
+    /// over and depends on the heartbeat for all of it.
+    struct TrickleFetcher {
+        manifest: RemoteManifest,
+    }
+
+    #[async_trait::async_trait]
+    impl SubmitInputFetcher for TrickleFetcher {
+        async fn fetch_manifest(
+            &self,
+            _url: &str,
+            _headers: &[(String, String)],
+            _oauth: &[String],
+            _key: Option<&serde_json::Value>,
+        ) -> StorageResult<RemoteManifest> {
+            Ok(self.manifest.clone())
+        }
+
+        async fn open_file_stream(
+            &self,
+            url: &str,
+            _headers: &[(String, String)],
+            _requires_access_token: bool,
+            _oauth: &[String],
+            _key: Option<&serde_json::Value>,
+        ) -> StorageResult<(Box<dyn tokio::io::AsyncBufRead + Send + Unpin>, Option<u64>)> {
+            let file = url
+                .rsplit('/')
+                .next()
+                .and_then(|name| name.strip_suffix(".ndjson"))
+                .unwrap_or("file")
+                .to_string();
+            let lines = ndjson(&format!("wal-{file}"), LINES);
+            let (reader, mut writer) = tokio::io::duplex(1024);
+            tokio::spawn(async move {
+                use tokio::io::AsyncWriteExt;
+                for line in lines.split_inclusive(|b| *b == b'\n') {
+                    if writer.write_all(line).await.is_err() {
+                        return;
+                    }
+                    tokio::time::sleep(LINE_PAUSE).await;
+                }
+            });
+            Ok((Box::new(tokio::io::BufReader::new(reader)), None))
+        }
+    }
+
+    capture_logs();
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("submit-wal.db");
+    let backend =
+        SqliteBackend::with_config(db_path.to_str().unwrap(), SqliteBackendConfig::default())
+            .unwrap();
+    backend.init_schema().unwrap();
+    let backend = Arc::new(backend);
+    let (sub_id, _) = seed(&backend, "wal").await;
+
+    // Grow the WAL from a connection that never auto-checkpoints, then pin it:
+    // a read transaction opened after the ballast keeps every frame in use, so
+    // no checkpoint can reset the WAL and `TRUNCATE` must wait for the reader.
+    let pin = rusqlite::Connection::open(&db_path).unwrap();
+    pin.execute_batch(
+        "PRAGMA wal_autocheckpoint = 0; CREATE TABLE wal_ballast (bytes BLOB NOT NULL);",
+    )
+    .unwrap();
+    for _ in 0..WAL_BALLAST_MIB {
+        pin.execute("INSERT INTO wal_ballast VALUES (randomblob(1048576))", [])
+            .unwrap();
+    }
+    let wal_bytes = std::fs::metadata(db_path.with_extension("db-wal"))
+        .map(|m| m.len())
+        .unwrap_or(0);
+    assert!(
+        wal_bytes >= (WAL_BALLAST_MIB as u64) << 20,
+        "the ballast must land in the WAL: {wal_bytes} bytes"
+    );
+    pin.execute_batch("BEGIN DEFERRED").unwrap();
+    let ballast: i64 = pin
+        .query_row("SELECT COUNT(*) FROM wal_ballast", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(ballast as usize, WAL_BALLAST_MIB);
+
+    let fetcher: Arc<dyn SubmitInputFetcher> = Arc::new(TrickleFetcher {
+        manifest: RemoteManifest {
+            output: (0..FILES)
+                .map(|f| RemoteFile {
+                    resource_type: Some("Patient".to_string()),
+                    url: format!("https://provider.example/wal/file-{f}.ndjson"),
+                    count: None,
+                })
+                .collect(),
+            ..Default::default()
+        },
+    });
+    let jobs: Arc<dyn BulkSubmitJobStore> = backend.clone();
+    let output: Arc<dyn ExportOutputStore> = Arc::new(LocalFsOutputStore::new(
+        tmp.path().join("out"),
+        "http://localhost:8080",
+    ));
+
+    // Two workers running the server's claim loop against the same manifest.
+    let claims: Arc<Mutex<Vec<(String, u64)>>> = Arc::default();
+    let done = Arc::new(AtomicBool::new(false));
+    let loops: Vec<_> = ["wal-worker-a", "wal-worker-b"]
+        .into_iter()
+        .map(|name| {
+            let (jobs, fetcher, output) = (jobs.clone(), fetcher.clone(), output.clone());
+            let (claims, done) = (Arc::clone(&claims), Arc::clone(&done));
+            tokio::spawn(async move {
+                let worker_id = WorkerId::new(name);
+                while !done.load(Ordering::SeqCst) {
+                    let claimed = jobs
+                        .claim_next_manifest(&worker_id, LEASE)
+                        .await
+                        .expect("claim");
+                    let Some(lease) = claimed else {
+                        tokio::time::sleep(Duration::from_millis(200)).await;
+                        continue;
+                    };
+                    claims
+                        .lock()
+                        .unwrap()
+                        .push((name.to_string(), lease.fencing_token));
+                    DefaultSubmitWorker::new(
+                        jobs.clone(),
+                        fetcher.clone(),
+                        output.clone(),
+                        worker_id.clone(),
+                    )
+                    .run_job(lease)
+                    .await
+                    .expect("run_job");
+                }
+            })
+        })
+        .collect();
+
+    let finished = tokio::time::timeout(Duration::from_secs(180), async {
+        loop {
+            let manifests = backend.list_manifests(&tenant(), &sub_id).await.unwrap();
+            if manifests[0].status.is_terminal() {
+                return manifests[0].status;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    })
+    .await
+    .expect("the manifest did not finish under a pinned WAL");
+    pin.execute_batch("COMMIT").unwrap();
+    drop(pin);
+    done.store(true, Ordering::SeqCst);
+    for handle in loops {
+        tokio::time::timeout(Duration::from_secs(60), handle)
+            .await
+            .expect("a worker loop did not wind down")
+            .unwrap();
+    }
+
+    let claims = claims.lock().unwrap().clone();
+    assert_eq!(
+        claims.len(),
+        1,
+        "the manifest was reclaimed and walked again: {claims:?}"
+    );
+    assert_eq!(
+        claims[0].1, 1,
+        "a single claim holds the first fencing token"
+    );
+    assert_eq!(finished, ManifestStatus::Completed);
+    let total = backend.count(&tenant(), Some("Patient")).await.unwrap();
+    assert_eq!(total as usize, FILES * LINES);
+
+    // Nothing lost, reclaimed or starved: no warning names either worker.
+    let lease_warnings = logged_lines(&[" WARN ", "wal-worker-"]);
+    assert!(
+        lease_warnings.is_empty(),
+        "no lease warning expected: {lease_warnings:#?}"
+    );
+    // The checkpoints ran against the pinned WAL, were kept busy by the
+    // reader, and said what they found.
+    let checkpoints = logged_lines(&[
+        "sqlite WAL checkpoint after a bulk-submit file",
+        "truncate_busy=true",
+        "wal_frames=",
+        "duration_ms=",
+    ]);
+    assert!(
+        checkpoints.len() >= FILES - 1,
+        "every file boundary checkpoints the pinned WAL and logs it: {checkpoints:#?}"
+    );
 }

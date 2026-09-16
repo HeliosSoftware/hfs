@@ -3,7 +3,7 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use helios_fhir::FhirVersion;
-use rusqlite::{TransactionBehavior, params};
+use rusqlite::{OptionalExtension, TransactionBehavior, params};
 use serde_json::Value;
 use std::time::Duration as StdDuration;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt};
@@ -35,6 +35,14 @@ use crate::tenant::{TenantContext, TenantId, TenantPermissions};
 
 use super::SqliteBackend;
 use super::storage::PreparedIndex;
+
+/// One ingested entry: its receipt, the rollback record its write warrants,
+/// and the resource as committed (absent when nothing was written).
+type IngestedEntry = (
+    BulkEntryResult,
+    Option<SubmissionChange>,
+    Option<crate::types::StoredResource>,
+);
 
 /// Process-local lock serializing manifest claims for the single-instance SQLite
 /// job store (SQLite has no `SELECT … FOR UPDATE SKIP LOCKED`).
@@ -152,6 +160,347 @@ async fn retry_bookkeeping_on_busy<T>(
     }
 }
 
+/// [`retry_bookkeeping_on_busy`], with every attempt on a blocking thread
+/// (#1127).
+///
+/// The synchronous helper runs each attempt inline on the calling task, and an
+/// attempt waiting on SQLite's write lock parks that runtime thread for up to a
+/// whole `busy_timeout` with no await point. The lease keeper bounds each
+/// heartbeat with `tokio::time::timeout`, and a timeout cannot fire on a future
+/// that blocks instead of pending: behind a multi-minute WAL checkpoint the
+/// heartbeat landed only after its lease had expired and a sibling worker had
+/// reclaimed the manifest, and the whole corpus was walked a second time.
+///
+/// Here each attempt goes through [`SqliteBackend::run_blocking`], so the
+/// future stays pending while the statement waits, the caller's timeout works,
+/// and the runtime thread keeps serving the other tasks. The retry policy is
+/// the synchronous helper's: an elapsed-time budget, only busy/locked retried,
+/// the first attempt always issued. `attempt` builds a fresh `'static` closure
+/// for each try.
+///
+/// Dropping the returned future does not cancel an attempt already running on
+/// its blocking thread (see `run_blocking`); it completes or fails busy on its
+/// own. Every write routed here is fenced by the lease, and each issued
+/// statement applies at most once, so a straggler cannot corrupt a manifest
+/// another worker now owns.
+async fn retry_bookkeeping_on_busy_async<T, F>(
+    backend: &SqliteBackend,
+    what: &str,
+    budget: StdDuration,
+    mut attempt: impl FnMut() -> F,
+) -> StorageResult<T>
+where
+    T: Send + 'static,
+    F: FnOnce(&rusqlite::Connection) -> StorageResult<T> + Send + 'static,
+{
+    let started = tokio::time::Instant::now();
+    let mut backoff = StdDuration::from_millis(50);
+    let mut attempt_no = 1u32;
+    loop {
+        match backend.run_blocking(attempt()).await {
+            Err(StorageError::Backend(BackendError::Unavailable { message, .. }))
+                if started.elapsed() + backoff < budget =>
+            {
+                tracing::warn!(
+                    attempt = attempt_no,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    budget_ms = budget.as_millis() as u64,
+                    backoff_ms = backoff.as_millis() as u64,
+                    "sqlite busy during {what}; retrying: {message}"
+                );
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(StdDuration::from_secs(1));
+                attempt_no += 1;
+            }
+            other => return other,
+        }
+    }
+}
+
+/// How long the file-boundary `TRUNCATE` checkpoint may wait on readers and
+/// writers before it gives up and leaves the rest for the next boundary
+/// (#1127).
+const CHECKPOINT_TRUNCATE_BUSY_TIMEOUT: StdDuration = StdDuration::from_secs(1);
+
+/// How long one heartbeat attempt may wait on the write lock (#1127). The
+/// retry loop around it spends the lease's budget in short attempts, so an
+/// attempt the keeper's timeout abandoned frees its pooled connection within
+/// this bound instead of holding it for a whole default `busy_timeout`.
+const HEARTBEAT_ATTEMPT_BUSY_TIMEOUT: StdDuration = StdDuration::from_secs(1);
+
+/// A file-boundary checkpoint slower than this is logged at `warn`: every
+/// writer, the lease heartbeat included, waited behind it.
+const SLOW_CHECKPOINT: StdDuration = StdDuration::from_secs(5);
+
+/// Shortens a connection's `busy_timeout` and restores the previous value when
+/// dropped, on every path out, a panic included (#1127). Pooled connections
+/// are reused as they are returned, so a timeout left short would make every
+/// later statement on that connection give up after a second.
+struct BusyTimeoutGuard<'c> {
+    conn: &'c rusqlite::Connection,
+    restore: StdDuration,
+}
+
+impl<'c> BusyTimeoutGuard<'c> {
+    fn shorten(conn: &'c rusqlite::Connection, to: StdDuration) -> rusqlite::Result<Self> {
+        let restore_ms: i64 = conn.query_row("PRAGMA busy_timeout", [], |row| row.get(0))?;
+        let restore = StdDuration::from_millis(u64::try_from(restore_ms).unwrap_or(0));
+        conn.busy_timeout(to)?;
+        Ok(Self { conn, restore })
+    }
+}
+
+impl Drop for BusyTimeoutGuard<'_> {
+    fn drop(&mut self) {
+        if let Err(error) = self.conn.busy_timeout(self.restore) {
+            tracing::warn!(
+                %error,
+                restore_ms = self.restore.as_millis() as u64,
+                "could not restore a sqlite connection's busy_timeout after shortening it"
+            );
+        }
+    }
+}
+
+/// What one file-boundary WAL checkpoint did (#1127).
+#[derive(Debug, Clone, Copy)]
+struct CheckpointReport {
+    /// Frames in the WAL when the checkpoint started.
+    wal_frames: i64,
+    /// Frames the `PASSIVE` pass copied into the database.
+    passive_checkpointed: i64,
+    /// Whether the `TRUNCATE` pass gave up on a reader or writer.
+    truncate_busy: bool,
+    /// Frames left in the WAL after the `TRUNCATE` pass (0 once truncated).
+    truncate_frames: i64,
+    page_size: i64,
+    duration: StdDuration,
+}
+
+impl CheckpointReport {
+    fn wal_bytes(&self) -> i64 {
+        self.wal_frames.max(0).saturating_mul(self.page_size.max(0))
+    }
+
+    fn log(&self) {
+        let duration_ms = self.duration.as_millis() as u64;
+        if self.duration > SLOW_CHECKPOINT {
+            tracing::warn!(
+                wal_frames = self.wal_frames,
+                wal_bytes = self.wal_bytes(),
+                passive_checkpointed = self.passive_checkpointed,
+                truncate_busy = self.truncate_busy,
+                truncate_frames = self.truncate_frames,
+                duration_ms,
+                "sqlite WAL checkpoint after a bulk-submit file was slow; \
+                 every writer, lease heartbeats included, waited behind it"
+            );
+        } else {
+            tracing::info!(
+                wal_frames = self.wal_frames,
+                wal_bytes = self.wal_bytes(),
+                passive_checkpointed = self.passive_checkpointed,
+                truncate_busy = self.truncate_busy,
+                truncate_frames = self.truncate_frames,
+                duration_ms,
+                "sqlite WAL checkpoint after a bulk-submit file"
+            );
+        }
+    }
+}
+
+/// Runs `PRAGMA wal_checkpoint(<mode>)` and returns `(busy, log, checkpointed)`.
+fn wal_checkpoint(conn: &rusqlite::Connection, mode: &str) -> rusqlite::Result<(bool, i64, i64)> {
+    conn.query_row(&format!("PRAGMA wal_checkpoint({mode})"), [], |row| {
+        Ok((row.get::<_, i64>(0)? != 0, row.get(1)?, row.get(2)?))
+    })
+}
+
+/// Folds the WAL back into the database without starving other writers
+/// (#1127).
+///
+/// A bare `TRUNCATE` copies every frame while holding the write lock, and at
+/// corpus scale the WAL is gigabytes by the time a file ends, so every writer
+/// queued for minutes and the lease expired behind it. `PASSIVE` first copies
+/// what it can without blocking anyone; `TRUNCATE` then has little left to copy
+/// and waits at most [`CHECKPOINT_TRUNCATE_BUSY_TIMEOUT`] for readers and
+/// writers before leaving the WAL for the next file boundary.
+fn checkpoint_wal(conn: &rusqlite::Connection) -> rusqlite::Result<CheckpointReport> {
+    let started = std::time::Instant::now();
+    let page_size: i64 = conn.query_row("PRAGMA page_size", [], |row| row.get(0))?;
+    let (_, wal_frames, passive_checkpointed) = wal_checkpoint(conn, "PASSIVE")?;
+    let (truncate_busy, truncate_frames, _) = {
+        let _short = BusyTimeoutGuard::shorten(conn, CHECKPOINT_TRUNCATE_BUSY_TIMEOUT)?;
+        wal_checkpoint(conn, "TRUNCATE")?
+    };
+    Ok(CheckpointReport {
+        wal_frames,
+        passive_checkpointed,
+        truncate_busy,
+        truncate_frames,
+        page_size,
+        duration: started.elapsed(),
+    })
+}
+
+/// What a committed batch adds to its manifest's counters.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct EntryTally {
+    total: i64,
+    processed: i64,
+    failed: i64,
+    skipped: i64,
+    /// The highest line charged so far, this batch included.
+    last_line: i64,
+}
+
+impl EntryTally {
+    /// Tallies the entries of `results` whose line lies beyond `counted`, the
+    /// highest line an earlier walk of the same file already charged (#1127).
+    /// `None` charges every entry.
+    ///
+    /// A line is charged once, with the outcome of the first walk that reached
+    /// it, so a re-walked file adds nothing until it gets further than before:
+    /// the counters count the manifest once, keep `total = processed + failed +
+    /// skipped` for what the batches charged, and never move backwards (#969).
+    fn beyond(results: &[BulkEntryResult], counted: Option<u64>) -> Self {
+        let floor = counted.unwrap_or(0);
+        let mut tally = Self {
+            last_line: floor as i64,
+            ..Self::default()
+        };
+        for result in results
+            .iter()
+            .filter(|r| counted.is_none_or(|c| r.line_number > c))
+        {
+            tally.total += 1;
+            match result.outcome {
+                BulkEntryOutcome::Skipped => tally.skipped += 1,
+                _ if result.is_success() => tally.processed += 1,
+                _ if result.is_error() => tally.failed += 1,
+                _ => {}
+            }
+            tally.last_line = tally.last_line.max(result.line_number as i64);
+        }
+        tally
+    }
+}
+
+/// Charges a committed batch against its input file's progress row, on the
+/// batch transaction's connection, and returns what the manifest counters add
+/// for it (see [`EntryTally::beyond`]). The batch transaction is
+/// `BEGIN IMMEDIATE`, so this read and write cannot interleave with another
+/// writer's.
+fn advance_file_progress(
+    conn: &rusqlite::Connection,
+    tenant_id: &str,
+    submission_id: &SubmissionId,
+    manifest_id: &str,
+    file_url: &str,
+    results: &[BulkEntryResult],
+) -> StorageResult<EntryTally> {
+    let counted: Option<i64> = conn
+        .prepare_cached(
+            "SELECT max_line FROM bulk_manifest_file_progress
+             WHERE tenant_id = ?1 AND submitter = ?2 AND submission_id = ?3
+               AND manifest_id = ?4 AND file_url = ?5",
+        )
+        .map_err(|e| internal_error(format!("prepare file progress read: {e}")))?
+        .query_row(
+            params![
+                tenant_id,
+                &submission_id.submitter,
+                &submission_id.submission_id,
+                manifest_id,
+                file_url
+            ],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| internal_error(format!("Failed to read file progress: {e}")))?;
+    let add = EntryTally::beyond(results, Some(counted.unwrap_or(0).max(0) as u64));
+    conn.prepare_cached(
+        "INSERT INTO bulk_manifest_file_progress
+            (tenant_id, submitter, submission_id, manifest_id, file_url, max_line,
+             total_entries, processed_entries, failed_entries, skipped_entries, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+         ON CONFLICT (tenant_id, submitter, submission_id, manifest_id, file_url) DO UPDATE SET
+            max_line = MAX(max_line, excluded.max_line),
+            total_entries = total_entries + excluded.total_entries,
+            processed_entries = processed_entries + excluded.processed_entries,
+            failed_entries = failed_entries + excluded.failed_entries,
+            skipped_entries = skipped_entries + excluded.skipped_entries,
+            updated_at = excluded.updated_at",
+    )
+    .map_err(|e| internal_error(format!("prepare file progress write: {e}")))?
+    .execute(params![
+        tenant_id,
+        &submission_id.submitter,
+        &submission_id.submission_id,
+        manifest_id,
+        file_url,
+        add.last_line,
+        add.total,
+        add.processed,
+        add.failed,
+        add.skipped,
+        Utc::now().to_rfc3339()
+    ])
+    .map_err(|e| internal_error(format!("Failed to write file progress: {e}")))?;
+    Ok(add)
+}
+
+/// Whether `stored` and `candidate` are the same resource content once the
+/// server-owned `meta.versionId` and `meta.lastUpdated` are ignored (#1127).
+/// An otherwise empty `meta` counts as absent. Compares in place, without
+/// cloning either document.
+fn same_content_ignoring_server_meta(stored: &Value, candidate: &Value) -> bool {
+    let (Value::Object(stored), Value::Object(candidate)) = (stored, candidate) else {
+        return stored == candidate;
+    };
+    fn client_meta(meta: Option<&Value>) -> Option<Vec<(&String, &Value)>> {
+        match meta {
+            None => None,
+            Some(Value::Object(meta)) => {
+                let rest: Vec<_> = meta
+                    .iter()
+                    .filter(|(key, _)| key.as_str() != "versionId" && key.as_str() != "lastUpdated")
+                    .collect();
+                (!rest.is_empty()).then_some(rest)
+            }
+            Some(other) => Some(vec![(&EMPTY_KEY, other)]),
+        }
+    }
+    static EMPTY_KEY: String = String::new();
+    let members = |object: &'_ serde_json::Map<String, Value>| {
+        object
+            .iter()
+            .filter(|(key, _)| key.as_str() != "meta")
+            .count()
+    };
+    if members(stored) != members(candidate) {
+        return false;
+    }
+    let (stored_meta, candidate_meta) = (
+        client_meta(stored.get("meta")),
+        client_meta(candidate.get("meta")),
+    );
+    let meta_equal = match (stored_meta, candidate_meta) {
+        (None, None) => true,
+        (Some(a), Some(b)) => {
+            a.len() == b.len()
+                && a.iter()
+                    .all(|(key, value)| b.iter().any(|(k, v)| k == key && v == value))
+        }
+        _ => false,
+    };
+    meta_equal
+        && stored
+            .iter()
+            .filter(|(key, _)| key.as_str() != "meta")
+            .all(|(key, value)| candidate.get(key) == Some(value))
+}
+
 #[async_trait]
 impl BulkSubmitProvider for SqliteBackend {
     async fn create_submission(
@@ -221,89 +570,102 @@ impl BulkSubmitProvider for SqliteBackend {
         tenant: &TenantContext,
         id: &SubmissionId,
     ) -> StorageResult<Option<SubmissionSummary>> {
-        let conn = self.get_connection()?;
-        let tenant_id = tenant.tenant_id().as_str();
+        // Served from the manifests' own counters, on a blocking thread
+        // (#1127). It used to aggregate `bulk_entry_results` — one row per
+        // ingested resource, tens of millions on a corpus-scale import — on
+        // every call, and it is called on every status poll and every few
+        // seconds by the lease keeper of each running manifest, competing with
+        // the ingest writer for the same database file.
+        //
+        // The counters are what the batches committed plus what the worker
+        // added for work no batch could receipt: `success_count` is resources
+        // written or left unchanged, `error_count` also covers lines and files
+        // that never reached a batch and entries flagged unindexed afterwards,
+        // and a re-walked file counts once.
+        let tenant_id = tenant.tenant_id().as_str().to_string();
+        let id = id.clone();
+        self.run_blocking(move |conn| {
+            let row = conn
+                .query_row(
+                    "SELECT status, created_at, updated_at, completed_at, metadata
+                     FROM bulk_submissions
+                     WHERE tenant_id = ?1 AND submitter = ?2 AND submission_id = ?3",
+                    params![tenant_id, &id.submitter, &id.submission_id],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, Option<String>>(3)?,
+                            row.get::<_, Option<Vec<u8>>>(4)?,
+                        ))
+                    },
+                )
+                .optional()
+                .map_err(|e| internal_error(format!("Failed to get submission: {}", e)))?;
+            let Some((status_str, created_at, updated_at, completed_at, metadata_bytes)) = row
+            else {
+                return Ok(None);
+            };
 
-        let result = conn.query_row(
-            "SELECT status, created_at, updated_at, completed_at, metadata
-             FROM bulk_submissions
-             WHERE tenant_id = ?1 AND submitter = ?2 AND submission_id = ?3",
-            params![tenant_id, &id.submitter, &id.submission_id],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, Option<String>>(3)?,
-                    row.get::<_, Option<Vec<u8>>>(4)?,
-                ))
-            },
-        );
+            let status: SubmissionStatus = status_str
+                .parse()
+                .map_err(|_| internal_error(format!("Invalid status: {}", status_str)))?;
 
-        match result {
-            Ok((status_str, created_at, updated_at, completed_at, metadata_bytes)) => {
-                let status: SubmissionStatus = status_str
-                    .parse()
-                    .map_err(|_| internal_error(format!("Invalid status: {}", status_str)))?;
+            let created_at = chrono::DateTime::parse_from_rfc3339(&created_at)
+                .map_err(|e| internal_error(format!("Invalid created_at: {}", e)))?
+                .with_timezone(&Utc);
 
-                let created_at = chrono::DateTime::parse_from_rfc3339(&created_at)
-                    .map_err(|e| internal_error(format!("Invalid created_at: {}", e)))?
-                    .with_timezone(&Utc);
+            let updated_at = chrono::DateTime::parse_from_rfc3339(&updated_at)
+                .map_err(|e| internal_error(format!("Invalid updated_at: {}", e)))?
+                .with_timezone(&Utc);
 
-                let updated_at = chrono::DateTime::parse_from_rfc3339(&updated_at)
-                    .map_err(|e| internal_error(format!("Invalid updated_at: {}", e)))?
-                    .with_timezone(&Utc);
+            let completed_at = completed_at.and_then(|s| {
+                chrono::DateTime::parse_from_rfc3339(&s)
+                    .ok()
+                    .map(|dt| dt.with_timezone(&Utc))
+            });
 
-                let completed_at = completed_at.and_then(|s| {
-                    chrono::DateTime::parse_from_rfc3339(&s)
-                        .ok()
-                        .map(|dt| dt.with_timezone(&Utc))
-                });
+            let metadata = metadata_bytes.and_then(|b| serde_json::from_slice(&b).ok());
 
-                let metadata = metadata_bytes.and_then(|b| serde_json::from_slice(&b).ok());
+            let (manifest_count, total, success, errors, skipped): (i64, i64, i64, i64, i64) = conn
+                .query_row(
+                    "SELECT COUNT(*),
+                            COALESCE(SUM(total_entries), 0),
+                            COALESCE(SUM(processed_entries), 0),
+                            COALESCE(SUM(failed_entries), 0),
+                            COALESCE(SUM(skipped_entries), 0)
+                     FROM bulk_manifests
+                     WHERE tenant_id = ?1 AND submitter = ?2 AND submission_id = ?3",
+                    params![tenant_id, &id.submitter, &id.submission_id],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                        ))
+                    },
+                )
+                .map_err(|e| internal_error(format!("Failed to count submission entries: {e}")))?;
+            let count = |value: i64| u64::try_from(value).unwrap_or(0);
 
-                // Get manifest count
-                let manifest_count: i32 = conn
-                    .query_row(
-                        "SELECT COUNT(*) FROM bulk_manifests
-                         WHERE tenant_id = ?1 AND submitter = ?2 AND submission_id = ?3",
-                        params![tenant_id, &id.submitter, &id.submission_id],
-                        |row| row.get(0),
-                    )
-                    .unwrap_or(0);
-
-                // Get aggregated counts from entry results
-                let (total, success, errors, skipped): (i64, i64, i64, i64) = conn
-                    .query_row(
-                        "SELECT
-                            COUNT(*),
-                            SUM(CASE WHEN outcome = 'success' THEN 1 ELSE 0 END),
-                            SUM(CASE WHEN outcome IN ('validation-error', 'processing-error') THEN 1 ELSE 0 END),
-                            SUM(CASE WHEN outcome = 'skipped' THEN 1 ELSE 0 END)
-                         FROM bulk_entry_results
-                         WHERE tenant_id = ?1 AND submitter = ?2 AND submission_id = ?3",
-                        params![tenant_id, &id.submitter, &id.submission_id],
-                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-                    )
-                    .unwrap_or((0, 0, 0, 0));
-
-                Ok(Some(SubmissionSummary {
-                    id: id.clone(),
-                    status,
-                    created_at,
-                    updated_at,
-                    completed_at,
-                    manifest_count: manifest_count as u32,
-                    total_entries: total as u64,
-                    success_count: success as u64,
-                    error_count: errors as u64,
-                    skipped_count: skipped as u64,
-                    metadata,
-                }))
-            }
-            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(internal_error(format!("Failed to get submission: {}", e))),
-        }
+            Ok(Some(SubmissionSummary {
+                id,
+                status,
+                created_at,
+                updated_at,
+                completed_at,
+                manifest_count: u32::try_from(manifest_count).unwrap_or(u32::MAX),
+                total_entries: count(total),
+                success_count: count(success),
+                error_count: count(errors),
+                skipped_count: count(skipped),
+                metadata,
+            }))
+        })
+        .await
     }
 
     async fn list_submissions(
@@ -823,6 +1185,10 @@ impl BulkSubmitProvider for SqliteBackend {
                 .collect();
         }
         let mut prepared = prepared.into_iter();
+        // The committed resources, for observers that index them (#1127);
+        // collected only when one asked, so counting-only runs hold nothing.
+        let want_resources = options.wants_committed_resources();
+        let mut committed_resources = Vec::new();
 
         for entry in entries {
             let prepared = prepared.next().flatten();
@@ -855,7 +1221,7 @@ impl BulkSubmitProvider for SqliteBackend {
                 .ingest_entry_in_txn(&mut txn, manifest_id, &entry, prepared, options)
                 .await;
 
-            let (entry_result, change) = match result {
+            let (entry_result, change, stored) = match result {
                 Ok(outcome) => outcome,
                 Err(e) => {
                     // Not counted here: the result built below is an error
@@ -876,7 +1242,7 @@ impl BulkSubmitProvider for SqliteBackend {
                             }]
                         }),
                     );
-                    (failed, None)
+                    (failed, None, None)
                 }
             };
 
@@ -897,6 +1263,9 @@ impl BulkSubmitProvider for SqliteBackend {
             }
             drop(_entry_span);
             results.push(entry_result);
+            if want_resources && let Some(stored) = stored {
+                committed_resources.push(stored);
+            }
         }
 
         // Manifest counters and the submission's timestamp, on the batch
@@ -908,11 +1277,18 @@ impl BulkSubmitProvider for SqliteBackend {
         // keeper's) starves against back-to-back batch transactions on SQLite,
         // and MAX keeps a late keeper flush from regressing it.
         //
-        // The entry counters accumulate: they are cumulative across every run
-        // of the manifest, and this batch — which owns them — is the only
-        // writer that knows what it committed. `processed_entries` counts the
-        // entries that did not fail, successes plus deliberate skips, so
-        // processed + failed is the number of entries walked (#969).
+        // This batch owns the entry counters: it is the only writer that knows
+        // what it committed. `processed_entries` counts resources written (or
+        // left unchanged), `skipped_entries` deliberate skips, `failed_entries`
+        // errors, so processed + skipped + failed is the number of entries
+        // walked (#954, #969).
+        //
+        // A batch from a named input file first goes through that file's
+        // progress row (#1127): the counters only grow by what takes the file
+        // past the furthest any walk of it got. A reclaimed manifest re-walking
+        // its files therefore reports each file once — the counters used to
+        // add the whole file again on every pass — and still never reports
+        // less than it had. Entries without a file keep plain accumulation.
         {
             let _span = crate::perf::span(crate::perf::Phase::BatchOverhead);
             let now = Utc::now().to_rfc3339();
@@ -926,13 +1302,22 @@ impl BulkSubmitProvider for SqliteBackend {
                     )
                 })
                 .unwrap_or((0, 0));
-            let total = results.len() as i64;
-            // `processed_entries` means resources written to the store, so skips
-            // are excluded and surface through their receipts (#954).
-            // `last_processed_line` is a line cursor, not an outcome tally, so it
-            // advances by every entry the batch walked (#969).
-            let succeeded = results.iter().filter(|r| r.is_success()).count() as i64;
+            // `last_processed_line` advances by the entries this batch newly
+            // charged (#969), which after #1127 is what the file's watermark
+            // let through: a re-walk of lines already counted advances neither
+            // the tally nor the cursor.
             txn.with_connection(|conn| {
+                let add = match options.file_url.as_deref() {
+                    Some(url) => advance_file_progress(
+                        conn,
+                        tenant_id,
+                        submission_id,
+                        manifest_id,
+                        url,
+                        &results,
+                    )?,
+                    None => EntryTally::beyond(&results, None),
+                };
                 conn.prepare_cached(
                     "UPDATE bulk_manifests SET
                         total_entries = total_entries + ?1,
@@ -940,20 +1325,22 @@ impl BulkSubmitProvider for SqliteBackend {
                         failed_entries = failed_entries + ?3,
                         last_processed_line = last_processed_line + ?1,
                         bytes_processed = MAX(bytes_processed, ?8),
-                        bytes_total = MAX(bytes_total, ?9)
+                        bytes_total = MAX(bytes_total, ?9),
+                        skipped_entries = skipped_entries + ?10
                      WHERE tenant_id = ?4 AND submitter = ?5 AND submission_id = ?6 AND manifest_id = ?7",
                 )
                 .map_err(|e| internal_error(format!("prepare manifest counts update: {e}")))?
                 .execute(params![
-                    total,
-                    succeeded,
-                    error_count as i64,
+                    add.total,
+                    add.processed,
+                    add.failed,
                     tenant_id,
                     &submission_id.submitter,
                     &submission_id.submission_id,
                     manifest_id,
                     consumed,
-                    bytes_total
+                    bytes_total,
+                    add.skipped
                 ])
                 .map_err(|e| internal_error(format!("Failed to update manifest counts: {}", e)))?;
 
@@ -975,7 +1362,15 @@ impl BulkSubmitProvider for SqliteBackend {
 
         crate::core::Transaction::commit(Box::new(txn)).await?;
         // Durable now: report it before the max-errors return below (#1078).
-        options.notify_batch_committed(tenant, submission_id, manifest_id, &results);
+        options
+            .notify_batch_committed(
+                tenant,
+                submission_id,
+                manifest_id,
+                &results,
+                &committed_resources,
+            )
+            .await;
 
         if aborted_on_max_errors {
             return Err(StorageError::BulkSubmit(
@@ -1069,6 +1464,7 @@ impl BulkSubmitProvider for SqliteBackend {
                     resource_type,
                     resource_id,
                     created: created.is_some_and(|value| value != 0),
+                    unchanged: false,
                     outcome,
                     operation_outcome,
                 },
@@ -1259,7 +1655,7 @@ impl SqliteBackend {
         entry: &NdjsonEntry,
         prepared: Option<PreparedIndex>,
         options: &BulkProcessingOptions,
-    ) -> StorageResult<(BulkEntryResult, Option<SubmissionChange>)> {
+    ) -> StorageResult<IngestedEntry> {
         use crate::core::Transaction;
 
         if let Some(id) = entry.resource_id.as_ref() {
@@ -1277,6 +1673,30 @@ impl SqliteBackend {
                                 "updates not allowed",
                             ),
                             None,
+                            None,
+                        ));
+                    }
+
+                    // Update the resource, honoring the submission's import mode.
+                    let content = options.content_for_update(current.content(), &entry.resource);
+
+                    // Opt-in (#1127): a replayed manifest used to rewrite every
+                    // byte-identical resource as a new version, doubling the
+                    // database and its history. Content equal to what is
+                    // stored, server meta aside, is left untouched: no
+                    // version, no history row, no index work, and no rollback
+                    // record, since there is nothing to undo.
+                    if options.skip_unchanged
+                        && same_content_ignoring_server_meta(current.content(), &content)
+                    {
+                        return Ok((
+                            BulkEntryResult::success_unchanged(
+                                entry.line_number,
+                                &entry.resource_type,
+                                current.id(),
+                            ),
+                            None,
+                            None,
                         ));
                     }
 
@@ -1289,8 +1709,6 @@ impl SqliteBackend {
                         current.content().clone(),
                     );
 
-                    // Update the resource, honoring the submission's import mode.
-                    let content = options.content_for_update(current.content(), &entry.resource);
                     let updated = txn.update(&current, content).await?;
 
                     Ok((
@@ -1301,6 +1719,7 @@ impl SqliteBackend {
                             false,
                         ),
                         Some(change),
+                        Some(updated),
                     ))
                 }
                 // A soft-deleted row reads as None and then fails the create
@@ -1329,6 +1748,7 @@ impl SqliteBackend {
                             true,
                         ),
                         Some(change),
+                        Some(created),
                     ))
                 }
             }
@@ -1355,6 +1775,7 @@ impl SqliteBackend {
                     true,
                 ),
                 Some(change),
+                Some(created),
             ))
         }
     }
@@ -1387,10 +1808,15 @@ impl StreamingBulkSubmitProvider for SqliteBackend {
 
         loop {
             let mut line = String::new();
-            let bytes_read = reader
-                .read_line(&mut line)
-                .await
-                .map_err(|e| internal_error(format!("Failed to read line: {}", e)))?;
+            let bytes_read = reader.read_line(&mut line).await.map_err(|e| {
+                // #1127: surface the reader's own message (e.g. the
+                // fetcher's give-up text) unprefixed so it reaches the
+                // manifest's error artifact intact.
+                StorageError::BulkSubmit(BulkSubmitError::InputStream {
+                    message: e.to_string(),
+                    source: Some(Box::new(e)),
+                })
+            })?;
 
             if bytes_read == 0 {
                 // End of stream
@@ -1691,9 +2117,20 @@ impl SubmitClaimStrategy for SqliteBackend {
 
         // Find one eligible manifest with a fetchable URL: pending, or processing
         // with an expired lease. Only manifests of non-terminal submissions count.
-        let row: Option<(String, String, String, String, i64)> = conn
+        type Candidate = (
+            String,
+            String,
+            String,
+            String,
+            i64,
+            String,
+            Option<String>,
+            Option<String>,
+        );
+        let row: Option<Candidate> = conn
             .query_row(
-                "SELECT m.tenant_id, m.submitter, m.submission_id, m.manifest_id, m.fencing_token
+                "SELECT m.tenant_id, m.submitter, m.submission_id, m.manifest_id, m.fencing_token,
+                        m.status, m.worker_id, m.lease_expiry
                  FROM bulk_manifests m
                  JOIN bulk_submissions s
                    ON s.tenant_id = m.tenant_id AND s.submitter = m.submitter
@@ -1715,12 +2152,25 @@ impl SubmitClaimStrategy for SqliteBackend {
                         row.get::<_, String>(2)?,
                         row.get::<_, String>(3)?,
                         row.get::<_, i64>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, Option<String>>(6)?,
+                        row.get::<_, Option<String>>(7)?,
                     ))
                 },
             )
             .ok();
 
-        let Some((tenant_id, submitter, submission_id, manifest_id, fencing_token)) = row else {
+        let Some((
+            tenant_id,
+            submitter,
+            submission_id,
+            manifest_id,
+            fencing_token,
+            previous_status,
+            previous_worker,
+            previous_expiry,
+        )) = row
+        else {
             return Ok(None);
         };
         let new_token = fencing_token + 1;
@@ -1741,6 +2191,20 @@ impl SubmitClaimStrategy for SqliteBackend {
         )
         .map_err(|e| internal_error(format!("Failed to claim manifest: {}", e)))?;
 
+        // A manifest taken from under a worker whose lease lapsed means that
+        // run's work is walked again (#1127): never silent.
+        if previous_status == "processing" {
+            tracing::warn!(
+                submission = %submission_id,
+                manifest = %manifest_id,
+                previous_worker = previous_worker.as_deref().unwrap_or("<none>"),
+                previous_lease_expiry = previous_expiry.as_deref().unwrap_or("<none>"),
+                worker = %worker_id.as_str(),
+                fencing_token = new_token,
+                "bulk-submit manifest reclaimed from a worker whose lease expired; its files are walked again"
+            );
+        }
+
         Ok(Some(ManifestLease {
             tenant: TenantContext::new(TenantId::new(tenant_id), TenantPermissions::full_access()),
             submission_id: SubmissionId::new(submitter, submission_id),
@@ -1759,28 +2223,41 @@ impl SubmitClaimStrategy for SqliteBackend {
         // SQLITE_BUSY: dropping it is what lets the lease lapse under a healthy
         // database (#942). Absolute expiry guarded by worker_id +
         // fencing_token, so a retry is idempotent and a stale lease still
-        // loses.
-        let affected = retry_bookkeeping_on_busy("heartbeat", lease_retry_budget(lease), || {
-            let conn = self.get_connection()?;
-            conn.execute(
-                "UPDATE bulk_manifests SET lease_expiry = ?1
-                 WHERE tenant_id = ?2 AND submitter = ?3 AND submission_id = ?4
-                   AND manifest_id = ?5 AND status = 'processing'
-                   AND worker_id = ?6 AND fencing_token = ?7",
-                params![
-                    new_expiry.to_rfc3339(),
-                    lease.tenant.tenant_id().as_str(),
-                    lease.submission_id.submitter,
-                    lease.submission_id.submission_id,
-                    lease.manifest_id,
-                    lease.worker_id.as_str(),
-                    lease.fencing_token as i64
-                ],
-            )
-            .map_err(|e| StorageError::Backend(classify_sqlite_error("heartbeat failed", e)))
-        })
-        .await
-        .map_err(LeaseError::Storage)?;
+        // loses. Each attempt waits on a blocking thread, so the keeper's
+        // timeout can still fire while the write lock is held elsewhere
+        // (#1127).
+        let expiry = new_expiry.to_rfc3339();
+        let affected =
+            retry_bookkeeping_on_busy_async(self, "heartbeat", lease_retry_budget(lease), || {
+                let lease = lease.clone();
+                let expiry = expiry.clone();
+                move |conn: &rusqlite::Connection| {
+                    let _short = BusyTimeoutGuard::shorten(conn, HEARTBEAT_ATTEMPT_BUSY_TIMEOUT)
+                        .map_err(|e| {
+                            StorageError::Backend(classify_sqlite_error("heartbeat failed", e))
+                        })?;
+                    conn.execute(
+                        "UPDATE bulk_manifests SET lease_expiry = ?1
+                         WHERE tenant_id = ?2 AND submitter = ?3 AND submission_id = ?4
+                           AND manifest_id = ?5 AND status = 'processing'
+                           AND worker_id = ?6 AND fencing_token = ?7",
+                        params![
+                            expiry,
+                            lease.tenant.tenant_id().as_str(),
+                            lease.submission_id.submitter,
+                            lease.submission_id.submission_id,
+                            lease.manifest_id,
+                            lease.worker_id.as_str(),
+                            lease.fencing_token as i64
+                        ],
+                    )
+                    .map_err(|e| {
+                        StorageError::Backend(classify_sqlite_error("heartbeat failed", e))
+                    })
+                }
+            })
+            .await
+            .map_err(LeaseError::Storage)?;
         if affected == 0 {
             Err(lease_lost(lease))
         } else {
@@ -2037,26 +2514,29 @@ impl SubmitWorkerStorage for SqliteBackend {
         // with nobody able to claim it again (#968). That also makes the retry
         // safe past an abort — the replay matches nothing and reads as a lost
         // lease, which is what a cancelled manifest should look like here.
-        let affected = retry_bookkeeping_on_busy(
+        let affected = retry_bookkeeping_on_busy_async(
+            self,
             "mark manifest processing",
             lease_retry_budget(lease),
             || {
-                let conn = self.get_connection()?;
-                conn.execute(
-                    "UPDATE bulk_manifests SET status = 'processing'
-                 WHERE tenant_id = ?1 AND submitter = ?2 AND submission_id = ?3
-                   AND manifest_id = ?4 AND status = 'processing'
-                   AND worker_id = ?5 AND fencing_token = ?6",
-                    params![
-                        lease.tenant.tenant_id().as_str(),
-                        lease.submission_id.submitter,
-                        lease.submission_id.submission_id,
-                        lease.manifest_id,
-                        lease.worker_id.as_str(),
-                        lease.fencing_token as i64
-                    ],
-                )
-                .map_err(|e| StorageError::Backend(classify_sqlite_error("mark processing", e)))
+                let lease = lease.clone();
+                move |conn: &rusqlite::Connection| {
+                    conn.execute(
+                        "UPDATE bulk_manifests SET status = 'processing'
+                         WHERE tenant_id = ?1 AND submitter = ?2 AND submission_id = ?3
+                           AND manifest_id = ?4 AND status = 'processing'
+                           AND worker_id = ?5 AND fencing_token = ?6",
+                        params![
+                            lease.tenant.tenant_id().as_str(),
+                            lease.submission_id.submitter,
+                            lease.submission_id.submission_id,
+                            lease.manifest_id,
+                            lease.worker_id.as_str(),
+                            lease.fencing_token as i64
+                        ],
+                    )
+                    .map_err(|e| StorageError::Backend(classify_sqlite_error("mark processing", e)))
+                }
             },
         )
         .await
@@ -2088,31 +2568,34 @@ impl SubmitWorkerStorage for SqliteBackend {
         // statement rolled back and added nothing. Hence `classify_sqlite_error`
         // rather than `internal_error` — misclassify the busy and this write
         // stops being retried at all (#942).
-        let affected = retry_bookkeeping_on_busy(
+        let affected = retry_bookkeeping_on_busy_async(
+            self,
             "manifest progress update",
             lease_retry_budget(lease),
             || {
-                let conn = self.get_connection()?;
-                conn.execute(
-                    "UPDATE bulk_manifests
-                 SET processed_entries = processed_entries + ?1,
-                     failed_entries = failed_entries + ?2,
-                     last_processed_line = last_processed_line + ?3
-                 WHERE tenant_id = ?4 AND submitter = ?5 AND submission_id = ?6
-                   AND manifest_id = ?7 AND worker_id = ?8 AND fencing_token = ?9",
-                    params![
-                        processed_delta as i64,
-                        failed_delta as i64,
-                        lines_delta as i64,
-                        lease.tenant.tenant_id().as_str(),
-                        lease.submission_id.submitter,
-                        lease.submission_id.submission_id,
-                        lease.manifest_id,
-                        lease.worker_id.as_str(),
-                        lease.fencing_token as i64
-                    ],
-                )
-                .map_err(|e| StorageError::Backend(classify_sqlite_error("update progress", e)))
+                let lease = lease.clone();
+                move |conn: &rusqlite::Connection| {
+                    conn.execute(
+                        "UPDATE bulk_manifests
+                         SET processed_entries = processed_entries + ?1,
+                             failed_entries = failed_entries + ?2,
+                             last_processed_line = last_processed_line + ?3
+                         WHERE tenant_id = ?4 AND submitter = ?5 AND submission_id = ?6
+                           AND manifest_id = ?7 AND worker_id = ?8 AND fencing_token = ?9",
+                        params![
+                            processed_delta as i64,
+                            failed_delta as i64,
+                            lines_delta as i64,
+                            lease.tenant.tenant_id().as_str(),
+                            lease.submission_id.submitter,
+                            lease.submission_id.submission_id,
+                            lease.manifest_id,
+                            lease.worker_id.as_str(),
+                            lease.fencing_token as i64
+                        ],
+                    )
+                    .map_err(|e| StorageError::Backend(classify_sqlite_error("update progress", e)))
+                }
             },
         )
         .await
@@ -2132,30 +2615,36 @@ impl SubmitWorkerStorage for SqliteBackend {
     ) -> Result<(), LeaseError> {
         // MAX() keeps the write monotonic, so a busy retry is idempotent and
         // the worker_id + fencing_token guard still fences stale leases (#942).
-        let affected =
-            retry_bookkeeping_on_busy("manifest bytes update", lease_retry_budget(lease), || {
-                let conn = self.get_connection()?;
-                conn.execute(
-                    "UPDATE bulk_manifests
-                 SET bytes_processed = MAX(bytes_processed, ?1),
-                     bytes_total = MAX(bytes_total, ?2)
-                 WHERE tenant_id = ?3 AND submitter = ?4 AND submission_id = ?5
-                   AND manifest_id = ?6 AND worker_id = ?7 AND fencing_token = ?8",
-                    params![
-                        bytes_processed as i64,
-                        bytes_total as i64,
-                        lease.tenant.tenant_id().as_str(),
-                        lease.submission_id.submitter,
-                        lease.submission_id.submission_id,
-                        lease.manifest_id,
-                        lease.worker_id.as_str(),
-                        lease.fencing_token as i64
-                    ],
-                )
-                .map_err(|e| StorageError::Backend(classify_sqlite_error("update bytes", e)))
-            })
-            .await
-            .map_err(LeaseError::Storage)?;
+        let affected = retry_bookkeeping_on_busy_async(
+            self,
+            "manifest bytes update",
+            lease_retry_budget(lease),
+            || {
+                let lease = lease.clone();
+                move |conn: &rusqlite::Connection| {
+                    conn.execute(
+                        "UPDATE bulk_manifests
+                         SET bytes_processed = MAX(bytes_processed, ?1),
+                             bytes_total = MAX(bytes_total, ?2)
+                         WHERE tenant_id = ?3 AND submitter = ?4 AND submission_id = ?5
+                           AND manifest_id = ?6 AND worker_id = ?7 AND fencing_token = ?8",
+                        params![
+                            bytes_processed as i64,
+                            bytes_total as i64,
+                            lease.tenant.tenant_id().as_str(),
+                            lease.submission_id.submitter,
+                            lease.submission_id.submission_id,
+                            lease.manifest_id,
+                            lease.worker_id.as_str(),
+                            lease.fencing_token as i64
+                        ],
+                    )
+                    .map_err(|e| StorageError::Backend(classify_sqlite_error("update bytes", e)))
+                }
+            },
+        )
+        .await
+        .map_err(LeaseError::Storage)?;
         if affected == 0 {
             Err(lease_lost(lease))
         } else {
@@ -2311,19 +2800,31 @@ impl SubmitWorkerStorage for SqliteBackend {
         // Fold the WAL back into the database at a file boundary (#978). The
         // passive auto-checkpoint yields to the back-to-back batch writers and
         // lets the WAL grow into the multi-gigabyte range over a long ingest,
-        // which slows every read and doubles disk use; a TRUNCATE checkpoint
-        // between files reclaims it while no batch holds the write lock. A
-        // busy return (a reader still in a WAL frame) is fine — the next file
-        // boundary tries again — so this is best-effort and never fails the
-        // ingest. Runs on a blocking thread so the checkpoint's I/O does not
-        // stall an async worker.
-        let backend = self.clone();
-        let _ = tokio::task::spawn_blocking(move || {
-            if let Ok(conn) = backend.get_connection() {
-                let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
-            }
-        })
-        .await;
+        // which slows every read and doubles disk use.
+        //
+        // A bare TRUNCATE held the write lock for the whole copy, minutes at
+        // corpus scale, and the lease heartbeat queued behind it until the
+        // lease expired (#1127): `checkpoint_wal` copies passively first and
+        // then truncates under a one-second busy timeout. A busy return (a
+        // reader still in a WAL frame) is fine — the next file boundary tries
+        // again — so this is best-effort and never fails the ingest. It runs
+        // on a blocking thread, and what it did is logged: the WAL frames and
+        // bytes, and the duration, at `warn` when writers waited long.
+        if self.is_memory() {
+            return;
+        }
+        let outcome = self
+            .run_blocking(|conn| {
+                checkpoint_wal(conn).map_err(|e| internal_error(format!("WAL checkpoint: {e}")))
+            })
+            .await;
+        match outcome {
+            Ok(report) => report.log(),
+            Err(error) => tracing::warn!(
+                %error,
+                "sqlite WAL checkpoint after a bulk-submit file failed; the next file boundary retries"
+            ),
+        }
     }
 
     async fn finish_manifest(&self, lease: &ManifestLease) -> Result<(), LeaseError> {
@@ -5475,9 +5976,14 @@ mod tests {
 
         #[derive(Default)]
         struct Recording(Mutex<Vec<Vec<(String, bool)>>>);
+        #[async_trait]
         impl BatchCommitObserver for Recording {
-            fn batch_committed(&self, batch: &BatchCommitted<'_>) {
+            async fn batch_committed(&self, batch: &BatchCommitted<'_>) {
                 assert_eq!(batch.tenant.tenant_id().as_str(), "test-tenant");
+                assert!(
+                    batch.resources.is_empty(),
+                    "a counting observer is not handed the resources"
+                );
                 self.0.lock().unwrap().push(
                     batch
                         .results
@@ -5551,6 +6057,86 @@ mod tests {
                 batch(&[5], false)
             ],
             "re-ingested ids are reported as updates"
+        );
+    }
+
+    /// #1127: an observer that asks for the resources gets each committed
+    /// batch's resources as written — the stored version, not the submitted
+    /// JSON — so an index-during-ingest sink indexes what the primary holds.
+    #[tokio::test]
+    async fn batch_observer_that_wants_resources_gets_them_as_committed() {
+        use crate::core::bulk_submit::{BatchCommitObserver, BatchCommitted};
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Default)]
+        struct Indexing(Mutex<Vec<Vec<(String, String)>>>);
+        #[async_trait]
+        impl BatchCommitObserver for Indexing {
+            async fn batch_committed(&self, batch: &BatchCommitted<'_>) {
+                assert_eq!(batch.resources.len(), batch.results.len());
+                self.0.lock().unwrap().push(
+                    batch
+                        .resources
+                        .iter()
+                        .map(|r| (r.id().to_string(), r.version_id().to_string()))
+                        .collect(),
+                );
+            }
+            fn wants_resources(&self) -> bool {
+                true
+            }
+        }
+
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+        let sub_id = SubmissionId::generate("test-system");
+        backend
+            .create_submission(&tenant, &sub_id, None)
+            .await
+            .unwrap();
+        let manifest = backend
+            .add_manifest(&tenant, &sub_id, None, None)
+            .await
+            .unwrap();
+
+        let lines: Vec<u8> = (1..=3)
+            .map(|i| format!("{{\"resourceType\":\"Patient\",\"id\":\"idx-{i}\"}}\n"))
+            .collect::<String>()
+            .into_bytes();
+        let mut runs = Vec::new();
+        for _ in 0..2 {
+            let indexing = Arc::new(Indexing::default());
+            let options = BulkProcessingOptions::new()
+                .with_batch_size(2)
+                .with_file_url("http://provider/patient.ndjson")
+                .with_batch_observer(indexing.clone());
+            let reader = Box::new(tokio::io::BufReader::new(std::io::Cursor::new(
+                lines.clone(),
+            )));
+            backend
+                .process_ndjson_stream(
+                    &tenant,
+                    &sub_id,
+                    &manifest.manifest_id,
+                    "Patient",
+                    reader,
+                    &options,
+                )
+                .await
+                .unwrap();
+            runs.push(indexing.0.lock().unwrap().clone());
+        }
+
+        let batch = |ids: &[u32], version: &str| -> Vec<(String, String)> {
+            ids.iter()
+                .map(|i| (format!("idx-{i}"), version.to_string()))
+                .collect()
+        };
+        assert_eq!(runs[0], vec![batch(&[1, 2], "1"), batch(&[3], "1")]);
+        assert_eq!(
+            runs[1],
+            vec![batch(&[1, 2], "2"), batch(&[3], "2")],
+            "a re-ingest hands over the new version it committed"
         );
     }
 
@@ -5886,6 +6472,487 @@ mod tests {
         assert!(
             after < before,
             "TRUNCATE checkpoint should reclaim the WAL: before={before} after={after}"
+        );
+    }
+
+    /// #1127: a heartbeat attempt waiting on SQLite's write lock no longer
+    /// blocks the runtime thread, so the lease keeper's `tokio::time::timeout`
+    /// fires on time. Before, each attempt ran inline and parked the (here
+    /// single) runtime thread for up to `busy_timeout`, and the timeout could
+    /// not fire until the write had already landed — after the lease expired.
+    #[tokio::test]
+    async fn heartbeat_under_a_held_write_lock_stays_cancellable() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("heartbeat-lock.db");
+        let backend = SqliteBackend::open(&db_path).unwrap();
+        backend.init_schema().unwrap();
+        let tenant = create_test_tenant();
+        seed_claimable(&backend, &tenant).await;
+        let lease = backend
+            .claim_next_manifest(&WorkerId::new("w1"), StdDuration::from_secs(60))
+            .await
+            .unwrap()
+            .unwrap();
+
+        let holder = rusqlite::Connection::open(&db_path).unwrap();
+        holder.execute_batch("BEGIN IMMEDIATE;").unwrap();
+
+        let started = std::time::Instant::now();
+        let outcome =
+            tokio::time::timeout(StdDuration::from_millis(300), backend.heartbeat(&lease)).await;
+        let waited = started.elapsed();
+        holder.execute_batch("ROLLBACK;").unwrap();
+
+        assert!(
+            outcome.is_err(),
+            "the heartbeat cannot land while another connection holds the write lock"
+        );
+        assert!(
+            waited < StdDuration::from_secs(5),
+            "the keeper's timeout must fire on time, not after busy_timeout: waited {waited:?}"
+        );
+        // With the lock released the lease is still ours and renews.
+        backend.heartbeat(&lease).await.unwrap();
+    }
+
+    /// #1127: the async retry helper keeps the synchronous one's policy —
+    /// busy/locked is retried until it succeeds, anything else surfaces.
+    #[tokio::test]
+    async fn async_bookkeeping_retry_retries_busy_and_surfaces_the_rest() {
+        let backend = create_test_backend();
+        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let result = retry_bookkeeping_on_busy_async(
+            &backend,
+            "test write",
+            StdDuration::from_secs(30),
+            || {
+                let attempts = attempts.clone();
+                move |_conn: &rusqlite::Connection| {
+                    if attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < 2 {
+                        Err(sqlite_busy())
+                    } else {
+                        Ok(7usize)
+                    }
+                }
+            },
+        )
+        .await;
+        assert_eq!(result.unwrap(), 7);
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 3);
+
+        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let result: StorageResult<()> = retry_bookkeeping_on_busy_async(
+            &backend,
+            "test write",
+            StdDuration::from_secs(30),
+            || {
+                let attempts = attempts.clone();
+                move |_conn: &rusqlite::Connection| {
+                    attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Err(internal_error("constraint violation".to_string()))
+                }
+            },
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(StorageError::Backend(BackendError::Internal { .. }))
+        ));
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// #1127: the file-boundary checkpoint logs what it folded — WAL frames,
+    /// bytes and duration — and still reclaims the WAL.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn checkpoint_after_file_logs_what_it_folded() {
+        use crate::core::bulk_submit_worker::SubmitWorkerStorage;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("checkpoint-log.db");
+        let backend = SqliteBackend::open(&db_path).unwrap();
+        backend.init_schema().unwrap();
+        let tenant = create_test_tenant();
+        for i in 0..200 {
+            backend
+                .create(
+                    &tenant,
+                    "Patient",
+                    json!({"resourceType": "Patient", "id": format!("ck-{i}")}),
+                    FhirVersion::default_enabled(),
+                )
+                .await
+                .unwrap();
+        }
+        let wal_path = db_path.with_extension("db-wal");
+        let before = std::fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0);
+
+        backend.checkpoint_after_file().await;
+
+        assert!(logs_contain(
+            "sqlite WAL checkpoint after a bulk-submit file"
+        ));
+        assert!(logs_contain("wal_frames"));
+        assert!(logs_contain("duration_ms"));
+        let after = std::fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0);
+        assert!(after < before, "before={before} after={after}");
+    }
+
+    /// #1127: the checkpoint copies passively, truncates under a short busy
+    /// timeout, reports the frames it found, and gives the connection back
+    /// with the `busy_timeout` it had — pooled connections are reused as is.
+    #[test]
+    fn checkpoint_wal_restores_the_busy_timeout_it_shortened() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = rusqlite::Connection::open(dir.path().join("guard.db")).unwrap();
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; CREATE TABLE t (x BLOB);",
+        )
+        .unwrap();
+        conn.busy_timeout(StdDuration::from_millis(30_000)).unwrap();
+        for _ in 0..50 {
+            conn.execute("INSERT INTO t VALUES (randomblob(4096))", [])
+                .unwrap();
+        }
+
+        let report = checkpoint_wal(&conn).unwrap();
+
+        assert!(report.wal_frames > 0, "{report:?}");
+        assert!(report.wal_bytes() > 0, "{report:?}");
+        assert!(!report.truncate_busy, "{report:?}");
+        assert_eq!(report.truncate_frames, 0, "{report:?}");
+        let busy: i64 = conn
+            .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(busy, 30_000, "the short checkpoint timeout must not leak");
+    }
+
+    /// #1127: taking a manifest from a worker whose lease lapsed is logged at
+    /// `warn`; a first claim of a pending manifest is not.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn reclaiming_an_expired_lease_is_logged_at_warn() {
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+        seed_claimable(&backend, &tenant).await;
+
+        backend
+            .claim_next_manifest(&WorkerId::new("first-worker"), StdDuration::ZERO)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!logs_contain("reclaimed from a worker whose lease expired"));
+
+        tokio::time::sleep(StdDuration::from_millis(20)).await;
+        let lease = backend
+            .claim_next_manifest(&WorkerId::new("second-worker"), StdDuration::from_secs(60))
+            .await
+            .unwrap()
+            .expect("an expired lease is reclaimable");
+        assert_eq!(lease.fencing_token, 2);
+        assert!(logs_contain("reclaimed from a worker whose lease expired"));
+        assert!(logs_contain("first-worker"));
+    }
+
+    fn ndjson_reader(lines: &[String]) -> Box<dyn AsyncBufRead + Send + Unpin> {
+        let body: String = lines.iter().map(|line| format!("{line}\n")).collect();
+        Box::new(tokio::io::BufReader::new(std::io::Cursor::new(
+            body.into_bytes(),
+        )))
+    }
+
+    fn patient_lines(prefix: &str, n: usize) -> Vec<String> {
+        (1..=n)
+            .map(|i| format!("{{\"resourceType\":\"Patient\",\"id\":\"{prefix}-{i}\"}}"))
+            .collect()
+    }
+
+    /// #1127: re-walking a file — what a reclaimed manifest does — counts it
+    /// once. The counters used to add the whole file on every pass (37.9M
+    /// entries reported for 19M receipts); a partial walk followed by a full
+    /// one still ends at the file's real size and never reports less.
+    #[tokio::test]
+    async fn rewalking_a_file_does_not_multiply_the_manifest_counters() {
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+        let sub_id = seed_claimable(&backend, &tenant).await;
+        let manifest_id = backend.list_manifests(&tenant, &sub_id).await.unwrap()[0]
+            .manifest_id
+            .clone();
+        let ingest = |url: &'static str, lines: Vec<String>, allow_updates: bool| {
+            let backend = backend.clone();
+            let tenant = tenant.clone();
+            let sub_id = sub_id.clone();
+            let manifest_id = manifest_id.clone();
+            async move {
+                let mut options = BulkProcessingOptions::new()
+                    .with_batch_size(2)
+                    .with_file_url(url);
+                options.allow_updates = allow_updates;
+                backend
+                    .process_ndjson_stream(
+                        &tenant,
+                        &sub_id,
+                        &manifest_id,
+                        "Patient",
+                        ndjson_reader(&lines),
+                        &options,
+                    )
+                    .await
+                    .unwrap();
+                backend.list_manifests(&tenant, &sub_id).await.unwrap()[0].clone()
+            }
+        };
+
+        let a = patient_lines("a", 3);
+        let first = ingest("http://provider/a.ndjson", a.clone(), true).await;
+        assert_eq!((first.total_entries, first.processed_entries), (3, 3));
+        let again = ingest("http://provider/a.ndjson", a.clone(), true).await;
+        assert_eq!((again.total_entries, again.processed_entries), (3, 3));
+        // A re-walk whose lines now come back skipped (updates disallowed)
+        // keeps each line's first outcome instead of counting it twice.
+        let skipped_again = ingest("http://provider/a.ndjson", a, false).await;
+        assert_eq!(
+            (
+                skipped_again.total_entries,
+                skipped_again.processed_entries,
+                skipped_again.failed_entries
+            ),
+            (3, 3, 0)
+        );
+        let line_cursor: i64 = backend
+            .get_connection()
+            .unwrap()
+            .query_row(
+                "SELECT last_processed_line FROM bulk_manifests WHERE manifest_id = ?1",
+                params![manifest_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(line_cursor, 3);
+
+        // A walk cut short, then the full file: the file ends counted once.
+        let b = patient_lines("b", 5);
+        let partial = ingest("http://provider/b.ndjson", b[..2].to_vec(), true).await;
+        assert_eq!(partial.total_entries, 5);
+        let full = ingest("http://provider/b.ndjson", b, true).await;
+        assert_eq!((full.total_entries, full.processed_entries), (8, 8));
+
+        // Skips are counted apart from written resources.
+        let skipped = ingest("http://provider/c.ndjson", patient_lines("a", 1), false).await;
+        assert_eq!((skipped.total_entries, skipped.processed_entries), (9, 8));
+
+        let summary = backend
+            .get_submission(&tenant, &sub_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (
+                summary.total_entries,
+                summary.success_count,
+                summary.error_count,
+                summary.skipped_count,
+                summary.manifest_count
+            ),
+            (9, 8, 0, 1, 1)
+        );
+    }
+
+    /// #1127: the submission summary comes from the manifest counters, not
+    /// from an aggregate over one receipt row per ingested resource.
+    #[tokio::test]
+    async fn get_submission_does_not_read_entry_results() {
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+        let sub_id = seed_claimable(&backend, &tenant).await;
+        let manifest_id = backend.list_manifests(&tenant, &sub_id).await.unwrap()[0]
+            .manifest_id
+            .clone();
+        backend
+            .process_ndjson_stream(
+                &tenant,
+                &sub_id,
+                &manifest_id,
+                "Patient",
+                ndjson_reader(&[
+                    patient_lines("s", 3).join("\n"),
+                    "{\"resourceType\":\"Patient\",\"id\":\"s-4\",\"gender\":42}".to_string(),
+                ]),
+                &BulkProcessingOptions::new().with_file_url("http://provider/s.ndjson"),
+            )
+            .await
+            .unwrap();
+        let counted = backend
+            .get_submission(&tenant, &sub_id)
+            .await
+            .unwrap()
+            .unwrap();
+
+        backend
+            .get_connection()
+            .unwrap()
+            .execute("DELETE FROM bulk_entry_results", [])
+            .unwrap();
+        let after = backend
+            .get_submission(&tenant, &sub_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(counted.total_entries, 4);
+        assert_eq!(
+            (
+                after.total_entries,
+                after.success_count,
+                after.error_count,
+                after.skipped_count
+            ),
+            (
+                counted.total_entries,
+                counted.success_count,
+                counted.error_count,
+                counted.skipped_count
+            ),
+            "receipts gone, summary unchanged"
+        );
+        assert!(
+            backend
+                .get_submission(&tenant, &SubmissionId::new("nobody", "missing"))
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// #1127: a batch charges only the lines beyond the furthest any walk of
+    /// its file got, each with the outcome it first had.
+    #[test]
+    fn file_progress_charges_each_line_once() {
+        let written: Vec<_> = (1..=4)
+            .map(|line| BulkEntryResult::success(line, "Patient", format!("p{line}"), true))
+            .collect();
+        let first = EntryTally::beyond(&written, Some(0));
+        assert_eq!(
+            (first.total, first.processed, first.failed, first.skipped),
+            (4, 4, 0, 0)
+        );
+        assert_eq!(first.last_line, 4);
+        // A re-walk that now skips those lines charges only the ones past the
+        // mark, so no line counts under two outcomes.
+        let skipped: Vec<_> = (1..=6)
+            .map(|line| BulkEntryResult::skipped(line, "Patient", "updates not allowed"))
+            .collect();
+        let again = EntryTally::beyond(&skipped, Some(first.last_line as u64));
+        assert_eq!(
+            (again.total, again.processed, again.failed, again.skipped),
+            (2, 0, 0, 2)
+        );
+        assert_eq!(again.last_line, 6);
+        // Without a file there is no line identity: every entry is charged.
+        assert_eq!(EntryTally::beyond(&skipped, None).total, 6);
+    }
+
+    /// #1127: comparing stored and submitted content ignores only the
+    /// server-owned meta members.
+    #[test]
+    fn unchanged_content_ignores_only_server_meta() {
+        let stored = json!({"resourceType": "Patient", "id": "p", "meta": {"versionId": "3", "lastUpdated": "2026-01-01T00:00:00Z", "profile": ["x"]}, "gender": "female"});
+        let same = json!({"gender": "female", "id": "p", "resourceType": "Patient", "meta": {"profile": ["x"], "versionId": "1"}});
+        assert!(same_content_ignoring_server_meta(&stored, &same));
+        let bare = json!({"resourceType": "Patient", "id": "p", "meta": {"versionId": "3"}});
+        assert!(same_content_ignoring_server_meta(
+            &bare,
+            &json!({"resourceType": "Patient", "id": "p"})
+        ));
+        let other_profile = json!({"resourceType": "Patient", "id": "p", "meta": {"profile": ["y"]}, "gender": "female"});
+        assert!(!same_content_ignoring_server_meta(&stored, &other_profile));
+        let extra = json!({"resourceType": "Patient", "id": "p", "meta": {"profile": ["x"]}, "gender": "female", "active": true});
+        assert!(!same_content_ignoring_server_meta(&stored, &extra));
+    }
+
+    /// #1127: with `skip_unchanged`, replaying identical resources writes no
+    /// new version, no history row and no rollback record, and reports them
+    /// as unchanged successes; a real change still updates. Without it a
+    /// replay keeps producing new versions.
+    #[tokio::test]
+    async fn skip_unchanged_leaves_identical_resources_untouched() {
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+        let sub_id = seed_claimable(&backend, &tenant).await;
+        let manifest_id = backend.list_manifests(&tenant, &sub_id).await.unwrap()[0]
+            .manifest_id
+            .clone();
+        let count = |table: &str| -> i64 {
+            backend
+                .get_connection()
+                .unwrap()
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap()
+        };
+        let run = |resource: Value, skip: bool| {
+            let backend = backend.clone();
+            let tenant = tenant.clone();
+            let sub_id = sub_id.clone();
+            let manifest_id = manifest_id.clone();
+            async move {
+                backend
+                    .process_entries(
+                        &tenant,
+                        &sub_id,
+                        &manifest_id,
+                        vec![NdjsonEntry::new(1, "Patient", resource)],
+                        &BulkProcessingOptions::new()
+                            .with_file_url("http://provider/replay.ndjson")
+                            .with_skip_unchanged(skip),
+                    )
+                    .await
+                    .unwrap()
+                    .remove(0)
+            }
+        };
+        let version = || async {
+            backend
+                .read(&tenant, "Patient", "replay")
+                .await
+                .unwrap()
+                .unwrap()
+                .version_id()
+                .to_string()
+        };
+        let patient = json!({"resourceType": "Patient", "id": "replay", "gender": "male"});
+
+        let created = run(patient.clone(), true).await;
+        assert!(created.created && !created.unchanged);
+        let (history, changes) = (count("resource_history"), count("bulk_submission_changes"));
+
+        let mut replayed = patient.clone();
+        replayed["meta"] = json!({"versionId": "7", "lastUpdated": "2020-01-01T00:00:00Z"});
+        let replay = run(replayed, true).await;
+        assert!(replay.is_success() && replay.unchanged && !replay.created);
+        assert_eq!(version().await, "1");
+        assert_eq!(count("resource_history"), history);
+        assert_eq!(count("bulk_submission_changes"), changes);
+
+        let changed = run(
+            json!({"resourceType": "Patient", "id": "replay", "gender": "female"}),
+            true,
+        )
+        .await;
+        assert!(changed.is_success() && !changed.unchanged);
+        assert_eq!(version().await, "2");
+
+        let default_replay = run(
+            json!({"resourceType": "Patient", "id": "replay", "gender": "female"}),
+            false,
+        )
+        .await;
+        assert!(!default_replay.unchanged);
+        assert_eq!(
+            version().await,
+            "3",
+            "off by default: a replay still versions"
         );
     }
 

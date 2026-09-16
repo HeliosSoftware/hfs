@@ -58,6 +58,11 @@ tokio = { version = "1", features = ["full"] }
 # `io` provides StreamReader, bridging the reqwest byte stream for bulk-submit
 # NDJSON files into the AsyncBufRead the ingestion engine consumes.
 tokio-util = { version = "0.7", features = ["io"] }
+# Bulk-submit file bodies are fetched without reqwest's transparent gzip so the
+# fetcher knows the wire offset a `Range` resume must start from; it decodes
+# gzip itself with the same decoder reqwest uses. `bytes` names the body chunks.
+async-compression = { version = "0.4", features = ["tokio", "gzip"] }
+bytes = "1"
 async-trait = "0.1"
 
 # Web framework
