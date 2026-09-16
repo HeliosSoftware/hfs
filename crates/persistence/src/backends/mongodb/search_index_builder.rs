@@ -33,6 +33,20 @@ impl FromStr for IndexBuildMode {
     }
 }
 
+impl IndexBuildMode {
+    /// Reads `HFS_MONGODB_INDEX_BUILD` from the process environment: absent
+    /// means [`IndexBuildMode::default`] (`Background`), present but invalid
+    /// is the same error message [`FromStr`] produces. The single place this
+    /// variable is parsed, so every caller (`MongoBackend::from_env` and the
+    /// `hfs` binary) agrees on what "invalid" means.
+    pub fn from_env() -> Result<Self, String> {
+        match std::env::var("HFS_MONGODB_INDEX_BUILD") {
+            Ok(raw) => raw.parse::<IndexBuildMode>(),
+            Err(_) => Ok(IndexBuildMode::default()),
+        }
+    }
+}
+
 #[cfg(test)]
 mod mode_tests {
     use super::*;
@@ -102,6 +116,39 @@ pub enum BuildOutcome {
 /// build of one of our names is in progress.
 const IN_PROGRESS_POLL: Duration = Duration::from_secs(30);
 
+/// Bound on how long `run_inner` waits for a *foreign* build (another
+/// process's `createIndexes`, or a `buildUUID` that never clears) of one of
+/// our generation-2 names. Our own `createIndexes` in step 2 is not subject
+/// to this: that one command is bounded by a single collection scan and is
+/// awaited directly, not through this poll loop. Six hours is generous for
+/// even a very large collection scan and still short enough that `inline`
+/// mode (which awaits this from `init_schema`) does not hang boot forever
+/// (I3).
+const IN_PROGRESS_MAX_WAIT: Duration = Duration::from_secs(6 * 60 * 60);
+
+/// `listIndexes` option keys, beyond `v`/`key`/`name`/`partialFilterExpression`,
+/// that change query results or index maintenance if present on a
+/// generation-2 name: `unique` and `sparse` change which documents the index
+/// admits, `expireAfterSeconds` deletes rows, `collation` changes string
+/// comparison (and therefore sort order and equality), `hidden` removes the
+/// index from planner consideration, `wildcardProjection`/`storageEngine`
+/// change what the index covers or how it is stored, and `weights`/
+/// `default_language` are text-index-only options that have no place on a
+/// key/partial-filter index at all. Any of these on our name means a person
+/// (or a script) built something under it that is not what the catalog
+/// describes (I2).
+const EXTRA_OPTION_KEYS: [&str; 9] = [
+    "unique",
+    "sparse",
+    "expireAfterSeconds",
+    "collation",
+    "hidden",
+    "wildcardProjection",
+    "storageEngine",
+    "weights",
+    "default_language",
+];
+
 /// One `listIndexes` reading, classified against the catalog.
 #[derive(Debug, Default)]
 struct Inspection {
@@ -109,7 +156,7 @@ struct Inspection {
     missing: Vec<SearchIndexSpec>,
     /// Our names that exist but carry a `buildUUID`: someone else is building them.
     in_progress: Vec<String>,
-    /// Our names that exist with a different key or partial filter.
+    /// Our names that exist with a different key, partial filter, or extra option.
     conflicting: Vec<(String, ListedIndex)>,
     /// Superseded generation-1 names still present.
     superseded_present: Vec<String>,
@@ -126,6 +173,10 @@ struct ListedIndex {
     key: Document,
     partial: Option<Document>,
     in_progress: bool,
+    /// Names of any [`EXTRA_OPTION_KEYS`] present on this entry (or its
+    /// `spec`). Non-empty means a generation-2 name is conflicting even when
+    /// its key and partial filter match the catalog (I2).
+    extra_options: Vec<String>,
 }
 
 pub(super) struct SearchIndexBuilder {
@@ -211,8 +262,21 @@ impl SearchIndexBuilder {
 
         // Someone else (another HFS process, or an operator's mongosh) is
         // building one of our names: wait for it rather than issue a second
-        // build of the same index.
+        // build of the same index. Bounded (I3): in `inline` mode this is
+        // awaited by `init_schema`, so an unbounded wait on a foreign build
+        // that is stuck (or a `buildUUID` that never clears) would hang
+        // boot forever with no way out.
+        let wait_started = std::time::Instant::now();
         while !inspection.in_progress.is_empty() {
+            if wait_started.elapsed() >= IN_PROGRESS_MAX_WAIT {
+                let message = format!(
+                    "gave up waiting for a foreign build of search_index index(es) {:?} after {} minutes; nothing was built or dropped",
+                    inspection.in_progress,
+                    IN_PROGRESS_MAX_WAIT.as_secs() / 60
+                );
+                tracing::error!("{message}");
+                return Ok(BuildOutcome::Failed { message });
+            }
             tracing::info!(indexes = ?inspection.in_progress, "waiting for in-progress search_index builds");
             tokio::time::sleep(IN_PROGRESS_POLL).await;
             inspection = self.inspect().await?;
@@ -304,23 +368,13 @@ impl SearchIndexBuilder {
         {
             match existing.iter().find(|d| d.name == spec.name) {
                 None => inspection.missing.push(spec),
-                Some(actual) => {
-                    // Numeric literals from mongosh land as doubles even when
-                    // the catalog spec's keys/partial filter are `1_i32`;
-                    // normalise before comparing so a pre-built database
-                    // (e.g. from the shipped mongosh script) is never
-                    // reported as a conflict.
-                    let same_keys = normalize_numbers(&actual.key) == normalize_numbers(&spec.keys);
-                    let same_partial = actual.partial.as_ref().map(normalize_numbers)
-                        == spec.partial.as_ref().map(normalize_numbers);
-                    if !(same_keys && same_partial) {
-                        inspection
-                            .conflicting
-                            .push((spec.name.to_string(), actual.clone()));
-                    } else if actual.in_progress {
-                        inspection.in_progress.push(spec.name.to_string());
-                    }
-                }
+                Some(actual) => match classify_spec(&spec, actual) {
+                    SpecStatus::Conflicting => inspection
+                        .conflicting
+                        .push((spec.name.to_string(), actual.clone())),
+                    SpecStatus::InProgress => inspection.in_progress.push(spec.name.to_string()),
+                    SpecStatus::Ready => {}
+                },
             }
         }
         for v1 in superseded_v1_specs() {
@@ -372,9 +426,18 @@ fn listed_indexes(reply: &Document) -> StorageResult<Vec<ListedIndex>> {
 
     let mut out = Vec::with_capacity(batch.len());
     for entry in batch.iter().filter_map(|b| b.as_document()) {
-        let (source, in_progress) = match entry.get_document("spec") {
-            Ok(spec) => (spec, entry.contains_key("buildUUID")),
-            Err(_) => (entry, false),
+        // A top-level `buildUUID` means "in progress" whichever shape the
+        // rest of the entry takes: the nested-`spec` shape is the common
+        // case, but nothing in the `listIndexes` contract says a server
+        // could not report a top-level `buildUUID` alongside top-level
+        // `name`/`key` too. Treating that as "not in progress" (as an
+        // earlier version of this function did when no `spec` was present)
+        // would classify it ready and let generation-1 be dropped mid-build
+        // (the MUST-FIX deferred minor from the review).
+        let in_progress = entry.contains_key("buildUUID");
+        let source = match entry.get_document("spec") {
+            Ok(spec) => spec,
+            Err(_) => entry,
         };
         let no_field = |field: &str| {
             StorageError::Backend(BackendError::Internal {
@@ -394,11 +457,17 @@ fn listed_indexes(reply: &Document) -> StorageResult<Vec<ListedIndex>> {
             .map_err(|_| no_field("key"))?
             .clone();
         let partial = source.get_document("partialFilterExpression").ok().cloned();
+        let extra_options = EXTRA_OPTION_KEYS
+            .iter()
+            .filter(|key| source.contains_key(**key))
+            .map(|key| key.to_string())
+            .collect();
         out.push(ListedIndex {
             name,
             key,
             partial,
             in_progress,
+            extra_options,
         });
     }
     Ok(out)
@@ -429,6 +498,39 @@ fn normalize_bson(value: &Bson) -> Bson {
 
 fn is_namespace_not_found(error: &mongodb::error::Error) -> bool {
     matches!(error.kind.as_ref(), mongodb::error::ErrorKind::Command(c) if c.code == 26)
+}
+
+/// How one `listIndexes` entry compares to the generation-2 spec it is named
+/// for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SpecStatus {
+    /// Different key, different partial filter, or an [`EXTRA_OPTION_KEYS`]
+    /// option present (I2) — a person built something under our name.
+    Conflicting,
+    /// Same key and partial filter, no extra options, but still building.
+    InProgress,
+    /// Same key and partial filter, no extra options, build finished.
+    Ready,
+}
+
+/// Classifies one existing index against the catalog spec it is named for.
+/// Pure and side-effect-free so the conflict rule (I2, and the key/partial
+/// comparison it already had) is unit-testable without a live server.
+fn classify_spec(spec: &SearchIndexSpec, actual: &ListedIndex) -> SpecStatus {
+    // Numeric literals from mongosh land as doubles even when the catalog
+    // spec's keys/partial filter are `1_i32`; normalise before comparing so
+    // a pre-built database (e.g. from the shipped mongosh script) is never
+    // reported as a conflict.
+    let same_keys = normalize_numbers(&actual.key) == normalize_numbers(&spec.keys);
+    let same_partial = actual.partial.as_ref().map(normalize_numbers)
+        == spec.partial.as_ref().map(normalize_numbers);
+    if !(same_keys && same_partial) || !actual.extra_options.is_empty() {
+        SpecStatus::Conflicting
+    } else if actual.in_progress {
+        SpecStatus::InProgress
+    } else {
+        SpecStatus::Ready
+    }
 }
 
 #[cfg(test)]
@@ -472,11 +574,19 @@ mod builder_tests {
                         },
                         "buildUUID": "test-build-uuid",
                     },
-                    // A superseded generation-1 index: also top-level fields.
+                    // A legacy/generation-1-shaped entry carrying a top-level
+                    // `buildUUID` with no `spec` wrapper. Nothing in the
+                    // `listIndexes` contract rules this out, and treating it
+                    // as "not in progress" (an earlier version of this
+                    // function did, by hard-coding `false` in this branch)
+                    // would classify it ready and let generation-1 be
+                    // dropped while it is still building (the MUST-FIX
+                    // deferred minor from the review).
                     {
                         "v": 2,
                         "key": { "tenant_id": 1 },
                         "name": "idx_search_string",
+                        "buildUUID": "legacy-shape-build-uuid",
                     },
                 ],
             },
@@ -491,18 +601,21 @@ mod builder_tests {
                     key: doc! { "tenant_id": 1 },
                     partial: Some(doc! { "value_string": { "$exists": true } }),
                     in_progress: false,
+                    extra_options: Vec::new(),
                 },
                 ListedIndex {
                     name: "idx_search_date_v2".to_string(),
                     key: doc! { "tenant_id": 1 },
                     partial: None,
                     in_progress: true,
+                    extra_options: Vec::new(),
                 },
                 ListedIndex {
                     name: "idx_search_string".to_string(),
                     key: doc! { "tenant_id": 1 },
                     partial: None,
-                    in_progress: false,
+                    in_progress: true,
+                    extra_options: Vec::new(),
                 },
             ]
         );
@@ -512,5 +625,66 @@ mod builder_tests {
     fn listed_indexes_errors_loudly_without_cursor_first_batch() {
         let reply = doc! { "ok": 1.0 };
         assert!(listed_indexes(&reply).is_err());
+    }
+
+    #[test]
+    fn listed_indexes_collects_extra_options_beyond_key_and_partial() {
+        let reply = doc! {
+            "cursor": {
+                "firstBatch": [
+                    {
+                        "v": 2,
+                        "key": { "tenant_id": 1, "value_date": 1 },
+                        "name": "idx_search_date_v2",
+                        "partialFilterExpression": { "value_date": { "$exists": true } },
+                        "collation": { "locale": "en" },
+                    },
+                ],
+            },
+        };
+
+        let listed = listed_indexes(&reply).expect("listed_indexes");
+        assert_eq!(listed[0].extra_options, vec!["collation".to_string()]);
+    }
+
+    /// I2: an index that matches the catalog's key and partial filter
+    /// exactly but carries an extra option (here `collation`) must still be
+    /// classified `Conflicting`, not `Ready` — a collation difference
+    /// changes string comparison results, so serving off it silently would
+    /// be a correctness bug, not just a performance one.
+    #[test]
+    fn classify_spec_treats_matching_index_with_extra_option_as_conflicting() {
+        let spec = generation2_specs()
+            .into_iter()
+            .find(|s| s.name == "idx_search_date_v2")
+            .expect("idx_search_date_v2 is in the catalog");
+
+        let actual = ListedIndex {
+            name: spec.name.to_string(),
+            key: spec.keys.clone(),
+            partial: spec.partial.clone(),
+            in_progress: false,
+            extra_options: vec!["collation".to_string()],
+        };
+
+        assert_eq!(classify_spec(&spec, &actual), SpecStatus::Conflicting);
+    }
+
+    #[test]
+    fn classify_spec_ready_when_key_partial_match_and_no_extra_options() {
+        let spec = generation2_specs()
+            .into_iter()
+            .find(|s| s.name == "idx_search_date_v2")
+            .expect("idx_search_date_v2 is in the catalog");
+
+        let actual = ListedIndex {
+            name: spec.name.to_string(),
+            key: spec.keys.clone(),
+            partial: spec.partial.clone(),
+            in_progress: false,
+            extra_options: Vec::new(),
+        };
+
+        assert_eq!(classify_spec(&spec, &actual), SpecStatus::Ready);
     }
 }

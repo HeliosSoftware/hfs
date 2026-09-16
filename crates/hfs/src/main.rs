@@ -82,7 +82,7 @@ use helios_persistence::search::ReindexOperation;
 use helios_persistence::backends::sqlite::{SqliteBackend, SqliteBackendConfig};
 
 #[cfg(feature = "mongodb")]
-use helios_persistence::backends::mongodb::{MongoBackend, MongoBackendConfig};
+use helios_persistence::backends::mongodb::{IndexBuildMode, MongoBackend, MongoBackendConfig};
 fn is_database_audit_dedicated(config: &AuditConfig, backend_kind: BackendKind) -> bool {
     match backend_kind {
         BackendKind::Sqlite | BackendKind::Postgres => config.database_url.is_some(),
@@ -159,7 +159,10 @@ fn es_write_refresh_from_config(
 }
 
 #[cfg(feature = "mongodb")]
-fn build_mongodb_config(config: &ServerConfig, search_offloaded: bool) -> MongoBackendConfig {
+fn build_mongodb_config(
+    config: &ServerConfig,
+    search_offloaded: bool,
+) -> anyhow::Result<MongoBackendConfig> {
     build_mongodb_config_with_env(config, search_offloaded, |name| std::env::var(name).ok())
 }
 
@@ -168,7 +171,7 @@ fn build_mongodb_config_with_env<F>(
     config: &ServerConfig,
     search_offloaded: bool,
     env: F,
-) -> MongoBackendConfig
+) -> anyhow::Result<MongoBackendConfig>
 where
     F: Fn(&str) -> Option<String>,
 {
@@ -200,8 +203,18 @@ where
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(1000)
         .max(1);
+    // The only way to reach `off` (the escape hatch that stops the builder
+    // touching the collection at all) or `inline`, so an invalid value must
+    // fail startup rather than silently fall back to `background` — same
+    // "bail with the invalid value" shape as HFS_BULK_EXPORT_OUTPUT_BACKEND.
+    let index_build = match env("HFS_MONGODB_INDEX_BUILD") {
+        Some(raw) => raw
+            .parse::<IndexBuildMode>()
+            .map_err(|message| anyhow::anyhow!(message))?,
+        None => IndexBuildMode::default(),
+    };
 
-    MongoBackendConfig {
+    Ok(MongoBackendConfig {
         connection_string,
         database_name,
         max_connections,
@@ -211,8 +224,9 @@ where
         data_dir: config.data_dir.clone(),
         search_offloaded,
         max_included_resources,
+        index_build,
         app_name: MongoBackendConfig::default().app_name,
-    }
+    })
 }
 
 #[cfg(feature = "sqlite")]
@@ -421,6 +435,12 @@ async fn create_audit_mongodb_storage(
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(15_000);
+        let index_build = match std::env::var("HFS_MONGODB_INDEX_BUILD") {
+            Ok(raw) => raw
+                .parse::<IndexBuildMode>()
+                .map_err(|message| anyhow::anyhow!(message))?,
+            Err(_) => IndexBuildMode::default(),
+        };
 
         let config = MongoBackendConfig {
             connection_string,
@@ -431,13 +451,14 @@ async fn create_audit_mongodb_storage(
             fhir_version: server_config.default_fhir_version,
             data_dir: server_config.data_dir.clone(),
             search_offloaded: false,
+            index_build,
             // Audit storage doesn't resolve _include/_revinclude; the default
             // (and any future new field) is fine here.
             ..Default::default()
         };
         MongoBackend::new(config)?
     } else {
-        MongoBackend::new(build_mongodb_config(server_config, false))?
+        MongoBackend::new(build_mongodb_config(server_config, false)?)?
     };
 
     backend.init_schema().await?;
@@ -590,7 +611,7 @@ async fn start_mongodb(
     auth_state: Option<Arc<AuthMiddlewareState>>,
     audit_state: Option<Arc<AuditMiddlewareState>>,
 ) -> anyhow::Result<()> {
-    let backend_config = build_mongodb_config(&config, false);
+    let backend_config = build_mongodb_config(&config, false)?;
     info!(
         url = %backend_config.connection_string,
         database = %backend_config.database_name,
@@ -2649,7 +2670,7 @@ async fn start_mongodb_elasticsearch(
     use helios_persistence::core::BackendKind;
 
     // Create MongoDB backend
-    let backend_config = build_mongodb_config(&config, true);
+    let backend_config = build_mongodb_config(&config, true)?;
     info!(
         url = %backend_config.connection_string,
         database = %backend_config.database_name,
@@ -3403,7 +3424,8 @@ mod tests {
             "HFS_MONGODB_CONNECT_TIMEOUT_MS" => Some("7500".to_string()),
             "HFS_MONGODB_SERVER_SELECTION_TIMEOUT_MS" => Some("2500".to_string()),
             _ => None,
-        });
+        })
+        .expect("valid config");
 
         assert_eq!(
             mongo_config.connection_string,
@@ -3416,6 +3438,7 @@ mod tests {
         assert_eq!(mongo_config.fhir_version, FhirVersion::R4);
         assert_eq!(mongo_config.data_dir, Some(data_dir));
         assert!(!mongo_config.search_offloaded);
+        assert_eq!(mongo_config.index_build, IndexBuildMode::Background);
     }
 
     #[cfg(feature = "mongodb")]
@@ -3430,11 +3453,39 @@ mod tests {
             "HFS_DATABASE_URL" => Some("postgres://localhost/hfs".to_string()),
             "HFS_MONGODB_DATABASE" => Some("mongo_db".to_string()),
             _ => None,
-        });
+        })
+        .expect("valid config");
 
         assert_eq!(mongo_config.connection_string, "mongodb://localhost:27017");
         assert_eq!(mongo_config.database_name, "mongo_db");
         assert!(mongo_config.search_offloaded);
+    }
+
+    #[cfg(feature = "mongodb")]
+    #[test]
+    fn test_build_mongodb_config_reads_index_build_and_rejects_invalid_values() {
+        let config = ServerConfig::default();
+
+        let mongo_config = build_mongodb_config_with_env(&config, false, |name| match name {
+            "HFS_MONGODB_INDEX_BUILD" => Some("off".to_string()),
+            _ => None,
+        })
+        .expect("valid config");
+        assert_eq!(mongo_config.index_build, IndexBuildMode::Off);
+
+        let mongo_config = build_mongodb_config_with_env(&config, false, |name| match name {
+            "HFS_MONGODB_INDEX_BUILD" => Some("inline".to_string()),
+            _ => None,
+        })
+        .expect("valid config");
+        assert_eq!(mongo_config.index_build, IndexBuildMode::Inline);
+
+        let err = build_mongodb_config_with_env(&config, false, |name| match name {
+            "HFS_MONGODB_INDEX_BUILD" => Some("nonsense".to_string()),
+            _ => None,
+        })
+        .expect_err("invalid mode must fail startup");
+        assert!(format!("{err}").contains("HFS_MONGODB_INDEX_BUILD"));
     }
 
     #[cfg(feature = "mongodb")]
@@ -3446,7 +3497,8 @@ mod tests {
             "HFS_MONGODB_URI" => Some("mongodb://mongo-specific:27017".to_string()),
             "HFS_DATABASE_URL" => Some("mongodb://database-url:27017".to_string()),
             _ => None,
-        });
+        })
+        .expect("valid config");
 
         assert_eq!(
             mongo_config.connection_string,

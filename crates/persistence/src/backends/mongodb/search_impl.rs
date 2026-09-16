@@ -291,6 +291,55 @@ fn parse_simple_search_params(params: &str) -> Vec<(String, String)> {
         .collect()
 }
 
+/// The `search_index` field a parameter type's value lives in. `None` for
+/// `Composite`/`Special`, which have no single value field of their own
+/// (composite rows carry each sub-parameter's own field; special params like
+/// `_id`/`_lastUpdated` are not stored in `search_index` at all).
+pub(super) fn value_field_for(param_type: SearchParamType) -> Option<&'static str> {
+    match param_type {
+        SearchParamType::String => Some("value_string"),
+        SearchParamType::Token => Some("value_token_code"),
+        SearchParamType::Date => Some("value_date"),
+        SearchParamType::Number => Some("value_number"),
+        SearchParamType::Quantity => Some("value_quantity_value"),
+        SearchParamType::Reference => Some("value_reference"),
+        SearchParamType::Uri => Some("value_uri"),
+        SearchParamType::Composite | SearchParamType::Special => None,
+    }
+}
+
+/// The envelope filter for a `:missing` presence check
+/// (`{tenant_id, resource_type, param_name}`, matching every row `search_index`
+/// carries for the parameter regardless of value), plus — when the parameter
+/// type has a value field — a `{value_field: {"$ne": null}}` conjunct.
+///
+/// The extra conjunct is not redundant with the envelope: every generation-2
+/// value index (`idx_search_*_v2`) is a *partial* index built with
+/// `partialFilterExpression: {value_field: {"$exists": true}}`, so MongoDB
+/// only considers it for a query it can prove is a subset of that filter.
+/// The bare envelope has no predicate on any value field at all, so no
+/// partial index qualifies and the planner falls back to a full scan of the
+/// `(tenant_id, resource_type)` slice on `idx_search_composite` — every
+/// parameter, every row of the type. Adding the value-field conjunct lets
+/// the planner pick that parameter's own partial index and, since
+/// `distinct_resource_ids` reads only `resource_id` (the index's trailing
+/// key), serves the scan fully covered. Measured on MongoDB 7.0.40.
+pub(super) fn missing_presence_filter(
+    tenant_id: &str,
+    resource_type: &str,
+    param: &SearchParameter,
+) -> Document {
+    let mut filter = doc! {
+        "tenant_id": tenant_id,
+        "resource_type": resource_type,
+        "param_name": &param.name,
+    };
+    if let Some(value_field) = value_field_for(param.param_type) {
+        filter.insert(value_field, doc! { "$ne": Bson::Null });
+    }
+    filter
+}
+
 #[async_trait]
 impl SearchProvider for MongoBackend {
     async fn search(
@@ -1292,20 +1341,17 @@ impl MongoBackend {
         directive: &crate::types::SortDirective,
         allowed: Option<&HashSet<String>>,
     ) -> StorageResult<Vec<String>> {
-        use crate::types::{SearchParamType as Spt, SortDirection};
+        use crate::types::SortDirection;
 
-        let value_field = match directive.param_type {
-            Some(Spt::Date) => "value_date",
-            Some(Spt::Number) => "value_number",
-            // The writer stores quantities in `value_quantity_value`, not
-            // `value_number`; mapping them to the latter made every quantity
-            // sort degrade silently to id order (#1040).
-            Some(Spt::Quantity) => "value_quantity_value",
-            Some(Spt::Token) => "value_token_code",
-            Some(Spt::Reference) => "value_reference",
-            Some(Spt::Uri) => "value_uri",
-            _ => "value_string",
-        };
+        // The writer stores quantities in `value_quantity_value`, not
+        // `value_number`; mapping them to the latter made every quantity
+        // sort degrade silently to id order (#1040). `value_field_for`
+        // covers that; a missing/composite/special param type falls back to
+        // `value_string`, matching the old catch-all arm.
+        let value_field = directive
+            .param_type
+            .and_then(value_field_for)
+            .unwrap_or("value_string");
         let (accumulator, order) = match directive.direction {
             SortDirection::Ascending => ("$min", 1),
             SortDirection::Descending => ("$max", -1),
@@ -1655,11 +1701,7 @@ impl MongoBackend {
             let with_entry = self
                 .distinct_resource_ids(
                     search_index,
-                    doc! {
-                        "tenant_id": tenant_id,
-                        "resource_type": resource_type,
-                        "param_name": &param.name,
-                    },
+                    missing_presence_filter(tenant_id, resource_type, param),
                 )
                 .await?;
             let ids = if wants_missing {
@@ -2948,6 +2990,93 @@ mod query_support_tests {
                 ..
             }) if modifier == "below"
         ));
+    }
+}
+
+/// Controller finding: a `:missing` presence filter with no value-field
+/// conjunct is served by a full scan of the `(tenant, type)` slice, because
+/// no generation-2 partial index has a `{tenant_id, resource_type,
+/// param_name}` prefix without a value predicate. See `missing_presence_filter`.
+#[cfg(test)]
+mod missing_presence_filter_tests {
+    use super::*;
+
+    /// Every `SearchParamType` variant, via a `match` that is exhaustive
+    /// over the enum: adding a new variant fails this test to compile
+    /// (rather than silently falling through `value_field_for`'s own
+    /// `Composite | Special => None` arm) until it is added here too.
+    #[test]
+    fn value_field_for_covers_every_variant() {
+        let variants = [
+            SearchParamType::String,
+            SearchParamType::Uri,
+            SearchParamType::Number,
+            SearchParamType::Date,
+            SearchParamType::Quantity,
+            SearchParamType::Token,
+            SearchParamType::Reference,
+            SearchParamType::Composite,
+            SearchParamType::Special,
+        ];
+        for variant in variants {
+            let expected = match variant {
+                SearchParamType::String => Some("value_string"),
+                SearchParamType::Token => Some("value_token_code"),
+                SearchParamType::Date => Some("value_date"),
+                SearchParamType::Number => Some("value_number"),
+                SearchParamType::Quantity => Some("value_quantity_value"),
+                SearchParamType::Reference => Some("value_reference"),
+                SearchParamType::Uri => Some("value_uri"),
+                SearchParamType::Composite | SearchParamType::Special => None,
+            };
+            assert_eq!(value_field_for(variant), expected, "{variant:?}");
+        }
+    }
+
+    fn param(name: &str, param_type: SearchParamType) -> SearchParameter {
+        SearchParameter {
+            name: name.to_string(),
+            param_type,
+            modifier: Some(SearchModifier::Missing),
+            values: vec![SearchValue::eq("false")],
+            chain: vec![],
+            components: vec![],
+        }
+    }
+
+    #[test]
+    fn missing_presence_filter_adds_value_field_conjunct_for_token() {
+        let filter = missing_presence_filter(
+            "tenant-1",
+            "Patient",
+            &param("gender", SearchParamType::Token),
+        );
+        assert_eq!(
+            filter,
+            doc! {
+                "tenant_id": "tenant-1",
+                "resource_type": "Patient",
+                "param_name": "gender",
+                "value_token_code": { "$ne": Bson::Null },
+            }
+        );
+    }
+
+    #[test]
+    fn missing_presence_filter_is_the_bare_envelope_for_composite() {
+        let filter = missing_presence_filter(
+            "tenant-1",
+            "Patient",
+            &param("some-composite", SearchParamType::Composite),
+        );
+        assert_eq!(
+            filter,
+            doc! {
+                "tenant_id": "tenant-1",
+                "resource_type": "Patient",
+                "param_name": "some-composite",
+            }
+        );
     }
 }
 

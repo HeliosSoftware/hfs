@@ -11989,3 +11989,55 @@ async fn mongodb_integration_bare_token_search_is_a_covered_v2_scan() {
     )
     .await;
 }
+
+/// Controller finding: `?gender:missing=false` used to be served by
+/// `matching_resource_ids_complement_only`'s envelope-only presence filter
+/// (`{tenant_id, resource_type, param_name}`), which no generation-2
+/// partial index has a prefix for (every partial index also requires its
+/// value field to exist), so the planner fell back to a full scan of the
+/// whole `(tenant, type)` slice on `idx_search_composite`. Adding the
+/// `value_token_code: {"$ne": null}` conjunct (`missing_presence_filter`)
+/// lets it use `idx_search_token_v2`'s partial filter instead, and since
+/// `distinct_resource_ids` reads only `resource_id` — the index's trailing
+/// key — the scan is fully covered.
+#[tokio::test]
+async fn mongodb_integration_missing_false_search_is_a_covered_v2_scan() {
+    let Some(backend) = create_backend_with_full_registry("missing_false").await else {
+        eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
+        return;
+    };
+    let tenant = create_tenant("tenant-missing-false");
+    for i in 0..20 {
+        let mut resource = json!({
+            "resourceType": "Patient", "id": format!("p{i}"),
+        });
+        if i % 2 == 0 {
+            resource["gender"] = json!("male");
+        }
+        backend
+            .create(&tenant, "Patient", resource, FhirVersion::default())
+            .await
+            .unwrap();
+    }
+    let db = raw_test_client(&backend.config().connection_string)
+        .await
+        .unwrap()
+        .database(&backend.config().database_name);
+    let q = SearchQuery::new("Patient").with_parameter(SearchParameter {
+        name: "gender".into(),
+        param_type: SearchParamType::Token,
+        modifier: Some(SearchModifier::Missing),
+        values: vec![SearchValue::eq("false")],
+        chain: vec![],
+        components: vec![],
+    });
+    assert_search_index_ops_are_covered(
+        &db,
+        async {
+            let r = backend.search(&tenant, &q).await.unwrap();
+            assert_eq!(r.resources.items.len(), 10);
+        },
+        "idx_search_token_v2",
+    )
+    .await;
+}

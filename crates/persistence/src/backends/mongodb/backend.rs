@@ -355,16 +355,13 @@ impl MongoBackend {
             .unwrap_or_else(default_max_included_resources)
             .max(1);
 
-        let index_build = match std::env::var("HFS_MONGODB_INDEX_BUILD") {
-            Ok(raw) => raw.parse::<IndexBuildMode>().map_err(|message| {
-                StorageError::Backend(BackendError::Internal {
-                    backend_name: "mongodb".to_string(),
-                    message,
-                    source: None,
-                })
-            })?,
-            Err(_) => IndexBuildMode::default(),
-        };
+        let index_build = IndexBuildMode::from_env().map_err(|message| {
+            StorageError::Backend(BackendError::Internal {
+                backend_name: "mongodb".to_string(),
+                message,
+                source: None,
+            })
+        })?;
 
         let config = MongoBackendConfig {
             connection_string,
