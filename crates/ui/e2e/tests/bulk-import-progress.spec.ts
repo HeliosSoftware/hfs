@@ -3,8 +3,8 @@
 // Before, every status read taken before the first entry landed reported a
 // bare byte percentage — a determinate-sounding sentence for a phase whose
 // duration is unknown, printed under the indeterminate sweep. The handler now
-// names the phase instead (`waiting for a worker`, `reading manifest`,
-// `sizing N of M files`, `downloading file N of M`), and none of those strings
+// names the phase instead (`Queued - starting shortly`, `Reading manifest`,
+// `Sizing N of M files`, `Downloading file N of M`), and none of those strings
 // may begin with `processing ` in any case, because the UI parses that prefix
 // case-insensitively into a percentage and would flip the bar to a determinate
 // fill — the #827 mix.
@@ -23,7 +23,7 @@ const MANIFEST_DELAY_MS = 6_000;
 const FILE_DELAY_MS = 2_500;
 
 const PRE_INGEST =
-  /^(waiting for a worker|reading manifest|sizing \d+ of \d+ files|downloading file \d+ of \d+)$/;
+  /^(Queued - (starting shortly|waiting for an external worker)|Reading manifest|Sizing \d+ of \d+ files|Downloading file \d+ of \d+)$/;
 const INGEST = /^Processing (\d+)%/;
 
 /** Two Patients per file, so the ingest phase reports several percentages. */
