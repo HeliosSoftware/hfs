@@ -1434,6 +1434,19 @@ immediate follow-up search misses the write. The `hfs` binary exposes these as
 `HFS_ELASTICSEARCH_WRITE_REFRESH` (see the
 [hfs README](../hfs/README.md#environment-variables)).
 
+That window applies to *client* searches. Server-side lookups that resolve a
+write against existing content do not inherit it: a transaction Bundle's
+conditional references (`"reference": "Organization?identifier=…"`) and the
+composite's conditional create/update/delete (`If-None-Exist`,
+`PUT [type]?[criteria]`) first call
+`SearchProvider::ensure_writes_visible` for the types they name. The composite
+drains its asynchronous sync queue up to that point, then the Elasticsearch
+backend refreshes those indices (a no-op under `WaitFor`/`True`, where the
+write was already searchable when it returned). A resource the server has
+acknowledged is therefore always found by such a lookup, on every sync mode
+and every `write_refresh` setting, and the cost is paid only by requests that
+carry such criteria (#1047).
+
 #### Very large resources on Elasticsearch-backed composites
 
 Every indexed search-parameter value is a nested object in the resource's
@@ -1447,9 +1460,80 @@ largest, 28,192).
 `ElasticsearchConfig::nested_objects_limit` (default 50000) is written into the
 index template, so new indices get it, and is raised during backend
 initialization on existing indices that are below it. The setting is dynamic,
-so resources that already indexed need no reindex; resources rejected before the
-raise are repaired with `POST /{type}/$reindex`. The `hfs` binary exposes it as
+so resources that already indexed need no reindex. Resources rejected before the
+raise can be reindexed with `POST /{type}/$reindex`, but raising the limit alone
+does not guarantee that repair: `$reindex` sends the same documents through the
+`_bulk` path described below. Before #1125, on `sqlite-elasticsearch`, every
+500-document `Provenance` request failed as a whole at the transport level
+(`backend unavailable: elasticsearch`, `retryable: true`), so `$reindex` indexed
+none of them. Treat a rebuild as a repair only once `GET /$reindex-status/{job_id}`
+reports `errorCount` 0 for the type. The `hfs` binary exposes the limit as
 `HFS_ELASTICSEARCH_NESTED_OBJECTS_LIMIT`.
+
+#### Bulk writes and rebuilds on Elasticsearch-backed composites
+
+`create_many` and `ReindexTarget::write_search_entries_page` put documents on the
+wire through one `_bulk` path. Each request is capped at 500 operations **and**
+at `ElasticsearchConfig::bulk_max_bytes` (default 10 MiB); a single document
+larger than the byte cap is sent alone. The cap exists because the client's
+`ElasticsearchConfig::request_timeout_ms` (default 30000) covers the whole
+request: 500 Synthea `Provenance` resources average ~108 KB each, and the ~54 MB
+body that produced timed out on every attempt.
+
+Failures are classified by shape:
+
+- **Transport timeout, `413`, or a proxy's `408`/`504`**: the chunk is split in
+  half and each half is resent, recursively, down to a single document, so an
+  oversized chunk is never resent unchanged nor reported as hundreds of
+  rejected resources. A single document still answered `413` is permanent; one
+  that still times out is transient, and on the client's own timeout the rest
+  of the page is failed as transient too rather than split further (the
+  cluster is stalled, and every halving would wait out another timeout).
+- **`429`**, for the whole request or per item: retried with bounded exponential
+  back-off, resending only the rejected items.
+- **Connection error, `5xx` for the whole request, or a `429` that outlasts its
+  retries**: every document of that request fails as transient.
+- **Per-document `4xx`** (for example the nested-object limit above): permanent,
+  so a rebuild that has only those is not retried.
+- **`ensure_index` transport failures**: transient (`BackendError::Unavailable`),
+  not `Internal`.
+
+A client-side timeout does not cancel the `_bulk` Elasticsearch is already
+executing, so a resource reported as failed may still end up indexed; confirm
+with a count before rebuilding again.
+
+`ElasticsearchConfig::reindex_refresh` sets the `refresh` parameter for rebuild
+writes separately from `write_refresh`; `None` (default) follows `write_refresh`.
+
+On a primary whose search is offloaded (`set_search_offloaded(true)`), the
+reindex writers `write_search_entries_on`, `write_search_entries_page` and
+`clear_search_index` are no-ops, as `begin/end_bulk_index_rebuild` already were,
+and `hfs` wires only Elasticsearch as the reindex target on
+`sqlite-elasticsearch`. Before #1125 the rebuild also wrote the SQLite
+`search_index`/FTS rows that no query there reads, and because the matching
+delete was already a no-op the rows accumulated on every run (≥ 11 KB per
+resource). A SQLite row `fetch_resources_page` cannot parse is reported as a
+per-resource error and no longer ends the rebuild of its type.
+
+A manifest ingested with indexing deferred records that it still owes a
+rebuild, in `bulk_manifests.index_pending` (SQLite schema v30), inside the
+transaction that publishes it. `SubmitWorkerStorage::list_manifests_awaiting_reindex`
+is what a restarted server scans to re-fire those rebuilds, and the marker is
+cleared once a generation finishes; backends that do not implement the three
+defaulted methods simply never resume, as before #1125.
+
+The `hfs` binary exposes these as `HFS_ELASTICSEARCH_REQUEST_TIMEOUT_MS`,
+`HFS_ELASTICSEARCH_BULK_MAX_BYTES`, `HFS_ELASTICSEARCH_BULK_CONCURRENCY` and
+`HFS_ELASTICSEARCH_REINDEX_REFRESH`, and the deferred rebuild's page as
+`HFS_REINDEX_BATCH_SIZE` plus `HFS_REINDEX_BATCH_BYTES` (see the
+[hfs README](../hfs/README.md#environment-variables)).
+
+Measured on `sqlite-elasticsearch` with a 228,580-resource Synthea cut
+(Elasticsearch 8.15, 4 GB heap): the rebuild completes in one generation with
+every Provenance indexed, against `main` losing 2,500 of them and failing
+twice. With `HFS_ELASTICSEARCH_WRITE_REFRESH=wait_for` the rebuild takes 806 s;
+adding `HFS_ELASTICSEARCH_REINDEX_REFRESH=false` takes it to 145 s
+(1,576 resources/s), which is the recommended pair.
 
 ### Cost-Based Optimization
 

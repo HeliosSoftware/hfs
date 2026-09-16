@@ -612,21 +612,70 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Sums `tenant`'s queued and in-progress rebuilds among `jobs`, or `None`
-/// when it has none running.
+/// What the rebuild banner says for `tenant` among `jobs` (#1065, #1125).
+///
+/// Queued and in-progress rebuilds win, summed, so a retry that is running
+/// shows its progress. With none running, the tenant's most recently finished
+/// rebuild decides: one that failed, or completed with per-resource errors,
+/// stays visible — searches keep missing those resources after the job stops —
+/// until a later rebuild finishes cleanly or the job's status expires. A
+/// cancelled rebuild shows nothing: stopping it was the operator's decision.
 fn reindex_activity_of(
     jobs: &[helios_persistence::search::ReindexProgress],
     tenant: &str,
 ) -> Option<ReindexActivity> {
-    let running: Vec<_> = jobs
-        .iter()
-        .filter(|job| job.status.is_running() && job.tenant_id.as_deref() == Some(tenant))
+    use helios_persistence::search::ReindexStatus;
+
+    let tenant_jobs = || {
+        jobs.iter()
+            .filter(move |job| job.tenant_id.as_deref() == Some(tenant))
+    };
+    let running: Vec<_> = tenant_jobs()
+        .filter(|job| job.status.is_running())
         .collect();
-    (!running.is_empty()).then(|| ReindexActivity {
-        jobs: running.len() as u64,
-        processed: running.iter().map(|job| job.processed_resources).sum(),
-        total: running.iter().map(|job| job.total_resources).sum(),
-    })
+    if !running.is_empty() {
+        return Some(ReindexActivity::Running {
+            jobs: running.len() as u64,
+            processed: running.iter().map(|job| job.processed_resources).sum(),
+            total: running.iter().map(|job| job.total_resources).sum(),
+        });
+    }
+    // `completed_at` is RFC 3339 with a variable number of fractional digits,
+    // so it is parsed rather than compared as text.
+    let finished_at = |job: &helios_persistence::search::ReindexProgress| {
+        job.completed_at
+            .as_deref()
+            .and_then(|at| chrono::DateTime::parse_from_rfc3339(at).ok())
+    };
+    let mut finished: Vec<_> = tenant_jobs()
+        .filter(|job| job.status.is_finished())
+        .collect();
+    finished.sort_by_key(|job| std::cmp::Reverse(finished_at(job)));
+    // A clean retry of named resources resolves the transient failures of the
+    // rebuild before it, not that rebuild's permanent ones: look past it.
+    let mut retried_cleanly = false;
+    for job in finished {
+        let clean = job.status == ReindexStatus::Completed && job.errors.is_empty();
+        if job.resource_scoped && clean {
+            retried_cleanly = true;
+            continue;
+        }
+        let errors = if retried_cleanly {
+            job.errors.iter().filter(|error| !error.retryable).count()
+        } else {
+            job.errors.len()
+        };
+        let unindexed = match job.status {
+            ReindexStatus::Failed => true,
+            ReindexStatus::Completed => errors > 0,
+            _ => false,
+        };
+        return unindexed.then(|| ReindexActivity::Failed {
+            job_id: job.job_id.clone(),
+            errors: errors as u64,
+        });
+    }
+    None
 }
 
 /// A tenant's last read job counts (see [`JOB_COUNTS_TTL`]).
@@ -1003,8 +1052,9 @@ impl<S> StorageDashboardProvider<S> {
         self
     }
 
-    /// Attaches the `$reindex` operation, whose running jobs become each
-    /// snapshot's [`DashboardSnapshot::reindex_active`] (#1065). `None` leaves
+    /// Attaches the `$reindex` operation, whose running jobs — or last
+    /// unfinished one — become each snapshot's
+    /// [`DashboardSnapshot::reindex_active`] (#1065, #1125). `None` leaves
     /// that field `None`, so no rebuild banner is ever shown.
     pub(crate) fn with_reindex(
         mut self,
@@ -1014,7 +1064,7 @@ impl<S> StorageDashboardProvider<S> {
         self
     }
 
-    /// The tenant's running search-index rebuilds. Reads the operation's
+    /// The tenant's running or last failed search-index rebuild. Reads the operation's
     /// in-memory job registry, never storage, so a page load stays
     /// constant-time (#1078).
     fn reindex_activity(&self, tenant: &str) -> Option<ReindexActivity> {
@@ -2259,27 +2309,54 @@ mod tests {
     use serde_json::Value;
     use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
+    fn reindex_job(
+        tenant: &str,
+        status: helios_persistence::search::ReindexStatus,
+        processed: u64,
+        total: u64,
+    ) -> helios_persistence::search::ReindexProgress {
+        let mut job = helios_persistence::search::ReindexProgress::new(format!(
+            "{tenant}-{status:?}-{processed}-{total}"
+        ));
+        job.tenant_id = Some(tenant.to_string());
+        job.status = status;
+        job.processed_resources = processed;
+        job.total_resources = total;
+        job
+    }
+
+    /// `job`, finished `minutes_ago`.
+    fn finished(
+        mut job: helios_persistence::search::ReindexProgress,
+        minutes_ago: i64,
+    ) -> helios_persistence::search::ReindexProgress {
+        job.completed_at =
+            Some((chrono::Utc::now() - chrono::Duration::minutes(minutes_ago)).to_rfc3339());
+        job
+    }
+
+    fn resource_error(id: &str) -> helios_persistence::search::reindex::ReindexProgressError {
+        helios_persistence::search::reindex::ReindexProgressError {
+            resource_type: "Provenance".to_string(),
+            resource_id: id.to_string(),
+            error: "backend unavailable: elasticsearch".to_string(),
+            retryable: true,
+        }
+    }
+
     #[test]
     fn reindex_activity_sums_only_the_tenants_running_jobs() {
-        use helios_persistence::search::{ReindexProgress, ReindexStatus};
+        use helios_persistence::search::ReindexStatus;
 
-        let job = |tenant: &str, status, processed, total| {
-            let mut job = ReindexProgress::new(format!("{tenant}-{processed}-{total}"));
-            job.tenant_id = Some(tenant.to_string());
-            job.status = status;
-            job.processed_resources = processed;
-            job.total_resources = total;
-            job
-        };
         let jobs = [
-            job("acme", ReindexStatus::InProgress, 250, 1_000),
-            job("acme", ReindexStatus::Queued, 0, 0),
-            job("acme", ReindexStatus::Completed, 500, 500),
-            job("other", ReindexStatus::InProgress, 9, 10),
+            reindex_job("acme", ReindexStatus::InProgress, 250, 1_000),
+            reindex_job("acme", ReindexStatus::Queued, 0, 0),
+            finished(reindex_job("acme", ReindexStatus::Completed, 500, 500), 1),
+            reindex_job("other", ReindexStatus::InProgress, 9, 10),
         ];
         assert_eq!(
             reindex_activity_of(&jobs, "acme"),
-            Some(ReindexActivity {
+            Some(ReindexActivity::Running {
                 jobs: 2,
                 processed: 250,
                 total: 1_000,
@@ -2289,7 +2366,83 @@ mod tests {
         assert_eq!(
             reindex_activity_of(&jobs[2..3], "acme"),
             None,
-            "a finished rebuild is not running"
+            "a rebuild that finished cleanly shows nothing"
+        );
+    }
+
+    #[test]
+    fn reindex_activity_keeps_showing_the_tenants_last_rebuild_when_it_left_resources_unindexed() {
+        use helios_persistence::search::ReindexStatus;
+
+        // #1125: generation 0 ends `Completed` with 11,704 resource errors.
+        let mut with_errors = finished(reindex_job("acme", ReindexStatus::Completed, 9, 9), 5);
+        with_errors.errors = vec![resource_error("p1"), resource_error("p2")];
+        assert_eq!(
+            reindex_activity_of(std::slice::from_ref(&with_errors), "acme"),
+            Some(ReindexActivity::Failed {
+                job_id: with_errors.job_id.clone(),
+                errors: 2,
+            }),
+            "a completion with resource errors stays visible after the job stops"
+        );
+        assert_eq!(
+            reindex_activity_of(std::slice::from_ref(&with_errors), "other"),
+            None,
+            "only for its own tenant"
+        );
+
+        let failed = finished(reindex_job("acme", ReindexStatus::Failed, 0, 9), 3);
+        assert_eq!(
+            reindex_activity_of(&[with_errors.clone(), failed.clone()], "acme"),
+            Some(ReindexActivity::Failed {
+                job_id: failed.job_id.clone(),
+                errors: 0,
+            }),
+            "a job that failed as a whole counts, and the most recent one wins"
+        );
+
+        // A retry running hides the old failure behind its progress…
+        let retry = reindex_job("acme", ReindexStatus::InProgress, 3, 9);
+        assert!(
+            reindex_activity_of(&[failed.clone(), retry], "acme")
+                .is_some_and(|activity| activity.is_running())
+        );
+        // …and a later clean rebuild clears it.
+        let clean = finished(reindex_job("acme", ReindexStatus::Completed, 9, 9), 1);
+        assert_eq!(
+            reindex_activity_of(&[with_errors.clone(), failed.clone(), clean], "acme"),
+            None
+        );
+        // So does a later cancellation: stopping a rebuild is the operator's call.
+        let cancelled = finished(reindex_job("acme", ReindexStatus::Cancelled, 1, 9), 1);
+        assert_eq!(reindex_activity_of(&[failed, cancelled], "acme"), None);
+    }
+
+    #[test]
+    fn a_clean_retry_of_failed_resources_keeps_the_permanent_failures_visible() {
+        use helios_persistence::search::ReindexStatus;
+
+        let mut rejected = resource_error("p2");
+        rejected.retryable = false;
+        let mut generation = finished(reindex_job("acme", ReindexStatus::Completed, 9, 9), 5);
+        generation.errors = vec![resource_error("p1"), rejected];
+        let mut retry = finished(reindex_job("acme", ReindexStatus::Completed, 1, 1), 1);
+        retry.resource_scoped = true;
+
+        assert_eq!(
+            reindex_activity_of(&[generation.clone(), retry.clone()], "acme"),
+            Some(ReindexActivity::Failed {
+                job_id: generation.job_id.clone(),
+                errors: 1,
+            }),
+            "the retry fixed p1; p2 was rejected permanently and is still unindexed"
+        );
+
+        generation.errors.truncate(1);
+        assert_eq!(
+            reindex_activity_of(&[generation, retry], "acme"),
+            None,
+            "a retry that fixed every failure clears the banner"
         );
     }
 

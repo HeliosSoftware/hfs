@@ -2386,6 +2386,94 @@
     return json.length > 60 ? json.slice(0, 60) + "…" : json;
   }
 
+  /* Keep long ids on one line as an 8-character chip; short ids stay whole
+   * (#1106). The full id is always the link's accessible name. */
+  function abbreviateId(id) {
+    return id.length <= 12 ? id : id.slice(0, 8);
+  }
+
+  /* Copy-id button beside the id chip (#1106); gated on the Clipboard API so
+   * a browser without it never renders a control that cannot work. */
+  function supportsClipboard() {
+    return Boolean(
+      window.navigator && navigator.clipboard && navigator.clipboard.writeText,
+    );
+  }
+
+  var SVG_NS = "http://www.w3.org/2000/svg";
+
+  function svgIcon(attrs, pathD) {
+    var svg = document.createElementNS(SVG_NS, "svg");
+    svg.setAttribute("viewBox", "0 0 16 16");
+    svg.setAttribute("width", attrs.size);
+    svg.setAttribute("height", attrs.size);
+    svg.setAttribute("fill", "none");
+    svg.setAttribute("stroke", "currentColor");
+    svg.setAttribute("stroke-width", "1.5");
+    svg.setAttribute("aria-hidden", "true");
+    if (attrs.rect) {
+      var rect = document.createElementNS(SVG_NS, "rect");
+      rect.setAttribute("width", "8");
+      rect.setAttribute("height", "8");
+      rect.setAttribute("x", "5.5");
+      rect.setAttribute("y", "5.5");
+      rect.setAttribute("rx", "1.5");
+      svg.appendChild(rect);
+    }
+    var path = document.createElementNS(SVG_NS, "path");
+    path.setAttribute("d", pathD);
+    svg.appendChild(path);
+    return svg;
+  }
+
+  function copyIcon() {
+    return svgIcon(
+      { size: "16", rect: true },
+      "M10.5 3.5v-.5a1.5 1.5 0 0 0-1.5-1.5H4A1.5 1.5 0 0 0 2.5 3v5A1.5 1.5 0 0 0 4 9.5h.5",
+    );
+  }
+
+  function checkIcon() {
+    return svgIcon({ size: "12", rect: false }, "M3 8.5l3.2 3L13 4.5");
+  }
+
+  function copyIdButton(id) {
+    var button = document.createElement("button");
+    button.type = "button";
+    button.className = "result-id__copy";
+    button.dataset.copyId = id;
+    button.setAttribute("aria-label", results.card.dataset.msgCopyId);
+    button.appendChild(copyIcon());
+    return button;
+  }
+
+  /* Swaps the copy button for a "Copied" pill for 2s, then restores it,
+   * returning focus only if it was on the pill or (the realistic case, since
+   * a focused element that becomes hidden loses focus to the document) on
+   * the body. Re-clicking within the window resets the timer (sql-export.js
+   * pattern). */
+  function showCopiedPill(button) {
+    if (button.copyResetTimer) window.clearTimeout(button.copyResetTimer);
+    var stalePill = button.nextElementSibling;
+    if (stalePill && stalePill.classList.contains("result-id__copied"))
+      stalePill.remove();
+    button.hidden = true;
+    var pill = document.createElement("span");
+    pill.className = "result-id__copied";
+    pill.setAttribute("role", "status");
+    pill.appendChild(checkIcon());
+    pill.appendChild(document.createTextNode(results.card.dataset.msgCopied));
+    button.insertAdjacentElement("afterend", pill);
+    button.copyResetTimer = window.setTimeout(function () {
+      var active = document.activeElement;
+      var refocus = active === pill || active === document.body;
+      pill.remove();
+      button.hidden = false;
+      button.copyResetTimer = null;
+      if (refocus) button.focus();
+    }, 2000);
+  }
+
   /* Typed default columns (#416): common fields per resource type when the
    * query names no _elements; unknown types keep the compact id/updated view. */
   var DEFAULT_COLUMNS = {
@@ -2409,17 +2497,17 @@
     return columns;
   }
 
+  /* Every result cell stays on one line, clipped with an ellipsis, and the
+   * clipped-or-not full value lives on the `td` for the shared tooltip
+   * (resource-filter.js) to read (#1106). */
   function cell(row, text, mono) {
     var td = document.createElement("td");
-    if (mono) {
-      var span = document.createElement("span");
-      span.className = "url";
-      span.textContent = text;
-      td.appendChild(span);
-    } else {
-      td.textContent = text;
-    }
+    var span = document.createElement("span");
+    span.className = mono ? "result-cell url" : "result-cell";
+    span.textContent = text;
+    td.appendChild(span);
     row.appendChild(td);
+    if (text) td.dataset.fullName = text;
     return td;
   }
 
@@ -2486,6 +2574,7 @@
     var head = document.createDocumentFragment();
     var headRow = document.createElement("tr");
     var th = document.createElement("th");
+    th.className = "col-id";
     th.textContent = "id";
     headRow.appendChild(th);
     columns.forEach(function (col) {
@@ -2503,15 +2592,41 @@
       var resource = entry.resource;
       var row = document.createElement("tr");
       var idCell = document.createElement("td");
+      idCell.className = "col-id";
       var link = document.createElement("a");
-      link.className = "url";
+      link.className = "result-id row-link";
       link.href = safeResourceHref(entry, context, resource);
       link.dataset.resourceType = context.type;
       link.dataset.resourceId = resource.id || "";
       link.target = "_blank";
       link.rel = "noopener";
-      link.textContent = resource.id || "";
-      idCell.appendChild(link);
+      var id = resource.id || "";
+      /* `.result-id` is `display: inline-flex` (#1106): Chromium's accessible
+       * name computation inserts a space between the text of two flex-item
+       * children, splitting "98f3fa36" and "-95ec-…" apart even though they
+       * are adjacent in the DOM with no whitespace between them. `aria-label`
+       * bypasses that name-from-content join and pins the accessible name to
+       * the exact full id; the hidden span stays for in-page find (Ctrl+F). */
+      link.setAttribute("aria-label", id);
+      var idText = document.createElement("span");
+      idText.className = "result-id__text";
+      idText.textContent = abbreviateId(id);
+      link.appendChild(idText);
+      if (id.length > 12) {
+        var idRest = document.createElement("span");
+        idRest.className = "visually-hidden";
+        idRest.textContent = id.slice(8);
+        link.appendChild(idRest);
+      }
+      var idGroup = document.createElement("span");
+      idGroup.className = "result-id-group";
+      idGroup.appendChild(link);
+      if (id && supportsClipboard()) idGroup.appendChild(copyIdButton(id));
+      idCell.appendChild(idGroup);
+      /* The shared tooltip (resource-filter.js) reads these from the `td`,
+       * not the link, so the copy button never interferes with it (#1106). */
+      idCell.dataset.fullName = id;
+      if (abbreviateId(id) !== id) idCell.dataset.tooltipAbbreviated = "";
       row.appendChild(idCell);
       columns.forEach(function (col) {
         cell(row, fmt(resource[col]));
@@ -2689,6 +2804,38 @@
         urlInput.dispatchEvent(new Event("input", { bubbles: true }));
       }
       runSearch(path, false);
+    });
+
+  /* Delegated on `results.body` (not replaced between renders, unlike the
+   * rows it holds) so every re-rendered page's copy buttons work without
+   * re-attaching a listener per row (#1106). */
+  results.body &&
+    results.body.addEventListener("click", function (event) {
+      /* The "Copied" pill sits exactly where the button just was, so a
+       * second, fast click in that spot lands on the pill rather than a
+       * (hidden) button. Left unhandled, that click would fall through to
+       * row-navigation.js's document-level listener and open the modal
+       * (#1106). `results.body` (the `tbody`) sits between the click target
+       * and `document` in the bubble path, so this listener always runs
+       * first; row-navigation.js already backs off once `defaultPrevented`
+       * is set. */
+      if (event.target.closest(".result-id__copied")) {
+        event.preventDefault();
+        return;
+      }
+      var button = event.target.closest(".result-id__copy");
+      if (!button) return;
+      event.preventDefault();
+      if (!supportsClipboard()) return;
+      navigator.clipboard
+        .writeText(button.dataset.copyId || "")
+        .then(function () {
+          showCopiedPill(button);
+        })
+        .catch(function () {
+          // Clipboard permission denied or unavailable: stay silent, as
+          // sql-export.js's Copy job id button does.
+        });
     });
 
   /* ---- Recent searches & the saved list -------------------------------- */

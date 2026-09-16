@@ -53,6 +53,7 @@ a startup warning.
 | `HFS_REQUEST_TIMEOUT` | `30` | Request timeout in seconds |
 | `HFS_DEFAULT_PAGE_SIZE` | `20` | Default search result page size |
 | `HFS_MAX_PAGE_SIZE` | `1000` | Maximum search result page size |
+| `HFS_EVERYTHING_MAX_UNPAGED` | `10000` | Ceiling on `match` entries for an unpaged `Patient/$everything`; when reached the response is paged and carries a `next` link. |
 
 ## Compression
 
@@ -154,3 +155,5 @@ curl http://localhost:8080/clinic-a/Patient
 | history, system | GET | `/_history` |
 | batch/transaction | POST | `/` |
 | health | GET | `/health` |
+| everything, instance | GET/POST | `/Patient/[id]/$everything` |
+| everything, type | GET/POST | `/Patient/$everything` |

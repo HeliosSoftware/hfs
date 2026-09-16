@@ -269,6 +269,60 @@ fn page_cursor_for(
 
 #[async_trait]
 impl SearchProvider for ElasticsearchBackend {
+    /// Refreshes the tenant's index for each named type, so every document
+    /// Elasticsearch has acknowledged is searchable now rather than after
+    /// the next `refresh_interval` tick (#1047).
+    ///
+    /// Under `write_refresh` `wait_for` or `true` an acknowledged write is
+    /// searchable by the time the write returned, so there is nothing to do.
+    /// A type whose index does not exist yet has had no writes to reveal.
+    async fn ensure_writes_visible(
+        &self,
+        tenant: &TenantContext,
+        resource_types: &[&str],
+    ) -> StorageResult<()> {
+        if self.write_refresh_param().is_some() || resource_types.is_empty() {
+            return Ok(());
+        }
+        let tenant_id = tenant.tenant_id().as_str();
+        let mut indices: Vec<String> = resource_types
+            .iter()
+            .map(|resource_type| self.index_name(tenant_id, resource_type))
+            .collect();
+        indices.sort_unstable();
+        indices.dedup();
+        let index_refs: Vec<&str> = indices.iter().map(String::as_str).collect();
+
+        let response = self
+            .client()
+            .indices()
+            .refresh(elasticsearch::indices::IndicesRefreshParts::Index(
+                &index_refs,
+            ))
+            .ignore_unavailable(true)
+            .allow_no_indices(true)
+            .send()
+            .await
+            .map_err(|e| {
+                internal_error(format!(
+                    "Failed to refresh indices [{}]: {}",
+                    indices.join(", "),
+                    e
+                ))
+            })?;
+        if !response.status_code().is_success() {
+            let status = response.status_code();
+            let body = response.text().await.unwrap_or_default();
+            return Err(internal_error(format!(
+                "Refresh of indices [{}] failed with status {}: {}",
+                indices.join(", "),
+                status,
+                body
+            )));
+        }
+        Ok(())
+    }
+
     async fn search(
         &self,
         tenant: &TenantContext,

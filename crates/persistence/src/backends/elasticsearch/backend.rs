@@ -136,6 +136,35 @@ pub struct ElasticsearchConfig {
     #[serde(default = "default_request_timeout_ms")]
     pub request_timeout_ms: u64,
 
+    /// Upper bound, in bytes, on the documents one `_bulk` request carries
+    /// (default: 10 MiB), on top of the fixed per-request operation count.
+    ///
+    /// Without it a page of large resources becomes one oversized request: 500
+    /// Synthea `Provenance` documents of ~108 KB each is a ~54 MB body, which
+    /// outlives the client's request timeout and fails every resource in it
+    /// (#1125). A single document larger than the cap is still sent, alone.
+    /// `0` disables the byte cap, leaving only the operation count.
+    #[serde(default = "default_bulk_max_bytes")]
+    pub bulk_max_bytes: usize,
+
+    /// How many `_bulk` requests of one page may be in flight at once
+    /// (default: 1, one request at a time).
+    ///
+    /// Requests of a page never touch the same document, so they can be sent
+    /// together; what stays sequential is the chain a request produces — its
+    /// halves after a `413` or a timeout, and its `429` resends. Raising this
+    /// shortens a rebuild on a cluster that is not the bottleneck (#1125).
+    #[serde(default = "default_bulk_concurrency")]
+    pub bulk_concurrency: usize,
+
+    /// Refresh behavior for `$reindex` and the deferred rebuild's `_bulk`
+    /// writes (default: `None`, which follows [`Self::write_refresh`]).
+    ///
+    /// Lets a rebuild skip the per-request refresh wait (`False`) while
+    /// ordinary writes keep read-after-write visibility (`WaitFor`).
+    #[serde(default)]
+    pub reindex_refresh: Option<WriteRefreshPolicy>,
+
     /// Optional authentication.
     #[serde(default)]
     pub auth: Option<ElasticsearchAuth>,
@@ -178,6 +207,21 @@ fn default_request_timeout_ms() -> u64 {
     30000
 }
 
+/// Default for [`ElasticsearchConfig::bulk_max_bytes`]: 10 MiB.
+pub const DEFAULT_BULK_MAX_BYTES: usize = 10 * 1024 * 1024;
+
+fn default_bulk_max_bytes() -> usize {
+    DEFAULT_BULK_MAX_BYTES
+}
+
+/// Default for [`ElasticsearchConfig::bulk_concurrency`]: one request at a
+/// time, which is what every release before #1125 did.
+pub const DEFAULT_BULK_CONCURRENCY: usize = 1;
+
+fn default_bulk_concurrency() -> usize {
+    DEFAULT_BULK_CONCURRENCY
+}
+
 impl Default for ElasticsearchConfig {
     fn default() -> Self {
         Self {
@@ -190,6 +234,9 @@ impl Default for ElasticsearchConfig {
             max_result_window: default_max_result_window(),
             nested_objects_limit: default_nested_objects_limit(),
             request_timeout_ms: default_request_timeout_ms(),
+            bulk_max_bytes: default_bulk_max_bytes(),
+            bulk_concurrency: default_bulk_concurrency(),
+            reindex_refresh: None,
             auth: None,
             disable_certificate_validation: false,
             fhir_version: FhirVersion::default_enabled(),
@@ -379,6 +426,35 @@ impl ElasticsearchBackend {
 
     pub(crate) fn write_refresh_param(&self) -> Option<elasticsearch::params::Refresh> {
         self.config.write_refresh.as_refresh_param()
+    }
+
+    /// The refresh policy a rebuild's `_bulk` writes use: the configured
+    /// [`ElasticsearchConfig::reindex_refresh`], or the ordinary write policy
+    /// when none is set.
+    pub(crate) fn reindex_refresh_param(&self) -> Option<elasticsearch::params::Refresh> {
+        self.config
+            .reindex_refresh
+            .unwrap_or(self.config.write_refresh)
+            .as_refresh_param()
+    }
+
+    /// The byte budget of one `_bulk` request, or `usize::MAX` when the cap
+    /// is disabled (`0`).
+    pub(crate) fn bulk_max_bytes(&self) -> usize {
+        match self.config.bulk_max_bytes {
+            0 => usize::MAX,
+            bytes => bytes,
+        }
+    }
+
+    /// The client's per-request timeout, as configured.
+    pub(crate) fn request_timeout_ms(&self) -> u64 {
+        self.config.request_timeout_ms
+    }
+
+    /// How many `_bulk` requests of one page may be in flight, never below 1.
+    pub(crate) fn bulk_concurrency(&self) -> usize {
+        self.config.bulk_concurrency.max(1)
     }
 
     /// Returns the per-tenant search parameter registries (shared base + tenant
@@ -760,6 +836,46 @@ mod tests {
         assert_eq!(config.number_of_shards, 1);
         assert_eq!(config.number_of_replicas, 1);
         assert_eq!(config.nodes, vec!["http://localhost:9200"]);
+        assert_eq!(config.request_timeout_ms, 30_000);
+        assert_eq!(config.bulk_max_bytes, DEFAULT_BULK_MAX_BYTES);
+        assert_eq!(config.reindex_refresh, None);
+    }
+
+    /// A rebuild follows the ordinary write policy unless it is given its
+    /// own, and a byte cap of `0` means "no cap", not "nothing fits" (#1125).
+    #[test]
+    fn reindex_refresh_falls_back_to_write_refresh_and_zero_bytes_is_uncapped() {
+        let backend = |write_refresh, reindex_refresh, bulk_max_bytes| {
+            ElasticsearchBackend::new(ElasticsearchConfig {
+                write_refresh,
+                reindex_refresh,
+                bulk_max_bytes,
+                ..Default::default()
+            })
+            .expect("client construction is lazy")
+        };
+        let follows = backend(WriteRefreshPolicy::WaitFor, None, 0);
+        assert!(matches!(
+            follows.reindex_refresh_param(),
+            Some(elasticsearch::params::Refresh::WaitFor)
+        ));
+        assert!(matches!(
+            follows.write_refresh_param(),
+            Some(elasticsearch::params::Refresh::WaitFor)
+        ));
+        assert_eq!(follows.bulk_max_bytes(), usize::MAX);
+
+        let own = backend(
+            WriteRefreshPolicy::WaitFor,
+            Some(WriteRefreshPolicy::False),
+            4096,
+        );
+        assert!(own.reindex_refresh_param().is_none());
+        assert!(matches!(
+            own.write_refresh_param(),
+            Some(elasticsearch::params::Refresh::WaitFor)
+        ));
+        assert_eq!(own.bulk_max_bytes(), 4096);
     }
 
     /// The method-level view of the injective derivation. The exhaustive

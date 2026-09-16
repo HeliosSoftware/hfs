@@ -235,6 +235,11 @@ impl CompositeStorage {
             });
         }
 
+        // The criteria resolve against the search index, which on a
+        // composite is the secondary: without this, an `If-None-Exist`
+        // create issued right after the matching resource was created finds
+        // nothing and writes the duplicate it exists to prevent (#1047).
+        self.ensure_writes_visible(tenant, &[resource_type]).await?;
         let result = self.search(tenant, &query).await?;
         Ok(result.resources.items)
     }
@@ -1342,6 +1347,46 @@ impl SearchProvider for CompositeStorage {
             .get(self.config.primary_id().unwrap_or("primary"))
             .map(|p| p.modifiers_for_param_type(param_type))
             .unwrap_or_default()
+    }
+
+    /// A composite's search lags its primary on two axes, and this closes
+    /// both: writes still sitting in the asynchronous sync queue, and writes
+    /// the search backend has accepted but not yet made searchable (#1047).
+    ///
+    /// The queue is drained up to this point first — the write has to reach
+    /// the search backend before a refresh there can reveal it. Under
+    /// synchronous sync every write already reached it before its own call
+    /// returned, so only the second step runs. The refresh is then delegated
+    /// along the same route `search` takes, so whichever backend answers the
+    /// search is the one made current. This is what makes the four `*-es`
+    /// composites behave alike: the primary's own index is offloaded and
+    /// empty (or, for S3, nonexistent), so the answer never comes from it.
+    async fn ensure_writes_visible(
+        &self,
+        tenant: &TenantContext,
+        resource_types: &[&str],
+    ) -> StorageResult<()> {
+        if let Some(manager) = self.sync_manager.as_ref()
+            && !self.syncs_search_synchronously()
+        {
+            manager.barrier().await?;
+        }
+
+        if let Some(search_backend) = self
+            .config
+            .backends_with_role(super::config::BackendRole::Search)
+            .next()
+            && let Some(provider) = self.search_providers.get(&search_backend.id)
+        {
+            return provider.ensure_writes_visible(tenant, resource_types).await;
+        }
+        if let Some(provider) = self
+            .search_providers
+            .get(self.config.primary_id().unwrap_or("primary"))
+        {
+            return provider.ensure_writes_visible(tenant, resource_types).await;
+        }
+        Ok(())
     }
 }
 

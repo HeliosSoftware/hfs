@@ -91,13 +91,55 @@ pub mod audit {
 }
 
 /// A page of resources for reindexing.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct ResourcePage {
     /// The resources in this page.
     pub resources: Vec<StoredResource>,
     /// Cursor for the next page (None if this is the last page).
+    ///
+    /// A source must derive it from the rows it *scanned*, not from the
+    /// resources it managed to decode: a row reported in [`Self::skipped`]
+    /// still advances the cursor, so one unreadable row never ends the
+    /// pagination of its type.
     pub next_cursor: Option<String>,
+    /// Rows the source read but could not turn into a [`StoredResource`]
+    /// (unparseable content or timestamp). The reindex records each one as a
+    /// permanent per-resource error instead of dropping it silently (#1125).
+    pub skipped: Vec<SkippedResource>,
 }
+
+/// A stored row a [`ReindexSource`] read but could not decode.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkippedResource {
+    /// The logical id of the row that could not be decoded.
+    pub resource_id: String,
+    /// Why it could not be decoded.
+    pub reason: String,
+}
+
+/// Identifies one resource of one type, for a reindex scoped to specific
+/// resources rather than whole types (see [`ReindexRequest::resource_ids`]).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct ResourceRef {
+    /// Resource type, e.g. `Provenance`.
+    pub resource_type: String,
+    /// Logical id.
+    pub resource_id: String,
+}
+
+impl ResourceRef {
+    /// Creates a reference to `resource_type/resource_id`.
+    pub fn new(resource_type: impl Into<String>, resource_id: impl Into<String>) -> Self {
+        Self {
+            resource_type: resource_type.into(),
+            resource_id: resource_id.into(),
+        }
+    }
+}
+
+/// Page size [`ReindexSource::fetch_resources_by_ids`]'s default
+/// implementation scans with.
+const FETCH_BY_IDS_SCAN_PAGE: u32 = 1000;
 
 /// A backend that can enumerate stored resources so they can be reindexed.
 ///
@@ -131,6 +173,66 @@ pub trait ReindexSource: Send + Sync {
         cursor: Option<&str>,
         limit: u32,
     ) -> StorageResult<ResourcePage>;
+
+    /// Fetches a page bounded by resource count **and** by bytes of stored
+    /// content, so a page of large resources is not one oversized read
+    /// (`max_bytes` of `0` means no byte cap, #1125).
+    ///
+    /// The default ignores the cap, which is what every source did before it
+    /// existed; a source that honours it must still return at least one
+    /// resource, or the page loop cannot advance.
+    async fn fetch_resources_page_capped(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        cursor: Option<&str>,
+        limit: u32,
+        max_bytes: u64,
+    ) -> StorageResult<ResourcePage> {
+        let _ = max_bytes;
+        self.fetch_resources_page(tenant, resource_type, cursor, limit)
+            .await
+    }
+
+    /// Fetches the current, non-deleted resources of `resource_type` whose
+    /// ids are in `ids`.
+    ///
+    /// Ids that no longer exist (deleted since they were recorded) are simply
+    /// absent from the result; order is unspecified. The default scans the
+    /// type with [`Self::fetch_resources_page`] and filters, stopping once
+    /// every id has been found — correct for every source, but linear in the
+    /// size of the type. Sources that can look resources up by id should
+    /// override it.
+    async fn fetch_resources_by_ids(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        ids: &[String],
+    ) -> StorageResult<Vec<StoredResource>> {
+        let mut wanted: std::collections::HashSet<&str> = ids.iter().map(String::as_str).collect();
+        let mut found = Vec::with_capacity(wanted.len());
+        let mut cursor: Option<String> = None;
+        while !wanted.is_empty() {
+            let page = self
+                .fetch_resources_page(
+                    tenant,
+                    resource_type,
+                    cursor.as_deref(),
+                    FETCH_BY_IDS_SCAN_PAGE,
+                )
+                .await?;
+            for resource in page.resources {
+                if wanted.remove(resource.id()) {
+                    found.push(resource);
+                }
+            }
+            match page.next_cursor {
+                Some(next) => cursor = Some(next),
+                None => break,
+            }
+        }
+        Ok(found)
+    }
 }
 
 /// A backend that maintains a search index which can be rebuilt.
@@ -254,6 +356,22 @@ pub struct ReindexRequest {
     /// large load; search on the affected store is unindexed meanwhile.
     #[serde(default)]
     pub bulk_index_rebuild: bool,
+
+    /// Specific resources to reindex (None = every resource of the selected
+    /// types). When set, the run fetches exactly these resources instead of
+    /// paging whole types, so a retry covers only what failed (#1125).
+    #[serde(default)]
+    pub resource_ids: Option<Vec<ResourceRef>>,
+
+    /// Upper bound, in bytes of stored content, on one page of resources
+    /// (`0` = no cap, only [`Self::batch_size`]).
+    ///
+    /// A page of 1,000 Synthea `Provenance` resources of ~108 KB each is
+    /// ~108 MB held in memory before a single document goes on the wire.
+    /// A source that honours the cap ends the page at the first resource
+    /// that crosses it, and always returns at least one (#1125).
+    #[serde(default)]
+    pub batch_bytes: u64,
 }
 
 fn default_batch_size() -> u32 {
@@ -268,6 +386,8 @@ impl Default for ReindexRequest {
             batch_size: default_batch_size(),
             clear_existing: false,
             bulk_index_rebuild: false,
+            resource_ids: None,
+            batch_bytes: 0,
         }
     }
 }
@@ -286,6 +406,22 @@ impl ReindexRequest {
     {
         Self {
             resource_types: Some(types.into_iter().map(Into::into).collect()),
+            ..Self::default()
+        }
+    }
+
+    /// Creates a reindex request for specific resources (see
+    /// [`ReindexRequest::resource_ids`]). `resource_types` is set to the
+    /// distinct types of `resources`, sorted.
+    pub fn for_resources<I>(resources: I) -> Self
+    where
+        I: IntoIterator<Item = ResourceRef>,
+    {
+        let resources: Vec<ResourceRef> = resources.into_iter().collect();
+        let types: BTreeSet<String> = resources.iter().map(|r| r.resource_type.clone()).collect();
+        Self {
+            resource_types: Some(types.into_iter().collect()),
+            resource_ids: Some(resources),
             ..Self::default()
         }
     }
@@ -317,6 +453,12 @@ impl ReindexRequest {
     /// Sets the bulk index rebuild mode (see the field).
     pub fn with_bulk_index_rebuild(mut self, on: bool) -> Self {
         self.bulk_index_rebuild = on;
+        self
+    }
+
+    /// Sets the byte cap of one page (see [`Self::batch_bytes`]).
+    pub fn with_batch_bytes(mut self, bytes: u64) -> Self {
+        self.batch_bytes = bytes;
         self
     }
 }
@@ -391,6 +533,14 @@ pub struct ReindexProgress {
 
     /// Current resource type being processed.
     pub current_resource_type: Option<String>,
+
+    /// Whether the job rebuilt named resources
+    /// ([`ReindexRequest::resource_ids`]) rather than whole types — the retry of
+    /// an earlier job's transient failures. A clean resource-scoped job says
+    /// nothing about the earlier job's permanent failures, so a per-tenant view
+    /// must not let it clear them (#1125).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub resource_scoped: bool,
 }
 
 /// An error encountered during reindexing.
@@ -401,6 +551,12 @@ pub struct ReindexProgressError {
     /// Resource ID.
     pub resource_id: String,
     /// Error message.
+    ///
+    /// Empty past the first [`MAX_REPORTED_RESOURCE_ERRORS`] errors of a job:
+    /// the type, id and classification of every failure are kept, because a
+    /// retry needs them, but a job that fails on millions of resources must not
+    /// hold millions of messages. `$reindex-status` lists only the first ones,
+    /// and the log carries a rate-limited sample per type.
     pub error: String,
     /// Whether the failure was transient — the writer was unavailable, timed
     /// out, or asked to back off — so running the same work again may succeed.
@@ -421,9 +577,81 @@ fn retryable_by_default() -> bool {
 /// is always the full total.
 const MAX_REPORTED_RESOURCE_ERRORS: usize = 100;
 
-/// Failing `Type/id`s named in the log line of an automatic generation that
-/// ended with permanent errors.
+/// Failing `Type/id`s named in the closing log line of an automatic generation
+/// that ended with resource errors, permanent or transient.
 const MAX_LOGGED_RESOURCE_ERRORS: usize = 5;
+
+/// Per-resource failures logged at `warn` for one resource type of one run;
+/// the rest are only counted, and summarized when the type ends.
+const MAX_WARNED_RESOURCE_FAILURES_PER_TYPE: u64 = 20;
+
+/// Logs a run's per-resource failures: each one by `Type/id` up to
+/// [`MAX_WARNED_RESOURCE_FAILURES_PER_TYPE`] per type, then one summary per
+/// type. Transient failures are named exactly like permanent ones, so a
+/// transport outage is as diagnosable from the log as a rejected document.
+struct ResourceFailureLog {
+    job_id: String,
+    tenant_id: String,
+    resource_type: Option<String>,
+    failed: u64,
+    transient: u64,
+}
+
+impl ResourceFailureLog {
+    fn new(job_id: &str, tenant: &TenantContext) -> Self {
+        Self {
+            job_id: job_id.to_string(),
+            tenant_id: tenant.tenant_id().to_string(),
+            resource_type: None,
+            failed: 0,
+            transient: 0,
+        }
+    }
+
+    /// Closes the previous type's summary and starts counting `resource_type`.
+    fn start_type(&mut self, resource_type: &str) {
+        self.finish_type();
+        self.resource_type = Some(resource_type.to_string());
+    }
+
+    fn record(&mut self, resource_type: &str, resource_id: &str, error: &str, retryable: bool) {
+        self.failed += 1;
+        if retryable {
+            self.transient += 1;
+        }
+        if self.failed <= MAX_WARNED_RESOURCE_FAILURES_PER_TYPE {
+            tracing::warn!(
+                tenant = %self.tenant_id,
+                job_id = %self.job_id,
+                resource_type,
+                resource_id,
+                retryable,
+                error,
+                "reindex could not index a resource"
+            );
+        }
+    }
+
+    /// Emits the summary of the type being counted, if it had failures.
+    fn finish_type(&mut self) {
+        if let Some(resource_type) = self.resource_type.take()
+            && self.failed > 0
+        {
+            tracing::warn!(
+                tenant = %self.tenant_id,
+                job_id = %self.job_id,
+                resource_type = %resource_type,
+                failed = self.failed,
+                transient = self.transient,
+                permanent = self.failed - self.transient,
+                not_logged = self.failed.saturating_sub(MAX_WARNED_RESOURCE_FAILURES_PER_TYPE),
+                "reindex left resources of this type unindexed (every failure is listed by $reindex-status for this job)"
+            );
+        }
+        self.failed = 0;
+        self.transient = 0;
+    }
+}
 
 /// Whether a writer's error is transient: the conditions the REST layer answers
 /// with `503` or `504`, where the backend never judged the resource itself.
@@ -455,6 +683,7 @@ impl ReindexProgress {
             completed_at: None,
             error_message: None,
             current_resource_type: None,
+            resource_scoped: false,
         }
     }
 
@@ -557,6 +786,29 @@ impl AutomaticReindexLimits {
     }
 }
 
+/// Where the record of an outstanding deferred rebuild lives, so a restart
+/// mid-rebuild can find it instead of losing it with the in-process job map
+/// (#1125). Implemented by the bulk-submit storage; a backend that does not
+/// record it simply never resumes, as before.
+#[async_trait]
+pub trait DeferredReindexLedger: Send + Sync {
+    /// The rebuild this manifest owed has run: drop the marker.
+    async fn rebuild_finished(&self, tenant: &TenantContext, manifest_id: &str);
+}
+
+/// What [`AutomaticReindexCoordinator::enqueue`] needs to start, or merge
+/// into, a tenant's pending generation.
+struct EnqueueGeneration {
+    op: Arc<ReindexOperation>,
+    tenant: TenantContext,
+    resource_types: Vec<String>,
+    context: DeferredReindexContext,
+    options: AutomaticRunOptions,
+    max_concurrency: usize,
+    /// Where the "still owes a rebuild" marker is cleared (#1125).
+    ledger: Option<Arc<dyn DeferredReindexLedger>>,
+}
+
 /// Shape of the `ReindexRequest` an automatic generation starts with.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct AutomaticRunOptions {
@@ -564,6 +816,8 @@ pub(crate) struct AutomaticRunOptions {
     pub(crate) batch_size: u32,
     /// `ReindexRequest::bulk_index_rebuild` for the runs the hook starts.
     pub(crate) bulk_index_rebuild: bool,
+    /// `ReindexRequest::batch_bytes` for the runs the hook starts.
+    pub(crate) batch_bytes: u64,
 }
 
 impl Default for AutomaticRunOptions {
@@ -571,6 +825,7 @@ impl Default for AutomaticRunOptions {
         Self {
             batch_size: DEFERRED_REINDEX_BATCH_SIZE,
             bulk_index_rebuild: false,
+            batch_bytes: 0,
         }
     }
 }
@@ -578,11 +833,18 @@ impl Default for AutomaticRunOptions {
 #[derive(Default)]
 struct AutomaticTenantState {
     pending_types: BTreeSet<String>,
+    /// Resources a finished generation failed on transiently, queued for a
+    /// retry that covers only them (#1125). Always a retry: a resource
+    /// generation that fails is not retried again.
+    pending_resources: BTreeSet<ResourceRef>,
     next_generation: u64,
     consecutive_failures: u8,
     context: DeferredReindexContext,
     options: AutomaticRunOptions,
     waiting_for_generation: bool,
+    /// Where to clear the "still owes a rebuild" marker once a generation
+    /// finishes (#1125).
+    ledger: Option<Arc<dyn DeferredReindexLedger>>,
 }
 
 #[derive(Default)]
@@ -847,6 +1109,7 @@ impl ReindexOperation {
         let job_id = Uuid::new_v4().to_string();
         let mut progress = ReindexProgress::new(&job_id);
         progress.tenant_id = Some(tenant.tenant_id().as_str().to_string());
+        progress.resource_scoped = request.resource_ids.is_some();
 
         // Store the job
         self.jobs.write().insert(job_id.clone(), progress);
@@ -1029,7 +1292,94 @@ enum AutomaticGenerationOutcome {
         resources: String,
         first_error: String,
     },
-    Failed(String),
+    Failed {
+        /// Status, error count and job-level error message.
+        summary: String,
+        /// Up to [`MAX_LOGGED_RESOURCE_ERRORS`] failing `Type/id`s, permanent
+        /// or transient; empty when the job failed before any resource.
+        resources: String,
+        /// What a retry has to cover.
+        retry: RetryScope,
+    },
+}
+
+/// What the retry of a failed automatic generation covers.
+#[derive(Debug, PartialEq, Eq)]
+enum RetryScope {
+    /// The job completed, and these resources failed transiently: only they
+    /// are retried, not every resource of their types (#1125).
+    Resources(Vec<ResourceRef>),
+    /// Too many resources failed transiently to hold and fetch them one by
+    /// one (more than [`MAX_RETRY_RESOURCES`]): every resource of the types
+    /// that failed is retried, not the generation's other types.
+    Types(Vec<String>),
+    /// The job failed as a whole (start, count, fetch, panic), so which
+    /// resources are missing is unknown: the generation is retried as it was.
+    Generation,
+}
+
+/// Most transiently failed resources a retry names one by one. Past it the
+/// retry rebuilds the failing types instead: a source without an indexed
+/// by-id fetch pages its whole type for every batch of ids, and each named
+/// resource is held in memory until the retry runs.
+const MAX_RETRY_RESOURCES: usize = 50_000;
+
+/// The work of one automatic generation.
+#[derive(Debug, Clone)]
+enum GenerationScope {
+    /// Every resource of these types.
+    Types(Vec<String>),
+    /// Exactly these resources — the retry of a generation's transient
+    /// resource failures.
+    Resources(Vec<ResourceRef>),
+}
+
+impl GenerationScope {
+    fn request(&self, options: AutomaticRunOptions) -> ReindexRequest {
+        match self {
+            Self::Types(types) => ReindexRequest::for_types(types.clone())
+                .with_bulk_index_rebuild(options.bulk_index_rebuild),
+            // Dropping and rebuilding a writer's value indexes costs a pass
+            // over its whole index: out of proportion for a handful of ids.
+            Self::Resources(resources) => ReindexRequest::for_resources(resources.clone()),
+        }
+        .with_batch_size(options.batch_size)
+        .with_batch_bytes(options.batch_bytes)
+    }
+
+    /// The distinct resource types the generation touches, sorted.
+    fn types(&self) -> Vec<String> {
+        match self {
+            Self::Types(types) => types.clone(),
+            Self::Resources(resources) => resources
+                .iter()
+                .map(|r| r.resource_type.clone())
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect(),
+        }
+    }
+
+    /// How many resources were named, for a resource generation.
+    fn resource_count(&self) -> Option<usize> {
+        match self {
+            Self::Types(_) => None,
+            Self::Resources(resources) => Some(resources.len()),
+        }
+    }
+}
+
+/// `Type/id` of the first [`MAX_LOGGED_RESOURCE_ERRORS`] distinct failing
+/// resources, joined for a log field.
+fn logged_resources(errors: &[ReindexProgressError]) -> String {
+    let mut seen = BTreeSet::new();
+    errors
+        .iter()
+        .map(|error| format!("{}/{}", error.resource_type, error.resource_id))
+        .filter(|name| seen.insert(name.clone()))
+        .take(MAX_LOGGED_RESOURCE_ERRORS)
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Decides what an automatic generation's finished job means for retry policy.
@@ -1047,29 +1397,59 @@ fn automatic_outcome(progress: Option<ReindexProgress>) -> AutomaticGenerationOu
         {
             AutomaticGenerationOutcome::PermanentErrors {
                 count: progress.errors.len(),
-                resources: progress
-                    .errors
-                    .iter()
-                    .take(MAX_LOGGED_RESOURCE_ERRORS)
-                    .map(|error| format!("{}/{}", error.resource_type, error.resource_id))
-                    .collect::<Vec<_>>()
-                    .join(", "),
+                resources: logged_resources(&progress.errors),
                 first_error: progress.errors[0].error.clone(),
             }
         }
-        Some(progress) => AutomaticGenerationOutcome::Failed(format!(
-            "status {:?}, {} resource errors{}",
-            progress.status,
-            progress.errors.len(),
-            progress
-                .error_message
-                .as_deref()
-                .map(|message| format!(", error: {message}"))
-                .unwrap_or_default()
-        )),
-        None => {
-            AutomaticGenerationOutcome::Failed("job status disappeared after task exit".to_string())
+        Some(progress) => {
+            // A completed job knows exactly which resources failed; the ones
+            // that failed transiently are the retry. A job that failed as a
+            // whole may have stopped before reaching most of its resources.
+            let retryable: BTreeSet<ResourceRef> = progress
+                .errors
+                .iter()
+                .filter(|error| error.retryable)
+                .map(|error| ResourceRef::new(&error.resource_type, &error.resource_id))
+                .collect();
+            let retry = if progress.status == ReindexStatus::Completed
+                && progress.error_message.is_none()
+                && !retryable.is_empty()
+            {
+                if retryable.len() > MAX_RETRY_RESOURCES {
+                    RetryScope::Types(
+                        retryable
+                            .iter()
+                            .map(|resource| resource.resource_type.clone())
+                            .collect::<BTreeSet<_>>()
+                            .into_iter()
+                            .collect(),
+                    )
+                } else {
+                    RetryScope::Resources(retryable.into_iter().collect())
+                }
+            } else {
+                RetryScope::Generation
+            };
+            AutomaticGenerationOutcome::Failed {
+                summary: format!(
+                    "status {:?}, {} resource errors{}",
+                    progress.status,
+                    progress.errors.len(),
+                    progress
+                        .error_message
+                        .as_deref()
+                        .map(|message| format!(", error: {message}"))
+                        .unwrap_or_default()
+                ),
+                resources: logged_resources(&progress.errors),
+                retry,
+            }
         }
+        None => AutomaticGenerationOutcome::Failed {
+            summary: "job status disappeared after task exit".to_string(),
+            resources: String::new(),
+            retry: RetryScope::Generation,
+        },
     }
 }
 
@@ -1089,15 +1469,16 @@ impl AutomaticReindexCoordinator {
         limits.clone()
     }
 
-    async fn enqueue(
-        self: Arc<Self>,
-        op: Arc<ReindexOperation>,
-        tenant: TenantContext,
-        resource_types: Vec<String>,
-        context: DeferredReindexContext,
-        options: AutomaticRunOptions,
-        max_concurrency: usize,
-    ) {
+    async fn enqueue(self: Arc<Self>, request: EnqueueGeneration) {
+        let EnqueueGeneration {
+            op,
+            tenant,
+            resource_types,
+            context,
+            options,
+            max_concurrency,
+            ledger,
+        } = request;
         let requested_types: BTreeSet<_> = resource_types.into_iter().collect();
         if requested_types.is_empty() {
             return;
@@ -1113,6 +1494,7 @@ impl AutomaticReindexCoordinator {
                 state.pending_types.extend(requested_types);
                 state.context = context.clone();
                 state.options = options;
+                state.ledger = ledger.clone();
                 tracing::info!(
                     tenant = %tenant_id,
                     submission = ?context.submission_id,
@@ -1136,6 +1518,7 @@ impl AutomaticReindexCoordinator {
                     state.pending_types.extend(requested_types.clone());
                     state.context = context.clone();
                     state.options = options;
+                    state.ledger = ledger.clone();
                     return;
                 }
             }
@@ -1163,6 +1546,7 @@ impl AutomaticReindexCoordinator {
                 state.pending_types.extend(requested_types);
                 state.context = context;
                 state.options = options;
+                state.ledger = ledger;
                 return;
             }
             tenants.insert(
@@ -1171,6 +1555,7 @@ impl AutomaticReindexCoordinator {
                     pending_types: requested_types,
                     context,
                     options,
+                    ledger,
                     ..Default::default()
                 },
             );
@@ -1189,23 +1574,42 @@ impl AutomaticReindexCoordinator {
         _resident_permit: tokio::sync::OwnedSemaphorePermit,
     ) {
         loop {
-            let (resource_types, generation, context, options) = {
+            let (scope, generation, context, options, ledger) = {
                 let mut tenants = self.tenants.lock().await;
                 let Some(state) = tenants.get_mut(&tenant_id) else {
                     return;
                 };
-                if state.pending_types.is_empty() {
+                // Whole types first. A queued resource retry whose type is
+                // about to be rebuilt in full is covered by that rebuild.
+                let scope = if !state.pending_types.is_empty() {
+                    let types = std::mem::take(&mut state.pending_types);
+                    state
+                        .pending_resources
+                        .retain(|resource| !types.contains(&resource.resource_type));
+                    GenerationScope::Types(types.into_iter().collect())
+                } else if !state.pending_resources.is_empty() {
+                    GenerationScope::Resources(
+                        std::mem::take(&mut state.pending_resources)
+                            .into_iter()
+                            .collect(),
+                    )
+                } else {
                     tenants.remove(&tenant_id);
                     return;
-                }
-                let types = std::mem::take(&mut state.pending_types)
-                    .into_iter()
-                    .collect::<Vec<_>>();
+                };
                 let generation = state.next_generation;
                 state.next_generation += 1;
                 state.waiting_for_generation = true;
-                (types, generation, state.context.clone(), state.options)
+                (
+                    scope,
+                    generation,
+                    state.context.clone(),
+                    state.options,
+                    state.ledger.clone(),
+                )
             };
+            let resource_types = scope.types();
+            let resource_count = scope.resource_count();
 
             // Acquire for each generation, then release before a follow-up.
             // Tokio's fair semaphore lets another resident tenant run first.
@@ -1224,13 +1628,7 @@ impl AutomaticReindexCoordinator {
             }
 
             let started = op
-                .start_tracked(
-                    tenant.clone(),
-                    ReindexRequest::for_types(resource_types.clone())
-                        .with_batch_size(options.batch_size)
-                        .with_bulk_index_rebuild(options.bulk_index_rebuild),
-                    None,
-                )
+                .start_tracked(tenant.clone(), scope.request(options), None)
                 .await;
             let (job_id, outcome) = match started {
                 Ok((job_id, task_exit)) => {
@@ -1241,6 +1639,7 @@ impl AutomaticReindexCoordinator {
                         submission = ?context.submission_id,
                         manifest = ?context.manifest_id,
                         types = ?resource_types,
+                        resources = ?resource_count,
                         "deferred reindex generation started"
                     );
                     let _ = task_exit.await;
@@ -1249,14 +1648,18 @@ impl AutomaticReindexCoordinator {
                 }
                 Err(error) => (
                     None,
-                    AutomaticGenerationOutcome::Failed(format!(
-                        "failed to start reindex job: {error}"
-                    )),
+                    AutomaticGenerationOutcome::Failed {
+                        summary: format!("failed to start reindex job: {error}"),
+                        resources: String::new(),
+                        retry: RetryScope::Generation,
+                    },
                 ),
             };
             drop(running_permit);
 
-            let mut retry = false;
+            // `Some(n)`: this generation's retry was queued, covering `n`
+            // resources, or every resource of its types when `None`.
+            let mut retry: Option<Option<usize>> = None;
             let continue_driver = {
                 let mut tenants = self.tenants.lock().await;
                 let Some(state) = tenants.get_mut(&tenant_id) else {
@@ -1272,21 +1675,47 @@ impl AutomaticReindexCoordinator {
                     AutomaticGenerationOutcome::PermanentErrors { .. } => {
                         state.consecutive_failures = 0;
                     }
-                    AutomaticGenerationOutcome::Failed(_) => {
-                        state.consecutive_failures += 1;
-                        if state.consecutive_failures == 1 {
-                            state.pending_types.extend(resource_types.iter().cloned());
-                            retry = true;
-                        } else {
-                            // This generation exhausted its retry, but callbacks
-                            // may have queued independent work while it ran.
-                            // Give that later batch its own retry budget instead
-                            // of removing the whole tenant entry below.
-                            state.consecutive_failures = 0;
+                    AutomaticGenerationOutcome::Failed {
+                        retry: scope_retry, ..
+                    } => {
+                        match (&scope, scope_retry) {
+                            // A resource generation is already the retry.
+                            (GenerationScope::Resources(_), _) => {
+                                state.consecutive_failures = 0;
+                            }
+                            // Only the resources that failed transiently are
+                            // retried. That retry is bounded by being a
+                            // resource generation, so the types' budget resets
+                            // — unless this generation already was the retry.
+                            (GenerationScope::Types(_), RetryScope::Resources(resources)) => {
+                                if state.consecutive_failures == 0 {
+                                    state.pending_resources.extend(resources.iter().cloned());
+                                    retry = Some(Some(resources.len()));
+                                }
+                                state.consecutive_failures = 0;
+                            }
+                            (GenerationScope::Types(types), scope_retry) => {
+                                let retry_types = match scope_retry {
+                                    RetryScope::Types(failing) => failing,
+                                    _ => types,
+                                };
+                                state.consecutive_failures += 1;
+                                if state.consecutive_failures == 1 {
+                                    state.pending_types.extend(retry_types.iter().cloned());
+                                    retry = Some(None);
+                                } else {
+                                    // This generation exhausted its retry, but
+                                    // callbacks may have queued independent work
+                                    // while it ran. Give that later batch its own
+                                    // retry budget instead of removing the whole
+                                    // tenant entry below.
+                                    state.consecutive_failures = 0;
+                                }
+                            }
                         }
                     }
                 }
-                if state.pending_types.is_empty() {
+                if state.pending_types.is_empty() && state.pending_resources.is_empty() {
                     tenants.remove(&tenant_id);
                     false
                 } else {
@@ -1294,6 +1723,20 @@ impl AutomaticReindexCoordinator {
                 }
             };
             self.tenant_changed.notify_waiters();
+
+            // The rebuild this manifest owed has run — cleanly, or with
+            // resources the backend rejects on every attempt. Either way there
+            // is nothing left for a restart to resume, so the marker goes
+            // (#1125). A failure keeps it: the work is still outstanding.
+            if matches!(
+                outcome,
+                AutomaticGenerationOutcome::Clean
+                    | AutomaticGenerationOutcome::PermanentErrors { .. }
+            ) && let (Some(ledger), Some(manifest_id)) =
+                (&ledger, context.manifest_id.as_deref())
+            {
+                ledger.rebuild_finished(&tenant, manifest_id).await;
+            }
 
             #[cfg(test)]
             if !continue_driver && let Some(barrier) = self.terminal_barrier.lock().await.take() {
@@ -1335,22 +1778,35 @@ impl AutomaticReindexCoordinator {
                     first_error = %first_error,
                     "deferred reindex completed, but resources were rejected permanently and are stored but not searchable; not retrying because a rerun fails the same way (every failure is listed by $reindex-status for this job)"
                 ),
-                AutomaticGenerationOutcome::Failed(error) if retry => tracing::warn!(
-                    tenant = %tenant_id,
-                    generation,
-                    job_id = ?job_id,
-                    error = %error,
-                    types = ?resource_types,
-                    "deferred reindex generation failed; retrying once"
-                ),
-                AutomaticGenerationOutcome::Failed(error) => tracing::error!(
-                    tenant = %tenant_id,
-                    generation,
-                    job_id = ?job_id,
-                    error = %error,
-                    types = ?resource_types,
-                    "deferred reindex failed twice; run $reindex manually"
-                ),
+                AutomaticGenerationOutcome::Failed {
+                    summary, resources, ..
+                } => match retry {
+                    Some(retried) => tracing::warn!(
+                        tenant = %tenant_id,
+                        generation,
+                        job_id = ?job_id,
+                        error = %summary,
+                        types = ?resource_types,
+                        resources = %resources,
+                        retry_resources = ?retried,
+                        retry_scope = if retried.is_some() {
+                            "failed resources only"
+                        } else {
+                            "whole types"
+                        },
+                        "deferred reindex generation failed; retrying once"
+                    ),
+                    None => tracing::error!(
+                        tenant = %tenant_id,
+                        generation,
+                        job_id = ?job_id,
+                        error = %summary,
+                        types = ?resource_types,
+                        generation_resources = ?resource_count,
+                        resources = %resources,
+                        "deferred reindex failed twice; run $reindex manually (every failure is listed by $reindex-status for this job)"
+                    ),
+                },
             }
 
             if !continue_driver {
@@ -1391,6 +1847,10 @@ fn mark_cancelled(jobs: &Arc<RwLock<HashMap<String, ReindexProgress>>>, job_id: 
 }
 
 /// Records a per-resource error against the job without aborting the run.
+///
+/// Every error keeps its type, id and classification; only the first
+/// [`MAX_REPORTED_RESOURCE_ERRORS`] keep their message (see
+/// [`ReindexProgressError::error`]).
 fn push_error(
     jobs: &Arc<RwLock<HashMap<String, ReindexProgress>>>,
     job_id: &str,
@@ -1401,12 +1861,89 @@ fn push_error(
 ) {
     let mut jobs_guard = jobs.write();
     if let Some(progress) = jobs_guard.get_mut(job_id) {
+        let error = if progress.errors.len() < MAX_REPORTED_RESOURCE_ERRORS {
+            error
+        } else {
+            String::new()
+        };
         progress.errors.push(ReindexProgressError {
             resource_type: resource_type.to_string(),
             resource_id: resource_id.to_string(),
             error,
             retryable,
         });
+    }
+}
+
+/// Records a per-resource error against the job and in the log.
+#[allow(clippy::too_many_arguments)]
+fn record_resource_failure(
+    jobs: &Arc<RwLock<HashMap<String, ReindexProgress>>>,
+    job_id: &str,
+    failures: &mut ResourceFailureLog,
+    resource_type: &str,
+    resource_id: &str,
+    error: String,
+    retryable: bool,
+) {
+    failures.record(resource_type, resource_id, &error, retryable);
+    push_error(jobs, job_id, resource_type, resource_id, error, retryable);
+}
+
+/// Rewrites one batch of resources through every writer and advances the
+/// job's counters by `resources.len() + extra_processed`.
+///
+/// Page-at-a-time so a writer can wrap it in one transaction; each writer
+/// reports a per-resource outcome for error attribution. The entry count for
+/// progress comes from the writers' own extraction — the driver no longer
+/// extracts a second time just to count. `extra_processed` accounts for rows
+/// of the batch that were read but not written (skipped, or deleted since
+/// they were named).
+#[allow(clippy::too_many_arguments)]
+async fn write_resource_batch(
+    tenant: &TenantContext,
+    writers: &[Arc<dyn ReindexTarget>],
+    jobs: &Arc<RwLock<HashMap<String, ReindexProgress>>>,
+    job_id: &str,
+    failures: &mut ResourceFailureLog,
+    resource_type: &str,
+    resources: &[StoredResource],
+    extra_processed: u64,
+) {
+    let mut wrote_any: Vec<bool> = vec![false; resources.len()];
+    let mut entry_counts: Vec<u64> = vec![0; resources.len()];
+    if !resources.is_empty() {
+        for writer in writers {
+            let outcomes = writer.write_search_entries_page(tenant, resources).await;
+            for (i, outcome) in outcomes.into_iter().enumerate() {
+                match outcome {
+                    Ok(written) => {
+                        wrote_any[i] = true;
+                        entry_counts[i] = entry_counts[i].max(written as u64);
+                    }
+                    Err(e) => record_resource_failure(
+                        jobs,
+                        job_id,
+                        failures,
+                        resource_type,
+                        resources[i].id(),
+                        format!("Failed to rebuild index entries: {e}"),
+                        is_transient_error(&e),
+                    ),
+                }
+            }
+        }
+    }
+
+    let mut jobs_guard = jobs.write();
+    if let Some(progress) = jobs_guard.get_mut(job_id) {
+        progress.processed_resources += resources.len() as u64 + extra_processed;
+        progress.entries_created += wrote_any
+            .iter()
+            .zip(&entry_counts)
+            .filter(|(wrote, _)| **wrote)
+            .map(|(_, entries)| entries)
+            .sum::<u64>();
     }
 }
 
@@ -1455,10 +1992,29 @@ async fn run_reindex(
         }
     }
 
+    // Named resources, grouped by type: a run scoped to them fetches exactly
+    // these ids instead of paging whole types (#1125).
+    let named_resources: Option<std::collections::BTreeMap<String, Vec<String>>> =
+        request.resource_ids.as_ref().map(|resources| {
+            let mut by_type: std::collections::BTreeMap<String, BTreeSet<String>> =
+                std::collections::BTreeMap::new();
+            for resource in resources {
+                by_type
+                    .entry(resource.resource_type.clone())
+                    .or_default()
+                    .insert(resource.resource_id.clone());
+            }
+            by_type
+                .into_iter()
+                .map(|(resource_type, ids)| (resource_type, ids.into_iter().collect()))
+                .collect()
+        });
+
     // Determine resource types to process
-    let resource_types = match request.resource_types {
-        Some(types) => types,
-        None => match source.list_resource_types(&tenant).await {
+    let resource_types = match (&named_resources, request.resource_types) {
+        (Some(named), _) => named.keys().cloned().collect(),
+        (None, Some(types)) => types,
+        (None, None) => match source.list_resource_types(&tenant).await {
             Ok(types) => types,
             Err(e) => {
                 mark_failed(
@@ -1473,16 +2029,20 @@ async fn run_reindex(
 
     // Count total resources
     let mut total_resources: u64 = 0;
-    for resource_type in &resource_types {
-        match source.count_resources(&tenant, resource_type).await {
-            Ok(count) => total_resources += count,
-            Err(e) => {
-                mark_failed(
-                    &jobs,
-                    &job_id,
-                    format!("Failed to count {resource_type}: {e}"),
-                );
-                return;
+    if let Some(named) = &named_resources {
+        total_resources = named.values().map(|ids| ids.len() as u64).sum();
+    } else {
+        for resource_type in &resource_types {
+            match source.count_resources(&tenant, resource_type).await {
+                Ok(count) => total_resources += count,
+                Err(e) => {
+                    mark_failed(
+                        &jobs,
+                        &job_id,
+                        format!("Failed to count {resource_type}: {e}"),
+                    );
+                    return;
+                }
             }
         }
     }
@@ -1520,6 +2080,7 @@ async fn run_reindex(
         }
     }
 
+    let mut failures = ResourceFailureLog::new(&job_id, &tenant);
     let outcome: Result<(), RunExit> = async {
         // Process each resource type
         for resource_type in &resource_types {
@@ -1535,6 +2096,45 @@ async fn run_reindex(
                     progress.current_resource_type = Some(resource_type.clone());
                 }
             }
+            failures.start_type(resource_type);
+
+            // A run scoped to named resources fetches them in batches of
+            // `batch_size` ids; an id deleted since it was named is simply
+            // absent, and counts as processed with nothing to index.
+            if let Some(ids) = named_resources
+                .as_ref()
+                .and_then(|named| named.get(resource_type))
+            {
+                for batch in ids.chunks(request.batch_size.max(1) as usize) {
+                    if cancel_rx.try_recv().is_ok() {
+                        return Err(RunExit::Cancelled);
+                    }
+                    let fetch_span = crate::perf::span(crate::perf::Phase::ReindexFetch);
+                    let fetched = source
+                        .fetch_resources_by_ids(&tenant, resource_type, batch)
+                        .await;
+                    drop(fetch_span);
+                    let resources = match fetched {
+                        Ok(resources) => resources,
+                        Err(e) => {
+                            return Err(RunExit::Failed(format!("Failed to fetch resources: {e}")));
+                        }
+                    };
+                    let missing = (batch.len() as u64).saturating_sub(resources.len() as u64);
+                    write_resource_batch(
+                        &tenant,
+                        &writers,
+                        &jobs,
+                        &job_id,
+                        &mut failures,
+                        resource_type,
+                        &resources,
+                        missing,
+                    )
+                    .await;
+                }
+                continue;
+            }
 
             // Process resources in batches
             let mut cursor: Option<String> = None;
@@ -1547,11 +2147,12 @@ async fn run_reindex(
                 // Fetch a page of resources
                 let fetch_span = crate::perf::span(crate::perf::Phase::ReindexFetch);
                 let fetched = source
-                    .fetch_resources_page(
+                    .fetch_resources_page_capped(
                         &tenant,
                         resource_type,
                         cursor.as_deref(),
                         request.batch_size,
+                        request.batch_bytes,
                     )
                     .await;
                 drop(fetch_span);
@@ -1562,44 +2163,33 @@ async fn run_reindex(
                     }
                 };
 
-                // Rebuild the page through every writer. Page-at-a-time so a
-                // writer can wrap it in one transaction; each writer reports a
-                // per-resource outcome for error attribution. The entry count for
-                // progress comes from the writers' own extraction — the driver no
-                // longer extracts a second time just to count.
-                let mut wrote_any: Vec<bool> = vec![false; page.resources.len()];
-                let mut entry_counts: Vec<u64> = vec![0; page.resources.len()];
-                for writer in &writers {
-                    let outcomes = writer
-                        .write_search_entries_page(&tenant, &page.resources)
-                        .await;
-                    for (i, outcome) in outcomes.into_iter().enumerate() {
-                        match outcome {
-                            Ok(written) => {
-                                wrote_any[i] = true;
-                                entry_counts[i] = entry_counts[i].max(written as u64);
-                            }
-                            Err(e) => push_error(
-                                &jobs,
-                                &job_id,
-                                resource_type,
-                                page.resources[i].id(),
-                                format!("Failed to rebuild index entries: {e}"),
-                                is_transient_error(&e),
-                            ),
-                        }
-                    }
+                // A row the source read but could not decode is a resource that
+                // stays unsearchable until the row is repaired: a permanent
+                // failure, recorded rather than silently dropped (#1125).
+                for skipped in &page.skipped {
+                    record_resource_failure(
+                        &jobs,
+                        &job_id,
+                        &mut failures,
+                        resource_type,
+                        &skipped.resource_id,
+                        format!("Failed to read stored resource: {}", skipped.reason),
+                        false,
+                    );
                 }
 
-                for (i, _resource) in page.resources.iter().enumerate() {
-                    let mut jobs_guard = jobs.write();
-                    if let Some(progress) = jobs_guard.get_mut(&job_id) {
-                        progress.processed_resources += 1;
-                        if wrote_any[i] {
-                            progress.entries_created += entry_counts[i];
-                        }
-                    }
-                }
+                // Rebuild the page through every writer.
+                write_resource_batch(
+                    &tenant,
+                    &writers,
+                    &jobs,
+                    &job_id,
+                    &mut failures,
+                    resource_type,
+                    &page.resources,
+                    page.skipped.len() as u64,
+                )
+                .await;
 
                 // Check if there are more pages
                 match page.next_cursor {
@@ -1612,6 +2202,7 @@ async fn run_reindex(
         Ok(())
     }
     .await;
+    failures.finish_type();
 
     if request.bulk_index_rebuild {
         for writer in &writers {
@@ -1675,6 +2266,10 @@ pub struct ReindexOnFinish {
     max_concurrency: usize,
     /// Request shape for the generations this hook enqueues.
     options: AutomaticRunOptions,
+    /// Clears the persisted "owes a rebuild" marker when a generation ends
+    /// (#1125). `None` keeps the pre-#1125 behaviour: nothing is recorded and
+    /// nothing is resumed.
+    ledger: Option<Arc<dyn DeferredReindexLedger>>,
 }
 
 /// The page the deferred rebuild uses. `ReindexRequest`'s default of 100
@@ -1704,12 +2299,27 @@ impl ReindexOnFinish {
             op,
             max_concurrency: max_concurrency.clamp(1, Semaphore::MAX_PERMITS),
             options: AutomaticRunOptions::default(),
+            ledger: None,
         }
     }
 
     /// Overrides the resources-per-transaction page of the rebuild.
     pub fn with_batch_size(mut self, batch_size: u32) -> Self {
         self.options.batch_size = batch_size.max(1);
+        self
+    }
+
+    /// Records rebuild completion in `ledger`, so an outstanding rebuild is
+    /// discoverable — and resumable — after a restart (#1125).
+    pub fn with_ledger(mut self, ledger: Arc<dyn DeferredReindexLedger>) -> Self {
+        self.ledger = Some(ledger);
+        self
+    }
+
+    /// Caps one page of the rebuild by bytes of stored content as well as by
+    /// resource count (`0` = count only).
+    pub fn with_batch_bytes(mut self, batch_bytes: u64) -> Self {
+        self.options.batch_bytes = batch_bytes;
         self
     }
 
@@ -1730,14 +2340,15 @@ impl ReindexOnFinish {
         self.op
             .automatic
             .clone()
-            .enqueue(
-                self.op.clone(),
-                tenant.clone(),
+            .enqueue(EnqueueGeneration {
+                op: self.op.clone(),
+                tenant: tenant.clone(),
                 resource_types,
                 context,
-                self.options,
-                self.max_concurrency,
-            )
+                options: self.options,
+                max_concurrency: self.max_concurrency,
+                ledger: self.ledger.clone(),
+            })
             .await;
     }
 }
@@ -1929,6 +2540,7 @@ mod tests {
                     helios_fhir::FhirVersion::default(),
                 )],
                 next_cursor: None,
+                skipped: Vec::new(),
             })
         }
     }
@@ -2070,6 +2682,22 @@ mod tests {
                 resource_type: resource_type.to_string(),
             }
         );
+        assert_eq!(
+            next_controlled_event(events).await,
+            ControlledEvent::Write {
+                tenant: tenant.to_string(),
+                resource_type: resource_type.to_string(),
+            }
+        );
+    }
+
+    /// The write of a resource retry generation: it names its resources, so
+    /// it fetches them by id without counting (paging) the type first.
+    async fn await_controlled_retry_write(
+        events: &mut tokio::sync::mpsc::UnboundedReceiver<ControlledEvent>,
+        tenant: &str,
+        resource_type: &str,
+    ) {
         assert_eq!(
             next_controlled_event(events).await,
             ControlledEvent::Write {
@@ -2761,7 +3389,9 @@ mod tests {
         }
 
         // Per-resource transient write errors leave the physical job Completed
-        // but are still failures for automatic retry policy.
+        // but are still failures for automatic retry policy. The retry covers
+        // only the failed resource: it is written again, but its type is not
+        // counted (paged) a second time, and it is not retried a third time.
         let (backend, mut events) = ControlledBackend::new(Vec::new(), 2);
         let op = controlled_operation(backend.clone());
         let hook = ReindexOnFinish::new(op.clone());
@@ -2770,13 +3400,24 @@ mod tests {
             vec!["Patient".to_string()],
         )
         .await;
-        for _ in 0..2 {
-            await_controlled_write(&mut events, "errorful-completion", "Patient").await;
-            backend.write_gate.add_permits(1);
-        }
+        await_controlled_write(&mut events, "errorful-completion", "Patient").await;
+        backend.write_gate.add_permits(1);
+        await_controlled_retry_write(&mut events, "errorful-completion", "Patient").await;
+        backend.write_gate.add_permits(1);
         await_automatic_idle(&op).await;
-        assert_eq!(backend.count_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(backend.count_calls.load(Ordering::SeqCst), 1);
         assert_eq!(backend.write_calls.load(Ordering::SeqCst), 2);
+        let mut jobs = op.list_jobs();
+        jobs.sort_by_key(|job| job.total_resources);
+        assert_eq!(jobs.len(), 2);
+        assert!(
+            jobs.iter()
+                .all(|job| job.status == ReindexStatus::Completed)
+        );
+        assert!(
+            jobs.iter()
+                .all(|job| job.errors.len() == 1 && job.errors[0].resource_id == "controlled-1")
+        );
     }
 
     #[tokio::test]
@@ -2837,25 +3478,117 @@ mod tests {
             other => panic!("expected permanent errors, got {other:?}"),
         }
 
-        // One transient error among permanent ones earns the retry.
+        // One transient error among permanent ones earns the retry — of the
+        // transient resources only, each once even when several writers failed
+        // on it, while the log names every failing resource.
         progress.errors.push(error("flaky", true));
-        assert!(matches!(
-            automatic_outcome(Some(progress.clone())),
-            AutomaticGenerationOutcome::Failed(_)
-        ));
+        progress.errors.push(error("flaky", true));
+        progress.errors.push(error("blip", true));
+        match automatic_outcome(Some(progress.clone())) {
+            AutomaticGenerationOutcome::Failed {
+                summary,
+                resources,
+                retry,
+            } => {
+                assert!(summary.contains("4 resource errors"), "{summary}");
+                assert_eq!(
+                    resources,
+                    "Provenance/big, Provenance/flaky, Provenance/blip"
+                );
+                assert_eq!(
+                    retry,
+                    RetryScope::Resources(vec![
+                        ResourceRef::new("Provenance", "blip"),
+                        ResourceRef::new("Provenance", "flaky"),
+                    ])
+                );
+            }
+            other => panic!("expected a failure, got {other:?}"),
+        }
 
-        // A job that failed as a whole is retried whatever its resource errors.
-        progress.errors.truncate(1);
+        // Past the cap the retry rebuilds the failing types instead of holding
+        // and fetching every failed resource by id.
+        let mut many = progress.clone();
+        many.errors
+            .extend((0..=MAX_RETRY_RESOURCES).map(|n| ReindexProgressError {
+                resource_type: "Observation".to_string(),
+                resource_id: format!("o{n}"),
+                error: String::new(),
+                retryable: true,
+            }));
+        match automatic_outcome(Some(many)) {
+            AutomaticGenerationOutcome::Failed { retry, .. } => assert_eq!(
+                retry,
+                RetryScope::Types(vec!["Observation".to_string(), "Provenance".to_string()])
+            ),
+            other => panic!("expected a failure, got {other:?}"),
+        }
+
+        // A job that failed as a whole is retried whatever its resource
+        // errors: it may have stopped before most of its resources.
+        progress.errors.truncate(2);
         progress.status = ReindexStatus::Failed;
         progress.error_message = Some("Failed to fetch resources".to_string());
         assert!(matches!(
             automatic_outcome(Some(progress)),
-            AutomaticGenerationOutcome::Failed(_)
+            AutomaticGenerationOutcome::Failed {
+                retry: RetryScope::Generation,
+                ..
+            }
         ));
         assert!(matches!(
             automatic_outcome(None),
-            AutomaticGenerationOutcome::Failed(_)
+            AutomaticGenerationOutcome::Failed {
+                retry: RetryScope::Generation,
+                ..
+            }
         ));
+    }
+
+    #[test]
+    fn logged_resources_names_the_first_distinct_failures() {
+        let errors: Vec<ReindexProgressError> = ["a", "a", "b", "c", "d", "e", "f"]
+            .iter()
+            .map(|id| ReindexProgressError {
+                resource_type: "Provenance".to_string(),
+                resource_id: id.to_string(),
+                error: String::new(),
+                retryable: true,
+            })
+            .collect();
+        assert_eq!(
+            logged_resources(&errors),
+            "Provenance/a, Provenance/b, Provenance/c, Provenance/d, Provenance/e"
+        );
+    }
+
+    #[test]
+    fn push_error_keeps_every_id_but_bounds_the_messages() {
+        let jobs: Arc<ReindexJobs> = Arc::default();
+        jobs.write()
+            .insert("job".to_string(), ReindexProgress::new("job"));
+        let total = MAX_REPORTED_RESOURCE_ERRORS + 7;
+        for n in 0..total {
+            push_error(
+                &jobs,
+                "job",
+                "Provenance",
+                &format!("p{n}"),
+                format!("failed p{n}"),
+                n % 2 == 0,
+            );
+        }
+        let progress = jobs.read().get("job").cloned().unwrap();
+        assert_eq!(progress.errors.len(), total);
+        for (n, error) in progress.errors.iter().enumerate() {
+            assert_eq!(error.resource_id, format!("p{n}"));
+            assert_eq!(error.retryable, n % 2 == 0);
+            if n < MAX_REPORTED_RESOURCE_ERRORS {
+                assert_eq!(error.error, format!("failed p{n}"));
+            } else {
+                assert!(error.error.is_empty(), "message kept for error {n}");
+            }
+        }
     }
 
     #[test]
@@ -2907,9 +3640,10 @@ mod tests {
         await_controlled_write(&mut events, "failed-retry-with-pending", "Patient").await;
         backend.write_gate.add_permits(1);
 
-        // The first failure schedules one retry. Queue unrelated work while
-        // that retry is in flight, then make the retry fail as well.
-        await_controlled_write(&mut events, "failed-retry-with-pending", "Patient").await;
+        // The first failure schedules one retry of the failed resource. Queue
+        // unrelated work while that retry is in flight, then make the retry
+        // fail as well.
+        await_controlled_retry_write(&mut events, "failed-retry-with-pending", "Patient").await;
         hook.reindex_types(&tenant, vec!["Observation".to_string()])
             .await;
         backend.write_gate.add_permits(1);
@@ -2919,7 +3653,7 @@ mod tests {
         backend.write_gate.add_permits(1);
         await_automatic_idle(&op).await;
 
-        assert_eq!(backend.count_calls.load(Ordering::SeqCst), 3);
+        assert_eq!(backend.count_calls.load(Ordering::SeqCst), 2);
         assert_eq!(backend.write_calls.load(Ordering::SeqCst), 3);
     }
 
@@ -2973,6 +3707,404 @@ mod tests {
         second.write_gate.add_permits(1);
         await_automatic_idle(&first_op).await;
         await_automatic_idle(&second_op).await;
+    }
+
+    /// A source holding `Patient/p0..p{n}` that pages by position and counts
+    /// the pages it serves.
+    struct PagedSource {
+        ids: Vec<String>,
+        pages: std::sync::atomic::AtomicUsize,
+    }
+
+    impl PagedSource {
+        fn new(n: usize) -> Self {
+            Self {
+                ids: (0..n).map(|i| format!("p{i}")).collect(),
+                pages: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ReindexSource for PagedSource {
+        async fn list_resource_types(&self, _: &TenantContext) -> StorageResult<Vec<String>> {
+            Ok(vec!["Patient".to_string()])
+        }
+
+        async fn count_resources(&self, _: &TenantContext, _: &str) -> StorageResult<u64> {
+            Ok(self.ids.len() as u64)
+        }
+
+        async fn fetch_resources_page(
+            &self,
+            tenant: &TenantContext,
+            resource_type: &str,
+            cursor: Option<&str>,
+            limit: u32,
+        ) -> StorageResult<ResourcePage> {
+            self.pages.fetch_add(1, Ordering::SeqCst);
+            let start: usize = cursor.map_or(0, |c| c.parse().unwrap());
+            let end = (start + limit as usize).min(self.ids.len());
+            Ok(ResourcePage {
+                resources: self.ids[start..end]
+                    .iter()
+                    .map(|id| {
+                        StoredResource::new(
+                            resource_type,
+                            id,
+                            tenant.tenant_id().clone(),
+                            serde_json::json!({"resourceType": resource_type, "id": id}),
+                            helios_fhir::FhirVersion::default(),
+                        )
+                    })
+                    .collect(),
+                next_cursor: (end < self.ids.len()).then(|| end.to_string()),
+                skipped: Vec::new(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn fetch_resources_by_ids_default_scans_pages_and_stops_when_all_found() {
+        let tenant = named_tenant("by-ids");
+        let source = PagedSource::new(FETCH_BY_IDS_SCAN_PAGE as usize * 3);
+
+        // Ids on the first and second page: the third page is never read.
+        let wanted = vec!["p1".to_string(), format!("p{}", FETCH_BY_IDS_SCAN_PAGE + 5)];
+        let mut found: Vec<String> = source
+            .fetch_resources_by_ids(&tenant, "Patient", &wanted)
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| r.id().to_string())
+            .collect();
+        found.sort();
+        let mut expected = wanted.clone();
+        expected.sort();
+        assert_eq!(found, expected);
+        assert_eq!(source.pages.load(Ordering::SeqCst), 2);
+
+        // An id that no longer exists is absent, and the scan ends at the last page.
+        let source = PagedSource::new(3);
+        let found = source
+            .fetch_resources_by_ids(&tenant, "Patient", &["p2".to_string(), "gone".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].id(), "p2");
+
+        // No ids, no reads.
+        let source = PagedSource::new(3);
+        assert!(
+            source
+                .fetch_resources_by_ids(&tenant, "Patient", &[])
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(source.pages.load(Ordering::SeqCst), 0);
+    }
+
+    /// Records the ids it is asked to write, failing some of them.
+    #[derive(Default)]
+    struct RecordingTarget {
+        written: parking_lot::Mutex<Vec<String>>,
+        /// Ids whose first write fails transiently.
+        transient_once: parking_lot::Mutex<BTreeSet<String>>,
+        /// Ids whose every write is rejected.
+        permanent: BTreeSet<String>,
+    }
+
+    #[async_trait]
+    impl ReindexTarget for RecordingTarget {
+        async fn delete_search_entries(
+            &self,
+            _: &TenantContext,
+            _: &str,
+            _: &str,
+        ) -> StorageResult<u64> {
+            Ok(0)
+        }
+
+        async fn write_search_entries(
+            &self,
+            _: &TenantContext,
+            resource: &StoredResource,
+        ) -> StorageResult<usize> {
+            let id = resource.id().to_string();
+            self.written.lock().push(id.clone());
+            if self.transient_once.lock().remove(&id) {
+                return Err(crate::error::BackendError::Unavailable {
+                    backend_name: "recording".into(),
+                    message: format!("injected transient failure of {id}"),
+                }
+                .into());
+            }
+            if self.permanent.contains(&id) {
+                return Err(crate::error::BackendError::Internal {
+                    backend_name: "recording".into(),
+                    message: format!("injected rejection of {id}"),
+                    source: None,
+                }
+                .into());
+            }
+            Ok(1)
+        }
+
+        async fn clear_search_index(&self, _: &TenantContext) -> StorageResult<u64> {
+            Ok(0)
+        }
+    }
+
+    fn recording_operation(
+        source: Arc<dyn ReindexSource>,
+        target: Arc<RecordingTarget>,
+    ) -> Arc<ReindexOperation> {
+        Arc::new(ReindexOperation::with_parts(
+            source,
+            vec![target],
+            Arc::new(crate::search::TenantSearchRegistries::base_only()),
+        ))
+    }
+
+    async fn await_finished(op: &ReindexOperation, id: &str) -> ReindexProgress {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(progress) = op.get_progress(id).await
+                    && progress.status.is_finished()
+                {
+                    return progress;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("reindex job did not finish")
+    }
+
+    #[tokio::test]
+    async fn a_run_scoped_to_resources_writes_only_those_resources() {
+        let source = Arc::new(PagedSource::new(10));
+        let target = Arc::new(RecordingTarget::default());
+        let op = recording_operation(source.clone(), target.clone());
+
+        let job = op
+            .start(
+                named_tenant("by-ids-run"),
+                ReindexRequest::for_resources([
+                    ResourceRef::new("Patient", "p7"),
+                    ResourceRef::new("Patient", "p2"),
+                    ResourceRef::new("Patient", "p2"),
+                    ResourceRef::new("Patient", "deleted"),
+                ])
+                .with_batch_size(1),
+                None,
+            )
+            .await
+            .unwrap();
+        let progress = await_finished(&op, &job).await;
+
+        assert_eq!(progress.status, ReindexStatus::Completed);
+        assert!(progress.errors.is_empty(), "{:?}", progress.errors);
+        let mut written = target.written.lock().clone();
+        written.sort();
+        assert_eq!(written, vec!["p2".to_string(), "p7".to_string()]);
+        // Three distinct ids named; the deleted one counts as processed with
+        // nothing to index.
+        assert_eq!(progress.total_resources, 3);
+        assert_eq!(progress.processed_resources, 3);
+        assert_eq!(progress.entries_created, 2);
+    }
+
+    /// Two pages of `Patient`; the first also reports a row it could not
+    /// decode.
+    struct SkippingSource;
+
+    #[async_trait]
+    impl ReindexSource for SkippingSource {
+        async fn list_resource_types(&self, _: &TenantContext) -> StorageResult<Vec<String>> {
+            Ok(vec!["Patient".to_string()])
+        }
+
+        async fn count_resources(&self, _: &TenantContext, _: &str) -> StorageResult<u64> {
+            Ok(3)
+        }
+
+        async fn fetch_resources_page(
+            &self,
+            tenant: &TenantContext,
+            resource_type: &str,
+            cursor: Option<&str>,
+            _: u32,
+        ) -> StorageResult<ResourcePage> {
+            let resource = |id: &str| {
+                StoredResource::new(
+                    resource_type,
+                    id,
+                    tenant.tenant_id().clone(),
+                    serde_json::json!({"resourceType": resource_type, "id": id}),
+                    helios_fhir::FhirVersion::default(),
+                )
+            };
+            Ok(match cursor {
+                None => ResourcePage {
+                    resources: vec![resource("good-1")],
+                    next_cursor: Some("page-2".to_string()),
+                    skipped: vec![SkippedResource {
+                        resource_id: "corrupt".to_string(),
+                        reason: "invalid JSON".to_string(),
+                    }],
+                },
+                Some(_) => ResourcePage {
+                    resources: vec![resource("good-2")],
+                    ..Default::default()
+                },
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_row_is_a_permanent_error_and_paging_continues() {
+        let target = Arc::new(RecordingTarget::default());
+        let op = recording_operation(Arc::new(SkippingSource), target.clone());
+
+        let job = op
+            .start(named_tenant("skipped-rows"), ReindexRequest::all(), None)
+            .await
+            .unwrap();
+        let progress = await_finished(&op, &job).await;
+
+        assert_eq!(progress.status, ReindexStatus::Completed);
+        assert_eq!(
+            *target.written.lock(),
+            vec!["good-1".to_string(), "good-2".to_string()]
+        );
+        assert_eq!(progress.processed_resources, 3);
+        assert_eq!(progress.errors.len(), 1);
+        let error = &progress.errors[0];
+        assert_eq!(error.resource_type, "Patient");
+        assert_eq!(error.resource_id, "corrupt");
+        assert!(!error.retryable);
+        assert!(error.error.contains("invalid JSON"), "{}", error.error);
+        assert!(progress.has_only_permanent_errors());
+    }
+
+    #[tokio::test]
+    async fn automatic_retry_covers_only_the_transiently_failed_resources() {
+        let source = Arc::new(PagedSource::new(5));
+        let target = Arc::new(RecordingTarget {
+            transient_once: parking_lot::Mutex::new(BTreeSet::from([
+                "p1".to_string(),
+                "p3".to_string(),
+            ])),
+            permanent: BTreeSet::from(["p4".to_string()]),
+            ..Default::default()
+        });
+        let op = recording_operation(source, target.clone());
+
+        ReindexOnFinish::new(op.clone())
+            .reindex_types(&named_tenant("retry-by-id"), vec!["Patient".to_string()])
+            .await;
+        await_automatic_idle(&op).await;
+
+        // Generation 0 writes the whole type; the retry writes the two
+        // resources that failed transiently — not the rejected p4, and not the
+        // three that indexed.
+        let written = target.written.lock().clone();
+        assert_eq!(written.len(), 7, "{written:?}");
+        assert_eq!(&written[..5], ["p0", "p1", "p2", "p3", "p4"]);
+        let mut retried = written[5..].to_vec();
+        retried.sort();
+        assert_eq!(retried, ["p1", "p3"]);
+
+        let mut jobs = op.list_jobs();
+        jobs.sort_by_key(|job| std::cmp::Reverse(job.total_resources));
+        assert_eq!(jobs.len(), 2);
+        assert_eq!(jobs[0].total_resources, 5);
+        assert_eq!(jobs[0].errors.len(), 3);
+        assert_eq!(jobs[1].total_resources, 2);
+        assert!(jobs[1].errors.is_empty(), "{:?}", jobs[1].errors);
+        assert!(
+            jobs.iter()
+                .all(|job| job.status == ReindexStatus::Completed)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_resource_retry_is_not_retried_again() {
+        let source = Arc::new(PagedSource::new(3));
+        let target = Arc::new(RecordingTarget::default());
+        // p1 fails transiently on both attempts.
+        target.transient_once.lock().insert("p1".to_string());
+        struct TwiceFailing(Arc<RecordingTarget>);
+        #[async_trait]
+        impl ReindexTarget for TwiceFailing {
+            async fn delete_search_entries(
+                &self,
+                tenant: &TenantContext,
+                resource_type: &str,
+                id: &str,
+            ) -> StorageResult<u64> {
+                self.0
+                    .delete_search_entries(tenant, resource_type, id)
+                    .await
+            }
+            async fn write_search_entries(
+                &self,
+                tenant: &TenantContext,
+                resource: &StoredResource,
+            ) -> StorageResult<usize> {
+                let outcome = self.0.write_search_entries(tenant, resource).await;
+                if resource.id() == "p1" {
+                    self.0.transient_once.lock().insert("p1".to_string());
+                }
+                outcome
+            }
+            async fn clear_search_index(&self, tenant: &TenantContext) -> StorageResult<u64> {
+                self.0.clear_search_index(tenant).await
+            }
+        }
+        let op = Arc::new(ReindexOperation::with_parts(
+            source,
+            vec![Arc::new(TwiceFailing(target.clone()))],
+            Arc::new(crate::search::TenantSearchRegistries::base_only()),
+        ));
+
+        ReindexOnFinish::new(op.clone())
+            .reindex_types(
+                &named_tenant("retry-exhausted"),
+                vec!["Patient".to_string()],
+            )
+            .await;
+        await_automatic_idle(&op).await;
+
+        let written = target.written.lock().clone();
+        assert_eq!(written, ["p0", "p1", "p2", "p1"]);
+        assert_eq!(op.list_jobs().len(), 2);
+    }
+
+    #[test]
+    fn reindex_request_for_resources_scopes_types_and_ids() {
+        let request = ReindexRequest::for_resources([
+            ResourceRef::new("Provenance", "b"),
+            ResourceRef::new("Patient", "a"),
+            ResourceRef::new("Provenance", "c"),
+        ]);
+        assert_eq!(
+            request.resource_types,
+            Some(vec!["Patient".to_string(), "Provenance".to_string()])
+        );
+        assert_eq!(request.resource_ids.as_ref().map(Vec::len), Some(3));
+        assert_eq!(request.batch_size, default_batch_size());
+
+        // A request serialized before the field existed still deserializes.
+        let legacy: ReindexRequest = serde_json::from_value(
+            serde_json::json!({"resource_types": null, "search_param_urls": null}),
+        )
+        .unwrap();
+        assert!(legacy.resource_ids.is_none());
+        assert!(ReindexRequest::default().resource_ids.is_none());
+        assert!(ResourcePage::default().skipped.is_empty());
     }
 
     #[test]

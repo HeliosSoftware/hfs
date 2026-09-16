@@ -193,6 +193,11 @@ chart-counts-unsupported-note = Dieses Speicher-Backend kann gespeicherte Ressou
 chart-as-of = Stand: { $time }.
 search-index-rebuilding = Suchindex wird neu aufgebaut — { $percent } % ({ $processed } von { $total } Ressourcen). Suchen können gespeicherte Ressourcen übersehen, bis der Aufbau abgeschlossen ist.
 search-index-rebuilding-counting = Suchindex wird neu aufgebaut. Suchen können gespeicherte Ressourcen übersehen, bis der Aufbau abgeschlossen ist.
+search-index-rebuild-failed = { $errors ->
+    [one] Der letzte Neuaufbau des Suchindex hat eine Ressource nicht indiziert. Suchen finden sie erst nach einem erfolgreichen Neuaufbau; GET $reindex-status/{ $job } nennt die betroffene Ressource.
+   *[other] Der letzte Neuaufbau des Suchindex hat { $count } Ressourcen nicht indiziert. Suchen finden sie erst nach einem erfolgreichen Neuaufbau; GET $reindex-status/{ $job } nennt die betroffenen Ressourcen.
+  }
+search-index-rebuild-failed-job = Der letzte Neuaufbau des Suchindex ist vor dem Abschluss fehlgeschlagen. Suchen können gespeicherte Ressourcen übersehen, bis ein Neuaufbau erfolgreich ist; GET $reindex-status/{ $job } nennt den Grund.
 chart-table-toggle = Als Tabelle anzeigen
 chart-table-when = Zeitpunkt
 chart-focus-series = Diese Serie fokussieren
@@ -445,6 +450,8 @@ queries-results-included = { $count } eingeschlossen
 queries-results-empty = Keine Ergebnisse.
 queries-searching = Suche läuft…
 queries-col-updated = Aktualisiert
+queries-copy-id = ID kopieren
+queries-copied = Kopiert
 queries-prev = Zurück
 queries-next = Weiter
 queries-results-fetch-error = Ergebnisse von { $origin } konnten nicht geladen werden. Prüfen Sie HFS_BASE_URL und versuchen Sie es erneut.

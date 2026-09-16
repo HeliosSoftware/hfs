@@ -301,6 +301,16 @@ where
                 .post(handlers::patient_export_kickoff_handler::<S>),
         )
         .route(
+            "/Patient/$everything",
+            get(handlers::patient_everything_type_handler::<S>)
+                .post(handlers::patient_everything_type_handler::<S>),
+        )
+        .route(
+            "/Patient/{id}/$everything",
+            get(handlers::patient_everything_instance_handler::<S>)
+                .post(handlers::patient_everything_instance_handler::<S>),
+        )
+        .route(
             "/Group/{id}/$export",
             get(handlers::group_export_kickoff_handler::<S>)
                 .post(handlers::group_export_kickoff_handler::<S>),

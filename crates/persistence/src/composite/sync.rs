@@ -34,7 +34,7 @@ use std::time::Duration;
 use helios_fhir::FhirVersion;
 use parking_lot::RwLock;
 use serde_json::Value;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio::time::sleep;
 use tracing::{debug, error, warn};
 
@@ -162,7 +162,7 @@ pub struct SyncManager {
     config: SyncConfig,
 
     /// Event queue for async mode.
-    event_sender: Option<mpsc::Sender<QueuedEvent>>,
+    event_sender: Option<mpsc::Sender<Queued>>,
 
     /// Sync status per backend.
     status: Arc<RwLock<HashMap<String, BackendSyncStatus>>>,
@@ -195,6 +195,24 @@ struct QueuedEvent {
     created_at: std::time::Instant,
 }
 
+/// An item on the asynchronous sync queue.
+enum Queued {
+    /// A sync event bound for the named backends.
+    Event(QueuedEvent),
+    /// A barrier, resolved once every item queued ahead of it has been
+    /// processed. See [`SyncManager::barrier`].
+    Barrier(oneshot::Sender<()>),
+}
+
+/// The asynchronous sync queue cannot take or complete a request: the worker
+/// was never started, has stopped, or was aborted mid-batch.
+fn sync_queue_unavailable(message: impl Into<String>) -> StorageError {
+    StorageError::Backend(BackendError::ConnectionFailed {
+        backend_name: "sync".to_string(),
+        message: message.into(),
+    })
+}
+
 impl SyncManager {
     /// Creates a new sync manager.
     pub fn new(config: SyncConfig) -> Self {
@@ -210,7 +228,7 @@ impl SyncManager {
         &mut self,
         backends: HashMap<String, Arc<dyn ResourceStorage + Send + Sync>>,
     ) -> tokio::task::JoinHandle<()> {
-        let (sender, receiver) = mpsc::channel::<QueuedEvent>(1000);
+        let (sender, receiver) = mpsc::channel::<Queued>(1000);
         self.event_sender = Some(sender);
 
         let config = self.config.clone();
@@ -223,7 +241,7 @@ impl SyncManager {
 
     /// Async worker that processes queued events.
     async fn async_worker(
-        mut receiver: mpsc::Receiver<QueuedEvent>,
+        mut receiver: mpsc::Receiver<Queued>,
         backends: HashMap<String, Arc<dyn ResourceStorage + Send + Sync>>,
         config: SyncConfig,
         status: Arc<RwLock<HashMap<String, BackendSyncStatus>>>,
@@ -242,7 +260,16 @@ impl SyncManager {
                 }
 
                 match tokio::time::timeout(remaining, receiver.recv()).await {
-                    Ok(Some(event)) => batch.push(event),
+                    Ok(Some(item)) => {
+                        // A barrier means someone is waiting on everything
+                        // ahead of it: process what is collected now rather
+                        // than holding it for the rest of the batch window.
+                        let flush = matches!(item, Queued::Barrier(_));
+                        batch.push(item);
+                        if flush {
+                            break;
+                        }
+                    }
                     Ok(None) => return, // Channel closed
                     Err(_) => break,    // Timeout
                 }
@@ -253,9 +280,19 @@ impl SyncManager {
             }
 
             // Process batch
-            let events: Vec<_> = std::mem::take(&mut batch);
+            let items: Vec<_> = std::mem::take(&mut batch);
 
-            for queued in events {
+            for item in items {
+                let queued = match item {
+                    Queued::Event(queued) => queued,
+                    Queued::Barrier(done) => {
+                        // Everything queued ahead of this point has been
+                        // handed to its backends. The waiter may have given
+                        // up; that is its business.
+                        let _ = done.send(());
+                        continue;
+                    }
+                };
                 for backend_id in &queued.backend_ids {
                     if let Some(backend) = backends.get(backend_id) {
                         let result = Self::sync_event_to_backend(
@@ -556,17 +593,14 @@ impl SyncManager {
             }
 
             sender
-                .send(QueuedEvent {
+                .send(Queued::Event(QueuedEvent {
                     event: event.clone(),
                     backend_ids: backend_ids.clone(),
                     created_at: std::time::Instant::now(),
-                })
+                }))
                 .await
                 .map_err(|e| {
-                    StorageError::Backend(crate::error::BackendError::ConnectionFailed {
-                        backend_name: "sync".to_string(),
-                        message: format!("Failed to queue sync event: {}", e),
-                    })
+                    sync_queue_unavailable(format!("Failed to queue sync event: {}", e))
                 })?;
 
             // Return pending status
@@ -583,12 +617,10 @@ impl SyncManager {
                 })
                 .collect())
         } else {
-            Err(StorageError::Backend(BackendError::ConnectionFailed {
-                backend_name: "sync".to_string(),
-                message: "Async sync mode is configured but the async worker was never started. \
-                          Call start_async_worker() before processing events."
-                    .to_string(),
-            }))
+            Err(sync_queue_unavailable(
+                "Async sync mode is configured but the async worker was never started. \
+                 Call start_async_worker() before processing events.",
+            ))
         }
     }
 
@@ -732,6 +764,35 @@ impl SyncManager {
         true
     }
 
+    /// Waits until every event queued for asynchronous sync before this
+    /// call has been handed to its backends.
+    ///
+    /// Unlike [`wait_for_sync`](Self::wait_for_sync), which waits for the
+    /// queue to be *empty* and so never returns under a steady write stream,
+    /// this rides the queue as an item of its own: it resolves as soon as the
+    /// worker reaches it, whatever arrives behind it. A search issued after
+    /// it returns sees every write acknowledged before it was called — the
+    /// read-your-writes a transaction's conditional-reference resolution
+    /// needs (#1047).
+    ///
+    /// Without an asynchronous worker (synchronous mode, or no worker
+    /// started) nothing is ever queued, so there is nothing to wait for.
+    pub async fn barrier(&self) -> StorageResult<()> {
+        let Some(sender) = self.event_sender.as_ref() else {
+            return Ok(());
+        };
+        let (done, reached) = oneshot::channel();
+        sender
+            .send(Queued::Barrier(done))
+            .await
+            .map_err(|e| sync_queue_unavailable(format!("Failed to queue sync barrier: {}", e)))?;
+        // The worker drops the barrier unsent only if it stops (or is
+        // aborted) while holding it.
+        reached.await.map_err(|_| {
+            sync_queue_unavailable("Async sync worker stopped before reaching the barrier")
+        })
+    }
+
     /// Waits for sync lag to be below threshold.
     pub async fn wait_for_sync(&self, timeout: Duration) -> bool {
         let deadline = tokio::time::Instant::now() + timeout;
@@ -870,5 +931,399 @@ mod tests {
         let config = SyncConfig::default();
         let manager = SyncManager::new(config);
         assert!(manager.is_healthy());
+    }
+
+    // ------------------------------------------------------------------
+    // `barrier()` (#1047)
+    //
+    // Exercised here, in-process, with a backend whose writes block until
+    // the test releases them, so what the worker holds when `barrier()` is
+    // called is a fact of the test rather than a race against scheduling.
+    // ------------------------------------------------------------------
+
+    use std::sync::Mutex;
+    use std::time::Instant;
+
+    use async_trait::async_trait;
+    use tokio::sync::Semaphore;
+
+    /// A secondary that announces each write as it starts, then holds it
+    /// until the test grants a permit, and records the writes it completed
+    /// in order.
+    struct GatedBackend {
+        completed: Mutex<Vec<String>>,
+        gate: Semaphore,
+        started: mpsc::UnboundedSender<String>,
+    }
+
+    impl GatedBackend {
+        fn new() -> (Arc<Self>, mpsc::UnboundedReceiver<String>) {
+            let (started, starts) = mpsc::unbounded_channel();
+            let backend = Arc::new(Self {
+                completed: Mutex::new(Vec::new()),
+                gate: Semaphore::new(0),
+                started,
+            });
+            (backend, starts)
+        }
+
+        /// Lets `n` more writes through.
+        fn release(&self, n: usize) {
+            self.gate.add_permits(n);
+        }
+
+        fn completed(&self) -> Vec<String> {
+            self.completed.lock().unwrap().clone()
+        }
+
+        async fn write(&self, op: String) {
+            let _ = self.started.send(op.clone());
+            self.gate
+                .acquire()
+                .await
+                .expect("gate is never closed")
+                .forget();
+            self.completed.lock().unwrap().push(op);
+        }
+    }
+
+    #[async_trait]
+    impl ResourceStorage for GatedBackend {
+        fn backend_name(&self) -> &'static str {
+            "gated"
+        }
+
+        async fn create(
+            &self,
+            tenant: &TenantContext,
+            resource_type: &str,
+            resource: Value,
+            fhir_version: FhirVersion,
+        ) -> StorageResult<StoredResource> {
+            let id = resource["id"].as_str().unwrap_or("").to_string();
+            self.write(format!("create {id}")).await;
+            Ok(StoredResource::new(
+                resource_type,
+                id,
+                tenant.tenant_id().clone(),
+                resource,
+                fhir_version,
+            ))
+        }
+
+        async fn create_or_update(
+            &self,
+            tenant: &TenantContext,
+            resource_type: &str,
+            id: &str,
+            resource: Value,
+            fhir_version: FhirVersion,
+        ) -> StorageResult<(StoredResource, bool)> {
+            self.write(format!("update {id}")).await;
+            Ok((
+                StoredResource::new(
+                    resource_type,
+                    id,
+                    tenant.tenant_id().clone(),
+                    resource,
+                    fhir_version,
+                ),
+                false,
+            ))
+        }
+
+        async fn read(
+            &self,
+            _tenant: &TenantContext,
+            _resource_type: &str,
+            _id: &str,
+        ) -> StorageResult<Option<StoredResource>> {
+            unimplemented!("the sync worker never reads")
+        }
+
+        async fn update(
+            &self,
+            _tenant: &TenantContext,
+            _current: &StoredResource,
+            _resource: Value,
+        ) -> StorageResult<StoredResource> {
+            unimplemented!("the sync worker updates through create_or_update")
+        }
+
+        async fn delete(
+            &self,
+            _tenant: &TenantContext,
+            _resource_type: &str,
+            id: &str,
+        ) -> StorageResult<()> {
+            self.write(format!("delete {id}")).await;
+            Ok(())
+        }
+
+        async fn count(
+            &self,
+            _tenant: &TenantContext,
+            _resource_type: Option<&str>,
+        ) -> StorageResult<u64> {
+            unimplemented!("the sync worker never counts")
+        }
+    }
+
+    fn async_config() -> SyncConfig {
+        SyncConfig {
+            mode: SyncMode::Asynchronous,
+            ..SyncConfig::default()
+        }
+    }
+
+    fn backends(
+        backend: &Arc<GatedBackend>,
+    ) -> HashMap<String, Arc<dyn ResourceStorage + Send + Sync>> {
+        let mut map: HashMap<String, Arc<dyn ResourceStorage + Send + Sync>> = HashMap::new();
+        map.insert("search".to_string(), backend.clone());
+        map
+    }
+
+    fn create_event(id: &str) -> SyncEvent {
+        SyncEvent::Create {
+            resource_type: "Patient".to_string(),
+            resource_id: id.to_string(),
+            content: serde_json::json!({"resourceType": "Patient", "id": id}),
+            tenant_id: TenantId::new("t"),
+            fhir_version: FhirVersion::default(),
+        }
+    }
+
+    fn update_event(id: &str) -> SyncEvent {
+        SyncEvent::Update {
+            resource_type: "Patient".to_string(),
+            resource_id: id.to_string(),
+            content: serde_json::json!({"resourceType": "Patient", "id": id}),
+            tenant_id: TenantId::new("t"),
+            version: "2".to_string(),
+            fhir_version: FhirVersion::default(),
+        }
+    }
+
+    fn delete_event(id: &str) -> SyncEvent {
+        SyncEvent::Delete {
+            resource_type: "Patient".to_string(),
+            resource_id: id.to_string(),
+            tenant_id: TenantId::new("t"),
+        }
+    }
+
+    /// The barrier resolves only once every event queued ahead of it has
+    /// been handed to the backend, and not for anything queued behind it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn barrier_resolves_after_the_events_queued_ahead_of_it() {
+        let (backend, mut starts) = GatedBackend::new();
+        let backends = backends(&backend);
+        let mut manager = Arc::new(SyncManager::new(async_config()));
+        let _worker = Arc::get_mut(&mut manager)
+            .unwrap()
+            .start_async_worker(backends.clone());
+
+        manager.sync(&create_event("a"), &backends).await.unwrap();
+        manager.sync(&create_event("b"), &backends).await.unwrap();
+        assert!(
+            backend.completed().is_empty(),
+            "async sync returns before the backend is written"
+        );
+
+        let barrier = {
+            let manager = manager.clone();
+            tokio::spawn(async move { manager.barrier().await })
+        };
+
+        // The worker is now holding `a`: it reached the backend, which is
+        // waiting for the test. The barrier must not have resolved.
+        assert_eq!(starts.recv().await.as_deref(), Some("create a"));
+        assert!(
+            !barrier.is_finished(),
+            "barrier resolved before `a` was written"
+        );
+        backend.release(1);
+        assert_eq!(starts.recv().await.as_deref(), Some("create b"));
+        assert!(
+            !barrier.is_finished(),
+            "barrier resolved before `b` was written"
+        );
+        backend.release(1);
+
+        barrier.await.unwrap().expect("barrier");
+        assert_eq!(backend.completed(), vec!["create a", "create b"]);
+
+        // Queued behind the barrier: the backend is holding it, and the
+        // barrier that already resolved did not wait for it.
+        manager.sync(&create_event("c"), &backends).await.unwrap();
+        assert_eq!(starts.recv().await.as_deref(), Some("create c"));
+        assert_eq!(backend.completed().len(), 2);
+        backend.release(1);
+        manager.barrier().await.expect("second barrier");
+        assert_eq!(
+            backend.completed(),
+            vec!["create a", "create b", "create c"]
+        );
+    }
+
+    /// Every event kind is ordered behind the barrier the same way: a
+    /// create, then the update and delete of the same resource, land in
+    /// the order they were queued before the barrier resolves.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn barrier_orders_every_event_kind() {
+        let (backend, _starts) = GatedBackend::new();
+        backend.release(3);
+        let backends = backends(&backend);
+        let mut manager = SyncManager::new(async_config());
+        let _worker = manager.start_async_worker(backends.clone());
+
+        manager.sync(&create_event("a"), &backends).await.unwrap();
+        manager.sync(&update_event("a"), &backends).await.unwrap();
+        manager.sync(&delete_event("a"), &backends).await.unwrap();
+        manager.barrier().await.expect("barrier");
+
+        assert_eq!(
+            backend.completed(),
+            vec!["create a", "update a", "delete a"]
+        );
+    }
+
+    /// The worker holds events for up to a 100ms batching window; a barrier
+    /// flushes what is collected immediately instead of waiting it out.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn barrier_flushes_the_batch_window_early() {
+        let (backend, _starts) = GatedBackend::new();
+        backend.release(1);
+        let backends = backends(&backend);
+        let mut manager = SyncManager::new(async_config());
+        let _worker = manager.start_async_worker(backends.clone());
+
+        let started = Instant::now();
+        manager.sync(&create_event("a"), &backends).await.unwrap();
+        manager.barrier().await.expect("barrier");
+        let elapsed = started.elapsed();
+
+        assert_eq!(backend.completed(), vec!["create a"]);
+        assert!(
+            elapsed < Duration::from_millis(100),
+            "barrier waited out the batch window: {elapsed:?}"
+        );
+    }
+
+    /// Without an asynchronous worker nothing is ever queued: synchronous
+    /// mode, or an asynchronous manager whose worker was never started.
+    #[tokio::test]
+    async fn barrier_without_a_worker_is_a_no_op() {
+        let synchronous = SyncManager::new(SyncConfig {
+            mode: SyncMode::Synchronous,
+            ..SyncConfig::default()
+        });
+        synchronous
+            .barrier()
+            .await
+            .expect("synchronous: nothing queued");
+
+        let never_started = SyncManager::new(async_config());
+        never_started
+            .barrier()
+            .await
+            .expect("no worker: nothing queued");
+    }
+
+    fn assert_sync_unavailable(err: &StorageError, expected_message: &str) {
+        match err {
+            StorageError::Backend(BackendError::ConnectionFailed {
+                backend_name,
+                message,
+            }) => {
+                assert_eq!(backend_name, "sync");
+                assert!(message.contains(expected_message), "{message}");
+            }
+            other => panic!("expected the sync queue to report itself unavailable: {other}"),
+        }
+    }
+
+    /// Asynchronous mode with no worker started cannot queue anything: the
+    /// write is refused up front rather than silently never synced.
+    #[tokio::test]
+    async fn async_sync_without_a_started_worker_is_refused() {
+        let (backend, _starts) = GatedBackend::new();
+        let backends = backends(&backend);
+        let manager = SyncManager::new(async_config());
+
+        let err = manager
+            .sync(&create_event("a"), &backends)
+            .await
+            .expect_err("nothing can take the event");
+        assert_sync_unavailable(&err, "async worker was never started");
+    }
+
+    /// Once the worker is gone the queue is closed, and a write that would
+    /// have been queued is refused rather than dropped.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn async_sync_after_the_worker_stopped_is_refused() {
+        let (backend, _starts) = GatedBackend::new();
+        let backends = backends(&backend);
+        let mut manager = SyncManager::new(async_config());
+        let worker = manager.start_async_worker(backends.clone());
+        worker.abort();
+        let _ = worker.await;
+
+        let err = manager
+            .sync(&create_event("a"), &backends)
+            .await
+            .expect_err("the receiver is gone; the event cannot be queued");
+        assert_sync_unavailable(&err, "Failed to queue sync event");
+    }
+
+    /// A worker that is already gone cannot even take the barrier; the
+    /// caller learns that rather than waiting forever.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn barrier_reports_a_stopped_worker() {
+        let (backend, _starts) = GatedBackend::new();
+        let backends = backends(&backend);
+        let mut manager = SyncManager::new(async_config());
+        let worker = manager.start_async_worker(backends);
+        worker.abort();
+        let _ = worker.await;
+
+        let err = manager
+            .barrier()
+            .await
+            .expect_err("the receiver is gone; the barrier cannot be queued");
+        assert_sync_unavailable(&err, "Failed to queue sync barrier");
+    }
+
+    /// A worker that dies while holding the barrier — aborted mid-batch,
+    /// with the barrier's event still being written — drops it unsent, and
+    /// the waiter is told so instead of hanging.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn barrier_reports_a_worker_that_died_holding_it() {
+        let (backend, mut starts) = GatedBackend::new();
+        let backends = backends(&backend);
+        let mut manager = Arc::new(SyncManager::new(async_config()));
+        let worker = Arc::get_mut(&mut manager)
+            .unwrap()
+            .start_async_worker(backends.clone());
+
+        manager.sync(&create_event("a"), &backends).await.unwrap();
+        let barrier = {
+            let manager = manager.clone();
+            tokio::spawn(async move { manager.barrier().await })
+        };
+
+        // The worker took the barrier along with `a` and is blocked inside
+        // the backend on `a`; kill it there.
+        assert_eq!(starts.recv().await.as_deref(), Some("create a"));
+        worker.abort();
+        let _ = worker.await;
+
+        let err = barrier
+            .await
+            .unwrap()
+            .expect_err("the barrier was dropped unsent");
+        assert_sync_unavailable(&err, "stopped before reaching the barrier");
+        assert!(backend.completed().is_empty(), "nothing was written");
     }
 }

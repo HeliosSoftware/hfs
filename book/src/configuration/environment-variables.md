@@ -31,6 +31,7 @@ public address explicitly behind a proxy. Request `Host`, `Forwarded`, and
 | `HFS_REQUEST_TIMEOUT` | `30` | Request timeout (seconds) |
 | `HFS_DEFAULT_PAGE_SIZE` | `20` | Default search result page size |
 | `HFS_MAX_PAGE_SIZE` | `1000` | Maximum search result page size |
+| `HFS_EVERYTHING_MAX_UNPAGED` | `10000` | Ceiling on `match` entries for an unpaged `Patient/$everything`; when reached the response is paged and carries a `next` link. |
 
 Request bodies may be sent compressed (`Content-Encoding: gzip`, `deflate`,
 `br`, or `zstd`); unsupported encodings are rejected with `415`. Responses
@@ -58,6 +59,12 @@ are compressed when the client sends `Accept-Encoding`.
 | `HFS_ELASTICSEARCH_REFRESH_INTERVAL` | `1s` | Index `refresh_interval` applied when an index is created (`-1` disables periodic refresh) |
 | `HFS_ELASTICSEARCH_WRITE_REFRESH` | `false` | `refresh` parameter on index/delete writes: `false`, `wait_for`, or `true` |
 | `HFS_ELASTICSEARCH_NESTED_OBJECTS_LIMIT` | `50000` | Index `mapping.nested_objects.limit`: max nested objects per document across all nested search-parameter fields. Set on new indices; raised at startup on existing indices below it |
+| `HFS_ELASTICSEARCH_REQUEST_TIMEOUT_MS` | `30000` | Timeout of every Elasticsearch request, including `_bulk`, in milliseconds. A `_bulk` request that times out is split in half and resent |
+| `HFS_ELASTICSEARCH_BULK_MAX_BYTES` | `10485760` | Byte cap per `_bulk` request body (10 MiB), applied together with the 500-operation cap |
+| `HFS_ELASTICSEARCH_BULK_CONCURRENCY` | `1` | `_bulk` requests of one page in flight at once; splitting and back-off stay sequential per request |
+| `HFS_REINDEX_BATCH_BYTES` | `0` | Byte cap on one page of the automatic rebuild (`0` = count only); honoured by the SQLite source |
+| `HFS_ELASTICSEARCH_REINDEX_REFRESH` | *(unset)* | `refresh` parameter for `$reindex` and deferred-rebuild writes: `false`, `wait_for`, or `true`. Unset follows `HFS_ELASTICSEARCH_WRITE_REFRESH` |
+| `HFS_REINDEX_BATCH_SIZE` | `1000` | Page size of the automatic deferred rebuild after a bulk import (all backends). `POST $reindex` keeps its own `batchSize` |
 | `HFS_S3_BUCKET` | `hfs` | S3 bucket name |
 | `HFS_S3_REGION` | *(AWS chain)* | AWS region override |
 | `HFS_S3_PREFIX` | *(none)* | Optional key prefix for all S3 object keys |

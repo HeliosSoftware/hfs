@@ -25,8 +25,8 @@ use crate::core::bulk_submit_publication::{
     ManifestPublicationResult, ManifestPublicationStatus, canonical_publication_files,
 };
 use crate::core::bulk_submit_worker::{
-    ManifestFetchParams, ManifestLease, ManifestWorkerView, PollTokenTarget, SubmitClaimStrategy,
-    SubmitFileRecord, SubmitFileRow, SubmitWorkerStorage,
+    ManifestFetchParams, ManifestLease, ManifestWorkerView, PendingReindex, PollTokenTarget,
+    SubmitClaimStrategy, SubmitFileRecord, SubmitFileRow, SubmitWorkerStorage,
 };
 use crate::error::{
     BackendError, BulkSubmitError, StorageError, StorageResult, classify_sqlite_error,
@@ -1811,6 +1811,97 @@ impl SubmitClaimStrategy for SqliteBackend {
 
 #[async_trait]
 impl SubmitWorkerStorage for SqliteBackend {
+    /// #1125: the marker that says this manifest still owes a search-index
+    /// rebuild. It lives on the manifest row, so it survives a restart that
+    /// loses the in-process job map.
+    async fn mark_manifest_index_pending(&self, lease: &ManifestLease) -> StorageResult<()> {
+        let conn = self.get_connection()?;
+        conn.execute(
+            "UPDATE bulk_manifests SET index_pending = 1
+             WHERE tenant_id = ?1 AND submitter = ?2 AND submission_id = ?3 AND manifest_id = ?4",
+            params![
+                lease.tenant.tenant_id().as_str(),
+                lease.submission_id.submitter,
+                lease.submission_id.submission_id,
+                lease.manifest_id,
+            ],
+        )
+        .map_err(|e| internal_error(format!("mark index pending: {e}")))?;
+        Ok(())
+    }
+
+    async fn clear_manifest_index_pending(
+        &self,
+        tenant: &TenantContext,
+        manifest_id: &str,
+    ) -> StorageResult<()> {
+        let conn = self.get_connection()?;
+        conn.execute(
+            "UPDATE bulk_manifests SET index_pending = 0
+             WHERE tenant_id = ?1 AND manifest_id = ?2",
+            params![tenant.tenant_id().as_str(), manifest_id],
+        )
+        .map_err(|e| internal_error(format!("clear index pending: {e}")))?;
+        Ok(())
+    }
+
+    /// The resource types come from what the manifest actually ingested
+    /// (`bulk_entry_results`), so nothing extra has to be stored to re-fire
+    /// the rebuild.
+    async fn list_manifests_awaiting_reindex(
+        &self,
+        limit: u32,
+    ) -> StorageResult<Vec<PendingReindex>> {
+        let conn = self.get_connection()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT tenant_id, submitter, submission_id, manifest_id FROM bulk_manifests
+                 WHERE index_pending = 1 ORDER BY added_at LIMIT ?1",
+            )
+            .map_err(|e| internal_error(format!("prepare pending reindex: {e}")))?;
+        let rows = stmt
+            .query_map(params![limit], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                ))
+            })
+            .map_err(|e| internal_error(format!("query pending reindex: {e}")))?;
+        let mut pending = Vec::new();
+        for row in rows {
+            let (tenant_id, submitter, submission_id, manifest_id) =
+                row.map_err(|e| internal_error(format!("row pending reindex: {e}")))?;
+            let mut types_stmt = conn
+                .prepare(
+                    "SELECT DISTINCT resource_type FROM bulk_entry_results
+                     WHERE tenant_id = ?1 AND submitter = ?2 AND submission_id = ?3
+                       AND manifest_id = ?4 AND resource_type IS NOT NULL
+                     ORDER BY resource_type",
+                )
+                .map_err(|e| internal_error(format!("prepare pending types: {e}")))?;
+            let types: Vec<String> = types_stmt
+                .query_map(
+                    params![tenant_id, submitter, submission_id, manifest_id],
+                    |r| r.get::<_, String>(0),
+                )
+                .map_err(|e| internal_error(format!("query pending types: {e}")))?
+                .filter_map(Result::ok)
+                .collect();
+            pending.push(PendingReindex {
+                tenant: TenantContext::new(
+                    TenantId::new(tenant_id),
+                    TenantPermissions::full_access(),
+                ),
+                submission: SubmissionId::new(submitter, submission_id),
+                manifest_id,
+                resource_types: types,
+            });
+        }
+        Ok(pending)
+    }
+
     async fn get_manifest_for_worker(
         &self,
         lease: &ManifestLease,
@@ -4976,6 +5067,81 @@ mod tests {
             .await
             .unwrap();
         sub_id
+    }
+
+    /// #1125: the marker that says a manifest still owes a search-index
+    /// rebuild lives on the manifest row, so a restart can find the work the
+    /// in-process job map lost. It is set while the rebuild is outstanding,
+    /// listed with the types the manifest actually ingested, and cleared when
+    /// the rebuild has run.
+    #[tokio::test]
+    async fn manifest_index_pending_survives_and_lists_the_ingested_types() {
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+        let sub_id = seed_claimable(&backend, &tenant).await;
+        let lease = backend
+            .claim_next_manifest(&WorkerId::new("w1"), StdDuration::from_secs(60))
+            .await
+            .unwrap()
+            .expect("a manifest should be claimable");
+
+        assert!(
+            backend
+                .list_manifests_awaiting_reindex(10)
+                .await
+                .unwrap()
+                .is_empty(),
+            "nothing owes a rebuild before one is deferred"
+        );
+
+        {
+            let conn = backend.get_connection().unwrap();
+            for (line, resource_type, id) in [
+                (1, "Patient", "p1"),
+                (2, "Provenance", "v1"),
+                (3, "Patient", "p2"),
+            ] {
+                conn.execute(
+                    "INSERT INTO bulk_entry_results (tenant_id,submitter,submission_id,manifest_id,file_url,line_number,resource_type,resource_id,outcome)
+                     VALUES (?1,?2,?3,?4,'http://example.com/a.ndjson',?5,?6,?7,'created')",
+                    params![
+                        tenant.tenant_id().as_str(),
+                        sub_id.submitter,
+                        sub_id.submission_id,
+                        lease.manifest_id,
+                        line,
+                        resource_type,
+                        id
+                    ],
+                )
+                .unwrap();
+            }
+        }
+        backend.mark_manifest_index_pending(&lease).await.unwrap();
+
+        let pending = backend.list_manifests_awaiting_reindex(10).await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].manifest_id, lease.manifest_id);
+        assert_eq!(pending[0].submission, sub_id);
+        assert_eq!(pending[0].tenant.tenant_id(), tenant.tenant_id());
+        assert_eq!(
+            pending[0].resource_types,
+            vec!["Patient".to_string(), "Provenance".to_string()],
+            "the types come from what the manifest ingested"
+        );
+
+        backend
+            .clear_manifest_index_pending(&tenant, &lease.manifest_id)
+            .await
+            .unwrap();
+        assert!(
+            backend
+                .list_manifests_awaiting_reindex(10)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a finished rebuild leaves nothing to resume"
+        );
     }
 
     #[tokio::test]

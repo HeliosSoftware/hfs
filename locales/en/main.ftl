@@ -202,6 +202,14 @@ chart-as-of = As of { $time }.
 search-index-rebuilding = Search index rebuilding — { $percent }% ({ $processed } of { $total } resources). Searches may miss stored resources until it finishes.
 # The same, before the rebuild has counted the resources it will process.
 search-index-rebuilding-counting = Search index rebuilding. Searches may miss stored resources until it finishes.
+# #1125: the tenant's most recent search-index rebuild ended with resources
+# left unindexed. $errors is a resource count; $job is the rebuild job id.
+search-index-rebuild-failed = { $errors ->
+    [one] The last search index rebuild left one resource unindexed. Searches miss it until a rebuild succeeds; GET $reindex-status/{ $job } says which one.
+   *[other] The last search index rebuild left { $count } resources unindexed. Searches miss them until a rebuild succeeds; GET $reindex-status/{ $job } lists which ones.
+  }
+# The same, when the rebuild failed as a whole before naming any resource.
+search-index-rebuild-failed-job = The last search index rebuild failed before it finished. Searches may miss stored resources until a rebuild succeeds; GET $reindex-status/{ $job } says why.
 chart-table-toggle = View as Table
 chart-table-when = Time
 chart-focus-series = Focus this series
@@ -454,6 +462,8 @@ queries-results-included = { $count } included
 queries-results-empty = No results.
 queries-searching = Searching…
 queries-col-updated = Updated
+queries-copy-id = Copy id
+queries-copied = Copied
 queries-prev = Previous
 queries-next = Next
 queries-results-fetch-error = Could not load results from { $origin }. Check HFS_BASE_URL and try again.

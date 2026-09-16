@@ -395,10 +395,16 @@ fn build_resource_capability(
     // `rest[0].operation`.
     match resource_type {
         "Patient" => {
-            entry["operation"] = serde_json::json!([{
-                "name": "export",
-                "definition": "http://hl7.org/fhir/uv/bulkdata/OperationDefinition/patient-export"
-            }]);
+            entry["operation"] = serde_json::json!([
+                {
+                    "name": "export",
+                    "definition": "http://hl7.org/fhir/uv/bulkdata/OperationDefinition/patient-export"
+                },
+                {
+                    "name": "everything",
+                    "definition": "http://hl7.org/fhir/OperationDefinition/Patient-everything"
+                }
+            ]);
         }
         "Group" => {
             entry["operation"] = serde_json::json!([{

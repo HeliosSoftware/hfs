@@ -1023,7 +1023,7 @@ async fn search_parameters_page_serves_the_registry_view() {
     assert!(html.contains(
         r#"<table class="data-table" data-row-navigation aria-label="Search Parameters">"#
     ));
-    assert!(html.contains(r#"<script src="/ui/assets/search-parameters.js" defer></script>"#));
+    assert!(html.contains(r#"<script src="/ui/assets/row-navigation.js" defer></script>"#));
     // The Resource Filter rail and the facet rows are server-rendered.
     assert!(html.contains(r#"id="sp-rail-list""#));
     assert!(html.contains("base=Patient"));
@@ -1312,6 +1312,30 @@ async fn search_and_queries_pin_recent_types_above_the_scrollable_list() {
         assert_eq!(response.status(), StatusCode::OK, "{path}");
         let html = body_text(response).await;
         assert_recent_types_are_pinned_above_the_list(&html);
+    }
+}
+
+/* Whole-row navigation on the results table (#1106): every page that embeds
+ * search-results.html marks the table and loads the handler that extends the
+ * id link's click target to the rest of the row. */
+#[tokio::test]
+async fn results_pages_enable_row_navigation() {
+    for path in ["/ui/resources", "/ui/search", "/ui/queries"] {
+        let response = app()
+            .oneshot(Request::get(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK, "{path}");
+        let html = body_text(response).await;
+        assert!(
+            html.contains(r#"<table class="data-table query-results__table" data-row-navigation>"#),
+            "{path}: {html}"
+        );
+        assert!(
+            html.contains(r#"<script src="/ui/assets/row-navigation.js" defer></script>"#),
+            "{path}: {html}"
+        );
     }
 }
 

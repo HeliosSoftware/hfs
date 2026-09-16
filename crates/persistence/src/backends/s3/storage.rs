@@ -1972,6 +1972,7 @@ impl ReindexSource for S3Backend {
         Ok(ResourcePage {
             resources,
             next_cursor,
+            skipped: Vec::new(),
         })
     }
 }

@@ -809,23 +809,69 @@ fn dashboard_notice(state: &SnapshotState, now: DateTime<Utc>) -> NoticeLine {
     }
 }
 
-/// `data-dash-notice` slug of the rebuild line (#1065).
+/// `data-dash-notice` slug of the rebuild line while a rebuild runs (#1065).
 const REBUILD_NOTICE: &str = "rebuilding";
+/// `data-dash-notice` slug of the rebuild line once the tenant's last rebuild
+/// left resources unindexed (#1125). Distinct from [`REBUILD_NOTICE`], so the
+/// switch from "rebuilding" to "failed" is announced rather than kept quiet.
+const REBUILD_FAILED_NOTICE: &str = "rebuild-failed";
 
-/// The "search index rebuilding" sentence for a running rebuild (#1065):
-/// with its percentage once the rebuild has counted its resources, without
-/// one before, so it never shows a fabricated "0%".
+/// The rebuild line's `data-dash-notice` slug for `activity`.
+fn rebuild_notice(activity: &ReindexActivity) -> &'static str {
+    if activity.is_running() {
+        REBUILD_NOTICE
+    } else {
+        REBUILD_FAILED_NOTICE
+    }
+}
+
+/// The rebuild line's `data-rebuild-state`: `running` or `failed`.
+fn rebuild_state(activity: &ReindexActivity) -> &'static str {
+    if activity.is_running() {
+        "running"
+    } else {
+        "failed"
+    }
+}
+
+/// The rebuild line's sentence.
+///
+/// For a running rebuild (#1065): with its percentage once the rebuild has
+/// counted its resources, without one before, so it never shows a fabricated
+/// "0%". For a last rebuild that left resources unindexed (#1125): how many,
+/// when the job attributed its errors to resources, and the `$reindex-status`
+/// job that lists them — the job ending does not make them searchable.
 fn rebuild_text(i18n: &I18n, activity: &ReindexActivity) -> String {
-    match activity.percent() {
-        Some(percent) => i18n.t_args(
-            "search-index-rebuilding",
-            &std::collections::BTreeMap::from([
-                ("percent".to_string(), percent.to_string()),
-                ("processed".to_string(), grouped(activity.processed)),
-                ("total".to_string(), grouped(activity.total)),
-            ]),
+    match activity {
+        ReindexActivity::Running {
+            processed, total, ..
+        } => match activity.percent() {
+            Some(percent) => i18n.t_args(
+                "search-index-rebuilding",
+                &std::collections::BTreeMap::from([
+                    ("percent".to_string(), percent.to_string()),
+                    ("processed".to_string(), grouped(*processed)),
+                    ("total".to_string(), grouped(*total)),
+                ]),
+            ),
+            None => i18n.t("search-index-rebuilding-counting"),
+        },
+        ReindexActivity::Failed { job_id, errors: 0 } => i18n.t_args(
+            "search-index-rebuild-failed-job",
+            &std::collections::BTreeMap::from([("job".to_string(), job_id.clone())]),
         ),
-        None => i18n.t("search-index-rebuilding-counting"),
+        // `errors` goes in as a number, not a pre-grouped string: Fluent then
+        // groups it for the locale (11.704 in German) and the catalog can
+        // select the plural form (#1125).
+        ReindexActivity::Failed { job_id, errors } => i18n.t_arg3(
+            "search-index-rebuild-failed",
+            "errors",
+            *errors,
+            "count",
+            grouped_in(*errors, &i18n.lang()),
+            "job",
+            job_id.clone(),
+        ),
     }
 }
 
@@ -854,8 +900,9 @@ struct IndexPage {
     /// Whether the page renders its waiting state: no figure is known yet
     /// (#1078).
     chart_waiting: bool,
-    /// A search-index rebuild running for the tenant (#1065), rendered as a
-    /// warning line inside the live region so each refresh keeps it current.
+    /// A search-index rebuild running for the tenant (#1065), or its last one
+    /// that left resources unindexed (#1125), rendered as a warning line
+    /// inside the live region so each refresh keeps it current.
     rebuild: Option<ReindexActivity>,
     /// Whether the storage backend cannot count at all
     /// ([`Figures::Unsupported`]): the chart area says so
@@ -926,10 +973,22 @@ impl IndexPage {
         rebuild_text(&self.i18n, activity)
     }
 
-    /// The rebuild line's `aria-live`: announced when it appears, then quiet
-    /// on the refreshes that only move its percentage.
-    fn rebuild_aria_live(&self) -> &'static str {
-        if self.quiet_notices.iter().any(|seen| seen == REBUILD_NOTICE) {
+    /// The rebuild line's `data-dash-notice` slug (see [`rebuild_notice`]).
+    fn rebuild_notice(&self, activity: &ReindexActivity) -> &'static str {
+        rebuild_notice(activity)
+    }
+
+    /// The rebuild line's `data-rebuild-state` (see [`rebuild_state`]).
+    fn rebuild_state(&self, activity: &ReindexActivity) -> &'static str {
+        rebuild_state(activity)
+    }
+
+    /// The rebuild line's `aria-live`: announced when it appears or changes
+    /// from running to failed, then quiet on the refreshes that only move its
+    /// percentage.
+    fn rebuild_aria_live(&self, activity: &ReindexActivity) -> &'static str {
+        let slug = rebuild_notice(activity);
+        if self.quiet_notices.iter().any(|seen| seen == slug) {
             "off"
         } else {
             "polite"
@@ -1010,8 +1069,9 @@ struct ResourcesPage {
     create_advertised_types: String,
     create_schema_types: String,
     create_metadata_available: bool,
-    /// A search-index rebuild running for the tenant (#1065): results may miss
-    /// stored resources until it finishes, so the page head says so.
+    /// A search-index rebuild running for the tenant (#1065), or its last one
+    /// that left resources unindexed (#1125): results may miss stored
+    /// resources, so the page head says so.
     rebuild: Option<ReindexActivity>,
     /// The search-builder partial's save controls are the Saved Queries page's
     /// job, not this one's.
@@ -1038,6 +1098,11 @@ impl ResourcesPage {
     /// The rebuild line's wording (see [`rebuild_text`]).
     fn rebuild_text(&self, activity: &ReindexActivity) -> String {
         rebuild_text(&self.i18n, activity)
+    }
+
+    /// The rebuild line's `data-rebuild-state` (see [`rebuild_state`]).
+    fn rebuild_state(&self, activity: &ReindexActivity) -> &'static str {
+        rebuild_state(activity)
     }
 }
 
@@ -2584,7 +2649,9 @@ async fn resources(
             .map(capability::CreateTargets::schema_resources_csv)
             .unwrap_or_default(),
         create_metadata_available: targets.is_some(),
-        rebuild: live.as_ref().and_then(|snapshot| snapshot.reindex_active),
+        rebuild: live
+            .as_ref()
+            .and_then(|snapshot| snapshot.reindex_active.clone()),
         show_save: false,
         rail_counts_approximate,
         rail_entries,
@@ -8097,7 +8164,11 @@ async fn build_index_page(
     let refresh_moving = live_refresh
         && (snapshot.figures.is_approximate()
             || snapshot.import_jobs_active.is_some_and(|n| n > 0)
-            || snapshot.reindex_active.is_some());
+            // Only a running rebuild moves; a failed one is a settled fact.
+            || snapshot
+                .reindex_active
+                .as_ref()
+                .is_some_and(ReindexActivity::is_running));
     let refresh_href = if slow_watch {
         Some(format!("{retry_base}&retry={DASH_PENDING_RETRIES}"))
     } else {
@@ -8116,7 +8187,7 @@ async fn build_index_page(
         all_types: dash.all_types,
         all_types_href: dash.all_types_href,
         notice,
-        rebuild: snapshot.reindex_active,
+        rebuild: snapshot.reindex_active.clone(),
         chart_waiting,
         chart_unsupported: unsupported,
         figures_unknown_key: if unsupported {
@@ -8609,6 +8680,19 @@ fn compact_count(n: u64) -> String {
 }
 
 /// Thousands-separated integer for prominent totals: `1204 -> "1,204"`.
+/// [`grouped`], with the thousands separator the locale uses: a comma in
+/// English, a period in German and Spanish (#1125). Fluent does not group
+/// numbers itself, so the grouped text travels as its own placeable while the
+/// raw number selects the plural form.
+pub(crate) fn grouped_in(n: u64, lang: &str) -> String {
+    let separator = if lang.starts_with("de") || lang.starts_with("es") {
+        "."
+    } else {
+        ","
+    };
+    grouped(n).replace(',', separator)
+}
+
 pub(crate) fn grouped(n: u64) -> String {
     let digits = n.to_string();
     let bytes = digits.as_bytes();
