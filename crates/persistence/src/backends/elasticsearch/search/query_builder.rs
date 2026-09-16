@@ -322,12 +322,30 @@ impl<'a> EsQueryBuilder<'a> {
     }
 
     /// Builds a clause for the _id special parameter.
+    ///
+    /// `_id` is dispatched here by name (`build_parameter_clause`, above),
+    /// bypassing the generic `:not` handling that wraps every other
+    /// parameter's clauses in `must_not` — so `_id:not=a` used to build the
+    /// exact same `term`/`terms` clause as a bare `_id=a` and match precisely
+    /// the resource the caller asked to exclude (#1092). `:missing` is
+    /// resolved earlier, in `build_parameter_clause`, and any other modifier
+    /// is rejected before this point by the backend's search entry point, so
+    /// only `None` and `Some(SearchModifier::Not)` are handled here.
     fn build_id_clause(&self, param: &SearchParameter) -> Option<Value> {
+        if param.values.is_empty() {
+            return None;
+        }
         let ids: Vec<&str> = param.values.iter().map(|v| v.value.as_str()).collect();
-        if ids.len() == 1 {
-            Some(json!({ "term": { "resource_id": ids[0] } }))
+        let clause = if ids.len() == 1 {
+            json!({ "term": { "resource_id": ids[0] } })
         } else {
-            Some(json!({ "terms": { "resource_id": ids } }))
+            json!({ "terms": { "resource_id": ids } })
+        };
+
+        if matches!(param.modifier, Some(SearchModifier::Not)) {
+            Some(json!({ "bool": { "must_not": [clause] } }))
+        } else {
+            Some(clause)
         }
     }
 
@@ -540,6 +558,90 @@ mod tests {
         let es_query = builder.build(&query);
         let body_str = serde_json::to_string(&es_query.body).unwrap();
         assert!(body_str.contains("resource_id"));
+    }
+
+    /// #1092: `_id` is dispatched through `build_id_clause`, bypassing the
+    /// generic `:not` handling that wraps every other parameter's clauses in
+    /// `must_not` — so `_id:not=a` used to build the exact same `term`
+    /// clause as a bare `_id=a` and match precisely the resource the caller
+    /// asked to exclude.
+    #[test]
+    fn id_no_modifier_control_is_a_term_clause() {
+        let query = SearchQuery::new("Patient").with_parameter(SearchParameter {
+            name: "_id".to_string(),
+            param_type: SearchParamType::Token,
+            modifier: None,
+            values: vec![SearchValue::eq("a")],
+            chain: vec![],
+            components: vec![],
+        });
+
+        let builder = EsQueryBuilder::new("acme", "Patient", "hfs_acme_patient".to_string());
+        let es_query = builder.build(&query);
+        let clause = &es_query.body["query"]["bool"]["must"][0];
+
+        assert_eq!(clause, &json!({ "term": { "resource_id": "a" } }));
+    }
+
+    /// Matches the SQL backends' `_id` builders, which both guard on
+    /// `values.is_empty()` and contribute no condition rather than an
+    /// empty `terms: []` clause (which would match nothing rather than
+    /// leaving the parameter's absence unconstrained).
+    #[test]
+    fn id_with_no_values_produces_no_clause() {
+        let param = SearchParameter {
+            name: "_id".to_string(),
+            param_type: SearchParamType::Token,
+            modifier: None,
+            values: vec![],
+            chain: vec![],
+            components: vec![],
+        };
+
+        let builder = EsQueryBuilder::new("acme", "Patient", "hfs_acme_patient".to_string());
+        assert!(builder.build_id_clause(&param).is_none());
+    }
+
+    #[test]
+    fn id_not_single_value_is_negated_with_must_not() {
+        let query = SearchQuery::new("Patient").with_parameter(SearchParameter {
+            name: "_id".to_string(),
+            param_type: SearchParamType::Token,
+            modifier: Some(SearchModifier::Not),
+            values: vec![SearchValue::eq("a")],
+            chain: vec![],
+            components: vec![],
+        });
+
+        let builder = EsQueryBuilder::new("acme", "Patient", "hfs_acme_patient".to_string());
+        let es_query = builder.build(&query);
+        let clause = &es_query.body["query"]["bool"]["must"][0];
+
+        assert_eq!(
+            clause,
+            &json!({ "bool": { "must_not": [ { "term": { "resource_id": "a" } } ] } })
+        );
+    }
+
+    #[test]
+    fn id_not_two_values_is_negated_with_must_not() {
+        let query = SearchQuery::new("Patient").with_parameter(SearchParameter {
+            name: "_id".to_string(),
+            param_type: SearchParamType::Token,
+            modifier: Some(SearchModifier::Not),
+            values: vec![SearchValue::eq("a"), SearchValue::eq("b")],
+            chain: vec![],
+            components: vec![],
+        });
+
+        let builder = EsQueryBuilder::new("acme", "Patient", "hfs_acme_patient".to_string());
+        let es_query = builder.build(&query);
+        let clause = &es_query.body["query"]["bool"]["must"][0];
+
+        assert_eq!(
+            clause,
+            &json!({ "bool": { "must_not": [ { "terms": { "resource_id": ["a", "b"] } } ] } })
+        );
     }
 
     #[test]
