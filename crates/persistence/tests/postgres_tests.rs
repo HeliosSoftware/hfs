@@ -6938,7 +6938,11 @@ mod postgres_integration {
 
     #[tokio::test]
     async fn postgres_integration_reindex_page_batches_and_scopes_writes() {
+        use helios_persistence::core::SearchProvider;
         use helios_persistence::search::{ReindexSource, ReindexTarget};
+        use helios_persistence::types::{
+            SearchParamType, SearchParameter, SearchQuery, SearchValue,
+        };
 
         let backend = create_backend().await;
         let tenant = create_tenant("reindex-page-batch");
@@ -7034,12 +7038,110 @@ mod postgres_integration {
             .unwrap()
             .get(0);
 
+        // The page's own full-text rows must come out of the write untouched —
+        // kept until each resource's upsert, not deleted and re-inserted — and
+        // rows the page does not name (another tenant's, or this tenant's
+        // outside the page) must survive byte-identical (#1146).
+        async fn scoped_fts_rows(
+            client: &tokio_postgres::Client,
+            tenant_id: &str,
+            other_tenant_id: &str,
+        ) -> Vec<(String, String, Option<String>, Option<String>)> {
+            client
+                .query(
+                    "SELECT tenant_id, resource_id, narrative_tsvector::text,
+                            content_tsvector::text
+                     FROM resource_fts
+                     WHERE resource_type = 'Patient'
+                       AND ((tenant_id = $1 AND resource_id = ANY($2::text[]))
+                         OR (tenant_id = $3 AND resource_id = 'page-a'))
+                     ORDER BY tenant_id, resource_id",
+                    &[
+                        &tenant_id,
+                        &vec!["page-a", "page-b", "outside"],
+                        &other_tenant_id,
+                    ],
+                )
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|row| (row.get(0), row.get(1), row.get(2), row.get(3)))
+                .collect()
+        }
+
+        let fts_before = scoped_fts_rows(&client, tenant_id, other_tenant_id).await;
+        assert_eq!(
+            fts_before.len(),
+            4,
+            "POSITIVE CONTROL: every page and bystander resource must have exactly \
+             one full-text row before the write: {fts_before:?}"
+        );
+
         let results = backend
             .write_search_entries_page(&tenant, &page.resources)
             .await;
         assert_eq!(results.len(), 2);
         assert!(results.iter().all(Result::is_ok));
         assert!(results.iter().all(|result| *result.as_ref().unwrap() > 0));
+
+        let fts_after = scoped_fts_rows(&client, tenant_id, other_tenant_id).await;
+        assert_eq!(fts_after.len(), 4);
+        for (scoped_tenant, resource_id) in [(tenant_id, "outside"), (other_tenant_id, "page-a")] {
+            let before = fts_before
+                .iter()
+                .find(|row| row.0 == scoped_tenant && row.1 == resource_id)
+                .expect("bystander full-text row must exist before the write");
+            let after = fts_after
+                .iter()
+                .find(|row| row.0 == scoped_tenant && row.1 == resource_id)
+                .expect("bystander full-text row must exist after the write");
+            assert_eq!(
+                after, before,
+                "the full-text row of {resource_id} ({scoped_tenant}) is outside the \
+                 page and must come out byte-identical"
+            );
+        }
+        for resource_id in ["page-a", "page-b"] {
+            let rows: Vec<_> = fts_after
+                .iter()
+                .filter(|row| row.0 == tenant_id && row.1 == resource_id)
+                .collect();
+            assert_eq!(
+                rows.len(),
+                1,
+                "{resource_id} must keep exactly one full-text row"
+            );
+            assert!(
+                rows[0]
+                    .3
+                    .as_deref()
+                    .is_some_and(|vector| !vector.is_empty()),
+                "{resource_id}'s full-text row must keep its content: {rows:?}"
+            );
+        }
+
+        // …and that content must still be reachable through the full-text
+        // parameter, not merely present in the column.
+        for (resource_id, family) in [("page-a", "Able"), ("page-b", "Baker")] {
+            let query = SearchQuery::new("Patient").with_parameter(SearchParameter {
+                name: "_content".to_string(),
+                param_type: SearchParamType::Special,
+                modifier: None,
+                values: vec![SearchValue::eq(family)],
+                chain: vec![],
+                components: vec![],
+            });
+            let hits = backend.search(&tenant, &query).await.unwrap();
+            assert_eq!(
+                hits.resources
+                    .items
+                    .iter()
+                    .map(|resource| resource.id().to_string())
+                    .collect::<Vec<_>>(),
+                vec![resource_id.to_string()],
+                "_content must still find {resource_id} after the page write"
+            );
+        }
 
         let remaining_stale: Vec<(String, String)> = client
             .query(
@@ -7103,110 +7205,567 @@ mod postgres_integration {
         assert_eq!(history_after, history_before);
     }
 
+    /// One `write_search_entries_page` call must stay one PostgreSQL
+    /// transaction, and (#1146) it must keep each valid `resource_fts` row
+    /// until that resource's upsert: no effective full-text write when the
+    /// stored bytes did not change, one `UPDATE` when they did.
+    ///
+    /// The probe records one row per trigger firing, with the resource and the
+    /// transaction that fired it. It deliberately does **not** project with
+    /// `SELECT DISTINCT`: a page write fires several identical `search_index`
+    /// triggers per resource, and the distinct projection this test used to do
+    /// collapsed exactly the multiplicity the assertions are about.
     #[tokio::test]
     async fn postgres_integration_reindex_page_uses_one_transaction_for_all_index_writes() {
+        use helios_persistence::core::SearchProvider;
         use helios_persistence::search::{ReindexSource, ReindexTarget};
+        use helios_persistence::types::{
+            SearchParamType, SearchParameter, SearchQuery, SearchValue, StoredResource,
+        };
+
+        /// One trigger firing: the operation, the resource it belongs to,
+        /// whether the full-text row already existed (BEFORE INSERT only), and
+        /// the transaction that fired it.
+        #[derive(Debug)]
+        struct ProbeRow {
+            operation: String,
+            resource_id: String,
+            row_existed: Option<bool>,
+            transaction_id: i64,
+        }
+
+        async fn probe_rows(client: &tokio_postgres::Client, table_name: &str) -> Vec<ProbeRow> {
+            client
+                .query(
+                    &format!(
+                        "SELECT operation, resource_id, row_existed, transaction_id
+                         FROM {table_name}"
+                    ),
+                    &[],
+                )
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|row| ProbeRow {
+                    operation: row.get(0),
+                    resource_id: row.get(1),
+                    row_existed: row.get(2),
+                    transaction_id: row.get(3),
+                })
+                .collect()
+        }
+
+        fn fired(rows: &[ProbeRow], operation: &str, resource_id: &str) -> usize {
+            rows.iter()
+                .filter(|row| row.operation == operation && row.resource_id == resource_id)
+                .count()
+        }
+
+        /// One entry per attempted upsert of this resource's full-text row,
+        /// carrying whether the row was already there when the attempt was made.
+        fn upsert_attempts(rows: &[ProbeRow], resource_id: &str) -> Vec<Option<bool>> {
+            rows.iter()
+                .filter(|row| {
+                    row.operation == "resource_fts_before_insert" && row.resource_id == resource_id
+                })
+                .map(|row| row.row_existed)
+                .collect()
+        }
+
+        fn assert_one_transaction(rows: &[ProbeRow], context: &str) {
+            let transactions: std::collections::BTreeSet<i64> =
+                rows.iter().map(|row| row.transaction_id).collect();
+            assert_eq!(
+                transactions.len(),
+                1,
+                "{context}: every index write of a page must share one PostgreSQL \
+                 transaction: {rows:?}"
+            );
+        }
+
+        fn narrative(term: &str) -> serde_json::Value {
+            json!({
+                "status": "generated",
+                "div": format!(
+                    "<div xmlns=\"http://www.w3.org/1999/xhtml\"><p>{term}</p></div>"
+                )
+            })
+        }
+
+        async fn fts_hits(
+            backend: &PostgresBackend,
+            tenant: &TenantContext,
+            parameter: &str,
+            term: &str,
+        ) -> Vec<String> {
+            let query = SearchQuery::new("Patient").with_parameter(SearchParameter {
+                name: parameter.to_string(),
+                param_type: SearchParamType::Special,
+                modifier: None,
+                values: vec![SearchValue::eq(term)],
+                chain: vec![],
+                components: vec![],
+            });
+            backend
+                .search(tenant, &query)
+                .await
+                .expect("full-text search should succeed")
+                .resources
+                .items
+                .iter()
+                .map(|resource| resource.id().to_string())
+                .collect()
+        }
+
+        async fn fts_vectors(
+            client: &tokio_postgres::Client,
+            tenant_id: &str,
+        ) -> Vec<(String, Option<String>, Option<String>)> {
+            client
+                .query(
+                    "SELECT resource_id, narrative_tsvector::text, content_tsvector::text
+                     FROM resource_fts
+                     WHERE tenant_id = $1 AND resource_type = 'Patient'
+                     ORDER BY resource_id",
+                    &[&tenant_id],
+                )
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|row| (row.get(0), row.get(1), row.get(2)))
+                .collect()
+        }
+
+        const PAGE_IDS: [&str; 2] = ["tx-a", "tx-b"];
 
         let (backend, dbname) = isolated_reindex_backend().await;
         let tenant = create_tenant("reindex-page-single-transaction");
         let tenant_id = tenant.tenant_id().as_str();
-        for id in ["tx-a", "tx-b"] {
-            backend
-                .create(
-                    &tenant,
-                    "Patient",
-                    json!({
-                        "resourceType": "Patient",
-                        "id": id,
-                        "name": [{"family": id}]
-                    }),
-                    FhirVersion::default(),
-                )
-                .await
-                .unwrap();
-        }
+        let unchanged_term = format!("Preservedtoken{}", uuid::Uuid::new_v4().simple());
+        let replaced_term = format!("Replacedtoken{}", uuid::Uuid::new_v4().simple());
+        let refreshed_term = format!("Refreshedtoken{}", uuid::Uuid::new_v4().simple());
+
+        // Fixtures through the CRUD write paths — `create` for one resource and
+        // `create` then `update` for the other — so the page finds full-text
+        // rows written the way a live tenant's rows are, not by a raw seed.
+        // The triggers go in after this, so the probe sees reindex writes only.
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({
+                    "resourceType": "Patient",
+                    "id": "tx-a",
+                    "name": [{"family": "TxAlpha"}],
+                    "text": narrative(&unchanged_term)
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        let created = backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({
+                    "resourceType": "Patient",
+                    "id": "tx-b",
+                    "name": [{"family": "TxBravo"}],
+                    "text": narrative(&replaced_term)
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        backend
+            .update(
+                &tenant,
+                &created,
+                json!({
+                    "resourceType": "Patient",
+                    "id": "tx-b",
+                    "name": [{"family": "TxBravoRevised"}],
+                    "text": narrative(&replaced_term)
+                }),
+            )
+            .await
+            .unwrap();
+
         let page = backend
             .fetch_resources_page(&tenant, "Patient", None, 10)
             .await
             .unwrap();
+        assert_eq!(
+            page.resources
+                .iter()
+                .map(|resource| resource.id())
+                .collect::<Vec<_>>(),
+            PAGE_IDS.to_vec()
+        );
+
+        // Settle the page's full-text rows on the stored-bytes serialization
+        // before the probe starts, still part of the fixture. A CRUD write
+        // tokenises the resource it holds in memory; a reindex tokenises the
+        // jsonb round trip, and the two orders differ in an object's keys, so
+        // the first reindex after a CRUD write may legitimately replace the
+        // stored vectors once. Runs 1 and 2 below must be reindexes of a page
+        // whose rows already hold what a reindex would write, which is the
+        // state a repeated reindex finds.
+        let settled = backend
+            .write_search_entries_page(&tenant, &page.resources)
+            .await;
+        assert!(
+            settled.iter().all(Result::is_ok),
+            "the fixture's settling page write must succeed: {settled:?}"
+        );
 
         let client = reindex_test_client_for(&dbname).await;
         let suffix = uuid::Uuid::new_v4().simple().to_string();
         let table_name = format!("reindex_tx_probe_{suffix}");
         let function_name = format!("record_reindex_tx_{suffix}");
+        let upsert_trigger = format!("record_fts_upsert_{suffix}");
         let search_trigger = format!("record_search_tx_{suffix}");
         let fts_trigger = format!("record_fts_tx_{suffix}");
         client
             .batch_execute(&format!(
-                "CREATE TABLE {table_name} (operation text NOT NULL, transaction_id bigint NOT NULL);
+                "CREATE TABLE {table_name} (
+                     operation text NOT NULL,
+                     resource_id text NOT NULL,
+                     row_existed boolean,
+                     transaction_id bigint NOT NULL
+                 );
                  CREATE FUNCTION {function_name}() RETURNS trigger LANGUAGE plpgsql AS $$
                  BEGIN
+                   IF TG_WHEN = 'BEFORE' THEN
+                     IF NEW.tenant_id = '{tenant_id}' THEN
+                       INSERT INTO {table_name}
+                         (operation, resource_id, row_existed, transaction_id)
+                       VALUES (
+                         'resource_fts_before_insert',
+                         NEW.resource_id,
+                         EXISTS (
+                           SELECT 1 FROM resource_fts existing
+                           WHERE existing.tenant_id = NEW.tenant_id
+                             AND existing.resource_type = NEW.resource_type
+                             AND existing.resource_id = NEW.resource_id
+                         ),
+                         txid_current()
+                       );
+                     END IF;
+                     RETURN NEW;
+                   END IF;
                    IF TG_OP = 'DELETE' THEN
                      IF OLD.tenant_id = '{tenant_id}' THEN
-                       INSERT INTO {table_name} VALUES (TG_TABLE_NAME || '_delete', txid_current());
+                       INSERT INTO {table_name} (operation, resource_id, transaction_id)
+                       VALUES (TG_TABLE_NAME || '_delete', OLD.resource_id, txid_current());
                      END IF;
                      RETURN OLD;
+                   ELSIF TG_OP = 'UPDATE' THEN
+                     IF NEW.tenant_id = '{tenant_id}' THEN
+                       INSERT INTO {table_name} (operation, resource_id, transaction_id)
+                       VALUES (TG_TABLE_NAME || '_update', NEW.resource_id, txid_current());
+                     END IF;
+                     RETURN NEW;
+                   ELSE
+                     IF NEW.tenant_id = '{tenant_id}' THEN
+                       INSERT INTO {table_name} (operation, resource_id, transaction_id)
+                       VALUES (TG_TABLE_NAME || '_insert', NEW.resource_id, txid_current());
+                     END IF;
+                     RETURN NEW;
                    END IF;
-                   IF NEW.tenant_id = '{tenant_id}' THEN
-                     INSERT INTO {table_name} VALUES (TG_TABLE_NAME || '_insert', txid_current());
-                   END IF;
-                   RETURN NEW;
                  END $$;
-                 CREATE TRIGGER {search_trigger} AFTER INSERT OR DELETE ON search_index
+                 CREATE TRIGGER {upsert_trigger} BEFORE INSERT ON resource_fts
                  FOR EACH ROW EXECUTE FUNCTION {function_name}();
-                 CREATE TRIGGER {fts_trigger} AFTER INSERT OR DELETE ON resource_fts
+                 CREATE TRIGGER {fts_trigger} AFTER INSERT OR UPDATE OR DELETE ON resource_fts
+                 FOR EACH ROW EXECUTE FUNCTION {function_name}();
+                 CREATE TRIGGER {search_trigger} AFTER INSERT OR DELETE ON search_index
                  FOR EACH ROW EXECUTE FUNCTION {function_name}();"
             ))
             .await
             .unwrap();
 
-        let results = backend
-            .write_search_entries_page(&tenant, &page.resources)
-            .await;
-        let probe_rows: Vec<(String, i64)> = client
-            .query(
-                &format!(
-                    "SELECT DISTINCT operation, transaction_id FROM {table_name} ORDER BY operation"
-                ),
-                &[],
+        // Two reindexes of the unchanged page. Both must attempt the full-text
+        // upsert over the row the CRUD path already wrote, and neither may
+        // produce an effective full-text write while still replacing
+        // `search_index` in the page's one transaction.
+        let mut unchanged_page_transactions = Vec::new();
+        for run in 1..=2 {
+            client
+                .execute(&format!("DELETE FROM {table_name}"), &[])
+                .await
+                .unwrap();
+
+            let results = backend
+                .write_search_entries_page(&tenant, &page.resources)
+                .await;
+            assert_eq!(results.len(), PAGE_IDS.len());
+            assert!(
+                results.iter().all(Result::is_ok),
+                "run {run}: an unchanged page must take the batched path, not the \
+                 per-resource fallback: {results:?}"
+            );
+
+            let rows = probe_rows(&client, &table_name).await;
+            let context = format!("unchanged page, run {run}");
+            assert_one_transaction(&rows, &context);
+            unchanged_page_transactions.push(rows[0].transaction_id);
+
+            for id in PAGE_IDS {
+                assert_eq!(
+                    upsert_attempts(&rows, id),
+                    vec![Some(true)],
+                    "{context}: {id} must attempt exactly one full-text upsert, over \
+                     the row that is already there: {rows:?}"
+                );
+                for operation in [
+                    "resource_fts_insert",
+                    "resource_fts_update",
+                    "resource_fts_delete",
+                ] {
+                    assert_eq!(
+                        fired(&rows, operation, id),
+                        0,
+                        "{context}: an unchanged {id} must produce no effective \
+                         full-text write: {rows:?}"
+                    );
+                }
+                assert!(
+                    fired(&rows, "search_index_delete", id) > 0
+                        && fired(&rows, "search_index_insert", id) > 0,
+                    "{context}: {id}'s search_index rows must still be replaced: {rows:?}"
+                );
+            }
+        }
+        assert_ne!(
+            unchanged_page_transactions[0], unchanged_page_transactions[1],
+            "each page write must be its own transaction"
+        );
+
+        // Mixed page, still under the triggers: the same settled valid
+        // resources plus one resource the extractor rejects. The page's one
+        // full-text DELETE must cover that failed pair alone — were it to use
+        // the page's arrays, the valid resources would report a delete here,
+        // their upsert would find no row to land on, and the stale row below
+        // would not be the only one that went.
+        let failed = StoredResource::new(
+            "Patient",
+            "tx-fail",
+            tenant.tenant_id().clone(),
+            json!({"resourceType": "Observation", "id": "tx-fail"}),
+            FhirVersion::default(),
+        );
+        client
+            .execute(
+                "INSERT INTO resource_fts
+                 (tenant_id, resource_type, resource_id, narrative_tsvector, content_tsvector)
+                 VALUES ($1, 'Patient', 'tx-fail', to_tsvector('english', 'stale'), to_tsvector('english', 'stale'))",
+                &[&tenant_id],
             )
             .await
-            .unwrap()
-            .into_iter()
-            .map(|row| (row.get(0), row.get(1)))
-            .collect();
+            .unwrap();
+        let mut mixed_page = page.resources.clone();
+        mixed_page.push(failed);
+
+        // Seeding the stale row went through the triggers; clear what setup
+        // recorded so the probe holds the page write's events only.
+        client
+            .execute(&format!("DELETE FROM {table_name}"), &[])
+            .await
+            .unwrap();
+
+        let results = backend
+            .write_search_entries_page(&tenant, &mixed_page)
+            .await;
+        assert_eq!(results.len(), 3);
+        assert!(
+            results[..2].iter().all(Result::is_ok),
+            "mixed page: the valid resources must still be reindexed: {results:?}"
+        );
+        assert!(
+            results[2].is_err(),
+            "mixed page: the synthetic resource's extraction failure must be \
+             reported: {results:?}"
+        );
+
+        let rows = probe_rows(&client, &table_name).await;
+        assert_one_transaction(&rows, "mixed page");
+        for id in PAGE_IDS {
+            assert_eq!(
+                upsert_attempts(&rows, id),
+                vec![Some(true)],
+                "mixed page: {id} must upsert over the row that is already there: {rows:?}"
+            );
+            for operation in [
+                "resource_fts_insert",
+                "resource_fts_update",
+                "resource_fts_delete",
+            ] {
+                assert_eq!(
+                    fired(&rows, operation, id),
+                    0,
+                    "mixed page: a valid {id} whose row is kept must produce no \
+                     full-text write: {rows:?}"
+                );
+            }
+            assert!(
+                fired(&rows, "search_index_delete", id) > 0
+                    && fired(&rows, "search_index_insert", id) > 0,
+                "mixed page: {id}'s search_index rows must still be replaced: {rows:?}"
+            );
+        }
+        assert_eq!(
+            fired(&rows, "resource_fts_delete", "tx-fail"),
+            1,
+            "mixed page: the failed resource's stale full-text row must be deleted \
+             exactly once: {rows:?}"
+        );
+        assert!(
+            upsert_attempts(&rows, "tx-fail").is_empty(),
+            "mixed page: the failed resource has no full-text row to upsert: {rows:?}"
+        );
+        for operation in ["resource_fts_insert", "resource_fts_update"] {
+            assert_eq!(
+                fired(&rows, operation, "tx-fail"),
+                0,
+                "mixed page: the failed resource must not be written: {rows:?}"
+            );
+        }
+
+        // Change the stored bytes of one resource behind the backend's back
+        // and re-run the page: the upsert must replace its vectors in place —
+        // one `UPDATE`, no delete and no insert.
+        let refreshed = json!({
+            "resourceType": "Patient",
+            "id": "tx-b",
+            "name": [{"family": "TxBravoRevised"}],
+            "text": narrative(&refreshed_term)
+        });
+        let updated = client
+            .execute(
+                "UPDATE resources SET data = $3
+                 WHERE tenant_id = $1 AND resource_type = 'Patient' AND id = $2",
+                &[&tenant_id, &"tx-b", &refreshed],
+            )
+            .await
+            .unwrap();
+        assert_eq!(updated, 1, "the raw data change must land on one row");
+
+        let changed_page = backend
+            .fetch_resources_page(&tenant, "Patient", None, 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            changed_page
+                .resources
+                .iter()
+                .map(|resource| resource.id())
+                .collect::<Vec<_>>(),
+            PAGE_IDS.to_vec()
+        );
+
+        client
+            .execute(&format!("DELETE FROM {table_name}"), &[])
+            .await
+            .unwrap();
+        let results = backend
+            .write_search_entries_page(&tenant, &changed_page.resources)
+            .await;
+        assert_eq!(results.len(), PAGE_IDS.len());
+        assert!(
+            results.iter().all(Result::is_ok),
+            "the changed page must take the batched path, not the per-resource \
+             fallback: {results:?}"
+        );
+
+        let rows = probe_rows(&client, &table_name).await;
+        assert_one_transaction(&rows, "changed page");
+        assert_eq!(
+            fired(&rows, "resource_fts_update", "tx-b"),
+            1,
+            "the changed resource's stored vectors must be replaced by exactly one \
+             UPDATE: {rows:?}"
+        );
+        for id in PAGE_IDS {
+            assert_eq!(
+                upsert_attempts(&rows, id),
+                vec![Some(true)],
+                "changed page: {id}'s upsert must still land on the existing row: {rows:?}"
+            );
+            assert_eq!(
+                fired(&rows, "resource_fts_delete", id),
+                0,
+                "changed page: keeping the row means no delete: {rows:?}"
+            );
+            assert_eq!(
+                fired(&rows, "resource_fts_insert", id),
+                0,
+                "changed page: the row is replaced in place, not re-inserted: {rows:?}"
+            );
+            if id != "tx-b" {
+                assert_eq!(
+                    fired(&rows, "resource_fts_update", id),
+                    0,
+                    "the untouched resource must not be rewritten: {rows:?}"
+                );
+            }
+            assert!(
+                fired(&rows, "search_index_delete", id) > 0
+                    && fired(&rows, "search_index_insert", id) > 0,
+                "changed page: {id}'s search_index rows must still be replaced: {rows:?}"
+            );
+        }
+
+        // The refreshed term must be searchable and the replaced one must be
+        // gone, through both full-text parameters.
+        for parameter in ["_text", "_content"] {
+            assert_eq!(
+                fts_hits(&backend, &tenant, parameter, &refreshed_term).await,
+                vec!["tx-b".to_string()],
+                "{parameter} must find the refreshed term"
+            );
+            assert!(
+                fts_hits(&backend, &tenant, parameter, &replaced_term)
+                    .await
+                    .is_empty(),
+                "{parameter} must not still match the replaced term"
+            );
+            assert_eq!(
+                fts_hits(&backend, &tenant, parameter, &unchanged_term).await,
+                vec!["tx-a".to_string()],
+                "{parameter} must still find the untouched resource's term"
+            );
+        }
 
         client
             .batch_execute(&format!(
-                "DROP TRIGGER {search_trigger} ON search_index;
+                "DROP TRIGGER {upsert_trigger} ON resource_fts;
                  DROP TRIGGER {fts_trigger} ON resource_fts;
+                 DROP TRIGGER {search_trigger} ON search_index;
                  DROP FUNCTION {function_name}();
                  DROP TABLE {table_name};"
             ))
             .await
             .unwrap();
 
-        assert!(results.iter().all(Result::is_ok));
+        // Equivalence check: a per-resource delete-and-write rebuild (what the
+        // fallback path does) must leave exactly the vectors the in-place page
+        // write left. The triggers are gone, so the rebuild is not probed.
+        let vectors_after_page_write = fts_vectors(&client, tenant_id).await;
+        for resource in &changed_page.resources {
+            backend
+                .delete_search_entries(&tenant, resource.resource_type(), resource.id())
+                .await
+                .unwrap();
+            backend
+                .write_search_entries(&tenant, resource)
+                .await
+                .unwrap();
+        }
         assert_eq!(
-            probe_rows
-                .iter()
-                .map(|(operation, _)| operation.as_str())
-                .collect::<Vec<_>>(),
-            vec![
-                "resource_fts_delete",
-                "resource_fts_insert",
-                "search_index_delete",
-                "search_index_insert",
-            ]
-        );
-        assert_eq!(
-            probe_rows
-                .iter()
-                .map(|(_, transaction_id)| *transaction_id)
-                .collect::<std::collections::HashSet<_>>()
-                .len(),
-            1,
-            "all page index writes must share one PostgreSQL transaction"
+            fts_vectors(&client, tenant_id).await,
+            vectors_after_page_write,
+            "in-place upserts must leave the same vectors a delete-and-write rebuild \
+             produces"
         );
     }
 
@@ -7410,7 +7969,9 @@ mod postgres_integration {
 
         let backend = create_backend().await;
         let tenant = create_tenant("reindex-page-extraction");
+        let bystander_tenant = create_tenant("reindex-page-extraction-bystander");
         let tenant_id = tenant.tenant_id().as_str();
+        let bystander_tenant_id = bystander_tenant.tenant_id().as_str();
         assert!(
             backend
                 .write_search_entries_page(&tenant, &[])
@@ -7442,22 +8003,40 @@ mod postgres_integration {
             )
             .await
             .unwrap();
-        client
-            .execute(
-                "INSERT INTO resource_fts
-                 (tenant_id, resource_type, resource_id, narrative_tsvector, content_tsvector)
-                 VALUES ($1, 'Patient', 'empty-fts', to_tsvector('english', 'stale'), to_tsvector('english', 'stale'))",
-                &[&tenant_id],
-            )
-            .await
-            .unwrap();
+        // Stale full-text rows for both page resources: an extraction failure
+        // and an emptied resource are the two ways a resource in the page ends
+        // up with no replacement to write, so both stale rows must go. Two
+        // bystanders must not: the same pair under another tenant, and another
+        // resource of this tenant outside the page.
+        for (scoped_tenant, resource_id) in [
+            (tenant_id, "invalid-extraction"),
+            (tenant_id, "empty-fts"),
+            (bystander_tenant_id, "invalid-extraction"),
+            (tenant_id, "outside-extraction"),
+        ] {
+            client
+                .execute(
+                    "INSERT INTO resource_fts
+                     (tenant_id, resource_type, resource_id, narrative_tsvector, content_tsvector)
+                     VALUES ($1, 'Patient', $2, to_tsvector('english', 'stale'), to_tsvector('english', 'stale'))",
+                    &[&scoped_tenant, &resource_id],
+                )
+                .await
+                .unwrap();
+        }
 
         let results = backend
             .write_search_entries_page(&tenant, &[invalid, empty_fts])
             .await;
         assert_eq!(results.len(), 2);
-        assert!(results[0].is_err());
-        assert!(results[1].is_ok());
+        assert!(
+            results[0].is_err(),
+            "the extraction failure must still be reported per resource: {results:?}"
+        );
+        assert!(
+            results[1].is_ok(),
+            "the emptied resource must still succeed: {results:?}"
+        );
 
         let stale_count: i64 = client
             .query_one(
@@ -7468,17 +8047,54 @@ mod postgres_integration {
             .await
             .unwrap()
             .get(0);
-        let empty_fts_count: i64 = client
-            .query_one(
-                "SELECT COUNT(*) FROM resource_fts
-                 WHERE tenant_id = $1 AND resource_id = 'empty-fts'",
-                &[&tenant_id],
-            )
-            .await
-            .unwrap()
-            .get(0);
-        assert_eq!(stale_count, 0);
-        assert_eq!(empty_fts_count, 0);
+        assert_eq!(
+            stale_count, 0,
+            "the failed resource must not keep stale search_index rows"
+        );
+
+        for resource_id in ["invalid-extraction", "empty-fts"] {
+            let stale_fts: i64 = client
+                .query_one(
+                    "SELECT COUNT(*) FROM resource_fts
+                     WHERE tenant_id = $1 AND resource_type = 'Patient'
+                       AND resource_id = $2",
+                    &[&tenant_id, &resource_id],
+                )
+                .await
+                .unwrap()
+                .get(0);
+            assert_eq!(
+                stale_fts, 0,
+                "{resource_id} must not keep a stale full-text row"
+            );
+        }
+
+        for (scoped_tenant, resource_id, label) in [
+            (
+                bystander_tenant_id,
+                "invalid-extraction",
+                "another tenant's row",
+            ),
+            (tenant_id, "outside-extraction", "a row outside the page"),
+        ] {
+            let survivors: Vec<String> = client
+                .query(
+                    "SELECT narrative_tsvector::text FROM resource_fts
+                     WHERE tenant_id = $1 AND resource_type = 'Patient'
+                       AND resource_id = $2",
+                    &[&scoped_tenant, &resource_id],
+                )
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|row| row.get::<_, Option<String>>(0).unwrap_or_default())
+                .collect();
+            assert_eq!(survivors.len(), 1, "{label} must survive the page write");
+            assert!(
+                survivors[0].contains("stale"),
+                "{label} must be left untouched: {survivors:?}"
+            );
+        }
     }
 
     #[tokio::test]

@@ -3951,20 +3951,49 @@ impl ReindexTarget for PostgresBackend {
                 internal_error(format!("Failed to delete search index page: {}", e))
             })?;
 
-            let fts_delete_span = crate::perf::span(crate::perf::Phase::ReindexFtsDelete);
-            let deleted = execute_cached(
-                &transaction,
-                "DELETE FROM resource_fts
-                 WHERE tenant_id = $1
-                   AND (resource_type, resource_id) IN (
-                       SELECT * FROM unnest($2::text[], $3::text[])
-                   )",
-                &[&tenant_id, &resource_types, &resource_ids],
-            )
-            .await;
-            drop(fts_delete_span);
-            deleted
-                .map_err(|e| internal_error(format!("Failed to delete FTS index page: {}", e)))?;
+            // Every resource whose extraction succeeded reaches
+            // `index_fts_content` later in this same transaction, and that call
+            // decides the row's fate from the content: non-empty content keeps
+            // the row and replaces its stored vectors in place through the
+            // `idx_fts_lookup` upsert, which withholds the write when they are
+            // already equal; empty content deletes the row explicitly. Neither
+            // branch needs the row gone first, so those pairs are left alone
+            // until their own write lands. A resource whose extraction failed
+            // gets no later call at all, and nothing else would remove its row,
+            // so those pairs are the only ones that have to be deleted here.
+            // Derive them together, and skip the statement entirely when the
+            // page has no failures.
+            let failed_pairs: Vec<(&str, &str)> = resources
+                .iter()
+                .zip(&extraction_errors)
+                .filter(|(_, error)| error.is_some())
+                .map(|(resource, _)| (resource.resource_type(), resource.id()))
+                .collect();
+            if !failed_pairs.is_empty() {
+                let failed_types: Vec<&str> = failed_pairs
+                    .iter()
+                    .map(|(resource_type, _)| *resource_type)
+                    .collect();
+                let failed_ids: Vec<&str> = failed_pairs
+                    .iter()
+                    .map(|(_, resource_id)| *resource_id)
+                    .collect();
+                let fts_delete_span = crate::perf::span(crate::perf::Phase::ReindexFtsDelete);
+                let deleted = execute_cached(
+                    &transaction,
+                    "DELETE FROM resource_fts
+                     WHERE tenant_id = $1
+                       AND (resource_type, resource_id) IN (
+                           SELECT * FROM unnest($2::text[], $3::text[])
+                       )",
+                    &[&tenant_id, &failed_types, &failed_ids],
+                )
+                .await;
+                drop(fts_delete_span);
+                deleted.map_err(|e| {
+                    internal_error(format!("Failed to delete FTS index page: {}", e))
+                })?;
+            }
 
             let valid_batches: Vec<(&str, &str, &[IndexRow])> = resources
                 .iter()
