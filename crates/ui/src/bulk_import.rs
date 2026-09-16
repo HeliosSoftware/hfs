@@ -1532,6 +1532,7 @@ mod tests {
             "Reading manifest",
             "Sizing 37 of 412 files",
             "Downloading file 1 of 412",
+            "Downloaded 24 of 24 files",
         ] {
             assert_eq!(progress_percent(phase), None, "phase: {phase}");
             assert!(
