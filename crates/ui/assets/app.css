@@ -1630,6 +1630,30 @@ select.field__input {
   margin-top: 6px;
 }
 
+/* A radio option inside a `fieldset.field` (#1108): the control and its
+   label text share the first row, and the hint sits on the second row
+   indented under the text — not under the radio. The 16px control plus the
+   10px gap match `.choice-card`, so the two radio treatments read alike. */
+.field--choice {
+  display: grid;
+  grid-template-columns: 16px 1fr;
+  column-gap: 10px;
+  align-items: center;
+  margin-bottom: 10px;
+}
+
+.field--choice > input[type="radio"] {
+  width: 16px;
+  height: 16px;
+  margin: 0;
+  accent-color: var(--accent);
+}
+
+.field--choice > .field__hint {
+  grid-column: 2;
+  margin-top: 2px;
+}
+
 .addbox__actions {
   margin-top: 4px;
   display: flex;

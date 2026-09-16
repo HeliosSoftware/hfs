@@ -606,7 +606,6 @@ bulk-import-new = Nueva submission
 bulk-import-create-title = Crear Bulk Submission
 bulk-import-field-name = Nombre de la submission
 bulk-import-auth = Autenticación
-bulk-import-auth-hint = Cómo autenticarse ante el servidor receptor.
 bulk-import-auth-none = Ninguna
 bulk-import-auth-none-hint = No se enviará cabecera de autorización.
 bulk-import-auth-backend = Autenticación backend services
