@@ -138,7 +138,7 @@ impl BulkSubmitProvider for S3Backend {
         &self,
         tenant: &TenantContext,
         id: &SubmissionId,
-    ) -> StorageResult<SubmissionSummary> {
+    ) -> StorageResult<()> {
         let location = self.tenant_location(tenant)?;
         let mut state = self.load_submission_state(&location, id).await?;
 
@@ -156,7 +156,7 @@ impl BulkSubmitProvider for S3Backend {
         self.save_submission_state(&location, id, &state).await?;
         self.touch_submit_registry(tenant, id, state.summary.status)
             .await?;
-        Ok(state.summary)
+        Ok(())
     }
 
     async fn abort_submission(

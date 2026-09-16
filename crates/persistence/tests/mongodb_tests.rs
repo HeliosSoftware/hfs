@@ -9268,6 +9268,121 @@ mod bulk_submit {
         );
     }
 
+    /// #998: the status-only read is a point read of the submission document.
+    /// The trait default routes through `get_submission`, whose summary counts
+    /// every receipt of the submission four times over (`count_outcomes`) —
+    /// measured at ~26s against 11M receipts — and that default was behind the
+    /// `$bulk-submit-status` poll, the status-only kick-off *Mark completed*
+    /// sends, and the lease keeper's 3s abort watch. The profiler pins that
+    /// neither the receipt nor the manifest collection is touched.
+    #[tokio::test]
+    async fn test_get_submission_status_is_a_point_read() {
+        let Some(backend) = create_backend("submit_status_point_read").await else {
+            return;
+        };
+        let tenant = create_tenant("submit-status");
+        let (id, manifest_id) = seed(&backend, &tenant).await;
+        // A receipt, so that a count would have something to find.
+        backend
+            .process_entries(
+                &tenant,
+                &id,
+                &manifest_id,
+                vec![NdjsonEntry::new(
+                    1,
+                    "Patient",
+                    json!({"resourceType": "Patient"}),
+                )],
+                &BulkProcessingOptions::new(),
+            )
+            .await
+            .unwrap();
+
+        let db = raw_test_client(&backend.config().connection_string)
+            .await
+            .unwrap()
+            .database(&backend.config().database_name);
+        if db.run_command(doc! { "profile": 2_i32 }).await.is_err() {
+            eprintln!("Skipping (the profiler is unavailable on this server)");
+            return;
+        }
+        let present = backend.get_submission_status(&tenant, &id).await.unwrap();
+        let missing = backend
+            .get_submission_status(&tenant, &SubmissionId::new("data-provider", "missing"))
+            .await
+            .unwrap();
+        let _ = db.run_command(doc! { "profile": 0_i32 }).await;
+        assert_eq!(present, Some(SubmissionStatus::InProgress));
+        assert_eq!(missing, None);
+
+        let profile = db.collection::<Document>("system.profile");
+        for untouched in ["bulk_entry_results", "bulk_manifests"] {
+            let reads = profile
+                .count_documents(doc! { "ns": format!("{}.{untouched}", db.name()) })
+                .await
+                .unwrap();
+            assert_eq!(
+                reads, 0,
+                "a status read must never touch {untouched}: that is the receipt \
+                 aggregation the trait default pays for"
+            );
+        }
+        let submission_reads = profile
+            .count_documents(doc! {
+                "ns": format!("{}.bulk_submissions", db.name()),
+                "op": "query",
+            })
+            .await
+            .unwrap();
+        assert_eq!(submission_reads, 2, "one point read per call");
+
+        // The terminal statuses and a corrupt row read back the way the full
+        // getter reports them.
+        let submissions = db.collection::<Document>("bulk_submissions");
+        let selector = doc! {
+            "tenant_id": tenant.tenant_id().as_str(),
+            "submitter": &id.submitter,
+            "submission_id": &id.submission_id,
+        };
+        for (raw, expected) in [
+            ("aborted", SubmissionStatus::Aborted),
+            ("complete", SubmissionStatus::Complete),
+        ] {
+            submissions
+                .update_one(selector.clone(), doc! { "$set": { "status": raw } })
+                .await
+                .unwrap();
+            assert_eq!(
+                backend.get_submission_status(&tenant, &id).await.unwrap(),
+                Some(expected)
+            );
+        }
+        submissions
+            .update_one(
+                selector.clone(),
+                doc! { "$set": { "status": "invalid-status" } },
+            )
+            .await
+            .unwrap();
+        let error = backend
+            .get_submission_status(&tenant, &id)
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("unknown submission status"),
+            "a corrupt status is an error, not a default: {error}"
+        );
+
+        // The full getter is untouched: it still aggregates the receipt.
+        submissions
+            .update_one(selector, doc! { "$set": { "status": "in-progress" } })
+            .await
+            .unwrap();
+        let summary = backend.get_submission(&tenant, &id).await.unwrap().unwrap();
+        assert_eq!(summary.total_entries, 1);
+        assert_eq!(summary.manifest_count, 1);
+    }
+
     #[tokio::test]
     async fn test_active_submission_count_and_expiry_scan() {
         let Some(backend) = create_backend("submit_counts").await else {

@@ -373,7 +373,7 @@ impl BulkSubmitProvider for PostgresBackend {
         &self,
         tenant: &TenantContext,
         id: &SubmissionId,
-    ) -> StorageResult<SubmissionSummary> {
+    ) -> StorageResult<()> {
         let client = self.get_client().await?;
         let tenant_id = tenant.tenant_id().as_str();
 
@@ -422,10 +422,7 @@ impl BulkSubmitProvider for PostgresBackend {
             )
             .await
             .map_err(|e| internal_error(format!("Failed to complete submission: {}", e)))?;
-
-        self.get_submission(tenant, id)
-            .await?
-            .ok_or_else(|| internal_error("Submission disappeared".to_string()))
+        Ok(())
     }
 
     async fn abort_submission(
