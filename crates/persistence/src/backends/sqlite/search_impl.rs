@@ -36,6 +36,17 @@ fn internal_error(message: String) -> StorageError {
     })
 }
 
+/// Rejects `_id` modifiers the `_id` query builder cannot honour (#1092).
+/// `_id` is dispatched by name in `build_special_parameter_condition`,
+/// bypassing the generic per-type modifier handling, so this must run before
+/// every path that can reach it: the top-level `search`/`search_count` below,
+/// and `search_with_connection` (also reached directly by the in-transaction
+/// `ifNoneExist` resolution path, `find_matching_resources_in_tx` in
+/// `storage.rs`, which never goes through `search`).
+fn reject_unsupported_id_modifier(query: &SearchQuery) -> StorageResult<()> {
+    crate::search::reject_unsupported_id_modifier(query)
+}
+
 fn reject_contained_missing(query: &SearchQuery) -> StorageResult<()> {
     if query.contained != crate::types::ContainedMode::Off
         && query
@@ -101,6 +112,8 @@ impl SqliteBackend {
         query: &SearchQuery,
         total: Option<u64>,
     ) -> StorageResult<SearchResult> {
+        reject_unsupported_id_modifier(query)?;
+
         let tenant_id = tenant.tenant_id().as_str();
         let resource_type = &query.resource_type;
 
@@ -366,9 +379,12 @@ impl SearchProvider for SqliteBackend {
         query: &SearchQuery,
     ) -> StorageResult<SearchResult> {
         reject_contained_missing(query)?;
+        reject_unsupported_id_modifier(query)?;
 
         // `_contained` search uses a dedicated path (different index columns and
         // heterogeneous result types); standard search handles `_contained=false`.
+        // This is the only entry point into that path, so the gate above is not
+        // repeated inside `search_contained` itself.
         if query.contained != crate::types::ContainedMode::Off {
             return self.search_contained(tenant, query).await;
         }
@@ -392,6 +408,7 @@ impl SearchProvider for SqliteBackend {
         query: &SearchQuery,
     ) -> StorageResult<u64> {
         reject_contained_missing(query)?;
+        reject_unsupported_id_modifier(query)?;
 
         let conn = self.get_connection()?;
         let tenant_id = tenant.tenant_id().as_str();

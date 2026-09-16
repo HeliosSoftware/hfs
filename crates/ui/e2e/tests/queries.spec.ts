@@ -2133,7 +2133,7 @@ test.describe("query builder", () => {
     await queries.builder.run("Patient?name=Sortable");
     await queries.results.waitShown();
 
-    // Patient renders its typed default columns without any _elements.
+    // Without _elements, columns come from the attributes the server returned (#1105).
     const headers = queries.page.locator("#query-results-head th");
     await expect(headers).toContainText(["id", "name", "gender", "birthDate"]);
 

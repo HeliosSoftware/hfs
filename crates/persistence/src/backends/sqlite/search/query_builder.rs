@@ -586,9 +586,29 @@ impl QueryBuilder {
                     })
                     .collect();
 
+                // `_id` is dispatched here rather than through the generic
+                // `:not` handling in `build_parameter_condition` (the
+                // `membership`/`NOT IN` wrapping above), so that handling
+                // never sees it and `_id:not` used to build the exact same
+                // `IN (...)` as a bare `_id`, returning precisely the
+                // resource the caller asked to exclude (#1092). The outer
+                // query enumerates `search_index` rows, so negating the
+                // membership test here yields every indexed resource of the
+                // type except the listed ids — the same semantics the
+                // generic path uses for every other parameter. Any modifier
+                // other than `:not` (`:missing` is resolved earlier, in
+                // `build_parameter_condition`) is rejected before this point
+                // by each backend's search entry point, so it is not handled
+                // here.
+                let not_kw = if matches!(param.modifier, Some(SearchModifier::Not)) {
+                    "NOT "
+                } else {
+                    ""
+                };
+
                 Some(SqlFragment::with_params(
                     format!(
-                        "resource_key IN (SELECT rowid FROM resources WHERE tenant_id = ?1 AND resource_type = ?2 AND id IN ({}))",
+                        "resource_key {not_kw}IN (SELECT rowid FROM resources WHERE tenant_id = ?1 AND resource_type = ?2 AND id IN ({}))",
                         placeholders.join(", ")
                     ),
                     params,
@@ -1138,6 +1158,91 @@ mod tests {
                 fragment.sql
             );
         }
+    }
+
+    /// #1092: `_id` is dispatched through `build_special_parameter_condition`,
+    /// which bypassed the generic `:not` handling in `build_parameter_condition`
+    /// (the `membership`/`NOT IN` wrapping just above) entirely, so `_id:not=a`
+    /// built the same `IN (...)` as a plain `_id=a` and returned exactly the
+    /// resource the caller asked to exclude.
+    fn id_param_string(value: &SqlParam) -> &str {
+        match value {
+            SqlParam::String(s) => s.as_str(),
+            other => panic!("expected a string param, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn id_no_modifier_control_is_a_positive_match() {
+        let builder = QueryBuilder::new("tenant1", "Patient");
+        let param = SearchParameter {
+            name: "_id".to_string(),
+            param_type: SearchParamType::Token,
+            modifier: None,
+            values: vec![SearchValue::eq("a")],
+            chain: vec![],
+            components: vec![],
+        };
+
+        let fragment = builder
+            .build_parameter_condition(&param, 2)
+            .expect("_id must produce a condition");
+
+        assert_eq!(
+            fragment.sql,
+            "resource_key IN (SELECT rowid FROM resources WHERE tenant_id = ?1 AND resource_type = ?2 AND id IN (?3))"
+        );
+        assert_eq!(fragment.params.len(), 1);
+        assert_eq!(id_param_string(&fragment.params[0]), "a");
+    }
+
+    #[test]
+    fn id_not_single_value_excludes_instead_of_matching() {
+        let builder = QueryBuilder::new("tenant1", "Patient");
+        let param = SearchParameter {
+            name: "_id".to_string(),
+            param_type: SearchParamType::Token,
+            modifier: Some(SearchModifier::Not),
+            values: vec![SearchValue::eq("a")],
+            chain: vec![],
+            components: vec![],
+        };
+
+        let fragment = builder
+            .build_parameter_condition(&param, 2)
+            .expect("_id:not must produce a condition");
+
+        assert_eq!(
+            fragment.sql,
+            "resource_key NOT IN (SELECT rowid FROM resources WHERE tenant_id = ?1 AND resource_type = ?2 AND id IN (?3))"
+        );
+        assert_eq!(fragment.params.len(), 1);
+        assert_eq!(id_param_string(&fragment.params[0]), "a");
+    }
+
+    #[test]
+    fn id_not_two_values_excludes_both() {
+        let builder = QueryBuilder::new("tenant1", "Patient");
+        let param = SearchParameter {
+            name: "_id".to_string(),
+            param_type: SearchParamType::Token,
+            modifier: Some(SearchModifier::Not),
+            values: vec![SearchValue::eq("a"), SearchValue::eq("b")],
+            chain: vec![],
+            components: vec![],
+        };
+
+        let fragment = builder
+            .build_parameter_condition(&param, 2)
+            .expect("_id:not must produce a condition");
+
+        assert_eq!(
+            fragment.sql,
+            "resource_key NOT IN (SELECT rowid FROM resources WHERE tenant_id = ?1 AND resource_type = ?2 AND id IN (?3, ?4))"
+        );
+        assert_eq!(fragment.params.len(), 2);
+        assert_eq!(id_param_string(&fragment.params[0]), "a");
+        assert_eq!(id_param_string(&fragment.params[1]), "b");
     }
 
     #[test]
