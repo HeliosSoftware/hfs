@@ -806,7 +806,10 @@ mod postgres_integration {
     use helios_persistence::backends::postgres::{PostgresBackend, PostgresConfig};
     use helios_persistence::core::SettingsStore;
     use helios_persistence::core::history::{HistoryParams, InstanceHistoryProvider};
-    use helios_persistence::core::{Backend, BackendCapability, BackendKind, ResourceStorage};
+    use helios_persistence::core::{
+        Backend, BackendCapability, BackendKind, ResourceStorage, Transaction, TransactionOptions,
+        TransactionProvider,
+    };
     use helios_persistence::error::{
         BackendError, BulkExportError, ConcurrencyError, ResourceError, StorageError,
     };
@@ -2909,6 +2912,544 @@ mod postgres_integration {
                 "duplicate history versions for {id2}: {versions:?}"
             );
         }
+    }
+
+    /// A writer that verified a stale version before waiting on the row lock
+    /// must fail with a version conflict after the winner commits. The
+    /// observer confirms that the wait really occurred, rather than allowing
+    /// this test to pass because the two updates happened sequentially.
+    #[tokio::test]
+    async fn postgres_transactional_update_conflict_after_verified_row_lock_wait() {
+        let (backend, dbname) = isolated_reindex_backend_with_max_connections(5).await;
+        let tenant = create_tenant("transactional-update-lock-wait");
+        let created = backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({
+                    "resourceType": "Patient",
+                    "id": "verified-row-lock-wait",
+                    "name": [{"family": "v1"}]
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(created.version_id(), "1");
+
+        let mut tx1 = backend
+            .begin_transaction(&tenant, TransactionOptions::new())
+            .await
+            .unwrap();
+        let mut tx2 = backend
+            .begin_transaction(&tenant, TransactionOptions::new())
+            .await
+            .unwrap();
+
+        let tx1_v1 = tx1
+            .read("Patient", created.id())
+            .await
+            .unwrap()
+            .expect("tx1 should read v1");
+        let tx2_v1 = tx2
+            .read("Patient", created.id())
+            .await
+            .unwrap()
+            .expect("tx2 should read v1");
+        assert_eq!(tx1_v1.version_id(), "1");
+        assert_eq!(tx2_v1.version_id(), "1");
+
+        let tx1_v2 = tx1
+            .update(
+                &tx1_v1,
+                json!({
+                    "resourceType": "Patient",
+                    "id": created.id(),
+                    "name": [{"family": "tx1-winner"}]
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(tx1_v2.version_id(), "2");
+
+        let observer = reindex_test_client_for(&dbname).await;
+        let waiter = tokio::spawn(async move {
+            let result = tx2
+                .update(
+                    &tx2_v1,
+                    json!({
+                        "resourceType": "Patient",
+                        "id": "verified-row-lock-wait",
+                        "name": [{"family": "tx2-loser"}]
+                    }),
+                )
+                .await;
+            let rollback = Box::new(tx2).rollback().await;
+            (result, rollback)
+        });
+
+        let blocked = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let waiting: i64 = observer
+                    .query_one(
+                        "SELECT COUNT(*)
+                         FROM pg_stat_activity AS waiting
+                         WHERE waiting.datname = current_database()
+                           AND waiting.state = 'active'
+                           AND position('UPDATE resources SET version_id' IN waiting.query) > 0
+                           AND cardinality(pg_blocking_pids(waiting.pid)) > 0
+                           AND EXISTS (
+                               SELECT 1
+                               FROM pg_stat_activity AS blocker
+                               WHERE blocker.pid = ANY(pg_blocking_pids(waiting.pid))
+                                 AND blocker.datname = current_database()
+                                 AND blocker.state = 'idle in transaction'
+                           )",
+                        &[],
+                    )
+                    .await
+                    .map_err(|error| error.to_string())?
+                    .get(0);
+                if waiting > 0 {
+                    return Ok::<(), String>(());
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+
+        match blocked {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                let rollback = Box::new(tx1).rollback().await;
+                let waiter_result = waiter.await;
+                panic!(
+                    "observer failed while waiting for tx2's lock: {error}; tx1 rollback: {rollback:?}; tx2 result: {waiter_result:?}"
+                );
+            }
+            Err(error) => {
+                let rollback = Box::new(tx1).rollback().await;
+                let waiter_result = waiter.await;
+                panic!(
+                    "tx2 did not become blocked before timeout ({error:?}); tx1 rollback: {rollback:?}; tx2 result: {waiter_result:?}"
+                );
+            }
+        }
+
+        if let Err(error) = Box::new(tx1).commit().await {
+            let waiter_result = waiter.await;
+            panic!("tx1 commit failed: {error}; tx2 result: {waiter_result:?}");
+        }
+        let (tx2_result, tx2_rollback) = waiter.await.unwrap();
+        tx2_rollback.expect("tx2 rollback should release its connection");
+        assert!(
+            matches!(
+                &tx2_result,
+                Err(StorageError::Concurrency(ConcurrencyError::VersionConflict {
+                    expected_version,
+                    actual_version,
+                    ..
+                })) if expected_version == "1" && actual_version == "2"
+            ),
+            "tx2 should report the committed winner as a version conflict, got {tx2_result:?}"
+        );
+
+        let live = backend
+            .read(&tenant, "Patient", created.id())
+            .await
+            .unwrap()
+            .expect("the winning live resource should remain");
+        assert_eq!(live.version_id(), "2");
+        assert_eq!(live.content()["name"][0]["family"], "tx1-winner");
+
+        let history = backend
+            .history_instance(&tenant, "Patient", created.id(), &HistoryParams::default())
+            .await
+            .unwrap();
+        assert_eq!(history.items.len(), 2);
+        assert_eq!(history.items[0].resource.version_id(), "2");
+        assert_eq!(
+            history.items[0].resource.content()["name"][0]["family"],
+            "tx1-winner"
+        );
+        assert_eq!(history.items[1].resource.version_id(), "1");
+        assert_eq!(
+            history.items[1].resource.content()["name"][0]["family"],
+            "v1"
+        );
+    }
+
+    #[tokio::test]
+    async fn postgres_transactional_update_succeeds_after_verified_blocker_rollback() {
+        let (backend, dbname) = isolated_reindex_backend_with_max_connections(5).await;
+        let tenant = create_tenant("transactional-update-blocker-rollback");
+        let created = backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({
+                    "resourceType": "Patient",
+                    "id": "verified-blocker-rollback",
+                    "name": [{"family": "v1"}]
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+
+        let mut tx1 = backend
+            .begin_transaction(&tenant, TransactionOptions::new())
+            .await
+            .unwrap();
+        let mut tx2 = backend
+            .begin_transaction(&tenant, TransactionOptions::new())
+            .await
+            .unwrap();
+        let tx1_v1 = tx1
+            .read("Patient", created.id())
+            .await
+            .unwrap()
+            .expect("tx1 should read v1");
+        let tx2_v1 = tx2
+            .read("Patient", created.id())
+            .await
+            .unwrap()
+            .expect("tx2 should read v1");
+
+        let tx1_v2 = tx1
+            .update(
+                &tx1_v1,
+                json!({
+                    "resourceType": "Patient",
+                    "id": created.id(),
+                    "name": [{"family": "tx1-rolled-back"}]
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(tx1_v2.version_id(), "2");
+
+        let waiter = tokio::spawn(async move {
+            let updated = tx2
+                .update(
+                    &tx2_v1,
+                    json!({
+                        "resourceType": "Patient",
+                        "id": "verified-blocker-rollback",
+                        "name": [{"family": "tx2-winner"}]
+                    }),
+                )
+                .await;
+            let committed = if updated.is_ok() {
+                Box::new(tx2).commit().await
+            } else {
+                Box::new(tx2).rollback().await
+            };
+            (updated, committed)
+        });
+        let observer = reindex_test_client_for(&dbname).await;
+        let blocked = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let waiting: i64 = observer
+                    .query_one(
+                        "SELECT COUNT(*)
+                         FROM pg_stat_activity AS waiting
+                         WHERE waiting.datname = current_database()
+                           AND waiting.state = 'active'
+                           AND position('UPDATE resources SET version_id' IN waiting.query) > 0
+                           AND cardinality(pg_blocking_pids(waiting.pid)) > 0
+                           AND EXISTS (
+                               SELECT 1
+                               FROM pg_stat_activity AS blocker
+                               WHERE blocker.pid = ANY(pg_blocking_pids(waiting.pid))
+                                 AND blocker.datname = current_database()
+                                 AND blocker.state = 'idle in transaction'
+                           )",
+                        &[],
+                    )
+                    .await
+                    .map_err(|error| error.to_string())?
+                    .get(0);
+                if waiting > 0 {
+                    return Ok::<(), String>(());
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        if let Err(error) = blocked {
+            let _ = Box::new(tx1).rollback().await;
+            waiter.abort();
+            let _ = waiter.await;
+            panic!("tx2 did not become blocked before timeout: {error:?}");
+        }
+        if let Ok(Err(error)) = blocked {
+            let _ = Box::new(tx1).rollback().await;
+            waiter.abort();
+            let _ = waiter.await;
+            panic!("observer failed while waiting for tx2: {error}");
+        }
+
+        Box::new(tx1)
+            .rollback()
+            .await
+            .expect("tx1 rollback should release the row lock");
+        let (updated, committed) = tokio::time::timeout(std::time::Duration::from_secs(10), waiter)
+            .await
+            .expect("tx2 remained blocked after tx1 rollback")
+            .expect("tx2 task panicked");
+        let updated = updated.expect("tx2 update should win after rollback");
+        committed.expect("tx2 commit should succeed");
+        assert_eq!(updated.version_id(), "2");
+        assert_eq!(updated.content()["name"][0]["family"], "tx2-winner");
+
+        let live = backend
+            .read(&tenant, "Patient", created.id())
+            .await
+            .unwrap()
+            .expect("the tx2 resource should remain live");
+        assert_eq!(live.version_id(), "2");
+        assert_eq!(live.content()["name"][0]["family"], "tx2-winner");
+        let history = backend
+            .history_instance(&tenant, "Patient", created.id(), &HistoryParams::default())
+            .await
+            .unwrap();
+        assert_eq!(history.items.len(), 2);
+        assert_eq!(history.items[0].resource.version_id(), "2");
+        assert_eq!(
+            history.items[0].resource.content()["name"][0]["family"],
+            "tx2-winner"
+        );
+        assert_eq!(history.items[1].resource.version_id(), "1");
+        assert_eq!(
+            history.items[1].resource.content()["name"][0]["family"],
+            "v1"
+        );
+    }
+
+    #[tokio::test]
+    async fn postgres_transactional_update_classifies_stale_missing_and_deleted() {
+        let backend = create_backend().await;
+        let tenant = create_tenant("transactional-update-classification");
+
+        let stale = backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType":"Patient","id":"tx-stale","active":true}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        let winner = backend
+            .update(
+                &tenant,
+                &stale,
+                json!({"resourceType":"Patient","id":"tx-stale","active":false}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(winner.version_id(), "2");
+        let mut stale_tx = backend
+            .begin_transaction(&tenant, TransactionOptions::new())
+            .await
+            .unwrap();
+        let stale_error = stale_tx
+            .update(
+                &stale,
+                json!({"resourceType":"Patient","id":"tx-stale","active":true}),
+            )
+            .await
+            .expect_err("stale live resource must conflict");
+        assert!(matches!(
+            stale_error,
+            StorageError::Concurrency(ConcurrencyError::VersionConflict {
+                expected_version,
+                actual_version,
+                ..
+            }) if expected_version == "1" && actual_version == "2"
+        ));
+        Box::new(stale_tx).rollback().await.unwrap();
+
+        let missing = helios_persistence::types::StoredResource::new(
+            "Patient",
+            "tx-missing",
+            tenant.tenant_id().clone(),
+            json!({"resourceType":"Patient","id":"tx-missing"}),
+            FhirVersion::default(),
+        );
+        let mut missing_tx = backend
+            .begin_transaction(&tenant, TransactionOptions::new())
+            .await
+            .unwrap();
+        let missing_error = missing_tx
+            .update(&missing, missing.content().clone())
+            .await
+            .expect_err("missing resource must be not found");
+        assert!(matches!(
+            missing_error,
+            StorageError::Resource(ResourceError::NotFound { ref id, .. }) if id == "tx-missing"
+        ));
+        Box::new(missing_tx).rollback().await.unwrap();
+
+        let deleted = backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType":"Patient","id":"tx-deleted","active":true}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        backend
+            .delete(&tenant, "Patient", deleted.id())
+            .await
+            .unwrap();
+        let mut deleted_tx = backend
+            .begin_transaction(&tenant, TransactionOptions::new())
+            .await
+            .unwrap();
+        let deleted_error = deleted_tx
+            .update(
+                &deleted,
+                json!({"resourceType":"Patient","id":"tx-deleted","active":false}),
+            )
+            .await
+            .expect_err("soft-deleted resource must be not found");
+        assert!(matches!(
+            deleted_error,
+            StorageError::Resource(ResourceError::NotFound { ref id, .. }) if id == "tx-deleted"
+        ));
+        Box::new(deleted_tx).rollback().await.unwrap();
+
+        assert_eq!(
+            backend
+                .history_instance(&tenant, "Patient", "tx-stale", &HistoryParams::default())
+                .await
+                .unwrap()
+                .items
+                .len(),
+            2,
+            "stale update must not add history"
+        );
+        assert!(
+            backend
+                .history_instance(&tenant, "Patient", "tx-missing", &HistoryParams::default())
+                .await
+                .unwrap()
+                .items
+                .is_empty()
+        );
+        assert_eq!(
+            backend
+                .history_instance(
+                    &tenant,
+                    "Patient",
+                    "tx-deleted",
+                    &HistoryParams::default().include_deleted(true),
+                )
+                .await
+                .unwrap()
+                .items
+                .len(),
+            2,
+            "deleted update must not add history beyond the tombstone"
+        );
+    }
+
+    #[tokio::test]
+    async fn postgres_transactional_update_preserves_sequential_versions_and_metadata() {
+        let backend = create_backend().await;
+        let tenant = create_tenant("transactional-update-sequential");
+        let started = chrono::Utc::now();
+        let v1 = backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType":"Patient","id":"tx-sequential","name":[{"family":"one"}]}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            (v1.resource_type(), v1.id(), v1.version_id()),
+            ("Patient", "tx-sequential", "1")
+        );
+        assert_eq!(v1.fhir_version(), FhirVersion::R4);
+
+        let mut tx = backend
+            .begin_transaction(&tenant, TransactionOptions::new())
+            .await
+            .unwrap();
+        let read_v1 = tx.read("Patient", v1.id()).await.unwrap().unwrap();
+        let v2 = tx
+            .update(
+                &read_v1,
+                json!({"resourceType":"Observation","id":"wrong","name":[{"family":"two"}]}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            (v2.resource_type(), v2.id(), v2.version_id()),
+            ("Patient", "tx-sequential", "2")
+        );
+        assert_eq!(v2.fhir_version(), FhirVersion::R4);
+        Box::new(tx).commit().await.unwrap();
+
+        let mut tx = backend
+            .begin_transaction(&tenant, TransactionOptions::new())
+            .await
+            .unwrap();
+        let read_v2 = tx.read("Patient", v1.id()).await.unwrap().unwrap();
+        let v3 = tx
+            .update(
+                &read_v2,
+                json!({"resourceType":"Patient","id":"other","name":[{"family":"three"}]}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            (v3.resource_type(), v3.id(), v3.version_id()),
+            ("Patient", "tx-sequential", "3")
+        );
+        assert_eq!(v3.fhir_version(), FhirVersion::R4);
+        Box::new(tx).commit().await.unwrap();
+
+        let live = backend
+            .read(&tenant, "Patient", v1.id())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(live.version_id(), "3");
+        assert_eq!(live.content()["name"][0]["family"], "three");
+        assert_eq!(live.content()["resourceType"], "Patient");
+        assert_eq!(live.content()["id"], "tx-sequential");
+        assert_eq!(live.fhir_version(), FhirVersion::R4);
+        assert!(live.last_modified() >= v2.last_modified());
+        assert!(live.last_modified() >= v1.last_modified());
+        assert!(v1.last_modified() >= started);
+        let body = live.content_with_meta();
+        assert_eq!(body["meta"]["versionId"], "3");
+        assert!(body["meta"]["lastUpdated"].as_str().is_some());
+
+        let history = backend
+            .history_instance(&tenant, "Patient", v1.id(), &HistoryParams::default())
+            .await
+            .unwrap();
+        assert_eq!(history.items.len(), 3);
+        let expected = [("3", "three"), ("2", "two"), ("1", "one")];
+        for (entry, (version, family)) in history.items.iter().zip(expected) {
+            assert_eq!(entry.resource.version_id(), version);
+            assert_eq!(entry.resource.resource_type(), "Patient");
+            assert_eq!(entry.resource.id(), "tx-sequential");
+            assert_eq!(entry.resource.fhir_version(), FhirVersion::R4);
+            assert_eq!(entry.resource.content()["resourceType"], "Patient");
+            assert_eq!(entry.resource.content()["id"], "tx-sequential");
+            assert_eq!(entry.resource.content()["name"][0]["family"], family);
+            assert!(entry.timestamp >= started);
+        }
+        assert!(history.items[2].timestamp <= history.items[1].timestamp);
+        assert!(history.items[1].timestamp <= history.items[0].timestamp);
     }
 
     #[tokio::test]
@@ -9268,6 +9809,8 @@ mod postgres_integration {
         let view = backend.get_manifest_for_worker(&lease).await.unwrap();
         assert_eq!(view.import_directives, directives);
         assert_eq!(view.metadata, metadata);
+        assert_eq!(view.fhir_base_url.as_deref(), Some("https://provider/fhir"));
+        assert_eq!(view.fhir_version, FhirVersion::R4);
         assert_eq!(
             ImportMode::from_directives(&view.import_directives),
             ImportMode::Merge
@@ -9316,6 +9859,354 @@ mod postgres_integration {
             json!("female"),
             "merge must retain elements the submission omitted"
         );
+        assert_eq!(stored.resource_type(), "Patient");
+        assert_eq!(stored.id(), "pg-merge-1");
+        assert_eq!(stored.version_id(), "2");
+        assert_eq!(stored.fhir_version(), FhirVersion::R4);
+        assert_eq!(stored.content()["resourceType"], "Patient");
+        assert_eq!(stored.content()["id"], "pg-merge-1");
+        assert_eq!(stored.content_with_meta()["meta"]["versionId"], "2");
+    }
+
+    #[tokio::test]
+    async fn postgres_bulk_submit_update_uses_one_core_mutation_statement() {
+        use helios_persistence::core::{BulkProcessingOptions, BulkSubmitProvider, NdjsonEntry};
+
+        let (backend, _dbname) = isolated_reindex_backend_with_max_connections(1).await;
+        let tenant = create_tenant("bulk-submit-core-update-statement");
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType":"Patient","id":"core-update","name":[{"family":"before"}]}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        let (submission, manifest) =
+            new_bulk_submit_manifest(&backend, &tenant, "core-update-statement").await;
+        let results = backend
+            .process_entries(
+                &tenant,
+                &submission,
+                &manifest.manifest_id,
+                vec![NdjsonEntry::new(
+                    1,
+                    "Patient",
+                    json!({"resourceType":"Patient","id":"core-update","name":[{"family":"after"}]}),
+                )],
+                &BulkProcessingOptions::new()
+                    .with_skip_unchanged(false)
+                    .with_file_url("core-update.ndjson"),
+            )
+            .await
+            .unwrap();
+        assert!(results[0].is_success() && !results[0].created);
+
+        // max_connections=1 makes this the same physical session that ran the
+        // ingest. The caller query is deliberately not part of the filtered
+        // mutation families below.
+        let client = backend.get_client().await.unwrap();
+        let statements: Vec<String> = client
+            .query(
+                "SELECT statement FROM pg_prepared_statements
+                 WHERE statement ILIKE '%resources%' OR statement ILIKE '%resource_history%'",
+                &[],
+            )
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.get(0))
+            .collect();
+        let normalized: Vec<String> = statements
+            .iter()
+            .map(|statement| {
+                statement
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+                    .to_ascii_lowercase()
+            })
+            .collect();
+        let guarded: Vec<_> = normalized
+            .iter()
+            .filter(|statement| {
+                statement.contains("with upd as (")
+                    && statement.contains("update resources set version_id")
+                    && statement.contains("insert into resource_history")
+                    && statement.contains("and version_id = $7")
+            })
+            .collect();
+        assert_eq!(
+            guarded.len(),
+            1,
+            "the bulk update must prepare exactly one guarded update+history family: {normalized:?}"
+        );
+        let standalone_resource_updates = normalized
+            .iter()
+            .filter(|statement| statement.starts_with("update resources set version_id"));
+        assert_eq!(
+            standalone_resource_updates.count(),
+            0,
+            "the old standalone resources UPDATE must not be prepared: {normalized:?}"
+        );
+        let standalone_history_inserts = normalized
+            .iter()
+            .filter(|statement| statement.starts_with("insert into resource_history"));
+        assert_eq!(
+            standalone_history_inserts.count(),
+            0,
+            "the old standalone history INSERT must not be prepared: {normalized:?}"
+        );
+    }
+
+    #[derive(Default)]
+    struct RecordingCommittedResources {
+        batches: std::sync::Mutex<Vec<(Vec<String>, Vec<String>)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl helios_persistence::core::BatchCommitObserver for RecordingCommittedResources {
+        async fn batch_committed(&self, batch: &helios_persistence::core::BatchCommitted<'_>) {
+            self.batches.lock().unwrap().push((
+                batch
+                    .results
+                    .iter()
+                    .map(|result| result.resource_id.clone().unwrap_or_default())
+                    .collect(),
+                batch
+                    .resources
+                    .iter()
+                    .map(|resource| resource.id().to_string())
+                    .collect(),
+            ));
+        }
+
+        fn wants_resources(&self) -> bool {
+            true
+        }
+    }
+
+    #[tokio::test]
+    async fn postgres_bulk_submit_update_savepoint_rolls_back_resource_and_history() {
+        use helios_persistence::core::{
+            BulkEntryOutcome, BulkProcessingOptions, BulkSubmitProvider,
+            BulkSubmitRollbackProvider, ChangeType, NdjsonEntry,
+        };
+        use std::sync::Arc;
+
+        let (backend, dbname) = isolated_reindex_backend().await;
+        let tenant = create_tenant("bulk-submit-update-savepoint");
+        let tenant_id = tenant.tenant_id().as_str().to_string();
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType":"Patient","id":"savepoint-original","name":[{"family":"original"}]}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        let client = reindex_test_client_for(&dbname).await;
+        let original_index_before: String = client
+            .query_one(
+                "SELECT md5(COALESCE(string_agg(to_jsonb(search_index)::text, '|' ORDER BY to_jsonb(search_index)::text), ''))
+                 FROM search_index WHERE tenant_id = $1 AND resource_type = 'Patient' AND resource_id = 'savepoint-original'",
+                &[&tenant_id],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let probe = format!("savepoint_update_probe_{suffix}");
+        let function = format!("fail_savepoint_update_{suffix}");
+        let trigger = format!("fail_savepoint_update_trigger_{suffix}");
+        client
+            .batch_execute(&format!(
+                "CREATE TABLE {probe} (calls bigint NOT NULL);
+                 INSERT INTO {probe} VALUES (0);
+                 CREATE FUNCTION {function}() RETURNS trigger LANGUAGE plpgsql AS $$
+                 DECLARE call_number bigint;
+                 BEGIN
+                   IF NEW.tenant_id = '{tenant_id}' AND NEW.resource_id = 'savepoint-original' THEN
+                     UPDATE {probe} SET calls = calls + 1 RETURNING calls INTO call_number;
+                     IF call_number = 1 THEN
+                       RAISE EXCEPTION 'forced first resource update index failure';
+                     END IF;
+                   END IF;
+                   RETURN NEW;
+                 END $$;
+                 CREATE TRIGGER {trigger} BEFORE INSERT ON search_index
+                   FOR EACH ROW EXECUTE FUNCTION {function}();"
+            ))
+            .await
+            .unwrap();
+
+        let (submission, manifest) =
+            new_bulk_submit_manifest(&backend, &tenant, "update-savepoint").await;
+        let observer = Arc::new(RecordingCommittedResources::default());
+        let processed = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            backend.process_entries(
+                &tenant,
+                &submission,
+                &manifest.manifest_id,
+                vec![
+                    NdjsonEntry::new(
+                        1,
+                        "Patient",
+                        json!({"resourceType":"Patient","id":"savepoint-original","name":[{"family":"failed"}]}),
+                    ),
+                    NdjsonEntry::new(
+                        2,
+                        "Patient",
+                        json!({"resourceType":"Patient","id":"savepoint-companion","name":[{"family":"companion"}]}),
+                    ),
+                ],
+                &BulkProcessingOptions::new()
+                    .with_defer_indexing(false)
+                    .with_batch_observer(observer.clone()),
+            ),
+        )
+        .await;
+        client
+            .batch_execute(&format!(
+                "DROP TRIGGER IF EXISTS {trigger} ON search_index;
+                 DROP FUNCTION IF EXISTS {function}();
+                 DROP TABLE IF EXISTS {probe};"
+            ))
+            .await
+            .unwrap();
+        let results = processed
+            .expect("bulk submit processing should finish before timeout")
+            .expect("the failed entry should be isolated by its savepoint");
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].outcome, BulkEntryOutcome::ProcessingError);
+        assert!(results[0].resource_id.is_none());
+        assert!(!results[0].created);
+        let first_outcome = results[0].operation_outcome.as_ref().unwrap();
+        assert_eq!(first_outcome["resourceType"], "OperationOutcome");
+        assert_eq!(first_outcome["issue"][0]["severity"], "error");
+        assert_eq!(first_outcome["issue"][0]["code"], "exception");
+        assert!(
+            first_outcome["issue"][0]["diagnostics"]
+                .as_str()
+                .unwrap()
+                .contains("forced first resource update index failure")
+        );
+        assert!(results[1].is_success() && results[1].created);
+        assert_eq!(
+            results[1].resource_id.as_deref(),
+            Some("savepoint-companion")
+        );
+
+        let original = backend
+            .read(&tenant, "Patient", "savepoint-original")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(original.version_id(), "1");
+        assert_eq!(original.content()["name"][0]["family"], "original");
+        let original_history = backend
+            .history_instance(
+                &tenant,
+                "Patient",
+                "savepoint-original",
+                &HistoryParams::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(original_history.items.len(), 1);
+        assert_eq!(original_history.items[0].resource.version_id(), "1");
+        let original_index_after: String = client
+            .query_one(
+                "SELECT md5(COALESCE(string_agg(to_jsonb(search_index)::text, '|' ORDER BY to_jsonb(search_index)::text), ''))
+                 FROM search_index WHERE tenant_id = $1 AND resource_type = 'Patient' AND resource_id = 'savepoint-original'",
+                &[&tenant_id],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(original_index_after, original_index_before);
+
+        let companion = backend
+            .read(&tenant, "Patient", "savepoint-companion")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(companion.version_id(), "1");
+        assert_eq!(companion.content()["name"][0]["family"], "companion");
+        assert_eq!(
+            backend
+                .history_instance(
+                    &tenant,
+                    "Patient",
+                    "savepoint-companion",
+                    &HistoryParams::default()
+                )
+                .await
+                .unwrap()
+                .items
+                .len(),
+            1
+        );
+
+        let receipts = backend
+            .get_entry_results_page(&tenant, &submission, &manifest.manifest_id, None, 10, None)
+            .await
+            .unwrap();
+        assert_eq!(receipts.entries.len(), 2);
+        assert_eq!(
+            receipts.entries[0].result.outcome,
+            BulkEntryOutcome::ProcessingError
+        );
+        assert_eq!(
+            receipts.entries[0].result.operation_outcome,
+            results[0].operation_outcome
+        );
+        assert_eq!(
+            receipts.entries[1].result.outcome,
+            BulkEntryOutcome::Success
+        );
+        assert_eq!(
+            receipts.entries[1].result.resource_id.as_deref(),
+            Some("savepoint-companion")
+        );
+        let counts = backend
+            .get_entry_counts(&tenant, &submission, &manifest.manifest_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            (counts.total, counts.success, counts.processing_error),
+            (2, 1, 1)
+        );
+        let manifest_after = backend
+            .get_manifest(&tenant, &submission, &manifest.manifest_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (
+                manifest_after.total_entries,
+                manifest_after.processed_entries,
+                manifest_after.failed_entries
+            ),
+            (2, 1, 1)
+        );
+        let changes = backend
+            .list_changes(&tenant, &submission, 10, 0)
+            .await
+            .unwrap();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].change_type, ChangeType::Create);
+        assert_eq!(changes[0].resource_id, "savepoint-companion");
+        let observed = observer.batches.lock().unwrap();
+        assert_eq!(observed.len(), 1);
+        assert_eq!(
+            observed[0].0,
+            vec!["".to_string(), "savepoint-companion".to_string()]
+        );
+        assert_eq!(observed[0].1, vec!["savepoint-companion".to_string()]);
     }
 
     #[derive(Clone)]
