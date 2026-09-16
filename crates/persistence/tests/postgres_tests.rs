@@ -5169,6 +5169,62 @@ mod postgres_integration {
         );
     }
 
+    /// `_lastUpdated` is dispatched by name into a dedicated builder that
+    /// reads only `param.values`, so a modifier other than `:missing` would
+    /// be dropped and the value consumed as a plain positive date match. It
+    /// must be rejected up front instead, the same way unsupported `_id`
+    /// modifiers are (#1092 follow-up).
+    #[tokio::test]
+    async fn postgres_integration_search_last_updated_unsupported_modifier_is_rejected() {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::error::{SearchError, StorageError};
+        use helios_persistence::types::{
+            SearchModifier, SearchParamType, SearchParameter, SearchQuery, SearchValue,
+        };
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("test-tenant");
+
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({ "resourceType": "Patient", "id": "a" }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+
+        let query = SearchQuery::new("Patient").with_parameter(SearchParameter {
+            name: "_lastUpdated".to_string(),
+            param_type: SearchParamType::Date,
+            modifier: Some(SearchModifier::Not),
+            values: vec![SearchValue::eq("2020")],
+            chain: vec![],
+            components: vec![],
+        });
+
+        let err = backend.search(&tenant, &query).await.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                StorageError::Search(SearchError::UnsupportedModifier { ref modifier, .. })
+                    if modifier == "not"
+            ),
+            "_lastUpdated:not must be rejected as an unsupported modifier, got: {err:?}"
+        );
+
+        let err = backend.search_count(&tenant, &query).await.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                StorageError::Search(SearchError::UnsupportedModifier { ref modifier, .. })
+                    if modifier == "not"
+            ),
+            "search_count must reject _lastUpdated:not as well, got: {err:?}"
+        );
+    }
+
     #[tokio::test]
     async fn postgres_integration_search_composite_code_value_quantity() {
         use helios_persistence::core::SearchProvider;
