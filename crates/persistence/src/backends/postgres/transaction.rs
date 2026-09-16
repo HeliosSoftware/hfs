@@ -515,7 +515,7 @@ impl Transaction for PostgresTransaction {
             .unwrap_or_else(crate::types::new_resource_id);
 
         // Build the resource with id and resourceType
-        let mut data = resource.clone();
+        let mut data = resource;
         if let Some(obj) = data.as_object_mut() {
             obj.insert("id".to_string(), Value::String(id.clone()));
             obj.insert(
@@ -699,7 +699,7 @@ impl Transaction for PostgresTransaction {
         let new_version_str = new_version.to_string();
 
         // Build the resource with id and resourceType
-        let mut data = resource.clone();
+        let mut data = resource;
         if let Some(obj) = data.as_object_mut() {
             obj.insert("id".to_string(), Value::String(id.to_string()));
             obj.insert(
