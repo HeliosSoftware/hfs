@@ -11354,3 +11354,150 @@ async fn mongodb_integration_builder_second_boot_issues_no_create_indexes() {
         "second boot must not issue createIndexes for any generation-2 search_index index"
     );
 }
+
+/// Every `search_index` operation a value-filtered search issues must be a
+/// covered index scan on a generation-2 index: `docsExamined == 0`.
+async fn assert_search_index_ops_are_covered(
+    db: &mongodb::Database,
+    search: impl std::future::Future<Output = ()>,
+    expected_index_fragment: &str,
+) {
+    use futures::stream::TryStreamExt;
+
+    if db.run_command(doc! { "profile": 2_i32 }).await.is_err() {
+        eprintln!("Skipping covered-plan assertion: profiling not permitted");
+        search.await;
+        return;
+    }
+    search.await;
+    let _ = db.run_command(doc! { "profile": 0_i32 }).await;
+    let ns = format!("{}.search_index", db.name());
+    let ops: Vec<Document> = db
+        .collection::<Document>("system.profile")
+        .find(doc! { "ns": &ns, "op": { "$in": ["query", "command"] } })
+        .await
+        .unwrap()
+        .try_collect::<Vec<Document>>()
+        .await
+        .unwrap();
+    assert!(
+        !ops.is_empty(),
+        "expected at least one profiled operation on {ns}"
+    );
+    for op in &ops {
+        let docs_examined = op
+            .get_i64("docsExamined")
+            .or_else(|_| op.get_i32("docsExamined").map(i64::from))
+            .unwrap_or(0);
+        let plan = op.get_str("planSummary").unwrap_or_default().to_string();
+        assert_eq!(
+            docs_examined, 0,
+            "not covered: planSummary={plan} op={op:?}"
+        );
+        // `planSummary` carries only the winning plan's key pattern (e.g.
+        // `IXSCAN { tenant_id: 1, ... }`), never the index's name — verified
+        // against this server: every other `planSummary` assertion already in
+        // this file (e.g. `mongodb_history_type_plan_is_a_bounded_index_walk`)
+        // only checks for the `IXSCAN` stage name, never a specific index. The
+        // chosen index's name is recorded deeper, at `execStats..indexName`;
+        // match there instead of substring-matching a field that structurally
+        // cannot carry it.
+        let op_repr = format!("{op:?}");
+        assert!(
+            op_repr.contains(&format!(
+                "\"indexName\": String(\"{expected_index_fragment}\")"
+            )),
+            "wrong index: planSummary={plan} op={op:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn mongodb_integration_date_range_search_is_a_covered_v2_scan() {
+    let Some(backend) = create_backend_with_full_registry("covered_date").await else {
+        eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
+        return;
+    };
+    let tenant = create_tenant("tenant-covered-date");
+    for i in 0..20 {
+        backend
+            .create(
+                &tenant,
+                "Observation",
+                json!({
+                    "resourceType": "Observation", "id": format!("o{i}"), "status": "final",
+                    "code": { "coding": [{ "system": "http://loinc.org", "code": "8302-2" }] },
+                    "effectiveDateTime": format!("2016-01-{:02}", i + 1)
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+    }
+    let db = raw_test_client(&backend.config().connection_string)
+        .await
+        .unwrap()
+        .database(&backend.config().database_name);
+    let q = SearchQuery::new("Observation").with_parameter(SearchParameter {
+        name: "date".into(),
+        param_type: SearchParamType::Date,
+        modifier: None,
+        values: vec![SearchValue::parse("ge2016-01-10")],
+        chain: vec![],
+        components: vec![],
+    });
+    assert_search_index_ops_are_covered(
+        &db,
+        async {
+            let r = backend.search(&tenant, &q).await.unwrap();
+            assert_eq!(r.resources.items.len(), 11);
+        },
+        "idx_search_date_v2",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn mongodb_integration_bare_token_search_is_a_covered_v2_scan() {
+    let Some(backend) = create_backend_with_full_registry("covered_token").await else {
+        eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
+        return;
+    };
+    let tenant = create_tenant("tenant-covered-token");
+    for i in 0..20 {
+        backend
+            .create(
+                &tenant,
+                "Observation",
+                json!({
+                    "resourceType": "Observation", "id": format!("o{i}"),
+                    "status": if i % 2 == 0 { "final" } else { "preliminary" },
+                    "code": { "coding": [{ "system": "http://loinc.org", "code": "8302-2" }] }
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+    }
+    let db = raw_test_client(&backend.config().connection_string)
+        .await
+        .unwrap()
+        .database(&backend.config().database_name);
+    let q = SearchQuery::new("Observation").with_parameter(SearchParameter {
+        name: "status".into(),
+        param_type: SearchParamType::Token,
+        modifier: None,
+        values: vec![SearchValue::eq("final")],
+        chain: vec![],
+        components: vec![],
+    });
+    assert_search_index_ops_are_covered(
+        &db,
+        async {
+            let r = backend.search(&tenant, &q).await.unwrap();
+            assert_eq!(r.resources.items.len(), 10);
+        },
+        "idx_search_token_v2",
+    )
+    .await;
+}

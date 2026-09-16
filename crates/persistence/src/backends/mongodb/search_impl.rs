@@ -1263,7 +1263,7 @@ impl MongoBackend {
 
         let mut driver_cursor = search_index
             .find(driver_filter)
-            .projection(doc! { "resource_id": 1 })
+            .projection(doc! { "resource_id": 1, "_id": 0 })
             .await
             .or_query_error("Failed to open driver cursor")?;
 
