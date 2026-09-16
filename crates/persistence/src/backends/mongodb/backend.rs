@@ -861,17 +861,22 @@ impl MongoBackend {
     /// rejected is a visible 400 rather than the old silent wrong answer;
     /// narrowing it would need a name-aware capability path.
     ///
-    /// Still unimplemented and therefore still unadvertised: `:above`/
-    /// `:below`/`:in`/`:not-in` (rejected outright by `validate_query_support`
-    /// for every type), token `:of-type`/`:text-advanced`, and reference
-    /// `:identifier`/`:above`/`:below`/`:text-advanced` — each still hits an
-    /// `UnsupportedModifier` catch-all in its type-specific builder.
+    /// `:above`/`:below` are now implemented for `uri` (#1002):
+    /// `build_uri_filter` resolves them segment-aware, mirroring SQLite and
+    /// Elasticsearch, so they are advertised there. `:in`/`:not-in` stay
+    /// unimplemented and unadvertised for every type (rejected outright by
+    /// `validate_query_support`), as do token `:above`/`:below`/`:of-type`/
+    /// `:text-advanced` and reference `:identifier`/`:above`/`:below`/
+    /// `:text-advanced` — token/reference `:above`/`:below` need terminology
+    /// subsumption and hierarchy resolution respectively, neither of which is
+    /// implemented — each still hits an `UnsupportedModifier` catch-all in
+    /// its type-specific builder.
     pub(super) fn modifiers_for_type(param_type: SearchParamType) -> Vec<&'static str> {
         match param_type {
             SearchParamType::String => vec!["exact", "contains", "text", "missing"],
             SearchParamType::Token => vec!["text", "code-text", "not", "missing"],
             SearchParamType::Reference => vec!["contains", "text", "code-text", "missing"],
-            SearchParamType::Uri => vec!["exact", "contains", "missing"],
+            SearchParamType::Uri => vec!["exact", "contains", "below", "above", "missing"],
             SearchParamType::Date | SearchParamType::Number | SearchParamType::Quantity => {
                 vec!["missing"]
             }
@@ -970,12 +975,13 @@ mod capability_tests {
         assert!(r.contains(&"missing"));
         assert!(!r.contains(&"identifier"));
 
-        // Uri honors exact/contains/missing but not :above/:below.
+        // Uri honors exact/contains/missing and :above/:below (#1002,
+        // segment-aware in build_uri_filter).
         let u = MongoBackend::modifiers_for_type(SearchParamType::Uri);
         assert!(u.contains(&"contains"));
         assert!(u.contains(&"missing"));
-        assert!(!u.contains(&"above"));
-        assert!(!u.contains(&"below"));
+        assert!(u.contains(&"above"));
+        assert!(u.contains(&"below"));
     }
 
     /// Every `SearchParamType` variant paired with a value `matching_resource_ids`
@@ -1069,13 +1075,22 @@ mod capability_tests {
 
         for param_type in all_param_types() {
             for &modifier_str in &MongoBackend::modifiers_for_type(param_type) {
-                // `validate_query_support` (search_impl.rs) rejects these four
-                // outright for every parameter type; advertising any of them
-                // would be a straightforward regression back to over-promising.
+                // `validate_query_support` (search_impl.rs) rejects `:in`/
+                // `:not-in` outright for every parameter type; advertising
+                // either would be a straightforward regression back to
+                // over-promising. `:above`/`:below` are rejected for every
+                // type EXCEPT uri (#1002: build_uri_filter resolves them
+                // there, segment-aware).
                 assert!(
-                    !matches!(modifier_str, "above" | "below" | "in" | "not-in"),
+                    !matches!(modifier_str, "in" | "not-in"),
                     "{param_type} advertises `{modifier_str}`, which \
                      validate_query_support rejects unconditionally"
+                );
+                assert!(
+                    !matches!(modifier_str, "above" | "below")
+                        || param_type == SearchParamType::Uri,
+                    "{param_type} advertises `{modifier_str}`, which \
+                     validate_query_support rejects for every type except uri"
                 );
 
                 // The advertised string must be a real, round-trippable

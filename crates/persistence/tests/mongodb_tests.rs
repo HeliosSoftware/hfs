@@ -4499,6 +4499,169 @@ async fn mongodb_integration_search_missing_not_and_param_sort() {
     assert!(page2.resources.page_info.has_previous);
 }
 
+/// #1002: `url:below`/`url:above` on MongoDB must be segment-aware, the same
+/// way SQLite and Elasticsearch already are — a `:below=http://example.org/fhir`
+/// must not match `http://example.org/fhirx/...` just because it shares the
+/// literal prefix.
+#[tokio::test]
+async fn mongodb_integration_uri_below_and_above_are_segment_aware() {
+    let Some(backend) = create_backend_with_full_registry("uri_below_above").await else {
+        eprintln!(
+            "Skipping mongodb_integration_uri_below_and_above_are_segment_aware (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+
+    let tenant = create_tenant("tenant-uri-below-above");
+
+    for (id, url) in [
+        ("vs-root", "http://example.org/fhir"),
+        ("vs-a", "http://example.org/fhir/ValueSet/a"),
+        ("vs-x", "http://example.org/fhirx/ValueSet/b"),
+    ] {
+        backend
+            .create(
+                &tenant,
+                "ValueSet",
+                json!({
+                    "resourceType": "ValueSet",
+                    "id": id,
+                    "status": "active",
+                    "url": url,
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+    }
+
+    let ids = |result: &helios_persistence::core::SearchResult| {
+        let mut ids = result
+            .resources
+            .items
+            .iter()
+            .map(|r| r.id().to_string())
+            .collect::<Vec<_>>();
+        ids.sort();
+        ids
+    };
+
+    // `:below=http://example.org/fhir` — the value itself, and anything
+    // under `.../fhir/`. `vs-x` shares the literal prefix but is under
+    // `.../fhirx/`, a different path segment, so it must NOT match.
+    let mut below = SearchQuery::new("ValueSet").with_parameter(SearchParameter {
+        name: "url".to_string(),
+        param_type: SearchParamType::Uri,
+        modifier: Some(SearchModifier::Below),
+        values: vec![SearchValue::eq("http://example.org/fhir")],
+        chain: vec![],
+        components: vec![],
+    });
+    below.total = Some(TotalMode::Accurate);
+    let result = backend.search(&tenant, &below).await.unwrap();
+    assert_eq!(ids(&result), vec!["vs-a", "vs-root"]);
+    assert_eq!(result.total, Some(2));
+
+    // `:above=http://example.org/fhir/ValueSet/a` — the value and its
+    // path-segment parents down to the authority; `vs-root` is one of those
+    // parents, `vs-x` is not.
+    let above_a = SearchQuery::new("ValueSet").with_parameter(SearchParameter {
+        name: "url".to_string(),
+        param_type: SearchParamType::Uri,
+        modifier: Some(SearchModifier::Above),
+        values: vec![SearchValue::eq("http://example.org/fhir/ValueSet/a")],
+        chain: vec![],
+        components: vec![],
+    });
+    let result = backend.search(&tenant, &above_a).await.unwrap();
+    assert_eq!(ids(&result), vec!["vs-a", "vs-root"]);
+
+    // `:above=http://example.org/fhirx/ValueSet/b` — only `vs-x` and its own
+    // parents; `vs-root` (a different scheme+authority path) never matches.
+    let above_x = SearchQuery::new("ValueSet").with_parameter(SearchParameter {
+        name: "url".to_string(),
+        param_type: SearchParamType::Uri,
+        modifier: Some(SearchModifier::Above),
+        values: vec![SearchValue::eq("http://example.org/fhirx/ValueSet/b")],
+        chain: vec![],
+        components: vec![],
+    });
+    let result = backend.search(&tenant, &above_x).await.unwrap();
+    assert_eq!(ids(&result), vec!["vs-x"]);
+
+    // No modifier: exact match only.
+    let exact = SearchQuery::new("ValueSet").with_parameter(SearchParameter {
+        name: "url".to_string(),
+        param_type: SearchParamType::Uri,
+        modifier: None,
+        values: vec![SearchValue::eq("http://example.org/fhir")],
+        chain: vec![],
+        components: vec![],
+    });
+    let result = backend.search(&tenant, &exact).await.unwrap();
+    assert_eq!(ids(&result), vec!["vs-root"]);
+}
+
+/// #1002: `:below` must stay a single anchored regex so `idx_search_uri_v2`
+/// stays bounded rather than falling back to a full collection scan.
+#[tokio::test]
+async fn mongodb_integration_uri_below_search_is_a_covered_v2_scan() {
+    let Some(backend) = create_backend_with_full_registry("covered_uri_below").await else {
+        eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
+        return;
+    };
+    let tenant = create_tenant("tenant-covered-uri-below");
+    for i in 0..20 {
+        backend
+            .create(
+                &tenant,
+                "ValueSet",
+                json!({
+                    "resourceType": "ValueSet", "id": format!("vs{i}"), "status": "active",
+                    "url": format!("http://example.org/fhir/ValueSet/{i}")
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+    }
+    for i in 0..5 {
+        backend
+            .create(
+                &tenant,
+                "ValueSet",
+                json!({
+                    "resourceType": "ValueSet", "id": format!("other{i}"), "status": "active",
+                    "url": format!("http://example.org/other/ValueSet/{i}")
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+    }
+    let db = raw_test_client(&backend.config().connection_string)
+        .await
+        .unwrap()
+        .database(&backend.config().database_name);
+    let q = SearchQuery::new("ValueSet").with_parameter(SearchParameter {
+        name: "url".into(),
+        param_type: SearchParamType::Uri,
+        modifier: Some(SearchModifier::Below),
+        values: vec![SearchValue::eq("http://example.org/fhir")],
+        chain: vec![],
+        components: vec![],
+    });
+    assert_search_index_ops_are_covered(
+        &db,
+        async {
+            let r = backend.search(&tenant, &q).await.unwrap();
+            assert_eq!(r.resources.items.len(), 20);
+        },
+        "idx_search_uri_v2",
+    )
+    .await;
+}
+
 /// #1056: a MongoDB parameter-sorted page's rows, `has_next` and `total` must
 /// all derive from one id sequence. `_id`/`_lastUpdated` are resource-level
 /// predicates that never reach the search index, so before the fix they
