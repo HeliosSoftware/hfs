@@ -124,17 +124,16 @@ Nothing. The planner chooses between v1 and v2 while both exist. The single hint
 
 ```text
 $match  { tenant_id, contained_type, is_contained: true, $or: [ <per-parameter branch> ... ] }
-$group  { _id: <key>, names: { $addToSet: $param_name } }
-        # key = { rtype, rid } for container return (one slot per container, so
-        #       _total and page boundaries count containers);
-        #       { rtype, rid, lid } for contained return (one slot per contained entity)
-$match  { names: { $all: [<distinct parameter names>] } }        # only when more than one parameter
+$group  { _id: { rtype: $resource_type, rid: $resource_id, lid: $contained_local_id },
+          names: { $addToSet: $param_name } }                    # always per contained entity
+$match  { names: { $all: [<distinct parameter names>] } }        # only when more than one parameter; the AND holds within one entity
+$group  { _id: { rtype: $_id.rtype, rid: $_id.rid } }            # container return only: collapse to one slot per container
 $sort   { _id.rtype: 1, _id.rid: 1, _id.lid: 1 }
 $facet  { page:  [ { $skip: offset }, { $limit: count } ],
           total: [ { $count: n } ] }                              # total branch only when _total is requested
 ```
 
-The `$match` fields are written in the index key order so the prefix `tenant_id, contained_type, is_contained` binds, and each `$or` branch carries `param_name` plus its value predicate as today (`build_search_index_filter("", "", param)` minus the tenant and type fields). `$group` reads `resource_type`, `resource_id` and `contained_local_id` from the index keys. The group key depends on the return mode (implementation ruling 2026-09-15): grouping by local id in container-return mode would make one container occupy several page slots and count several times in `_total`, while rendering once after deduplication. `offset` and `count` come from `_offset` and `_count`, defaulting as they do in `search()`.
+The `$match` fields are written in the index key order so the prefix `tenant_id, contained_type, is_contained` binds, and each `$or` branch carries `param_name` plus its value predicate as today (`build_search_index_filter("", "", param)` minus the tenant and type fields). `$group` reads `resource_type`, `resource_id` and `contained_local_id` from the index keys. Grouping is two-stage (implementation rulings 2026-09-15): the first `$group` is always per contained entity so a multi-parameter AND is evaluated within one entity; in container-return mode a second `$group` collapses to one slot per container, so `_total` and page boundaries count containers rather than entities. `offset` and `count` come from `_offset` and `_count`, defaulting as they do in `search()`.
 
 ### 5.2 Container fetch
 
