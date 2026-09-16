@@ -20,6 +20,9 @@
 
 #![cfg(feature = "mongodb")]
 
+#[path = "common/container_cleanup.rs"]
+mod container_cleanup;
+
 mod sof_conformance_mongodb_tests {
     use axum::http::{HeaderName, HeaderValue};
     use axum_test::TestServer;
@@ -48,6 +51,8 @@ mod sof_conformance_mongodb_tests {
 
     struct SharedMongo {
         connection_string: String,
+        /// Kept alive for the duration of the test binary; the
+        /// `container_cleanup` exit hook removes it at process exit.
         _container: testcontainers::ContainerAsync<Mongo>,
     }
 
@@ -56,14 +61,17 @@ mod sof_conformance_mongodb_tests {
     async fn shared_mongo() -> &'static SharedMongo {
         SHARED_MONGO
             .get_or_init(|| async {
-                // Label with the CI run id so the workflow's cleanup job can
-                // reap the container (mirrors the PostgreSQL conformance suite).
+                // Label with the CI run id (mirrors the PostgreSQL conformance
+                // suite); `SHARED_MONGO` is a static and never dropped, so the
+                // `container_cleanup` exit hook removes the container at
+                // process exit.
                 let run_id = std::env::var("GITHUB_RUN_ID").unwrap_or_default();
-                let container = Mongo::default()
-                    .with_label("github.run_id", &run_id)
-                    .start()
-                    .await
-                    .expect("failed to start MongoDB container");
+                let container = super::container_cleanup::with_cleanup_label(
+                    Mongo::default().with_label("github.run_id", &run_id),
+                )
+                .start()
+                .await
+                .expect("failed to start MongoDB container");
                 let port = container
                     .get_host_port_ipv4(27017)
                     .await

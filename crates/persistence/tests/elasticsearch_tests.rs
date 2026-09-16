@@ -3451,6 +3451,128 @@ mod es_integration {
         );
     }
 
+    /// #1092: `_id` is dispatched by name into a dedicated builder
+    /// (`build_id_clause`) that bypassed the generic `:not` handling
+    /// entirely, so `_id:not=<id>` returned *only* the resource the caller
+    /// asked to exclude — the precise inverse of the request.
+    #[tokio::test]
+    async fn es_integration_search_id_not_excludes_listed_ids() {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::types::{
+            SearchModifier, SearchParamType, SearchParameter, SearchQuery, SearchValue, TotalMode,
+        };
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("test-tenant");
+
+        for id in ["a", "b", "c"] {
+            backend
+                .create(
+                    &tenant,
+                    "Patient",
+                    json!({ "resourceType": "Patient", "id": id }),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+
+        // Wait for index refresh
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+        let mut query = SearchQuery::new("Patient")
+            .with_parameter(SearchParameter {
+                name: "_id".to_string(),
+                param_type: SearchParamType::Token,
+                modifier: Some(SearchModifier::Not),
+                values: vec![SearchValue::eq("b")],
+                chain: vec![],
+                components: vec![],
+            })
+            .with_count(100);
+        query.total = Some(TotalMode::Accurate);
+
+        let result = backend.search(&tenant, &query).await.unwrap();
+        let mut ids: Vec<String> = result
+            .resources
+            .items
+            .iter()
+            .map(|r| r.id().to_string())
+            .collect();
+        ids.sort();
+        assert_eq!(ids, vec!["a", "c"], "_id:not=b must exclude only b");
+        assert_eq!(result.total, Some(2));
+
+        let mut query_two = SearchQuery::new("Patient")
+            .with_parameter(SearchParameter {
+                name: "_id".to_string(),
+                param_type: SearchParamType::Token,
+                modifier: Some(SearchModifier::Not),
+                values: vec![SearchValue::eq("a"), SearchValue::eq("b")],
+                chain: vec![],
+                components: vec![],
+            })
+            .with_count(100);
+        query_two.total = Some(TotalMode::Accurate);
+
+        let result_two = backend.search(&tenant, &query_two).await.unwrap();
+        let ids_two: Vec<String> = result_two
+            .resources
+            .items
+            .iter()
+            .map(|r| r.id().to_string())
+            .collect();
+        assert_eq!(ids_two, vec!["c"], "_id:not=a,b must exclude both a and b");
+        assert_eq!(result_two.total, Some(1));
+    }
+
+    /// #1092: modifiers the `_id` builder cannot honour must be rejected
+    /// rather than silently degrading to a positive match (mirrors
+    /// #1055/#1091's MongoDB `metadata_param_honoured` gate).
+    #[tokio::test]
+    async fn es_integration_search_id_unsupported_modifier_is_rejected() {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::error::{SearchError, StorageError};
+        use helios_persistence::types::{
+            SearchModifier, SearchParamType, SearchParameter, SearchQuery, SearchValue,
+        };
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("test-tenant");
+
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({ "resourceType": "Patient", "id": "a" }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+
+        // Wait for index refresh
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+        let query = SearchQuery::new("Patient").with_parameter(SearchParameter {
+            name: "_id".to_string(),
+            param_type: SearchParamType::Token,
+            modifier: Some(SearchModifier::Text),
+            values: vec![SearchValue::eq("a")],
+            chain: vec![],
+            components: vec![],
+        });
+
+        let err = backend.search(&tenant, &query).await.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                StorageError::Search(SearchError::UnsupportedModifier { ref modifier, .. })
+                    if modifier == "text"
+            ),
+            "_id:text must be rejected as an unsupported modifier, got: {err:?}"
+        );
+    }
+
     #[tokio::test]
     async fn es_integration_search_date() {
         use helios_persistence::core::SearchProvider;

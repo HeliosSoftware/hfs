@@ -177,6 +177,10 @@ regex = "1"
 testcontainers = "0.27"
 testcontainers-modules = { version = "0.15", features = ["postgres", "mongo"] }
 
+# `#[ctor::dtor]` exit hook that removes testcontainers held in `static`s
+# (tests/common/container_cleanup.rs).
+ctor = "0.2"
+
 [package.metadata.docs.rs]
 features = ["R4", "sqlite"]
 rustdoc-args = ["--cfg", "docsrs"]
