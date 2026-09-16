@@ -1040,7 +1040,7 @@ async fn poll_status(submission: &mut Submission, tenant: &str) {
                 .headers()
                 .get("x-progress")
                 .map(|v| String::from_utf8_lossy(v.as_bytes()).into_owned())
-                .unwrap_or_else(|| "in progress".to_string());
+                .unwrap_or_else(|| "In progress".to_string());
             if submission.progress != progress {
                 push_log(submission, format!("Status: {progress}"));
             }
@@ -1384,8 +1384,8 @@ pub async fn status_fragment(
 /// bar about to fill, not a percentage that never moves — the indeterminate
 /// sweep is reserved for recipients that report no percentage at all.
 ///
-/// Pre-ingest phase reports (#953) — `Queued - starting shortly`, `reading
-/// manifest`, `sizing {done} of {total} files`, `downloading file {done} of
+/// Pre-ingest phase reports (#953) — `Queued - starting shortly`, `Reading
+/// manifest`, `Sizing {done} of {total} files`, `Downloading file {done} of
 /// {total}` — deliberately fall through to `None`: there is no meaningful
 /// share-of-the-whole to draw yet, so the card pairs the phase text with the
 /// indeterminate sweep. #827 is the rule being honoured here — a determinate
@@ -1529,9 +1529,9 @@ mod tests {
         for phase in [
             "Queued - starting shortly",
             "Queued - waiting for an external worker",
-            "reading manifest",
-            "sizing 37 of 412 files",
-            "downloading file 1 of 412",
+            "Reading manifest",
+            "Sizing 37 of 412 files",
+            "Downloading file 1 of 412",
         ] {
             assert_eq!(progress_percent(phase), None, "phase: {phase}");
             assert!(
@@ -1562,7 +1562,7 @@ mod tests {
     #[test]
     fn a_stalled_report_stays_indeterminate() {
         assert_eq!(
-            progress_percent("stalled at 40% - a worker stopped without handoff; see server logs"),
+            progress_percent("Stalled at 40% - a worker stopped without handoff; see server logs"),
             None
         );
     }
@@ -1574,6 +1574,6 @@ mod tests {
         assert_eq!(progress_percent("processing 101% complete"), None);
         assert_eq!(progress_percent("processing complete"), None);
         assert_eq!(progress_percent(""), None);
-        assert_eq!(progress_percent("in progress"), None);
+        assert_eq!(progress_percent("In progress"), None);
     }
 }

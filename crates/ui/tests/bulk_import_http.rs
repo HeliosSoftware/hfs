@@ -2279,15 +2279,15 @@ async fn mock_recipient_reporting(reports: &'static [&'static str]) -> String {
 async fn pre_ingest_phases_show_their_text_on_an_indeterminate_bar() {
     const PHASES: [&str; 4] = [
         "Queued - starting shortly",
-        "reading manifest",
-        "sizing 37 of 412 files",
-        "downloading file 1 of 412",
+        "Reading manifest",
+        "Sizing 37 of 412 files",
+        "Downloading file 1 of 412",
     ];
     let recipient = mock_recipient_reporting(&[
         "Queued - starting shortly",
-        "reading manifest",
-        "sizing 37 of 412 files",
-        "downloading file 1 of 412",
+        "Reading manifest",
+        "Sizing 37 of 412 files",
+        "Downloading file 1 of 412",
         "processing 35% complete",
     ])
     .await;
@@ -2335,7 +2335,7 @@ async fn pre_ingest_phases_show_their_text_on_an_indeterminate_bar() {
 /// those bytes `obs-text` and leaves their meaning undefined, but nothing
 /// forbids sending them, and HFS itself shipped an em dash there for a while.
 /// Reading the header with `HeaderValue::to_str` rejected the *whole* value on
-/// the first such byte, so the card showed a hardcoded "in progress" instead of
+/// the first such byte, so the card showed a hardcoded "In progress" instead of
 /// the recipient's real report: the uninformative status #953 exists to remove,
 /// reintroduced by an encoding detail. Decoding lossily keeps the report.
 #[tokio::test]
@@ -2351,7 +2351,7 @@ async fn a_non_ascii_progress_report_still_reaches_the_operator() {
         "the report must survive its non-ASCII byte: {html}"
     );
     assert!(
-        !html.contains("in progress"),
+        !html.contains("In progress"),
         "the placeholder must not stand in for a report we received: {html}"
     );
     // And the percentage still parses, so the bar stays determinate.
