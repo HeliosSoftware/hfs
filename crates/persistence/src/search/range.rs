@@ -1,18 +1,22 @@
 //! Implicit-precision ranges for ordered (number/quantity) search values.
 //!
 //! FHIR treats a decimal search value as a range determined by its significant
-//! figures: `100` ⇒ `[99.5, 100.5)`, `100.0` ⇒ `[99.95, 100.05)`. Comparator
-//! prefixes are then defined against that range's boundaries (per
-//! <https://build.fhir.org/search.html#prefix>):
+//! figures: `100` ⇒ `[99.5, 100.5)`, `100.0` ⇒ `[99.95, 100.05)`. That range
+//! only bounds the `eq`/`ne` prefixes; every other comparator prefix compares
+//! against the exact search value `v`, per the FHIR number search spec
+//! (<https://hl7.org/fhir/R4/search.html#number>): *"When a comparison prefix
+//! in the set gt, lt, ge, le, sa & eb is provided, the implicit precision of
+//! the number is ignored, and they are treated as if they have arbitrarily
+//! high precision."*
 //!
-//! | prefix | match (target value `x`, search range `[lo, hi)`) |
-//! |--------|---------------------------------------------------|
-//! | `eq`   | `lo ≤ x < hi`                                     |
-//! | `ne`   | `x < lo OR x ≥ hi`                                 |
-//! | `ge`   | `x ≥ lo`                                           |
-//! | `le`   | `x < hi`                                           |
-//! | `gt` / `sa` | `x ≥ hi`                                      |
-//! | `lt` / `eb` | `x < lo`                                      |
+//! | prefix | match (target value `x`) |
+//! |--------|---------------------------|
+//! | `eq`   | `lo ≤ x < hi`             |
+//! | `ne`   | `x < lo OR x ≥ hi`         |
+//! | `gt` / `sa` | `x > v`               |
+//! | `lt` / `eb` | `x < v`               |
+//! | `ge`   | `x ≥ v`                   |
+//! | `le`   | `x ≤ v`                   |
 
 /// Returns the implicit precision (ULP of the least significant digit) of a
 /// decimal value from its string form: `"100"` → 1.0, `"100.0"` → 0.1.

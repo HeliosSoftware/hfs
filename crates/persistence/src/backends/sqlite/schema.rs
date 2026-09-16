@@ -10,17 +10,21 @@ use crate::core::bulk_submit_legacy::{
 use crate::error::StorageResult;
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 29;
+pub const SCHEMA_VERSION: i32 = 30;
 
-/// The `search_index` value indexes: every index on the table except
-/// `idx_search_composite`, which the delete-by-resource path needs at all
-/// times. This is the canonical set — a test asserts a fresh schema carries
-/// exactly these — and the list the bulk index rebuild drops and recreates
-/// (see [`drop_search_value_indexes`] / [`ensure_search_value_indexes`]).
+/// The `search_index` value indexes. Excludes `idx_search_composite`, which the
+/// delete-by-resource path needs at all times, and `idx_search_token_display`,
+/// dropped in v29 for write volume (#945): `value_token_display` is populated on
+/// most Coding rows but its only reader is the uncommon token `:text` /
+/// `:code-text` modifier, which is a `COLLATE NOCASE` scan rather than an index
+/// seek — `:text-advanced` uses the FTS table instead. This is the canonical set
+/// — a test asserts a fresh schema carries exactly these — and the list the bulk
+/// index rebuild drops and recreates (see [`drop_search_value_indexes`] /
+/// [`ensure_search_value_indexes`]).
 ///
 /// Keep each entry's SQL byte-for-byte what the migration ladder creates,
 /// normalised to one line, so the self-heal on startup and the ladder agree.
-pub(crate) const SEARCH_VALUE_INDEXES: [(&str, &str); 13] = [
+pub(crate) const SEARCH_VALUE_INDEXES: [(&str, &str); 12] = [
     (
         "idx_search_string",
         "CREATE INDEX IF NOT EXISTS idx_search_string ON search_index(tenant_id, resource_type, param_name, value_string) WHERE value_string IS NOT NULL",
@@ -48,10 +52,6 @@ pub(crate) const SEARCH_VALUE_INDEXES: [(&str, &str); 13] = [
     (
         "idx_search_uri",
         "CREATE INDEX IF NOT EXISTS idx_search_uri ON search_index(tenant_id, resource_type, param_name, value_uri) WHERE value_uri IS NOT NULL",
-    ),
-    (
-        "idx_search_token_display",
-        "CREATE INDEX IF NOT EXISTS idx_search_token_display ON search_index(tenant_id, resource_type, param_name, value_token_display) WHERE value_token_display IS NOT NULL",
     ),
     (
         "idx_search_identifier_type",
@@ -440,6 +440,7 @@ fn migrate_schema(conn: &Connection, from_version: i32) -> StorageResult<()> {
             26 => migrate_v26_to_v27(conn)?,
             27 => migrate_v27_to_v28(conn)?,
             28 => migrate_v28_to_v29(conn)?,
+            29 => migrate_v29_to_v30(conn)?,
             _ => {
                 return Err(crate::error::StorageError::Backend(
                     crate::error::BackendError::Internal {
@@ -1371,7 +1372,20 @@ fn migrate_v27_to_v28(conn: &Connection) -> StorageResult<()> {
     Ok(())
 }
 
-/// Migrate from schema version 28 to version 29 (#1127).
+/// Migrate from schema version 28 to version 29.
+///
+/// Drops `idx_search_token_display` (#945). The column stays and keeps feeding
+/// the FTS trigger; only the b-tree index goes. Token `:text` / `:code-text`
+/// (the index's only readers, and already `COLLATE NOCASE` scans rather than
+/// seeks) fall back to a partition scan over the parameter's rows, while every
+/// bulk-ingested Coding-with-display row stops paying an index insertion.
+fn migrate_v28_to_v29(conn: &Connection) -> StorageResult<()> {
+    conn.execute("DROP INDEX IF EXISTS idx_search_token_display", [])
+        .map_err(|e| migration_err(format!("v29 drop token_display index: {e}")))?;
+    Ok(())
+}
+
+/// Migrate from schema version 29 to version 30 (#1127).
 ///
 /// Makes the bulk-submit manifest counters describe the manifest rather than
 /// the sum over every pass that walked it:
@@ -1388,7 +1402,7 @@ fn migrate_v27_to_v28(conn: &Connection) -> StorageResult<()> {
 /// Replay-safe: the column is added only when missing and the table is
 /// `IF NOT EXISTS`. Manifests counted before this version have no file rows,
 /// so a later re-walk of one of their files counts it once more.
-fn migrate_v28_to_v29(conn: &Connection) -> StorageResult<()> {
+fn migrate_v29_to_v30(conn: &Connection) -> StorageResult<()> {
     if !table_columns(conn, "bulk_manifests")?
         .iter()
         .any(|column| column == "skipped_entries")
@@ -1397,7 +1411,7 @@ fn migrate_v28_to_v29(conn: &Connection) -> StorageResult<()> {
             "ALTER TABLE bulk_manifests ADD COLUMN skipped_entries INTEGER NOT NULL DEFAULT 0",
             [],
         )
-        .map_err(|e| migration_err(format!("v29 add skipped_entries: {e}")))?;
+        .map_err(|e| migration_err(format!("v30 add skipped_entries: {e}")))?;
     }
     conn.execute(
         "CREATE TABLE IF NOT EXISTS bulk_manifest_file_progress (
@@ -1419,7 +1433,7 @@ fn migrate_v28_to_v29(conn: &Connection) -> StorageResult<()> {
         )",
         [],
     )
-    .map_err(|e| migration_err(format!("v29 create bulk_manifest_file_progress: {e}")))?;
+    .map_err(|e| migration_err(format!("v30 create bulk_manifest_file_progress: {e}")))?;
     Ok(())
 }
 
@@ -3615,10 +3629,10 @@ mod tests {
         }
     }
 
-    /// #1127: the v29 file-progress table and skipped counter exist on a fresh
+    /// #1127: the v30 file-progress table and skipped counter exist on a fresh
     /// database, and replaying the migration on one that has them is a no-op.
     #[test]
-    fn test_v29_adds_file_progress_and_skipped_entries() {
+    fn test_v30_adds_file_progress_and_skipped_entries() {
         let conn = Connection::open_in_memory().unwrap();
         initialize_schema(&conn).unwrap();
         assert!(
@@ -3631,7 +3645,7 @@ mod tests {
         for column in ["file_url", "max_line", "total_entries", "skipped_entries"] {
             assert!(file_columns.iter().any(|c| c == column), "missing {column}");
         }
-        migrate_v28_to_v29(&conn).unwrap();
+        migrate_v29_to_v30(&conn).unwrap();
     }
 
     #[test]

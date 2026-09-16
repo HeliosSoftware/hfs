@@ -1837,7 +1837,11 @@ impl MongoBackend {
     /// Value form: `[prefix]number[|system|code]` (or the `number|code` shorthand).
     /// The comparison runs on `value_quantity_value`; an optional system/code
     /// further constrain `value_quantity_system` / `value_quantity_unit` (the
-    /// extractor stores the quantity code under the unit field).
+    /// extractor stores the quantity code under the unit field). Per the FHIR
+    /// number search spec (see `crate::search::range`), `eq`/`ne` match the
+    /// implicit-precision range derived from the number's textual form (`60`
+    /// ⇒ `[59.5, 60.5)`), while `gt`/`lt`/`ge`/`le`/`sa`/`eb` compare against
+    /// the exact value.
     fn build_quantity_filter(&self, value: &SearchValue) -> StorageResult<Document> {
         let parts: Vec<&str> = value.value.splitn(3, '|').collect();
         let parsed = parts[0].parse::<f64>().map_err(|e| {
@@ -1850,6 +1854,14 @@ impl MongoBackend {
             SearchPrefix::Ap => {
                 let delta = (parsed.abs() * 0.1).max(0.1);
                 doc! { "$gte": parsed - delta, "$lte": parsed + delta }
+            }
+            SearchPrefix::Eq => {
+                let (lo, hi) = crate::search::implicit_range(parsed, parts[0]);
+                doc! { "$gte": lo, "$lt": hi }
+            }
+            SearchPrefix::Ne => {
+                let (lo, hi) = crate::search::implicit_range(parsed, parts[0]);
+                doc! { "$not": { "$gte": lo, "$lt": hi } }
             }
             _ => {
                 let op = Self::prefix_to_mongo_operator(value.prefix)?;
@@ -1880,6 +1892,12 @@ impl MongoBackend {
         Ok(filter)
     }
 
+    /// Builds a MongoDB filter for a number parameter, comparing against
+    /// `value_number`. Per the FHIR number search spec (see
+    /// `crate::search::range`), `eq`/`ne` match the implicit-precision range
+    /// derived from the number's textual form (`60` ⇒ `[59.5, 60.5)`, `60.0`
+    /// ⇒ `[59.95, 60.05)`), while `gt`/`lt`/`ge`/`le`/`sa`/`eb` compare
+    /// against the exact value.
     fn build_number_filter(&self, value: &SearchValue) -> StorageResult<Document> {
         let parsed = value.value.parse::<f64>().map_err(|e| {
             StorageError::Search(SearchError::QueryParseError {
@@ -1897,6 +1915,18 @@ impl MongoBackend {
                     }
                 })
             }
+            SearchPrefix::Eq => {
+                let (lo, hi) = crate::search::implicit_range(parsed, &value.value);
+                Ok(doc! {
+                    "value_number": { "$gte": lo, "$lt": hi }
+                })
+            }
+            SearchPrefix::Ne => {
+                let (lo, hi) = crate::search::implicit_range(parsed, &value.value);
+                Ok(doc! {
+                    "value_number": { "$not": { "$gte": lo, "$lt": hi } }
+                })
+            }
             _ => {
                 let op = Self::prefix_to_mongo_operator(value.prefix)?;
                 Ok(doc! {
@@ -1908,6 +1938,10 @@ impl MongoBackend {
         }
     }
 
+    /// Maps a comparator prefix to its MongoDB query operator. The number and
+    /// quantity filters only route `gt`/`lt`/`ge`/`le`/`sa`/`eb` through here:
+    /// `eq`/`ne` build the implicit-precision range and `ap` its delta range
+    /// directly in `build_number_filter` / `build_quantity_filter`.
     fn prefix_to_mongo_operator(prefix: SearchPrefix) -> StorageResult<&'static str> {
         match prefix {
             SearchPrefix::Eq => Ok("$eq"),
@@ -2892,6 +2926,132 @@ mod value_list_tests {
                 "a single-value condition stays flat, not wrapped in $or"
             );
         }
+    }
+}
+
+/// #1011: `eq`/`ne` on number/quantity match the implicit-precision range
+/// derived from the value's textual form, per `crate::search::range`, while
+/// every other comparator prefix compares against the exact value.
+#[cfg(test)]
+mod number_quantity_precision_tests {
+    use super::*;
+    use crate::backends::mongodb::MongoBackendConfig;
+
+    fn backend() -> MongoBackend {
+        MongoBackend::new(MongoBackendConfig::default()).unwrap()
+    }
+
+    fn number_bounds(raw: &str) -> Document {
+        let backend = backend();
+        let param = SearchParameter {
+            name: "value-number".to_string(),
+            param_type: SearchParamType::Number,
+            modifier: None,
+            values: vec![SearchValue::parse(raw)],
+            chain: vec![],
+            components: vec![],
+        };
+        let filter = backend
+            .build_search_index_filter("t1", "Observation", &param)
+            .expect("valid filter");
+        filter
+            .get_document("value_number")
+            .expect("value_number condition")
+            .clone()
+    }
+
+    #[test]
+    fn number_eq_uses_text_precision_range() {
+        let bounds = number_bounds("60");
+        assert!((bounds.get_f64("$gte").unwrap() - 59.5).abs() < 1e-9);
+        assert!((bounds.get_f64("$lt").unwrap() - 60.5).abs() < 1e-9);
+
+        // A trailing zero narrows the implicit precision: "60.0" carries one
+        // more significant figure than "60", so the range is ten times
+        // tighter around the same center.
+        let bounds = number_bounds("60.0");
+        assert!((bounds.get_f64("$gte").unwrap() - 59.95).abs() < 1e-9);
+        assert!((bounds.get_f64("$lt").unwrap() - 60.05).abs() < 1e-9);
+    }
+
+    #[test]
+    fn number_ne_excludes_text_precision_range() {
+        let bounds = number_bounds("ne60");
+        let not_doc = bounds.get_document("$not").expect("$not condition");
+        assert!((not_doc.get_f64("$gte").unwrap() - 59.5).abs() < 1e-9);
+        assert!((not_doc.get_f64("$lt").unwrap() - 60.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn quantity_eq_uses_text_precision_range() {
+        let backend = backend();
+        let param = SearchParameter {
+            name: "value-quantity".to_string(),
+            param_type: SearchParamType::Quantity,
+            modifier: None,
+            values: vec![SearchValue::parse("60.0|http://unitsofmeasure.org|kg")],
+            chain: vec![],
+            components: vec![],
+        };
+        let filter = backend
+            .build_search_index_filter("t1", "Observation", &param)
+            .expect("valid filter");
+
+        let bounds = filter
+            .get_document("value_quantity_value")
+            .expect("value_quantity_value condition");
+        assert!((bounds.get_f64("$gte").unwrap() - 59.95).abs() < 1e-9);
+        assert!((bounds.get_f64("$lt").unwrap() - 60.05).abs() < 1e-9);
+        assert_eq!(filter.get_str("value_quantity_unit").unwrap(), "kg");
+    }
+
+    #[test]
+    fn number_comparators_stay_exact() {
+        let gt = number_bounds("gt60");
+        assert_eq!(gt.get_f64("$gt").unwrap(), 60.0);
+
+        let le = number_bounds("le60");
+        assert_eq!(le.get_f64("$lte").unwrap(), 60.0);
+    }
+
+    /// #1011 finding 1: MongoDB's `$not` also matches documents where the
+    /// field is missing, so an unscoped `ne` filter could over-match. But
+    /// `build_search_index_filter` always ANDs the value condition with
+    /// `tenant_id`/`resource_type`/`param_name` in the same top-level
+    /// document (:1560), and a given `param_name` is indexed with exactly
+    /// one `IndexValue` variant per parameter (`storage.rs`'s
+    /// `index_value_to_document`, e.g. `IndexValue::Number` always inserts
+    /// `value_number`). So every `search_index` document that matches this
+    /// filter's `tenant_id`/`resource_type`/`param_name` already carries
+    /// `value_number`, and no `search_index` document for a *different*
+    /// parameter or resource type can match — `$not` never reaches into
+    /// another parameter's rows or missing-field rows. No `$exists` guard is
+    /// needed; this pins the sibling keys are present alongside `$not`.
+    #[test]
+    fn ne_filter_stays_scoped_to_tenant_resource_and_param() {
+        let backend = backend();
+        let param = SearchParameter {
+            name: "value-number".to_string(),
+            param_type: SearchParamType::Number,
+            modifier: None,
+            values: vec![SearchValue::parse("ne60")],
+            chain: vec![],
+            components: vec![],
+        };
+        let filter = backend
+            .build_search_index_filter("t1", "Observation", &param)
+            .expect("valid filter");
+
+        assert_eq!(filter.get_str("tenant_id").unwrap(), "t1");
+        assert_eq!(filter.get_str("resource_type").unwrap(), "Observation");
+        assert_eq!(filter.get_str("param_name").unwrap(), "value-number");
+        assert!(
+            filter
+                .get_document("value_number")
+                .expect("value_number condition")
+                .contains_key("$not"),
+            "ne is a value_number-scoped $not, sitting alongside the tenant/resource/param keys: {filter:?}"
+        );
     }
 }
 

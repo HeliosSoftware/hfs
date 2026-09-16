@@ -570,10 +570,9 @@ mod query_builder_tests {
         let fragment = result.unwrap();
         assert!(fragment.sql.contains("value_number"));
         assert!(fragment.sql.contains(">= $"));
-        // ge matches from the low boundary of the implicit range: "0.5" has
-        // precision 0.1, so the bound is 0.5 - 0.05 = 0.45.
+        // ge ignores implicit precision and matches the exact search value.
         match &fragment.params[0] {
-            SqlParam::Float(f) => assert!((f - 0.45).abs() < 1e-9),
+            SqlParam::Float(f) => assert!((f - 0.5).abs() < 1e-9),
             _ => panic!("Expected Float param"),
         }
     }
@@ -3523,6 +3522,249 @@ mod postgres_integration {
             "UCUM-equivalent quantity (1000 mg) should match stored 1 g"
         );
         assert_eq!(result.resources.items[0].id(), "obs-mass-pg");
+    }
+
+    #[tokio::test]
+    async fn postgres_integration_quantity_comparators_ignore_search_precision() {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::types::{
+            SearchParamType, SearchParameter, SearchPrefix, SearchQuery, SearchValue,
+        };
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("test-tenant");
+
+        // Issue #1011: `value-quantity=gt60` must exclude 60.2 kg exactly at
+        // the boundary while still matching every value strictly above 60,
+        // regardless of how the search value's own precision is written.
+        let weights = [
+            ("obs-weight-55-4", 55.4),
+            ("obs-weight-58-5", 58.5),
+            ("obs-weight-60-2", 60.2),
+            ("obs-weight-64-5", 64.5),
+        ];
+        for (id, value) in weights {
+            backend
+                .create(
+                    &tenant,
+                    "Observation",
+                    json!({
+                        "resourceType": "Observation",
+                        "id": id,
+                        "status": "final",
+                        "code": { "coding": [{ "system": "http://loinc.org", "code": "29463-7" }] },
+                        "valueQuantity": {
+                            "value": value,
+                            "unit": "kg",
+                            "system": "http://unitsofmeasure.org",
+                            "code": "kg"
+                        }
+                    }),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+
+        async fn search_ids(
+            backend: &PostgresBackend,
+            tenant: &TenantContext,
+            prefix: SearchPrefix,
+            value: &str,
+        ) -> Vec<String> {
+            let query = SearchQuery::new("Observation").with_parameter(SearchParameter {
+                name: "value-quantity".to_string(),
+                param_type: SearchParamType::Quantity,
+                modifier: None,
+                values: vec![SearchValue::new(prefix, value)],
+                chain: vec![],
+                components: vec![],
+            });
+            let result = backend.search(tenant, &query).await.unwrap();
+            let mut ids: Vec<String> = result
+                .resources
+                .items
+                .iter()
+                .map(|r| r.id().to_string())
+                .collect();
+            ids.sort();
+            ids
+        }
+
+        let gt60 = search_ids(&backend, &tenant, SearchPrefix::Gt, "60").await;
+        assert_eq!(gt60, vec!["obs-weight-60-2", "obs-weight-64-5"], "gt60");
+
+        let gt60_0 = search_ids(&backend, &tenant, SearchPrefix::Gt, "60.0").await;
+        assert_eq!(
+            gt60_0,
+            vec!["obs-weight-60-2", "obs-weight-64-5"],
+            "gt60.0 must match gt60 exactly: implicit precision is ignored"
+        );
+
+        let le60_2 = search_ids(&backend, &tenant, SearchPrefix::Le, "60.2").await;
+        assert_eq!(
+            le60_2,
+            vec!["obs-weight-55-4", "obs-weight-58-5", "obs-weight-60-2"],
+            "le60.2"
+        );
+
+        let lt58_5 = search_ids(&backend, &tenant, SearchPrefix::Lt, "58.5").await;
+        assert_eq!(lt58_5, vec!["obs-weight-55-4"], "lt58.5");
+
+        let eq60 = search_ids(&backend, &tenant, SearchPrefix::Eq, "60").await;
+        assert_eq!(
+            eq60,
+            vec!["obs-weight-60-2"],
+            "eq60 ranges over [59.5, 60.5), which contains 60.2"
+        );
+
+        let eq60_0 = search_ids(&backend, &tenant, SearchPrefix::Eq, "60.0").await;
+        assert!(
+            eq60_0.is_empty(),
+            "eq60.0 ranges over [59.95, 60.05), which excludes 60.2: got {eq60_0:?}"
+        );
+
+        let gt60_kg = search_ids(
+            &backend,
+            &tenant,
+            SearchPrefix::Gt,
+            "60|http://unitsofmeasure.org|kg",
+        )
+        .await;
+        assert_eq!(
+            gt60_kg,
+            vec!["obs-weight-60-2", "obs-weight-64-5"],
+            "gt60|...|kg (raw branch)"
+        );
+
+        // Cross-unit boundary: 60.2 kg canonicalizes to exactly 60200 g, so
+        // `ge60200|...|g` must match it (and everything above) through the
+        // canonical branch.
+        let ge60200_g = search_ids(
+            &backend,
+            &tenant,
+            SearchPrefix::Ge,
+            "60200|http://unitsofmeasure.org|g",
+        )
+        .await;
+        assert_eq!(
+            ge60200_g,
+            vec!["obs-weight-60-2", "obs-weight-64-5"],
+            "ge60200|...|g (canonical branch, cross-unit exact boundary)"
+        );
+    }
+
+    #[tokio::test]
+    async fn postgres_integration_quantity_ne_uses_canonical_values() {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::types::{
+            SearchParamType, SearchParameter, SearchPrefix, SearchQuery, SearchValue,
+        };
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("test-tenant");
+
+        // Issue #1011 (gate follow-up): `ne60|...|kg` must exclude resources
+        // whose value equals 60 kg *by unit conversion*, not only resources
+        // stored literally as kg. Mixed kg/g dataset around the 60 kg / 60000 g
+        // boundary.
+        let weights = [
+            ("obs-ne-55-4-kg", 55.4, "kg"),
+            ("obs-ne-60-2-kg", 60.2, "kg"),
+            ("obs-ne-55000-g", 55000.0, "g"),
+            ("obs-ne-60000-g", 60000.0, "g"),
+            ("obs-ne-64500-g", 64500.0, "g"),
+        ];
+        for (id, value, unit) in weights {
+            backend
+                .create(
+                    &tenant,
+                    "Observation",
+                    json!({
+                        "resourceType": "Observation",
+                        "id": id,
+                        "status": "final",
+                        "code": { "coding": [{ "system": "http://loinc.org", "code": "29463-7" }] },
+                        "valueQuantity": {
+                            "value": value,
+                            "unit": unit,
+                            "system": "http://unitsofmeasure.org",
+                            "code": unit
+                        }
+                    }),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+
+        async fn search_ids(
+            backend: &PostgresBackend,
+            tenant: &TenantContext,
+            prefix: SearchPrefix,
+            value: &str,
+        ) -> Vec<String> {
+            let query = SearchQuery::new("Observation").with_parameter(SearchParameter {
+                name: "value-quantity".to_string(),
+                param_type: SearchParamType::Quantity,
+                modifier: None,
+                values: vec![SearchValue::new(prefix, value)],
+                chain: vec![],
+                components: vec![],
+            });
+            let result = backend.search(tenant, &query).await.unwrap();
+            let mut ids: Vec<String> = result
+                .resources
+                .items
+                .iter()
+                .map(|r| r.id().to_string())
+                .collect();
+            ids.sort();
+            ids
+        }
+
+        let ne60_kg = search_ids(
+            &backend,
+            &tenant,
+            SearchPrefix::Ne,
+            "60|http://unitsofmeasure.org|kg",
+        )
+        .await;
+        assert_eq!(
+            ne60_kg,
+            vec!["obs-ne-55-4-kg", "obs-ne-55000-g", "obs-ne-64500-g"],
+            "ne60|...|kg must exclude 60.2 kg and its canonical equivalent 60000 g"
+        );
+
+        let ne60000_g = search_ids(
+            &backend,
+            &tenant,
+            SearchPrefix::Ne,
+            "60000|http://unitsofmeasure.org|g",
+        )
+        .await;
+        assert_eq!(
+            ne60000_g,
+            vec![
+                "obs-ne-55-4-kg",
+                "obs-ne-55000-g",
+                "obs-ne-60-2-kg",
+                "obs-ne-64500-g"
+            ],
+            "ne60000|...|g must exclude 60000 g and its canonical equivalent 60.2 kg"
+        );
+
+        let ne60_raw = search_ids(&backend, &tenant, SearchPrefix::Ne, "60").await;
+        assert_eq!(
+            ne60_raw,
+            vec![
+                "obs-ne-55-4-kg",
+                "obs-ne-55000-g",
+                "obs-ne-60000-g",
+                "obs-ne-64500-g"
+            ],
+            "ne60 without a unit only excludes the raw value 60.2, regardless of unit"
+        );
     }
 
     #[tokio::test]

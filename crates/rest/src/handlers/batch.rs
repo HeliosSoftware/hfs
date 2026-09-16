@@ -1549,11 +1549,7 @@ fn admit_bundle_mutation(
             message: format!("{method} entry missing resource"),
         })?;
 
-        admit_resource_type(resource_type, resource, fhir_version).map_err(|error| {
-            RestError::BadRequest {
-                message: error.to_string(),
-            }
-        })?;
+        admit_resource_type(resource_type, resource, fhir_version)?;
     }
 
     if resource_type == "AuditEvent"
