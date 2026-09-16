@@ -25,8 +25,8 @@ use helios_persistence::core::{
     Backend, BackendCapability, BackendKind, BundleEntry, BundleEntryEffect, BundleMethod,
     BundleProvider, BundleResult, ConditionalCreateResult, ConditionalDeleteResult,
     ConditionalStorage, ConditionalUpdateResult, HistoryParams, IncludeProvider,
-    InstanceHistoryProvider, PatchFormat, ResourceStorage, RevincludeProvider, SearchProvider,
-    SettingsStore, SystemHistoryProvider, TypeHistoryProvider, VersionedStorage,
+    InstanceHistoryProvider, PatchFormat, PurgableStorage, ResourceStorage, RevincludeProvider,
+    SearchProvider, SettingsStore, SystemHistoryProvider, TypeHistoryProvider, VersionedStorage,
 };
 use helios_persistence::error::{
     BackendError, ConcurrencyError, ResourceError, StorageError, TransactionError,
@@ -2484,6 +2484,322 @@ async fn mongodb_integration_update_with_match_and_delete_with_match() {
         .delete_with_match(&tenant, "Patient", created.id(), "2")
         .await
         .unwrap();
+}
+
+/// #1160 Task 4: `update` and `delete` must clear a resource's rows from
+/// `search_index_contained`, not just `search_index` — otherwise the
+/// contained-row collection accumulates rows for values that no longer exist
+/// (an old contained Patient's name after the container is updated, or after
+/// it's deleted outright).
+///
+/// Also covers `purge`: a second holder is created and purged directly
+/// (mirroring `crates/rest/src/handlers/purge.rs`, which calls
+/// `PurgableStorage::purge` straight off the backend — there is no existing
+/// `.purge(` test in this file to model a sibling on, so this is that
+/// coverage).
+#[tokio::test]
+async fn mongodb_integration_update_and_delete_leave_no_orphan_contained_rows() {
+    let Some(backend) = create_backend_with_full_registry("contained_orphans").await else {
+        eprintln!(
+            "Skipping mongodb_integration_update_and_delete_leave_no_orphan_contained_rows (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = create_tenant("tenant-contained-orphans");
+
+    let with_contained = |id: &str, family: &str| {
+        json!({
+            "resourceType": "Observation",
+            "id": id,
+            "status": "final",
+            "subject": { "reference": "#p" },
+            "contained": [{
+                "resourceType": "Patient",
+                "id": "p",
+                "name": [{ "family": family }]
+            }]
+        })
+    };
+
+    let client = raw_test_client(&backend.config().connection_string)
+        .await
+        .expect("failed to connect MongoDB client for search_index_contained assertions");
+    let db = client.database(&backend.config().database_name);
+    let contained = db.collection::<Document>("search_index_contained");
+    let search_index = db.collection::<Document>("search_index");
+
+    /// The sorted `value_string`s of the `name` rows for `resource_id ==
+    /// "holder"` in `collection`. `value_string` is stored as written (see
+    /// `build_search_index_document`'s `IndexValue::String` arm) — not
+    /// folded or lower-cased — so the assertions below match the original
+    /// casing of the seeded family names.
+    async fn names(collection: &mongodb::Collection<Document>) -> Vec<String> {
+        use futures::TryStreamExt;
+        let rows: Vec<Document> = collection
+            .find(doc! { "resource_id": "holder", "param_name": "name" })
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let mut values: Vec<String> = rows
+            .into_iter()
+            .filter_map(|r| r.get_str("value_string").ok().map(str::to_string))
+            .collect();
+        values.sort();
+        values
+    }
+
+    let created = backend
+        .create(
+            &tenant,
+            "Observation",
+            with_contained("holder", "First"),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(names(&contained).await, vec!["First"]);
+
+    // Update: the old contained rows are gone, the new ones are there.
+    let updated = backend
+        .update(&tenant, &created, with_contained("holder", "Second"))
+        .await
+        .unwrap();
+    assert_eq!(names(&contained).await, vec!["Second"]);
+
+    // Delete: nothing left in either collection.
+    backend
+        .delete(&tenant, "Observation", updated.id())
+        .await
+        .unwrap();
+    let key = doc! {
+        "tenant_id": "tenant-contained-orphans",
+        "resource_type": "Observation",
+        "resource_id": "holder",
+    };
+    assert_eq!(contained.count_documents(key.clone()).await.unwrap(), 0);
+    assert_eq!(search_index.count_documents(key).await.unwrap(), 0);
+
+    // Purge: a second holder's contained rows are hard-deleted too (#1160
+    // Task 4's `purge` change). There is no REST-independent way to purge
+    // other than the trait method the REST handler calls directly.
+    backend
+        .create(
+            &tenant,
+            "Observation",
+            with_contained("holder-purge", "PurgeMe"),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    let purge_key = doc! {
+        "tenant_id": "tenant-contained-orphans",
+        "resource_type": "Observation",
+        "resource_id": "holder-purge",
+    };
+    assert!(
+        contained.count_documents(purge_key.clone()).await.unwrap() > 0,
+        "precondition: the second holder's contained row must exist before purge"
+    );
+    backend
+        .purge(&tenant, "Observation", "holder-purge")
+        .await
+        .unwrap();
+    assert_eq!(
+        contained.count_documents(purge_key.clone()).await.unwrap(),
+        0
+    );
+    assert_eq!(search_index.count_documents(purge_key).await.unwrap(), 0);
+}
+
+/// #1160 Task 4: the transaction-bundle delete path
+/// (`delete_search_index_in_bundle_transaction`) must clear
+/// `search_index_contained` too, not just `search_index`.
+#[tokio::test]
+async fn mongodb_integration_transaction_bundle_indexes_and_clears_contained_rows() {
+    let Some(backend) = create_backend_with_full_registry("bundle_contained_orphans").await else {
+        eprintln!(
+            "Skipping mongodb_integration_transaction_bundle_indexes_and_clears_contained_rows (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = create_tenant("tenant-bundle-contained");
+
+    let with_contained = json!({
+        "resourceType": "Observation",
+        "id": "bundle-holder",
+        "status": "final",
+        "subject": { "reference": "#p" },
+        "contained": [{
+            "resourceType": "Patient",
+            "id": "p",
+            "name": [{ "family": "BundleFamily" }]
+        }]
+    });
+
+    let create_entries = vec![BundleEntry {
+        method: BundleMethod::Put,
+        url: "Observation/bundle-holder".to_string(),
+        resource: Some(with_contained),
+        if_match: None,
+        if_none_match: None,
+        if_none_exist: None,
+        full_url: None,
+    }];
+
+    let Some(create_result) = process_transaction_or_skip(
+        &backend,
+        &tenant,
+        create_entries,
+        "mongodb_integration_transaction_bundle_indexes_and_clears_contained_rows/create",
+    )
+    .await
+    else {
+        return;
+    };
+    assert_eq!(create_result.entries[0].status, 201);
+
+    let client = raw_test_client(&backend.config().connection_string)
+        .await
+        .expect("failed to connect MongoDB client for search_index_contained assertions");
+    let db = client.database(&backend.config().database_name);
+    let key = doc! {
+        "tenant_id": "tenant-bundle-contained",
+        "resource_type": "Observation",
+        "resource_id": "bundle-holder",
+    };
+    let contained_count = db
+        .collection::<Document>("search_index_contained")
+        .count_documents(key.clone())
+        .await
+        .unwrap();
+    assert!(
+        contained_count > 0,
+        "the contained Patient's values must be indexed after the create transaction"
+    );
+
+    let delete_entries = vec![BundleEntry {
+        method: BundleMethod::Delete,
+        url: "Observation/bundle-holder".to_string(),
+        resource: None,
+        if_match: None,
+        if_none_match: None,
+        if_none_exist: None,
+        full_url: None,
+    }];
+
+    let Some(delete_result) = process_transaction_or_skip(
+        &backend,
+        &tenant,
+        delete_entries,
+        "mongodb_integration_transaction_bundle_indexes_and_clears_contained_rows/delete",
+    )
+    .await
+    else {
+        return;
+    };
+    assert_eq!(delete_result.entries[0].status, 204);
+
+    assert_eq!(
+        db.collection::<Document>("search_index_contained")
+            .count_documents(key.clone())
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        db.collection::<Document>("search_index")
+            .count_documents(key)
+            .await
+            .unwrap(),
+        0
+    );
+}
+
+/// #1160 Task 4: `purge_tenant_data` must clear `search_index_contained` for
+/// the purged tenant too, not just `search_index`, and must leave other
+/// tenants' contained rows untouched.
+#[tokio::test]
+async fn mongodb_integration_purge_tenant_clears_contained_rows() {
+    let Some(backend) = create_backend_with_full_registry("purge_tenant_contained").await else {
+        eprintln!(
+            "Skipping mongodb_integration_purge_tenant_clears_contained_rows (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+
+    let tenant_a = create_tenant("tenant-purge-contained-a");
+    let tenant_b = create_tenant("tenant-purge-contained-b");
+
+    let with_contained = |id: &str| {
+        json!({
+            "resourceType": "Observation",
+            "id": id,
+            "status": "final",
+            "subject": { "reference": "#p" },
+            "contained": [{
+                "resourceType": "Patient",
+                "id": "p",
+                "name": [{ "family": "PurgeTenantFamily" }]
+            }]
+        })
+    };
+
+    backend
+        .create(
+            &tenant_a,
+            "Observation",
+            with_contained("purge-a-holder"),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    backend
+        .create(
+            &tenant_b,
+            "Observation",
+            with_contained("purge-b-holder"),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+
+    let client = raw_test_client(&backend.config().connection_string)
+        .await
+        .expect("failed to connect MongoDB client for search_index_contained assertions");
+    let db = client.database(&backend.config().database_name);
+    let contained = db.collection::<Document>("search_index_contained");
+
+    assert!(
+        contained
+            .count_documents(doc! { "tenant_id": "tenant-purge-contained-a" })
+            .await
+            .unwrap()
+            > 0,
+        "precondition: tenant A's contained rows must exist before purge"
+    );
+
+    backend
+        .purge_tenant_data("tenant-purge-contained-a")
+        .await
+        .unwrap();
+
+    assert_eq!(
+        contained
+            .count_documents(doc! { "tenant_id": "tenant-purge-contained-a" })
+            .await
+            .unwrap(),
+        0
+    );
+    assert!(
+        contained
+            .count_documents(doc! { "tenant_id": "tenant-purge-contained-b" })
+            .await
+            .unwrap()
+            > 0,
+        "tenant B's contained rows must be untouched"
+    );
 }
 
 #[tokio::test]

@@ -947,6 +947,18 @@ impl MongoBackend {
                     )
                     .await,
                 )?;
+                // Contained rows key the same way (#1160 Task 4), so the
+                // same filter clears their stale rows too.
+                or_exhausted(
+                    "clear batch contained search index",
+                    retry_transient_with(
+                        &BULK_INGEST_RETRY,
+                        options.cancel.as_ref(),
+                        "clear batch contained search index",
+                        || async { contained_collection.delete_many(filter.clone()).await },
+                    )
+                    .await,
+                )?;
             }
         }
 
@@ -995,17 +1007,19 @@ impl MongoBackend {
                     let contained_documents = &contained_documents;
                     async move {
                         if replay {
-                            // Replay delete stays scoped to `search_index`
-                            // for now; #1160 Task 4 extends it to
-                            // `search_index_contained` too.
+                            // A replay clears the batch's rows in both
+                            // collections before the chunked inserts below
+                            // re-write them (#1160 Task 4) — creates
+                            // included, since their rows may have partially
+                            // landed.
                             for (resource_type, ids) in written_by_type {
-                                collection
-                                    .delete_many(doc! {
-                                        "tenant_id": tenant_id,
-                                        "resource_type": *resource_type,
-                                        "resource_id": { "$in": ids.clone() },
-                                    })
-                                    .await?;
+                                let filter = doc! {
+                                    "tenant_id": tenant_id,
+                                    "resource_type": *resource_type,
+                                    "resource_id": { "$in": ids.clone() },
+                                };
+                                collection.delete_many(filter.clone()).await?;
+                                contained_collection.delete_many(filter).await?;
                             }
                         }
                         for chunk in documents.chunks(INSERT_DOCS_PER_COMMAND) {
