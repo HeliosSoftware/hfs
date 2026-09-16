@@ -261,6 +261,36 @@ pub trait SubmitClaimStrategy: Send + Sync {
     async fn release(&self, lease: ManifestLease) -> StorageResult<()>;
 }
 
+/// Every bulk-submit storage is the ledger the deferred rebuild clears when it
+/// finishes: the marker lives on the manifest row it already owns (#1125).
+#[async_trait]
+impl<T: SubmitWorkerStorage> crate::search::reindex::DeferredReindexLedger for T {
+    async fn rebuild_finished(&self, tenant: &TenantContext, manifest_id: &str) {
+        if let Err(e) = self.clear_manifest_index_pending(tenant, manifest_id).await {
+            tracing::warn!(
+                tenant = %tenant.tenant_id(),
+                manifest = %manifest_id,
+                error = %e,
+                "search index rebuilt, but the marker that says it was owed could not be cleared; startup may run it again"
+            );
+        }
+    }
+}
+
+/// A manifest that was ingested with indexing deferred and whose search-index
+/// rebuild has not finished — what a restarted server re-fires (#1125).
+#[derive(Debug, Clone)]
+pub struct PendingReindex {
+    /// Tenant the manifest was ingested for.
+    pub tenant: TenantContext,
+    /// Submitter plus submission id.
+    pub submission: SubmissionId,
+    /// Manifest whose rebuild is outstanding.
+    pub manifest_id: String,
+    /// Resource types the manifest carried, sorted.
+    pub resource_types: Vec<String>,
+}
+
 /// Worker-owned mutations of manifest/submission state.
 ///
 /// The fenced methods (those taking a [`ManifestLease`]) verify `worker_id` +
@@ -479,6 +509,36 @@ pub trait SubmitWorkerStorage: Send + Sync {
         ttl: Duration,
         limit: u32,
     ) -> StorageResult<Vec<(TenantContext, SubmissionId)>>;
+
+    /// Records that this manifest's resources were ingested with indexing
+    /// deferred, so the search-index rebuild they still owe survives a restart
+    /// (#1125). The default does nothing: a backend that cannot record it
+    /// behaves exactly as before.
+    async fn mark_manifest_index_pending(&self, lease: &ManifestLease) -> StorageResult<()> {
+        let _ = lease;
+        Ok(())
+    }
+
+    /// Clears the marker [`Self::mark_manifest_index_pending`] set, once the
+    /// rebuild has run.
+    async fn clear_manifest_index_pending(
+        &self,
+        tenant: &TenantContext,
+        manifest_id: &str,
+    ) -> StorageResult<()> {
+        let (_, _) = (tenant, manifest_id);
+        Ok(())
+    }
+
+    /// Manifests that still owe a rebuild, oldest first — what a restarted
+    /// server has to re-fire. The default returns nothing.
+    async fn list_manifests_awaiting_reindex(
+        &self,
+        limit: u32,
+    ) -> StorageResult<Vec<PendingReindex>> {
+        let _ = limit;
+        Ok(Vec::new())
+    }
 
     /// Records a transaction time on the submission when its status manifest is first
     /// finalized (idempotent — only sets if currently unset).
@@ -2076,6 +2136,16 @@ where
         types.dedup();
         match (&self.reindex_hook, types.is_empty()) {
             (Some(hook), false) => {
+                // Recorded before the hook runs: a crash between here and the
+                // end of the rebuild leaves the marker, and startup re-fires it.
+                if let Err(e) = self.jobs.mark_manifest_index_pending(lease).await {
+                    tracing::warn!(
+                        submission = %lease.submission_id,
+                        manifest = %lease.manifest_id,
+                        error = %e,
+                        "could not record that this manifest owes a search-index rebuild; a restart before it finishes will not resume it"
+                    );
+                }
                 tracing::info!(
                     submission = %lease.submission_id,
                     manifest = %lease.manifest_id,

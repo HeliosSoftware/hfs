@@ -2687,6 +2687,212 @@ async fn test_reindex_fans_out_to_every_target() {
     );
 }
 
+/// Runs `request` on `op` and waits for it to complete cleanly.
+async fn run_reindex_to_completion(
+    op: &ReindexOperation,
+    tenant: &TenantContext,
+    request: ReindexRequest,
+) {
+    let job_id = op.start(tenant.clone(), request, None).await.unwrap();
+    for _ in 0..200 {
+        tokio::time::sleep(tokio::time::Duration::from_millis(25)).await;
+        let progress = op.get_progress(&job_id).await.unwrap();
+        match progress.status {
+            ReindexStatus::Completed => {
+                assert!(progress.errors.is_empty(), "{:?}", progress.errors);
+                return;
+            }
+            ReindexStatus::Failed | ReindexStatus::Cancelled => {
+                panic!(
+                    "reindex ended {:?}: {:?}",
+                    progress.status, progress.error_message
+                )
+            }
+            _ => {}
+        }
+    }
+    panic!("reindex timed out");
+}
+
+fn count_index_rows(path: &std::path::Path, table: &str) -> i64 {
+    let conn = rusqlite::Connection::open(path).unwrap();
+    conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+        row.get(0)
+    })
+    .unwrap()
+}
+
+/// #1125: `sqlite-es` wires the offloaded SQLite primary as a reindex writer
+/// next to Elasticsearch. The rebuild must reach the secondary for every
+/// resource while leaving SQLite's `search_index` and FTS tables exactly as
+/// they were — no dead rows written, none accumulated across reruns, and
+/// `clearExisting` not reaching into an index nothing reads.
+#[tokio::test]
+async fn test_reindex_leaves_offloaded_sqlite_index_untouched_when_wired_as_writer() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("fhir.db");
+    let data_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|p| p.parent())
+        .map(|p| p.join("data"))
+        .unwrap_or_else(|| PathBuf::from("data"));
+    let tenant = create_tenant("test-tenant");
+
+    // Index some resources locally first, so "untouched" is observable.
+    {
+        let local = SqliteBackend::with_config(
+            &path,
+            SqliteBackendConfig {
+                data_dir: Some(data_dir.clone()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        local.init_schema().unwrap();
+        for i in 1..=3 {
+            local
+                .create(
+                    &tenant,
+                    "Patient",
+                    json!({
+                        "resourceType": "Patient",
+                        "id": format!("p{i}"),
+                        "name": [{"family": "Offload"}]
+                    }),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+    }
+    let index_rows = count_index_rows(&path, "search_index");
+    let fts_rows = count_index_rows(&path, "resource_fts");
+    assert!(
+        index_rows > 0 && fts_rows > 0,
+        "precondition: indexed locally"
+    );
+
+    let offloaded = SqliteBackend::with_config(
+        &path,
+        SqliteBackendConfig {
+            data_dir: Some(data_dir),
+            search_offloaded: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    offloaded.init_schema().unwrap();
+    let offloaded = Arc::new(offloaded);
+    let secondary = Arc::new(SpyReindexTarget::default());
+    let op = ReindexOperation::with_parts(
+        offloaded.clone(),
+        vec![offloaded.clone(), secondary.clone()],
+        offloaded.tenant_registries().clone(),
+    );
+
+    for run in 1..=2 {
+        run_reindex_to_completion(
+            &op,
+            &tenant,
+            ReindexRequest::for_types(vec!["Patient"]).clear_existing(),
+        )
+        .await;
+        assert_eq!(
+            secondary.written.lock().unwrap().len(),
+            3 * run,
+            "run {run}: every resource must still reach the secondary"
+        );
+        assert_eq!(
+            count_index_rows(&path, "search_index"),
+            index_rows,
+            "run {run}: an offloaded primary must not gain or lose search_index rows"
+        );
+        assert_eq!(
+            count_index_rows(&path, "resource_fts"),
+            fts_rows,
+            "run {run}: an offloaded primary must not gain or lose FTS rows"
+        );
+    }
+}
+
+/// The id-scoped lookup a retry of failed resources uses (#1125): only live
+/// resources of the requested type come back, duplicates and unknown ids are
+/// harmless, and a list longer than one `IN (...)` batch is fully covered.
+#[tokio::test]
+async fn test_reindex_fetch_resources_by_ids() {
+    let backend = create_backend();
+    let tenant = create_tenant("test-tenant");
+    for i in 1..=5 {
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType": "Patient", "id": format!("p{i}")}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+    }
+    backend
+        .create(
+            &tenant,
+            "Observation",
+            json!({"resourceType": "Observation", "id": "p4", "status": "final"}),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    backend.delete(&tenant, "Patient", "p5").await.unwrap();
+    // Same ids in another tenant must not leak in.
+    let other = create_tenant("other-tenant");
+    backend
+        .create(
+            &other,
+            "Patient",
+            json!({"resourceType": "Patient", "id": "p3"}),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+
+    // 1,200 ids spanning several batches, the real ones at the edges and in
+    // the middle, plus a duplicate and a deleted resource.
+    let mut ids: Vec<String> = (0..1200).map(|k| format!("missing-{k}")).collect();
+    ids[0] = "p1".to_string();
+    ids[640] = "p3".to_string();
+    ids[1199] = "p4".to_string();
+    ids.push("p1".to_string());
+    ids.push("p5".to_string());
+
+    let mut found: Vec<(String, String)> = backend
+        .fetch_resources_by_ids(&tenant, "Patient", &ids)
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| {
+            assert_eq!(r.tenant_id().as_str(), "test-tenant");
+            (r.resource_type().to_string(), r.id().to_string())
+        })
+        .collect();
+    found.sort();
+    assert_eq!(
+        found,
+        [
+            ("Patient".to_string(), "p1".to_string()),
+            ("Patient".to_string(), "p3".to_string()),
+            ("Patient".to_string(), "p4".to_string()),
+        ]
+    );
+
+    assert!(
+        backend
+            .fetch_resources_by_ids(&tenant, "Patient", &[])
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
 // ============================================================================
 // Conditional Operations Tests (using search index)
 // ============================================================================

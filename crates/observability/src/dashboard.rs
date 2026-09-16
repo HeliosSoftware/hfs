@@ -162,25 +162,53 @@ pub struct ExportJobCounts {
     pub queued: u64,
 }
 
-/// A search-index rebuild (`$reindex`) in progress for one tenant (#1065).
+/// A tenant's search-index rebuild (`$reindex`) that the UI must mention
+/// (#1065, #1125).
 ///
-/// Carried by [`DashboardSnapshot::reindex_active`]. While it runs, stored
-/// resources stay readable by id but searches can miss them, so the UI says so
-/// rather than letting an empty result read as lost data.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-pub struct ReindexActivity {
-    /// Rebuild jobs running (queued or in progress).
-    pub jobs: u64,
-    /// Resources processed so far, across those jobs.
-    pub processed: u64,
-    /// Resources to process, across those jobs; `0` while still being counted.
-    pub total: u64,
+/// Carried by [`DashboardSnapshot::reindex_active`]. While a rebuild runs,
+/// stored resources stay readable by id but searches can miss them, so the UI
+/// says so rather than letting an empty result read as lost data. When the
+/// tenant's most recent rebuild ended without indexing everything, the same
+/// holds indefinitely, so the UI keeps saying so — and where to find which
+/// resources — instead of dropping the line the moment the job stops running.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum ReindexActivity {
+    /// Rebuilds queued or in progress for the tenant.
+    Running {
+        /// Rebuild jobs running (queued or in progress).
+        jobs: u64,
+        /// Resources processed so far, across those jobs.
+        processed: u64,
+        /// Resources to process, across those jobs; `0` while still being
+        /// counted.
+        total: u64,
+    },
+    /// The tenant's most recent rebuild ended, but left resources unindexed:
+    /// it failed outright, or completed with per-resource errors.
+    Failed {
+        /// The job to look up with `$reindex-status/{job_id}`.
+        job_id: String,
+        /// Resources the job reported as not indexed; `0` when the job failed
+        /// as a whole before attributing any error to a resource.
+        errors: u64,
+    },
 }
 
 impl ReindexActivity {
-    /// Whole percent done, `None` while the total is still being counted.
+    /// Whether a rebuild is still running, so figures keep moving.
+    pub fn is_running(&self) -> bool {
+        matches!(self, Self::Running { .. })
+    }
+
+    /// Whole percent done of a running rebuild; `None` while its total is
+    /// still being counted, and for a rebuild that has ended.
     pub fn percent(&self) -> Option<u64> {
-        (self.total > 0).then(|| self.processed.min(self.total) * 100 / self.total)
+        match *self {
+            Self::Running {
+                processed, total, ..
+            } => (total > 0).then(|| processed.min(total) * 100 / total),
+            Self::Failed { .. } => None,
+        }
     }
 }
 
@@ -217,9 +245,11 @@ pub struct DashboardSnapshot {
     /// Non-terminal bulk-submit (import) jobs for the tenant. `None` under the
     /// same conditions as [`Self::export_jobs`].
     pub import_jobs_active: Option<u64>,
-    /// Search-index rebuilds running for the tenant (#1065). `None` when none
-    /// is running or the deployment has no `$reindex` operation: the rebuild
-    /// banner is then simply absent, never a fabricated "0%".
+    /// Search-index rebuilds running for the tenant (#1065), or its most
+    /// recent rebuild when that one left resources unindexed (#1125). `None`
+    /// when none is running and the last one indexed everything, or the
+    /// deployment has no `$reindex` operation: the rebuild banner is then
+    /// simply absent, never a fabricated "0%".
     pub reindex_active: Option<ReindexActivity>,
     /// Where the figures come from and how far they can be trusted (#1078).
     /// Only [`Figures::Exact`] and [`Figures::Approximate`] carry figures; the
@@ -737,7 +767,7 @@ mod tests {
 
     #[test]
     fn reindex_activity_percent_is_whole_and_unknown_until_counted() {
-        let activity = |processed, total| ReindexActivity {
+        let activity = |processed, total| ReindexActivity::Running {
             jobs: 1,
             processed,
             total,
@@ -747,6 +777,17 @@ mod tests {
         assert_eq!(activity(18_957_456, 18_957_914).percent(), Some(99));
         // A counter that overshoots its total never reads above 100%.
         assert_eq!(activity(12, 10).percent(), Some(100));
+        assert!(activity(0, 0).is_running());
+    }
+
+    #[test]
+    fn a_failed_rebuild_is_not_running_and_has_no_percentage() {
+        let failed = ReindexActivity::Failed {
+            job_id: "job-1".to_string(),
+            errors: 11_704,
+        };
+        assert!(!failed.is_running());
+        assert_eq!(failed.percent(), None);
     }
 
     #[tokio::test]

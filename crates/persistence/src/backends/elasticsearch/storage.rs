@@ -4,11 +4,17 @@
 //! changes from the primary backend. The ES backend is primarily a search secondary,
 //! but it must implement ResourceStorage for sync support.
 
+use std::collections::VecDeque;
+use std::ops::Range;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
+
+use futures::StreamExt;
+
 use async_trait::async_trait;
 use chrono::Utc;
-use elasticsearch::{
-    BulkOperation, BulkParts, DeleteByQueryParts, DeleteParts, GetParts, IndexParts,
-};
+use elasticsearch::params::Refresh;
+use elasticsearch::{BulkParts, DeleteByQueryParts, DeleteParts, GetParts, IndexParts};
 use helios_fhir::FhirVersion;
 use serde_json::{Value, json};
 
@@ -23,10 +29,10 @@ use crate::types::StoredResource;
 use super::backend::ElasticsearchBackend;
 use super::schema;
 
-/// Upper bound on operations per `_bulk` request in
-/// [`ResourceStorage::create_many`]. Keeps a request body bounded (conformance
-/// resources are a few KB each; contained documents ride along) without
-/// making a load pay one refresh wait per handful of documents.
+/// Upper bound on operations per `_bulk` request, on top of the configured byte
+/// budget ([`ElasticsearchConfig::bulk_max_bytes`](super::backend::ElasticsearchConfig::bulk_max_bytes)).
+/// Small resources hit this count first, so a load does not pay one refresh
+/// wait per handful of documents; large ones hit the byte budget first (#1125).
 const BULK_OPS_PER_REQUEST: usize = 500;
 
 /// Why a resource's documents did not index in a `_bulk` request.
@@ -41,8 +47,105 @@ struct BulkFailure {
 
 /// Whether a `_bulk` request or item status asks for a retry rather than
 /// rejecting the document.
-fn is_transient_bulk_status(status: u64) -> bool {
+pub(super) fn is_transient_bulk_status(status: u64) -> bool {
     status == 429 || (500..600).contains(&status)
+}
+
+/// Attempts an operation Elasticsearch answers `429` gets, the first included,
+/// before it is reported as a transient failure.
+const BULK_MAX_ATTEMPTS: u32 = 5;
+
+/// Wait before the first resend of throttled operations; doubles on each
+/// further resend, up to [`BULK_BACKOFF_MAX`].
+const BULK_BACKOFF_BASE: Duration = Duration::from_millis(100);
+
+/// Upper bound on one back-off wait.
+const BULK_BACKOFF_MAX: Duration = Duration::from_secs(5);
+
+/// The wait before the `resend`-th resend (`resend >= 1`) of throttled
+/// operations.
+fn backoff_delay(resend: u32) -> Duration {
+    let doublings = resend.saturating_sub(1).min(16);
+    BULK_BACKOFF_BASE
+        .saturating_mul(1u32 << doublings)
+        .min(BULK_BACKOFF_MAX)
+}
+
+/// Groups consecutive operations, given their sizes in bytes, into `_bulk`
+/// requests of at most `max_ops` operations and `max_bytes` bytes.
+///
+/// An operation larger than `max_bytes` on its own gets a request of its own —
+/// it is sent, not dropped — so the cap bounds every request that *can* be
+/// bounded. Without a byte cap a page of large resources was one request: 500
+/// Synthea `Provenance` documents of ~108 KB each is a ~54 MB body, which
+/// outlived the client timeout and failed all 500 (#1125).
+fn chunk_ranges(sizes: &[usize], max_ops: usize, max_bytes: usize) -> Vec<Range<usize>> {
+    let max_ops = max_ops.max(1);
+    let mut ranges = Vec::new();
+    let mut start = 0;
+    let mut bytes = 0usize;
+    for (i, &size) in sizes.iter().enumerate() {
+        if i > start && (i - start == max_ops || bytes.saturating_add(size) > max_bytes) {
+            ranges.push(start..i);
+            start = i;
+            bytes = 0;
+        }
+        bytes = bytes.saturating_add(size);
+    }
+    if start < sizes.len() {
+        ranges.push(start..sizes.len());
+    }
+    ranges
+}
+
+/// Renders a `_bulk` item's `error` object as `type: reason`, following the
+/// `caused_by` chain.
+///
+/// The chain matters: Elasticsearch reports a document over the nested-object
+/// limit as `document_parsing_exception: failed to parse`, and only its
+/// `caused_by` says which limit (#1050). Anything that is not an error object
+/// is rendered verbatim.
+fn describe_item_error(error: &Value) -> String {
+    let mut parts = Vec::new();
+    let mut current = Some(error);
+    while let Some(cause) = current {
+        let kind = cause.get("type").and_then(Value::as_str);
+        let reason = cause.get("reason").and_then(Value::as_str);
+        match (kind, reason) {
+            (Some(kind), Some(reason)) => parts.push(format!("{kind}: {reason}")),
+            (Some(kind), None) => parts.push(kind.to_string()),
+            (None, Some(reason)) => parts.push(reason.to_string()),
+            (None, None) => break,
+        }
+        // Bounded: a malformed response must not make this loop forever-ish.
+        if parts.len() == 8 {
+            break;
+        }
+        current = cause.get("caused_by");
+    }
+    if parts.is_empty() {
+        error.to_string()
+    } else {
+        parts.join("; caused by ")
+    }
+}
+
+/// The detail of `error`, including the message `BackendError::Unavailable`'s
+/// display leaves out.
+fn error_detail(error: &StorageError) -> String {
+    match error {
+        StorageError::Backend(BackendError::Unavailable { message, .. }) => message.clone(),
+        other => other.to_string(),
+    }
+}
+
+/// Whether `error` is an outage (the cluster could not be reached or asked to
+/// be retried) rather than a rejection.
+fn is_unavailable(error: &StorageError) -> bool {
+    matches!(
+        error,
+        StorageError::Backend(BackendError::Unavailable { .. })
+    )
 }
 
 fn internal_error(message: String) -> StorageError {
@@ -610,9 +713,9 @@ impl ResourceStorage for ElasticsearchBackend {
         ))
     }
 
-    /// One `_bulk` request per [`BULK_OPS_PER_REQUEST`] operations, with the
-    /// configured write-refresh policy applied once per request rather than
-    /// once per document.
+    /// `_bulk` requests of at most [`BULK_OPS_PER_REQUEST`] operations and the
+    /// configured byte budget, with the configured write-refresh policy applied
+    /// once per request rather than once per document.
     ///
     /// This is what makes a bulk load survivable under `refresh=wait_for`:
     /// that policy blocks each write until the next scheduled refresh (the
@@ -721,7 +824,7 @@ impl ResourceStorage for ElasticsearchBackend {
             if ensured.insert(ty.clone())
                 && let Err(e) = schema::ensure_index(self, tenant_id, &ty).await
             {
-                let message = e.to_string();
+                let message = error_detail(&e);
                 return prepared
                     .iter()
                     .map(|_| Err(internal_error(message.clone())))
@@ -741,7 +844,9 @@ impl ResourceStorage for ElasticsearchBackend {
                     .map(move |(index, doc_id, doc)| (i, index.as_str(), doc_id.as_str(), doc))
             })
             .collect();
-        let failures = self.send_bulk_index(&ops, prepared.len()).await;
+        let failures = self
+            .send_bulk_index(&ops, prepared.len(), self.write_refresh_param())
+            .await;
 
         let now = Utc::now();
         prepared
@@ -1336,110 +1441,368 @@ impl PurgableStorage for ElasticsearchBackend {
 // ============================================================================
 
 impl ElasticsearchBackend {
-    /// Sends `ops` as chunked `_bulk` requests and reports, per owner, the
-    /// first failure among the operations it contributed.
+    /// Indexes `ops` — `(owner, index, document id, document)` — in bounded
+    /// `_bulk` requests, and returns the first failure of each of the `owners`.
     ///
-    /// `ops` is `(owner index, ES index, document id, document)`. Owners are
-    /// positions in the caller's own list — a resource usually contributes more
-    /// than one document (its own plus one per `contained` entry), and one bad
-    /// document fails the resource that produced it and nothing else.
+    /// Owners are positions in the caller's own list — a resource usually
+    /// contributes more than one document (its own plus one per `contained`
+    /// entry), and one bad document fails the resource that produced it and
+    /// nothing else.
     ///
     /// Shared by [`ResourceStorage::create_many`] and
     /// [`ReindexTarget::write_search_entries_page`] so a rebuild and a bulk
-    /// create put the same documents on the wire the same way — one request per
-    /// [`BULK_OPS_PER_REQUEST`] operations, and one write-refresh wait per
-    /// request rather than per document.
+    /// create put the same documents on the wire the same way, with `refresh`
+    /// applied once per request rather than once per document.
+    ///
+    /// Each operation is serialized once; its size bounds requests by bytes as
+    /// well as by [`BULK_OPS_PER_REQUEST`] operations, and the same bytes are
+    /// resent however often a request is retried. A failure is handled by what
+    /// it says about the documents (#1125):
+    ///
+    /// - The client timed out, or the cluster (or a proxy) answered `413`,
+    ///   `408` or `504`: the request was too large, not its documents wrong. It
+    ///   is split in half and each half is resent, down to a single document;
+    ///   only a lone document that still times out (transient) or is too large
+    ///   (permanent) is reported. A lone document timing out on the client
+    ///   fails the rest of the page as transient instead of splitting further:
+    ///   the cluster is stalled, and every further halving would wait out
+    ///   another timeout.
+    /// - The cluster answered `429`, for the request or for items in it: the
+    ///   rejected operations alone are resent after a back-off, up to
+    ///   [`BULK_MAX_ATTEMPTS`] attempts, then reported as transient.
+    /// - An item rejected with another `4xx` is permanent: rerunning it fails
+    ///   the same way. Its message names the error's `type` and `reason`.
+    /// - Anything else on the whole request (connection refused, `5xx`, an
+    ///   unreadable response) fails its operations as transient.
     async fn send_bulk_index(
         &self,
         ops: &[(usize, &str, &str, &Value)],
         owners: usize,
+        refresh: Option<Refresh>,
     ) -> Vec<Option<BulkFailure>> {
+        /// Operations sent together, by position in `ops`.
+        struct Batch {
+            ops: Vec<usize>,
+            /// How many times these operations were already resent after `429`.
+            resends: u32,
+            /// How many halvings produced this batch.
+            depth: u32,
+        }
+
         let mut failures: Vec<Option<BulkFailure>> = (0..owners).map(|_| None).collect();
-        fn fail_chunk(
+        fn fail(
             failures: &mut [Option<BulkFailure>],
-            chunk: &[(usize, &str, &str, &Value)],
-            message: String,
+            owner: usize,
+            message: &str,
             transient: bool,
         ) {
-            for (i, ..) in chunk {
-                failures[*i].get_or_insert_with(|| BulkFailure {
-                    message: message.clone(),
-                    transient,
-                });
+            failures[owner].get_or_insert_with(|| BulkFailure {
+                message: message.to_string(),
+                transient,
+            });
+        }
+
+        // The action and document lines of every operation, serialized once.
+        let mut lines: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(ops.len());
+        let mut sendable: Vec<usize> = Vec::with_capacity(ops.len());
+        let mut sizes: Vec<usize> = Vec::with_capacity(ops.len());
+        for (position, (owner, index, doc_id, doc)) in ops.iter().enumerate() {
+            let action =
+                serde_json::to_vec(&json!({ "index": { "_index": index, "_id": doc_id } }));
+            match (action, serde_json::to_vec(doc)) {
+                (Ok(action), Ok(document)) => {
+                    // `NdBody` ends each line with a newline.
+                    sizes.push(action.len() + document.len() + 2);
+                    sendable.push(position);
+                    lines.push((action, document));
+                }
+                (Err(e), _) | (_, Err(e)) => {
+                    fail(
+                        &mut failures,
+                        *owner,
+                        &format!("Failed to serialize document: {e}"),
+                        false,
+                    );
+                    lines.push((Vec::new(), Vec::new()));
+                }
             }
         }
-        for chunk in ops.chunks(BULK_OPS_PER_REQUEST) {
-            let body: Vec<BulkOperation<Value>> = chunk
-                .iter()
-                .map(|(_, index, doc_id, doc)| {
-                    BulkOperation::index((*doc).clone())
-                        .index(*index)
-                        .id(*doc_id)
-                        .into()
-                })
-                .collect();
-            let mut request = self.client().bulk(BulkParts::None).body(body);
-            if let Some(refresh) = self.write_refresh_param() {
-                request = request.refresh(refresh);
-            }
-            let response = match request.send().await {
-                Ok(response) => response,
-                Err(e) => {
-                    fail_chunk(
+
+        let roots: Vec<Batch> = chunk_ranges(&sizes, BULK_OPS_PER_REQUEST, self.bulk_max_bytes())
+            .into_iter()
+            .map(|range| Batch {
+                ops: sendable[range].to_vec(),
+                resends: 0,
+                depth: 0,
+            })
+            .collect();
+
+        // Requests of one page never touch the same document, so they may go
+        // out together. What has to stay sequential is the chain a request
+        // produces: its halves, its back-off resends and the order they are
+        // sent in. So each root chunk gets its own queue, and
+        // `HFS_ELASTICSEARCH_BULK_CONCURRENCY` says how many of those chains
+        // are in flight (default `1` — one request at a time, as before).
+        let concurrency = self.bulk_concurrency().clamp(1, roots.len().max(1));
+        // A single document timing out means the cluster stopped answering,
+        // not that the request was too large: once one chain finds that out,
+        // the others stop sending what they still have queued instead of
+        // waiting out a timeout each (#1125). Chains that are already halving
+        // in lockstep still pay their own way down, so a stalled cluster costs
+        // about `concurrency * log2(chunk)` requests — far short of one per
+        // document, and in parallel.
+        let stalled = AtomicBool::new(false);
+        let lines = &lines;
+        let stalled = &stalled;
+        let send_chain = |mut queue: VecDeque<Batch>| async move {
+            let mut failures: Vec<Option<BulkFailure>> = (0..owners).map(|_| None).collect();
+
+            // Halves `batch` and puts both halves at the front of the queue, in order.
+            let split = |queue: &mut VecDeque<Batch>, mut batch: Batch, reason: &str| {
+                if batch.depth == 0 {
+                    tracing::warn!(
+                        operations = batch.ops.len(),
+                        reason,
+                        "Elasticsearch _bulk request too large; splitting it in half and resending each half"
+                    );
+                } else {
+                    tracing::debug!(
+                        operations = batch.ops.len(),
+                        depth = batch.depth,
+                        reason,
+                        "splitting _bulk request again"
+                    );
+                }
+                let right = batch.ops.split_off(batch.ops.len() / 2);
+                queue.push_front(Batch {
+                    ops: right,
+                    resends: 0,
+                    depth: batch.depth + 1,
+                });
+                queue.push_front(Batch {
+                    ops: batch.ops,
+                    resends: 0,
+                    depth: batch.depth + 1,
+                });
+            };
+
+            while let Some(batch) = queue.pop_front() {
+                let fail_batch =
+                    |failures: &mut [Option<BulkFailure>], message: &str, transient: bool| {
+                        for &position in &batch.ops {
+                            fail(failures, ops[position].0, message, transient);
+                        }
+                    };
+                if stalled.load(Ordering::Relaxed) {
+                    fail_batch(
                         &mut failures,
-                        chunk,
-                        format!("Failed to send bulk index request: {e}"),
+                        "Not sent: Elasticsearch stopped answering _bulk requests for this page",
                         true,
                     );
                     continue;
                 }
-            };
-            let status = response.status_code();
-            let payload: Value = match response.json().await {
-                Ok(payload) if status.is_success() => payload,
-                Ok(payload) => {
-                    fail_chunk(
+                if batch.resends > 0 {
+                    tokio::time::sleep(backoff_delay(batch.resends)).await;
+                }
+
+                let body: Vec<&[u8]> = batch
+                    .ops
+                    .iter()
+                    .flat_map(|&position| {
+                        let (action, document) = &lines[position];
+                        [action.as_slice(), document.as_slice()]
+                    })
+                    .collect();
+                let mut request = self.client().bulk(BulkParts::None).body(body);
+                if let Some(refresh) = refresh {
+                    request = request.refresh(refresh);
+                }
+
+                let response = match request.send().await {
+                    Ok(response) => response,
+                    Err(e) if e.is_timeout() && batch.ops.len() > 1 => {
+                        split(&mut queue, batch, "timeout");
+                        continue;
+                    }
+                    Err(e) if e.is_timeout() => {
+                        let message = format!(
+                            "Bulk index request for a single document timed out after {} ms: {e}",
+                            self.request_timeout_ms()
+                        );
+                        fail_batch(&mut failures, &message, true);
+                        // A lone document timing out means the cluster, not the
+                        // request size, is the problem: halving the rest of the
+                        // queue would wait out a timeout per document.
+                        let remaining: usize = queue.iter().map(|rest| rest.ops.len()).sum();
+                        if remaining > 0 {
+                            tracing::warn!(
+                                remaining,
+                                "Elasticsearch did not answer a single-document _bulk request in time; failing the rest of the page as transient"
+                            );
+                        }
+                        stalled.store(true, Ordering::Relaxed);
+                        for rest in queue.drain(..) {
+                            for position in rest.ops {
+                                fail(&mut failures, ops[position].0, &message, true);
+                            }
+                        }
+                        break;
+                    }
+                    Err(e) => {
+                        fail_batch(
+                            &mut failures,
+                            &format!("Failed to send bulk index request: {e}"),
+                            true,
+                        );
+                        continue;
+                    }
+                };
+
+                // The status decides before the body is read: a `413` or a proxy's
+                // error page need not be JSON.
+                let status = response.status_code().as_u16();
+                // `408`/`504` are a proxy's or gateway's timeout: the same failure
+                // as the client's own, reported by something in between.
+                let too_large = status == 413;
+                let timed_out = status == 408 || status == 504;
+                if too_large || timed_out {
+                    if batch.ops.len() > 1 {
+                        let reason = if too_large {
+                            "413 Request Entity Too Large"
+                        } else {
+                            "request timed out upstream (408/504)"
+                        };
+                        split(&mut queue, batch, reason);
+                    } else {
+                        let body = response.text().await.unwrap_or_default();
+                        let message = if too_large {
+                            format!("Document too large for a bulk request (status 413): {body}")
+                        } else {
+                            format!(
+                                "Bulk index request for a single document timed out (status {status}): {body}"
+                            )
+                        };
+                        fail_batch(&mut failures, &message, timed_out);
+                    }
+                    continue;
+                }
+                if status == 429 {
+                    let body = response.text().await.unwrap_or_default();
+                    if batch.resends + 1 < BULK_MAX_ATTEMPTS {
+                        queue.push_front(Batch {
+                            ops: batch.ops,
+                            resends: batch.resends + 1,
+                            depth: batch.depth,
+                        });
+                    } else {
+                        fail_batch(
+                            &mut failures,
+                            &format!(
+                                "Bulk index request throttled (status 429) {BULK_MAX_ATTEMPTS} times: {body}"
+                            ),
+                            true,
+                        );
+                    }
+                    continue;
+                }
+                if !(200..300).contains(&status) {
+                    let body = response.text().await.unwrap_or_default();
+                    fail_batch(
                         &mut failures,
-                        chunk,
-                        format!("Bulk index request failed (status {status}): {payload}"),
-                        is_transient_bulk_status(u64::from(status.as_u16())),
+                        &format!("Bulk index request failed (status {status}): {body}"),
+                        is_transient_bulk_status(u64::from(status)),
                     );
                     continue;
                 }
-                Err(e) => {
-                    fail_chunk(
-                        &mut failures,
-                        chunk,
-                        format!("Failed to read bulk index response: {e}"),
-                        true,
-                    );
-                    continue;
-                }
-            };
-            let items = payload
-                .get("items")
-                .and_then(|v| v.as_array())
-                .cloned()
-                .unwrap_or_default();
-            for (position, (i, ..)) in chunk.iter().enumerate() {
-                let item = items.get(position).and_then(|item| item.get("index"));
-                let item_status = item
-                    .and_then(|v| v.get("status"))
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0);
-                if !(200..300).contains(&item_status) {
+
+                let payload: Value = match response.json().await {
+                    Ok(payload) => payload,
+                    Err(e) if e.is_timeout() && batch.ops.len() > 1 => {
+                        split(&mut queue, batch, "timeout reading the response");
+                        continue;
+                    }
+                    Err(e) => {
+                        fail_batch(
+                            &mut failures,
+                            &format!("Failed to read bulk index response: {e}"),
+                            true,
+                        );
+                        continue;
+                    }
+                };
+                let items = payload.get("items").and_then(Value::as_array);
+                let mut throttled: Vec<usize> = Vec::new();
+                let mut throttle_message: Option<String> = None;
+                for (item_position, &position) in batch.ops.iter().enumerate() {
+                    let item = items
+                        .and_then(|items| items.get(item_position))
+                        .and_then(|item| item.get("index"));
+                    let item_status = item
+                        .and_then(|v| v.get("status"))
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0);
+                    if (200..300).contains(&item_status) {
+                        continue;
+                    }
                     let error = item
                         .and_then(|v| v.get("error"))
-                        .map(|v| v.to_string())
+                        .map(describe_item_error)
                         .unwrap_or_else(|| "no item in bulk response".to_string());
+                    let message =
+                        format!("Failed to index document (status {item_status}): {error}");
+                    if item_status == 429 {
+                        throttled.push(position);
+                        throttle_message.get_or_insert(message);
+                        continue;
+                    }
                     // A missing item (status 0) means the response did not
                     // account for the document, not that it was rejected.
-                    failures[*i].get_or_insert_with(|| BulkFailure {
-                        message: format!(
-                            "Failed to index document (status {item_status}): {error}"
-                        ),
-                        transient: item_status == 0 || is_transient_bulk_status(item_status),
-                    });
+                    fail(
+                        &mut failures,
+                        ops[position].0,
+                        &message,
+                        item_status == 0 || is_transient_bulk_status(item_status),
+                    );
+                }
+                if !throttled.is_empty() {
+                    if batch.resends + 1 < BULK_MAX_ATTEMPTS {
+                        queue.push_front(Batch {
+                            ops: throttled,
+                            resends: batch.resends + 1,
+                            depth: batch.depth,
+                        });
+                    } else {
+                        let message = format!(
+                            "{} (throttled {BULK_MAX_ATTEMPTS} times)",
+                            throttle_message.unwrap_or_default()
+                        );
+                        for position in throttled {
+                            fail(&mut failures, ops[position].0, &message, true);
+                        }
+                    }
+                }
+            }
+            failures
+        };
+
+        // Merged in chunk order, so which message a resource ends up with does
+        // not depend on which chain finished first.
+        let chains: Vec<Vec<Option<BulkFailure>>> = if concurrency <= 1 {
+            vec![send_chain(roots.into_iter().collect()).await]
+        } else {
+            futures::stream::iter(
+                roots
+                    .into_iter()
+                    .map(|batch| send_chain(VecDeque::from([batch]))),
+            )
+            .buffered(concurrency)
+            .collect()
+            .await
+        };
+        for chain in chains {
+            for (slot, failure) in failures.iter_mut().zip(chain) {
+                if slot.is_none() {
+                    *slot = failure;
                 }
             }
         }
@@ -1467,8 +1830,10 @@ impl ReindexTarget for ElasticsearchBackend {
         Ok(0)
     }
 
-    /// Rebuilds a page of resources in one `_bulk` request per
-    /// [`BULK_OPS_PER_REQUEST`] documents.
+    /// Rebuilds a page of resources in `_bulk` requests bounded by
+    /// [`BULK_OPS_PER_REQUEST`] documents and the configured byte budget, under
+    /// the rebuild's own refresh policy
+    /// ([`ElasticsearchConfig::reindex_refresh`](super::backend::ElasticsearchConfig::reindex_refresh)).
     ///
     /// The default trait implementation walks the page one resource at a time,
     /// which against Elasticsearch is one HTTP round trip each and held
@@ -1566,10 +1931,19 @@ impl ReindexTarget for ElasticsearchBackend {
             if ensured.insert(ty.clone())
                 && let Err(e) = schema::ensure_index(self, tenant_id, &ty).await
             {
-                let message = e.to_string();
+                // Keep whether it was an outage: the rebuild retries an
+                // unreachable cluster, not a rejected resource (#1125).
+                let message = error_detail(&e);
+                let unavailable = is_unavailable(&e);
                 return resources
                     .iter()
-                    .map(|_| Err(internal_error(message.clone())))
+                    .map(|_| {
+                        Err(if unavailable {
+                            unavailable_error(message.clone())
+                        } else {
+                            internal_error(message.clone())
+                        })
+                    })
                     .collect();
             }
         }
@@ -1583,7 +1957,9 @@ impl ReindexTarget for ElasticsearchBackend {
                     .map(move |(index, doc_id, doc)| (i, index.as_str(), doc_id.as_str(), doc))
             })
             .collect();
-        let failures = self.send_bulk_index(&ops, prepared.len()).await;
+        let failures = self
+            .send_bulk_index(&ops, prepared.len(), self.reindex_refresh_param())
+            .await;
 
         prepared
             .into_iter()
@@ -1787,6 +2163,7 @@ impl ReindexSource for ElasticsearchBackend {
             return Ok(ResourcePage {
                 resources: Vec::new(),
                 next_cursor: None,
+                skipped: Vec::new(),
             });
         }
 
@@ -1819,6 +2196,7 @@ impl ReindexSource for ElasticsearchBackend {
         Ok(ResourcePage {
             resources,
             next_cursor,
+            skipped: Vec::new(),
         })
     }
 }
@@ -1874,7 +2252,57 @@ async fn delete_by_query_scoped(
 
 #[cfg(test)]
 mod tests {
-    use super::is_transient_bulk_status;
+    use super::{
+        BULK_BACKOFF_BASE, BULK_BACKOFF_MAX, backoff_delay, chunk_ranges, describe_item_error,
+        error_detail, is_transient_bulk_status, is_unavailable,
+    };
+    use crate::error::{BackendError, StorageError};
+    use serde_json::json;
+
+    #[test]
+    fn chunk_ranges_caps_operations_per_request() {
+        assert_eq!(chunk_ranges(&[1; 5], 2, usize::MAX), vec![0..2, 2..4, 4..5]);
+        assert_eq!(chunk_ranges(&[1; 4], 2, usize::MAX), vec![0..2, 2..4]);
+        assert!(chunk_ranges(&[], 2, usize::MAX).is_empty());
+        // A zero operation cap still makes progress, one per request.
+        assert_eq!(chunk_ranges(&[1; 2], 0, usize::MAX), vec![0..1, 1..2]);
+    }
+
+    #[test]
+    fn chunk_ranges_caps_bytes_per_request() {
+        // 40 + 40 fits 100, the third would make 120.
+        assert_eq!(
+            chunk_ranges(&[40, 40, 40, 40, 20], 500, 100),
+            vec![0..2, 2..5]
+        );
+        // Exactly at the cap still fits.
+        assert_eq!(chunk_ranges(&[50, 50, 50], 500, 100), vec![0..2, 2..3]);
+    }
+
+    /// The #1125 shape: a page of Provenance-sized documents must not become
+    /// one ~54 MB request.
+    #[test]
+    fn chunk_ranges_keeps_large_documents_under_the_byte_cap() {
+        let sizes = vec![108_000; 500];
+        let cap = 10 * 1024 * 1024;
+        let ranges = chunk_ranges(&sizes, 500, cap);
+        assert!(ranges.len() > 1);
+        assert_eq!(ranges.iter().map(|r| r.len()).sum::<usize>(), 500);
+        for range in &ranges {
+            assert!(
+                sizes[range.clone()].iter().sum::<usize>() <= cap,
+                "{range:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn chunk_ranges_sends_an_oversized_document_alone_rather_than_dropping_it() {
+        assert_eq!(
+            chunk_ranges(&[10, 500, 10, 10], 500, 100),
+            vec![0..1, 1..2, 2..4]
+        );
+    }
 
     #[test]
     fn bulk_statuses_that_ask_for_a_retry_are_transient() {
@@ -1886,5 +2314,55 @@ mod tests {
         for status in [200, 201, 400, 404, 409, 413] {
             assert!(!is_transient_bulk_status(status), "{status}");
         }
+    }
+
+    #[test]
+    fn backoff_doubles_and_is_capped() {
+        assert_eq!(backoff_delay(1), BULK_BACKOFF_BASE);
+        assert_eq!(backoff_delay(2), BULK_BACKOFF_BASE * 2);
+        assert_eq!(backoff_delay(3), BULK_BACKOFF_BASE * 4);
+        assert_eq!(backoff_delay(40), BULK_BACKOFF_MAX);
+    }
+
+    /// Elasticsearch puts the nested-object limit in `caused_by`; a message
+    /// that stopped at the top-level reason would say only "failed to parse".
+    #[test]
+    fn item_errors_name_their_type_reason_and_cause() {
+        let error = json!({
+            "type": "document_parsing_exception",
+            "reason": "[1:2] failed to parse",
+            "caused_by": {
+                "type": "illegal_argument_exception",
+                "reason": "The number of nested documents has exceeded the allowed limit of [10000]."
+            }
+        });
+        assert_eq!(
+            describe_item_error(&error),
+            "document_parsing_exception: [1:2] failed to parse; caused by \
+             illegal_argument_exception: The number of nested documents has exceeded the allowed limit of [10000]."
+        );
+        assert_eq!(
+            describe_item_error(&json!({"type": "version_conflict_engine_exception"})),
+            "version_conflict_engine_exception"
+        );
+        assert_eq!(describe_item_error(&json!("plain")), "\"plain\"");
+    }
+
+    #[test]
+    fn a_page_wide_error_keeps_the_detail_unavailable_does_not_display() {
+        let outage = StorageError::Backend(BackendError::Unavailable {
+            backend_name: "elasticsearch".to_string(),
+            message: "Failed to check index existence for hfs_t_patient: timed out".to_string(),
+        });
+        assert!(is_unavailable(&outage));
+        assert!(error_detail(&outage).contains("timed out"));
+
+        let rejection = StorageError::Backend(BackendError::Internal {
+            backend_name: "elasticsearch".to_string(),
+            message: "mapper_parsing_exception".to_string(),
+            source: None,
+        });
+        assert!(!is_unavailable(&rejection));
+        assert!(error_detail(&rejection).contains("mapper_parsing_exception"));
     }
 }

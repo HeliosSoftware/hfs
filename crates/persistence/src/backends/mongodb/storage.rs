@@ -4303,6 +4303,7 @@ impl ReindexSource for MongoBackend {
         Ok(ResourcePage {
             resources,
             next_cursor,
+            skipped: Vec::new(),
         })
     }
 }
