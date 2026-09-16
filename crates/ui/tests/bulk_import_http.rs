@@ -2574,7 +2574,7 @@ async fn an_unanswered_status_change_is_queued_and_re_sent_from_the_status_card(
         fragment.contains("Recipient acknowledged (200)"),
         "{fragment}"
     );
-    let sent = received.lock().unwrap();
+    let sent = received.lock().unwrap().clone();
     assert_eq!(sent.len(), 1, "exactly one re-send: {sent:?}");
     let code = sent[0]["parameter"]
         .as_array()
@@ -2586,7 +2586,6 @@ async fn an_unanswered_status_change_is_queued_and_re_sent_from_the_status_card(
         })
         .unwrap_or_default();
     assert_eq!(code, "completed");
-    drop(sent);
     let stored = read_document(&ctx, &detail_path).await;
     assert_eq!(stored["status"], "completed", "{stored}");
     assert!(stored.get("pendingStatus").is_none(), "{stored}");
