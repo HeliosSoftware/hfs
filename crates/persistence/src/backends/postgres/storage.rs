@@ -107,6 +107,74 @@ SET narrative_tsvector = EXCLUDED.narrative_tsvector, content_tsvector = EXCLUDE
 WHERE resource_fts.content_tsvector IS DISTINCT FROM EXCLUDED.content_tsvector \
    OR resource_fts.narrative_tsvector IS DISTINCT FROM EXCLUDED.narrative_tsvector";
 
+/// The page writer's version of [`FTS_UPSERT_SQL`]: the same row for up to
+/// [`FTS_BATCH_SIZE`] resources per statement.
+///
+/// Same target table, same five columns, same conflict target, same
+/// `IS DISTINCT FROM` guard, same two `to_tsvector('english', …)` calls — the
+/// only difference is where the rows come from. Instead of five scalars, four
+/// parallel `text[]` arrays are expanded by `unnest`, which walks them in
+/// lockstep; the caller pushes one element into each array per resource, so
+/// they are equal length by construction. `tenant_id` stays a scalar (`$1`),
+/// which is the only shape a page can have: `$reindex` pages one tenant at a
+/// time. Both of those are what let the statement be fixed text — a single
+/// prepared statement per connection under `execute_cached`, rather than one
+/// prepare per resource.
+///
+/// # Duplicates are not coalesced
+///
+/// Postgres refuses an `ON CONFLICT DO UPDATE` that proposes the same key
+/// twice in one statement: `ON CONFLICT DO UPDATE command cannot affect row a
+/// second time`. That is left to happen rather than pre-empted with a `WHERE`.
+/// The page comes from `fetch_resources_page`, which reads `resources` by
+/// primary key, so a resource id cannot legitimately appear twice, and a
+/// statement that quietly dropped one copy of a duplicated id would hide the
+/// caller defect that produced it. A duplicate aborts the page, and the
+/// per-resource fallback (`write_reindex_page_individually` →
+/// `index_fts_content`) writes the page one row at a time instead.
+///
+/// # No truncating retry here
+///
+/// `index_fts_content` retries an oversized input against
+/// `FTS_MAX_INPUT_BYTES`, which assumes the session is still usable: true for
+/// an ordinary write, which runs without an explicit transaction. This
+/// statement runs inside the page's managed transaction, where a
+/// `program_limit_exceeded` has already aborted it, so nothing here may
+/// truncate or retry — the page rolls back and each resource is repeated by
+/// the ordinary path, which truncates there (see
+/// `postgres_integration_reindex_page_retries_oversized_fts_individually`).
+const FTS_BATCH_UPSERT_SQL: &str = "\
+INSERT INTO resource_fts (tenant_id, resource_type, resource_id, narrative_tsvector, content_tsvector) \
+SELECT $1::text, batch.resource_type, batch.resource_id, \
+to_tsvector('english', batch.narrative), to_tsvector('english', batch.full_content) \
+FROM unnest($2::text[], $3::text[], $4::text[], $5::text[]) \
+AS batch(resource_type, resource_id, narrative, full_content) \
+ON CONFLICT (tenant_id, resource_type, resource_id) DO UPDATE \
+SET narrative_tsvector = EXCLUDED.narrative_tsvector, content_tsvector = EXCLUDED.content_tsvector \
+WHERE resource_fts.content_tsvector IS DISTINCT FROM EXCLUDED.content_tsvector \
+   OR resource_fts.narrative_tsvector IS DISTINCT FROM EXCLUDED.narrative_tsvector";
+
+/// Resources per statement in [`FTS_BATCH_UPSERT_SQL`].
+///
+/// A cap on one statement's bind payload and workset — not a page size, and
+/// not a byte ceiling. The page is whatever the caller asked for, and this
+/// splits it: an operator's `POST $reindex` defaults to `batchSize` 100, so
+/// that page is one statement, while the automatic deferred rebuild after a
+/// bulk import defaults to `HFS_REINDEX_BATCH_SIZE`, whose 1,000 makes it ten
+/// statements over this same code. Nothing here bounds the bytes a group
+/// carries — the four `text[]` parameters are as large as the resources in
+/// them — and a group whose input is too large for one `to_tsvector` fails the
+/// page, which is repeated per resource and truncated there (see
+/// [`FTS_BATCH_UPSERT_SQL`]).
+///
+/// The three things this number trades off: the parameters one statement binds
+/// (four `text[]` arrays of up to this many elements), the text a reindex page
+/// holds twice at once (the staged `SearchableContent`, on top of the `data`
+/// the page's resources already carry — ~70 KB for a group at the corpus's
+/// measured mean 688-byte content), and the work one aborted transaction
+/// throws away before the per-resource fallback repeats it.
+const FTS_BATCH_SIZE: usize = 100;
+
 /// How much text a single retry hands `to_tsvector` after it has refused the
 /// whole thing.
 ///
@@ -1624,11 +1692,13 @@ impl PostgresBackend {
         //
         // Retry once against a truncated input instead. Ordinary resource
         // writes run without an explicit transaction, so their session remains
-        // usable. A batched reindex calls this inside its managed page
-        // transaction; PostgreSQL aborts that transaction after this error, so
-        // the retry fails and the page writer rolls back and repeats each
-        // resource through the ordinary path. The bundle path
-        // (`PostgresTransaction`) does not write `resource_fts` at all.
+        // usable. A page reindex does not call this inside its managed
+        // transaction at all: the batched statement fails in its own statement,
+        // PostgreSQL aborts that transaction there, the page writer rolls it
+        // back and repeats the page per resource, and this function is reached
+        // from that fallback — outside any transaction, where the truncated
+        // retry can succeed. The bundle path (`PostgresTransaction`) does not
+        // write `resource_fts` at all.
         if err.code() != Some(&tokio_postgres::error::SqlState::PROGRAM_LIMIT_EXCEEDED) {
             return Err(internal_error(format!(
                 "Failed to insert FTS content: {}",
@@ -1658,6 +1728,87 @@ impl PostgresBackend {
         )
         .await
         .map_err(|e| internal_error(format!("Failed to insert FTS content: {}", e)))?;
+
+        Ok(())
+    }
+
+    /// Writes a page's full-text rows in consecutive groups of
+    /// [`FTS_BATCH_SIZE`], one statement per group.
+    ///
+    /// `resources` is the page *minus* the resources whose search-parameter
+    /// extraction failed. Those are reported per resource by the caller and
+    /// have no full-text row to rebuild, so this function never has to make an
+    /// error decision: everything it is handed is expected to be written.
+    /// Ordering, the `search_index` row counts, and the error slots all stay
+    /// with the caller too — this writes FTS rows and nothing else.
+    ///
+    /// Groups are consecutive slices of the page rather than a regathering of
+    /// it, so the statement boundaries are a function of the page alone.
+    ///
+    /// The `SearchableContent` for one group is built inside the iteration and
+    /// dropped at the end of it, so the text this holds twice (the resource
+    /// `data` the page already carries, plus the extracted narrative and
+    /// content) is bounded by [`FTS_BATCH_SIZE`] resources rather than by the
+    /// page's length.
+    ///
+    /// A resource whose content is empty is left out of the group's arrays: the
+    /// page's own `DELETE FROM resource_fts` has already removed its row, and
+    /// the row must not come back. A group left holding only such resources
+    /// issues no statement at all.
+    ///
+    /// Every error is returned as it arrives — never truncated, never retried,
+    /// never re-split into smaller groups. The caller treats any error as
+    /// page-fatal and re-runs the page through the per-resource path, which is
+    /// where an input too large for one `to_tsvector` is truncated and where a
+    /// transaction this statement aborted gets rolled back.
+    async fn index_fts_content_batch<C>(
+        &self,
+        client: &C,
+        tenant_id: &str,
+        resources: &[&StoredResource],
+    ) -> StorageResult<()>
+    where
+        C: deadpool_postgres::GenericClient + ?Sized,
+    {
+        if !self.fts_table_exists(client).await? {
+            return Ok(());
+        }
+
+        for group in resources.chunks(FTS_BATCH_SIZE) {
+            let mut resource_types = Vec::with_capacity(group.len());
+            let mut resource_ids = Vec::with_capacity(group.len());
+            let mut narratives = Vec::with_capacity(group.len());
+            let mut full_contents = Vec::with_capacity(group.len());
+
+            for resource in group {
+                let content = extract_searchable_content(resource.content());
+                if content.is_empty() {
+                    continue;
+                }
+                resource_types.push(resource.resource_type().to_string());
+                resource_ids.push(resource.id().to_string());
+                narratives.push(content.narrative);
+                full_contents.push(content.full_content);
+            }
+
+            if resource_types.is_empty() {
+                continue;
+            }
+
+            execute_cached(
+                client,
+                FTS_BATCH_UPSERT_SQL,
+                &[
+                    &tenant_id,
+                    &resource_types,
+                    &resource_ids,
+                    &narratives,
+                    &full_contents,
+                ],
+            )
+            .await
+            .map_err(|e| internal_error(format!("Failed to insert FTS content: {}", e)))?;
+        }
 
         Ok(())
     }
@@ -3996,18 +4147,19 @@ impl ReindexTarget for PostgresBackend {
             );
 
             let fts_span = crate::perf::span(crate::perf::Phase::ReindexFts);
-            for (resource, error) in resources.iter().zip(&extraction_errors) {
-                if error.is_none() {
-                    self.index_fts_content(
-                        &transaction,
-                        tenant_id,
-                        resource.resource_type(),
-                        resource.id(),
-                        resource.content(),
-                    )
-                    .await?;
-                }
-            }
+            // One statement per group of `FTS_BATCH_SIZE` resources, instead of
+            // one per resource: the whole point of this path. The resource ids
+            // are already flattened for the page's `search_index` writes, and
+            // they are unique per page, which is what the statement's
+            // `ON CONFLICT` needs (see `FTS_BATCH_UPSERT_SQL`).
+            let fts_batch: Vec<&StoredResource> = resources
+                .iter()
+                .zip(&extraction_errors)
+                .filter(|(_, error)| error.is_none())
+                .map(|(resource, _)| resource)
+                .collect();
+            self.index_fts_content_batch(&transaction, tenant_id, &fts_batch)
+                .await?;
             drop(fts_span);
             Ok(())
         }
