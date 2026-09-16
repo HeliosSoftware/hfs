@@ -110,9 +110,22 @@ struct Inspection {
     /// Our names that exist but carry a `buildUUID`: someone else is building them.
     in_progress: Vec<String>,
     /// Our names that exist with a different key or partial filter.
-    conflicting: Vec<(String, Document)>,
+    conflicting: Vec<(String, ListedIndex)>,
     /// Superseded generation-1 names still present.
     superseded_present: Vec<String>,
+}
+
+/// One `listIndexes` `firstBatch` entry, normalised to the fields this module
+/// cares about, regardless of whether the server reported it "ready" (fields
+/// at the top level) or "in progress" (fields nested under `spec`, alongside
+/// a top-level `buildUUID` — only reported when the command carries
+/// `includeBuildUUIDs: true`). See [`listed_indexes`].
+#[derive(Debug, Clone, PartialEq)]
+struct ListedIndex {
+    name: String,
+    key: Document,
+    partial: Option<Document>,
+    in_progress: bool,
 }
 
 pub(super) struct SearchIndexBuilder {
@@ -282,35 +295,14 @@ impl SearchIndexBuilder {
             }
             Err(e) => return Err(e.into()),
         };
-        let existing: Vec<Document> = match reply
-            .get_document("cursor")
-            .ok()
-            .and_then(|c| c.get_array("firstBatch").ok())
-        {
-            Some(batch) => batch
-                .iter()
-                .filter_map(|b| b.as_document().cloned())
-                .collect(),
-            // A reply with no `cursor.firstBatch` is not "no indexes exist" —
-            // treating it that way would silently skip the conflict check and
-            // re-issue a full build. Fail loudly instead.
-            None => {
-                return Err(StorageError::Backend(BackendError::Internal {
-                    backend_name: "mongodb".to_string(),
-                    message: format!(
-                        "listIndexes reply for {SEARCH_INDEX_COLLECTION} had no cursor.firstBatch: {reply:?}"
-                    ),
-                    source: None,
-                }));
-            }
-        };
+        let existing = listed_indexes(&reply)?;
 
         let mut inspection = Inspection::default();
         for spec in generation2_specs()
             .into_iter()
             .filter(|s| s.build == IndexBuild::Background)
         {
-            match existing.iter().find(|d| d.get_str("name") == Ok(spec.name)) {
+            match existing.iter().find(|d| d.name == spec.name) {
                 None => inspection.missing.push(spec),
                 Some(actual) => {
                     // Numeric literals from mongosh land as doubles even when
@@ -318,25 +310,21 @@ impl SearchIndexBuilder {
                     // normalise before comparing so a pre-built database
                     // (e.g. from the shipped mongosh script) is never
                     // reported as a conflict.
-                    let same_keys = actual.get_document("key").ok().map(normalize_numbers)
-                        == Some(normalize_numbers(&spec.keys));
-                    let same_partial = actual
-                        .get_document("partialFilterExpression")
-                        .ok()
-                        .map(normalize_numbers)
+                    let same_keys = normalize_numbers(&actual.key) == normalize_numbers(&spec.keys);
+                    let same_partial = actual.partial.as_ref().map(normalize_numbers)
                         == spec.partial.as_ref().map(normalize_numbers);
                     if !(same_keys && same_partial) {
                         inspection
                             .conflicting
                             .push((spec.name.to_string(), actual.clone()));
-                    } else if actual.contains_key("buildUUID") {
+                    } else if actual.in_progress {
                         inspection.in_progress.push(spec.name.to_string());
                     }
                 }
             }
         }
         for v1 in superseded_v1_specs() {
-            if existing.iter().any(|d| d.get_str("name") == Ok(v1.name)) {
+            if existing.iter().any(|d| d.name == v1.name) {
                 inspection.superseded_present.push(v1.name.to_string());
             }
         }
@@ -350,6 +338,70 @@ impl SearchIndexBuilder {
 /// finished one and the wait loop in `run_inner` never fires.
 fn list_indexes_command() -> Document {
     doc! { "listIndexes": SEARCH_INDEX_COLLECTION, "includeBuildUUIDs": true }
+}
+
+/// Normalises every `cursor.firstBatch` entry of a `listIndexes` reply
+/// (issued with `includeBuildUUIDs: true`, see [`list_indexes_command`]) into
+/// a [`ListedIndex`].
+///
+/// A finished index reports `name`/`key`/`partialFilterExpression` at the
+/// entry's top level. An index whose build is still running reports none of
+/// those at the top level at all — instead they are nested under a `spec`
+/// sub-document, alongside a top-level `buildUUID`:
+/// `{ "spec": { "v": 2, "key": {...}, "name": "...", "partialFilterExpression": {...} }, "buildUUID": <uuid> }`.
+/// Reading `name`/`key` from the entry's top level unconditionally — as an
+/// earlier version of this function did — silently misses every in-progress
+/// index (it never matches its catalog spec by name, so it is reported
+/// `missing` instead of `in_progress`), which left the wait loop in
+/// `run_inner` dead code.
+fn listed_indexes(reply: &Document) -> StorageResult<Vec<ListedIndex>> {
+    let no_first_batch = || {
+        StorageError::Backend(BackendError::Internal {
+            backend_name: "mongodb".to_string(),
+            message: format!(
+                "listIndexes reply for {SEARCH_INDEX_COLLECTION} had no cursor.firstBatch: {reply:?}"
+            ),
+            source: None,
+        })
+    };
+    let batch = reply
+        .get_document("cursor")
+        .ok()
+        .and_then(|c| c.get_array("firstBatch").ok())
+        .ok_or_else(no_first_batch)?;
+
+    let mut out = Vec::with_capacity(batch.len());
+    for entry in batch.iter().filter_map(|b| b.as_document()) {
+        let (source, in_progress) = match entry.get_document("spec") {
+            Ok(spec) => (spec, entry.contains_key("buildUUID")),
+            Err(_) => (entry, false),
+        };
+        let no_field = |field: &str| {
+            StorageError::Backend(BackendError::Internal {
+                backend_name: "mongodb".to_string(),
+                message: format!(
+                    "listIndexes entry for {SEARCH_INDEX_COLLECTION} had no {field}: {entry:?}"
+                ),
+                source: None,
+            })
+        };
+        let name = source
+            .get_str("name")
+            .map_err(|_| no_field("name"))?
+            .to_string();
+        let key = source
+            .get_document("key")
+            .map_err(|_| no_field("key"))?
+            .clone();
+        let partial = source.get_document("partialFilterExpression").ok().cloned();
+        out.push(ListedIndex {
+            name,
+            key,
+            partial,
+            in_progress,
+        });
+    }
+    Ok(out)
 }
 
 /// Recursively converts `Int32`/`Int64` values to `Double`, so a catalog spec
@@ -395,5 +447,70 @@ mod builder_tests {
         let ints = doc! { "a": 1_i32, "b": { "c": 2_i64 } };
         let doubles = doc! { "a": 1.0, "b": { "c": 2.0 } };
         assert_eq!(normalize_numbers(&ints), normalize_numbers(&doubles));
+    }
+
+    #[test]
+    fn listed_indexes_normalises_ready_in_progress_and_legacy_shapes() {
+        let reply = doc! {
+            "cursor": {
+                "firstBatch": [
+                    // A finished index: fields at the entry's top level.
+                    {
+                        "v": 2,
+                        "key": { "tenant_id": 1 },
+                        "name": "idx_search_string_v2",
+                        "partialFilterExpression": { "value_string": { "$exists": true } },
+                    },
+                    // An in-progress build (only reported this way because
+                    // the command carries `includeBuildUUIDs: true`): fields
+                    // nested under `spec`, no top-level name/key at all.
+                    {
+                        "spec": {
+                            "v": 2,
+                            "key": { "tenant_id": 1 },
+                            "name": "idx_search_date_v2",
+                        },
+                        "buildUUID": "test-build-uuid",
+                    },
+                    // A superseded generation-1 index: also top-level fields.
+                    {
+                        "v": 2,
+                        "key": { "tenant_id": 1 },
+                        "name": "idx_search_string",
+                    },
+                ],
+            },
+        };
+
+        let listed = listed_indexes(&reply).expect("listed_indexes");
+        assert_eq!(
+            listed,
+            vec![
+                ListedIndex {
+                    name: "idx_search_string_v2".to_string(),
+                    key: doc! { "tenant_id": 1 },
+                    partial: Some(doc! { "value_string": { "$exists": true } }),
+                    in_progress: false,
+                },
+                ListedIndex {
+                    name: "idx_search_date_v2".to_string(),
+                    key: doc! { "tenant_id": 1 },
+                    partial: None,
+                    in_progress: true,
+                },
+                ListedIndex {
+                    name: "idx_search_string".to_string(),
+                    key: doc! { "tenant_id": 1 },
+                    partial: None,
+                    in_progress: false,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn listed_indexes_errors_loudly_without_cursor_first_batch() {
+        let reply = doc! { "ok": 1.0 };
+        assert!(listed_indexes(&reply).is_err());
     }
 }
