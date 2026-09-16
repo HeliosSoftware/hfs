@@ -7766,6 +7766,379 @@ mod postgres_integration {
         );
     }
 
+    /// #1140: one page must reach `resource_fts` in `ceil(n / 100)` statements,
+    /// not one statement per resource.
+    ///
+    /// The page's `search_index` writes are already batched; the full-text
+    /// upsert was still one statement — and so one extra round trip — per
+    /// resource, inside the same page transaction. Counting the writes needs a
+    /// trigger, and a trigger is DDL, so this runs on a database of its own: a
+    /// `BEFORE INSERT … FOR EACH STATEMENT` trigger on `resource_fts` counts
+    /// each `INSERT` statement the page writer issues — 100 for a hundred
+    /// resources before this change, 1 after it, and 2 for a hundred and one.
+    ///
+    /// The probe is installed after seeding, so the `create` calls that build
+    /// each corpus contribute nothing to it and every delta measured below is
+    /// the page writer's own statements. The bystander tenant holds the same
+    /// first three resource ids as the hundred-resource tenant with different
+    /// narratives, so losing the tenant predicate in the batched delete or the
+    /// batched upsert changes its row count or its vectors.
+    #[tokio::test]
+    async fn postgres_integration_reindex_page_batches_fts_writes_by_hundreds() {
+        use helios_persistence::search::{ReindexSource, ReindexTarget};
+
+        let (backend, dbname) = isolated_reindex_backend().await;
+        let client = reindex_test_client_for(&dbname).await;
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let table_name = format!("fts_statement_probe_{suffix}");
+        let function_name = format!("count_fts_statements_{suffix}");
+        let trigger_name = format!("count_fts_statements_{suffix}");
+
+        let hundred = create_tenant("reindex-page-fts-hundred");
+        let hundred_one = create_tenant("reindex-page-fts-hundred-one");
+        let bystander = create_tenant("reindex-page-fts-bystander");
+        // Every resource carries a term of its own, so a row's two vectors can
+        // be tied to that resource's content rather than to the page's.
+        let marker_for = |id: &str| {
+            format!(
+                "marker{}",
+                id.strip_prefix("fts-batch-")
+                    .expect("test ids are fts-batch-NNN")
+            )
+        };
+        let patient = |id: &str, family: &str| {
+            json!({
+                "resourceType": "Patient",
+                "id": id,
+                "name": [{"family": family}],
+                "text": {
+                    "status": "generated",
+                    "div": format!(
+                        "<div>narrative for {family} {id} {}</div>",
+                        marker_for(id)
+                    )
+                }
+            })
+        };
+
+        for index in 0..101 {
+            let id = format!("fts-batch-{index:03}");
+            if index < 100 {
+                backend
+                    .create(
+                        &hundred,
+                        "Patient",
+                        patient(&id, "Able"),
+                        FhirVersion::default(),
+                    )
+                    .await
+                    .unwrap();
+            }
+            backend
+                .create(
+                    &hundred_one,
+                    "Patient",
+                    patient(&id, "Baker"),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+        for index in 0..3 {
+            let id = format!("fts-batch-{index:03}");
+            backend
+                .create(
+                    &bystander,
+                    "Patient",
+                    patient(&id, "Bystander"),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+
+        async fn fts_snapshot(
+            client: &tokio_postgres::Client,
+            tenant_id: &str,
+        ) -> Vec<(String, String, String)> {
+            client
+                .query(
+                    "SELECT resource_id, narrative_tsvector::text, content_tsvector::text
+                     FROM resource_fts WHERE tenant_id = $1 ORDER BY resource_id",
+                    &[&tenant_id],
+                )
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|row| (row.get(0), row.get(1), row.get(2)))
+                .collect()
+        }
+        let bystander_before = fts_snapshot(&client, bystander.tenant_id().as_str()).await;
+        assert_eq!(bystander_before.len(), 3);
+
+        client
+            .batch_execute(&format!(
+                "CREATE TABLE {table_name} (id bigserial PRIMARY KEY);
+                 CREATE FUNCTION {function_name}() RETURNS trigger LANGUAGE plpgsql AS $$
+                 BEGIN
+                   INSERT INTO {table_name} DEFAULT VALUES;
+                   RETURN NULL;
+                 END $$;
+                 CREATE TRIGGER {trigger_name} BEFORE INSERT ON resource_fts
+                 FOR EACH STATEMENT EXECUTE FUNCTION {function_name}();"
+            ))
+            .await
+            .unwrap();
+
+        for (tenant, expected_statements) in [(&hundred, 1i64), (&hundred_one, 2i64)] {
+            let tenant_id = tenant.tenant_id().as_str();
+            let page = backend
+                .fetch_resources_page(tenant, "Patient", None, 200)
+                .await
+                .unwrap();
+            let page_size = page.resources.len() as i64;
+            assert!(
+                page_size == 100 || page_size == 101,
+                "unexpected page size {page_size}"
+            );
+
+            let before: i64 = client
+                .query_one(&format!("SELECT COUNT(*) FROM {table_name}"), &[])
+                .await
+                .unwrap()
+                .get(0);
+            let results = backend
+                .write_search_entries_page(tenant, &page.resources)
+                .await;
+            let after: i64 = client
+                .query_one(&format!("SELECT COUNT(*) FROM {table_name}"), &[])
+                .await
+                .unwrap()
+                .get(0);
+
+            assert_eq!(results.len(), page.resources.len());
+            assert!(
+                results.iter().all(Result::is_ok),
+                "page write must succeed for every resource"
+            );
+            assert_eq!(
+                after - before,
+                expected_statements,
+                "a page of {page_size} resources must write resource_fts in \
+                 {expected_statements} statement(s)"
+            );
+
+            // One row per id, rather than a shorter or duplicated page.
+            let rows: i64 = client
+                .query_one(
+                    "SELECT COUNT(*) FROM resource_fts
+                     WHERE tenant_id = $1 AND resource_type = 'Patient'",
+                    &[&tenant_id],
+                )
+                .await
+                .unwrap()
+                .get(0);
+            let distinct_ids: i64 = client
+                .query_one(
+                    "SELECT COUNT(DISTINCT resource_id) FROM resource_fts
+                     WHERE tenant_id = $1 AND resource_type = 'Patient'",
+                    &[&tenant_id],
+                )
+                .await
+                .unwrap()
+                .get(0);
+            assert_eq!(rows, page_size, "one FTS row per page resource");
+            assert_eq!(distinct_ids, page_size, "one FTS row per resource id");
+
+            // And every row's vectors must be that row's own. `own_marker` is
+            // planted in exactly one resource's narrative — which its full
+            // content also carries, since the narrative is appended to it —
+            // while `other_marker` belongs to the next resource on the page, so
+            // a row that took its content from a neighbour fails one leg or the
+            // other. The count is the number of page ids for which both
+            // columns answer their own marker and neither answers the other's.
+            let ids: Vec<String> = page
+                .resources
+                .iter()
+                .map(|resource| resource.id().to_string())
+                .collect();
+            let own_markers: Vec<String> = ids.iter().map(|id| marker_for(id)).collect();
+            let other_markers: Vec<String> = (0..ids.len())
+                .map(|index| own_markers[(index + 1) % own_markers.len()].clone())
+                .collect();
+            let verified: i64 = client
+                .query_one(
+                    "SELECT COUNT(*)
+                     FROM unnest($1::text[], $2::text[], $3::text[])
+                          AS expected(resource_id, own_marker, other_marker)
+                     JOIN resource_fts fts
+                       ON fts.tenant_id = $4 AND fts.resource_type = 'Patient'
+                      AND fts.resource_id = expected.resource_id
+                     WHERE fts.narrative_tsvector @@ plainto_tsquery('english', expected.own_marker)
+                       AND fts.content_tsvector @@ plainto_tsquery('english', expected.own_marker)
+                       AND NOT (fts.narrative_tsvector @@ plainto_tsquery('english', expected.other_marker))
+                       AND NOT (fts.content_tsvector @@ plainto_tsquery('english', expected.other_marker))",
+                    &[&ids, &own_markers, &other_markers, &tenant_id],
+                )
+                .await
+                .unwrap()
+                .get(0);
+            assert_eq!(
+                verified, page_size,
+                "every row must carry its own content in both vectors, and no \
+                 other page resource's content in either"
+            );
+        }
+
+        assert_eq!(
+            fts_snapshot(&client, bystander.tenant_id().as_str()).await,
+            bystander_before,
+            "a page write must not touch another tenant's full-text rows"
+        );
+
+        client
+            .batch_execute(&format!(
+                "DROP TRIGGER {trigger_name} ON resource_fts;
+                 DROP FUNCTION {function_name}();
+                 DROP TABLE {table_name};"
+            ))
+            .await
+            .unwrap();
+    }
+
+    /// The batched writer must leave the *same* full-text row as the
+    /// per-resource writer, and both must be reachable through the public
+    /// `_text` / `_content` searches.
+    ///
+    /// Comparing the two `tsvector` columns as text is the strong form of
+    /// "equivalent": a row can exist with the right shape — right tenant, right
+    /// resource — and still carry a different vector (a different text search
+    /// configuration, the content in the narrative column, no tokenisation at
+    /// all). The searches then pin that the vectors mean what they are supposed
+    /// to mean: the narrative term answers `_text`, the term that exists only
+    /// outside the narrative answers `_content`, and it does not answer `_text`.
+    #[tokio::test]
+    async fn postgres_integration_reindex_page_fts_batch_matches_individual_writer() {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::search::{ReindexSource, ReindexTarget};
+        use helios_persistence::types::{
+            SearchParamType, SearchParameter, SearchQuery, SearchValue,
+        };
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("reindex-page-fts-equivalence");
+        let tenant_id = tenant.tenant_id().as_str();
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({
+                    "resourceType": "Patient",
+                    "id": "fts-equivalence",
+                    "text": {
+                        "status": "generated",
+                        "div": "<div>Narrative mentions xanthochromia.</div>"
+                    },
+                    "name": [{"family": "Marshmallow"}]
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+
+        let page = backend
+            .fetch_resources_page(&tenant, "Patient", None, 10)
+            .await
+            .unwrap();
+        assert_eq!(page.resources.len(), 1);
+        let stored = &page.resources[0];
+
+        let client = reindex_test_client().await;
+        async fn vectors(client: &tokio_postgres::Client, tenant_id: &str) -> (String, String) {
+            let row = client
+                .query_one(
+                    "SELECT narrative_tsvector::text, content_tsvector::text FROM resource_fts
+                     WHERE tenant_id = $1 AND resource_type = 'Patient'
+                       AND resource_id = 'fts-equivalence'",
+                    &[&tenant_id],
+                )
+                .await
+                .expect("exactly one FTS row for the resource");
+            (row.get(0), row.get(1))
+        }
+        async fn hits(
+            backend: &PostgresBackend,
+            tenant: &TenantContext,
+            param_name: &str,
+            term: &str,
+        ) -> Vec<String> {
+            let query = SearchQuery::new("Patient").with_parameter(SearchParameter {
+                name: param_name.to_string(),
+                param_type: SearchParamType::Special,
+                modifier: None,
+                values: vec![SearchValue::eq(term)],
+                chain: vec![],
+                components: vec![],
+            });
+            backend
+                .search(tenant, &query)
+                .await
+                .expect("full-text search should succeed")
+                .resources
+                .items
+                .iter()
+                .map(|resource| resource.id().to_string())
+                .collect()
+        }
+        async fn assert_searchable(backend: &PostgresBackend, tenant: &TenantContext) {
+            assert_eq!(
+                hits(backend, tenant, "_text", "xanthochromia").await,
+                vec!["fts-equivalence".to_string()],
+                "_text must find the narrative term"
+            );
+            assert_eq!(
+                hits(backend, tenant, "_content", "marshmallow").await,
+                vec!["fts-equivalence".to_string()],
+                "_content must find the term that only exists outside the narrative"
+            );
+            assert!(
+                hits(backend, tenant, "_text", "marshmallow")
+                    .await
+                    .is_empty(),
+                "the narrative column must not carry the rest of the resource"
+            );
+        }
+
+        // `create` wrote a row too, but from the in-memory `Value`; the writers
+        // below re-derive their input from the `jsonb` round-tripped row, whose
+        // object keys come back in a different order, and `to_tsvector`
+        // positions follow that order. So `create`'s row is a positive control
+        // that the resource is findable, not a byte-comparable reference.
+        assert_searchable(&backend, &tenant).await;
+
+        // The per-resource writer is the reference, because it is what the
+        // fallback runs when the page transaction fails.
+        backend
+            .write_search_entries(&tenant, stored)
+            .await
+            .expect("per-resource reindex write");
+        let individual = vectors(&client, tenant_id).await;
+        assert_searchable(&backend, &tenant).await;
+
+        // The page writer must land on the same row, byte for byte.
+        let results = backend
+            .write_search_entries_page(&tenant, std::slice::from_ref(stored))
+            .await;
+        assert_eq!(results.len(), 1);
+        assert!(results[0].is_ok(), "page write must succeed");
+        let batched = vectors(&client, tenant_id).await;
+        assert_eq!(
+            batched, individual,
+            "the batched writer must leave the row the per-resource writer leaves"
+        );
+        assert_searchable(&backend, &tenant).await;
+    }
+
     #[tokio::test]
     async fn postgres_integration_reindex_page_failure_releases_single_connection_pool() {
         use helios_persistence::search::{ReindexSource, ReindexTarget};
@@ -7959,6 +8332,19 @@ mod postgres_integration {
         assert_eq!(error_count["valueInteger"], json!(1));
     }
 
+    /// A page whose middle resource fails search-parameter extraction still
+    /// reports the failure in its original slot, and the page commits the rest.
+    ///
+    /// An extraction failure is a per-resource verdict, not a page failure: the
+    /// caller filters that resource out of the `search_index` and full-text
+    /// inserts before either statement is built, so nothing aborts, nothing
+    /// falls back, and the resources on either side of it are written by the
+    /// batched path as usual. The page's `DELETE FROM resource_fts` still
+    /// covers every resource on the page, so the failed resource's stale row is
+    /// gone rather than left behind — which is what an extraction failure has
+    /// to mean for full-text search. A resource whose extracted content is
+    /// empty, on the other hand, is written by that batched path and simply
+    /// gets no row back.
     #[tokio::test]
     async fn postgres_integration_reindex_page_handles_empty_and_extraction_failure() {
         use helios_persistence::search::ReindexTarget;
@@ -7974,6 +8360,17 @@ mod postgres_integration {
                 .is_empty()
         );
 
+        let before_error = StoredResource::new(
+            "Patient",
+            "before-error",
+            tenant.tenant_id().clone(),
+            json!({
+                "resourceType": "Patient",
+                "id": "before-error",
+                "name": [{"family": "BeforeError"}]
+            }),
+            FhirVersion::default(),
+        );
         let invalid = StoredResource::new(
             "Patient",
             "invalid-extraction",
@@ -7988,6 +8385,17 @@ mod postgres_integration {
             json!({}),
             FhirVersion::default(),
         );
+        let after_error = StoredResource::new(
+            "Patient",
+            "after-error",
+            tenant.tenant_id().clone(),
+            json!({
+                "resourceType": "Patient",
+                "id": "after-error",
+                "name": [{"family": "AfterError"}]
+            }),
+            FhirVersion::default(),
+        );
         let client = reindex_test_client().await;
         client
             .execute(
@@ -7998,22 +8406,37 @@ mod postgres_integration {
             )
             .await
             .unwrap();
-        client
-            .execute(
-                "INSERT INTO resource_fts
-                 (tenant_id, resource_type, resource_id, narrative_tsvector, content_tsvector)
-                 VALUES ($1, 'Patient', 'empty-fts', to_tsvector('english', 'stale'), to_tsvector('english', 'stale'))",
-                &[&tenant_id],
-            )
-            .await
-            .unwrap();
+        for resource_id in ["invalid-extraction", "empty-fts"] {
+            client
+                .execute(
+                    "INSERT INTO resource_fts
+                     (tenant_id, resource_type, resource_id, narrative_tsvector, content_tsvector)
+                     VALUES ($1, 'Patient', $2, to_tsvector('english', 'stale'), to_tsvector('english', 'stale'))",
+                    &[&tenant_id, &resource_id],
+                )
+                .await
+                .unwrap();
+        }
 
         let results = backend
-            .write_search_entries_page(&tenant, &[invalid, empty_fts])
+            .write_search_entries_page(&tenant, &[before_error, invalid, empty_fts, after_error])
             .await;
-        assert_eq!(results.len(), 2);
-        assert!(results[0].is_err());
-        assert!(results[1].is_ok());
+        assert_eq!(results.len(), 4);
+        assert!(results[0].is_ok(), "the resource before the failure");
+        let error = results[1]
+            .as_ref()
+            .expect_err("the mismatched resource type must fail extraction");
+        assert!(
+            error
+                .to_string()
+                .contains("Search parameter extraction failed"),
+            "the extraction failure must be reported as itself: {error}"
+        );
+        assert!(
+            results[2].is_ok(),
+            "the resource with no searchable content"
+        );
+        assert!(results[3].is_ok(), "the resource after the failure");
 
         let stale_count: i64 = client
             .query_one(
@@ -8024,17 +8447,27 @@ mod postgres_integration {
             .await
             .unwrap()
             .get(0);
-        let empty_fts_count: i64 = client
-            .query_one(
-                "SELECT COUNT(*) FROM resource_fts
-                 WHERE tenant_id = $1 AND resource_id = 'empty-fts'",
-                &[&tenant_id],
-            )
-            .await
-            .unwrap()
-            .get(0);
         assert_eq!(stale_count, 0);
-        assert_eq!(empty_fts_count, 0);
+        for (resource_id, expected_fts_rows) in [
+            ("invalid-extraction", 0),
+            ("empty-fts", 0),
+            ("before-error", 1),
+            ("after-error", 1),
+        ] {
+            let fts_rows: i64 = client
+                .query_one(
+                    "SELECT COUNT(*) FROM resource_fts
+                     WHERE tenant_id = $1 AND resource_id = $2",
+                    &[&tenant_id, &resource_id],
+                )
+                .await
+                .unwrap()
+                .get(0);
+            assert_eq!(
+                fts_rows, expected_fts_rows,
+                "unexpected full-text rows for {resource_id}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -8096,6 +8529,31 @@ mod postgres_integration {
 
         assert_eq!(results.len(), 3);
         for (resource, result) in page.resources.iter().zip(results) {
+            // The page's writes all rolled back, so both tables start clean for
+            // every resource on it: the two the fallback reindexed end with one
+            // full-text row, and the one it could not write ends with none.
+            let expected_fts_rows: i64 = if resource.id() == "fallback-fail" {
+                0
+            } else {
+                1
+            };
+            let fts_rows: i64 = client
+                .query_one(
+                    "SELECT COUNT(*) FROM resource_fts
+                     WHERE tenant_id = $1 AND resource_type = 'Patient'
+                       AND resource_id = $2",
+                    &[&tenant_id, &resource.id()],
+                )
+                .await
+                .unwrap()
+                .get(0);
+            assert_eq!(
+                fts_rows,
+                expected_fts_rows,
+                "unexpected full-text rows for {}",
+                resource.id()
+            );
+
             if resource.id() == "fallback-fail" {
                 assert!(result.is_err());
             } else {
@@ -8115,18 +8573,30 @@ mod postgres_integration {
         }
     }
 
+    /// A resource too large for one `tsvector` aborts the batched statement —
+    /// `to_tsvector` refuses it and Postgres has already killed the page
+    /// transaction — so the page must fall back to the per-resource writer,
+    /// which truncates the input, and the truncated row must be the *first*
+    /// `FTS_MAX_INPUT_BYTES` of the text.
+    ///
+    /// The pool holds one connection on purpose: the fallback can only run if
+    /// the page released the client before abandoning it, and a pool this size
+    /// turns that obligation into either a timeout or a pass rather than a
+    /// second connection quietly covering for it.
     #[tokio::test]
     async fn postgres_integration_reindex_page_retries_oversized_fts_individually() {
         use helios_persistence::search::ReindexTarget;
         use helios_persistence::types::StoredResource;
 
-        let backend = create_backend().await;
+        let (backend, dbname) = isolated_reindex_backend_with_max_connections(1).await;
         let tenant = create_tenant("reindex-page-oversized-fts");
         let tenant_id = tenant.tenant_id().as_str();
-        let text = (0..100_000)
+        let lexemes: Vec<String> = (0..100_000)
             .map(|index| format!("lexeme{index:08x}"))
-            .collect::<Vec<_>>()
-            .join(" ");
+            .collect();
+        let early = lexemes[0].clone();
+        let late = lexemes[99_999].clone();
+        let text = lexemes.join(" ");
         let resource = StoredResource::new(
             "Patient",
             "oversized-fts",
@@ -8139,24 +8609,46 @@ mod postgres_integration {
             FhirVersion::default(),
         );
 
-        let results = backend
-            .write_search_entries_page(&tenant, &[resource])
-            .await;
+        let results = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            backend.write_search_entries_page(&tenant, &[resource]),
+        )
+        .await
+        .expect("the oversized fallback must not deadlock a one-connection pool");
         assert_eq!(results.len(), 1);
-        assert!(results[0].is_ok());
+        assert!(
+            results[0].is_ok(),
+            "the per-resource retry must index a truncated row: {:?}",
+            results[0].as_ref().err().map(ToString::to_string)
+        );
 
-        let client = reindex_test_client().await;
-        let fts_rows: i64 = client
-            .query_one(
-                "SELECT COUNT(*) FROM resource_fts
+        let client = reindex_test_client_for(&dbname).await;
+        let rows: Vec<(bool, bool, bool, bool)> = client
+            .query(
+                "SELECT narrative_tsvector @@ plainto_tsquery('english', $2),
+                        content_tsvector @@ plainto_tsquery('english', $2),
+                        narrative_tsvector @@ plainto_tsquery('english', $3),
+                        content_tsvector @@ plainto_tsquery('english', $3)
+                 FROM resource_fts
                  WHERE tenant_id = $1 AND resource_type = 'Patient'
                    AND resource_id = 'oversized-fts'",
-                &[&tenant_id],
+                &[&tenant_id, &early, &late],
             )
             .await
             .unwrap()
-            .get(0);
-        assert_eq!(fts_rows, 1);
+            .into_iter()
+            .map(|row| (row.get(0), row.get(1), row.get(2), row.get(3)))
+            .collect();
+        assert_eq!(rows.len(), 1, "the retry must leave exactly one FTS row");
+        let (early_narrative, early_content, late_narrative, late_content) = rows[0];
+        assert!(
+            early_narrative && early_content,
+            "both vectors must carry the start of the input"
+        );
+        assert!(
+            !late_narrative && !late_content,
+            "neither vector may carry text past the truncation point"
+        );
     }
 
     #[tokio::test]
