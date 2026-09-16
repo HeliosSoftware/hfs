@@ -762,13 +762,21 @@ impl MongoBackend {
 
     /// Resolves one server-side page of `_contained` matches over
     /// `idx_search_contained` (#1059): `$match` in the index's key order,
-    /// `$group` by the container and, for `_containedType=contained`, the
-    /// local id (read from the index keys) — grouping by container alone
-    /// for the default `_containedType=container` so one container is one
-    /// slot, `_total` counts containers, and a page cannot straddle a
-    /// container with multiple internal matches — then `$sort` for a stable
-    /// page order, then `$skip`/`$limit`, with a `$facet` count alongside
-    /// when `_total` is requested.
+    /// then a two-stage grouping (#1059 review N1). The first `$group` is
+    /// always per contained *entity* — `{ rtype, rid, lid }` — because a
+    /// multi-parameter AND (the `names: $all` `$match` that follows it) must
+    /// hold within one contained entity, not across every entity a container
+    /// happens to hold: grouping straight to the container would let one
+    /// contained Patient matching `name=Smith` and a different contained
+    /// Patient matching `gender=male` in the same container satisfy
+    /// `name=Smith&gender=male` together, which is wrong. Only for the
+    /// default `_containedType=container` is there a second `$group`, which
+    /// collapses the surviving per-entity slots down to one slot per
+    /// container (dropping `lid`) so a container is one page slot, `_total`
+    /// counts containers, and a page cannot straddle a container with
+    /// multiple internal matches. Then `$sort` for a stable page order, then
+    /// `$skip`/`$limit`, with a `$facet` count alongside when `_total` is
+    /// requested.
     #[allow(clippy::too_many_arguments)]
     async fn matching_contained(
         &self,
@@ -812,17 +820,6 @@ impl MongoBackend {
             });
         }
 
-        let group_id = match contained_return {
-            ContainedReturn::Container => doc! {
-                "rtype": "$resource_type",
-                "rid": "$resource_id",
-            },
-            ContainedReturn::Contained => doc! {
-                "rtype": "$resource_type",
-                "rid": "$resource_id",
-                "lid": "$contained_local_id",
-            },
-        };
         let mut pipeline = vec![
             doc! { "$match": {
                 "tenant_id": tenant_id,
@@ -830,15 +827,32 @@ impl MongoBackend {
                 "is_contained": true,
                 "$or": branches,
             }},
+            // Always per entity: the AND below must hold within one
+            // contained resource, not across every entity a container holds.
             doc! { "$group": {
-                "_id": group_id,
+                "_id": {
+                    "rtype": "$resource_type",
+                    "rid": "$resource_id",
+                    "lid": "$contained_local_id",
+                },
                 "names": { "$addToSet": "$param_name" },
             }},
         ];
         if distinct_names.len() > 1 {
             pipeline.push(doc! { "$match": { "names": { "$all": distinct_names } } });
         }
-        pipeline.push(doc! { "$sort": { "_id.rtype": 1, "_id.rid": 1, "_id.lid": 1 } });
+        let sort = match contained_return {
+            ContainedReturn::Container => {
+                // Collapse the surviving per-entity slots to one per
+                // container now that the per-entity AND has been applied.
+                pipeline.push(doc! { "$group": {
+                    "_id": { "rtype": "$_id.rtype", "rid": "$_id.rid" },
+                }});
+                doc! { "_id.rtype": 1, "_id.rid": 1 }
+            }
+            ContainedReturn::Contained => doc! { "_id.rtype": 1, "_id.rid": 1, "_id.lid": 1 },
+        };
+        pipeline.push(doc! { "$sort": sort });
         let page_stages = vec![
             doc! { "$skip": offset as i64 },
             doc! { "$limit": limit as i64 },

@@ -3567,6 +3567,96 @@ async fn mongodb_integration_contained_container_with_two_matches_counts_once() 
     assert_eq!(ids, vec!["p1", "p2", "p3"]);
 }
 
+/// #1059 review N1: a multi-parameter AND must hold within one contained
+/// entity, not across every entity a container happens to hold.
+#[tokio::test]
+async fn mongodb_integration_contained_multi_parameter_and_is_per_contained_entity() {
+    use helios_persistence::types::{ContainedMode, ContainedReturn};
+    let Some(backend) = create_backend_with_full_registry("contained_multi_param_per_entity").await
+    else {
+        eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
+        return;
+    };
+    let tenant = create_tenant("tenant-contained-multi-param");
+
+    // `split`: the two conditions (name=Smith, gender=male) are each
+    // satisfied, but by DIFFERENT contained Patients — must NOT match.
+    backend
+        .create(
+            &tenant,
+            "Observation",
+            json!({
+                "resourceType": "Observation", "id": "split", "status": "final",
+                "subject": { "reference": "#a" },
+                "contained": [
+                    { "resourceType": "Patient", "id": "a", "name": [{ "family": "Smith" }], "gender": "female" },
+                    { "resourceType": "Patient", "id": "b", "name": [{ "family": "Jones" }], "gender": "male" }
+                ]
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    // `whole`: one contained Patient satisfies BOTH conditions — must match.
+    backend
+        .create(
+            &tenant,
+            "Observation",
+            json!({
+                "resourceType": "Observation", "id": "whole", "status": "final",
+                "subject": { "reference": "#c" },
+                "contained": [
+                    { "resourceType": "Patient", "id": "c", "name": [{ "family": "Smith" }], "gender": "male" }
+                ]
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+
+    let query = |contained_return: ContainedReturn| {
+        let mut q = SearchQuery::new("Patient")
+            .with_parameter(SearchParameter {
+                name: "name".into(),
+                param_type: SearchParamType::String,
+                modifier: None,
+                values: vec![SearchValue::eq("Smith")],
+                chain: vec![],
+                components: vec![],
+            })
+            .with_parameter(SearchParameter {
+                name: "gender".into(),
+                param_type: SearchParamType::Token,
+                modifier: None,
+                values: vec![SearchValue::eq("male")],
+                chain: vec![],
+                components: vec![],
+            });
+        q.contained = ContainedMode::On;
+        q.contained_return = contained_return;
+        q.total = Some(TotalMode::Accurate);
+        q
+    };
+
+    // Container return: only `whole`, never `split`.
+    let r = backend
+        .search(&tenant, &query(ContainedReturn::Container))
+        .await
+        .unwrap();
+    let urls: Vec<String> = r.resources.items.iter().map(|x| x.url()).collect();
+    assert_eq!(urls, vec!["Observation/whole"]);
+    assert_eq!(r.total, Some(1));
+
+    // Contained return: only Patient `c`, the one entity that actually
+    // matches both parameters.
+    let r = backend
+        .search(&tenant, &query(ContainedReturn::Contained))
+        .await
+        .unwrap();
+    assert_eq!(r.resources.items.len(), 1);
+    assert_eq!(r.resources.items[0].id(), "c");
+}
+
 #[tokio::test]
 async fn mongodb_integration_contained_both_pages_across_the_top_level_boundary() {
     use helios_persistence::types::ContainedMode;
