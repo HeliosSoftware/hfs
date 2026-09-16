@@ -657,11 +657,15 @@ impl ResourceStorage for SqliteBackend {
         .map_err(|e| internal_error(format!("Failed to insert deletion history: {}", e)))?;
 
         // Delete search index entries (skip when search is offloaded). Keyed on
-        // resource_key so it rides idx_search_composite; the soft-delete keeps
+        // resource_key. The tenant_id/resource_type prefix is required for the
+        // delete to seek idx_search_composite instead of full-scanning
+        // search_index (see delete_search_index, #1197); the soft-delete keeps
         // the resources row, so the subquery resolves.
         if !self.is_search_offloaded() {
             conn.execute(
-                "DELETE FROM search_index WHERE resource_key = (
+                "DELETE FROM search_index
+                  WHERE tenant_id = ?1 AND resource_type = ?2
+                    AND resource_key = (
                      SELECT rowid FROM resources
                       WHERE tenant_id = ?1 AND resource_type = ?2 AND id = ?3
                  )",
@@ -1834,15 +1838,22 @@ impl SqliteBackend {
             return Ok(0);
         }
 
-        // Delete from main search index, keyed on the integer `resource_key`
-        // so the delete rides `idx_search_composite` (rekeyed to resource_key
-        // in v31) instead of scanning the type. Every caller of this method
-        // deletes while the `resources` row still exists (update, re-index,
-        // soft-delete), so the subquery resolves; the purge path, which removes
-        // the `resources` row first, deletes by `resource_id` inline instead.
+        // Delete from main search index by resource_key. The `tenant_id` and
+        // `resource_type` equality prefix is load-bearing, not redundant with
+        // the subquery: `idx_search_composite` leads with
+        // `(tenant_id, resource_type, resource_key, …)`, so a predicate on
+        // `resource_key` alone cannot use it and SQLite falls back to a full
+        // scan of `search_index` — O(rows) per delete, which is O(rows) per
+        // resource UPDATE and per re-indexed resource (#1197). With the prefix
+        // the delete is a covering seek. Every caller runs while the `resources`
+        // row still exists (update, re-index, soft-delete), so the subquery
+        // resolves; the purge path removes `resources` first and deletes by
+        // `resource_id` inline instead.
         let deleted = conn
             .prepare_cached(
-                "DELETE FROM search_index WHERE resource_key = (
+                "DELETE FROM search_index
+                  WHERE tenant_id = ?1 AND resource_type = ?2
+                    AND resource_key = (
                      SELECT rowid FROM resources
                       WHERE tenant_id = ?1 AND resource_type = ?2 AND id = ?3
                  )",
