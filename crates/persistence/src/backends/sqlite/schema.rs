@@ -1405,7 +1405,10 @@ fn migrate_v28_to_v29(conn: &Connection) -> StorageResult<()> {
 fn migrate_v29_to_v30(conn: &Connection) -> StorageResult<()> {
     // SQLite has no `ADD COLUMN IF NOT EXISTS`; ignore a duplicate-column error
     // so the ladder is replay-safe (see `migrate_v10_to_v11`).
-    let _ = conn.execute("ALTER TABLE search_index ADD COLUMN resource_key INTEGER", []);
+    let _ = conn.execute(
+        "ALTER TABLE search_index ADD COLUMN resource_key INTEGER",
+        [],
+    );
     conn.execute_batch(
         "UPDATE search_index
             SET resource_key = (
