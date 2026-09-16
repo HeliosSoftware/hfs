@@ -74,6 +74,7 @@ pub mod reindex;
 pub mod seeder;
 pub mod tenant_registries;
 pub mod text_fold;
+pub mod uri;
 pub mod writer;
 
 // Re-export main types
@@ -100,4 +101,5 @@ pub use seeder::{
 };
 pub use tenant_registries::{StoredParamLoader, TenantSearchRegistries};
 pub use text_fold::fold_text;
+pub use uri::compute_parent_uris;
 pub use writer::SearchIndexWriter;
