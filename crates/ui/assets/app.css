@@ -3191,6 +3191,114 @@ details.json-fold[open] > summary .icon {
   overflow-wrap: anywhere;
 }
 
+/* Result id chip (#1106): long ids never wrap past one line — the label
+   shows an 8-character prefix and the full id stays the link's accessible
+   name (see .visually-hidden usage in saved-queries.js). */
+.query-results__table .col-id {
+  white-space: nowrap;
+  vertical-align: middle;
+}
+
+.query-results__table .result-id {
+  display: inline-flex;
+  flex-direction: row;
+  align-items: center;
+  height: 20px;
+  padding: 0 7px;
+  border-radius: 6px;
+  background: var(--muted-soft);
+  color: var(--muted-text);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11px;
+  white-space: nowrap;
+  text-decoration: none;
+}
+
+.query-results__table .result-id:hover {
+  color: var(--text-strong);
+}
+
+.query-results__table .result-id:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* Visible id text inside the chip (#1106): the rest of an abbreviated id
+   lives in a sibling .visually-hidden node, so this span carries the id's
+   own no-wrap contract rather than relying on the chip around it. */
+.query-results__table .result-id__text {
+  white-space: nowrap;
+  overflow-wrap: normal;
+}
+
+/* Copy-id button and its "Copied" confirmation pill (#1106), clipboard-gated
+   so a browser without the Clipboard API never renders either. */
+.result-id-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.result-id__copy {
+  width: 22px;
+  height: 22px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+}
+
+tr:hover .result-id__copy,
+.result-id__copy:hover,
+.result-id__copy:focus-visible {
+  border-color: var(--surface-border);
+  background: var(--surface);
+  color: var(--text);
+}
+
+.result-id__copy:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.result-id__copied {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: 20px;
+  padding: 0 7px;
+  border-radius: 999px;
+  background: var(--ok-soft);
+  color: var(--ok);
+  font-size: 11px;
+  font-weight: 600;
+}
+
+/* Single-line result cells (#1106): every data cell clips at the same width
+   as `.data-table .col-name` so rows stay a uniform height regardless of
+   content length; the full value surfaces in the shared tooltip
+   (resource-filter.js) on hover and, for the id, on keyboard focus. */
+.query-results__table td {
+  vertical-align: middle;
+}
+
+.query-results__table .result-cell {
+  display: block;
+  max-width: 240px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.query-results__table .result-cell.url {
+  overflow-wrap: normal;
+}
+
 .table-foot {
   display: flex;
   flex-wrap: wrap;

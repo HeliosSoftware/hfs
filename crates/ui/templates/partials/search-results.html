@@ -8,6 +8,8 @@
          data-msg-included="{{ i18n.t_arg("queries-results-included", "count", "{count}".to_string()) }}"
          data-msg-empty="{{ i18n.t("queries-results-empty") }}"
          data-msg-updated="{{ i18n.t("queries-col-updated") }}"
+         data-msg-copy-id="{{ i18n.t("queries-copy-id") }}"
+         data-msg-copied="{{ i18n.t("queries-copied") }}"
          data-msg-fetch-error="{{ i18n.t_arg("queries-results-fetch-error", "origin", "{origin}".to_string()) }}">
   <div class="query-results__head">
     <h2 class="query-group__type">{{ i18n.t("queries-results") }}</h2>
@@ -25,7 +27,7 @@
     </label>
   </div>
   <div class="table-wrap">
-    <table class="data-table">
+    <table class="data-table query-results__table" data-row-navigation>
       <thead id="query-results-head"></thead>
       <tbody id="query-results-body"></tbody>
     </table>
