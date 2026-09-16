@@ -11,7 +11,8 @@ use serde_json::Value;
 
 use crate::core::{Transaction, TransactionOptions, TransactionProvider};
 use crate::error::{
-    BackendError, ConcurrencyError, ResourceError, StorageError, StorageResult, TransactionError,
+    BackendError, ConcurrencyError, QueryErrorExt, ResourceError, StorageError, StorageResult,
+    TransactionError,
 };
 use crate::search::SearchParameterExtractor;
 use crate::tenant::{Operation, TenantContext};
@@ -708,8 +709,8 @@ impl Transaction for PostgresTransaction {
                 &fhir_version_str,
             ],
         )
-            .await
-            .map_err(|e| internal_error(format!("Failed to update resource: {}", e)))?;
+        .await
+        .or_query_error("Failed to update resource")?;
 
         if updated == 0 {
             // The statement matched nothing because the row is missing,
@@ -723,7 +724,7 @@ impl Transaction for PostgresTransaction {
                 &[&tenant_id, &resource_type, &id],
             )
             .await
-            .map_err(|e| internal_error(format!("Failed to get current version: {}", e)))?;
+            .or_query_error("Failed to get current version")?;
 
             return match actual {
                 Some(row) => Err(StorageError::Concurrency(
