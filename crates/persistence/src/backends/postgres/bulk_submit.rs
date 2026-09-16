@@ -743,21 +743,25 @@ impl BulkSubmitProvider for PostgresBackend {
             ));
         }
 
-        // Update manifest status to processing, on a client scoped to this one
-        // statement.
+        // Promote a pending manifest to processing, on a client scoped to this
+        // one statement.
         //
-        // `status IN ('pending', 'processing')` keeps it a promotion rather
-        // than a reset: the statement runs on *every* batch, so without the
-        // guard the batch that lands right after `abort_submission` moved the
-        // manifest to `'failed'` would quietly put it back to `'processing'`
-        // and the abort would read as if it had never happened (#968).
+        // `status = 'pending'` makes this the promotion of the first batch and
+        // nothing else. The shared engine runs the statement on *every* batch,
+        // both in synchronous `process_entries` calls and in the lease-holding
+        // worker that reaches it through `process_ndjson_stream`, and once the
+        // manifest is `processing` the later batches must leave the column
+        // alone instead of rewriting the value it already has. Every other
+        // state, whether `failed` after `abort_submission` moved the manifest,
+        // `replaced`, or any terminal status, matches nothing, so an abort
+        // cannot read as if it had never happened (#968).
         {
             let client = self.get_client().await?;
             client
                 .execute(
                     "UPDATE bulk_manifests SET status = 'processing'
                      WHERE tenant_id = $1 AND submitter = $2 AND submission_id = $3 AND manifest_id = $4
-                       AND status IN ('pending', 'processing')",
+                       AND status = 'pending'",
                     &[
                         &tenant_id,
                         &submission_id.submitter.as_str(),
