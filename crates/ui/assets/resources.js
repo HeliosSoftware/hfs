@@ -305,11 +305,14 @@
    * public URL, which may include a path prefix or tenant segment. Use the
    * trusted resource identity attached by saved-queries.js instead of parsing
    * that deployment-specific URL. The results live in the content column, not
-   * under `root` (the type panel), so the listener is on the document. */
+   * under `root` (the type panel), so the listener is on the document.
+   * row-navigation.js (#1106) turns a click anywhere in the row into a click
+   * on this id link, so this capture-phase interceptor opens the modal for
+   * whole-row clicks too. */
   document.addEventListener(
     "click",
     function (event) {
-      var link = event.target.closest("#query-results-body a.url");
+      var link = event.target.closest("#query-results-body a.result-id");
       if (!link) return;
       var type = link.dataset.resourceType || "";
       var id = link.dataset.resourceId || "";
