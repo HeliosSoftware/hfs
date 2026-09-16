@@ -1748,12 +1748,7 @@ fn wire_reindex(
 
 /// Builds the deferred bulk-submit hook using the existing submit-worker
 /// concurrency as the per-process automatic reindex limit.
-#[cfg(any(
-    feature = "sqlite",
-    feature = "postgres",
-    feature = "mongodb",
-    feature = "elasticsearch"
-))]
+#[cfg(feature = "mongodb")]
 fn automatic_reindex_hook(
     op: Arc<ReindexOperation>,
     config: &ServerConfig,

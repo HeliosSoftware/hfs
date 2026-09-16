@@ -217,7 +217,7 @@ impl QueryBuilder {
         // Base conditions: tenant and resource type
         // These always use ?1 and ?2 since they're shared with the outer query
         // Projects `resource_key` (the integer surrogate), not `resource_id`:
-        // with the v30 composite index `(tenant_id, resource_type, resource_key,
+        // with the v31 composite index `(tenant_id, resource_type, resource_key,
         // …)`, selecting and filtering on `resource_key` keeps this wrapper a
         // covering-index seek. The outer query compares it to `resources.rowid`.
         let mut base = SqlFragment::new(
