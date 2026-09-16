@@ -3223,6 +3223,14 @@ details.json-fold[open] > summary .icon {
   outline-offset: 2px;
 }
 
+/* Visible id text inside the chip (#1106): the rest of an abbreviated id
+   lives in a sibling .visually-hidden node, so this span carries the id's
+   own no-wrap contract rather than relying on the chip around it. */
+.query-results__table .result-id__text {
+  white-space: nowrap;
+  overflow-wrap: normal;
+}
+
 /* Copy-id button and its "Copied" confirmation pill (#1106), clipboard-gated
    so a browser without the Clipboard API never renders either. */
 .result-id-group {
