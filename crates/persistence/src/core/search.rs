@@ -444,6 +444,35 @@ pub trait SearchProvider: ResourceStorage {
         let _ = param_type;
         Vec::new()
     }
+
+    /// Makes every write this storage acknowledged before the call visible
+    /// to a subsequent [`search`](Self::search) of the given resource types.
+    ///
+    /// A search normally reads whatever the index holds *now*; for most
+    /// callers that is the right trade. A caller that resolves a write
+    /// against existing content — a transaction's conditional reference
+    /// (`Organization?identifier=…`), an `If-None-Exist` create — needs the
+    /// index to reflect the writes the server already returned `201` for,
+    /// or it rejects a legitimate request with a misleading "matches no
+    /// existing resource" (#1047). Such a caller invokes this first.
+    ///
+    /// Backends whose index is written in the same transaction as the
+    /// resource (SQLite, PostgreSQL, MongoDB) are consistent by construction
+    /// and keep the default no-op. Elasticsearch refreshes the named indices
+    /// so documents it has acknowledged become searchable without waiting for
+    /// the refresh interval. A composite first drains its asynchronous sync
+    /// queue up to this point, then delegates to its search backend.
+    ///
+    /// The cost is paid only by callers that ask for it, and only for the
+    /// types they name; plain searches are untouched.
+    async fn ensure_writes_visible(
+        &self,
+        tenant: &TenantContext,
+        resource_types: &[&str],
+    ) -> StorageResult<()> {
+        let _ = (tenant, resource_types);
+        Ok(())
+    }
 }
 
 /// Search provider that supports searching across multiple resource types.

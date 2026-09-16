@@ -2458,6 +2458,143 @@ mod es_integration {
         assert_eq!(result.resources.items[0].id(), "raw-composite-1");
     }
 
+    /// #1047: a lookup that resolves a write against existing content (a
+    /// transaction's conditional reference, an `If-None-Exist` create) must
+    /// see every write the composite has already acknowledged, whatever the
+    /// Elasticsearch write-refresh policy. This is the default policy
+    /// (`false`) with a refresh interval long enough that the index cannot
+    /// catch up on its own during the test: the lookup has to ask.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn es_integration_composite_conditional_lookups_see_unrefreshed_writes() {
+        use std::collections::HashMap;
+
+        use helios_persistence::backends::sqlite::SqliteBackend;
+        use helios_persistence::composite::{
+            CompositeConfig, CompositeStorage, DynSearchProvider, DynStorage, SyncMode,
+        };
+        use helios_persistence::core::{
+            ConditionalCreateResult, ConditionalStorage, SearchProvider,
+        };
+        use helios_persistence::types::{
+            SearchParamType, SearchParameter, SearchQuery, SearchValue,
+        };
+
+        let es = shared_es().await;
+        let unique_prefix = format!("hfs_{}", uuid::Uuid::new_v4().simple());
+        let es_config = ElasticsearchConfig {
+            nodes: vec![format!("http://{}:{}", es.host, es.port)],
+            index_prefix: unique_prefix,
+            number_of_replicas: 0,
+            refresh_interval: "30s".to_string(),
+            write_refresh: WriteRefreshPolicy::False,
+            ..Default::default()
+        };
+        let es_backend = Arc::new(
+            ElasticsearchBackend::with_shared_registry(es_config, build_search_registry())
+                .expect("create ES backend"),
+        );
+        es_backend
+            .initialize()
+            .await
+            .expect("initialize ES backend");
+
+        // The production shape: the primary's own index is offloaded to ES.
+        let mut sqlite = SqliteBackend::in_memory().expect("create SQLite backend");
+        sqlite.set_search_offloaded(true);
+        let sqlite = Arc::new(sqlite);
+        sqlite.init_schema().expect("init SQLite schema");
+
+        let composite_config = CompositeConfig::builder()
+            .primary("sqlite", BackendKind::Sqlite)
+            .search_backend("es", BackendKind::Elasticsearch)
+            .sync_mode(SyncMode::Synchronous)
+            .build()
+            .expect("build composite config");
+
+        let mut backends: HashMap<String, DynStorage> = HashMap::new();
+        backends.insert("sqlite".to_string(), sqlite.clone() as DynStorage);
+        backends.insert("es".to_string(), es_backend.clone() as DynStorage);
+
+        let mut search_providers: HashMap<String, DynSearchProvider> = HashMap::new();
+        search_providers.insert("sqlite".to_string(), sqlite.clone() as DynSearchProvider);
+        search_providers.insert("es".to_string(), es_backend.clone() as DynSearchProvider);
+
+        let composite = CompositeStorage::new(composite_config, backends)
+            .expect("create composite storage")
+            .with_search_providers(search_providers)
+            .with_full_primary(sqlite);
+
+        let tenant = create_tenant("unrefreshed-composite-tenant");
+        let organization = json!({
+            "resourceType": "Organization",
+            "identifier": [{"system": "urn:zzz:probe", "value": "ORG-PROBE-1047"}],
+            "name": "ZZZ Probe Org"
+        });
+        let created = composite
+            .create(
+                &tenant,
+                "Organization",
+                organization.clone(),
+                FhirVersion::default(),
+            )
+            .await
+            .expect("create through composite");
+
+        // `If-None-Exist` right after the create: the same criteria a
+        // transaction's conditional reference carries.
+        let outcome = composite
+            .conditional_create(
+                &tenant,
+                "Organization",
+                organization,
+                "identifier=urn:zzz:probe|ORG-PROBE-1047",
+                FhirVersion::default(),
+            )
+            .await
+            .expect("conditional create through composite");
+        match outcome {
+            ConditionalCreateResult::Exists(existing) => {
+                assert_eq!(existing.id(), created.id());
+            }
+            ConditionalCreateResult::Created(_) => {
+                panic!("conditional create missed the Organization created moments earlier")
+            }
+            ConditionalCreateResult::MultipleMatches(n) => panic!("unexpected {n} matches"),
+        }
+
+        // The primitive the transaction path uses, then the lookup it runs.
+        composite
+            .ensure_writes_visible(&tenant, &["Organization"])
+            .await
+            .expect("ensure_writes_visible through composite");
+        let query = SearchQuery::new("Organization").with_parameter(SearchParameter {
+            name: "identifier".to_string(),
+            param_type: SearchParamType::Token,
+            modifier: None,
+            values: vec![SearchValue::token(Some("urn:zzz:probe"), "ORG-PROBE-1047")],
+            chain: vec![],
+            components: vec![],
+        });
+        let result = composite
+            .search(&tenant, &query)
+            .await
+            .expect("search through composite");
+        assert_eq!(
+            result.resources.items.len(),
+            1,
+            "an acknowledged write must be searchable after ensure_writes_visible, \
+             without waiting for the refresh interval"
+        );
+        assert_eq!(result.resources.items[0].id(), created.id());
+
+        // A type with no index yet is not an error: nothing was written to it.
+        composite
+            .ensure_writes_visible(&tenant, &["Location"])
+            .await
+            .expect("refreshing a type with no index yet is a no-op");
+    }
+
     /// `create_many` is one `_bulk` request per batch, so under
     /// `refresh=wait_for` a batch pays one refresh wait — not one per
     /// document. With a 5s refresh interval, 40 per-document writes would

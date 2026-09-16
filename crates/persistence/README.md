@@ -1434,6 +1434,19 @@ immediate follow-up search misses the write. The `hfs` binary exposes these as
 `HFS_ELASTICSEARCH_WRITE_REFRESH` (see the
 [hfs README](../hfs/README.md#environment-variables)).
 
+That window applies to *client* searches. Server-side lookups that resolve a
+write against existing content do not inherit it: a transaction Bundle's
+conditional references (`"reference": "Organization?identifier=…"`) and the
+composite's conditional create/update/delete (`If-None-Exist`,
+`PUT [type]?[criteria]`) first call
+`SearchProvider::ensure_writes_visible` for the types they name. The composite
+drains its asynchronous sync queue up to that point, then the Elasticsearch
+backend refreshes those indices (a no-op under `WaitFor`/`True`, where the
+write was already searchable when it returned). A resource the server has
+acknowledged is therefore always found by such a lookup, on every sync mode
+and every `write_refresh` setting, and the cost is paid only by requests that
+carry such criteria (#1047).
+
 #### Very large resources on Elasticsearch-backed composites
 
 Every indexed search-parameter value is a nested object in the resource's
