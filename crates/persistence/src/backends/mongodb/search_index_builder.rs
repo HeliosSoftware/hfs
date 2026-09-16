@@ -524,7 +524,7 @@ fn classify_spec(spec: &SearchIndexSpec, actual: &ListedIndex) -> SpecStatus {
     let same_keys = normalize_numbers(&actual.key) == normalize_numbers(&spec.keys);
     let same_partial = actual.partial.as_ref().map(normalize_numbers)
         == spec.partial.as_ref().map(normalize_numbers);
-    if !(same_keys && same_partial) || !actual.extra_options.is_empty() {
+    if !(same_keys && same_partial && actual.extra_options.is_empty()) {
         SpecStatus::Conflicting
     } else if actual.in_progress {
         SpecStatus::InProgress
