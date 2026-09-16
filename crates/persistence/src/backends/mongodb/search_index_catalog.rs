@@ -183,9 +183,6 @@ pub(crate) fn superseded_v1_specs() -> Vec<SearchIndexSpec> {
 
 /// The indexes of `search_index_contained`. Created inline at boot: contained
 /// resources are rare, so the collection is small on every deployment.
-// Only this module's tests call it in this task; `schema.rs` starts creating
-// these inline in a later #1160 task.
-#[allow(dead_code)]
 pub(crate) fn contained_specs() -> Vec<SearchIndexSpec> {
     vec![
         // Same keys as the generation-2 partial index minus `is_contained`

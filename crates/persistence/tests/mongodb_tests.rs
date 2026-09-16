@@ -11530,6 +11530,17 @@ async fn mongodb_integration_boot_creates_only_inline_search_indexes_and_keeps_g
         vec!["_id_", "idx_search_composite", "idx_search_resource"]
     );
 
+    // Generation 3: the contained collection gets its two indexes inline too.
+    let contained_names = index_names(&db, "search_index_contained").await;
+    assert_eq!(
+        contained_names,
+        vec![
+            "_id_",
+            "idx_search_contained",
+            "idx_search_contained_resource"
+        ]
+    );
+
     // A record written by the builder must survive the next boot.
     db.collection::<Document>("schema_version")
         .update_one(
@@ -11555,28 +11566,21 @@ async fn mongodb_integration_boot_creates_only_inline_search_indexes_and_keeps_g
     );
 }
 
-/// Sorted index names on `search_index`, from a raw `listIndexes`.
-async fn search_index_names(db: &mongodb::Database) -> Vec<String> {
-    let reply = db
-        .run_command(doc! { "listIndexes": "search_index" })
+/// Sorted index names on `collection`. Empty for a missing collection
+/// (`list_index_names` errors rather than returning an empty list there).
+async fn index_names(db: &mongodb::Database, collection: &str) -> Vec<String> {
+    let mut names = db
+        .collection::<Document>(collection)
+        .list_index_names()
         .await
-        .expect("listIndexes");
-    let mut names: Vec<String> = reply
-        .get_document("cursor")
-        .unwrap()
-        .get_array("firstBatch")
-        .unwrap()
-        .iter()
-        .map(|b| {
-            b.as_document()
-                .unwrap()
-                .get_str("name")
-                .unwrap()
-                .to_string()
-        })
-        .collect();
+        .unwrap_or_default();
     names.sort();
     names
+}
+
+/// Sorted index names on `search_index`.
+async fn search_index_names(db: &mongodb::Database) -> Vec<String> {
+    index_names(db, "search_index").await
 }
 
 /// The nine generation-1 value indexes, created the way pre-generation-2

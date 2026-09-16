@@ -10,7 +10,10 @@ use tokio::runtime::RuntimeFlavor;
 use crate::error::{BackendError, StorageError, StorageResult};
 
 use super::backend::MongoBackendConfig;
-use super::search_index_catalog::{IndexBuild, SEARCH_INDEX_COLLECTION, current_specs};
+use super::search_index_catalog::{
+    IndexBuild, SEARCH_INDEX_COLLECTION, SEARCH_INDEX_CONTAINED_COLLECTION, contained_specs,
+    current_specs,
+};
 
 /// Current MongoDB schema version.
 ///
@@ -245,8 +248,9 @@ async fn ensure_history_indexes(database: &Database) -> StorageResult<()> {
 }
 
 /// Creates the `search_index` indexes whose build is cheap enough to await at
-/// boot. Everything else (the generation-2 value indexes and the contained
-/// index) is built by `SearchIndexBuilder` after boot; see the catalog.
+/// boot; the generation-2 value indexes are built by `SearchIndexBuilder`
+/// after boot (see the catalog). The contained collection's two indexes are
+/// small enough to create here, inline, every boot.
 async fn ensure_search_indexes(database: &Database) -> StorageResult<()> {
     let search_index = database.collection::<Document>(SEARCH_INDEX_COLLECTION);
     for spec in current_specs()
@@ -254,6 +258,12 @@ async fn ensure_search_indexes(database: &Database) -> StorageResult<()> {
         .filter(|s| s.build == IndexBuild::Inline)
     {
         search_index.create_index(spec.index_model()).await?;
+    }
+    // Contained rows live in their own, small collection (#1160); both of
+    // its indexes are cheap enough to await at boot.
+    let contained = database.collection::<Document>(SEARCH_INDEX_CONTAINED_COLLECTION);
+    for spec in contained_specs() {
+        contained.create_index(spec.index_model()).await?;
     }
     Ok(())
 }
