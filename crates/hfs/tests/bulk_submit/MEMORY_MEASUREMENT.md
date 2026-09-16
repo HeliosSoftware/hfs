@@ -107,6 +107,17 @@ python3 crates/hfs/tests/bulk_submit/summarize_memory.py \
   target/issue-995/new-series
 ```
 
+The controller serves its own fixtures over loopback. That provider speaks HTTP/1.1
+with keep-alive: the stdlib default, HTTP/1.0, closes the connection after every
+response and was measured to truncate multi-gigabyte bodies — 4-8 files per run
+losing their final 20-130 KB, HFS reporting a reset mid-stream, and the submission
+still reaching `completed` (#1126). A run over a truncated corpus produces clean-looking
+RSS and throughput numbers for input that was never fully delivered, so this is a
+property of the measurement, not a transport detail. `--provider-url` replaces the
+built-in provider with a caller-owned static server rooted at `<output-dir>/fixtures`,
+which the controller probes before measuring and never starts or stops; `run.json`
+records under `config.corpus_provider` which of the two served the corpus.
+
 `--dry-run` prints configuration without launching anything. Each output directory
 must be new. `run.json`, phase/host/RSS/container CSV files, logs and validation
 results remain on failure. A root-managed local trust-auth database was used for

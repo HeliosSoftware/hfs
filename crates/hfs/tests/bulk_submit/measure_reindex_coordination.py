@@ -91,11 +91,24 @@ def parameters_map(resource: Any) -> dict[str, Any]:
     return values
 
 
+class FixtureHandler(http.server.SimpleHTTPRequestHandler):
+    """Static handler pinned to HTTP/1.1.
+
+    ``BaseHTTPRequestHandler`` defaults to ``HTTP/1.0``, which closes the socket
+    after every response; that was measured to truncate NDJSON bodies while the
+    submission still reported ``completed`` (#1126), so a scenario could be
+    scored against a corpus HFS never fully received.  ``Content-Length`` is
+    always sent from ``os.stat``, so keep-alive is framed correctly.  The
+    timeout reaps connections that now outlive their request.
+    """
+
+    protocol_version = "HTTP/1.1"
+    timeout = 300
+
+
 class FixtureServer:
     def __init__(self, root: Path, host: str, port: int) -> None:
-        handler = functools.partial(
-            http.server.SimpleHTTPRequestHandler, directory=str(root)
-        )
+        handler = functools.partial(FixtureHandler, directory=str(root))
         self.server = http.server.ThreadingHTTPServer((host, port), handler)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
 
