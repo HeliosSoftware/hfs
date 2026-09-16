@@ -1475,10 +1475,25 @@ delete was already a no-op the rows accumulated on every run (≥ 11 KB per
 resource). A SQLite row `fetch_resources_page` cannot parse is reported as a
 per-resource error and no longer ends the rebuild of its type.
 
+A manifest ingested with indexing deferred records that it still owes a
+rebuild, in `bulk_manifests.index_pending` (SQLite schema v29), inside the
+transaction that publishes it. `SubmitWorkerStorage::list_manifests_awaiting_reindex`
+is what a restarted server scans to re-fire those rebuilds, and the marker is
+cleared once a generation finishes; backends that do not implement the three
+defaulted methods simply never resume, as before #1125.
+
 The `hfs` binary exposes these as `HFS_ELASTICSEARCH_REQUEST_TIMEOUT_MS`,
-`HFS_ELASTICSEARCH_BULK_MAX_BYTES` and `HFS_ELASTICSEARCH_REINDEX_REFRESH`, and
-the deferred rebuild's page size as `HFS_REINDEX_BATCH_SIZE` (see the
+`HFS_ELASTICSEARCH_BULK_MAX_BYTES`, `HFS_ELASTICSEARCH_BULK_CONCURRENCY` and
+`HFS_ELASTICSEARCH_REINDEX_REFRESH`, and the deferred rebuild's page as
+`HFS_REINDEX_BATCH_SIZE` plus `HFS_REINDEX_BATCH_BYTES` (see the
 [hfs README](../hfs/README.md#environment-variables)).
+
+Measured on `sqlite-elasticsearch` with a 228,580-resource Synthea cut
+(Elasticsearch 8.15, 4 GB heap): the rebuild completes in one generation with
+every Provenance indexed, against `main` losing 2,500 of them and failing
+twice. With `HFS_ELASTICSEARCH_WRITE_REFRESH=wait_for` the rebuild takes 806 s;
+adding `HFS_ELASTICSEARCH_REINDEX_REFRESH=false` takes it to 145 s
+(1,576 resources/s), which is the recommended pair.
 
 ### Cost-Based Optimization
 

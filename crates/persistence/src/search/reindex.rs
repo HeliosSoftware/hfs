@@ -174,6 +174,26 @@ pub trait ReindexSource: Send + Sync {
         limit: u32,
     ) -> StorageResult<ResourcePage>;
 
+    /// Fetches a page bounded by resource count **and** by bytes of stored
+    /// content, so a page of large resources is not one oversized read
+    /// (`max_bytes` of `0` means no byte cap, #1125).
+    ///
+    /// The default ignores the cap, which is what every source did before it
+    /// existed; a source that honours it must still return at least one
+    /// resource, or the page loop cannot advance.
+    async fn fetch_resources_page_capped(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        cursor: Option<&str>,
+        limit: u32,
+        max_bytes: u64,
+    ) -> StorageResult<ResourcePage> {
+        let _ = max_bytes;
+        self.fetch_resources_page(tenant, resource_type, cursor, limit)
+            .await
+    }
+
     /// Fetches the current, non-deleted resources of `resource_type` whose
     /// ids are in `ids`.
     ///
@@ -342,6 +362,16 @@ pub struct ReindexRequest {
     /// paging whole types, so a retry covers only what failed (#1125).
     #[serde(default)]
     pub resource_ids: Option<Vec<ResourceRef>>,
+
+    /// Upper bound, in bytes of stored content, on one page of resources
+    /// (`0` = no cap, only [`Self::batch_size`]).
+    ///
+    /// A page of 1,000 Synthea `Provenance` resources of ~108 KB each is
+    /// ~108 MB held in memory before a single document goes on the wire.
+    /// A source that honours the cap ends the page at the first resource
+    /// that crosses it, and always returns at least one (#1125).
+    #[serde(default)]
+    pub batch_bytes: u64,
 }
 
 fn default_batch_size() -> u32 {
@@ -357,6 +387,7 @@ impl Default for ReindexRequest {
             clear_existing: false,
             bulk_index_rebuild: false,
             resource_ids: None,
+            batch_bytes: 0,
         }
     }
 }
@@ -422,6 +453,12 @@ impl ReindexRequest {
     /// Sets the bulk index rebuild mode (see the field).
     pub fn with_bulk_index_rebuild(mut self, on: bool) -> Self {
         self.bulk_index_rebuild = on;
+        self
+    }
+
+    /// Sets the byte cap of one page (see [`Self::batch_bytes`]).
+    pub fn with_batch_bytes(mut self, bytes: u64) -> Self {
+        self.batch_bytes = bytes;
         self
     }
 }
@@ -749,6 +786,16 @@ impl AutomaticReindexLimits {
     }
 }
 
+/// Where the record of an outstanding deferred rebuild lives, so a restart
+/// mid-rebuild can find it instead of losing it with the in-process job map
+/// (#1125). Implemented by the bulk-submit storage; a backend that does not
+/// record it simply never resumes, as before.
+#[async_trait]
+pub trait DeferredReindexLedger: Send + Sync {
+    /// The rebuild this manifest owed has run: drop the marker.
+    async fn rebuild_finished(&self, tenant: &TenantContext, manifest_id: &str);
+}
+
 /// Shape of the `ReindexRequest` an automatic generation starts with.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct AutomaticRunOptions {
@@ -756,6 +803,8 @@ pub(crate) struct AutomaticRunOptions {
     pub(crate) batch_size: u32,
     /// `ReindexRequest::bulk_index_rebuild` for the runs the hook starts.
     pub(crate) bulk_index_rebuild: bool,
+    /// `ReindexRequest::batch_bytes` for the runs the hook starts.
+    pub(crate) batch_bytes: u64,
 }
 
 impl Default for AutomaticRunOptions {
@@ -763,6 +812,7 @@ impl Default for AutomaticRunOptions {
         Self {
             batch_size: DEFERRED_REINDEX_BATCH_SIZE,
             bulk_index_rebuild: false,
+            batch_bytes: 0,
         }
     }
 }
@@ -779,6 +829,9 @@ struct AutomaticTenantState {
     context: DeferredReindexContext,
     options: AutomaticRunOptions,
     waiting_for_generation: bool,
+    /// Where to clear the "still owes a rebuild" marker once a generation
+    /// finishes (#1125).
+    ledger: Option<Arc<dyn DeferredReindexLedger>>,
 }
 
 #[derive(Default)]
@@ -1278,6 +1331,7 @@ impl GenerationScope {
             Self::Resources(resources) => ReindexRequest::for_resources(resources.clone()),
         }
         .with_batch_size(options.batch_size)
+        .with_batch_bytes(options.batch_bytes)
     }
 
     /// The distinct resource types the generation touches, sorted.
@@ -1410,6 +1464,7 @@ impl AutomaticReindexCoordinator {
         context: DeferredReindexContext,
         options: AutomaticRunOptions,
         max_concurrency: usize,
+        ledger: Option<Arc<dyn DeferredReindexLedger>>,
     ) {
         let requested_types: BTreeSet<_> = resource_types.into_iter().collect();
         if requested_types.is_empty() {
@@ -1426,6 +1481,7 @@ impl AutomaticReindexCoordinator {
                 state.pending_types.extend(requested_types);
                 state.context = context.clone();
                 state.options = options;
+                state.ledger = ledger.clone();
                 tracing::info!(
                     tenant = %tenant_id,
                     submission = ?context.submission_id,
@@ -1449,6 +1505,7 @@ impl AutomaticReindexCoordinator {
                     state.pending_types.extend(requested_types.clone());
                     state.context = context.clone();
                     state.options = options;
+                    state.ledger = ledger.clone();
                     return;
                 }
             }
@@ -1476,6 +1533,7 @@ impl AutomaticReindexCoordinator {
                 state.pending_types.extend(requested_types);
                 state.context = context;
                 state.options = options;
+                state.ledger = ledger;
                 return;
             }
             tenants.insert(
@@ -1484,6 +1542,7 @@ impl AutomaticReindexCoordinator {
                     pending_types: requested_types,
                     context,
                     options,
+                    ledger,
                     ..Default::default()
                 },
             );
@@ -1502,7 +1561,7 @@ impl AutomaticReindexCoordinator {
         _resident_permit: tokio::sync::OwnedSemaphorePermit,
     ) {
         loop {
-            let (scope, generation, context, options) = {
+            let (scope, generation, context, options, ledger) = {
                 let mut tenants = self.tenants.lock().await;
                 let Some(state) = tenants.get_mut(&tenant_id) else {
                     return;
@@ -1528,7 +1587,13 @@ impl AutomaticReindexCoordinator {
                 let generation = state.next_generation;
                 state.next_generation += 1;
                 state.waiting_for_generation = true;
-                (scope, generation, state.context.clone(), state.options)
+                (
+                    scope,
+                    generation,
+                    state.context.clone(),
+                    state.options,
+                    state.ledger.clone(),
+                )
             };
             let resource_types = scope.types();
             let resource_count = scope.resource_count();
@@ -1645,6 +1710,20 @@ impl AutomaticReindexCoordinator {
                 }
             };
             self.tenant_changed.notify_waiters();
+
+            // The rebuild this manifest owed has run — cleanly, or with
+            // resources the backend rejects on every attempt. Either way there
+            // is nothing left for a restart to resume, so the marker goes
+            // (#1125). A failure keeps it: the work is still outstanding.
+            if matches!(
+                outcome,
+                AutomaticGenerationOutcome::Clean
+                    | AutomaticGenerationOutcome::PermanentErrors { .. }
+            ) && let (Some(ledger), Some(manifest_id)) =
+                (&ledger, context.manifest_id.as_deref())
+            {
+                ledger.rebuild_finished(&tenant, manifest_id).await;
+            }
 
             #[cfg(test)]
             if !continue_driver && let Some(barrier) = self.terminal_barrier.lock().await.take() {
@@ -2055,11 +2134,12 @@ async fn run_reindex(
                 // Fetch a page of resources
                 let fetch_span = crate::perf::span(crate::perf::Phase::ReindexFetch);
                 let fetched = source
-                    .fetch_resources_page(
+                    .fetch_resources_page_capped(
                         &tenant,
                         resource_type,
                         cursor.as_deref(),
                         request.batch_size,
+                        request.batch_bytes,
                     )
                     .await;
                 drop(fetch_span);
@@ -2173,6 +2253,10 @@ pub struct ReindexOnFinish {
     max_concurrency: usize,
     /// Request shape for the generations this hook enqueues.
     options: AutomaticRunOptions,
+    /// Clears the persisted "owes a rebuild" marker when a generation ends
+    /// (#1125). `None` keeps the pre-#1125 behaviour: nothing is recorded and
+    /// nothing is resumed.
+    ledger: Option<Arc<dyn DeferredReindexLedger>>,
 }
 
 /// The page the deferred rebuild uses. `ReindexRequest`'s default of 100
@@ -2202,12 +2286,27 @@ impl ReindexOnFinish {
             op,
             max_concurrency: max_concurrency.clamp(1, Semaphore::MAX_PERMITS),
             options: AutomaticRunOptions::default(),
+            ledger: None,
         }
     }
 
     /// Overrides the resources-per-transaction page of the rebuild.
     pub fn with_batch_size(mut self, batch_size: u32) -> Self {
         self.options.batch_size = batch_size.max(1);
+        self
+    }
+
+    /// Records rebuild completion in `ledger`, so an outstanding rebuild is
+    /// discoverable — and resumable — after a restart (#1125).
+    pub fn with_ledger(mut self, ledger: Arc<dyn DeferredReindexLedger>) -> Self {
+        self.ledger = Some(ledger);
+        self
+    }
+
+    /// Caps one page of the rebuild by bytes of stored content as well as by
+    /// resource count (`0` = count only).
+    pub fn with_batch_bytes(mut self, batch_bytes: u64) -> Self {
+        self.options.batch_bytes = batch_bytes;
         self
     }
 
@@ -2235,6 +2334,7 @@ impl ReindexOnFinish {
                 context,
                 self.options,
                 self.max_concurrency,
+                self.ledger.clone(),
             )
             .await;
     }

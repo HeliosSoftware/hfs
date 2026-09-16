@@ -1518,7 +1518,7 @@ async fn start_sqlite(
     let reindex_hook = ops
         .reindex
         .clone()
-        .map(|op| automatic_reindex_hook(op, &config));
+        .map(|op| automatic_reindex_hook_with_ledger(op, &config, Some(backend.clone())));
     let submit_bundle = build_bulk_submit(
         &config,
         backend.clone(),
@@ -1737,14 +1737,28 @@ fn automatic_reindex_hook(
     op: Arc<ReindexOperation>,
     config: &ServerConfig,
 ) -> Arc<dyn helios_persistence::core::DeferredReindexHook> {
-    Arc::new(
-        helios_persistence::search::ReindexOnFinish::with_max_concurrency(
-            op,
-            config.bulk_submit.worker_concurrency as usize,
-        )
-        .with_batch_size(config.reindex_batch_size)
-        .with_bulk_index_rebuild(config.bulk_submit.bulk_index_rebuild),
+    automatic_reindex_hook_with_ledger(op, config, None)
+}
+
+/// The deferred-rebuild hook, plus where to clear the persisted "this manifest
+/// still owes a rebuild" marker when a generation finishes (#1125). Without a
+/// ledger nothing is recorded and a restart cannot resume, as before.
+fn automatic_reindex_hook_with_ledger(
+    op: Arc<ReindexOperation>,
+    config: &ServerConfig,
+    ledger: Option<Arc<dyn helios_persistence::search::DeferredReindexLedger>>,
+) -> Arc<dyn helios_persistence::core::DeferredReindexHook> {
+    let hook = helios_persistence::search::ReindexOnFinish::with_max_concurrency(
+        op,
+        config.bulk_submit.worker_concurrency as usize,
     )
+    .with_batch_size(config.reindex_batch_size)
+    .with_batch_bytes(config.reindex_batch_bytes)
+    .with_bulk_index_rebuild(config.bulk_submit.bulk_index_rebuild);
+    Arc::new(match ledger {
+        Some(ledger) => hook.with_ledger(ledger),
+        None => hook,
+    })
 }
 
 /// Ops bundle for a backend that indexes itself — the standalone deployments
@@ -2095,6 +2109,41 @@ fn spawn_submit_workers(
     if defer_indexing {
         info!("Bulk submit fast-load: search indexing deferred to post-manifest reindex");
     }
+    // #1125: manifests whose rebuild was still outstanding when the server
+    // stopped. The marker is on the manifest row, so it survived; re-firing
+    // the same hook the live path uses keeps one code path.
+    if defer_indexing && let Some(hook) = reindex_hook.clone() {
+        let jobs = jobs.clone();
+        tokio::spawn(async move {
+            match jobs.list_manifests_awaiting_reindex(256).await {
+                Ok(pending) if !pending.is_empty() => {
+                    info!(
+                        manifests = pending.len(),
+                        "resuming search-index rebuilds left outstanding by an earlier run"
+                    );
+                    for manifest in pending {
+                        if manifest.resource_types.is_empty() {
+                            continue;
+                        }
+                        hook.reindex_types_with_context(
+                            &manifest.tenant,
+                            manifest.resource_types,
+                            helios_persistence::core::DeferredReindexContext {
+                                submission_id: Some(manifest.submission.to_string()),
+                                manifest_id: Some(manifest.manifest_id),
+                            },
+                        )
+                        .await;
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    "could not look for search-index rebuilds left outstanding by an earlier run"
+                ),
+            }
+        });
+    }
     let file_concurrency = file_concurrency.max(1) as usize;
     if file_concurrency > 1 {
         info!(
@@ -2240,6 +2289,7 @@ async fn start_sqlite_elasticsearch(
         nested_objects_limit: config.elasticsearch_nested_objects_limit,
         request_timeout_ms: config.elasticsearch_request_timeout_ms,
         bulk_max_bytes: config.elasticsearch_bulk_max_bytes,
+        bulk_concurrency: config.elasticsearch_bulk_concurrency,
         reindex_refresh: es_reindex_refresh_from_config(&config)?,
         ..Default::default()
     };
@@ -2335,7 +2385,7 @@ async fn start_sqlite_elasticsearch(
     let reindex_hook = ops
         .reindex
         .clone()
-        .map(|op| automatic_reindex_hook(op, &config));
+        .map(|op| automatic_reindex_hook_with_ledger(op, &config, Some(sqlite.clone())));
     // Bulk ingestion runs on the SQLite primary's engine, but wrapped so that
     // finished manifests sync their resources into Elasticsearch — the raw
     // primary skips local indexing when search is offloaded, and without the
@@ -2539,6 +2589,7 @@ async fn start_postgres_elasticsearch(
         nested_objects_limit: config.elasticsearch_nested_objects_limit,
         request_timeout_ms: config.elasticsearch_request_timeout_ms,
         bulk_max_bytes: config.elasticsearch_bulk_max_bytes,
+        bulk_concurrency: config.elasticsearch_bulk_concurrency,
         reindex_refresh: es_reindex_refresh_from_config(&config)?,
         ..Default::default()
     };
@@ -2754,6 +2805,7 @@ async fn start_mongodb_elasticsearch(
         nested_objects_limit: config.elasticsearch_nested_objects_limit,
         request_timeout_ms: config.elasticsearch_request_timeout_ms,
         bulk_max_bytes: config.elasticsearch_bulk_max_bytes,
+        bulk_concurrency: config.elasticsearch_bulk_concurrency,
         reindex_refresh: es_reindex_refresh_from_config(&config)?,
         ..Default::default()
     };
@@ -3025,6 +3077,7 @@ async fn start_s3(
                 Arc::new(
                     helios_persistence::search::ReindexOnFinish::new(op)
                         .with_batch_size(config.reindex_batch_size)
+                        .with_batch_bytes(config.reindex_batch_bytes)
                         .with_bulk_index_rebuild(config.bulk_submit.bulk_index_rebuild),
                 ) as Arc<dyn helios_persistence::core::DeferredReindexHook>
             }),
@@ -3171,6 +3224,7 @@ async fn start_s3_elasticsearch(
         nested_objects_limit: config.elasticsearch_nested_objects_limit,
         request_timeout_ms: config.elasticsearch_request_timeout_ms,
         bulk_max_bytes: config.elasticsearch_bulk_max_bytes,
+        bulk_concurrency: config.elasticsearch_bulk_concurrency,
         reindex_refresh: es_reindex_refresh_from_config(&config)?,
         ..Default::default()
     };

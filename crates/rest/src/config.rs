@@ -1165,6 +1165,14 @@ pub struct ServerConfig {
     )]
     pub elasticsearch_bulk_max_bytes: usize,
 
+    /// How many Elasticsearch `_bulk` requests of one page may be in flight
+    /// at once. `1` (the default) sends them one at a time, as every release
+    /// before #1125 did; raising it shortens a rebuild when the cluster is not
+    /// the bottleneck. Splitting after a `413` or a timeout, and `429`
+    /// back-off, stay sequential within the request that caused them.
+    #[arg(long, env = "HFS_ELASTICSEARCH_BULK_CONCURRENCY", default_value = "1")]
+    pub elasticsearch_bulk_concurrency: usize,
+
     /// Refresh behavior for `$reindex` and the deferred post-import rebuild:
     /// "false", "wait_for" or "true". Unset follows
     /// `HFS_ELASTICSEARCH_WRITE_REFRESH`, so "false" lets a rebuild skip the
@@ -1177,6 +1185,14 @@ pub struct ServerConfig {
     /// `batchSize` parameter.
     #[arg(long, env = "HFS_REINDEX_BATCH_SIZE", default_value = "1000")]
     pub reindex_batch_size: u32,
+
+    /// Byte cap of one page of the automatic rebuild, on top of
+    /// `HFS_REINDEX_BATCH_SIZE`. `0` (the default) means count only; with a
+    /// cap set, a page of ~108 KB `Provenance` resources ends at the first one
+    /// that crosses it instead of holding ~108 MB in memory (#1125). Honoured
+    /// by the SQLite source; other sources page by count only.
+    #[arg(long, env = "HFS_REINDEX_BATCH_BYTES", default_value = "0")]
+    pub reindex_batch_bytes: u64,
 
     /// Enable SQL-on-FHIR operations ($sql-run, $sql-export).
     /// When enabled, the configured storage backend MUST provide an in-DB
@@ -1448,8 +1464,10 @@ impl Default for ServerConfig {
             elasticsearch_nested_objects_limit: 50_000,
             elasticsearch_request_timeout_ms: 30_000,
             elasticsearch_bulk_max_bytes: 10 * 1024 * 1024,
+            elasticsearch_bulk_concurrency: 1,
             elasticsearch_reindex_refresh: None,
             reindex_batch_size: 1000,
+            reindex_batch_bytes: 0,
             sof_enabled: true,
             ui_enabled: true,
             dashboard_reconcile_interval_secs: 30,
@@ -1600,6 +1618,9 @@ impl ServerConfig {
             errors.push("Elasticsearch bulk max bytes cannot be 0".to_string());
         }
 
+        if self.elasticsearch_bulk_concurrency == 0 {
+            errors.push("Elasticsearch bulk concurrency cannot be 0".to_string());
+        }
         if self.reindex_batch_size == 0 {
             errors.push("Reindex batch size cannot be 0".to_string());
         }
@@ -1712,8 +1733,10 @@ impl ServerConfig {
             elasticsearch_nested_objects_limit: 50_000,
             elasticsearch_request_timeout_ms: 30_000,
             elasticsearch_bulk_max_bytes: 10 * 1024 * 1024,
+            elasticsearch_bulk_concurrency: 1,
             elasticsearch_reindex_refresh: None,
             reindex_batch_size: 1000,
+            reindex_batch_bytes: 0,
             sof_enabled: true,
             ui_enabled: true,
             dashboard_reconcile_interval_secs: 30,
@@ -2312,6 +2335,8 @@ mod tests {
             assert_eq!(config.elasticsearch_bulk_max_bytes, 10 * 1024 * 1024);
             assert_eq!(config.elasticsearch_reindex_refresh, None);
             assert_eq!(config.reindex_batch_size, 1000);
+            assert_eq!(config.reindex_batch_bytes, 0);
+            assert_eq!(config.elasticsearch_bulk_concurrency, 1);
         }
     }
 

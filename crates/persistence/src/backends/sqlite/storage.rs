@@ -3957,6 +3957,24 @@ impl ReindexSource for SqliteBackend {
         cursor: Option<&str>,
         limit: u32,
     ) -> StorageResult<ResourcePage> {
+        self.fetch_resources_page_capped(tenant, resource_type, cursor, limit, 0)
+            .await
+    }
+
+    /// Pages by resource count and, when `max_bytes` is set, by the bytes of
+    /// stored JSON the page carries: a page of ~108 KB `Provenance` resources
+    /// ends at the first one that crosses the cap instead of holding ~108 MB
+    /// before a single document is written (#1125). At least one resource is
+    /// always returned, so the page loop advances even on a resource larger
+    /// than the cap.
+    async fn fetch_resources_page_capped(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        cursor: Option<&str>,
+        limit: u32,
+        max_bytes: u64,
+    ) -> StorageResult<ResourcePage> {
         let conn = self.get_connection()?;
         let tenant_id = tenant.tenant_id().as_str().to_string();
 
@@ -4013,6 +4031,8 @@ impl ReindexSource for SqliteBackend {
         let mut skipped = Vec::new();
         let mut scanned = 0usize;
         let mut last_scanned: Option<String> = None;
+        let mut bytes = 0u64;
+        let mut capped = false;
         for row in rows {
             // A step error is the database failing, not one row being bad:
             // surface it rather than guess where the next page starts.
@@ -4025,6 +4045,7 @@ impl ReindexSource for SqliteBackend {
             if let (Some(last_updated), Some(id)) = (&row.last_updated, &row.id) {
                 last_scanned = Some(format!("{last_updated}|{id}"));
             }
+            let row_bytes = row.data.as_ref().map_or(0, |data| data.len() as u64);
             match row.decode(tenant, resource_type) {
                 Ok(resource) => resources.push(resource),
                 Err(skip) => {
@@ -4038,12 +4059,20 @@ impl ReindexSource for SqliteBackend {
                     skipped.push(skip);
                 }
             }
+            // Counted after the row is taken, so a page always carries at
+            // least one resource however large it is.
+            bytes = bytes.saturating_add(row_bytes);
+            if max_bytes > 0 && bytes >= max_bytes && scanned < limit as usize {
+                capped = true;
+                break;
+            }
         }
 
-        // A full page means there may be more rows, however many of them
-        // decoded: deciding on `resources.len()` let one unreadable row end
-        // the pagination of its whole type silently.
-        let next_cursor = if limit > 0 && scanned == limit as usize {
+        // A full page, or one the byte cap ended early, means there may be
+        // more rows, however many of them decoded: deciding on
+        // `resources.len()` let one unreadable row end the pagination of its
+        // whole type silently.
+        let next_cursor = if limit > 0 && (capped || scanned == limit as usize) {
             Some(last_scanned.ok_or_else(|| {
                 internal_error(format!(
                     "Cannot page {resource_type}: no row in a full page has a readable id and lastUpdated"
@@ -4833,6 +4862,142 @@ mod tests {
             "{}",
             skipped[1].reason
         );
+    }
+
+    /// #1125: `HFS_REINDEX_BATCH_BYTES` bounds a reindex page by the bytes of
+    /// stored JSON it carries as well as by its resource count, so a page of
+    /// large resources is not one oversized read. Under a cap only one
+    /// resource fits beneath, the scan must still walk the whole type — every
+    /// resource once, no resource twice — and then stop.
+    #[tokio::test]
+    async fn fetch_resources_page_capped_pages_one_resource_at_a_time_under_a_byte_cap() {
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+        for i in 1..=5 {
+            backend
+                .create(
+                    &tenant,
+                    "Patient",
+                    json!({
+                        "resourceType": "Patient",
+                        "id": format!("p{i}"),
+                        "name": [{"family": "Capped"}]
+                    }),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+        // A cap the smallest stored row already reaches on its own: whichever
+        // resource a page starts with ends it.
+        let cap: u64 = {
+            let conn = backend.get_connection().unwrap();
+            conn.query_row(
+                "SELECT MIN(LENGTH(data)) FROM resources \
+                 WHERE tenant_id = ?1 AND resource_type = 'Patient' AND is_deleted = 0",
+                params![tenant.tenant_id().as_str()],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap() as u64
+        };
+        assert!(cap > 0, "precondition: the rows have stored bytes");
+
+        let mut seen = Vec::new();
+        let mut cursor: Option<String> = None;
+        let mut pages = 0;
+        loop {
+            let page = backend
+                .fetch_resources_page_capped(&tenant, "Patient", cursor.as_deref(), 100, cap)
+                .await
+                .unwrap();
+            pages += 1;
+            assert!(pages <= 10, "pagination must terminate");
+            assert!(
+                page.resources.len() <= 1,
+                "the cap admits one resource per page, got {}",
+                page.resources.len()
+            );
+            seen.extend(page.resources.iter().map(|r| r.id().to_string()));
+            match page.next_cursor {
+                Some(next) => cursor = Some(next),
+                None => break,
+            }
+        }
+
+        seen.sort();
+        assert_eq!(
+            seen,
+            ["p1", "p2", "p3", "p4", "p5"],
+            "every resource is returned exactly once across the capped pages"
+        );
+
+        // `0` is the cap switched off: the same rows come back as one page.
+        let whole = backend
+            .fetch_resources_page_capped(&tenant, "Patient", None, 100, 0)
+            .await
+            .unwrap();
+        assert_eq!(whole.resources.len(), 5);
+        assert!(whole.next_cursor.is_none());
+    }
+
+    /// #1125: the bytes are counted *after* the row is taken, so a resource
+    /// larger than the cap is still returned. A page that refused it would be
+    /// empty, and the reindex loop would either stop early or ask for the same
+    /// page forever.
+    #[tokio::test]
+    async fn fetch_resources_page_capped_returns_a_resource_larger_than_the_cap() {
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({
+                    "resourceType": "Patient",
+                    "id": "big",
+                    "name": [{"family": "X".repeat(20_000)}]
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType": "Patient", "id": "small"}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+
+        // Two bytes: below every row, the oversized one included.
+        let mut seen = Vec::new();
+        let mut cursor: Option<String> = None;
+        let mut pages = 0;
+        loop {
+            let page = backend
+                .fetch_resources_page_capped(&tenant, "Patient", cursor.as_deref(), 100, 2)
+                .await
+                .unwrap();
+            pages += 1;
+            assert!(pages <= 4, "pagination must terminate");
+            if seen.len() < 2 {
+                assert_eq!(
+                    page.resources.len(),
+                    1,
+                    "page {pages} is empty: a resource over the cap was refused"
+                );
+            }
+            seen.extend(page.resources.iter().map(|r| r.id().to_string()));
+            match page.next_cursor {
+                Some(next) => cursor = Some(next),
+                None => break,
+            }
+        }
+
+        seen.sort();
+        assert_eq!(seen, ["big", "small"]);
     }
 
     /// The SQLite writer drops its value indexes on `begin` and has every one

@@ -147,6 +147,16 @@ pub struct ElasticsearchConfig {
     #[serde(default = "default_bulk_max_bytes")]
     pub bulk_max_bytes: usize,
 
+    /// How many `_bulk` requests of one page may be in flight at once
+    /// (default: 1, one request at a time).
+    ///
+    /// Requests of a page never touch the same document, so they can be sent
+    /// together; what stays sequential is the chain a request produces — its
+    /// halves after a `413` or a timeout, and its `429` resends. Raising this
+    /// shortens a rebuild on a cluster that is not the bottleneck (#1125).
+    #[serde(default = "default_bulk_concurrency")]
+    pub bulk_concurrency: usize,
+
     /// Refresh behavior for `$reindex` and the deferred rebuild's `_bulk`
     /// writes (default: `None`, which follows [`Self::write_refresh`]).
     ///
@@ -204,6 +214,14 @@ fn default_bulk_max_bytes() -> usize {
     DEFAULT_BULK_MAX_BYTES
 }
 
+/// Default for [`ElasticsearchConfig::bulk_concurrency`]: one request at a
+/// time, which is what every release before #1125 did.
+pub const DEFAULT_BULK_CONCURRENCY: usize = 1;
+
+fn default_bulk_concurrency() -> usize {
+    DEFAULT_BULK_CONCURRENCY
+}
+
 impl Default for ElasticsearchConfig {
     fn default() -> Self {
         Self {
@@ -217,6 +235,7 @@ impl Default for ElasticsearchConfig {
             nested_objects_limit: default_nested_objects_limit(),
             request_timeout_ms: default_request_timeout_ms(),
             bulk_max_bytes: default_bulk_max_bytes(),
+            bulk_concurrency: default_bulk_concurrency(),
             reindex_refresh: None,
             auth: None,
             disable_certificate_validation: false,
@@ -431,6 +450,11 @@ impl ElasticsearchBackend {
     /// The client's per-request timeout, as configured.
     pub(crate) fn request_timeout_ms(&self) -> u64 {
         self.config.request_timeout_ms
+    }
+
+    /// How many `_bulk` requests of one page may be in flight, never below 1.
+    pub(crate) fn bulk_concurrency(&self) -> usize {
+        self.config.bulk_concurrency.max(1)
     }
 
     /// Returns the per-tenant search parameter registries (shared base + tenant

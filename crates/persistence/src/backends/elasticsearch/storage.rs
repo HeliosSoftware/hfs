@@ -6,7 +6,10 @@
 
 use std::collections::VecDeque;
 use std::ops::Range;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
+
+use futures::StreamExt;
 
 use async_trait::async_trait;
 use chrono::Utc;
@@ -1525,228 +1528,281 @@ impl ElasticsearchBackend {
             }
         }
 
-        let mut queue: VecDeque<Batch> =
-            chunk_ranges(&sizes, BULK_OPS_PER_REQUEST, self.bulk_max_bytes())
-                .into_iter()
-                .map(|range| Batch {
-                    ops: sendable[range].to_vec(),
+        let roots: Vec<Batch> = chunk_ranges(&sizes, BULK_OPS_PER_REQUEST, self.bulk_max_bytes())
+            .into_iter()
+            .map(|range| Batch {
+                ops: sendable[range].to_vec(),
+                resends: 0,
+                depth: 0,
+            })
+            .collect();
+
+        // Requests of one page never touch the same document, so they may go
+        // out together. What has to stay sequential is the chain a request
+        // produces: its halves, its back-off resends and the order they are
+        // sent in. So each root chunk gets its own queue, and
+        // `HFS_ELASTICSEARCH_BULK_CONCURRENCY` says how many of those chains
+        // are in flight (default `1` — one request at a time, as before).
+        let concurrency = self.bulk_concurrency().clamp(1, roots.len().max(1));
+        // A single document timing out means the cluster stopped answering,
+        // not that the request was too large: once one chain finds that out,
+        // the others stop sending what they still have queued instead of
+        // waiting out a timeout each (#1125). Chains that are already halving
+        // in lockstep still pay their own way down, so a stalled cluster costs
+        // about `concurrency * log2(chunk)` requests — far short of one per
+        // document, and in parallel.
+        let stalled = AtomicBool::new(false);
+        let lines = &lines;
+        let stalled = &stalled;
+        let send_chain = |mut queue: VecDeque<Batch>| async move {
+            let mut failures: Vec<Option<BulkFailure>> = (0..owners).map(|_| None).collect();
+
+            // Halves `batch` and puts both halves at the front of the queue, in order.
+            let split = |queue: &mut VecDeque<Batch>, mut batch: Batch, reason: &str| {
+                if batch.depth == 0 {
+                    tracing::warn!(
+                        operations = batch.ops.len(),
+                        reason,
+                        "Elasticsearch _bulk request too large; splitting it in half and resending each half"
+                    );
+                } else {
+                    tracing::debug!(
+                        operations = batch.ops.len(),
+                        depth = batch.depth,
+                        reason,
+                        "splitting _bulk request again"
+                    );
+                }
+                let right = batch.ops.split_off(batch.ops.len() / 2);
+                queue.push_front(Batch {
+                    ops: right,
                     resends: 0,
-                    depth: 0,
-                })
-                .collect();
+                    depth: batch.depth + 1,
+                });
+                queue.push_front(Batch {
+                    ops: batch.ops,
+                    resends: 0,
+                    depth: batch.depth + 1,
+                });
+            };
 
-        // Halves `batch` and puts both halves at the front of the queue, in order.
-        let split = |queue: &mut VecDeque<Batch>, mut batch: Batch, reason: &str| {
-            if batch.depth == 0 {
-                tracing::warn!(
-                    operations = batch.ops.len(),
-                    reason,
-                    "Elasticsearch _bulk request too large; splitting it in half and resending each half"
-                );
-            } else {
-                tracing::debug!(
-                    operations = batch.ops.len(),
-                    depth = batch.depth,
-                    reason,
-                    "splitting _bulk request again"
-                );
-            }
-            let right = batch.ops.split_off(batch.ops.len() / 2);
-            queue.push_front(Batch {
-                ops: right,
-                resends: 0,
-                depth: batch.depth + 1,
-            });
-            queue.push_front(Batch {
-                ops: batch.ops,
-                resends: 0,
-                depth: batch.depth + 1,
-            });
-        };
+            while let Some(batch) = queue.pop_front() {
+                let fail_batch =
+                    |failures: &mut [Option<BulkFailure>], message: &str, transient: bool| {
+                        for &position in &batch.ops {
+                            fail(failures, ops[position].0, message, transient);
+                        }
+                    };
+                if stalled.load(Ordering::Relaxed) {
+                    fail_batch(
+                        &mut failures,
+                        "Not sent: Elasticsearch stopped answering _bulk requests for this page",
+                        true,
+                    );
+                    continue;
+                }
+                if batch.resends > 0 {
+                    tokio::time::sleep(backoff_delay(batch.resends)).await;
+                }
 
-        while let Some(batch) = queue.pop_front() {
-            if batch.resends > 0 {
-                tokio::time::sleep(backoff_delay(batch.resends)).await;
-            }
-            let fail_batch =
-                |failures: &mut [Option<BulkFailure>], message: &str, transient: bool| {
-                    for &position in &batch.ops {
-                        fail(failures, ops[position].0, message, transient);
+                let body: Vec<&[u8]> = batch
+                    .ops
+                    .iter()
+                    .flat_map(|&position| {
+                        let (action, document) = &lines[position];
+                        [action.as_slice(), document.as_slice()]
+                    })
+                    .collect();
+                let mut request = self.client().bulk(BulkParts::None).body(body);
+                if let Some(refresh) = refresh {
+                    request = request.refresh(refresh);
+                }
+
+                let response = match request.send().await {
+                    Ok(response) => response,
+                    Err(e) if e.is_timeout() && batch.ops.len() > 1 => {
+                        split(&mut queue, batch, "timeout");
+                        continue;
+                    }
+                    Err(e) if e.is_timeout() => {
+                        let message = format!(
+                            "Bulk index request for a single document timed out after {} ms: {e}",
+                            self.request_timeout_ms()
+                        );
+                        fail_batch(&mut failures, &message, true);
+                        // A lone document timing out means the cluster, not the
+                        // request size, is the problem: halving the rest of the
+                        // queue would wait out a timeout per document.
+                        let remaining: usize = queue.iter().map(|rest| rest.ops.len()).sum();
+                        if remaining > 0 {
+                            tracing::warn!(
+                                remaining,
+                                "Elasticsearch did not answer a single-document _bulk request in time; failing the rest of the page as transient"
+                            );
+                        }
+                        stalled.store(true, Ordering::Relaxed);
+                        for rest in queue.drain(..) {
+                            for position in rest.ops {
+                                fail(&mut failures, ops[position].0, &message, true);
+                            }
+                        }
+                        break;
+                    }
+                    Err(e) => {
+                        fail_batch(
+                            &mut failures,
+                            &format!("Failed to send bulk index request: {e}"),
+                            true,
+                        );
+                        continue;
                     }
                 };
 
-            let body: Vec<&[u8]> = batch
-                .ops
-                .iter()
-                .flat_map(|&position| {
-                    let (action, document) = &lines[position];
-                    [action.as_slice(), document.as_slice()]
-                })
-                .collect();
-            let mut request = self.client().bulk(BulkParts::None).body(body);
-            if let Some(refresh) = refresh {
-                request = request.refresh(refresh);
-            }
-
-            let response = match request.send().await {
-                Ok(response) => response,
-                Err(e) if e.is_timeout() && batch.ops.len() > 1 => {
-                    split(&mut queue, batch, "timeout");
+                // The status decides before the body is read: a `413` or a proxy's
+                // error page need not be JSON.
+                let status = response.status_code().as_u16();
+                // `408`/`504` are a proxy's or gateway's timeout: the same failure
+                // as the client's own, reported by something in between.
+                let too_large = status == 413;
+                let timed_out = status == 408 || status == 504;
+                if too_large || timed_out {
+                    if batch.ops.len() > 1 {
+                        let reason = if too_large {
+                            "413 Request Entity Too Large"
+                        } else {
+                            "request timed out upstream (408/504)"
+                        };
+                        split(&mut queue, batch, reason);
+                    } else {
+                        let body = response.text().await.unwrap_or_default();
+                        let message = if too_large {
+                            format!("Document too large for a bulk request (status 413): {body}")
+                        } else {
+                            format!(
+                                "Bulk index request for a single document timed out (status {status}): {body}"
+                            )
+                        };
+                        fail_batch(&mut failures, &message, timed_out);
+                    }
                     continue;
                 }
-                Err(e) if e.is_timeout() => {
-                    let message = format!(
-                        "Bulk index request for a single document timed out after {} ms: {e}",
-                        self.request_timeout_ms()
-                    );
-                    fail_batch(&mut failures, &message, true);
-                    // A lone document timing out means the cluster, not the
-                    // request size, is the problem: halving the rest of the
-                    // queue would wait out a timeout per document.
-                    let remaining: usize = queue.iter().map(|rest| rest.ops.len()).sum();
-                    if remaining > 0 {
-                        tracing::warn!(
-                            remaining,
-                            "Elasticsearch did not answer a single-document _bulk request in time; failing the rest of the page as transient"
+                if status == 429 {
+                    let body = response.text().await.unwrap_or_default();
+                    if batch.resends + 1 < BULK_MAX_ATTEMPTS {
+                        queue.push_front(Batch {
+                            ops: batch.ops,
+                            resends: batch.resends + 1,
+                            depth: batch.depth,
+                        });
+                    } else {
+                        fail_batch(
+                            &mut failures,
+                            &format!(
+                                "Bulk index request throttled (status 429) {BULK_MAX_ATTEMPTS} times: {body}"
+                            ),
+                            true,
                         );
                     }
-                    for rest in queue.drain(..) {
-                        for position in rest.ops {
+                    continue;
+                }
+                if !(200..300).contains(&status) {
+                    let body = response.text().await.unwrap_or_default();
+                    fail_batch(
+                        &mut failures,
+                        &format!("Bulk index request failed (status {status}): {body}"),
+                        is_transient_bulk_status(u64::from(status)),
+                    );
+                    continue;
+                }
+
+                let payload: Value = match response.json().await {
+                    Ok(payload) => payload,
+                    Err(e) if e.is_timeout() && batch.ops.len() > 1 => {
+                        split(&mut queue, batch, "timeout reading the response");
+                        continue;
+                    }
+                    Err(e) => {
+                        fail_batch(
+                            &mut failures,
+                            &format!("Failed to read bulk index response: {e}"),
+                            true,
+                        );
+                        continue;
+                    }
+                };
+                let items = payload.get("items").and_then(Value::as_array);
+                let mut throttled: Vec<usize> = Vec::new();
+                let mut throttle_message: Option<String> = None;
+                for (item_position, &position) in batch.ops.iter().enumerate() {
+                    let item = items
+                        .and_then(|items| items.get(item_position))
+                        .and_then(|item| item.get("index"));
+                    let item_status = item
+                        .and_then(|v| v.get("status"))
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0);
+                    if (200..300).contains(&item_status) {
+                        continue;
+                    }
+                    let error = item
+                        .and_then(|v| v.get("error"))
+                        .map(describe_item_error)
+                        .unwrap_or_else(|| "no item in bulk response".to_string());
+                    let message =
+                        format!("Failed to index document (status {item_status}): {error}");
+                    if item_status == 429 {
+                        throttled.push(position);
+                        throttle_message.get_or_insert(message);
+                        continue;
+                    }
+                    // A missing item (status 0) means the response did not
+                    // account for the document, not that it was rejected.
+                    fail(
+                        &mut failures,
+                        ops[position].0,
+                        &message,
+                        item_status == 0 || is_transient_bulk_status(item_status),
+                    );
+                }
+                if !throttled.is_empty() {
+                    if batch.resends + 1 < BULK_MAX_ATTEMPTS {
+                        queue.push_front(Batch {
+                            ops: throttled,
+                            resends: batch.resends + 1,
+                            depth: batch.depth,
+                        });
+                    } else {
+                        let message = format!(
+                            "{} (throttled {BULK_MAX_ATTEMPTS} times)",
+                            throttle_message.unwrap_or_default()
+                        );
+                        for position in throttled {
                             fail(&mut failures, ops[position].0, &message, true);
                         }
                     }
-                    break;
                 }
-                Err(e) => {
-                    fail_batch(
-                        &mut failures,
-                        &format!("Failed to send bulk index request: {e}"),
-                        true,
-                    );
-                    continue;
-                }
-            };
+            }
+            failures
+        };
 
-            // The status decides before the body is read: a `413` or a proxy's
-            // error page need not be JSON.
-            let status = response.status_code().as_u16();
-            // `408`/`504` are a proxy's or gateway's timeout: the same failure
-            // as the client's own, reported by something in between.
-            let too_large = status == 413;
-            let timed_out = status == 408 || status == 504;
-            if too_large || timed_out {
-                if batch.ops.len() > 1 {
-                    let reason = if too_large {
-                        "413 Request Entity Too Large"
-                    } else {
-                        "request timed out upstream (408/504)"
-                    };
-                    split(&mut queue, batch, reason);
-                } else {
-                    let body = response.text().await.unwrap_or_default();
-                    let message = if too_large {
-                        format!("Document too large for a bulk request (status 413): {body}")
-                    } else {
-                        format!(
-                            "Bulk index request for a single document timed out (status {status}): {body}"
-                        )
-                    };
-                    fail_batch(&mut failures, &message, timed_out);
-                }
-                continue;
-            }
-            if status == 429 {
-                let body = response.text().await.unwrap_or_default();
-                if batch.resends + 1 < BULK_MAX_ATTEMPTS {
-                    queue.push_front(Batch {
-                        ops: batch.ops,
-                        resends: batch.resends + 1,
-                        depth: batch.depth,
-                    });
-                } else {
-                    fail_batch(
-                        &mut failures,
-                        &format!(
-                            "Bulk index request throttled (status 429) {BULK_MAX_ATTEMPTS} times: {body}"
-                        ),
-                        true,
-                    );
-                }
-                continue;
-            }
-            if !(200..300).contains(&status) {
-                let body = response.text().await.unwrap_or_default();
-                fail_batch(
-                    &mut failures,
-                    &format!("Bulk index request failed (status {status}): {body}"),
-                    is_transient_bulk_status(u64::from(status)),
-                );
-                continue;
-            }
-
-            let payload: Value = match response.json().await {
-                Ok(payload) => payload,
-                Err(e) if e.is_timeout() && batch.ops.len() > 1 => {
-                    split(&mut queue, batch, "timeout reading the response");
-                    continue;
-                }
-                Err(e) => {
-                    fail_batch(
-                        &mut failures,
-                        &format!("Failed to read bulk index response: {e}"),
-                        true,
-                    );
-                    continue;
-                }
-            };
-            let items = payload.get("items").and_then(Value::as_array);
-            let mut throttled: Vec<usize> = Vec::new();
-            let mut throttle_message: Option<String> = None;
-            for (item_position, &position) in batch.ops.iter().enumerate() {
-                let item = items
-                    .and_then(|items| items.get(item_position))
-                    .and_then(|item| item.get("index"));
-                let item_status = item
-                    .and_then(|v| v.get("status"))
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0);
-                if (200..300).contains(&item_status) {
-                    continue;
-                }
-                let error = item
-                    .and_then(|v| v.get("error"))
-                    .map(describe_item_error)
-                    .unwrap_or_else(|| "no item in bulk response".to_string());
-                let message = format!("Failed to index document (status {item_status}): {error}");
-                if item_status == 429 {
-                    throttled.push(position);
-                    throttle_message.get_or_insert(message);
-                    continue;
-                }
-                // A missing item (status 0) means the response did not
-                // account for the document, not that it was rejected.
-                fail(
-                    &mut failures,
-                    ops[position].0,
-                    &message,
-                    item_status == 0 || is_transient_bulk_status(item_status),
-                );
-            }
-            if !throttled.is_empty() {
-                if batch.resends + 1 < BULK_MAX_ATTEMPTS {
-                    queue.push_front(Batch {
-                        ops: throttled,
-                        resends: batch.resends + 1,
-                        depth: batch.depth,
-                    });
-                } else {
-                    let message = format!(
-                        "{} (throttled {BULK_MAX_ATTEMPTS} times)",
-                        throttle_message.unwrap_or_default()
-                    );
-                    for position in throttled {
-                        fail(&mut failures, ops[position].0, &message, true);
-                    }
+        // Merged in chunk order, so which message a resource ends up with does
+        // not depend on which chain finished first.
+        let chains: Vec<Vec<Option<BulkFailure>>> = if concurrency <= 1 {
+            vec![send_chain(roots.into_iter().collect()).await]
+        } else {
+            futures::stream::iter(
+                roots
+                    .into_iter()
+                    .map(|batch| send_chain(VecDeque::from([batch]))),
+            )
+            .buffered(concurrency)
+            .collect()
+            .await
+        };
+        for chain in chains {
+            for (slot, failure) in failures.iter_mut().zip(chain) {
+                if slot.is_none() {
+                    *slot = failure;
                 }
             }
         }

@@ -625,3 +625,86 @@ async fn a_rejected_index_creation_stays_permanent() {
     let message = outcomes[0].as_ref().unwrap_err().to_string();
     assert!(message.contains("bad mapping"), "{message}");
 }
+
+// ============================================================================
+// Concurrency: the chains of one page never overlap on a document
+// ============================================================================
+
+/// `HFS_ELASTICSEARCH_BULK_CONCURRENCY` lets the root chunks of one page go
+/// out as independent chains. The page's documents are partitioned between
+/// those chains, so more chains must not mean a document sent twice, skipped,
+/// or reported by the wrong chain. Nothing here may be asserted by request
+/// index — which chain finishes first is not fixed (#1125).
+#[tokio::test]
+async fn concurrent_chains_index_every_document_of_a_page_exactly_once() {
+    let server = cluster().await;
+    on_bulk(&server, |request| indexed(bulk_ids(request).len())).await;
+    let backend = backend_with(&server, |config| {
+        config.bulk_max_bytes = 0;
+        config.bulk_concurrency = 4;
+    });
+    let ids: Vec<String> = (0..1_200).map(|n| format!("p{n}")).collect();
+    let resources: Vec<StoredResource> = ids.iter().map(|id| patient(id, 0)).collect();
+
+    let outcomes = backend
+        .write_search_entries_page(&tenant(), &resources)
+        .await;
+
+    assert_eq!(outcomes.len(), 1_200);
+    assert_all_ok(&outcomes);
+
+    let requests = bulk_requests(&server).await;
+    // 1200 operations at 500 per request: three root chunks, hence three
+    // chains however much concurrency was asked for. Sorted, because the
+    // chains answer in whatever order the cluster serves them.
+    let mut sizes: Vec<usize> = requests.iter().map(|r| bulk_ids(r).len()).collect();
+    sizes.sort_unstable();
+    assert_eq!(sizes, vec![200, 500, 500]);
+
+    let mut sent: Vec<String> = requests.iter().flat_map(bulk_ids).collect();
+    assert_eq!(sent.len(), 1_200, "no document is sent twice");
+    let unique: HashSet<&String> = sent.iter().collect();
+    assert_eq!(unique.len(), 1_200, "no document is sent twice");
+    sent.sort();
+    // One document per resource, named `<type>_<id>`.
+    let mut expected: Vec<String> = ids.iter().map(|id| format!("Patient_{id}")).collect();
+    expected.sort();
+    assert_eq!(sent, expected, "every document of the page is sent");
+}
+
+/// A cluster that answers nothing in time stalls every chain, not just the one
+/// that noticed: the shared flag stops the others before they send. Without it
+/// each chain would halve its own chunk down to single documents and wait out
+/// a timeout for each of them.
+#[tokio::test]
+async fn a_stalled_cluster_stops_every_concurrent_chain_instead_of_timing_out_per_document() {
+    let server = cluster().await;
+    on_bulk(&server, |request| {
+        indexed(bulk_ids(request).len()).set_delay(Duration::from_secs(5))
+    })
+    .await;
+    let backend = backend_with(&server, |config| {
+        config.bulk_max_bytes = 0;
+        config.bulk_concurrency = 4;
+        config.request_timeout_ms = 250;
+    });
+    let resources: Vec<StoredResource> = (0..1_200).map(|n| patient(&format!("p{n}"), 0)).collect();
+
+    let outcomes = backend
+        .write_search_entries_page(&tenant(), &resources)
+        .await;
+
+    assert_eq!(outcomes.len(), 1_200);
+    for outcome in &outcomes {
+        assert!(is_transient(outcome), "{outcome:?}");
+    }
+    // A chain halves 500 -> 250 -> ... -> 1 in nine requests before a lone
+    // document times out, and that stops the rest: a few dozen requests at
+    // most, nowhere near one per document.
+    let requests = bulk_requests(&server).await;
+    assert!(
+        requests.len() < 50,
+        "{} requests for 1200 documents",
+        requests.len()
+    );
+}
