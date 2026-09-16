@@ -26,7 +26,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::i18n::{I18n, RequestLocale};
-use crate::{RequestTenant, RequestVersion, WebState, current_status, render};
+use crate::{
+    RequestTenant, RequestVersion, WebState, current_status, render, upstream_failure_detail,
+};
 
 fn public_url_with_segments<'a>(
     public_base_url: &str,
@@ -942,24 +944,15 @@ fn with_tenant(request: reqwest::RequestBuilder, tenant: &str) -> reqwest::Reque
     request.header("X-Tenant-ID", tenant)
 }
 
-/// Renders a poll transport failure with its cause. `reqwest::Error`'s
-/// `Display` stops at the URL and hides the reason in `source()`, which made
-/// a timeout, a refused connection, and a reset log byte-identically (#957).
+/// Renders a poll transport failure with its cause (#957). The rendering
+/// itself is shared with the export workspace's kick-off (#1185); what is
+/// specific here is the cap and why a status poll can sit at it.
 fn poll_failure_detail(e: &reqwest::Error) -> String {
-    if e.is_timeout() {
-        return format!(
-            "timed out after {STATUS_POLL_TIMEOUT_SECS}s — the recipient's status \
-             endpoint can be slow while it is ingesting"
-        );
-    }
-    let mut detail = e.to_string();
-    let mut src = std::error::Error::source(e);
-    while let Some(cause) = src {
-        detail.push_str(": ");
-        detail.push_str(&cause.to_string());
-        src = cause.source();
-    }
-    detail
+    upstream_failure_detail(
+        e,
+        STATUS_POLL_TIMEOUT_SECS,
+        "the recipient's status endpoint can be slow while it is ingesting",
+    )
 }
 
 /// Whether the recipient asked us to hold off: a stored `next_poll_at` still

@@ -63,6 +63,39 @@ test.describe("query builder", () => {
       .not.toBe(firstPage.join());
   });
 
+  // The header reports the match count, not the page size: the page asks the
+  // server for `_total=accurate` on the wire while the typed query stays as
+  // typed. An explicit `_total=none` is respected, and the header then says
+  // the count is partial while a next page exists (#1003).
+  test("the results header shows the match count, not the page size", async ({
+    queries,
+    request,
+  }) => {
+    const family = `Total${Date.now()}`;
+    const ids = [];
+    for (let i = 0; i < 3; i++) {
+      ids.push(await createResource(request, "Patient", { name: [{ family }] }));
+    }
+    for (const id of ids) await waitSearchable(request, "Patient", id);
+
+    await queries.goto();
+    await queries.builder.run(`Patient?family=${family}&_count=2`);
+    await queries.results.waitShown();
+    await expect(queries.results.rows).toHaveCount(2);
+    await expect(queries.results.meta).toHaveText(/^3 results/);
+    await expect(queries.results.next).toBeVisible();
+    // The URL box keeps the exact text the user typed — `run()` fills it
+    // verbatim and never re-normalizes with a "GET " prefix (that only
+    // happens when loading a query from Recent) — confirming `withTotal`
+    // only touches the wire request, not what is shown here.
+    await expect(queries.builder.url).toHaveValue(`Patient?family=${family}&_count=2`);
+
+    await queries.builder.run(`Patient?family=${family}&_count=2&_total=none`);
+    await queries.results.waitShown();
+    await expect(queries.results.rows).toHaveCount(2);
+    await expect(queries.results.meta).toHaveText(/^2\+ results/);
+  });
+
   test("failed pagination preserves the visible page and can be retried", async ({
     queries,
   }) => {
@@ -72,6 +105,11 @@ test.describe("query builder", () => {
     const paginationPath =
       "/public/fhir/acme/_paging/opaque-token?_getpages=opaque%2Ftoken&_count=1";
     const paginationUrl = paginationOrigin + paginationPath;
+    // #1003: every fetch the page makes asks for `_total=accurate` on the
+    // wire (neither URL above already carries a `_total=`), so the routes
+    // below must match what actually goes out, not the bare server links.
+    const initialUrlWithTotal = pageOrigin + initialPath + "&_total=accurate";
+    const paginationUrlWithTotal = paginationUrl + "&_total=accurate";
     let initialRequests = 0;
     let paginationAttempts = 0;
 
@@ -114,7 +152,7 @@ test.describe("query builder", () => {
     await queries.page.route("**/*", async (route) => {
       const request = route.request();
       const url = request.url();
-      if (request.method() === "GET" && url === pageOrigin + initialPath) {
+      if (request.method() === "GET" && url === initialUrlWithTotal) {
         initialRequests += 1;
         await route.fulfill({
           status: 200,
@@ -123,7 +161,7 @@ test.describe("query builder", () => {
         });
         return;
       }
-      if (url !== paginationUrl) {
+      if (url !== paginationUrlWithTotal) {
         await route.continue();
         return;
       }
@@ -272,7 +310,7 @@ test.describe("query builder", () => {
       () =>
         (window as typeof window & { __hfsFetchInputs?: string[] }).__hfsFetchInputs || [],
     );
-    expect(fetchInputs.filter((input) => input === paginationUrl)).toHaveLength(4);
+    expect(fetchInputs.filter((input) => input === paginationUrlWithTotal)).toHaveLength(4);
   });
 
   // #1106: row-navigation.js delegates the click from `document`, so a click
@@ -1604,7 +1642,9 @@ test.describe("query builder", () => {
       return request.method() === "GET" && url.pathname === "/Patient";
     });
     await queries.builder.runButton.click();
-    expect(new URL((await sent).url()).search).toBe("?gender=OrAlpha556");
+    // #1003: withTotal appends `_total=accurate` on the wire (the URL box
+    // above stays the user's literal text).
+    expect(new URL((await sent).url()).search).toBe("?gender=OrAlpha556&_total=accurate");
   });
 
   test("known parameter types expose the complete modifier matrix", async ({ page, queries }) => {
@@ -1829,7 +1869,9 @@ test.describe("query builder", () => {
       return request.method() === "GET" && url.pathname === "/Patient";
     });
     await queries.builder.runButton.click();
-    expect(new URL((await sent).url()).search).toBe("?gender=OrAlpha556");
+    // #1003: withTotal appends `_total=accurate` on the wire (the URL box
+    // above stays the user's literal text).
+    expect(new URL((await sent).url()).search).toBe("?gender=OrAlpha556&_total=accurate");
   });
 
   test("removing the last pending row immediately releases builder consumers", async ({
@@ -2133,7 +2175,7 @@ test.describe("query builder", () => {
     await queries.builder.run("Patient?name=Sortable");
     await queries.results.waitShown();
 
-    // Patient renders its typed default columns without any _elements.
+    // Without _elements, columns come from the attributes the server returned (#1105).
     const headers = queries.page.locator("#query-results-head th");
     await expect(headers).toContainText(["id", "name", "gender", "birthDate"]);
 

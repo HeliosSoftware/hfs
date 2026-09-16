@@ -446,6 +446,7 @@ queries-param-placeholder = Parameter
 queries-value-placeholder = Wert
 queries-results = Ergebnisse
 queries-results-total = { $count } Ergebnisse
+queries-results-total-partial = { $count }+ Ergebnisse
 queries-results-included = { $count } eingeschlossen
 queries-results-empty = Keine Ergebnisse.
 queries-searching = Suche läuft…

@@ -11,7 +11,8 @@ use serde_json::Value;
 
 use crate::core::{Transaction, TransactionOptions, TransactionProvider};
 use crate::error::{
-    BackendError, ConcurrencyError, ResourceError, StorageError, StorageResult, TransactionError,
+    BackendError, ConcurrencyError, QueryErrorExt, ResourceError, StorageError, StorageResult,
+    TransactionError,
 };
 use crate::search::SearchParameterExtractor;
 use crate::tenant::{Operation, TenantContext};
@@ -515,7 +516,7 @@ impl Transaction for PostgresTransaction {
             .unwrap_or_else(crate::types::new_resource_id);
 
         // Build the resource with id and resourceType
-        let mut data = resource.clone();
+        let mut data = resource;
         if let Some(obj) = data.as_object_mut() {
             obj.insert("id".to_string(), Value::String(id.clone()));
             obj.insert(
@@ -663,43 +664,15 @@ impl Transaction for PostgresTransaction {
         let resource_type = current.resource_type();
         let id = current.id();
 
-        // Verify current version still matches (optimistic locking)
-        let row = query_opt_cached(
-            client,
-            "SELECT version_id FROM resources
-                 WHERE tenant_id = $1 AND resource_type = $2 AND id = $3 AND is_deleted = FALSE",
-            &[&tenant_id, &resource_type, &id],
-        )
-        .await
-        .map_err(|e| internal_error(format!("Failed to get current version: {}", e)))?;
-
-        let db_version = match row {
-            Some(row) => row.get::<_, String>(0),
-            None => {
-                return Err(StorageError::Resource(ResourceError::NotFound {
-                    resource_type: resource_type.to_string(),
-                    id: id.to_string(),
-                }));
-            }
-        };
-
-        if db_version != current.version_id() {
-            return Err(StorageError::Concurrency(
-                ConcurrencyError::VersionConflict {
-                    resource_type: resource_type.to_string(),
-                    id: id.to_string(),
-                    expected_version: current.version_id().to_string(),
-                    actual_version: db_version,
-                },
-            ));
-        }
-
-        // Calculate new version
-        let new_version: u64 = db_version.parse().unwrap_or(0) + 1;
+        // The expected version is `current`'s, and the UPDATE below only matches a
+        // row that still carries it — so the new version follows from what the
+        // caller already read, with no round trip to ask what is stored.
+        let expected_version = current.version_id().to_string();
+        let new_version: u64 = current.version_id().parse().unwrap_or(0) + 1;
         let new_version_str = new_version.to_string();
 
         // Build the resource with id and resourceType
-        let mut data = resource.clone();
+        let mut data = resource;
         if let Some(obj) = data.as_object_mut() {
             obj.insert("id".to_string(), Value::String(id.to_string()));
             obj.insert(
@@ -711,13 +684,20 @@ impl Transaction for PostgresTransaction {
         let now = Utc::now();
         let fhir_version = current.fhir_version();
         let fhir_version_str = fhir_version.as_mime_param();
-        let is_deleted = false;
-
-        // Update the resource
-        execute_cached(
+        // Version check, update and history row in one statement. Folding the
+        // expected version into the `WHERE` makes the check and write atomic:
+        // a concurrent writer cannot bump the version between two statements
+        // and have this update overwrite it while reporting success.
+        let updated = execute_cached(
             client,
-            "UPDATE resources SET version_id = $1, data = $2, last_updated = $3
-                 WHERE tenant_id = $4 AND resource_type = $5 AND id = $6",
+            "WITH upd AS (
+                 UPDATE resources SET version_id = $1, data = $2, last_updated = $3
+                 WHERE tenant_id = $4 AND resource_type = $5 AND id = $6
+                   AND is_deleted = FALSE AND version_id = $7
+                 RETURNING tenant_id, resource_type, id, version_id, data, last_updated, is_deleted
+             )
+             INSERT INTO resource_history (tenant_id, resource_type, id, version_id, data, last_updated, is_deleted, fhir_version)
+             SELECT tenant_id, resource_type, id, version_id, data, last_updated, is_deleted, $8 FROM upd",
             &[
                 &new_version_str,
                 &data,
@@ -725,20 +705,42 @@ impl Transaction for PostgresTransaction {
                 &tenant_id,
                 &resource_type,
                 &id,
+                &expected_version,
+                &fhir_version_str,
             ],
         )
         .await
-        .map_err(|e| internal_error(format!("Failed to update resource: {}", e)))?;
+        .or_query_error("Failed to update resource")?;
 
-        // Insert into history
-        execute_cached(
+        if updated == 0 {
+            // The statement matched nothing because the row is missing,
+            // soft-deleted, or has a different version. Only the last case is
+            // a concurrency conflict; the lookup is needed only on this error
+            // path to distinguish it from the two not-found cases.
+            let actual = query_opt_cached(
                 client,
-                "INSERT INTO resource_history (tenant_id, resource_type, id, version_id, data, last_updated, is_deleted, fhir_version)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
-                &[&tenant_id, &resource_type, &id, &new_version_str, &data, &now, &is_deleted, &fhir_version_str],
+                "SELECT version_id FROM resources
+                 WHERE tenant_id = $1 AND resource_type = $2 AND id = $3 AND is_deleted = FALSE",
+                &[&tenant_id, &resource_type, &id],
             )
             .await
-            .map_err(|e| internal_error(format!("Failed to insert history: {}", e)))?;
+            .or_query_error("Failed to get current version")?;
+
+            return match actual {
+                Some(row) => Err(StorageError::Concurrency(
+                    ConcurrencyError::VersionConflict {
+                        resource_type: resource_type.to_string(),
+                        id: id.to_string(),
+                        expected_version,
+                        actual_version: row.get::<_, String>(0),
+                    },
+                )),
+                None => Err(StorageError::Resource(ResourceError::NotFound {
+                    resource_type: resource_type.to_string(),
+                    id: id.to_string(),
+                })),
+            };
+        }
 
         // Re-index the resource for search
         self.index_resource(
