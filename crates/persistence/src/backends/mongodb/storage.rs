@@ -4251,6 +4251,8 @@ impl PurgableStorage for MongoBackend {
         let resources = db.collection::<Document>(MongoBackend::RESOURCES_COLLECTION);
         let history = db.collection::<Document>(MongoBackend::RESOURCE_HISTORY_COLLECTION);
         let search_index = db.collection::<Document>(MongoBackend::SEARCH_INDEX_COLLECTION);
+        let search_index_contained =
+            db.collection::<Document>(MongoBackend::SEARCH_INDEX_CONTAINED_COLLECTION);
 
         let key = doc! { "tenant_id": tenant_id, "resource_type": resource_type };
 
@@ -4274,6 +4276,12 @@ impl PurgableStorage for MongoBackend {
             .delete_many(doc! { "tenant_id": tenant_id, "resource_type": resource_type })
             .await
             .or_query_error("Failed to purge search index")?;
+        // Contained rows share the container's (tenant_id, resource_type),
+        // so a type-level purge keys the same way (#1160 Task 4).
+        search_index_contained
+            .delete_many(doc! { "tenant_id": tenant_id, "resource_type": resource_type })
+            .await
+            .or_query_error("Failed to purge contained search index")?;
 
         Ok(count)
     }

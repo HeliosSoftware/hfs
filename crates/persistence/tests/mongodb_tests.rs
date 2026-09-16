@@ -2492,11 +2492,12 @@ async fn mongodb_integration_update_with_match_and_delete_with_match() {
 /// (an old contained Patient's name after the container is updated, or after
 /// it's deleted outright).
 ///
-/// Also covers `purge`: a second holder is created and purged directly
-/// (mirroring `crates/rest/src/handlers/purge.rs`, which calls
-/// `PurgableStorage::purge` straight off the backend — there is no existing
-/// `.purge(` test in this file to model a sibling on, so this is that
-/// coverage).
+/// Also covers `purge` and `purge_all`: a second holder is created and
+/// purged directly, then a third is created and cleared via a type-level
+/// purge (mirroring `crates/rest/src/handlers/purge.rs`, which calls
+/// `PurgableStorage::purge`/`purge_all` straight off the backend — there is
+/// no existing `.purge(`/`.purge_all(` test in this file to model a sibling
+/// on, so this is that coverage).
 #[tokio::test]
 async fn mongodb_integration_update_and_delete_leave_no_orphan_contained_rows() {
     let Some(backend) = create_backend_with_full_registry("contained_orphans").await else {
@@ -2611,6 +2612,37 @@ async fn mongodb_integration_update_and_delete_leave_no_orphan_contained_rows() 
         0
     );
     assert_eq!(search_index.count_documents(purge_key).await.unwrap(), 0);
+
+    // Type-level purge (`purge_all`): clears every remaining Observation's
+    // contained rows for the tenant too, not just `search_index` (#1160
+    // Task 4). Mirrors how the REST layer calls it
+    // (`crates/rest/src/handlers/purge.rs`, `purge.purge_all(tenant, type)`)
+    // — no existing test in this file calls `purge_all`, so this invokes
+    // the backend method directly, the same way the single-resource `purge`
+    // coverage above does.
+    backend
+        .create(
+            &tenant,
+            "Observation",
+            with_contained("holder-purge-all", "PurgeAllMe"),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    let type_key = doc! {
+        "tenant_id": "tenant-contained-orphans",
+        "resource_type": "Observation",
+    };
+    assert!(
+        contained.count_documents(type_key.clone()).await.unwrap() > 0,
+        "precondition: an Observation's contained row must exist before purge_all"
+    );
+    backend.purge_all(&tenant, "Observation").await.unwrap();
+    assert_eq!(
+        contained.count_documents(type_key.clone()).await.unwrap(),
+        0
+    );
+    assert_eq!(search_index.count_documents(type_key).await.unwrap(), 0);
 }
 
 /// #1160 Task 4: the transaction-bundle delete path
