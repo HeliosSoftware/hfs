@@ -567,6 +567,25 @@ where
         .map_err(RestError::from)?
     {
         if existing_status.is_terminal() {
+            // A status-only kick-off that restates the terminal status the
+            // submission already has is not a further submission — it is the
+            // same close-out arriving twice, and it must answer the same way
+            // both times. The Data Provider that sent it may never have seen
+            // the first answer (a timed-out request whose server side still
+            // committed), and its only safe move is to send it again; a 409
+            // there would read as a refusal of a transition that landed
+            // (#998). Nothing else is admitted: a manifest, a replacement, or
+            // the *other* terminal status stays a conflict.
+            let restates = req.manifest_url.is_none()
+                && req.replaces_manifest_url.is_none()
+                && matches!(
+                    (req.submission_status.as_str(), existing_status),
+                    ("completed", SubmissionStatus::Complete)
+                        | ("stopped", SubmissionStatus::Aborted)
+                );
+            if restates {
+                return kickoff_accepted(&sub_id);
+            }
             return Err(RestError::Conflict {
                 message: format!(
                     "submission {} is already {} — no further submissions allowed",
@@ -692,6 +711,11 @@ where
             .map_err(RestError::from)?;
     }
 
+    kickoff_accepted(&sub_id)
+}
+
+/// The `200` a `$bulk-submit` kick-off answers once it has been applied.
+fn kickoff_accepted(sub_id: &SubmissionId) -> RestResult<Response> {
     let oo = json!({
         "resourceType": "OperationOutcome",
         "issue": [{
