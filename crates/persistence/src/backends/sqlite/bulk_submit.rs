@@ -4671,6 +4671,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_default_get_submission_status_preserves_results() {
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+        let present = SubmissionId::generate("status-default");
+
+        backend
+            .create_submission(&tenant, &present, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            backend
+                .get_submission_status(&tenant, &present)
+                .await
+                .unwrap(),
+            Some(SubmissionStatus::InProgress)
+        );
+
+        let missing = SubmissionId::generate("status-default");
+        assert_eq!(
+            backend
+                .get_submission_status(&tenant, &missing)
+                .await
+                .unwrap(),
+            None
+        );
+
+        backend
+            .get_connection()
+            .unwrap()
+            .execute(
+                "UPDATE bulk_submissions SET status = 'invalid-status'
+                 WHERE tenant_id = ?1 AND submitter = ?2 AND submission_id = ?3",
+                params![
+                    tenant.tenant_id().as_str(),
+                    &present.submitter,
+                    &present.submission_id
+                ],
+            )
+            .unwrap();
+        let error = backend
+            .get_submission_status(&tenant, &present)
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("Invalid status: invalid-status"),
+            "the default must preserve get_submission errors: {error}"
+        );
+    }
+
+    #[tokio::test]
     async fn test_duplicate_submission() {
         let backend = create_test_backend();
         let tenant = create_test_tenant();

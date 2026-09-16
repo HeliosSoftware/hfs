@@ -282,6 +282,37 @@ impl BulkSubmitProvider for PostgresBackend {
         }))
     }
 
+    async fn get_submission_status(
+        &self,
+        tenant: &TenantContext,
+        id: &SubmissionId,
+    ) -> StorageResult<Option<SubmissionStatus>> {
+        let client = self.get_client().await?;
+        let tenant_id = tenant.tenant_id().as_str();
+
+        let row = query_opt_cached(
+            &client,
+            "SELECT status
+             FROM bulk_submissions
+             WHERE tenant_id = $1 AND submitter = $2 AND submission_id = $3",
+            &[
+                &tenant_id,
+                &id.submitter.as_str(),
+                &id.submission_id.as_str(),
+            ],
+        )
+        .await
+        .map_err(|e| internal_error(format!("Failed to get submission status: {}", e)))?;
+
+        row.map(|row| {
+            let status: String = row.get(0);
+            status
+                .parse()
+                .map_err(|_| internal_error(format!("Invalid status: {}", status)))
+        })
+        .transpose()
+    }
+
     async fn list_submissions(
         &self,
         tenant: &TenantContext,

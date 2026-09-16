@@ -800,11 +800,9 @@ where
         &self,
         lease: &ManifestLease,
     ) -> StorageResult<Option<SubmissionStatus>> {
-        Ok(self
-            .0
-            .get_submission(&lease.tenant, &lease.submission_id)
-            .await?
-            .map(|summary| summary.status))
+        self.0
+            .get_submission_status(&lease.tenant, &lease.submission_id)
+            .await
     }
 }
 
@@ -6425,6 +6423,80 @@ mod tests {
             tokio::time::sleep(StdDuration::from_millis(50)).await;
         }
         cancel.is_cancelled()
+    }
+
+    struct StatusOnlyRenewal {
+        status: Option<SubmissionStatus>,
+        fails: bool,
+    }
+
+    #[async_trait]
+    impl LeaseRenewal for StatusOnlyRenewal {
+        async fn heartbeat(&self, lease: &ManifestLease) -> Result<DateTime<Utc>, LeaseError> {
+            Ok(lease.renewed_expiry())
+        }
+
+        async fn flush_bytes(&self, _lease: &ManifestLease, _consumed: u64, _total: u64) {}
+
+        async fn submission_status(
+            &self,
+            _lease: &ManifestLease,
+        ) -> StorageResult<Option<SubmissionStatus>> {
+            if self.fails {
+                Err(StorageError::Backend(
+                    crate::error::BackendError::Internal {
+                        backend_name: "stub".to_string(),
+                        message: "status unavailable".to_string(),
+                        source: None,
+                    },
+                ))
+            } else {
+                Ok(self.status)
+            }
+        }
+    }
+
+    async fn watch_cancels(status: Option<SubmissionStatus>, fails: bool) -> bool {
+        let cancel = CancelToken::new();
+        watch_submission(
+            &StatusOnlyRenewal { status, fails },
+            &keeper_lease(),
+            &cancel,
+        )
+        .await;
+        cancel.is_cancelled()
+    }
+
+    #[tokio::test]
+    async fn test_job_store_renewal_reads_submission_status() {
+        let backend = Arc::new(SqliteBackend::in_memory().unwrap());
+        backend.init_schema().unwrap();
+        let tenant = tenant();
+        let submission_id = SubmissionId::generate("renewal-status");
+        backend
+            .create_submission(&tenant, &submission_id, None)
+            .await
+            .unwrap();
+        let lease = ManifestLease {
+            tenant,
+            submission_id,
+            ..keeper_lease()
+        };
+        let renewal = JobStoreRenewal(backend);
+
+        assert_eq!(
+            renewal.submission_status(&lease).await.unwrap(),
+            Some(SubmissionStatus::InProgress)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_watch_submission_preserves_status_outcomes() {
+        assert!(watch_cancels(Some(SubmissionStatus::Aborted), false).await);
+        assert!(!watch_cancels(Some(SubmissionStatus::InProgress), false).await);
+        assert!(!watch_cancels(Some(SubmissionStatus::Complete), false).await);
+        assert!(!watch_cancels(None, false).await);
+        assert!(!watch_cancels(None, true).await);
     }
 
     /// A heartbeat that cannot land before the lease expires is fatal (#969).

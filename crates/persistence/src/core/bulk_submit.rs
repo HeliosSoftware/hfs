@@ -1361,6 +1361,22 @@ pub trait BulkSubmitProvider: ResourceStorage {
         id: &SubmissionId,
     ) -> StorageResult<Option<SubmissionSummary>>;
 
+    /// Gets only the current status of a submission.
+    ///
+    /// Backends may override this when reading a complete submission summary is
+    /// materially more expensive than reading its status. The default preserves
+    /// the full getter's found, missing, and error semantics.
+    async fn get_submission_status(
+        &self,
+        tenant: &TenantContext,
+        id: &SubmissionId,
+    ) -> StorageResult<Option<SubmissionStatus>> {
+        Ok(self
+            .get_submission(tenant, id)
+            .await?
+            .map(|submission| submission.status))
+    }
+
     /// Lists submissions.
     ///
     /// # Arguments
