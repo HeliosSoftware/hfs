@@ -1846,6 +1846,7 @@ fn spawn_export_workers<Dp>(
         return;
     }
     let lease = std::time::Duration::from_secs(cfg.lease_duration_secs);
+    let max_attempts = cfg.max_attempts;
     for i in 0..cfg.worker_concurrency {
         let jobs = jobs.clone();
         let data = data.clone();
@@ -1856,7 +1857,7 @@ fn spawn_export_workers<Dp>(
             let worker = DefaultExportWorker::new(jobs.clone(), data, output, worker_id.clone())
                 .with_exclude_since_newly_added(exclude_newly_added);
             loop {
-                match jobs.claim_next(&worker_id, lease).await {
+                match jobs.claim_next(&worker_id, lease, max_attempts).await {
                     Ok(Some(claimed)) => {
                         if let Err(e) = worker.run_job(claimed).await {
                             tracing::error!("export worker job failed: {e}");

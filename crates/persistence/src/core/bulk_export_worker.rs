@@ -133,18 +133,43 @@ pub struct WorkerJobView {
 pub trait ExportClaimStrategy: Send + Sync {
     /// Atomically transitions one eligible job (`accepted`, or `in_progress`
     /// with an expired lease) to held-by-this-worker, bumping the fencing
-    /// token. Returns `Ok(None)` when no job is available.
+    /// token and the job's claim count. Returns `Ok(None)` when no job is
+    /// available.
+    ///
+    /// `max_attempts` caps how many times one job may be claimed. A job that
+    /// would exceed it is not handed out again: it is retired with
+    /// [`abandoned_export_message`] as its error, and the scan moves on to the
+    /// next eligible job (#1041).
+    ///
+    /// Re-claiming an `in_progress` job **discards the previous attempt's
+    /// progress and file rows**, atomically with the token bump: the worker
+    /// restarts `part_index` at 0 on every attempt, so a resumed run would
+    /// otherwise overwrite the parts the dead worker wrote and lose their
+    /// resources without failing the job (#1041). Output artifacts are left on
+    /// disk/S3 for the TTL sweep — see the backend implementations for why
+    /// unlinking them under a zombie worker is worse than orphaning them.
     async fn claim_next(
         &self,
         worker_id: &WorkerId,
         lease_duration: Duration,
+        max_attempts: u32,
     ) -> StorageResult<Option<ExportJobLease>>;
 
     /// Renews a lease the worker still holds; returns the new expiry, or
     /// `LeaseError::LeaseLost` if the job was reclaimed.
     async fn heartbeat(&self, lease: &ExportJobLease) -> Result<DateTime<Utc>, LeaseError>;
 
-    /// Releases a lease early (graceful shutdown). Best-effort.
+    /// Releases a lease early (graceful shutdown). Best-effort: the job goes
+    /// back to `accepted` for the next worker to pick up.
+    ///
+    /// **Currently unused** — nothing in the workspace calls it; the worker
+    /// loop lets a shutdown lease lapse instead. Before wiring up a caller,
+    /// note that the implementations do *not* give back the attempt they
+    /// consumed (see `max_attempts` on [`Self::claim_next`]): a job released
+    /// and re-claimed still burns one of its attempts, so a few rolling
+    /// restarts would retire a perfectly healthy export. A caller must first
+    /// make `release` decrement `attempts` — fenced on `worker_id` +
+    /// `fencing_token`, so a zombie cannot spend another worker's attempt.
     async fn release(&self, lease: ExportJobLease) -> StorageResult<()>;
 }
 
@@ -780,6 +805,21 @@ fn public_failure_message(e: &StorageError) -> String {
     }
 }
 
+/// The failure text stored on a job the claim cap retired (#1041).
+///
+/// A job whose lease expires mid-run is reclaimable, so a job that keeps dying
+/// the same way — a worker crash, an OOM, a pod eviction — would otherwise be
+/// passed from worker to worker forever: never terminal, never poll-able as a
+/// failure, and holding one of its tenant's export slots the whole time.
+/// `claim_next` stops handing it out once its claims would exceed the
+/// configured cap and stores this instead. It is shown to the export's owner,
+/// so it says what happened without naming a worker, a host or a backend.
+pub fn abandoned_export_message(attempts: u32) -> String {
+    let unit = if attempts == 1 { "attempt" } else { "attempts" };
+    let cause = "each worker that claimed it lost its lease before finishing";
+    format!("export abandoned after {attempts} {unit}: {cause}")
+}
+
 /// Applies `_elements` projection to an NDJSON line.
 ///
 /// When `elements` is non-empty, keeps `resourceType`, `id`, `meta` and the
@@ -886,6 +926,9 @@ mod tests {
         use chrono::Utc;
         use std::sync::Arc;
 
+        /// Claim cap for tests that are not exercising the cap itself.
+        const TEST_MAX_ATTEMPTS: u32 = 3;
+
         fn tenant() -> TenantContext {
             TenantContext::new(TenantId::new("t1"), TenantPermissions::full_access())
         }
@@ -936,7 +979,7 @@ mod tests {
             );
 
             let lease = backend
-                .claim_next(&worker_id, Duration::from_secs(60))
+                .claim_next(&worker_id, Duration::from_secs(60), TEST_MAX_ATTEMPTS)
                 .await
                 .unwrap()
                 .expect("job claimable");
@@ -1091,7 +1134,7 @@ mod tests {
             );
 
             let lease = backend
-                .claim_next(&worker_id, Duration::from_secs(60))
+                .claim_next(&worker_id, Duration::from_secs(60), TEST_MAX_ATTEMPTS)
                 .await
                 .unwrap()
                 .expect("job claimable");
@@ -1162,7 +1205,7 @@ mod tests {
             .with_audit(sink.clone(), "Device/hfs");
 
             let lease = backend
-                .claim_next(&worker_id, Duration::from_secs(60))
+                .claim_next(&worker_id, Duration::from_secs(60), TEST_MAX_ATTEMPTS)
                 .await
                 .unwrap()
                 .expect("job claimable");
@@ -1233,7 +1276,7 @@ mod tests {
             );
 
             let lease = backend
-                .claim_next(&worker_id, Duration::from_secs(60))
+                .claim_next(&worker_id, Duration::from_secs(60), TEST_MAX_ATTEMPTS)
                 .await
                 .unwrap()
                 .expect("job claimable");
@@ -1301,7 +1344,7 @@ mod tests {
             );
 
             let lease = backend
-                .claim_next(&worker_id, Duration::from_secs(60))
+                .claim_next(&worker_id, Duration::from_secs(60), TEST_MAX_ATTEMPTS)
                 .await
                 .unwrap()
                 .expect("job claimable");

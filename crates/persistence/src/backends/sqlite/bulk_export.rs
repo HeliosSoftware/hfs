@@ -16,6 +16,7 @@ use crate::core::bulk_export::{
 use crate::core::bulk_export_output::{ExportPartKey, FinalizedPart};
 use crate::core::bulk_export_worker::{
     ExportClaimStrategy, ExportJobLease, ExportWorkerStorage, LeaseError, WorkerId, WorkerJobView,
+    abandoned_export_message,
 };
 use crate::error::{BackendError, BulkExportError, StorageError, StorageResult};
 use crate::tenant::{TenantContext, TenantId, TenantPermissions};
@@ -667,9 +668,10 @@ impl ExportClaimStrategy for SqliteBackend {
         &self,
         worker_id: &WorkerId,
         lease_duration: StdDuration,
+        max_attempts: u32,
     ) -> StorageResult<Option<ExportJobLease>> {
         let _guard = CLAIM_LOCK.lock().await;
-        let conn = self.get_connection()?;
+        let mut conn = self.get_connection()?;
         let now = Utc::now();
         let now_str = now.to_rfc3339();
         let lease_expiry = now
@@ -677,46 +679,142 @@ impl ExportClaimStrategy for SqliteBackend {
                 .unwrap_or_else(|_| chrono::Duration::seconds(60));
         let lease_expiry_str = lease_expiry.to_rfc3339();
 
-        // Find one eligible job: accepted, or in-progress with an expired lease.
-        let row: Option<(String, String, i64)> = conn
-            .query_row(
-                "SELECT id, tenant_id, fencing_token FROM bulk_export_jobs
-                 WHERE status = 'accepted'
-                    OR (status = 'in-progress' AND (lease_expiry IS NULL OR lease_expiry < ?1))
-                 ORDER BY created_at LIMIT 1",
-                params![now_str],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        // The whole scan runs inside one IMMEDIATE transaction. The token bump
+        // and the wipe of a re-claimed job's half-written state have to land
+        // together: a reader that saw the new token but the old progress rows
+        // would resume a run that is in the middle of being restarted (#1041).
+        // `CLAIM_LOCK` only serializes claims within this process.
+        let txn = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|e| internal_error(format!("Failed to begin claim txn: {}", e)))?;
+
+        // Each turn either claims a job or retires one whose attempts are
+        // spent. Retiring moves the job out of the eligible set, so the scan
+        // makes progress on every turn and a caller is never left empty-handed
+        // while another job is still claimable (#1041).
+        let claimed = loop {
+            // Find one eligible job: accepted, or in-progress with an expired lease.
+            let row: Option<(String, String, String, i64, i64)> = txn
+                .query_row(
+                    "SELECT id, tenant_id, status, fencing_token, attempts FROM bulk_export_jobs
+                     WHERE status = 'accepted'
+                        OR (status = 'in-progress' AND (lease_expiry IS NULL OR lease_expiry < ?1))
+                     ORDER BY created_at LIMIT 1",
+                    params![now_str],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                        ))
+                    },
+                )
+                .ok();
+
+            let Some((job_id, tenant_id, status, fencing_token, attempts)) = row else {
+                break None;
+            };
+            let new_token = fencing_token + 1;
+            let attempt = attempts + 1;
+
+            if attempt > i64::from(max_attempts) {
+                // Every worker that held this job lost its lease before
+                // finishing. Hand it to no one else: fail it terminally so the
+                // status poll ends in an error the client can act on, and so
+                // the job stops occupying one of the tenant's export slots.
+                let attempts_made = u32::try_from(attempts).unwrap_or(u32::MAX);
+                txn.execute(
+                    "UPDATE bulk_export_jobs
+                     SET status = 'error', error_message = ?1, completed_at = ?2,
+                         current_type = NULL, worker_id = NULL, lease_expiry = NULL
+                     WHERE id = ?3",
+                    params![abandoned_export_message(attempts_made), now_str, job_id],
+                )
+                .map_err(|e| internal_error(format!("Failed to abandon export job: {}", e)))?;
+                tracing::warn!(
+                    job_id = %job_id,
+                    attempts = attempts_made,
+                    "export job abandoned: its lease expired on every attempt"
+                );
+                // No wipe: the job is terminal, and the output TTL sweep
+                // reclaims its rows and its artifacts together.
+                continue;
+            }
+
+            // A re-claimed job restarts from scratch. The worker resumes
+            // *within* a type from `cursor_state` but always restarts
+            // `part_index` at 0, so keeping the previous attempt's rows would
+            // let the resumed run overwrite parts 0..n of the half-finished
+            // type — silently dropping every resource the dead worker had
+            // already written, with the job still ending `complete` (#1041).
+            // Types that did finish would also be exported twice, inflating
+            // `exported_count`. A job still `accepted` never wrote anything.
+            //
+            // Only the rows go. The artifacts stay: unlinking them would pull
+            // the `.tmp` file out from under a zombie worker, whose
+            // `finalize_part` would then fail its rename with a plain
+            // `StorageError` instead of `LeaseLost` — and that makes the
+            // worker loop emit a spurious `failed` audit event for a job now
+            // running under someone else's lease. The periodic TTL cleanup
+            // drops the job's whole output prefix anyway.
+            if status == "in-progress" {
+                txn.execute(
+                    "DELETE FROM bulk_export_progress WHERE job_id = ?1",
+                    params![job_id],
+                )
+                .map_err(|e| {
+                    internal_error(format!("Failed to clear reclaimed progress: {}", e))
+                })?;
+                txn.execute(
+                    "DELETE FROM bulk_export_files WHERE job_id = ?1",
+                    params![job_id],
+                )
+                .map_err(|e| {
+                    internal_error(format!("Failed to clear reclaimed file rows: {}", e))
+                })?;
+                tracing::info!(
+                    job_id = %job_id,
+                    attempt,
+                    "reclaimed export job: discarding the previous attempt's progress"
+                );
+            }
+
+            txn.execute(
+                "UPDATE bulk_export_jobs
+                 SET status = 'in-progress', worker_id = ?1, lease_expiry = ?2,
+                     heartbeat_at = ?3, fencing_token = ?4, attempts = ?5,
+                     started_at = COALESCE(started_at, ?3)
+                 WHERE id = ?6",
+                params![
+                    worker_id.as_str(),
+                    lease_expiry_str,
+                    now_str,
+                    new_token,
+                    attempt,
+                    job_id
+                ],
             )
-            .ok();
+            .map_err(|e| internal_error(format!("Failed to claim export job: {}", e)))?;
 
-        let Some((job_id, tenant_id, fencing_token)) = row else {
-            return Ok(None);
+            break Some(ExportJobLease {
+                job_id: ExportJobId::from_string(job_id),
+                tenant: TenantContext::new(
+                    TenantId::new(tenant_id),
+                    TenantPermissions::full_access(),
+                ),
+                worker_id: worker_id.clone(),
+                lease_expiry,
+                fencing_token: new_token as u64,
+            });
         };
-        let new_token = fencing_token + 1;
 
-        conn.execute(
-            "UPDATE bulk_export_jobs
-             SET status = 'in-progress', worker_id = ?1, lease_expiry = ?2,
-                 heartbeat_at = ?3, fencing_token = ?4,
-                 started_at = COALESCE(started_at, ?3)
-             WHERE id = ?5",
-            params![
-                worker_id.as_str(),
-                lease_expiry_str,
-                now_str,
-                new_token,
-                job_id
-            ],
-        )
-        .map_err(|e| internal_error(format!("Failed to claim export job: {}", e)))?;
+        // Committed on both paths: an empty scan may still have retired jobs.
+        txn.commit()
+            .map_err(|e| internal_error(format!("Failed to commit claim txn: {}", e)))?;
 
-        Ok(Some(ExportJobLease {
-            job_id: ExportJobId::from_string(job_id),
-            tenant: TenantContext::new(TenantId::new(tenant_id), TenantPermissions::full_access()),
-            worker_id: worker_id.clone(),
-            lease_expiry,
-            fencing_token: new_token as u64,
-        }))
+        Ok(claimed)
     }
 
     async fn heartbeat(&self, lease: &ExportJobLease) -> Result<DateTime<Utc>, LeaseError> {
@@ -1639,6 +1737,9 @@ mod tests {
     use helios_fhir::FhirVersion;
     use serde_json::json;
 
+    /// Claim cap for tests that are not exercising the cap itself.
+    const TEST_MAX_ATTEMPTS: u32 = 3;
+
     fn create_test_backend() -> SqliteBackend {
         let backend = SqliteBackend::in_memory().unwrap();
         backend.init_schema().unwrap();
@@ -1749,7 +1850,7 @@ mod tests {
         // Move one of tenant A's jobs to in-progress via the real worker path.
         let worker = WorkerId::new("worker-1");
         let lease = backend
-            .claim_next(&worker, StdDuration::from_secs(60))
+            .claim_next(&worker, StdDuration::from_secs(60), TEST_MAX_ATTEMPTS)
             .await
             .unwrap()
             .expect("a job should be claimable");
@@ -1827,7 +1928,7 @@ mod tests {
 
         let worker = WorkerId::new("worker-1");
         let lease = backend
-            .claim_next(&worker, StdDuration::from_secs(60))
+            .claim_next(&worker, StdDuration::from_secs(60), TEST_MAX_ATTEMPTS)
             .await
             .unwrap()
             .expect("a job should be claimable");
@@ -1837,7 +1938,7 @@ mod tests {
         // A second claim finds nothing (the only job is now in-progress).
         assert!(
             backend
-                .claim_next(&worker, StdDuration::from_secs(60))
+                .claim_next(&worker, StdDuration::from_secs(60), TEST_MAX_ATTEMPTS)
                 .await
                 .unwrap()
                 .is_none()
@@ -1879,7 +1980,7 @@ mod tests {
 
         let worker_a = WorkerId::new("worker-a");
         let lease_a = backend
-            .claim_next(&worker_a, StdDuration::from_millis(1))
+            .claim_next(&worker_a, StdDuration::from_millis(1), TEST_MAX_ATTEMPTS)
             .await
             .unwrap()
             .unwrap();
@@ -1888,7 +1989,7 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         let worker_b = WorkerId::new("worker-b");
         let lease_b = backend
-            .claim_next(&worker_b, StdDuration::from_secs(60))
+            .claim_next(&worker_b, StdDuration::from_secs(60), TEST_MAX_ATTEMPTS)
             .await
             .unwrap()
             .unwrap();
@@ -1927,6 +2028,177 @@ mod tests {
             .unwrap();
     }
 
+    /// Reads a job's raw claim counter, which no trait surfaces.
+    fn attempts_of(backend: &SqliteBackend, job_id: &ExportJobId) -> i64 {
+        backend
+            .get_connection()
+            .unwrap()
+            .query_row(
+                "SELECT attempts FROM bulk_export_jobs WHERE id = ?1",
+                params![job_id.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    /// A job whose lease expires mid-run is reclaimable, so one that keeps
+    /// dying the same way used to be handed to worker after worker forever:
+    /// never terminal, `error_message` never set, the status poll answering
+    /// `202` indefinitely, and one of the tenant's export slots held the whole
+    /// time (#1041). The claim cap retires it instead.
+    #[tokio::test]
+    async fn test_claim_cap_retires_a_job_that_never_finishes() {
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+
+        let job_id = backend
+            .start_export(&tenant, test_input(ExportRequest::system()))
+            .await
+            .unwrap();
+
+        // Two claims, each losing its lease before finishing.
+        for attempt in 1..=2 {
+            let worker = WorkerId::new(format!("worker-{attempt}"));
+            let lease = backend
+                .claim_next(&worker, StdDuration::from_millis(1), 2)
+                .await
+                .unwrap()
+                .expect("claimable while attempts remain");
+            assert_eq!(lease.fencing_token, attempt as u64, "fencing still bumps");
+            assert_eq!(attempts_of(&backend, &job_id), attempt, "attempts counted");
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+
+        // The third claim would exceed the cap, so the job is retired rather
+        // than handed out again.
+        let worker = WorkerId::new("worker-3");
+        assert!(
+            backend
+                .claim_next(&worker, StdDuration::from_secs(60), 2)
+                .await
+                .unwrap()
+                .is_none(),
+            "a job past its attempt cap must not be claimable"
+        );
+
+        let progress = backend.get_export_status(&tenant, &job_id).await.unwrap();
+        assert_eq!(progress.status, ExportStatus::Error);
+        assert_eq!(progress.error_message, Some(abandoned_export_message(2)));
+        assert!(
+            progress.completed_at.is_some(),
+            "a retired job is terminal, so it has a completion time"
+        );
+
+        // And it stays retired: a later claim does not resurrect it.
+        assert!(
+            backend
+                .claim_next(&worker, StdDuration::from_secs(60), 2)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// Retiring a job is not the end of the scan — the claim that spends the
+    /// last attempt still hands back the next eligible job, so one stuck job
+    /// cannot stall a worker that has other work waiting.
+    #[tokio::test]
+    async fn test_claim_cap_still_returns_the_next_eligible_job() {
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+
+        let stuck = backend
+            .start_export(&tenant, test_input(ExportRequest::system()))
+            .await
+            .unwrap();
+        // The claim scan orders by `created_at`; a beat between the two
+        // inserts keeps `stuck` ahead of `fresh` on a coarse system clock.
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        let fresh = backend
+            .start_export(&tenant, test_input(ExportRequest::system()))
+            .await
+            .unwrap();
+
+        let worker = WorkerId::new("worker-1");
+        let lease = backend
+            .claim_next(&worker, StdDuration::from_millis(1), 1)
+            .await
+            .unwrap()
+            .expect("the older job is claimed first");
+        assert_eq!(lease.job_id, stuck);
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+
+        let lease = backend
+            .claim_next(&worker, StdDuration::from_secs(60), 1)
+            .await
+            .unwrap()
+            .expect("the scan must go past the retired job, not stop at it");
+        assert_eq!(lease.job_id, fresh);
+
+        assert_eq!(
+            backend
+                .get_export_status(&tenant, &stuck)
+                .await
+                .unwrap()
+                .status,
+            ExportStatus::Error
+        );
+        assert_eq!(
+            backend
+                .get_export_status(&tenant, &fresh)
+                .await
+                .unwrap()
+                .status,
+            ExportStatus::InProgress
+        );
+    }
+
+    /// The cap only ever sees jobs that come back for another claim: a job
+    /// that runs to completion on its first attempt is untouched by it.
+    #[tokio::test]
+    async fn test_claim_cap_leaves_a_completed_job_alone() {
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+
+        let job_id = backend
+            .start_export(&tenant, test_input(ExportRequest::system()))
+            .await
+            .unwrap();
+
+        let worker = WorkerId::new("worker-1");
+        let lease = backend
+            .claim_next(&worker, StdDuration::from_secs(60), 1)
+            .await
+            .unwrap()
+            .expect("job claimable");
+        backend
+            .finish_export_job(&tenant, &job_id, &worker, lease.fencing_token)
+            .await
+            .unwrap();
+
+        let progress = backend.get_export_status(&tenant, &job_id).await.unwrap();
+        assert_eq!(progress.status, ExportStatus::Complete);
+        assert_eq!(progress.error_message, None);
+        assert_eq!(attempts_of(&backend, &job_id), 1);
+
+        // A complete job is not eligible, so no later scan can retire it.
+        assert!(
+            backend
+                .claim_next(&worker, StdDuration::from_secs(60), 1)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            backend
+                .get_export_status(&tenant, &job_id)
+                .await
+                .unwrap()
+                .status,
+            ExportStatus::Complete
+        );
+    }
+
     #[tokio::test]
     async fn test_set_export_current_type_persists_and_clears() {
         let backend = create_test_backend();
@@ -1938,7 +2210,7 @@ mod tests {
             .unwrap();
         let worker = WorkerId::new("worker-1");
         let lease = backend
-            .claim_next(&worker, StdDuration::from_secs(60))
+            .claim_next(&worker, StdDuration::from_secs(60), TEST_MAX_ATTEMPTS)
             .await
             .unwrap()
             .expect("job claimable");
@@ -1984,7 +2256,7 @@ mod tests {
             .unwrap();
         let worker = WorkerId::new("worker-1");
         let lease = backend
-            .claim_next(&worker, StdDuration::from_secs(60))
+            .claim_next(&worker, StdDuration::from_secs(60), TEST_MAX_ATTEMPTS)
             .await
             .unwrap()
             .expect("job claimable");
@@ -2023,7 +2295,7 @@ mod tests {
             .unwrap();
         let worker = WorkerId::new("worker-1");
         let lease = backend
-            .claim_next(&worker, StdDuration::from_secs(60))
+            .claim_next(&worker, StdDuration::from_secs(60), TEST_MAX_ATTEMPTS)
             .await
             .unwrap()
             .expect("job claimable");

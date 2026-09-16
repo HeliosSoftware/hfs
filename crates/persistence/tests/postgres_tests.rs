@@ -8049,9 +8049,12 @@ mod postgres_integration {
         PatientExportProvider, StartExportInput, TypeExportProgress,
     };
     use helios_persistence::core::bulk_export_worker::{
-        ExportClaimStrategy, ExportWorkerStorage, LeaseError, WorkerId,
+        ExportClaimStrategy, ExportWorkerStorage, LeaseError, WorkerId, abandoned_export_message,
     };
     use std::time::Duration as StdDuration;
+
+    /// Claim cap for tests that are not exercising the cap itself.
+    const TEST_MAX_ATTEMPTS: u32 = 3;
 
     fn export_input(request: ExportRequest) -> StartExportInput {
         StartExportInput {
@@ -8072,8 +8075,31 @@ mod postgres_integration {
         target: &helios_persistence::core::bulk_export::ExportJobId,
         lease_duration: StdDuration,
     ) -> helios_persistence::core::bulk_export_worker::ExportJobLease {
+        claim_specific_with_cap(
+            backend,
+            worker_id,
+            target,
+            lease_duration,
+            TEST_MAX_ATTEMPTS,
+        )
+        .await
+    }
+
+    /// [`claim_specific`] with an explicit claim cap, for the tests that drive
+    /// one job past it (#1041).
+    async fn claim_specific_with_cap(
+        backend: &helios_persistence::backends::postgres::PostgresBackend,
+        worker_id: &WorkerId,
+        target: &helios_persistence::core::bulk_export::ExportJobId,
+        lease_duration: StdDuration,
+        max_attempts: u32,
+    ) -> helios_persistence::core::bulk_export_worker::ExportJobLease {
         for _ in 0..100 {
-            match backend.claim_next(worker_id, lease_duration).await.unwrap() {
+            match backend
+                .claim_next(worker_id, lease_duration, max_attempts)
+                .await
+                .unwrap()
+            {
                 Some(lease) if &lease.job_id == target => return lease,
                 Some(other) => {
                     // Drain other tests' jobs out of the queue by completing
@@ -8426,6 +8452,194 @@ mod postgres_integration {
             .finish_export_job(&tenant, &job_id, &worker_b, lease_b.fencing_token)
             .await
             .unwrap();
+    }
+
+    /// Reads a job's raw claim counter, which no trait surfaces.
+    async fn export_attempts(
+        backend: &PostgresBackend,
+        job_id: &helios_persistence::core::bulk_export::ExportJobId,
+    ) -> i32 {
+        let client = backend.get_client().await.unwrap();
+        client
+            .query_one(
+                "SELECT attempts FROM bulk_export_jobs WHERE id = $1",
+                &[&job_id.as_str()],
+            )
+            .await
+            .unwrap()
+            .get(0)
+    }
+
+    /// Completes every currently-claimable job, so a scan-order assertion sees
+    /// only the jobs the test itself created on the shared instance.
+    async fn drain_claim_queue(backend: &PostgresBackend) {
+        let worker = WorkerId::new(format!("pg-drain-{}", uuid::Uuid::new_v4()));
+        for _ in 0..100 {
+            match backend
+                .claim_next(&worker, StdDuration::from_secs(60), TEST_MAX_ATTEMPTS)
+                .await
+                .unwrap()
+            {
+                Some(lease) => {
+                    let _ = backend
+                        .finish_export_job(
+                            &lease.tenant,
+                            &lease.job_id,
+                            &lease.worker_id,
+                            lease.fencing_token,
+                        )
+                        .await;
+                }
+                None => return,
+            }
+        }
+    }
+
+    /// A job whose lease expires mid-run is reclaimable, so one that keeps
+    /// dying the same way used to be handed to worker after worker forever:
+    /// never terminal, `error_message` never set, the status poll answering
+    /// `202` indefinitely, and one of the tenant's export slots held the whole
+    /// time (#1041). The claim cap retires it instead.
+    #[tokio::test]
+    async fn postgres_integration_export_claim_cap_retires_a_job_that_never_finishes() {
+        let _guard = BULK_EXPORT_TEST_LOCK.lock().await;
+        let backend = create_backend().await;
+        let tenant = create_tenant("export-attempt-cap");
+
+        let job_id = backend
+            .start_export(&tenant, export_input(ExportRequest::system()))
+            .await
+            .unwrap();
+
+        // Two claims, each losing its lease before finishing.
+        for attempt in 1..=2 {
+            let worker = WorkerId::new(format!("pg-cap-{attempt}-{}", uuid::Uuid::new_v4()));
+            let lease =
+                claim_specific_with_cap(&backend, &worker, &job_id, StdDuration::from_millis(1), 2)
+                    .await;
+            assert!(lease.fencing_token >= attempt as u64, "fencing still bumps");
+            assert_eq!(
+                export_attempts(&backend, &job_id).await,
+                attempt,
+                "attempts counted"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+
+        // The third claim would exceed the cap, so the job is retired rather
+        // than handed out again.
+        let worker = WorkerId::new(format!("pg-cap-3-{}", uuid::Uuid::new_v4()));
+        for _ in 0..20 {
+            match backend
+                .claim_next(&worker, StdDuration::from_secs(60), 2)
+                .await
+                .unwrap()
+            {
+                Some(lease) => {
+                    assert_ne!(
+                        lease.job_id, job_id,
+                        "a job past its attempt cap must not be claimable"
+                    );
+                    // Another test's job: complete it and keep scanning.
+                    let _ = backend
+                        .finish_export_job(
+                            &lease.tenant,
+                            &lease.job_id,
+                            &lease.worker_id,
+                            lease.fencing_token,
+                        )
+                        .await;
+                }
+                None => break,
+            }
+        }
+
+        let progress = backend.get_export_status(&tenant, &job_id).await.unwrap();
+        assert_eq!(progress.status, ExportStatus::Error);
+        assert_eq!(progress.error_message, Some(abandoned_export_message(2)));
+        assert!(
+            progress.completed_at.is_some(),
+            "a retired job is terminal, so it has a completion time"
+        );
+    }
+
+    /// Retiring a job is not the end of the scan — the claim that spends the
+    /// last attempt still hands back the next eligible job, so one stuck job
+    /// cannot stall a worker that has other work waiting.
+    #[tokio::test]
+    async fn postgres_integration_export_claim_cap_still_returns_the_next_job() {
+        let _guard = BULK_EXPORT_TEST_LOCK.lock().await;
+        let backend = create_backend().await;
+        let tenant = create_tenant("export-attempt-cap-scan");
+
+        // The assertion below is about scan order, so start from an empty
+        // queue rather than behind another test's leftovers.
+        drain_claim_queue(&backend).await;
+
+        let stuck = backend
+            .start_export(&tenant, export_input(ExportRequest::system()))
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        let fresh = backend
+            .start_export(&tenant, export_input(ExportRequest::system()))
+            .await
+            .unwrap();
+
+        let worker = WorkerId::new(format!("pg-cap-scan-{}", uuid::Uuid::new_v4()));
+        let lease =
+            claim_specific_with_cap(&backend, &worker, &stuck, StdDuration::from_millis(1), 1)
+                .await;
+        assert_eq!(lease.job_id, stuck);
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let lease = backend
+            .claim_next(&worker, StdDuration::from_secs(60), 1)
+            .await
+            .unwrap()
+            .expect("the scan must go past the retired job, not stop at it");
+        assert_eq!(lease.job_id, fresh);
+
+        assert_eq!(
+            backend
+                .get_export_status(&tenant, &stuck)
+                .await
+                .unwrap()
+                .status,
+            ExportStatus::Error
+        );
+        backend
+            .finish_export_job(&tenant, &fresh, &worker, lease.fencing_token)
+            .await
+            .unwrap();
+    }
+
+    /// The cap only ever sees jobs that come back for another claim: a job that
+    /// runs to completion on its first attempt is untouched by it.
+    #[tokio::test]
+    async fn postgres_integration_export_claim_cap_leaves_a_completed_job_alone() {
+        let _guard = BULK_EXPORT_TEST_LOCK.lock().await;
+        let backend = create_backend().await;
+        let tenant = create_tenant("export-attempt-cap-complete");
+
+        let job_id = backend
+            .start_export(&tenant, export_input(ExportRequest::system()))
+            .await
+            .unwrap();
+
+        let worker = WorkerId::new(format!("pg-cap-done-{}", uuid::Uuid::new_v4()));
+        let lease =
+            claim_specific_with_cap(&backend, &worker, &job_id, StdDuration::from_secs(60), 1)
+                .await;
+        backend
+            .finish_export_job(&tenant, &job_id, &worker, lease.fencing_token)
+            .await
+            .unwrap();
+
+        let progress = backend.get_export_status(&tenant, &job_id).await.unwrap();
+        assert_eq!(progress.status, ExportStatus::Complete);
+        assert_eq!(progress.error_message, None);
+        assert_eq!(export_attempts(&backend, &job_id).await, 1);
     }
 
     #[tokio::test]
