@@ -44,7 +44,7 @@ All kick-offs require `Prefer: respond-async`. The default response is `202 Acce
 
 Job-state storage reuses the same backend and connection pool that holds FHIR resources. SQLite deployments share `./data/hfs.db`. PostgreSQL deployments share `HFS_DATABASE_URL`. There is no separate job-store configuration.
 
-Bulk export is currently available on `sqlite`, `postgres`, `sqlite-elasticsearch`, and `postgres-elasticsearch`. Other backends return `501` until job-state implementations exist.
+Bulk export is currently available on `sqlite`, `postgres`, `sqlite-elasticsearch`, `postgres-elasticsearch`, and `mongodb` (a SQLite sidecar job store). The composite `mongo-elasticsearch` and the `s3`/`s3-elasticsearch` backends return `501` until job-state implementations exist there.
 
 ## Single-instance Recipe
 
