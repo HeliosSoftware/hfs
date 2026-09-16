@@ -10,7 +10,7 @@ use tokio::runtime::RuntimeFlavor;
 use crate::error::{BackendError, StorageError, StorageResult};
 
 use super::backend::MongoBackendConfig;
-use super::search_index_catalog::{IndexBuild, SEARCH_INDEX_COLLECTION, generation2_specs};
+use super::search_index_catalog::{IndexBuild, SEARCH_INDEX_COLLECTION, current_specs};
 
 /// Current MongoDB schema version.
 ///
@@ -249,7 +249,7 @@ async fn ensure_history_indexes(database: &Database) -> StorageResult<()> {
 /// index) is built by `SearchIndexBuilder` after boot; see the catalog.
 async fn ensure_search_indexes(database: &Database) -> StorageResult<()> {
     let search_index = database.collection::<Document>(SEARCH_INDEX_COLLECTION);
-    for spec in generation2_specs()
+    for spec in current_specs()
         .iter()
         .filter(|s| s.build == IndexBuild::Inline)
     {

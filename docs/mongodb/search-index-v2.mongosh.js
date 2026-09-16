@@ -142,21 +142,6 @@ db.runCommand({
           "$exists": true
         }
       }
-    },
-    {
-      "key": {
-        "tenant_id": 1,
-        "contained_type": 1,
-        "is_contained": 1,
-        "param_name": 1,
-        "resource_type": 1,
-        "resource_id": 1,
-        "contained_local_id": 1
-      },
-      "name": "idx_search_contained",
-      "partialFilterExpression": {
-        "is_contained": true
-      }
     }
   ]
 });

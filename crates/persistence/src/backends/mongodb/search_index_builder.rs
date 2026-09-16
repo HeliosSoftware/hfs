@@ -85,7 +85,7 @@ use super::schema::{
 };
 use super::search_index_catalog::{
     IndexBuild, SEARCH_INDEX_COLLECTION, SEARCH_INDEX_GENERATION, SearchIndexSpec,
-    create_indexes_command, generation2_specs, superseded_v1_specs,
+    create_indexes_command, current_specs, superseded_v1_specs,
 };
 
 /// What one run of the builder did.
@@ -214,7 +214,7 @@ impl SearchIndexBuilder {
                 .map(|(n, _)| n.clone())
                 .collect();
             for (name, actual) in &inspection.conflicting {
-                let expected_spec = generation2_specs().into_iter().find(|s| s.name == name);
+                let expected_spec = current_specs().into_iter().find(|s| s.name == name);
                 let expected_keys = expected_spec.as_ref().map(|s| s.keys.clone());
                 let expected_partial = expected_spec.as_ref().and_then(|s| s.partial.clone());
                 tracing::error!(
@@ -350,7 +350,7 @@ impl SearchIndexBuilder {
             // Every background spec is then "missing" and the build is instant.
             Err(e) if is_namespace_not_found(&e) => {
                 return Ok(Inspection {
-                    missing: generation2_specs()
+                    missing: current_specs()
                         .into_iter()
                         .filter(|s| s.build == IndexBuild::Background)
                         .collect(),
@@ -362,7 +362,7 @@ impl SearchIndexBuilder {
         let existing = listed_indexes(&reply)?;
 
         let mut inspection = Inspection::default();
-        for spec in generation2_specs()
+        for spec in current_specs()
             .into_iter()
             .filter(|s| s.build == IndexBuild::Background)
         {
@@ -654,7 +654,7 @@ mod builder_tests {
     /// be a correctness bug, not just a performance one.
     #[test]
     fn classify_spec_treats_matching_index_with_extra_option_as_conflicting() {
-        let spec = generation2_specs()
+        let spec = current_specs()
             .into_iter()
             .find(|s| s.name == "idx_search_date_v2")
             .expect("idx_search_date_v2 is in the catalog");
@@ -672,7 +672,7 @@ mod builder_tests {
 
     #[test]
     fn classify_spec_ready_when_key_partial_match_and_no_extra_options() {
-        let spec = generation2_specs()
+        let spec = current_specs()
             .into_iter()
             .find(|s| s.name == "idx_search_date_v2")
             .expect("idx_search_date_v2 is in the catalog");
