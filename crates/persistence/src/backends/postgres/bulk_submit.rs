@@ -1445,8 +1445,8 @@ impl PostgresBackend {
             let previous_contents: Vec<Option<Value>> =
                 changes.iter().map(|c| c.previous_content.clone()).collect();
             let changed_at: Vec<DateTime<Utc>> = changes.iter().map(|c| c.changed_at).collect();
-            client
-                .execute(
+            super::cached::execute_cached(
+                client,
                     "INSERT INTO bulk_submission_changes
                      (tenant_id, submitter, submission_id, change_id, manifest_id, change_type, resource_type, resource_id, previous_version, new_version, previous_content, changed_at)
                      SELECT $1, $2, $3, *
@@ -1495,7 +1495,8 @@ impl PostgresBackend {
             &outcome_codes,
             &outcome_json,
         ];
-        let store_receipt = client.execute(
+        let store_receipt = super::cached::execute_cached(
+            client,
             // Upsert: the worker re-fetches a whole file after a transient
             // failure, and the retry must overwrite its own earlier rows
             // instead of colliding with them (#457).

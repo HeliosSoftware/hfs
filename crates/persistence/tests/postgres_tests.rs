@@ -10534,7 +10534,7 @@ mod postgres_integration {
         // worker claim test above so the cross-tenant queue cannot hand it to
         // that test while this one is processing the batch.
         let _guard = BULK_SUBMIT_TEST_LOCK.lock().await;
-        let backend = create_backend().await;
+        let backend = create_backend_with_max_connections(1).await;
         let tenant = create_tenant("bulk_submit_batch");
         let sub_id = SubmissionId::generate("pg-batch-test");
         backend
@@ -10614,6 +10614,23 @@ mod postgres_integration {
             .await
             .unwrap();
 
+        let client = backend.get_client().await.unwrap();
+        let prepared_bookkeeping: i64 = client
+            .query_one(
+                "SELECT COUNT(*) FROM pg_prepared_statements
+                 WHERE statement LIKE 'INSERT INTO bulk_submission_changes%'
+                    OR statement LIKE 'WITH receipt_rows AS%'",
+                &[],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(
+            prepared_bookkeeping, 2,
+            "three receipts and two rollback changes should retain two prepared statements"
+        );
+        drop(client);
+
         // `process_entries` leaves synchronous manifests in `processing`
         // without a worker lease. Such rows remain eligible for the worker
         // claim queue, so terminate this test submission before releasing the
@@ -10634,21 +10651,92 @@ mod postgres_integration {
         );
         assert!(results[2].is_success() && !results[2].created);
 
+        let receipts = backend
+            .get_entry_results_page(&tenant, &sub_id, &manifest.manifest_id, None, 10, None)
+            .await
+            .unwrap();
+        assert!(receipts.next.is_none());
+        for paged in &receipts.entries {
+            let identity = paged.stored_identity.as_ref().unwrap();
+            assert_eq!(identity.file_url, "https://provider/p.ndjson");
+            assert_eq!(identity.line_number, paged.result.line_number);
+            assert_eq!(paged.result.resource_type, "Patient");
+        }
+        let receipt_facts: Vec<_> = receipts
+            .entries
+            .iter()
+            .map(|paged| {
+                let result = &paged.result;
+                (
+                    result.line_number,
+                    result.resource_id.as_deref(),
+                    result.created,
+                    result.outcome,
+                    result.operation_outcome.is_some(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            receipt_facts,
+            vec![
+                (
+                    1,
+                    Some("pg-batch-new"),
+                    true,
+                    BulkEntryOutcome::Success,
+                    false
+                ),
+                (2, None, false, BulkEntryOutcome::ProcessingError, true),
+                (
+                    3,
+                    Some("pg-batch-upd"),
+                    false,
+                    BulkEntryOutcome::Success,
+                    false
+                ),
+            ]
+        );
+
         // The failed entry did not poison the batch: both writes committed,
         // together with their receipts and rollback records.
-        assert!(
-            backend
-                .read(&tenant, "Patient", "pg-batch-new")
-                .await
-                .unwrap()
-                .is_some()
-        );
+        let created = backend
+            .read(&tenant, "Patient", "pg-batch-new")
+            .await
+            .unwrap()
+            .expect("created patient");
+        assert_eq!(created.version_id(), "1");
+        assert_eq!(created.content()["name"], json!([{"family":"BatchNew"}]));
         let updated = backend
             .read(&tenant, "Patient", "pg-batch-upd")
             .await
             .unwrap()
             .expect("updated patient");
+        assert_eq!(updated.version_id(), "2");
         assert_eq!(updated.content()["name"], json!([{"family":"BatchUpd"}]));
+
+        let created_history = backend
+            .history_instance(
+                &tenant,
+                "Patient",
+                "pg-batch-new",
+                &HistoryParams::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(created_history.items.len(), 1);
+        assert_eq!(created_history.items[0].resource.version_id(), "1");
+        let updated_history = backend
+            .history_instance(
+                &tenant,
+                "Patient",
+                "pg-batch-upd",
+                &HistoryParams::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(updated_history.items.len(), 2);
+        assert_eq!(updated_history.items[0].resource.version_id(), "2");
+        assert_eq!(updated_history.items[1].resource.version_id(), "1");
 
         let counts = backend
             .get_entry_counts(&tenant, &sub_id, &manifest.manifest_id)
@@ -10668,7 +10756,9 @@ mod postgres_integration {
             .iter()
             .find(|change| change.resource_id == "pg-batch-new")
             .expect("create change");
+        assert_eq!(create.manifest_id, manifest.manifest_id);
         assert_eq!(create.change_type, ChangeType::Create);
+        assert_eq!(create.resource_type, "Patient");
         assert_eq!(create.new_version, "1");
         assert!(create.previous_version.is_none());
         assert!(create.previous_content.is_none());
@@ -10676,7 +10766,9 @@ mod postgres_integration {
             .iter()
             .find(|change| change.resource_id == "pg-batch-upd")
             .expect("update change");
+        assert_eq!(update.manifest_id, manifest.manifest_id);
         assert_eq!(update.change_type, ChangeType::Update);
+        assert_eq!(update.resource_type, "Patient");
         assert_eq!(update.previous_version.as_deref(), Some("1"));
         assert_eq!(update.new_version, "2");
         assert_eq!(
