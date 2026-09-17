@@ -14,6 +14,7 @@ use crate::core::bulk_export::{
 use crate::core::bulk_export_output::{ExportPartKey, FinalizedPart};
 use crate::core::bulk_export_worker::{
     ExportClaimStrategy, ExportJobLease, ExportWorkerStorage, LeaseError, WorkerId, WorkerJobView,
+    abandoned_export_message,
 };
 use crate::error::{BackendError, BulkExportError, StorageError, StorageResult};
 use crate::tenant::{TenantContext, TenantId, TenantPermissions};
@@ -588,9 +589,15 @@ impl ExportClaimStrategy for PostgresBackend {
         &self,
         worker_id: &WorkerId,
         lease_duration: StdDuration,
+        max_attempts: u32,
     ) -> StorageResult<Option<ExportJobLease>> {
         let mut client = self.get_client().await?;
         let now = Utc::now();
+        // The 60s here is a `std -> chrono` conversion fallback, not a lease
+        // policy: it only fires for a configured duration too large for
+        // `chrono::Duration` (hundreds of millions of years). It stays, and it
+        // deliberately matches `ExportJobLease::renewed_expiry`, so an absurd
+        // configuration degrades to the same value on claim and on renewal.
         let lease_expiry = now
             + chrono::Duration::from_std(lease_duration)
                 .unwrap_or_else(|_| chrono::Duration::seconds(60));
@@ -600,64 +607,156 @@ impl ExportClaimStrategy for PostgresBackend {
             .await
             .map_err(|e| internal_error(format!("Failed to begin claim txn: {}", e)))?;
 
-        let rows = txn
-            .query(
-                "SELECT id, tenant_id, fencing_token FROM bulk_export_jobs
-                 WHERE status = 'accepted'
-                    OR (status = 'in-progress' AND (lease_expiry IS NULL OR lease_expiry < $1))
-                 ORDER BY created_at
-                 LIMIT 1
-                 FOR UPDATE SKIP LOCKED",
-                &[&now],
+        // Each turn either claims a job or retires one whose attempts are
+        // spent. Retiring moves the job out of the eligible set — visible to
+        // the next select, which runs in this same transaction — so the scan
+        // makes progress on every turn and a caller is never left empty-handed
+        // while another job is still claimable (#1041).
+        loop {
+            let rows = txn
+                .query(
+                    "SELECT id, tenant_id, status, fencing_token, attempts FROM bulk_export_jobs
+                     WHERE status = 'accepted'
+                        OR (status = 'in-progress' AND (lease_expiry IS NULL OR lease_expiry < $1))
+                     ORDER BY created_at
+                     LIMIT 1
+                     FOR UPDATE SKIP LOCKED",
+                    &[&now],
+                )
+                .await
+                .map_err(|e| internal_error(format!("Failed to select claimable job: {}", e)))?;
+
+            let Some(row) = rows.first() else {
+                txn.commit()
+                    .await
+                    .map_err(|e| internal_error(format!("Failed to commit claim txn: {}", e)))?;
+                return Ok(None);
+            };
+            let job_id: String = row.get(0);
+            let tenant_id: String = row.get(1);
+            let status: String = row.get(2);
+            let fencing_token: i64 = row.get(3);
+            let attempts: i32 = row.get(4);
+            let new_token = fencing_token + 1;
+            let attempt = attempts + 1;
+
+            if i64::from(attempt) > i64::from(max_attempts) {
+                // Every worker that held this job lost its lease before
+                // finishing. Hand it to no one else: fail it terminally so the
+                // status poll ends in an error the client can act on, and so
+                // the job stops occupying one of the tenant's export slots.
+                let attempts_made = u32::try_from(attempts).unwrap_or(u32::MAX);
+                txn.execute(
+                    "UPDATE bulk_export_jobs
+                     SET status = 'error', error_message = $1, completed_at = $2,
+                         current_type = NULL, worker_id = NULL, lease_expiry = NULL
+                     WHERE id = $3",
+                    &[
+                        &abandoned_export_message(attempts_made),
+                        &now,
+                        &job_id.as_str(),
+                    ],
+                )
+                .await
+                .map_err(|e| internal_error(format!("Failed to abandon export job: {}", e)))?;
+                tracing::warn!(
+                    job_id = %job_id,
+                    attempts = attempts_made,
+                    "export job abandoned: its lease expired on every attempt"
+                );
+                // No wipe: the job is terminal, and the output TTL sweep
+                // reclaims its rows and its artifacts together.
+                continue;
+            }
+
+            // A re-claimed job restarts from scratch. The worker resumes
+            // *within* a type from `cursor_state` but always restarts
+            // `part_index` at 0, so keeping the previous attempt's rows would
+            // let the resumed run overwrite parts 0..n of the half-finished
+            // type — silently dropping every resource the dead worker had
+            // already written, with the job still ending `complete` (#1041).
+            // Types that did finish would also be exported twice, inflating
+            // `exported_count`. A job still `accepted` never wrote anything.
+            //
+            // Only the rows go. The artifacts stay: unlinking them would pull
+            // the `.tmp` file out from under a zombie worker, whose
+            // `finalize_part` would then fail its rename with a plain
+            // `StorageError` instead of `LeaseLost` — and that makes the
+            // worker loop emit a spurious `failed` audit event for a job now
+            // running under someone else's lease. The periodic TTL cleanup
+            // drops the job's whole output prefix anyway.
+            //
+            // The DELETEs ride in the claim transaction, so the token bump and
+            // the wipe become visible together.
+            if status == "in-progress" {
+                txn.execute(
+                    "DELETE FROM bulk_export_progress WHERE job_id = $1",
+                    &[&job_id.as_str()],
+                )
+                .await
+                .map_err(|e| {
+                    internal_error(format!("Failed to clear reclaimed progress: {}", e))
+                })?;
+                txn.execute(
+                    "DELETE FROM bulk_export_files WHERE job_id = $1",
+                    &[&job_id.as_str()],
+                )
+                .await
+                .map_err(|e| {
+                    internal_error(format!("Failed to clear reclaimed file rows: {}", e))
+                })?;
+                tracing::info!(
+                    job_id = %job_id,
+                    attempt,
+                    "reclaimed export job: discarding the previous attempt's progress"
+                );
+            }
+
+            txn.execute(
+                "UPDATE bulk_export_jobs
+                 SET status = 'in-progress', worker_id = $1, lease_expiry = $2,
+                     heartbeat_at = $3, fencing_token = $4, attempts = $5,
+                     started_at = COALESCE(started_at, $3)
+                 WHERE id = $6",
+                &[
+                    &worker_id.as_str(),
+                    &lease_expiry,
+                    &now,
+                    &new_token,
+                    &attempt,
+                    &job_id.as_str(),
+                ],
             )
             .await
-            .map_err(|e| internal_error(format!("Failed to select claimable job: {}", e)))?;
+            .map_err(|e| internal_error(format!("Failed to claim export job: {}", e)))?;
 
-        let Some(row) = rows.first() else {
             txn.commit()
                 .await
                 .map_err(|e| internal_error(format!("Failed to commit claim txn: {}", e)))?;
-            return Ok(None);
-        };
-        let job_id: String = row.get(0);
-        let tenant_id: String = row.get(1);
-        let fencing_token: i64 = row.get(2);
-        let new_token = fencing_token + 1;
 
-        txn.execute(
-            "UPDATE bulk_export_jobs
-             SET status = 'in-progress', worker_id = $1, lease_expiry = $2,
-                 heartbeat_at = $3, fencing_token = $4,
-                 started_at = COALESCE(started_at, $3)
-             WHERE id = $5",
-            &[
-                &worker_id.as_str(),
-                &lease_expiry,
-                &now,
-                &new_token,
-                &job_id.as_str(),
-            ],
-        )
-        .await
-        .map_err(|e| internal_error(format!("Failed to claim export job: {}", e)))?;
-
-        txn.commit()
-            .await
-            .map_err(|e| internal_error(format!("Failed to commit claim txn: {}", e)))?;
-
-        Ok(Some(ExportJobLease {
-            job_id: ExportJobId::from_string(job_id),
-            tenant: TenantContext::new(TenantId::new(tenant_id), TenantPermissions::full_access()),
-            worker_id: worker_id.clone(),
-            lease_expiry,
-            fencing_token: new_token as u64,
-        }))
+            return Ok(Some(ExportJobLease {
+                job_id: ExportJobId::from_string(job_id),
+                tenant: TenantContext::new(
+                    TenantId::new(tenant_id),
+                    TenantPermissions::full_access(),
+                ),
+                worker_id: worker_id.clone(),
+                lease_expiry,
+                fencing_token: new_token as u64,
+                lease_duration,
+            }));
+        }
     }
 
     async fn heartbeat(&self, lease: &ExportJobLease) -> Result<DateTime<Utc>, LeaseError> {
         let client = self.get_client().await.map_err(LeaseError::Storage)?;
         let now = Utc::now();
-        let new_expiry = now + chrono::Duration::seconds(60);
+        // Renew by the duration the job was claimed under, not by a constant
+        // this backend picked. A hardcoded 60s here made
+        // `HFS_BULK_EXPORT_LEASE_DURATION` inert: the first heartbeat shrank
+        // every lease back to a minute, so a slow batch still outlived its
+        // lease and the job got reclaimed in a loop (#1152, #1041).
+        let new_expiry = lease.renewed_expiry();
         let affected = client
             .execute(
                 "UPDATE bulk_export_jobs

@@ -162,8 +162,13 @@ pub trait ExportOutputStore: Send + Sync {
 
     /// Marks a part as finalized and immutable.
     ///
-    /// For object stores this completes the multipart upload; for the local
-    /// filesystem this fsyncs and renames `.tmp` → final.
+    /// The writer is flushed and closed first; the part only becomes readable
+    /// if that succeeds. The local filesystem store then renames `.tmp` →
+    /// final; the S3 store uploads the buffered scratch file as a single
+    /// `PutObject` and deletes the scratch copy. No implementation keeps an
+    /// upload open across calls, so there is nothing to abort if the caller is
+    /// cancelled before reaching this point — only local scratch to reclaim
+    /// (see [`ExportOutputStore::delete_job_outputs`]).
     async fn finalize_part(
         &self,
         key: &ExportPartKey,
