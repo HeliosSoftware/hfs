@@ -891,6 +891,15 @@ impl LeaseKeeper {
                     }
                     match tokio::time::timeout(left, jobs.heartbeat(&lease)).await {
                         Ok(Ok(new_expiry)) => {
+                            tracing::debug!(
+                                submission = %lease.submission_id,
+                                manifest = %lease.manifest_id,
+                                worker = %lease.worker_id,
+                                fencing_token = lease.fencing_token,
+                                held_until = %new_expiry,
+                                now = %Utc::now(),
+                                "bulk-submit lease renewed"
+                            );
                             renewed = Some(new_expiry);
                             break;
                         }
@@ -912,6 +921,8 @@ impl LeaseKeeper {
                                     manifest = %lease.manifest_id,
                                     worker = %lease.worker_id,
                                     fencing_token = lease.fencing_token,
+                                    held_until = %expiry,
+                                    now = %Utc::now(),
                                     "bulk-submit lease lost: another worker reclaimed the \
                                      manifest; abandoning this run"
                                 );
