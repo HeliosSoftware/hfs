@@ -8,6 +8,13 @@ db.search_index_contained.find().forEach(function (row) {
   row.is_contained = true;
   try { db.search_index.insertOne(row); } catch (e) { if (e.code !== 11000) throw e; }
 });
+// Reset the migration record so a later generation-3 boot re-runs the move: its
+// inserts are duplicate-key no-ops for rows already copied back above, and it then
+// deletes the source rows this script just restored.
+db.schema_version.updateOne(
+  { _id: "schema_version" },
+  { $unset: { "search_indexes.contained_rows_moved": "" }, $set: { "search_indexes.generation": 2 } }
+);
 db.runCommand({
   "createIndexes": "search_index",
   "indexes": [

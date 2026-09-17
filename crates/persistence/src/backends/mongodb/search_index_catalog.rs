@@ -281,8 +281,11 @@ pub(crate) fn mongosh_script(specs: &[SearchIndexSpec]) -> String {
 }
 
 /// Downgrade helper: copies contained rows back into `search_index` with
-/// `is_contained: true` and recreates the generation-2 partial index, so a
-/// pre-generation-3 binary serves `_contained` searches again.
+/// `is_contained: true`, recreates the generation-2 partial index, and resets
+/// the `schema_version` migration record (clears `contained_rows_moved`, sets
+/// `generation` back to 2) so a pre-generation-3 binary serves `_contained`
+/// searches again, and a later generation-3 boot re-runs the move instead of
+/// skipping it.
 #[allow(dead_code)]
 pub(crate) fn contained_rollback_script() -> String {
     let spec = superseded_contained_spec();
@@ -300,6 +303,13 @@ pub(crate) fn contained_rollback_script() -> String {
          \x20 row.is_contained = true;\n\
          \x20 try {{ db.search_index.insertOne(row); }} catch (e) {{ if (e.code !== 11000) throw e; }}\n\
          }});\n\
+         // Reset the migration record so a later generation-3 boot re-runs the move: its\n\
+         // inserts are duplicate-key no-ops for rows already copied back above, and it then\n\
+         // deletes the source rows this script just restored.\n\
+         db.schema_version.updateOne(\n\
+         \x20 {{ _id: \"schema_version\" }},\n\
+         \x20 {{ $unset: {{ \"search_indexes.contained_rows_moved\": \"\" }}, $set: {{ \"search_indexes.generation\": 2 }} }}\n\
+         );\n\
          db.runCommand({json});\n"
     )
 }

@@ -9117,6 +9117,140 @@ mod bulk_submit {
         );
     }
 
+    /// #1160, spec-mandated: bulk-submit ingest is a separate code path from
+    /// `create`/`update` (it owns its own index write, see
+    /// `test_defer_indexing_skips_the_search_index_but_stores_everything_else`
+    /// above), so it must independently be proven to route a container's
+    /// contained rows into `search_index_contained` rather than `search_index`,
+    /// and to clear the old contained rows on re-ingest exactly like any other
+    /// ingest path's delete-then-insert.
+    #[tokio::test]
+    async fn mongodb_integration_bulk_ingest_writes_and_reclears_contained_rows() {
+        // The minimal embedded registry `create_backend` uses only indexes
+        // generic Resource-level parameters (`_id`, `_lastUpdated`, ...);
+        // `Patient.name`/`family` need the full spec registry to be active.
+        let Some(backend) = create_backend_with_full_registry("submit_contained_rows").await else {
+            return;
+        };
+        let tenant = create_tenant("submit-tenant");
+        let (id, manifest_id) = seed(&backend, &tenant).await;
+
+        let observation_with_contained_name = |family: &str| {
+            json!({
+                "resourceType": "Observation",
+                "id": "holder",
+                "status": "final",
+                "code": {"coding": [{"system": "http://loinc.org", "code": "8302-2"}]},
+                "contained": [
+                    {
+                        "resourceType": "Patient",
+                        "id": "p",
+                        "name": [{"family": family}]
+                    }
+                ],
+                "subject": {"reference": "#p"}
+            })
+        };
+
+        let results = backend
+            .process_entries(
+                &tenant,
+                &id,
+                &manifest_id,
+                vec![NdjsonEntry::new(
+                    1,
+                    "Observation",
+                    observation_with_contained_name("First"),
+                )],
+                &BulkProcessingOptions::new(),
+            )
+            .await
+            .unwrap();
+        assert!(results[0].is_success() && results[0].created);
+
+        let client = raw_test_client(&backend.config().connection_string)
+            .await
+            .unwrap();
+        let db = client.database(&backend.config().database_name);
+        let search_index = db.collection::<Document>("search_index");
+        let contained = db.collection::<Document>("search_index_contained");
+
+        assert!(
+            search_index
+                .count_documents(doc! {
+                    "tenant_id": tenant.tenant_id().as_str(),
+                    "resource_type": "Observation",
+                    "resource_id": "holder",
+                })
+                .await
+                .unwrap()
+                > 0,
+            "the container's own rows land in search_index"
+        );
+        assert_eq!(
+            search_index
+                .count_documents(doc! { "resource_id": "holder", "is_contained": true })
+                .await
+                .unwrap(),
+            0,
+            "generation-3 contained rows never carry is_contained on search_index"
+        );
+
+        let name_row = contained
+            .find_one(doc! {
+                "resource_type": "Observation",
+                "resource_id": "holder",
+                "contained_local_id": "p",
+                "param_name": "name",
+            })
+            .await
+            .unwrap()
+            .expect("the contained Patient's name row lands in search_index_contained");
+        assert!(!name_row.contains_key("is_contained"));
+        assert_eq!(name_row.get_str("value_string"), Ok("First"));
+
+        // Re-ingest the same id, with the contained Patient renamed. This
+        // backend's ingest path treats a repeat id as an update (see
+        // `test_process_entries_creates_and_updates` above), so no base
+        // version is required.
+        let results = backend
+            .process_entries(
+                &tenant,
+                &id,
+                &manifest_id,
+                vec![NdjsonEntry::new(
+                    2,
+                    "Observation",
+                    observation_with_contained_name("Second"),
+                )],
+                &BulkProcessingOptions::new()
+                    .with_file_url("https://provider.example/second.ndjson"),
+            )
+            .await
+            .unwrap();
+        assert!(results[0].is_success() && !results[0].created);
+
+        use futures::TryStreamExt;
+        let name_rows: Vec<Document> = contained
+            .find(doc! {
+                "resource_type": "Observation",
+                "resource_id": "holder",
+                "contained_local_id": "p",
+                "param_name": "name",
+            })
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        assert_eq!(
+            name_rows.len(),
+            1,
+            "re-ingest must clear the old contained row before writing the new one: {name_rows:?}"
+        );
+        assert_eq!(name_rows[0].get_str("value_string"), Ok("Second"));
+    }
+
     /// A batch is planned against an overlay of its own staged writes, so an id
     /// repeated inside one batch versions forward exactly as it did when every
     /// entry was its own round trip: one history row per entry, the last
@@ -13040,6 +13174,74 @@ async fn mongodb_integration_builder_off_mode_warns_and_changes_nothing() {
     ]);
     expected.sort();
     assert_eq!(search_index_names(&db).await, expected);
+}
+
+/// #1160: `move_contained_rows` runs before the `IndexBuildMode::Off` early
+/// return (it is a correctness fix, not an index build — see
+/// `mongodb_integration_builder_moves_contained_rows_and_drops_the_old_partial_index`
+/// above for the `inline`-mode version), so off mode must still move existing
+/// contained rows out of `search_index` into `search_index_contained` — but,
+/// matching "off mode changes nothing about indexes; warn only", it must
+/// leave the superseded `idx_search_contained` partial index in place.
+#[tokio::test]
+async fn mongodb_integration_builder_off_mode_moves_contained_rows_but_keeps_the_old_index() {
+    let Some(cs) = shared_mongo::connection_string().await else {
+        eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
+        return;
+    };
+    let db_name = build_test_database_name("builder_off_contained");
+    let db = raw_test_client(&cs).await.unwrap().database(&db_name);
+    // A generation-2 database: the old partial index and two contained rows
+    // written the old way.
+    let old = superseded_contained_spec_model();
+    db.collection::<Document>("search_index")
+        .create_index(old)
+        .await
+        .unwrap();
+    db.collection::<Document>("search_index")
+        .insert_many(vec![
+            doc! { "tenant_id": "t", "resource_type": "Observation", "resource_id": "holder", "param_name": "name", "param_type": "string", "value_string": "smith", "is_contained": true, "contained_type": "Patient", "contained_local_id": "p" },
+            doc! { "tenant_id": "t", "resource_type": "Observation", "resource_id": "holder", "param_name": "gender", "param_type": "token", "value_token_code": "female", "is_contained": true, "contained_type": "Patient", "contained_local_id": "p" },
+        ])
+        .await
+        .unwrap();
+
+    let backend = boot_with_mode(&cs, &db_name, IndexBuildMode::Off).await;
+    backend
+        .wait_for_search_index_build()
+        .await
+        .expect("builder ran");
+
+    let own = db.collection::<Document>("search_index");
+    let contained = db.collection::<Document>("search_index_contained");
+    assert_eq!(
+        own.count_documents(doc! { "is_contained": true })
+            .await
+            .unwrap(),
+        0,
+        "off mode still runs the contained-row move"
+    );
+    assert_eq!(
+        contained
+            .count_documents(doc! { "resource_id": "holder" })
+            .await
+            .unwrap(),
+        2
+    );
+    let sv = db
+        .collection::<Document>("schema_version")
+        .find_one(doc! { "_id": "schema_version" })
+        .await
+        .unwrap()
+        .unwrap();
+    let si = sv.get_document("search_indexes").unwrap();
+    assert_eq!(si.get_bool("contained_rows_moved"), Ok(true));
+    assert!(
+        search_index_names(&db)
+            .await
+            .contains(&"idx_search_contained".to_string()),
+        "off mode must not drop the superseded contained index; only warn"
+    );
 }
 
 /// Off mode inspects and warns; it must never drop a leftover v1 index even

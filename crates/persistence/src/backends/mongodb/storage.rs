@@ -4701,9 +4701,7 @@ impl ReindexTarget for MongoBackend {
             .map(|(i, p)| match p.failure {
                 Some(msg) => Err(internal_error(msg)),
                 None => match insert_failures.remove(&i) {
-                    Some(msg) => Err(internal_error(format!(
-                        "Failed to insert search index entries: {msg}"
-                    ))),
+                    Some(msg) => Err(internal_error(msg)),
                     None => Ok(p.docs.own.len() + p.docs.contained.len()),
                 },
             })
@@ -4727,9 +4725,12 @@ const SEARCH_INDEX_INSERT_CHUNK: usize = 5_000;
 /// for its contained rows) so a failed contained insert attributes back to
 /// its resource exactly like a failed own insert.
 ///
-/// Returns the per-resource write failures found. A page-level error — one
-/// the driver did not attribute to specific documents — is returned as
-/// `Err`, for the caller to fan out to every resource in the page.
+/// Returns the per-resource write failures found, each message already
+/// carrying `error_context` (so a `search_index_contained` failure reads as
+/// that, not as "Failed to insert search index entries" regardless of which
+/// collection actually failed). A page-level error — one the driver did not
+/// attribute to specific documents — is returned as `Err`, for the caller to
+/// fan out to every resource in the page.
 async fn insert_search_entries_chunk(
     collection: &mongodb::Collection<Document>,
     owners: &[usize],
@@ -4750,7 +4751,7 @@ async fn insert_search_entries_chunk(
                         let owner = owners[offset + write_error.index];
                         insert_failures
                             .entry(owner)
-                            .or_insert_with(|| write_error.message.clone());
+                            .or_insert_with(|| format!("{error_context}: {}", write_error.message));
                     }
                 }
                 _ => return Err(format!("{error_context}: {e}")),

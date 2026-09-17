@@ -438,7 +438,14 @@ impl SearchIndexBuilder {
             if page.is_empty() {
                 break;
             }
-            let ids: Vec<Bson> = page.iter().filter_map(|r| r.get("_id").cloned()).collect();
+            let ids: Vec<Bson> = page
+                .iter()
+                .map(|r| {
+                    r.get("_id")
+                        .cloned()
+                        .expect("MongoDB documents always carry _id")
+                })
+                .collect();
             let mut rows = page;
             for row in &mut rows {
                 row.remove("is_contained");
