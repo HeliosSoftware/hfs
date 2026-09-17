@@ -635,6 +635,7 @@ bulk-import-status-stopped = Angehalten
 bulk-import-status-completed = Abgeschlossen
 bulk-import-status-failed = Fehlgeschlagen
 bulk-import-status-error = Die letzte Statusänderung hat den Datenempfänger nicht erreicht, diese Submission ist daher unverändert – bitte erneut versuchen. ({ $detail })
+bulk-import-status-pending = Die letzte Statusänderung hat den Datenempfänger nicht erreicht; sie bleibt vorgemerkt und wird automatisch erneut gesendet, solange diese Seite geöffnet ist. ({ $detail })
 bulk-import-detail-recipient = Datenempfänger
 bulk-import-detail-id = Submission-ID
 bulk-import-detail-submitter = Einreicher

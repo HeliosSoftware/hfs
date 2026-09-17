@@ -557,6 +557,107 @@ fn kickoff_body_with_status(submission_id: &str, code: &str) -> Value {
     })
 }
 
+/// A status-only kick-off: identity plus `submissionStatus`, no manifest —
+/// the shape the Import page's Abort / Mark completed buttons send.
+fn status_only_body(submission_id: &str, code: &str) -> Value {
+    json!({
+        "resourceType": "Parameters",
+        "parameter": [
+            {"name": "submitter", "valueIdentifier": {"system": "http://ehr", "value": "ehr-1"}},
+            {"name": "submissionId", "valueString": submission_id},
+            {"name": "submissionStatus", "valueCoding": {
+                "system": "http://hl7.org/fhir/event-status", "code": code}}
+        ]
+    })
+}
+
+/// #998: a status-only kick-off that restates the terminal status a submission
+/// already has answers `200` again. The provider whose first close-out timed
+/// out client-side — while the server still committed it — can only send it
+/// again, and a `409` there reads as the transition having been refused. Only
+/// the exact restatement is idempotent: the other terminal status, or any
+/// kick-off carrying a manifest, is still a conflict.
+#[tokio::test]
+async fn test_restating_a_terminal_status_is_idempotent() {
+    let (server, backend, ..) = create_submit_server().await;
+    let tenant = helios_persistence::tenant::TenantContext::new(
+        helios_persistence::tenant::TenantId::new("test-tenant"),
+        helios_persistence::tenant::TenantPermissions::full_access(),
+    );
+
+    // completed, then completed again.
+    assert_eq!(
+        server
+            .post("/$bulk-submit")
+            .json(&kickoff_body_with_status("again-1", "completed"))
+            .await
+            .status_code(),
+        StatusCode::OK
+    );
+    let repeated = server
+        .post("/$bulk-submit")
+        .json(&status_only_body("again-1", "completed"))
+        .await;
+    assert_eq!(
+        repeated.status_code(),
+        StatusCode::OK,
+        "the same close-out twice is one close-out: {}",
+        repeated.text()
+    );
+    let completed_id = helios_persistence::core::SubmissionId::new("http://ehr|ehr-1", "again-1");
+    assert_eq!(
+        backend
+            .get_submission_status(&tenant, &completed_id)
+            .await
+            .unwrap(),
+        Some(helios_persistence::core::SubmissionStatus::Complete)
+    );
+    // ...but not stopped after completed,
+    assert_eq!(
+        server
+            .post("/$bulk-submit")
+            .json(&status_only_body("again-1", "stopped"))
+            .await
+            .status_code(),
+        StatusCode::CONFLICT
+    );
+    // ...nor a restatement that also carries a manifest.
+    assert_eq!(
+        server
+            .post("/$bulk-submit")
+            .json(&kickoff_body_with_status("again-1", "completed"))
+            .await
+            .status_code(),
+        StatusCode::CONFLICT
+    );
+
+    // stopped, then stopped again — the abort is not re-run.
+    assert_eq!(
+        server
+            .post("/$bulk-submit")
+            .json(&kickoff_body_with_status("again-2", "stopped"))
+            .await
+            .status_code(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        server
+            .post("/$bulk-submit")
+            .json(&status_only_body("again-2", "stopped"))
+            .await
+            .status_code(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        server
+            .post("/$bulk-submit")
+            .json(&status_only_body("again-2", "completed"))
+            .await
+            .status_code(),
+        StatusCode::CONFLICT
+    );
+}
+
 /// `submissionStatus=completed` SHALL make the submission terminal.
 ///
 /// Regression: the kick-off handler branched only on `stopped`, so `completed`
@@ -593,7 +694,9 @@ async fn test_completed_status_finalizes_submission() {
         summary.status
     );
 
-    // And being terminal, it must reject further kick-offs.
+    // And being terminal, it must reject further kick-offs — this one carries
+    // a manifest, so it is a further submission, not a restated close-out
+    // (`test_restating_a_terminal_status_is_idempotent`).
     assert_eq!(
         server
             .post("/$bulk-submit")

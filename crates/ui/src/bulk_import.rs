@@ -22,6 +22,7 @@ use axum::{
     response::{IntoResponse, Redirect, Response},
 };
 use chrono::{SecondsFormat, Utc};
+use helios_persistence::error::{BackendError, ConcurrencyError, StorageError};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -71,6 +72,10 @@ fn recipient_base_url_value(
 /// Log entries kept per submission. The whole settings document is capped at
 /// 256 KiB server-side, so the log must stay bounded.
 const LOG_CAP: usize = 100;
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
+}
 
 // ---------------------------------------------------------------------------
 // Model
@@ -126,6 +131,24 @@ pub struct Submission {
     /// deserializing.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub status_error: String,
+    /// A status change (`stopped` | `completed`) the operator asked for that
+    /// the recipient has not *answered* — the kick-off timed out or never
+    /// connected, as distinct from a refusal (#998). Before this field the
+    /// transition was simply dropped: `set_status` assigned the status only on
+    /// a 2xx, so a recipient too busy to answer inside the kick-off budget
+    /// turned *Mark completed* into a log line and nothing else. Now the
+    /// request is kept here and re-sent by the status fragment on its next
+    /// due tick, until the recipient answers one way or the other or the
+    /// attempt budget runs out.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub pending_status: String,
+    /// No re-send of `pending_status` goes out before this instant.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub pending_status_retry_at: String,
+    /// Unanswered kick-offs so far for `pending_status`, against
+    /// [`STATUS_CHANGE_MAX_ATTEMPTS`].
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub pending_status_attempts: u32,
     #[serde(default)]
     pub created_at: String,
     #[serde(default)]
@@ -206,22 +229,92 @@ async fn save(
     id: &str,
     submission: &Submission,
     expected: Option<i64>,
-) -> Result<i64, String> {
+) -> Result<i64, StorageError> {
     let Some(store) = &state.bulk_provider else {
-        return Err("bulk provider store unavailable".to_string());
+        return Err(BackendError::Unavailable {
+            backend_name: "bulk-provider".to_string(),
+            message: "bulk provider store unavailable".to_string(),
+        }
+        .into());
     };
-    let document = serde_json::to_value(submission).map_err(|e| e.to_string())?;
+    let document = serde_json::to_value(submission).map_err(|e| BackendError::Unavailable {
+        backend_name: "bulk-provider".to_string(),
+        message: format!("submission does not serialize: {e}"),
+    })?;
     store
         .put_provider_submission(&tenant_ctx(rt), id, document, expected)
         .await
         .map(|stored| stored.version)
-        .map_err(|e| e.to_string())
+}
+
+/// Whether a save lost the optimistic-versioning race to another writer.
+fn is_version_conflict(e: &StorageError) -> bool {
+    matches!(
+        e,
+        StorageError::Concurrency(
+            ConcurrencyError::OptimisticLockFailure { .. }
+                | ConcurrencyError::VersionConflict { .. }
+        )
+    )
+}
+
+/// How many times a write is re-derived and re-tried after losing the
+/// version race. The competing writer is the status fragment's 5s tick, which
+/// holds a version for as long as one recipient poll takes; two re-loads
+/// cover a tick that lands between the load and the save twice over.
+const CAS_ATTEMPTS: u32 = 3;
+
+/// Loads the submission, applies `mutate`, and saves under optimistic
+/// versioning — re-loading and re-applying when another writer got in first.
+///
+/// The operator's own actions go through here. The status fragment rewrites
+/// the same document on every 5s tick, so a *Mark completed* pressed during
+/// a live ingest used to lose the compare-and-swap to a poll more often than
+/// not: `optimistic lock failure ... BulkProviderSubmission/...` in the log,
+/// and the press gone (#998). The poll's own writes still use [`save_or_warn`]
+/// and stay lossy — a lost poll is re-derived on the next tick, a lost press
+/// is not.
+///
+/// `mutate` returns `false` to leave the document alone (its precondition no
+/// longer holds on the fresh copy); the result is then `Ok(false)`. It may
+/// run more than once and must not carry state across runs.
+async fn commit<F>(
+    state: &WebState,
+    rt: &RequestTenant,
+    id: &str,
+    mut mutate: F,
+) -> Result<bool, StorageError>
+where
+    F: FnMut(&mut Submission) -> bool,
+{
+    let mut attempt = 1;
+    loop {
+        let Some((mut submission, version)) = load_one(state, rt, id).await else {
+            return Ok(false);
+        };
+        if !mutate(&mut submission) {
+            return Ok(false);
+        }
+        match save(state, rt, id, &submission, Some(version)).await {
+            Ok(_) => return Ok(true),
+            Err(e) if is_version_conflict(&e) && attempt < CAS_ATTEMPTS => {
+                tracing::debug!(
+                    submission = %id,
+                    attempt,
+                    "bulk-import submission changed under a status change; re-applying"
+                );
+                attempt += 1;
+            }
+            Err(e) => return Err(e),
+        }
+    }
 }
 
 /// Saves and, on failure, logs — for the paths whose response is a redirect
 /// either way. A version conflict here means another handler (usually the 5s
 /// status poller) wrote first; the caller's state is stale and the next
 /// load/poll re-derives it, so the lost write is benign but still logged.
+/// Operator actions that must not be lost go through [`commit`] instead.
 async fn save_or_warn(
     state: &WebState,
     rt: &RequestTenant,
@@ -273,9 +366,18 @@ struct LogLine {
 fn status_error_message(i18n: &I18n, submission: &Submission) -> String {
     if submission.status_error.is_empty() {
         String::new()
-    } else {
+    } else if submission.pending_status.is_empty() {
         i18n.t_arg(
             "bulk-import-status-error",
+            "detail",
+            submission.status_error.clone(),
+        )
+    } else {
+        // The recipient never answered, so the change is still queued and
+        // re-sent from the status fragment (#998) — a different sentence from
+        // the refusal above, whose only remedy is another press.
+        i18n.t_arg(
+            "bulk-import-status-pending",
             "detail",
             submission.status_error.clone(),
         )
@@ -458,6 +560,9 @@ pub async fn create(
         token_url: form.token_url.trim().to_string(),
         status: "not-started".to_string(),
         status_error: String::new(),
+        pending_status: String::new(),
+        pending_status_retry_at: String::new(),
+        pending_status_attempts: 0,
         created_at: now_stamp(),
         manifests: serde_json::Map::new(),
         log: Vec::new(),
@@ -479,7 +584,7 @@ pub async fn create(
     submit_one_with_id(&mut submission, &id, &mid, &rt.id).await;
     match save(&state, &rt, &id, &submission, Some(0)).await {
         Ok(_) => Redirect::to(&format!("/ui/bulk-import/{id}")).into_response(),
-        Err(e) => (StatusCode::BAD_GATEWAY, e).into_response(),
+        Err(e) => (StatusCode::BAD_GATEWAY, e.to_string()).into_response(),
     }
 }
 
@@ -624,7 +729,7 @@ pub async fn edit(
                 current_status(&state, rv.0, &rt),
                 id,
                 s,
-                Some(e),
+                Some(e.to_string()),
                 true,
             );
             *response.status_mut() = StatusCode::BAD_GATEWAY;
@@ -1280,6 +1385,11 @@ pub async fn complete(
     set_status(state, rt, _principal, id, "completed").await
 }
 
+/// Whether a submission can still be closed out by hand.
+fn can_change_status(status: &str) -> bool {
+    matches!(status, "in-progress" | "failed")
+}
+
 async fn set_status(
     state: WebState,
     rt: RequestTenant,
@@ -1287,57 +1397,195 @@ async fn set_status(
     id: String,
     status: &str,
 ) -> Response {
-    let Some((mut s, sv)) = load_one(&state, &rt, &id).await else {
+    let Some((s, _)) = load_one(&state, &rt, &id).await else {
         return Redirect::to("/ui/bulk-import").into_response();
     };
-    if !matches!(s.status.as_str(), "in-progress" | "failed") {
+    if !can_change_status(&s.status) {
         return conflict("only in-progress or failed submissions can change terminal status");
     }
-    push_log(&mut s, format!("Marking submission {status}..."));
-    let parameters = kickoff_parameters(&s, &id, status, None);
-    match post_kickoff(&s, &parameters, &rt.id).await {
-        Ok((code, _, _)) if (200..300).contains(&code) => {
-            push_log(&mut s, format!("Recipient acknowledged ({code})."));
-            s.status = status.to_string();
+    // The network call happens once, against the copy just loaded — the
+    // recipient, auth and identity it needs are immutable on a submission.
+    // Recording its outcome is what races the status fragment's own writes,
+    // so that part is re-derived on a fresh copy for as long as it loses.
+    let outcome = request_status_change(&s, &id, status, &rt.id).await;
+    let committed = commit(&state, &rt, &id, |fresh| {
+        // The precondition is re-checked on the fresh copy: a poll that
+        // landed a `200` meanwhile has closed the submission out already.
+        if !can_change_status(&fresh.status) {
+            return false;
+        }
+        push_log(fresh, format!("Marking submission {status}..."));
+        // A press is a fresh request with a fresh attempt budget, whatever an
+        // earlier unanswered one had used up.
+        fresh.pending_status_attempts = 0;
+        apply_status_change(fresh, status, &outcome);
+        true
+    })
+    .await;
+    match committed {
+        Ok(_) => {}
+        Err(e) => {
+            tracing::warn!(submission = %id, error = %e, "failed to persist bulk-import status change");
+        }
+    }
+    Redirect::to(&format!("/ui/bulk-import/{id}")).into_response()
+}
+
+/// What a status-only kick-off came back with. The two failure shapes are
+/// kept apart because they call for opposite reactions (#998): a refusal is
+/// the recipient's answer and only another press can change it; no answer at
+/// all leaves the change queued and re-sent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum KickoffOutcome {
+    /// A 2xx: the recipient applied the change.
+    Acknowledged(u16),
+    /// The recipient answered, and said no — its status and explanation.
+    Refused(String),
+    /// No answer: a timeout, a refused connection, a reset, or a token the
+    /// authorization server would not mint.
+    Unreachable(String),
+}
+
+/// POSTs the status-only kick-off and classifies the result.
+async fn request_status_change(
+    submission: &Submission,
+    id: &str,
+    status: &str,
+    tenant: &str,
+) -> KickoffOutcome {
+    let parameters = kickoff_parameters(submission, id, status, None);
+    match post_kickoff(submission, &parameters, tenant).await {
+        Ok((code, _, _)) if (200..300).contains(&code) => KickoffOutcome::Acknowledged(code),
+        Ok((code, content_type, body)) => KickoffOutcome::Refused(format!(
+            "{code}: {}",
+            summarize_error_body(&content_type, &body)
+        )),
+        Err(e) => KickoffOutcome::Unreachable(e),
+    }
+}
+
+/// How long to wait before re-sending an unanswered status change. Longer
+/// than the fragment's 5s cadence on purpose: a recipient that just spent the
+/// whole kick-off budget not answering is not back five seconds later.
+const STATUS_CHANGE_RETRY_SECS: u64 = 15;
+
+/// Unanswered kick-offs after which a queued status change is dropped and
+/// the banner falls back to "try again". Ten attempts at the kick-off budget
+/// plus the retry hold is roughly five minutes of a recipient not answering,
+/// which is an outage, not load — and the page keeps re-sending only while
+/// it is open, so an unbounded queue would also be a surprise to come back
+/// to.
+const STATUS_CHANGE_MAX_ATTEMPTS: u32 = 10;
+
+/// Records the outcome of a requested status change on the submission.
+///
+/// Only an acknowledgement changes the status. A refusal leaves the
+/// submission as it was, with the recipient's answer on the banner. No
+/// answer keeps the change *queued*: `pending_status` is set, the attempt is
+/// counted, and the status fragment re-sends it once
+/// `pending_status_retry_at` has passed — the recipient accepts the same
+/// close-out twice (a restated terminal status answers `200`), so a first
+/// attempt that landed server-side but timed out client-side is resolved by
+/// the re-send rather than reported as a refusal (#998).
+fn apply_status_change(submission: &mut Submission, status: &str, outcome: &KickoffOutcome) {
+    match outcome {
+        KickoffOutcome::Acknowledged(code) => {
+            push_log(submission, format!("Recipient acknowledged ({code})."));
+            submission.status = status.to_string();
             // The change landed, so any banner from an earlier attempt is
-            // stale (#968).
-            s.status_error = String::new();
+            // stale (#968), and so is a queued re-send of it.
+            submission.status_error = String::new();
+            clear_pending_status(submission);
             // A closed-out submission stops polling the recipient, which
             // answers an aborted submission's status poll with a clean `200`
             // that would otherwise flip Stopped to Completed (#1069). The
             // result stamps the close-out so the card shows its Result form,
             // keeping any counts an earlier `200` manifest recorded.
             if is_terminal(status) {
-                s.poll_url = String::new();
-                s.next_poll_at = String::new();
-                s.progress = String::new();
-                s.result = json!({
+                submission.poll_url = String::new();
+                submission.next_poll_at = String::new();
+                submission.progress = String::new();
+                submission.result = json!({
                     "completedAt": now_stamp(),
-                    "outputs": s.result["outputs"].as_u64().unwrap_or(0),
-                    "errors": s.result["errors"].as_u64().unwrap_or(0),
+                    "outputs": submission.result["outputs"].as_u64().unwrap_or(0),
+                    "errors": submission.result["errors"].as_u64().unwrap_or(0),
                 });
             }
         }
-        Ok((code, content_type, body)) => {
-            let detail = format!("{code}: {}", summarize_error_body(&content_type, &body));
+        KickoffOutcome::Refused(detail) => {
             push_log(
-                &mut s,
+                submission,
                 format!("Recipient rejected the status change: {detail}"),
             );
             // The submission keeps its own status, so the press left no trace
             // anywhere but the log until #968 — a saturated recipient that
-            // times out or rejects the kick-off must not look like a
-            // successful Abort. `can_abort` is unchanged, so the retry stays
-            // one click away.
-            s.status_error = detail;
+            // rejects the kick-off must not look like a successful Abort.
+            // `can_abort` is unchanged, so the retry stays one click away.
+            // An answer, even a no, settles any queued re-send.
+            submission.status_error = detail.clone();
+            clear_pending_status(submission);
         }
-        Err(e) => {
-            push_log(&mut s, format!("Status change failed: {e}"));
-            s.status_error = e;
+        KickoffOutcome::Unreachable(detail) => {
+            submission.status_error = detail.clone();
+            submission.pending_status_attempts += 1;
+            let attempt = submission.pending_status_attempts;
+            if attempt >= STATUS_CHANGE_MAX_ATTEMPTS {
+                push_log(
+                    submission,
+                    format!(
+                        "Status change failed: {detail} — giving up after {attempt} unanswered \
+                         attempts; press the button again to retry."
+                    ),
+                );
+                clear_pending_status(submission);
+            } else {
+                push_log(
+                    submission,
+                    format!(
+                        "Status change failed: {detail} — the request is kept and will be \
+                         re-sent in {STATUS_CHANGE_RETRY_SECS}s while this page is open \
+                         (attempt {attempt} of {STATUS_CHANGE_MAX_ATTEMPTS})."
+                    ),
+                );
+                submission.pending_status = status.to_string();
+                submission.pending_status_retry_at = (Utc::now()
+                    + chrono::Duration::seconds(STATUS_CHANGE_RETRY_SECS as i64))
+                .to_rfc3339_opts(SecondsFormat::Millis, true);
+            }
         }
     }
-    save_or_warn(&state, &rt, &id, &s, Some(sv)).await;
-    Redirect::to(&format!("/ui/bulk-import/{id}")).into_response()
+}
+
+fn clear_pending_status(submission: &mut Submission) {
+    submission.pending_status = String::new();
+    submission.pending_status_retry_at = String::new();
+    submission.pending_status_attempts = 0;
+}
+
+/// Whether a queued status change should be re-sent now: one is queued, the
+/// submission can still take it, and the retry hold has passed (an empty or
+/// unparseable hold counts as passed, like `poll_due`).
+fn pending_status_due(submission: &Submission) -> bool {
+    !submission.pending_status.is_empty()
+        && can_change_status(&submission.status)
+        && (submission.pending_status_retry_at.is_empty()
+            || chrono::DateTime::parse_from_rfc3339(&submission.pending_status_retry_at)
+                .map(|t| Utc::now() >= t.with_timezone(&Utc))
+                .unwrap_or(true))
+}
+
+/// Re-sends the queued status change and records what came back.
+async fn retry_pending_status(submission: &mut Submission, id: &str, tenant: &str) {
+    let status = submission.pending_status.clone();
+    push_log(
+        submission,
+        format!(
+            "Re-sending: marking submission {status} (attempt {} of {STATUS_CHANGE_MAX_ATTEMPTS})...",
+            submission.pending_status_attempts + 1
+        ),
+    );
+    let outcome = request_status_change(submission, id, &status, tenant).await;
+    apply_status_change(submission, &status, &outcome);
 }
 
 /// The recipient-status card fragment, polled by htmx while a poll URL is
@@ -1387,10 +1635,36 @@ pub async fn status_fragment(
     let Some((mut s, sv)) = load_one(&state, &rt, &id).await else {
         return StatusCode::NOT_FOUND.into_response();
     };
+    let mut changed = false;
     // A closed-out submission is never polled, even if it was stored with a
     // poll URL before #1069 — the recipient's answer no longer decides it.
     if !s.poll_url.is_empty() && !is_terminal(&s.status) && poll_due(&s) {
         poll_status(&mut s, &rt.id).await;
+        changed = true;
+    }
+    // A status change the recipient never answered is re-sent from here, on
+    // the same tick that polls (#998): the fragment is the one thing that
+    // runs while the operator watches the page, and the press must not
+    // depend on them pressing again. A poll that just closed the submission
+    // out (a clean `200`) settles the queue instead — the close-out the
+    // operator asked for is moot once the recipient reports the import
+    // finished, and no kick-off can be sent for it any more.
+    if pending_status_due(&s) {
+        retry_pending_status(&mut s, &id, &rt.id).await;
+        changed = true;
+    } else if !s.pending_status.is_empty() && !can_change_status(&s.status) {
+        let (pending, status) = (s.pending_status.clone(), s.status.clone());
+        push_log(
+            &mut s,
+            format!(
+                "Queued status change ({pending}) dropped: the submission is already {status}."
+            ),
+        );
+        s.status_error = String::new();
+        clear_pending_status(&mut s);
+        changed = true;
+    }
+    if changed {
         save_or_warn(&state, &rt, &id, &s, Some(sv)).await;
     }
     let label = status_label(&i18n, &s.status);
@@ -1608,5 +1882,173 @@ mod tests {
         assert_eq!(progress_percent("processing complete"), None);
         assert_eq!(progress_percent(""), None);
         assert_eq!(progress_percent("In progress"), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // #998 — recording a status-change outcome
+    // -----------------------------------------------------------------------
+
+    fn running() -> Submission {
+        Submission {
+            status: "in-progress".to_string(),
+            poll_url: "http://recipient.example/poll".to_string(),
+            progress: "Processing 65%".to_string(),
+            result: json!({ "outputs": 2, "errors": 0 }),
+            ..Default::default()
+        }
+    }
+
+    fn last_log_line(submission: &Submission) -> String {
+        submission
+            .log
+            .last()
+            .and_then(|entry| entry["message"].as_str())
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    #[test]
+    fn an_acknowledged_change_lands_and_settles_the_queue() {
+        let mut s = running();
+        s.pending_status = "completed".to_string();
+        s.pending_status_attempts = 3;
+        s.status_error = "timed out".to_string();
+
+        apply_status_change(&mut s, "completed", &KickoffOutcome::Acknowledged(200));
+
+        assert_eq!(s.status, "completed");
+        assert!(s.pending_status.is_empty());
+        assert!(s.pending_status_retry_at.is_empty());
+        assert_eq!(s.pending_status_attempts, 0);
+        assert!(s.status_error.is_empty());
+        // Closed out: no more polling, and the result card is stamped while
+        // the counts an earlier manifest recorded survive (#1069).
+        assert!(s.poll_url.is_empty());
+        assert!(s.progress.is_empty());
+        assert_eq!(s.result["outputs"], 2);
+        assert!(
+            s.result["completedAt"]
+                .as_str()
+                .is_some_and(|at| !at.is_empty()),
+            "{}",
+            s.result
+        );
+        assert_eq!(last_log_line(&s), "Recipient acknowledged (200).");
+    }
+
+    #[test]
+    fn a_refusal_keeps_the_status_and_queues_nothing() {
+        let mut s = running();
+        s.pending_status = "stopped".to_string();
+        s.pending_status_attempts = 2;
+
+        apply_status_change(
+            &mut s,
+            "stopped",
+            &KickoffOutcome::Refused("409: already closed".to_string()),
+        );
+
+        assert_eq!(s.status, "in-progress", "a refusal changes nothing");
+        assert_eq!(s.status_error, "409: already closed");
+        assert!(s.pending_status.is_empty(), "an answer settles the queue");
+        assert_eq!(s.pending_status_attempts, 0);
+        assert!(!pending_status_due(&s));
+        assert_eq!(s.poll_url, "http://recipient.example/poll");
+    }
+
+    #[test]
+    fn an_unanswered_change_is_queued_with_a_hold_and_an_attempt_count() {
+        let mut s = running();
+
+        apply_status_change(
+            &mut s,
+            "completed",
+            &KickoffOutcome::Unreachable("timed out".to_string()),
+        );
+
+        assert_eq!(s.status, "in-progress", "nothing landed yet");
+        assert_eq!(s.pending_status, "completed");
+        assert_eq!(s.pending_status_attempts, 1);
+        assert_eq!(s.status_error, "timed out");
+        assert!(last_log_line(&s).starts_with("Status change failed: timed out"));
+        assert!(
+            last_log_line(&s).contains("attempt 1 of 10"),
+            "{}",
+            last_log_line(&s)
+        );
+        assert!(
+            !pending_status_due(&s),
+            "held for {STATUS_CHANGE_RETRY_SECS}s before the re-send"
+        );
+        s.pending_status_retry_at = "2000-01-01T00:00:00.000Z".to_string();
+        assert!(pending_status_due(&s));
+        s.pending_status_retry_at = String::new();
+        assert!(pending_status_due(&s), "no hold at all is due");
+        s.status = "completed".to_string();
+        assert!(
+            !pending_status_due(&s),
+            "a closed-out submission takes no status change"
+        );
+    }
+
+    #[test]
+    fn the_queue_gives_up_after_the_attempt_budget() {
+        let mut s = running();
+        for attempt in 1..STATUS_CHANGE_MAX_ATTEMPTS {
+            apply_status_change(
+                &mut s,
+                "stopped",
+                &KickoffOutcome::Unreachable("connection reset".to_string()),
+            );
+            assert_eq!(
+                s.pending_status, "stopped",
+                "attempt {attempt} still queued"
+            );
+            assert_eq!(s.pending_status_attempts, attempt);
+        }
+        apply_status_change(
+            &mut s,
+            "stopped",
+            &KickoffOutcome::Unreachable("connection reset".to_string()),
+        );
+        assert!(s.pending_status.is_empty(), "the budget is spent");
+        assert_eq!(s.pending_status_attempts, 0);
+        assert_eq!(s.status, "in-progress");
+        assert_eq!(
+            s.status_error, "connection reset",
+            "the banner falls back to 'try again' with the last diagnosis"
+        );
+        assert!(
+            last_log_line(&s).contains("giving up after 10 unanswered attempts"),
+            "{}",
+            last_log_line(&s)
+        );
+    }
+
+    #[test]
+    fn a_version_conflict_is_the_one_save_error_that_is_retried() {
+        assert!(is_version_conflict(&StorageError::Concurrency(
+            ConcurrencyError::OptimisticLockFailure {
+                resource_type: "BulkProviderSubmission".to_string(),
+                id: "s".to_string(),
+                expected_etag: "W/\"1\"".to_string(),
+                actual_etag: Some("W/\"2\"".to_string()),
+            }
+        )));
+        assert!(is_version_conflict(&StorageError::Concurrency(
+            ConcurrencyError::VersionConflict {
+                resource_type: "BulkProviderSubmission".to_string(),
+                id: "s".to_string(),
+                expected_version: "1".to_string(),
+                actual_version: "2".to_string(),
+            }
+        )));
+        assert!(!is_version_conflict(
+            &BackendError::Unavailable {
+                backend_name: "bulk-provider".to_string(),
+                message: "down".to_string(),
+            }
+            .into()
+        ));
     }
 }

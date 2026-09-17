@@ -944,6 +944,38 @@ impl BulkSubmitProvider for MongoBackend {
         submission_summary(&document, id.clone(), &totals).map(Some)
     }
 
+    /// Reads only the submission document's `status` field.
+    ///
+    /// The trait default goes through [`get_submission`](Self::get_submission),
+    /// whose summary counts every receipt document of the submission four
+    /// times over (`count_outcomes`). At 11M receipts that is ~26s per call —
+    /// and this method is on every hot path that only needs the status: the
+    /// `$bulk-submit-status` poll, the status-only kick-off behind *Mark
+    /// completed*, and the lease keeper's 3s abort watch (#998). One indexed
+    /// point read instead.
+    async fn get_submission_status(
+        &self,
+        tenant: &TenantContext,
+        id: &SubmissionId,
+    ) -> StorageResult<Option<SubmissionStatus>> {
+        let Some(document) = self
+            .submissions()
+            .await?
+            .find_one(submission_filter(tenant, id))
+            .projection(doc! { "_id": 0, "status": 1 })
+            .await
+            .map_err(|e| internal_error(format!("read submission status: {e}")))?
+        else {
+            return Ok(None);
+        };
+        document
+            .get_str("status")
+            .unwrap_or("in-progress")
+            .parse()
+            .map(Some)
+            .map_err(|e: String| internal_error(e))
+    }
+
     async fn list_submissions(
         &self,
         tenant: &TenantContext,
@@ -1021,7 +1053,7 @@ impl BulkSubmitProvider for MongoBackend {
         &self,
         tenant: &TenantContext,
         id: &SubmissionId,
-    ) -> StorageResult<SubmissionSummary> {
+    ) -> StorageResult<()> {
         let document = self.load_submission_doc(tenant, id).await?;
         if document.get_str("status").unwrap_or_default()
             != SubmissionStatus::InProgress.to_string()
@@ -1044,10 +1076,7 @@ impl BulkSubmitProvider for MongoBackend {
             )
             .await
             .map_err(|e| internal_error(format!("complete submission: {e}")))?;
-
-        self.get_submission(tenant, id)
-            .await?
-            .ok_or_else(|| internal_error("submission disappeared while completing"))
+        Ok(())
     }
 
     async fn abort_submission(
