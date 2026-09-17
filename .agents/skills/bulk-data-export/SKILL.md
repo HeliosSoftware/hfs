@@ -36,9 +36,10 @@ All kick-offs require `Prefer: respond-async`. The default response is `202 Acce
 | `HFS_BULK_EXPORT_WORKER_CONCURRENCY` | `2` | In-process worker pool size |
 | `HFS_BULK_EXPORT_DISABLE_LOCAL_WORKER` | `false` | Disable in-pod workers for separate exporter deployments |
 | `HFS_BULK_EXPORT_MAX_CONCURRENT_PER_TENANT` | `4` | Per-tenant active job cap; kick-off returns `429` if exceeded |
+| `HFS_BULK_EXPORT_MAX_ATTEMPTS` | `3` | Claims allowed per job; a job reclaimed past this is failed as abandoned |
 | `HFS_BULK_EXPORT_BATCH_SIZE` | `1000` | Resources per `fetch_export_batch` |
 | `HFS_BULK_EXPORT_LEASE_DURATION` | `60` | Initial lease length in seconds; must exceed heartbeat interval |
-| `HFS_BULK_EXPORT_HEARTBEAT_INTERVAL` | `20` | Worker heartbeat cadence in seconds |
+| `HFS_BULK_EXPORT_HEARTBEAT_INTERVAL` | `20` | Lease-keeper renewal cadence in seconds; a background task renews the lease at this cadence while a job runs; must be below the lease duration |
 | `HFS_BULK_EXPORT_CLEANUP_INTERVAL` | `300` | Cleanup scan interval in seconds |
 | `HFS_BULK_EXPORT_SINCE_NEWLY_ADDED` | `include` | Group export `_since` toggle: include or exclude |
 

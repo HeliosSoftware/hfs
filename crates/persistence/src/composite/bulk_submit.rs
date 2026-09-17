@@ -658,7 +658,7 @@ impl BulkSubmitProvider for CompositeSubmitJobs {
         &self,
         tenant: &TenantContext,
         id: &SubmissionId,
-    ) -> StorageResult<SubmissionSummary> {
+    ) -> StorageResult<()> {
         self.primary.complete_submission(tenant, id).await
     }
 

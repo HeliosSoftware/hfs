@@ -567,6 +567,25 @@ where
         .map_err(RestError::from)?
     {
         if existing_status.is_terminal() {
+            // A status-only kick-off that restates the terminal status the
+            // submission already has is not a further submission — it is the
+            // same close-out arriving twice, and it must answer the same way
+            // both times. The Data Provider that sent it may never have seen
+            // the first answer (a timed-out request whose server side still
+            // committed), and its only safe move is to send it again; a 409
+            // there would read as a refusal of a transition that landed
+            // (#998). Nothing else is admitted: a manifest, a replacement, or
+            // the *other* terminal status stays a conflict.
+            let restates = req.manifest_url.is_none()
+                && req.replaces_manifest_url.is_none()
+                && matches!(
+                    (req.submission_status.as_str(), existing_status),
+                    ("completed", SubmissionStatus::Complete)
+                        | ("stopped", SubmissionStatus::Aborted)
+                );
+            if restates {
+                return kickoff_accepted(&sub_id);
+            }
             return Err(RestError::Conflict {
                 message: format!(
                     "submission {} is already {} — no further submissions allowed",
@@ -692,6 +711,11 @@ where
             .map_err(RestError::from)?;
     }
 
+    kickoff_accepted(&sub_id)
+}
+
+/// The `200` a `$bulk-submit` kick-off answers once it has been applied.
+fn kickoff_accepted(sub_id: &SubmissionId) -> RestResult<Response> {
     let oo = json!({
         "resourceType": "OperationOutcome",
         "issue": [{
@@ -958,7 +982,7 @@ where
                 "bulk-submit ingestion appears stalled: a processing manifest's \
                  worker lease expired without renewal or reclaim"
             );
-            format!("stalled at {pct}% - a worker stopped without handoff; see server logs")
+            format!("Stalled at {pct}% - a worker stopped without handoff; see server logs")
         } else if entries > 0 {
             // Operator-facing wording (#954): the percentage is byte progress,
             // the count is FHIR resources written to the store ("written", not
@@ -1009,16 +1033,16 @@ where
                 .filter(|m| !m.status.is_terminal())
                 .find(|m| m.phase.is_some())
                 .and_then(|m| match m.phase {
-                    Some(ManifestPhase::ReadingManifest) => Some("reading manifest".to_string()),
+                    Some(ManifestPhase::ReadingManifest) => Some("Reading manifest".to_string()),
                     // `files_total == 0` means the denominator is not known yet
                     // (the manifest has not been parsed, or advertised no
                     // output). Fall through rather than emit "of 0 files".
                     Some(ManifestPhase::Sizing) if m.files_total > 0 => Some(format!(
-                        "sizing {} of {} files",
+                        "Sizing {} of {} files",
                         m.files_done, m.files_total
                     )),
                     Some(ManifestPhase::Downloading) if m.files_total > 0 => Some(format!(
-                        "downloading file {} of {}",
+                        "Downloading file {} of {}",
                         m.files_done, m.files_total
                     )),
                     _ => None,

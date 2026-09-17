@@ -938,10 +938,15 @@ async fn bulk_submit_lifecycle_and_processing() {
     assert_eq!(counts.total, 2);
     assert_eq!(counts.success, 2);
 
-    let completed = backend
+    backend
         .complete_submission(&tenant, &submission_id)
         .await
         .unwrap();
+    let completed = backend
+        .get_submission(&tenant, &submission_id)
+        .await
+        .unwrap()
+        .expect("the completed submission still exists");
     assert_eq!(completed.status, SubmissionStatus::Complete);
 }
 

@@ -668,6 +668,36 @@ impl BulkSubmitProvider for SqliteBackend {
         .await
     }
 
+    /// Reads only the `status` column. The trait default builds the whole
+    /// summary, whose `COUNT`/`SUM` over `bulk_entry_results` grows with the
+    /// submission and contends with the ingest writer — for a status poll, a
+    /// status-only kick-off, or the lease keeper's abort watch, all of which
+    /// need one column (#998).
+    async fn get_submission_status(
+        &self,
+        tenant: &TenantContext,
+        id: &SubmissionId,
+    ) -> StorageResult<Option<SubmissionStatus>> {
+        let conn = self.get_connection()?;
+        let tenant_id = tenant.tenant_id().as_str();
+        match conn.query_row(
+            "SELECT status FROM bulk_submissions
+             WHERE tenant_id = ?1 AND submitter = ?2 AND submission_id = ?3",
+            params![tenant_id, &id.submitter, &id.submission_id],
+            |row| row.get::<_, String>(0),
+        ) {
+            Ok(status) => status
+                .parse()
+                .map(Some)
+                .map_err(|_| internal_error(format!("Invalid status: {}", status))),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(internal_error(format!(
+                "Failed to get submission status: {}",
+                e
+            ))),
+        }
+    }
+
     async fn list_submissions(
         &self,
         tenant: &TenantContext,
@@ -734,7 +764,7 @@ impl BulkSubmitProvider for SqliteBackend {
         &self,
         tenant: &TenantContext,
         id: &SubmissionId,
-    ) -> StorageResult<SubmissionSummary> {
+    ) -> StorageResult<()> {
         let conn = self.get_connection()?;
         let tenant_id = tenant.tenant_id().as_str();
 
@@ -770,10 +800,7 @@ impl BulkSubmitProvider for SqliteBackend {
             params![now, now, tenant_id, &id.submitter, &id.submission_id],
         )
         .map_err(|e| internal_error(format!("Failed to complete submission: {}", e)))?;
-
-        self.get_submission(tenant, id)
-            .await?
-            .ok_or_else(|| internal_error("Submission disappeared".to_string()))
+        Ok(())
     }
 
     async fn abort_submission(
@@ -5171,8 +5198,10 @@ mod tests {
         assert_eq!(summary.manifest_count, 0);
     }
 
+    /// The status-only read (an override since #998, a trait default before)
+    /// reports found, missing and corrupt rows exactly as the full getter does.
     #[tokio::test]
-    async fn test_default_get_submission_status_preserves_results() {
+    async fn test_get_submission_status_preserves_results() {
         let backend = create_test_backend();
         let tenant = create_test_tenant();
         let present = SubmissionId::generate("status-default");
@@ -5217,7 +5246,7 @@ mod tests {
             .unwrap_err();
         assert!(
             error.to_string().contains("Invalid status: invalid-status"),
-            "the default must preserve get_submission errors: {error}"
+            "the status read must report a corrupt row the way get_submission does: {error}"
         );
     }
 
@@ -5422,7 +5451,12 @@ mod tests {
             .await
             .unwrap();
 
-        let summary = backend.complete_submission(&tenant, &sub_id).await.unwrap();
+        backend.complete_submission(&tenant, &sub_id).await.unwrap();
+        let summary = backend
+            .get_submission(&tenant, &sub_id)
+            .await
+            .unwrap()
+            .expect("the completed submission still exists");
         assert_eq!(summary.status, SubmissionStatus::Complete);
         assert!(summary.completed_at.is_some());
     }

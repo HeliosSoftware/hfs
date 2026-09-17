@@ -293,6 +293,12 @@ pub struct BulkExportConfig {
     pub disable_local_worker: bool,
     /// Cap on simultaneous in-flight jobs per tenant.
     pub max_concurrent_per_tenant: u32,
+    /// Cap on how many times one job may be claimed by a worker.
+    ///
+    /// A job whose lease expires mid-run is reclaimable; once its claims would
+    /// exceed this cap the claim path retires it with an error instead of
+    /// handing it to yet another worker (#1041).
+    pub max_attempts: u32,
     /// Resources per `fetch_export_batch` call.
     pub batch_size: u32,
     /// Initial lease length issued at claim, in seconds.
@@ -323,6 +329,7 @@ impl Default for BulkExportConfig {
             worker_concurrency: 2,
             disable_local_worker: false,
             max_concurrent_per_tenant: 4,
+            max_attempts: 3,
             batch_size: 1000,
             lease_duration_secs: 60,
             heartbeat_interval_secs: 20,
@@ -375,6 +382,7 @@ impl BulkExportConfig {
                 "HFS_BULK_EXPORT_MAX_CONCURRENT_PER_TENANT",
                 d.max_concurrent_per_tenant,
             ),
+            max_attempts: env_u32("HFS_BULK_EXPORT_MAX_ATTEMPTS", d.max_attempts),
             batch_size: env_u32("HFS_BULK_EXPORT_BATCH_SIZE", d.batch_size),
             lease_duration_secs: env_u64("HFS_BULK_EXPORT_LEASE_DURATION", d.lease_duration_secs),
             heartbeat_interval_secs: env_u64(
@@ -429,6 +437,9 @@ impl BulkExportConfig {
         }
         if self.max_concurrent_per_tenant == 0 {
             errors.push("HFS_BULK_EXPORT_MAX_CONCURRENT_PER_TENANT must be >= 1".to_string());
+        }
+        if self.max_attempts == 0 {
+            errors.push("HFS_BULK_EXPORT_MAX_ATTEMPTS must be >= 1".to_string());
         }
         if self.batch_size == 0 {
             errors.push("HFS_BULK_EXPORT_BATCH_SIZE must be >= 1".to_string());
@@ -2772,6 +2783,16 @@ mod tests {
         };
         let errs = cfg.validate().unwrap_err();
         assert!(errs.iter().any(|e| e.contains("local-fs")));
+    }
+
+    #[test]
+    fn test_bulk_export_config_zero_heartbeat_interval() {
+        let cfg = BulkExportConfig {
+            heartbeat_interval_secs: 0,
+            ..BulkExportConfig::default()
+        };
+        let errs = cfg.validate().unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("HEARTBEAT_INTERVAL")));
     }
 
     #[test]
