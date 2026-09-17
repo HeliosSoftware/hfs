@@ -27,13 +27,13 @@ R6 = ["helios-fhir/R6", "helios-fhir-validator/R6", "helios-sof/R6"]
 # and registry types (#238) and the per-version compartment-params table
 # (#237). Data flows one way — the UI depends on the workspace, never the
 # reverse.
-helios-fhir = { path = "../fhir", version = "0.2.1", default-features = false }
+helios-fhir = { path = "../fhir", version = "0.2.2", default-features = false }
 
 # The FHIR Schema IR and the editor projection (#264, on top of #232). The
 # resolver is a synchronous hashmap lookup, and FHIRPath is an optional feature
 # we deliberately do not take: the live editing loop needs the cheap structural
 # pass, not the async effects pass.
-helios-fhir-validator = { path = "../fhir-validator", version = "0.2.1", default-features = false }
+helios-fhir-validator = { path = "../fhir-validator", version = "0.2.2", default-features = false }
 
 # ViewDefinition structural + FHIRPath-syntax linting for the CodeMirror 6
 # editor's async linter (#753 ticket 03, POC evaluation — not merged
@@ -46,7 +46,7 @@ helios-fhir-validator = { path = "../fhir-validator", version = "0.2.1", default
 # precedent avoids. helios-sof already depends on helios-fhir + helios-fhirpath
 # with default-features = false, so this adds no new dependency to the graph,
 # only a new edge to a crate the workspace already builds for `hfs`.
-helios-sof = { path = "../sof", version = "0.2.1", default-features = false }
+helios-sof = { path = "../sof", version = "0.2.2", default-features = false }
 
 # Deserializes the FHIR resources fetched from the server's own
 # `/SearchParameter` and `/CompartmentDefinition` endpoints, and derives the
@@ -68,7 +68,7 @@ futures-lite = "2"
 
 # `OutboundAuthProvider`: the credentials the UI attaches to its server-to-server
 # self-calls (a service token when auth is enabled; a no-op when it is not).
-helios-auth = { path = "../auth", version = "0.2.1" }
+helios-auth = { path = "../auth", version = "0.2.2" }
 
 # Web framework (matches the version used by helios-hfs / helios-rest)
 axum = "0.8"
@@ -104,7 +104,7 @@ askama = "0.16"
 # Chrome shared with the HTS admin UI (#799): the topbar account menu's markup
 # lives there once and both products render it, so they cannot drift the way
 # they did before — see crates/ui-chrome/README.md.
-helios-ui-chrome = { path = "../ui-chrome", version = "0.2.1" }
+helios-ui-chrome = { path = "../ui-chrome", version = "0.2.2" }
 
 # Typed htmx header handling: the infallible `HxRequest` extractor for the
 # fragment-vs-full-page branch, and `AutoVaryLayer` for correct HTTP caching
@@ -141,12 +141,12 @@ similar = { version = "2", features = ["inline"] }
 # latest snapshot to render the "FHIR resources over time" chart without any
 # dependency on the persistence layer itself. Falls back to placeholder data
 # when no provider is registered (e.g. the standalone UI example).
-helios-observability = { path = "../observability", version = "0.2.1" }
+helios-observability = { path = "../observability", version = "0.2.2" }
 
 # Read path for the tenant-maintenance page: the `ResourceStorage` tenant
 # registry (list/register/deregister) + per-tenant resource counts. The UI
 # depends on the rest of the server, never the reverse.
-helios-persistence = { path = "../persistence", version = "0.2.1", default-features = false, features = ["R4"] }
+helios-persistence = { path = "../persistence", version = "0.2.2", default-features = false, features = ["R4"] }
 
 
 [dev-dependencies]
@@ -160,9 +160,9 @@ tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 # A real SQLite-backed store so the tenant-maintenance page tests exercise the
 # actual registry read/write path (the `sqlite` feature is test-only).
-helios-persistence = { path = "../persistence", version = "0.2.1", default-features = false, features = ["R4", "sqlite"] }
+helios-persistence = { path = "../persistence", version = "0.2.2", default-features = false, features = ["R4", "sqlite"] }
 # Seed a FHIR resource in tests so a data-only (unregistered) tenant appears.
-helios-fhir = { path = "../fhir", version = "0.2.1", default-features = false, features = ["R4"] }
+helios-fhir = { path = "../fhir", version = "0.2.2", default-features = false, features = ["R4"] }
 serde_json = "1"
 zip = { version = "2.4", default-features = false, features = ["deflate"] }
 # Parses rendered pages and htmx fragments so tests assert on elements and

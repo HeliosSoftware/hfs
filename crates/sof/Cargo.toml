@@ -31,10 +31,10 @@ otel = ["helios-observability/otel"]
 [dependencies]
 clap = { version = "4.0", features = ["derive", "env"] }
 tokio = { version = "1.0", features = ["full"] }
-helios-fhir = { path = "../fhir", version = "0.2.1", default-features = false }
-helios-observability = { path = "../observability", version = "0.2.1" }
-helios-fhirpath = { path = "../fhirpath", version = "0.2.1", default-features = false }
-helios-fhirpath-support = { path = "../fhirpath-support", version = "0.2.1" }
+helios-fhir = { path = "../fhir", version = "0.2.2", default-features = false }
+helios-observability = { path = "../observability", version = "0.2.2" }
+helios-fhirpath = { path = "../fhirpath", version = "0.2.2", default-features = false }
+helios-fhirpath-support = { path = "../fhirpath-support", version = "0.2.2" }
 serde = { workspace = true }
 # `preserve_order` is load-bearing: `lint::lint_view_definition` (#753 ticket
 # 03) returns diagnostics ordered by JSON pointer in document order, which

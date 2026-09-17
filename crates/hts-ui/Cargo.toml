@@ -20,7 +20,7 @@ R6 = ["helios-fhir/R6"]
 
 [dependencies]
 # FHIR types for typed request/response shaping in later Phase 2 slices.
-helios-fhir = { path = "../fhir", version = "0.2.1", default-features = false }
+helios-fhir = { path = "../fhir", version = "0.2.2", default-features = false }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -56,7 +56,7 @@ askama = "0.16"
 
 # Chrome shared with the HFS UI (#799): the topbar account menu is rendered
 # from markup that lives in that crate, not copied into this one's templates.
-helios-ui-chrome = { path = "../ui-chrome", version = "0.2.1" }
+helios-ui-chrome = { path = "../ui-chrome", version = "0.2.2" }
 
 # Typed htmx header handling: `HxRequest` extractor for the fragment-vs-page
 # branch, and `AutoVaryLayer` for correct HTTP caching (`Vary: HX-Request`).
