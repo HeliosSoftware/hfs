@@ -2151,6 +2151,258 @@ mod tests {
             );
         }
 
+        /// An [`ExportOutputStore`] that fails as soon as the worker opens a
+        /// part writer, optionally letting a second worker steal the job first.
+        ///
+        /// `open_writer` is the shortest route to the `LeaseError::Storage`
+        /// that `run_job` answers by failing the job: the run only reaches it
+        /// once the job has been loaded and marked in-progress under the lease,
+        /// which is exactly where a real export dies when its output store goes
+        /// away mid-run.
+        struct FailingOutput {
+            /// When set, this worker re-claims the job before the failure is
+            /// returned, so the running attempt's fencing token is already
+            /// stale by the time it tries to record that failure.
+            steal: Option<(Arc<SqliteBackend>, WorkerId)>,
+        }
+
+        #[async_trait::async_trait]
+        impl ExportOutputStore for FailingOutput {
+            async fn open_writer(
+                &self,
+                _key: &ExportPartKey,
+            ) -> StorageResult<crate::core::bulk_export_output::ExportPartWriter> {
+                if let Some((backend, thief)) = &self.steal {
+                    // The run's lease was claimed for a millisecond, so it has
+                    // lapsed and the job is eligible again; the claim bumps the
+                    // fencing token past the one this run is fenced on.
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                    let stolen = backend
+                        .claim_next(thief, Duration::from_secs(60), TEST_MAX_ATTEMPTS)
+                        .await
+                        .expect("claim_next")
+                        .expect("the lapsed lease must be re-claimable");
+                    assert_eq!(&stolen.worker_id, thief, "the job must change hands");
+                }
+                Err(StorageError::Backend(
+                    crate::error::BackendError::Internal {
+                        backend_name: "failing-output".to_string(),
+                        message: "output store unavailable".to_string(),
+                        source: None,
+                    },
+                ))
+            }
+
+            async fn finalize_part(
+                &self,
+                _key: &ExportPartKey,
+                _writer: crate::core::bulk_export_output::ExportPartWriter,
+            ) -> StorageResult<FinalizedPart> {
+                unreachable!("no writer is ever opened")
+            }
+
+            async fn download_url(
+                &self,
+                _key: &ExportPartKey,
+                _ttl: Duration,
+            ) -> StorageResult<crate::core::bulk_export_output::DownloadUrl> {
+                unreachable!("no part is ever written")
+            }
+
+            async fn open_reader(
+                &self,
+                _key: &ExportPartKey,
+            ) -> StorageResult<std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send>>> {
+                unreachable!("no part is ever written")
+            }
+
+            async fn delete_job_outputs(
+                &self,
+                _tenant: &TenantContext,
+                _job_id: &ExportJobId,
+            ) -> StorageResult<()> {
+                unreachable!("no part is ever written")
+            }
+        }
+
+        /// What a run whose output store failed left behind.
+        struct FailedRun {
+            /// What `run_job_with_keeper` returned.
+            result: StorageResult<()>,
+            /// The terminal audit events the run emitted, if any.
+            events: Vec<helios_fhir::r4::AuditEvent>,
+            /// The job's status once the run was over.
+            status: ExportStatus,
+            /// The failure text stored on the job, if any.
+            error_message: Option<String>,
+            /// Every `warn`/`error` the run logged.
+            warnings: Vec<String>,
+        }
+
+        /// Drives a one-patient system export whose output store fails on the
+        /// first `open_writer`, and reports what the run left behind.
+        ///
+        /// `steal_with`, when set, is the worker that re-claims the job from
+        /// inside that failing `open_writer` — the only window in which the
+        /// lease can change hands *after* the run has started failing and
+        /// *before* it records the failure.
+        async fn run_export_with_failing_output(steal_with: Option<WorkerId>) -> FailedRun {
+            use crate::test_audit::CollectorSink;
+
+            let backend = Arc::new(SqliteBackend::in_memory().unwrap());
+            backend.init_schema().unwrap();
+            let tenant = tenant();
+
+            backend
+                .create(
+                    &tenant,
+                    "Patient",
+                    serde_json::json!({"resourceType": "Patient", "id": "p1"}),
+                    helios_fhir::FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+
+            let job_id = backend
+                .start_export(
+                    &tenant,
+                    StartExportInput {
+                        request: ExportRequest::system().with_types(vec!["Patient".to_string()]),
+                        transaction_time: Utc::now(),
+                        request_url: "http://localhost/$export".to_string(),
+                        owner_subject: Some("Practitioner/dr-1".to_string()),
+                        fhir_version: helios_fhir::FhirVersion::default(),
+                    },
+                )
+                .await
+                .unwrap();
+
+            let output = Arc::new(FailingOutput {
+                steal: steal_with.map(|thief| (Arc::clone(&backend), thief)),
+            });
+
+            let sink = Arc::new(CollectorSink::new());
+            let worker_id = WorkerId::new("w-output-down");
+            let worker = DefaultExportWorker::new(
+                Arc::clone(&backend),
+                Arc::clone(&backend),
+                Arc::clone(&output),
+                worker_id.clone(),
+            )
+            .with_audit(sink.clone(), "Device/hfs");
+
+            // A one-millisecond lease: the run keeps its fencing token — every
+            // fenced write still matches on it — but the job itself is
+            // re-claimable by the time the output store fails.
+            let lease = backend
+                .claim_next(&worker_id, Duration::from_millis(1), TEST_MAX_ATTEMPTS)
+                .await
+                .unwrap()
+                .expect("job claimable");
+
+            // The keeper renews a stub, so the job store never sees a heartbeat
+            // that would resurrect the real lease, and the keeper never
+            // declares the run abandoned — which would end it before it could
+            // reach the failure path under test.
+            let keeper = LeaseKeeper::spawn(
+                StubRenewal::new(Renewal::Lands),
+                ExportJobLease {
+                    lease_expiry: Utc::now() + chrono::Duration::seconds(300),
+                    lease_duration: Duration::from_secs(300),
+                    ..lease.clone()
+                },
+                DEFAULT_HEARTBEAT_INTERVAL,
+            );
+
+            let warnings = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let guard = tracing::subscriber::set_default(CaptureWarnings(Arc::clone(&warnings)));
+            let result = worker.run_job_with_keeper(lease, keeper).await;
+            drop(guard);
+
+            let progress = backend.get_export_status(&tenant, &job_id).await.unwrap();
+            let warnings = warnings.lock().unwrap().clone();
+            FailedRun {
+                result,
+                events: sink.events(),
+                status: progress.status,
+                error_message: progress.error_message,
+                warnings,
+            }
+        }
+
+        /// A run that fails while its lease is gone records nothing at all: the
+        /// worker that reclaimed the job owns its outcome now, so auditing the
+        /// failure here would put two terminal events on one job (#1041).
+        ///
+        /// This is the one lost-lease path that is only reachable from a
+        /// *failing* run — `fail_export_job` itself answering `LeaseLost` —
+        /// which is why the output store both steals the lease and fails.
+        #[tokio::test]
+        async fn test_run_job_does_not_audit_a_failure_it_no_longer_owns() {
+            let run = run_export_with_failing_output(Some(WorkerId::new("w-thief"))).await;
+
+            assert!(
+                run.result.is_ok(),
+                "a failure under a lost lease belongs to the new owner, not to \
+                 this run: {:?}",
+                run.result.err()
+            );
+            assert!(
+                run.events.is_empty(),
+                "a run that lost its lease must emit no terminal audit event, \
+                 got {:?}",
+                run.events.len()
+            );
+            assert_eq!(
+                run.status,
+                ExportStatus::InProgress,
+                "the job must be left as the worker that reclaimed it set it up, \
+                 not failed out from under that worker"
+            );
+            assert_eq!(run.error_message, None);
+            assert!(
+                run.warnings
+                    .iter()
+                    .any(|e: &String| e.contains("recording a failed run")),
+                "an abandoned failure must say so in the log: {:?}",
+                run.warnings
+            );
+        }
+
+        /// The contrast that keeps the test above honest: the very same storage
+        /// failure, with the lease still held, does fail the job, audit it, and
+        /// surface the error to the worker loop.
+        #[tokio::test]
+        async fn test_run_job_audits_a_failure_it_still_owns() {
+            use crate::test_audit::detail_map;
+
+            let run = run_export_with_failing_output(None).await;
+
+            assert!(
+                run.result.is_err(),
+                "a storage failure under a held lease must surface"
+            );
+            assert_eq!(run.events.len(), 1, "exactly one terminal event per run");
+            let details = detail_map(&run.events[0]);
+            assert_eq!(
+                details.get("bulk-export-operation").map(String::as_str),
+                Some("failed")
+            );
+            assert_eq!(
+                run.events[0]
+                    .outcome
+                    .as_ref()
+                    .and_then(|o| o.value.as_deref()),
+                Some("8")
+            );
+            assert_eq!(run.status, ExportStatus::Error);
+            assert_eq!(
+                run.error_message.as_deref(),
+                Some("export failed: internal storage error"),
+                "the stored message is the masked, publishable one"
+            );
+        }
+
         /// `filter_batch_lines` should keep exactly the lines the search
         /// provider confirms match, in the batch's original order, paging
         /// through the search result until it is exhausted.
