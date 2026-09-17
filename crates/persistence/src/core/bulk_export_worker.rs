@@ -2151,6 +2151,174 @@ mod tests {
             );
         }
 
+        /// A run that takes several lease lifetimes still finishes — under the
+        /// real [`LeaseKeeper`] that [`DefaultExportWorker::run_job`] spawns for
+        /// itself, with a second worker polling `claim_next` throughout.
+        ///
+        /// This is the test #1041 is about. Every other keeper test drives a
+        /// stub: they prove the keeper renews, and that a run whose lease is
+        /// already gone abandons cleanly. Neither shows the two halves working
+        /// together, which is the only thing the reporter cared about. Before
+        /// the fix the sole heartbeat was inline at the end of each batch, so
+        /// nothing renewed the lease while a batch was being fetched, filtered
+        /// and written: the contender below would have reclaimed the job
+        /// part-way through, wiped this attempt's parts and restarted the
+        /// export from its first resource type — forever, because the next
+        /// attempt is just as slow as the last.
+        ///
+        /// The work here outlasts the lease more than twice over: ten batches
+        /// at 500 ms each under a two-second lease.
+        #[tokio::test]
+        async fn test_run_job_outlives_a_lease_shorter_than_the_work() {
+            /// Short enough that the run spans several of them.
+            const LEASE: Duration = Duration::from_secs(2);
+            /// Renews roughly six times per lease, so no single heartbeat
+            /// landing late can decide the outcome.
+            const HEARTBEAT: Duration = Duration::from_millis(300);
+            /// One batch — and so one part — per seeded resource.
+            const PATIENTS: usize = 10;
+
+            let backend = Arc::new(SqliteBackend::in_memory().unwrap());
+            backend.init_schema().unwrap();
+            let tenant = tenant();
+
+            for i in 0..PATIENTS {
+                backend
+                    .create(
+                        &tenant,
+                        "Patient",
+                        serde_json::json!({"resourceType": "Patient", "id": format!("p{i}")}),
+                        helios_fhir::FhirVersion::default(),
+                    )
+                    .await
+                    .unwrap();
+            }
+
+            let tmp = tempfile::tempdir().unwrap();
+            let output = Arc::new(SlowOutput {
+                inner: Arc::new(LocalFsOutputStore::new(tmp.path(), "http://localhost:8080")),
+                // Ten batches spend ~5 s in the output store alone, well past
+                // the lease taken out below.
+                delay: Duration::from_millis(500),
+            });
+
+            let job_id = backend
+                .start_export(
+                    &tenant,
+                    StartExportInput {
+                        request: ExportRequest::system()
+                            .with_types(vec!["Patient".to_string()])
+                            .with_batch_size(1),
+                        transaction_time: Utc::now(),
+                        request_url: "http://localhost/$export".to_string(),
+                        owner_subject: Some("sub".to_string()),
+                        fhir_version: helios_fhir::FhirVersion::default(),
+                    },
+                )
+                .await
+                .unwrap();
+
+            let worker_id = WorkerId::new("w-slow");
+            let worker = DefaultExportWorker::new(
+                Arc::clone(&backend),
+                Arc::clone(&backend),
+                Arc::clone(&output),
+                worker_id.clone(),
+            )
+            .with_heartbeat_interval(HEARTBEAT);
+
+            let lease = backend
+                .claim_next(&worker_id, LEASE, TEST_MAX_ATTEMPTS)
+                .await
+                .unwrap()
+                .expect("job claimable");
+            assert_eq!(lease.job_id, job_id);
+            let claimed_token = lease.fencing_token;
+            let claimed_expiry = lease.lease_expiry;
+
+            // A second worker doing exactly what the worker loop does: asking
+            // the job store for anything claimable. A lease allowed to lapse
+            // makes the job eligible again, and this is what would take it.
+            let contender = {
+                let backend = Arc::clone(&backend);
+                tokio::spawn(async move {
+                    let thief = WorkerId::new("w-contender");
+                    loop {
+                        if let Some(stolen) = backend
+                            .claim_next(&thief, Duration::from_secs(60), TEST_MAX_ATTEMPTS)
+                            .await
+                            .expect("claim_next")
+                        {
+                            return stolen;
+                        }
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                })
+            };
+
+            // The real `run_job`, which builds its own `LeaseKeeper` — that is
+            // the whole point of this test.
+            worker.run_job(lease).await.unwrap();
+            contender.abort();
+
+            match contender.await {
+                Err(e) if e.is_cancelled() => {}
+                Ok(stolen) => panic!(
+                    "a second worker reclaimed the job while it was still \
+                     running ({stolen:?}): its lease was not renewed during the \
+                     export"
+                ),
+                Err(e) => panic!("the contending claimer panicked: {e}"),
+            }
+
+            let progress = backend.get_export_status(&tenant, &job_id).await.unwrap();
+            assert_eq!(
+                progress.status,
+                ExportStatus::Complete,
+                "a run longer than its lease must still finish the job"
+            );
+
+            // Read the lease columns straight from the job row: nothing on the
+            // public status surface exposes them, and they are what tell a
+            // renewed lease apart from a merely lucky run.
+            let (token, expiry): (i64, String) = backend
+                .get_connection()
+                .unwrap()
+                .query_row(
+                    "SELECT fencing_token, lease_expiry FROM bulk_export_jobs WHERE id = ?1",
+                    rusqlite::params![job_id.as_str()],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(
+                token as u64, claimed_token,
+                "the job must still carry the original claim's fencing token; a \
+                 higher one means it changed hands mid-run"
+            );
+
+            let expiry = chrono::DateTime::parse_from_rfc3339(&expiry)
+                .expect("lease_expiry is stored as RFC 3339")
+                .with_timezone(&Utc);
+            assert!(
+                expiry > claimed_expiry,
+                "the keeper must have pushed the lease out during the run: \
+                 persisted expiry {expiry} is no later than the claim's \
+                 {claimed_expiry}"
+            );
+
+            let manifest = backend.get_export_manifest(&tenant, &job_id).await.unwrap();
+            assert_eq!(
+                manifest.output.len(),
+                PATIENTS,
+                "every batch should have produced its own part"
+            );
+            let total: u64 = manifest.output.iter().map(|e| e.count).sum();
+            assert_eq!(
+                total, PATIENTS as u64,
+                "every seeded resource should be exported exactly once"
+            );
+        }
+
         /// An [`ExportOutputStore`] that fails as soon as the worker opens a
         /// part writer, optionally letting a second worker steal the job first.
         ///
