@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use deadpool_postgres::GenericClient;
 use helios_fhir::FhirVersion;
 use serde_json::Value;
 use tokio::sync::Semaphore;
@@ -143,10 +144,13 @@ WHERE resource_fts.content_tsvector IS DISTINCT FROM EXCLUDED.content_tsvector \
 /// `FTS_MAX_INPUT_BYTES`, which assumes the session is still usable: true for
 /// an ordinary write, which runs without an explicit transaction. This
 /// statement runs inside the page's managed transaction, where a
-/// `program_limit_exceeded` has already aborted it, so nothing here may
-/// truncate or retry — the page rolls back and each resource is repeated by
-/// the ordinary path, which truncates there (see
-/// `postgres_integration_reindex_page_retries_oversized_fts_individually`).
+/// `program_limit_exceeded` has aborted it back to the `reindex_fts_phase`
+/// savepoint, and a grouped statement cannot say which row was too large. So
+/// nothing here truncates or retries — the page writer rolls back to that
+/// savepoint, keeping the `search_index` work already done, and replays the
+/// FTS phase one resource at a time under per-resource savepoints, truncating
+/// only the oversized ones (see
+/// `postgres_integration_reindex_page_recovers_oversized_fts_without_replaying_search_parameters`).
 const FTS_BATCH_UPSERT_SQL: &str = "\
 INSERT INTO resource_fts (tenant_id, resource_type, resource_id, narrative_tsvector, content_tsvector) \
 SELECT $1::text, batch.resource_type, batch.resource_id, \
@@ -168,7 +172,7 @@ WHERE resource_fts.content_tsvector IS DISTINCT FROM EXCLUDED.content_tsvector \
 /// statements over this same code. Nothing here bounds the bytes a group
 /// carries — the four `text[]` parameters are as large as the resources in
 /// them — and a group whose input is too large for one `to_tsvector` fails the
-/// page, which is repeated per resource and truncated there (see
+/// FTS phase, which is replayed per resource and truncated there (see
 /// [`FTS_BATCH_UPSERT_SQL`]).
 ///
 /// The three things this number trades off: the parameters one statement binds
@@ -1626,6 +1630,110 @@ impl PostgresBackend {
     /// deliberately: the fix adds a `to_tsvector` per bundle entry, which is
     /// cost on the import path, and it belongs with a decision about the
     /// paragraph above rather than inside a performance change.
+    async fn execute_fts_statement<C>(
+        client: &C,
+        tenant_id: &str,
+        resource_type: &str,
+        resource_id: &str,
+        content: &SearchableContent,
+    ) -> Result<(), tokio_postgres::Error>
+    where
+        C: deadpool_postgres::GenericClient + ?Sized,
+    {
+        if content.is_empty() {
+            execute_cached(
+                client,
+                "DELETE FROM resource_fts WHERE tenant_id = $1 AND resource_type = $2 AND resource_id = $3",
+                &[&tenant_id, &resource_type, &resource_id],
+            )
+            .await?;
+            return Ok(());
+        }
+
+        execute_cached(
+            client,
+            FTS_UPSERT_SQL,
+            &[
+                &resource_id,
+                &resource_type,
+                &tenant_id,
+                &content.narrative,
+                &content.full_content,
+            ],
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn retry_truncated_fts<C>(
+        client: &C,
+        tenant_id: &str,
+        resource_type: &str,
+        resource_id: &str,
+        content: &SearchableContent,
+    ) -> StorageResult<()>
+    where
+        C: deadpool_postgres::GenericClient + ?Sized,
+    {
+        let narrative = truncate_on_char_boundary(&content.narrative, FTS_MAX_INPUT_BYTES);
+        let full_content = truncate_on_char_boundary(&content.full_content, FTS_MAX_INPUT_BYTES);
+        tracing::warn!(
+            "FTS content for {}/{} exceeds PostgreSQL's 1 MB tsvector limit; \
+             indexing the first {} bytes of narrative and content only",
+            resource_type,
+            resource_id,
+            FTS_MAX_INPUT_BYTES,
+        );
+        let truncated = SearchableContent {
+            narrative: narrative.to_string(),
+            full_content: full_content.to_string(),
+        };
+        Self::execute_fts_statement(client, tenant_id, resource_type, resource_id, &truncated)
+            .await
+            .map_err(|e| internal_error(format!("Failed to insert FTS content: {}", e)))
+    }
+
+    async fn index_fts_content_page<C>(
+        &self,
+        client: &C,
+        tenant_id: &str,
+        resource_type: &str,
+        resource_id: &str,
+        resource: &Value,
+    ) -> Result<(), PageFtsError>
+    where
+        C: deadpool_postgres::GenericClient + ?Sized,
+    {
+        if !self
+            .fts_table_exists(client)
+            .await
+            .map_err(PageFtsError::Other)?
+        {
+            return Ok(());
+        }
+
+        let content = extract_searchable_content(resource);
+        match Self::execute_fts_statement(client, tenant_id, resource_type, resource_id, &content)
+            .await
+        {
+            Ok(()) => Ok(()),
+            Err(error)
+                if error.code()
+                    == Some(&tokio_postgres::error::SqlState::PROGRAM_LIMIT_EXCEEDED) =>
+            {
+                Err(PageFtsError::ProgramLimitExceeded { error, content })
+            }
+            Err(error) if content.is_empty() => Err(PageFtsError::Other(internal_error(format!(
+                "Failed to delete empty FTS index: {}",
+                error
+            )))),
+            Err(error) => Err(PageFtsError::Other(internal_error(format!(
+                "Failed to insert FTS content: {}",
+                error
+            )))),
+        }
+    }
+
     async fn index_fts_content<C>(
         &self,
         client: &C,
@@ -1644,21 +1752,6 @@ impl PostgresBackend {
         // Extract searchable content
         let content = extract_searchable_content(resource);
 
-        if content.is_empty() {
-            // Nothing to index. A stored resource always carries at least its
-            // `resourceType`, so this is unreachable in practice, but if a
-            // rewrite ever did empty a resource out, the previous row has to go
-            // rather than survive as a stale match.
-            execute_cached(
-                client,
-                "DELETE FROM resource_fts WHERE tenant_id = $1 AND resource_type = $2 AND resource_id = $3",
-                &[&tenant_id, &resource_type, &resource_id],
-            )
-            .await
-            .map_err(|e| internal_error(format!("Failed to delete empty FTS index: {}", e)))?;
-            return Ok(());
-        }
-
         // Store the vectors, not their input. `narrative_text` and
         // `full_content` are write-only columns — `_text` and `_content` query
         // `narrative_tsvector` / `content_tsvector` and nothing reads the raw
@@ -1667,18 +1760,15 @@ impl PostgresBackend {
         // instead of in a `BEFORE INSERT` trigger; the trigger is dropped in
         // schema v26 because it would otherwise overwrite these vectors with
         // the tsvector of an empty string.
-        let result = execute_cached(
-            client,
-            FTS_UPSERT_SQL,
-            &[
-                &resource_id,
-                &resource_type,
-                &tenant_id,
-                &content.narrative,
-                &content.full_content,
-            ],
-        )
-        .await;
+        let result =
+            Self::execute_fts_statement(client, tenant_id, resource_type, resource_id, &content)
+                .await;
+
+        if content.is_empty() {
+            result
+                .map_err(|e| internal_error(format!("Failed to delete empty FTS index: {}", e)))?;
+            return Ok(());
+        }
 
         let err = match result {
             Ok(_) => return Ok(()),
@@ -1710,28 +1800,7 @@ impl PostgresBackend {
             )));
         }
 
-        let narrative = truncate_on_char_boundary(&content.narrative, FTS_MAX_INPUT_BYTES);
-        let full_content = truncate_on_char_boundary(&content.full_content, FTS_MAX_INPUT_BYTES);
-        tracing::warn!(
-            "FTS content for {}/{} exceeds PostgreSQL's 1 MB tsvector limit; \
-             indexing the first {} bytes of narrative and content only",
-            resource_type,
-            resource_id,
-            FTS_MAX_INPUT_BYTES,
-        );
-        execute_cached(
-            client,
-            FTS_UPSERT_SQL,
-            &[
-                &resource_id,
-                &resource_type,
-                &tenant_id,
-                &narrative,
-                &full_content,
-            ],
-        )
-        .await
-        .map_err(|e| internal_error(format!("Failed to insert FTS content: {}", e)))?;
+        Self::retry_truncated_fts(client, tenant_id, resource_type, resource_id, &content).await?;
 
         Ok(())
     }
@@ -1761,20 +1830,25 @@ impl PostgresBackend {
     /// issues no statement at all.
     ///
     /// Every error is returned as it arrives — never truncated, never retried,
-    /// never re-split into smaller groups. The caller treats any error as
-    /// page-fatal and re-runs the page through the per-resource path, which is
-    /// where an input too large for one `to_tsvector` is truncated and where a
-    /// transaction this statement aborted gets rolled back.
+    /// never re-split into smaller groups. A `program_limit_exceeded` is
+    /// reported as [`BatchFtsError::ProgramLimitExceeded`] so the caller can
+    /// roll back to its FTS-phase savepoint and replay the phase per resource,
+    /// truncating the oversized input there; every other error is page-fatal
+    /// and the caller re-runs the page through the per-resource path.
     async fn index_fts_content_batch<C>(
         &self,
         client: &C,
         tenant_id: &str,
         resources: &[&StoredResource],
-    ) -> StorageResult<()>
+    ) -> Result<(), BatchFtsError>
     where
         C: deadpool_postgres::GenericClient + ?Sized,
     {
-        if !self.fts_table_exists(client).await? {
+        if !self
+            .fts_table_exists(client)
+            .await
+            .map_err(BatchFtsError::Other)?
+        {
             return Ok(());
         }
 
@@ -1811,7 +1885,16 @@ impl PostgresBackend {
                 ],
             )
             .await
-            .map_err(|e| internal_error(format!("Failed to insert FTS content: {}", e)))?;
+            .map_err(|error| {
+                if error.code() == Some(&tokio_postgres::error::SqlState::PROGRAM_LIMIT_EXCEEDED) {
+                    BatchFtsError::ProgramLimitExceeded(error)
+                } else {
+                    BatchFtsError::Other(internal_error(format!(
+                        "Failed to insert FTS content: {}",
+                        error
+                    )))
+                }
+            })?;
         }
 
         Ok(())
@@ -4510,20 +4593,128 @@ impl ReindexTarget for PostgresBackend {
                     .sum(),
             );
 
+            transaction
+                .batch_execute("SAVEPOINT reindex_fts_phase")
+                .await
+                .map_err(|e| {
+                    internal_error(format!("Failed to create FTS phase savepoint: {}", e))
+                })?;
             let fts_span = crate::perf::span(crate::perf::Phase::ReindexFts);
             // One statement per group of `FTS_BATCH_SIZE` resources, instead of
             // one per resource: the whole point of this path. The resource ids
             // are already flattened for the page's `search_index` writes, and
             // they are unique per page, which is what the statement's
             // `ON CONFLICT` needs (see `FTS_BATCH_UPSERT_SQL`).
+            //
+            // The batch runs under `reindex_fts_phase`. A `to_tsvector` input
+            // over PostgreSQL's 1 MB limit aborts the transaction, but only
+            // back to that savepoint: the page's `search_index` work above it
+            // survives, and the FTS phase is replayed one resource at a time,
+            // truncating just the oversized ones (`retry_truncated_fts`).
+            // Any other failure still fails the page, which
+            // `write_reindex_page_individually` repeats per resource.
             let fts_batch: Vec<&StoredResource> = resources
                 .iter()
                 .zip(&extraction_errors)
                 .filter(|(_, error)| error.is_none())
                 .map(|(resource, _)| resource)
                 .collect();
-            self.index_fts_content_batch(&transaction, tenant_id, &fts_batch)
-                .await?;
+            let oversized = match self
+                .index_fts_content_batch(&transaction, tenant_id, &fts_batch)
+                .await
+            {
+                Ok(()) => None,
+                Err(BatchFtsError::ProgramLimitExceeded(error)) => Some(error),
+                Err(BatchFtsError::Other(error)) => return Err(error),
+            };
+
+            if let Some(error) = oversized {
+                transaction
+                    .batch_execute("ROLLBACK TO SAVEPOINT reindex_fts_phase")
+                    .await
+                    .map_err(|e| {
+                        internal_error(format!(
+                            "Failed to rollback FTS phase after PROGRAM_LIMIT_EXCEEDED: {}",
+                            e
+                        ))
+                    })?;
+                tracing::debug!(
+                    "Recovering PostgreSQL reindex FTS page after PROGRAM_LIMIT_EXCEEDED: {}",
+                    error
+                );
+
+                for resource in &fts_batch {
+                    transaction
+                        .batch_execute("SAVEPOINT reindex_fts_resource")
+                        .await
+                        .map_err(|e| {
+                            internal_error(format!("Failed to create FTS resource savepoint: {}", e))
+                        })?;
+
+                    let attempt = self
+                        .index_fts_content_page(
+                            &transaction,
+                            tenant_id,
+                            resource.resource_type(),
+                            resource.id(),
+                            resource.content(),
+                        )
+                        .await;
+                    match attempt {
+                        Ok(()) => {
+                            transaction
+                                .batch_execute("RELEASE SAVEPOINT reindex_fts_resource")
+                                .await
+                                .map_err(|e| {
+                                    internal_error(format!(
+                                        "Failed to release FTS resource savepoint: {}",
+                                        e
+                                    ))
+                                })?;
+                        }
+                        Err(PageFtsError::ProgramLimitExceeded { content, error }) => {
+                            transaction
+                                .batch_execute("ROLLBACK TO SAVEPOINT reindex_fts_resource")
+                                .await
+                                .map_err(|e| {
+                                    internal_error(format!(
+                                        "Failed to rollback FTS resource after PROGRAM_LIMIT_EXCEEDED: {}",
+                                        e
+                                    ))
+                                })?;
+                            tracing::debug!(
+                                "Retrying PostgreSQL reindex FTS resource after PROGRAM_LIMIT_EXCEEDED: {}",
+                                error
+                            );
+                            Self::retry_truncated_fts(
+                                &transaction,
+                                tenant_id,
+                                resource.resource_type(),
+                                resource.id(),
+                                &content,
+                            )
+                            .await?;
+                            transaction
+                                .batch_execute("RELEASE SAVEPOINT reindex_fts_resource")
+                                .await
+                                .map_err(|e| {
+                                    internal_error(format!(
+                                        "Failed to release FTS resource savepoint: {}",
+                                        e
+                                    ))
+                                })?;
+                        }
+                        Err(PageFtsError::Other(error)) => return Err(error),
+                    }
+                }
+            }
+
+            transaction
+                .batch_execute("RELEASE SAVEPOINT reindex_fts_phase")
+                .await
+                .map_err(|e| {
+                    internal_error(format!("Failed to release FTS phase savepoint: {}", e))
+                })?;
             drop(fts_span);
             Ok(())
         }
@@ -4606,6 +4797,31 @@ impl ReindexTarget for PostgresBackend {
 // ============================================================================
 // FTS Content Extraction (local copy to avoid cross-feature dependency on sqlite)
 // ============================================================================
+
+/// Outcome of one resource's FTS statement inside a reindex page transaction.
+///
+/// A `program_limit_exceeded` (the 1 MB `tsvector` cap) is surfaced with the
+/// content that tripped it so the caller can roll back to its savepoint and
+/// retry that one resource truncated; anything else is page-fatal.
+enum PageFtsError {
+    ProgramLimitExceeded {
+        error: tokio_postgres::Error,
+        content: SearchableContent,
+    },
+    Other(StorageError),
+}
+
+/// Outcome of a grouped FTS statement (`FTS_BATCH_UPSERT_SQL`) inside a
+/// reindex page transaction.
+///
+/// A grouped statement cannot say which of its rows exceeded the `tsvector`
+/// limit, so `ProgramLimitExceeded` carries only the error: the caller rolls
+/// back to the FTS-phase savepoint and replays the page per resource, where
+/// [`PageFtsError`] identifies the oversized one.
+enum BatchFtsError {
+    ProgramLimitExceeded(tokio_postgres::Error),
+    Other(StorageError),
+}
 
 /// Content extracted from a resource for full-text search.
 struct SearchableContent {
