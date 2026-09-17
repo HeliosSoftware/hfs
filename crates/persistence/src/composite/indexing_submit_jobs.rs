@@ -429,7 +429,7 @@ impl BulkSubmitProvider for IndexingSubmitJobs {
         &self,
         tenant: &TenantContext,
         id: &SubmissionId,
-    ) -> StorageResult<SubmissionSummary> {
+    ) -> StorageResult<()> {
         self.inner.complete_submission(tenant, id).await
     }
 
