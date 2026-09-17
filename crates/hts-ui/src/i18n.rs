@@ -6,7 +6,8 @@
 //! override (persisted in the `hts_lang` cookie by the language switcher) →
 //! cookie → `Accept-Language` (RFC 4647 Lookup) → `en`.
 //!
-//! Catalogs live in `locales/<locale>/main.ftl` at the workspace root and are
+//! Catalogs live in `locales/<locale>/main.ftl` at the workspace root (reached
+//! through this crate's `locales` symlink so `cargo publish` packages them) and are
 //! embedded at compile time — no runtime file or CDN dependency. HTS-specific
 //! keys carry the `hts-*` namespace (see design doc §7 Fluent convention).
 //! `en` is the source locale and the final fallback: a key missing from a
@@ -29,7 +30,7 @@ use unic_langid::{LanguageIdentifier, langid};
 
 fluent_templates::static_loader! {
     static LOCALES = {
-        locales: "../../locales",
+        locales: "locales",
         fallback_language: "en",
         // The UI renders whole localized sentences into an LTR document; the
         // Unicode bidi isolation marks Fluent adds around placeables by
