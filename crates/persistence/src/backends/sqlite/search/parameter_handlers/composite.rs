@@ -52,7 +52,7 @@ impl CompositeHandler {
 
         // Build condition for each component
         for (part, component) in parts.iter().zip(components.iter()) {
-            let component_value = Self::parse_component_value(part);
+            let component_value = Self::parse_component_value(part, component.param_type);
             let fragment = Self::build_component_sql_from_type(
                 &component_value,
                 component.param_type,
@@ -95,7 +95,7 @@ impl CompositeHandler {
         let mut fragments = Vec::new();
         let mut current_offset = param_offset;
         for (part, component) in parts.iter().zip(components.iter()) {
-            let component_value = Self::parse_component_value(part);
+            let component_value = Self::parse_component_value(part, component.param_type);
             let fragment = Self::build_component_sql_from_type(
                 &component_value,
                 component.param_type,
@@ -135,7 +135,7 @@ impl CompositeHandler {
 
         for (part, component) in parts.iter().zip(components.iter()) {
             // Create a SearchValue for this component part
-            let component_value = Self::parse_component_value(part);
+            let component_value = Self::parse_component_value(part, component.param_type);
 
             // Generate SQL for this component based on its type
             let fragment = Self::build_component_sql(&component_value, component, current_offset);
@@ -171,9 +171,24 @@ impl CompositeHandler {
         }
     }
 
-    /// Parses a component value, extracting any prefix.
-    fn parse_component_value(part: &str) -> SearchValue {
-        // Check for comparison prefixes at the start
+    /// Parses a component value, extracting a comparison prefix.
+    ///
+    /// Comparison prefixes (`ne`/`gt`/`lt`/`ge`/`le`/`sa`/`eb`/`ap`/`eq`) exist
+    /// only for number, date and quantity search values, so they are recognised
+    /// **only** for those component types. For a token, string, reference or uri
+    /// component the part is taken verbatim — otherwise a code that merely begins
+    /// with one of those letter pairs (`left`, `negative`, `ge123`) would be
+    /// silently mangled into `ft`/`gative`/`123` and never match (#1236). This
+    /// matches the Elasticsearch and MongoDB backends, which already parse
+    /// prefixes only in their Number/Date/Quantity arms.
+    fn parse_component_value(part: &str, param_type: SearchParamType) -> SearchValue {
+        if !matches!(
+            param_type,
+            SearchParamType::Number | SearchParamType::Date | SearchParamType::Quantity
+        ) {
+            return SearchValue::new(SearchPrefix::Eq, part);
+        }
+
         let prefixes = [
             ("ne", SearchPrefix::Ne),
             ("gt", SearchPrefix::Gt),
@@ -285,5 +300,40 @@ mod tests {
 
         assert!(frag.sql.contains("value_token_code"));
         assert!(frag.sql.contains("value_date"));
+    }
+
+    /// A token/string/reference/uri code that merely begins with a comparison
+    /// prefix's letters must be taken verbatim, not mangled (#1236).
+    #[test]
+    fn non_numeric_components_keep_a_prefix_lookalike_verbatim() {
+        for (code, ty) in [
+            ("left", SearchParamType::Token),
+            ("negative", SearchParamType::String),
+            ("leukocytes", SearchParamType::Token),
+            ("ge123", SearchParamType::Token),
+        ] {
+            let v = CompositeHandler::parse_component_value(code, ty);
+            assert!(
+                matches!(v.prefix, SearchPrefix::Eq),
+                "{code}: prefix stripped"
+            );
+            assert_eq!(v.value, code, "{code}: value corrupted");
+        }
+    }
+
+    /// Number, date and quantity components still parse their prefix.
+    #[test]
+    fn numeric_components_still_parse_their_prefix() {
+        let q = CompositeHandler::parse_component_value("lt60", SearchParamType::Quantity);
+        assert!(matches!(q.prefix, SearchPrefix::Lt));
+        assert_eq!(q.value, "60");
+
+        let d = CompositeHandler::parse_component_value("ge2024-01-01", SearchParamType::Date);
+        assert!(matches!(d.prefix, SearchPrefix::Ge));
+        assert_eq!(d.value, "2024-01-01");
+
+        let n = CompositeHandler::parse_component_value("gt5", SearchParamType::Number);
+        assert!(matches!(n.prefix, SearchPrefix::Gt));
+        assert_eq!(n.value, "5");
     }
 }
