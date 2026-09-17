@@ -10,7 +10,7 @@ use crate::core::bulk_submit_legacy::{
 use crate::error::StorageResult;
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 32;
+pub const SCHEMA_VERSION: i32 = 33;
 
 /// The `search_index` value indexes. Excludes `idx_search_composite`, which the
 /// delete-by-resource path needs at all times, and `idx_search_token_display`,
@@ -443,6 +443,7 @@ fn migrate_schema(conn: &Connection, from_version: i32) -> StorageResult<()> {
             29 => migrate_v29_to_v30(conn)?,
             30 => migrate_v30_to_v31(conn)?,
             31 => migrate_v31_to_v32(conn)?,
+            32 => migrate_v32_to_v33(conn)?,
             _ => {
                 return Err(crate::error::StorageError::Backend(
                     crate::error::BackendError::Internal {
@@ -1539,6 +1540,30 @@ fn migrate_v31_to_v32(conn: &Connection) -> StorageResult<()> {
         [],
     )
     .map_err(|e| migration_err(format!("v32 create bulk_manifest_file_progress: {e}")))?;
+    Ok(())
+}
+
+/// Migrate from schema version 32 to version 33.
+///
+/// Adds `bulk_export_jobs.attempts` — how many times the job has been claimed
+/// by a worker (#1041). A job whose lease expires mid-run is reclaimable, so
+/// without a count of past claims a job that keeps dying the same way is handed
+/// to worker after worker forever, never reaching a terminal state and never
+/// giving its tenant's concurrency slot back. `claim_next` bumps the column on
+/// every claim and retires the job once the count would exceed the configured
+/// cap.
+fn migrate_v32_to_v33(conn: &Connection) -> StorageResult<()> {
+    let has_column = conn
+        .prepare("SELECT 1 FROM pragma_table_info('bulk_export_jobs') WHERE name = 'attempts'")
+        .and_then(|mut stmt| stmt.exists([]))
+        .unwrap_or(false);
+    if !has_column {
+        conn.execute(
+            "ALTER TABLE bulk_export_jobs ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0",
+            [],
+        )
+        .map_err(|e| migration_err(format!("v33 attempts column: {e}")))?;
+    }
     Ok(())
 }
 

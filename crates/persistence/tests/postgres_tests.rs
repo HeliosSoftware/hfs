@@ -5717,6 +5717,62 @@ mod postgres_integration {
         );
     }
 
+    /// `_lastUpdated` is dispatched by name into a dedicated builder that
+    /// reads only `param.values`, so a modifier other than `:missing` would
+    /// be dropped and the value consumed as a plain positive date match. It
+    /// must be rejected up front instead, the same way unsupported `_id`
+    /// modifiers are (#1092 follow-up).
+    #[tokio::test]
+    async fn postgres_integration_search_last_updated_unsupported_modifier_is_rejected() {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::error::{SearchError, StorageError};
+        use helios_persistence::types::{
+            SearchModifier, SearchParamType, SearchParameter, SearchQuery, SearchValue,
+        };
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("test-tenant");
+
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({ "resourceType": "Patient", "id": "a" }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+
+        let query = SearchQuery::new("Patient").with_parameter(SearchParameter {
+            name: "_lastUpdated".to_string(),
+            param_type: SearchParamType::Date,
+            modifier: Some(SearchModifier::Not),
+            values: vec![SearchValue::eq("2020")],
+            chain: vec![],
+            components: vec![],
+        });
+
+        let err = backend.search(&tenant, &query).await.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                StorageError::Search(SearchError::UnsupportedModifier { ref modifier, .. })
+                    if modifier == "not"
+            ),
+            "_lastUpdated:not must be rejected as an unsupported modifier, got: {err:?}"
+        );
+
+        let err = backend.search_count(&tenant, &query).await.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                StorageError::Search(SearchError::UnsupportedModifier { ref modifier, .. })
+                    if modifier == "not"
+            ),
+            "search_count must reject _lastUpdated:not as well, got: {err:?}"
+        );
+    }
+
     #[tokio::test]
     async fn postgres_integration_search_composite_code_value_quantity() {
         use helios_persistence::core::SearchProvider;
@@ -8274,9 +8330,23 @@ mod postgres_integration {
             .await
             .unwrap();
 
-        // The bystander tenant's rows must survive both paths byte for byte.
+        // The bystander tenant's rows must survive both paths byte for byte,
+        // and so must this tenant's resource outside the page (#1146): the
+        // page's full-text statements name their resources, so a row the page
+        // does not name is never deleted, re-inserted, or rewritten.
         let bystander_before = index_snapshot(&client, other_tenant_id).await;
         let bystander_fts_before = fts_snapshot(&client, other_tenant_id).await;
+        let outside_fts_before: Vec<String> = fts_snapshot(&client, tenant_id)
+            .await
+            .into_iter()
+            .filter(|row| row.starts_with("outside|"))
+            .collect();
+        assert_eq!(
+            outside_fts_before.len(),
+            1,
+            "POSITIVE CONTROL: the resource outside the page must have exactly one \
+             full-text row before the write"
+        );
 
         let page = backend
             .fetch_resources_page(&tenant, "Patient", None, ids.len() as u32)
@@ -8356,6 +8426,17 @@ mod postgres_integration {
                 );
             }
         }
+
+        let outside_fts_after: Vec<String> = fts_snapshot(&client, tenant_id)
+            .await
+            .into_iter()
+            .filter(|row| row.starts_with("outside|"))
+            .collect();
+        assert_eq!(
+            outside_fts_after, outside_fts_before,
+            "the full-text row of the resource outside the page must come out of \
+             the page write byte-identical"
+        );
 
         let remaining_stale: Vec<(String, String)> = client
             .query(
@@ -8537,110 +8618,567 @@ mod postgres_integration {
         assert_eq!(history_after, history_before);
     }
 
+    /// One `write_search_entries_page` call must stay one PostgreSQL
+    /// transaction, and (#1146) it must keep each valid `resource_fts` row
+    /// until that resource's upsert: no effective full-text write when the
+    /// stored bytes did not change, one `UPDATE` when they did.
+    ///
+    /// The probe records one row per trigger firing, with the resource and the
+    /// transaction that fired it. It deliberately does **not** project with
+    /// `SELECT DISTINCT`: a page write fires several identical `search_index`
+    /// triggers per resource, and the distinct projection this test used to do
+    /// collapsed exactly the multiplicity the assertions are about.
     #[tokio::test]
     async fn postgres_integration_reindex_page_uses_one_transaction_for_all_index_writes() {
+        use helios_persistence::core::SearchProvider;
         use helios_persistence::search::{ReindexSource, ReindexTarget};
+        use helios_persistence::types::{
+            SearchParamType, SearchParameter, SearchQuery, SearchValue, StoredResource,
+        };
+
+        /// One trigger firing: the operation, the resource it belongs to,
+        /// whether the full-text row already existed (BEFORE INSERT only), and
+        /// the transaction that fired it.
+        #[derive(Debug)]
+        struct ProbeRow {
+            operation: String,
+            resource_id: String,
+            row_existed: Option<bool>,
+            transaction_id: i64,
+        }
+
+        async fn probe_rows(client: &tokio_postgres::Client, table_name: &str) -> Vec<ProbeRow> {
+            client
+                .query(
+                    &format!(
+                        "SELECT operation, resource_id, row_existed, transaction_id
+                         FROM {table_name}"
+                    ),
+                    &[],
+                )
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|row| ProbeRow {
+                    operation: row.get(0),
+                    resource_id: row.get(1),
+                    row_existed: row.get(2),
+                    transaction_id: row.get(3),
+                })
+                .collect()
+        }
+
+        fn fired(rows: &[ProbeRow], operation: &str, resource_id: &str) -> usize {
+            rows.iter()
+                .filter(|row| row.operation == operation && row.resource_id == resource_id)
+                .count()
+        }
+
+        /// One entry per attempted upsert of this resource's full-text row,
+        /// carrying whether the row was already there when the attempt was made.
+        fn upsert_attempts(rows: &[ProbeRow], resource_id: &str) -> Vec<Option<bool>> {
+            rows.iter()
+                .filter(|row| {
+                    row.operation == "resource_fts_before_insert" && row.resource_id == resource_id
+                })
+                .map(|row| row.row_existed)
+                .collect()
+        }
+
+        fn assert_one_transaction(rows: &[ProbeRow], context: &str) {
+            let transactions: std::collections::BTreeSet<i64> =
+                rows.iter().map(|row| row.transaction_id).collect();
+            assert_eq!(
+                transactions.len(),
+                1,
+                "{context}: every index write of a page must share one PostgreSQL \
+                 transaction: {rows:?}"
+            );
+        }
+
+        fn narrative(term: &str) -> serde_json::Value {
+            json!({
+                "status": "generated",
+                "div": format!(
+                    "<div xmlns=\"http://www.w3.org/1999/xhtml\"><p>{term}</p></div>"
+                )
+            })
+        }
+
+        async fn fts_hits(
+            backend: &PostgresBackend,
+            tenant: &TenantContext,
+            parameter: &str,
+            term: &str,
+        ) -> Vec<String> {
+            let query = SearchQuery::new("Patient").with_parameter(SearchParameter {
+                name: parameter.to_string(),
+                param_type: SearchParamType::Special,
+                modifier: None,
+                values: vec![SearchValue::eq(term)],
+                chain: vec![],
+                components: vec![],
+            });
+            backend
+                .search(tenant, &query)
+                .await
+                .expect("full-text search should succeed")
+                .resources
+                .items
+                .iter()
+                .map(|resource| resource.id().to_string())
+                .collect()
+        }
+
+        async fn fts_vectors(
+            client: &tokio_postgres::Client,
+            tenant_id: &str,
+        ) -> Vec<(String, Option<String>, Option<String>)> {
+            client
+                .query(
+                    "SELECT resource_id, narrative_tsvector::text, content_tsvector::text
+                     FROM resource_fts
+                     WHERE tenant_id = $1 AND resource_type = 'Patient'
+                     ORDER BY resource_id",
+                    &[&tenant_id],
+                )
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|row| (row.get(0), row.get(1), row.get(2)))
+                .collect()
+        }
+
+        const PAGE_IDS: [&str; 2] = ["tx-a", "tx-b"];
 
         let (backend, dbname) = isolated_reindex_backend().await;
         let tenant = create_tenant("reindex-page-single-transaction");
         let tenant_id = tenant.tenant_id().as_str();
-        for id in ["tx-a", "tx-b"] {
-            backend
-                .create(
-                    &tenant,
-                    "Patient",
-                    json!({
-                        "resourceType": "Patient",
-                        "id": id,
-                        "name": [{"family": id}]
-                    }),
-                    FhirVersion::default(),
-                )
-                .await
-                .unwrap();
-        }
+        let unchanged_term = format!("Preservedtoken{}", uuid::Uuid::new_v4().simple());
+        let replaced_term = format!("Replacedtoken{}", uuid::Uuid::new_v4().simple());
+        let refreshed_term = format!("Refreshedtoken{}", uuid::Uuid::new_v4().simple());
+
+        // Fixtures through the CRUD write paths — `create` for one resource and
+        // `create` then `update` for the other — so the page finds full-text
+        // rows written the way a live tenant's rows are, not by a raw seed.
+        // The triggers go in after this, so the probe sees reindex writes only.
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({
+                    "resourceType": "Patient",
+                    "id": "tx-a",
+                    "name": [{"family": "TxAlpha"}],
+                    "text": narrative(&unchanged_term)
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        let created = backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({
+                    "resourceType": "Patient",
+                    "id": "tx-b",
+                    "name": [{"family": "TxBravo"}],
+                    "text": narrative(&replaced_term)
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        backend
+            .update(
+                &tenant,
+                &created,
+                json!({
+                    "resourceType": "Patient",
+                    "id": "tx-b",
+                    "name": [{"family": "TxBravoRevised"}],
+                    "text": narrative(&replaced_term)
+                }),
+            )
+            .await
+            .unwrap();
+
         let page = backend
             .fetch_resources_page(&tenant, "Patient", None, 10)
             .await
             .unwrap();
+        assert_eq!(
+            page.resources
+                .iter()
+                .map(|resource| resource.id())
+                .collect::<Vec<_>>(),
+            PAGE_IDS.to_vec()
+        );
+
+        // Settle the page's full-text rows on the stored-bytes serialization
+        // before the probe starts, still part of the fixture. A CRUD write
+        // tokenises the resource it holds in memory; a reindex tokenises the
+        // jsonb round trip, and the two orders differ in an object's keys, so
+        // the first reindex after a CRUD write may legitimately replace the
+        // stored vectors once. Runs 1 and 2 below must be reindexes of a page
+        // whose rows already hold what a reindex would write, which is the
+        // state a repeated reindex finds.
+        let settled = backend
+            .write_search_entries_page(&tenant, &page.resources)
+            .await;
+        assert!(
+            settled.iter().all(Result::is_ok),
+            "the fixture's settling page write must succeed: {settled:?}"
+        );
 
         let client = reindex_test_client_for(&dbname).await;
         let suffix = uuid::Uuid::new_v4().simple().to_string();
         let table_name = format!("reindex_tx_probe_{suffix}");
         let function_name = format!("record_reindex_tx_{suffix}");
+        let upsert_trigger = format!("record_fts_upsert_{suffix}");
         let search_trigger = format!("record_search_tx_{suffix}");
         let fts_trigger = format!("record_fts_tx_{suffix}");
         client
             .batch_execute(&format!(
-                "CREATE TABLE {table_name} (operation text NOT NULL, transaction_id bigint NOT NULL);
+                "CREATE TABLE {table_name} (
+                     operation text NOT NULL,
+                     resource_id text NOT NULL,
+                     row_existed boolean,
+                     transaction_id bigint NOT NULL
+                 );
                  CREATE FUNCTION {function_name}() RETURNS trigger LANGUAGE plpgsql AS $$
                  BEGIN
+                   IF TG_WHEN = 'BEFORE' THEN
+                     IF NEW.tenant_id = '{tenant_id}' THEN
+                       INSERT INTO {table_name}
+                         (operation, resource_id, row_existed, transaction_id)
+                       VALUES (
+                         'resource_fts_before_insert',
+                         NEW.resource_id,
+                         EXISTS (
+                           SELECT 1 FROM resource_fts existing
+                           WHERE existing.tenant_id = NEW.tenant_id
+                             AND existing.resource_type = NEW.resource_type
+                             AND existing.resource_id = NEW.resource_id
+                         ),
+                         txid_current()
+                       );
+                     END IF;
+                     RETURN NEW;
+                   END IF;
                    IF TG_OP = 'DELETE' THEN
                      IF OLD.tenant_id = '{tenant_id}' THEN
-                       INSERT INTO {table_name} VALUES (TG_TABLE_NAME || '_delete', txid_current());
+                       INSERT INTO {table_name} (operation, resource_id, transaction_id)
+                       VALUES (TG_TABLE_NAME || '_delete', OLD.resource_id, txid_current());
                      END IF;
                      RETURN OLD;
+                   ELSIF TG_OP = 'UPDATE' THEN
+                     IF NEW.tenant_id = '{tenant_id}' THEN
+                       INSERT INTO {table_name} (operation, resource_id, transaction_id)
+                       VALUES (TG_TABLE_NAME || '_update', NEW.resource_id, txid_current());
+                     END IF;
+                     RETURN NEW;
+                   ELSE
+                     IF NEW.tenant_id = '{tenant_id}' THEN
+                       INSERT INTO {table_name} (operation, resource_id, transaction_id)
+                       VALUES (TG_TABLE_NAME || '_insert', NEW.resource_id, txid_current());
+                     END IF;
+                     RETURN NEW;
                    END IF;
-                   IF NEW.tenant_id = '{tenant_id}' THEN
-                     INSERT INTO {table_name} VALUES (TG_TABLE_NAME || '_insert', txid_current());
-                   END IF;
-                   RETURN NEW;
                  END $$;
-                 CREATE TRIGGER {search_trigger} AFTER INSERT OR DELETE ON search_index
+                 CREATE TRIGGER {upsert_trigger} BEFORE INSERT ON resource_fts
                  FOR EACH ROW EXECUTE FUNCTION {function_name}();
-                 CREATE TRIGGER {fts_trigger} AFTER INSERT OR DELETE ON resource_fts
+                 CREATE TRIGGER {fts_trigger} AFTER INSERT OR UPDATE OR DELETE ON resource_fts
+                 FOR EACH ROW EXECUTE FUNCTION {function_name}();
+                 CREATE TRIGGER {search_trigger} AFTER INSERT OR DELETE ON search_index
                  FOR EACH ROW EXECUTE FUNCTION {function_name}();"
             ))
             .await
             .unwrap();
 
-        let results = backend
-            .write_search_entries_page(&tenant, &page.resources)
-            .await;
-        let probe_rows: Vec<(String, i64)> = client
-            .query(
-                &format!(
-                    "SELECT DISTINCT operation, transaction_id FROM {table_name} ORDER BY operation"
-                ),
-                &[],
+        // Two reindexes of the unchanged page. Both must attempt the full-text
+        // upsert over the row the CRUD path already wrote, and neither may
+        // produce an effective full-text write while still replacing
+        // `search_index` in the page's one transaction.
+        let mut unchanged_page_transactions = Vec::new();
+        for run in 1..=2 {
+            client
+                .execute(&format!("DELETE FROM {table_name}"), &[])
+                .await
+                .unwrap();
+
+            let results = backend
+                .write_search_entries_page(&tenant, &page.resources)
+                .await;
+            assert_eq!(results.len(), PAGE_IDS.len());
+            assert!(
+                results.iter().all(Result::is_ok),
+                "run {run}: an unchanged page must take the batched path, not the \
+                 per-resource fallback: {results:?}"
+            );
+
+            let rows = probe_rows(&client, &table_name).await;
+            let context = format!("unchanged page, run {run}");
+            assert_one_transaction(&rows, &context);
+            unchanged_page_transactions.push(rows[0].transaction_id);
+
+            for id in PAGE_IDS {
+                assert_eq!(
+                    upsert_attempts(&rows, id),
+                    vec![Some(true)],
+                    "{context}: {id} must attempt exactly one full-text upsert, over \
+                     the row that is already there: {rows:?}"
+                );
+                for operation in [
+                    "resource_fts_insert",
+                    "resource_fts_update",
+                    "resource_fts_delete",
+                ] {
+                    assert_eq!(
+                        fired(&rows, operation, id),
+                        0,
+                        "{context}: an unchanged {id} must produce no effective \
+                         full-text write: {rows:?}"
+                    );
+                }
+                assert!(
+                    fired(&rows, "search_index_delete", id) > 0
+                        && fired(&rows, "search_index_insert", id) > 0,
+                    "{context}: {id}'s search_index rows must still be replaced: {rows:?}"
+                );
+            }
+        }
+        assert_ne!(
+            unchanged_page_transactions[0], unchanged_page_transactions[1],
+            "each page write must be its own transaction"
+        );
+
+        // Mixed page, still under the triggers: the same settled valid
+        // resources plus one resource the extractor rejects. The page's one
+        // full-text DELETE must cover that failed pair alone — were it to use
+        // the page's arrays, the valid resources would report a delete here,
+        // their upsert would find no row to land on, and the stale row below
+        // would not be the only one that went.
+        let failed = StoredResource::new(
+            "Patient",
+            "tx-fail",
+            tenant.tenant_id().clone(),
+            json!({"resourceType": "Observation", "id": "tx-fail"}),
+            FhirVersion::default(),
+        );
+        client
+            .execute(
+                "INSERT INTO resource_fts
+                 (tenant_id, resource_type, resource_id, narrative_tsvector, content_tsvector)
+                 VALUES ($1, 'Patient', 'tx-fail', to_tsvector('english', 'stale'), to_tsvector('english', 'stale'))",
+                &[&tenant_id],
             )
             .await
-            .unwrap()
-            .into_iter()
-            .map(|row| (row.get(0), row.get(1)))
-            .collect();
+            .unwrap();
+        let mut mixed_page = page.resources.clone();
+        mixed_page.push(failed);
+
+        // Seeding the stale row went through the triggers; clear what setup
+        // recorded so the probe holds the page write's events only.
+        client
+            .execute(&format!("DELETE FROM {table_name}"), &[])
+            .await
+            .unwrap();
+
+        let results = backend
+            .write_search_entries_page(&tenant, &mixed_page)
+            .await;
+        assert_eq!(results.len(), 3);
+        assert!(
+            results[..2].iter().all(Result::is_ok),
+            "mixed page: the valid resources must still be reindexed: {results:?}"
+        );
+        assert!(
+            results[2].is_err(),
+            "mixed page: the synthetic resource's extraction failure must be \
+             reported: {results:?}"
+        );
+
+        let rows = probe_rows(&client, &table_name).await;
+        assert_one_transaction(&rows, "mixed page");
+        for id in PAGE_IDS {
+            assert_eq!(
+                upsert_attempts(&rows, id),
+                vec![Some(true)],
+                "mixed page: {id} must upsert over the row that is already there: {rows:?}"
+            );
+            for operation in [
+                "resource_fts_insert",
+                "resource_fts_update",
+                "resource_fts_delete",
+            ] {
+                assert_eq!(
+                    fired(&rows, operation, id),
+                    0,
+                    "mixed page: a valid {id} whose row is kept must produce no \
+                     full-text write: {rows:?}"
+                );
+            }
+            assert!(
+                fired(&rows, "search_index_delete", id) > 0
+                    && fired(&rows, "search_index_insert", id) > 0,
+                "mixed page: {id}'s search_index rows must still be replaced: {rows:?}"
+            );
+        }
+        assert_eq!(
+            fired(&rows, "resource_fts_delete", "tx-fail"),
+            1,
+            "mixed page: the failed resource's stale full-text row must be deleted \
+             exactly once: {rows:?}"
+        );
+        assert!(
+            upsert_attempts(&rows, "tx-fail").is_empty(),
+            "mixed page: the failed resource has no full-text row to upsert: {rows:?}"
+        );
+        for operation in ["resource_fts_insert", "resource_fts_update"] {
+            assert_eq!(
+                fired(&rows, operation, "tx-fail"),
+                0,
+                "mixed page: the failed resource must not be written: {rows:?}"
+            );
+        }
+
+        // Change the stored bytes of one resource behind the backend's back
+        // and re-run the page: the upsert must replace its vectors in place —
+        // one `UPDATE`, no delete and no insert.
+        let refreshed = json!({
+            "resourceType": "Patient",
+            "id": "tx-b",
+            "name": [{"family": "TxBravoRevised"}],
+            "text": narrative(&refreshed_term)
+        });
+        let updated = client
+            .execute(
+                "UPDATE resources SET data = $3
+                 WHERE tenant_id = $1 AND resource_type = 'Patient' AND id = $2",
+                &[&tenant_id, &"tx-b", &refreshed],
+            )
+            .await
+            .unwrap();
+        assert_eq!(updated, 1, "the raw data change must land on one row");
+
+        let changed_page = backend
+            .fetch_resources_page(&tenant, "Patient", None, 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            changed_page
+                .resources
+                .iter()
+                .map(|resource| resource.id())
+                .collect::<Vec<_>>(),
+            PAGE_IDS.to_vec()
+        );
+
+        client
+            .execute(&format!("DELETE FROM {table_name}"), &[])
+            .await
+            .unwrap();
+        let results = backend
+            .write_search_entries_page(&tenant, &changed_page.resources)
+            .await;
+        assert_eq!(results.len(), PAGE_IDS.len());
+        assert!(
+            results.iter().all(Result::is_ok),
+            "the changed page must take the batched path, not the per-resource \
+             fallback: {results:?}"
+        );
+
+        let rows = probe_rows(&client, &table_name).await;
+        assert_one_transaction(&rows, "changed page");
+        assert_eq!(
+            fired(&rows, "resource_fts_update", "tx-b"),
+            1,
+            "the changed resource's stored vectors must be replaced by exactly one \
+             UPDATE: {rows:?}"
+        );
+        for id in PAGE_IDS {
+            assert_eq!(
+                upsert_attempts(&rows, id),
+                vec![Some(true)],
+                "changed page: {id}'s upsert must still land on the existing row: {rows:?}"
+            );
+            assert_eq!(
+                fired(&rows, "resource_fts_delete", id),
+                0,
+                "changed page: keeping the row means no delete: {rows:?}"
+            );
+            assert_eq!(
+                fired(&rows, "resource_fts_insert", id),
+                0,
+                "changed page: the row is replaced in place, not re-inserted: {rows:?}"
+            );
+            if id != "tx-b" {
+                assert_eq!(
+                    fired(&rows, "resource_fts_update", id),
+                    0,
+                    "the untouched resource must not be rewritten: {rows:?}"
+                );
+            }
+            assert!(
+                fired(&rows, "search_index_delete", id) > 0
+                    && fired(&rows, "search_index_insert", id) > 0,
+                "changed page: {id}'s search_index rows must still be replaced: {rows:?}"
+            );
+        }
+
+        // The refreshed term must be searchable and the replaced one must be
+        // gone, through both full-text parameters.
+        for parameter in ["_text", "_content"] {
+            assert_eq!(
+                fts_hits(&backend, &tenant, parameter, &refreshed_term).await,
+                vec!["tx-b".to_string()],
+                "{parameter} must find the refreshed term"
+            );
+            assert!(
+                fts_hits(&backend, &tenant, parameter, &replaced_term)
+                    .await
+                    .is_empty(),
+                "{parameter} must not still match the replaced term"
+            );
+            assert_eq!(
+                fts_hits(&backend, &tenant, parameter, &unchanged_term).await,
+                vec!["tx-a".to_string()],
+                "{parameter} must still find the untouched resource's term"
+            );
+        }
 
         client
             .batch_execute(&format!(
-                "DROP TRIGGER {search_trigger} ON search_index;
+                "DROP TRIGGER {upsert_trigger} ON resource_fts;
                  DROP TRIGGER {fts_trigger} ON resource_fts;
+                 DROP TRIGGER {search_trigger} ON search_index;
                  DROP FUNCTION {function_name}();
                  DROP TABLE {table_name};"
             ))
             .await
             .unwrap();
 
-        assert!(results.iter().all(Result::is_ok));
+        // Equivalence check: a per-resource delete-and-write rebuild (what the
+        // fallback path does) must leave exactly the vectors the in-place page
+        // write left. The triggers are gone, so the rebuild is not probed.
+        let vectors_after_page_write = fts_vectors(&client, tenant_id).await;
+        for resource in &changed_page.resources {
+            backend
+                .delete_search_entries(&tenant, resource.resource_type(), resource.id())
+                .await
+                .unwrap();
+            backend
+                .write_search_entries(&tenant, resource)
+                .await
+                .unwrap();
+        }
         assert_eq!(
-            probe_rows
-                .iter()
-                .map(|(operation, _)| operation.as_str())
-                .collect::<Vec<_>>(),
-            vec![
-                "resource_fts_delete",
-                "resource_fts_insert",
-                "search_index_delete",
-                "search_index_insert",
-            ]
-        );
-        assert_eq!(
-            probe_rows
-                .iter()
-                .map(|(_, transaction_id)| *transaction_id)
-                .collect::<std::collections::HashSet<_>>()
-                .len(),
-            1,
-            "all page index writes must share one PostgreSQL transaction"
+            fts_vectors(&client, tenant_id).await,
+            vectors_after_page_write,
+            "in-place upserts must leave the same vectors a delete-and-write rebuild \
+             produces"
         );
     }
 
@@ -9217,12 +9755,15 @@ mod postgres_integration {
     /// caller filters that resource out of the `search_index` and full-text
     /// inserts before either statement is built, so nothing aborts, nothing
     /// falls back, and the resources on either side of it are written by the
-    /// batched path as usual. The page's `DELETE FROM resource_fts` still
-    /// covers every resource on the page, so the failed resource's stale row is
-    /// gone rather than left behind — which is what an extraction failure has
-    /// to mean for full-text search. A resource whose extracted content is
-    /// empty, on the other hand, is written by that batched path and simply
-    /// gets no row back.
+    /// batched path as usual. The page's `DELETE FROM resource_fts` names only
+    /// the failed resources (#1146), so the failed resource's stale row is gone
+    /// rather than left behind — which is what an extraction failure has to
+    /// mean for full-text search — while every valid resource keeps its row
+    /// until its own upsert. A resource whose extracted content is empty is
+    /// handed to that batched path, which deletes its stale row rather than
+    /// rebuilding it. Two rows the page does not name must survive untouched:
+    /// the same pair under another tenant, and another resource of this tenant
+    /// outside the page.
     #[tokio::test]
     async fn postgres_integration_reindex_page_handles_empty_and_extraction_failure() {
         use helios_persistence::search::ReindexTarget;
@@ -9230,7 +9771,9 @@ mod postgres_integration {
 
         let backend = create_backend().await;
         let tenant = create_tenant("reindex-page-extraction");
+        let bystander_tenant = create_tenant("reindex-page-extraction-bystander");
         let tenant_id = tenant.tenant_id().as_str();
+        let bystander_tenant_id = bystander_tenant.tenant_id().as_str();
         assert!(
             backend
                 .write_search_entries_page(&tenant, &[])
@@ -9284,13 +9827,23 @@ mod postgres_integration {
             )
             .await
             .unwrap();
-        for resource_id in ["invalid-extraction", "empty-fts"] {
+        // Stale full-text rows for two page resources: an extraction failure
+        // and an emptied resource are the two ways a resource in the page ends
+        // up with no replacement to write, so both stale rows must go. Two
+        // bystanders must not: the same pair under another tenant, and another
+        // resource of this tenant outside the page.
+        for (scoped_tenant, resource_id) in [
+            (tenant_id, "invalid-extraction"),
+            (tenant_id, "empty-fts"),
+            (bystander_tenant_id, "invalid-extraction"),
+            (tenant_id, "outside-extraction"),
+        ] {
             client
                 .execute(
                     "INSERT INTO resource_fts
                      (tenant_id, resource_type, resource_id, narrative_tsvector, content_tsvector)
                      VALUES ($1, 'Patient', $2, to_tsvector('english', 'stale'), to_tsvector('english', 'stale'))",
-                    &[&tenant_id, &resource_id],
+                    &[&scoped_tenant, &resource_id],
                 )
                 .await
                 .unwrap();
@@ -9325,7 +9878,10 @@ mod postgres_integration {
             .await
             .unwrap()
             .get(0);
-        assert_eq!(stale_count, 0);
+        assert_eq!(
+            stale_count, 0,
+            "the failed resource must not keep stale search_index rows"
+        );
         for (resource_id, expected_fts_rows) in [
             ("invalid-extraction", 0),
             ("empty-fts", 0),
@@ -9335,7 +9891,8 @@ mod postgres_integration {
             let fts_rows: i64 = client
                 .query_one(
                     "SELECT COUNT(*) FROM resource_fts
-                     WHERE tenant_id = $1 AND resource_id = $2",
+                     WHERE tenant_id = $1 AND resource_type = 'Patient'
+                       AND resource_id = $2",
                     &[&tenant_id, &resource_id],
                 )
                 .await
@@ -9344,6 +9901,33 @@ mod postgres_integration {
             assert_eq!(
                 fts_rows, expected_fts_rows,
                 "unexpected full-text rows for {resource_id}"
+            );
+        }
+
+        for (scoped_tenant, resource_id, label) in [
+            (
+                bystander_tenant_id,
+                "invalid-extraction",
+                "another tenant's row",
+            ),
+            (tenant_id, "outside-extraction", "a row outside the page"),
+        ] {
+            let survivors: Vec<String> = client
+                .query(
+                    "SELECT narrative_tsvector::text FROM resource_fts
+                     WHERE tenant_id = $1 AND resource_type = 'Patient'
+                       AND resource_id = $2",
+                    &[&scoped_tenant, &resource_id],
+                )
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|row| row.get::<_, Option<String>>(0).unwrap_or_default())
+                .collect();
+            assert_eq!(survivors.len(), 1, "{label} must survive the page write");
+            assert!(
+                survivors[0].contains("stale"),
+                "{label} must be left untouched: {survivors:?}"
             );
         }
     }
@@ -9526,6 +10110,588 @@ mod postgres_integration {
         assert!(
             !late_narrative && !late_content,
             "neither vector may carry text past the truncation point"
+        );
+    }
+
+    #[tokio::test]
+    async fn postgres_integration_reindex_page_recovers_oversized_fts_without_replaying_search_parameters()
+     {
+        use helios_persistence::search::{ReindexSource, ReindexTarget};
+
+        // Keep the page well below MULTI_BATCH_ROWS: each Observation contributes
+        // one ordinary `status` SearchParameter row, so this probes recovery from
+        // an FTS failure without also splitting the multi-row search insert.
+        let (backend, dbname) = isolated_reindex_backend().await;
+        let first_tenant = create_tenant("reindex-page-fts-recovery-first");
+        let second_tenant = create_tenant("reindex-page-fts-recovery-second");
+        let first_tenant_id = first_tenant.tenant_id().as_str().to_string();
+        let second_tenant_id = second_tenant.tenant_id().as_str().to_string();
+
+        let text = (0..100_000)
+            .map(|index| format!("lexeme{index:08x}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        for (tenant, entries) in [
+            (
+                &first_tenant,
+                [
+                    ("a-normal", false),
+                    ("b-oversized", true),
+                    ("c-normal", false),
+                ],
+            ),
+            (
+                &second_tenant,
+                [
+                    ("a-oversized", true),
+                    ("b-normal", false),
+                    ("c-oversized", true),
+                ],
+            ),
+        ] {
+            for (id, oversized) in entries {
+                let resource = if oversized {
+                    json!({
+                        "resourceType": "Observation",
+                        "id": id,
+                        "status": id,
+                        "text": {"status": "generated", "div": format!("<div>{text}</div>")}
+                    })
+                } else {
+                    json!({
+                        "resourceType": "Observation",
+                        "id": id,
+                        "status": id
+                    })
+                };
+                // Seed through create so the ordinary writer establishes the
+                // approved truncated FTS result for every oversized resource.
+                backend
+                    .create(tenant, "Observation", resource, FhirVersion::default())
+                    .await
+                    .unwrap();
+            }
+        }
+
+        let first_page = backend
+            .fetch_resources_page(&first_tenant, "Observation", None, 3)
+            .await
+            .unwrap();
+        let second_page = backend
+            .fetch_resources_page(&second_tenant, "Observation", None, 3)
+            .await
+            .unwrap();
+        assert_eq!(
+            first_page
+                .resources
+                .iter()
+                .map(|resource| resource.id())
+                .collect::<Vec<_>>(),
+            vec!["a-normal", "b-oversized", "c-normal"]
+        );
+        assert_eq!(
+            second_page
+                .resources
+                .iter()
+                .map(|resource| resource.id())
+                .collect::<Vec<_>>(),
+            vec!["a-oversized", "b-normal", "c-oversized"]
+        );
+
+        let client = reindex_test_client_for(&dbname).await;
+        let first_ids = vec!["a-normal", "b-oversized", "c-normal"];
+        let second_ids = vec!["a-oversized", "b-normal", "c-oversized"];
+        let first_search_before: Vec<(String, String, Option<String>, Option<String>)> = client
+            .query(
+                "SELECT resource_id, param_name, value_string, value_string_folded
+                 FROM search_index
+                 WHERE tenant_id = $1 AND resource_type = 'Observation'
+                   AND resource_id = ANY($2::text[])
+                 ORDER BY array_position($2::text[], resource_id), param_name, value_string",
+                &[&first_tenant_id, &first_ids],
+            )
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| (row.get(0), row.get(1), row.get(2), row.get(3)))
+            .collect();
+        let second_search_before: Vec<(String, String, Option<String>, Option<String>)> = client
+            .query(
+                "SELECT resource_id, param_name, value_string, value_string_folded
+                 FROM search_index
+                 WHERE tenant_id = $1 AND resource_type = 'Observation'
+                   AND resource_id = ANY($2::text[])
+                 ORDER BY array_position($2::text[], resource_id), param_name, value_string",
+                &[&second_tenant_id, &second_ids],
+            )
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| (row.get(0), row.get(1), row.get(2), row.get(3)))
+            .collect();
+        let first_fts_before: Vec<(String, Vec<String>, Vec<String>)> = client
+            .query(
+                "SELECT resource_id, tsvector_to_array(narrative_tsvector),
+                        tsvector_to_array(content_tsvector)
+                 FROM resource_fts
+                 WHERE tenant_id = $1 AND resource_type = 'Observation'
+                   AND resource_id = ANY($2::text[])
+                 ORDER BY array_position($2::text[], resource_id)",
+                &[&first_tenant_id, &first_ids],
+            )
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| (row.get(0), row.get(1), row.get(2)))
+            .collect();
+        let second_fts_before: Vec<(String, Vec<String>, Vec<String>)> = client
+            .query(
+                "SELECT resource_id, tsvector_to_array(narrative_tsvector),
+                        tsvector_to_array(content_tsvector)
+                 FROM resource_fts
+                 WHERE tenant_id = $1 AND resource_type = 'Observation'
+                   AND resource_id = ANY($2::text[])
+                 ORDER BY array_position($2::text[], resource_id)",
+                &[&second_tenant_id, &second_ids],
+            )
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| (row.get(0), row.get(1), row.get(2)))
+            .collect();
+
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let sequence_name = format!("reindex_fts_search_attempts_{suffix}");
+        let function_name = format!("count_reindex_fts_search_attempts_{suffix}");
+        let trigger_name = format!("count_reindex_fts_search_attempts_{suffix}");
+        client
+            .batch_execute(&format!(
+                "CREATE SEQUENCE {sequence_name};
+                 CREATE FUNCTION {function_name}() RETURNS trigger LANGUAGE plpgsql AS $$
+                 BEGIN
+                   PERFORM nextval('{sequence_name}');
+                   RETURN NEW;
+                 END $$;
+                 CREATE TRIGGER {trigger_name} AFTER INSERT ON search_index
+                 FOR EACH ROW EXECUTE FUNCTION {function_name}();"
+            ))
+            .await
+            .unwrap();
+
+        let first_results = backend
+            .write_search_entries_page(&first_tenant, &first_page.resources)
+            .await;
+        let second_results = backend
+            .write_search_entries_page(&second_tenant, &second_page.resources)
+            .await;
+
+        let first_search_after: Vec<(String, String, Option<String>, Option<String>)> = client
+            .query(
+                "SELECT resource_id, param_name, value_string, value_string_folded
+                 FROM search_index
+                 WHERE tenant_id = $1 AND resource_type = 'Observation'
+                   AND resource_id = ANY($2::text[])
+                 ORDER BY array_position($2::text[], resource_id), param_name, value_string",
+                &[&first_tenant_id, &first_ids],
+            )
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| (row.get(0), row.get(1), row.get(2), row.get(3)))
+            .collect();
+        let second_search_after: Vec<(String, String, Option<String>, Option<String>)> = client
+            .query(
+                "SELECT resource_id, param_name, value_string, value_string_folded
+                 FROM search_index
+                 WHERE tenant_id = $1 AND resource_type = 'Observation'
+                   AND resource_id = ANY($2::text[])
+                 ORDER BY array_position($2::text[], resource_id), param_name, value_string",
+                &[&second_tenant_id, &second_ids],
+            )
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| (row.get(0), row.get(1), row.get(2), row.get(3)))
+            .collect();
+        let first_fts_after: Vec<(String, Vec<String>, Vec<String>)> = client
+            .query(
+                "SELECT resource_id, tsvector_to_array(narrative_tsvector),
+                        tsvector_to_array(content_tsvector)
+                 FROM resource_fts
+                 WHERE tenant_id = $1 AND resource_type = 'Observation'
+                   AND resource_id = ANY($2::text[])
+                 ORDER BY array_position($2::text[], resource_id)",
+                &[&first_tenant_id, &first_ids],
+            )
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| (row.get(0), row.get(1), row.get(2)))
+            .collect();
+        let second_fts_after: Vec<(String, Vec<String>, Vec<String>)> = client
+            .query(
+                "SELECT resource_id, tsvector_to_array(narrative_tsvector),
+                        tsvector_to_array(content_tsvector)
+                 FROM resource_fts
+                 WHERE tenant_id = $1 AND resource_type = 'Observation'
+                   AND resource_id = ANY($2::text[])
+                 ORDER BY array_position($2::text[], resource_id)",
+                &[&second_tenant_id, &second_ids],
+            )
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| (row.get(0), row.get(1), row.get(2)))
+            .collect();
+
+        let first_fts_terms: Vec<(String, bool, bool)> = client
+            .query(
+                "SELECT resource_id,
+                        content_tsvector @@ plainto_tsquery('english', $2),
+                        content_tsvector @@ plainto_tsquery('english', $3)
+                 FROM resource_fts
+                 WHERE tenant_id = $1 AND resource_id = ANY($4::text[])
+                 ORDER BY array_position($4::text[], resource_id)",
+                &[
+                    &first_tenant_id,
+                    &"lexeme00000000",
+                    &"lexeme000186a0",
+                    &first_ids,
+                ],
+            )
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| (row.get(0), row.get(1), row.get(2)))
+            .collect();
+        let second_fts_terms: Vec<(String, bool, bool)> = client
+            .query(
+                "SELECT resource_id,
+                        content_tsvector @@ plainto_tsquery('english', $2),
+                        content_tsvector @@ plainto_tsquery('english', $3)
+                 FROM resource_fts
+                 WHERE tenant_id = $1 AND resource_id = ANY($4::text[])
+                 ORDER BY array_position($4::text[], resource_id)",
+                &[
+                    &second_tenant_id,
+                    &"lexeme00000000",
+                    &"lexeme000186a0",
+                    &second_ids,
+                ],
+            )
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| (row.get(0), row.get(1), row.get(2)))
+            .collect();
+        let search_attempts: i64 = client
+            .query_one(&format!("SELECT last_value FROM {sequence_name}"), &[])
+            .await
+            .unwrap()
+            .get(0);
+
+        client
+            .batch_execute(&format!(
+                "DROP TRIGGER {trigger_name} ON search_index;
+                 DROP FUNCTION {function_name}();
+                 DROP SEQUENCE {sequence_name};"
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(first_results.len(), 3);
+        for (resource, result) in first_page.resources.iter().zip(&first_results) {
+            assert!(
+                result.is_ok(),
+                "reindex failed for first-page resource {}: {:?}",
+                resource.id(),
+                result.as_ref().err()
+            );
+        }
+        assert_eq!(second_results.len(), 3);
+        for (resource, result) in second_page.resources.iter().zip(&second_results) {
+            assert!(
+                result.is_ok(),
+                "reindex failed for second-page resource {}: {:?}",
+                resource.id(),
+                result.as_ref().err()
+            );
+        }
+        assert_eq!(first_search_after, first_search_before);
+        assert_eq!(second_search_after, second_search_before);
+        assert_eq!(first_fts_after, first_fts_before);
+        assert_eq!(second_fts_after, second_fts_before);
+        assert_eq!(
+            first_fts_terms,
+            vec![
+                ("a-normal".to_string(), false, false),
+                ("b-oversized".to_string(), true, false),
+                ("c-normal".to_string(), false, false),
+            ]
+        );
+        assert_eq!(
+            second_fts_terms,
+            vec![
+                ("a-oversized".to_string(), true, false),
+                ("b-normal".to_string(), false, false),
+                ("c-oversized".to_string(), true, false),
+            ]
+        );
+        // One search-index insert per resource is the single-pass contract.
+        // The current implementation reaches 12: three rows per page in the
+        // aborted batch plus three rows per page in the full-page fallback.
+        assert_eq!(search_attempts, 6);
+    }
+
+    async fn reindex_page_fts_trigger_case(
+        target_id: &str,
+        target_is_oversized: bool,
+        leading_is_oversized: bool,
+        trigger_message: &str,
+    ) -> (
+        Vec<helios_persistence::types::StoredResource>,
+        Vec<Result<usize, StorageError>>,
+        Vec<(String, i64)>,
+        Vec<(String, i64)>,
+    ) {
+        use helios_persistence::search::{ReindexSource, ReindexTarget};
+
+        let (backend, dbname) = isolated_reindex_backend_with_max_connections(1).await;
+        let tenant = create_tenant("reindex-page-fts-error");
+        let tenant_id = tenant.tenant_id().as_str().to_string();
+        let text = (0..100_000)
+            .map(|index| format!("lexeme{index:08x}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let leading_id = if leading_is_oversized {
+            "a-oversized"
+        } else {
+            "a-normal"
+        };
+        let entries = [
+            (leading_id, leading_is_oversized),
+            (target_id, target_is_oversized),
+            ("c-normal", false),
+        ];
+        for (id, oversized) in entries {
+            let resource = if oversized {
+                json!({
+                    "resourceType": "Observation",
+                    "id": id,
+                    "status": id,
+                    "text": {"status": "generated", "div": format!("<div>{text}</div>")}
+                })
+            } else {
+                json!({"resourceType": "Observation", "id": id, "status": id})
+            };
+            backend
+                .create(&tenant, "Observation", resource, FhirVersion::default())
+                .await
+                .unwrap();
+        }
+
+        let page = backend
+            .fetch_resources_page(&tenant, "Observation", None, 3)
+            .await
+            .unwrap();
+        let ids: Vec<&str> = page
+            .resources
+            .iter()
+            .map(|resource| resource.id())
+            .collect();
+        let client = reindex_test_client_for(&dbname).await;
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let function_name = format!("reject_reindex_fts_{suffix}");
+        let trigger_name = format!("reject_reindex_fts_{suffix}");
+        client
+            .batch_execute(&format!(
+                "CREATE FUNCTION {function_name}() RETURNS trigger LANGUAGE plpgsql AS $$
+                 BEGIN
+                   IF NEW.tenant_id = '{tenant_id}' AND NEW.resource_id = '{target_id}' THEN
+                     RAISE EXCEPTION '{trigger_message}';
+                   END IF;
+                   RETURN NEW;
+                 END $$;
+                 CREATE TRIGGER {trigger_name} BEFORE INSERT ON resource_fts
+                 FOR EACH ROW EXECUTE FUNCTION {function_name}();"
+            ))
+            .await
+            .unwrap();
+
+        let results = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            backend.write_search_entries_page(&tenant, &page.resources),
+        )
+        .await
+        .expect("FTS page fallback must not deadlock a one-connection pool");
+
+        client
+            .batch_execute(&format!(
+                "DROP TRIGGER {trigger_name} ON resource_fts;
+                 DROP FUNCTION {function_name}();"
+            ))
+            .await
+            .unwrap();
+
+        let search_rows: Vec<(String, i64)> = client
+            .query(
+                "SELECT resource_id, COUNT(*)::bigint
+                 FROM search_index
+                 WHERE tenant_id = $1 AND resource_type = 'Observation'
+                   AND resource_id = ANY($2::text[])
+                 GROUP BY resource_id
+                 ORDER BY array_position($2::text[], resource_id)",
+                &[&tenant_id, &ids],
+            )
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| (row.get(0), row.get(1)))
+            .collect();
+        let fts_rows: Vec<(String, i64)> = client
+            .query(
+                "SELECT resource_id, COUNT(*)::bigint
+                 FROM resource_fts
+                 WHERE tenant_id = $1 AND resource_type = 'Observation'
+                   AND resource_id = ANY($2::text[])
+                 GROUP BY resource_id
+                 ORDER BY array_position($2::text[], resource_id)",
+                &[&tenant_id, &ids],
+            )
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| (row.get(0), row.get(1)))
+            .collect();
+
+        (page.resources, results, search_rows, fts_rows)
+    }
+
+    #[tokio::test]
+    async fn postgres_integration_reindex_page_unexpected_fts_error_falls_back_per_resource() {
+        let (resources, results, search_rows, fts_rows) =
+            reindex_page_fts_trigger_case("b-normal", false, false, "unexpected FTS page failure")
+                .await;
+
+        assert_eq!(
+            resources
+                .iter()
+                .map(|resource| resource.id())
+                .collect::<Vec<_>>(),
+            vec!["a-normal", "b-normal", "c-normal"]
+        );
+        for (resource, result) in resources.iter().zip(&results) {
+            if resource.id() == "b-normal" {
+                let error = result.as_ref().expect_err("trigger target must fail");
+                assert_eq!(
+                    error.to_string(),
+                    "internal error in postgres: Failed to insert FTS content: db error"
+                );
+            } else {
+                assert!(result.is_ok(), "{} should be reindexed", resource.id());
+            }
+        }
+        // The ordinary fallback writes search_index before the target FTS
+        // failure, so the failed resource's search rows are not assumed absent.
+        assert_eq!(
+            search_rows,
+            vec![
+                ("a-normal".to_string(), 1),
+                ("b-normal".to_string(), 1),
+                ("c-normal".to_string(), 1),
+            ]
+        );
+        assert_eq!(
+            fts_rows,
+            vec![("a-normal".to_string(), 1), ("c-normal".to_string(), 1)]
+        );
+    }
+
+    #[tokio::test]
+    async fn postgres_integration_reindex_page_unexpected_fts_error_during_oversized_recovery_falls_back_per_resource()
+     {
+        let (resources, results, search_rows, fts_rows) = reindex_page_fts_trigger_case(
+            "b-normal",
+            false,
+            true,
+            "unexpected FTS recovery failure",
+        )
+        .await;
+
+        assert_eq!(
+            resources
+                .iter()
+                .map(|resource| resource.id())
+                .collect::<Vec<_>>(),
+            vec!["a-oversized", "b-normal", "c-normal"]
+        );
+        assert_eq!(results.len(), 3);
+        for (resource, result) in resources.iter().zip(&results) {
+            if resource.id() == "b-normal" {
+                let error = result
+                    .as_ref()
+                    .expect_err("recovery trigger target must fail");
+                assert_eq!(
+                    error.to_string(),
+                    "internal error in postgres: Failed to insert FTS content: db error"
+                );
+            } else {
+                assert!(result.is_ok(), "{} should be reindexed", resource.id());
+            }
+        }
+        assert_eq!(
+            search_rows,
+            vec![
+                ("a-oversized".to_string(), 1),
+                ("b-normal".to_string(), 1),
+                ("c-normal".to_string(), 1),
+            ]
+        );
+        assert_eq!(
+            fts_rows,
+            vec![("a-oversized".to_string(), 1), ("c-normal".to_string(), 1),]
+        );
+    }
+
+    #[tokio::test]
+    async fn postgres_integration_reindex_page_truncated_fts_retry_error_falls_back_per_resource() {
+        let (resources, results, search_rows, fts_rows) = reindex_page_fts_trigger_case(
+            "b-oversized",
+            true,
+            false,
+            "truncated FTS retry failure",
+        )
+        .await;
+
+        assert_eq!(
+            resources
+                .iter()
+                .map(|resource| resource.id())
+                .collect::<Vec<_>>(),
+            vec!["a-normal", "b-oversized", "c-normal"]
+        );
+        for (resource, result) in resources.iter().zip(&results) {
+            if resource.id() == "b-oversized" {
+                let error = result.as_ref().expect_err("retry trigger target must fail");
+                assert_eq!(
+                    error.to_string(),
+                    "internal error in postgres: Failed to insert FTS content: db error"
+                );
+            } else {
+                assert!(result.is_ok(), "{} should be reindexed", resource.id());
+            }
+        }
+        assert_eq!(
+            search_rows,
+            vec![
+                ("a-normal".to_string(), 1),
+                ("b-oversized".to_string(), 1),
+                ("c-normal".to_string(), 1),
+            ]
+        );
+        assert_eq!(
+            fts_rows,
+            vec![("a-normal".to_string(), 1), ("c-normal".to_string(), 1)]
         );
     }
 
@@ -9996,9 +11162,12 @@ mod postgres_integration {
         PatientExportProvider, StartExportInput, TypeExportProgress,
     };
     use helios_persistence::core::bulk_export_worker::{
-        ExportClaimStrategy, ExportWorkerStorage, LeaseError, WorkerId,
+        ExportClaimStrategy, ExportWorkerStorage, LeaseError, WorkerId, abandoned_export_message,
     };
     use std::time::Duration as StdDuration;
+
+    /// Claim cap for tests that are not exercising the cap itself.
+    const TEST_MAX_ATTEMPTS: u32 = 3;
 
     fn export_input(request: ExportRequest) -> StartExportInput {
         StartExportInput {
@@ -10019,8 +11188,31 @@ mod postgres_integration {
         target: &helios_persistence::core::bulk_export::ExportJobId,
         lease_duration: StdDuration,
     ) -> helios_persistence::core::bulk_export_worker::ExportJobLease {
+        claim_specific_with_cap(
+            backend,
+            worker_id,
+            target,
+            lease_duration,
+            TEST_MAX_ATTEMPTS,
+        )
+        .await
+    }
+
+    /// [`claim_specific`] with an explicit claim cap, for the tests that drive
+    /// one job past it (#1041).
+    async fn claim_specific_with_cap(
+        backend: &helios_persistence::backends::postgres::PostgresBackend,
+        worker_id: &WorkerId,
+        target: &helios_persistence::core::bulk_export::ExportJobId,
+        lease_duration: StdDuration,
+        max_attempts: u32,
+    ) -> helios_persistence::core::bulk_export_worker::ExportJobLease {
         for _ in 0..100 {
-            match backend.claim_next(worker_id, lease_duration).await.unwrap() {
+            match backend
+                .claim_next(worker_id, lease_duration, max_attempts)
+                .await
+                .unwrap()
+            {
                 Some(lease) if &lease.job_id == target => return lease,
                 Some(other) => {
                     // Drain other tests' jobs out of the queue by completing
@@ -10369,6 +11561,861 @@ mod postgres_integration {
         ));
 
         // Worker B can still finish.
+        backend
+            .finish_export_job(&tenant, &job_id, &worker_b, lease_b.fencing_token)
+            .await
+            .unwrap();
+    }
+
+    /// Reads a job's raw claim counter, which no trait surfaces.
+    async fn export_attempts(
+        backend: &PostgresBackend,
+        job_id: &helios_persistence::core::bulk_export::ExportJobId,
+    ) -> i32 {
+        let client = backend.get_client().await.unwrap();
+        client
+            .query_one(
+                "SELECT attempts FROM bulk_export_jobs WHERE id = $1",
+                &[&job_id.as_str()],
+            )
+            .await
+            .unwrap()
+            .get(0)
+    }
+
+    /// Completes every currently-claimable job, so a scan-order assertion sees
+    /// only the jobs the test itself created on the shared instance.
+    async fn drain_claim_queue(backend: &PostgresBackend) {
+        let worker = WorkerId::new(format!("pg-drain-{}", uuid::Uuid::new_v4()));
+        for _ in 0..100 {
+            match backend
+                .claim_next(&worker, StdDuration::from_secs(60), TEST_MAX_ATTEMPTS)
+                .await
+                .unwrap()
+            {
+                Some(lease) => {
+                    let _ = backend
+                        .finish_export_job(
+                            &lease.tenant,
+                            &lease.job_id,
+                            &lease.worker_id,
+                            lease.fencing_token,
+                        )
+                        .await;
+                }
+                None => return,
+            }
+        }
+    }
+
+    /// A job whose lease expires mid-run is reclaimable, so one that keeps
+    /// dying the same way used to be handed to worker after worker forever:
+    /// never terminal, `error_message` never set, the status poll answering
+    /// `202` indefinitely, and one of the tenant's export slots held the whole
+    /// time (#1041). The claim cap retires it instead.
+    #[tokio::test]
+    async fn postgres_integration_export_claim_cap_retires_a_job_that_never_finishes() {
+        let _guard = BULK_EXPORT_TEST_LOCK.lock().await;
+        let backend = create_backend().await;
+        let tenant = create_tenant("export-attempt-cap");
+
+        let job_id = backend
+            .start_export(&tenant, export_input(ExportRequest::system()))
+            .await
+            .unwrap();
+
+        // Two claims, each losing its lease before finishing.
+        for attempt in 1..=2 {
+            let worker = WorkerId::new(format!("pg-cap-{attempt}-{}", uuid::Uuid::new_v4()));
+            let lease =
+                claim_specific_with_cap(&backend, &worker, &job_id, StdDuration::from_millis(1), 2)
+                    .await;
+            assert!(lease.fencing_token >= attempt as u64, "fencing still bumps");
+            assert_eq!(
+                export_attempts(&backend, &job_id).await,
+                attempt,
+                "attempts counted"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+
+        // The third claim would exceed the cap, so the job is retired rather
+        // than handed out again.
+        let worker = WorkerId::new(format!("pg-cap-3-{}", uuid::Uuid::new_v4()));
+        for _ in 0..20 {
+            match backend
+                .claim_next(&worker, StdDuration::from_secs(60), 2)
+                .await
+                .unwrap()
+            {
+                Some(lease) => {
+                    assert_ne!(
+                        lease.job_id, job_id,
+                        "a job past its attempt cap must not be claimable"
+                    );
+                    // Another test's job: complete it and keep scanning.
+                    let _ = backend
+                        .finish_export_job(
+                            &lease.tenant,
+                            &lease.job_id,
+                            &lease.worker_id,
+                            lease.fencing_token,
+                        )
+                        .await;
+                }
+                None => break,
+            }
+        }
+
+        let progress = backend.get_export_status(&tenant, &job_id).await.unwrap();
+        assert_eq!(progress.status, ExportStatus::Error);
+        assert_eq!(progress.error_message, Some(abandoned_export_message(2)));
+        assert!(
+            progress.completed_at.is_some(),
+            "a retired job is terminal, so it has a completion time"
+        );
+    }
+
+    /// Retiring a job is not the end of the scan — the claim that spends the
+    /// last attempt still hands back the next eligible job, so one stuck job
+    /// cannot stall a worker that has other work waiting.
+    #[tokio::test]
+    async fn postgres_integration_export_claim_cap_still_returns_the_next_job() {
+        let _guard = BULK_EXPORT_TEST_LOCK.lock().await;
+        let backend = create_backend().await;
+        let tenant = create_tenant("export-attempt-cap-scan");
+
+        // The assertion below is about scan order, so start from an empty
+        // queue rather than behind another test's leftovers.
+        drain_claim_queue(&backend).await;
+
+        let stuck = backend
+            .start_export(&tenant, export_input(ExportRequest::system()))
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        let fresh = backend
+            .start_export(&tenant, export_input(ExportRequest::system()))
+            .await
+            .unwrap();
+
+        let worker = WorkerId::new(format!("pg-cap-scan-{}", uuid::Uuid::new_v4()));
+        let lease =
+            claim_specific_with_cap(&backend, &worker, &stuck, StdDuration::from_millis(1), 1)
+                .await;
+        assert_eq!(lease.job_id, stuck);
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let lease = backend
+            .claim_next(&worker, StdDuration::from_secs(60), 1)
+            .await
+            .unwrap()
+            .expect("the scan must go past the retired job, not stop at it");
+        assert_eq!(lease.job_id, fresh);
+
+        assert_eq!(
+            backend
+                .get_export_status(&tenant, &stuck)
+                .await
+                .unwrap()
+                .status,
+            ExportStatus::Error
+        );
+        backend
+            .finish_export_job(&tenant, &fresh, &worker, lease.fencing_token)
+            .await
+            .unwrap();
+    }
+
+    /// The cap only ever sees jobs that come back for another claim: a job that
+    /// runs to completion on its first attempt is untouched by it.
+    #[tokio::test]
+    async fn postgres_integration_export_claim_cap_leaves_a_completed_job_alone() {
+        let _guard = BULK_EXPORT_TEST_LOCK.lock().await;
+        let backend = create_backend().await;
+        let tenant = create_tenant("export-attempt-cap-complete");
+
+        let job_id = backend
+            .start_export(&tenant, export_input(ExportRequest::system()))
+            .await
+            .unwrap();
+
+        let worker = WorkerId::new(format!("pg-cap-done-{}", uuid::Uuid::new_v4()));
+        let lease =
+            claim_specific_with_cap(&backend, &worker, &job_id, StdDuration::from_secs(60), 1)
+                .await;
+        backend
+            .finish_export_job(&tenant, &job_id, &worker, lease.fencing_token)
+            .await
+            .unwrap();
+
+        let progress = backend.get_export_status(&tenant, &job_id).await.unwrap();
+        assert_eq!(progress.status, ExportStatus::Complete);
+        assert_eq!(progress.error_message, None);
+        assert_eq!(export_attempts(&backend, &job_id).await, 1);
+    }
+
+    use helios_persistence::core::bulk_export_output::{ExportPartKey, FinalizedPart};
+
+    /// Counts a job's rows in the two tables a re-claim wipes; no trait
+    /// surfaces them as raw counts.
+    async fn export_row_counts(
+        backend: &PostgresBackend,
+        job_id: &helios_persistence::core::bulk_export::ExportJobId,
+    ) -> (i64, i64) {
+        let client = backend.get_client().await.unwrap();
+        let progress: i64 = client
+            .query_one(
+                "SELECT COUNT(*) FROM bulk_export_progress WHERE job_id = $1",
+                &[&job_id.as_str()],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        let files: i64 = client
+            .query_one(
+                "SELECT COUNT(*) FROM bulk_export_files WHERE job_id = $1",
+                &[&job_id.as_str()],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        (progress, files)
+    }
+
+    /// Records one finalized output part the way the worker does after a flush.
+    #[allow(clippy::too_many_arguments)]
+    async fn record_output_part(
+        backend: &PostgresBackend,
+        tenant: &TenantContext,
+        job_id: &helios_persistence::core::bulk_export::ExportJobId,
+        worker: &WorkerId,
+        fencing_token: u64,
+        resource_type: &str,
+        part_index: u32,
+        line_count: u64,
+    ) {
+        let part = FinalizedPart {
+            key: ExportPartKey::output(
+                tenant.tenant_id().as_str(),
+                job_id.clone(),
+                resource_type,
+                part_index,
+                fencing_token,
+            ),
+            resource_type: resource_type.to_string(),
+            line_count,
+            size_bytes: line_count * 120,
+        };
+        backend
+            .record_export_file(tenant, job_id, worker, fencing_token, &part, "output")
+            .await
+            .unwrap();
+    }
+
+    /// Persists per-type progress the way the worker does between batches.
+    async fn record_type_progress(
+        backend: &PostgresBackend,
+        tenant: &TenantContext,
+        job_id: &helios_persistence::core::bulk_export::ExportJobId,
+        worker: &WorkerId,
+        fencing_token: u64,
+        progress: TypeExportProgress,
+    ) {
+        backend
+            .update_export_type_progress(tenant, job_id, worker, fencing_token, &progress)
+            .await
+            .unwrap();
+    }
+
+    /// Re-claiming a job whose lease expired mid-run drops everything the dead
+    /// worker wrote, in the same transaction that bumps the fencing token, so
+    /// the new lease starts from a clean slate (#1041).
+    #[tokio::test]
+    async fn postgres_integration_export_reclaim_discards_the_previous_attempts_rows() {
+        let _guard = BULK_EXPORT_TEST_LOCK.lock().await;
+        let backend = create_backend().await;
+        let tenant = create_tenant("export-reclaim-wipe");
+
+        let job_id = backend
+            .start_export(&tenant, export_input(ExportRequest::system()))
+            .await
+            .unwrap();
+
+        let worker_a = WorkerId::new(format!("pg-wipe-a-{}", uuid::Uuid::new_v4()));
+        let lease_a =
+            claim_specific(&backend, &worker_a, &job_id, StdDuration::from_millis(1)).await;
+        backend
+            .mark_export_in_progress(&tenant, &job_id, &worker_a, lease_a.fencing_token)
+            .await
+            .unwrap();
+        let mut patient = TypeExportProgress::new("Patient");
+        patient.exported_count = 200;
+        patient.cursor_state = Some("page-3".to_string());
+        record_type_progress(
+            &backend,
+            &tenant,
+            &job_id,
+            &worker_a,
+            lease_a.fencing_token,
+            patient,
+        )
+        .await;
+        for part_index in 0..2 {
+            record_output_part(
+                &backend,
+                &tenant,
+                &job_id,
+                &worker_a,
+                lease_a.fencing_token,
+                "Patient",
+                part_index,
+                100,
+            )
+            .await;
+        }
+        assert_eq!(
+            export_row_counts(&backend, &job_id).await,
+            (1, 2),
+            "the first attempt wrote progress and file rows"
+        );
+
+        // The lease lapses and worker B takes over.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let worker_b = WorkerId::new(format!("pg-wipe-b-{}", uuid::Uuid::new_v4()));
+        let lease_b =
+            claim_specific(&backend, &worker_b, &job_id, StdDuration::from_secs(60)).await;
+        assert!(
+            lease_b.fencing_token > lease_a.fencing_token,
+            "the re-claim still bumps the fencing token"
+        );
+
+        assert_eq!(
+            export_row_counts(&backend, &job_id).await,
+            (0, 0),
+            "the re-claim wipes the previous attempt's progress and file rows"
+        );
+        let view = backend
+            .get_export_job_for_worker(&tenant, &job_id, &worker_b, lease_b.fencing_token)
+            .await
+            .unwrap();
+        assert!(
+            view.type_progress.is_empty(),
+            "the new attempt resumes from nothing, not from a cursor whose parts are gone"
+        );
+        assert!(
+            backend
+                .get_export_manifest(&tenant, &job_id)
+                .await
+                .unwrap()
+                .output
+                .is_empty(),
+            "no part of the abandoned attempt survives into the manifest"
+        );
+
+        backend
+            .finish_export_job(&tenant, &job_id, &worker_b, lease_b.fencing_token)
+            .await
+            .unwrap();
+    }
+
+    /// The wipe is only for re-claims: an `accepted` job never wrote anything,
+    /// and its first claim goes through the same code path untouched.
+    #[tokio::test]
+    async fn postgres_integration_export_first_claim_has_nothing_to_discard() {
+        let _guard = BULK_EXPORT_TEST_LOCK.lock().await;
+        let backend = create_backend().await;
+        let tenant = create_tenant("export-first-claim");
+
+        let job_id = backend
+            .start_export(&tenant, export_input(ExportRequest::system()))
+            .await
+            .unwrap();
+        assert_eq!(export_row_counts(&backend, &job_id).await, (0, 0));
+
+        let worker = WorkerId::new(format!("pg-first-claim-{}", uuid::Uuid::new_v4()));
+        let lease = claim_specific(&backend, &worker, &job_id, StdDuration::from_secs(60)).await;
+        assert!(lease.fencing_token >= 1);
+        assert_eq!(export_attempts(&backend, &job_id).await, 1);
+
+        // Rows written under the fresh lease stay put — the wipe runs before
+        // them, not after.
+        record_type_progress(
+            &backend,
+            &tenant,
+            &job_id,
+            &worker,
+            lease.fencing_token,
+            TypeExportProgress::new("Patient"),
+        )
+        .await;
+        record_output_part(
+            &backend,
+            &tenant,
+            &job_id,
+            &worker,
+            lease.fencing_token,
+            "Patient",
+            0,
+            10,
+        )
+        .await;
+        assert_eq!(export_row_counts(&backend, &job_id).await, (1, 1));
+
+        backend
+            .finish_export_job(&tenant, &job_id, &worker, lease.fencing_token)
+            .await
+            .unwrap();
+        let manifest = backend.get_export_manifest(&tenant, &job_id).await.unwrap();
+        assert_eq!(manifest.output.len(), 1);
+    }
+
+    /// The reason the wipe exists. The worker resumes *within* a type from
+    /// `cursor_state` but always restarts `part_index` at 0, and
+    /// `record_export_file` upserts on `(job, file_type, resource_type,
+    /// part_index)`. Keeping the first attempt's rows would therefore let the
+    /// second attempt's parts overwrite them row by row: the manifest would
+    /// list attempt 2's post-cursor parts under attempt 1's indexes, the
+    /// pre-cursor resources would vanish, and the job would still end
+    /// `complete` — silent data loss (#1041). After the wipe a manifest can
+    /// only ever describe one attempt.
+    #[tokio::test]
+    async fn postgres_integration_export_reclaim_cannot_mix_parts_from_two_attempts() {
+        let _guard = BULK_EXPORT_TEST_LOCK.lock().await;
+        let backend = create_backend().await;
+        let tenant = create_tenant("export-reclaim-manifest");
+
+        let job_id = backend
+            .start_export(&tenant, export_input(ExportRequest::system()))
+            .await
+            .unwrap();
+
+        // Attempt 1: Observation runs to the end, Patient stops mid-type with
+        // two parts written and a cursor pointing past them.
+        let worker_a = WorkerId::new(format!("pg-mix-a-{}", uuid::Uuid::new_v4()));
+        let lease_a =
+            claim_specific(&backend, &worker_a, &job_id, StdDuration::from_millis(1)).await;
+        backend
+            .mark_export_in_progress(&tenant, &job_id, &worker_a, lease_a.fencing_token)
+            .await
+            .unwrap();
+        let mut observation = TypeExportProgress::new("Observation");
+        observation.exported_count = 50;
+        record_type_progress(
+            &backend,
+            &tenant,
+            &job_id,
+            &worker_a,
+            lease_a.fencing_token,
+            observation,
+        )
+        .await;
+        record_output_part(
+            &backend,
+            &tenant,
+            &job_id,
+            &worker_a,
+            lease_a.fencing_token,
+            "Observation",
+            0,
+            50,
+        )
+        .await;
+        let mut patient = TypeExportProgress::new("Patient");
+        patient.exported_count = 200;
+        patient.cursor_state = Some("after-patient-200".to_string());
+        record_type_progress(
+            &backend,
+            &tenant,
+            &job_id,
+            &worker_a,
+            lease_a.fencing_token,
+            patient,
+        )
+        .await;
+        for part_index in 0..2 {
+            record_output_part(
+                &backend,
+                &tenant,
+                &job_id,
+                &worker_a,
+                lease_a.fencing_token,
+                "Patient",
+                part_index,
+                100,
+            )
+            .await;
+        }
+
+        // Worker A dies; worker B re-claims the job.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let worker_b = WorkerId::new(format!("pg-mix-b-{}", uuid::Uuid::new_v4()));
+        let lease_b =
+            claim_specific(&backend, &worker_b, &job_id, StdDuration::from_secs(60)).await;
+
+        // Nothing of attempt 1 is left for attempt 2's part 0 to overwrite.
+        assert_eq!(
+            export_row_counts(&backend, &job_id).await,
+            (0, 0),
+            "attempt 2 must not inherit attempt 1's rows"
+        );
+        let view = backend
+            .get_export_job_for_worker(&tenant, &job_id, &worker_b, lease_b.fencing_token)
+            .await
+            .unwrap();
+        assert!(
+            view.type_progress.is_empty(),
+            "no surviving cursor, so attempt 2 re-exports Patient from the start"
+        );
+
+        // Attempt 2 re-exports both types from scratch and finishes.
+        record_output_part(
+            &backend,
+            &tenant,
+            &job_id,
+            &worker_b,
+            lease_b.fencing_token,
+            "Patient",
+            0,
+            300,
+        )
+        .await;
+        record_output_part(
+            &backend,
+            &tenant,
+            &job_id,
+            &worker_b,
+            lease_b.fencing_token,
+            "Observation",
+            0,
+            50,
+        )
+        .await;
+        backend
+            .finish_export_job(&tenant, &job_id, &worker_b, lease_b.fencing_token)
+            .await
+            .unwrap();
+
+        let manifest = backend.get_export_manifest(&tenant, &job_id).await.unwrap();
+        assert_eq!(manifest.status, ExportStatus::Complete);
+        assert_eq!(
+            manifest.output.len(),
+            2,
+            "one part per type, all from attempt 2"
+        );
+        assert!(
+            manifest
+                .output
+                .iter()
+                .all(|entry| entry.key.fencing_token == lease_b.fencing_token),
+            "every manifest entry belongs to the attempt that finished the job"
+        );
+        let patient_entry = manifest
+            .output
+            .iter()
+            .find(|entry| entry.resource_type == "Patient")
+            .expect("Patient part present");
+        assert_eq!(
+            patient_entry.count, 300,
+            "the manifest reports attempt 2's whole Patient export, not a post-cursor remainder \
+             sitting on top of attempt 1's rows"
+        );
+    }
+
+    /// The wipe is scoped to the job being re-claimed: another job of the same
+    /// tenant keeps its progress and file rows, however the DELETEs are
+    /// written.
+    #[tokio::test]
+    async fn postgres_integration_export_reclaim_leaves_other_jobs_rows_alone() {
+        let _guard = BULK_EXPORT_TEST_LOCK.lock().await;
+        let backend = create_backend().await;
+        let tenant = create_tenant("export-reclaim-neighbour");
+
+        let bystander = backend
+            .start_export(&tenant, export_input(ExportRequest::system()))
+            .await
+            .unwrap();
+        let reclaimed = backend
+            .start_export(&tenant, export_input(ExportRequest::system()))
+            .await
+            .unwrap();
+
+        // The bystander holds a long lease, so it is never eligible for the
+        // re-claim below; only its rows can prove the DELETEs are job-scoped.
+        let worker_a = WorkerId::new(format!("pg-bystander-{}", uuid::Uuid::new_v4()));
+        let lease_bystander =
+            claim_specific(&backend, &worker_a, &bystander, StdDuration::from_secs(60)).await;
+        record_type_progress(
+            &backend,
+            &tenant,
+            &bystander,
+            &worker_a,
+            lease_bystander.fencing_token,
+            TypeExportProgress::new("Patient"),
+        )
+        .await;
+        record_output_part(
+            &backend,
+            &tenant,
+            &bystander,
+            &worker_a,
+            lease_bystander.fencing_token,
+            "Patient",
+            0,
+            7,
+        )
+        .await;
+
+        let worker_b = WorkerId::new(format!("pg-neighbour-b-{}", uuid::Uuid::new_v4()));
+        let lease_b =
+            claim_specific(&backend, &worker_b, &reclaimed, StdDuration::from_millis(1)).await;
+        record_type_progress(
+            &backend,
+            &tenant,
+            &reclaimed,
+            &worker_b,
+            lease_b.fencing_token,
+            TypeExportProgress::new("Patient"),
+        )
+        .await;
+        record_output_part(
+            &backend,
+            &tenant,
+            &reclaimed,
+            &worker_b,
+            lease_b.fencing_token,
+            "Patient",
+            0,
+            9,
+        )
+        .await;
+
+        // Only `reclaimed` has an expired lease, so only its rows go.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let worker_c = WorkerId::new(format!("pg-neighbour-c-{}", uuid::Uuid::new_v4()));
+        let lease_c =
+            claim_specific(&backend, &worker_c, &reclaimed, StdDuration::from_secs(60)).await;
+        assert!(lease_c.fencing_token > lease_b.fencing_token);
+
+        assert_eq!(export_row_counts(&backend, &reclaimed).await, (0, 0));
+        assert_eq!(
+            export_row_counts(&backend, &bystander).await,
+            (1, 1),
+            "a concurrent job's rows are not collateral damage"
+        );
+        let bystander_manifest = backend
+            .get_export_manifest(&tenant, &bystander)
+            .await
+            .unwrap();
+        assert_eq!(bystander_manifest.output.len(), 1);
+        assert_eq!(bystander_manifest.output[0].count, 7);
+
+        backend
+            .finish_export_job(&tenant, &reclaimed, &worker_c, lease_c.fencing_token)
+            .await
+            .unwrap();
+        backend
+            .finish_export_job(
+                &tenant,
+                &bystander,
+                &worker_a,
+                lease_bystander.fencing_token,
+            )
+            .await
+            .unwrap();
+    }
+
+    /// Reads a job's persisted lease columns, which no trait surfaces.
+    async fn export_lease_row(
+        backend: &PostgresBackend,
+        job_id: &helios_persistence::core::bulk_export::ExportJobId,
+    ) -> (DateTime<Utc>, DateTime<Utc>) {
+        let client = backend.get_client().await.unwrap();
+        let row = client
+            .query_one(
+                "SELECT lease_expiry, heartbeat_at FROM bulk_export_jobs WHERE id = $1",
+                &[&job_id.as_str()],
+            )
+            .await
+            .unwrap();
+        let expiry: Option<DateTime<Utc>> = row.get(0);
+        let heartbeat_at: Option<DateTime<Utc>> = row.get(1);
+        (
+            expiry.expect("a claimed job has a lease expiry"),
+            heartbeat_at.expect("a claimed job has a heartbeat timestamp"),
+        )
+    }
+
+    /// A heartbeat used to write a hardcoded `now + 60s`, so a deployment that
+    /// raised `HFS_BULK_EXPORT_LEASE_DURATION` for slow batches saw the very
+    /// first renewal shrink the lease back to a minute — and the job got
+    /// reclaimed mid-run anyway (#1152). The renewal now extends by the
+    /// duration the job was claimed under.
+    #[tokio::test]
+    async fn postgres_integration_export_heartbeat_extends_by_a_short_lease_duration() {
+        let _guard = BULK_EXPORT_TEST_LOCK.lock().await;
+        let backend = create_backend().await;
+        let tenant = create_tenant("export-heartbeat-short");
+
+        let job_id = backend
+            .start_export(&tenant, export_input(ExportRequest::system()))
+            .await
+            .unwrap();
+        let worker = WorkerId::new(format!("pg-hb-short-{}", uuid::Uuid::new_v4()));
+        let lease = claim_specific(&backend, &worker, &job_id, StdDuration::from_secs(5)).await;
+
+        let before = Utc::now();
+        let returned = backend.heartbeat(&lease).await.unwrap();
+        let (persisted, heartbeat_at) = export_lease_row(&backend, &job_id).await;
+
+        assert!(
+            (returned - persisted).num_milliseconds().abs() < 1,
+            "the heartbeat returns exactly the expiry it wrote: {returned} vs {persisted}"
+        );
+        let extension = persisted - before;
+        assert!(
+            extension >= chrono::Duration::seconds(4),
+            "a 5s lease is renewed for about 5s, got {extension}"
+        );
+        assert!(
+            extension < chrono::Duration::seconds(30),
+            "a 5s lease must not be stretched toward the old hardcoded 60s, got {extension}"
+        );
+        assert!(
+            heartbeat_at >= before - chrono::Duration::seconds(1),
+            "the heartbeat timestamp moves with the renewal"
+        );
+
+        backend
+            .finish_export_job(&tenant, &job_id, &worker, lease.fencing_token)
+            .await
+            .unwrap();
+    }
+
+    /// The other half of #1152: a lease longer than the old hardcoded minute
+    /// keeps its length across renewals, which is the whole point of raising
+    /// `HFS_BULK_EXPORT_LEASE_DURATION` for exports whose batches take minutes.
+    #[tokio::test]
+    async fn postgres_integration_export_heartbeat_honors_a_long_lease_duration() {
+        let _guard = BULK_EXPORT_TEST_LOCK.lock().await;
+        let backend = create_backend().await;
+        let tenant = create_tenant("export-heartbeat-long");
+
+        let job_id = backend
+            .start_export(&tenant, export_input(ExportRequest::system()))
+            .await
+            .unwrap();
+        let worker = WorkerId::new(format!("pg-hb-long-{}", uuid::Uuid::new_v4()));
+        let lease = claim_specific(&backend, &worker, &job_id, StdDuration::from_secs(300)).await;
+
+        let before = Utc::now();
+        backend.heartbeat(&lease).await.unwrap();
+        let (persisted, _) = export_lease_row(&backend, &job_id).await;
+
+        let extension = persisted - before;
+        assert!(
+            extension > chrono::Duration::seconds(120),
+            "a 300s lease must not be shrunk to the old hardcoded 60s, got {extension}"
+        );
+        assert!(
+            extension >= chrono::Duration::seconds(299)
+                && extension <= chrono::Duration::seconds(330),
+            "a 300s lease is renewed for about 300s, got {extension}"
+        );
+
+        backend
+            .finish_export_job(&tenant, &job_id, &worker, lease.fencing_token)
+            .await
+            .unwrap();
+    }
+
+    /// Round trip: the duration passed to `claim_next` rides on the lease it
+    /// returns, and that is what every later renewal extends by — so repeated
+    /// heartbeats keep pushing the expiry out by the configured duration
+    /// instead of converging on a backend constant (#1152).
+    #[tokio::test]
+    async fn postgres_integration_export_claim_lease_duration_round_trips_into_heartbeats() {
+        let _guard = BULK_EXPORT_TEST_LOCK.lock().await;
+        let backend = create_backend().await;
+        let tenant = create_tenant("export-heartbeat-roundtrip");
+
+        let job_id = backend
+            .start_export(&tenant, export_input(ExportRequest::system()))
+            .await
+            .unwrap();
+        let worker = WorkerId::new(format!("pg-hb-rt-{}", uuid::Uuid::new_v4()));
+        let configured = StdDuration::from_secs(180);
+        let lease = claim_specific(&backend, &worker, &job_id, configured).await;
+
+        assert_eq!(
+            lease.lease_duration, configured,
+            "the claim carries the configured lease duration back to the worker"
+        );
+        let (claimed_expiry, _) = export_lease_row(&backend, &job_id).await;
+        assert!(
+            claimed_expiry - Utc::now() > chrono::Duration::seconds(120),
+            "the claim itself already honours the configured duration"
+        );
+
+        let first = backend.heartbeat(&lease).await.unwrap();
+        assert!(
+            first >= claimed_expiry,
+            "a renewal never moves the expiry backwards: {first} vs {claimed_expiry}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let second = backend.heartbeat(&lease).await.unwrap();
+        assert!(
+            second > first,
+            "each renewal pushes the expiry further out: {second} vs {first}"
+        );
+        let (persisted, _) = export_lease_row(&backend, &job_id).await;
+        assert!(
+            persisted - Utc::now() > chrono::Duration::seconds(120),
+            "after two renewals the lease is still the configured 180s, not 60s"
+        );
+
+        backend
+            .finish_export_job(&tenant, &job_id, &worker, lease.fencing_token)
+            .await
+            .unwrap();
+    }
+
+    /// Renewing by the lease's own duration must not weaken the fence: a
+    /// worker whose job was re-claimed still learns it lost the lease, and
+    /// writes nothing to the row now owned by someone else.
+    #[tokio::test]
+    async fn postgres_integration_export_heartbeat_on_a_stolen_lease_is_lost() {
+        let _guard = BULK_EXPORT_TEST_LOCK.lock().await;
+        let backend = create_backend().await;
+        let tenant = create_tenant("export-heartbeat-stolen");
+
+        let job_id = backend
+            .start_export(&tenant, export_input(ExportRequest::system()))
+            .await
+            .unwrap();
+        let worker_a = WorkerId::new(format!("pg-hb-stolen-a-{}", uuid::Uuid::new_v4()));
+        let lease_a =
+            claim_specific(&backend, &worker_a, &job_id, StdDuration::from_millis(1)).await;
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let worker_b = WorkerId::new(format!("pg-hb-stolen-b-{}", uuid::Uuid::new_v4()));
+        let lease_b =
+            claim_specific(&backend, &worker_b, &job_id, StdDuration::from_secs(60)).await;
+        assert!(lease_b.fencing_token > lease_a.fencing_token);
+        let (expiry_after_steal, _) = export_lease_row(&backend, &job_id).await;
+
+        assert!(matches!(
+            backend.heartbeat(&lease_a).await,
+            Err(LeaseError::LeaseLost { job_id: lost }) if lost == job_id
+        ));
+        let (expiry_now, _) = export_lease_row(&backend, &job_id).await;
+        assert_eq!(
+            expiry_now, expiry_after_steal,
+            "the fenced-out heartbeat left the new owner's lease untouched"
+        );
+
+        // The new owner's own heartbeat still works.
+        backend.heartbeat(&lease_b).await.unwrap();
         backend
             .finish_export_job(&tenant, &job_id, &worker_b, lease_b.fencing_token)
             .await

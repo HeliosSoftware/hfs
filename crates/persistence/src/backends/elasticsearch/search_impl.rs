@@ -45,15 +45,15 @@ fn unavailable_error(message: String) -> crate::error::StorageError {
     })
 }
 
-/// Rejects `_id` modifiers the `_id` query builder cannot honour (#1092).
-/// `_id` is dispatched by name in `build_parameter_clause`, bypassing the
-/// generic per-type `:not` handling, so this must run before every path that
-/// can reach it. Elasticsearch has no `ConditionalStorage`/`ifNoneExist`
+/// Rejects `_id` / `_lastUpdated` modifiers their dedicated query builders
+/// cannot honour (#1092). Both are dispatched by name in
+/// `build_parameter_clause`, bypassing the generic per-type `:not` handling,
+/// so this must run before every path that can reach them. Elasticsearch has no `ConditionalStorage`/`ifNoneExist`
 /// path of its own (conditional-create criteria are resolved against the
 /// primary backend), so `search` and `search_count` below are the only
 /// entry points.
-fn reject_unsupported_id_modifier(query: &SearchQuery) -> StorageResult<()> {
-    crate::search::reject_unsupported_id_modifier(query)
+fn reject_unsupported_metadata_modifier(query: &SearchQuery) -> StorageResult<()> {
+    crate::search::reject_unsupported_metadata_modifier(query)
 }
 
 /// Maximum retry attempts for transient ES search failures (in addition to the
@@ -339,7 +339,7 @@ impl SearchProvider for ElasticsearchBackend {
         tenant: &TenantContext,
         query: &SearchQuery,
     ) -> StorageResult<SearchResult> {
-        reject_unsupported_id_modifier(query)?;
+        reject_unsupported_metadata_modifier(query)?;
 
         // `_contained` search post-processes contained-doc hits into containers or
         // contained resources; standard search excludes contained docs via the
@@ -517,7 +517,7 @@ impl SearchProvider for ElasticsearchBackend {
         tenant: &TenantContext,
         query: &SearchQuery,
     ) -> StorageResult<u64> {
-        reject_unsupported_id_modifier(query)?;
+        reject_unsupported_metadata_modifier(query)?;
 
         let tenant_id = tenant.tenant_id().as_str();
         let resource_type = &query.resource_type;

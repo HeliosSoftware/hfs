@@ -9,7 +9,7 @@ use crate::core::bulk_submit_legacy::{
 use crate::error::{BackendError, StorageResult};
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 39;
+pub const SCHEMA_VERSION: i32 = 40;
 
 /// Advisory-lock key serializing schema migration across HFS instances sharing
 /// one database. Arbitrary but must stay stable across releases.
@@ -374,6 +374,7 @@ async fn migrate_schema(
             }
             37 => migrate_v37_to_v38(client).await?,
             38 => migrate_v38_to_v39(client).await?,
+            39 => migrate_v39_to_v40(client).await?,
             _ => {
                 return Err(pg_error(format!("Unknown schema version: {}", version)));
             }
@@ -3685,6 +3686,26 @@ async fn migrate_v38_to_v39(client: &deadpool_postgres::Client) -> StorageResult
             .await
             .map_err(|e| pg_error(format!("Migration v38->v39 failed: {}", e)))?;
     }
+
+    Ok(())
+}
+
+/// v39 -> v40: `attempts` on `bulk_export_jobs` (#1041).
+///
+/// Counts how many times the job has been claimed by a worker. A job whose
+/// lease expires mid-run is reclaimable, so without a count of past claims a
+/// job that keeps dying the same way is handed to worker after worker forever,
+/// never reaching a terminal state and never giving its tenant's concurrency
+/// slot back. `claim_next` bumps the column on every claim and retires the job
+/// once the count would exceed the configured cap.
+async fn migrate_v39_to_v40(client: &deadpool_postgres::Client) -> StorageResult<()> {
+    client
+        .execute(
+            "ALTER TABLE bulk_export_jobs ADD COLUMN IF NOT EXISTS attempts INTEGER NOT NULL DEFAULT 0",
+            &[],
+        )
+        .await
+        .map_err(|e| pg_error(format!("Migration v39->v40 failed: {}", e)))?;
 
     Ok(())
 }

@@ -1485,14 +1485,19 @@ pub trait BulkSubmitProvider: ResourceStorage {
 
     /// Marks a submission as complete.
     ///
+    /// This is a status transition only. It deliberately returns nothing:
+    /// building a [`SubmissionSummary`] means aggregating every receipt row of
+    /// the submission, which at corpus scale (millions of entries) took tens
+    /// of seconds on every `submissionStatus=completed` kick-off — the same
+    /// kick-off the Import page's *Mark completed* button sends with a 15s
+    /// budget, so the transition timed out and was lost (#998). A caller that
+    /// wants the counts calls [`get_submission`](Self::get_submission)
+    /// afterwards and pays for them knowingly.
+    ///
     /// # Arguments
     ///
     /// * `tenant` - The tenant context
     /// * `id` - The submission identifier
-    ///
-    /// # Returns
-    ///
-    /// The updated submission summary.
     ///
     /// # Errors
     ///
@@ -1502,7 +1507,7 @@ pub trait BulkSubmitProvider: ResourceStorage {
         &self,
         tenant: &TenantContext,
         id: &SubmissionId,
-    ) -> StorageResult<SubmissionSummary>;
+    ) -> StorageResult<()>;
 
     /// Aborts a submission.
     ///

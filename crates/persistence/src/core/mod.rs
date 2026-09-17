@@ -127,6 +127,7 @@ pub use bulk_export_output::{
 pub use bulk_export_worker::{
     BulkExportJobStore, DefaultExportWorker, ExportClaimStrategy, ExportJobLease,
     ExportResourceProvider, ExportWorkerStorage, LeaseError, WorkerId, WorkerJobView,
+    abandoned_export_message,
 };
 pub use bulk_provider::{BulkProviderStore, StoredProviderSubmission};
 pub use bulk_submit::{

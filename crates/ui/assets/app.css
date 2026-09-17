@@ -2200,6 +2200,14 @@ select.field__input {
   color: var(--muted);
 }
 
+/* #1184: give the rebuild notice a small gap above it so it reads as its own
+   element, not a continuation of the lede. Scoped to `.page-head` so the shared
+   `.notice` rule (used flush inside cards) is untouched, and so the dashboard's
+   in-chart notice keeps its own spacing. */
+.page-head [data-rebuild-notice] {
+  margin-top: 12px;
+}
+
 .back-link,
 .back-link:visited {
   display: inline-flex;
