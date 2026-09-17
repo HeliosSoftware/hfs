@@ -524,13 +524,56 @@ jobs:
             || echo "::warning::Elasticsearch refresh request did not return success — proceeding anyway"
 
       - name: Sanity-check shared Inferno stack
+        env:
+          INFERNO_PROJECT: ${{ needs.inferno-stack-up.outputs.project }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          FALLBACK_PROJECT: inferno-${{ github.run_id }}-${{ github.run_attempt }}
         run: |
           INFERNO_HOST="${DOCKER_HOST_IP:-localhost}"
           echo "INFERNO_HOST=$INFERNO_HOST" >> $GITHUB_ENV
-          if ! curl -sf "http://$INFERNO_HOST:$INFERNO_PORT/api/test_suites" > /dev/null; then
-            echo "Shared Inferno stack not reachable at http://$INFERNO_HOST:$INFERNO_PORT"
+
+          # Retry briefly. The shared stack is already proven healthy by
+          # inferno-stack-up, so this only covers a transient blip (nginx busy
+          # serving the previous matrix job's results, a momentary connection
+          # reset). A stack that is genuinely gone will not come back, so the
+          # window stays short: 10 x 3s, against stack-up's 60 x 2s.
+          for attempt in $(seq 1 10); do
+            if curl -sf "http://$INFERNO_HOST:$INFERNO_PORT/api/test_suites" > /dev/null; then
+              echo "Shared Inferno stack reachable at http://$INFERNO_HOST:$INFERNO_PORT"
+              exit 0
+            fi
+            echo "Attempt $attempt/10: Inferno not reachable yet..."
+            sleep 3
+          done
+
+          echo "Shared Inferno stack not reachable at http://$INFERNO_HOST:$INFERNO_PORT"
+
+          PROJECT="${INFERNO_PROJECT:-$FALLBACK_PROJECT}"
+          echo "Compose project for this run's stack: $PROJECT"
+          # Not `docker compose ps`: the test-kit checkout (and its compose
+          # file) only exists in the inferno-stack-up job, so query the daemon
+          # by compose label the same way inferno-stack-down does.
+          DOCKER_ERR=$(mktemp)
+          if ! CONTAINERS=$(docker ps -a --filter "label=com.docker.compose.project=$PROJECT" --format '{{.Names}}\t{{.Status}}' 2>"$DOCKER_ERR"); then
+            echo "Could not query the Docker daemon about compose project '$PROJECT':"
+            cat "$DOCKER_ERR"
+            echo "::error::The Inferno stack did not answer at http://$INFERNO_HOST:$INFERNO_PORT after 30s, and the Docker daemon could not be queried to say why."
             exit 1
           fi
+
+          if [ -z "$CONTAINERS" ]; then
+            echo "No containers exist for compose project '$PROJECT' — the stack for this run was torn down."
+            if [ "$RUN_ATTEMPT" != "1" ]; then
+              echo "::error::Run attempt $RUN_ATTEMPT re-ran this job alone, but 'Stop Shared Inferno Stack' already tore down the stack at the end of the previous attempt. 'Re-run failed jobs' does not re-run 'Start Shared Inferno Stack', and this job inherits that job's replayed outputs (port $INFERNO_PORT, project $PROJECT) pointing at containers that no longer exist. Use 'Re-run all jobs' instead."
+            else
+              echo "::error::The shared Inferno stack is gone even though this is run attempt 1 — check whether 'Stop Shared Inferno Stack' or another workflow removed compose project '$PROJECT' while the matrix was still running."
+            fi
+          else
+            echo "Containers still present for compose project '$PROJECT':"
+            printf '%s\n' "$CONTAINERS"
+            echo "::error::The Inferno stack's containers exist but the API did not answer at http://$INFERNO_HOST:$INFERNO_PORT after 30s — inspect the container status above."
+          fi
+          exit 1
 
       - name: Create results directory
         run: mkdir -p inferno-results
