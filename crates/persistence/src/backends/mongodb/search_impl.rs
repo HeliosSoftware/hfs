@@ -380,6 +380,72 @@ pub(super) fn missing_presence_filter(
     filter
 }
 
+/// The resource-document field a cursor pages over.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum CursorKeysetField {
+    /// `last_updated`, carried in the cursor as an RFC 3339 string.
+    LastUpdated,
+    /// `id`, carried as is. Unique within a `(tenant, type)` slice of the
+    /// resources collection, so it needs no tie-break.
+    Id,
+}
+
+impl CursorKeysetField {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::LastUpdated => "last_updated",
+            Self::Id => "id",
+        }
+    }
+}
+
+/// The keyset a `_cursor` compares against: the sorted field and its
+/// forward direction (#1058). Mirrors the SQLite / PostgreSQL
+/// `primary_keyset_key`: the sort itself is re-derived from the request's
+/// `_sort` (which the `next` / `previous` links preserve), and the cursor
+/// carries only the boundary value of that field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct CursorKeyset {
+    field: CursorKeysetField,
+    direction: crate::types::SortDirection,
+}
+
+impl CursorKeyset {
+    /// The keyset for `query`, or `None` when its sort cannot be keyset-paged:
+    /// more than one directive, or a directive [`Self`] has no field for
+    /// (a search parameter, whose key lives in the search index).
+    fn for_query(query: &SearchQuery) -> Option<Self> {
+        match query.sort.as_slice() {
+            [] => Some(Self {
+                field: CursorKeysetField::LastUpdated,
+                direction: crate::types::SortDirection::Descending,
+            }),
+            [directive] => {
+                let field = match directive.parameter.as_str() {
+                    "_lastUpdated" => CursorKeysetField::LastUpdated,
+                    "_id" | "id" => CursorKeysetField::Id,
+                    _ => return None,
+                };
+                Some(Self {
+                    field,
+                    direction: directive.direction,
+                })
+            }
+            _ => None,
+        }
+    }
+
+    /// `resource`'s value of the keyset field, as the cursor carries it.
+    fn value_of(self, resource: &StoredResource) -> CursorValue {
+        match self.field {
+            CursorKeysetField::LastUpdated => {
+                CursorValue::String(resource.last_modified().to_rfc3339())
+            }
+            CursorKeysetField::Id => CursorValue::String(resource.id().to_string()),
+        }
+    }
+}
+
 #[async_trait]
 impl SearchProvider for MongoBackend {
     async fn search(
@@ -411,11 +477,16 @@ impl SearchProvider for MongoBackend {
             None
         };
 
-        if cursor.is_some() && !query.sort.is_empty() {
+        // Keyset for cursor pagination (#1058): the default sort or a single
+        // `_id` / `_lastUpdated` directive. `None` for multi-field sorts,
+        // which page by offset only — no cursor is minted for them below, so
+        // an inbound one can only be a client's own construction.
+        let keyset = CursorKeyset::for_query(query);
+        if cursor.is_some() && keyset.is_none() {
             return Err(StorageError::Search(SearchError::QueryParseError {
-                message:
-                    "MongoDB cursor pagination currently supports only default _lastUpdated sort"
-                        .to_string(),
+                message: "MongoDB cursor pagination supports the default sort or a single \
+                          _id / _lastUpdated sort directive"
+                    .to_string(),
             }));
         }
 
@@ -430,7 +501,7 @@ impl SearchProvider for MongoBackend {
         // Sorting by an indexed search parameter (#881): the sort key lives
         // in the search index, not on the resource documents, so the ordered
         // id list is computed there and the page fetched by id. Offset-paged;
-        // cursor pagination with any custom sort is already rejected above.
+        // it has no keyset, so a cursor is already rejected above.
         let param_sort = query
             .sort
             .iter()
@@ -452,7 +523,7 @@ impl SearchProvider for MongoBackend {
             &query.resource_type,
             query,
             matched_ids.as_ref(),
-            cursor.as_ref(),
+            cursor.as_ref().zip(keyset.as_ref()),
         )?;
 
         let sort = self.build_sort_document(query, previous_mode)?;
@@ -488,28 +559,22 @@ impl SearchProvider for MongoBackend {
             cursor.is_some() || query.offset.unwrap_or(0) > 0,
         );
 
-        let next_cursor = if has_next {
-            resources.last().map(|resource| {
-                PageCursor::new(
-                    vec![CursorValue::String(resource.last_modified().to_rfc3339())],
-                    resource.id(),
-                )
-                .encode()
-            })
-        } else {
-            None
+        // Cursors carry the value of the field the page is sorted on; a sort
+        // with no keyset (multi-field) gets none and pages by offset, which
+        // is what the REST layer's `next` link falls back to. Minting one
+        // here would advertise a link the entry point above rejects (#1058).
+        let next_cursor = match (&keyset, has_next) {
+            (Some(k), true) => resources.last().map(|resource| {
+                PageCursor::new(vec![k.value_of(resource)], resource.id()).encode()
+            }),
+            _ => None,
         };
 
-        let previous_cursor = if has_previous {
-            resources.first().map(|resource| {
-                PageCursor::previous(
-                    vec![CursorValue::String(resource.last_modified().to_rfc3339())],
-                    resource.id(),
-                )
-                .encode()
-            })
-        } else {
-            None
+        let previous_cursor = match (&keyset, has_previous) {
+            (Some(k), true) => resources.first().map(|resource| {
+                PageCursor::previous(vec![k.value_of(resource)], resource.id()).encode()
+            }),
+            _ => None,
         };
 
         let total = if query.total.is_some() {
@@ -2363,7 +2428,7 @@ impl MongoBackend {
         resource_type: &str,
         query: &SearchQuery,
         matched_ids: Option<&HashSet<String>>,
-        cursor: Option<&PageCursor>,
+        cursor: Option<(&PageCursor, &CursorKeyset)>,
     ) -> StorageResult<Document> {
         let mut conditions = vec![doc! {
             "tenant_id": tenant_id,
@@ -2396,8 +2461,8 @@ impl MongoBackend {
             }
         }
 
-        if let Some(cursor) = cursor {
-            conditions.push(self.build_cursor_condition(cursor)?);
+        if let Some((cursor, keyset)) = cursor {
+            conditions.push(self.build_cursor_condition(cursor, keyset)?);
         }
 
         if conditions.len() == 1 {
@@ -2510,40 +2575,55 @@ impl MongoBackend {
         }
     }
 
-    fn build_cursor_condition(&self, cursor: &PageCursor) -> StorageResult<Document> {
-        let timestamp = match cursor.sort_values().first() {
-            Some(CursorValue::String(value)) => DateTime::parse_from_rfc3339(value)
-                .map_err(|_| {
-                    StorageError::Search(SearchError::InvalidCursor {
-                        cursor: cursor.encode(),
-                    })
-                })?
-                .with_timezone(&Utc),
-            _ => {
-                return Err(StorageError::Search(SearchError::InvalidCursor {
-                    cursor: cursor.encode(),
-                }));
+    /// The keyset predicate for `cursor` over `keyset`'s field, in the
+    /// order [`Self::build_sort_document`] produces for the same query:
+    /// the sorted field first, then `id` descending (ascending in previous
+    /// mode) as the tie-break when the field is not `id` itself.
+    fn build_cursor_condition(
+        &self,
+        cursor: &PageCursor,
+        keyset: &CursorKeyset,
+    ) -> StorageResult<Document> {
+        let invalid = || {
+            StorageError::Search(SearchError::InvalidCursor {
+                cursor: cursor.encode(),
+            })
+        };
+        let boundary = match (keyset.field, cursor.sort_values().first()) {
+            (CursorKeysetField::LastUpdated, Some(CursorValue::String(value))) => {
+                let timestamp = DateTime::parse_from_rfc3339(value)
+                    .map_err(|_| invalid())?
+                    .with_timezone(&Utc);
+                Bson::DateTime(chrono_to_bson(timestamp))
             }
+            (CursorKeysetField::Id, Some(CursorValue::String(value))) => {
+                Bson::String(value.clone())
+            }
+            _ => return Err(invalid()),
         };
 
-        let ts = chrono_to_bson(timestamp);
+        let previous = cursor.direction() == CursorDirection::Previous;
+        // Rows strictly after the boundary in page order: past it along the
+        // sort direction, flipped when walking back to the previous page.
+        let ascending = (keyset.direction == crate::types::SortDirection::Ascending) != previous;
+        let field_op = if ascending { "$gt" } else { "$lt" };
+        // `id` is the secondary key in descending order (see
+        // `build_sort_document`), so the tie-break is `$lt` going forward.
+        let id_op = if previous { "$gt" } else { "$lt" };
+
+        let field = keyset.field.as_str();
         let id = cursor.resource_id().to_string();
 
-        if cursor.direction() == CursorDirection::Previous {
-            Ok(doc! {
-                "$or": [
-                    { "last_updated": { "$gt": ts } },
-                    { "last_updated": ts, "id": { "$gt": id } }
-                ]
-            })
-        } else {
-            Ok(doc! {
-                "$or": [
-                    { "last_updated": { "$lt": ts } },
-                    { "last_updated": ts, "id": { "$lt": id } }
-                ]
-            })
+        if keyset.field == CursorKeysetField::Id {
+            return Ok(doc! { field: { field_op: boundary } });
         }
+
+        Ok(doc! {
+            "$or": [
+                { field: { field_op: boundary.clone() } },
+                { field: boundary, "id": { id_op: id } }
+            ]
+        })
     }
 
     fn build_sort_document(
@@ -4101,5 +4181,197 @@ mod trim_probe_row_tests {
         let mut rows: Vec<i32> = Vec::new();
         assert_eq!(trim_probe_row(&mut rows, 3, true, true), (false, false));
         assert!(rows.is_empty());
+    }
+}
+
+/// #1058: the cursor a page mints must be one the same query accepts, and
+/// its predicate must compare the field the page was sorted on.
+#[cfg(test)]
+mod cursor_keyset_tests {
+    use super::*;
+    use crate::backends::mongodb::MongoBackendConfig;
+    use crate::types::{SortDirection, SortDirective};
+
+    fn backend() -> MongoBackend {
+        MongoBackend::new(MongoBackendConfig::default()).unwrap()
+    }
+
+    fn keyset(sorts: &[&str]) -> Option<CursorKeyset> {
+        let mut query = SearchQuery::new("Patient");
+        for sort in sorts {
+            query = query.with_sort(SortDirective::parse(sort));
+        }
+        CursorKeyset::for_query(&query)
+    }
+
+    #[test]
+    fn default_sort_pages_over_last_updated_descending() {
+        assert_eq!(
+            keyset(&[]),
+            Some(CursorKeyset {
+                field: CursorKeysetField::LastUpdated,
+                direction: SortDirection::Descending,
+            })
+        );
+    }
+
+    #[test]
+    fn single_id_or_last_updated_sorts_have_a_keyset() {
+        assert_eq!(
+            keyset(&["_id"]),
+            Some(CursorKeyset {
+                field: CursorKeysetField::Id,
+                direction: SortDirection::Ascending,
+            })
+        );
+        assert_eq!(
+            keyset(&["-_id"]),
+            Some(CursorKeyset {
+                field: CursorKeysetField::Id,
+                direction: SortDirection::Descending,
+            })
+        );
+        assert_eq!(
+            keyset(&["-_lastUpdated"]),
+            Some(CursorKeyset {
+                field: CursorKeysetField::LastUpdated,
+                direction: SortDirection::Descending,
+            })
+        );
+        assert_eq!(
+            keyset(&["_lastUpdated"]),
+            Some(CursorKeyset {
+                field: CursorKeysetField::LastUpdated,
+                direction: SortDirection::Ascending,
+            })
+        );
+    }
+
+    /// Multi-field sorts and parameter sorts page by offset only: no keyset,
+    /// so no cursor is minted and an inbound one is rejected.
+    #[test]
+    fn multi_field_and_parameter_sorts_have_no_keyset() {
+        assert_eq!(keyset(&["_lastUpdated", "_id"]), None);
+        assert_eq!(keyset(&["birthdate"]), None);
+        assert_eq!(keyset(&["_id", "birthdate"]), None);
+    }
+
+    fn resource(id: &str, last_updated: &str) -> StoredResource {
+        let ts = DateTime::parse_from_rfc3339(last_updated)
+            .unwrap()
+            .with_timezone(&Utc);
+        StoredResource::from_storage(
+            "Patient".to_string(),
+            id.to_string(),
+            "1".to_string(),
+            crate::tenant::TenantId::new("t"),
+            serde_json::json!({"resourceType": "Patient", "id": id}),
+            ts,
+            ts,
+            None,
+            FhirVersion::default(),
+        )
+    }
+
+    /// The minted value is the sorted field's, and decoding it back through
+    /// `build_cursor_condition` yields a predicate over that same field.
+    #[test]
+    fn id_sort_cursor_compares_id() {
+        let k = keyset(&["_id"]).unwrap();
+        let r = resource("p-5", "2026-01-02T03:04:05Z");
+        let cursor =
+            PageCursor::decode(&PageCursor::new(vec![k.value_of(&r)], r.id()).encode()).unwrap();
+        assert!(matches!(
+            cursor.sort_values().first(),
+            Some(CursorValue::String(v)) if v == "p-5"
+        ));
+
+        let next = backend().build_cursor_condition(&cursor, &k).unwrap();
+        assert_eq!(next, doc! { "id": { "$gt": "p-5" } });
+
+        let prev = PageCursor::decode(&PageCursor::previous(vec![k.value_of(&r)], r.id()).encode())
+            .unwrap();
+        let previous = backend().build_cursor_condition(&prev, &k).unwrap();
+        assert_eq!(previous, doc! { "id": { "$lt": "p-5" } });
+
+        let desc = keyset(&["-_id"]).unwrap();
+        let next_desc = backend().build_cursor_condition(&cursor, &desc).unwrap();
+        assert_eq!(next_desc, doc! { "id": { "$lt": "p-5" } });
+    }
+
+    /// `_lastUpdated` keeps `id` (descending) as the tie-break, in both
+    /// explicit directions and for the default sort.
+    #[test]
+    fn last_updated_sort_cursor_compares_last_updated_then_id() {
+        let r = resource("p-5", "2026-01-02T03:04:05Z");
+        let ts = Bson::DateTime(chrono_to_bson(r.last_modified()));
+
+        let default = keyset(&[]).unwrap();
+        let cursor =
+            PageCursor::decode(&PageCursor::new(vec![default.value_of(&r)], r.id()).encode())
+                .unwrap();
+        assert!(matches!(
+            cursor.sort_values().first(),
+            Some(CursorValue::String(v)) if v == "2026-01-02T03:04:05+00:00"
+        ));
+        assert_eq!(
+            backend().build_cursor_condition(&cursor, &default).unwrap(),
+            doc! { "$or": [
+                { "last_updated": { "$lt": ts.clone() } },
+                { "last_updated": ts.clone(), "id": { "$lt": "p-5" } }
+            ]}
+        );
+
+        let explicit_desc = keyset(&["-_lastUpdated"]).unwrap();
+        assert_eq!(
+            backend()
+                .build_cursor_condition(&cursor, &explicit_desc)
+                .unwrap(),
+            backend().build_cursor_condition(&cursor, &default).unwrap()
+        );
+
+        let asc = keyset(&["_lastUpdated"]).unwrap();
+        assert_eq!(
+            backend().build_cursor_condition(&cursor, &asc).unwrap(),
+            doc! { "$or": [
+                { "last_updated": { "$gt": ts.clone() } },
+                { "last_updated": ts.clone(), "id": { "$lt": "p-5" } }
+            ]}
+        );
+
+        let prev =
+            PageCursor::decode(&PageCursor::previous(vec![asc.value_of(&r)], r.id()).encode())
+                .unwrap();
+        assert_eq!(
+            backend().build_cursor_condition(&prev, &asc).unwrap(),
+            doc! { "$or": [
+                { "last_updated": { "$lt": ts.clone() } },
+                { "last_updated": ts, "id": { "$gt": "p-5" } }
+            ]}
+        );
+    }
+
+    /// A cursor whose value is not a timestamp is invalid for a
+    /// `_lastUpdated` keyset — e.g. an `_id`-sort cursor replayed against a
+    /// query whose `_sort` was changed by hand.
+    #[test]
+    fn cursor_value_must_match_the_keyset_field() {
+        let cursor = PageCursor::new(vec![CursorValue::String("p-5".into())], "p-5");
+        let err = backend()
+            .build_cursor_condition(&cursor, &keyset(&[]).unwrap())
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            StorageError::Search(SearchError::InvalidCursor { .. })
+        ));
+
+        let numeric = PageCursor::new(vec![CursorValue::Number(5)], "p-5");
+        let err = backend()
+            .build_cursor_condition(&numeric, &keyset(&["_id"]).unwrap())
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            StorageError::Search(SearchError::InvalidCursor { .. })
+        ));
     }
 }

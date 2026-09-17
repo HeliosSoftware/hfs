@@ -4625,6 +4625,292 @@ async fn mongodb_integration_cursor_paging_backward_from_page_two_has_no_previou
     assert!(back1.resources.page_info.next_cursor.is_some());
 }
 
+/// #1058: a page sorted by `_id` minted a `next` cursor that the same query
+/// then rejected (and whose predicate compared `last_updated` anyway). The
+/// cursor now pages over the sorted field, so following `next` from page to
+/// page yields the listing in `_id` order with no row skipped or repeated.
+#[tokio::test]
+async fn mongodb_integration_search_cursor_pagination_sorted_by_id() {
+    let Some(backend) = create_backend("search_cursor_sort_id").await else {
+        eprintln!(
+            "Skipping mongodb_integration_search_cursor_pagination_sorted_by_id (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+
+    let tenant = create_tenant("tenant-search-cursor-sort-id");
+
+    // Created in reverse id order so `_id` order differs from the default
+    // `_lastUpdated` order: a cursor that still compared `last_updated`
+    // would not produce these pages.
+    for id in ["cp-5", "cp-4", "cp-3", "cp-2", "cp-1"] {
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({
+                    "resourceType": "Patient",
+                    "id": id,
+                    "name": [{"family": format!("Cursor-{}", id)}],
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    }
+
+    let page_ids = |result: &helios_persistence::core::SearchResult| -> Vec<String> {
+        result
+            .resources
+            .items
+            .iter()
+            .map(|r| r.id().to_string())
+            .collect()
+    };
+
+    let query = SearchQuery::new("Patient")
+        .with_count(2)
+        .with_sort(SortDirective::parse("_id"));
+
+    let page1 = backend.search(&tenant, &query).await.unwrap();
+    assert_eq!(page_ids(&page1), vec!["cp-1", "cp-2"]);
+    assert!(page1.resources.page_info.has_next);
+    assert!(!page1.resources.page_info.has_previous);
+    assert!(page1.resources.page_info.previous_cursor.is_none());
+    let next1 = page1
+        .resources
+        .page_info
+        .next_cursor
+        .clone()
+        .expect("page 1 of an _id-sorted listing mints a next cursor");
+
+    // The advertised `next` link carries the request's `_sort` (the REST
+    // layer substitutes only `_cursor` into the self link), so the backend
+    // sees the same sort plus the cursor: this used to be a 400.
+    let page2 = backend
+        .search(&tenant, &query.clone().with_cursor(next1))
+        .await
+        .expect("following the next link of an _id-sorted page must succeed");
+    assert_eq!(page_ids(&page2), vec!["cp-3", "cp-4"]);
+    assert!(page2.resources.page_info.has_next);
+    assert!(page2.resources.page_info.has_previous);
+    let next2 = page2
+        .resources
+        .page_info
+        .next_cursor
+        .clone()
+        .expect("page 2 mints a next cursor");
+
+    let page3 = backend
+        .search(&tenant, &query.clone().with_cursor(next2))
+        .await
+        .unwrap();
+    assert_eq!(page_ids(&page3), vec!["cp-5"]);
+    assert!(!page3.resources.page_info.has_next);
+    assert!(page3.resources.page_info.next_cursor.is_none());
+
+    // Back from page 2 lands on page 1, in `_id` order.
+    let previous2 = page2
+        .resources
+        .page_info
+        .previous_cursor
+        .clone()
+        .expect("page 2 mints a previous cursor");
+    let back1 = backend
+        .search(&tenant, &query.clone().with_cursor(previous2))
+        .await
+        .expect("following the previous link of an _id-sorted page must succeed");
+    assert_eq!(page_ids(&back1), vec!["cp-1", "cp-2"]);
+
+    // Descending: same corpus, reverse walk.
+    let desc = SearchQuery::new("Patient")
+        .with_count(2)
+        .with_sort(SortDirective::parse("-_id"));
+    let d1 = backend.search(&tenant, &desc).await.unwrap();
+    assert_eq!(page_ids(&d1), vec!["cp-5", "cp-4"]);
+    let d2 = backend
+        .search(
+            &tenant,
+            &desc
+                .clone()
+                .with_cursor(d1.resources.page_info.next_cursor.clone().unwrap()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(page_ids(&d2), vec!["cp-3", "cp-2"]);
+    let d3 = backend
+        .search(
+            &tenant,
+            &desc
+                .clone()
+                .with_cursor(d2.resources.page_info.next_cursor.clone().unwrap()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(page_ids(&d3), vec!["cp-1"]);
+    assert!(!d3.resources.page_info.has_next);
+}
+
+/// #1058, `_lastUpdated` spelled out: an explicit `-_lastUpdated` is the
+/// default order and pages identically to it; ascending `_lastUpdated` walks
+/// the other way. Both used to advertise a cursor the next request rejected.
+#[tokio::test]
+async fn mongodb_integration_search_cursor_pagination_sorted_by_last_updated() {
+    let Some(backend) = create_backend("search_cursor_sort_last_updated").await else {
+        eprintln!(
+            "Skipping mongodb_integration_search_cursor_pagination_sorted_by_last_updated (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+
+    let tenant = create_tenant("tenant-search-cursor-sort-lu");
+
+    for id in ["lu-1", "lu-2", "lu-3"] {
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({
+                    "resourceType": "Patient",
+                    "id": id,
+                    "name": [{"family": format!("Cursor-{}", id)}],
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        // Distinct `last_updated` values (millisecond precision in BSON).
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    }
+
+    let walk = |query: SearchQuery| {
+        let backend = &backend;
+        let tenant = &tenant;
+        async move {
+            let mut ids = Vec::new();
+            let mut cursor: Option<String> = None;
+            loop {
+                let q = match cursor.take() {
+                    Some(c) => query.clone().with_cursor(c),
+                    None => query.clone(),
+                };
+                let page = backend
+                    .search(tenant, &q)
+                    .await
+                    .expect("following a next link of a _lastUpdated-sorted page must succeed");
+                assert_eq!(page.resources.items.len(), 1);
+                ids.push(page.resources.items[0].id().to_string());
+                if !page.resources.page_info.has_next {
+                    assert!(page.resources.page_info.next_cursor.is_none());
+                    break;
+                }
+                cursor = Some(
+                    page.resources
+                        .page_info
+                        .next_cursor
+                        .clone()
+                        .expect("has_next implies a next cursor"),
+                );
+                assert!(ids.len() <= 3, "next links must terminate");
+            }
+            ids
+        }
+    };
+
+    let newest_first = walk(
+        SearchQuery::new("Patient")
+            .with_count(1)
+            .with_sort(SortDirective::parse("-_lastUpdated")),
+    )
+    .await;
+    assert_eq!(newest_first, vec!["lu-3", "lu-2", "lu-1"]);
+
+    let default_order = walk(SearchQuery::new("Patient").with_count(1)).await;
+    assert_eq!(default_order, newest_first);
+
+    let oldest_first = walk(
+        SearchQuery::new("Patient")
+            .with_count(1)
+            .with_sort(SortDirective::parse("_lastUpdated")),
+    )
+    .await;
+    assert_eq!(oldest_first, vec!["lu-1", "lu-2", "lu-3"]);
+}
+
+/// #1058: a sort with no keyset (two directives) mints no cursor at all, so
+/// nothing advertises a link the backend would reject; it pages by offset.
+/// A cursor sent with such a sort anyway is rejected up front rather than
+/// applied to the wrong field.
+#[tokio::test]
+async fn mongodb_integration_search_multi_field_sort_mints_no_cursor() {
+    let Some(backend) = create_backend("search_multi_sort_no_cursor").await else {
+        eprintln!(
+            "Skipping mongodb_integration_search_multi_field_sort_mints_no_cursor (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+
+    let tenant = create_tenant("tenant-search-multi-sort");
+
+    for id in ["ms-1", "ms-2", "ms-3"] {
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType": "Patient", "id": id}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+    }
+
+    let query = SearchQuery::new("Patient")
+        .with_count(2)
+        .with_sort(SortDirective::parse("_lastUpdated"))
+        .with_sort(SortDirective::parse("_id"));
+
+    let page1 = backend.search(&tenant, &query).await.unwrap();
+    assert_eq!(page1.resources.items.len(), 2);
+    assert!(page1.resources.page_info.has_next);
+    assert!(
+        page1.resources.page_info.next_cursor.is_none(),
+        "a multi-field sort has no keyset and must not advertise a cursor"
+    );
+    assert!(page1.resources.page_info.previous_cursor.is_none());
+
+    let mut offset_query = query.clone();
+    offset_query.offset = Some(2);
+    let page2 = backend.search(&tenant, &offset_query).await.unwrap();
+    assert_eq!(page2.resources.items.len(), 1);
+    assert!(!page2.resources.page_info.has_next);
+    assert!(page2.resources.page_info.has_previous);
+    assert!(page2.resources.page_info.next_cursor.is_none());
+    assert!(page2.resources.page_info.previous_cursor.is_none());
+
+    // Borrow a well-formed cursor from a keyset-paged query and replay it
+    // against the multi-field sort.
+    let borrowed = backend
+        .search(&tenant, &SearchQuery::new("Patient").with_count(1))
+        .await
+        .unwrap()
+        .resources
+        .page_info
+        .next_cursor
+        .expect("default sort mints a cursor");
+    let err = backend
+        .search(&tenant, &query.with_cursor(borrowed))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            StorageError::Search(helios_persistence::error::SearchError::QueryParseError { .. })
+        ),
+        "unexpected error: {err:?}"
+    );
+}
+
 #[tokio::test]
 async fn mongodb_integration_search_missing_not_and_param_sort() {
     let Some(backend) = create_backend_with_full_registry("search_missing_not_sort").await else {
