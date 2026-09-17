@@ -1110,7 +1110,7 @@ where
         }
         BundleMethod::Post => {
             // Create operation
-            let resource = match entry.get("resource") {
+            let mut resource = match entry.get("resource") {
                 Some(r) => r.clone(),
                 None => {
                     // `invalid`, not `required`: `Bundle.entry.resource` is
@@ -1124,6 +1124,16 @@ where
                     });
                 }
             };
+
+            // http.html#create: the server ignores an id supplied on a POST and
+            // assigns its own — exactly as a standalone create and the
+            // transaction executor's `parse_entry` both do. This batch path
+            // reads the raw entry resource rather than the parse-time-stripped
+            // copy, so without this the create lands under the client id and a
+            // later import of the same id silently overwrites it as v2 (#1223).
+            if let Some(obj) = resource.as_object_mut() {
+                obj.remove("id");
+            }
 
             if let Err(error) =
                 admit_bundle_mutation(&method, &resource_type, Some(&resource), fhir_version)
