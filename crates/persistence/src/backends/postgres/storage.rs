@@ -1887,7 +1887,12 @@ impl PostgresBackend {
                     &[&tenant_id, &empty_types, &empty_ids],
                 )
                 .await
-                .map_err(|e| internal_error(format!("Failed to delete empty FTS index: {}", e)))?;
+                .map_err(|e| {
+                    BatchFtsError::Other(internal_error(format!(
+                        "Failed to delete empty FTS index: {}",
+                        e
+                    )))
+                })?;
             }
 
             if resource_types.is_empty() {
