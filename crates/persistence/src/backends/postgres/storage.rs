@@ -1824,10 +1824,13 @@ impl PostgresBackend {
     /// content) is bounded by [`FTS_BATCH_SIZE`] resources rather than by the
     /// page's length.
     ///
-    /// A resource whose content is empty is left out of the group's arrays: the
-    /// page's own `DELETE FROM resource_fts` has already removed its row, and
-    /// the row must not come back. A group left holding only such resources
-    /// issues no statement at all.
+    /// A resource whose content is empty is left out of the group's arrays and
+    /// its row is deleted instead, in one statement per group that has any:
+    /// the page's own `DELETE FROM resource_fts` names only the resources whose
+    /// extraction failed (#1146), so the row of an emptied resource is this
+    /// function's to remove, exactly as `index_fts_content` removes it on the
+    /// per-resource path. A group left holding only such resources issues the
+    /// delete and no upsert; a group with none issues the upsert alone.
     ///
     /// Every error is returned as it arrives — never truncated, never retried,
     /// never re-split into smaller groups. A `program_limit_exceeded` is
@@ -1857,16 +1860,34 @@ impl PostgresBackend {
             let mut resource_ids = Vec::with_capacity(group.len());
             let mut narratives = Vec::with_capacity(group.len());
             let mut full_contents = Vec::with_capacity(group.len());
+            let mut empty_types: Vec<&str> = Vec::new();
+            let mut empty_ids: Vec<&str> = Vec::new();
 
             for resource in group {
                 let content = extract_searchable_content(resource.content());
                 if content.is_empty() {
+                    empty_types.push(resource.resource_type());
+                    empty_ids.push(resource.id());
                     continue;
                 }
                 resource_types.push(resource.resource_type().to_string());
                 resource_ids.push(resource.id().to_string());
                 narratives.push(content.narrative);
                 full_contents.push(content.full_content);
+            }
+
+            if !empty_ids.is_empty() {
+                execute_cached(
+                    client,
+                    "DELETE FROM resource_fts
+                     WHERE tenant_id = $1
+                       AND (resource_type, resource_id) IN (
+                           SELECT * FROM unnest($2::text[], $3::text[])
+                       )",
+                    &[&tenant_id, &empty_types, &empty_ids],
+                )
+                .await
+                .map_err(|e| internal_error(format!("Failed to delete empty FTS index: {}", e)))?;
             }
 
             if resource_types.is_empty() {
@@ -4549,20 +4570,49 @@ impl ReindexTarget for PostgresBackend {
                 internal_error(format!("Failed to delete search index page: {}", e))
             })?;
 
-            let fts_delete_span = crate::perf::span(crate::perf::Phase::ReindexFtsDelete);
-            let deleted = execute_cached(
-                &transaction,
-                "DELETE FROM resource_fts
-                 WHERE tenant_id = $1
-                   AND (resource_type, resource_id) IN (
-                       SELECT * FROM unnest($2::text[], $3::text[])
-                   )",
-                &[&tenant_id, &resource_types, &resource_ids],
-            )
-            .await;
-            drop(fts_delete_span);
-            deleted
-                .map_err(|e| internal_error(format!("Failed to delete FTS index page: {}", e)))?;
+            // Every resource whose extraction succeeded reaches
+            // `index_fts_content_batch` later in this same transaction, and
+            // that call decides each row's fate from the content: non-empty
+            // content keeps the row and replaces its stored vectors in place
+            // through the `idx_fts_lookup` upsert, which withholds the write
+            // when they are already equal; empty content deletes the row. Neither
+            // branch needs the row gone first, so those pairs are left alone
+            // until their own write lands. A resource whose extraction failed
+            // gets no later call at all, and nothing else would remove its row,
+            // so those pairs are the only ones that have to be deleted here.
+            // Derive them together, and skip the statement entirely when the
+            // page has no failures.
+            let failed_pairs: Vec<(&str, &str)> = resources
+                .iter()
+                .zip(&extraction_errors)
+                .filter(|(_, error)| error.is_some())
+                .map(|(resource, _)| (resource.resource_type(), resource.id()))
+                .collect();
+            if !failed_pairs.is_empty() {
+                let failed_types: Vec<&str> = failed_pairs
+                    .iter()
+                    .map(|(resource_type, _)| *resource_type)
+                    .collect();
+                let failed_ids: Vec<&str> = failed_pairs
+                    .iter()
+                    .map(|(_, resource_id)| *resource_id)
+                    .collect();
+                let fts_delete_span = crate::perf::span(crate::perf::Phase::ReindexFtsDelete);
+                let deleted = execute_cached(
+                    &transaction,
+                    "DELETE FROM resource_fts
+                     WHERE tenant_id = $1
+                       AND (resource_type, resource_id) IN (
+                           SELECT * FROM unnest($2::text[], $3::text[])
+                       )",
+                    &[&tenant_id, &failed_types, &failed_ids],
+                )
+                .await;
+                drop(fts_delete_span);
+                deleted.map_err(|e| {
+                    internal_error(format!("Failed to delete FTS index page: {}", e))
+                })?;
+            }
 
             let valid_batches: Vec<(&str, &str, &[IndexRow])> = resources
                 .iter()
