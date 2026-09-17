@@ -2674,6 +2674,195 @@ mod postgres_integration {
         assert!(error.to_string().contains("Invalid status: invalid-status"));
     }
 
+    /// #1151: completing a submission must release its only pooled connection
+    /// before a caller performs the separate summary read. The production
+    /// contract returns `()`; this regression exercises that transition with a
+    /// one-connection pool and then verifies the persisted summary in a second
+    /// checkout.
+    #[tokio::test]
+    async fn postgres_complete_submission_uses_one_connection_and_preserves_scope_and_summary() {
+        use std::time::Duration;
+
+        use helios_persistence::core::{
+            BulkSubmitProvider, ManifestStatus, SubmissionId, SubmissionStatus,
+        };
+        use helios_persistence::error::{BulkSubmitError, StorageError};
+
+        fn assert_already_complete(error: StorageError, expected: &SubmissionId) {
+            match error {
+                StorageError::BulkSubmit(BulkSubmitError::AlreadyComplete { submission_id }) => {
+                    assert_eq!(submission_id, expected.submission_id)
+                }
+                other => panic!("expected AlreadyComplete, got {other:?}"),
+            }
+        }
+
+        let _guard = BULK_SUBMIT_TEST_LOCK.lock().await;
+        let backend = create_backend_with_max_connections(1).await;
+        let tenant = create_tenant("complete-submission-one-connection");
+        let other_tenant = create_tenant("complete-submission-other-tenant");
+        let submission = SubmissionId::new("completion-submitter", "shared-submission-id");
+        let other_submitter =
+            SubmissionId::new("completion-other-submitter", "shared-submission-id");
+        let aborted = SubmissionId::new("completion-submitter", "aborted-submission-id");
+        let missing = SubmissionId::new("completion-submitter", "missing-submission-id");
+        let metadata = json!({
+            "source": "issue-1151",
+            "nested": { "preserved": true }
+        });
+
+        backend
+            .create_submission(&tenant, &submission, Some(metadata.clone()))
+            .await
+            .unwrap();
+        let manifest = backend
+            .add_manifest(
+                &tenant,
+                &submission,
+                Some("https://provider.example/issue-1151-manifest.json"),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // These neighbours overlap the target's submission identifier. A
+        // completion scoped by fewer than tenant + submitter + submission id
+        // would incorrectly transition at least one of them.
+        backend
+            .create_submission(&other_tenant, &submission, None)
+            .await
+            .unwrap();
+        backend
+            .create_submission(&tenant, &other_submitter, None)
+            .await
+            .unwrap();
+        backend
+            .create_submission(&tenant, &aborted, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            backend
+                .abort_submission(&tenant, &aborted, "terminal-state regression")
+                .await
+                .unwrap(),
+            0
+        );
+
+        // `get_submission` reads these persisted manifest counters directly.
+        // Keep the raw client inside this narrow scope so the one pooled
+        // connection is available to `complete_submission` below.
+        {
+            let client = backend.get_client().await.unwrap();
+            let tenant_id = tenant.tenant_id().as_str();
+            let updated = client
+                .execute(
+                    "UPDATE bulk_manifests SET
+                        status = 'completed', total_entries = 12,
+                        processed_entries = 7, failed_entries = 3,
+                        skipped_entries = 2
+                     WHERE tenant_id = $1 AND submitter = $2
+                       AND submission_id = $3 AND manifest_id = $4",
+                    &[
+                        &tenant_id,
+                        &submission.submitter.as_str(),
+                        &submission.submission_id.as_str(),
+                        &manifest.manifest_id.as_str(),
+                    ],
+                )
+                .await
+                .unwrap();
+            assert_eq!(updated, 1);
+        }
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            backend.complete_submission(&tenant, &submission),
+        )
+        .await
+        .expect("complete_submission must not wait for a second pool connection")
+        .unwrap();
+
+        let summary = backend
+            .get_submission(&tenant, &submission)
+            .await
+            .unwrap()
+            .expect("completed submission must remain readable");
+        assert_eq!(summary.id, submission);
+        assert_eq!(summary.status, SubmissionStatus::Complete);
+        assert_eq!(summary.metadata, Some(metadata));
+        assert_eq!(summary.manifest_count, 1);
+        assert_eq!(summary.total_entries, 12);
+        assert_eq!(summary.success_count, 7);
+        assert_eq!(summary.error_count, 3);
+        assert_eq!(summary.skipped_count, 2);
+        let completed_at = summary
+            .completed_at
+            .as_ref()
+            .expect("completion timestamp must be persisted");
+        assert_eq!(completed_at, &summary.updated_at);
+        assert!(completed_at >= &summary.created_at);
+
+        let repeated_summary = backend
+            .get_submission(&tenant, &submission)
+            .await
+            .unwrap()
+            .expect("completed submission must remain readable repeatedly");
+        assert_eq!(
+            serde_json::to_value(&repeated_summary).unwrap(),
+            serde_json::to_value(&summary).unwrap(),
+            "a repeated full summary read must be stable"
+        );
+
+        let stored_manifest = backend
+            .get_manifest(&tenant, &submission, &manifest.manifest_id)
+            .await
+            .unwrap()
+            .expect("the target manifest must remain readable");
+        assert_eq!(stored_manifest.status, ManifestStatus::Completed);
+
+        for (neighbour_tenant, neighbour_submission) in
+            [(&other_tenant, &submission), (&tenant, &other_submitter)]
+        {
+            let neighbour = backend
+                .get_submission(neighbour_tenant, neighbour_submission)
+                .await
+                .unwrap()
+                .expect("identity neighbour must remain readable");
+            assert_eq!(neighbour.status, SubmissionStatus::InProgress);
+            assert_eq!(neighbour.completed_at, None);
+        }
+
+        let missing_error = backend
+            .complete_submission(&tenant, &missing)
+            .await
+            .unwrap_err();
+        match missing_error {
+            StorageError::BulkSubmit(BulkSubmitError::SubmissionNotFound {
+                submitter,
+                submission_id,
+            }) => {
+                assert_eq!(submitter, missing.submitter);
+                assert_eq!(submission_id, missing.submission_id);
+            }
+            other => panic!("expected SubmissionNotFound, got {other:?}"),
+        }
+
+        assert_already_complete(
+            backend
+                .complete_submission(&tenant, &submission)
+                .await
+                .unwrap_err(),
+            &submission,
+        );
+        assert_already_complete(
+            backend
+                .complete_submission(&tenant, &aborted)
+                .await
+                .unwrap_err(),
+            &aborted,
+        );
+    }
+
     #[tokio::test]
     async fn statement_timeout_applies_to_every_pooled_connection() {
         let pg = shared_pg().await;
