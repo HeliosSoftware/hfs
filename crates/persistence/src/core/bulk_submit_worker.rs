@@ -1688,6 +1688,11 @@ where
             );
             return Ok(());
         }
+        // Every output file has been consumed to its end. The counters keep
+        // outranking the phase at the status endpoint, so this is rendered as
+        // a suffix on the progress line rather than in place of it (#1218).
+        self.report_phase(&lease, ManifestPhase::Downloaded, file_count, file_count)
+            .await;
         let mut failed = failed_at.load(Ordering::Relaxed);
         // Carried to the receipt step so the summary OperationOutcome can
         // discount the failures that already have an artifact of their own.
@@ -4204,10 +4209,13 @@ mod tests {
             assert_eq!(*total, 3);
         }
 
-        // The phase outlives the run; the status endpoint is what keeps a
-        // stale one harmless, by letting the byte/entry counters outrank it.
+        // Once the fan-out drains, the phase flips to `downloaded` with the
+        // counter pinned at the total (#1218). It outlives the run; the status
+        // endpoint keeps a stale one harmless by letting the byte/entry
+        // counters outrank it.
         let manifests = backend.list_manifests(&tenant, &sub_id).await.unwrap();
-        assert_eq!(manifests[0].phase, Some(ManifestPhase::Downloading));
+        assert_eq!(manifests[0].phase, Some(ManifestPhase::Downloaded));
+        assert_eq!(manifests[0].files_done, 3);
         assert_eq!(manifests[0].files_total, 3);
     }
 

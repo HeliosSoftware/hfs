@@ -9748,6 +9748,100 @@ mod postgres_integration {
         assert_eq!(error_count["valueInteger"], json!(1));
     }
 
+    /// The batched full-text phase of a reindex page deletes the stale row of a
+    /// resource whose content became empty (`index_fts_content_batch`, whose
+    /// error mapping #1230 restored). If that delete fails, the page must not
+    /// skip it — the stale row would keep matching `_text` and `_content` — but
+    /// fail and be replayed per resource. The trigger rejects only the first
+    /// delete of the row and counts attempts in a sequence (sequences survive a
+    /// rollback): the page must still end `Ok` with the row gone, after exactly
+    /// one rejected batched attempt and one successful per-resource delete.
+    #[tokio::test]
+    async fn postgres_integration_reindex_page_replays_a_failed_empty_fts_delete() {
+        use helios_persistence::search::ReindexTarget;
+        use helios_persistence::types::StoredResource;
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("reindex-page-empty-fts-delete-failure");
+        let tenant_id = tenant.tenant_id().as_str();
+        let emptied = StoredResource::new(
+            "Patient",
+            "emptied",
+            tenant.tenant_id().clone(),
+            json!({}),
+            FhirVersion::default(),
+        );
+
+        let client = reindex_test_client().await;
+        client
+            .execute(
+                "INSERT INTO resource_fts
+                 (tenant_id, resource_type, resource_id, narrative_tsvector, content_tsvector)
+                 VALUES ($1, 'Patient', 'emptied', to_tsvector('english', 'stale'), to_tsvector('english', 'stale'))",
+                &[&tenant_id],
+            )
+            .await
+            .unwrap();
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let attempts = format!("fts_delete_attempts_{suffix}");
+        let function_name = format!("reject_first_fts_delete_{suffix}");
+        let trigger_name = format!("reject_first_fts_delete_{suffix}");
+        client
+            .batch_execute(&format!(
+                "CREATE SEQUENCE {attempts};
+                 CREATE FUNCTION {function_name}() RETURNS trigger LANGUAGE plpgsql AS $$
+                 BEGIN
+                   IF OLD.tenant_id = '{tenant_id}' AND nextval('{attempts}') = 1 THEN
+                     RAISE EXCEPTION 'injected resource_fts delete failure';
+                   END IF;
+                   RETURN OLD;
+                 END $$;
+                 CREATE TRIGGER {trigger_name} BEFORE DELETE ON resource_fts
+                 FOR EACH ROW EXECUTE FUNCTION {function_name}();"
+            ))
+            .await
+            .unwrap();
+
+        let outcomes = backend
+            .write_search_entries_page(&tenant, std::slice::from_ref(&emptied))
+            .await;
+
+        let attempted: i64 = client
+            .query_one(&format!("SELECT last_value FROM {attempts}"), &[])
+            .await
+            .unwrap()
+            .get(0);
+        client
+            .batch_execute(&format!(
+                "DROP TRIGGER {trigger_name} ON resource_fts;
+                 DROP FUNCTION {function_name}();
+                 DROP SEQUENCE {attempts};"
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(outcomes.len(), 1);
+        assert!(
+            outcomes[0].is_ok(),
+            "the per-resource replay must recover the page: {:?}",
+            outcomes[0]
+        );
+        assert_eq!(
+            attempted, 2,
+            "one rejected batched delete, then one successful per-resource delete"
+        );
+        let remaining: i64 = client
+            .query_one(
+                "SELECT COUNT(*) FROM resource_fts
+                 WHERE tenant_id = $1 AND resource_type = 'Patient' AND resource_id = 'emptied'",
+                &[&tenant_id],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(remaining, 0, "the replay must delete the stale row");
+    }
+
     /// A page whose middle resource fails search-parameter extraction still
     /// reports the failure in its original slot, and the page commits the rest.
     ///

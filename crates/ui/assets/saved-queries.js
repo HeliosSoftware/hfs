@@ -2748,13 +2748,47 @@
     }
   }
 
-  function showResultsError(path) {
+  function isSameOrigin(path) {
+    try {
+      return (
+        new URL(path, window.location.href).origin === window.location.origin
+      );
+    } catch (e) {
+      return false;
+    }
+  }
+
+  /* Pulls a human message out of a FHIR OperationOutcome, so an error
+   * *response* (e.g. a 501 "search is not implemented" from a search-less
+   * backend, #1227) shows the server's own diagnostic instead of the generic
+   * "check HFS_BASE_URL" hint, which is only right for a failed connection. */
+  function outcomeMessage(body) {
+    try {
+      if (body && body.resourceType === "OperationOutcome" && body.issue) {
+        var issue = body.issue[0];
+        if (issue) {
+          return (
+            issue.diagnostics ||
+            (issue.details && issue.details.text) ||
+            null
+          );
+        }
+      }
+    } catch (e) {
+      /* fall through to the generic message */
+    }
+    return null;
+  }
+
+  function showResultsError(path, message) {
     if (results.card) results.card.hidden = false;
     if (results.error) {
-      results.error.textContent = results.card.dataset.msgFetchError.replace(
-        "{origin}",
-        failedOrigin(path),
-      );
+      results.error.textContent =
+        message ||
+        results.card.dataset.msgFetchError.replace(
+          "{origin}",
+          failedOrigin(path),
+        );
       results.error.hidden = false;
     }
     document.dispatchEvent(
@@ -2809,7 +2843,22 @@
         credentials: "same-origin",
       })
         .then(function (response) {
-          if (!response.ok) return null;
+          if (!response.ok) {
+            // Same-origin error responses carry our own OperationOutcome,
+            // whose diagnostic beats the generic connection hint (#1227). A
+            // cross-origin pagination target is never read back — its body
+            // could leak an upstream response — so it keeps the generic
+            // message.
+            if (!isSameOrigin(path)) return { __resultsError: null };
+            return response.json().then(
+              function (body) {
+                return { __resultsError: outcomeMessage(body) };
+              },
+              function () {
+                return { __resultsError: null };
+              },
+            );
+          }
           return response.json().catch(function () {
             return null;
           });
@@ -2817,6 +2866,10 @@
         .then(function (body) {
           if (ticket !== searchTicket) return;
           setResultsBusy(false);
+          if (body && body.__resultsError !== undefined) {
+            showResultsError(path, body.__resultsError);
+            return;
+          }
           if (!renderResults(path, body, requestedContext))
             showResultsError(path);
         })

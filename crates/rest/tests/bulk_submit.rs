@@ -2202,6 +2202,53 @@ async fn test_poll_reports_the_downloading_phase_with_file_counts() {
     );
 }
 
+/// #1218: once every output file has been pulled, the poll says so — and
+/// keeps saying so beside the counters, which otherwise outrank every phase.
+/// That is what tells "still downloading" apart from the manifest's wind-down.
+#[tokio::test]
+async fn test_poll_reports_all_files_downloaded_beside_the_counters() {
+    let (server, backend, _fetcher, _output, _tmp) =
+        create_submit_server_with(mock_fetcher(), BulkSubmitConfig::default()).await;
+    let poll_path = start_and_get_poll_path(&server).await;
+
+    let lease = backend
+        .claim_next_manifest(&WorkerId::new("downloaded-worker"), Duration::from_secs(60))
+        .await
+        .expect("claim")
+        .expect("a manifest to claim");
+    backend
+        .update_manifest_bytes(&lease, 350, 1_000)
+        .await
+        .expect("bytes update");
+    backend
+        .add_manifest_progress(&lease, 1_234, 0, 1_234)
+        .await
+        .expect("progress update");
+
+    // Files still being pulled: the counters alone speak.
+    backend
+        .update_manifest_phase(&lease, ManifestPhase::Downloading, 24, 24)
+        .await
+        .expect("phase update");
+    let progress = poll_progress(&server, &poll_path).await;
+    assert_eq!(progress, "Processing 35% - 1,234 Resources written");
+
+    // Fan-out drained: the counters keep the lead, the completion trails.
+    backend
+        .update_manifest_phase(&lease, ManifestPhase::Downloaded, 24, 24)
+        .await
+        .expect("phase update");
+    let progress = poll_progress(&server, &poll_path).await;
+    assert_eq!(
+        progress, "Processing 35% - 1,234 Resources written - Downloaded 24 of 24 files",
+        "the poller must be told every file is in, got: {progress}"
+    );
+    assert!(
+        progress.is_ascii(),
+        "X-Progress is a header value: {progress}"
+    );
+}
+
 /// A phase whose denominator is not known yet must not print "of 0": it falls
 /// back to the plain percentage instead.
 #[tokio::test]

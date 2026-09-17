@@ -248,6 +248,43 @@ async fn the_list_page_renders_and_offers_creation() {
     // from the manifest URL.
     assert!(!html.contains(r#"name="submission_id""#));
     assert!(!html.contains(r#"name="fhir_base_url""#));
+    assert_auth_fieldset(&html);
+}
+
+/// The shared Authentication fieldset (#761, #1108): the legend sits
+/// directly above the radios — no legend-level hint — each radio is a
+/// `field--choice` whose hint indents under its label text, and the
+/// credential fields, JWKS pointer, and Test authentication button follow
+/// in order.
+fn assert_auth_fieldset(html: &str) {
+    assert!(!html.contains("How to authenticate to the recipient server."));
+    let legend = html.find("<legend").expect("auth legend");
+    let none = html[legend..]
+        .find(r#"<label class="field field--choice">"#)
+        .map(|i| legend + i)
+        .expect("None radio");
+    assert!(
+        !html[legend..none].contains("field__hint"),
+        "no hint between the legend and the first radio"
+    );
+    let order = [
+        r#"value="none""#,
+        r#"<span class="field__choice-label">None</span>"#,
+        "No authorization header will be sent.",
+        r#"value="backend-services""#,
+        r#"name="client_id""#,
+        r#"name="token_url""#,
+        "/.well-known/bulk-submit-jwks.json",
+        r#"formaction="/ui/bulk-import/test-auth""#,
+    ];
+    let mut cursor = legend;
+    for needle in order {
+        let at = html[cursor..]
+            .find(needle)
+            .unwrap_or_else(|| panic!("{needle} after offset {cursor}"));
+        cursor += at;
+    }
+    assert_eq!(html.matches(r#"class="field field--choice""#).count(), 2);
 }
 
 #[tokio::test]
@@ -345,6 +382,7 @@ async fn the_detail_page_uses_the_shared_full_width_components() {
     assert!(html.contains(r#"<span>Created</span><code>"#));
     assert!(html.contains(r#"<span>Status</span><div id="submission-status">"#));
     assert!(html.contains(r#"<span>Authentication</span><div>"#));
+    assert_auth_fieldset(&html);
 
     let assert_back_link =
         |localized_html: &str, label: &str| {
