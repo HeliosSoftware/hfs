@@ -7,6 +7,7 @@
       "valueCode": "oo"
     }
   ],
+  "url": "http://hl7.org/fhir/DeviceDefinition/example-prodspec",
   "identifier": [
     {
       "value": "789123"
@@ -14,6 +15,7 @@
   ],
   "status": "active",
   "experimental": true,
+  "publisher": "HL7 International / Orders and Observations",
   "contact": [
     {
       "telecom": [
@@ -23,7 +25,5 @@
         }
       ]
     }
-  ],
-  "url": "http://hl7.org/fhir/DeviceDefinition/example-prodspec",
-  "publisher": "HL7 International / Orders and Observations"
+  ]
 }

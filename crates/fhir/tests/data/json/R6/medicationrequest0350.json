@@ -49,10 +49,16 @@
     },
     {
       "concept": {
+        "text": "Alternative therapy due to penicillin allergy"
+      }
+    },
+    {
+      "concept": {
         "coding": [
           {
             "system": "http://snomed.info/sct",
-            "code": "724053002"
+            "code": "724053002",
+            "display": "Antibiotic therapy for prevention of recurrent infection (procedure)"
           }
         ]
       }

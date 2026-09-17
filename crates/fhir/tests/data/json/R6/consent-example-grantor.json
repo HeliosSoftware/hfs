@@ -32,12 +32,12 @@
       "display": "Simone Heps"
     }
   ],
-  "controller": [
+  "manager": [
     {
       "reference": "Organization/f203"
     }
   ],
-  "manager": [
+  "controller": [
     {
       "reference": "Organization/f203"
     }

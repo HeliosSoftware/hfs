@@ -564,15 +564,18 @@
   <extension url="http://hl7.org/fhir/StructureDefinition/structuredefinition-standards-status">
     <valueCode value="normative"/>
   </extension>
+  <extension url="http://hl7.org/fhir/StructureDefinition/structuredefinition-normative-version">
+    <valueCode value="6.0.0-snapshot1"/>
+  </extension>
   <extension url="http://hl7.org/fhir/StructureDefinition/structuredefinition-wg">
     <valueCode value="fhir"/>
   </extension>
   <url value="http://hl7.org/fhir/StructureDefinition/Timing"/>
-  <version value="6.0.0-ballot4"/>
+  <version value="6.0.0-snapshot1"/>
   <name value="Timing"/>
   <status value="active"/>
   <experimental value="false"/>
-  <date value="2026-07-17T03:44:13+00:00"/>
+  <date value="2026-09-14T16:43:45+00:00"/>
   <publisher value="HL7 International / FHIR Infrastructure"/>
   <contact>
     <telecom>
@@ -595,7 +598,7 @@
     </coding>
   </jurisdiction>
   <purpose value="Need to able to track proposed timing schedules. There are several different ways to do this: one or more specified times, a simple rules like three times a day, or  before/after meals."/>
-  <fhirVersion value="6.0.0-ballot4"/>
+  <fhirVersion value="6.0.0-snapshot1"/>
   <mapping>
     <identity value="v2"/>
     <uri value="http://hl7.org/v2"/>
@@ -1141,7 +1144,7 @@
         </extension>
         <strength value="required"/>
         <description value="A unit of time (units from UCUM)."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/units-of-time|6.0.0-ballot4"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/units-of-time|6.0.0-snapshot1"/>
       </binding>
       <mapping>
         <identity value="rim"/>
@@ -1298,7 +1301,7 @@
         </extension>
         <strength value="required"/>
         <description value="A unit of time (units from UCUM)."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/units-of-time|6.0.0-ballot4"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/units-of-time|6.0.0-snapshot1"/>
       </binding>
       <mapping>
         <identity value="rim"/>
@@ -1394,7 +1397,7 @@
           <valueString value="DayOfWeek"/>
         </extension>
         <strength value="required"/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/days-of-week|6.0.0-ballot4"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/days-of-week|6.0.0-snapshot1"/>
       </binding>
       <mapping>
         <identity value="rim"/>
@@ -1467,7 +1470,7 @@
         </extension>
         <strength value="required"/>
         <description value="Real-world event relating to the schedule."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/event-timing|6.0.0-ballot4"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/event-timing|6.0.0-snapshot1"/>
       </binding>
       <mapping>
         <identity value="rim"/>
@@ -1783,7 +1786,7 @@
         </extension>
         <strength value="required"/>
         <description value="A unit of time (units from UCUM)."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/units-of-time|6.0.0-ballot4"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/units-of-time|6.0.0-snapshot1"/>
       </binding>
       <mapping>
         <identity value="rim"/>
@@ -1875,7 +1878,7 @@
         </extension>
         <strength value="required"/>
         <description value="A unit of time (units from UCUM)."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/units-of-time|6.0.0-ballot4"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/units-of-time|6.0.0-snapshot1"/>
       </binding>
       <mapping>
         <identity value="rim"/>
@@ -1932,7 +1935,7 @@
           <valueString value="DayOfWeek"/>
         </extension>
         <strength value="required"/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/days-of-week|6.0.0-ballot4"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/days-of-week|6.0.0-snapshot1"/>
       </binding>
       <mapping>
         <identity value="rim"/>
@@ -1979,7 +1982,7 @@
         </extension>
         <strength value="required"/>
         <description value="Real-world event relating to the schedule."/>
-        <valueSet value="http://hl7.org/fhir/ValueSet/event-timing|6.0.0-ballot4"/>
+        <valueSet value="http://hl7.org/fhir/ValueSet/event-timing|6.0.0-snapshot1"/>
       </binding>
       <mapping>
         <identity value="rim"/>

@@ -37,6 +37,9 @@
       <code value="stat"/>
     </coding>
   </priority>
+  <request>
+    <reference value="http://pharmacy.org/MedicationRequest/AB1234G"/>
+  </request>
   <originalPrescription>
     <reference value="http://pharmacy.org/MedicationRequest/AB1202B"/>
   </originalPrescription>

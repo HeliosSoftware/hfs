@@ -2,7 +2,7 @@
   "resourceType": "CodeSystem",
   "id": "capability-statement-kind",
   "meta": {
-    "lastUpdated": "2026-07-17T14:44:13.245+11:00"
+    "lastUpdated": "2026-09-15T03:43:45.341+11:00"
   },
   "text": {
     "status": "extensions",
@@ -34,7 +34,7 @@
       "value": "urn:oid:2.16.840.1.113883.4.642.1.189"
     }
   ],
-  "version": "6.0.0-ballot4",
+  "version": "6.0.0-snapshot1",
   "name": "CapabilityStatementKind",
   "title": "Capability Statement Kind",
   "status": "active",

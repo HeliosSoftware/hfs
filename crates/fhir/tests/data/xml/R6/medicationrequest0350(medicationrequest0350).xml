@@ -49,12 +49,19 @@
       <display value="Allergy to penicillins (e.g., amoxicillin)"/>
     </reference>
   </reason>
+  <!-- Reason #2: Alternative therapy (because of that allergy) -->
+  <reason>
+    <concept>
+      <text value="Alternative therapy due to penicillin allergy"/>
+    </concept>
+  </reason>
   <!-- Reason #3: Actual indication (infection prevention / prophylaxis) -->
   <reason>
     <concept>
       <coding>
         <system value="http://snomed.info/sct"/>
         <code value="724053002"/>
+        <display value="Antibiotic therapy for prevention of recurrent infection (procedure)"/>
       </coding>
     </concept>
   </reason>

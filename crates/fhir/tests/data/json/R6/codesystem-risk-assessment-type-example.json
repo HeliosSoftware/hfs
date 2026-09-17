@@ -2,7 +2,7 @@
   "resourceType": "CodeSystem",
   "id": "risk-assessment-type-example",
   "meta": {
-    "lastUpdated": "2026-07-17T14:44:13.245+11:00"
+    "lastUpdated": "2026-09-15T03:43:45.341+11:00"
   },
   "text": {
     "status": "generated",
@@ -23,7 +23,7 @@
     }
   ],
   "url": "http://hl7.org/fhir/risk-assessment-type-example",
-  "version": "6.0.0-ballot4",
+  "version": "6.0.0-snapshot1",
   "name": "RiskAssessmentTypeExample",
   "title": "Risk Assessment Type Example",
   "status": "active",

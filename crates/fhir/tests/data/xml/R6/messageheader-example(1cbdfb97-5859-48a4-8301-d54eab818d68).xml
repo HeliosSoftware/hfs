@@ -25,6 +25,10 @@
       <reference value="http://acme.com/ehr/fhir/Practitioner/2323-33-4"/>
     </receiver>
   </destination>
+  <!-- <timestamp value="2012-01-04T09:10:14Z"/> -->
+  <!-- <author>
+		<reference value="Practitioner/example"/>
+	</author> -->
   <source>
     <endpointUrl value="llp:10.11.12.13:5432"/>
     <name value="Acme Central Patient Registry"/>
