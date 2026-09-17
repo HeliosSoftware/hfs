@@ -1,0 +1,22 @@
+{#
+  The tenant's search-index rebuild line on the Import pages (#1245) — the
+  same sentence Home and Resources show (#1065, #1125).
+
+  A submission turns Completed when ingest finishes, which with indexing
+  deferred is when the rebuild that makes it searchable *starts*. The status
+  card stops polling at that same moment, so this region follows the rebuild
+  by itself: every few seconds while one runs, slower otherwise, so a page
+  opened mid-ingest still learns the rebuild began. A tick whose line did not
+  change is answered `204` (same `digest`) and nothing is swapped.
+
+  `seen` tells the server which state this render shows, so the line is
+  announced when it appears or turns from running to failed, and stays quiet
+  on the refreshes that only move its percentage.
+#}
+<div id="import-rebuild" data-rebuild-digest="{{ rebuild.digest }}"
+     hx-get="/ui/bulk-import/rebuild?digest={{ rebuild.digest }}&amp;seen={{ rebuild.state }}"
+     hx-trigger="every {{ rebuild.secs }}s" hx-swap="outerHTML" hx-sync="this:drop">
+  {% if let Some(line) = rebuild.line %}
+  <p class="notice notice--warn" aria-live="{{ line.aria_live }}" data-rebuild-notice data-rebuild-state="{{ rebuild.state }}">{{ line.text }}</p>
+  {% endif %}
+</div>

@@ -17,11 +17,12 @@
 use askama::Template;
 use axum::{
     Extension,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     response::{IntoResponse, Redirect, Response},
 };
 use chrono::{SecondsFormat, Utc};
+use helios_observability::dashboard::{DashboardWindow, ReindexActivity};
 use helios_persistence::error::{BackendError, ConcurrencyError, StorageError};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -417,6 +418,86 @@ fn status_label(i18n: &I18n, status: &str) -> String {
     }
 }
 
+/// `data-rebuild-state` of the region while the tenant has no rebuild line.
+const REBUILD_IDLE: &str = "idle";
+
+/// The tenant's search-index rebuild line as the Import pages show it (#1245):
+/// `partials/bulk_import_rebuild.html`, included by both pages and rendered
+/// alone by [`rebuild_fragment`].
+///
+/// A submission turns Completed when ingest finishes. With indexing deferred
+/// that is the moment the rebuild that makes its resources searchable
+/// *starts*, so "Completed" alone told the operator the import was done while
+/// searches kept missing most of it. The line is the tenant's, not the
+/// submission's: the recipient is this server's own tenant, generations of one
+/// tenant merge, and a rebuild that left resources unindexed concerns every
+/// submission on the page.
+struct RebuildRegion {
+    line: Option<RebuildLine>,
+    /// `running`, `failed`, or [`REBUILD_IDLE`].
+    state: &'static str,
+    /// Seconds to the region's next refresh.
+    secs: u32,
+    /// What a refresh sends back; an unchanged one is answered `204`.
+    digest: String,
+}
+
+struct RebuildLine {
+    text: String,
+    aria_live: &'static str,
+}
+
+impl RebuildRegion {
+    /// The region for `activity`. `seen` is the state the requesting render
+    /// shows (`None` on a page load): the line is announced when it appears
+    /// or changes state, not on the refreshes that only move its percentage.
+    fn new(i18n: &I18n, activity: Option<&ReindexActivity>, seen: Option<&str>) -> Self {
+        use std::hash::{Hash, Hasher};
+
+        let state = activity.map_or(REBUILD_IDLE, crate::rebuild_state);
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        activity.hash(&mut hasher);
+        i18n.lang().hash(&mut hasher);
+        Self {
+            line: activity.map(|activity| RebuildLine {
+                text: crate::rebuild_text(i18n, activity),
+                aria_live: if seen == Some(state) { "off" } else { "polite" },
+            }),
+            state,
+            // Only a running rebuild moves; a failed one is a settled fact.
+            secs: crate::dashboard_refresh()
+                .secs(activity.is_some_and(ReindexActivity::is_running)),
+            digest: format!("{:016x}", hasher.finish()),
+        }
+    }
+
+    /// The region for the request's tenant. Reads the same cached,
+    /// counter-backed snapshot Resources does, so following it adds no
+    /// storage load.
+    async fn read(i18n: &I18n, rt: &RequestTenant, seen: Option<&str>) -> Self {
+        let snapshot = helios_observability::dashboard::snapshot(
+            DashboardWindow::default(),
+            &rt.id,
+            &[],
+            false,
+        )
+        .await;
+        Self::new(
+            i18n,
+            snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.reindex_active.as_ref()),
+            seen,
+        )
+    }
+}
+
+#[derive(Template)]
+#[template(path = "partials/bulk_import_rebuild.html")]
+struct RebuildFragment {
+    rebuild: RebuildRegion,
+}
+
 #[derive(Template)]
 #[template(path = "pages/bulk-import.html")]
 struct BulkImportPage {
@@ -424,6 +505,7 @@ struct BulkImportPage {
     i18n: I18n,
     active_page: &'static str,
     available: bool,
+    rebuild: RebuildRegion,
     rows: Vec<SubmissionRow>,
     error: Option<String>,
 }
@@ -445,6 +527,7 @@ struct BulkImportDetailPage {
     /// empty renders the bare out-of-band host the status card swaps into.
     /// Distinct from `error`, which is the edit dialog's one-shot failure.
     status_error: String,
+    rebuild: RebuildRegion,
     auth: String,
     client_id: String,
     token_url: String,
@@ -500,6 +583,7 @@ pub async fn page(
 
     render(BulkImportPage {
         status,
+        rebuild: RebuildRegion::read(&i18n, &rt, None).await,
         i18n,
         active_page: "bulk-import",
         available,
@@ -604,12 +688,40 @@ pub async fn detail(
         return Redirect::to("/ui/bulk-import").into_response();
     };
 
-    render_detail_page(i18n, status, id, s, None, false)
+    let rebuild = RebuildRegion::read(&i18n, &rt, None).await;
+    render_detail_page(i18n, status, rebuild, id, s, None, false)
+}
+
+#[derive(Deserialize)]
+pub struct RebuildQuery {
+    /// The [`RebuildRegion::digest`] the requesting region shows.
+    #[serde(default)]
+    digest: String,
+    /// The `data-rebuild-state` the requesting region shows.
+    #[serde(default)]
+    seen: String,
+}
+
+/// `GET /ui/bulk-import/rebuild` — the rebuild region's own refresh (#1245).
+/// `204` while the line it would render is the one the page already shows.
+pub async fn rebuild_fragment(
+    locale: RequestLocale,
+    rt: RequestTenant,
+    _principal: Option<Extension<helios_auth::Principal>>,
+    Query(query): Query<RebuildQuery>,
+) -> Response {
+    let i18n = I18n::new(locale);
+    let rebuild = RebuildRegion::read(&i18n, &rt, Some(&query.seen)).await;
+    if rebuild.digest == query.digest {
+        return StatusCode::NO_CONTENT.into_response();
+    }
+    render(RebuildFragment { rebuild })
 }
 
 fn render_detail_page(
     i18n: I18n,
     status: crate::Status,
+    rebuild: RebuildRegion,
     id: String,
     s: Submission,
     error: Option<String>,
@@ -652,6 +764,7 @@ fn render_detail_page(
         created_at: s.created_at,
         status_label: label,
         status_error,
+        rebuild,
         auth: s.auth.clone(),
         client_id: s.client_id,
         token_url: s.token_url,
@@ -724,9 +837,11 @@ pub async fn edit(
         Ok(_) => Redirect::to(&format!("/ui/bulk-import/{id}")).into_response(),
         Err(e) => {
             let i18n = I18n::new(locale);
+            let rebuild = RebuildRegion::read(&i18n, &rt, None).await;
             let mut response = render_detail_page(
                 i18n,
                 current_status(&state, rv.0, &rt),
+                rebuild,
                 id,
                 s,
                 Some(e.to_string()),
