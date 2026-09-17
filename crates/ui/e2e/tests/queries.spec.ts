@@ -313,6 +313,38 @@ test.describe("query builder", () => {
     expect(fetchInputs.filter((input) => input === paginationUrlWithTotal)).toHaveLength(4);
   });
 
+  // #1227: a same-origin error *response* (e.g. a search-less backend answering
+  // 501) surfaces the server's own OperationOutcome diagnostic, not the generic
+  // "check HFS_BASE_URL" hint, which is only right for a failed connection.
+  test("a same-origin error response shows its OperationOutcome, not the base-url hint", async ({
+    queries,
+  }) => {
+    const initialPath = "/Patient?_count=1&_sort=_id";
+    await queries.page.route("**/Patient?*", async (route) => {
+      await route.fulfill({
+        status: 501,
+        contentType: "application/fhir+json",
+        body: JSON.stringify({
+          resourceType: "OperationOutcome",
+          issue: [
+            {
+              severity: "error",
+              code: "not-supported",
+              diagnostics:
+                "Feature 'search' is not implemented on this backend",
+            },
+          ],
+        }),
+      });
+    });
+
+    await queries.goto();
+    await queries.builder.run(initialPath);
+    await expect(queries.results.error).toBeVisible();
+    await expect(queries.results.error).toContainText("is not implemented");
+    await expect(queries.results.error).not.toContainText("HFS_BASE_URL");
+  });
+
   // #1106: row-navigation.js delegates the click from `document`, so a click
   // anywhere in the row opens the resource, same as clicking the id link.
   test("clicking a non-id cell opens the resource in a new tab", async ({
