@@ -1944,7 +1944,7 @@ async fn test_poll_reports_a_stalled_ingestion() {
         .unwrap()
         .to_string();
     assert!(
-        progress.contains("stalled"),
+        progress.contains("Stalled"),
         "a dead worker pool must be visible to the poller, got: {progress}"
     );
 }
@@ -2032,7 +2032,7 @@ async fn test_poll_reports_the_manifest_read_phase() {
 
     let progress = poll_progress(&server, &poll_path).await;
     assert_eq!(
-        progress, "reading manifest",
+        progress, "Reading manifest",
         "the manifest fetch must be visible to the poller, got: {progress}"
     );
     assert!(
@@ -2061,7 +2061,7 @@ async fn test_poll_reports_the_sizing_phase_with_file_counts() {
 
     let progress = poll_progress(&server, &poll_path).await;
     assert_eq!(
-        progress, "sizing 37 of 412 files",
+        progress, "Sizing 37 of 412 files",
         "pre-sizing must report its file counts, got: {progress}"
     );
     assert!(
@@ -2090,7 +2090,7 @@ async fn test_poll_reports_the_downloading_phase_with_file_counts() {
 
     let progress = poll_progress(&server, &poll_path).await;
     assert_eq!(
-        progress, "downloading file 1 of 412",
+        progress, "Downloading file 1 of 412",
         "the file being fetched must be visible to the poller, got: {progress}"
     );
     assert!(
