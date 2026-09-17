@@ -10855,9 +10855,15 @@ mod bulk_submit {
             "a completed submission must free its slot"
         );
 
-        // A zero TTL makes every submission expired; a long one, none.
+        // A zero TTL expires every submission older than the scan instant; a
+        // long one, none. `updated_at` is stored at millisecond precision and
+        // the scan selects strictly older rows, so scanning at `Utc::now()` in
+        // the same millisecond as the completion write would (correctly) miss
+        // it. That only stopped hiding once #1194 removed the summary re-read
+        // from `complete_submission`; scan from a second later instead.
+        let after_write = chrono::Utc::now() + chrono::Duration::seconds(1);
         let expired = backend
-            .list_expired_submissions(chrono::Utc::now(), Duration::from_secs(0), 10)
+            .list_expired_submissions(after_write, Duration::from_secs(0), 10)
             .await
             .unwrap();
         assert!(expired.iter().any(|(_, sub)| sub == &id));
