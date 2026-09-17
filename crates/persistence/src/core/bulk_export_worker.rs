@@ -731,10 +731,9 @@ where
                 Ok(())
             }
             Err(LeaseError::Storage(e)) => {
-                // Best-effort: mark the job failed (also fenced).
                 tracing::error!(job_id = %lease.job_id, error = %e, "export job failed");
                 let public = public_failure_message(&e);
-                let _ = self
+                let marked = self
                     .jobs
                     .fail_export_job(
                         &lease.tenant,
@@ -744,6 +743,15 @@ where
                         &public,
                     )
                     .await;
+                if let Err(LeaseError::LeaseLost { .. }) = marked {
+                    // The job moved on while this run was failing — reclaimed
+                    // by another worker, or retired by the attempt cap. Whoever
+                    // owns it now records its outcome; auditing a failure here
+                    // would put two terminal events on one job, which is the
+                    // double-count every other lost-lease path avoids.
+                    warn_lease_lost(&lease, "recording a failed run");
+                    return Ok(());
+                }
                 self.emit_audit(
                     &lease.job_id,
                     view.as_ref(),
