@@ -714,6 +714,44 @@ impl ExportClaimStrategy for SqliteBackend {
                 .unwrap_or_else(|_| chrono::Duration::seconds(60));
         let lease_expiry_str = lease_expiry.to_rfc3339();
 
+        // Lock-free eligibility probe, in autocommit. The claim itself needs an
+        // IMMEDIATE transaction, which takes SQLite's single write lock the
+        // moment it begins — so without this the *idle* poll queued behind
+        // every long writer too. Against a search-index rebuild (a ~500ms lock
+        // with a 5ms gap) a claim poll waited ~10s on average and sometimes
+        // blew past `busy_timeout`, parking a worker thread and logging an
+        // error for an empty queue. In WAL mode a reader never blocks, so an
+        // empty queue now costs one uncontended SELECT (#1185 is the same
+        // pathology on the kick-off insert).
+        //
+        // The race with the transaction below is benign and needs no handling:
+        // a job that appears right after the probe is claimed by the next poll
+        // (2s later), exactly as before this transaction existed; a job that
+        // disappears leaves the scan's own SELECT empty, which is the
+        // already-existing `break None` path. The in-transaction SELECT stays
+        // authoritative, so bump-and-wipe atomicity is untouched.
+        let eligible = match conn.query_row(
+            "SELECT 1 FROM bulk_export_jobs
+             WHERE status = 'accepted'
+                OR (status = 'in-progress' AND (lease_expiry IS NULL OR lease_expiry < ?1))
+             LIMIT 1",
+            params![now_str],
+            |_| Ok(()),
+        ) {
+            Ok(()) => true,
+            Err(rusqlite::Error::QueryReturnedNoRows) => false,
+            // Never `.ok()` here: a busy database is not an empty queue (#1185).
+            Err(e) => {
+                return Err(StorageError::Backend(classify_sqlite_error(
+                    "Failed to probe for an eligible export job",
+                    e,
+                )));
+            }
+        };
+        if !eligible {
+            return Ok(None);
+        }
+
         // The whole scan runs inside one IMMEDIATE transaction. The token bump
         // and the wipe of a re-claimed job's half-written state have to land
         // together: a reader that saw the new token but the old progress rows
@@ -3609,6 +3647,55 @@ mod tests {
             }
             other => panic!("a busy database must stay retryable, got {other:?}"),
         }
+    }
+
+    /// An idle poll must not queue behind a long writer. `claim_next` scans
+    /// inside an IMMEDIATE transaction, which grabs SQLite's write lock as it
+    /// begins, so a search-index rebuild used to park every empty poll for
+    /// seconds — and past `busy_timeout` it came back `Unavailable`, which the
+    /// worker loop logs as an error and backs off 5s from. The lock-free
+    /// eligibility probe answers an empty queue as a WAL read, which no writer
+    /// blocks.
+    #[tokio::test]
+    async fn an_idle_claim_does_not_wait_behind_a_writer() {
+        use crate::backends::sqlite::SqliteBackendConfig;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("idle-claim.db");
+        let backend = SqliteBackend::with_config(
+            &db_path,
+            SqliteBackendConfig {
+                max_connections: 2,
+                // The production default: the point is that the poll returns
+                // long before it, not that the timeout is short.
+                busy_timeout_ms: 30_000,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        backend.init_schema().unwrap();
+
+        // Same stand-in for the rebuild as the kick-off test above: what
+        // matters is SQLite's file-level write lock, not a pool slot.
+        let rebuild = rusqlite::Connection::open(&db_path).unwrap();
+        rebuild.execute_batch("BEGIN IMMEDIATE;").unwrap();
+
+        let worker = WorkerId::new("worker-idle");
+        let started = std::time::Instant::now();
+        let claimed = backend
+            .claim_next(&worker, StdDuration::from_secs(60), TEST_MAX_ATTEMPTS)
+            .await;
+        let elapsed = started.elapsed();
+        rebuild.execute_batch("ROLLBACK;").unwrap();
+
+        assert!(
+            matches!(&claimed, Ok(None)),
+            "an empty queue reads as empty even while a writer holds the lock: {claimed:?}"
+        );
+        assert!(
+            elapsed < StdDuration::from_secs(5),
+            "the idle poll waited {elapsed:?} on the write lock"
+        );
     }
 
     /// A row the driver cannot hand over must fail the read, not quietly drop
