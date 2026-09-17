@@ -170,7 +170,9 @@ struct Inspection {
     in_progress: Vec<String>,
     /// Our names that exist with a different key, partial filter, or extra option.
     conflicting: Vec<(String, ListedIndex)>,
-    /// Superseded generation-1 names still present.
+    /// Superseded names still present: generation-1 index names, plus the
+    /// generation-2 `search_index` contained-row index name if it is still
+    /// there.
     superseded_present: Vec<String>,
 }
 
@@ -222,7 +224,17 @@ impl SearchIndexBuilder {
         // Bounded by the number of contained rows, which is small on every
         // deployment, so this never meaningfully delays boot even in
         // `inline` mode.
-        let moved = self.move_contained_rows().await?;
+        // Wrap the move's own errors with a distinguishing prefix: this
+        // whole function's errors are otherwise reported by `run`'s
+        // catch-all as "search_index generation-N build failed: ...", which
+        // would mislabel a move failure as an index-build failure.
+        let moved = self.move_contained_rows().await.map_err(|e| {
+            StorageError::Backend(BackendError::Internal {
+                backend_name: "mongodb".to_string(),
+                message: format!("contained-row move failed: {e}"),
+                source: Some(Box::new(e)),
+            })
+        })?;
         if moved > 0 {
             tracing::info!(
                 moved,
@@ -465,9 +477,10 @@ fn contained_spec_superseded(existing: &[ListedIndex]) -> bool {
 
 /// True when `e` is a driver `InsertMany` error whose every per-document
 /// write error is a duplicate key (11000) — i.e. every row in the batch was
-/// already inserted by an earlier, interrupted attempt at the same page. Any
-/// other shape (a page-level error, or a write error with a different code)
-/// is a real failure the caller must propagate.
+/// already inserted by an earlier, interrupted attempt at the same page — and
+/// no write concern error accompanies it. Any other shape (a page-level
+/// error, a write error with a different code, or a write concern error) is
+/// a real failure the caller must propagate.
 fn is_only_duplicate_keys(e: &mongodb::error::Error) -> bool {
     matches!(
         e.kind.as_ref(),
@@ -476,6 +489,12 @@ fn is_only_duplicate_keys(e: &mongodb::error::Error) -> bool {
                 .write_errors
                 .as_ref()
                 .is_some_and(|errors| errors.iter().all(|e| e.code == 11000))
+                // With `ordered(false)`, a batch can report duplicate-key
+                // write errors for some documents alongside a write concern
+                // error for the ones that did insert; treating that as "all
+                // duplicates" would let the caller delete source rows whose
+                // copies were never majority-acknowledged.
+                && insert_many.write_concern_error.is_none()
     )
 }
 
