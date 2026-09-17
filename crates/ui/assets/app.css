@@ -1649,6 +1649,10 @@ select.field__input {
   accent-color: var(--accent);
 }
 
+.field__choice-label {
+  color: var(--text);
+}
+
 .field--choice > .field__hint {
   grid-column: 2;
   margin-top: 2px;
@@ -3003,6 +3007,12 @@ details.json-fold[open] > summary .icon {
   font-size: 11px;
   color: var(--muted);
   font-variant-numeric: tabular-nums;
+}
+
+/* An estimated rail count ("≈1234"): its title explains the estimate, so
+   the cursor advertises the tooltip. */
+.count--approximate {
+  cursor: help;
 }
 
 /* Appended to <body> and positioned from the focused/hovered truncated-name
