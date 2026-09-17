@@ -283,6 +283,11 @@ pub enum ManifestPhase {
     Sizing,
     /// Ingesting the `output` files (before the first counters flush).
     Downloading,
+    /// Every `output` file has been pulled to its end; what remains is the
+    /// manifest's own wind-down (deleted files, receipts, artifacts, and the
+    /// per-manifest reindex under deferred indexing). Reported so a poller can
+    /// tell "still pulling files" from "all files in" (#1218).
+    Downloaded,
 }
 
 impl std::fmt::Display for ManifestPhase {
@@ -291,6 +296,7 @@ impl std::fmt::Display for ManifestPhase {
             Self::ReadingManifest => write!(f, "reading-manifest"),
             Self::Sizing => write!(f, "sizing"),
             Self::Downloading => write!(f, "downloading"),
+            Self::Downloaded => write!(f, "downloaded"),
         }
     }
 }
@@ -303,6 +309,7 @@ impl std::str::FromStr for ManifestPhase {
             "reading-manifest" | "reading_manifest" => Ok(Self::ReadingManifest),
             "sizing" => Ok(Self::Sizing),
             "downloading" => Ok(Self::Downloading),
+            "downloaded" => Ok(Self::Downloaded),
             _ => Err(format!("unknown manifest phase: {}", s)),
         }
     }

@@ -976,6 +976,30 @@ where
         // the bar out of its indeterminate state. Mixing the two was the
         // regression of #827, so indeterminate phases must stay lexically
         // distinct from that prefix.
+        // The manifest whose phase speaks for the submission: a status header
+        // is a single line, and the manifest a worker is actually inside is
+        // the interesting one. Hence the first non-terminal manifest carrying
+        // a phase.
+        let phase_manifest = manifests
+            .iter()
+            .filter(|m| !m.status.is_terminal())
+            .find(|m| m.phase.is_some());
+        // "All files in" (#1218) is the one phase that stays interesting after
+        // the counters move — it is what separates a long tail of downloads
+        // from the manifest's own wind-down (receipts, artifacts, reindex). It
+        // therefore rides along as a suffix on the counter line instead of
+        // being outranked into silence like the other phases.
+        let downloaded = phase_manifest.and_then(|m| match m.phase {
+            Some(ManifestPhase::Downloaded) if m.files_total > 0 => Some(format!(
+                "Downloaded {} of {} files",
+                m.files_done, m.files_total
+            )),
+            _ => None,
+        });
+        let downloaded_suffix = downloaded
+            .as_deref()
+            .map(|d| format!(" - {d}"))
+            .unwrap_or_default();
         let progress = if stalled {
             tracing::warn!(
                 submission = %sub_id,
@@ -999,11 +1023,11 @@ where
             // the number #969 exists to show was invisible exactly when it had
             // something to say.
             format!(
-                "Processing {pct}% - {} Resources written",
+                "Processing {pct}% - {} Resources written{downloaded_suffix}",
                 group_thousands(entries)
             )
         } else if pct > 0 {
-            format!("Processing {pct}%")
+            format!("Processing {pct}%{downloaded_suffix}")
         } else if !manifests.is_empty()
             && manifests
                 .iter()
@@ -1025,13 +1049,7 @@ where
             }
         } else {
             // A worker holds a manifest but has not produced a countable byte.
-            // The first non-terminal manifest carrying a phase speaks for the
-            // submission: a status header is a single line, and the manifest a
-            // worker is actually inside is the interesting one.
-            manifests
-                .iter()
-                .filter(|m| !m.status.is_terminal())
-                .find(|m| m.phase.is_some())
+            phase_manifest
                 .and_then(|m| match m.phase {
                     Some(ManifestPhase::ReadingManifest) => Some("Reading manifest".to_string()),
                     // `files_total == 0` means the denominator is not known yet
@@ -1045,6 +1063,9 @@ where
                         "Downloading file {} of {}",
                         m.files_done, m.files_total
                     )),
+                    // Every file was empty (or the counters never flushed):
+                    // still worth saying that the downloads are behind us.
+                    Some(ManifestPhase::Downloaded) => downloaded.clone(),
                     _ => None,
                 })
                 .unwrap_or_else(|| format!("Processing {pct}%"))
