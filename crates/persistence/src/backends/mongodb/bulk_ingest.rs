@@ -915,6 +915,8 @@ impl MongoBackend {
         }
 
         let collection = db.collection::<Document>(MongoBackend::SEARCH_INDEX_COLLECTION);
+        let contained_collection =
+            db.collection::<Document>(MongoBackend::SEARCH_INDEX_CONTAINED_COLLECTION);
 
         // Only ids that carried rows before the batch need clearing; a create
         // has nothing to delete, which is the whole of a first import. The
@@ -945,12 +947,25 @@ impl MongoBackend {
                     )
                     .await,
                 )?;
+                // Contained rows key the same way (#1160 Task 4), so the
+                // same filter clears their stale rows too.
+                or_exhausted(
+                    "clear batch contained search index",
+                    retry_transient_with(
+                        &BULK_INGEST_RETRY,
+                        options.cancel.as_ref(),
+                        "clear batch contained search index",
+                        || async { contained_collection.delete_many(filter.clone()).await },
+                    )
+                    .await,
+                )?;
             }
         }
 
         // Ids of every plan the batch wrote, for the replay delete below.
         let mut written_by_type: HashMap<&str, Vec<Bson>> = HashMap::new();
         let mut documents = Vec::new();
+        let mut contained_documents = Vec::new();
         for (plan_idx, plan) in planned.plans.iter().enumerate() {
             if failed.contains_key(&plan_idx) {
                 continue;
@@ -959,14 +974,16 @@ impl MongoBackend {
                 .entry(plan.resource_type.as_str())
                 .or_default()
                 .push(Bson::from(plan.id.as_str()));
-            documents.extend(self.search_index_documents(
+            let docs = self.search_index_documents(
                 tenant_id,
                 &plan.resource_type,
                 &plan.id,
                 &plan.content,
-            ));
+            );
+            documents.extend(docs.own);
+            contained_documents.extend(docs.contained);
         }
-        if documents.is_empty() {
+        if documents.is_empty() && contained_documents.is_empty() {
             return Ok(());
         }
 
@@ -984,22 +1001,35 @@ impl MongoBackend {
                 || {
                     let replay = !std::mem::replace(&mut first, false);
                     let collection = collection.clone();
+                    let contained_collection = contained_collection.clone();
                     let written_by_type = &written_by_type;
                     let documents = &documents;
+                    let contained_documents = &contained_documents;
                     async move {
                         if replay {
+                            // A replay clears the batch's rows in both
+                            // collections before the chunked inserts below
+                            // re-write them (#1160 Task 4) — creates
+                            // included, since their rows may have partially
+                            // landed.
                             for (resource_type, ids) in written_by_type {
-                                collection
-                                    .delete_many(doc! {
-                                        "tenant_id": tenant_id,
-                                        "resource_type": *resource_type,
-                                        "resource_id": { "$in": ids.clone() },
-                                    })
-                                    .await?;
+                                let filter = doc! {
+                                    "tenant_id": tenant_id,
+                                    "resource_type": *resource_type,
+                                    "resource_id": { "$in": ids.clone() },
+                                };
+                                collection.delete_many(filter.clone()).await?;
+                                contained_collection.delete_many(filter).await?;
                             }
                         }
                         for chunk in documents.chunks(INSERT_DOCS_PER_COMMAND) {
                             collection.insert_many(chunk).ordered(false).await?;
+                        }
+                        for chunk in contained_documents.chunks(INSERT_DOCS_PER_COMMAND) {
+                            contained_collection
+                                .insert_many(chunk)
+                                .ordered(false)
+                                .await?;
                         }
                         Ok(())
                     }
