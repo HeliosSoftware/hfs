@@ -6,6 +6,7 @@
 //! handlers stay in sync.
 
 use helios_persistence::core::search::SearchProvider;
+use helios_persistence::error::{BackendError, StorageError};
 use helios_persistence::tenant::TenantContext;
 use helios_persistence::types::{
     SearchParamType, SearchParameter, SearchPrefix, SearchQuery, SearchValue,
@@ -94,14 +95,23 @@ where
         });
     }
 
-    let result =
-        state
-            .storage()
-            .search(tenant, &query)
-            .await
-            .map_err(|e| RestError::InternalError {
+    let result = match state.storage().search(tenant, &query).await {
+        Ok(result) => result,
+        // A backend without a search index (standalone S3) cannot answer
+        // `url=`. That used to surface as a 500 for every SQL View and SQL
+        // Query Library — their `depends-on` entries are canonicals — and for
+        // any `subjectCanonical` (#1228). Such a backend offers a scan of the
+        // type instead; definitions are few, so matching them in process is
+        // cheap.
+        Err(StorageError::Backend(BackendError::UnsupportedCapability { .. })) => {
+            return resolve_by_scan(state, tenant, resource_type, url).await;
+        }
+        Err(e) => {
+            return Err(RestError::InternalError {
                 message: format!("canonical lookup failed for {resource_type} url={url}: {e}"),
-            })?;
+            });
+        }
+    };
 
     // The search already filters by `url=`/`version=`, but a backend could in
     // principle return an approximate match (e.g. tokenized full-text search);
@@ -131,6 +141,56 @@ where
             message: "unreachable: candidates was non-empty".into(),
         })?;
     Ok(chosen.content().clone())
+}
+
+/// Resolves a canonical on a backend that has no search, by scanning the
+/// resource type and applying [`canonical_matches`] in process.
+///
+/// A backend with neither search nor scan cannot resolve canonicals at all;
+/// that is a capability gap and answers `501` with the reason, never a `500`.
+async fn resolve_by_scan<S>(
+    state: &AppState<S>,
+    tenant: &TenantContext,
+    resource_type: &str,
+    url: &str,
+) -> Result<Value, RestError>
+where
+    S: SearchProvider + Send + Sync + 'static,
+{
+    let Some(scan) = state.storage().resource_scan() else {
+        return Err(RestError::NotImplemented {
+            feature: format!(
+                "resolving the canonical reference '{url}': this storage backend has no search \
+                 index, so canonical references cannot be resolved on it; reference the \
+                 {resource_type} by id instead"
+            ),
+        });
+    };
+    let resources = scan
+        .scan_resources(tenant, resource_type)
+        .await
+        .map_err(|e| RestError::InternalError {
+            message: format!("canonical lookup failed for {resource_type} url={url}: {e}"),
+        })?;
+    newest_canonical_match(resources, url).ok_or_else(|| RestError::NotFound {
+        resource_type: resource_type.to_string(),
+        id: url.to_string(),
+    })
+}
+
+/// Picks, among scanned `resources`, the one [`canonical_matches`] selects for
+/// `url` — the most recently updated when several versions match, which is
+/// the rule the search path applies through `last_modified`.
+fn newest_canonical_match(resources: Vec<Value>, url: &str) -> Option<Value> {
+    resources
+        .into_iter()
+        .filter(|resource| canonical_matches(resource, url))
+        .max_by_key(|resource| {
+            resource
+                .pointer("/meta/lastUpdated")
+                .and_then(Value::as_str)
+                .and_then(|stamp| chrono::DateTime::parse_from_rfc3339(stamp).ok())
+        })
 }
 
 /// The one canonical-matching rule shared by storage lookups
@@ -175,8 +235,8 @@ fn split_canonical_version(url: &str) -> (String, Option<String>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{canonical_matches, split_canonical_version};
-    use serde_json::json;
+    use super::{canonical_matches, newest_canonical_match, split_canonical_version};
+    use serde_json::{Value, json};
 
     #[test]
     fn bare_url_has_no_version() {
@@ -212,6 +272,30 @@ mod tests {
         let (u, v) = split_canonical_version("http://example.org/ViewDefinition/x@y|2.0");
         assert_eq!(u, "http://example.org/ViewDefinition/x@y");
         assert_eq!(v.as_deref(), Some("2.0"));
+    }
+
+    /// #1228: on a backend without search the canonical is matched over a scan.
+    /// The pick must follow the search path's rules — a pinned version selects
+    /// that version, an unpinned canonical the most recently updated match.
+    #[test]
+    fn newest_canonical_match_follows_the_search_paths_rules() {
+        let scanned = vec![
+            json!({"resourceType": "ViewDefinition", "id": "other", "url": "http://example.org/other",
+                   "meta": {"lastUpdated": "2026-09-17T12:00:00Z"}}),
+            json!({"resourceType": "ViewDefinition", "id": "old", "url": "http://example.org/vd", "version": "1.0.0",
+                   "meta": {"lastUpdated": "2026-09-01T00:00:00Z"}}),
+            json!({"resourceType": "ViewDefinition", "id": "new", "url": "http://example.org/vd", "version": "2.0.0",
+                   "meta": {"lastUpdated": "2026-09-10T00:00:00Z"}}),
+        ];
+        let pick = |url: &str| {
+            newest_canonical_match(scanned.clone(), url)
+                .and_then(|r| r.get("id").and_then(Value::as_str).map(str::to_string))
+        };
+        assert_eq!(pick("http://example.org/vd").as_deref(), Some("new"));
+        assert_eq!(pick("http://example.org/vd|1.0.0").as_deref(), Some("old"));
+        assert_eq!(pick("http://example.org/vd@2.0.0").as_deref(), Some("new"));
+        assert_eq!(pick("http://example.org/vd|9.9.9"), None);
+        assert_eq!(pick("http://example.org/missing"), None);
     }
 
     #[test]
