@@ -28,7 +28,7 @@ issue and replace the `☐` cells.
 | `sqlite-es` (SQLite + Elasticsearch) | ☐ | ☐ | ☐ | ☐ | ☐ | ☐ | ☐ | ☐ | ☐ | ☐ |
 | `postgres` | ☐ | ☐ | ☐ | ☐ | ☐ | ☐ | ☐ | ☐ | ☐ | ☐ |
 | `pg-es` (PostgreSQL + Elasticsearch) | ☐ | ☐ | ☐ | ☐ | ☐ | ☐ | ☐ | ☐ | ☐ | ☐ |
-| `mongodb` | ☐ | ☐ | ☐ | ☐ | ☐ (4.8, 4.10, 4.11 N/A) | N/A (501) | ☐ | ☐ | ☐ | ☐ |
+| `mongodb` | ☐ | ☐ | ☐ | ☐ | ☐ (4.8, 4.13 N/A) | ☐ | ☐ | ☐ | ☐ | ☐ |
 | `mongo-es` (MongoDB + Elasticsearch) | ☐ | ☐ | ☐ | ☐ | ☐ | N/A (501) | ☐ | ☐ | ☐ | ☐ |
 | `s3` (MinIO) | ☐ | ☐ | ☐ (batch only) | ☐ | N/A (no search) | N/A (501) | ☐ | ☐ | ☐ | ☐ |
 | `s3-es` (MinIO + Elasticsearch) | ☐ | ☐ | ☐ (batch only) | ☐ | ☐ | N/A (501) | ☐ | ☐ | ☐ | ☐ |
@@ -45,9 +45,9 @@ that is a failure.
 |---|---|---|---|---|---|---|---|---|
 | CRUD, history | yes | yes | yes | yes | yes | yes | yes | yes |
 | Search | yes | yes (ES) | yes | yes (ES) | yes | yes (ES) | **no** | yes (ES) |
-| Chained and `_has` search | yes | yes | yes | yes | **no** | yes | no | yes |
-| Transaction Bundles | yes | yes | yes | yes | yes | yes | **no** (batch only) | **no** (batch only) |
-| Bulk Data `$export` (job store) | yes | yes | yes | yes | no (501) | no (501) | no (501) | no (501) |
+| Chained and `_has` search | yes | yes | yes | yes | yes | yes | no | yes |
+| Transaction Bundles | yes | yes | yes | yes | yes (replica set) | yes (replica set) | **no** (batch only) | **no** (batch only) |
+| Bulk Data `$export` (job store) | yes | yes | yes | yes | yes | no (501) | no (501) | no (501) |
 | `$bulk-submit` ingestion (Import page) | yes | yes | yes | yes | yes | yes | yes¹ | yes¹ |
 | `$sql-run` / `$sql-export` runner | in-DB | in-DB (primary) | in-DB | in-DB (primary) | in-DB (aggregation) | in-DB (primary) | in-process scan | in-process scan |
 | Subscriptions engine | yes | yes | yes | yes | yes | yes | yes | yes |
@@ -144,8 +144,10 @@ docker run -d --name hfs-es -p 9200:9200 \
   -e discovery.type=single-node -e xpack.security.enabled=false \
   -e "ES_JAVA_OPTS=-Xms1g -Xmx1g" elasticsearch:8.15.0
 
-# MongoDB 7.0 (mongodb, mongo-es)
-docker run -d --name hfs-mongo -p 27017:27017 mongo:7.0
+# MongoDB 7.0 (mongodb, mongo-es) — a single-node replica set: transaction Bundles
+# need multi-document transactions, which a standalone mongod cannot run (T2 6.3).
+docker run -d --name hfs-mongo -p 27017:27017 mongo:7.0 --replSet rs0 --bind_ip_all
+docker exec hfs-mongo mongosh --quiet --eval 'rs.initiate({_id:"rs0",members:[{_id:0,host:"localhost:27017"}]})'
 
 # MinIO (s3, s3-es, and the S3 output-backend variants of T5/T7)
 docker run -d --name hfs-minio -p 9000:9000 -p 9001:9001 \
@@ -162,6 +164,7 @@ Readiness checks:
 docker exec hfs-pg pg_isready -U helios
 curl -s localhost:9200/_cluster/health | jq .status
 docker exec hfs-mongo mongosh --quiet --eval 'db.runCommand({ping:1}).ok'
+docker exec hfs-mongo mongosh --quiet --eval 'rs.status().ok'    # 1
 curl -sf localhost:9000/minio/health/live && echo minio ok
 ```
 
@@ -210,7 +213,7 @@ document writes `http://localhost:8080`; substitute your own base URL throughout
 | `sqlite-es` | `HFS_STORAGE_BACKEND=sqlite-es HFS_ELASTICSEARCH_NODES=http://localhost:9200` |
 | `postgres` | `HFS_STORAGE_BACKEND=postgres HFS_DATABASE_URL=postgresql://helios:helios@localhost:5432/helios` |
 | `pg-es` | as `postgres` plus `HFS_STORAGE_BACKEND=pg-es HFS_ELASTICSEARCH_NODES=http://localhost:9200` |
-| `mongodb` | `HFS_STORAGE_BACKEND=mongodb HFS_MONGODB_URI=mongodb://localhost:27017 HFS_MONGODB_DATABASE=helios` |
+| `mongodb` | `HFS_STORAGE_BACKEND=mongodb HFS_MONGODB_URI=mongodb://localhost:27017/?replicaSet=rs0&directConnection=true HFS_MONGODB_DATABASE=helios` |
 | `mongo-es` | as `mongodb` plus `HFS_STORAGE_BACKEND=mongo-es HFS_ELASTICSEARCH_NODES=http://localhost:9200` |
 | `s3` | `HFS_STORAGE_BACKEND=s3 HFS_S3_BUCKET=hfs HFS_S3_ENDPOINT=http://localhost:9000 HFS_S3_FORCE_PATH_STYLE=true HFS_S3_REGION=us-east-1 AWS_ACCESS_KEY_ID=hfs-minio AWS_SECRET_ACCESS_KEY=hfs-minio-secret` |
 | `s3-es` | as `s3` plus `HFS_STORAGE_BACKEND=s3-es HFS_ELASTICSEARCH_NODES=http://localhost:9200` |
@@ -231,7 +234,9 @@ open $HFS/ui   # dashboard renders; sidebar shows the backend and FHIR version
 
 Pass criteria: `/health` is 200; CapabilityStatement `fhirVersion` is `4.0.1`;
 the startup log names the expected backend (and Elasticsearch index prefix for
-composites); `/ui` loads with zero resources.
+composites); `/ui` loads; the clinical rail is at 0 while the dashboard reads
+about 1.4k stored resources (the 1,374 SearchParameter and 5 CompartmentDefinition
+resources seeded at startup).
 
 Also check version switching works on a multi-version build: `curl -sf
 "$HFS/metadata?_format=json" -H 'Accept: application/fhir+json; fhirVersion=5.0'
@@ -529,7 +534,7 @@ issues a `PUT` and the ids are known in advance.
 
 | # | Search type | Type into the QUERY box | Expected in the Results card |
 |---|---|---|---|
-| 4.1 | **string** | `GET /Patient?family=Parker433` then `GET /Patient?family:exact=Parker433` then `GET /Patient?family:contains=arker43` then `GET /Patient?name=cari853` | **30 results** for the first two; the `:contains` form ≥ 30; the lower-case `name=cari853` form finds the anchor patient (≥ 8 results — `name` also matches given names, case-insensitively) |
+| 4.1 | **string** | `GET /Patient?family=Parker433` then `GET /Patient?family:exact=Parker433` then `GET /Patient?family:contains=arker43` then `GET /Patient?name=cari853` | **30 results** for the first two; the `:contains` form ≥ 30; the lower-case `name=cari853` form finds the anchor patient (**3 results** — given names match too; `name=Cari853`, `given=Cari853` and `name:exact=Cari853` return the same 3) |
 | 4.2 | **token** | `GET /Patient?gender=female` · `GET /Patient?gender:not=female` · `GET /Patient?identifier=http://hl7.org/fhir/sid/us-ssn\|999-33-3920` · `GET /Observation?code=http://loinc.org\|8302-2` · `GET /Observation?code=8302-2` | **5,814** · **5,891** (the two add up to 11,705) · **1 result** = the anchor patient · > 175,000 results, identical for the `system\|code` and code-only forms |
 | 4.3 | **date** | `GET /Patient?birthdate=ge1980-01-01&birthdate=lt1990-01-01` · `GET /Encounter?patient=PID&date=ge2016` · `GET /Patient?_lastUpdated=ge<today, YYYY-MM-DD>` | **1,268 results** · between 1 and 24 results, every `period.start` in 2016 or later · **11,705** |
 | 4.4 | **number** | `GET /RiskAssessment?probability=gt0.5` · `GET /RiskAssessment?probability=lt0.5` · `GET /RiskAssessment?probability=ap0.8` | **1 result** (`manual-risk`) · **0 results** · **1 result** |
@@ -538,10 +543,10 @@ issues a `PUT` and the ids are known in advance.
 | 4.7 | **uri** | `GET /ValueSet?url=http://example.org/fhir/ValueSet/manual-test` · `GET /ValueSet?url:below=http://example.org/fhir` | **1 result** · ≥ 1 |
 | 4.8 | **composite** | `GET /Observation?code-value-quantity=http://loinc.org\|8302-2$gt150` | > 0; equals the first count in 4.5; every row is a Body Height with value > 150 **N/A on `mongodb`** (composite search is not implemented there; expect a clear 400, not a 500) |
 | 4.9 | **special** (`_id`) | `GET /Patient?_id=PID` · `GET /Patient?_id=PID,<LPID from T2>` | **1** · **2** |
-| 4.10 | **chained** | `GET /Observation?subject.identifier=http://hl7.org/fhir/sid/us-ssn\|999-33-3920` · `GET /Observation?subject:Patient.family=Parker433&_count=5` | **165 results** (same as 4.6) · > 165, every row's `subject.display` ends in Parker433. **N/A on `mongodb`** (forward chains unsupported; expect a clear error, not a 500) |
-| 4.11 | **reverse chained** | `GET /Patient?_has:Observation:patient:code=http://loinc.org\|8302-2&_count=5` | > 0; pick a row, then `GET /Observation?patient=<that id>&code=8302-2` is > 0. **N/A on `mongodb`** |
+| 4.10 | **chained** | `GET /Observation?subject.identifier=http://hl7.org/fhir/sid/us-ssn\|999-33-3920` · `GET /Observation?subject:Patient.family=Parker433&_count=5` | **165 results** (same as 4.6) · > 165, every row's `subject.display` ends in Parker433. |
+| 4.11 | **reverse chained** | `GET /Patient?_has:Observation:patient:code=http://loinc.org\|8302-2&_count=5` | > 0; pick a row, then `GET /Observation?patient=<that id>&code=8302-2` is > 0. |
 | 4.12 | **_revinclude / _sort / paging** | `GET /Patient?_id=PID&_revinclude=Condition:patient` · `GET /Observation?patient=PID&_sort=-date&_count=5` · `GET /Patient?_count=20&_total=accurate` | **1 result · 15 included** · **165 results**, 5 rows, `effective` dates descending (also try the **Sort** dropdown: *Most recent*/*Oldest* re-run with `_sort` swapped) · **11,705 results**, 20 rows, **Next** appears; click it — the total stays 11,705 and **Previous** appears |
-| 4.13 | **_content** (full text) | `GET /Patient?_content=Everett` | ≥ 83 results (83 patients live in Everett); on composites check the log to confirm Elasticsearch served it |
+| 4.13 | **_content** (full text) | `GET /Patient?_content=Everett` | ≥ 83 results (83 patients live in Everett); on composites check the log to confirm Elasticsearch served it. **N/A on `mongodb`** (standalone MongoDB has no full-text search; the server answers 501 `full-text search not available`) |
 | 4.14 | **visual builder + saved query** | On **Saved Queries** (`/ui/queries`, type the URL) click **Patient** in the rail, then **+ Add condition**: parameter `family`, modifier **is**, value `Parker433`; **+ Add condition**: parameter `birthdate`, comparator **ge**, value `2010-01-01`; **+ _count** → key `_sort`, value `birthdate`. | The QUERY box reads `GET /Patient?family=Parker433&birthdate=ge2010-01-01&_sort=birthdate`; **Run** shows the Parker433 children (≥ 1, birth dates ascending). Enter **Name** `Parker kids`, click **Save**; it appears under **Patient** in the saved list; **Run** there re-runs it and its meta shows `1×`; the **Recent** dropdown lists it under **Saved**. |
 
 ### 8.3 Searches over the data loaded by Batch / Transaction (T2)
@@ -553,14 +558,14 @@ shows up twice, while the patient and everything under it exist only once.
 
 | # | Search type | Type into the QUERY box | Expected in the Results card |
 |---|---|---|---|
-| 4.15 | **token / string** on the patient | `GET /Patient?identifier=http://hl7.org/fhir/sid/us-ssn\|999-19-2626` · `GET /Patient?address-city=Millis` · `GET /Patient?family=Larkin917&given=Nicky270&gender=female` | **1 result** = `LPID` (this SSN exists only in the batch archive) · **13 results** (12 corpus + `LPID`) · ≥ 1, `LPID` among them |
+| 4.15 | **token / string** on the patient | `GET /Patient?identifier=http://hl7.org/fhir/sid/us-ssn\|999-19-2626` · `GET /Patient?address-city=Millis` · `GET /Patient?address-city:exact=Millis` · `GET /Patient?family=Larkin917&given=Nicky270&gender=female` | **1 result** = `LPID` (this SSN exists only in the batch archive) · **19 results** (string search is a prefix match: 13 in Millis plus 6 in Millis-Clicquot) · **13 results** (the selective exact form) · ≥ 1, `LPID` among them |
 | 4.16 | **date** (`_lastUpdated`) separates the two import paths | `GET /Patient?_lastUpdated=lt<T3 start>` · `GET /Patient?_lastUpdated=ge<T3 start>` where `<T3 start>` is the instant noted in 7.2 in UTC, e.g. `2026-09-04T14:00:00Z` | **1 result** = `LPID` (created in T2, before the import) · **11,704** |
 | 4.17 | **token + date** on Encounters | `GET /Encounter?patient=LPID&class=EMER` · `GET /Encounter?patient=LPID&class=IMP` · `GET /Encounter?patient=LPID&date=ge2020` · `GET /Encounter?patient=LPID&type=http://snomed.info/sct\|424619006` | **5** · **1** · **38** · **17** (prenatal visits) |
 | 4.18 | **reference + `_include`** through references the transaction resolved | `GET /Encounter?patient=LPID&_include=Encounter:service-provider` · `GET /Encounter?patient=LPID&_include=Encounter:participant` | **49 results · 4 included** (the four batch Organizations) · **49 results · 4 included** (the four batch Practitioners). In the raw Bundle (**Open in New Tab**) every `serviceProvider.reference` is a literal `Organization/<id>` |
-| 4.19 | **chained** through the batch reference data | `GET /Encounter?patient=LPID&service-provider.name=ENCOMPASS` · `GET /Encounter?patient=LPID&participant.identifier=http://hl7.org/fhir/sid/us-npi\|9999989798` | **38** · **38** (38 of the 49 encounters are at ENCOMPASS HEALTH BRAINTREE with Dr. Nickolas58 Schumm995). **N/A on `mongodb`** |
+| 4.19 | **chained** through the batch reference data | `GET /Encounter?patient=LPID&service-provider.name=ENCOMPASS` · `GET /Encounter?patient=LPID&participant.identifier=http://hl7.org/fhir/sid/us-npi\|9999989798` | **38** · **38** (38 of the 49 encounters are at ENCOMPASS HEALTH BRAINTREE with Dr. Nickolas58 Schumm995). |
 | 4.20 | **batch reference data**, duplicated by the corpus | `GET /Organization?name=TIMOTHY DANIELS HOUSE` · `GET /Organization?address-city=HOLLISTON` · `GET /Practitioner?identifier=http://hl7.org/fhir/sid/us-npi\|9999888693` · `GET /Practitioner?family=Torphy630&given=Laine739&gender=female` · `GET /Location?name=A&A HEALTHCARE LLC` | **2 results** each (one created by the T2 batch with a server-assigned id, one imported by T3 with the Synthea id) |
 | 4.21 | **clinical data** under the patient | `GET /Condition?patient=LPID&clinical-status=active` · `GET /Condition?patient=LPID&code=http://snomed.info/sct\|72892002` · `GET /Observation?patient=LPID&code=29463-7&value-quantity=gt60` · `GET /Observation?patient=LPID&code-value-quantity=http://loinc.org\|8302-2$gt160` · `GET /Immunization?patient=LPID&vaccine-code=http://hl7.org/fhir/sid/cvx\|140` · `GET /MedicationRequest?patient=LPID&status=stopped` · `GET /MedicationRequest?patient=LPID&code=http://www.nlm.nih.gov/research/umls/rxnorm\|757594` | **6** · **3** (Normal pregnancy) · **2** (60.2 kg and 64.5 kg) · **3** (all 164.1 cm; **N/A on `mongodb`**, composite) · **3** (seasonal influenza) · **9** · **4** (Jolivette 28 Day Pack) |
-| 4.22 | **`_revinclude` / `_has` / `_sort`** | `GET /Patient?_id=LPID&_revinclude=Immunization:patient` · `GET /Patient?_has:Condition:patient:code=http://snomed.info/sct\|706893006&_count=50` · `GET /Observation?patient=LPID&code=29463-7&_sort=date` | **1 result · 8 included** · `LPID` is among the rows · **4 results** whose values read 55.4, 58.5, 60.2, 64.5 from top to bottom (open each row). **`_has` is N/A on `mongodb`** |
+| 4.22 | **`_revinclude` / `_has` / `_sort`** | `GET /Patient?_id=LPID&_revinclude=Immunization:patient` · `GET /Patient?_has:Condition:patient:code=http://snomed.info/sct\|706893006&_count=50` · `GET /Observation?patient=LPID&code=29463-7&_sort=date` | **1 result · 8 included** · `LPID` is among the rows · **4 results** whose values read 55.4, 58.5, 60.2, 64.5 from top to bottom (open each row). |
 
 ### 8.4 Searches over the data loaded by the bulk import (T3)
 
@@ -574,8 +579,8 @@ These target the anchor patient (`PID`) and corpus-only reference data, beyond w
 | 4.25 | **references the bulk import left unresolved** | `GET /Encounter?patient=PID&_include=Encounter:service-provider`, then open one row | **24 results** with **no** *included* count. In the JSON, `serviceProvider.reference` is still the string `Organization?identifier=https://github.com/synthetichealth/synthea\|…`: the bulk import stores resources verbatim and does not rewrite conditional references, unlike the transaction in 4.18. Expected — record it, not a failure |
 | 4.26 | **clinical data** under the patient | `GET /Condition?patient=PID&clinical-status=active` · `GET /Condition?patient=PID&code=http://snomed.info/sct\|65363002` · `GET /Immunization?patient=PID` · `GET /MedicationRequest?patient=PID` · `GET /Procedure?patient=PID` | **1** · **2** (Otitis media) · **25** · **7** · **18** |
 | 4.27 | **quantity + `_sort`** (growth chart) | `GET /Observation?patient=PID&code=8302-2&_sort=date&_count=20` · `GET /Observation?patient=PID&code=8302-2&value-quantity=gt120` · `GET /Observation?patient=PID&code=8302-2&value-quantity=gt100\|\|cm` | **15 results**, oldest first; opening the first and last rows shows 72 cm (2016-09-07) and 145.3 cm (2026-01-06) · **4** · **8** |
-| 4.28 | **corpus-only reference data** | `GET /Organization?identifier=https://github.com/synthetichealth/synthea\|e2a8b444-9b8f-36ff-84c4-05ee98589482` · `GET /Organization?name=WHITLEY WELLNESS` · `GET /Location?address-city=Fitchburg` · `GET /Location?name=Fitchburg Outpatient Clinic` | **1** each (WHITLEY WELLNESS LLC, Charlestown, is the anchor's usual provider and is not in the batch archive) |
-| 4.29 | **`_has` / `_revinclude`** across the corpus | `GET /Patient?_has:Condition:patient:code=http://snomed.info/sct\|65363002&_id=PID` · `GET /Patient?_id=PID&_revinclude=Immunization:patient` · `GET /Patient?_id=PID&_revinclude=Encounter:patient&_revinclude=Procedure:patient` | **1** · **1 result · 25 included** · **1 result · 42 included** (24 + 18). **`_has` is N/A on `mongodb`** |
+| 4.28 | **corpus-only reference data** | `GET /Organization?identifier=https://github.com/synthetichealth/synthea\|e2a8b444-9b8f-36ff-84c4-05ee98589482` · `GET /Organization?name=WHITLEY WELLNESS` · `GET /Location?address-city=Fitchburg` · `GET /Location?name=Fitchburg Outpatient Clinic` | **1** each for the first two (WHITLEY WELLNESS LLC, Charlestown, is the anchor's usual provider and is not in the batch archive) · **8** for `address-city=Fitchburg` (the corpus holds eight Locations in Fitchburg) · **1** for `name=Fitchburg Outpatient Clinic`, the selective query |
+| 4.29 | **`_has` / `_revinclude`** across the corpus | `GET /Patient?_has:Condition:patient:code=http://snomed.info/sct\|65363002&_id=PID` · `GET /Patient?_id=PID&_revinclude=Immunization:patient` · `GET /Patient?_id=PID&_revinclude=Encounter:patient&_revinclude=Procedure:patient` | **1** · **1 result · 25 included** · **1 result · 42 included** (24 + 18). |
 
 Pass criteria: every row in 8.2–8.4 produces the expected count or shape; no row
 reports an error except the documented N/A rows on `mongodb`; the **Open in New Tab** URL matches
@@ -610,7 +615,7 @@ files**, *finished in …*, and one download pill per resource type.
 
 | # | Name | Form | Expect on the card |
 |---|---|---|---|
-| 5.1 | `everything-small` | scope **Everything**; untick **All Resources** and tick only `Organization`, `Practitioner`, `Location` | **Complete · 3 files**; pills `Organization`, `Practitioner`, `Location`. Download `Organization`: 1,140 lines (1,136 corpus + 4 from T2); each line is one JSON object |
+| 5.1 | `everything-small` | scope **Everything**; untick **All Resources** and tick only `Organization`, `Practitioner`, `Location` | **Complete · 6 files** (output is chunked at 1,000 resources per file: `Location-0` with 1,000 plus `Location-1` with 137, and likewise for the other two types); pills `Organization`, `Practitioner`, `Location`. Download `Organization-0` and `Organization-1`: 1,000 + 140 lines = 1,140 total (1,136 corpus + 4 from T2); each line is one JSON object |
 | 5.2 | `one-patient` | scope **Patients**; in **Patients** search `Parker433` and pick Cari853 Esperanza675 Parker433 (or paste `PID`); types `Patient`, `Condition`, `Observation` | **Complete · 3 files**; `Patient` file has 1 line, `Condition` 15, `Observation` 165 |
 | 5.3 | `group-active-conditions` | scope **Group**, **Group ID** `manual-group`; types `Patient`, `Condition`; **Type filter** `Condition?clinical-status=active`; **FHIR elements** empty; **Since** *All time* | **Complete · 2 files**; `Patient` has 1 line; every line of `Condition` has `clinicalStatus` = `active` and belongs to `PID` (fewer than the 15 of 5.2) |
 | 5.4 | `elements-subset` | scope **Everything**; type `Patient` only; **FHIR elements** `id,gender` | **Complete · 1 file**; each Patient line has only `id`, `gender`, `meta` and the `meta.tag` `SUBSETTED` |
@@ -618,7 +623,7 @@ files**, *finished in …*, and one download pill per resource type.
 | 5.6 | negative | leave **Name** empty and **Start Export** | the form re-renders with *"Enter a name for this export."* |
 
 Then on `everything-small` click **Download All Resources**: the browser saves a ZIP
-holding the three NDJSON files. On `cancel-me` click **Delete** → the warning
+holding the six NDJSON files. On `cancel-me` click **Delete** → the warning
 *"Delete cancel-me and its output files from the server? This cannot be undone."* →
 **Delete export**; the card disappears.
 
@@ -638,7 +643,7 @@ are entered in UTC, e.g. `2026-09-04T14:00:00Z`.
 | 5.8 | `until-import` | type `Patient`; **Since** *All time*; **Until** `<T3 start>` | window line **Until <instant>**; `Patient` has **1** line: Nicky270 Ann985 Larkin917 |
 | 5.9 | `since-until` | type `Patient`; **Since** *Custom* `<T3 start>`, **Until** `<T3 end>` | window line `since → until`; `Patient` has **11,704** lines |
 | 5.10 | `since-fixtures` | types `Patient`, `RiskAssessment`, `ValueSet`, `Group`; **Since** *Custom* `<T3 end>` | `RiskAssessment`, `ValueSet`, `Group` pills with **1** line each (`manual-risk`, `manual-test-vs`, `manual-group`); no `Patient` pill, or an empty `Patient` file |
-| 5.11 | `last-day` | type `Organization`; **Since** *Last day* | window line shows an instant about 24 h ago; **1,140** lines when T2 and T3 ran within the last day (otherwise only the T2 copies, 4 lines) |
+| 5.11 | `last-day` | type `Organization`; **Since** *Last day* | window line shows an instant about 24 h ago; **0** lines with a well-formed empty `output: []` unless T2 and T3 ran within the last day, in which case **1,140** |
 | 5.12 | negative | **Since** *Custom*, **Custom instant** `yesterday` | the form re-renders with *"Enter a valid FHIR instant, such as 2026-08-01T00:00:00Z."* under the field; switch the preset back to *All time* and the same text no longer blocks the submit (the field is disabled) |
 
 ### 9.4 Failure and Retry
@@ -656,7 +661,7 @@ HFS_BULK_EXPORT_REQUIRES_ACCESS_TOKEN=false` plus the MinIO credentials from sec
 
 Pass criteria: 5.1–5.4 and 5.7–5.11 complete with the stated files and line counts;
 5.5 cancels; 5.6 and 5.12 are rejected; 5.13 fails, retries, and deletes as
-described; the ZIP download works. On `mongodb`, `mongo-es`, `s3`, `s3-es` the
+described; the ZIP download works. On `mongo-es`, `s3`, `s3-es` the
 card appears immediately as **Failed** with
 `kick-off answered 501: bulk export not supported by this backend` — record N/A, and
 check that **Delete** removes the failed card.
@@ -833,7 +838,7 @@ kind is exported in every format.
 | # | Name | Subjects | Format | Expect |
 |---|---|---|---|---|
 | 7.m | `vd-csv` | `patient_demographics` | **CSV**, header on | header `id,gender,birth_date,family,city` plus **11,705** data lines; `PID`'s line reads `…,female,2015-12-29,Parker433,Everett` |
-| 7.n | `vd-parquet` | `patient_demographics` | **Parquet** | schema `id, gender, birth_date, family, city`; **11,705** rows; `birth_date` is a date column, not a string |
+| 7.n | `vd-parquet` | `patient_demographics` | **Parquet** | schema `id, gender, birth_date, family, city`; **11,705** rows; `birth_date` is a **string** column, which is correct — the SQL on FHIR 3.0.0-ballot default mapping (see #569) renders FHIR `date`, `dateTime` and `time` as `CHARACTER VARYING` |
 | 7.o | `query-ndjson` | `tall_female_patients`, `min_height` = `150` | **NDJSON** | one JSON object per line with `id`, `city`, `height`; line count equals the data-line count of 7.b |
 | 7.p | `query-parquet` | `tall_female_patients`, `min_height` = `150` | **Parquet** | schema `id, city, height` with `height` numeric; row count equals 7.o |
 | 7.q | `view-ndjson` | `female_patients` | **NDJSON** | **5,814** lines, each with `id`, `birth_date`, `city` and no `gender` key |
@@ -1017,11 +1022,20 @@ Verify:
 3. Upload `encounters.json` once more on **Batch / Transaction**, reload the page:
    **Delivered in 24 h** and **Sent** advance by 3; the sparkline gains a point in the
    current half-hour bucket.
-4. Failure path: kill the receiver, upload `encounters.json`, wait ~30 s, reload. The
-   chip becomes **Error** (after 3 consecutive failures), the row is highlighted, the
-   **Failing** card reads 1, and **Fail streak** counts the failures. Try the **Sort**
-   menu (**Status** / **Most sent** / **Fail streak**). Restart the receiver; after the
-   retries land, reload: the chip is **Active** again and the streak is `0`.
+4. Failure path: kill the receiver, upload `encounters.json`, reload. The **Error**
+   chip counts *exhausted deliveries*, not connection failures, so the streak appears
+   only after the retry window (about **five minutes**, right after `Max retries
+   exhausted` in the log; at 30 s the dashboard still reads `Active · Failing 0 ·
+   streak 0` while the log already holds `Connection failed` lines). Once the streak
+   appears: the chip is **Error**, the row is highlighted, the **Failing** card reads
+   1, and **Fail streak** counts the failures. Try the **Sort** menu (**Status** /
+   **Most sent** / **Fail streak**). Recovery: inside the retry window, restarting the
+   receiver is enough — the queued retries land and reloading shows **Active** again
+   with streak `0`. After the retry window, the subscription is `status=error`, and
+   recovery is a **reactivation** (`PUT` the Subscription with `status: requested` →
+   new handshake → `active`), not a wait — restarting the receiver alone no longer
+   recovers it. **Sent** restarts at 1 because the counter is
+   `events-since-subscription-start`.
 5. Restart HFS: the engine rehydrates (`HFS_SUBSCRIPTION_REHYDRATE=true`) and the row
    returns as **Active** without re-creating anything. Check the log for
    `Failed to persist subscription status transition` — it must not appear.
@@ -1054,12 +1068,17 @@ For each backend row, attach to the release issue:
 
 ## 15. Known expectations and gotchas
 
-- **Bulk export on MongoDB/S3** returns `501`: the Export page shows a **Failed** card
-  reading `kick-off answered 501: bulk export not supported by this backend`. Expected.
+- **Bulk export on `mongo-es`/S3** returns `501`: the Export page shows a **Failed** card
+  reading `kick-off answered 501: bulk export not supported by this backend`. Expected —
+  the composite and S3-backed rows have no bulk-export job store. Standalone `mongodb`
+  supports `$export` (a SQLite sidecar job store).
 - **S3 standalone has no search**: the Resources page cannot run queries on the `s3`
   row (T4 is N/A); `s3-es` searches through Elasticsearch.
 - **Transaction Bundles on S3** are refused by design; batch Bundles work.
-- **MongoDB** does not support chained or `_has` searches (T4 rows 4.10, 4.11).
+- **Transaction Bundles on a standalone `mongod`** answer `501` with diagnostics
+  `Isolation level 'transaction bundles for mongodb require replica-set or sharded
+  topology' is not supported`; `batch` Bundles are unaffected — this is why §4 starts
+  MongoDB as a single-node replica set.
 - **`near`** is not implemented on any backend and is deliberately absent from T4.
 - **`$reindex` on `s3` standalone** returns `501` (no search index). Expected.
 - **Elasticsearch composites** are eventually consistent unless

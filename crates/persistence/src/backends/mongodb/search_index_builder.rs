@@ -1,4 +1,7 @@
-//! Post-boot builder for the generation-2 `search_index` indexes (#1059, #1084).
+//! Post-boot builder for the generation-3 `search_index` indexes (#1059,
+//! #1084, #1160). Also moves any contained rows still sitting in
+//! `search_index` (a pre-#1160 database) into `search_index_contained`,
+//! ahead of any index build, in every [`IndexBuildMode`].
 
 use std::str::FromStr;
 
@@ -73,6 +76,7 @@ mod mode_tests {
 
 use std::time::Duration;
 
+use futures::stream::TryStreamExt;
 use mongodb::{
     Database,
     bson::{Bson, Document, doc},
@@ -81,11 +85,13 @@ use mongodb::{
 use crate::error::{BackendError, StorageError, StorageResult};
 
 use super::schema::{
-    drop_index_if_present, get_search_index_generation, set_search_index_generation,
+    contained_rows_moved, drop_index_if_present, get_search_index_generation,
+    set_contained_rows_moved, set_search_index_generation,
 };
 use super::search_index_catalog::{
-    IndexBuild, SEARCH_INDEX_COLLECTION, SEARCH_INDEX_GENERATION, SearchIndexSpec,
-    create_indexes_command, generation2_specs, superseded_v1_specs,
+    IndexBuild, SEARCH_INDEX_COLLECTION, SEARCH_INDEX_CONTAINED_COLLECTION,
+    SEARCH_INDEX_GENERATION, SearchIndexSpec, create_indexes_command, current_specs,
+    superseded_contained_spec, superseded_v1_specs,
 };
 
 /// What one run of the builder did.
@@ -126,6 +132,12 @@ const IN_PROGRESS_POLL: Duration = Duration::from_secs(30);
 /// (I3).
 const IN_PROGRESS_MAX_WAIT: Duration = Duration::from_secs(6 * 60 * 60);
 
+/// Page size for [`SearchIndexBuilder::move_contained_rows`]. Small enough
+/// that a crash mid-move only replays one page's worth of work on the next
+/// boot, large enough that moving even a sizeable backlog of contained rows
+/// takes few round trips.
+const MOVE_PAGE: usize = 1_000;
+
 /// `listIndexes` option keys, beyond `v`/`key`/`name`/`partialFilterExpression`,
 /// that change query results or index maintenance if present on a
 /// generation-2 name: `unique` and `sparse` change which documents the index
@@ -158,7 +170,9 @@ struct Inspection {
     in_progress: Vec<String>,
     /// Our names that exist with a different key, partial filter, or extra option.
     conflicting: Vec<(String, ListedIndex)>,
-    /// Superseded generation-1 names still present.
+    /// Superseded names still present: generation-1 index names, plus the
+    /// generation-2 `search_index` contained-row index name if it is still
+    /// there.
     superseded_present: Vec<String>,
 }
 
@@ -205,6 +219,29 @@ impl SearchIndexBuilder {
     }
 
     async fn run_inner(&self) -> StorageResult<BuildOutcome> {
+        // A correctness fix, not an index build: runs in every mode,
+        // including `off`, and ahead of everything else below (#1160).
+        // Bounded by the number of contained rows, which is small on every
+        // deployment, so this never meaningfully delays boot even in
+        // `inline` mode.
+        // Wrap the move's own errors with a distinguishing prefix: this
+        // whole function's errors are otherwise reported by `run`'s
+        // catch-all as "search_index generation-N build failed: ...", which
+        // would mislabel a move failure as an index-build failure.
+        let moved = self.move_contained_rows().await.map_err(|e| {
+            StorageError::Backend(BackendError::Internal {
+                backend_name: "mongodb".to_string(),
+                message: format!("contained-row move failed: {e}"),
+                source: Some(Box::new(e)),
+            })
+        })?;
+        if moved > 0 {
+            tracing::info!(
+                moved,
+                "moved contained search_index rows to search_index_contained"
+            );
+        }
+
         let mut inspection = self.inspect().await?;
 
         if !inspection.conflicting.is_empty() {
@@ -214,7 +251,7 @@ impl SearchIndexBuilder {
                 .map(|(n, _)| n.clone())
                 .collect();
             for (name, actual) in &inspection.conflicting {
-                let expected_spec = generation2_specs().into_iter().find(|s| s.name == name);
+                let expected_spec = current_specs().into_iter().find(|s| s.name == name);
                 let expected_keys = expected_spec.as_ref().map(|s| s.keys.clone());
                 let expected_partial = expected_spec.as_ref().and_then(|s| s.partial.clone());
                 tracing::error!(
@@ -234,30 +271,13 @@ impl SearchIndexBuilder {
         }
 
         if self.mode == IndexBuildMode::Off {
-            let missing: Vec<String> = inspection
-                .missing
-                .iter()
-                .map(|s| s.name.to_string())
-                .collect();
-            if missing.is_empty() && inspection.superseded_present.is_empty() {
-                self.record_if_needed().await?;
-                return Ok(BuildOutcome::UpToDate);
-            }
-            for spec in &inspection.missing {
-                tracing::warn!(
-                    index = spec.name,
-                    "HFS_MONGODB_INDEX_BUILD=off: generation-2 search_index index is missing; \
-                     build it with docs/mongodb/search-index-v2.mongosh.js"
-                );
-            }
-            for name in &inspection.superseded_present {
-                tracing::warn!(
-                    index = %name,
-                    "HFS_MONGODB_INDEX_BUILD=off: {name} is a superseded generation-1 \
-                     search_index index; drop it with db.search_index.dropIndex(\"{name}\")"
-                );
-            }
-            return Ok(BuildOutcome::Skipped { missing });
+            return match off_mode_decision(&inspection) {
+                None => {
+                    self.record_if_needed().await?;
+                    Ok(BuildOutcome::UpToDate)
+                }
+                Some(outcome) => Ok(outcome),
+            };
         }
 
         // Someone else (another HFS process, or an operator's mongosh) is
@@ -286,17 +306,17 @@ impl SearchIndexBuilder {
         if !inspection.missing.is_empty() {
             let refs: Vec<&SearchIndexSpec> = inspection.missing.iter().collect();
             let names: Vec<&str> = refs.iter().map(|s| s.name).collect();
-            tracing::info!(indexes = ?names, "building generation-2 search_index indexes in one collection scan");
+            tracing::info!(indexes = ?names, "building generation-{SEARCH_INDEX_GENERATION} search_index indexes in one collection scan");
             let started = std::time::Instant::now();
             self.database
                 .run_command(create_indexes_command(&refs))
                 .await?;
-            tracing::info!(indexes = ?names, elapsed_s = started.elapsed().as_secs(), "generation-2 search_index build complete");
+            tracing::info!(indexes = ?names, elapsed_s = started.elapsed().as_secs(), "generation-{SEARCH_INDEX_GENERATION} search_index build complete");
             created = names.into_iter().map(String::from).collect();
             inspection = self.inspect().await?;
             if !inspection.missing.is_empty() || !inspection.in_progress.is_empty() {
                 let message = format!(
-                    "createIndexes returned but generation-2 indexes are still missing or in progress: {:?} / {:?}",
+                    "createIndexes returned but generation-{SEARCH_INDEX_GENERATION} indexes are still missing or in progress: {:?} / {:?}",
                     inspection
                         .missing
                         .iter()
@@ -350,7 +370,7 @@ impl SearchIndexBuilder {
             // Every background spec is then "missing" and the build is instant.
             Err(e) if is_namespace_not_found(&e) => {
                 return Ok(Inspection {
-                    missing: generation2_specs()
+                    missing: current_specs()
                         .into_iter()
                         .filter(|s| s.build == IndexBuild::Background)
                         .collect(),
@@ -362,7 +382,7 @@ impl SearchIndexBuilder {
         let existing = listed_indexes(&reply)?;
 
         let mut inspection = Inspection::default();
-        for spec in generation2_specs()
+        for spec in current_specs()
             .into_iter()
             .filter(|s| s.build == IndexBuild::Background)
         {
@@ -382,8 +402,142 @@ impl SearchIndexBuilder {
                 inspection.superseded_present.push(v1.name.to_string());
             }
         }
+        if contained_spec_superseded(&existing) {
+            inspection
+                .superseded_present
+                .push(superseded_contained_spec().name.to_string());
+        }
         Ok(inspection)
     }
+
+    /// One-time move of contained rows out of `search_index` (#1160). Runs
+    /// in every mode: it is a correctness fix for the standard search, not
+    /// an index build, and it is bounded by the number of contained rows,
+    /// which is small on every deployment. Idempotent page by page, so a
+    /// crash mid-way resumes on the next boot.
+    async fn move_contained_rows(&self) -> StorageResult<u64> {
+        if contained_rows_moved(&self.database).await? {
+            return Ok(0);
+        }
+        let source = self
+            .database
+            .collection::<Document>(SEARCH_INDEX_COLLECTION);
+        let target = self
+            .database
+            .collection::<Document>(SEARCH_INDEX_CONTAINED_COLLECTION);
+        let mut moved = 0u64;
+        loop {
+            let mut cursor = source
+                .find(doc! { "is_contained": true })
+                .limit(MOVE_PAGE as i64)
+                .await?;
+            let mut page = Vec::with_capacity(MOVE_PAGE);
+            while let Some(row) = cursor.try_next().await? {
+                page.push(row);
+            }
+            if page.is_empty() {
+                break;
+            }
+            let ids: Vec<Bson> = page
+                .iter()
+                .map(|r| {
+                    r.get("_id")
+                        .cloned()
+                        .expect("MongoDB documents always carry _id")
+                })
+                .collect();
+            let mut rows = page;
+            for row in &mut rows {
+                row.remove("is_contained");
+            }
+            // Keep `_id`, so a replayed page is a duplicate-key no-op.
+            if let Err(e) = target.insert_many(&rows).ordered(false).await
+                && !is_only_duplicate_keys(&e)
+            {
+                return Err(e.into());
+            }
+            source.delete_many(doc! { "_id": { "$in": ids } }).await?;
+            moved += rows.len() as u64;
+            tracing::info!(
+                moved,
+                "moving contained search_index rows to search_index_contained"
+            );
+        }
+        set_contained_rows_moved(&self.database).await?;
+        Ok(moved)
+    }
+}
+
+/// True when `existing` (a `search_index` `listIndexes` reading) carries the
+/// generation-2 partial index under the superseded contained name (#1160):
+/// same name as [`superseded_contained_spec`] and a `partialFilterExpression`
+/// present. The current, non-superseded index of that name lives on
+/// `search_index_contained` and is never in a `search_index` `listIndexes`
+/// reply, so this can never mistake the current index for the superseded one.
+/// Pure so it is unit-testable without a live server.
+fn contained_spec_superseded(existing: &[ListedIndex]) -> bool {
+    let contained = superseded_contained_spec();
+    existing
+        .iter()
+        .any(|d| d.name == contained.name && d.partial.is_some())
+}
+
+/// True when `e` is a driver `InsertMany` error whose every per-document
+/// write error is a duplicate key (11000) — i.e. every row in the batch was
+/// already inserted by an earlier, interrupted attempt at the same page — and
+/// no write concern error accompanies it. Any other shape (a page-level
+/// error, a write error with a different code, or a write concern error) is
+/// a real failure the caller must propagate.
+fn is_only_duplicate_keys(e: &mongodb::error::Error) -> bool {
+    matches!(
+        e.kind.as_ref(),
+        mongodb::error::ErrorKind::InsertMany(insert_many)
+            if insert_many
+                .write_errors
+                .as_ref()
+                .is_some_and(|errors| errors.iter().all(|e| e.code == 11000))
+                // With `ordered(false)`, a batch can report duplicate-key
+                // write errors for some documents alongside a write concern
+                // error for the ones that did insert; treating that as "all
+                // duplicates" would let the caller delete source rows whose
+                // copies were never majority-acknowledged.
+                && insert_many.write_concern_error.is_none()
+    )
+}
+
+/// [`IndexBuildMode::Off`]'s decision for one [`Inspection`]: `None` when
+/// every background spec is present and no superseded index remains (the
+/// caller then records the generation and reports `UpToDate`); otherwise
+/// warns about every missing spec and every superseded name — including
+/// `idx_search_contained` once [`SearchIndexBuilder::inspect`] marks it
+/// superseded (#1160) — and reports `Skipped`. Never builds or drops
+/// anything. Pure apart from the `tracing` calls, so it is unit-testable
+/// without a live server.
+fn off_mode_decision(inspection: &Inspection) -> Option<BuildOutcome> {
+    if inspection.missing.is_empty() && inspection.superseded_present.is_empty() {
+        return None;
+    }
+    for spec in &inspection.missing {
+        tracing::warn!(
+            index = spec.name,
+            "HFS_MONGODB_INDEX_BUILD=off: generation-{SEARCH_INDEX_GENERATION} search_index index is missing; \
+             build it with docs/mongodb/search-index-v2.mongosh.js"
+        );
+    }
+    for name in &inspection.superseded_present {
+        tracing::warn!(
+            index = %name,
+            "HFS_MONGODB_INDEX_BUILD=off: {name} is a superseded search_index index; \
+             drop it with db.search_index.dropIndex(\"{name}\")"
+        );
+    }
+    Some(BuildOutcome::Skipped {
+        missing: inspection
+            .missing
+            .iter()
+            .map(|s| s.name.to_string())
+            .collect(),
+    })
 }
 
 /// The `listIndexes` command this module sends. `includeBuildUUIDs: true` is
@@ -654,7 +808,7 @@ mod builder_tests {
     /// be a correctness bug, not just a performance one.
     #[test]
     fn classify_spec_treats_matching_index_with_extra_option_as_conflicting() {
-        let spec = generation2_specs()
+        let spec = current_specs()
             .into_iter()
             .find(|s| s.name == "idx_search_date_v2")
             .expect("idx_search_date_v2 is in the catalog");
@@ -672,7 +826,7 @@ mod builder_tests {
 
     #[test]
     fn classify_spec_ready_when_key_partial_match_and_no_extra_options() {
-        let spec = generation2_specs()
+        let spec = current_specs()
             .into_iter()
             .find(|s| s.name == "idx_search_date_v2")
             .expect("idx_search_date_v2 is in the catalog");
@@ -686,5 +840,63 @@ mod builder_tests {
         };
 
         assert_eq!(classify_spec(&spec, &actual), SpecStatus::Ready);
+    }
+
+    /// #1160: a listed `idx_search_contained` with a `partialFilterExpression`
+    /// is the generation-2 shape still sitting on `search_index` — it must be
+    /// classified superseded so the builder drops it once the rows it used to
+    /// serve have moved to `search_index_contained`.
+    #[test]
+    fn superseded_present_includes_the_generation2_contained_index() {
+        let contained = superseded_contained_spec();
+        let existing = vec![ListedIndex {
+            name: contained.name.to_string(),
+            key: contained.keys.clone(),
+            partial: contained.partial.clone(),
+            in_progress: false,
+            extra_options: Vec::new(),
+        }];
+
+        assert!(contained_spec_superseded(&existing));
+    }
+
+    /// The *current* `idx_search_contained` (generation 3, no partial filter,
+    /// on `search_index_contained`) never appears in a `search_index`
+    /// `listIndexes` reply in the first place, but even a same-named plain
+    /// index with no partial filter must not be mistaken for the superseded
+    /// generation-2 shape.
+    #[test]
+    fn contained_spec_not_superseded_without_a_partial_filter() {
+        let contained = superseded_contained_spec();
+        let existing = vec![ListedIndex {
+            name: contained.name.to_string(),
+            key: contained.keys.clone(),
+            partial: None,
+            in_progress: false,
+            extra_options: Vec::new(),
+        }];
+
+        assert!(!contained_spec_superseded(&existing));
+    }
+
+    #[test]
+    fn off_mode_warns_about_the_contained_index_and_drops_nothing() {
+        let inspection = Inspection {
+            missing: Vec::new(),
+            in_progress: Vec::new(),
+            conflicting: Vec::new(),
+            superseded_present: vec!["idx_search_contained".to_string()],
+        };
+
+        assert_eq!(
+            off_mode_decision(&inspection),
+            Some(BuildOutcome::Skipped { missing: vec![] })
+        );
+    }
+
+    #[test]
+    fn off_mode_decision_is_none_when_nothing_missing_or_superseded() {
+        let inspection = Inspection::default();
+        assert_eq!(off_mode_decision(&inspection), None);
     }
 }

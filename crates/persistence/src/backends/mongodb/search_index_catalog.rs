@@ -1,10 +1,19 @@
-//! Declarative catalog of the `search_index` indexes (#1059, #1084).
+//! Declarative catalog of the `search_index` indexes (#1059, #1084, #1160).
 //!
 //! Generation 2 replaces the nine full value indexes with partial indexes that
 //! carry `resource_id` as their trailing key, so a value-filtered scan can be
-//! covered, and adds a partial index over contained rows. New names, never
-//! changed keys: MongoDB refuses a different key spec under an existing name
-//! (`IndexKeySpecsConflict`, 86), which would fail every deployed boot.
+//! covered, and adds a partial index over contained rows on `search_index`
+//! itself. New names, never changed keys: MongoDB refuses a different key
+//! spec under an existing name (`IndexKeySpecsConflict`, 86), which would
+//! fail every deployed boot.
+//!
+//! Generation 3 (#1160) moves contained rows off `search_index` entirely,
+//! into their own `search_index_contained` collection ([`contained_specs`]),
+//! so a standard search can never match through them by construction —
+//! standard search never reads that collection. Generation 2's partial index
+//! over contained rows on `search_index` ([`superseded_contained_spec`]) is
+//! superseded: the builder drops it once the rows it used to serve have
+//! moved (see `search_index_builder.rs`).
 
 use mongodb::{
     IndexModel,
@@ -12,13 +21,18 @@ use mongodb::{
     options::IndexOptions,
 };
 
-/// The collection every spec in this catalog belongs to.
+/// The collection every value spec in this catalog belongs to.
 pub(crate) const SEARCH_INDEX_COLLECTION: &str = "search_index";
+/// Where contained-resource rows live since generation 3 (#1160). The
+/// standard search never reads it, which is what excludes contained rows
+/// from a standard search by construction.
+pub(crate) const SEARCH_INDEX_CONTAINED_COLLECTION: &str = "search_index_contained";
 
 /// Recorded in the `schema_version` document as `search_indexes.generation`
 /// once every [`IndexBuild::Background`] spec is present and the superseded
-/// generation-1 indexes are gone.
-pub(crate) const SEARCH_INDEX_GENERATION: i32 = 2;
+/// indexes are gone. Generation 3 = generation 2 minus `idx_search_contained`
+/// on `search_index` (contained rows moved to their own collection, #1160).
+pub(crate) const SEARCH_INDEX_GENERATION: i32 = 3;
 
 /// When an index is created relative to boot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -102,8 +116,9 @@ fn value_v1(name: &'static str, value_keys: &[&str]) -> SearchIndexSpec {
     }
 }
 
-/// Every index `search_index` should have once generation 2 is complete.
-pub(crate) fn generation2_specs() -> Vec<SearchIndexSpec> {
+/// Every index `search_index` should have once the current generation is
+/// complete.
+pub(crate) fn current_specs() -> Vec<SearchIndexSpec> {
     vec![
         value_v2("idx_search_string_v2", &["value_string"]),
         // Code first: the commonest token predicate (`status=final`,
@@ -126,24 +141,6 @@ pub(crate) fn generation2_specs() -> Vec<SearchIndexSpec> {
             "idx_search_identifier_type_v2",
             &["value_identifier_type_system", "value_identifier_type_code"],
         ),
-        // Only contained rows carry `is_contained` (see
-        // `build_contained_index_document`), so this partial index holds only
-        // them; the trailing keys let the contained pipeline's `$group` read
-        // its key from the index.
-        SearchIndexSpec {
-            name: "idx_search_contained",
-            keys: doc! {
-                "tenant_id": 1_i32,
-                "contained_type": 1_i32,
-                "is_contained": 1_i32,
-                "param_name": 1_i32,
-                "resource_type": 1_i32,
-                "resource_id": 1_i32,
-                "contained_local_id": 1_i32,
-            },
-            partial: Some(doc! { "is_contained": true }),
-            build: IndexBuild::Background,
-        },
         // Unchanged from generation 1. Both lead with `resource_id`;
         // `idx_search_composite` is hinted by name in the id-materialisation
         // path and `idx_search_resource` serves reindex deletes.
@@ -193,26 +190,81 @@ pub(crate) fn superseded_v1_specs() -> Vec<SearchIndexSpec> {
     ]
 }
 
-/// A raw `createIndexes` command for `specs`. One command builds every index
-/// in a single collection scan, which is why the builder issues one command
-/// rather than one per index.
-pub(crate) fn create_indexes_command(specs: &[&SearchIndexSpec]) -> Document {
+/// The indexes of `search_index_contained`. Created inline at boot: contained
+/// resources are rare, so the collection is small on every deployment.
+pub(crate) fn contained_specs() -> Vec<SearchIndexSpec> {
+    vec![
+        // Same keys as the generation-2 partial index minus `is_contained`
+        // (every row here is contained), so the contained pipeline's `$group`
+        // still reads its key from the index.
+        SearchIndexSpec {
+            name: "idx_search_contained",
+            keys: doc! {
+                "tenant_id": 1_i32,
+                "contained_type": 1_i32,
+                "param_name": 1_i32,
+                "resource_type": 1_i32,
+                "resource_id": 1_i32,
+                "contained_local_id": 1_i32,
+            },
+            partial: None,
+            build: IndexBuild::Inline,
+        },
+        // Delete-by-container paths, mirroring `idx_search_resource`.
+        SearchIndexSpec {
+            name: "idx_search_contained_resource",
+            keys: doc! { "tenant_id": 1_i32, "resource_type": 1_i32, "resource_id": 1_i32 },
+            partial: None,
+            build: IndexBuild::Inline,
+        },
+    ]
+}
+
+/// The generation-2 partial index over contained rows on `search_index`,
+/// dropped by the builder once the rows have moved. Exact keys, so the
+/// rollback script recreates what existed.
+pub(crate) fn superseded_contained_spec() -> SearchIndexSpec {
+    SearchIndexSpec {
+        name: "idx_search_contained",
+        keys: doc! {
+            "tenant_id": 1_i32,
+            "contained_type": 1_i32,
+            "is_contained": 1_i32,
+            "param_name": 1_i32,
+            "resource_type": 1_i32,
+            "resource_id": 1_i32,
+            "contained_local_id": 1_i32,
+        },
+        partial: Some(doc! { "is_contained": true }),
+        build: IndexBuild::Background,
+    }
+}
+
+/// A raw `createIndexes` command for `specs` on `collection`.
+pub(crate) fn create_indexes_command_for(collection: &str, specs: &[&SearchIndexSpec]) -> Document {
     let indexes: Vec<Bson> = specs
         .iter()
         .map(|s| Bson::Document(s.create_indexes_entry()))
         .collect();
-    doc! { "createIndexes": SEARCH_INDEX_COLLECTION, "indexes": indexes }
+    doc! { "createIndexes": collection, "indexes": indexes }
 }
 
-/// The operator script: the same `createIndexes` command as relaxed extended
-/// JSON, wrapped for `mongosh`. `docs/mongodb/*.mongosh.js` are generated
-/// from this and a unit test keeps them equal.
+/// A raw `createIndexes` command for `specs` on `search_index`. One command
+/// builds every index in a single collection scan, which is why the builder
+/// issues one command rather than one per index.
+pub(crate) fn create_indexes_command(specs: &[&SearchIndexSpec]) -> Document {
+    create_indexes_command_for(SEARCH_INDEX_COLLECTION, specs)
+}
+
+/// The operator script: the same `createIndexes` command for `collection` as
+/// relaxed extended JSON, wrapped for `mongosh`. `docs/mongodb/*.mongosh.js`
+/// are generated from this and a unit test keeps them equal.
 // Only this module's tests call it (to check the checked-in mongosh scripts
 // are up to date); a normal build never generates the scripts at runtime.
 #[allow(dead_code)]
-pub(crate) fn mongosh_script(specs: &[SearchIndexSpec]) -> String {
+pub(crate) fn mongosh_script_for(collection: &str, specs: &[SearchIndexSpec]) -> String {
     let refs: Vec<&SearchIndexSpec> = specs.iter().collect();
-    let cmd = Bson::Document(create_indexes_command(&refs)).into_relaxed_extjson();
+    let cmd = Bson::Document(create_indexes_command_for(collection, &refs)).into_relaxed_extjson();
     let json = serde_json::to_string_pretty(&cmd).expect("createIndexes command serializes");
     format!(
         "// Generated from crates/persistence/src/backends/mongodb/search_index_catalog.rs.\n\
@@ -223,20 +275,59 @@ pub(crate) fn mongosh_script(specs: &[SearchIndexSpec]) -> String {
     )
 }
 
+#[allow(dead_code)]
+pub(crate) fn mongosh_script(specs: &[SearchIndexSpec]) -> String {
+    mongosh_script_for(SEARCH_INDEX_COLLECTION, specs)
+}
+
+/// Downgrade helper: copies contained rows back into `search_index` with
+/// `is_contained: true`, recreates the generation-2 partial index, and resets
+/// the `schema_version` migration record (clears `contained_rows_moved`, sets
+/// `generation` back to 2) so a pre-generation-3 binary serves `_contained`
+/// searches again, and a later generation-3 boot re-runs the move instead of
+/// skipping it.
+#[allow(dead_code)]
+pub(crate) fn contained_rollback_script() -> String {
+    let spec = superseded_contained_spec();
+    let refs = [&spec];
+    let cmd = Bson::Document(create_indexes_command(&refs)).into_relaxed_extjson();
+    let json = serde_json::to_string_pretty(&cmd).expect("createIndexes command serializes");
+    format!(
+        "// Generated from crates/persistence/src/backends/mongodb/search_index_catalog.rs.\n\
+         // Do not edit by hand: a unit test compares this file to the catalog.\n\
+         // Usage: mongosh \"$HFS_MONGODB_URL/$HFS_MONGODB_DATABASE\" <this file>\n\
+         // Copies contained rows back into search_index (with is_contained: true) and\n\
+         // recreates the generation-2 partial index, for a rollback to a binary that\n\
+         // predates search_index_contained. Idempotent: rows already present are skipped.\n\
+         db.search_index_contained.find().forEach(function (row) {{\n\
+         \x20 row.is_contained = true;\n\
+         \x20 try {{ db.search_index.insertOne(row); }} catch (e) {{ if (e.code !== 11000) throw e; }}\n\
+         }});\n\
+         // Reset the migration record so a later generation-3 boot re-runs the move: its\n\
+         // inserts are duplicate-key no-ops for rows already copied back above, and it then\n\
+         // deletes the source rows this script just restored.\n\
+         db.schema_version.updateOne(\n\
+         \x20 {{ _id: \"schema_version\" }},\n\
+         \x20 {{ $unset: {{ \"search_indexes.contained_rows_moved\": \"\" }}, $set: {{ \"search_indexes.generation\": 2 }} }}\n\
+         );\n\
+         db.runCommand({json});\n"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn value_specs() -> Vec<SearchIndexSpec> {
-        generation2_specs()
+        current_specs()
             .into_iter()
             .filter(|s| s.name.ends_with("_v2"))
             .collect()
     }
 
     #[test]
-    fn generation2_has_nine_value_specs_plus_contained_plus_two_unchanged() {
-        let names: Vec<&str> = generation2_specs().iter().map(|s| s.name).collect();
+    fn current_specs_are_nine_value_specs_plus_two_unchanged_and_no_contained() {
+        let names: Vec<&str> = current_specs().iter().map(|s| s.name).collect();
         assert_eq!(
             names,
             vec![
@@ -249,11 +340,90 @@ mod tests {
                 "idx_search_uri_v2",
                 "idx_search_token_display_v2",
                 "idx_search_identifier_type_v2",
-                "idx_search_contained",
                 "idx_search_composite",
                 "idx_search_resource",
             ]
         );
+        assert_eq!(SEARCH_INDEX_GENERATION, 3);
+    }
+
+    #[test]
+    fn contained_specs_are_two_inline_plain_indexes_on_the_contained_collection() {
+        let specs = contained_specs();
+        assert_eq!(specs.len(), 2);
+        assert!(
+            specs
+                .iter()
+                .all(|s| s.build == IndexBuild::Inline && s.partial.is_none())
+        );
+        let by_name = |n: &str| specs.iter().find(|s| s.name == n).expect(n).clone();
+        assert_eq!(
+            by_name("idx_search_contained")
+                .keys
+                .keys()
+                .collect::<Vec<_>>(),
+            vec![
+                "tenant_id",
+                "contained_type",
+                "param_name",
+                "resource_type",
+                "resource_id",
+                "contained_local_id"
+            ]
+        );
+        assert_eq!(
+            by_name("idx_search_contained_resource")
+                .keys
+                .keys()
+                .collect::<Vec<_>>(),
+            vec!["tenant_id", "resource_type", "resource_id"]
+        );
+        assert_eq!(SEARCH_INDEX_CONTAINED_COLLECTION, "search_index_contained");
+    }
+
+    #[test]
+    fn superseded_contained_spec_is_the_generation2_partial_index() {
+        let c = superseded_contained_spec();
+        assert_eq!(c.name, "idx_search_contained");
+        assert_eq!(
+            c.keys.keys().collect::<Vec<_>>(),
+            vec![
+                "tenant_id",
+                "contained_type",
+                "is_contained",
+                "param_name",
+                "resource_type",
+                "resource_id",
+                "contained_local_id"
+            ]
+        );
+        assert_eq!(c.partial, Some(doc! { "is_contained": true }));
+    }
+
+    #[test]
+    fn create_indexes_command_for_targets_the_named_collection() {
+        let specs = contained_specs();
+        let refs: Vec<&SearchIndexSpec> = specs.iter().collect();
+        let cmd = create_indexes_command_for(SEARCH_INDEX_CONTAINED_COLLECTION, &refs);
+        assert_eq!(cmd.get_str("createIndexes"), Ok("search_index_contained"));
+        assert_eq!(cmd.get_array("indexes").unwrap().len(), 2);
+    }
+
+    #[test]
+    fn contained_prebuild_script_in_docs_matches_the_catalog() {
+        let expected = mongosh_script_for(SEARCH_INDEX_CONTAINED_COLLECTION, &contained_specs());
+        let on_disk = include_str!("../../../../../docs/mongodb/search-index-contained.mongosh.js");
+        assert_eq!(
+            on_disk, expected,
+            "docs/mongodb/search-index-contained.mongosh.js is stale"
+        );
+    }
+
+    #[test]
+    fn contained_rollback_script_in_docs_matches_the_catalog() {
+        let on_disk =
+            include_str!("../../../../../docs/mongodb/search-index-contained-rollback.mongosh.js");
+        assert_eq!(on_disk, contained_rollback_script());
     }
 
     #[test]
@@ -284,7 +454,7 @@ mod tests {
 
     #[test]
     fn token_v2_is_code_first() {
-        let token = generation2_specs()
+        let token = current_specs()
             .into_iter()
             .find(|s| s.name == "idx_search_token_v2")
             .unwrap();
@@ -303,31 +473,8 @@ mod tests {
     }
 
     #[test]
-    fn contained_spec_is_partial_on_is_contained_true() {
-        let c = generation2_specs()
-            .into_iter()
-            .find(|s| s.name == "idx_search_contained")
-            .unwrap();
-        let keys: Vec<&str> = c.keys.keys().map(String::as_str).collect();
-        assert_eq!(
-            keys,
-            vec![
-                "tenant_id",
-                "contained_type",
-                "is_contained",
-                "param_name",
-                "resource_type",
-                "resource_id",
-                "contained_local_id"
-            ]
-        );
-        assert_eq!(c.partial, Some(doc! { "is_contained": true }));
-        assert_eq!(c.build, IndexBuild::Background);
-    }
-
-    #[test]
     fn composite_and_resource_are_unchanged_and_inline() {
-        let specs = generation2_specs();
+        let specs = current_specs();
         let composite = specs
             .iter()
             .find(|s| s.name == "idx_search_composite")
@@ -367,7 +514,7 @@ mod tests {
                 "idx_search_identifier_type",
             ]
         );
-        let g2: Vec<&str> = generation2_specs().iter().map(|s| s.name).collect();
+        let g2: Vec<&str> = current_specs().iter().map(|s| s.name).collect();
         for name in &v1 {
             assert!(
                 !g2.contains(name),
@@ -394,7 +541,7 @@ mod tests {
 
     #[test]
     fn create_indexes_command_carries_name_key_and_partial_filter() {
-        let specs = generation2_specs();
+        let specs = current_specs();
         let background: Vec<&SearchIndexSpec> = specs
             .iter()
             .filter(|s| s.build == IndexBuild::Background)
@@ -402,7 +549,7 @@ mod tests {
         let cmd = create_indexes_command(&background);
         assert_eq!(cmd.get_str("createIndexes"), Ok("search_index"));
         let indexes = cmd.get_array("indexes").unwrap();
-        assert_eq!(indexes.len(), 10);
+        assert_eq!(indexes.len(), 9);
         let first = indexes[0].as_document().unwrap();
         assert_eq!(first.get_str("name"), Ok("idx_search_string_v2"));
         assert_eq!(first.get_document("key").unwrap(), &background[0].keys);
@@ -410,7 +557,7 @@ mod tests {
             first.get_document("partialFilterExpression").unwrap(),
             &doc! { "value_string": { "$exists": true } }
         );
-        let composite_entry = generation2_specs()
+        let composite_entry = current_specs()
             .into_iter()
             .find(|s| s.name == "idx_search_composite")
             .unwrap()
@@ -421,7 +568,7 @@ mod tests {
     #[test]
     fn prebuild_script_in_docs_matches_the_catalog() {
         let expected = mongosh_script(
-            &generation2_specs()
+            &current_specs()
                 .into_iter()
                 .filter(|s| s.build == IndexBuild::Background)
                 .collect::<Vec<_>>(),

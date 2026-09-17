@@ -232,6 +232,8 @@ impl MongoBackend {
     pub(crate) const RESOURCES_COLLECTION: &'static str = "resources";
     pub(crate) const RESOURCE_HISTORY_COLLECTION: &'static str = "resource_history";
     pub(crate) const SEARCH_INDEX_COLLECTION: &'static str = "search_index";
+    pub(crate) const SEARCH_INDEX_CONTAINED_COLLECTION: &'static str =
+        super::search_index_catalog::SEARCH_INDEX_CONTAINED_COLLECTION;
     pub(crate) const TENANTS_COLLECTION: &'static str = "tenants";
 
     /// The capabilities this backend declares.
@@ -498,9 +500,11 @@ impl MongoBackend {
     /// Initializes the MongoDB schema/index bootstrap for this backend.
     ///
     /// Inline-class indexes are created before this returns. The
-    /// generation-2 `search_index` indexes are built by `SearchIndexBuilder`:
-    /// spawned and left running in `background` mode, awaited in `inline`
-    /// mode, and only inspected in `off` mode (see `IndexBuildMode`).
+    /// generation-3 `search_index` indexes are built by `SearchIndexBuilder`,
+    /// which moves any contained rows out of `search_index` first, in every
+    /// mode (#1160): spawned and left running in `background` mode, awaited
+    /// in `inline` mode, and only inspected in `off` mode (see
+    /// `IndexBuildMode`).
     pub async fn init_schema(&self) -> StorageResult<()> {
         let db = self.get_database().await?;
         schema::initialize_schema_async(&db).await?;

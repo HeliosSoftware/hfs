@@ -429,7 +429,7 @@ impl BulkSubmitProvider for IndexingSubmitJobs {
         &self,
         tenant: &TenantContext,
         id: &SubmissionId,
-    ) -> StorageResult<SubmissionSummary> {
+    ) -> StorageResult<()> {
         self.inner.complete_submission(tenant, id).await
     }
 
@@ -877,6 +877,28 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    /// `complete_submission` is forwarded to the inner store with the trait's
+    /// status-only `()` result (#1194): the stored status becomes Complete,
+    /// and a second completion is rejected by the store, not swallowed by the
+    /// wrapper.
+    #[tokio::test]
+    async fn complete_submission_is_forwarded_to_the_inner_store() {
+        let h = harness(SpyTarget::default()).await;
+
+        h.jobs.complete_submission(&tenant(), &h.sub).await.unwrap();
+        assert_eq!(
+            h.sqlite
+                .get_submission_status(&tenant(), &h.sub)
+                .await
+                .unwrap(),
+            Some(SubmissionStatus::Complete)
+        );
+        assert!(
+            h.jobs.complete_submission(&tenant(), &h.sub).await.is_err(),
+            "completing twice must surface the store's rejection"
+        );
     }
 
     #[tokio::test]
