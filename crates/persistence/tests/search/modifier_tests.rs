@@ -6,9 +6,10 @@
 use serde_json::json;
 
 use helios_persistence::core::{ResourceStorage, SearchProvider};
+use helios_persistence::error::{SearchError, StorageError};
 use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
 use helios_persistence::types::{
-    SearchModifier, SearchParamType, SearchParameter, SearchQuery, SearchValue,
+    SearchModifier, SearchParamType, SearchParameter, SearchQuery, SearchValue, TotalMode,
 };
 
 use helios_fhir::FhirVersion;
@@ -489,6 +490,101 @@ async fn test_not_modifier_includes_resources_missing_the_element() {
             .iter()
             .any(|r| r.content().get("gender").is_none()),
         "a patient without a gender element must match gender:not=male"
+    );
+}
+
+/// #1092: `_id` is dispatched by name into a dedicated builder that bypassed
+/// the generic `:not` handling entirely, so `_id:not=<id>` returned *only*
+/// the resource the caller asked to exclude — the precise inverse of the
+/// request. `:missing` is unaffected (it resolves before this dispatch) and
+/// is already pinned above; this covers `:not` and the modifier-rejection
+/// gate that now guards it.
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn test_id_not_excludes_listed_ids() {
+    let backend = create_sqlite_backend();
+    let tenant = create_tenant();
+
+    for id in ["a", "b", "c"] {
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType": "Patient", "id": id}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+    }
+
+    let mut query = SearchQuery::new("Patient").with_parameter(SearchParameter {
+        name: "_id".to_string(),
+        param_type: SearchParamType::Token,
+        modifier: Some(SearchModifier::Not),
+        values: vec![SearchValue::eq("b")],
+        chain: vec![],
+        components: vec![],
+    });
+    query.total = Some(TotalMode::Accurate);
+
+    let result = backend.search(&tenant, &query).await.unwrap();
+    let mut ids: Vec<&str> = result.resources.items.iter().map(|r| r.id()).collect();
+    ids.sort();
+    assert_eq!(ids, vec!["a", "c"], "_id:not=b must exclude only b");
+    assert_eq!(result.total, Some(2));
+
+    let mut query_two = SearchQuery::new("Patient").with_parameter(SearchParameter {
+        name: "_id".to_string(),
+        param_type: SearchParamType::Token,
+        modifier: Some(SearchModifier::Not),
+        values: vec![SearchValue::eq("a"), SearchValue::eq("b")],
+        chain: vec![],
+        components: vec![],
+    });
+    query_two.total = Some(TotalMode::Accurate);
+
+    let result_two = backend.search(&tenant, &query_two).await.unwrap();
+    let ids_two: Vec<&str> = result_two.resources.items.iter().map(|r| r.id()).collect();
+    assert_eq!(ids_two, vec!["c"], "_id:not=a,b must exclude both a and b");
+    assert_eq!(result_two.total, Some(1));
+}
+
+/// #1092: modifiers the `_id` builder cannot honour must be rejected rather
+/// than silently degrading to a positive match (mirrors #1055/#1091's
+/// MongoDB `metadata_param_honoured` gate).
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn test_id_unsupported_modifier_is_rejected() {
+    let backend = create_sqlite_backend();
+    let tenant = create_tenant();
+
+    backend
+        .create(
+            &tenant,
+            "Patient",
+            json!({"resourceType": "Patient", "id": "a"}),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+
+    let query = SearchQuery::new("Patient").with_parameter(SearchParameter {
+        name: "_id".to_string(),
+        param_type: SearchParamType::Token,
+        modifier: Some(SearchModifier::Text),
+        values: vec![SearchValue::eq("a")],
+        chain: vec![],
+        components: vec![],
+    });
+
+    let err = backend.search(&tenant, &query).await.unwrap_err();
+    assert!(
+        matches!(
+            err,
+            StorageError::Search(SearchError::UnsupportedModifier { ref modifier, .. })
+                if modifier == "text"
+        ),
+        "_id:text must be rejected as an unsupported modifier, got: {err:?}"
     );
 }
 

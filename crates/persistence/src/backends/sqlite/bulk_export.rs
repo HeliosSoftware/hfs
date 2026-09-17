@@ -18,7 +18,10 @@ use crate::core::bulk_export_worker::{
     ExportClaimStrategy, ExportJobLease, ExportWorkerStorage, LeaseError, WorkerId, WorkerJobView,
     abandoned_export_message,
 };
-use crate::error::{BackendError, BulkExportError, StorageError, StorageResult};
+use crate::error::{
+    BackendError, BulkExportError, QueryErrorExt, StorageError, StorageResult,
+    classify_sqlite_error,
+};
 use crate::tenant::{TenantContext, TenantId, TenantPermissions};
 
 use super::SqliteBackend;
@@ -79,6 +82,15 @@ fn push_export_window(
     }
 }
 
+/// Wraps a *non-driver* failure (serde, chrono, an enum parse of a column)
+/// as [`BackendError::Internal`].
+///
+/// Driver failures must NOT come through here: a `rusqlite::Error` carries a
+/// result code, and flattening it into a string threw away `SQLITE_BUSY` /
+/// `SQLITE_LOCKED`, so a kick-off that merely lost a race with a background
+/// index rebuild surfaced as a 500 instead of a retryable 503 (#1185). Use
+/// [`QueryErrorExt::or_query_error`] (or [`classify_sqlite_error`] where the
+/// error is already unwrapped) for anything that came out of rusqlite.
 fn internal_error(message: String) -> StorageError {
     StorageError::Backend(BackendError::Internal {
         backend_name: "sqlite".to_string(),
@@ -130,7 +142,7 @@ impl BulkExportStorage for SqliteBackend {
                 input.fhir_version.as_mime_param(),
             ],
         )
-        .map_err(|e| internal_error(format!("Failed to create export job: {}", e)))?;
+        .or_query_error("Failed to create export job")?;
 
         Ok(job_id)
     }
@@ -160,7 +172,7 @@ impl BulkExportStorage for SqliteBackend {
                         job_id: job_id.to_string(),
                     })
                 } else {
-                    internal_error(format!("Failed to get export status: {}", e))
+                    StorageError::Backend(classify_sqlite_error("Failed to get export status", e))
                 }
             })?;
 
@@ -205,8 +217,13 @@ impl BulkExportStorage for SqliteBackend {
                  FROM bulk_export_progress
                  WHERE job_id = ?1",
             )
-            .map_err(|e| internal_error(format!("Failed to prepare progress query: {}", e)))?;
+            .or_query_error("Failed to prepare progress query")?;
 
+        // `query_map` only binds the parameters — the first `sqlite3_step`,
+        // and with it a `SQLITE_BUSY` from a rebuild holding the write lock,
+        // lands on the per-row `Result` below. Discarding those with
+        // `filter_map(|r| r.ok())` reported an empty read as success (#1185),
+        // so every row iteration in this file is collected through its error.
         let type_progress: Vec<TypeExportProgress> = stmt
             .query_map(params![job_id.as_str()], |row| {
                 Ok(TypeExportProgress {
@@ -217,9 +234,9 @@ impl BulkExportStorage for SqliteBackend {
                     cursor_state: row.get(4)?,
                 })
             })
-            .map_err(|e| internal_error(format!("Failed to query progress: {}", e)))?
-            .filter_map(|r| r.ok())
-            .collect();
+            .or_query_error("Failed to query progress")?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .or_query_error("Failed to read progress rows")?;
 
         Ok(ExportProgress {
             job_id: job_id.clone(),
@@ -257,7 +274,7 @@ impl BulkExportStorage for SqliteBackend {
                         job_id: job_id.to_string(),
                     })
                 } else {
-                    internal_error(format!("Failed to get export status: {}", e))
+                    StorageError::Backend(classify_sqlite_error("Failed to get export status", e))
                 }
             })?;
 
@@ -278,7 +295,7 @@ impl BulkExportStorage for SqliteBackend {
             "UPDATE bulk_export_jobs SET status = 'cancelled', completed_at = ?1 WHERE id = ?2",
             params![now, job_id.as_str()],
         )
-        .map_err(|e| internal_error(format!("Failed to cancel export: {}", e)))?;
+        .or_query_error("Failed to cancel export")?;
 
         Ok(())
     }
@@ -291,14 +308,23 @@ impl BulkExportStorage for SqliteBackend {
         let conn = self.get_connection()?;
         let tenant_id = tenant.tenant_id().as_str();
 
-        // Check exists
-        let exists: bool = conn
-            .query_row(
-                "SELECT 1 FROM bulk_export_jobs WHERE id = ?1 AND tenant_id = ?2",
-                params![job_id.as_str(), tenant_id],
-                |_| Ok(true),
-            )
-            .unwrap_or(false);
+        // Check exists. A driver failure here is not an absent job: swallowing
+        // it would answer 404 for a row that is merely locked (#1185), so only
+        // an empty result means "gone".
+        let exists: bool = match conn.query_row(
+            "SELECT 1 FROM bulk_export_jobs WHERE id = ?1 AND tenant_id = ?2",
+            params![job_id.as_str(), tenant_id],
+            |_| Ok(true),
+        ) {
+            Ok(found) => found,
+            Err(rusqlite::Error::QueryReturnedNoRows) => false,
+            Err(e) => {
+                return Err(StorageError::Backend(classify_sqlite_error(
+                    "Failed to look up export job",
+                    e,
+                )));
+            }
+        };
 
         if !exists {
             return Err(StorageError::BulkExport(BulkExportError::JobNotFound {
@@ -311,7 +337,7 @@ impl BulkExportStorage for SqliteBackend {
             "DELETE FROM bulk_export_jobs WHERE id = ?1 AND tenant_id = ?2",
             params![job_id.as_str(), tenant_id],
         )
-        .map_err(|e| internal_error(format!("Failed to delete export: {}", e)))?;
+        .or_query_error("Failed to delete export")?;
 
         Ok(())
     }
@@ -351,7 +377,7 @@ impl BulkExportStorage for SqliteBackend {
                         job_id: job_id.to_string(),
                     })
                 } else {
-                    internal_error(format!("Failed to get export job: {}", e))
+                    StorageError::Backend(classify_sqlite_error("Failed to get export job", e))
                 }
             })?;
 
@@ -367,7 +393,7 @@ impl BulkExportStorage for SqliteBackend {
                  WHERE job_id = ?1
                  ORDER BY file_type, resource_type, part_index",
             )
-            .map_err(|e| internal_error(format!("Failed to prepare files query: {}", e)))?;
+            .or_query_error("Failed to prepare files query")?;
 
         let rows: Vec<(String, i64, String, i64, i64)> = stmt
             .query_map(params![job_id.as_str()], |row| {
@@ -379,9 +405,9 @@ impl BulkExportStorage for SqliteBackend {
                     row.get(4)?,
                 ))
             })
-            .map_err(|e| internal_error(format!("Failed to query files: {}", e)))?
-            .filter_map(|r| r.ok())
-            .collect();
+            .or_query_error("Failed to query files")?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .or_query_error("Failed to read export file rows")?;
 
         let mut output = Vec::new();
         let mut errors = Vec::new();
@@ -435,19 +461,25 @@ impl BulkExportStorage for SqliteBackend {
 
             let mut stmt = conn
                 .prepare(query)
-                .map_err(|e| internal_error(format!("Failed to prepare list query: {}", e)))?;
+                .or_query_error("Failed to prepare list query")?;
 
             stmt.query_map(params![tenant_id], |row| row.get(0))
-                .map_err(|e| internal_error(format!("Failed to query exports: {}", e)))?
-                .filter_map(|r| r.ok())
-                .collect()
+                .or_query_error("Failed to query exports")?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .or_query_error("Failed to read export rows")?
         };
 
         let mut results = Vec::new();
         for id in job_ids {
             let job_id = ExportJobId::from_string(id);
-            if let Ok(progress) = self.get_export_status(tenant, &job_id).await {
-                results.push(progress);
+            // A job deleted between listing the ids and reading its status is
+            // a benign race, and drops out of the list. Anything else must
+            // not: swallowing a busy database here returned a short list as
+            // if those exports had never existed (#1185).
+            match self.get_export_status(tenant, &job_id).await {
+                Ok(progress) => results.push(progress),
+                Err(StorageError::BulkExport(BulkExportError::JobNotFound { .. })) => {}
+                Err(e) => return Err(e),
             }
         }
 
@@ -493,7 +525,7 @@ impl BulkExportStorage for SqliteBackend {
                         job_id: job_id.to_string(),
                     })
                 } else {
-                    internal_error(format!("Failed to get export job metadata: {}", e))
+                    StorageError::Backend(classify_sqlite_error("Failed to get export job metadata", e))
                 }
             })?;
 
@@ -556,7 +588,10 @@ impl BulkExportStorage for SqliteBackend {
                         job_id: format!("{job_id}/{part}"),
                     })
                 } else {
-                    internal_error(format!("Failed to get export file metadata: {}", e))
+                    StorageError::Backend(classify_sqlite_error(
+                        "Failed to get export file metadata",
+                        e,
+                    ))
                 }
             })?;
 
@@ -588,7 +623,7 @@ impl BulkExportStorage for SqliteBackend {
                 params![tenant_id],
                 |row| row.get(0),
             )
-            .map_err(|e| internal_error(format!("Failed to count active exports: {}", e)))?;
+            .or_query_error("Failed to count active exports")?;
         Ok(count as u64)
     }
 
@@ -605,7 +640,7 @@ impl BulkExportStorage for SqliteBackend {
                 params![tenant_id, status.to_string()],
                 |row| row.get(0),
             )
-            .map_err(|e| internal_error(format!("Failed to count exports by status: {e}")))?;
+            .or_query_error("Failed to count exports by status")?;
         Ok(count as u64)
     }
 
@@ -628,13 +663,13 @@ impl BulkExportStorage for SqliteBackend {
                    AND completed_at IS NOT NULL AND completed_at < ?1
                  ORDER BY completed_at LIMIT ?2",
             )
-            .map_err(|e| internal_error(format!("Failed to prepare expired query: {}", e)))?;
+            .or_query_error("Failed to prepare expired query")?;
 
         let rows: Vec<(String, String)> = stmt
             .query_map(params![cutoff, limit], |row| Ok((row.get(0)?, row.get(1)?)))
-            .map_err(|e| internal_error(format!("Failed to query expired exports: {}", e)))?
-            .filter_map(|r| r.ok())
-            .collect();
+            .or_query_error("Failed to query expired exports")?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .or_query_error("Failed to read expired export rows")?;
 
         Ok(rows
             .into_iter()
@@ -686,7 +721,7 @@ impl ExportClaimStrategy for SqliteBackend {
         // `CLAIM_LOCK` only serializes claims within this process.
         let txn = conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-            .map_err(|e| internal_error(format!("Failed to begin claim txn: {}", e)))?;
+            .or_query_error("Failed to begin claim txn")?;
 
         // Each turn either claims a job or retires one whose attempts are
         // spent. Retiring moves the job out of the eligible set, so the scan
@@ -694,24 +729,36 @@ impl ExportClaimStrategy for SqliteBackend {
         // while another job is still claimable (#1041).
         let claimed = loop {
             // Find one eligible job: accepted, or in-progress with an expired lease.
-            let row: Option<(String, String, String, i64, i64)> = txn
-                .query_row(
-                    "SELECT id, tenant_id, status, fencing_token, attempts FROM bulk_export_jobs
-                     WHERE status = 'accepted'
-                        OR (status = 'in-progress' AND (lease_expiry IS NULL OR lease_expiry < ?1))
-                     ORDER BY created_at LIMIT 1",
-                    params![now_str],
-                    |row| {
-                        Ok((
-                            row.get(0)?,
-                            row.get(1)?,
-                            row.get(2)?,
-                            row.get(3)?,
-                            row.get(4)?,
-                        ))
-                    },
-                )
-                .ok();
+            // Only an empty result means "nothing to do": discarding the
+            // error here made a `SQLITE_BUSY` from a concurrent index rebuild
+            // look like an idle queue, so the worker parked instead of
+            // retrying and the export never started (#1185). The worker loop
+            // already logs and backs off on `Err`.
+            let row: Option<(String, String, String, i64, i64)> = match txn.query_row(
+                "SELECT id, tenant_id, status, fencing_token, attempts FROM bulk_export_jobs
+                 WHERE status = 'accepted'
+                    OR (status = 'in-progress' AND (lease_expiry IS NULL OR lease_expiry < ?1))
+                 ORDER BY created_at LIMIT 1",
+                params![now_str],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            ) {
+                Ok(found) => Some(found),
+                Err(rusqlite::Error::QueryReturnedNoRows) => None,
+                Err(e) => {
+                    return Err(StorageError::Backend(classify_sqlite_error(
+                        "Failed to select an eligible export job",
+                        e,
+                    )));
+                }
+            };
 
             let Some((job_id, tenant_id, status, fencing_token, attempts)) = row else {
                 break None;
@@ -732,7 +779,7 @@ impl ExportClaimStrategy for SqliteBackend {
                      WHERE id = ?3",
                     params![abandoned_export_message(attempts_made), now_str, job_id],
                 )
-                .map_err(|e| internal_error(format!("Failed to abandon export job: {}", e)))?;
+                .or_query_error("Failed to abandon export job")?;
                 tracing::warn!(
                     job_id = %job_id,
                     attempts = attempts_made,
@@ -764,16 +811,12 @@ impl ExportClaimStrategy for SqliteBackend {
                     "DELETE FROM bulk_export_progress WHERE job_id = ?1",
                     params![job_id],
                 )
-                .map_err(|e| {
-                    internal_error(format!("Failed to clear reclaimed progress: {}", e))
-                })?;
+                .or_query_error("Failed to clear reclaimed progress")?;
                 txn.execute(
                     "DELETE FROM bulk_export_files WHERE job_id = ?1",
                     params![job_id],
                 )
-                .map_err(|e| {
-                    internal_error(format!("Failed to clear reclaimed file rows: {}", e))
-                })?;
+                .or_query_error("Failed to clear reclaimed file rows")?;
                 tracing::info!(
                     job_id = %job_id,
                     attempt,
@@ -796,7 +839,7 @@ impl ExportClaimStrategy for SqliteBackend {
                     job_id
                 ],
             )
-            .map_err(|e| internal_error(format!("Failed to claim export job: {}", e)))?;
+            .or_query_error("Failed to claim export job")?;
 
             break Some(ExportJobLease {
                 job_id: ExportJobId::from_string(job_id),
@@ -812,8 +855,7 @@ impl ExportClaimStrategy for SqliteBackend {
         };
 
         // Committed on both paths: an empty scan may still have retired jobs.
-        txn.commit()
-            .map_err(|e| internal_error(format!("Failed to commit claim txn: {}", e)))?;
+        txn.commit().or_query_error("Failed to commit claim txn")?;
 
         Ok(claimed)
     }
@@ -840,7 +882,8 @@ impl ExportClaimStrategy for SqliteBackend {
                     lease.fencing_token as i64
                 ],
             )
-            .map_err(|e| LeaseError::Storage(internal_error(format!("heartbeat failed: {e}"))))?;
+            .or_query_error("heartbeat failed")
+            .map_err(LeaseError::Storage)?;
         if affected == 0 {
             Err(LeaseError::LeaseLost {
                 job_id: lease.job_id.clone(),
@@ -863,7 +906,7 @@ impl ExportClaimStrategy for SqliteBackend {
                 lease.fencing_token as i64
             ],
         )
-        .map_err(|e| internal_error(format!("Failed to release lease: {}", e)))?;
+        .or_query_error("Failed to release lease")?;
         Ok(())
     }
 }
@@ -913,8 +956,9 @@ impl ExportWorkerStorage for SqliteBackend {
                 rusqlite::Error::QueryReturnedNoRows => LeaseError::LeaseLost {
                     job_id: job_id.clone(),
                 },
-                other => LeaseError::Storage(internal_error(format!(
-                    "Failed to load worker job: {other}"
+                other => LeaseError::Storage(StorageError::Backend(classify_sqlite_error(
+                    "Failed to load worker job",
+                    other,
                 ))),
             })?;
 
@@ -943,7 +987,8 @@ impl ExportWorkerStorage for SqliteBackend {
                 "SELECT resource_type, total_count, exported_count, error_count, cursor_state
                  FROM bulk_export_progress WHERE job_id = ?1",
             )
-            .map_err(|e| LeaseError::Storage(internal_error(format!("prepare progress: {e}"))))?;
+            .or_query_error("prepare progress")
+            .map_err(LeaseError::Storage)?;
         let type_progress: Vec<TypeExportProgress> = stmt
             .query_map(params![job_id.as_str()], |row| {
                 Ok(TypeExportProgress {
@@ -954,9 +999,11 @@ impl ExportWorkerStorage for SqliteBackend {
                     cursor_state: row.get(4)?,
                 })
             })
-            .map_err(|e| LeaseError::Storage(internal_error(format!("query progress: {e}"))))?
-            .filter_map(|r| r.ok())
-            .collect();
+            .or_query_error("query progress")
+            .map_err(LeaseError::Storage)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .or_query_error("read progress rows")
+            .map_err(LeaseError::Storage)?;
 
         Ok(WorkerJobView {
             request,
@@ -990,7 +1037,8 @@ impl ExportWorkerStorage for SqliteBackend {
                     fencing_token as i64
                 ],
             )
-            .map_err(|e| LeaseError::Storage(internal_error(format!("mark_in_progress: {e}"))))?;
+            .or_query_error("mark_in_progress")
+            .map_err(LeaseError::Storage)?;
         if affected == 0 {
             Err(LeaseError::LeaseLost {
                 job_id: job_id.clone(),
@@ -1035,9 +1083,8 @@ impl ExportWorkerStorage for SqliteBackend {
                     fencing_token as i64,
                 ],
             )
-            .map_err(|e| {
-                LeaseError::Storage(internal_error(format!("update_type_progress: {e}")))
-            })?;
+            .or_query_error("update_type_progress")
+            .map_err(LeaseError::Storage)?;
         if affected == 0 {
             Err(LeaseError::LeaseLost {
                 job_id: job_id.clone(),
@@ -1073,9 +1120,8 @@ impl ExportWorkerStorage for SqliteBackend {
                     fencing_token as i64
                 ],
             )
-            .map_err(|e| {
-                LeaseError::Storage(internal_error(format!("set_export_current_type: {e}")))
-            })?;
+            .or_query_error("set_export_current_type")
+            .map_err(LeaseError::Storage)?;
         if affected == 0 {
             Err(LeaseError::LeaseLost {
                 job_id: job_id.clone(),
@@ -1125,7 +1171,8 @@ impl ExportWorkerStorage for SqliteBackend {
                     fencing_token as i64,
                 ],
             )
-            .map_err(|e| LeaseError::Storage(internal_error(format!("record_export_file: {e}"))))?;
+            .or_query_error("record_export_file")
+            .map_err(LeaseError::Storage)?;
         if affected == 0 {
             Err(LeaseError::LeaseLost {
                 job_id: job_id.clone(),
@@ -1157,7 +1204,8 @@ impl ExportWorkerStorage for SqliteBackend {
                     fencing_token as i64
                 ],
             )
-            .map_err(|e| LeaseError::Storage(internal_error(format!("finish_job: {e}"))))?;
+            .or_query_error("finish_job")
+            .map_err(LeaseError::Storage)?;
         if affected == 0 {
             Err(LeaseError::LeaseLost {
                 job_id: job_id.clone(),
@@ -1191,7 +1239,8 @@ impl ExportWorkerStorage for SqliteBackend {
                     fencing_token as i64
                 ],
             )
-            .map_err(|e| LeaseError::Storage(internal_error(format!("fail_job: {e}"))))?;
+            .or_query_error("fail_job")
+            .map_err(LeaseError::Storage)?;
         if affected == 0 {
             Err(LeaseError::LeaseLost {
                 job_id: job_id.clone(),
@@ -1217,13 +1266,23 @@ impl ExportDataProvider for SqliteBackend {
             // Verify the types exist in the database
             let mut valid_types = Vec::new();
             for rt in &request.resource_types {
-                let exists: bool = conn
-                    .query_row(
-                        "SELECT 1 FROM resources WHERE tenant_id = ?1 AND resource_type = ?2 AND is_deleted = 0 LIMIT 1",
-                        params![tenant_id, rt],
-                        |_| Ok(true),
-                    )
-                    .unwrap_or(false);
+                // Only an empty result means "this type has no data". Treating a
+                // driver failure as absence would quietly drop a requested type
+                // from the export and still report success (#1185).
+                let exists: bool = match conn.query_row(
+                    "SELECT 1 FROM resources WHERE tenant_id = ?1 AND resource_type = ?2 AND is_deleted = 0 LIMIT 1",
+                    params![tenant_id, rt],
+                    |_| Ok(true),
+                ) {
+                    Ok(found) => found,
+                    Err(rusqlite::Error::QueryReturnedNoRows) => false,
+                    Err(e) => {
+                        return Err(StorageError::Backend(classify_sqlite_error(
+                            "Failed to probe resource type",
+                            e,
+                        )));
+                    }
+                };
                 if exists {
                     valid_types.push(rt.clone());
                 }
@@ -1238,13 +1297,13 @@ impl ExportDataProvider for SqliteBackend {
                  WHERE tenant_id = ?1 AND is_deleted = 0
                  ORDER BY resource_type",
             )
-            .map_err(|e| internal_error(format!("Failed to prepare types query: {}", e)))?;
+            .or_query_error("Failed to prepare types query")?;
 
         let types: Vec<String> = stmt
             .query_map(params![tenant_id], |row| row.get(0))
-            .map_err(|e| internal_error(format!("Failed to query types: {}", e)))?
-            .filter_map(|r| r.ok())
-            .collect();
+            .or_query_error("Failed to query types")?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .or_query_error("Failed to read resource type rows")?;
 
         Ok(types)
     }
@@ -1271,7 +1330,7 @@ impl ExportDataProvider for SqliteBackend {
 
         let count: i64 = conn
             .query_row(&query, params_slice.as_slice(), |row| row.get(0))
-            .map_err(|e| internal_error(format!("Failed to count resources: {}", e)))?;
+            .or_query_error("Failed to count resources")?;
 
         Ok(count as u64)
     }
@@ -1314,7 +1373,7 @@ impl ExportDataProvider for SqliteBackend {
 
         let mut stmt = conn
             .prepare(&query)
-            .map_err(|e| internal_error(format!("Failed to prepare batch query: {}", e)))?;
+            .or_query_error("Failed to prepare batch query")?;
 
         let rows: Vec<(String, Vec<u8>, String)> = stmt
             .query_map(params_slice.as_slice(), |row| {
@@ -1324,9 +1383,9 @@ impl ExportDataProvider for SqliteBackend {
                     row.get::<_, String>(2)?,
                 ))
             })
-            .map_err(|e| internal_error(format!("Failed to query batch: {}", e)))?
-            .filter_map(|r| r.ok())
-            .collect();
+            .or_query_error("Failed to query batch")?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .or_query_error("Failed to read batch rows")?;
 
         let has_more = rows.len() > batch_size as usize;
         let rows = if has_more {
@@ -1394,13 +1453,13 @@ impl PatientExportProvider for SqliteBackend {
 
         let mut stmt = conn
             .prepare(&query)
-            .map_err(|e| internal_error(format!("Failed to prepare patient ids query: {}", e)))?;
+            .or_query_error("Failed to prepare patient ids query")?;
 
         let ids: Vec<String> = stmt
             .query_map(params_slice.as_slice(), |row| row.get(0))
-            .map_err(|e| internal_error(format!("Failed to query patient ids: {}", e)))?
-            .filter_map(|r| r.ok())
-            .collect();
+            .or_query_error("Failed to query patient ids")?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .or_query_error("Failed to read patient id rows")?;
 
         let has_more = ids.len() > batch_size as usize;
         let ids = if has_more {
@@ -1471,9 +1530,9 @@ impl PatientExportProvider for SqliteBackend {
             let params_slice: Vec<&dyn rusqlite::ToSql> =
                 params_vec.iter().map(|p| p.as_ref()).collect();
 
-            let mut stmt = conn.prepare(&query).map_err(|e| {
-                internal_error(format!("Failed to prepare compartment query: {}", e))
-            })?;
+            let mut stmt = conn
+                .prepare(&query)
+                .or_query_error("Failed to prepare compartment query")?;
 
             let rows: Vec<(String, Vec<u8>, String)> = stmt
                 .query_map(params_slice.as_slice(), |row| {
@@ -1483,9 +1542,9 @@ impl PatientExportProvider for SqliteBackend {
                         row.get::<_, String>(2)?,
                     ))
                 })
-                .map_err(|e| internal_error(format!("Failed to query compartment: {}", e)))?
-                .filter_map(|r| r.ok())
-                .collect();
+                .or_query_error("Failed to query compartment")?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .or_query_error("Failed to read compartment rows")?;
 
             let has_more = rows.len() > batch_size as usize;
             let rows = if has_more {
@@ -1565,7 +1624,7 @@ impl PatientExportProvider for SqliteBackend {
 
         let mut stmt = conn
             .prepare(&query)
-            .map_err(|e| internal_error(format!("Failed to prepare compartment query: {}", e)))?;
+            .or_query_error("Failed to prepare compartment query")?;
 
         let rows: Vec<(String, Vec<u8>, String)> = stmt
             .query_map(params_slice.as_slice(), |row| {
@@ -1575,9 +1634,9 @@ impl PatientExportProvider for SqliteBackend {
                     row.get::<_, String>(2)?,
                 ))
             })
-            .map_err(|e| internal_error(format!("Failed to query compartment: {}", e)))?
-            .filter_map(|r| r.ok())
-            .collect();
+            .or_query_error("Failed to query compartment")?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .or_query_error("Failed to read compartment rows")?;
 
         let has_more = rows.len() > batch_size as usize;
         let rows = if has_more {
@@ -1629,7 +1688,7 @@ impl GroupExportProvider for SqliteBackend {
                         group_id: group_id.to_string(),
                     })
                 } else {
-                    internal_error(format!("Failed to get group: {}", e))
+                    StorageError::Backend(classify_sqlite_error("Failed to get group", e))
                 }
             })?;
 
@@ -1704,7 +1763,7 @@ impl GroupExportProvider for SqliteBackend {
                         group_id: group_id.to_string(),
                     })
                 } else {
-                    internal_error(format!("Failed to get group: {}", e))
+                    StorageError::Backend(classify_sqlite_error("Failed to get group", e))
                 }
             })?;
         let group: Value = serde_json::from_slice(&data)
@@ -3503,5 +3562,91 @@ mod tests {
                 BulkExportError::JobNotFound { .. }
             ))
         ));
+    }
+
+    /// #1185: the kick-off is one small insert, and a search-index rebuild
+    /// holding SQLite's single write lock makes it wait out `busy_timeout`
+    /// and fail with `SQLITE_BUSY`. That is a transient condition worth
+    /// retrying, so it has to reach REST as `Unavailable` — which renders as
+    /// 503 with `Retry-After`. Flattened into `Internal` it answered 500, and
+    /// nothing retried a database that was merely busy.
+    #[tokio::test]
+    async fn a_busy_database_makes_the_kickoff_retryable_not_a_fault() {
+        use crate::backends::sqlite::SqliteBackendConfig;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("kickoff-busy.db");
+        let backend = SqliteBackend::with_config(
+            &db_path,
+            SqliteBackendConfig {
+                max_connections: 2,
+                busy_timeout_ms: 20,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        backend.init_schema().unwrap();
+        let tenant = create_test_tenant();
+
+        // A raw connection outside the pool stands in for the rebuild: the
+        // lock that matters is SQLite's file-level write lock, not a pool
+        // slot, so `BEGIN IMMEDIATE` reproduces the contention exactly.
+        let rebuild = rusqlite::Connection::open(&db_path).unwrap();
+        rebuild.execute_batch("BEGIN IMMEDIATE;").unwrap();
+
+        let err = backend
+            .start_export(&tenant, test_input(ExportRequest::system()))
+            .await
+            .expect_err("the insert cannot land while the write lock is held");
+        rebuild.execute_batch("ROLLBACK;").unwrap();
+
+        match err {
+            StorageError::Backend(BackendError::Unavailable { message, .. }) => {
+                assert!(
+                    message.contains("Failed to create export job"),
+                    "the context must survive classification: {message}"
+                );
+            }
+            other => panic!("a busy database must stay retryable, got {other:?}"),
+        }
+    }
+
+    /// A row the driver cannot hand over must fail the read, not quietly drop
+    /// out of it. `query_map` binds the parameters and nothing more — the
+    /// first `sqlite3_step` happens on the per-row `Result` — so the old
+    /// `filter_map(|r| r.ok())` turned a failed read into an empty one, and
+    /// `$export-status` answered 200 with no progress instead of saying it
+    /// could not read it (#1185).
+    #[tokio::test]
+    async fn an_unreadable_progress_row_fails_the_status_read() {
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+        let job_id = backend
+            .start_export(&tenant, test_input(ExportRequest::system()))
+            .await
+            .unwrap();
+
+        // `exported_count` has INTEGER affinity, so a non-numeric string is
+        // stored as TEXT and reading it back as an `i64` fails the same way a
+        // driver error on that row would.
+        backend
+            .get_connection()
+            .unwrap()
+            .execute(
+                "INSERT INTO bulk_export_progress
+                 (job_id, resource_type, total_count, exported_count, error_count)
+                 VALUES (?1, 'Patient', 1, 'not-a-number', 0)",
+                params![job_id.as_str()],
+            )
+            .unwrap();
+
+        let err = backend
+            .get_export_status(&tenant, &job_id)
+            .await
+            .expect_err("an unreadable row must not read as an absent one");
+        assert!(
+            matches!(err, StorageError::Backend(_)),
+            "unexpected error: {err:?}"
+        );
     }
 }

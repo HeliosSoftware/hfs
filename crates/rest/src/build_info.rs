@@ -13,10 +13,17 @@ pub const SOFTWARE_NAME: &str = "Helios FHIR Server";
 /// workspace version, so this is also the `hfs` binary's version.
 pub const PKG_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// Abbreviated git commit the build was cut from, or `""` when the build
-/// script could not determine one (source tarball with no `.git`, no `git` on
-/// `PATH`). Set by `build.rs`; overridable at build time via `HFS_GIT_SHA`.
-const GIT_SHA_RAW: &str = env!("HFS_BUILD_GIT_SHA");
+/// Abbreviated git commit the build was cut from, when `build.rs` could
+/// determine one; absent for a source tarball with no `.git`, or with no
+/// `git` on `PATH`. Overridable at build time via `HFS_GIT_SHA`.
+///
+/// `option_env!`, not `env!` with an empty-string sentinel: clippy const-folds
+/// `is_empty()` on anything reachable through `env!`, so the sentinel check in
+/// [`git_sha`] was a constant expression in every build — always `false` where
+/// a commit resolved, always `true` where none did — and `const_is_empty`
+/// failed the build under `-D warnings` (#1185 CI). As an `Option` there is no
+/// such check to fold.
+const GIT_SHA_RAW: Option<&str> = option_env!("HFS_BUILD_GIT_SHA");
 
 /// What `--version` prints after the binary name: `0.2.1 (git 1a2b3c4d5)`, or
 /// just `0.2.1` when the commit is unknown.
@@ -37,8 +44,17 @@ pub const GIT_SHA_EXTENSION_URL: &str =
 
 /// The git commit the build was cut from, when the build script could
 /// determine one.
+///
+/// `GIT_SHA_RAW` is a build-time constant, so on a build where the script
+/// found no commit clippy sees `"".is_empty()` and reports the check as
+/// always-false (`const_is_empty`). The emptiness genuinely varies per
+/// build, so the check stays.
+#[allow(clippy::const_is_empty)]
 pub fn git_sha() -> Option<&'static str> {
-    (!GIT_SHA_RAW.is_empty()).then_some(GIT_SHA_RAW)
+    // `build.rs` never emits an empty value, but the variable can also come
+    // straight from the build environment, so an empty one still means
+    // "unknown" rather than a commit named "".
+    GIT_SHA_RAW.filter(|sha| !sha.is_empty())
 }
 
 /// `CapabilityStatement.software` for this build.
@@ -61,6 +77,11 @@ mod tests {
     use super::*;
 
     #[test]
+    // `PKG_VERSION` comes from `env!`, so clippy const-folds the `is_empty()`
+    // below and calls it pointless. It is not: every string starts with the
+    // empty one, so without it the assertion above would hold vacuously for a
+    // crate that somehow carried no version.
+    #[allow(clippy::const_is_empty)]
     fn version_string_starts_with_package_version() {
         assert!(
             VERSION_STRING.starts_with(PKG_VERSION),

@@ -249,12 +249,15 @@ where
         // Validate each patient reference resolves.
         for pref in &patient_refs {
             let id = pref.strip_prefix("Patient/").unwrap_or(pref);
-            let exists = state
-                .storage()
-                .read(tenant.context(), "Patient", id)
-                .await
-                .map_err(map_storage_err)?
-                .is_some();
+            // Same `Ok(None)` / `Err(Resource(Gone))` split as the Group gate
+            // above: a soft-deleted Patient is "does not resolve" for export
+            // purposes, so it joins the 400 below rather than escaping as a
+            // 410 that would read as "the $export endpoint is gone".
+            let exists = match state.storage().read(tenant.context(), "Patient", id).await {
+                Ok(found) => found.is_some(),
+                Err(StorageError::Resource(ResourceError::Gone { .. })) => false,
+                Err(e) => return Err(map_storage_err(e)),
+            };
             if !exists {
                 return Err(bad_request(format!("unknown patient reference '{pref}'")));
             }
@@ -405,9 +408,15 @@ fn map_storage_err(e: StorageError) -> RestError {
         }) => RestError::NotImplemented {
             feature: "bulk export not supported by this backend".to_string(),
         },
-        other => RestError::InternalError {
-            message: other.to_string(),
-        },
+        // Everything else is classified by the shared `From<StorageError>`
+        // conversion instead of being flattened into a 500. The SQLite
+        // kick-off insert that waits out `busy_timeout` behind a search-index
+        // rebuild arrives here as `BackendError::Unavailable`; that impl turns
+        // it into a 503 with `Retry-After`, which is what it is — a transient,
+        // retryable condition rather than a server fault (#1185). Collapsing
+        // it to a 500 also dropped the message, so the client saw only the
+        // generic "An internal error occurred" sentence.
+        other => RestError::from(other),
     }
 }
 
@@ -890,6 +899,7 @@ fn owns_job(principal: Option<&Principal>, owner_subject: Option<&str>) -> bool 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use helios_persistence::error::BackendError;
 
     #[tokio::test]
     async fn streamed_export_body_propagates_reader_errors() {
@@ -922,5 +932,130 @@ mod tests {
             advertised_download_url(&protected, || "https://public.example/artifact".to_string()),
             "https://public.example/artifact"
         );
+    }
+
+    /// #1185: on SQLite a kick-off insert that waits out `busy_timeout` behind
+    /// a search-index rebuild fails with `SQLITE_BUSY`, which the backend
+    /// classifies as `BackendError::Unavailable`. It used to reach the client
+    /// as a bare 500 with no `Retry-After` and a generic message, so nothing
+    /// retried and the operator had no idea the database was merely busy.
+    #[test]
+    fn map_storage_err_turns_a_busy_backend_into_a_retryable_503() {
+        let busy = StorageError::Backend(BackendError::Unavailable {
+            backend_name: "sqlite".to_string(),
+            message: "Failed to create export job: database is locked".to_string(),
+        });
+
+        let (status, code, message) = map_storage_err(busy).client_response();
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(code, "transient");
+        assert_eq!(
+            message, "Failed to create export job: database is locked",
+            "a transient failure keeps its detail; only genuine faults are sanitized"
+        );
+
+        let response = axum::response::IntoResponse::into_response(map_storage_err(
+            StorageError::Backend(BackendError::Unavailable {
+                backend_name: "sqlite".to_string(),
+                message: "database is locked".to_string(),
+            }),
+        ));
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let retry_after = response
+            .headers()
+            .get(axum::http::header::RETRY_AFTER)
+            .expect("a 503 must tell the client when to come back");
+        assert!(
+            retry_after
+                .to_str()
+                .expect("Retry-After is ASCII")
+                .parse::<u32>()
+                .expect("Retry-After is delta-seconds")
+                > 0
+        );
+    }
+
+    /// The remaining backend conditions must keep the classification the shared
+    /// `From<BackendError>` conversion gives them, rather than all collapsing
+    /// onto one status.
+    #[test]
+    fn map_storage_err_separates_transient_backends_from_real_faults() {
+        let cases = [
+            (
+                BackendError::ConnectionFailed {
+                    backend_name: "sqlite".to_string(),
+                    message: "no such file".to_string(),
+                },
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                BackendError::PoolExhausted {
+                    backend_name: "sqlite".to_string(),
+                },
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                BackendError::Timeout {
+                    backend_name: "postgres".to_string(),
+                    message: "statement timeout".to_string(),
+                },
+                StatusCode::GATEWAY_TIMEOUT,
+            ),
+            (
+                BackendError::Internal {
+                    backend_name: "sqlite".to_string(),
+                    message: "malformed row".to_string(),
+                    source: None,
+                },
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+        ];
+
+        for (backend_err, expected) in cases {
+            let label = backend_err.to_string();
+            let (status, _, _) =
+                map_storage_err(StorageError::Backend(backend_err)).client_response();
+            assert_eq!(status, expected, "wrong status for {label}");
+        }
+    }
+
+    /// Delegating the catch-all must not swallow the three specialisations the
+    /// export routes layer on top: they are matched before it and stay put.
+    /// `BulkExport(_)` in particular is a 500 in the generic conversion, so a
+    /// missing job would regress to 500 if its arm ever moved after the
+    /// delegation.
+    #[test]
+    fn map_storage_err_keeps_its_bulk_export_specialisations() {
+        let missing_job = map_storage_err(StorageError::BulkExport(BulkExportError::JobNotFound {
+            job_id: "job-1".to_string(),
+        }));
+        assert!(
+            matches!(&missing_job, RestError::NotFound { resource_type, id }
+                if resource_type == "export-job" && id == "job-1"),
+            "unexpected mapping: {missing_job:?}"
+        );
+        assert_eq!(missing_job.client_response().0, StatusCode::NOT_FOUND);
+
+        let missing_group =
+            map_storage_err(StorageError::BulkExport(BulkExportError::GroupNotFound {
+                group_id: "g-1".to_string(),
+            }));
+        assert!(
+            matches!(&missing_group, RestError::NotFound { resource_type, id }
+                if resource_type == "Group" && id == "g-1"),
+            "unexpected mapping: {missing_group:?}"
+        );
+
+        let unsupported =
+            map_storage_err(StorageError::Backend(BackendError::UnsupportedCapability {
+                backend_name: "mongodb".to_string(),
+                capability: "bulk_export".to_string(),
+            }));
+        assert!(
+            matches!(&unsupported, RestError::NotImplemented { feature }
+                if feature == "bulk export not supported by this backend"),
+            "the export-specific wording must survive: {unsupported:?}"
+        );
+        assert_eq!(unsupported.client_response().0, StatusCode::NOT_IMPLEMENTED);
     }
 }

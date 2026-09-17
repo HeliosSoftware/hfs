@@ -65,6 +65,7 @@ pub mod chain_resolver;
 pub mod converters;
 pub mod errors;
 pub mod extractor;
+pub mod id_modifier;
 pub mod list_resolver;
 pub mod loader;
 pub mod range;
@@ -73,6 +74,7 @@ pub mod reindex;
 pub mod seeder;
 pub mod tenant_registries;
 pub mod text_fold;
+pub mod uri;
 pub mod writer;
 
 // Re-export main types
@@ -80,6 +82,7 @@ pub use chain_resolver::{query_has_chains, resolve_chains};
 pub use converters::{IndexValue, ValueConverter};
 pub use errors::{ExtractionError, LoaderError, RegistryError, ReindexError};
 pub use extractor::{ContainedExtraction, ExtractedValue, SearchParameterExtractor};
+pub use id_modifier::reject_unsupported_id_modifier;
 pub use list_resolver::{query_has_list, resolve_list};
 pub use loader::SearchParameterLoader;
 pub use range::{implicit_precision, implicit_range};
@@ -98,4 +101,5 @@ pub use seeder::{
 };
 pub use tenant_registries::{StoredParamLoader, TenantSearchRegistries};
 pub use text_fold::fold_text;
+pub use uri::compute_parent_uris;
 pub use writer::SearchIndexWriter;

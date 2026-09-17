@@ -682,7 +682,9 @@ test("a result under a public path prefix still opens in the modal", async ({
   const queryPath = `/Patient?_id=${id}`;
   const publicUrl = `https://fhir.example.test/public/fhir/acme/Patient/${id}`;
 
-  await page.route(`**${queryPath}`, async (route) => {
+  // The page appends `_total=accurate` to every search it sends (#1003);
+  // match the wire request, not the typed path.
+  await page.route(`**${queryPath}&_total=accurate`, async (route) => {
     await route.fulfill({
       status: 200,
       contentType: "application/fhir+json",
@@ -1063,4 +1065,159 @@ test("rows with short and long values have the same height", async ({
     rows.map((row) => row.getBoundingClientRect().height),
   );
   expect(Math.abs(heights[0] - heights[1])).toBeLessThanOrEqual(1);
+});
+
+/* ---- result columns follow the payload (#1105) ------------------------ */
+
+// The Resources page defaults to the natural-language search pane when NL
+// search is configured (the e2e server always configures it, #1105's e2e run
+// showed the builder pane is `display: none` in that mode regardless of its
+// `hidden` attribute) — switch to the structured builder before driving it
+// through `resources.builder`, mirroring the existing "switching away and
+// back" test above.
+async function switchToBuilderMode(resources: ResourcesPage): Promise<void> {
+  const builderMode = resources.page.locator("[data-mode-btn='builder']");
+  if (await builderMode.count()) await builderMode.click();
+}
+
+test("a full SearchParameter listing shows every attribute the server returned", async ({
+  resources,
+}) => {
+  await resources.goto("SearchParameter");
+  await switchToBuilderMode(resources);
+  await resources.builder.run("SearchParameter?_count=5");
+  await resources.results.waitShown();
+  // The card is already visible from the page's own initial default listing
+  // (#1105) — wait for this run's own response to land (an auto-retrying
+  // assertion) before reading the headers it produced.
+  await expect(resources.results.rows).toHaveCount(5);
+
+  const headers = await resources.page.locator("#query-results-head th").allTextContents();
+  expect(headers).toContain("code");
+  expect(headers).toContain("base");
+  expect(headers).toContain("type");
+  expect(headers).toContain("expression");
+  expect(headers).not.toContain("resourceType");
+  expect(headers).not.toContain("meta");
+  expect(headers).not.toContain("text");
+  expect(headers[0]).toBe("id");
+
+  const updated = await resources.results.card.getAttribute("data-msg-updated");
+  expect(headers[headers.length - 1]).toBe(updated);
+});
+
+test("_summary=true lists the returned summary elements, not just five", async ({ resources }) => {
+  await resources.goto("SearchParameter");
+  await switchToBuilderMode(resources);
+  await resources.builder.run("SearchParameter?_summary=true&_count=5");
+  await resources.results.waitShown();
+  await expect(resources.results.rows).toHaveCount(5);
+
+  const headers = await resources.page.locator("#query-results-head th").allTextContents();
+  expect(headers).toContain("code");
+  expect(headers).toContain("base");
+  expect(headers).toContain("type");
+  expect(headers).toContain("publisher");
+  expect(headers).not.toContain("expression");
+});
+
+test("_elements keeps overriding the returned attributes", async ({ resources }) => {
+  await resources.goto("SearchParameter");
+  await switchToBuilderMode(resources);
+  await resources.builder.run("SearchParameter?_elements=code,base&_count=5");
+  await resources.results.waitShown();
+  await expect(resources.results.rows).toHaveCount(5);
+
+  const headers = await resources.page.locator("#query-results-head th").allTextContents();
+  const updated = await resources.results.card.getAttribute("data-msg-updated");
+  expect(headers).toEqual(["id", "code", "base", updated]);
+});
+
+test("a Patient summary shows every summary element it has, not a hand-picked four", async ({
+  resources,
+  request,
+}) => {
+  const id = await createResource(request, "Patient", {
+    identifier: [{ system: "urn:test", value: "cols-1105" }],
+    active: true,
+    name: [{ family: "Columns1105" }],
+    telecom: [{ system: "phone", value: "555-1105" }],
+    gender: "female",
+    birthDate: "1990-05-11",
+    address: [{ city: "Quito" }],
+  });
+  await waitSearchable(request, "Patient", id);
+
+  await resources.goto("Patient");
+  await switchToBuilderMode(resources);
+  await resources.builder.run(`Patient?_id=${id}&_summary=true`);
+  await resources.results.waitShown();
+  await expect(resources.results.rows).toHaveCount(1);
+
+  const headers = await resources.page.locator("#query-results-head th").allTextContents();
+  const order = ["identifier", "active", "name", "telecom", "gender", "birthDate", "address"];
+  const positions = order.map((col) => headers.indexOf(col));
+  for (const position of positions) expect(position).toBeGreaterThanOrEqual(0);
+  for (let i = 1; i < positions.length; i++) {
+    expect(positions[i]).toBeGreaterThan(positions[i - 1]);
+  }
+});
+
+test("columns are the union across the returned resources", async ({ resources, request }) => {
+  const genderOnlyId = await createResource(request, "Patient", {
+    name: [{ family: "UnionGender" }],
+    gender: "female",
+  });
+  const birthDateOnlyId = await createResource(request, "Patient", {
+    name: [{ family: "UnionBirthDate" }],
+    birthDate: "1985-03-02",
+  });
+  await waitSearchable(request, "Patient", genderOnlyId);
+  await waitSearchable(request, "Patient", birthDateOnlyId);
+
+  await resources.goto("Patient");
+  await switchToBuilderMode(resources);
+  await resources.builder.run(`Patient?_id=${genderOnlyId},${birthDateOnlyId}`);
+  await resources.results.waitShown();
+  await expect(resources.results.rows).toHaveCount(2);
+
+  const headers = await resources.page.locator("#query-results-head th").allTextContents();
+  expect(headers).toContain("gender");
+  expect(headers).toContain("birthDate");
+
+  const nameIndex = headers.indexOf("name");
+  const birthDateIndex = headers.indexOf("birthDate");
+  const rowCount = await resources.results.rows.count();
+  let genderOnlyRowCells: string[] | null = null;
+  for (let i = 0; i < rowCount; i++) {
+    const cells = await resources.results.rows.nth(i).locator("td").allTextContents();
+    if (cells[nameIndex] === "UnionGender") genderOnlyRowCells = cells;
+  }
+  expect(genderOnlyRowCells).not.toBeNull();
+  expect(genderOnlyRowCells![birthDateIndex]).toBe("");
+});
+
+test("an empty page falls back to the type's summary columns", async ({ resources }) => {
+  await resources.goto("Patient");
+  await switchToBuilderMode(resources);
+  await expect(resources.builder.paramOptions.first()).toBeAttached();
+  await resources.builder.run("Patient?name=NoSuchPerson1105");
+  await resources.results.waitShown();
+  // The card is already visible from the page's own initial default listing
+  // (#1105) — wait for the *new*, empty response to actually land (an
+  // auto-retrying assertion) before reading the headers it produced.
+  await expect(resources.results.rows).toHaveCount(0);
+
+  const headers = await resources.page.locator("#query-results-head th").allTextContents();
+  for (const col of [
+    "identifier",
+    "active",
+    "name",
+    "telecom",
+    "gender",
+    "birthDate",
+    "managingOrganization",
+  ]) {
+    expect(headers).toContain(col);
+  }
 });

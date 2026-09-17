@@ -141,6 +141,59 @@ fn fhir_version_from_output_format(output_format: Option<&str>) -> FhirVersion {
         .unwrap_or_else(FhirVersion::default_enabled)
 }
 
+/// Projection of a full `SubmissionManifest` row, shared by `get_manifest`
+/// and `list_manifests` so both select every field. The columns are decoded
+/// by name in [`decode_submission_manifest_row`], so their order here is
+/// only cosmetic.
+const SUBMISSION_MANIFEST_COLUMNS: &str = "\
+manifest_id, manifest_url, replaces_manifest_url, status, added_at, total_entries, \
+processed_entries, failed_entries, lease_expiry, bytes_processed, bytes_total, phase, \
+files_done, files_total";
+
+/// Decodes one `bulk_manifests` row selected with
+/// [`SUBMISSION_MANIFEST_COLUMNS`], reading every field by column name.
+///
+/// An unreadable `status` is an error, but an unreadable `phase` is not: it is
+/// a cosmetic hint, and a row written by a newer HFS must still be readable
+/// here (#953).
+fn decode_submission_manifest_row(row: &tokio_postgres::Row) -> StorageResult<SubmissionManifest> {
+    let manifest_id: String = row.get("manifest_id");
+    let manifest_url: Option<String> = row.get("manifest_url");
+    let replaces_manifest_url: Option<String> = row.get("replaces_manifest_url");
+    let status_str: String = row.get("status");
+    let added_at: DateTime<Utc> = row.get("added_at");
+    let total: i32 = row.get("total_entries");
+    let processed: i32 = row.get("processed_entries");
+    let failed: i32 = row.get("failed_entries");
+    let lease_expiry: Option<DateTime<Utc>> = row.get("lease_expiry");
+    let bytes_processed: i64 = row.get("bytes_processed");
+    let bytes_total: i64 = row.get("bytes_total");
+    let phase: Option<String> = row.get("phase");
+    let files_done: i64 = row.get("files_done");
+    let files_total: i64 = row.get("files_total");
+
+    let status: ManifestStatus = status_str
+        .parse()
+        .map_err(|_| internal_error(format!("Invalid manifest status: {}", status_str)))?;
+
+    Ok(SubmissionManifest {
+        manifest_id,
+        manifest_url,
+        replaces_manifest_url,
+        status,
+        added_at,
+        total_entries: total as u64,
+        processed_entries: processed as u64,
+        failed_entries: failed as u64,
+        lease_expiry,
+        bytes_processed: bytes_processed.max(0) as u64,
+        bytes_total: bytes_total.max(0) as u64,
+        phase: phase.and_then(|p| p.parse::<ManifestPhase>().ok()),
+        files_done: files_done.max(0) as u64,
+        files_total: files_total.max(0) as u64,
+    })
+}
+
 #[async_trait]
 impl BulkSubmitProvider for PostgresBackend {
     async fn create_submission(
@@ -628,9 +681,11 @@ impl BulkSubmitProvider for PostgresBackend {
 
         let rows = client
             .query(
-                "SELECT manifest_url, replaces_manifest_url, status, added_at, total_entries, processed_entries, failed_entries, lease_expiry, bytes_processed, bytes_total, phase, files_done, files_total
-                 FROM bulk_manifests
-                 WHERE tenant_id = $1 AND submitter = $2 AND submission_id = $3 AND manifest_id = $4",
+                &format!(
+                    "SELECT {SUBMISSION_MANIFEST_COLUMNS}
+                     FROM bulk_manifests
+                     WHERE tenant_id = $1 AND submitter = $2 AND submission_id = $3 AND manifest_id = $4"
+                ),
                 &[
                     &tenant_id,
                     &submission_id.submitter.as_str(),
@@ -645,44 +700,7 @@ impl BulkSubmitProvider for PostgresBackend {
             return Ok(None);
         }
 
-        let row = &rows[0];
-        let manifest_url: Option<String> = row.get(0);
-        let replaces_manifest_url: Option<String> = row.get(1);
-        let status_str: String = row.get(2);
-        let added_at: chrono::DateTime<Utc> = row.get(3);
-        let total: i32 = row.get(4);
-        let processed: i32 = row.get(5);
-        let failed: i32 = row.get(6);
-        let lease_expiry: Option<chrono::DateTime<Utc>> = row.get(7);
-        let bytes_processed: i64 = row.get(8);
-        let bytes_total: i64 = row.get(9);
-        // Unlike `status`, an unreadable phase is not an error: it is a
-        // cosmetic hint, and a row written by a newer HFS must still be
-        // readable here (#953).
-        let phase: Option<String> = row.get(10);
-        let files_done: i64 = row.get(11);
-        let files_total: i64 = row.get(12);
-
-        let status: ManifestStatus = status_str
-            .parse()
-            .map_err(|_| internal_error(format!("Invalid manifest status: {}", status_str)))?;
-
-        Ok(Some(SubmissionManifest {
-            manifest_id: manifest_id.to_string(),
-            manifest_url,
-            replaces_manifest_url,
-            status,
-            added_at,
-            total_entries: total as u64,
-            processed_entries: processed as u64,
-            failed_entries: failed as u64,
-            lease_expiry,
-            bytes_processed: bytes_processed.max(0) as u64,
-            bytes_total: bytes_total.max(0) as u64,
-            phase: phase.and_then(|p| p.parse::<ManifestPhase>().ok()),
-            files_done: files_done.max(0) as u64,
-            files_total: files_total.max(0) as u64,
-        }))
+        Ok(Some(decode_submission_manifest_row(&rows[0])?))
     }
 
     async fn list_manifests(
@@ -693,11 +711,18 @@ impl BulkSubmitProvider for PostgresBackend {
         let client = self.get_client().await?;
         let tenant_id = tenant.tenant_id().as_str();
 
+        // One query, one connection checkout: the previous shape selected the
+        // ids first and then called `get_manifest` per row while still holding
+        // this client, so on a pool of one connection the list waited for a
+        // connection it was itself holding until the pool timed out (#1144).
         let rows = client
             .query(
-                "SELECT manifest_id FROM bulk_manifests
-                 WHERE tenant_id = $1 AND submitter = $2 AND submission_id = $3
-                 ORDER BY added_at",
+                &format!(
+                    "SELECT {SUBMISSION_MANIFEST_COLUMNS}
+                     FROM bulk_manifests
+                     WHERE tenant_id = $1 AND submitter = $2 AND submission_id = $3
+                     ORDER BY added_at"
+                ),
                 &[
                     &tenant_id,
                     &submission_id.submitter.as_str(),
@@ -707,15 +732,9 @@ impl BulkSubmitProvider for PostgresBackend {
             .await
             .map_err(|e| internal_error(format!("Failed to query manifests: {}", e)))?;
 
-        let mut results = Vec::new();
+        let mut results = Vec::with_capacity(rows.len());
         for row in &rows {
-            let manifest_id: String = row.get(0);
-            if let Some(manifest) = self
-                .get_manifest(tenant, submission_id, &manifest_id)
-                .await?
-            {
-                results.push(manifest);
-            }
+            results.push(decode_submission_manifest_row(row)?);
         }
 
         Ok(results)
@@ -745,21 +764,25 @@ impl BulkSubmitProvider for PostgresBackend {
             ));
         }
 
-        // Update manifest status to processing, on a client scoped to this one
-        // statement.
+        // Promote a pending manifest to processing, on a client scoped to this
+        // one statement.
         //
-        // `status IN ('pending', 'processing')` keeps it a promotion rather
-        // than a reset: the statement runs on *every* batch, so without the
-        // guard the batch that lands right after `abort_submission` moved the
-        // manifest to `'failed'` would quietly put it back to `'processing'`
-        // and the abort would read as if it had never happened (#968).
+        // `status = 'pending'` makes this the promotion of the first batch and
+        // nothing else. The shared engine runs the statement on *every* batch,
+        // both in synchronous `process_entries` calls and in the lease-holding
+        // worker that reaches it through `process_ndjson_stream`, and once the
+        // manifest is `processing` the later batches must leave the column
+        // alone instead of rewriting the value it already has. Every other
+        // state, whether `failed` after `abort_submission` moved the manifest,
+        // `replaced`, or any terminal status, matches nothing, so an abort
+        // cannot read as if it had never happened (#968).
         {
             let client = self.get_client().await?;
             client
                 .execute(
                     "UPDATE bulk_manifests SET status = 'processing'
                      WHERE tenant_id = $1 AND submitter = $2 AND submission_id = $3 AND manifest_id = $4
-                       AND status IN ('pending', 'processing')",
+                       AND status = 'pending'",
                     &[
                         &tenant_id,
                         &submission_id.submitter.as_str(),

@@ -2790,10 +2790,14 @@ async fn query_params_catalog(
     })
 }
 
-/// Default result-table columns for a resource type (#958): its summary
-/// elements minus resource infrastructure, capped so the table stays
-/// scannable. Replaces the six-type hardcoded map in the browser — every
-/// type the spec defines summary elements for now gets real columns.
+/// Default result-table columns for a resource type (#958): every summary
+/// element minus resource infrastructure. Replaces the six-type hardcoded map
+/// in the browser — every type the spec defines summary elements for now
+/// gets real columns.
+///
+/// The list is the type's full summary set; the browser derives the table's
+/// actual columns from the resources a page returns and only falls back to
+/// this hint when the page is empty (#1105).
 ///
 /// The names are JSON element names straight from
 /// [`helios_fhir::summary_elements`] — the browser uses each one as both the
@@ -2816,7 +2820,6 @@ fn default_result_columns(version: helios_fhir::FhirVersion, resource_type: &str
     helios_fhir::summary_elements(version, resource_type)
         .into_iter()
         .filter(|f| !INFRASTRUCTURE.contains(&f.as_str()))
-        .take(5)
         .collect()
 }
 
@@ -8915,6 +8918,34 @@ pub(crate) fn render_not_found(
     (StatusCode::NOT_FOUND, render(page)).into_response()
 }
 
+/// Renders a failed self-call to HFS with its cause. `reqwest::Error`'s
+/// `Display` stops at the URL — `error sending request for url (...)` — and
+/// hides the reason in `source()`, which made a timeout, a refused
+/// connection, and a reset read byte-identically (#957).
+///
+/// A timeout is the one cause worth naming outright, because it is the only
+/// one the user can act on by waiting: `timeout_secs` is the cap this
+/// particular call gave the server, and `timeout_hint` says why that call can
+/// legitimately run long. Every other cause is the `Display` text with its
+/// `source()` chain appended, colon-separated (#1185).
+pub(crate) fn upstream_failure_detail(
+    e: &reqwest::Error,
+    timeout_secs: u64,
+    timeout_hint: &str,
+) -> String {
+    if e.is_timeout() {
+        return format!("timed out after {timeout_secs}s — {timeout_hint}");
+    }
+    let mut detail = e.to_string();
+    let mut src = std::error::Error::source(e);
+    while let Some(cause) = src {
+        detail.push_str(": ");
+        detail.push_str(&cause.to_string());
+        src = cause.source();
+    }
+    detail
+}
+
 fn unix_timestamp_seconds() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -9455,11 +9486,33 @@ mod tests {
     fn default_result_columns_use_json_element_names() {
         assert_eq!(
             default_result_columns(helios_fhir::FhirVersion::R4, "Claim"),
-            ["status", "type", "use", "patient", "billablePeriod"]
+            [
+                "status",
+                "type",
+                "use",
+                "patient",
+                "billablePeriod",
+                "created",
+                "insurer",
+                "provider",
+                "priority",
+                "insurance"
+            ]
         );
         assert_eq!(
             default_result_columns(helios_fhir::FhirVersion::R4, "Patient"),
-            ["identifier", "active", "name", "telecom", "gender"]
+            [
+                "identifier",
+                "active",
+                "name",
+                "telecom",
+                "gender",
+                "birthDate",
+                "deceased",
+                "address",
+                "managingOrganization",
+                "link"
+            ]
         );
         assert!(default_result_columns(helios_fhir::FhirVersion::R4, "Nope").is_empty());
     }

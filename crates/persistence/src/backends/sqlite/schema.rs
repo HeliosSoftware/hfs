@@ -2897,6 +2897,42 @@ mod tests {
         }
     }
 
+    /// Delete-by-resource must seek `idx_search_composite`, never full-scan
+    /// `search_index`. The composite leads with `(tenant_id, resource_type,
+    /// resource_key, …)`, so the DELETE has to carry the `tenant_id` /
+    /// `resource_type` equality prefix; a predicate on `resource_key` alone
+    /// scans the whole table — O(rows) on every resource UPDATE and re-index
+    /// (#1197). This guards against dropping the prefix again.
+    #[test]
+    fn delete_by_resource_key_seeks_the_composite_index() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+        let plan: Vec<String> = conn
+            .prepare(
+                "EXPLAIN QUERY PLAN
+                 DELETE FROM search_index
+                  WHERE tenant_id = ?1 AND resource_type = ?2
+                    AND resource_key = (
+                        SELECT rowid FROM resources
+                         WHERE tenant_id = ?1 AND resource_type = ?2 AND id = ?3
+                    )",
+            )
+            .unwrap()
+            .query_map(["t1", "Patient", "p1"], |r| r.get::<_, String>(3))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        let joined = plan.join(" | ");
+        assert!(
+            joined.contains("idx_search_composite"),
+            "delete-by-resource must seek idx_search_composite; plan was: {joined}"
+        );
+        assert!(
+            !joined.contains("SCAN search_index"),
+            "delete-by-resource must not full-scan search_index; plan was: {joined}"
+        );
+    }
+
     /// The canonical value-index list must be exactly what a fresh schema
     /// carries, name and definition alike — it is what a bulk index rebuild
     /// recreates and what startup self-heals from, so drift here would
