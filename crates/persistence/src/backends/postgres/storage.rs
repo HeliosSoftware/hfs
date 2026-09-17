@@ -1704,7 +1704,11 @@ impl PostgresBackend {
     where
         C: deadpool_postgres::GenericClient + ?Sized,
     {
-        if !self.fts_table_exists(client).await? {
+        if !self
+            .fts_table_exists(client)
+            .await
+            .map_err(PageFtsError::Other)?
+        {
             return Ok(());
         }
 
@@ -1840,7 +1844,11 @@ impl PostgresBackend {
     where
         C: deadpool_postgres::GenericClient + ?Sized,
     {
-        if !self.fts_table_exists(client).await? {
+        if !self
+            .fts_table_exists(client)
+            .await
+            .map_err(BatchFtsError::Other)?
+        {
             return Ok(());
         }
 
@@ -4803,12 +4811,6 @@ enum PageFtsError {
     Other(StorageError),
 }
 
-impl From<StorageError> for PageFtsError {
-    fn from(error: StorageError) -> Self {
-        Self::Other(error)
-    }
-}
-
 /// Outcome of a grouped FTS statement (`FTS_BATCH_UPSERT_SQL`) inside a
 /// reindex page transaction.
 ///
@@ -4819,12 +4821,6 @@ impl From<StorageError> for PageFtsError {
 enum BatchFtsError {
     ProgramLimitExceeded(tokio_postgres::Error),
     Other(StorageError),
-}
-
-impl From<StorageError> for BatchFtsError {
-    fn from(error: StorageError) -> Self {
-        Self::Other(error)
-    }
 }
 
 /// Content extracted from a resource for full-text search.
