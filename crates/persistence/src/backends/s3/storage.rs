@@ -339,6 +339,21 @@ impl S3Backend {
         tenant: &TenantContext,
         resource_type: &str,
     ) -> StorageResult<Vec<Value>> {
+        Ok(self
+            .scan_live_stored(tenant, resource_type)
+            .await?
+            .into_iter()
+            .map(|resource| resource.content().clone())
+            .collect())
+    }
+
+    /// [`Self::scan_live_resources`] with the storage envelope kept (version,
+    /// timestamps), for callers that hand the resources back as search matches.
+    pub(crate) async fn scan_live_stored(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+    ) -> StorageResult<Vec<StoredResource>> {
         use futures::stream::{self, StreamExt};
 
         let location = self.tenant_location(tenant)?;
@@ -364,7 +379,7 @@ impl S3Backend {
             if resource.is_deleted() {
                 continue;
             }
-            resources.push(resource.content().clone());
+            resources.push(resource);
         }
         Ok(resources)
     }
@@ -705,6 +720,10 @@ impl ResourceStorage for S3Backend {
             InProcessSofRunner::new(scan, FhirVersion::default_enabled(), "s3-in-process")
                 .with_reference_resolver(resolver),
         ))
+    }
+
+    fn resource_scan(&self) -> Option<std::sync::Arc<dyn crate::sof::in_process::ResourceScan>> {
+        Some(std::sync::Arc::new(self.clone()))
     }
 
     async fn create(
@@ -1594,13 +1613,68 @@ use crate::core::storage::{
 use crate::types::IncludeDirective;
 use crate::types::SearchQuery;
 
+/// The SQL-on-FHIR definition types, which standalone S3 lists by scanning.
+///
+/// S3 has no search index, and answering a search by reading every object of a
+/// type is not something to do quietly for `Patient` or `Observation`: those
+/// stay `501`. These two are different in kind — a handful of
+/// operator-authored definitions — and without a way to list them the SQL
+/// Views, SQL Queries and SQL Export pages render empty, as if nothing had
+/// been saved (#1228).
+const SCAN_LISTED_TYPES: [&str; 2] = ["ViewDefinition", "Library"];
+
+/// Whether `query` is the plain "everything of this type" listing of one of
+/// [`SCAN_LISTED_TYPES`]: no filter of any kind, so that a scan returns
+/// exactly what a search would.
+fn lists_by_scan(query: &SearchQuery) -> bool {
+    SCAN_LISTED_TYPES.contains(&query.resource_type.as_str())
+        && query.parameters.is_empty()
+        && query.compartment.is_none()
+        && query.includes.is_empty()
+        && query.cursor.is_none()
+}
+
+impl S3Backend {
+    /// Serves a filterless listing of a definition type from a scan, newest
+    /// first like every other backend's default order. One page: `_count`
+    /// bounds it, and the reported total is what the scan found.
+    async fn list_definitions_by_scan(
+        &self,
+        tenant: &TenantContext,
+        query: &SearchQuery,
+    ) -> StorageResult<SearchResult> {
+        let mut resources = self.scan_live_stored(tenant, &query.resource_type).await?;
+        resources.sort_by(|a, b| {
+            b.last_modified()
+                .cmp(&a.last_modified())
+                .then_with(|| a.id().cmp(b.id()))
+        });
+        let total = resources.len() as u64;
+        let offset = query.offset.unwrap_or(0) as usize;
+        let count = query.count.unwrap_or(100) as usize;
+        let page: Vec<StoredResource> = resources.into_iter().skip(offset).take(count).collect();
+        let mut page_info = crate::types::PageInfo::end();
+        page_info.total = Some(total);
+        page_info.has_previous = offset > 0;
+        Ok(SearchResult {
+            resources: crate::types::Page::new(page, page_info),
+            included: Vec::new(),
+            total: Some(total),
+            scores: std::collections::HashMap::new(),
+        })
+    }
+}
+
 #[async_trait]
 impl SearchProvider for S3Backend {
     async fn search(
         &self,
-        _tenant: &TenantContext,
-        _query: &SearchQuery,
+        tenant: &TenantContext,
+        query: &SearchQuery,
     ) -> StorageResult<SearchResult> {
+        if lists_by_scan(query) {
+            return self.list_definitions_by_scan(tenant, query).await;
+        }
         Err(StorageError::Backend(BackendError::UnsupportedCapability {
             backend_name: "S3".to_string(),
             capability: "search".to_string(),
