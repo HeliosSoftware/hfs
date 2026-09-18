@@ -592,7 +592,12 @@ pub trait ResourceStorage: Send + Sync {
     ///
     /// # Returns
     ///
-    /// A vector of found resources (missing/deleted resources are omitted).
+    /// A vector of found resources. A missing id (`Ok(None)`) and a
+    /// soft-deleted id (`Err(Gone)`) are both omitted rather than failing the
+    /// batch — one deleted target must not sink the reads of every other id, so
+    /// callers resolving a set of references (`$everything` supporting resources,
+    /// SOF reference resolution, the ingest index sink) get the resources that
+    /// do exist. Any other error still propagates.
     async fn read_batch(
         &self,
         tenant: &TenantContext,
@@ -601,8 +606,11 @@ pub trait ResourceStorage: Send + Sync {
     ) -> StorageResult<Vec<StoredResource>> {
         let mut results = Vec::with_capacity(ids.len());
         for id in ids {
-            if let Some(resource) = self.read(tenant, resource_type, id).await? {
-                results.push(resource);
+            match self.read(tenant, resource_type, id).await {
+                Ok(Some(resource)) => results.push(resource),
+                Ok(None) => {}
+                Err(StorageError::Resource(ResourceError::Gone { .. })) => {}
+                Err(e) => return Err(e),
             }
         }
         Ok(results)
