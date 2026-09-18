@@ -1,0 +1,48 @@
+=== arrancando HFS: puerto 18085, ES http://localhost:19200, prefijo hfs_20260917_0601 ===
+2026-09-18T19:01:05.188430Z  INFO hfs: Audit logging is DISABLED
+2026-09-18T19:01:05.188539Z  INFO hfs: Authentication is DISABLED
+2026-09-18T19:01:05.188564Z  INFO hfs: Starting Helios FHIR Server port=18085 host=127.0.0.1 bind_address=127.0.0.1:18085 public_base_url=http://localhost:18085 fhir_version=R4 storage_backend=sqlite-elasticsearch terminology_server=None auth_enabled=false audit_backend=none
+2026-09-18T19:01:05.188597Z  INFO hfs: Initializing SQLite backend database=./data/hfs.db
+2026-09-18T19:01:05.598138Z  INFO helios_persistence::backends::sqlite::backend: SQLite mmap_size: requested 32212254720 bytes (30720 MiB), effective 32212254720 bytes (30720 MiB)
+2026-09-18T19:01:05.623813Z  INFO helios_fhir::search::loader: Loaded 1372 SearchParameters from spec file: "./data\\search-parameters-r4.json"
+2026-09-18T19:01:05.631586Z  INFO helios_persistence::backends::sqlite::backend: SearchParameter registry initialized: 1389 total (1364 spec from ./data\search-parameters-r4.json, 10 fallback, 15 custom [sql-on-fhir-search-parameters.json]) covering 136 resource types
+2026-09-18T19:01:05.632707Z  INFO hfs: SQLite search indexing disabled (offloaded to Elasticsearch)
+2026-09-18T19:01:05.632764Z  INFO hfs: Initializing Elasticsearch backend nodes=["http://localhost:19200"] index_prefix=hfs_20260917_0601
+2026-09-18T19:01:05.632961Z  INFO helios_persistence::backends::sqlite::backend: SQLite mmap_size: requested 32212254720 bytes (30720 MiB), effective 32212254720 bytes (30720 MiB)
+2026-09-18T19:01:05.632979Z  INFO hfs: Composite storage initialized: SQLite (primary) + Elasticsearch (search)
+2026-09-18T19:01:05.632990Z  INFO helios_persistence::backends::sqlite::backend: SQLite mmap_size: requested 32212254720 bytes (30720 MiB), effective 32212254720 bytes (30720 MiB)
+2026-09-18T19:01:05.673756Z  INFO hfs: Bulk export config: enabled=true output_backend=local-fs requires_access_token=auto
+2026-09-18T19:01:05.673802Z  INFO hfs: Bulk export worker pool started (2 workers)
+2026-09-18T19:01:05.673809Z  INFO hfs: Reindex writes to search targets targets=["elasticsearch"]
+2026-09-18T19:01:05.673828Z  INFO hfs: Bulk submit indexes into Elasticsearch during ingest; the deferred reindex runs only for types the search index rejected queue=64 concurrency=8 coalesce=4 max_wait_secs=30
+2026-09-18T19:01:05.673836Z  INFO hfs: Bulk submit config: enabled=true output_backend=local-fs requires_access_token=auto
+2026-09-18T19:01:05.673965Z  INFO hfs: Bulk submit fast-load: search indexing deferred to post-manifest reindex
+2026-09-18T19:01:05.673979Z  INFO hfs: Bulk submit worker pool started (1 workers)
+2026-09-18T19:01:05.673994Z  INFO helios_rest: Creating REST API server with backend: composite
+2026-09-18T19:01:05.676088Z  INFO helios_rest: Using in-DB SofRunner runner="sqlite-indb" fhir_version=R4
+2026-09-18T19:01:05.676118Z  INFO helios_rest: Export controller: InMemory + FilesystemSink dir=tmp/edson/work/sql-exports
+2026-09-18T19:01:05.676267Z  INFO helios_rest: Subscriptions engine ENABLED (status write-back ON)
+2026-09-18T19:01:05.677134Z  INFO helios_subscriptions::rehydrate: Rehydrating subscription engine from storage tenants=1
+2026-09-18T19:01:05.677894Z  INFO hfs: Server listening address=127.0.0.1:18085
+2026-09-18T19:01:05.677573Z  INFO helios_subscriptions::rehydrate: Rehydrated subscription tenant="default" subscription_id=manual-sub topic_url=http://example.org/topics/encounter-start status=error channel_type=rest-hook fhir_version=R4
+2026-09-18T19:01:05.678041Z  INFO helios_subscriptions::rehydrate: Re-activating `requested` subscriptions after rehydration subscriptions=1 max_concurrent=8
+2026-09-18T19:01:05.679041Z  INFO helios_subscriptions::engine: Sending subscription handshake tenant_id="default" subscription_id="manual-sub" channel_type=rest-hook endpoint="http://127.0.0.1:9999/webhook" attempt=1 max_attempts=1
+2026-09-18T19:01:05.689332Z  INFO helios_subscriptions::engine: Handshake successful, activating subscription tenant_id="default" subscription_id="manual-sub" channel_type=rest-hook endpoint="http://127.0.0.1:9999/webhook" attempt=1
+2026-09-18T19:01:06.430621Z  INFO helios_subscriptions::rehydrate: Subscription engine rehydrated tenants=1 topics=1 subscriptions=1 dormant=0 failed=0 handshakes=1
+2026-09-18T19:01:07.680539Z  INFO helios_persistence::backends::sqlite::backend: SQLite mmap_size: requested 32212254720 bytes (30720 MiB), effective 32212254720 bytes (30720 MiB)
+2026-09-18T19:01:38.962757Z  INFO helios_persistence::backends::sqlite::backend: SQLite mmap_size: requested 32212254720 bytes (30720 MiB), effective 32212254720 bytes (30720 MiB)
+2026-09-18T19:01:38.966272Z  INFO helios_persistence::backends::sqlite::backend: SQLite mmap_size: requested 32212254720 bytes (30720 MiB), effective 32212254720 bytes (30720 MiB)
+2026-09-18T19:02:33.250232Z  INFO helios_subscriptions::engine: Subscription event evaluated tenant_id=default resource_type=Encounter resource_id=01a0b5e6-21a4-76e1-960b-afa667eb3a15 event_type=create matched_subscriptions=1
+2026-09-18T19:02:33.250324Z  INFO helios_subscriptions::engine: Dispatching subscription event notification tenant_id=default subscription_id=manual-sub topic_url=http://example.org/topics/encounter-start channel_type=rest-hook endpoint="http://127.0.0.1:9999/webhook" event_number=1 focus_reference=Encounter/01a0b5e6-21a4-76e1-960b-afa667eb3a15
+2026-09-18T19:02:33.257334Z  INFO helios_subscriptions::engine: Subscription notification dispatched tenant_id="default" subscription_id="manual-sub" notification_type="event-notification" event_number=1 channel_type=rest-hook endpoint="http://127.0.0.1:9999/webhook"
+2026-09-18T19:02:34.265203Z  INFO helios_subscriptions::engine: Subscription event evaluated tenant_id=default resource_type=Encounter resource_id=01a0b5e6-2221-79d2-9c47-cdf3bb360936 event_type=create matched_subscriptions=1
+2026-09-18T19:02:34.265290Z  INFO helios_subscriptions::engine: Dispatching subscription event notification tenant_id=default subscription_id=manual-sub topic_url=http://example.org/topics/encounter-start channel_type=rest-hook endpoint="http://127.0.0.1:9999/webhook" event_number=2 focus_reference=Encounter/01a0b5e6-2221-79d2-9c47-cdf3bb360936
+2026-09-18T19:02:34.271298Z  INFO helios_subscriptions::engine: Subscription notification dispatched tenant_id="default" subscription_id="manual-sub" notification_type="event-notification" event_number=2 channel_type=rest-hook endpoint="http://127.0.0.1:9999/webhook"
+2026-09-18T19:02:35.288174Z  INFO helios_subscriptions::engine: Subscription event evaluated tenant_id=default resource_type=Encounter resource_id=01a0b5e6-2619-7e91-9a48-7c45cda89553 event_type=create matched_subscriptions=1
+2026-09-18T19:02:35.288266Z  INFO helios_subscriptions::engine: Dispatching subscription event notification tenant_id=default subscription_id=manual-sub topic_url=http://example.org/topics/encounter-start channel_type=rest-hook endpoint="http://127.0.0.1:9999/webhook" event_number=3 focus_reference=Encounter/01a0b5e6-2619-7e91-9a48-7c45cda89553
+2026-09-18T19:02:35.297132Z  INFO helios_subscriptions::engine: Subscription notification dispatched tenant_id="default" subscription_id="manual-sub" notification_type="event-notification" event_number=3 channel_type=rest-hook endpoint="http://127.0.0.1:9999/webhook"
+2026-09-18T19:13:06.663828Z  INFO helios_persistence::backends::sqlite::backend: SQLite mmap_size: requested 32212254720 bytes (30720 MiB), effective 32212254720 bytes (30720 MiB)
+2026-09-18T19:13:06.663891Z  INFO helios_persistence::backends::sqlite::backend: SQLite mmap_size: requested 32212254720 bytes (30720 MiB), effective 32212254720 bytes (30720 MiB)
+2026-09-18T19:20:07.667699Z  INFO helios_persistence::backends::sqlite::backend: SQLite mmap_size: requested 32212254720 bytes (30720 MiB), effective 32212254720 bytes (30720 MiB)
+2026-09-18T19:20:07.667699Z  INFO helios_persistence::backends::sqlite::backend: SQLite mmap_size: requested 32212254720 bytes (30720 MiB), effective 32212254720 bytes (30720 MiB)
+2026-09-18T19:20:07.669697Z  INFO helios_persistence::backends::sqlite::backend: SQLite mmap_size: requested 32212254720 bytes (30720 MiB), effective 32212254720 bytes (30720 MiB)
