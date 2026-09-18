@@ -1116,10 +1116,12 @@ For each backend row, attach to the release issue:
 ## SQLite + Elasticsearch — findings from the sqlite-es pass
 
 The steps in this matrix were revised during this pass under #1126. The original T3
-procedure could not be completed: it ran for more than 71 hours without reaching its
-pass criteria — 18 h 31 min of ingest plus a deferred search rebuild projected at
-~53 h. Performance, not correctness, is what forced the deviation. With the revised
-procedure and configuration (release binary, index-during-ingest instead of a
+procedure could not be completed. About **32.5 hours were actually spent** on it —
+18 h 31 min of ingest, in two passes because the server lost its bulk-submit lease
+halfway, plus 14 h of deferred search rebuild advancing at 93 resources/s, stopped at
+1,665,207 of 18,955,865 documents. Finishing that rebuild projected to
+**~53 h more**. Performance, not correctness, is what forced the deviation. With the
+revised procedure and configuration (release binary, index-during-ingest instead of a
 deferred rebuild, and documented Elasticsearch sizing), the same 18,955,865-resource
 corpus imports and indexes in 4 h 36 m 47 s — about 4.6 hours, verified 100% complete
 with 24 output files and 0 errors.

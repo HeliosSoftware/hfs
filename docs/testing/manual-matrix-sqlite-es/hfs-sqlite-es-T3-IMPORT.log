@@ -1,0 +1,170 @@
+=== arrancando HFS: puerto 18085, ES http://localhost:19200, prefijo hfs_20260917_0601 ===
+2026-09-17T10:36:59.328412Z  INFO hfs: Audit logging is DISABLED
+2026-09-17T10:36:59.328553Z  INFO hfs: Authentication is DISABLED
+2026-09-17T10:36:59.328584Z  INFO hfs: Starting Helios FHIR Server port=18085 host=127.0.0.1 bind_address=127.0.0.1:18085 public_base_url=http://localhost:18085 fhir_version=R4 storage_backend=sqlite-elasticsearch terminology_server=None auth_enabled=false audit_backend=none
+2026-09-17T10:36:59.328642Z  INFO hfs: Initializing SQLite backend database=./data/hfs.db
+2026-09-17T10:36:59.330423Z  INFO helios_persistence::backends::sqlite::backend: SQLite mmap_size: requested 32212254720 bytes (30720 MiB), effective 32212254720 bytes (30720 MiB)
+2026-09-17T10:36:59.359798Z  INFO helios_fhir::search::loader: Loaded 1372 SearchParameters from spec file: "./data\\search-parameters-r4.json"
+2026-09-17T10:36:59.368957Z  INFO helios_persistence::backends::sqlite::backend: SearchParameter registry initialized: 1389 total (1364 spec from ./data\search-parameters-r4.json, 10 fallback, 15 custom [sql-on-fhir-search-parameters.json]) covering 136 resource types
+2026-09-17T10:36:59.371309Z  INFO helios_persistence::backends::sqlite::backend: SQLite mmap_size: requested 32212254720 bytes (30720 MiB), effective 32212254720 bytes (30720 MiB)
+2026-09-17T10:36:59.379670Z  INFO helios_persistence::backends::sqlite::backend: SQLite mmap_size: requested 32212254720 bytes (30720 MiB), effective 32212254720 bytes (30720 MiB)
+2026-09-17T10:36:59.396014Z  INFO hfs: SQLite search indexing disabled (offloaded to Elasticsearch)
+2026-09-17T10:36:59.396103Z  INFO hfs: Initializing Elasticsearch backend nodes=["http://localhost:19200"] index_prefix=hfs_20260917_0601
+2026-09-17T10:36:59.396412Z  INFO hfs: Composite storage initialized: SQLite (primary) + Elasticsearch (search)
+2026-09-17T10:37:05.913518Z  INFO helios_persistence::search::seeder: Seeded spec SearchParameters into storage created=1374 existing=0 failed=0 tenant=default
+2026-09-17T10:37:07.028794Z  INFO helios_persistence::search::seeder: Seeded spec CompartmentDefinitions into storage created=5 existing=0 failed=0 tenant=default
+2026-09-17T10:37:07.028851Z  INFO hfs: Bulk export config: enabled=true output_backend=local-fs requires_access_token=auto
+2026-09-17T10:37:07.028902Z  INFO hfs: Bulk export worker pool started (2 workers)
+2026-09-17T10:37:07.028914Z  INFO hfs: Reindex writes to search targets targets=["elasticsearch"]
+2026-09-17T10:37:07.028948Z  INFO hfs: Bulk submit indexes into Elasticsearch during ingest; the deferred reindex runs only for types the search index rejected queue=64 concurrency=8 coalesce=4 max_wait_secs=30
+2026-09-17T10:37:07.028966Z  INFO hfs: Bulk submit config: enabled=true output_backend=local-fs requires_access_token=auto
+2026-09-17T10:37:07.029166Z  INFO hfs: Bulk submit fast-load: search indexing deferred to post-manifest reindex
+2026-09-17T10:37:07.029206Z  INFO hfs: Bulk submit worker pool started (1 workers)
+2026-09-17T10:37:07.029245Z  INFO helios_rest: Creating REST API server with backend: composite
+2026-09-17T10:37:07.032993Z  INFO helios_rest: Using in-DB SofRunner runner="sqlite-indb" fhir_version=R4
+2026-09-17T10:37:07.033053Z  INFO helios_rest: Export controller: InMemory + FilesystemSink dir=tmp/edson/work/sql-exports
+2026-09-17T10:37:07.033389Z  INFO helios_rest: Subscriptions engine ENABLED (status write-back ON)
+2026-09-17T10:37:07.033525Z  INFO helios_subscriptions::rehydrate: Rehydrating subscription engine from storage tenants=1
+2026-09-17T10:37:07.033781Z  INFO helios_subscriptions::rehydrate: Subscription engine rehydrated tenants=1 topics=0 subscriptions=0 dormant=0 failed=0 handshakes=0
+2026-09-17T10:37:07.036249Z  INFO hfs: Server listening address=127.0.0.1:18085
+2026-09-17T10:38:55.315149Z  INFO helios_persistence::backends::sqlite::bulk_submit: sqlite WAL checkpoint after a bulk-submit file wal_frames=20054 wal_bytes=82141184 passive_checkpointed=20054 truncate_busy=false truncate_frames=0 duration_ms=232
+2026-09-17T10:39:11.883286Z  INFO helios_persistence::backends::sqlite::bulk_submit: sqlite WAL checkpoint after a bulk-submit file wal_frames=8946 wal_bytes=36642816 passive_checkpointed=8946 truncate_busy=false truncate_frames=0 duration_ms=302
+2026-09-17T10:39:26.459989Z  INFO helios_persistence::backends::sqlite::bulk_submit: sqlite WAL checkpoint after a bulk-submit file wal_frames=49979 wal_bytes=204713984 passive_checkpointed=49979 truncate_busy=false truncate_frames=0 duration_ms=576
+2026-09-17T10:40:28.169550Z  INFO helios_persistence::backends::sqlite::backend: SQLite mmap_size: requested 32212254720 bytes (30720 MiB), effective 32212254720 bytes (30720 MiB)
+2026-09-17T10:46:57.467155Z  INFO helios_persistence::backends::sqlite::backend: SQLite mmap_size: requested 32212254720 bytes (30720 MiB), effective 32212254720 bytes (30720 MiB)
+2026-09-17T10:46:57.467172Z  INFO helios_persistence::backends::sqlite::backend: SQLite mmap_size: requested 32212254720 bytes (30720 MiB), effective 32212254720 bytes (30720 MiB)
+2026-09-17T10:59:47.397390Z  INFO helios_persistence::backends::sqlite::bulk_submit: sqlite WAL checkpoint after a bulk-submit file wal_frames=15749 wal_bytes=64507904 passive_checkpointed=15749 truncate_busy=false truncate_frames=0 duration_ms=1738
+2026-09-17T10:59:53.630096Z  INFO helios_persistence::backends::sqlite::backend: SQLite mmap_size: requested 32212254720 bytes (30720 MiB), effective 32212254720 bytes (30720 MiB)
+2026-09-17T11:03:45.542689Z  INFO helios_persistence::backends::sqlite::bulk_submit: sqlite WAL checkpoint after a bulk-submit file wal_frames=33510 wal_bytes=137256960 passive_checkpointed=33510 truncate_busy=false truncate_frames=0 duration_ms=2564
+2026-09-17T11:04:19.415188Z  INFO helios_persistence::backends::sqlite::bulk_submit: sqlite WAL checkpoint after a bulk-submit file wal_frames=44366 wal_bytes=181723136 passive_checkpointed=44366 truncate_busy=false truncate_frames=0 duration_ms=1888
+2026-09-17T11:05:09.839303Z  INFO helios_persistence::backends::sqlite::backend: SQLite mmap_size: requested 32212254720 bytes (30720 MiB), effective 32212254720 bytes (30720 MiB)
+2026-09-17T11:05:09.839382Z  INFO helios_persistence::backends::sqlite::backend: SQLite mmap_size: requested 32212254720 bytes (30720 MiB), effective 32212254720 bytes (30720 MiB)
+2026-09-17T11:05:09.840951Z  INFO helios_persistence::backends::sqlite::backend: SQLite mmap_size: requested 32212254720 bytes (30720 MiB), effective 32212254720 bytes (30720 MiB)
+2026-09-17T11:14:12.143468Z  INFO helios_persistence::backends::sqlite::backend: SQLite mmap_size: requested 32212254720 bytes (30720 MiB), effective 32212254720 bytes (30720 MiB)
+2026-09-17T11:14:12.145393Z  INFO helios_persistence::backends::sqlite::backend: SQLite mmap_size: requested 32212254720 bytes (30720 MiB), effective 32212254720 bytes (30720 MiB)
+2026-09-17T11:14:12.145942Z  INFO helios_persistence::backends::sqlite::backend: SQLite mmap_size: requested 32212254720 bytes (30720 MiB), effective 32212254720 bytes (30720 MiB)
+2026-09-17T11:14:12.654739Z  WARN helios_ui::bulk_import: failed to persist bulk-import submission submission=00551711-0025-4912-8fc8-4693840cf05f error=optimistic lock failure: resource BulkProviderSubmission/00551711-0025-4912-8fc8-4693840cf05f has been modified
+2026-09-17T11:26:15.983012Z  INFO helios_persistence::backends::sqlite::bulk_submit: sqlite WAL checkpoint after a bulk-submit file wal_frames=41966 wal_bytes=171892736 passive_checkpointed=41966 truncate_busy=false truncate_frames=0 duration_ms=2809
+2026-09-17T11:27:08.841006Z  INFO helios_persistence::backends::sqlite::backend: SQLite mmap_size: requested 32212254720 bytes (30720 MiB), effective 32212254720 bytes (30720 MiB)
+2026-09-17T11:27:08.842305Z  INFO helios_persistence::backends::sqlite::backend: SQLite mmap_size: requested 32212254720 bytes (30720 MiB), effective 32212254720 bytes (30720 MiB)
+2026-09-17T11:37:00.387373Z  INFO helios_persistence::backends::sqlite::backend: SQLite mmap_size: requested 32212254720 bytes (30720 MiB), effective 32212254720 bytes (30720 MiB)
+2026-09-17T11:37:00.387472Z  INFO helios_persistence::backends::sqlite::backend: SQLite mmap_size: requested 32212254720 bytes (30720 MiB), effective 32212254720 bytes (30720 MiB)
+2026-09-17T11:37:00.388299Z  INFO helios_persistence::backends::sqlite::backend: SQLite mmap_size: requested 32212254720 bytes (30720 MiB), effective 32212254720 bytes (30720 MiB)
+2026-09-17T11:37:00.390109Z  INFO helios_persistence::backends::sqlite::backend: SQLite mmap_size: requested 32212254720 bytes (30720 MiB), effective 32212254720 bytes (30720 MiB)
+2026-09-17T11:37:00.390348Z  INFO helios_persistence::backends::sqlite::backend: SQLite mmap_size: requested 32212254720 bytes (30720 MiB), effective 32212254720 bytes (30720 MiB)
+2026-09-17T11:37:39.636022Z  INFO helios_persistence::backends::sqlite::bulk_submit: sqlite WAL checkpoint after a bulk-submit file wal_frames=14671 wal_bytes=60092416 passive_checkpointed=14671 truncate_busy=false truncate_frames=0 duration_ms=1579
+2026-09-17T11:47:16.885733Z  INFO helios_persistence::backends::sqlite::bulk_submit: sqlite WAL checkpoint after a bulk-submit file wal_frames=47572 wal_bytes=194854912 passive_checkpointed=47572 truncate_busy=false truncate_frames=0 duration_ms=2299
+2026-09-17T11:48:11.713200Z  INFO helios_persistence::backends::sqlite::backend: SQLite mmap_size: requested 32212254720 bytes (30720 MiB), effective 32212254720 bytes (30720 MiB)
+2026-09-17T11:58:33.788600Z  INFO helios_persistence::backends::sqlite::backend: SQLite mmap_size: requested 32212254720 bytes (30720 MiB), effective 32212254720 bytes (30720 MiB)
+2026-09-17T11:58:33.788716Z  INFO helios_persistence::backends::sqlite::backend: SQLite mmap_size: requested 32212254720 bytes (30720 MiB), effective 32212254720 bytes (30720 MiB)
+2026-09-17T12:07:43.763288Z  INFO helios_persistence::backends::sqlite::backend: SQLite mmap_size: requested 32212254720 bytes (30720 MiB), effective 32212254720 bytes (30720 MiB)
+2026-09-17T12:10:56.545029Z  INFO helios_persistence::backends::sqlite::backend: SQLite mmap_size: requested 32212254720 bytes (30720 MiB), effective 32212254720 bytes (30720 MiB)
+2026-09-17T12:10:56.545212Z  INFO helios_persistence::backends::sqlite::backend: SQLite mmap_size: requested 32212254720 bytes (30720 MiB), effective 32212254720 bytes (30720 MiB)
+2026-09-17T12:19:27.464856Z  INFO helios_persistence::backends::sqlite::backend: SQLite mmap_size: requested 32212254720 bytes (30720 MiB), effective 32212254720 bytes (30720 MiB)
+2026-09-17T12:25:28.882831Z  INFO helios_persistence::backends::sqlite::bulk_submit: sqlite WAL checkpoint after a bulk-submit file wal_frames=29869 wal_bytes=122343424 passive_checkpointed=29869 truncate_busy=false truncate_frames=0 duration_ms=811
+2026-09-17T12:25:50.488446Z  INFO helios_persistence::backends::sqlite::bulk_submit: sqlite WAL checkpoint after a bulk-submit file wal_frames=13418 wal_bytes=54960128 passive_checkpointed=13418 truncate_busy=false truncate_frames=0 duration_ms=260
+2026-09-17T12:26:42.543521Z  INFO helios_persistence::backends::sqlite::bulk_submit: sqlite WAL checkpoint after a bulk-submit file wal_frames=17678 wal_bytes=72409088 passive_checkpointed=17678 truncate_busy=false truncate_frames=0 duration_ms=359
+2026-09-17T12:26:42.694895Z  INFO helios_persistence::backends::sqlite::bulk_submit: sqlite WAL checkpoint after a bulk-submit file wal_frames=2383 wal_bytes=9760768 passive_checkpointed=2383 truncate_busy=false truncate_frames=0 duration_ms=34
+2026-09-17T12:27:31.863746Z  INFO helios_persistence::backends::sqlite::bulk_submit: sqlite WAL checkpoint after a bulk-submit file wal_frames=2971 wal_bytes=12169216 passive_checkpointed=2971 truncate_busy=false truncate_frames=0 duration_ms=135
+2026-09-17T12:28:51.539601Z  INFO helios_persistence::backends::sqlite::bulk_submit: sqlite WAL checkpoint after a bulk-submit file wal_frames=30754 wal_bytes=125968384 passive_checkpointed=30754 truncate_busy=false truncate_frames=0 duration_ms=526
+2026-09-17T12:29:29.729888Z  INFO helios_persistence::backends::sqlite::backend: SQLite mmap_size: requested 32212254720 bytes (30720 MiB), effective 32212254720 bytes (30720 MiB)
+2026-09-17T12:29:47.897859Z  INFO helios_persistence::backends::sqlite::backend: SQLite mmap_size: requested 32212254720 bytes (30720 MiB), effective 32212254720 bytes (30720 MiB)
+2026-09-17T12:30:32.019833Z  INFO helios_persistence::backends::sqlite::backend: SQLite mmap_size: requested 32212254720 bytes (30720 MiB), effective 32212254720 bytes (30720 MiB)
+2026-09-17T12:30:32.020159Z  INFO helios_persistence::backends::sqlite::backend: SQLite mmap_size: requested 32212254720 bytes (30720 MiB), effective 32212254720 bytes (30720 MiB)
+2026-09-17T12:34:48.372505Z  INFO helios_persistence::backends::sqlite::bulk_submit: sqlite WAL checkpoint after a bulk-submit file wal_frames=1486 wal_bytes=6086656 passive_checkpointed=1486 truncate_busy=false truncate_frames=0 duration_ms=225
+2026-09-17T12:37:00.370858Z  INFO helios_persistence::backends::sqlite::backend: SQLite mmap_size: requested 32212254720 bytes (30720 MiB), effective 32212254720 bytes (30720 MiB)
+2026-09-17T12:37:00.370928Z  INFO helios_persistence::backends::sqlite::backend: SQLite mmap_size: requested 32212254720 bytes (30720 MiB), effective 32212254720 bytes (30720 MiB)
+2026-09-17T12:37:00.370973Z  INFO helios_persistence::backends::sqlite::backend: SQLite mmap_size: requested 32212254720 bytes (30720 MiB), effective 32212254720 bytes (30720 MiB)
+2026-09-17T12:37:00.372794Z  INFO helios_persistence::backends::sqlite::backend: SQLite mmap_size: requested 32212254720 bytes (30720 MiB), effective 32212254720 bytes (30720 MiB)
+2026-09-17T12:47:36.700426Z  INFO helios_persistence::backends::sqlite::backend: SQLite mmap_size: requested 32212254720 bytes (30720 MiB), effective 32212254720 bytes (30720 MiB)
+2026-09-17T12:49:34.218483Z  INFO helios_persistence::backends::sqlite::backend: SQLite mmap_size: requested 32212254720 bytes (30720 MiB), effective 32212254720 bytes (30720 MiB)
+2026-09-17T12:49:34.219386Z  INFO helios_persistence::backends::sqlite::backend: SQLite mmap_size: requested 32212254720 bytes (30720 MiB), effective 32212254720 bytes (30720 MiB)
+2026-09-17T13:05:09.173200Z  INFO helios_persistence::backends::sqlite::backend: SQLite mmap_size: requested 32212254720 bytes (30720 MiB), effective 32212254720 bytes (30720 MiB)
+2026-09-17T13:05:48.260381Z  INFO helios_persistence::backends::sqlite::backend: SQLite mmap_size: requested 32212254720 bytes (30720 MiB), effective 32212254720 bytes (30720 MiB)
+2026-09-17T13:05:48.261347Z  INFO helios_persistence::backends::sqlite::backend: SQLite mmap_size: requested 32212254720 bytes (30720 MiB), effective 32212254720 bytes (30720 MiB)
+2026-09-17T13:17:33.074529Z  INFO helios_persistence::backends::sqlite::backend: SQLite mmap_size: requested 32212254720 bytes (30720 MiB), effective 32212254720 bytes (30720 MiB)
+2026-09-17T13:17:33.074538Z  INFO helios_persistence::backends::sqlite::backend: SQLite mmap_size: requested 32212254720 bytes (30720 MiB), effective 32212254720 bytes (30720 MiB)
+2026-09-17T13:22:26.675418Z  INFO helios_persistence::backends::sqlite::backend: SQLite mmap_size: requested 32212254720 bytes (30720 MiB), effective 32212254720 bytes (30720 MiB)
+2026-09-17T13:22:26.677675Z  INFO helios_persistence::backends::sqlite::backend: SQLite mmap_size: requested 32212254720 bytes (30720 MiB), effective 32212254720 bytes (30720 MiB)
+2026-09-17T13:32:34.803725Z  INFO helios_persistence::backends::sqlite::backend: SQLite mmap_size: requested 32212254720 bytes (30720 MiB), effective 32212254720 bytes (30720 MiB)
+2026-09-17T13:36:59.916134Z  INFO helios_persistence::backends::sqlite::backend: SQLite mmap_size: requested 32212254720 bytes (30720 MiB), effective 32212254720 bytes (30720 MiB)
+2026-09-17T13:36:59.916251Z  INFO helios_persistence::backends::sqlite::backend: SQLite mmap_size: requested 32212254720 bytes (30720 MiB), effective 32212254720 bytes (30720 MiB)
+2026-09-17T13:36:59.918408Z  INFO helios_persistence::backends::sqlite::backend: SQLite mmap_size: requested 32212254720 bytes (30720 MiB), effective 32212254720 bytes (30720 MiB)
+2026-09-17T13:36:59.918540Z  INFO helios_persistence::backends::sqlite::backend: SQLite mmap_size: requested 32212254720 bytes (30720 MiB), effective 32212254720 bytes (30720 MiB)
+2026-09-17T13:36:59.921194Z  INFO helios_persistence::backends::sqlite::backend: SQLite mmap_size: requested 32212254720 bytes (30720 MiB), effective 32212254720 bytes (30720 MiB)
+2026-09-17T13:36:59.926220Z  INFO helios_persistence::backends::sqlite::backend: SQLite mmap_size: requested 32212254720 bytes (30720 MiB), effective 32212254720 bytes (30720 MiB)
+2026-09-17T13:44:31.214182Z  WARN helios_ui::bulk_import: failed to persist bulk-import submission submission=00551711-0025-4912-8fc8-4693840cf05f error=optimistic lock failure: resource BulkProviderSubmission/00551711-0025-4912-8fc8-4693840cf05f has been modified
+2026-09-17T13:52:36.813448Z  INFO helios_persistence::backends::sqlite::backend: SQLite mmap_size: requested 32212254720 bytes (30720 MiB), effective 32212254720 bytes (30720 MiB)
+2026-09-17T13:52:36.815225Z  INFO helios_persistence::backends::sqlite::backend: SQLite mmap_size: requested 32212254720 bytes (30720 MiB), effective 32212254720 bytes (30720 MiB)
+2026-09-17T13:52:36.818541Z  INFO helios_persistence::backends::sqlite::backend: SQLite mmap_size: requested 32212254720 bytes (30720 MiB), effective 32212254720 bytes (30720 MiB)
+2026-09-17T14:02:59.747746Z  INFO helios_persistence::backends::sqlite::backend: SQLite mmap_size: requested 32212254720 bytes (30720 MiB), effective 32212254720 bytes (30720 MiB)
+2026-09-17T14:02:59.749173Z  INFO helios_persistence::backends::sqlite::backend: SQLite mmap_size: requested 32212254720 bytes (30720 MiB), effective 32212254720 bytes (30720 MiB)
+2026-09-17T14:09:45.988197Z  INFO helios_persistence::backends::sqlite::backend: SQLite mmap_size: requested 32212254720 bytes (30720 MiB), effective 32212254720 bytes (30720 MiB)
+2026-09-17T14:09:45.989865Z  INFO helios_persistence::backends::sqlite::backend: SQLite mmap_size: requested 32212254720 bytes (30720 MiB), effective 32212254720 bytes (30720 MiB)
+2026-09-17T14:16:43.706382Z  WARN helios_persistence::backends::sqlite::bulk_submit: sqlite busy during heartbeat; retrying: heartbeat failed: database is locked attempt=1 elapsed_ms=1161 budget_ms=300000 backoff_ms=50
+2026-09-17T14:23:08.712031Z  INFO helios_persistence::backends::sqlite::backend: SQLite mmap_size: requested 32212254720 bytes (30720 MiB), effective 32212254720 bytes (30720 MiB)
+2026-09-17T14:23:08.713639Z  INFO helios_persistence::backends::sqlite::backend: SQLite mmap_size: requested 32212254720 bytes (30720 MiB), effective 32212254720 bytes (30720 MiB)
+2026-09-17T14:23:08.713639Z  INFO helios_persistence::backends::sqlite::backend: SQLite mmap_size: requested 32212254720 bytes (30720 MiB), effective 32212254720 bytes (30720 MiB)
+2026-09-17T14:33:34.890236Z  INFO helios_persistence::backends::sqlite::backend: SQLite mmap_size: requested 32212254720 bytes (30720 MiB), effective 32212254720 bytes (30720 MiB)
+2026-09-17T14:33:34.891190Z  INFO helios_persistence::backends::sqlite::backend: SQLite mmap_size: requested 32212254720 bytes (30720 MiB), effective 32212254720 bytes (30720 MiB)
+2026-09-17T14:34:43.875398Z  INFO helios_persistence::backends::sqlite::bulk_submit: sqlite WAL checkpoint after a bulk-submit file wal_frames=15958 wal_bytes=65363968 passive_checkpointed=15958 truncate_busy=false truncate_frames=0 duration_ms=1178
+2026-09-17T14:34:44.246128Z  INFO helios_persistence::backends::sqlite::bulk_submit: sqlite WAL checkpoint after a bulk-submit file wal_frames=2608 wal_bytes=10682368 passive_checkpointed=2608 truncate_busy=false truncate_frames=0 duration_ms=88
+2026-09-17T14:34:50.276854Z  INFO helios_persistence::backends::sqlite::bulk_submit: sqlite WAL checkpoint after a bulk-submit file wal_frames=15610 wal_bytes=63938560 passive_checkpointed=15610 truncate_busy=false truncate_frames=0 duration_ms=359
+2026-09-17T14:34:50.621195Z  INFO helios_persistence::backends::sqlite::bulk_submit: sqlite WAL checkpoint after a bulk-submit file wal_frames=2365 wal_bytes=9687040 passive_checkpointed=2365 truncate_busy=false truncate_frames=0 duration_ms=64
+2026-09-17T14:34:50.936179Z  INFO helios_persistence::backends::sqlite::bulk_submit: sqlite WAL checkpoint after a bulk-submit file wal_frames=2659 wal_bytes=10891264 passive_checkpointed=2659 truncate_busy=false truncate_frames=0 duration_ms=73
+2026-09-17T14:36:59.642629Z  INFO helios_persistence::backends::sqlite::backend: SQLite mmap_size: requested 32212254720 bytes (30720 MiB), effective 32212254720 bytes (30720 MiB)
+2026-09-17T14:36:59.642711Z  INFO helios_persistence::backends::sqlite::backend: SQLite mmap_size: requested 32212254720 bytes (30720 MiB), effective 32212254720 bytes (30720 MiB)
+2026-09-17T14:36:59.643923Z  INFO helios_persistence::backends::sqlite::backend: SQLite mmap_size: requested 32212254720 bytes (30720 MiB), effective 32212254720 bytes (30720 MiB)
+2026-09-17T14:36:59.644812Z  INFO helios_persistence::backends::sqlite::backend: SQLite mmap_size: requested 32212254720 bytes (30720 MiB), effective 32212254720 bytes (30720 MiB)
+2026-09-17T14:36:59.644953Z  INFO helios_persistence::backends::sqlite::backend: SQLite mmap_size: requested 32212254720 bytes (30720 MiB), effective 32212254720 bytes (30720 MiB)
+2026-09-17T14:48:56.095296Z  INFO helios_persistence::backends::sqlite::backend: SQLite mmap_size: requested 32212254720 bytes (30720 MiB), effective 32212254720 bytes (30720 MiB)
+2026-09-17T14:49:52.872540Z  WARN helios_persistence::backends::sqlite::bulk_submit: sqlite busy during heartbeat; retrying: heartbeat failed: database is locked attempt=1 elapsed_ms=1177 budget_ms=300000 backoff_ms=50
+2026-09-17T14:54:33.823126Z  INFO helios_persistence::backends::sqlite::backend: SQLite mmap_size: requested 32212254720 bytes (30720 MiB), effective 32212254720 bytes (30720 MiB)
+2026-09-17T14:54:33.823219Z  INFO helios_persistence::backends::sqlite::backend: SQLite mmap_size: requested 32212254720 bytes (30720 MiB), effective 32212254720 bytes (30720 MiB)
+2026-09-17T14:57:27.890728Z  WARN helios_ui::bulk_import: failed to persist bulk-import submission submission=00551711-0025-4912-8fc8-4693840cf05f error=optimistic lock failure: resource BulkProviderSubmission/00551711-0025-4912-8fc8-4693840cf05f has been modified
+2026-09-17T14:57:55.465339Z  WARN helios_persistence::backends::sqlite::bulk_submit: sqlite busy during heartbeat; retrying: heartbeat failed: database is locked attempt=1 elapsed_ms=1275 budget_ms=300000 backoff_ms=50
+2026-09-17T14:58:56.846483Z  WARN helios_persistence::backends::sqlite::bulk_submit: sqlite busy during heartbeat; retrying: heartbeat failed: database is locked attempt=1 elapsed_ms=1314 budget_ms=300000 backoff_ms=50
+2026-09-17T15:00:23.029182Z  INFO helios_persistence::backends::sqlite::bulk_submit: sqlite WAL checkpoint after a bulk-submit file wal_frames=15844 wal_bytes=64897024 passive_checkpointed=15844 truncate_busy=false truncate_frames=0 duration_ms=1181
+2026-09-17T15:03:14.715113Z  INFO helios_persistence::backends::sqlite::bulk_submit: sqlite WAL checkpoint after a bulk-submit file wal_frames=30207 wal_bytes=123727872 passive_checkpointed=30207 truncate_busy=false truncate_frames=0 duration_ms=1565
+2026-09-17T15:05:52.229161Z  INFO helios_persistence::backends::sqlite::bulk_submit: sqlite WAL checkpoint after a bulk-submit file wal_frames=34558 wal_bytes=141549568 passive_checkpointed=34558 truncate_busy=false truncate_frames=0 duration_ms=2585
+2026-09-17T15:08:30.474329Z  INFO helios_persistence::backends::sqlite::backend: SQLite mmap_size: requested 32212254720 bytes (30720 MiB), effective 32212254720 bytes (30720 MiB)
+2026-09-17T15:08:30.474576Z  INFO helios_persistence::backends::sqlite::backend: SQLite mmap_size: requested 32212254720 bytes (30720 MiB), effective 32212254720 bytes (30720 MiB)
+2026-09-17T15:08:30.474629Z  INFO helios_persistence::backends::sqlite::backend: SQLite mmap_size: requested 32212254720 bytes (30720 MiB), effective 32212254720 bytes (30720 MiB)
+2026-09-17T15:14:53.136061Z  INFO helios_persistence::core::bulk_submit_worker: bulk-submit indexed every resource during ingest; no deferred reindex needed submission=urn:helios:hfs:bulk-submit|00551711-0025-4912-8fc8-4693840cf05f/00551711-0025-4912-8fc8-4693840cf05f manifest=d2f491ce-a575-4ba3-a9c1-5d6be569ee04
+2026-09-17T15:26:00.307714Z  INFO helios_persistence::backends::sqlite::backend: SQLite mmap_size: requested 32212254720 bytes (30720 MiB), effective 32212254720 bytes (30720 MiB)
+2026-09-17T15:37:13.673007Z  INFO helios_persistence::backends::sqlite::backend: SQLite mmap_size: requested 32212254720 bytes (30720 MiB), effective 32212254720 bytes (30720 MiB)
+2026-09-17T15:39:25.921744Z  INFO helios_persistence::backends::sqlite::backend: SQLite mmap_size: requested 32212254720 bytes (30720 MiB), effective 32212254720 bytes (30720 MiB)
+2026-09-17T15:39:25.929608Z  INFO helios_persistence::backends::sqlite::backend: SQLite mmap_size: requested 32212254720 bytes (30720 MiB), effective 32212254720 bytes (30720 MiB)
+2026-09-17T15:50:14.251973Z  INFO helios_persistence::backends::sqlite::backend: SQLite mmap_size: requested 32212254720 bytes (30720 MiB), effective 32212254720 bytes (30720 MiB)
+2026-09-17T15:56:42.471623Z  INFO helios_persistence::backends::sqlite::backend: SQLite mmap_size: requested 32212254720 bytes (30720 MiB), effective 32212254720 bytes (30720 MiB)
+2026-09-17T16:07:00.631504Z  INFO helios_persistence::backends::sqlite::backend: SQLite mmap_size: requested 32212254720 bytes (30720 MiB), effective 32212254720 bytes (30720 MiB)
+2026-09-17T16:07:00.631272Z  INFO helios_persistence::backends::sqlite::backend: SQLite mmap_size: requested 32212254720 bytes (30720 MiB), effective 32212254720 bytes (30720 MiB)
+2026-09-17T16:17:36.020894Z  INFO helios_persistence::backends::sqlite::backend: SQLite mmap_size: requested 32212254720 bytes (30720 MiB), effective 32212254720 bytes (30720 MiB)
+2026-09-17T16:27:00.820206Z  INFO helios_persistence::backends::sqlite::backend: SQLite mmap_size: requested 32212254720 bytes (30720 MiB), effective 32212254720 bytes (30720 MiB)
+2026-09-17T16:27:00.820314Z  INFO helios_persistence::backends::sqlite::backend: SQLite mmap_size: requested 32212254720 bytes (30720 MiB), effective 32212254720 bytes (30720 MiB)
+2026-09-17T16:37:55.590756Z  INFO helios_persistence::backends::sqlite::backend: SQLite mmap_size: requested 32212254720 bytes (30720 MiB), effective 32212254720 bytes (30720 MiB)
+2026-09-17T16:37:55.604983Z  INFO helios_persistence::backends::sqlite::backend: SQLite mmap_size: requested 32212254720 bytes (30720 MiB), effective 32212254720 bytes (30720 MiB)
+2026-09-17T16:48:00.148932Z  INFO helios_persistence::backends::sqlite::backend: SQLite mmap_size: requested 32212254720 bytes (30720 MiB), effective 32212254720 bytes (30720 MiB)
+2026-09-17T16:48:00.149234Z  INFO helios_persistence::backends::sqlite::backend: SQLite mmap_size: requested 32212254720 bytes (30720 MiB), effective 32212254720 bytes (30720 MiB)
+2026-09-17T16:58:40.815955Z  INFO helios_persistence::backends::sqlite::backend: SQLite mmap_size: requested 32212254720 bytes (30720 MiB), effective 32212254720 bytes (30720 MiB)
+2026-09-17T16:58:40.831138Z  INFO helios_persistence::backends::sqlite::backend: SQLite mmap_size: requested 32212254720 bytes (30720 MiB), effective 32212254720 bytes (30720 MiB)
+2026-09-17T17:09:23.514371Z  INFO helios_persistence::backends::sqlite::backend: SQLite mmap_size: requested 32212254720 bytes (30720 MiB), effective 32212254720 bytes (30720 MiB)
+2026-09-17T17:09:23.514978Z  INFO helios_persistence::backends::sqlite::backend: SQLite mmap_size: requested 32212254720 bytes (30720 MiB), effective 32212254720 bytes (30720 MiB)
+2026-09-17T17:20:02.239717Z  INFO helios_persistence::backends::sqlite::backend: SQLite mmap_size: requested 32212254720 bytes (30720 MiB), effective 32212254720 bytes (30720 MiB)
+2026-09-17T17:20:02.254507Z  INFO helios_persistence::backends::sqlite::backend: SQLite mmap_size: requested 32212254720 bytes (30720 MiB), effective 32212254720 bytes (30720 MiB)
+2026-09-17T17:31:17.067046Z  INFO helios_persistence::backends::sqlite::backend: SQLite mmap_size: requested 32212254720 bytes (30720 MiB), effective 32212254720 bytes (30720 MiB)
+2026-09-17T17:31:17.067332Z  INFO helios_persistence::backends::sqlite::backend: SQLite mmap_size: requested 32212254720 bytes (30720 MiB), effective 32212254720 bytes (30720 MiB)
+2026-09-17T17:42:59.936418Z  INFO helios_persistence::backends::sqlite::backend: SQLite mmap_size: requested 32212254720 bytes (30720 MiB), effective 32212254720 bytes (30720 MiB)
+2026-09-17T17:42:59.951126Z  INFO helios_persistence::backends::sqlite::backend: SQLite mmap_size: requested 32212254720 bytes (30720 MiB), effective 32212254720 bytes (30720 MiB)
+2026-09-17T17:54:10.674904Z  INFO helios_persistence::backends::sqlite::backend: SQLite mmap_size: requested 32212254720 bytes (30720 MiB), effective 32212254720 bytes (30720 MiB)
+2026-09-17T18:02:08.839176Z  INFO helios_persistence::backends::sqlite::backend: SQLite mmap_size: requested 32212254720 bytes (30720 MiB), effective 32212254720 bytes (30720 MiB)
+2026-09-17T18:02:08.839927Z  INFO helios_persistence::backends::sqlite::backend: SQLite mmap_size: requested 32212254720 bytes (30720 MiB), effective 32212254720 bytes (30720 MiB)
+2026-09-17T18:02:08.839953Z  INFO helios_persistence::backends::sqlite::backend: SQLite mmap_size: requested 32212254720 bytes (30720 MiB), effective 32212254720 bytes (30720 MiB)
+2026-09-17T18:02:08.841014Z  INFO helios_persistence::backends::sqlite::backend: SQLite mmap_size: requested 32212254720 bytes (30720 MiB), effective 32212254720 bytes (30720 MiB)
+2026-09-17T18:13:16.049961Z  INFO helios_persistence::backends::sqlite::backend: SQLite mmap_size: requested 32212254720 bytes (30720 MiB), effective 32212254720 bytes (30720 MiB)
+2026-09-17T18:13:16.050278Z  INFO helios_persistence::backends::sqlite::backend: SQLite mmap_size: requested 32212254720 bytes (30720 MiB), effective 32212254720 bytes (30720 MiB)
+2026-09-17T18:23:52.948751Z  INFO helios_persistence::backends::sqlite::backend: SQLite mmap_size: requested 32212254720 bytes (30720 MiB), effective 32212254720 bytes (30720 MiB)
+2026-09-17T18:32:53.541113Z  INFO helios_persistence::backends::sqlite::backend: SQLite mmap_size: requested 32212254720 bytes (30720 MiB), effective 32212254720 bytes (30720 MiB)
+2026-09-17T18:43:30.589940Z  INFO helios_persistence::backends::sqlite::backend: SQLite mmap_size: requested 32212254720 bytes (30720 MiB), effective 32212254720 bytes (30720 MiB)
+2026-09-17T18:43:30.590320Z  INFO helios_persistence::backends::sqlite::backend: SQLite mmap_size: requested 32212254720 bytes (30720 MiB), effective 32212254720 bytes (30720 MiB)
+2026-09-17T18:54:01.418824Z  INFO helios_persistence::backends::sqlite::backend: SQLite mmap_size: requested 32212254720 bytes (30720 MiB), effective 32212254720 bytes (30720 MiB)

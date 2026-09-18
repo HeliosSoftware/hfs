@@ -14,9 +14,15 @@ Taken from the submission detail page, not from a stopwatch:
 
 ## Screenshots
 
+All nine were captured on 2026-09-18 at 15:20 local, after the full T0-T9 pass and
+after the T9 rehydration restart. `01-t3-submission-completed.png` is a historical
+detail page, so it shows the import itself; the rest show end-of-pass state.
+
 - [x] `01-t3-submission-completed.png` - T3 submission detail, Completed - status card + full submission log
 - [x] `02-sql-exports-list.png` - SQL Exports list with completed cards and their `finished in` times
-- [x] `03-ui-dashboard.png` - `/ui` after the import
+- [x] `03-ui-dashboard.png` - `/ui` **at the end of the pass**, not immediately
+  after T3: the counts include the resources created in T2, T4, T5 and T8
+  (Patient reads 11,705, not the corpus's 11,704)
 - [x] `04-subscriptions.png` - `/ui/subscriptions` after T9
 - [x] `05-bulk-exports-list.png` - Bulk Data exports list (T5)
 - [x] `06-view-definitions.png` - ViewDefinitions (T6)
@@ -26,8 +32,16 @@ Taken from the submission detail page, not from a stopwatch:
 
 ## Server logs
 
-- `hfs-sqlite-es-run2.log` - 2452 lines, 570070 bytes
-- `hfs-sqlite-es-run2-after-restart.log` - 48 lines, 8341 bytes
+- `hfs-sqlite-es-T3-IMPORT.log` - 170 lines - **the T3 import itself.** Covers
+  2026-09-17T10:36:59Z onward and holds the line the timing rests on:
+  `15:14:53.136Z bulk-submit indexed every resource during ingest; no deferred
+  reindex`. Zero `search index queue is full` and zero `reported unindexed`.
+- `t3-import-monitor.log` - 17 lines - the monitor that sampled the import.
+- `hfs-sqlite-es-post-T3-session.log` - 2452 lines - the *later* session, which ran
+  T4 through T9. It does **not** contain the import; an earlier revision of this
+  bundle attached it as if it did.
+- `hfs-sqlite-es-run2-after-restart.log` - 48 lines - the restart that exercised
+  subscription rehydration (T9).
 
 ## Export samples
 
