@@ -114,7 +114,10 @@ pub use upstream::{
 /// the single source of those bytes for both binaries, and nothing here is
 /// waiting on a later phase.
 #[derive(Clone, RustEmbed)]
-#[folder = "ui-assets"]
+// `build.rs` sets the cfg when the `ui-assets` symlink did not materialize as
+// a directory (Windows checkout without `core.symlinks`, #1257).
+#[cfg_attr(not(helios_workspace_ui_assets), folder = "ui-assets")]
+#[cfg_attr(helios_workspace_ui_assets, folder = "../ui/assets")]
 struct Assets;
 
 /// Shared router state: values that are constant for the process lifetime.

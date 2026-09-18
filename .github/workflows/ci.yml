@@ -551,6 +551,24 @@ jobs:
         run: |
           cargo clippy --all-targets --all-features -- -D warnings -A clippy::items_after_test_module -A clippy::large_enum_variant -A clippy::question_mark -A clippy::collapsible_match -A clippy::collapsible_if -A clippy::field_reassign_with_default -A clippy::doc-overindented-list-items -A clippy::doc-lazy-continuation
 
+      # Git for Windows defaults to `core.symlinks=false` and checks a symlink
+      # out as a text file holding the link target, which broke the Windows
+      # release build (#1257). No Windows job builds the UI crates before
+      # merge, so reproduce that checkout shape here and prove the build
+      # scripts' workspace-path fallback still compiles.
+      - name: Check UI crates build without symlink support (#1257)
+        if: runner.os != 'Windows'
+        run: |
+          links="crates/ui/locales crates/hts-ui/locales crates/hts-ui/ui-assets"
+          restore() { git checkout-index --force -- $links; }
+          trap restore EXIT
+          for link in $links; do
+            target=$(readlink "$link")
+            rm "$link"
+            printf '%s' "$target" > "$link"
+          done
+          cargo check -p helios-ui -p helios-hts-ui
+
       - name: Format check
         working-directory: crates/pysof
         run: |
