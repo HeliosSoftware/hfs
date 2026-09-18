@@ -1,7 +1,7 @@
 //! Index-during-ingest, end to end through the submit worker (#1127).
 //!
-//! With `HFS_BULK_SUBMIT_INDEX_DURING_INGEST` the server wraps the composite's
-//! job store in [`IndexingSubmitJobs`], which attaches an [`IngestIndexSink`]
+//! With `HFS_BULK_SUBMIT_DEFER_INDEXING=false` (#1242) the server wraps the
+//! composite's job store in [`IndexingSubmitJobs`], which attaches an [`IngestIndexSink`]
 //! to every ingest and drains it before the manifest's receipts are written.
 //! These tests drive a real [`DefaultSubmitWorker`] over that stack and pin the
 //! two acceptance criteria the unit tests cannot:
