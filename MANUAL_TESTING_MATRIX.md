@@ -1110,3 +1110,96 @@ For each backend row, attach to the release issue:
   never `git commit -a` after building.
 - Auth stays off for this pass; when auth is on, `$export`, `$bulk-submit`,
   `$sql-export`, `$purge`, and `$reindex` need their `system/*` scopes.
+
+---
+
+## SQLite + Elasticsearch — findings from the sqlite-es pass
+
+The steps in this matrix were revised during this pass under #1126. The original T3
+procedure could not be completed. About **32.5 hours were actually spent** on it —
+18 h 31 min of ingest, in two passes because the server lost its bulk-submit lease
+halfway, plus 14 h of deferred search rebuild advancing at 93 resources/s, stopped at
+1,665,207 of 18,955,865 documents. Finishing that rebuild projected to
+**~53 h more**. Performance, not correctness, is what forced the deviation. With the
+revised procedure and configuration (release binary, index-during-ingest instead of a
+deferred rebuild, and documented Elasticsearch sizing), the same 18,955,865-resource
+corpus imports and indexes in 4 h 36 m 47 s — about 4.6 hours, verified 100% complete
+with 24 output files and 0 errors.
+
+Evidence for every finding below (screenshots, server logs, and export samples) is
+in [`docs/testing/manual-matrix-sqlite-es/`](docs/testing/manual-matrix-sqlite-es/).
+
+### §6.2 — the reference-data targets are unreachable once T3 has loaded
+
+The 1,140 / 1,142 reference-data targets are unreachable once the T3 corpus is
+loaded. 13 of the 17 bundle entries are conditional creates (`ifNoneExist`) and the
+corpus already contains those Synthea organizations, locations and practitioners;
+each condition matches exactly one existing resource, so nothing is created. Only
+the 4 `PractitionerRole` entries — the only ones without `ifNoneExist` — are
+created. §6.2 should run before the import, or state the expected no-op.
+
+### §7.5 — re-uploading the T2 bundle is not rejected
+
+Re-uploading the T2 bundle is **not** rejected. It created a second full copy of all
+662 resources, which had to be reverted by hand.
+
+### §8.3 — `family=Larkin917` returns 38, not 1
+
+The corpus holds 38 patients with that surname. The step needs `given=Ann985` added
+to narrow it to the one patient created in T2.
+
+### §9.2 step 5.7 — "1 file" is wrong at scale
+
+Output chunks at 1,000 resources per file, so the Patient export produces 12 files
+(11 × 1,000 + 705), not 1.
+
+### §9.3 — the matrix assumes T2 runs before the import
+
+Run after the import, 5.8 yields 0 rather than 1, 5.9 yields 11,704 rather than
+11,705, and 5.10 shows 1 Patient where the matrix expects none. All three are
+correct behaviour; the matrix should state the ordering dependency.
+
+### §9.2 step 5.2 — the one-patient export takes ~8 minutes
+
+On `sqlite-es` the local search index is empty, so the compartment query filters
+with `json_extract` over the data column
+(`crates/persistence/src/backends/sqlite/bulk_export.rs:1615-1639`), which no index
+covers: retrieving one patient's 165 Observations reads all 7,699,987 Observation
+rows. Passes, but set expectations.
+
+### §10.3 — "only patient_demographics remains" does not hold
+
+The rail filter skips the "Recently used" group and only applies on Enter (#1275).
+
+### §11.2 — "temporarily replace `:min_height` with 150" cannot work
+
+The run is blocked by the parameter declared on the Library, not by the SQL text,
+and the Parameters card where the value is entered does not exist until the query
+is saved. Correct order is save first, then fill the card — which itself fails
+(#1276).
+
+### §11.3 — steps 7.b, 7.d, 7.o, 7.p are not executable at this scale
+
+Every step using `tall_female_patients` fails with `row limit exceeded
+(1000000 rows)`: the query depends on `observation_flat`, which must materialize
+7.7M rows before any filter applies. Governed by
+`HFS_SOF_SQLQUERY_MAX_SOURCE_ROWS_PER_VD` (default 1,000,000). Separately,
+`$sql-export` reports this as HTTP 500 while `$sql-run` returns 422 for the same
+condition — the export path should preserve the 422. (finding 9)
+
+### §13 — restarting HFS also recovers an error subscription
+
+The matrix says recovery after the retry window requires a manual `PUT`;
+rehydration re-handshakes, and `crates/subscriptions/src/rehydrate.rs:126-131`
+documents this as "the only recovery an error subscription has". Verified: a
+subscription in `status=error` came back `active` after restart, with no
+`Failed to persist subscription status transition` in the log.
+
+### §12 — the receiver snippet does not work on Windows
+
+The heredoc fails in Git Bash, and redirecting with `>` in PowerShell both silences
+the console and writes the log as UTF-16, breaking `wc -l` and `grep`.
+
+### §7.4 — `curl localhost:9200/...` fails in PowerShell
+
+`curl` is an alias for `Invoke-WebRequest` there. `curl.exe` is required.

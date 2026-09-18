@@ -1,0 +1,17 @@
+MONITOR T3 arrancado. prefijo=hfs_20260917_0601 id=00551711-0025-4912-8fc8-4693840cf05f total_esperado=18955865
+PROGRESO 300s: written=528991 es_count=575470 (3% de 18955865) rejected=0 status=processing
+PROGRESO 609s: written=851191 es_count=966370 (5% de 18955865) rejected=0 status=processing
+PROGRESO 917s: written=1289791 es_count=1323770 (6% de 18955865) rejected=0 status=processing
+PROGRESO 1226s: written=1576491 es_count=1679870 (8% de 18955865) rejected=0 status=processing
+PROGRESO 1535s: written=2197328 es_count=2262483 (11% de 18955865) rejected=0 status=processing
+PROGRESO 1845s: written=2648004 es_count=2758247 (14% de 18955865) rejected=0 status=processing
+LOG: 2026-09-17T11:14:12.654739Z  WARN helios_ui::bulk_import: failed to persist bulk-import submission submission=00551711-0025-4912-8fc8-4693840cf05f error=optimistic lock failure: re
+PROGRESO 2154s: written=3096604 es_count=3137641 (16% de 18955865) rejected=0 status=processing
+PROGRESO 2462s: written=3378604 es_count=3482047 (18% de 18955865) rejected=0 status=processing
+PROGRESO 2771s: written=3776704 es_count=3824342 (20% de 18955865) rejected=0 status=processing
+PROGRESO 3079s: written=4104235 es_count=4251614 (22% de 18955865) rejected=0 status=processing
+PROGRESO 3387s: written=4526335 es_count=4577459 (24% de 18955865) rejected=0 status=processing
+PROGRESO 3695s: written=4833654 es_count=5044188 (26% de 18955865) rejected=0 status=processing
+PROGRESO 4004s: written=5392354 es_count=5453533 (28% de 18955865) rejected=0 status=processing
+
+[killed]
