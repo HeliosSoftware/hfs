@@ -78,12 +78,21 @@ pub struct ExportJobLease {
     pub lease_duration: Duration,
 }
 
+/// Calculates an export lease expiry from one operation timestamp.
+///
+/// Claims and heartbeats share this conversion so the stored expiry and
+/// heartbeat timestamp describe exactly the duration the job was claimed for.
+/// The fallback preserves the existing behavior for durations that cannot be
+/// represented by `chrono`.
+pub(crate) fn export_lease_expiry(now: DateTime<Utc>, lease_duration: Duration) -> DateTime<Utc> {
+    now + chrono::Duration::from_std(lease_duration)
+        .unwrap_or_else(|_| chrono::Duration::seconds(60))
+}
+
 impl ExportJobLease {
     /// The expiry a renewal issued now should set.
     pub fn renewed_expiry(&self) -> DateTime<Utc> {
-        Utc::now()
-            + chrono::Duration::from_std(self.lease_duration)
-                .unwrap_or_else(|_| chrono::Duration::seconds(60))
+        export_lease_expiry(Utc::now(), self.lease_duration)
     }
 }
 
@@ -1239,6 +1248,33 @@ fn apply_elements(line: &str, elements: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_export_lease_expiry_uses_explicit_time_duration_and_fallback() {
+        let now = DateTime::parse_from_rfc3339("2026-09-17T12:00:00.123456789Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        for seconds in [30, 60, 180] {
+            let duration = Duration::from_secs(seconds);
+            assert_eq!(
+                export_lease_expiry(now, duration),
+                now + chrono::Duration::seconds(seconds as i64)
+            );
+        }
+
+        let later = now + chrono::Duration::seconds(17);
+        assert_eq!(
+            export_lease_expiry(later, Duration::from_secs(180)),
+            later + chrono::Duration::seconds(180),
+            "a later renewal starts from its own operation time"
+        );
+        assert_eq!(
+            export_lease_expiry(now, Duration::MAX),
+            now + chrono::Duration::seconds(60),
+            "an unrepresentable duration keeps the existing 60s fallback"
+        );
+    }
 
     #[test]
     fn test_apply_elements_noop_when_empty() {
