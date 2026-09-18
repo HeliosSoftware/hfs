@@ -1596,6 +1596,26 @@ async fn definition_types_list_by_scan_and_everything_else_stays_unsupported() {
     let page = backend.search(&t, &first).await.expect("bounded listing");
     assert_eq!(page.resources.items.len(), 1);
     assert_eq!(page.total, Some(2));
+    assert!(!page.resources.page_info.has_previous);
+
+    // `_offset` walks past the first page; the two pages cover both ids once.
+    let mut second = SearchQuery::new("ViewDefinition");
+    second.count = Some(1);
+    second.offset = Some(1);
+    let rest = backend.search(&t, &second).await.expect("offset listing");
+    assert_eq!(rest.resources.items.len(), 1);
+    assert!(rest.resources.page_info.has_previous);
+    assert_ne!(rest.resources.items[0].id(), page.resources.items[0].id());
+
+    // Past the end: an empty page that still reports the total.
+    let mut beyond = SearchQuery::new("ViewDefinition");
+    beyond.offset = Some(5);
+    let empty = backend
+        .search(&t, &beyond)
+        .await
+        .expect("listing beyond the end");
+    assert!(empty.resources.items.is_empty());
+    assert_eq!(empty.total, Some(2));
 
     // Another tenant sees none of it.
     let other = backend
