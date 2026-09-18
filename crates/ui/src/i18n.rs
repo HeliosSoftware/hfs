@@ -6,7 +6,8 @@
 //! explicit `?lang=` override (persisted in the `hfs_lang` cookie by the
 //! language switcher) → cookie → `Accept-Language` (RFC 4647 Lookup) → `en`.
 //!
-//! Catalogs live in `locales/<locale>/main.ftl` at the workspace root and are
+//! Catalogs live in `locales/<locale>/main.ftl` at the workspace root (reached
+//! through this crate's `locales` symlink so `cargo publish` packages them) and are
 //! embedded at compile time — no runtime file or CDN dependency, matching the
 //! asset stance of this crate. `en` is the source locale and the final
 //! fallback: a key missing from a translation renders its English string,
@@ -24,6 +25,22 @@ use std::collections::{BTreeMap, HashMap};
 use std::convert::Infallible;
 use unic_langid::{LanguageIdentifier, langid};
 
+#[cfg(not(helios_workspace_locales))]
+fluent_templates::static_loader! {
+    static LOCALES = {
+        locales: "locales",
+        fallback_language: "en",
+        // The UI renders whole localized sentences into an LTR document; the
+        // Unicode bidi isolation marks Fluent adds around placeables by
+        // default would only show up as garbage in tests and diffs.
+        customise: |bundle| bundle.set_use_isolating(false),
+    };
+}
+
+// Same loader against the workspace-root catalogs, for checkouts where the
+// `locales` symlink did not materialize as a directory (Windows without
+// `core.symlinks`, #1257). `build.rs` sets the cfg.
+#[cfg(helios_workspace_locales)]
 fluent_templates::static_loader! {
     static LOCALES = {
         locales: "../../locales",

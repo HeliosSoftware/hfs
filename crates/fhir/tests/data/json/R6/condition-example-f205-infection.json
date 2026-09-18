@@ -27,7 +27,11 @@
     ]
   },
   "bodyStructure": [
-    {}
+    {
+      "reference": {
+        "reference": "BodyStructure/skin-patch"
+      }
+    }
   ],
   "subject": {
     "reference": "Patient/f201",

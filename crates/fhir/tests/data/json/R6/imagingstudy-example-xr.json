@@ -8,8 +8,6 @@
   "identifier": [
     {
       "use": "official",
-      "system": "urn:dicom:uid",
-      "value": "urn:oid:2.16.124.113543.6003.1154777499.30246.19789.3503430046",
       "type": {
         "coding": [
           {
@@ -17,7 +15,9 @@
             "code": "110180"
           }
         ]
-      }
+      },
+      "system": "urn:dicom:uid",
+      "value": "urn:oid:2.16.124.113543.6003.1154777499.30246.19789.3503430046"
     },
     {
       "use": "secondary",
@@ -67,17 +67,17 @@
       "reference": "ServiceRequest/example"
     }
   ],
+  "procedure": [
+    {
+      "reference": "Procedure/example"
+    }
+  ],
   "referrer": {
     "reference": "Practitioner/example"
   },
   "endpoint": [
     {
       "reference": "Endpoint/example-wadors"
-    }
-  ],
-  "procedure": [
-    {
-      "reference": "Procedure/example"
     }
   ],
   "reason": [

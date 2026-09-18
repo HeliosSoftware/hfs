@@ -17,12 +17,12 @@
       <a name="hc101"> </a>
       <p>Mapping from 
         <a href="valueset-address-use.html">AddressUse</a> to 
-        <a href="http://terminology.hl7.org/7.2.0/ValueSet-v3-AddressUse.html">AddressUse</a>
+        <a href="http://terminology.hl7.org/7.3.0/ValueSet-v3-AddressUse.html">AddressUse</a>
       </p>
       <br/>
       <p>Mapping from 
         <a href="codesystem-address-use.html">AddressUse</a> to 
-        <a href="http://terminology.hl7.org/7.2.0/CodeSystem-v3-AddressUse.html">AddressUse</a>
+        <a href="http://terminology.hl7.org/7.3.0/CodeSystem-v3-AddressUse.html">AddressUse</a>
       </p>
       <table class="grid">
         <tr>
@@ -42,7 +42,7 @@
         <tr>
           <td>home</td>
           <td>
-            <a href="codesystem-concept-map-relationship.html#equivalent" title="equivalent">is equivalent to</a>
+            <a href="codesystem-concept-map-relationship.html#concept-map-relationship-equivalent" title="equivalent">is equivalent to</a>
           </td>
           <td>H (home address)</td>
           <td/>
@@ -50,7 +50,7 @@
         <tr>
           <td>work</td>
           <td>
-            <a href="codesystem-concept-map-relationship.html#equivalent" title="equivalent">is equivalent to</a>
+            <a href="codesystem-concept-map-relationship.html#concept-map-relationship-equivalent" title="equivalent">is equivalent to</a>
           </td>
           <td>WP (work place)</td>
           <td/>
@@ -58,7 +58,7 @@
         <tr>
           <td>temp (Temporary)</td>
           <td>
-            <a href="codesystem-concept-map-relationship.html#equivalent" title="equivalent">is equivalent to</a>
+            <a href="codesystem-concept-map-relationship.html#concept-map-relationship-equivalent" title="equivalent">is equivalent to</a>
           </td>
           <td>TMP (temporary address)</td>
           <td/>
@@ -66,7 +66,7 @@
         <tr>
           <td>old (Old / Incorrect)</td>
           <td>
-            <a href="codesystem-concept-map-relationship.html#not-related-to" title="not-related-to">is not related to</a>
+            <a href="codesystem-concept-map-relationship.html#concept-map-relationship-not-related-to" title="not-related-to">is not related to</a>
           </td>
           <td>BAD (bad address)</td>
           <td>In the HL7 v3 AD, old is handled by the usablePeriod element, but you have to provide a time, there's no simple equivalent of flagging an address as old</td>
@@ -86,7 +86,7 @@
     <system value="urn:ietf:rfc:3986"/>
     <value value="urn:uuid:53cd62ee-033e-414c-9f58-3ca97b5ffc3b"/>
   </identifier>
-  <version value="6.0.0-ballot4"/>
+  <version value="6.0.0-snapshot1"/>
   <name value="FHIRv3AddressUse"/>
   <title value="FHIR/v3 Address Use Mapping"/>
   <status value="draft"/>

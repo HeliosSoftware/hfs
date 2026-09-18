@@ -74,7 +74,26 @@
             "reference": "#Cohort-Definition"
           },
           "exclude": false,
-          "description": "fatal intracranial hemorrhage within 7 days"
+          "description": "fatal intracranial hemorrhage within 7 days",
+          "relativeTime": [
+            {
+              "contextCode": {
+                "coding": [
+                  {
+                    "system": "http://hl7.org/fhir/evidence-variable-event",
+                    "code": "study-start",
+                    "display": "Study Start"
+                  }
+                ]
+              },
+              "offsetDuration": {
+                "value": 7,
+                "unit": "days",
+                "system": "http://unitsofmeasure.org",
+                "code": "d"
+              }
+            }
+          ]
         }
       ]
     }
@@ -105,6 +124,15 @@
     "reference": {
       "reference": "#Definition-Group"
     }
+  },
+  "handling": {
+    "coding": [
+      {
+        "system": "https://fevir.net/sevco",
+        "code": "STATO:0000090",
+        "display": "dichotomous variable"
+      }
+    ]
   },
   "meta": {
     "tag": [

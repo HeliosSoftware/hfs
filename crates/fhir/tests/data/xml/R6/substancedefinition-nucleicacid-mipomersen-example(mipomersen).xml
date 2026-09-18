@@ -67,6 +67,29 @@
       </status>
     </official>
   </name>
+  <relationship>
+    <substanceDefinitionCodeableConcept>
+      <coding>
+        <system value="https://www.uniprot.org"/>
+        <code value="P04114"/>
+        <display value="apolipoprotein B-100"/>
+      </coding>
+    </substanceDefinitionCodeableConcept>
+    <type>
+      <coding>
+        <system value="http://hl7.org/fhir/substance-relationship-type"/>
+        <code value="TherapeuticTarget"/>
+        <display value="Therapeutic target"/>
+      </coding>
+    </type>
+    <interaction>
+      <coding>
+        <system value="http://hl7.org/fhir/substance-interaction-type"/>
+        <code value="inhibition"/>
+        <display value="Inhibition"/>
+      </coding>
+    </interaction>
+  </relationship>
   <nucleicAcid>
     <sequenceType>
       <coding>
@@ -102,7 +125,7 @@
         </coding>
       </threePrime>
       <linkage>
-        <connectivity/>
+        <connectivity value="phosphorothioate"/>
         <substance>
           <concept>
             <coding>
@@ -158,27 +181,4 @@
       </gene>
     </gene>
   </nucleicAcid>
-  <relationship>
-    <substanceDefinitionCodeableConcept>
-      <coding>
-        <system value="https://www.uniprot.org"/>
-        <code value="P04114"/>
-        <display value="apolipoprotein B-100"/>
-      </coding>
-    </substanceDefinitionCodeableConcept>
-    <type>
-      <coding>
-        <system value="http://hl7.org/fhir/substance-relationship-type"/>
-        <code value="TherapeuticTarget"/>
-        <display value="Therapeutic target"/>
-      </coding>
-    </type>
-    <interaction>
-      <coding>
-        <system value="http://hl7.org/fhir/substance-interaction-type"/>
-        <code value="inhibition"/>
-        <display value="Inhibition"/>
-      </coding>
-    </interaction>
-  </relationship>
 </SubstanceDefinition>

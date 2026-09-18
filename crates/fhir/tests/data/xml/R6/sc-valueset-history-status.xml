@@ -34,28 +34,28 @@
         <tr>
           <td>entered-in-error</td>
           <td>
-            <a href="codesystem-concept-map-relationship.html#equivalent" title="equivalent">is equivalent to</a>
+            <a href="codesystem-concept-map-relationship.html#concept-map-relationship-equivalent" title="equivalent">is equivalent to</a>
           </td>
           <td>error</td>
         </tr>
         <tr>
           <td>completed</td>
           <td>
-            <a href="codesystem-concept-map-relationship.html#equivalent" title="equivalent">is equivalent to</a>
+            <a href="codesystem-concept-map-relationship.html#concept-map-relationship-equivalent" title="equivalent">is equivalent to</a>
           </td>
           <td>complete</td>
         </tr>
         <tr>
           <td>health-unknown</td>
           <td>
-            <a href="codesystem-concept-map-relationship.html#equivalent" title="equivalent">is equivalent to</a>
+            <a href="codesystem-concept-map-relationship.html#concept-map-relationship-equivalent" title="equivalent">is equivalent to</a>
           </td>
           <td>unknown</td>
         </tr>
         <tr>
           <td>partial</td>
           <td>
-            <a href="codesystem-concept-map-relationship.html#equivalent" title="equivalent">is equivalent to</a>
+            <a href="codesystem-concept-map-relationship.html#concept-map-relationship-equivalent" title="equivalent">is equivalent to</a>
           </td>
           <td>partial</td>
         </tr>
@@ -63,7 +63,7 @@
     </div>
   </text>
   <url value="http://hl7.org/fhir/ConceptMap/sc-history-status"/>
-  <version value="6.0.0-ballot4"/>
+  <version value="6.0.0-snapshot1"/>
   <name value="FamilyHistoryStatusCanonicalMap"/>
   <title value="Canonical Mapping for &quot;Family History Status&quot;"/>
   <status value="draft"/>

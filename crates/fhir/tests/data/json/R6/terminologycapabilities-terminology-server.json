@@ -47,7 +47,9 @@
     {
       "uri": "http://loinc.org",
       "version": [
-        null
+        {
+          "value": "2.73"
+        }
       ],
       "content": "complete"
     }

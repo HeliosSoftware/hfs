@@ -13,7 +13,7 @@
   "relationship": {
     "coding": [
       {
-        "system": "http://hl7.org/fhir/deviceassociation-relationship",
+        "system": "http://terminology.hl7.org/CodeSystem/deviceassociation-relationship",
         "code": "implanted-in",
         "display": "Implanted In"
       }
@@ -23,7 +23,7 @@
   "relationshipStatus": {
     "coding": [
       {
-        "system": "http://hl7.org/fhir/deviceassociation-relationship-status",
+        "system": "http://terminology.hl7.org/CodeSystem/deviceassociation-relationship-status",
         "code": "removed",
         "display": "Removed"
       }

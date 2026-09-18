@@ -10,17 +10,17 @@
   <extension url="http://hl7.org/fhir/StructureDefinition/structuredefinition-wg">
     <valueCode value="oo"/>
   </extension>
+  <url value="http://hl7.org/fhir/DeviceDefinition/example-prodspec"/>
   <identifier>
     <value value="789123"/>
   </identifier>
   <status value="active"/>
   <experimental value="true"/>
+  <publisher value="HL7 International / Orders and Observations"/>
   <contact>
     <telecom>
       <system value="url"/>
       <value value="http://www.hl7.org/Special/committees/orders"/>
     </telecom>
   </contact>
-  <url value="http://hl7.org/fhir/DeviceDefinition/example-prodspec"/>
-  <publisher value="HL7 International / Orders and Observations"/>
 </DeviceDefinition>

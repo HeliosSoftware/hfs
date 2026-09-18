@@ -30,6 +30,17 @@
           ],
           "text": "Carbohydrate, by difference"
         }
+      },
+      "amountRatio": {
+        "numerator": {
+          "value": 1.82,
+          "comparator": "ad",
+          "unit": "g"
+        },
+        "denominator": {
+          "value": 1,
+          "unit": "shake"
+        }
       }
     },
     {
@@ -43,6 +54,17 @@
             }
           ],
           "text": "Protein"
+        }
+      },
+      "amountRatio": {
+        "numerator": {
+          "value": 9.09,
+          "comparator": "ad",
+          "unit": "g"
+        },
+        "denominator": {
+          "value": 1,
+          "unit": "shake"
         }
       }
     },
@@ -58,6 +80,17 @@
           ],
           "text": "Iodine, I"
         }
+      },
+      "amountRatio": {
+        "numerator": {
+          "value": 11,
+          "comparator": "ad",
+          "unit": "µg"
+        },
+        "denominator": {
+          "value": 1,
+          "unit": "shake"
+        }
       }
     },
     {
@@ -71,6 +104,17 @@
             }
           ],
           "text": "Thiamin"
+        }
+      },
+      "amountRatio": {
+        "numerator": {
+          "value": 0,
+          "comparator": "ad",
+          "unit": "mg"
+        },
+        "denominator": {
+          "value": 1,
+          "unit": "shake"
         }
       }
     },
@@ -86,6 +130,17 @@
           ],
           "text": "Riboflavin"
         }
+      },
+      "amountRatio": {
+        "numerator": {
+          "value": 0.129,
+          "comparator": "ad",
+          "unit": "mg"
+        },
+        "denominator": {
+          "value": 1,
+          "unit": "shake"
+        }
       }
     },
     {
@@ -99,6 +154,17 @@
             }
           ],
           "text": "Vitamin B-6"
+        }
+      },
+      "amountRatio": {
+        "numerator": {
+          "value": 0.152,
+          "comparator": "ad",
+          "unit": "mg"
+        },
+        "denominator": {
+          "value": 1,
+          "unit": "shake"
         }
       }
     },
@@ -114,6 +180,17 @@
           ],
           "text": "Pantothenic acid"
         }
+      },
+      "amountRatio": {
+        "numerator": {
+          "value": 0.758,
+          "comparator": "ad",
+          "unit": "mg"
+        },
+        "denominator": {
+          "value": 1,
+          "unit": "shake"
+        }
       }
     },
     {
@@ -127,6 +204,17 @@
             }
           ],
           "text": "Cholesterol"
+        }
+      },
+      "amountRatio": {
+        "numerator": {
+          "value": 6,
+          "comparator": "ad",
+          "unit": "mg"
+        },
+        "denominator": {
+          "value": 1,
+          "unit": "shake"
         }
       }
     },
@@ -142,6 +230,17 @@
           ],
           "text": "Vitamin A, IU"
         }
+      },
+      "amountRatio": {
+        "numerator": {
+          "value": 455,
+          "comparator": "ad",
+          "unit": "IU"
+        },
+        "denominator": {
+          "value": 1,
+          "unit": "shake"
+        }
       }
     },
     {
@@ -155,6 +254,17 @@
             }
           ],
           "text": "Fatty acids, total saturated"
+        }
+      },
+      "amountRatio": {
+        "numerator": {
+          "value": 0.15,
+          "comparator": "ad",
+          "unit": "g"
+        },
+        "denominator": {
+          "value": 1,
+          "unit": "shake"
         }
       }
     },
@@ -170,6 +280,17 @@
           ],
           "text": "Magnesium, Mg"
         }
+      },
+      "amountRatio": {
+        "numerator": {
+          "value": 30,
+          "comparator": "ad",
+          "unit": "mg"
+        },
+        "denominator": {
+          "value": 1,
+          "unit": "shake"
+        }
       }
     },
     {
@@ -183,6 +304,17 @@
             }
           ],
           "text": "Manganese, Mn"
+        }
+      },
+      "amountRatio": {
+        "numerator": {
+          "value": 0,
+          "comparator": "ad",
+          "unit": "mg"
+        },
+        "denominator": {
+          "value": 1,
+          "unit": "shake"
         }
       }
     },
@@ -198,6 +330,17 @@
           ],
           "text": "Potassium, K"
         }
+      },
+      "amountRatio": {
+        "numerator": {
+          "value": 142,
+          "comparator": "ad",
+          "unit": "mg"
+        },
+        "denominator": {
+          "value": 1,
+          "unit": "shake"
+        }
       }
     },
     {
@@ -211,6 +354,17 @@
             }
           ],
           "text": "Sodium, Na"
+        }
+      },
+      "amountRatio": {
+        "numerator": {
+          "value": 42,
+          "comparator": "ad",
+          "unit": "mg"
+        },
+        "denominator": {
+          "value": 1,
+          "unit": "shake"
         }
       }
     },
@@ -226,6 +380,17 @@
           ],
           "text": "Fiber, total dietary"
         }
+      },
+      "amountRatio": {
+        "numerator": {
+          "value": 0.6,
+          "comparator": "ad",
+          "unit": "g"
+        },
+        "denominator": {
+          "value": 1,
+          "unit": "shake"
+        }
       }
     },
     {
@@ -239,6 +404,17 @@
             }
           ],
           "text": "Niacin"
+        }
+      },
+      "amountRatio": {
+        "numerator": {
+          "value": 3.03,
+          "comparator": "ad",
+          "unit": "mg"
+        },
+        "denominator": {
+          "value": 1,
+          "unit": "shake"
         }
       }
     },
@@ -254,6 +430,17 @@
           ],
           "text": "Fatty acids, total trans"
         }
+      },
+      "amountRatio": {
+        "numerator": {
+          "value": 0,
+          "comparator": "ad",
+          "unit": "g"
+        },
+        "denominator": {
+          "value": 1,
+          "unit": "shake"
+        }
       }
     },
     {
@@ -267,6 +454,17 @@
             }
           ],
           "text": "Selenium, Se"
+        }
+      },
+      "amountRatio": {
+        "numerator": {
+          "value": 5,
+          "comparator": "ad",
+          "unit": "µg"
+        },
+        "denominator": {
+          "value": 1,
+          "unit": "shake"
         }
       }
     },
@@ -282,6 +480,17 @@
           ],
           "text": "Vitamin C, total ascorbic acid"
         }
+      },
+      "amountRatio": {
+        "numerator": {
+          "value": 9.1,
+          "comparator": "ad",
+          "unit": "mg"
+        },
+        "denominator": {
+          "value": 1,
+          "unit": "shake"
+        }
       }
     },
     {
@@ -295,6 +504,17 @@
             }
           ],
           "text": "Phosphorus, P"
+        }
+      },
+      "amountRatio": {
+        "numerator": {
+          "value": 121,
+          "comparator": "ad",
+          "unit": "mg"
+        },
+        "denominator": {
+          "value": 1,
+          "unit": "shake"
         }
       }
     },
@@ -310,6 +530,17 @@
           ],
           "text": "Copper, Cu"
         }
+      },
+      "amountRatio": {
+        "numerator": {
+          "value": 0.152,
+          "comparator": "ad",
+          "unit": "mg"
+        },
+        "denominator": {
+          "value": 1,
+          "unit": "shake"
+        }
       }
     },
     {
@@ -323,6 +554,17 @@
             }
           ],
           "text": "Zinc, Zn"
+        }
+      },
+      "amountRatio": {
+        "numerator": {
+          "value": 1.14,
+          "comparator": "ad",
+          "unit": "mg"
+        },
+        "denominator": {
+          "value": 1,
+          "unit": "shake"
         }
       }
     },
@@ -338,6 +580,17 @@
           ],
           "text": "Vitamin B-12"
         }
+      },
+      "amountRatio": {
+        "numerator": {
+          "value": 0.45,
+          "comparator": "ad",
+          "unit": "µg"
+        },
+        "denominator": {
+          "value": 1,
+          "unit": "shake"
+        }
       }
     },
     {
@@ -351,6 +604,17 @@
             }
           ],
           "text": "Total lipid (fat)"
+        }
+      },
+      "amountRatio": {
+        "numerator": {
+          "value": 0.45,
+          "comparator": "ad",
+          "unit": "g"
+        },
+        "denominator": {
+          "value": 1,
+          "unit": "shake"
         }
       }
     },
@@ -366,6 +630,17 @@
           ],
           "text": "Sugars, total including NLEA"
         }
+      },
+      "amountRatio": {
+        "numerator": {
+          "value": 0.3,
+          "comparator": "ad",
+          "unit": "g"
+        },
+        "denominator": {
+          "value": 1,
+          "unit": "shake"
+        }
       }
     },
     {
@@ -379,6 +654,17 @@
             }
           ],
           "text": "Calcium, Ca"
+        }
+      },
+      "amountRatio": {
+        "numerator": {
+          "value": 197,
+          "comparator": "ad",
+          "unit": "mg"
+        },
+        "denominator": {
+          "value": 1,
+          "unit": "shake"
         }
       }
     },
@@ -394,6 +680,17 @@
           ],
           "text": "Folate, total"
         }
+      },
+      "amountRatio": {
+        "numerator": {
+          "value": 30,
+          "comparator": "ad",
+          "unit": "µg"
+        },
+        "denominator": {
+          "value": 1,
+          "unit": "shake"
+        }
       }
     },
     {
@@ -407,6 +704,17 @@
             }
           ],
           "text": "Vitamin K (phylloquinone)"
+        }
+      },
+      "amountRatio": {
+        "numerator": {
+          "value": 6.1,
+          "comparator": "ad",
+          "unit": "µg"
+        },
+        "denominator": {
+          "value": 1,
+          "unit": "shake"
         }
       }
     },
@@ -422,6 +730,17 @@
           ],
           "text": "Iron, Fe"
         }
+      },
+      "amountRatio": {
+        "numerator": {
+          "value": 1.36,
+          "comparator": "ad",
+          "unit": "mg"
+        },
+        "denominator": {
+          "value": 1,
+          "unit": "shake"
+        }
       }
     },
     {
@@ -436,6 +755,17 @@
           ],
           "text": "Energy"
         }
+      },
+      "amountRatio": {
+        "numerator": {
+          "value": 45,
+          "comparator": "ad",
+          "unit": "kcal"
+        },
+        "denominator": {
+          "value": 1,
+          "unit": "shake"
+        }
       }
     },
     {
@@ -449,6 +779,17 @@
             }
           ],
           "text": "Folic acid"
+        }
+      },
+      "amountRatio": {
+        "numerator": {
+          "value": 18,
+          "comparator": "ad",
+          "unit": "µg"
+        },
+        "denominator": {
+          "value": 1,
+          "unit": "shake"
         }
       }
     }

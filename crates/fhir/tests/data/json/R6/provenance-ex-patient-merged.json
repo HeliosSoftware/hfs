@@ -14,7 +14,14 @@
   ],
   "recorded": "2024-06-01T19:00:00Z",
   "authorization": [
-    null
+    {
+      "coding": [
+        {
+          "system": "http://terminology.hl7.org/CodeSystem/v3-ActReason",
+          "code": "HQUALIMP"
+        }
+      ]
+    }
   ],
   "why": "Merge Patient Records that were matched by SSN and confirmed by review, with the data linked to the non-surviving patient is also fixed up to point at the surviving patient.",
   "activity": {

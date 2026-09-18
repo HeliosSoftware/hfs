@@ -61,6 +61,19 @@
       }
     ]
   },
+  "bodyStructure": [
+    {
+      "concept": {
+        "coding": [
+          {
+            "system": "http://snomed.info/sct",
+            "code": "361355005",
+            "display": "Entire head and neck"
+          }
+        ]
+      }
+    }
+  ],
   "subject": {
     "reference": "Patient/f201",
     "display": "Roel"

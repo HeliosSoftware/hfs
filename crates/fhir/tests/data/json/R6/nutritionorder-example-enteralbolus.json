@@ -18,6 +18,10 @@
     "display": "Inpatient"
   },
   "dateTime": "2014-09-17",
+  "requester": {
+    "reference": "Practitioner/example",
+    "display": "Dr Adam Careful"
+  },
   "allergyIntolerance": [
     {
       "reference": "AllergyIntolerance/example",
@@ -46,17 +50,31 @@
     }
   ],
   "enteralFormula": {
-    "type": {
-      "concept": {
-        "coding": [
-          {
-            "system": "http://snomed.info/sct",
-            "code": "441541000124107",
-            "display": "High energy enteral formula"
-          }
-        ]
+    "type": [
+      {
+        "concept": {
+          "coding": [
+            {
+              "system": "http://snomed.info/sct",
+              "code": "441541000124107",
+              "display": "High energy enteral formula"
+            }
+          ]
+        }
+      },
+      {
+        "concept": {
+          "coding": [
+            {
+              "system": "http://snomed.info/sct",
+              "code": "442991000124104",
+              "display": "Adult high protein formula"
+            }
+          ]
+        }
       }
-    },
+    ],
+    "productName": "Acme High Protein Formula",
     "caloricDensity": {
       "value": 1.5,
       "unit": "calories per milliliter",
@@ -98,8 +116,30 @@
         }
       }
     ],
+    "maxVolumeToAdminister": {
+      "value": 1440,
+      "unit": "milliliter/day",
+      "system": "http://unitsofmeasure.org",
+      "code": "mL/d"
+    },
     "administrationInstruction": "240 mls every 4hrs"
   },
+  "additive": [
+    {
+      "modularType": {
+        "concept": {
+          "coding": [
+            {
+              "system": "http://terminology.hl7.org/CodeSystem/entformula-additive",
+              "code": "lipid",
+              "display": "Lipid"
+            }
+          ]
+        }
+      },
+      "productName": "Acme Lipid Additive"
+    }
+  ],
   "meta": {
     "tag": [
       {

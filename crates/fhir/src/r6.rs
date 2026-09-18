@@ -8,7 +8,7 @@
 //! # FHIR Version
 //!
 //! - **Version**: current
-//! - **Release Date**: July 18, 2026
+//! - **Release Date**: September 17, 2026
 //! - **Status**: draft
 //! - **Specification**: <http://build.fhir.org/>
 //!
@@ -142,7 +142,7 @@ use crate::{DecimalElement, Element};
 /// Base type: http://hl7.org/fhir/StructureDefinition/DomainResource
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [Account](http://hl7.org/fhir/StructureDefinition/Account)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -235,7 +235,7 @@ pub struct Account {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: IETF language tag for a human language
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1
     pub language: Option<Code>,
     /// Text summary of the resource, for human interpretation
     ///
@@ -394,7 +394,7 @@ pub struct Account {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: Indicates whether the account is available to be used.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/account-status|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/account-status|6.0.0-snapshot1
     pub status: Code,
     /// Tracks the lifecycle of the account through the billing process
     ///
@@ -645,7 +645,7 @@ pub struct Account {
     ///
     /// ## Binding
     /// - **Strength**: required
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/currencies|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/currencies|6.0.0-snapshot1
     pub currency: Option<CodeableConcept>,
     /// Calculated account balance(s)
     ///
@@ -1605,7 +1605,7 @@ pub enum ActivityDefinitionProduct {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DomainResource
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [ActivityDefinition](http://hl7.org/fhir/StructureDefinition/ActivityDefinition)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -1699,7 +1699,7 @@ pub struct ActivityDefinition {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: IETF language tag for a human language
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1
     pub language: Option<Code>,
     /// Text summary of the resource, for human interpretation
     ///
@@ -2013,7 +2013,7 @@ pub struct ActivityDefinition {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: The lifecycle status of an artifact.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/publication-status|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/publication-status|6.0.0-snapshot1
     pub status: Code,
     /// For testing only - never for real usage
     ///
@@ -2513,7 +2513,7 @@ pub struct ActivityDefinition {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: The kind of activity the definition is describing.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/request-resource-types|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/request-resource-types|6.0.0-snapshot1
     pub kind: Option<Code>,
     /// What profile the resource needs to conform to
     ///
@@ -2569,7 +2569,7 @@ pub struct ActivityDefinition {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: Codes indicating the degree of authority/intentionality associated with a request.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/request-intent|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/request-intent|6.0.0-snapshot1
     pub intent: Option<Code>,
     /// routine | urgent | asap | stat
     ///
@@ -2585,7 +2585,7 @@ pub struct ActivityDefinition {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: Identifies the level of importance to be assigned to actioning the request.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/request-priority|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/request-priority|6.0.0-snapshot1
     pub priority: Option<Code>,
     /// True if the activity should not be performed
     ///
@@ -3078,7 +3078,7 @@ pub struct ActivityDefinitionParticipant {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: The type of participant in the activity.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/action-participant-type|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/action-participant-type|6.0.0-snapshot1
     #[fhir_serde(rename = "type")]
     pub r#type: Option<Code>,
     /// Who or what can participate
@@ -3164,7 +3164,7 @@ pub enum ActorDefinitionVersionAlgorithm {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DomainResource
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [ActorDefinition](http://hl7.org/fhir/StructureDefinition/ActorDefinition)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -3258,7 +3258,7 @@ pub struct ActorDefinition {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: IETF language tag for a human language
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1
     pub language: Option<Code>,
     /// Text summary of the resource, for human interpretation
     ///
@@ -3557,7 +3557,7 @@ pub struct ActorDefinition {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: The lifecycle status of an artifact.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/publication-status|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/publication-status|6.0.0-snapshot1
     pub status: Code,
     /// For testing only - never for real usage
     ///
@@ -3813,7 +3813,7 @@ pub struct ActorDefinition {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: The type of actor - system or human.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/actordefinition-actor-type|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/actordefinition-actor-type|6.0.0-snapshot1
     #[fhir_serde(rename = "type")]
     pub r#type: Code,
     /// Further details about the type of actor
@@ -3891,7 +3891,7 @@ pub struct ActorDefinition {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DataType
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [Address](http://hl7.org/fhir/StructureDefinition/Address)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -3960,7 +3960,7 @@ pub struct Address {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: The use of an address (home / work / etc.).
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/address-use|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/address-use|6.0.0-snapshot1
     #[fhir_serde(rename = "use")]
     pub r#use: Option<Code>,
     /// postal | physical | both
@@ -3994,7 +3994,7 @@ pub struct Address {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: The type of an address (physical / postal).
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/address-type|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/address-type|6.0.0-snapshot1
     #[fhir_serde(rename = "type")]
     pub r#type: Option<Code>,
     /// Text representation of the address
@@ -4172,7 +4172,7 @@ pub struct Address {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DomainResource
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [AdministrableProductDefinition](http://hl7.org/fhir/StructureDefinition/AdministrableProductDefinition)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -4265,7 +4265,7 @@ pub struct AdministrableProductDefinition {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: IETF language tag for a human language
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1
     pub language: Option<Code>,
     /// Text summary of the resource, for human interpretation
     ///
@@ -4424,7 +4424,7 @@ pub struct AdministrableProductDefinition {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: The lifecycle status of an artifact.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/publication-status|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/publication-status|6.0.0-snapshot1
     pub status: Code,
     /// References a product from which one or more of the constituent parts of that product can be prepared and used as described by this administrable product
     ///
@@ -4798,7 +4798,7 @@ pub struct AdministrableProductDefinitionProperty {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: The lifecycle status of an artifact.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/publication-status|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/publication-status|6.0.0-snapshot1
     pub status: Option<CodeableConcept>,
 }
 
@@ -5310,7 +5310,7 @@ pub enum AdverseEventEffect {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DomainResource
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [AdverseEvent](http://hl7.org/fhir/StructureDefinition/AdverseEvent)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -5404,7 +5404,7 @@ pub struct AdverseEvent {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: IETF language tag for a human language
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1
     pub language: Option<Code>,
     /// Text summary of the resource, for human interpretation
     ///
@@ -5579,7 +5579,7 @@ pub struct AdverseEvent {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: Codes identifying the lifecycle stage of an event.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/adverse-event-status|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/adverse-event-status|6.0.0-snapshot1
     pub status: Code,
     /// actual | potential | unknown
     ///
@@ -5609,7 +5609,7 @@ pub struct AdverseEvent {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: Overall nature of the adverse event, e.g. real or potential.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/adverse-event-actuality|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/adverse-event-actuality|6.0.0-snapshot1
     pub actuality: Code,
     /// wrong-patient | procedure-mishap | medication-mishap | device | unsafe-physical-environment | hospital-acquired-infection | wrong-body-site
     ///
@@ -6443,7 +6443,7 @@ pub struct AdverseEventSuspectEntityCausality {
 /// Base type: http://hl7.org/fhir/StructureDefinition/Quantity
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [Age](http://hl7.org/fhir/StructureDefinition/Age)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -6530,7 +6530,7 @@ pub struct Age {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: How the Quantity should be understood and represented.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/quantity-comparator|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/quantity-comparator|6.0.0-snapshot1
     pub comparator: Option<Code>,
     /// Unit representation
     ///
@@ -6628,7 +6628,7 @@ pub enum AllergyIntoleranceOnset {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DomainResource
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [AllergyIntolerance](http://hl7.org/fhir/StructureDefinition/AllergyIntolerance)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -6722,7 +6722,7 @@ pub struct AllergyIntolerance {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: IETF language tag for a human language
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1
     pub language: Option<Code>,
     /// Text summary of the resource, for human interpretation
     ///
@@ -6902,7 +6902,7 @@ pub struct AllergyIntolerance {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: The clinical status of the allergy or intolerance.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/allergyintolerance-clinical|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/allergyintolerance-clinical|6.0.0-snapshot1
     #[fhir_serde(rename = "clinicalStatus")]
     pub clinical_status: Option<CodeableConcept>,
     /// unconfirmed | presumed | confirmed | refuted | entered-in-error
@@ -6931,7 +6931,7 @@ pub struct AllergyIntolerance {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: Assertion about certainty associated with a propensity, or potential risk, of a reaction to the identified substance.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/allergyintolerance-verification|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/allergyintolerance-verification|6.0.0-snapshot1
     #[fhir_serde(rename = "verificationStatus")]
     pub verification_status: Option<CodeableConcept>,
     /// allergy | intolerance - Underlying mechanism (if known)
@@ -7040,7 +7040,7 @@ pub struct AllergyIntolerance {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: Estimate of the potential clinical harm, or seriousness, of a reaction to an identified substance.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/allergy-intolerance-criticality|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/allergy-intolerance-criticality|6.0.0-snapshot1
     ///
     /// ## Aliases
     /// Severity, Seriousness, Contra-indication, Risk
@@ -7464,7 +7464,7 @@ pub struct AllergyIntoleranceReaction {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: Clinical assessment of the severity of a reaction event as a whole, potentially considering multiple different manifestations.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/reaction-event-severity|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/reaction-event-severity|6.0.0-snapshot1
     pub severity: Option<Code>,
     /// How the subject was exposed to the substance
     ///
@@ -7527,7 +7527,7 @@ pub enum AnnotationAuthor {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DataType
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [Annotation](http://hl7.org/fhir/StructureDefinition/Annotation)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -7623,7 +7623,7 @@ pub struct Annotation {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DomainResource
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [Appointment](http://hl7.org/fhir/StructureDefinition/Appointment)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -7716,7 +7716,7 @@ pub struct Appointment {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: IETF language tag for a human language
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1
     pub language: Option<Code>,
     /// Text summary of the resource, for human interpretation
     ///
@@ -7883,7 +7883,7 @@ pub struct Appointment {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: The free/busy status of an appointment.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/appointmentstatus|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/appointmentstatus|6.0.0-snapshot1
     ///
     /// ## Conditions
     /// Used when: app-4, app-3, app-7
@@ -8623,7 +8623,7 @@ pub struct AppointmentParticipant {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: The Participation status of an appointment.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/participationstatus|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/participationstatus|6.0.0-snapshot1
     pub status: Option<Code>,
 }
 
@@ -8734,7 +8734,7 @@ pub struct AppointmentRecurrenceTemplate {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: IANA Timezones (BCP 175)
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/timezones|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/timezones|6.0.0-snapshot1
     pub timezone: Option<CodeableConcept>,
     /// The frequency of the recurrence
     ///
@@ -8970,7 +8970,7 @@ pub struct AppointmentRecurrenceTemplateMonthlyTemplate {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: The set of weeks in a month.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/week-of-month|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/week-of-month|6.0.0-snapshot1
     #[fhir_serde(rename = "nthWeekOfMonth")]
     pub nth_week_of_month: Option<Code>,
     /// mon | tue | wed | thu | fri | sat | sun
@@ -8991,7 +8991,7 @@ pub struct AppointmentRecurrenceTemplateMonthlyTemplate {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: The days of the week.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/days-of-week|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/days-of-week|6.0.0-snapshot1
     #[fhir_serde(rename = "dayOfWeek")]
     pub day_of_week: Option<Code>,
     /// Recurs every nth month
@@ -9110,7 +9110,7 @@ pub struct AppointmentRecurrenceTemplateWeeklyTemplate {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: The days of the week.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/days-of-week|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/days-of-week|6.0.0-snapshot1
     #[fhir_serde(rename = "daysOfWeek")]
     pub days_of_week: Option<Vec<Code>>,
     /// Recurs every nth week
@@ -9242,7 +9242,7 @@ pub struct AppointmentRecurrenceTemplateYearlyTemplate {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DomainResource
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [AppointmentResponse](http://hl7.org/fhir/StructureDefinition/AppointmentResponse)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -9335,7 +9335,7 @@ pub struct AppointmentResponse {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: IETF language tag for a human language
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1
     pub language: Option<Code>,
     /// Text summary of the resource, for human interpretation
     ///
@@ -9604,7 +9604,7 @@ pub struct AppointmentResponse {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: The Participation status of an appointment.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/appointmentresponse-status|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/appointmentresponse-status|6.0.0-snapshot1
     #[fhir_serde(rename = "participantStatus")]
     pub participant_status: Code,
     /// Additional comments
@@ -9697,7 +9697,7 @@ pub enum ArtifactAssessmentArtifact {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DomainResource
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [ArtifactAssessment](http://hl7.org/fhir/StructureDefinition/ArtifactAssessment)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -9791,7 +9791,7 @@ pub struct ArtifactAssessment {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: IETF language tag for a human language
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1
     pub language: Option<Code>,
     /// Text summary of the resource, for human interpretation
     ///
@@ -10100,7 +10100,7 @@ pub struct ArtifactAssessment {
     ///
     /// ## Binding
     /// - **Strength**: required
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/artifactassessment-workflow-status|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/artifactassessment-workflow-status|6.0.0-snapshot1
     #[fhir_serde(rename = "workflowStatus")]
     pub workflow_status: Option<Code>,
     /// unresolved | not-persuasive | persuasive | persuasive-with-modification | not-persuasive-with-modification
@@ -10119,7 +10119,7 @@ pub struct ArtifactAssessment {
     ///
     /// ## Binding
     /// - **Strength**: required
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/artifactassessment-disposition|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/artifactassessment-disposition|6.0.0-snapshot1
     pub disposition: Option<Code>,
 }
 
@@ -10480,7 +10480,7 @@ pub struct ArtifactAssessmentRelatesTo {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DataType
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [Attachment](http://hl7.org/fhir/StructureDefinition/Attachment)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -10544,7 +10544,7 @@ pub struct Attachment {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: BCP 13 (RFCs 2045, 2046, 2047, 4288, 4289 and 2049)
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/mimetypes|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/mimetypes|6.0.0-snapshot1
     ///
     /// ## Conditions
     /// Used when: att-1
@@ -10574,7 +10574,7 @@ pub struct Attachment {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: IETF language tag for a human language.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1
     pub language: Option<Code>,
     /// Data inline, base64ed
     ///
@@ -10798,7 +10798,7 @@ pub enum AuditEventOccurred {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DomainResource
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [AuditEvent](http://hl7.org/fhir/StructureDefinition/AuditEvent)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -10892,7 +10892,7 @@ pub struct AuditEvent {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: IETF language tag for a human language
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1
     pub language: Option<Code>,
     /// Text summary of the resource, for human interpretation
     ///
@@ -11098,7 +11098,7 @@ pub struct AuditEvent {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: DICOM Audit Event Action
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/audit-event-action|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/audit-event-action|6.0.0-snapshot1
     pub action: Option<Code>,
     /// emergency | alert | critical | error | warning | notice | informational | debug
     ///
@@ -11121,7 +11121,7 @@ pub struct AuditEvent {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: This is in the SysLog header, PRI. http://tools.ietf.org/html/rfc5424#appendix-A.3
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/audit-event-severity|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/audit-event-severity|6.0.0-snapshot1
     pub severity: Option<Code>,
     /// When the activity occurred
     ///
@@ -12424,7 +12424,7 @@ pub struct AuditEventSource {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DataType
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [Availability](http://hl7.org/fhir/StructureDefinition/Availability)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -12587,7 +12587,7 @@ pub struct AvailabilityAvailableTime {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: The purpose for which an extended contact detail should be used.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/days-of-week|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/days-of-week|6.0.0-snapshot1
     #[fhir_serde(rename = "daysOfWeek")]
     pub days_of_week: Option<Vec<Code>>,
     /// Always available? i.e. 24 hour service
@@ -12757,7 +12757,7 @@ pub struct AvailabilityNotAvailableTime {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DomainResource
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [Basic](http://hl7.org/fhir/StructureDefinition/Basic)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -12850,7 +12850,7 @@ pub struct Basic {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: IETF language tag for a human language
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1
     pub language: Option<Code>,
     /// Text summary of the resource, for human interpretation
     ///
@@ -13088,7 +13088,7 @@ pub struct Basic {
 /// Base type: http://hl7.org/fhir/StructureDefinition/Resource
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [Binary](http://hl7.org/fhir/StructureDefinition/Binary)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -13179,7 +13179,7 @@ pub struct Binary {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: IETF language tag for a human language
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1
     pub language: Option<Code>,
     /// MimeType of the binary content
     ///
@@ -13197,7 +13197,7 @@ pub struct Binary {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: The mime type of an attachment. Any valid mime type is allowed.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/mimetypes|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/mimetypes|6.0.0-snapshot1
     #[fhir_serde(rename = "contentType")]
     pub content_type: Code,
     /// Identifies another resource to use as proxy when enforcing access control
@@ -13258,7 +13258,7 @@ pub struct Binary {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DomainResource
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [BiologicallyDerivedProduct](http://hl7.org/fhir/StructureDefinition/BiologicallyDerivedProduct)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -13351,7 +13351,7 @@ pub struct BiologicallyDerivedProduct {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: IETF language tag for a human language
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1
     pub language: Option<Code>,
     /// Text summary of the resource, for human interpretation
     ///
@@ -13616,8 +13616,8 @@ pub struct BiologicallyDerivedProduct {
     /// A unique identifier for an aliquot of a product
     ///
     /// A unique identifier for an aliquot of a product. Used to distinguish
-    /// individual aliquots of a product carrying the same biologicalSource and
-    /// productCode identifiers.
+    /// individual aliquots associated with the same biological source event and
+    /// product code.
     ///
     /// ## Cardinality: Optional (0..1)
     ///
@@ -13810,8 +13810,9 @@ pub struct BiologicallyDerivedProductCollection {
     /// The patient providing the product.
     ///
     /// ## Implementation Notes
-    /// The collection.source may reference an identifiable patient. Implementers
-    /// shall ensure the appropriate data access controls are established.
+    /// The collection.sourcePatient may reference an identifiable patient.
+    /// Implementers shall ensure the appropriate data access controls are
+    /// established.
     ///
     /// ## Cardinality: Optional (0..1)
     ///
@@ -14032,7 +14033,7 @@ pub struct BiologicallyDerivedProductProperty {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DomainResource
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [BodyStructure](http://hl7.org/fhir/StructureDefinition/BodyStructure)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -14125,7 +14126,7 @@ pub struct BodyStructure {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: IETF language tag for a human language
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1
     pub language: Option<Code>,
     /// Text summary of the resource, for human interpretation
     ///
@@ -14526,9 +14527,8 @@ pub struct BodyStructureIncludedStructure {
     pub qualifier: Option<Vec<CodeableConcept>>,
     /// Kind of Structure
     ///
-    /// The kind of structure being represented by the body structure at
-    /// `BodyStructure.location`. This can define both normal and abnormal
-    /// morphologies.
+    /// The morphology of the included anatomical or pathological structure. This can
+    /// define both normal and abnormal morphologies.
     ///
     /// ## Implementation Notes
     /// The minimum cardinality of 0 supports the use case of specifying a location
@@ -14664,7 +14664,8 @@ pub struct BodyStructureIncludedStructureBodyLandmarkOrientation {
     pub modifier_extension: Option<Vec<Extension>>,
     /// Explanation of landmark
     ///
-    /// Body landmark description used as a reference to locate something else.
+    /// Body landmark description used as a reference to locate the corresponding
+    /// structure.
     ///
     /// ## Cardinality: Optional, Multiple (0..*)
     ///
@@ -14680,7 +14681,7 @@ pub struct BodyStructureIncludedStructureBodyLandmarkOrientation {
     pub landmark_description: Option<Vec<CodeableConcept>>,
     /// Clockface orientation
     ///
-    /// An description of the direction away from a landmark something is located
+    /// A description of the direction away from a landmark something is located
     /// based on a radial clock dial.
     ///
     /// ## Cardinality: Optional, Multiple (0..*)
@@ -14852,7 +14853,7 @@ pub struct BodyStructureIncludedStructureBodyLandmarkOrientationDistanceFromLand
 /// Base type: http://hl7.org/fhir/StructureDefinition/Resource
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [Bundle](http://hl7.org/fhir/StructureDefinition/Bundle)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -14945,7 +14946,7 @@ pub struct Bundle {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: IETF language tag for a human language
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1
     pub language: Option<Code>,
     /// Persistent identifier for the bundle
     ///
@@ -14995,7 +14996,7 @@ pub struct Bundle {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: Indicates the purpose of a bundle - how it is intended to be used.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/bundle-type|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/bundle-type|6.0.0-snapshot1
     ///
     /// ## Conditions
     /// Used when: bdl-1, bdl-2, bdl-3a, bdl-3b, bdl-3c, bdl-3d, bdl-7, bdl-9, bdl-10, bdl-11, bdl-12, bdl-13, bdl-14, bdl-15, bdl-17, bdl-18
@@ -15496,7 +15497,7 @@ pub struct BundleEntryRequest {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: HTTP verbs (in the HTTP command line). See [HTTP rfc](https://tools.ietf.org/html/rfc7231) for details.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/http-verb|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/http-verb|6.0.0-snapshot1
     ///
     /// ## Conditions
     /// Used when: bdl-3b, bdl-3c, bdl-14, bdl-15
@@ -15890,7 +15891,7 @@ pub struct BundleEntrySearch {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: Why an entry is in the result set - whether it's included as a match or because of an _include requirement, or to convey information or warning information about the search process.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/search-entry-mode|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/search-entry-mode|6.0.0-snapshot1
     pub mode: Option<Code>,
     /// Search ranking (between 0 and 1)
     ///
@@ -16044,7 +16045,7 @@ pub struct BundleLink {
     ///
     /// ## Binding
     /// - **Strength**: required
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/iana-link-relations|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/iana-link-relations|6.0.0-snapshot1
     ///
     /// ## Conditions
     /// Used when: bdl-18
@@ -16090,7 +16091,7 @@ pub enum CapabilityStatementVersionAlgorithm {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DomainResource
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [CapabilityStatement](http://hl7.org/fhir/StructureDefinition/CapabilityStatement)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -16184,7 +16185,7 @@ pub struct CapabilityStatement {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: IETF language tag for a human language
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1
     pub language: Option<Code>,
     /// Text summary of the resource, for human interpretation
     ///
@@ -16485,7 +16486,7 @@ pub struct CapabilityStatement {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: The lifecycle status of an artifact.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/publication-status|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/publication-status|6.0.0-snapshot1
     pub status: Code,
     /// For testing only - never for real usage
     ///
@@ -16772,7 +16773,7 @@ pub struct CapabilityStatement {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: How a capability statement is intended to be used.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/capability-statement-kind|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/capability-statement-kind|6.0.0-snapshot1
     ///
     /// ## Conditions
     /// Used when: cpb-16, cpb-15, cpb-3, cpb-14
@@ -16897,7 +16898,7 @@ pub struct CapabilityStatement {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: All published FHIR Versions.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/FHIR-version|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/FHIR-version|6.0.0-snapshot1
     #[fhir_serde(rename = "fhirVersion")]
     pub fhir_version: Code,
     /// formats supported (xml | json | ttl | mime type)
@@ -16922,7 +16923,7 @@ pub struct CapabilityStatement {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: The mime type of an attachment. Any valid mime type is allowed (BCP 13; RFCs 2045, 2046, 2047, 4288, 4289 and 2049), and also `json`, `xml`, and `ttl`.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/supplemented-mimetypes|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/supplemented-mimetypes|6.0.0-snapshot1
     pub format: Option<Vec<Code>>,
     /// Patch formats supported (Mime types for FHIR and JSON And XML Patch)
     ///
@@ -16947,7 +16948,7 @@ pub struct CapabilityStatement {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: BCP 13 (RFCs 2045, 2046, 2047, 4288, 4289 and 2049)
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/patchmimetypes|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/patchmimetypes|6.0.0-snapshot1
     #[fhir_serde(rename = "patchFormat")]
     pub patch_format: Option<Vec<Code>>,
     /// Languages supported
@@ -16972,7 +16973,7 @@ pub struct CapabilityStatement {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: IETF language tag for a human language
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1
     #[fhir_serde(rename = "acceptLanguage")]
     pub accept_language: Option<Vec<Code>>,
     /// Implementation guides supported
@@ -17177,7 +17178,7 @@ pub struct CapabilityStatementDocument {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: Whether the application produces or consumes documents.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/document-mode|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/document-mode|6.0.0-snapshot1
     ///
     /// ## Conditions
     /// Used when: cpb-7
@@ -17763,7 +17764,7 @@ pub struct CapabilityStatementMessagingSupportedMessage {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: The mode of a message capability statement.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/event-capability-mode|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/event-capability-mode|6.0.0-snapshot1
     pub mode: Code,
     /// Message supported by this system
     ///
@@ -17901,7 +17902,7 @@ pub struct CapabilityStatementRest {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: The mode of a RESTful capability statement.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/restful-capability-mode|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/restful-capability-mode|6.0.0-snapshot1
     ///
     /// ## Conditions
     /// Used when: cpb-4
@@ -18132,7 +18133,7 @@ pub struct CapabilityStatementRestInteraction {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: Interactions supported by REST at the system level.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/system-restful-interaction|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/system-restful-interaction|6.0.0-snapshot1
     pub code: Code,
     /// Anything special about interaction behavior
     ///
@@ -18389,7 +18390,7 @@ pub struct CapabilityStatementRestResource {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: How the system supports versioning for a resource.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/versioning-policy|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/versioning-policy|6.0.0-snapshot1
     pub versioning: Option<Code>,
     /// Whether vRead can return past versions
     ///
@@ -18461,7 +18462,7 @@ pub struct CapabilityStatementRestResource {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: A code that indicates how the server supports conditional read.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/conditional-read-status|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/conditional-read-status|6.0.0-snapshot1
     #[fhir_serde(rename = "conditionalRead")]
     pub conditional_read: Option<Code>,
     /// If allows/uses conditional update
@@ -18511,7 +18512,7 @@ pub struct CapabilityStatementRestResource {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: A code that indicates how the server supports conditional delete.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/conditional-delete-status|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/conditional-delete-status|6.0.0-snapshot1
     #[fhir_serde(rename = "conditionalDelete")]
     pub conditional_delete: Option<Code>,
     /// literal | logical | resolves | enforced | local
@@ -18527,7 +18528,7 @@ pub struct CapabilityStatementRestResource {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: A set of flags that defines how references are supported.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/reference-handling-policy|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/reference-handling-policy|6.0.0-snapshot1
     #[fhir_serde(rename = "referencePolicy")]
     pub reference_policy: Option<Vec<Code>>,
     /// _include values supported by the server
@@ -18741,7 +18742,7 @@ pub struct CapabilityStatementRestResourceInteraction {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: Interactions supported by REST at the type or instance level.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/type-restful-interaction|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/type-restful-interaction|6.0.0-snapshot1
     pub code: Code,
     /// Anything special about interaction behavior
     ///
@@ -19106,7 +19107,7 @@ pub struct CapabilityStatementRestResourceSearchParam {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: Data types allowed to be used for search parameters.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/search-param-type|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/search-param-type|6.0.0-snapshot1
     #[fhir_serde(rename = "type")]
     pub r#type: Code,
     /// Server-specific usage
@@ -19419,7 +19420,7 @@ pub struct CapabilityStatementSoftware {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DomainResource
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [CarePlan](http://hl7.org/fhir/StructureDefinition/CarePlan)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -19512,7 +19513,7 @@ pub struct CarePlan {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: IETF language tag for a human language
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1
     pub language: Option<Code>,
     /// Text summary of the resource, for human interpretation
     ///
@@ -19760,7 +19761,7 @@ pub struct CarePlan {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: Indicates whether the plan is currently being acted upon, represents future intentions or is now a historical record.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/request-status|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/request-status|6.0.0-snapshot1
     pub status: Code,
     /// proposal | plan | order | option | directive
     ///
@@ -19792,7 +19793,7 @@ pub struct CarePlan {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: Codes indicating the degree of authority/intentionality associated with a care plan.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/care-plan-intent|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/care-plan-intent|6.0.0-snapshot1
     pub intent: Code,
     /// Type of plan
     ///
@@ -20272,7 +20273,7 @@ pub struct CarePlanActivity {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DomainResource
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [CareTeam](http://hl7.org/fhir/StructureDefinition/CareTeam)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -20365,7 +20366,7 @@ pub struct CareTeam {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: IETF language tag for a human language
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1
     pub language: Option<Code>,
     /// Text summary of the resource, for human interpretation
     ///
@@ -20538,7 +20539,7 @@ pub struct CareTeam {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: Indicates the status of the care team.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/care-team-status|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/care-team-status|6.0.0-snapshot1
     pub status: Option<Code>,
     /// Type of team
     ///
@@ -20941,7 +20942,7 @@ pub struct CareTeamParticipant {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DomainResource
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [Claim](http://hl7.org/fhir/StructureDefinition/Claim)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -21034,7 +21035,7 @@ pub struct Claim {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: IETF language tag for a human language
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1
     pub language: Option<Code>,
     /// Text summary of the resource, for human interpretation
     ///
@@ -21215,7 +21216,7 @@ pub struct Claim {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: A code specifying the state of the resource instance.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/fm-status|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/fm-status|6.0.0-snapshot1
     pub status: Code,
     /// Reason for status change
     ///
@@ -21323,7 +21324,7 @@ pub struct Claim {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: The purpose of the Claim: predetermination, preauthorization, claim.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/claim-use|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/claim-use|6.0.0-snapshot1
     #[fhir_serde(rename = "use")]
     pub r#use: Code,
     /// The recipient(s) of the products and services
@@ -25110,7 +25111,7 @@ pub struct ClaimSupportingInfo {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DomainResource
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [ClaimResponse](http://hl7.org/fhir/StructureDefinition/ClaimResponse)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -25203,7 +25204,7 @@ pub struct ClaimResponse {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: IETF language tag for a human language
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1
     pub language: Option<Code>,
     /// Text summary of the resource, for human interpretation
     ///
@@ -25381,7 +25382,7 @@ pub struct ClaimResponse {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: A code specifying the state of the resource instance.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/fm-status|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/fm-status|6.0.0-snapshot1
     pub status: Code,
     /// Reason for status change
     ///
@@ -25487,7 +25488,7 @@ pub struct ClaimResponse {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: Claim, preauthorization, predetermination.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/claim-use|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/claim-use|6.0.0-snapshot1
     #[fhir_serde(rename = "use")]
     pub r#use: Code,
     /// The recipient(s) of the products and services
@@ -25605,7 +25606,7 @@ pub struct ClaimResponse {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: The result of the claim processing.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/claim-outcome|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/claim-outcome|6.0.0-snapshot1
     pub outcome: Code,
     /// Result of the adjudication
     ///
@@ -29170,7 +29171,7 @@ pub struct ClaimResponseProcessNote {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: IETF language tag for a human language
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1
     pub language: Option<CodeableConcept>,
 }
 
@@ -29754,7 +29755,7 @@ pub struct ClaimResponseTotal {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DomainResource
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [ClinicalUseDefinition](http://hl7.org/fhir/StructureDefinition/ClinicalUseDefinition)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -29847,7 +29848,7 @@ pub struct ClinicalUseDefinition {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: IETF language tag for a human language
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1
     pub language: Option<Code>,
     /// Text summary of the resource, for human interpretation
     ///
@@ -30000,7 +30001,7 @@ pub struct ClinicalUseDefinition {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: Overall defining type of this clinical use definition.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/clinical-use-definition-type|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/clinical-use-definition-type|6.0.0-snapshot1
     #[fhir_serde(rename = "type")]
     pub r#type: Code,
     /// A categorisation of the issue, primarily for dividing warnings into subject heading areas such as "Pregnancy", "Overdose"
@@ -31455,7 +31456,7 @@ pub enum CodeSystemVersionAlgorithm {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DomainResource
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [CodeSystem](http://hl7.org/fhir/StructureDefinition/CodeSystem)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -31549,7 +31550,7 @@ pub struct CodeSystem {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: IETF language tag for a human language
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1
     pub language: Option<Code>,
     /// Text summary of the resource, for human interpretation
     ///
@@ -31848,7 +31849,7 @@ pub struct CodeSystem {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: The lifecycle status of an artifact.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/publication-status|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/publication-status|6.0.0-snapshot1
     pub status: Code,
     /// For testing only - never for real usage
     ///
@@ -32331,7 +32332,7 @@ pub struct CodeSystem {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: The meaning of the hierarchy of concepts in a code system.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/codesystem-hierarchy-meaning|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/codesystem-hierarchy-meaning|6.0.0-snapshot1
     ///
     /// ## Conditions
     /// Used when: csd-2, csd-3
@@ -32408,7 +32409,7 @@ pub struct CodeSystem {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: The extent of the content of the code system (the concepts and codes it defines) are represented in a code system resource.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/codesystem-content-mode|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/codesystem-content-mode|6.0.0-snapshot1
     ///
     /// ## Conditions
     /// Used when: csd-4
@@ -32815,7 +32816,7 @@ pub struct CodeSystemConceptDesignation {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: IETF language tag for a human language
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1
     pub language: Option<Code>,
     /// Details how this designation would be used
     ///
@@ -33170,7 +33171,7 @@ pub struct CodeSystemFilter {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: The kind of operation to perform as a part of a property based filter.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/filter-operator|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/filter-operator|6.0.0-snapshot1
     pub operator: Option<Vec<Code>>,
     /// Code from the system, or regex criteria, or boolean value for exists
     ///
@@ -33359,7 +33360,7 @@ pub struct CodeSystemProperty {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: The type of a property value.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/concept-property-type|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/concept-property-type|6.0.0-snapshot1
     #[fhir_serde(rename = "type")]
     pub r#type: Code,
 }
@@ -33376,7 +33377,7 @@ pub struct CodeSystemProperty {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DataType
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [CodeableConcept](http://hl7.org/fhir/StructureDefinition/CodeableConcept)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -33478,7 +33479,7 @@ pub struct CodeableConcept {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DataType
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [CodeableReference](http://hl7.org/fhir/StructureDefinition/CodeableReference)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -33559,7 +33560,7 @@ pub struct CodeableReference {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DataType
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [Coding](http://hl7.org/fhir/StructureDefinition/Coding)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -33728,7 +33729,7 @@ pub struct Coding {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DomainResource
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [Communication](http://hl7.org/fhir/StructureDefinition/Communication)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -33821,7 +33822,7 @@ pub struct Communication {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: IETF language tag for a human language
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1
     pub language: Option<Code>,
     /// Text summary of the resource, for human interpretation
     ///
@@ -34046,7 +34047,7 @@ pub struct Communication {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: The status of the communication.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/event-status|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/event-status|6.0.0-snapshot1
     pub status: Code,
     /// Reason for current status
     ///
@@ -34117,7 +34118,7 @@ pub struct Communication {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: Codes indicating the relative importance of a communication.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/request-priority|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/request-priority|6.0.0-snapshot1
     pub priority: Option<Code>,
     /// A channel of communication
     ///
@@ -34452,7 +34453,7 @@ pub enum CommunicationRequestOccurrence {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DomainResource
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [CommunicationRequest](http://hl7.org/fhir/StructureDefinition/CommunicationRequest)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -34546,7 +34547,7 @@ pub struct CommunicationRequest {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: IETF language tag for a human language
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1
     pub language: Option<Code>,
     /// Text summary of the resource, for human interpretation
     ///
@@ -34791,7 +34792,7 @@ pub struct CommunicationRequest {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: The status of the communication request.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/request-status|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/request-status|6.0.0-snapshot1
     pub status: Code,
     /// Reason for current status
     ///
@@ -34850,7 +34851,7 @@ pub struct CommunicationRequest {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: Codes indicating the degree of authority/intentionality associated with a request.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/request-intent|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/request-intent|6.0.0-snapshot1
     pub intent: Code,
     /// Message category
     ///
@@ -34890,7 +34891,7 @@ pub struct CommunicationRequest {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: Codes indicating the relative importance of a communication request.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/request-priority|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/request-priority|6.0.0-snapshot1
     pub priority: Option<Code>,
     /// True if request is prohibiting action
     ///
@@ -35265,7 +35266,7 @@ pub enum CompartmentDefinitionVersionAlgorithm {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DomainResource
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [CompartmentDefinition](http://hl7.org/fhir/StructureDefinition/CompartmentDefinition)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -35359,7 +35360,7 @@ pub struct CompartmentDefinition {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: IETF language tag for a human language
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1
     pub language: Option<Code>,
     /// Text summary of the resource, for human interpretation
     ///
@@ -35641,7 +35642,7 @@ pub struct CompartmentDefinition {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: The lifecycle status of an artifact.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/publication-status|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/publication-status|6.0.0-snapshot1
     pub status: Code,
     /// For testing only - never for real usage
     ///
@@ -35835,7 +35836,7 @@ pub struct CompartmentDefinition {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: Which type a compartment definition describes.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/compartment-type|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/compartment-type|6.0.0-snapshot1
     pub code: Code,
     /// Whether the search syntax is supported
     ///
@@ -35978,7 +35979,7 @@ pub struct CompartmentDefinitionResource {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: One of the resource types defined as part of this version of FHIR.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/extended-resource-types|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/extended-resource-types|6.0.0-snapshot1
     pub code: Code,
     /// Search Parameter Name link to the compartment
     ///
@@ -36044,7 +36045,7 @@ pub struct CompartmentDefinitionResource {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DomainResource
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [Composition](http://hl7.org/fhir/StructureDefinition/Composition)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -36137,7 +36138,7 @@ pub struct Composition {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: IETF language tag for a human language
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1
     pub language: Option<Code>,
     /// Text summary of the resource, for human interpretation
     ///
@@ -36392,7 +36393,7 @@ pub struct Composition {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: The workflow status of the composition.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/composition-status|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/composition-status|6.0.0-snapshot1
     pub status: Code,
     /// Kind of composition (LOINC if possible)
     ///
@@ -37869,7 +37870,7 @@ pub enum ConceptMapTargetScope {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DomainResource
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [ConceptMap](http://hl7.org/fhir/StructureDefinition/ConceptMap)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -37963,7 +37964,7 @@ pub struct ConceptMap {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: IETF language tag for a human language
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1
     pub language: Option<Code>,
     /// Text summary of the resource, for human interpretation
     ///
@@ -38260,7 +38261,7 @@ pub struct ConceptMap {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: The lifecycle status of an artifact.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/publication-status|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/publication-status|6.0.0-snapshot1
     ///
     /// ## Conditions
     /// Used when: cmd-1
@@ -38735,7 +38736,7 @@ pub struct ConceptMap {
     ///
     /// ## Binding
     /// - **Strength**: required
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/concept-map-relationship|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/concept-map-relationship|6.0.0-snapshot1
     #[fhir_serde(rename = "allowedRelationship")]
     pub allowed_relationship: Option<Vec<Code>>,
     /// The source value set that contains the concepts that are being mapped
@@ -38964,7 +38965,7 @@ pub struct ConceptMapAdditionalAttribute {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: The type of a mapping attribute value.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/conceptmap-attribute-type|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/conceptmap-attribute-type|6.0.0-snapshot1
     #[fhir_serde(rename = "type")]
     pub r#type: Code,
 }
@@ -39525,7 +39526,7 @@ pub struct ConceptMapGroupElementTarget {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: The relationship between concepts.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/concept-map-relationship|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/concept-map-relationship|6.0.0-snapshot1
     ///
     /// ## Conditions
     /// Used when: cmd-1
@@ -40011,7 +40012,7 @@ pub struct ConceptMapGroupUnmapped {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: Defines which action to take if there is no match in the group.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/conceptmap-unmapped-mode|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/conceptmap-unmapped-mode|6.0.0-snapshot1
     ///
     /// ## Conditions
     /// Used when: cmd-3, cmd-2, cmd-8, cmd-9, cmd-10
@@ -40094,7 +40095,7 @@ pub struct ConceptMapGroupUnmapped {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: The default relationship value to apply between the source and target concepts when no concept mapping is specified.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/concept-map-relationship|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/concept-map-relationship|6.0.0-snapshot1
     ///
     /// ## Conditions
     /// Used when: cmd-9
@@ -40279,7 +40280,7 @@ pub struct ConceptMapProperty {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: The type of a property value.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/conceptmap-property-type|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/conceptmap-property-type|6.0.0-snapshot1
     ///
     /// ## Conditions
     /// Used when: cmd-11
@@ -40355,7 +40356,7 @@ pub enum ConditionAbatement {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DomainResource
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [Condition](http://hl7.org/fhir/StructureDefinition/Condition)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -40449,7 +40450,7 @@ pub struct Condition {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: IETF language tag for a human language
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1
     pub language: Option<Code>,
     /// Text summary of the resource, for human interpretation
     ///
@@ -40628,7 +40629,7 @@ pub struct Condition {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: The clinical status of the condition or diagnosis.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/condition-clinical|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/condition-clinical|6.0.0-snapshot1
     ///
     /// ## Conditions
     /// Used when: con-3
@@ -40659,7 +40660,7 @@ pub struct Condition {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: The verification status to support or decline the clinical status of the condition or diagnosis.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/condition-ver-status|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/condition-ver-status|6.0.0-snapshot1
     #[fhir_serde(rename = "verificationStatus")]
     pub verification_status: Option<CodeableConcept>,
     /// Classification of type of condition
@@ -41130,7 +41131,7 @@ pub struct ConditionStage {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DomainResource
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [Consent](http://hl7.org/fhir/StructureDefinition/Consent)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -41223,7 +41224,7 @@ pub struct Consent {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: IETF language tag for a human language
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1
     pub language: Option<Code>,
     /// Text summary of the resource, for human interpretation
     ///
@@ -41386,7 +41387,7 @@ pub struct Consent {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: Indicates the state of the consent.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/consent-state-codes|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/consent-state-codes|6.0.0-snapshot1
     pub status: Code,
     /// Classification of the consent statement - for indexing/retrieval
     ///
@@ -41625,7 +41626,7 @@ pub struct Consent {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: Sets the base decision for Consent to be either permit or deny, with provisions assumed to be a negation of the previous level.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/consent-provision-type|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/consent-provision-type|6.0.0-snapshot1
     ///
     /// ## Conditions
     /// Used when: consent-1
@@ -42324,7 +42325,7 @@ pub struct ConsentProvisionData {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: How a resource reference is interpreted when testing consent restrictions.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/consent-data-meaning|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/consent-data-meaning|6.0.0-snapshot1
     pub meaning: Code,
     /// The actual data reference
     ///
@@ -42521,7 +42522,7 @@ pub struct ConsentVerification {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DataType
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [ContactDetail](http://hl7.org/fhir/StructureDefinition/ContactDetail)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -42606,7 +42607,7 @@ pub struct ContactDetail {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DataType
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [ContactPoint](http://hl7.org/fhir/StructureDefinition/ContactPoint)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -42663,7 +42664,7 @@ pub struct ContactPoint {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: Telecommunications form for contact point.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/contact-point-system|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/contact-point-system|6.0.0-snapshot1
     ///
     /// ## Conditions
     /// Used when: cpt-2
@@ -42717,7 +42718,7 @@ pub struct ContactPoint {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: Use of contact point.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/contact-point-use|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/contact-point-use|6.0.0-snapshot1
     #[fhir_serde(rename = "use")]
     pub r#use: Option<Code>,
     /// Specify preferred order of use (1 = highest)
@@ -42779,7 +42780,7 @@ pub struct ContactPoint {
 /// Base type: http://hl7.org/fhir/StructureDefinition/Quantity
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [Count](http://hl7.org/fhir/StructureDefinition/Count)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -42866,7 +42867,7 @@ pub struct Count {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: How the Quantity should be understood and represented.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/quantity-comparator|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/quantity-comparator|6.0.0-snapshot1
     pub comparator: Option<Code>,
     /// Unit representation
     ///
@@ -42943,7 +42944,7 @@ pub struct Count {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DomainResource
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [Coverage](http://hl7.org/fhir/StructureDefinition/Coverage)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -43036,7 +43037,7 @@ pub struct Coverage {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: IETF language tag for a human language
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1
     pub language: Option<Code>,
     /// Text summary of the resource, for human interpretation
     ///
@@ -43211,7 +43212,7 @@ pub struct Coverage {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: A code specifying the state of the resource instance.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/fm-status|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/fm-status|6.0.0-snapshot1
     pub status: Code,
     /// Reason for status change
     ///
@@ -43260,7 +43261,7 @@ pub struct Coverage {
     ///
     /// ## Binding
     /// - **Strength**: required
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/coverage-kind|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/coverage-kind|6.0.0-snapshot1
     pub kind: Code,
     /// Self-pay parties and responsibility
     ///
@@ -44297,7 +44298,7 @@ pub enum CoverageEligibilityRequestServiced {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DomainResource
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [CoverageEligibilityRequest](http://hl7.org/fhir/StructureDefinition/CoverageEligibilityRequest)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -44391,7 +44392,7 @@ pub struct CoverageEligibilityRequest {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: IETF language tag for a human language
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1
     pub language: Option<Code>,
     /// Text summary of the resource, for human interpretation
     ///
@@ -44554,7 +44555,7 @@ pub struct CoverageEligibilityRequest {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: A code specifying the state of the resource instance.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/fm-status|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/fm-status|6.0.0-snapshot1
     pub status: Code,
     /// Reason for status change
     ///
@@ -44618,7 +44619,7 @@ pub struct CoverageEligibilityRequest {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: A code specifying the types of information being requested.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/eligibilityrequest-purpose|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/eligibilityrequest-purpose|6.0.0-snapshot1
     pub purpose: Option<Vec<Code>>,
     /// Intended recipient of products and services
     ///
@@ -45646,7 +45647,7 @@ pub enum CoverageEligibilityResponseServiced {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DomainResource
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [CoverageEligibilityResponse](http://hl7.org/fhir/StructureDefinition/CoverageEligibilityResponse)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -45740,7 +45741,7 @@ pub struct CoverageEligibilityResponse {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: IETF language tag for a human language
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1
     pub language: Option<Code>,
     /// Text summary of the resource, for human interpretation
     ///
@@ -45903,7 +45904,7 @@ pub struct CoverageEligibilityResponse {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: A code specifying the state of the resource instance.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/fm-status|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/fm-status|6.0.0-snapshot1
     pub status: Code,
     /// Reason for status change
     ///
@@ -45949,7 +45950,7 @@ pub struct CoverageEligibilityResponse {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: A code specifying the types of information being requested.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/eligibilityresponse-purpose|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/eligibilityresponse-purpose|6.0.0-snapshot1
     pub purpose: Option<Vec<Code>>,
     /// Intended recipient of products and services
     ///
@@ -46067,7 +46068,7 @@ pub struct CoverageEligibilityResponse {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: The outcome of the processing.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/eligibility-outcome|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/eligibility-outcome|6.0.0-snapshot1
     pub outcome: Code,
     /// Disposition Message
     ///
@@ -47161,7 +47162,7 @@ pub enum DataRequirementSubject {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DataType
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [DataRequirement](http://hl7.org/fhir/StructureDefinition/DataRequirement)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -47221,7 +47222,7 @@ pub struct DataRequirement {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: List of FHIR types (resources, data types).
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/fhir-types|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/fhir-types|6.0.0-snapshot1
     #[fhir_serde(rename = "type")]
     pub r#type: Code,
     /// The profile of the required data
@@ -47749,7 +47750,7 @@ pub struct DataRequirementSort {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: The possible sort directions, ascending or descending.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/sort-direction|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/sort-direction|6.0.0-snapshot1
     pub direction: Code,
 }
 
@@ -47889,7 +47890,7 @@ pub struct DataRequirementValueFilter {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: Possible comparators for the valueFilter element.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/value-filter-comparator|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/value-filter-comparator|6.0.0-snapshot1
     pub comparator: Option<Code>,
     /// The value of the filter, as a boolean, integer, string, Quantity, Range, Ratio, or RatioRange value
     ///
@@ -47934,7 +47935,7 @@ pub enum DetectedIssueIdentified {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DomainResource
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [DetectedIssue](http://hl7.org/fhir/StructureDefinition/DetectedIssue)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -48028,7 +48029,7 @@ pub struct DetectedIssue {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: IETF language tag for a human language
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1
     pub language: Option<Code>,
     /// Text summary of the resource, for human interpretation
     ///
@@ -48209,7 +48210,7 @@ pub struct DetectedIssue {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: Indicates the status of the identified issue.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/detectedissue-status|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/detectedissue-status|6.0.0-snapshot1
     ///
     /// ## Aliases
     /// status
@@ -48811,7 +48812,7 @@ pub struct DetectedIssueMitigation {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DomainResource
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [Device](http://hl7.org/fhir/StructureDefinition/Device)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -48904,7 +48905,7 @@ pub struct Device {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: IETF language tag for a human language
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1
     pub language: Option<Code>,
     /// Text summary of the resource, for human interpretation
     ///
@@ -49100,7 +49101,7 @@ pub struct Device {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: The record status of the device.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/device-status|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/device-status|6.0.0-snapshot1
     pub status: Option<Code>,
     /// lost | damaged | destroyed | available
     ///
@@ -50424,7 +50425,7 @@ pub struct DeviceUdiCarrier {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: Codes to identify how UDI data was entered.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/udi-entry-type|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/udi-entry-type|6.0.0-snapshot1
     #[fhir_serde(rename = "entryType")]
     pub entry_type: Option<Code>,
 }
@@ -50439,7 +50440,7 @@ pub struct DeviceUdiCarrier {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DomainResource
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [DeviceAlert](http://hl7.org/fhir/StructureDefinition/DeviceAlert)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -50532,7 +50533,7 @@ pub struct DeviceAlert {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: IETF language tag for a human language
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1
     pub language: Option<Code>,
     /// Text summary of the resource, for human interpretation
     ///
@@ -50721,7 +50722,7 @@ pub struct DeviceAlert {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: in-progress | completed | entered-in-error | unknown
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/devicealert-status|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/devicealert-status|6.0.0-snapshot1
     pub status: Code,
     /// High level categorization of device alert
     ///
@@ -51315,7 +51316,7 @@ pub struct DeviceAlertSignal {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DomainResource
 ///
 /// ## Status: draft
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [DeviceAssociation](http://hl7.org/fhir/StructureDefinition/DeviceAssociation)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -51408,7 +51409,7 @@ pub struct DeviceAssociation {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: IETF language tag for a human language
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1
     pub language: Option<Code>,
     /// Text summary of the resource, for human interpretation
     ///
@@ -51598,7 +51599,7 @@ pub struct DeviceAssociation {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: Describes the lifecycle of the association.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/deviceassociation-status|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/deviceassociation-status|6.0.0-snapshot1
     pub status: Code,
     /// The reasons given for the current Device Association status
     ///
@@ -51719,7 +51720,7 @@ pub enum DeviceDefinitionVersionAlgorithm {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DomainResource
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [DeviceDefinition](http://hl7.org/fhir/StructureDefinition/DeviceDefinition)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -51813,7 +51814,7 @@ pub struct DeviceDefinition {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: IETF language tag for a human language
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1
     pub language: Option<Code>,
     /// Text summary of the resource, for human interpretation
     ///
@@ -52113,7 +52114,7 @@ pub struct DeviceDefinition {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: The lifecycle status of an artifact.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/publication-status|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/publication-status|6.0.0-snapshot1
     pub status: Code,
     /// For testing only - never for real usage
     ///
@@ -52621,7 +52622,7 @@ pub struct DeviceDefinition {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: Device output language.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1
     #[fhir_serde(rename = "outputLanguage")]
     pub output_language: Option<Vec<Code>>,
     /// Inherent, essentially fixed, characteristics of this kind of device, e.g., time properties, size, etc
@@ -53426,7 +53427,7 @@ pub struct DeviceDefinitionCorrectiveAction {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: The type or scope of the corrective action.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/device-correctiveactionscope|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/device-correctiveactionscope|6.0.0-snapshot1
     pub scope: Option<Code>,
     /// Start and end dates of the  corrective action
     ///
@@ -55190,7 +55191,7 @@ pub struct DeviceDefinitionUdiDeviceIdentifierMarketDistribution {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DomainResource
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [DeviceMetric](http://hl7.org/fhir/StructureDefinition/DeviceMetric)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -55283,7 +55284,7 @@ pub struct DeviceMetric {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: IETF language tag for a human language
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1
     pub language: Option<Code>,
     /// Text summary of the resource, for human interpretation
     ///
@@ -55448,7 +55449,7 @@ pub struct DeviceMetric {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: Describes the status of the DeviceMetric.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/metric-status|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/metric-status|6.0.0-snapshot1
     pub status: Code,
     /// on | off | standby | unknown
     ///
@@ -55468,7 +55469,7 @@ pub struct DeviceMetric {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: Describes the operational status of the DeviceMetric.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/metric-operational-status|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/metric-operational-status|6.0.0-snapshot1
     #[fhir_serde(rename = "operationalStatus")]
     pub operational_status: Option<Code>,
     /// The kind of metric represented
@@ -55809,13 +55810,13 @@ pub enum DeviceRequestOccurrence {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DomainResource
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [DeviceRequest](http://hl7.org/fhir/StructureDefinition/DeviceRequest)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
 #[fhir_resource(
     choice_elements = "product,occurrence",
-    summary_fields = "id,meta,implicit_rules,modifier_extension,identifier,based_on,replaces,group_identifier,status,intent,priority,do_not_perform,product,subject,encounter,occurrence,authored_on,requester,performer,location,reason"
+    summary_fields = "id,meta,implicit_rules,modifier_extension,identifier,based_on,replaces,group_identifier,status,intent,category,priority,do_not_perform,product,subject,encounter,occurrence,authored_on,requester,performer,location,reason"
 )]
 pub struct DeviceRequest {
     /// Logical id of this artifact
@@ -55903,7 +55904,7 @@ pub struct DeviceRequest {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: IETF language tag for a human language
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1
     pub language: Option<Code>,
     /// Text summary of the resource, for human interpretation
     ///
@@ -56108,7 +56109,7 @@ pub struct DeviceRequest {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: Codes representing the status of the request.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/request-status|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/request-status|6.0.0-snapshot1
     pub status: Option<Code>,
     /// proposal | solicit-offer | offer-response | plan | directive | order | original-order | reflex-order | filler-order | instance-order | option
     ///
@@ -56131,8 +56132,27 @@ pub struct DeviceRequest {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: The kind of diagnostic request.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/request-intent|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/request-intent|6.0.0-snapshot1
     pub intent: Code,
+    /// Classification of request
+    ///
+    /// A code that classifies the device request for searching, sorting and display
+    /// purposes.
+    ///
+    /// ## Cardinality: Optional, Multiple (0..*)
+    ///
+    /// ## Special Semantics
+    /// - Included in summary
+    ///
+    /// ## Constraints
+    /// - **ele-1**: All FHIR elements must have a @value or children (error)
+    ///   Expression: `hasValue() or (children().count() > id.count())`
+    ///
+    /// ## Binding
+    /// - **Strength**: example
+    /// - **Description**: Classification of the requested device.
+    /// - **ValueSet**: http://terminology.hl7.org/ValueSet/v3-ActEncounterCode
+    pub category: Option<Vec<CodeableConcept>>,
     /// routine | urgent | asap | stat
     ///
     /// Indicates how quickly the request should be addressed with respect to other
@@ -56151,7 +56171,7 @@ pub struct DeviceRequest {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: Identifies the level of importance to be assigned to actioning the request.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/request-priority|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/request-priority|6.0.0-snapshot1
     pub priority: Option<Code>,
     /// True if the request is to stop or not to start using the device
     ///
@@ -56600,7 +56620,7 @@ pub enum DiagnosticReportEffective {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DomainResource
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [DiagnosticReport](http://hl7.org/fhir/StructureDefinition/DiagnosticReport)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -56694,7 +56714,7 @@ pub struct DiagnosticReport {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: IETF language tag for a human language
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1
     pub language: Option<Code>,
     /// Text summary of the resource, for human interpretation
     ///
@@ -56888,7 +56908,7 @@ pub struct DiagnosticReport {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: The status of the diagnostic report.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/diagnostic-report-status|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/diagnostic-report-status|6.0.0-snapshot1
     pub status: Code,
     /// Reason for current status
     ///
@@ -57675,7 +57695,7 @@ pub struct DiagnosticReportSupportingInfo {
 /// Base type: http://hl7.org/fhir/StructureDefinition/Quantity
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [Distance](http://hl7.org/fhir/StructureDefinition/Distance)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -57762,7 +57782,7 @@ pub struct Distance {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: How the Quantity should be understood and represented.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/quantity-comparator|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/quantity-comparator|6.0.0-snapshot1
     pub comparator: Option<Code>,
     /// Unit representation
     ///
@@ -57843,7 +57863,7 @@ pub struct Distance {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DomainResource
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [DocumentReference](http://hl7.org/fhir/StructureDefinition/DocumentReference)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -57936,7 +57956,7 @@ pub struct DocumentReference {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: IETF language tag for a human language
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1
     pub language: Option<Code>,
     /// Text summary of the resource, for human interpretation
     ///
@@ -58151,7 +58171,7 @@ pub struct DocumentReference {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: The status of the document reference.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/document-reference-status|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/document-reference-status|6.0.0-snapshot1
     pub status: Code,
     /// registered | partial | preliminary | final | amended | corrected | appended | cancelled | entered-in-error | deprecated | unknown
     ///
@@ -58172,7 +58192,7 @@ pub struct DocumentReference {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: Status of the underlying document.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/composition-status|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/composition-status|6.0.0-snapshot1
     #[fhir_serde(rename = "docStatus")]
     pub doc_status: Option<Code>,
     /// Imaging modality used
@@ -59295,7 +59315,7 @@ pub struct DocumentReferenceRelatesTo {
 /// Base type: http://hl7.org/fhir/StructureDefinition/BackboneType
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [Dosage](http://hl7.org/fhir/StructureDefinition/Dosage)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -60016,7 +60036,7 @@ pub enum DosageConditionValue {
 /// Base type: http://hl7.org/fhir/StructureDefinition/BackboneType
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [DosageCondition](http://hl7.org/fhir/StructureDefinition/DosageCondition)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -60158,7 +60178,7 @@ pub struct DosageCondition {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: How the criteria value is tested.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/comparison-operation|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/comparison-operation|6.0.0-snapshot1
     pub operation: Option<Code>,
     /// The value for this critera
     ///
@@ -60198,7 +60218,7 @@ pub struct DosageCondition {
 /// Base type: http://hl7.org/fhir/StructureDefinition/BackboneType
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [DosageDetails](http://hl7.org/fhir/StructureDefinition/DosageDetails)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -60294,7 +60314,7 @@ pub struct DosageDetails {
     /// in the structured dosage, and may contain additional information not found in
     /// the structured dosage content, if applicable.
     ///
-    /// ## Cardinality: Required (1..1)
+    /// ## Cardinality: Optional (0..1)
     ///
     /// ## Special Semantics
     /// - Included in summary
@@ -60303,7 +60323,7 @@ pub struct DosageDetails {
     /// - **ele-1**: All FHIR elements must have a @value or children (error)
     ///   Expression: `hasValue() or (children().count() > id.count())`
     #[fhir_serde(rename = "renderedInstruction")]
-    pub rendered_instruction: Markdown,
+    pub rendered_instruction: Option<Markdown>,
     /// One step in a sequence of steps that comprise the dosage course
     ///
     /// One step in a sequence of steps that comprise the dosage course.
@@ -60457,7 +60477,7 @@ pub struct DosageDetailsStep {
 /// Base type: http://hl7.org/fhir/StructureDefinition/BackboneType
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [DosageSafety](http://hl7.org/fhir/StructureDefinition/DosageSafety)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -60667,7 +60687,7 @@ pub struct DosageSafetyDoseLimit {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: Definition.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/dose-limit-scope|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/dose-limit-scope|6.0.0-snapshot1
     pub scope: Code,
     /// The period over which the quantity is safe to use (if scope = period)
     ///
@@ -60705,7 +60725,7 @@ pub struct DosageSafetyDoseLimit {
 /// Base type: http://hl7.org/fhir/StructureDefinition/Quantity
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [Duration](http://hl7.org/fhir/StructureDefinition/Duration)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -60792,7 +60812,7 @@ pub struct Duration {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: How the Quantity should be understood and represented.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/quantity-comparator|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/quantity-comparator|6.0.0-snapshot1
     pub comparator: Option<Code>,
     /// Unit representation
     ///
@@ -61451,7 +61471,7 @@ pub enum ElementDefinitionMaxValue {
 /// Base type: http://hl7.org/fhir/StructureDefinition/BackboneType
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [ElementDefinition](http://hl7.org/fhir/StructureDefinition/ElementDefinition)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -61582,7 +61602,7 @@ pub struct ElementDefinition {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: How a property is represented when serialized.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/property-representation|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/property-representation|6.0.0-snapshot1
     pub representation: Option<Vec<Code>>,
     /// Name for this particular element (in a set of slices)
     ///
@@ -62708,7 +62728,7 @@ pub struct ElementDefinitionBinding {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: Indication of the degree of conformance expectations associated with a binding.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/binding-strength|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/binding-strength|6.0.0-snapshot1
     ///
     /// ## Aliases
     /// conformance, extensibility
@@ -62869,7 +62889,7 @@ pub struct ElementDefinitionBindingAdditional {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: The use of an additional binding.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/additional-binding-purpose|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/additional-binding-purpose|6.0.0-snapshot1
     pub purpose: Code,
     /// The value set for the additional binding
     ///
@@ -63070,7 +63090,7 @@ pub struct ElementDefinitionConstraint {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: SHALL applications comply with this constraint?
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/constraint-severity|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/constraint-severity|6.0.0-snapshot1
     ///
     /// ## Conditions
     /// Used when: eld-26
@@ -63516,7 +63536,7 @@ pub struct ElementDefinitionMapping {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: BCP 13 (RFCs 2045, 2046, 2047, 4288, 4289 and 2049)
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/mimetypes|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/mimetypes|6.0.0-snapshot1
     pub language: Option<Code>,
     /// Details of the mapping
     ///
@@ -63703,7 +63723,7 @@ pub struct ElementDefinitionSlicing {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: How slices are interpreted when evaluating an instance.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/resource-slicing-rules|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/resource-slicing-rules|6.0.0-snapshot1
     ///
     /// ## Conditions
     /// Used when: eld-25
@@ -63785,7 +63805,7 @@ pub struct ElementDefinitionSlicingDiscriminator {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: How an element value is interpreted when discrimination is evaluated.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/discriminator-type|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/discriminator-type|6.0.0-snapshot1
     #[fhir_serde(rename = "type")]
     pub r#type: Code,
     /// Path to element value
@@ -63972,7 +63992,7 @@ pub struct ElementDefinitionType {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: How resource references can be aggregated.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/resource-aggregation-mode|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/resource-aggregation-mode|6.0.0-snapshot1
     ///
     /// ## Conditions
     /// Used when: eld-4
@@ -63999,7 +64019,7 @@ pub struct ElementDefinitionType {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: Whether a reference needs to be version specific or version independent, or whether either can be used.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/reference-version-rules|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/reference-version-rules|6.0.0-snapshot1
     pub versioning: Option<Code>,
 }
 
@@ -64013,7 +64033,7 @@ pub struct ElementDefinitionType {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DomainResource
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [Encounter](http://hl7.org/fhir/StructureDefinition/Encounter)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -64106,7 +64126,7 @@ pub struct Encounter {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: IETF language tag for a human language
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1
     pub language: Option<Code>,
     /// Text summary of the resource, for human interpretation
     ///
@@ -64265,7 +64285,7 @@ pub struct Encounter {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: Current state of the encounter.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/encounter-status|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/encounter-status|6.0.0-snapshot1
     pub status: Code,
     /// A granular, workflows specific set of statuses that apply to the encounter
     ///
@@ -65385,7 +65405,7 @@ pub struct EncounterLocation {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: The status of the location.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/encounter-location-status|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/encounter-location-status|6.0.0-snapshot1
     pub status: Option<Code>,
     /// The form of the location (usually the level in the location hierarchy - bed, room, ward, virtual etc.)
     ///
@@ -65781,7 +65801,7 @@ pub struct EncounterReason {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DomainResource
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [Endpoint](http://hl7.org/fhir/StructureDefinition/Endpoint)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -65874,7 +65894,7 @@ pub struct Endpoint {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: IETF language tag for a human language
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1
     pub language: Option<Code>,
     /// Text summary of the resource, for human interpretation
     ///
@@ -66036,7 +66056,7 @@ pub struct Endpoint {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: The status of the endpoint.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/endpoint-status|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/endpoint-status|6.0.0-snapshot1
     pub status: Code,
     /// Protocol/Profile/Standard to be used with this endpoint connection
     ///
@@ -66400,7 +66420,7 @@ pub struct EndpointPayload {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: BCP 13 (RFCs 2045, 2046, 2047, 4288, 4289 and 2049)
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/mimetypes|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/mimetypes|6.0.0-snapshot1
     #[fhir_serde(rename = "mimeType")]
     pub mime_type: Option<Vec<Code>>,
     /// The profile that is expected at this endpoint
@@ -66444,7 +66464,7 @@ pub struct EndpointPayload {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DomainResource
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [EpisodeOfCare](http://hl7.org/fhir/StructureDefinition/EpisodeOfCare)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -66537,7 +66557,7 @@ pub struct EpisodeOfCare {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: IETF language tag for a human language
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1
     pub language: Option<Code>,
     /// Text summary of the resource, for human interpretation
     ///
@@ -66695,7 +66715,7 @@ pub struct EpisodeOfCare {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: The status of the episode of care.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/episode-of-care-status|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/episode-of-care-status|6.0.0-snapshot1
     pub status: Code,
     /// Past list of status codes (the current status may be included to cover the start date of the status)
     ///
@@ -67294,7 +67314,7 @@ pub struct EpisodeOfCareStatusHistory {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: The status of the episode of care.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/episode-of-care-status|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/episode-of-care-status|6.0.0-snapshot1
     pub status: Code,
     /// Duration the EpisodeOfCare was in the specified status
     ///
@@ -67341,7 +67361,7 @@ pub enum EventDefinitionSubject {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DomainResource
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [EventDefinition](http://hl7.org/fhir/StructureDefinition/EventDefinition)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -67435,7 +67455,7 @@ pub struct EventDefinition {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: IETF language tag for a human language
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1
     pub language: Option<Code>,
     /// Text summary of the resource, for human interpretation
     ///
@@ -67748,7 +67768,7 @@ pub struct EventDefinition {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: The lifecycle status of an artifact.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/publication-status|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/publication-status|6.0.0-snapshot1
     pub status: Code,
     /// For testing only - never for real usage
     ///
@@ -68245,7 +68265,7 @@ pub enum EvidenceVersionAlgorithm {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DomainResource
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [Evidence](http://hl7.org/fhir/StructureDefinition/Evidence)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -68339,7 +68359,7 @@ pub struct Evidence {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: IETF language tag for a human language
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1
     pub language: Option<Code>,
     /// Text summary of the resource, for human interpretation
     ///
@@ -68625,7 +68645,7 @@ pub struct Evidence {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: The lifecycle status of an artifact.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/publication-status|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/publication-status|6.0.0-snapshot1
     pub status: Option<Code>,
     /// For testing only - never for real usage
     ///
@@ -70603,7 +70623,7 @@ pub struct EvidenceVariableDefinition {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: The role that the variable plays.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/variable-role|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/variable-role|6.0.0-snapshot1
     #[fhir_serde(rename = "variableRole")]
     pub variable_role: Code,
     /// Sub-classification of the role of the variable
@@ -70717,7 +70737,7 @@ pub enum EvidenceVariableVersionAlgorithm {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DomainResource
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [EvidenceVariable](http://hl7.org/fhir/StructureDefinition/EvidenceVariable)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -70811,7 +70831,7 @@ pub struct EvidenceVariable {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: IETF language tag for a human language
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1
     pub language: Option<Code>,
     /// Text summary of the resource, for human interpretation
     ///
@@ -71136,7 +71156,7 @@ pub struct EvidenceVariable {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: The lifecycle status of an artifact.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/publication-status|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/publication-status|6.0.0-snapshot1
     pub status: Option<Code>,
     /// For testing only - never for real usage
     ///
@@ -72513,7 +72533,7 @@ pub enum ExampleScenarioVersionAlgorithm {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DomainResource
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [ExampleScenario](http://hl7.org/fhir/StructureDefinition/ExampleScenario)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -72607,7 +72627,7 @@ pub struct ExampleScenario {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: IETF language tag for a human language
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1
     pub language: Option<Code>,
     /// Text summary of the resource, for human interpretation
     ///
@@ -72905,7 +72925,7 @@ pub struct ExampleScenario {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: The lifecycle status of an artifact.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/publication-status|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/publication-status|6.0.0-snapshot1
     ///
     /// ## Conditions
     /// Used when: exs-3, exs-4, exs-5
@@ -73356,7 +73376,7 @@ pub struct ExampleScenarioActor {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: The type of actor - system or non-system.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/actordefinition-actor-type|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/actordefinition-actor-type|6.0.0-snapshot1
     ///
     /// ## Conditions
     /// Used when: exs-24
@@ -74761,7 +74781,7 @@ pub struct ExampleScenarioProcessStepOperation {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DomainResource
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [ExplanationOfBenefit](http://hl7.org/fhir/StructureDefinition/ExplanationOfBenefit)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -74854,7 +74874,7 @@ pub struct ExplanationOfBenefit {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: IETF language tag for a human language
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1
     pub language: Option<Code>,
     /// Text summary of the resource, for human interpretation
     ///
@@ -75032,7 +75052,7 @@ pub struct ExplanationOfBenefit {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: A code specifying the state of the resource instance.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/explanationofbenefit-status|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/explanationofbenefit-status|6.0.0-snapshot1
     pub status: Code,
     /// Reason for status change
     ///
@@ -75139,7 +75159,7 @@ pub struct ExplanationOfBenefit {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: Complete, proposed, exploratory, other.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/claim-use|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/claim-use|6.0.0-snapshot1
     #[fhir_serde(rename = "use")]
     pub r#use: Code,
     /// The recipient(s) of the products and services
@@ -75502,7 +75522,7 @@ pub struct ExplanationOfBenefit {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: The result of the claim processing.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/claim-outcome|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/claim-outcome|6.0.0-snapshot1
     pub outcome: Code,
     /// Result of the adjudication
     ///
@@ -81202,7 +81222,7 @@ pub struct ExplanationOfBenefitProcessNote {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: IETF language tag for a human language
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1
     pub language: Option<CodeableConcept>,
 }
 
@@ -81941,7 +81961,7 @@ pub struct ExplanationOfBenefitTotal {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DataType
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [Expression](http://hl7.org/fhir/StructureDefinition/Expression)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -82095,7 +82115,7 @@ pub struct Expression {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DataType
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [ExtendedContactDetail](http://hl7.org/fhir/StructureDefinition/ExtendedContactDetail)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -82425,7 +82445,7 @@ pub enum ExtensionValue {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DataType
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [Extension](http://hl7.org/fhir/StructureDefinition/Extension)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -82560,7 +82580,7 @@ pub enum FamilyMemberHistoryDeceased {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DomainResource
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [FamilyMemberHistory](http://hl7.org/fhir/StructureDefinition/FamilyMemberHistory)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -82654,7 +82674,7 @@ pub struct FamilyMemberHistory {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: IETF language tag for a human language
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1
     pub language: Option<Code>,
     /// Text summary of the resource, for human interpretation
     ///
@@ -82828,7 +82848,7 @@ pub struct FamilyMemberHistory {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: A code that identifies the status of the family history record.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/history-status|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/history-status|6.0.0-snapshot1
     pub status: Code,
     /// subject-unknown | withheld | unable-to-obtain | deferred
     ///
@@ -83496,7 +83516,7 @@ pub struct FamilyMemberHistoryProcedure {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DomainResource
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [Flag](http://hl7.org/fhir/StructureDefinition/Flag)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -83589,7 +83609,7 @@ pub struct Flag {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: IETF language tag for a human language
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1
     pub language: Option<Code>,
     /// Text summary of the resource, for human interpretation
     ///
@@ -83763,7 +83783,7 @@ pub struct Flag {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: Indicates whether this flag is active and needs to be displayed to a user, or whether it is no longer needed or was entered in error.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/flag-status|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/flag-status|6.0.0-snapshot1
     pub status: Option<Code>,
     /// Clinical, administrative, etc
     ///
@@ -83919,7 +83939,7 @@ pub enum GoalStart {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DomainResource
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [Goal](http://hl7.org/fhir/StructureDefinition/Goal)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -84013,7 +84033,7 @@ pub struct Goal {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: IETF language tag for a human language
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1
     pub language: Option<Code>,
     /// Text summary of the resource, for human interpretation
     ///
@@ -84188,7 +84208,7 @@ pub struct Goal {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: Codes that reflect the current state of a goal and whether the goal is still being targeted.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/goal-status|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/goal-status|6.0.0-snapshot1
     #[fhir_serde(rename = "lifecycleStatus")]
     pub lifecycle_status: Code,
     /// Reason for current lifecycle status
@@ -84612,7 +84632,7 @@ pub struct GoalAcceptance {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: Codes that identify whether the goal has been accepted or not.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/goal-accept-status|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/goal-accept-status|6.0.0-snapshot1
     pub status: Option<Code>,
     /// Priority of goal for individual
     ///
@@ -84871,7 +84891,7 @@ pub enum GroupVersionAlgorithm {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DomainResource
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [Group](http://hl7.org/fhir/StructureDefinition/Group)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -84965,7 +84985,7 @@ pub struct Group {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: IETF language tag for a human language
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1
     pub language: Option<Code>,
     /// Text summary of the resource, for human interpretation
     ///
@@ -85267,7 +85287,7 @@ pub struct Group {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: The lifecycle status of an artifact.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/publication-status|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/publication-status|6.0.0-snapshot1
     pub status: Option<Code>,
     /// For testing only - never for real usage
     ///
@@ -85502,7 +85522,7 @@ pub struct Group {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: Types of resources that are part of group.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/group-type|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/group-type|6.0.0-snapshot1
     ///
     /// ## Conditions
     /// Used when: grp-2
@@ -85544,7 +85564,7 @@ pub struct Group {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: The basis for membership in a group
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/group-membership-basis|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/group-membership-basis|6.0.0-snapshot1
     ///
     /// ## Conditions
     /// Used when: grp-2
@@ -85641,7 +85661,7 @@ pub struct Group {
     ///
     /// ## Binding
     /// - **Strength**: required
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/group-characteristic-combination|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/group-characteristic-combination|6.0.0-snapshot1
     #[fhir_serde(rename = "combinationMethod")]
     pub combination_method: Option<Code>,
     /// Provides the value of "n" when "at-least" or "at-most" codes are used
@@ -86231,7 +86251,7 @@ pub enum GuidanceResponseModule {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DomainResource
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [GuidanceResponse](http://hl7.org/fhir/StructureDefinition/GuidanceResponse)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -86325,7 +86345,7 @@ pub struct GuidanceResponse {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: IETF language tag for a human language
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1
     pub language: Option<Code>,
     /// Text summary of the resource, for human interpretation
     ///
@@ -86572,7 +86592,7 @@ pub struct GuidanceResponse {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: The status of a guidance response.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/guidance-response-status|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/guidance-response-status|6.0.0-snapshot1
     pub status: Code,
     /// Individual service was done for/to
     ///
@@ -86798,7 +86818,7 @@ pub struct GuidanceResponse {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DomainResource
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [HealthcareService](http://hl7.org/fhir/StructureDefinition/HealthcareService)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -86891,7 +86911,7 @@ pub struct HealthcareService {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: IETF language tag for a human language
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1
     pub language: Option<Code>,
     /// Text summary of the resource, for human interpretation
     ///
@@ -87365,7 +87385,7 @@ pub struct HealthcareService {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: IETF language tag for a human language
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1
     pub communication: Option<Vec<CodeableConcept>>,
     /// Ways that the service accepts referrals
     ///
@@ -87657,7 +87677,7 @@ pub struct HealthcareServiceEligibility {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DataType
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [HumanName](http://hl7.org/fhir/StructureDefinition/HumanName)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -87722,7 +87742,7 @@ pub struct HumanName {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: The use of a human name.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/name-use|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/name-use|6.0.0-snapshot1
     #[fhir_serde(rename = "use")]
     pub r#use: Option<Code>,
     /// Text representation of the full name
@@ -87852,7 +87872,7 @@ pub struct HumanName {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DataType
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [Identifier](http://hl7.org/fhir/StructureDefinition/Identifier)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -87917,7 +87937,7 @@ pub struct Identifier {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: Identifies the purpose for this identifier, if known .
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/identifier-use|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/identifier-use|6.0.0-snapshot1
     #[fhir_serde(rename = "use")]
     pub r#use: Option<Code>,
     /// Description of identifier
@@ -88055,7 +88075,7 @@ pub struct Identifier {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DomainResource
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [ImagingSelection](http://hl7.org/fhir/StructureDefinition/ImagingSelection)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -88148,7 +88168,7 @@ pub struct ImagingSelection {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: IETF language tag for a human language
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1
     pub language: Option<Code>,
     /// Text summary of the resource, for human interpretation
     ///
@@ -88324,7 +88344,7 @@ pub struct ImagingSelection {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: The status of the ImagingSelection.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/imagingselection-status|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/imagingselection-status|6.0.0-snapshot1
     pub status: Code,
     /// Classifies the imaging selection
     ///
@@ -88802,7 +88822,7 @@ pub struct ImagingSelectionImageRegion3D {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: The type of image region.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/imagingselection-3dgraphictype|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/imagingselection-3dgraphictype|6.0.0-snapshot1
     ///
     /// ## Aliases
     /// GraphicType
@@ -89257,7 +89277,7 @@ pub struct ImagingSelectionInstanceImageRegion2D {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: The type of image region.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/imagingselection-2dgraphictype|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/imagingselection-2dgraphictype|6.0.0-snapshot1
     ///
     /// ## Aliases
     /// GraphicType
@@ -89439,7 +89459,7 @@ pub struct ImagingSelectionPerformer {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DomainResource
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [ImagingStudy](http://hl7.org/fhir/StructureDefinition/ImagingStudy)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -89532,7 +89552,7 @@ pub struct ImagingStudy {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: IETF language tag for a human language
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1
     pub language: Option<Code>,
     /// Text summary of the resource, for human interpretation
     ///
@@ -89718,7 +89738,7 @@ pub struct ImagingStudy {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: The status of the ImagingStudy.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/imagingstudy-status|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/imagingstudy-status|6.0.0-snapshot1
     pub status: Code,
     /// The distinct values for series' modalities
     ///
@@ -90691,7 +90711,7 @@ pub enum ImmunizationOccurrence {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DomainResource
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [Immunization](http://hl7.org/fhir/StructureDefinition/Immunization)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -90785,7 +90805,7 @@ pub struct Immunization {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: IETF language tag for a human language
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1
     pub language: Option<Code>,
     /// Text summary of the resource, for human interpretation
     ///
@@ -90959,7 +90979,7 @@ pub struct Immunization {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: x
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/immunization-status|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/immunization-status|6.0.0-snapshot1
     pub status: Code,
     /// Reason not done
     ///
@@ -91956,7 +91976,7 @@ pub enum ImplementationGuideVersionAlgorithm {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DomainResource
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [ImplementationGuide](http://hl7.org/fhir/StructureDefinition/ImplementationGuide)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -92050,7 +92070,7 @@ pub struct ImplementationGuide {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: IETF language tag for a human language
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1
     pub language: Option<Code>,
     /// Text summary of the resource, for human interpretation
     ///
@@ -92353,7 +92373,7 @@ pub struct ImplementationGuide {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: The lifecycle status of an artifact.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/publication-status|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/publication-status|6.0.0-snapshot1
     pub status: Code,
     /// For testing only - never for real usage
     ///
@@ -92637,7 +92657,7 @@ pub struct ImplementationGuide {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: The license that applies to an Implementation Guide (using an SPDX license Identifiers, or 'not-open-source'). The binding is required but new SPDX license Identifiers are allowed to be used (https://spdx.org/licenses/).
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/spdx-license|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/spdx-license|6.0.0-snapshot1
     pub license: Option<Code>,
     /// FHIR Version(s) this Implementation Guide targets
     ///
@@ -92667,7 +92687,7 @@ pub struct ImplementationGuide {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: All published FHIR Versions.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/FHIR-version|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/FHIR-version|6.0.0-snapshot1
     ///
     /// ## Conditions
     /// Used when: ig-2
@@ -93208,7 +93228,7 @@ pub struct ImplementationGuideDefinitionPage {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: A code that indicates how the page is generated.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/guide-page-generation|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/guide-page-generation|6.0.0-snapshot1
     pub generation: Code,
     /// Nested Pages / Sections
     ///
@@ -93486,7 +93506,7 @@ pub struct ImplementationGuideDefinitionResource {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: All published FHIR Versions.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/FHIR-version|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/FHIR-version|6.0.0-snapshot1
     ///
     /// ## Conditions
     /// Used when: ig-2
@@ -94466,7 +94486,7 @@ pub struct ImplementationGuideManifestResource {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DomainResource
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [Ingredient](http://hl7.org/fhir/StructureDefinition/Ingredient)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -94559,7 +94579,7 @@ pub struct Ingredient {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: IETF language tag for a human language
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1
     pub language: Option<Code>,
     /// Text summary of the resource, for human interpretation
     ///
@@ -94719,7 +94739,7 @@ pub struct Ingredient {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: The lifecycle status of an artifact.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/publication-status|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/publication-status|6.0.0-snapshot1
     pub status: Code,
     /// The product which this ingredient is a constituent part of
     ///
@@ -94971,7 +94991,7 @@ pub struct IngredientManufacturer {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: The way in which this manufacturer is associated with the ingredient.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/ingredient-manufacturer-role|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/ingredient-manufacturer-role|6.0.0-snapshot1
     pub role: Option<Code>,
     /// An organization that manufactures this ingredient
     ///
@@ -95606,7 +95626,7 @@ pub enum LibrarySubject {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DomainResource
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [Library](http://hl7.org/fhir/StructureDefinition/Library)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -95700,7 +95720,7 @@ pub struct Library {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: IETF language tag for a human language
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1
     pub language: Option<Code>,
     /// Text summary of the resource, for human interpretation
     ///
@@ -96010,7 +96030,7 @@ pub struct Library {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: The lifecycle status of an artifact.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/publication-status|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/publication-status|6.0.0-snapshot1
     pub status: Code,
     /// For testing only - never for real usage
     ///
@@ -96524,7 +96544,7 @@ pub struct Library {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DomainResource
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [List](http://hl7.org/fhir/StructureDefinition/List)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -96617,7 +96637,7 @@ pub struct List {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: IETF language tag for a human language
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1
     pub language: Option<Code>,
     /// Text summary of the resource, for human interpretation
     ///
@@ -96773,7 +96793,7 @@ pub struct List {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: The current state of the list.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/list-status|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/list-status|6.0.0-snapshot1
     pub status: Code,
     /// working | snapshot | changes
     ///
@@ -96803,7 +96823,7 @@ pub struct List {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: The processing mode that applies to this list.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/list-mode|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/list-mode|6.0.0-snapshot1
     pub mode: Code,
     /// Descriptive name for the list
     ///
@@ -97222,7 +97242,7 @@ pub struct ListEntry {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DomainResource
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [Location](http://hl7.org/fhir/StructureDefinition/Location)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -97315,7 +97335,7 @@ pub struct Location {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: IETF language tag for a human language
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1
     pub language: Option<Code>,
     /// Text summary of the resource, for human interpretation
     ///
@@ -97474,7 +97494,7 @@ pub struct Location {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: Indicates whether the location is still in use.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/location-status|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/location-status|6.0.0-snapshot1
     pub status: Option<Code>,
     /// The operational status of the location (typically only for a bed/room)
     ///
@@ -97605,7 +97625,7 @@ pub struct Location {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: Indicates whether a resource instance represents a specific location or a class of locations.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/location-mode|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/location-mode|6.0.0-snapshot1
     pub mode: Option<Code>,
     /// Types of services available at this location
     ///
@@ -97986,7 +98006,7 @@ pub struct LocationPosition {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DomainResource
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [ManufacturedItemDefinition](http://hl7.org/fhir/StructureDefinition/ManufacturedItemDefinition)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -98079,7 +98099,7 @@ pub struct ManufacturedItemDefinition {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: IETF language tag for a human language
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1
     pub language: Option<Code>,
     /// Text summary of the resource, for human interpretation
     ///
@@ -98237,7 +98257,7 @@ pub struct ManufacturedItemDefinition {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: The lifecycle status of an artifact.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/publication-status|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/publication-status|6.0.0-snapshot1
     pub status: Code,
     /// A descriptive name applied to this item
     ///
@@ -98872,7 +98892,7 @@ pub struct ManufacturedItemDefinitionProperty {
 /// Base type: http://hl7.org/fhir/StructureDefinition/BackboneType
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [MarketingStatus](http://hl7.org/fhir/StructureDefinition/MarketingStatus)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -99065,7 +99085,7 @@ pub enum MeasureSubject {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DomainResource
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [Measure](http://hl7.org/fhir/StructureDefinition/Measure)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -99159,7 +99179,7 @@ pub struct Measure {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: IETF language tag for a human language
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1
     pub language: Option<Code>,
     /// Text summary of the resource, for human interpretation
     ///
@@ -99468,7 +99488,7 @@ pub struct Measure {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: The lifecycle status of an artifact.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/publication-status|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/publication-status|6.0.0-snapshot1
     pub status: Code,
     /// For testing only - never for real usage
     ///
@@ -100373,7 +100393,7 @@ pub struct MeasureGroup {
     ///
     /// ## Binding
     /// - **Strength**: required
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/fhir-types|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/fhir-types|6.0.0-snapshot1
     pub basis: Option<Code>,
     /// Population basis requirements
     ///
@@ -101807,7 +101827,7 @@ pub struct MeasureTerm {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DomainResource
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [MeasureReport](http://hl7.org/fhir/StructureDefinition/MeasureReport)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -101900,7 +101920,7 @@ pub struct MeasureReport {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: IETF language tag for a human language
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1
     pub language: Option<Code>,
     /// Text summary of the resource, for human interpretation
     ///
@@ -102103,7 +102123,7 @@ pub struct MeasureReport {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: The status of the measure report (e.g. complete, pending, or error)
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/measure-report-status|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/measure-report-status|6.0.0-snapshot1
     pub status: Code,
     /// individual | subject-list | summary | data-exchange | other
     ///
@@ -102135,7 +102155,7 @@ pub struct MeasureReport {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: The type of the measure report: individual, patient listing, or summary
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/measure-report-type|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/measure-report-type|6.0.0-snapshot1
     ///
     /// ## Conditions
     /// Used when: mrp-1
@@ -102168,7 +102188,7 @@ pub struct MeasureReport {
     ///
     /// ## Binding
     /// - **Strength**: required
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/submit-data-update-type|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/submit-data-update-type|6.0.0-snapshot1
     #[fhir_serde(rename = "dataUpdateType")]
     pub data_update_type: Option<Code>,
     /// What measure was calculated
@@ -103736,7 +103756,7 @@ pub struct MeasureReportGroupStratifierStratumPopulation {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DomainResource
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [Medication](http://hl7.org/fhir/StructureDefinition/Medication)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -103829,7 +103849,7 @@ pub struct Medication {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: IETF language tag for a human language
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1
     pub language: Option<Code>,
     /// Text summary of the resource, for human interpretation
     ///
@@ -104031,7 +104051,7 @@ pub struct Medication {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: A coded concept defining if the medication is in active use.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/medication-status|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/medication-status|6.0.0-snapshot1
     pub status: Option<Code>,
     /// Organization that has authorization to market medication
     ///
@@ -104640,7 +104660,7 @@ pub enum MedicationAdministrationOccurrence {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DomainResource
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [MedicationAdministration](http://hl7.org/fhir/StructureDefinition/MedicationAdministration)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -104734,7 +104754,7 @@ pub struct MedicationAdministration {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: IETF language tag for a human language
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1
     pub language: Option<Code>,
     /// Text summary of the resource, for human interpretation
     ///
@@ -104928,7 +104948,7 @@ pub struct MedicationAdministration {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: A set of codes indicating the current status of a MedicationAdministration.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/medication-admin-status|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/medication-admin-status|6.0.0-snapshot1
     pub status: Code,
     /// Reason status of the administration changed
     ///
@@ -105578,7 +105598,7 @@ pub struct MedicationAdministrationPerformer {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DomainResource
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [MedicationDispense](http://hl7.org/fhir/StructureDefinition/MedicationDispense)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -105671,7 +105691,7 @@ pub struct MedicationDispense {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: IETF language tag for a human language
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1
     pub language: Option<Code>,
     /// Text summary of the resource, for human interpretation
     ///
@@ -105860,7 +105880,7 @@ pub struct MedicationDispense {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: Describes the lifecycle of the dispense.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/medicationdispense-status|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/medicationdispense-status|6.0.0-snapshot1
     pub status: Code,
     /// Why a dispense was not performed
     ///
@@ -106545,7 +106565,7 @@ pub enum MedicationRequestEffectiveTiming {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DomainResource
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [MedicationRequest](http://hl7.org/fhir/StructureDefinition/MedicationRequest)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -106639,7 +106659,7 @@ pub struct MedicationRequest {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: IETF language tag for a human language
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1
     pub language: Option<Code>,
     /// Text summary of the resource, for human interpretation
     ///
@@ -106859,7 +106879,7 @@ pub struct MedicationRequest {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: A coded concept specifying the state of the prescribing event. Describes the lifecycle of the prescription.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/medicationrequest-status|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/medicationrequest-status|6.0.0-snapshot1
     pub status: Code,
     /// Reason for current status
     ///
@@ -106926,7 +106946,7 @@ pub struct MedicationRequest {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: The kind of medication order.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/medicationrequest-intent|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/medicationrequest-intent|6.0.0-snapshot1
     pub intent: Code,
     /// Grouping or category of medication request
     ///
@@ -106972,7 +106992,7 @@ pub struct MedicationRequest {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: Identifies the level of importance to be assigned to actioning the request.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/request-priority|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/request-priority|6.0.0-snapshot1
     pub priority: Option<Code>,
     /// If true, indicates the provider is ordering a patient should not take the specified medication
     ///
@@ -107934,7 +107954,7 @@ pub enum MedicationStatementEffective {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DomainResource
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [MedicationStatement](http://hl7.org/fhir/StructureDefinition/MedicationStatement)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -108028,7 +108048,7 @@ pub struct MedicationStatement {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: IETF language tag for a human language
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1
     pub language: Option<Code>,
     /// Text summary of the resource, for human interpretation
     ///
@@ -108211,7 +108231,7 @@ pub struct MedicationStatement {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: A coded concept indicating the current status of a MedicationStatement.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/medication-statement-status|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/medication-statement-status|6.0.0-snapshot1
     pub status: Code,
     /// Type of medication statement
     ///
@@ -108611,7 +108631,7 @@ pub struct MedicationStatementAdherence {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DomainResource
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [MedicinalProductDefinition](http://hl7.org/fhir/StructureDefinition/MedicinalProductDefinition)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -108704,7 +108724,7 @@ pub struct MedicinalProductDefinition {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: IETF language tag for a human language
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1
     pub language: Option<Code>,
     /// Text summary of the resource, for human interpretation
     ///
@@ -110195,7 +110215,7 @@ pub struct MedicinalProductDefinitionNameUsage {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: IETF language tag for a human language
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1
     pub language: Option<CodeableConcept>,
 }
 
@@ -110402,7 +110422,7 @@ pub enum MessageDefinitionEvent {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DomainResource
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [MessageDefinition](http://hl7.org/fhir/StructureDefinition/MessageDefinition)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -110496,7 +110516,7 @@ pub struct MessageDefinition {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: IETF language tag for a human language
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1
     pub language: Option<Code>,
     /// Text summary of the resource, for human interpretation
     ///
@@ -110804,7 +110824,7 @@ pub struct MessageDefinition {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: The lifecycle status of an artifact.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/publication-status|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/publication-status|6.0.0-snapshot1
     pub status: Code,
     /// For testing only - never for real usage
     ///
@@ -111117,7 +111137,7 @@ pub struct MessageDefinition {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: The impact of the content of a message.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/message-significance-category|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/message-significance-category|6.0.0-snapshot1
     pub category: Option<Code>,
     /// Resource(s) that are the subject of the event
     ///
@@ -111158,7 +111178,7 @@ pub struct MessageDefinition {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: This enables the capability currently available through MSH-16 (Application Level acknowledgement) in HL7 Version 2 to declare at a message definition level whether a response is required or only upon error or success, or never.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/messageheader-response-request|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/messageheader-response-request|6.0.0-snapshot1
     #[fhir_serde(rename = "responseRequired")]
     pub response_required: Option<Code>,
     /// Responses to this message
@@ -111507,7 +111527,7 @@ pub enum MessageHeaderEvent {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DomainResource
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [MessageHeader](http://hl7.org/fhir/StructureDefinition/MessageHeader)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -111601,7 +111621,7 @@ pub struct MessageHeader {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: IETF language tag for a human language
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1
     pub language: Option<Code>,
     /// Text summary of the resource, for human interpretation
     ///
@@ -112181,7 +112201,7 @@ pub struct MessageHeaderResponse {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: The kind of response to a message.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/response-code|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/response-code|6.0.0-snapshot1
     pub code: Code,
     /// Specific list of hints/warnings/errors
     ///
@@ -112435,7 +112455,7 @@ pub struct MessageHeaderSource {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DataType
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [Meta](http://hl7.org/fhir/StructureDefinition/Meta)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -112652,7 +112672,7 @@ pub struct Meta {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DataType
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [MonetaryComponent](http://hl7.org/fhir/StructureDefinition/MonetaryComponent)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -112710,7 +112730,7 @@ pub struct MonetaryComponent {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: The purpose for which an extended contact detail should be used.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/price-component-type|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/price-component-type|6.0.0-snapshot1
     #[fhir_serde(rename = "type")]
     pub r#type: Code,
     /// Codes may be used to differentiate between kinds of taxes, surcharges, discounts etc.
@@ -112772,7 +112792,7 @@ pub struct MonetaryComponent {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DataType
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [Money](http://hl7.org/fhir/StructureDefinition/Money)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -112852,7 +112872,7 @@ pub struct Money {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: A code indicating the currency, taken from ISO 4217.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/currencies|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/currencies|6.0.0-snapshot1
     pub currency: Option<Code>,
 }
 
@@ -112878,7 +112898,7 @@ pub enum NamingSystemVersionAlgorithm {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DomainResource
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [NamingSystem](http://hl7.org/fhir/StructureDefinition/NamingSystem)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -112972,7 +112992,7 @@ pub struct NamingSystem {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: IETF language tag for a human language
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1
     pub language: Option<Code>,
     /// Text summary of the resource, for human interpretation
     ///
@@ -113270,7 +113290,7 @@ pub struct NamingSystem {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: The lifecycle status of an artifact.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/publication-status|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/publication-status|6.0.0-snapshot1
     pub status: Code,
     /// codesystem | identifier | root
     ///
@@ -113289,7 +113309,7 @@ pub struct NamingSystem {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: Identifies the purpose of the naming system.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/namingsystem-type|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/namingsystem-type|6.0.0-snapshot1
     ///
     /// ## Conditions
     /// Used when: nsd-1
@@ -113895,7 +113915,7 @@ pub struct NamingSystemUniqueId {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: Identifies the style of unique identifier used to identify a namespace.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/namingsystem-identifier-type|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/namingsystem-identifier-type|6.0.0-snapshot1
     ///
     /// ## Conditions
     /// Used when: nsd-1, nsd-2, nsd-3
@@ -114001,7 +114021,7 @@ pub struct NamingSystemUniqueId {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DataType
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [Narrative](http://hl7.org/fhir/StructureDefinition/Narrative)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -114055,7 +114075,7 @@ pub struct Narrative {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: The status of a resource narrative.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/narrative-status|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/narrative-status|6.0.0-snapshot1
     pub status: Code,
     /// Limited xhtml content
     ///
@@ -114121,7 +114141,7 @@ pub enum NutritionIntakeReported {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DomainResource
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [NutritionIntake](http://hl7.org/fhir/StructureDefinition/NutritionIntake)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -114215,7 +114235,7 @@ pub struct NutritionIntake {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: IETF language tag for a human language
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1
     pub language: Option<Code>,
     /// Text summary of the resource, for human interpretation
     ///
@@ -114428,7 +114448,7 @@ pub struct NutritionIntake {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: A coded concept indicating the current status of a NutritionIntake.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/event-status|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/event-status|6.0.0-snapshot1
     pub status: Code,
     /// Reason for current status
     ///
@@ -115328,7 +115348,7 @@ pub struct NutritionIntakePerformer {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DomainResource
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [NutritionOrder](http://hl7.org/fhir/StructureDefinition/NutritionOrder)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -115421,7 +115441,7 @@ pub struct NutritionOrder {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: IETF language tag for a human language
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1
     pub language: Option<Code>,
     /// Text summary of the resource, for human interpretation
     ///
@@ -115614,7 +115634,7 @@ pub struct NutritionOrder {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: Codes identifying the lifecycle stage of the nutrition order.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/request-status|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/request-status|6.0.0-snapshot1
     pub status: Code,
     /// proposal | solicit-offer | offer-response | plan | directive | order | original-order | reflex-order | filler-order | instance-order | option
     ///
@@ -115645,7 +115665,7 @@ pub struct NutritionOrder {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: Codes indicating the degree of authority/intentionality associated with a nutrition order.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/request-intent|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/request-intent|6.0.0-snapshot1
     ///
     /// ## Aliases
     /// category
@@ -116165,7 +116185,7 @@ pub struct NutritionOrderEnteralFormula {
     /// The type of adult or pediatric enteral feeding such as an adult standard
     /// formula with fiber or a soy-based infant feeding.
     ///
-    /// ## Cardinality: Optional (0..1)
+    /// ## Cardinality: Optional, Multiple (0..*)
     ///
     /// ## Special Semantics
     /// - Included in summary
@@ -116179,7 +116199,7 @@ pub struct NutritionOrderEnteralFormula {
     /// - **Description**: Codes for type of enteral formula to be administered to patient.
     /// - **ValueSet**: http://hl7.org/fhir/ValueSet/entformula-type
     #[fhir_serde(rename = "type")]
-    pub r#type: Option<CodeableReference>,
+    pub r#type: Option<Vec<CodeableReference>>,
     /// Product or brand name of the enteral feeding
     ///
     /// The product or brand name of the enteral feeding product such as "ACME Adult
@@ -117468,7 +117488,7 @@ pub struct NutritionOrderSupplementSchedule {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DomainResource
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [NutritionProduct](http://hl7.org/fhir/StructureDefinition/NutritionProduct)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -117561,7 +117581,7 @@ pub struct NutritionProduct {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: IETF language tag for a human language
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1
     pub language: Option<Code>,
     /// Text summary of the resource, for human interpretation
     ///
@@ -117707,7 +117727,7 @@ pub struct NutritionProduct {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: Codes identifying the lifecycle stage of a product.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/nutritionproduct-status|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/nutritionproduct-status|6.0.0-snapshot1
     pub status: Option<Code>,
     /// A code that can identify the product
     ///
@@ -118593,7 +118613,7 @@ pub enum ObservationValue {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DomainResource
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [Observation](http://hl7.org/fhir/StructureDefinition/Observation)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -118687,7 +118707,7 @@ pub struct Observation {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: IETF language tag for a human language
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1
     pub language: Option<Code>,
     /// Text summary of the resource, for human interpretation
     ///
@@ -118910,7 +118930,7 @@ pub struct Observation {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: Codes providing the status of an observation.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/observation-status|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/observation-status|6.0.0-snapshot1
     pub status: Code,
     /// Reason for current status
     ///
@@ -120280,7 +120300,7 @@ pub struct ObservationTriggeredBy {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: The type of TriggeredBy Observation.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/observation-triggeredbytype|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/observation-triggeredbytype|6.0.0-snapshot1
     #[fhir_serde(rename = "type")]
     pub r#type: Code,
     /// Reason that the observation was triggered
@@ -120332,7 +120352,7 @@ pub enum ObservationDefinitionDevice {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DomainResource
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [ObservationDefinition](http://hl7.org/fhir/StructureDefinition/ObservationDefinition)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -120426,7 +120446,7 @@ pub struct ObservationDefinition {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: IETF language tag for a human language
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1
     pub language: Option<Code>,
     /// Text summary of the resource, for human interpretation
     ///
@@ -120715,7 +120735,7 @@ pub struct ObservationDefinition {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: Codes identifying the state of an ObservationDefinition.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/publication-status|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/publication-status|6.0.0-snapshot1
     pub status: Code,
     /// If For testing only - never for real usage
     ///
@@ -121139,7 +121159,7 @@ pub struct ObservationDefinition {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: Permitted data type for observation value.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/permitted-data-type|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/permitted-data-type|6.0.0-snapshot1
     ///
     /// ## Conditions
     /// Used when: obd-0
@@ -121459,7 +121479,7 @@ pub struct ObservationDefinitionComponent {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: Permitted data type for observation value.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/permitted-data-type|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/permitted-data-type|6.0.0-snapshot1
     ///
     /// ## Conditions
     /// Used when: obd-1
@@ -121639,7 +121659,7 @@ pub struct ObservationDefinitionQualifiedValue {
     ///
     /// ## Binding
     /// - **Strength**: required
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/administrative-gender|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/administrative-gender|6.0.0-snapshot1
     #[fhir_serde(rename = "sexParameterForClinicalUse")]
     pub sex_parameter_for_clinical_use: Option<Code>,
     /// Applicable age range for the set of qualified values
@@ -121692,7 +121712,7 @@ pub struct ObservationDefinitionQualifiedValue {
     ///
     /// ## Binding
     /// - **Strength**: required
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/observation-range-category|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/observation-range-category|6.0.0-snapshot1
     #[fhir_serde(rename = "rangeCategory")]
     pub range_category: Option<Code>,
     /// The range for continuous or ordinal observations
@@ -121797,7 +121817,7 @@ pub enum OperationDefinitionVersionAlgorithm {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DomainResource
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [OperationDefinition](http://hl7.org/fhir/StructureDefinition/OperationDefinition)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -121891,7 +121911,7 @@ pub struct OperationDefinition {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: IETF language tag for a human language
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1
     pub language: Option<Code>,
     /// Text summary of the resource, for human interpretation
     ///
@@ -122198,7 +122218,7 @@ pub struct OperationDefinition {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: The lifecycle status of an artifact.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/publication-status|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/publication-status|6.0.0-snapshot1
     pub status: Code,
     /// operation | query
     ///
@@ -122221,7 +122241,7 @@ pub struct OperationDefinition {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: Whether an operation is a normal operation or a query.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/operation-kind|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/operation-kind|6.0.0-snapshot1
     ///
     /// ## Conditions
     /// Used when: opd-5, opd-6, opd-7
@@ -122505,7 +122525,7 @@ pub struct OperationDefinition {
     ///
     /// ## Binding
     /// - **Strength**: required
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/synchronicity-control|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/synchronicity-control|6.0.0-snapshot1
     pub synchronicity: Option<Code>,
     /// Recommended name for operation in search url
     ///
@@ -122979,7 +122999,7 @@ pub struct OperationDefinitionParameter {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: Whether an operation parameter is an input or an output parameter.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/operation-parameter-use|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/operation-parameter-use|6.0.0-snapshot1
     ///
     /// ## Conditions
     /// Used when: opd-6, opd-7, opd-4
@@ -123001,7 +123021,7 @@ pub struct OperationDefinitionParameter {
     ///
     /// ## Binding
     /// - **Strength**: required
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/operation-parameter-scope|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/operation-parameter-scope|6.0.0-snapshot1
     pub scope: Option<Vec<Code>>,
     /// Minimum Cardinality
     ///
@@ -123078,7 +123098,7 @@ pub struct OperationDefinitionParameter {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: A list of all the types defined in this version of the FHIR specification - Abstract Types, Data Types and Resource Types.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/fhir-types|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/fhir-types|6.0.0-snapshot1
     #[fhir_serde(rename = "allowedType")]
     pub allowed_type: Option<Vec<Code>>,
     /// If type is Reference | canonical, allowed targets. If type is 'Resource', then this constrains the allowed resource types
@@ -123128,7 +123148,7 @@ pub struct OperationDefinitionParameter {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: Data types allowed to be used for search parameters.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/search-param-type|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/search-param-type|6.0.0-snapshot1
     ///
     /// ## Conditions
     /// Used when: opd-6, opd-2, opd-4
@@ -123288,7 +123308,7 @@ pub struct OperationDefinitionParameterBinding {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: Indication of the degree of conformance expectations associated with a binding.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/binding-strength|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/binding-strength|6.0.0-snapshot1
     ///
     /// ## Aliases
     /// conformance, extensibility
@@ -123443,7 +123463,7 @@ pub struct OperationDefinitionParameterReferencedFrom {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DomainResource
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [OperationOutcome](http://hl7.org/fhir/StructureDefinition/OperationOutcome)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -123534,7 +123554,7 @@ pub struct OperationOutcome {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: IETF language tag for a human language
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1
     pub language: Option<Code>,
     /// Text summary of the resource, for human interpretation
     ///
@@ -123785,7 +123805,7 @@ pub struct OperationOutcomeIssue {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: How the issue affects the success of the action.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/issue-severity|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/issue-severity|6.0.0-snapshot1
     pub severity: Code,
     /// Error or warning code
     ///
@@ -123822,7 +123842,7 @@ pub struct OperationOutcomeIssue {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: A code that describes the type of issue.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/issue-type|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/issue-type|6.0.0-snapshot1
     pub code: Code,
     /// Additional details about the error
     ///
@@ -123898,7 +123918,7 @@ pub struct OperationOutcomeIssue {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DomainResource
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [Organization](http://hl7.org/fhir/StructureDefinition/Organization)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -123991,7 +124011,7 @@ pub struct Organization {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: IETF language tag for a human language
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1
     pub language: Option<Code>,
     /// Text summary of the resource, for human interpretation
     ///
@@ -124538,7 +124558,7 @@ pub struct OrganizationQualification {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DomainResource
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [OrganizationAffiliation](http://hl7.org/fhir/StructureDefinition/OrganizationAffiliation)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -124631,7 +124651,7 @@ pub struct OrganizationAffiliation {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: IETF language tag for a human language
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1
     pub language: Option<Code>,
     /// Text summary of the resource, for human interpretation
     ///
@@ -124954,7 +124974,7 @@ pub struct OrganizationAffiliation {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DomainResource
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [PackagedProductDefinition](http://hl7.org/fhir/StructureDefinition/PackagedProductDefinition)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -125047,7 +125067,7 @@ pub struct PackagedProductDefinition {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: IETF language tag for a human language
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1
     pub language: Option<Code>,
     /// Text summary of the resource, for human interpretation
     ///
@@ -126114,7 +126134,7 @@ pub struct PackagedProductDefinitionPackagingProperty {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DataType
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [ParameterDefinition](http://hl7.org/fhir/StructureDefinition/ParameterDefinition)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -126184,7 +126204,7 @@ pub struct ParameterDefinition {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: Whether the parameter is input or output.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/operation-parameter-use|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/operation-parameter-use|6.0.0-snapshot1
     #[fhir_serde(rename = "use")]
     pub r#use: Code,
     /// Minimum cardinality
@@ -126245,7 +126265,7 @@ pub struct ParameterDefinition {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: List of FHIR types (resources, data types).
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/fhir-types|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/fhir-types|6.0.0-snapshot1
     #[fhir_serde(rename = "type")]
     pub r#type: Code,
     /// What profile the value is expected to be
@@ -126275,7 +126295,7 @@ pub struct ParameterDefinition {
 /// Base type: http://hl7.org/fhir/StructureDefinition/Resource
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [Parameters](http://hl7.org/fhir/StructureDefinition/Parameters)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -126366,7 +126386,7 @@ pub struct Parameters {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: IETF language tag for a human language
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1
     pub language: Option<Code>,
     /// Operation Parameter
     ///
@@ -126756,7 +126776,7 @@ pub enum PatientMultipleBirth {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DomainResource
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [Patient](http://hl7.org/fhir/StructureDefinition/Patient)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -126850,7 +126870,7 @@ pub struct Patient {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: IETF language tag for a human language
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1
     pub language: Option<Code>,
     /// Text summary of the resource, for human interpretation
     ///
@@ -127116,7 +127136,7 @@ pub struct Patient {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: The gender of a person used for administrative purposes.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/administrative-gender|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/administrative-gender|6.0.0-snapshot1
     pub gender: Option<Code>,
     /// The date of birth for the individual
     ///
@@ -127512,7 +127532,7 @@ pub struct PatientCommunication {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: IETF language tag for a human language
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1
     pub language: CodeableConcept,
     /// Language preference indicator
     ///
@@ -127802,7 +127822,7 @@ pub struct PatientContact {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: The gender of a person used for administrative purposes.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/administrative-gender|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/administrative-gender|6.0.0-snapshot1
     pub gender: Option<Code>,
     /// Organization that is associated with the contact
     ///
@@ -127973,7 +127993,7 @@ pub struct PatientLink {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: The type of link between this patient resource and another Patient resource, or Patient/RelatedPerson when using the `seealso` code
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/link-type|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/link-type|6.0.0-snapshot1
     #[fhir_serde(rename = "type")]
     pub r#type: Code,
 }
@@ -127987,7 +128007,7 @@ pub struct PatientLink {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DomainResource
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [PaymentNotice](http://hl7.org/fhir/StructureDefinition/PaymentNotice)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -128080,7 +128100,7 @@ pub struct PaymentNotice {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: IETF language tag for a human language
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1
     pub language: Option<Code>,
     /// Text summary of the resource, for human interpretation
     ///
@@ -128243,7 +128263,7 @@ pub struct PaymentNotice {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: A code specifying the state of the resource instance.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/fm-status|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/fm-status|6.0.0-snapshot1
     pub status: Code,
     /// Reason for status change
     ///
@@ -128442,7 +128462,7 @@ pub struct PaymentNotice {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DomainResource
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [PaymentReconciliation](http://hl7.org/fhir/StructureDefinition/PaymentReconciliation)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -128535,7 +128555,7 @@ pub struct PaymentReconciliation {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: IETF language tag for a human language
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1
     pub language: Option<Code>,
     /// Text summary of the resource, for human interpretation
     ///
@@ -128716,7 +128736,7 @@ pub struct PaymentReconciliation {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: A code specifying the state of the resource instance.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/fm-status|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/fm-status|6.0.0-snapshot1
     pub status: Code,
     /// Reason for status change
     ///
@@ -128884,7 +128904,7 @@ pub struct PaymentReconciliation {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: The outcome of the processing.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/payment-outcome|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/payment-outcome|6.0.0-snapshot1
     pub outcome: Option<Code>,
     /// Disposition message
     ///
@@ -129571,7 +129591,7 @@ pub struct PaymentReconciliationProcessNote {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: The presentation types of notes.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/note-type|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/note-type|6.0.0-snapshot1
     #[fhir_serde(rename = "type")]
     pub r#type: Option<Code>,
     /// Note explanatory text
@@ -129598,7 +129618,7 @@ pub struct PaymentReconciliationProcessNote {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DataType
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [Period](http://hl7.org/fhir/StructureDefinition/Period)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -129708,7 +129728,7 @@ pub enum PersonDeceased {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DomainResource
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [Person](http://hl7.org/fhir/StructureDefinition/Person)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -129802,7 +129822,7 @@ pub struct Person {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: IETF language tag for a human language
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1
     pub language: Option<Code>,
     /// Text summary of the resource, for human interpretation
     ///
@@ -130039,7 +130059,7 @@ pub struct Person {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: The gender of a person used for administrative purposes.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/administrative-gender|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/administrative-gender|6.0.0-snapshot1
     pub gender: Option<Code>,
     /// The date on which the person was born
     ///
@@ -130330,7 +130350,7 @@ pub struct PersonCommunication {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: IETF language tag for a human language
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1
     pub language: CodeableConcept,
     /// Language preference indicator
     ///
@@ -130467,7 +130487,7 @@ pub struct PersonLink {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: The level of confidence that this link represents the same actual person, based on NIST Authentication Levels.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/identity-assuranceLevel|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/identity-assuranceLevel|6.0.0-snapshot1
     pub assurance: Option<Code>,
 }
 
@@ -130522,7 +130542,7 @@ pub enum PlanDefinitionAsNeeded {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DomainResource
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [PlanDefinition](http://hl7.org/fhir/StructureDefinition/PlanDefinition)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -130616,7 +130636,7 @@ pub struct PlanDefinition {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: IETF language tag for a human language
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1
     pub language: Option<Code>,
     /// Text summary of the resource, for human interpretation
     ///
@@ -130948,7 +130968,7 @@ pub struct PlanDefinition {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: The lifecycle status of an artifact.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/publication-status|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/publication-status|6.0.0-snapshot1
     pub status: Code,
     /// For testing only - never for real usage
     ///
@@ -131728,7 +131748,7 @@ pub struct PlanDefinitionAction {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: Identifies the level of importance to be assigned to actioning the request.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/request-priority|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/request-priority|6.0.0-snapshot1
     pub priority: Option<Code>,
     /// Code representing the meaning of the action or sub-actions
     ///
@@ -132004,7 +132024,7 @@ pub struct PlanDefinitionAction {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: Defines applicability behavior of a group.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/action-applicability-behavior|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/action-applicability-behavior|6.0.0-snapshot1
     #[fhir_serde(rename = "applicabilityBehavior")]
     pub applicability_behavior: Option<Code>,
     /// visual-group | logical-group | sentence-group
@@ -132023,7 +132043,7 @@ pub struct PlanDefinitionAction {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: Defines organization behavior of a group.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/action-grouping-behavior|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/action-grouping-behavior|6.0.0-snapshot1
     #[fhir_serde(rename = "groupingBehavior")]
     pub grouping_behavior: Option<Code>,
     /// any | all | all-or-none | exactly-one | at-most-one | one-or-more
@@ -132042,7 +132062,7 @@ pub struct PlanDefinitionAction {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: Defines selection behavior of a group.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/action-selection-behavior|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/action-selection-behavior|6.0.0-snapshot1
     #[fhir_serde(rename = "selectionBehavior")]
     pub selection_behavior: Option<Code>,
     /// must | could | must-unless-documented
@@ -132061,7 +132081,7 @@ pub struct PlanDefinitionAction {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: Defines expectations around whether an action or action group is required.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/action-required-behavior|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/action-required-behavior|6.0.0-snapshot1
     #[fhir_serde(rename = "requiredBehavior")]
     pub required_behavior: Option<Code>,
     /// yes | no
@@ -132080,7 +132100,7 @@ pub struct PlanDefinitionAction {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: Defines selection frequency behavior for an action or group.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/action-precheck-behavior|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/action-precheck-behavior|6.0.0-snapshot1
     #[fhir_serde(rename = "precheckBehavior")]
     pub precheck_behavior: Option<Code>,
     /// single | multiple
@@ -132099,7 +132119,7 @@ pub struct PlanDefinitionAction {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: Defines behavior for an action or a group for how many times that item may be repeated.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/action-cardinality-behavior|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/action-cardinality-behavior|6.0.0-snapshot1
     #[fhir_serde(rename = "cardinalityBehavior")]
     pub cardinality_behavior: Option<Code>,
     /// Description of the activity to be performed
@@ -132312,7 +132332,7 @@ pub struct PlanDefinitionActionCondition {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: Defines the kinds of conditions that can appear on actions.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/action-condition-kind|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/action-condition-kind|6.0.0-snapshot1
     pub kind: Code,
     /// Boolean-valued expression
     ///
@@ -132867,7 +132887,7 @@ pub struct PlanDefinitionActionParticipant {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: The type of participant in the activity.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/action-participant-type|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/action-participant-type|6.0.0-snapshot1
     #[fhir_serde(rename = "type")]
     pub r#type: Option<Code>,
     /// Who or what can participate
@@ -133069,7 +133089,7 @@ pub struct PlanDefinitionActionRelatedAction {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: Defines the types of relationships between actions.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/action-relationship-type|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/action-relationship-type|6.0.0-snapshot1
     pub relationship: Code,
     /// before | before-start | before-end | concurrent | concurrent-with-start | concurrent-with-end | after | after-start | after-end
     ///
@@ -133084,7 +133104,7 @@ pub struct PlanDefinitionActionRelatedAction {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: Defines the types of relationships between actions.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/action-relationship-type|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/action-relationship-type|6.0.0-snapshot1
     #[fhir_serde(rename = "endRelationship")]
     pub end_relationship: Option<Code>,
     /// Time offset for the relationship
@@ -133328,7 +133348,7 @@ pub struct PlanDefinitionActorOption {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: The type of participant in the activity.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/action-participant-type|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/action-participant-type|6.0.0-snapshot1
     #[fhir_serde(rename = "type")]
     pub r#type: Option<Code>,
     /// Who or what can participate
@@ -133778,7 +133798,7 @@ pub enum PractitionerDeceased {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DomainResource
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [Practitioner](http://hl7.org/fhir/StructureDefinition/Practitioner)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -133872,7 +133892,7 @@ pub struct Practitioner {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: IETF language tag for a human language
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1
     pub language: Option<Code>,
     /// Text summary of the resource, for human interpretation
     ///
@@ -134114,7 +134134,7 @@ pub struct Practitioner {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: The gender of a person used for administrative purposes.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/administrative-gender|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/administrative-gender|6.0.0-snapshot1
     pub gender: Option<Code>,
     /// The date  on which the practitioner was born
     ///
@@ -134369,7 +134389,7 @@ pub struct PractitionerCommunication {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: IETF language tag for a human language
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1
     pub language: CodeableConcept,
     /// Language preference indicator
     ///
@@ -134585,7 +134605,7 @@ pub struct PractitionerQualification {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DomainResource
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [PractitionerRole](http://hl7.org/fhir/StructureDefinition/PractitionerRole)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -134678,7 +134698,7 @@ pub struct PractitionerRole {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: IETF language tag for a human language
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1
     pub language: Option<Code>,
     /// Text summary of the resource, for human interpretation
     ///
@@ -135100,7 +135120,7 @@ pub struct PractitionerRole {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: IETF language tag for a human language
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1
     pub communication: Option<Vec<CodeableConcept>>,
     /// Times the Practitioner is available at this location and/or healthcare service (including exceptions)
     ///
@@ -135197,7 +135217,7 @@ pub enum ProcedureReported {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DomainResource
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [Procedure](http://hl7.org/fhir/StructureDefinition/Procedure)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -135291,7 +135311,7 @@ pub struct Procedure {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: IETF language tag for a human language
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1
     pub language: Option<Code>,
     /// Text summary of the resource, for human interpretation
     ///
@@ -135512,7 +135532,7 @@ pub struct Procedure {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: A code specifying the state of the procedure.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/event-status|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/event-status|6.0.0-snapshot1
     pub status: Code,
     /// Reason for current status
     ///
@@ -136288,7 +136308,7 @@ pub enum ProductShelfLifePeriod {
 /// Base type: http://hl7.org/fhir/StructureDefinition/BackboneType
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [ProductShelfLife](http://hl7.org/fhir/StructureDefinition/ProductShelfLife)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -136459,7 +136479,7 @@ pub enum ProvenanceOccurred {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DomainResource
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [Provenance](http://hl7.org/fhir/StructureDefinition/Provenance)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -136553,7 +136573,7 @@ pub struct Provenance {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: IETF language tag for a human language
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1
     pub language: Option<Code>,
     /// Text summary of the resource, for human interpretation
     ///
@@ -137258,7 +137278,7 @@ pub struct ProvenanceEntity {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: How an entity was used in an activity.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/provenance-entity-role|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/provenance-entity-role|6.0.0-snapshot1
     pub role: Code,
     /// Identity of entity
     ///
@@ -137317,7 +137337,7 @@ pub struct ProvenanceEntity {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DataType
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [Quantity](http://hl7.org/fhir/StructureDefinition/Quantity)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -137404,7 +137424,7 @@ pub struct Quantity {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: How the Quantity should be understood and represented.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/quantity-comparator|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/quantity-comparator|6.0.0-snapshot1
     pub comparator: Option<Code>,
     /// Unit representation
     ///
@@ -137495,7 +137515,7 @@ pub enum QuestionnaireVersionAlgorithm {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DomainResource
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [Questionnaire](http://hl7.org/fhir/StructureDefinition/Questionnaire)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -137589,7 +137609,7 @@ pub struct Questionnaire {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: IETF language tag for a human language
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1
     pub language: Option<Code>,
     /// Text summary of the resource, for human interpretation
     ///
@@ -137930,7 +137950,7 @@ pub struct Questionnaire {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: The lifecycle status of an artifact.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/publication-status|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/publication-status|6.0.0-snapshot1
     ///
     /// ## Conditions
     /// Used when: que-1a
@@ -137984,7 +138004,7 @@ pub struct Questionnaire {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: One of the resource types defined as part of this version of FHIR.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/resource-types|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/resource-types|6.0.0-snapshot1
     #[fhir_serde(rename = "subjectType")]
     pub subject_type: Option<Vec<Code>>,
     /// Date last changed
@@ -138642,7 +138662,7 @@ pub struct QuestionnaireItem {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: Distinguishes groups from questions and display text and indicates data type for questions.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/item-type-useable|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/item-type-useable|6.0.0-snapshot1
     ///
     /// ## Conditions
     /// Used when: que-9, que-8, que-6, que-5, que-3, que-10, que-1a, que-1b, que-1c
@@ -138727,7 +138747,7 @@ pub struct QuestionnaireItem {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: Controls how multiple enableWhen values are interpreted -  whether all or any must be true.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/questionnaire-enable-behavior|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/questionnaire-enable-behavior|6.0.0-snapshot1
     ///
     /// ## Conditions
     /// Used when: que-12
@@ -138751,7 +138771,7 @@ pub struct QuestionnaireItem {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: Defines how disabled elements should be rendered
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/questionnaire-disabled-display|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/questionnaire-disabled-display|6.0.0-snapshot1
     #[fhir_serde(rename = "disabledDisplay")]
     pub disabled_display: Option<Code>,
     /// Whether the item must be included in data results
@@ -138899,7 +138919,7 @@ pub struct QuestionnaireItem {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: Indicates differnt modes for restricting values when options or valueset are specified
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/questionnaire-answer-constraint|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/questionnaire-answer-constraint|6.0.0-snapshot1
     ///
     /// ## Conditions
     /// Used when: que-10, que-14
@@ -139407,7 +139427,7 @@ pub struct QuestionnaireItemEnableWhen {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: The criteria by which a question is enabled.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/questionnaire-enable-operator|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/questionnaire-enable-operator|6.0.0-snapshot1
     ///
     /// ## Conditions
     /// Used when: que-7
@@ -139624,7 +139644,7 @@ pub struct QuestionnaireItemInitial {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DomainResource
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [QuestionnaireResponse](http://hl7.org/fhir/StructureDefinition/QuestionnaireResponse)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -139717,7 +139737,7 @@ pub struct QuestionnaireResponse {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: IETF language tag for a human language
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1
     pub language: Option<Code>,
     /// Text summary of the resource, for human interpretation
     ///
@@ -139974,7 +139994,7 @@ pub struct QuestionnaireResponse {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: Lifecycle status of the questionnaire response.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/questionnaire-answers-status|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/questionnaire-answers-status|6.0.0-snapshot1
     pub status: Code,
     /// The subject of the questions
     ///
@@ -140141,6 +140161,8 @@ pub struct QuestionnaireResponse {
     ///   Expression: `(answer.exists() and item.exists()).not()`
     /// - **qrs-2**: Repeated answers are combined in the answers array of a single item (error)
     ///   Expression: `repeat(answer|item).select(item.where(answer.value.exists()).linkId.isDistinct()).allTrue()`
+    /// - **qrs-4**: The same answer cannot be specified more than once for the same question (error)
+    ///   Expression: `answer.value.isDistinct().allTrue()`
     pub item: Option<Vec<QuestionnaireResponseItem>>,
 }
 
@@ -140169,6 +140191,8 @@ pub struct QuestionnaireResponse {
 ///   Expression: `(answer.exists() and item.exists()).not()`
 /// - **qrs-2**: Repeated answers are combined in the answers array of a single item (error)
 ///   Expression: `repeat(answer|item).select(item.where(answer.value.exists()).linkId.isDistinct()).allTrue()`
+/// - **qrs-4**: The same answer cannot be specified more than once for the same question (error)
+///   Expression: `answer.value.isDistinct().allTrue()`
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
 pub struct QuestionnaireResponseItem {
     /// Unique id for inter-element referencing
@@ -140335,7 +140359,7 @@ pub struct QuestionnaireResponseItem {
     ///   Expression: `hasValue() or (children().count() > id.count())`
     ///
     /// ## Conditions
-    /// Used when: qrs-1, qrs-2
+    /// Used when: qrs-1, qrs-2, qrs-4
     pub answer: Option<Vec<QuestionnaireResponseItemAnswer>>,
     /// Child items of group item
     ///
@@ -140413,7 +140437,7 @@ pub enum QuestionnaireResponseItemAnswerValue {
 ///   Expression: `hasValue() or (children().count() > id.count())`
 ///
 /// ## Conditions
-/// Used when: qrs-1, qrs-2
+/// Used when: qrs-1, qrs-2, qrs-4
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
 #[fhir_resource(choice_elements = "value")]
 pub struct QuestionnaireResponseItemAnswer {
@@ -140571,7 +140595,7 @@ pub struct QuestionnaireResponseItemAnswer {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DataType
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [Range](http://hl7.org/fhir/StructureDefinition/Range)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -140663,7 +140687,7 @@ pub struct Range {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DataType
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [Ratio](http://hl7.org/fhir/StructureDefinition/Ratio)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -140749,7 +140773,7 @@ pub struct Ratio {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DataType
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [RatioRange](http://hl7.org/fhir/StructureDefinition/RatioRange)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -140855,7 +140879,7 @@ pub struct RatioRange {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DataType
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [Reference](http://hl7.org/fhir/StructureDefinition/Reference)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -141053,7 +141077,7 @@ pub struct Reference {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DomainResource
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [RegulatedAuthorization](http://hl7.org/fhir/StructureDefinition/RegulatedAuthorization)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -141146,7 +141170,7 @@ pub struct RegulatedAuthorization {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: IETF language tag for a human language
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1
     pub language: Option<Code>,
     /// Text summary of the resource, for human interpretation
     ///
@@ -141721,7 +141745,7 @@ pub struct RegulatedAuthorizationCase {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DataType
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [RelatedArtifact](http://hl7.org/fhir/StructureDefinition/RelatedArtifact)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -141789,7 +141813,7 @@ pub struct RelatedArtifact {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: The type of relationship to the related artifact.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/related-artifact-type|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/related-artifact-type|6.0.0-snapshot1
     #[fhir_serde(rename = "type")]
     pub r#type: Code,
     /// Short label
@@ -141927,7 +141951,7 @@ pub struct RelatedArtifact {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DomainResource
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [RelatedPerson](http://hl7.org/fhir/StructureDefinition/RelatedPerson)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -142020,7 +142044,7 @@ pub struct RelatedPerson {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: IETF language tag for a human language
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1
     pub language: Option<Code>,
     /// Text summary of the resource, for human interpretation
     ///
@@ -142331,7 +142355,7 @@ pub struct RelatedPerson {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: The gender of a person used for administrative purposes.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/administrative-gender|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/administrative-gender|6.0.0-snapshot1
     pub gender: Option<Code>,
     /// The date on which the related person was born
     ///
@@ -142549,7 +142573,7 @@ pub struct RelatedPersonCommunication {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: IETF language tag for a human language
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1
     pub language: CodeableConcept,
     /// Language preference indicator
     ///
@@ -142594,7 +142618,7 @@ pub enum RelativeTimeOffset {
 /// Base type: http://hl7.org/fhir/StructureDefinition/BackboneType
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [RelativeTime](http://hl7.org/fhir/StructureDefinition/RelativeTime)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -142797,7 +142821,7 @@ pub struct RelativeTime {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DomainResource
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [RequestOrchestration](http://hl7.org/fhir/StructureDefinition/RequestOrchestration)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -142890,7 +142914,7 @@ pub struct RequestOrchestration {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: IETF language tag for a human language
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1
     pub language: Option<Code>,
     /// Text summary of the resource, for human interpretation
     ///
@@ -143154,7 +143178,7 @@ pub struct RequestOrchestration {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: Codes identifying the lifecycle stage of a request.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/request-status|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/request-status|6.0.0-snapshot1
     pub status: Code,
     /// proposal | solicit-offer | offer-response | plan | directive | order | original-order | reflex-order | filler-order | instance-order | option
     ///
@@ -143178,7 +143202,7 @@ pub struct RequestOrchestration {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: Codes indicating the degree of authority/intentionality associated with a request.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/request-intent|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/request-intent|6.0.0-snapshot1
     ///
     /// ## Aliases
     /// category
@@ -143201,7 +143225,7 @@ pub struct RequestOrchestration {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: Identifies the level of importance to be assigned to actioning the request.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/request-priority|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/request-priority|6.0.0-snapshot1
     pub priority: Option<Code>,
     /// What's being requested/ordered
     ///
@@ -143526,7 +143550,7 @@ pub struct RequestOrchestrationAction {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: Identifies the level of importance to be assigned to actioning the request.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/request-priority|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/request-priority|6.0.0-snapshot1
     pub priority: Option<Code>,
     /// Code representing the meaning of the action or sub-actions
     ///
@@ -143718,7 +143742,7 @@ pub struct RequestOrchestrationAction {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: Defines applicability behavior of a group.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/action-applicability-behavior|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/action-applicability-behavior|6.0.0-snapshot1
     #[fhir_serde(rename = "applicabilityBehavior")]
     pub applicability_behavior: Option<Code>,
     /// visual-group | logical-group | sentence-group
@@ -143734,7 +143758,7 @@ pub struct RequestOrchestrationAction {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: Defines organization behavior of a group.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/action-grouping-behavior|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/action-grouping-behavior|6.0.0-snapshot1
     #[fhir_serde(rename = "groupingBehavior")]
     pub grouping_behavior: Option<Code>,
     /// any | all | all-or-none | exactly-one | at-most-one | one-or-more
@@ -143750,7 +143774,7 @@ pub struct RequestOrchestrationAction {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: Defines selection behavior of a group.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/action-selection-behavior|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/action-selection-behavior|6.0.0-snapshot1
     #[fhir_serde(rename = "selectionBehavior")]
     pub selection_behavior: Option<Code>,
     /// must | could | must-unless-documented
@@ -143766,7 +143790,7 @@ pub struct RequestOrchestrationAction {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: Defines expectations around whether an action or action group is required.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/action-required-behavior|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/action-required-behavior|6.0.0-snapshot1
     #[fhir_serde(rename = "requiredBehavior")]
     pub required_behavior: Option<Code>,
     /// yes | no
@@ -143782,7 +143806,7 @@ pub struct RequestOrchestrationAction {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: Defines selection frequency behavior for an action or group.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/action-precheck-behavior|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/action-precheck-behavior|6.0.0-snapshot1
     #[fhir_serde(rename = "precheckBehavior")]
     pub precheck_behavior: Option<Code>,
     /// single | multiple
@@ -143798,7 +143822,7 @@ pub struct RequestOrchestrationAction {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: Defines behavior for an action or a group for how many times that item may be repeated.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/action-cardinality-behavior|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/action-cardinality-behavior|6.0.0-snapshot1
     #[fhir_serde(rename = "cardinalityBehavior")]
     pub cardinality_behavior: Option<Code>,
     /// The target of the action
@@ -144025,7 +144049,7 @@ pub struct RequestOrchestrationActionCondition {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: The kind of condition for the action.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/action-condition-kind|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/action-condition-kind|6.0.0-snapshot1
     pub kind: Code,
     /// Boolean-valued expression
     ///
@@ -144588,7 +144612,7 @@ pub struct RequestOrchestrationActionParticipant {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: The type of participant in the activity.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/action-participant-type|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/action-participant-type|6.0.0-snapshot1
     #[fhir_serde(rename = "type")]
     pub r#type: Option<Code>,
     /// Who or what can participate
@@ -144788,7 +144812,7 @@ pub struct RequestOrchestrationActionRelatedAction {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: Defines the types of relationships between actions.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/action-relationship-type|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/action-relationship-type|6.0.0-snapshot1
     pub relationship: Code,
     /// before | before-start | before-end | concurrent | concurrent-with-start | concurrent-with-end | after | after-start | after-end
     ///
@@ -144803,7 +144827,7 @@ pub struct RequestOrchestrationActionRelatedAction {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: Defines the types of relationships between actions.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/action-relationship-type|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/action-relationship-type|6.0.0-snapshot1
     #[fhir_serde(rename = "endRelationship")]
     pub end_relationship: Option<Code>,
     /// Time offset for the relationship
@@ -144842,7 +144866,7 @@ pub enum RequirementsVersionAlgorithm {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DomainResource
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [Requirements](http://hl7.org/fhir/StructureDefinition/Requirements)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -144936,7 +144960,7 @@ pub struct Requirements {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: IETF language tag for a human language
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1
     pub language: Option<Code>,
     /// Text summary of the resource, for human interpretation
     ///
@@ -145233,7 +145257,7 @@ pub struct Requirements {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: The lifecycle status of an artifact.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/publication-status|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/publication-status|6.0.0-snapshot1
     pub status: Code,
     /// For testing only - never for real usage
     ///
@@ -145938,7 +145962,7 @@ pub struct RequirementsStatement {
     ///
     /// ## Binding
     /// - **Strength**: required
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/conformance-expectation|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/conformance-expectation|6.0.0-snapshot1
     pub conformance: Option<Vec<Code>>,
     /// Set to true if requirements statement is conditional
     ///
@@ -146362,7 +146386,7 @@ pub struct RequirementsStatementPartOf {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DomainResource
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [ResearchStudy](http://hl7.org/fhir/StructureDefinition/ResearchStudy)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -146455,7 +146479,7 @@ pub struct ResearchStudy {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: IETF language tag for a human language
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1
     pub language: Option<Code>,
     /// Text summary of the resource, for human interpretation
     ///
@@ -146739,7 +146763,7 @@ pub struct ResearchStudy {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: Codes that convey the current publication status of the research study resource.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/publication-status|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/publication-status|6.0.0-snapshot1
     pub status: Code,
     /// treatment | prevention | diagnostic | supportive-care | screening | health-services-research | basic-science | device-feasibility
     ///
@@ -147545,7 +147569,7 @@ pub struct ResearchStudyLabel {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: IETF language tag for a human language
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1
     pub language: Option<Code>,
 }
 
@@ -148506,7 +148530,7 @@ pub struct ResearchStudyRelatesTo {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DomainResource
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [ResearchSubject](http://hl7.org/fhir/StructureDefinition/ResearchSubject)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -148599,7 +148623,7 @@ pub struct ResearchSubject {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: IETF language tag for a human language
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1
     pub language: Option<Code>,
     /// Text summary of the resource, for human interpretation
     ///
@@ -148753,7 +148777,7 @@ pub struct ResearchSubject {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: Codes that convey the current publication status of the research study resource.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/publication-status|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/publication-status|6.0.0-snapshot1
     pub status: Code,
     /// Start and end of participation
     ///
@@ -149156,7 +149180,7 @@ pub enum RiskAssessmentOccurrence {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DomainResource
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [RiskAssessment](http://hl7.org/fhir/StructureDefinition/RiskAssessment)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -149250,7 +149274,7 @@ pub struct RiskAssessment {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: IETF language tag for a human language
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1
     pub language: Option<Code>,
     /// Text summary of the resource, for human interpretation
     ///
@@ -149425,7 +149449,7 @@ pub struct RiskAssessment {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: The status of the risk assessment; e.g. preliminary, final, amended, etc.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/observation-status|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/observation-status|6.0.0-snapshot1
     pub status: Code,
     /// Evaluation mechanism
     ///
@@ -149841,7 +149865,7 @@ pub struct RiskAssessmentPrediction {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DataType
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [SampledData](http://hl7.org/fhir/StructureDefinition/SampledData)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -149934,7 +149958,7 @@ pub struct SampledData {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: Units of measure allowed for an element.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/ucum-units|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/ucum-units|6.0.0-snapshot1
     #[fhir_serde(rename = "intervalUnit")]
     pub interval_unit: Code,
     /// Multiply data by this before adding to origin
@@ -150073,7 +150097,7 @@ pub struct SampledData {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DomainResource
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [Schedule](http://hl7.org/fhir/StructureDefinition/Schedule)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -150166,7 +150190,7 @@ pub struct Schedule {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: IETF language tag for a human language
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1
     pub language: Option<Code>,
     /// Text summary of the resource, for human interpretation
     ///
@@ -150470,7 +150494,7 @@ pub enum SearchParameterVersionAlgorithm {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DomainResource
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [SearchParameter](http://hl7.org/fhir/StructureDefinition/SearchParameter)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -150564,7 +150588,7 @@ pub struct SearchParameter {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: IETF language tag for a human language
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1
     pub language: Option<Code>,
     /// Text summary of the resource, for human interpretation
     ///
@@ -150888,7 +150912,7 @@ pub struct SearchParameter {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: The lifecycle status of an artifact.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/publication-status|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/publication-status|6.0.0-snapshot1
     pub status: Code,
     /// For testing only - never for real usage
     ///
@@ -151224,7 +151248,7 @@ pub struct SearchParameter {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: Data types allowed to be used for search parameters.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/search-param-type|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/search-param-type|6.0.0-snapshot1
     ///
     /// ## Conditions
     /// Used when: spd-2, spd-3
@@ -151266,7 +151290,7 @@ pub struct SearchParameter {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: How a search parameter relates to the set of elements returned by evaluating its expression query.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/search-processingmode|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/search-processingmode|6.0.0-snapshot1
     ///
     /// ## Conditions
     /// Used when: spd-1
@@ -151360,7 +151384,7 @@ pub struct SearchParameter {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: What Search Comparator Codes are supported in search.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/search-comparator|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/search-comparator|6.0.0-snapshot1
     ///
     /// ## Conditions
     /// Used when: spd-3
@@ -151378,7 +151402,7 @@ pub struct SearchParameter {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: A supported modifier for a search parameter.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/search-modifier-all-codes|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/search-modifier-all-codes|6.0.0-snapshot1
     pub modifier: Option<Vec<Code>>,
     /// Chained names supported
     ///
@@ -151584,7 +151608,7 @@ pub enum ServiceRequestOccurrence {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DomainResource
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [ServiceRequest](http://hl7.org/fhir/StructureDefinition/ServiceRequest)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -151678,7 +151702,7 @@ pub struct ServiceRequest {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: IETF language tag for a human language
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1
     pub language: Option<Code>,
     /// Text summary of the resource, for human interpretation
     ///
@@ -151907,7 +151931,7 @@ pub struct ServiceRequest {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: The status of a service order.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/request-status|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/request-status|6.0.0-snapshot1
     pub status: Code,
     /// Reason for current status
     ///
@@ -151962,7 +151986,7 @@ pub struct ServiceRequest {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: The kind of service request.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/request-intent|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/request-intent|6.0.0-snapshot1
     pub intent: Code,
     /// Classification of service
     ///
@@ -152009,7 +152033,7 @@ pub struct ServiceRequest {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: Identifies the level of importance to be assigned to actioning the request.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/request-priority|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/request-priority|6.0.0-snapshot1
     pub priority: Option<Code>,
     /// True if service/procedure should not be performed
     ///
@@ -152046,11 +152070,14 @@ pub struct ServiceRequest {
     /// requested.
     ///
     /// ## Implementation Notes
-    /// Many laboratory and radiology procedure codes embed the specimen/organ system
-    /// in the test order name, for example, serum or serum/plasma glucose, or a
-    /// chest x-ray. The specimen might not be recorded separately from the test
-    /// code. The PlanDefinition may be used when you want to group multiple
-    /// activities together (e.g., order set that are part of a plan).
+    /// For laboratory tests and radiology, codes should be drawn from LOINC or, when
+    /// using SNOMED CT, from the Observable Entity hierarchy (363787002 | Observable
+    /// entity (observable entity) |). Many laboratory and radiology procedure codes
+    /// embed the specimen/organ system in the test order name, for example, serum or
+    /// serum/plasma glucose, or a chest x-ray. The specimen might not be recorded
+    /// separately from the test code. The PlanDefinition may be used when you want
+    /// to group multiple activities together (e.g., order sets that are part of a
+    /// plan).
     ///
     /// ## Cardinality: Optional (0..1)
     ///
@@ -152125,12 +152152,12 @@ pub struct ServiceRequest {
     ///   Expression: `hasValue() or (children().count() > id.count())`
     #[fhir_serde(flatten)]
     pub quantity: Option<ServiceRequestQuantity>,
-    /// Individual or Entity the service is ordered for
+    /// Individual or Entity of record for whom the service is ordered
     ///
-    /// On whom or what the service is to be performed. This is usually a human
-    /// patient, but can also be requested on animals, groups of humans or animals,
-    /// devices such as dialysis machines, or even locations (typically for
-    /// environmental scans).
+    /// On whose or what record the service to be performed is recorded. This is
+    /// usually a human patient, but can also be requested on animals, groups of
+    /// humans or animals, devices such as dialysis machines, or even locations
+    /// (typically for environmental scans).
     ///
     /// ## Cardinality: Required (1..1)
     ///
@@ -152950,7 +152977,7 @@ pub struct ServiceRequestPatientInstruction {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DataType
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [Signature](http://hl7.org/fhir/StructureDefinition/Signature)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -153088,7 +153115,7 @@ pub struct Signature {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: BCP 13 (RFCs 2045, 2046, 2047, 4288, 4289 and 2049)
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/mimetypes|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/mimetypes|6.0.0-snapshot1
     #[fhir_serde(rename = "targetFormat")]
     pub target_format: Option<Code>,
     /// The technical format of the signature
@@ -153106,7 +153133,7 @@ pub struct Signature {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: BCP 13 (RFCs 2045, 2046, 2047, 4288, 4289 and 2049)
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/mimetypes|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/mimetypes|6.0.0-snapshot1
     #[fhir_serde(rename = "sigFormat")]
     pub sig_format: Option<Code>,
     /// The actual signature content (XML Signature, JSON Jose, picture, etc.)
@@ -153135,7 +153162,7 @@ pub struct Signature {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DomainResource
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [Slot](http://hl7.org/fhir/StructureDefinition/Slot)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -153228,7 +153255,7 @@ pub struct Slot {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: IETF language tag for a human language
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1
     pub language: Option<Code>,
     /// Text summary of the resource, for human interpretation
     ///
@@ -153477,7 +153504,7 @@ pub struct Slot {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: The free/busy status of the slot.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/slotstatus|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/slotstatus|6.0.0-snapshot1
     pub status: Code,
     /// Date/Time that the slot is to begin
     ///
@@ -153540,7 +153567,7 @@ pub struct Slot {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DomainResource
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [Specimen](http://hl7.org/fhir/StructureDefinition/Specimen)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -153633,7 +153660,7 @@ pub struct Specimen {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: IETF language tag for a human language
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1
     pub language: Option<Code>,
     /// Text summary of the resource, for human interpretation
     ///
@@ -153799,7 +153826,7 @@ pub struct Specimen {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: Codes providing the status/availability of a specimen.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/specimen-status|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/specimen-status|6.0.0-snapshot1
     pub status: Option<Code>,
     /// Kind of material that forms the specimen
     ///
@@ -153941,7 +153968,7 @@ pub struct Specimen {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: Codes for the combined status of a specimen.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/specimen-combined|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/specimen-combined|6.0.0-snapshot1
     pub combined: Option<Code>,
     /// The role the specimen serves
     ///
@@ -154293,7 +154320,7 @@ pub struct SpecimenCollection {
     /// Representing fasting status using this element is preferred to representing
     /// it with an observation using a 'pre-coordinated code' such as LOINC 2005-7
     /// (Calcium [Moles/​time] in 2 hour Urine --12 hours fasting), or using a
-    /// component observation ` such as `Observation.component code` = LOINC 49541-6
+    /// component observation such as `Observation.component.code` = LOINC 49541-6
     /// (Fasting status - Reported).
     ///
     /// ## Cardinality: Optional (0..1)
@@ -154884,7 +154911,7 @@ pub enum SpecimenDefinitionVersionAlgorithm {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DomainResource
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [SpecimenDefinition](http://hl7.org/fhir/StructureDefinition/SpecimenDefinition)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -154978,7 +155005,7 @@ pub struct SpecimenDefinition {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: IETF language tag for a human language
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1
     pub language: Option<Code>,
     /// Text summary of the resource, for human interpretation
     ///
@@ -155282,7 +155309,7 @@ pub struct SpecimenDefinition {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: Codes identifying the status of a SpecimenDefinition resource.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/publication-status|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/publication-status|6.0.0-snapshot1
     pub status: Code,
     /// If this SpecimenDefinition is not for real usage
     ///
@@ -155807,7 +155834,7 @@ pub struct SpecimenDefinitionTypeTested {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: Degree of preference of a type of conditioned specimen.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/specimen-contained-preference|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/specimen-contained-preference|6.0.0-snapshot1
     pub preference: Code,
     /// The specimen's container
     ///
@@ -156359,7 +156386,7 @@ pub enum StructureDefinitionVersionAlgorithm {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DomainResource
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [StructureDefinition](http://hl7.org/fhir/StructureDefinition/StructureDefinition)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -156453,7 +156480,7 @@ pub struct StructureDefinition {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: IETF language tag for a human language
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1
     pub language: Option<Code>,
     /// Text summary of the resource, for human interpretation
     ///
@@ -156768,7 +156795,7 @@ pub struct StructureDefinition {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: The lifecycle status of an artifact.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/publication-status|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/publication-status|6.0.0-snapshot1
     pub status: Code,
     /// For testing only - never for real usage
     ///
@@ -157066,7 +157093,7 @@ pub struct StructureDefinition {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: All published FHIR Versions.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/FHIR-version|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/FHIR-version|6.0.0-snapshot1
     #[fhir_serde(rename = "fhirVersion")]
     pub fhir_version: Option<Code>,
     /// External specification that the content is mapped to
@@ -157101,7 +157128,7 @@ pub struct StructureDefinition {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: Defines the type of structure that a definition is describing.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/structure-definition-kind|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/structure-definition-kind|6.0.0-snapshot1
     ///
     /// ## Conditions
     /// Used when: sdf-15a, sdf-15, sdf-11, sdf-29, sdf-8, sdf-3, sdf-8a
@@ -157270,7 +157297,7 @@ pub struct StructureDefinition {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: How a type relates to its baseDefinition.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/type-derivation-rule|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/type-derivation-rule|6.0.0-snapshot1
     ///
     /// ## Conditions
     /// Used when: sdf-1, sdf-21, sdf-5, sdf-27, sdf-29
@@ -157436,7 +157463,7 @@ pub struct StructureDefinitionContext {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: How an extension context is interpreted.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/extension-context-type|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/extension-context-type|6.0.0-snapshot1
     #[fhir_serde(rename = "type")]
     pub r#type: Code,
     /// Where the extension can be used in instances
@@ -157852,7 +157879,7 @@ pub struct StructureDefinitionSnapshot {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DomainResource
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [Subscription](http://hl7.org/fhir/StructureDefinition/Subscription)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -157945,7 +157972,7 @@ pub struct Subscription {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: IETF language tag for a human language
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1
     pub language: Option<Code>,
     /// Text summary of the resource, for human interpretation
     ///
@@ -158123,7 +158150,7 @@ pub struct Subscription {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: The status of a subscription.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/subscription-status|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/subscription-status|6.0.0-snapshot1
     pub status: Code,
     /// Reference to the subscription topic being subscribed to
     ///
@@ -158333,7 +158360,7 @@ pub struct Subscription {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: BCP 13 (RFCs 2045, 2046, 2047, 4288, 4289 and 2049)
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/mimetypes|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/mimetypes|6.0.0-snapshot1
     #[fhir_serde(rename = "contentType")]
     pub content_type: Option<Code>,
     /// empty | id-only | full-resource
@@ -158360,7 +158387,7 @@ pub struct Subscription {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: Codes to represent how much resource content to send in the notification payload.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/subscription-payload-content|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/subscription-payload-content|6.0.0-snapshot1
     pub content: Option<Code>,
     /// Maximum number of events that can be combined in a single notification
     ///
@@ -158530,7 +158557,7 @@ pub struct SubscriptionFilterBy {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: Search Comparator Codes applied to this filter.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/search-comparator|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/search-comparator|6.0.0-snapshot1
     ///
     /// ## Conditions
     /// Used when: scr-1
@@ -158552,7 +158579,7 @@ pub struct SubscriptionFilterBy {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: Search Modifier Code applied to this filter.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/search-modifier-code|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/search-modifier-code|6.0.0-snapshot1
     ///
     /// ## Conditions
     /// Used when: scr-1
@@ -158726,7 +158753,7 @@ pub struct SubscriptionParameter {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DomainResource
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [SubscriptionStatus](http://hl7.org/fhir/StructureDefinition/SubscriptionStatus)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -158819,7 +158846,7 @@ pub struct SubscriptionStatus {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: IETF language tag for a human language
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1
     pub language: Option<Code>,
     /// Text summary of the resource, for human interpretation
     ///
@@ -158960,7 +158987,7 @@ pub struct SubscriptionStatus {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: The status of a subscription at the time this notification was generated.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/subscription-status|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/subscription-status|6.0.0-snapshot1
     ///
     /// ## Conditions
     /// Used when: sst-2
@@ -158982,7 +159009,7 @@ pub struct SubscriptionStatus {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: The type of notification represented by the status message.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/subscription-notification-type|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/subscription-notification-type|6.0.0-snapshot1
     ///
     /// ## Conditions
     /// Used when: sst-1, sst-2
@@ -159543,7 +159570,7 @@ pub enum SubscriptionTopicVersionAlgorithm {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DomainResource
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [SubscriptionTopic](http://hl7.org/fhir/StructureDefinition/SubscriptionTopic)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -159637,7 +159664,7 @@ pub struct SubscriptionTopic {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: IETF language tag for a human language
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1
     pub language: Option<Code>,
     /// Text summary of the resource, for human interpretation
     ///
@@ -159976,7 +160003,7 @@ pub struct SubscriptionTopic {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: The lifecycle status of an artifact.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/publication-status|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/publication-status|6.0.0-snapshot1
     pub status: Code,
     /// If For testing only - never for real usage
     ///
@@ -160438,7 +160465,7 @@ pub struct SubscriptionTopicTrigger {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: FHIR RESTful interaction used to filter a resource-based SubscriptionTopic trigger.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/interaction-trigger|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/interaction-trigger|6.0.0-snapshot1
     #[fhir_serde(rename = "supportedInteraction")]
     pub supported_interaction: Option<Vec<Code>>,
     /// Query based trigger rule
@@ -160725,7 +160752,7 @@ pub struct SubscriptionTopicTriggerCanFilterBy {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: Search Comparator Codes supported in this filter.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/search-comparator|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/search-comparator|6.0.0-snapshot1
     pub comparator: Option<Vec<Code>>,
     /// missing | exact | contains | not | text | in | not-in | below | above | type | identifier | of-type | code-text | text-advanced | iterate
     ///
@@ -160744,7 +160771,7 @@ pub struct SubscriptionTopicTriggerCanFilterBy {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: Search Modifier Codes supported in this filter.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/search-modifier-code|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/search-modifier-code|6.0.0-snapshot1
     pub modifier: Option<Vec<Code>>,
 }
 
@@ -161184,7 +161211,7 @@ pub struct SubscriptionTopicTriggerQueryCriteria {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: Behavior a server can exhibit when a criteria state does not exist (e.g., state prior to a create or after a delete).
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/subscriptiontopic-cr-behavior|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/subscriptiontopic-cr-behavior|6.0.0-snapshot1
     #[fhir_serde(rename = "resultForCreate")]
     pub result_for_create: Option<Code>,
     /// Rule applied to current resource state
@@ -161223,7 +161250,7 @@ pub struct SubscriptionTopicTriggerQueryCriteria {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: Behavior a server can exhibit when a criteria state does not exist (e.g., state prior to a create or after a delete).
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/subscriptiontopic-cr-behavior|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/subscriptiontopic-cr-behavior|6.0.0-snapshot1
     #[fhir_serde(rename = "resultForDelete")]
     pub result_for_delete: Option<Code>,
     /// Both must be true flag
@@ -161264,7 +161291,7 @@ pub struct SubscriptionTopicTriggerQueryCriteria {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DomainResource
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [Substance](http://hl7.org/fhir/StructureDefinition/Substance)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -161357,7 +161384,7 @@ pub struct Substance {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: IETF language tag for a human language
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1
     pub language: Option<Code>,
     /// Text summary of the resource, for human interpretation
     ///
@@ -161513,7 +161540,7 @@ pub struct Substance {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: A code to indicate if the substance is actively used.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/substance-status|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/substance-status|6.0.0-snapshot1
     pub status: Option<Code>,
     /// What class/type of substance this is
     ///
@@ -161614,7 +161641,7 @@ pub struct Substance {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DomainResource
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [SubstanceDefinition](http://hl7.org/fhir/StructureDefinition/SubstanceDefinition)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -161707,7 +161734,7 @@ pub struct SubstanceDefinition {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: IETF language tag for a human language
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1
     pub language: Option<Code>,
     /// Text summary of the resource, for human interpretation
     ///
@@ -163045,7 +163072,7 @@ pub struct SubstanceDefinitionName {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: IETF language tag for a human language
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1
     pub language: Option<Vec<CodeableConcept>>,
     /// The use context of this name e.g. as an active ingredient or as a food colour additive
     ///
@@ -166257,7 +166284,7 @@ pub struct SubstanceDefinitionSourceMaterial {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: Jurisdiction codes
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/country|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/country|6.0.0-snapshot1
     #[fhir_serde(rename = "countryOfOrigin")]
     pub country_of_origin: Option<Vec<CodeableConcept>>,
 }
@@ -166655,7 +166682,7 @@ pub struct SubstanceDefinitionStructureRepresentation {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DomainResource
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [Task](http://hl7.org/fhir/StructureDefinition/Task)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -166748,7 +166775,7 @@ pub struct Task {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: IETF language tag for a human language
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1
     pub language: Option<Code>,
     /// Text summary of the resource, for human interpretation
     ///
@@ -166978,7 +167005,7 @@ pub struct Task {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: The current status of the task.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/task-status|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/task-status|6.0.0-snapshot1
     pub status: Code,
     /// Reason for current status
     ///
@@ -167049,7 +167076,7 @@ pub struct Task {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: Distinguishes whether the task is a proposal, plan or full order.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/task-intent|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/task-intent|6.0.0-snapshot1
     pub intent: Code,
     /// routine | urgent | asap | stat
     ///
@@ -167071,7 +167098,7 @@ pub struct Task {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: The priority of a task (may affect service level applied to the task).
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/request-priority|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/request-priority|6.0.0-snapshot1
     pub priority: Option<Code>,
     /// True if Task is prohibiting action
     ///
@@ -168599,7 +168626,7 @@ pub enum TerminologyCapabilitiesVersionAlgorithm {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DomainResource
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [TerminologyCapabilities](http://hl7.org/fhir/StructureDefinition/TerminologyCapabilities)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -168693,7 +168720,7 @@ pub struct TerminologyCapabilities {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: IETF language tag for a human language
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1
     pub language: Option<Code>,
     /// Text summary of the resource, for human interpretation
     ///
@@ -168995,7 +169022,7 @@ pub struct TerminologyCapabilities {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: The lifecycle status of an artifact.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/publication-status|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/publication-status|6.0.0-snapshot1
     pub status: Code,
     /// For testing only - never for real usage
     ///
@@ -169268,7 +169295,7 @@ pub struct TerminologyCapabilities {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: How a capability statement is intended to be used.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/capability-statement-kind|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/capability-statement-kind|6.0.0-snapshot1
     ///
     /// ## Conditions
     /// Used when: tcp-3, tcp-5, tcp-4
@@ -169390,7 +169417,7 @@ pub struct TerminologyCapabilities {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: The degree to which the server supports the code search parameter on ValueSet, if it is supported.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/code-search-support|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/code-search-support|6.0.0-snapshot1
     #[fhir_serde(rename = "codeSearch")]
     pub code_search: Option<Code>,
     /// Information about the [ValueSet/$validate-code](valueset-operation-validate-code.html) operation
@@ -169829,7 +169856,7 @@ pub struct TerminologyCapabilitiesCodeSystemVersion {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: IETF language tag for a human language
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1
     pub language: Option<Vec<Code>>,
     /// Filter Properties supported
     ///
@@ -170635,7 +170662,7 @@ pub struct TerminologyCapabilitiesSupplements {
     ///
     /// ## Binding
     /// - **Strength**: required
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/global-langpack-support|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/global-langpack-support|6.0.0-snapshot1
     pub globals: Option<Code>,
 }
 
@@ -170861,7 +170888,7 @@ pub struct TerminologyCapabilitiesValidateCode {
 /// Base type: http://hl7.org/fhir/StructureDefinition/BackboneType
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [Timing](http://hl7.org/fhir/StructureDefinition/Timing)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -171253,7 +171280,7 @@ pub struct TimingRepeat {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: A unit of time (units from UCUM).
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/units-of-time|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/units-of-time|6.0.0-snapshot1
     ///
     /// ## Conditions
     /// Used when: tim-1
@@ -171346,7 +171373,7 @@ pub struct TimingRepeat {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: A unit of time (units from UCUM).
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/units-of-time|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/units-of-time|6.0.0-snapshot1
     ///
     /// ## Conditions
     /// Used when: tim-2
@@ -171414,7 +171441,7 @@ pub struct TimingRepeat {
     ///
     /// ## Binding
     /// - **Strength**: required
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/days-of-week|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/days-of-week|6.0.0-snapshot1
     #[fhir_serde(rename = "dayOfWeek")]
     pub day_of_week: Option<Vec<Code>>,
     /// Time of day for action
@@ -171464,7 +171491,7 @@ pub struct TimingRepeat {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: Real-world event relating to the schedule.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/event-timing|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/event-timing|6.0.0-snapshot1
     ///
     /// ## Conditions
     /// Used when: tim-9, tim-10
@@ -171514,7 +171541,7 @@ pub enum TriggerDefinitionTiming {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DataType
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [TriggerDefinition](http://hl7.org/fhir/StructureDefinition/TriggerDefinition)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -171573,7 +171600,7 @@ pub struct TriggerDefinition {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: The type of trigger.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/trigger-type|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/trigger-type|6.0.0-snapshot1
     ///
     /// ## Conditions
     /// Used when: trd-3
@@ -171744,7 +171771,7 @@ pub enum UsageContextValue {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DataType
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [UsageContext](http://hl7.org/fhir/StructureDefinition/UsageContext)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -171852,7 +171879,7 @@ pub enum ValueSetVersionAlgorithm {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DomainResource
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [ValueSet](http://hl7.org/fhir/StructureDefinition/ValueSet)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -171946,7 +171973,7 @@ pub struct ValueSet {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: IETF language tag for a human language
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1
     pub language: Option<Code>,
     /// Text summary of the resource, for human interpretation
     ///
@@ -172249,7 +172276,7 @@ pub struct ValueSet {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: The lifecycle status of an artifact.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/publication-status|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/publication-status|6.0.0-snapshot1
     pub status: Code,
     /// For testing only - never for real usage
     ///
@@ -173429,7 +173456,7 @@ pub struct ValueSetComposeIncludeConceptDesignation {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: IETF language tag for a human language
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1
     pub language: Option<Code>,
     /// Types of uses of designations
     ///
@@ -173633,7 +173660,7 @@ pub struct ValueSetComposeIncludeFilter {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: The kind of operation to perform as a part of a property based filter.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/filter-operator|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/filter-operator|6.0.0-snapshot1
     pub op: Code,
     /// Code from the system, or regex criteria, or boolean value for exists
     ///
@@ -175861,7 +175888,7 @@ pub enum VirtualServiceDetailAddress {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DataType
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [VirtualServiceDetail](http://hl7.org/fhir/StructureDefinition/VirtualServiceDetail)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
@@ -176017,12 +176044,12 @@ pub struct VirtualServiceDetail {
 /// Base type: http://hl7.org/fhir/StructureDefinition/DomainResource
 ///
 /// ## Status: active
-/// FHIR Version: 6.0.0-ballot4
+/// FHIR Version: 6.0.0-snapshot1
 ///
 /// See: [VisionPrescription](http://hl7.org/fhir/StructureDefinition/VisionPrescription)
 #[derive(Debug, Clone, PartialEq, FhirSerde, FhirPath, Default)]
 #[fhir_resource(
-    summary_fields = "id,meta,implicit_rules,modifier_extension,based_on,group_identifier,status,intent,priority,created,patient,date_written,prescriber,lens_specification"
+    summary_fields = "id,meta,implicit_rules,modifier_extension,based_on,group_identifier,status,intent,category,priority,created,patient,date_written,prescriber,lens_specification"
 )]
 pub struct VisionPrescription {
     /// Logical id of this artifact
@@ -176110,7 +176137,7 @@ pub struct VisionPrescription {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: IETF language tag for a human language
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/all-languages|6.0.0-snapshot1
     pub language: Option<Code>,
     /// Text summary of the resource, for human interpretation
     ///
@@ -176303,7 +176330,7 @@ pub struct VisionPrescription {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: A code specifying the state of the resource instance.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/fm-status|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/fm-status|6.0.0-snapshot1
     pub status: Code,
     /// proposal | solicit-offer | offer-response | plan | directive | order | original-order | reflex-order | filler-order | instance-order | option
     ///
@@ -176342,8 +176369,28 @@ pub struct VisionPrescription {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: The intent of the request.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/request-intent|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/request-intent|6.0.0-snapshot1
     pub intent: Code,
+    /// Classification of prescription
+    ///
+    /// A code that classifies the vision prescription for searching, sorting and
+    /// display purposes. Example values include safety wear, cosmetic,
+    /// orthocorrective, and orthokeratology.
+    ///
+    /// ## Cardinality: Optional, Multiple (0..*)
+    ///
+    /// ## Special Semantics
+    /// - Included in summary
+    ///
+    /// ## Constraints
+    /// - **ele-1**: All FHIR elements must have a @value or children (error)
+    ///   Expression: `hasValue() or (children().count() > id.count())`
+    ///
+    /// ## Binding
+    /// - **Strength**: example
+    /// - **Description**: Classification of the vision prescription.
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/vision-prescription-category
+    pub category: Option<Vec<CodeableConcept>>,
     /// routine | urgent | asap | stat
     ///
     /// Indicates how quickly the vision prescription should be addressed with
@@ -176362,7 +176409,7 @@ pub struct VisionPrescription {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: The priority of the request.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/request-priority|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/request-priority|6.0.0-snapshot1
     pub priority: Option<Code>,
     /// Response creation date
     ///
@@ -176617,7 +176664,7 @@ pub struct VisionPrescriptionLensSpecification {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: A coded concept listing the eye codes.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/vision-eye-codes|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/vision-eye-codes|6.0.0-snapshot1
     pub eye: Code,
     /// Power of the lens
     ///
@@ -176907,7 +176954,7 @@ pub struct VisionPrescriptionLensSpecificationPrism {
     /// ## Binding
     /// - **Strength**: required
     /// - **Description**: A coded concept listing the base codes.
-    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/vision-base-codes|6.0.0-ballot4
+    /// - **ValueSet**: http://hl7.org/fhir/ValueSet/vision-base-codes|6.0.0-snapshot1
     pub base: Code,
 }
 
@@ -185277,6 +185324,7 @@ pub static FIELD_TYPES: &[(&str, &str, &str, bool)] = &[
     ("DeviceRequest", "asNeededFor", "CodeableConcept", false),
     ("DeviceRequest", "authoredOn", "dateTime", false),
     ("DeviceRequest", "basedOn", "Reference", true),
+    ("DeviceRequest", "category", "CodeableConcept", true),
     ("DeviceRequest", "contained", "Resource", true),
     ("DeviceRequest", "doNotPerform", "boolean", false),
     ("DeviceRequest", "encounter", "Reference", false),
@@ -194573,7 +194621,7 @@ pub static FIELD_TYPES: &[(&str, &str, &str, bool)] = &[
         "NutritionOrderEnteralFormula",
         "type",
         "CodeableReference",
-        false,
+        true,
     ),
     (
         "NutritionOrderEnteralFormulaAdministration",
@@ -202874,6 +202922,7 @@ pub static FIELD_TYPES: &[(&str, &str, &str, bool)] = &[
     ),
     ("VirtualServiceDetail", "sessionKey", "string", false),
     ("VisionPrescription", "basedOn", "Reference", true),
+    ("VisionPrescription", "category", "CodeableConcept", true),
     ("VisionPrescription", "contained", "Resource", true),
     ("VisionPrescription", "created", "dateTime", false),
     ("VisionPrescription", "dateWritten", "dateTime", false),

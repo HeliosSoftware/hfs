@@ -41,7 +41,7 @@
         <tr>
           <td>263204007 (Fracture of shaft of ulna)</td>
           <td>
-            <a href="codesystem-concept-map-relationship.html#source-is-broader-than-target" title="source-is-broader-than-target">is broader than</a>
+            <a href="codesystem-concept-map-relationship.html#concept-map-relationship-source-is-broader-than-target" title="source-is-broader-than-target">is broader than</a>
           </td>
           <td>S52.209A (Unsp fracture of shaft of unsp ulna, init for clos fx)</td>
           <td>The target mapping to ICD-10-CM is 'source-is-broader-than-target', since additional patient data on the encounter (initial vs. subsequent) and fracture type is required for a valid ICD-10-CM mapping.</td>
@@ -49,7 +49,7 @@
         <tr>
           <td>263204007 (Fracture of shaft of ulna)</td>
           <td>
-            <a href="codesystem-concept-map-relationship.html#source-is-broader-than-target" title="source-is-broader-than-target">is broader than</a>
+            <a href="codesystem-concept-map-relationship.html#concept-map-relationship-source-is-broader-than-target" title="source-is-broader-than-target">is broader than</a>
           </td>
           <td>S52.209D (Unsp fx shaft of unsp ulna, subs for clos fx w routn heal)</td>
           <td>The target mapping to ICD-10-CM is 'source-is-broader-than-target', since additional patient data on the encounter (initial vs. subsequent), fracture type and healing (for subsequent encounter) is required for a valid ICD-10-CM mapping.</td>
@@ -69,7 +69,7 @@
     <system value="urn:ietf:rfc:3986"/>
     <value value="urn:uuid:53cd62ee-033e-414c-9f58-3ca97b5ffc3b"/>
   </identifier>
-  <version value="6.0.0-ballot4"/>
+  <version value="6.0.0-snapshot1"/>
   <name value="SNOMEDCTToICD10CMMappingsForFractureOfUlna"/>
   <title value="SNOMED CT to ICD-10-CM mappings for fracture of ulna"/>
   <status value="draft"/>
