@@ -25,9 +25,25 @@ use std::collections::{BTreeMap, HashMap};
 use std::convert::Infallible;
 use unic_langid::{LanguageIdentifier, langid};
 
+#[cfg(not(helios_workspace_locales))]
 fluent_templates::static_loader! {
     static LOCALES = {
         locales: "locales",
+        fallback_language: "en",
+        // The UI renders whole localized sentences into an LTR document; the
+        // Unicode bidi isolation marks Fluent adds around placeables by
+        // default would only show up as garbage in tests and diffs.
+        customise: |bundle| bundle.set_use_isolating(false),
+    };
+}
+
+// Same loader against the workspace-root catalogs, for checkouts where the
+// `locales` symlink did not materialize as a directory (Windows without
+// `core.symlinks`, #1257). `build.rs` sets the cfg.
+#[cfg(helios_workspace_locales)]
+fluent_templates::static_loader! {
+    static LOCALES = {
+        locales: "../../locales",
         fallback_language: "en",
         // The UI renders whole localized sentences into an LTR document; the
         // Unicode bidi isolation marks Fluent adds around placeables by
