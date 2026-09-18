@@ -1670,7 +1670,19 @@ where
                         .map(|d| format!("{}/exports", d.display()))
                 })
                 .unwrap_or_else(|| "./data/exports".to_string());
-            Arc::new(LocalFsOutputStore::new(output_dir, config.base_url.clone()))
+            // The served file endpoint enforces a token only when auth is on, so
+            // the manifest's requiresAccessToken must follow the auth state under
+            // `auto`; an explicit true/false override still wins (#1269). `false`
+            // is rejected for local-fs by config validation (no pre-signing).
+            let requires_token = match cfg.requires_access_token.as_str() {
+                "true" => true,
+                "false" => false,
+                _ => AuthConfig::from_env().enabled,
+            };
+            Arc::new(
+                LocalFsOutputStore::new(output_dir, config.base_url.clone())
+                    .with_access_token_required(requires_token),
+            )
         }
         "s3" => {
             #[cfg(feature = "s3")]
