@@ -29,13 +29,13 @@ use helios_persistence::core::{
     SearchProvider, SettingsStore, SystemHistoryProvider, TypeHistoryProvider, VersionedStorage,
 };
 use helios_persistence::error::{
-    BackendError, ConcurrencyError, ResourceError, StorageError, TransactionError,
+    BackendError, ConcurrencyError, ResourceError, SearchError, StorageError, TransactionError,
 };
 use helios_persistence::search::SearchParameterStatus;
 use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
 use helios_persistence::types::{
-    IncludeDirective, IncludeType, SearchModifier, SearchParamType, SearchParameter, SearchPrefix,
-    SearchQuery, SearchValue, SortDirective, TotalMode,
+    CompositeSearchComponent, IncludeDirective, IncludeType, SearchModifier, SearchParamType,
+    SearchParameter, SearchPrefix, SearchQuery, SearchValue, SortDirective, TotalMode,
 };
 use mongodb::Client;
 use mongodb::bson::{Document, doc};
@@ -13952,4 +13952,907 @@ async fn mongodb_integration_missing_false_search_is_a_covered_v2_scan() {
         "idx_search_token_v2",
     )
     .await;
+}
+
+// ============================================================================
+// Composite Search Parameter Tests (#1206)
+// ============================================================================
+//
+// Composite rows are stored one `search_index` document per component value,
+// sharing `param_name` = the composite's own code plus a `composite_group`
+// (the base-instance index) -- the same layout SQLite queries
+// (`sqlite_tests.rs`'s `code_value_quantity_query`/`test_composite_search_basic`
+// are the reference). These tests build the `SearchParameter` directly with
+// explicit `components`, mirroring the REST layer's registry-driven wiring,
+// so they need `create_backend_with_full_registry` only to make sure the
+// *extractor* decomposes composites into per-component rows the same way the
+// real R4 registry does on write.
+
+/// Builds a `code-value-quantity` composite query with the component types
+/// the registry supplies for `Observation` (Token code, Quantity value).
+fn code_value_quantity_query(value: &str) -> SearchQuery {
+    code_value_quantity_query_values(&[value])
+}
+
+/// Same as [`code_value_quantity_query`] but with multiple OR'd composite
+/// values — the REST layer (`search_query_builder.rs`'s
+/// `split_unescaped_commas`) splits a comma-separated composite query into
+/// separate `SearchValue` entries *before* it reaches storage, so a
+/// persistence-layer comma-OR test must build `values` the same way rather
+/// than pass one string containing a literal `,` (which would instead be
+/// mistaken for an extra `$`-separated component here).
+fn code_value_quantity_query_values(values: &[&str]) -> SearchQuery {
+    SearchQuery::new("Observation").with_parameter(SearchParameter {
+        name: "code-value-quantity".to_string(),
+        param_type: SearchParamType::Composite,
+        modifier: None,
+        values: values.iter().map(|v| SearchValue::eq(*v)).collect(),
+        chain: vec![],
+        components: vec![
+            CompositeSearchComponent {
+                param_type: SearchParamType::Token,
+                param_name: "code".to_string(),
+            },
+            CompositeSearchComponent {
+                param_type: SearchParamType::Quantity,
+                param_name: "value-quantity".to_string(),
+            },
+        ],
+    })
+}
+
+/// Builds a `component-code-value-quantity` composite query (blood-pressure
+/// style panels, where each vital sign lives in its own `component` entry
+/// and hence its own `composite_group`).
+fn component_code_value_quantity_query(value: &str) -> SearchQuery {
+    SearchQuery::new("Observation").with_parameter(SearchParameter {
+        name: "component-code-value-quantity".to_string(),
+        param_type: SearchParamType::Composite,
+        modifier: None,
+        values: vec![SearchValue::eq(value)],
+        chain: vec![],
+        components: vec![
+            CompositeSearchComponent {
+                param_type: SearchParamType::Token,
+                param_name: "component-code".to_string(),
+            },
+            CompositeSearchComponent {
+                param_type: SearchParamType::Quantity,
+                param_name: "component-value-quantity".to_string(),
+            },
+        ],
+    })
+}
+
+async fn seed_height_weight_observations(backend: &MongoBackend, tenant: &TenantContext) {
+    for (id, code, value) in [
+        ("height-150", "8302-2", 150.0_f64),
+        ("height-170", "8302-2", 170.0_f64),
+        ("weight-180", "29463-7", 180.0_f64),
+    ] {
+        backend
+            .create(
+                tenant,
+                "Observation",
+                json!({
+                    "resourceType": "Observation",
+                    "id": id,
+                    "status": "final",
+                    "code": {"coding": [{"system": "http://loinc.org", "code": code}]},
+                    "valueQuantity": {
+                        "value": value,
+                        "unit": "cm",
+                        "system": "http://unitsofmeasure.org"
+                    }
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+    }
+}
+
+/// Body Height observations at two values plus an unrelated Body Weight:
+/// `code-value-quantity` must match only the composite instance where BOTH
+/// the code and the quantity threshold are satisfied together, with or
+/// without the `system|` qualifier on the token component.
+#[tokio::test]
+async fn mongodb_integration_composite_quantity_search() {
+    let Some(backend) = create_backend_with_full_registry("composite_quantity").await else {
+        eprintln!(
+            "Skipping mongodb_integration_composite_quantity_search (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = create_tenant("tenant-composite-quantity");
+    seed_height_weight_observations(&backend, &tenant).await;
+
+    let with_system = backend
+        .search(
+            &tenant,
+            &code_value_quantity_query("http://loinc.org|8302-2$gt160"),
+        )
+        .await
+        .expect("composite search with system|code");
+    assert_eq!(
+        with_system.resources.items.len(),
+        1,
+        "only the 170cm height satisfies code=8302-2 AND value>160"
+    );
+    assert_eq!(with_system.resources.items[0].id(), "height-170");
+
+    let bare_code = backend
+        .search(&tenant, &code_value_quantity_query("8302-2$gt160"))
+        .await
+        .expect("composite search with bare code");
+    assert_eq!(
+        bare_code.resources.items.len(),
+        1,
+        "the bare-code form must match the same resource as system|code"
+    );
+    assert_eq!(bare_code.resources.items[0].id(), "height-170");
+
+    let above_all = backend
+        .search(
+            &tenant,
+            &code_value_quantity_query("http://loinc.org|8302-2$gt200"),
+        )
+        .await
+        .expect("composite search above every height");
+    assert!(
+        above_all.resources.items.is_empty(),
+        "no Body Height exceeds 200"
+    );
+}
+
+/// A blood-pressure panel where `component[0]` is systolic (8480-6 = 120)
+/// and `component[1]` is diastolic (8462-4 = 80): each lives in its own
+/// `composite_group`, so a query pairing one component's code with the
+/// *other* component's value must not match even though both values exist
+/// somewhere on the resource -- this is the regression a non-grouped (plain
+/// AND) implementation would get wrong.
+#[tokio::test]
+async fn mongodb_integration_composite_component_code_value_quantity_respects_group() {
+    let Some(backend) = create_backend_with_full_registry("composite_component_bp").await else {
+        eprintln!(
+            "Skipping mongodb_integration_composite_component_code_value_quantity_respects_group (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = create_tenant("tenant-composite-bp");
+
+    backend
+        .create(
+            &tenant,
+            "Observation",
+            json!({
+                "resourceType": "Observation",
+                "id": "bp-1",
+                "status": "final",
+                "code": {"coding": [{"system": "http://loinc.org", "code": "85354-9"}]},
+                "component": [
+                    {
+                        "code": {"coding": [{"system": "http://loinc.org", "code": "8480-6"}]},
+                        "valueQuantity": {
+                            "value": 120,
+                            "unit": "mmHg",
+                            "system": "http://unitsofmeasure.org"
+                        }
+                    },
+                    {
+                        "code": {"coding": [{"system": "http://loinc.org", "code": "8462-4"}]},
+                        "valueQuantity": {
+                            "value": 80,
+                            "unit": "mmHg",
+                            "system": "http://unitsofmeasure.org"
+                        }
+                    }
+                ]
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+
+    let systolic_match = backend
+        .search(
+            &tenant,
+            &component_code_value_quantity_query("8480-6$gt100"),
+        )
+        .await
+        .expect("systolic composite search");
+    assert_eq!(
+        systolic_match.resources.items.len(),
+        1,
+        "systolic 120 > 100 must match code=8480-6"
+    );
+
+    let cross_group = backend
+        .search(
+            &tenant,
+            &component_code_value_quantity_query("8462-4$gt100"),
+        )
+        .await
+        .expect("diastolic composite search");
+    assert!(
+        cross_group.resources.items.is_empty(),
+        "8462-4 (diastolic, value 80) must not match value>100 just because the \
+         *other* component (systolic, 120) happens to satisfy it -- they are in \
+         different composite_group instances"
+    );
+}
+
+/// Comma-separated composite values are OR'd, same as any other parameter
+/// (#1062's semantics, extended to composites).
+#[tokio::test]
+async fn mongodb_integration_composite_comma_or() {
+    let Some(backend) = create_backend_with_full_registry("composite_comma_or").await else {
+        eprintln!(
+            "Skipping mongodb_integration_composite_comma_or (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = create_tenant("tenant-composite-comma-or");
+    seed_height_weight_observations(&backend, &tenant).await;
+
+    let query = code_value_quantity_query_values(&[
+        "http://loinc.org|8302-2$gt160",
+        "http://loinc.org|29463-7$gt170",
+    ]);
+    let result = backend
+        .search(&tenant, &query)
+        .await
+        .expect("comma-OR composite search");
+    assert_eq!(
+        result.resources.items.len(),
+        2,
+        "both the 170cm height and the 180 weight must match the OR'd values"
+    );
+    let ids: std::collections::HashSet<&str> =
+        result.resources.items.iter().map(|r| r.id()).collect();
+    assert!(ids.contains("height-170"));
+    assert!(ids.contains("weight-180"));
+}
+
+/// A composite parameter combined with a plain token parameter, in both
+/// directions: intersecting with a matching value keeps the composite's
+/// result, intersecting with a non-matching value empties it. Also checks
+/// that `search_count` agrees with `search()` on the same query.
+#[tokio::test]
+async fn mongodb_integration_composite_combined_with_plain_param() {
+    let Some(backend) = create_backend_with_full_registry("composite_plus_plain").await else {
+        eprintln!(
+            "Skipping mongodb_integration_composite_combined_with_plain_param (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = create_tenant("tenant-composite-plus-plain");
+    seed_height_weight_observations(&backend, &tenant).await;
+
+    let matching_status = SearchParameter {
+        name: "status".to_string(),
+        param_type: SearchParamType::Token,
+        values: vec![SearchValue::eq("final")],
+        ..Default::default()
+    };
+    let query =
+        code_value_quantity_query("http://loinc.org|8302-2$gt160").with_parameter(matching_status);
+    let result = backend
+        .search(&tenant, &query)
+        .await
+        .expect("composite + matching plain param");
+    assert_eq!(result.resources.items.len(), 1);
+
+    let count = backend
+        .search_count(&tenant, &query)
+        .await
+        .expect("search_count for composite + plain param");
+    assert_eq!(
+        count as usize,
+        result.resources.items.len(),
+        "search_count must agree with search() on the same query"
+    );
+
+    let non_matching_status = SearchParameter {
+        name: "status".to_string(),
+        param_type: SearchParamType::Token,
+        values: vec![SearchValue::eq("cancelled")],
+        ..Default::default()
+    };
+    let empty_query = code_value_quantity_query("http://loinc.org|8302-2$gt160")
+        .with_parameter(non_matching_status);
+    let empty = backend
+        .search(&tenant, &empty_query)
+        .await
+        .expect("composite + non-matching plain param");
+    assert!(
+        empty.resources.items.is_empty(),
+        "no observation has status=cancelled, so intersecting with it must empty the result"
+    );
+}
+
+/// A composite value whose `$`-separated part count does not match the
+/// parameter's declared component count is a structural error
+/// (`SearchError::InvalidComposite`), not a silent empty result or a panic.
+#[tokio::test]
+async fn mongodb_integration_composite_arity_mismatch_errors() {
+    let Some(backend) = create_backend_with_full_registry("composite_arity").await else {
+        eprintln!(
+            "Skipping mongodb_integration_composite_arity_mismatch_errors (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = create_tenant("tenant-composite-arity");
+
+    // "8302-2" has no "$"-separated second part, but the parameter declares
+    // two components (code, value-quantity).
+    let query = code_value_quantity_query("8302-2");
+    let err = backend
+        .search(&tenant, &query)
+        .await
+        .expect_err("arity mismatch must error, not silently empty");
+    assert!(
+        matches!(
+            err,
+            StorageError::Search(SearchError::InvalidComposite { .. })
+        ),
+        "expected InvalidComposite, got {err:?}"
+    );
+}
+
+// ============================================================================
+// #1206 review fixes
+// ============================================================================
+
+/// Fix 1 (blocking): a composite quantity component's `ne` must not be
+/// satisfied by a *sibling* component's row sharing the same
+/// `param_name`/envelope. height-150's own quantity row (value=150) must
+/// fail `ne150`; before the fix, height-150's *token* row (which has no
+/// `value_quantity_value` field at all) would satisfy an unguarded `$not`
+/// and let height-150 through anyway.
+#[tokio::test]
+async fn mongodb_integration_composite_quantity_ne_excludes_matching_value() {
+    let Some(backend) = create_backend_with_full_registry("composite_quantity_ne").await else {
+        eprintln!(
+            "Skipping mongodb_integration_composite_quantity_ne_excludes_matching_value (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = create_tenant("tenant-composite-quantity-ne");
+    seed_height_weight_observations(&backend, &tenant).await;
+
+    let result = backend
+        .search(
+            &tenant,
+            &code_value_quantity_query("http://loinc.org|8302-2$ne150"),
+        )
+        .await
+        .expect("composite ne search");
+    assert_eq!(
+        result.resources.items.len(),
+        1,
+        "height-150 (value=150) must be excluded by ne150; only height-170 remains"
+    );
+    assert_eq!(result.resources.items[0].id(), "height-170");
+}
+
+/// #1206 follow-up: when every component of a composite value uses the
+/// `ne` prefix, MongoDB has no component filter left that is bounded by
+/// anything other than "field exists" -- there is no candidate to drive
+/// from, and probing an unbounded `ne` arm is itself the hazard this guard
+/// exists to avoid (measured: 18.7 minutes over 5.9M keys/docs unbounded on
+/// a 228M-row corpus, vs 11ms once bounded to a batch). This must be caught
+/// in planning (`composite_driver_probe`) before any row is read, so no
+/// seed data is needed. `code-value-quantity`'s components are hand-declared
+/// here as two Quantity components (rather than the registry's real
+/// Token+Quantity shape) purely to get two `ne`-eligible parts; this
+/// backend's only registry lookup for a composite component is for
+/// reference-typed components, which neither of these is.
+#[tokio::test]
+async fn mongodb_integration_composite_all_ne_components_errors() {
+    let Some(backend) = create_backend_with_full_registry("composite_all_ne").await else {
+        eprintln!(
+            "Skipping mongodb_integration_composite_all_ne_components_errors (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = create_tenant("tenant-composite-all-ne");
+
+    let query = SearchQuery::new("Observation").with_parameter(SearchParameter {
+        name: "code-value-quantity".to_string(),
+        param_type: SearchParamType::Composite,
+        modifier: None,
+        values: vec![SearchValue::eq("ne1$ne2")],
+        chain: vec![],
+        components: vec![
+            CompositeSearchComponent {
+                param_type: SearchParamType::Quantity,
+                param_name: "value-quantity".to_string(),
+            },
+            CompositeSearchComponent {
+                param_type: SearchParamType::Quantity,
+                param_name: "value-quantity-2".to_string(),
+            },
+        ],
+    });
+
+    let err = backend
+        .search(&tenant, &query)
+        .await
+        .expect_err("a composite value with every component 'ne' must error, not silently scan");
+    assert!(
+        matches!(
+            err,
+            StorageError::Search(SearchError::InvalidComposite { .. })
+        ),
+        "expected InvalidComposite, got {err:?}"
+    );
+}
+
+/// Fix 2 (blocking): `build_search_parameters` (used by `If-None-Exist` and
+/// the non-transactional conditional operations) must populate a
+/// composite's `components` from the registry, the same way
+/// `search_query_builder.rs` does for a REST-originated query -- otherwise
+/// `split_composite_value` sees no declared components and 400s with "has
+/// no declared components" instead of ever reaching the match/create
+/// decision.
+#[tokio::test]
+async fn mongodb_integration_composite_if_none_exist_resolves_or_creates() {
+    let Some(backend) = create_backend_with_full_registry("composite_if_none_exist").await else {
+        eprintln!(
+            "Skipping mongodb_integration_composite_if_none_exist_resolves_or_creates (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = create_tenant("tenant-composite-if-none-exist");
+    seed_height_weight_observations(&backend, &tenant).await;
+
+    // $gt160 matches the existing height-170: the conditional create must
+    // resolve to it and create nothing.
+    let match_entries = vec![BundleEntry {
+        method: BundleMethod::Post,
+        url: "Observation".to_string(),
+        resource: Some(json!({
+            "resourceType": "Observation",
+            "status": "final",
+            "code": {"coding": [{"system": "http://loinc.org", "code": "8302-2"}]},
+            "valueQuantity": {
+                "value": 165.0,
+                "unit": "cm",
+                "system": "http://unitsofmeasure.org"
+            }
+        })),
+        if_match: None,
+        if_none_match: None,
+        if_none_exist: Some("code-value-quantity=http://loinc.org|8302-2$gt160".to_string()),
+        full_url: Some("urn:uuid:should-not-be-created".to_string()),
+    }];
+    let Some(match_result) = process_transaction_or_skip(
+        &backend,
+        &tenant,
+        match_entries,
+        "mongodb_integration_composite_if_none_exist_resolves_or_creates/match",
+    )
+    .await
+    else {
+        return;
+    };
+    assert_eq!(
+        match_result.entries[0].status, 200,
+        "the composite ifNoneExist match must be answered, not duplicated"
+    );
+    assert_eq!(match_result.entries[0].effect, BundleEntryEffect::NoOp);
+    let matched = match_result.entries[0]
+        .resource
+        .as_ref()
+        .expect("matched resource is echoed");
+    assert_eq!(matched["id"], json!("height-170"));
+
+    // $gt300 matches nothing: the conditional create must actually create.
+    let create_entries = vec![BundleEntry {
+        method: BundleMethod::Post,
+        url: "Observation".to_string(),
+        resource: Some(json!({
+            "resourceType": "Observation",
+            "status": "final",
+            "code": {"coding": [{"system": "http://loinc.org", "code": "8302-2"}]},
+            "valueQuantity": {
+                "value": 310.0,
+                "unit": "cm",
+                "system": "http://unitsofmeasure.org"
+            }
+        })),
+        if_match: None,
+        if_none_match: None,
+        if_none_exist: Some("code-value-quantity=http://loinc.org|8302-2$gt300".to_string()),
+        full_url: Some("urn:uuid:should-be-created".to_string()),
+    }];
+    let Some(create_result) = process_transaction_or_skip(
+        &backend,
+        &tenant,
+        create_entries,
+        "mongodb_integration_composite_if_none_exist_resolves_or_creates/create",
+    )
+    .await
+    else {
+        return;
+    };
+    assert_eq!(create_result.entries[0].status, 201);
+    assert_eq!(create_result.entries[0].effect, BundleEntryEffect::Created);
+}
+
+/// Fix 2, non-transactional path: `conditional_create` routes through
+/// `find_matching_resources` -> `build_search_parameters`, the same
+/// function the transactional ifNoneExist matcher (`storage.rs`) calls, so
+/// this exercises the same fix outside a transaction/session.
+#[tokio::test]
+async fn mongodb_integration_composite_conditional_create_matches_existing() {
+    let Some(backend) = create_backend_with_full_registry("composite_conditional_create").await
+    else {
+        eprintln!(
+            "Skipping mongodb_integration_composite_conditional_create_matches_existing (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = create_tenant("tenant-composite-conditional-create");
+    seed_height_weight_observations(&backend, &tenant).await;
+
+    let result = backend
+        .conditional_create(
+            &tenant,
+            "Observation",
+            json!({
+                "resourceType": "Observation",
+                "status": "final",
+                "code": {"coding": [{"system": "http://loinc.org", "code": "8302-2"}]},
+                "valueQuantity": {
+                    "value": 165.0,
+                    "unit": "cm",
+                    "system": "http://unitsofmeasure.org"
+                }
+            }),
+            "code-value-quantity=http://loinc.org|8302-2$gt160",
+            FhirVersion::default(),
+        )
+        .await
+        .expect("conditional_create with a composite search_params string must not 400");
+
+    match result {
+        ConditionalCreateResult::Exists(existing) => {
+            assert_eq!(existing.id(), "height-170");
+        }
+        other => panic!("expected Exists(height-170), got {other:?}"),
+    }
+}
+
+/// Fix 3 (blocking): `_contained` combined with a composite parameter must
+/// be a clear 400, not a silent partial filter -- `matching_contained`
+/// skips `Composite` params entirely, so `_contained=both` would otherwise
+/// filter only its top-level half by the composite and let the contained
+/// half ignore it.
+#[tokio::test]
+async fn mongodb_integration_contained_rejects_composite_parameter() {
+    use helios_persistence::types::ContainedMode;
+
+    let Some(backend) = create_backend_with_full_registry("contained_composite").await else {
+        eprintln!(
+            "Skipping mongodb_integration_contained_rejects_composite_parameter (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = create_tenant("tenant-contained-composite");
+
+    let mut query = code_value_quantity_query("http://loinc.org|8302-2$gt150");
+    query.contained = ContainedMode::Both;
+
+    let err = backend
+        .search(&tenant, &query)
+        .await
+        .expect_err("composite + _contained=both must be rejected, not silently under-filtered");
+    assert!(
+        matches!(
+            err,
+            StorageError::Search(SearchError::InvalidComposite { .. })
+        ),
+        "expected InvalidComposite, got {err:?}"
+    );
+
+    let count_err = backend
+        .search_count(&tenant, &query)
+        .await
+        .expect_err("search_count must reject the same combination");
+    assert!(matches!(
+        count_err,
+        StorageError::Search(SearchError::InvalidComposite { .. })
+    ));
+}
+
+/// Fix 5 test gap: `:not` on a composite parameter must be rejected by
+/// `validate_query_support`, not reach the composite builder (there is no
+/// defined composite semantics for "no value of the parameter matches").
+#[tokio::test]
+async fn mongodb_integration_composite_not_modifier_rejected() {
+    let Some(backend) = create_backend_with_full_registry("composite_not_modifier").await else {
+        eprintln!(
+            "Skipping mongodb_integration_composite_not_modifier_rejected (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = create_tenant("tenant-composite-not");
+
+    let mut query = code_value_quantity_query("http://loinc.org|8302-2$gt150");
+    query.parameters[0].modifier = Some(SearchModifier::Not);
+
+    let err = backend
+        .search(&tenant, &query)
+        .await
+        .expect_err(":not on a composite must be rejected");
+    assert!(
+        matches!(
+            err,
+            StorageError::Search(SearchError::UnsupportedModifier { .. })
+        ),
+        "expected UnsupportedModifier, got {err:?}"
+    );
+}
+
+/// Fix 5 test gap: tenant isolation. Composite rows are scoped by
+/// `tenant_id` exactly like every other `search_index` row, but this pins
+/// it explicitly for the composite path specifically.
+#[tokio::test]
+async fn mongodb_integration_composite_tenant_isolation() {
+    let Some(backend) = create_backend_with_full_registry("composite_tenant_isolation").await
+    else {
+        eprintln!(
+            "Skipping mongodb_integration_composite_tenant_isolation (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant_a = create_tenant("tenant-composite-iso-a");
+    let tenant_b = create_tenant("tenant-composite-iso-b");
+    seed_height_weight_observations(&backend, &tenant_a).await;
+
+    let result = backend
+        .search(
+            &tenant_b,
+            &code_value_quantity_query("http://loinc.org|8302-2$gt150"),
+        )
+        .await
+        .expect("composite search must not error across tenants");
+    assert!(
+        result.resources.items.is_empty(),
+        "tenant B must not see tenant A's composite rows"
+    );
+}
+
+/// Fix 5 test gap: the composite always won the driver probe in
+/// `mongodb_integration_composite_combined_with_plain_param` (2 rows vs 3).
+/// This second phase adds a `status=amended` observation held by exactly
+/// one resource -- fewer rows than either composite component arm -- so the
+/// *plain* parameter wins the driver probe this time, and the composite
+/// (checked via the grouped pair check regardless of which param drives)
+/// must still filter the smaller candidate set correctly.
+#[tokio::test]
+async fn mongodb_integration_composite_combined_with_plain_param_plain_wins_driver() {
+    let Some(backend) = create_backend_with_full_registry("composite_plus_plain_driver").await
+    else {
+        eprintln!(
+            "Skipping mongodb_integration_composite_combined_with_plain_param_plain_wins_driver (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = create_tenant("tenant-composite-plus-plain-driver");
+    seed_height_weight_observations(&backend, &tenant).await;
+
+    backend
+        .create(
+            &tenant,
+            "Observation",
+            json!({
+                "resourceType": "Observation",
+                "id": "height-190-amended",
+                "status": "amended",
+                "code": {"coding": [{"system": "http://loinc.org", "code": "8302-2"}]},
+                "valueQuantity": {
+                    "value": 190.0,
+                    "unit": "cm",
+                    "system": "http://unitsofmeasure.org"
+                }
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+
+    // Token arm (code=8302-2): height-150, height-170, height-190-amended = 3.
+    // Quantity arm (value>160, shared param_name across every Observation's
+    // code-value-quantity rows): height-170, height-190-amended, weight-180
+    // = 3. status=amended: exactly 1 -- fewer than either composite arm.
+    let amended_status = SearchParameter {
+        name: "status".to_string(),
+        param_type: SearchParamType::Token,
+        values: vec![SearchValue::eq("amended")],
+        ..Default::default()
+    };
+    let query =
+        code_value_quantity_query("http://loinc.org|8302-2$gt160").with_parameter(amended_status);
+    let result = backend
+        .search(&tenant, &query)
+        .await
+        .expect("composite + plain param where the plain param wins the driver probe");
+    assert_eq!(
+        result.resources.items.len(),
+        1,
+        "only height-190-amended has status=amended AND satisfies the composite"
+    );
+    assert_eq!(result.resources.items[0].id(), "height-190-amended");
+}
+
+/// Fix 5 test gap: the quantity component arm must be able to win the
+/// driver probe over the token arm (not merely tie or lose), and the result
+/// must still be correct when it does. Five observations share
+/// code=8302-2 (token arm count 5); only one exceeds the quantity
+/// threshold (quantity arm count 1).
+#[tokio::test]
+async fn mongodb_integration_composite_quantity_arm_wins_driver_probe() {
+    let Some(backend) = create_backend_with_full_registry("composite_quantity_arm_driver").await
+    else {
+        eprintln!(
+            "Skipping mongodb_integration_composite_quantity_arm_wins_driver_probe (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = create_tenant("tenant-composite-quantity-arm-driver");
+
+    for (id, value) in [
+        ("h1", 100.0_f64),
+        ("h2", 110.0),
+        ("h3", 120.0),
+        ("h4", 130.0),
+        ("h5", 170.0),
+    ] {
+        backend
+            .create(
+                &tenant,
+                "Observation",
+                json!({
+                    "resourceType": "Observation",
+                    "id": id,
+                    "status": "final",
+                    "code": {"coding": [{"system": "http://loinc.org", "code": "8302-2"}]},
+                    "valueQuantity": {
+                        "value": value,
+                        "unit": "cm",
+                        "system": "http://unitsofmeasure.org"
+                    }
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+    }
+
+    let result = backend
+        .search(
+            &tenant,
+            &code_value_quantity_query("http://loinc.org|8302-2$gt160"),
+        )
+        .await
+        .expect("composite search where the quantity arm wins the driver probe");
+    assert_eq!(result.resources.items.len(), 1);
+    assert_eq!(result.resources.items[0].id(), "h5");
+}
+
+/// Fix 5 test gap (multi-batch): the composite's *winning* (driver) arm
+/// itself has more than `CANDIDATE_BATCH_SIZE` (512) rows, so the per-batch
+/// pair check in `matching_resource_ids` must run more than once to exhaust
+/// the driver cursor and accumulate `confirmed` across batches. 600
+/// Observations satisfy `$gt160` (the quantity arm, 600 rows) and only 10 do
+/// not (the token arm — all 610 share code=8302-2 — therefore loses the
+/// driver-probe comparison to the quantity arm's 600, but the quantity arm
+/// still exceeds one batch on its own). Seeded via batched transaction
+/// Bundles (50 entries per batch, the same shape
+/// `mongodb_integration_search_paged_intersection_correctness` uses for its
+/// 600-row setup) rather than 610 sequential single creates.
+#[tokio::test]
+async fn mongodb_integration_composite_multi_batch_driver_paging() {
+    const MATCHING: usize = 600; // 8302-2 @ 170 (satisfies $gt160; exceeds CANDIDATE_BATCH_SIZE)
+    const NON_MATCHING: usize = 10; // 8302-2 @ 150 (does not satisfy $gt160)
+
+    let Some(backend) = create_backend_with_full_registry("composite_multi_batch").await else {
+        eprintln!(
+            "Skipping mongodb_integration_composite_multi_batch_driver_paging (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = create_tenant("tenant-composite-multi-batch");
+
+    for chunk_start in (0..MATCHING).step_by(50) {
+        let end = (chunk_start + 50).min(MATCHING);
+        let entries: Vec<BundleEntry> = (chunk_start..end)
+            .map(|i| BundleEntry {
+                method: BundleMethod::Post,
+                url: "Observation".to_string(),
+                resource: Some(json!({
+                    "resourceType": "Observation",
+                    "status": "final",
+                    "code": {"coding": [{"system": "http://loinc.org", "code": "8302-2"}]},
+                    "valueQuantity": {
+                        "value": 170.0,
+                        "unit": "cm",
+                        "system": "http://unitsofmeasure.org"
+                    }
+                })),
+                if_match: None,
+                if_none_match: None,
+                if_none_exist: None,
+                full_url: Some(format!("urn:uuid:matching-{i}")),
+            })
+            .collect();
+        let Some(r) = process_transaction_or_skip(
+            &backend,
+            &tenant,
+            entries,
+            "mongodb_integration_composite_multi_batch_driver_paging (matching setup)",
+        )
+        .await
+        else {
+            return;
+        };
+        assert!(
+            r.entries.iter().all(|e| e.status == 201),
+            "matching batch create failed"
+        );
+    }
+
+    for chunk_start in (0..NON_MATCHING).step_by(10) {
+        let end = (chunk_start + 10).min(NON_MATCHING);
+        let entries: Vec<BundleEntry> = (chunk_start..end)
+            .map(|i| BundleEntry {
+                method: BundleMethod::Post,
+                url: "Observation".to_string(),
+                resource: Some(json!({
+                    "resourceType": "Observation",
+                    "status": "final",
+                    "code": {"coding": [{"system": "http://loinc.org", "code": "8302-2"}]},
+                    "valueQuantity": {
+                        "value": 150.0,
+                        "unit": "cm",
+                        "system": "http://unitsofmeasure.org"
+                    }
+                })),
+                if_match: None,
+                if_none_match: None,
+                if_none_exist: None,
+                full_url: Some(format!("urn:uuid:non-matching-{i}")),
+            })
+            .collect();
+        let Some(r) = process_transaction_or_skip(
+            &backend,
+            &tenant,
+            entries,
+            "mongodb_integration_composite_multi_batch_driver_paging (non-matching setup)",
+        )
+        .await
+        else {
+            return;
+        };
+        assert!(
+            r.entries.iter().all(|e| e.status == 201),
+            "non-matching batch create failed"
+        );
+    }
+
+    let query = code_value_quantity_query("http://loinc.org|8302-2$gt160").with_count(1000);
+    let result = backend
+        .search(&tenant, &query)
+        .await
+        .expect("composite search across a driver larger than CANDIDATE_BATCH_SIZE");
+    assert_eq!(result.resources.items.len(), MATCHING);
+
+    let count = backend
+        .search_count(&tenant, &query)
+        .await
+        .expect("search_count must agree with search on the same multi-batch query");
+    assert_eq!(count as usize, MATCHING);
 }
