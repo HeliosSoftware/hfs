@@ -25,7 +25,7 @@ gen-packs = []
 cli = ["dep:clap"]
 
 [dependencies]
-helios-fhir = { path = "../fhir", version = "0.2.2", default-features = false }
+helios-fhir = { path = "../fhir", version = "0.2.3", default-features = false }
 # `rc` enables Deserialize/Serialize for Arc<T> — element schemas are shared
 # by reference across cooperative schema sets.
 serde = { workspace = true, features = ["rc"] }
@@ -40,7 +40,7 @@ regex = "1"
 # Dyn-compatible async TerminologyProvider.
 async-trait = "0.1"
 clap = { version = "4", features = ["derive"], optional = true }
-helios-fhirpath = { path = "../fhirpath", version = "0.2.2", optional = true, default-features = false }
+helios-fhirpath = { path = "../fhirpath", version = "0.2.3", optional = true, default-features = false }
 
 [dev-dependencies]
 serde = { workspace = true }

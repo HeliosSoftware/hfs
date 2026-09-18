@@ -21,9 +21,9 @@ R6 = ["helios-fhir/R6"]
 otel = ["helios-observability/otel"]
 
 [dependencies]
-helios-fhir = { path = "../fhir", version = "0.2.2", default-features = false }
-helios-fhirpath-support = { path = "../fhirpath-support", version = "0.2.2" }
-helios-observability = { path = "../observability", version = "0.2.2" }
+helios-fhir = { path = "../fhir", version = "0.2.3", default-features = false }
+helios-fhirpath-support = { path = "../fhirpath-support", version = "0.2.3" }
+helios-observability = { path = "../observability", version = "0.2.3" }
 chumsky = "0.10"
 roxmltree = "0.20"
 chrono = { workspace = true } # For date/time parsing and functions

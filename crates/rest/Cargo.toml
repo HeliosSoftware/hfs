@@ -43,15 +43,15 @@ otel = ["helios-observability/otel"]
 
 [dependencies]
 # Core dependencies
-helios-fhir = { path = "../fhir", version = "0.2.2", default-features = false }
-helios-persistence = { path = "../persistence", version = "0.2.2", default-features = false }
-helios-serde = { path = "../serde", version = "0.2.2", optional = true, default-features = false }
-helios-sof = { path = "../sof", version = "0.2.2", default-features = false }
-helios-auth = { path = "../auth", version = "0.2.2" }
-helios-audit = { path = "../audit", version = "0.2.2", default-features = false }
-helios-subscriptions = { path = "../subscriptions", version = "0.2.2", optional = true, default-features = false }
-helios-fhir-validator = { path = "../fhir-validator", version = "0.2.2", default-features = false, features = ["fhirpath"] }
-helios-observability = { path = "../observability", version = "0.2.2" }
+helios-fhir = { path = "../fhir", version = "0.2.3", default-features = false }
+helios-persistence = { path = "../persistence", version = "0.2.3", default-features = false }
+helios-serde = { path = "../serde", version = "0.2.3", optional = true, default-features = false }
+helios-sof = { path = "../sof", version = "0.2.3", default-features = false }
+helios-auth = { path = "../auth", version = "0.2.3" }
+helios-audit = { path = "../audit", version = "0.2.3", default-features = false }
+helios-subscriptions = { path = "../subscriptions", version = "0.2.3", optional = true, default-features = false }
+helios-fhir-validator = { path = "../fhir-validator", version = "0.2.3", default-features = false, features = ["fhirpath"] }
+helios-observability = { path = "../observability", version = "0.2.3" }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
