@@ -100,6 +100,13 @@ jobs:
           # but lose their fixed host ports (6789/6379), which would collide
           # with a concurrent inferno-us-core stack on the same Docker host.
           #
+          # The validator image sizes its heap at 79% of visible RAM
+          # (Initial/MaxRAMPercentage=79) and upstream gives the container no
+          # limit, so it claims 79% of the *whole Docker host* up front — 9.2GiB
+          # of 11.72GiB here — and is OOM-killed whenever a neighbour needs
+          # room, erroring every validation test. Bound it the way the
+          # HeliosSoftware/us-core-test-kit fork does.
+          #
           # Upstream's nginx does not wait for inferno, and nginx refuses to
           # start when its proxy_pass host does not resolve yet.
           mkdir -p ci-images/nginx
@@ -124,6 +131,11 @@ jobs:
               volumes: !override []
             fhirpath:
               ports: !override []
+            hl7_validator_service:
+              restart: on-failure
+              mem_limit: 6g
+              environment:
+                JAVA_TOOL_OPTIONS: -Xmx4g
             inferno_reference_server:
               profiles: ["client-suite"]
             db:
