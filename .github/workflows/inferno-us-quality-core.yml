@@ -100,6 +100,13 @@ jobs:
           # but lose their fixed host ports (6789/6379), which would collide
           # with a concurrent inferno-us-core stack on the same Docker host.
           #
+          # The validator image sizes its heap at 79% of visible RAM
+          # (Initial/MaxRAMPercentage=79) and upstream gives the container no
+          # limit, so it claims 79% of the *whole Docker host* up front — 9.2GiB
+          # of 11.72GiB here — and is OOM-killed whenever a neighbour needs
+          # room, erroring every validation test. Bound it the way the
+          # HeliosSoftware/us-core-test-kit fork does.
+          #
           # Upstream's nginx does not wait for inferno, and nginx refuses to
           # start when its proxy_pass host does not resolve yet.
           mkdir -p ci-images/nginx
@@ -124,6 +131,11 @@ jobs:
               volumes: !override []
             fhirpath:
               ports: !override []
+            hl7_validator_service:
+              restart: on-failure
+              mem_limit: 6g
+              environment:
+                JAVA_TOOL_OPTIONS: -Xmx4g
             inferno_reference_server:
               profiles: ["client-suite"]
             db:
@@ -154,17 +166,25 @@ jobs:
 
           INFERNO_HOST="${DOCKER_HOST_IP:-localhost}"
           echo "Waiting for Inferno test kit to respond on $INFERNO_HOST:$INFERNO_PORT..."
-          for i in {1..60}; do
-            if curl -sf "http://$INFERNO_HOST:$INFERNO_PORT/api/test_suites" > /dev/null 2>&1; then
-              echo "Inferno is ready"
+          # Inferno answering is not enough: the HL7 validator is a separate
+          # ~2GB JVM container, and when it is down every validation and
+          # reference-resolution test errors with "Connection failed to
+          # validator" (135 of 580) while the rest of the run looks healthy.
+          # Probe it through nginx's /hl7validatorapi/ proxy and require both.
+          for i in {1..90}; do
+            INFERNO_OK=0; VALIDATOR_OK=0
+            curl -sf "http://$INFERNO_HOST:$INFERNO_PORT/api/test_suites" > /dev/null 2>&1 && INFERNO_OK=1
+            curl -sf "http://$INFERNO_HOST:$INFERNO_PORT/hl7validatorapi/validator/version" > /dev/null 2>&1 && VALIDATOR_OK=1
+            if [ "$INFERNO_OK" = 1 ] && [ "$VALIDATOR_OK" = 1 ]; then
+              echo "Inferno and the HL7 validator are ready"
               echo "port=$INFERNO_PORT" >> $GITHUB_OUTPUT
               echo "project=$PROJECT" >> $GITHUB_OUTPUT
               exit 0
             fi
-            echo "Attempt $i/60: Inferno not ready yet..."
+            echo "Attempt $i/90: not ready yet (inferno=$INFERNO_OK validator=$VALIDATOR_OK)..."
             sleep 2
           done
-          echo "Inferno is not reachable at http://$INFERNO_HOST:$INFERNO_PORT"
+          echo "Inferno stack is not ready at http://$INFERNO_HOST:$INFERNO_PORT (inferno=$INFERNO_OK validator=$VALIDATOR_OK)"
           docker compose -p "$PROJECT" ps
           docker compose -p "$PROJECT" logs --tail 200
           exit 1
@@ -305,6 +325,12 @@ jobs:
           echo "INFERNO_HOST=$INFERNO_HOST" >> $GITHUB_ENV
           if ! curl -sf "http://$INFERNO_HOST:$INFERNO_PORT/api/test_suites" > /dev/null; then
             echo "Shared Inferno stack not reachable at http://$INFERNO_HOST:$INFERNO_PORT"
+            exit 1
+          fi
+          # Re-check the validator right before the run: the HFS build sits
+          # between stack-up and here, long enough for it to have died.
+          if ! curl -sf "http://$INFERNO_HOST:$INFERNO_PORT/hl7validatorapi/validator/version" > /dev/null; then
+            echo "::error::HL7 validator not reachable through the shared Inferno stack; see the 'Stop Shared Inferno Stack' job for container state and logs"
             exit 1
           fi
 
@@ -635,6 +661,36 @@ jobs:
           if [ -z "$PROJECT" ]; then
             PROJECT="inferno-qc-${{ github.run_id }}-${{ github.run_attempt }}"
           fi
+
+          # The stack's logs die with it, so capture why a container fell over
+          # (OOM vs crash vs never started) before removing anything.
+          echo "::group::Container state"
+          for ID in $(docker ps -aq --filter "label=com.docker.compose.project=$PROJECT"); do
+            docker inspect "$ID" \
+              --format '{{.Name}} Status={{.State.Status}} ExitCode={{.State.ExitCode}} OOMKilled={{.State.OOMKilled}} Restarts={{.RestartCount}} FinishedAt={{.State.FinishedAt}}' 2>&1 || true
+          done
+          echo "::endgroup::"
+          # Host-wide, not just this project: the validator has no mem_limit,
+          # so OOMKilled=true on it means the *host* ran out, and the culprit
+          # is as likely a neighbour (another workflow's stack, a leaked
+          # container) as this stack.
+          echo "::group::Docker host memory + all containers"
+          docker run --rm busybox sh -c \
+            'grep -E "MemTotal|MemFree|MemAvailable|SwapTotal|SwapFree" /proc/meminfo' 2>&1 || true
+          docker stats --no-stream --format 'table {{.Name}}\t{{.MemUsage}}\t{{.MemPerc}}' 2>&1 || true
+          docker ps -a --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}' 2>&1 || true
+          echo "::endgroup::"
+          echo "::group::Host OOM-killer (kernel ring buffer)"
+          docker run --rm --privileged busybox dmesg 2>/dev/null \
+            | grep -iE "out of memory|killed process|oom-kill" | tail -15 || true
+          echo "::endgroup::"
+          for SVC in hl7_validator_service inferno worker; do
+            echo "::group::$SVC logs (last 150 lines)"
+            ID=$(docker ps -aq --filter "label=com.docker.compose.project=$PROJECT" --filter "label=com.docker.compose.service=$SVC" | head -1)
+            [ -n "$ID" ] && docker logs --tail 150 "$ID" 2>&1 || echo "(no container)"
+            echo "::endgroup::"
+          done
+
           echo "Tearing down compose project: $PROJECT"
 
           IDS=$(docker ps -aq --filter "label=com.docker.compose.project=$PROJECT")
