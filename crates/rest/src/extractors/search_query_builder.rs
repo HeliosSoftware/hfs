@@ -4,7 +4,9 @@
 
 use std::collections::HashMap;
 
-use helios_persistence::search::{SearchParameterRegistry, resolve_param_type};
+use helios_persistence::search::{
+    SearchParameterRegistry, parse_typed_values, split_unescaped_commas,
+};
 use helios_persistence::types::{
     CompositeSearchComponent, ContainedMode, ContainedReturn, IncludeDirective, IncludeType,
     ReverseChainedParameter, SearchModifier, SearchParamType, SearchParameter, SearchQuery,
@@ -13,43 +15,6 @@ use helios_persistence::types::{
 
 use super::SearchParams;
 use crate::error::RestError;
-
-/// Splits a FHIR search value into its comma-separated OR-alternatives,
-/// respecting backslash escaping.
-///
-/// Per the FHIR spec, the characters `, | $ \` are escaped with a leading
-/// backslash inside a value. Only the comma is the OR-list separator at this
-/// layer, so we split on *unescaped* commas and unescape `\,` and `\\` here.
-/// Other escapes (`\|`, `\$`) are left intact for the backend's token/composite
-/// parsing to interpret.
-fn split_unescaped_commas(value: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut cur = String::new();
-    let mut chars = value.chars().peekable();
-    while let Some(c) = chars.next() {
-        match c {
-            '\\' => match chars.peek() {
-                Some(',') => {
-                    cur.push(',');
-                    chars.next();
-                }
-                Some('\\') => {
-                    cur.push('\\');
-                    chars.next();
-                }
-                // Preserve other escapes (e.g. `\|`, `\$`) for downstream parsing.
-                _ => cur.push('\\'),
-            },
-            ',' => {
-                out.push(cur.trim().to_string());
-                cur = String::new();
-            }
-            _ => cur.push(c),
-        }
-    }
-    out.push(cur.trim().to_string());
-    out
-}
 
 /// Builds a SearchQuery from REST parameters.
 ///
@@ -424,14 +389,16 @@ fn parse_search_parameter(
     // value escaping. A literal comma in a value is written `\,` and must not
     // start a new OR-alternative.
     let raw_values: Vec<String> = split_unescaped_commas(value);
-    let tentative_values: Vec<SearchValue> =
-        raw_values.iter().map(|v| SearchValue::parse(v)).collect();
 
-    // Resolve the canonical type from the search parameter registry. This is
-    // deterministic for any registered parameter (which is everything in the
-    // FHIR spec); the value-shape heuristic is reached only for unregistered
-    // custom params. See `helios_persistence::search::resolve_param_type`.
-    let param_type = resolve_param_type(registry, resource_type, base_name, &tentative_values);
+    // Resolve the canonical type from the search parameter registry and parse
+    // the values for it. This is deterministic for any registered parameter
+    // (which is everything in the FHIR spec); the value-shape heuristic is
+    // reached only for unregistered custom params. The routine is shared with
+    // the chain resolver, which parses the terminal parameter of a chained or
+    // `_has` search the same way — for a chained parameter `base_name` is the
+    // reference hop, so its values stay raw here and are typed there. See
+    // `helios_persistence::search::parse_typed_values`.
+    let (param_type, values) = parse_typed_values(registry, resource_type, base_name, &raw_values);
 
     // FHIR-spec modifier validation: reject a modifier that is not defined for
     // this parameter's type (e.g. `:exact` on a token, `:contains` on a date)
@@ -455,18 +422,6 @@ fn parse_search_parameter(
             });
         }
     }
-
-    let values: Vec<SearchValue> = if matches!(
-        param_type,
-        SearchParamType::Date | SearchParamType::Number | SearchParamType::Quantity
-    ) {
-        tentative_values
-    } else {
-        raw_values
-            .iter()
-            .map(|v| SearchValue::eq(v.clone()))
-            .collect()
-    };
 
     let mut param = SearchParameter {
         name: base_name.to_string(),

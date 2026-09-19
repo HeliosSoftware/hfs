@@ -15,10 +15,14 @@ use crate::core::SearchProvider;
 use crate::error::StorageResult;
 use crate::tenant::TenantContext;
 use crate::types::{
-    ReverseChainedParameter, SearchParamType, SearchParameter, SearchQuery, SearchValue,
+    ReverseChainedParameter, SearchParamType, SearchParameter, SearchPrefix, SearchQuery,
+    SearchValue,
 };
 
-use super::{IndexValue, SearchParameterExtractor, resolve_param_type};
+use super::{
+    IndexValue, SearchParameterExtractor, SearchParameterRegistry, parse_typed_values,
+    resolve_param_type, split_unescaped_commas,
+};
 
 /// Returns true if the query contains any chained or reverse-chained parameter.
 pub fn query_has_chains(query: &SearchQuery) -> bool {
@@ -64,12 +68,7 @@ where
                 },
             ));
         }
-        let value = param
-            .values
-            .first()
-            .map(|v| v.value.clone())
-            .unwrap_or_default();
-        let ids = resolve_forward_chain(storage, tenant, &base_type, param, &value).await?;
+        let ids = resolve_forward_chain(storage, tenant, &base_type, param).await?;
         id_sets.push(ids.into_iter().collect());
     }
 
@@ -188,7 +187,6 @@ async fn resolve_forward_chain<S>(
     tenant: &TenantContext,
     base_type: &str,
     param: &SearchParameter,
-    value: &str,
 ) -> StorageResult<Vec<String>>
 where
     S: SearchProvider + ?Sized,
@@ -199,8 +197,9 @@ where
     }
     let terminal_param = &hops[hops.len() - 1].target_param;
 
-    // Candidate parent/target types per hop, and the terminal param's type.
-    let (parent_types_per_hop, terminal_types, terminal_type) = {
+    // Candidate parent/target types per hop, and the terminal param's type
+    // and parsed values.
+    let (parent_types_per_hop, terminal_types, terminal_type, terminal_values) = {
         let reg = storage.search_param_registry(tenant);
         let registry = reg.read();
 
@@ -239,13 +238,18 @@ where
             .cloned()
             .collect();
         let terminal_types = if defined.is_empty() { current } else { defined };
-        let terminal_type = resolve_param_type(
+        // The chained parameter arrives typed as its *reference* hop, so its
+        // values are still raw (already comma-split into the OR list). Only
+        // here is the terminal param's type known, so this is where they are
+        // parsed — all of them, not just the first (#1292).
+        let (terminal_type, terminal_values) = parse_terminal_values(
             &registry,
             &terminal_types[0],
             terminal_param,
-            &[SearchValue::eq(value)],
+            &param.values,
+            false,
         );
-        (parents, terminal_types, terminal_type)
+        (parents, terminal_types, terminal_type, terminal_values)
     };
 
     // Deepest hop: search each candidate terminal type, union the refs.
@@ -255,7 +259,7 @@ where
             name: terminal_param.clone(),
             param_type: terminal_type,
             modifier: None,
-            values: vec![SearchValue::eq(value)],
+            values: terminal_values.clone(),
             chain: vec![],
             components: vec![],
         });
@@ -355,19 +359,19 @@ where
             components: vec![],
         })
     } else {
-        // Terminal: match source resources by `search_param=value`.
-        let values = match &reverse_chain.value {
-            Some(v) => vec![v.clone()],
-            None => vec![],
-        };
-        let search_param_type = {
+        // Terminal: match source resources by `search_param=value`. A `_has`
+        // carries its value as one raw string, so the OR list is split here
+        // too, then parsed for the terminal param's type (#1292).
+        let raw: Vec<SearchValue> = reverse_chain.value.iter().cloned().collect();
+        let (search_param_type, values) = {
             let reg = storage.search_param_registry(tenant);
             let registry = reg.read();
-            resolve_param_type(
+            parse_terminal_values(
                 &registry,
                 &reverse_chain.source_type,
                 &reverse_chain.search_param,
-                &values,
+                &raw,
+                true,
             )
         };
         SearchQuery::new(&reverse_chain.source_type).with_parameter(SearchParameter {
@@ -401,6 +405,43 @@ where
         }
     }
     Ok(ids)
+}
+
+/// Parses the values of a chain's terminal parameter exactly as a direct search
+/// on that parameter would, via [`parse_typed_values`]: a comparator prefix is
+/// split off for date/number/quantity terminals only, so `birthdate=ge1980` is a
+/// comparison while `family=Lee` stays the literal "Lee".
+///
+/// `values` are raw — the query builder cannot type them, since it only knows
+/// the reference hop. Forward-chain values arrive already split into their OR
+/// alternatives (and unescaped), so `split_commas` is false for them; a `_has`
+/// value arrives as a single unsplit string, so it is split here.
+///
+/// A value that already carries a non-`eq` prefix was parsed by the caller
+/// (programmatic queries, or an unregistered reference hop whose date-shaped
+/// value the type heuristic claimed) and is passed through untouched.
+fn parse_terminal_values(
+    registry: &SearchParameterRegistry,
+    resource_type: &str,
+    param_name: &str,
+    values: &[SearchValue],
+    split_commas: bool,
+) -> (SearchParamType, Vec<SearchValue>) {
+    if values.iter().any(|v| v.prefix != SearchPrefix::Eq) {
+        let param_type = resolve_param_type(registry, resource_type, param_name, values);
+        return (param_type, values.to_vec());
+    }
+    let raw_values: Vec<String> = values
+        .iter()
+        .flat_map(|v| {
+            if split_commas {
+                split_unescaped_commas(&v.value)
+            } else {
+                vec![v.value.clone()]
+            }
+        })
+        .collect();
+    parse_typed_values(registry, resource_type, param_name, &raw_values)
 }
 
 /// Extracts reference values for `search_param` from a resource, using the
@@ -634,6 +675,352 @@ mod tests {
         let rewritten = resolve_chains(&b, &t, &query).await.unwrap();
         let result = b.search(&t, &rewritten).await.unwrap();
         assert!(result.resources.items.is_empty(), "no patient named Nobody");
+    }
+
+    // ---- #1292: the terminal parameter is parsed like a direct parameter ----
+
+    /// Two patients (born 1980-05-06 "Lee" and 1990-01-01 "Gert"), two
+    /// Procedures each, plus an Encounter/Observation/DiagnosticReport/
+    /// RiskAssessment per patient for the multi-hop, quantity and number cases.
+    async fn seed_dated(b: &SqliteBackend, t: &TenantContext) {
+        let resources = [
+            json!({ "resourceType": "Patient", "id": "p80", "birthDate": "1980-05-06",
+                    "name": [{ "family": "Lee" }] }),
+            json!({ "resourceType": "Patient", "id": "p90", "birthDate": "1990-01-01",
+                    "name": [{ "family": "Gert" }] }),
+            json!({ "resourceType": "Procedure", "id": "pr1", "status": "completed",
+                    "subject": { "reference": "Patient/p80" },
+                    "performedDateTime": "2013-04-05T09:20:00-04:00" }),
+            json!({ "resourceType": "Procedure", "id": "pr2", "status": "completed",
+                    "subject": { "reference": "Patient/p80" },
+                    "performedDateTime": "2013-04-05" }),
+            json!({ "resourceType": "Procedure", "id": "pr3", "status": "completed",
+                    "subject": { "reference": "Patient/p90" },
+                    "performedDateTime": "2020-06-01T10:00:00+05:30" }),
+            json!({ "resourceType": "Procedure", "id": "pr4", "status": "completed",
+                    "subject": { "reference": "Patient/p90" },
+                    "performedDateTime": "2021-02-03" }),
+            json!({ "resourceType": "Encounter", "id": "e80", "status": "finished",
+                    "class": { "code": "AMB" },
+                    "subject": { "reference": "Patient/p80" } }),
+            json!({ "resourceType": "Encounter", "id": "e90", "status": "finished",
+                    "class": { "code": "AMB" },
+                    "subject": { "reference": "Patient/p90" } }),
+            json!({ "resourceType": "Observation", "id": "ob80", "status": "final",
+                    "code": { "text": "hr" },
+                    "subject": { "reference": "Patient/p80" },
+                    "encounter": { "reference": "Encounter/e80" },
+                    "valueQuantity": { "value": 60, "unit": "bpm" } }),
+            json!({ "resourceType": "Observation", "id": "ob90", "status": "final",
+                    "code": { "text": "hr" },
+                    "subject": { "reference": "Patient/p90" },
+                    "encounter": { "reference": "Encounter/e90" },
+                    "valueQuantity": { "value": 90, "unit": "bpm" } }),
+            json!({ "resourceType": "DiagnosticReport", "id": "dr80", "status": "final",
+                    "code": { "text": "panel" },
+                    "result": [{ "reference": "Observation/ob80" }] }),
+            json!({ "resourceType": "DiagnosticReport", "id": "dr90", "status": "final",
+                    "code": { "text": "panel" },
+                    "result": [{ "reference": "Observation/ob90" }] }),
+            json!({ "resourceType": "RiskAssessment", "id": "ra80", "status": "final",
+                    "subject": { "reference": "Patient/p80" },
+                    "prediction": [{ "probabilityDecimal": 0.2 }] }),
+            json!({ "resourceType": "RiskAssessment", "id": "ra90", "status": "final",
+                    "subject": { "reference": "Patient/p90" },
+                    "prediction": [{ "probabilityDecimal": 0.8 }] }),
+        ];
+        for resource in resources {
+            let resource_type = resource["resourceType"].as_str().unwrap().to_string();
+            b.create(t, &resource_type, resource, FhirVersion::default())
+                .await
+                .unwrap();
+        }
+    }
+
+    /// A forward-chained parameter exactly as the REST query builder emits it:
+    /// typed as the reference hop, values raw and already comma-split.
+    fn forward(base: &str, hops: &[(&str, &str, &str)], raw_values: &[&str]) -> SearchQuery {
+        SearchQuery::new(base).with_parameter(SearchParameter {
+            name: hops[0].0.to_string(),
+            param_type: SearchParamType::Reference,
+            modifier: None,
+            values: raw_values.iter().map(|v| SearchValue::eq(*v)).collect(),
+            chain: hops
+                .iter()
+                .map(|(reference, target_type, target_param)| ChainedParameter {
+                    reference_param: reference.to_string(),
+                    target_type: Some(target_type.to_string()),
+                    target_param: target_param.to_string(),
+                })
+                .collect(),
+            components: vec![],
+        })
+    }
+
+    /// A `_has` exactly as the REST query builder emits it: one raw value.
+    fn has(base: &str, source: &str, reference: &str, param: &str, raw: &str) -> SearchQuery {
+        let mut query = SearchQuery::new(base);
+        query.reverse_chains.push(ReverseChainedParameter::terminal(
+            source,
+            reference,
+            param,
+            SearchValue::eq(raw),
+        ));
+        query
+    }
+
+    async fn run(b: &SqliteBackend, t: &TenantContext, query: &SearchQuery) -> Vec<String> {
+        let rewritten = resolve_chains(b, t, query).await.unwrap();
+        let result = b.search(t, &rewritten).await.unwrap();
+        let mut ids: Vec<String> = result
+            .resources
+            .items
+            .iter()
+            .map(|r| r.id().to_string())
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    fn pairs(values: &[SearchValue]) -> Vec<(SearchPrefix, &str)> {
+        values
+            .iter()
+            .map(|v| (v.prefix, v.value.as_str()))
+            .collect()
+    }
+
+    const SUBJECT_BIRTHDATE: &[(&str, &str, &str)] = &[("subject", "Patient", "birthdate")];
+
+    #[tokio::test]
+    async fn forward_chain_date_prefixes() {
+        let b = backend();
+        let t = tenant();
+        seed_dated(&b, &t).await;
+
+        // Procedure?subject:Patient.birthdate=ge1980-01-01
+        let q = forward("Procedure", SUBJECT_BIRTHDATE, &["ge1980-01-01"]);
+        assert_eq!(run(&b, &t, &q).await, ["pr1", "pr2", "pr3", "pr4"]);
+
+        let q = forward("Procedure", SUBJECT_BIRTHDATE, &["ge1985-01-01"]);
+        assert_eq!(run(&b, &t, &q).await, ["pr3", "pr4"]);
+
+        let q = forward("Procedure", SUBJECT_BIRTHDATE, &["lt1985-01-01"]);
+        assert_eq!(run(&b, &t, &q).await, ["pr1", "pr2"]);
+
+        // An explicit `eq` is a prefix too, not part of the date.
+        let q = forward("Procedure", SUBJECT_BIRTHDATE, &["eq1980-05-06"]);
+        assert_eq!(run(&b, &t, &q).await, ["pr1", "pr2"]);
+
+        // Unprefixed values keep working.
+        let q = forward("Procedure", SUBJECT_BIRTHDATE, &["1980-05-06"]);
+        assert_eq!(run(&b, &t, &q).await, ["pr1", "pr2"]);
+
+        // A prefixed value nobody satisfies still yields the empty result.
+        let q = forward("Procedure", SUBJECT_BIRTHDATE, &["gt2000-01-01"]);
+        assert!(run(&b, &t, &q).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn forward_chain_or_list_returns_the_union() {
+        let b = backend();
+        let t = tenant();
+        seed_dated(&b, &t).await;
+
+        // Procedure?subject:Patient.birthdate=1980-05-06,1990-01-01
+        let q = forward(
+            "Procedure",
+            SUBJECT_BIRTHDATE,
+            &["1980-05-06", "1990-01-01"],
+        );
+        assert_eq!(run(&b, &t, &q).await, ["pr1", "pr2", "pr3", "pr4"]);
+
+        // Prefixes apply per alternative.
+        let q = forward("Procedure", SUBJECT_BIRTHDATE, &["lt1970", "ge1990"]);
+        assert_eq!(run(&b, &t, &q).await, ["pr3", "pr4"]);
+    }
+
+    #[tokio::test]
+    async fn forward_chain_quantity_prefix() {
+        let b = backend();
+        let t = tenant();
+        seed_dated(&b, &t).await;
+
+        // DiagnosticReport?result.value-quantity=gt70
+        let hops = &[("result", "Observation", "value-quantity")];
+        let q = forward("DiagnosticReport", hops, &["gt70"]);
+        assert_eq!(run(&b, &t, &q).await, ["dr90"]);
+
+        let q = forward("DiagnosticReport", hops, &["le60"]);
+        assert_eq!(run(&b, &t, &q).await, ["dr80"]);
+    }
+
+    #[tokio::test]
+    async fn forward_multi_hop_chain_with_prefix() {
+        let b = backend();
+        let t = tenant();
+        seed_dated(&b, &t).await;
+
+        // Observation?encounter.subject.birthdate=ge1985-01-01
+        let hops = &[
+            ("encounter", "Encounter", "subject"),
+            ("subject", "Patient", "birthdate"),
+        ];
+        let q = forward("Observation", hops, &["ge1985-01-01"]);
+        assert_eq!(run(&b, &t, &q).await, ["ob90"]);
+
+        let q = forward("Observation", hops, &["lt1985-01-01", "ge1990-01-01"]);
+        assert_eq!(run(&b, &t, &q).await, ["ob80", "ob90"]);
+    }
+
+    #[tokio::test]
+    async fn forward_chain_last_updated_prefix() {
+        let b = backend();
+        let t = tenant();
+        seed_dated(&b, &t).await;
+
+        // Procedure?subject:Patient._lastUpdated=ge2000-01-01
+        let hops = &[("subject", "Patient", "_lastUpdated")];
+        let q = forward("Procedure", hops, &["ge2000-01-01"]);
+        assert_eq!(run(&b, &t, &q).await, ["pr1", "pr2", "pr3", "pr4"]);
+
+        let q = forward("Procedure", hops, &["lt2000-01-01"]);
+        assert!(run(&b, &t, &q).await.is_empty());
+    }
+
+    /// Prefix parsing is type-aware: a string or token terminal that merely
+    /// starts with the letters of a comparator keeps them.
+    #[tokio::test]
+    async fn string_terminal_starting_with_prefix_letters_is_untouched() {
+        let b = backend();
+        let t = tenant();
+        seed_dated(&b, &t).await;
+
+        let hops = &[("subject", "Patient", "family")];
+        let q = forward("Procedure", hops, &["Lee"]);
+        assert_eq!(run(&b, &t, &q).await, ["pr1", "pr2"]);
+
+        let q = forward("Procedure", hops, &["gert"]);
+        assert_eq!(run(&b, &t, &q).await, ["pr3", "pr4"]);
+
+        // Same for a `_has` token terminal: not `ne` + "cessary".
+        let (ty, values) = {
+            let reg = b.search_param_registry(&t);
+            let registry = reg.read();
+            parse_terminal_values(
+                &registry,
+                "Procedure",
+                "status",
+                &[SearchValue::eq("necessary")],
+                true,
+            )
+        };
+        assert_eq!(ty, SearchParamType::Token);
+        assert_eq!(pairs(&values), [(SearchPrefix::Eq, "necessary")]);
+    }
+
+    #[tokio::test]
+    async fn has_date_prefix() {
+        let b = backend();
+        let t = tenant();
+        seed_dated(&b, &t).await;
+
+        // Patient?_has:Procedure:subject:date=ge2013-01-01
+        let q = has("Patient", "Procedure", "subject", "date", "ge2013-01-01");
+        assert_eq!(run(&b, &t, &q).await, ["p80", "p90"]);
+
+        let q = has("Patient", "Procedure", "subject", "date", "ge2020-01-01");
+        assert_eq!(run(&b, &t, &q).await, ["p90"]);
+
+        let q = has("Patient", "Procedure", "subject", "date", "lt2014");
+        assert_eq!(run(&b, &t, &q).await, ["p80"]);
+
+        let q = has("Patient", "Procedure", "subject", "date", "eq2013-04-05");
+        assert_eq!(run(&b, &t, &q).await, ["p80"]);
+    }
+
+    #[tokio::test]
+    async fn has_or_list() {
+        let b = backend();
+        let t = tenant();
+        seed_dated(&b, &t).await;
+
+        // Patient?_has:Procedure:subject:date=2013-04-05T09:20:00-04:00,2020
+        let q = has(
+            "Patient",
+            "Procedure",
+            "subject",
+            "date",
+            "2013-04-05T09:20:00-04:00,2020",
+        );
+        assert_eq!(run(&b, &t, &q).await, ["p80", "p90"]);
+
+        // Prefixes apply per alternative.
+        let q = has("Patient", "Procedure", "subject", "date", "lt2000,ge2021");
+        assert_eq!(run(&b, &t, &q).await, ["p90"]);
+
+        // An escaped comma is part of the value, not an OR separator.
+        let (_, values) = {
+            let reg = b.search_param_registry(&t);
+            let registry = reg.read();
+            parse_terminal_values(
+                &registry,
+                "Patient",
+                "family",
+                &[SearchValue::eq("Lee\\, Jr,Gert")],
+                true,
+            )
+        };
+        assert_eq!(
+            pairs(&values),
+            [(SearchPrefix::Eq, "Lee, Jr"), (SearchPrefix::Eq, "Gert")]
+        );
+    }
+
+    #[tokio::test]
+    async fn has_number_and_quantity_prefixes() {
+        let b = backend();
+        let t = tenant();
+        seed_dated(&b, &t).await;
+
+        // Patient?_has:RiskAssessment:subject:probability=gt0.5
+        let q = has(
+            "Patient",
+            "RiskAssessment",
+            "subject",
+            "probability",
+            "gt0.5",
+        );
+        assert_eq!(run(&b, &t, &q).await, ["p90"]);
+        let q = has(
+            "Patient",
+            "RiskAssessment",
+            "subject",
+            "probability",
+            "le0.5",
+        );
+        assert_eq!(run(&b, &t, &q).await, ["p80"]);
+
+        // Patient?_has:Observation:subject:value-quantity=gt70
+        let q = has(
+            "Patient",
+            "Observation",
+            "subject",
+            "value-quantity",
+            "gt70",
+        );
+        assert_eq!(run(&b, &t, &q).await, ["p90"]);
+    }
+
+    /// Values a caller already parsed (non-`eq` prefix) pass through as given.
+    #[tokio::test]
+    async fn pre_parsed_values_pass_through() {
+        let b = backend();
+        let t = tenant();
+        seed_dated(&b, &t).await;
+
+        let mut q = forward("Procedure", SUBJECT_BIRTHDATE, &[]);
+        q.parameters[0].values = vec![SearchValue::new(SearchPrefix::Ge, "1985-01-01")];
+        assert_eq!(run(&b, &t, &q).await, ["pr3", "pr4"]);
     }
 
     /// A two-level chain over a wide intermediate set used to 500 with

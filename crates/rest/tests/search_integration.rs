@@ -2068,6 +2068,186 @@ mod chaining {
         }
     }
 
+    /// Two patients with two Procedures each, plus an Encounter and an
+    /// Observation per patient for the multi-hop case (#1292).
+    async fn seed_dated_chain_data(backend: &SqliteBackend) {
+        let tenant = test_tenant();
+        let resources = [
+            json!({"resourceType": "Patient", "id": "p80", "birthDate": "1980-05-06",
+                   "name": [{"family": "Lee"}]}),
+            json!({"resourceType": "Patient", "id": "p90", "birthDate": "1990-01-01",
+                   "name": [{"family": "Gert"}]}),
+            json!({"resourceType": "Procedure", "id": "pr1", "status": "completed",
+                   "subject": {"reference": "Patient/p80"},
+                   "performedDateTime": "2013-04-05T09:20:00-04:00"}),
+            json!({"resourceType": "Procedure", "id": "pr2", "status": "completed",
+                   "subject": {"reference": "Patient/p80"},
+                   "performedDateTime": "2013-04-05"}),
+            json!({"resourceType": "Procedure", "id": "pr3", "status": "completed",
+                   "subject": {"reference": "Patient/p90"},
+                   "performedDateTime": "2020-06-01T10:00:00+05:30"}),
+            json!({"resourceType": "Procedure", "id": "pr4", "status": "completed",
+                   "subject": {"reference": "Patient/p90"},
+                   "performedDateTime": "2021-02-03"}),
+            json!({"resourceType": "Encounter", "id": "e80", "status": "finished",
+                   "class": {"code": "AMB"},
+                   "subject": {"reference": "Patient/p80"}}),
+            json!({"resourceType": "Encounter", "id": "e90", "status": "finished",
+                   "class": {"code": "AMB"},
+                   "subject": {"reference": "Patient/p90"}}),
+            json!({"resourceType": "Observation", "id": "ob80", "status": "final",
+                   "code": {"text": "hr"},
+                   "subject": {"reference": "Patient/p80"},
+                   "encounter": {"reference": "Encounter/e80"},
+                   "valueQuantity": {"value": 60, "unit": "bpm"}}),
+            json!({"resourceType": "Observation", "id": "ob90", "status": "final",
+                   "code": {"text": "hr"},
+                   "subject": {"reference": "Patient/p90"},
+                   "encounter": {"reference": "Encounter/e90"},
+                   "valueQuantity": {"value": 90, "unit": "bpm"}}),
+        ];
+        for resource in resources {
+            let resource_type = resource["resourceType"].as_str().unwrap().to_string();
+            backend
+                .create(&tenant, &resource_type, resource, FhirVersion::R4)
+                .await
+                .unwrap();
+        }
+    }
+
+    /// Sorted ids of a search that must succeed.
+    async fn ids(server: &TestServer, url: &str) -> Vec<String> {
+        let response = server
+            .get(url)
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+        response.assert_status_ok();
+        let body: Value = response.json();
+        let mut ids: Vec<String> = get_bundle_entries(&body)
+            .iter()
+            .map(|e| e["resource"]["id"].as_str().unwrap().to_string())
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    /// #1292: the terminal parameter of a forward chain is parsed like the
+    /// same parameter in a direct search — comparator prefix and OR list.
+    #[tokio::test]
+    async fn test_chained_terminal_value_prefix_and_or_list() {
+        let (server, backend) = create_test_server().await;
+        seed_dated_chain_data(&backend).await;
+        let all = ["pr1", "pr2", "pr3", "pr4"];
+
+        assert_eq!(
+            ids(&server, "/Procedure?subject:Patient.birthdate=1980-05-06").await,
+            ["pr1", "pr2"]
+        );
+        assert_eq!(
+            ids(&server, "/Procedure?subject:Patient.birthdate=ge1980-01-01").await,
+            all
+        );
+        assert_eq!(
+            ids(&server, "/Procedure?subject:Patient.birthdate=eq1980-05-06").await,
+            ["pr1", "pr2"]
+        );
+        assert_eq!(
+            ids(&server, "/Procedure?subject:Patient.birthdate=lt1985-01-01").await,
+            ["pr1", "pr2"]
+        );
+        // Untyped chain, same answer.
+        assert_eq!(
+            ids(&server, "/Procedure?subject.birthdate=ge1985-01-01").await,
+            ["pr3", "pr4"]
+        );
+        // Every value of the OR list counts, not just the first.
+        assert_eq!(
+            ids(
+                &server,
+                "/Procedure?subject:Patient.birthdate=1980-05-06,1990-01-01"
+            )
+            .await,
+            all
+        );
+        // It agrees with the equivalent direct search.
+        assert_eq!(
+            ids(&server, "/Patient?birthdate=ge1985-01-01").await,
+            ["p90"]
+        );
+        // Multi-hop.
+        assert_eq!(
+            ids(
+                &server,
+                "/Observation?encounter.subject.birthdate=ge1985-01-01"
+            )
+            .await,
+            ["ob90"]
+        );
+        // Quantity terminal.
+        assert_eq!(
+            ids(
+                &server,
+                "/Encounter?_has:Observation:encounter:value-quantity=gt70"
+            )
+            .await,
+            ["e90"]
+        );
+        // Chained _lastUpdated.
+        assert_eq!(
+            ids(
+                &server,
+                "/Procedure?subject:Patient._lastUpdated=ge2000-01-01"
+            )
+            .await,
+            all
+        );
+        assert!(
+            ids(
+                &server,
+                "/Procedure?subject:Patient._lastUpdated=lt2000-01-01"
+            )
+            .await
+            .is_empty()
+        );
+        // A string terminal that starts with comparator letters is untouched.
+        assert_eq!(
+            ids(&server, "/Procedure?subject:Patient.family=Lee").await,
+            ["pr1", "pr2"]
+        );
+        assert_eq!(
+            ids(&server, "/Procedure?subject:Patient.family=gert").await,
+            ["pr3", "pr4"]
+        );
+    }
+
+    /// #1292: same for the terminal parameter of `_has`.
+    #[tokio::test]
+    async fn test_has_terminal_value_prefix_and_or_list() {
+        let (server, backend) = create_test_server().await;
+        seed_dated_chain_data(&backend).await;
+
+        assert_eq!(
+            ids(&server, "/Patient?_has:Procedure:subject:date=ge2013-01-01").await,
+            ["p80", "p90"]
+        );
+        assert_eq!(
+            ids(&server, "/Patient?_has:Procedure:subject:date=ge2020-01-01").await,
+            ["p90"]
+        );
+        assert_eq!(
+            ids(&server, "/Patient?_has:Procedure:subject:date=lt2014").await,
+            ["p80"]
+        );
+        assert_eq!(
+            ids(
+                &server,
+                "/Patient?_has:Procedure:subject:date=2013-04-05T09:20:00-04:00,2020"
+            )
+            .await,
+            ["p80", "p90"]
+        );
+    }
+
     #[tokio::test]
     async fn test_multiple_chain_levels() {
         let (server, backend) = create_test_server().await;
