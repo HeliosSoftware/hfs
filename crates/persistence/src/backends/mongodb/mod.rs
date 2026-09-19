@@ -12,14 +12,16 @@
 //! - schema/index bootstrap foundations (including search index collection)
 //! - basic [`crate::core::SearchProvider`] support for first-wave parameter types
 //! - [`crate::core::ConditionalStorage`] support for create/update/delete
-//!
-//! Advanced search/composite behavior remains part of later phases.
+//! - composite search parameters (#1206), via grouped `(resource_id,
+//!   composite_group)` pair checks — see `composite_search` and
+//!   `docs/mongodb/search-indexes.md`
 
 pub(crate) mod backend;
 mod bulk_export;
 mod bulk_ingest;
 pub(crate) mod bulk_provider;
 mod bulk_submit;
+mod composite_search;
 mod retry;
 pub(crate) mod schema;
 mod search_impl;

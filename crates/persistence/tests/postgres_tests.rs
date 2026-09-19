@@ -68,6 +68,11 @@ mod date_boundary_suite;
 #[path = "search/date_precision_suite.rs"]
 mod date_precision_suite;
 
+/// The backend-agnostic conditional-criteria suite (#1312): criteria whose
+/// values begin with comparator letters. Same `#[path]` arrangement.
+#[path = "search/conditional_criteria_suite.rs"]
+mod conditional_criteria_suite;
+
 #[path = "common/container_cleanup.rs"]
 mod container_cleanup;
 
@@ -11447,6 +11452,661 @@ mod postgres_integration {
         assert_eq!(ids, vec!["p1".to_string()]);
     }
 
+    /// Seeds two patients and one observation each for the chained-date tests
+    /// (#1290), through the real write path so `birthdate` / `date` /
+    /// `subject` are indexed by the backend rather than hand-inserted.
+    ///
+    /// - `p-old` born 1975-03-02, observation `o-old` effective
+    ///   `2019-05-04T23:30:00-07:00` (= `2019-05-05T06:30:00Z`)
+    /// - `p-new` born 1990-01-15, observation `o-new` effective `2021-08-09`
+    ///
+    /// Asserts that an *unchained* date search finds the seeded rows, so a
+    /// chained assertion below can never pass vacuously against an empty index.
+    async fn seed_chain_date_fixture(backend: &PostgresBackend, tenant: &TenantContext) {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::types::{
+            SearchParamType, SearchParameter, SearchQuery, SearchValue,
+        };
+
+        for (id, birth) in [("p-old", "1975-03-02"), ("p-new", "1990-01-15")] {
+            backend
+                .create(
+                    tenant,
+                    "Patient",
+                    json!({"resourceType": "Patient", "id": id, "birthDate": birth}),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+        for (id, subject, effective) in [
+            ("o-old", "Patient/p-old", "2019-05-04T23:30:00-07:00"),
+            ("o-new", "Patient/p-new", "2021-08-09"),
+        ] {
+            backend
+                .create(
+                    tenant,
+                    "Observation",
+                    json!({
+                        "resourceType": "Observation",
+                        "id": id,
+                        "status": "final",
+                        "code": {"text": "x"},
+                        "subject": {"reference": subject},
+                        "effectiveDateTime": effective,
+                    }),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+
+        let date_query = |rt: &str, name: &str, v: &str| {
+            SearchQuery::new(rt).with_parameter(SearchParameter {
+                name: name.to_string(),
+                param_type: SearchParamType::Date,
+                modifier: None,
+                values: vec![SearchValue::eq(v)],
+                chain: vec![],
+                components: vec![],
+            })
+        };
+        let found = backend
+            .search(tenant, &date_query("Patient", "birthdate", "1990-01-15"))
+            .await
+            .unwrap();
+        assert_eq!(
+            found.resources.items.len(),
+            1,
+            "fixture: birthdate must be indexed or the chained tests are vacuous"
+        );
+        let found = backend
+            .search(tenant, &date_query("Observation", "date", "2021-08-09"))
+            .await
+            .unwrap();
+        assert_eq!(
+            found.resources.items.len(),
+            1,
+            "fixture: Observation.date must be indexed or the chained tests are vacuous"
+        );
+    }
+
+    fn sorted_ids(mut ids: Vec<String>) -> Vec<String> {
+        ids.sort();
+        ids.dedup();
+        ids
+    }
+
+    fn expect_ids(ids: &[&str]) -> Vec<String> {
+        ids.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// `Observation?subject:Patient.birthdate=<value>` through the
+    /// `ChainedSearchProvider` trait API (#1290). The chain builder bound the
+    /// raw string against `value_date TIMESTAMPTZ`.
+    #[tokio::test]
+    async fn postgres_integration_resolve_chain_date_terminal() {
+        use helios_persistence::core::ChainedSearchProvider;
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("chain-date");
+        seed_chain_date_fixture(&backend, &tenant).await;
+
+        let cases: &[(&str, &[&str])] = &[
+            // Unprefixed day precision means the whole day.
+            ("1990-01-15", &["o-new"]),
+            ("1990-01", &["o-new"]),
+            ("1990", &["o-new"]),
+            ("eq1990-01-15", &["o-new"]),
+            ("ne1990-01-15", &["o-old"]),
+            ("ge1980-01-01", &["o-new"]),
+            ("ge1990-01-15", &["o-new"]),
+            ("gt1990-01-15", &[]),
+            ("gt1975-03-02", &["o-new"]),
+            ("lt1980-01-01", &["o-old"]),
+            ("lt1975-03-02", &[]),
+            ("le1975-03-02", &["o-old"]),
+            ("le1990-01-15", &["o-new", "o-old"]),
+            ("sa1975-03-02", &["o-new"]),
+            ("eb1990-01-15", &["o-old"]),
+            // Not a date: must match nothing, never widen.
+            ("not-a-date", &[]),
+            ("nenot-a-date", &[]),
+        ];
+        for (value, expected) in cases {
+            let ids = backend
+                .resolve_chain(&tenant, "Observation", "subject:Patient.birthdate", value)
+                .await
+                .unwrap_or_else(|e| panic!("birthdate={value}: {e}"));
+            assert_eq!(sorted_ids(ids), expect_ids(expected), "birthdate={value}");
+        }
+    }
+
+    /// A forward chain whose terminal is a full instant carrying a negative
+    /// offset: `DiagnosticReport?result:Observation.date=<value>`.
+    #[tokio::test]
+    async fn postgres_integration_resolve_chain_date_terminal_instant_with_offset() {
+        use helios_persistence::core::ChainedSearchProvider;
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("chain-date-instant");
+        seed_chain_date_fixture(&backend, &tenant).await;
+        for (id, result) in [
+            ("dr-old", "Observation/o-old"),
+            ("dr-new", "Observation/o-new"),
+        ] {
+            backend
+                .create(
+                    &tenant,
+                    "DiagnosticReport",
+                    json!({
+                        "resourceType": "DiagnosticReport",
+                        "id": id,
+                        "status": "final",
+                        "code": {"text": "x"},
+                        "result": [{"reference": result}],
+                    }),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+
+        let cases: &[(&str, &[&str])] = &[
+            // The stored instant, written in its own zone and in UTC.
+            ("2019-05-04T23:30:00-07:00", &["dr-old"]),
+            ("2019-05-05T06:30:00Z", &["dr-old"]),
+            // One second either side, in the negative-offset zone.
+            ("gt2019-05-04T23:29:59-07:00", &["dr-new", "dr-old"]),
+            ("gt2019-05-04T23:30:00-07:00", &["dr-new"]),
+            ("ge2019-05-04T23:30:00-07:00", &["dr-new", "dr-old"]),
+            ("lt2019-05-04T23:30:01-07:00", &["dr-old"]),
+            ("lt2019-05-04T23:30:00-07:00", &[]),
+            ("le2019-05-04T23:30:00-07:00", &["dr-old"]),
+            // Day precision is read in UTC: the instant falls on 05-05 there.
+            ("2019-05-05", &["dr-old"]),
+            ("2019-05-04", &[]),
+        ];
+        for (value, expected) in cases {
+            let ids = backend
+                .resolve_chain(
+                    &tenant,
+                    "DiagnosticReport",
+                    "result:Observation.date",
+                    value,
+                )
+                .await
+                .unwrap_or_else(|e| panic!("date={value}: {e}"));
+            assert_eq!(sorted_ids(ids), expect_ids(expected), "date={value}");
+        }
+    }
+
+    /// `Patient?_has:Observation:subject:date=<value>` through the trait API.
+    #[tokio::test]
+    async fn postgres_integration_resolve_reverse_chain_date_terminal() {
+        use helios_persistence::core::ChainedSearchProvider;
+        use helios_persistence::types::{ReverseChainedParameter, SearchValue};
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("reverse-chain-date");
+        seed_chain_date_fixture(&backend, &tenant).await;
+
+        let cases: &[(&str, &[&str])] = &[
+            ("2021-08-09", &["p-new"]),
+            ("2021-08", &["p-new"]),
+            ("ge2020-01-01", &["p-new"]),
+            ("lt2020-01-01", &["p-old"]),
+            ("gt2021-08-09", &[]),
+            ("le2021-08-09", &["p-new", "p-old"]),
+            ("ne2021-08-09", &["p-old"]),
+            ("2019-05-04T23:30:00-07:00", &["p-old"]),
+            ("ge2019-05-04T23:30:00-07:00", &["p-new", "p-old"]),
+            ("gt2019-05-04T23:30:00-07:00", &["p-new"]),
+            ("not-a-date", &[]),
+        ];
+        for (value, expected) in cases {
+            let rc = ReverseChainedParameter::terminal(
+                "Observation",
+                "subject",
+                "date",
+                SearchValue::parse(value),
+            );
+            let ids = backend
+                .resolve_reverse_chain(&tenant, "Patient", &rc)
+                .await
+                .unwrap_or_else(|e| panic!("_has date={value}: {e}"));
+            assert_eq!(sorted_ids(ids), expect_ids(expected), "_has date={value}");
+        }
+    }
+
+    /// Chained and reverse-chained `_lastUpdated`, which the chain builder
+    /// reads from `resources.last_updated` (also `TIMESTAMPTZ`).
+    #[tokio::test]
+    async fn postgres_integration_resolve_chain_last_updated_terminal() {
+        use helios_persistence::core::ChainedSearchProvider;
+        use helios_persistence::types::{ReverseChainedParameter, SearchValue};
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("chain-last-updated");
+        seed_chain_date_fixture(&backend, &tenant).await;
+
+        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        let cases: &[(&str, &[&str])] = &[
+            ("gt2000-01-01", &["o-new", "o-old"]),
+            ("ge2000", &["o-new", "o-old"]),
+            ("lt2000-01-01", &[]),
+            ("gt2999-01-01", &[]),
+            ("le2999-01-01T00:00:00-05:00", &["o-new", "o-old"]),
+            ("not-a-date", &[]),
+        ];
+        for (value, expected) in cases {
+            let ids = backend
+                .resolve_chain(
+                    &tenant,
+                    "Observation",
+                    "subject:Patient._lastUpdated",
+                    value,
+                )
+                .await
+                .unwrap_or_else(|e| panic!("_lastUpdated={value}: {e}"));
+            assert_eq!(
+                sorted_ids(ids),
+                expect_ids(expected),
+                "_lastUpdated={value}"
+            );
+        }
+
+        // Day-precision eq must cover the whole (UTC) day. Skipped in the rare
+        // run that straddles midnight UTC between the writes and this line.
+        if today == chrono::Utc::now().format("%Y-%m-%d").to_string() {
+            let ids = backend
+                .resolve_chain(
+                    &tenant,
+                    "Observation",
+                    "subject:Patient._lastUpdated",
+                    &today,
+                )
+                .await
+                .unwrap_or_else(|e| panic!("_lastUpdated={today}: {e}"));
+            assert_eq!(
+                sorted_ids(ids),
+                expect_ids(&["o-new", "o-old"]),
+                "_lastUpdated={today}"
+            );
+        }
+
+        let reverse_cases: &[(&str, &[&str])] =
+            &[("gt2000-01-01", &["p-new", "p-old"]), ("lt2000-01-01", &[])];
+        for (value, expected) in reverse_cases {
+            let rc = ReverseChainedParameter::terminal(
+                "Observation",
+                "subject",
+                "_lastUpdated",
+                SearchValue::parse(value),
+            );
+            let ids = backend
+                .resolve_reverse_chain(&tenant, "Patient", &rc)
+                .await
+                .unwrap_or_else(|e| panic!("_has _lastUpdated={value}: {e}"));
+            assert_eq!(
+                sorted_ids(ids),
+                expect_ids(expected),
+                "_has _lastUpdated={value}"
+            );
+        }
+    }
+
+    /// Seeds the chained-numeric fixture (#1306) through the real write path.
+    ///
+    /// Number terminal, `MolecularSequence.referenceSeq.windowStart`, reached
+    /// by `Observation?has-member:MolecularSequence.window-start`:
+    /// `on-neg` → -100, `on-zero` → 0, `on-100` → 100, `on-105` → 105,
+    /// `on-200` → 200. The zero row is what an unparseable number used to
+    /// match, because it was read as `0`.
+    ///
+    /// Quantity terminal, `Observation.valueQuantity`, reached by
+    /// `DiagnosticReport?result:Observation.value-quantity` and by
+    /// `Patient?_has:Observation:subject:value-quantity`:
+    /// `dr-neg`/`pq-neg` → -5.4 mg, `dr-a`/`pq-a` → 5.4 mg,
+    /// `dr-b`/`pq-b` → 5.9 mg, `dr-c`/`pq-c` → 6.5 mg,
+    /// `dr-g`/`pq-g` → 0.0054 g (the same amount as 5.4 mg).
+    ///
+    /// Asserts that the *unchained* number and quantity searches find the
+    /// seeded rows, so a chained assertion can never pass vacuously against an
+    /// index that holds no numeric rows.
+    async fn seed_chain_numeric_fixture(backend: &PostgresBackend, tenant: &TenantContext) {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::types::{
+            SearchParamType, SearchParameter, SearchQuery, SearchValue,
+        };
+
+        for (suffix, window_start) in [
+            ("neg", -100),
+            ("zero", 0),
+            ("100", 100),
+            ("105", 105),
+            ("200", 200),
+        ] {
+            backend
+                .create(
+                    tenant,
+                    "MolecularSequence",
+                    json!({
+                        "resourceType": "MolecularSequence",
+                        "id": format!("ms-{suffix}"),
+                        "coordinateSystem": 0,
+                        "referenceSeq": {"windowStart": window_start, "windowEnd": 1000},
+                    }),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+            backend
+                .create(
+                    tenant,
+                    "Observation",
+                    json!({
+                        "resourceType": "Observation",
+                        "id": format!("on-{suffix}"),
+                        "status": "final",
+                        "code": {"text": "x"},
+                        "hasMember": [{"reference": format!("MolecularSequence/ms-{suffix}")}],
+                    }),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+
+        for (suffix, amount, unit) in [
+            ("neg", -5.4, "mg"),
+            ("a", 5.4, "mg"),
+            ("b", 5.9, "mg"),
+            ("c", 6.5, "mg"),
+            ("g", 0.0054, "g"),
+        ] {
+            backend
+                .create(
+                    tenant,
+                    "Patient",
+                    json!({"resourceType": "Patient", "id": format!("pq-{suffix}")}),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+            backend
+                .create(
+                    tenant,
+                    "Observation",
+                    json!({
+                        "resourceType": "Observation",
+                        "id": format!("oq-{suffix}"),
+                        "status": "final",
+                        "code": {"text": "x"},
+                        "subject": {"reference": format!("Patient/pq-{suffix}")},
+                        "valueQuantity": {
+                            "value": amount,
+                            "unit": unit,
+                            "system": "http://unitsofmeasure.org",
+                            "code": unit,
+                        },
+                    }),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+            backend
+                .create(
+                    tenant,
+                    "DiagnosticReport",
+                    json!({
+                        "resourceType": "DiagnosticReport",
+                        "id": format!("dr-{suffix}"),
+                        "status": "final",
+                        "code": {"text": "x"},
+                        "result": [{"reference": format!("Observation/oq-{suffix}")}],
+                    }),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+
+        let query = |rt: &str, name: &str, ty: SearchParamType, v: &str| {
+            SearchQuery::new(rt).with_parameter(SearchParameter {
+                name: name.to_string(),
+                param_type: ty,
+                modifier: None,
+                values: vec![SearchValue::parse(v)],
+                chain: vec![],
+                components: vec![],
+            })
+        };
+        let found = backend
+            .search(
+                tenant,
+                &query(
+                    "MolecularSequence",
+                    "window-start",
+                    SearchParamType::Number,
+                    "ap100",
+                ),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            found.resources.items.len(),
+            2,
+            "fixture: window-start must be indexed or the chained tests are vacuous"
+        );
+        let found = backend
+            .search(
+                tenant,
+                &query(
+                    "Observation",
+                    "value-quantity",
+                    SearchParamType::Quantity,
+                    "ap5.4",
+                ),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            found.resources.items.len(),
+            2,
+            "fixture: value-quantity must be indexed or the chained tests are vacuous"
+        );
+    }
+
+    /// Compares one chained-numeric case, recording rather than panicking so a
+    /// run reports every failing prefix at once.
+    fn check_chain_case(
+        failures: &mut Vec<String>,
+        label: &str,
+        value: &str,
+        result: Result<Vec<String>, impl std::fmt::Display>,
+        expected: &[&str],
+    ) {
+        match result {
+            Err(e) => failures.push(format!("{label}={value}: {e}")),
+            Ok(ids) => {
+                let ids = sorted_ids(ids);
+                if ids != expect_ids(expected) {
+                    failures.push(format!("{label}={value}: got {ids:?}, want {expected:?}"));
+                }
+            }
+        }
+    }
+
+    /// `Observation?has-member:MolecularSequence.window-start=<value>` through
+    /// the `ChainedSearchProvider` trait API (#1306). `ap` inlined its bounds
+    /// into the SQL text yet still returned a bind, so the statement was handed
+    /// one more parameter than it had placeholders.
+    #[tokio::test]
+    async fn postgres_integration_resolve_chain_number_terminal() {
+        use helios_persistence::core::ChainedSearchProvider;
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("chain-number");
+        seed_chain_numeric_fixture(&backend, &tenant).await;
+
+        let cases: &[(&str, &[&str])] = &[
+            ("ap100", &["on-100", "on-105"]),
+            // A negative value: the window is [-110, -90], not [-90, -110].
+            ("ap-100", &["on-neg"]),
+            ("ap0", &["on-zero"]),
+            ("100", &["on-100"]),
+            ("100.0", &["on-100"]),
+            ("ne100", &["on-105", "on-200", "on-neg", "on-zero"]),
+            ("gt100", &["on-105", "on-200"]),
+            ("ge100", &["on-100", "on-105", "on-200"]),
+            ("lt100", &["on-neg", "on-zero"]),
+            ("le100", &["on-100", "on-neg", "on-zero"]),
+            ("lt0", &["on-neg"]),
+            // Not a number: must match nothing. It used to be read as 0.
+            ("abc", &[]),
+            ("apabc", &[]),
+            ("neabc", &[]),
+            ("gtabc", &[]),
+        ];
+        let mut failures = Vec::new();
+        for (value, expected) in cases {
+            let result = backend
+                .resolve_chain(
+                    &tenant,
+                    "Observation",
+                    "has-member:MolecularSequence.window-start",
+                    value,
+                )
+                .await;
+            check_chain_case(&mut failures, "window-start", value, result, expected);
+        }
+        assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+    }
+
+    /// `DiagnosticReport?result:Observation.value-quantity=<value>` through the
+    /// trait API (#1306), including the `number|system|code` forms.
+    #[tokio::test]
+    async fn postgres_integration_resolve_chain_quantity_terminal() {
+        use helios_persistence::core::ChainedSearchProvider;
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("chain-quantity");
+        seed_chain_numeric_fixture(&backend, &tenant).await;
+
+        let cases: &[(&str, &[&str])] = &[
+            // No unit: the stored number alone is compared.
+            ("ap5.4", &["dr-a", "dr-b"]),
+            ("ap-5.4", &["dr-neg"]),
+            ("5.4", &["dr-a"]),
+            ("ne5.4", &["dr-b", "dr-c", "dr-g", "dr-neg"]),
+            ("gt5.4", &["dr-b", "dr-c"]),
+            ("ge5.4", &["dr-a", "dr-b", "dr-c"]),
+            ("lt0", &["dr-neg"]),
+            ("sa5.4", &["dr-b", "dr-c"]),
+            ("eb5.4", &["dr-g", "dr-neg"]),
+            ("le5.4", &["dr-a", "dr-g", "dr-neg"]),
+            // With a unit, as the unchained search reads it: the stored unit,
+            // or a UCUM equivalent (0.0054 g is 5.4 mg).
+            ("5.4|http://unitsofmeasure.org|mg", &["dr-a", "dr-g"]),
+            ("5.4||mg", &["dr-a", "dr-g"]),
+            (
+                "ap5.4|http://unitsofmeasure.org|mg",
+                &["dr-a", "dr-b", "dr-g"],
+            ),
+            ("ap-5.4||mg", &["dr-neg"]),
+            ("gt5.4||mg", &["dr-b", "dr-c"]),
+            ("5.4||kg", &[]),
+            // Not a number: must match nothing. It used to be read as 0.
+            ("abc", &[]),
+            ("apabc", &[]),
+            ("neabc", &[]),
+            ("abc||mg", &[]),
+        ];
+        let mut failures = Vec::new();
+        for (value, expected) in cases {
+            let result = backend
+                .resolve_chain(
+                    &tenant,
+                    "DiagnosticReport",
+                    "result:Observation.value-quantity",
+                    value,
+                )
+                .await;
+            check_chain_case(&mut failures, "value-quantity", value, result, expected);
+        }
+        assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+    }
+
+    /// Reverse chains onto numeric terminals (#1306):
+    /// `Patient?_has:Observation:subject:value-quantity=<value>` for quantity
+    /// and `Patient?_has:ChargeItem:subject:factor-override=<value>` for number.
+    #[tokio::test]
+    async fn postgres_integration_resolve_reverse_chain_numeric_terminal() {
+        use helios_persistence::core::ChainedSearchProvider;
+        use helios_persistence::types::{ReverseChainedParameter, SearchValue};
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("reverse-chain-numeric");
+        seed_chain_numeric_fixture(&backend, &tenant).await;
+        for (patient, factor) in [("pq-a", 2.0), ("pq-neg", -2.0), ("pq-c", 0.0)] {
+            backend
+                .create(
+                    &tenant,
+                    "ChargeItem",
+                    json!({
+                        "resourceType": "ChargeItem",
+                        "id": format!("ci-{patient}"),
+                        "status": "billable",
+                        "code": {"text": "x"},
+                        "subject": {"reference": format!("Patient/{patient}")},
+                        "factorOverride": factor,
+                    }),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+
+        let cases: &[(&str, &str, &str, &[&str])] = &[
+            ("Observation", "value-quantity", "ap5.4", &["pq-a", "pq-b"]),
+            ("Observation", "value-quantity", "ap-5.4", &["pq-neg"]),
+            (
+                "Observation",
+                "value-quantity",
+                "5.4||mg",
+                &["pq-a", "pq-g"],
+            ),
+            ("Observation", "value-quantity", "lt0", &["pq-neg"]),
+            ("Observation", "value-quantity", "apabc", &[]),
+            ("ChargeItem", "factor-override", "ap2", &["pq-a"]),
+            ("ChargeItem", "factor-override", "ap-2", &["pq-neg"]),
+            ("ChargeItem", "factor-override", "2", &["pq-a"]),
+            ("ChargeItem", "factor-override", "ne2", &["pq-c", "pq-neg"]),
+            ("ChargeItem", "factor-override", "lt0", &["pq-neg"]),
+            ("ChargeItem", "factor-override", "abc", &[]),
+            ("ChargeItem", "factor-override", "apabc", &[]),
+        ];
+        let mut failures = Vec::new();
+        for (source, param, value, expected) in cases {
+            let rc = ReverseChainedParameter::terminal(
+                *source,
+                "subject",
+                *param,
+                SearchValue::parse(value),
+            );
+            let result = backend.resolve_reverse_chain(&tenant, "Patient", &rc).await;
+            check_chain_case(
+                &mut failures,
+                &format!("_has {param}"),
+                value,
+                result,
+                expected,
+            );
+        }
+        assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+    }
+
     // ========================================================================
     // Bulk Export — Phase 2 multi-instance job state on Postgres.
     // ========================================================================
@@ -12541,138 +13201,59 @@ mod postgres_integration {
         )
     }
 
-    /// A heartbeat used to write a hardcoded `now + 60s`, so a deployment that
-    /// raised `HFS_BULK_EXPORT_LEASE_DURATION` for slow batches saw the very
-    /// first renewal shrink the lease back to a minute — and the job got
-    /// reclaimed mid-run anyway (#1152). The renewal now extends by the
-    /// duration the job was claimed under.
-    #[tokio::test]
-    async fn postgres_integration_export_heartbeat_extends_by_a_short_lease_duration() {
-        let _guard = BULK_EXPORT_TEST_LOCK.lock().await;
-        let backend = create_backend().await;
-        let tenant = create_tenant("export-heartbeat-short");
-
-        let job_id = backend
-            .start_export(&tenant, export_input(ExportRequest::system()))
-            .await
-            .unwrap();
-        let worker = WorkerId::new(format!("pg-hb-short-{}", uuid::Uuid::new_v4()));
-        let lease = claim_specific(&backend, &worker, &job_id, StdDuration::from_secs(5)).await;
-
-        let before = Utc::now();
-        let returned = backend.heartbeat(&lease).await.unwrap();
-        let (persisted, heartbeat_at) = export_lease_row(&backend, &job_id).await;
-
-        assert!(
-            (returned - persisted).num_milliseconds().abs() < 1,
-            "the heartbeat returns exactly the expiry it wrote: {returned} vs {persisted}"
-        );
-        let extension = persisted - before;
-        assert!(
-            extension >= chrono::Duration::seconds(4),
-            "a 5s lease is renewed for about 5s, got {extension}"
-        );
-        assert!(
-            extension < chrono::Duration::seconds(30),
-            "a 5s lease must not be stretched toward the old hardcoded 60s, got {extension}"
-        );
-        assert!(
-            heartbeat_at >= before - chrono::Duration::seconds(1),
-            "the heartbeat timestamp moves with the renewal"
-        );
-
-        backend
-            .finish_export_job(&tenant, &job_id, &worker, lease.fencing_token)
-            .await
-            .unwrap();
-    }
-
-    /// The other half of #1152: a lease longer than the old hardcoded minute
-    /// keeps its length across renewals, which is the whole point of raising
-    /// `HFS_BULK_EXPORT_LEASE_DURATION` for exports whose batches take minutes.
-    #[tokio::test]
-    async fn postgres_integration_export_heartbeat_honors_a_long_lease_duration() {
-        let _guard = BULK_EXPORT_TEST_LOCK.lock().await;
-        let backend = create_backend().await;
-        let tenant = create_tenant("export-heartbeat-long");
-
-        let job_id = backend
-            .start_export(&tenant, export_input(ExportRequest::system()))
-            .await
-            .unwrap();
-        let worker = WorkerId::new(format!("pg-hb-long-{}", uuid::Uuid::new_v4()));
-        let lease = claim_specific(&backend, &worker, &job_id, StdDuration::from_secs(300)).await;
-
-        let before = Utc::now();
-        backend.heartbeat(&lease).await.unwrap();
-        let (persisted, _) = export_lease_row(&backend, &job_id).await;
-
-        let extension = persisted - before;
-        assert!(
-            extension > chrono::Duration::seconds(120),
-            "a 300s lease must not be shrunk to the old hardcoded 60s, got {extension}"
-        );
-        assert!(
-            extension >= chrono::Duration::seconds(299)
-                && extension <= chrono::Duration::seconds(330),
-            "a 300s lease is renewed for about 300s, got {extension}"
-        );
-
-        backend
-            .finish_export_job(&tenant, &job_id, &worker, lease.fencing_token)
-            .await
-            .unwrap();
-    }
-
-    /// Round trip: the duration passed to `claim_next` rides on the lease it
-    /// returns, and that is what every later renewal extends by — so repeated
-    /// heartbeats keep pushing the expiry out by the configured duration
-    /// instead of converging on a backend constant (#1152).
+    /// Claims and repeated heartbeats preserve short, default, and long lease
+    /// durations in both stored timestamps (#1152).
     #[tokio::test]
     async fn postgres_integration_export_claim_lease_duration_round_trips_into_heartbeats() {
         let _guard = BULK_EXPORT_TEST_LOCK.lock().await;
         let backend = create_backend().await;
         let tenant = create_tenant("export-heartbeat-roundtrip");
 
-        let job_id = backend
-            .start_export(&tenant, export_input(ExportRequest::system()))
-            .await
-            .unwrap();
-        let worker = WorkerId::new(format!("pg-hb-rt-{}", uuid::Uuid::new_v4()));
-        let configured = StdDuration::from_secs(180);
-        let lease = claim_specific(&backend, &worker, &job_id, configured).await;
+        for seconds in [30, 60, 180] {
+            let job_id = backend
+                .start_export(&tenant, export_input(ExportRequest::system()))
+                .await
+                .unwrap();
+            let worker = WorkerId::new(format!("pg-hb-{seconds}-{}", uuid::Uuid::new_v4()));
+            let configured = StdDuration::from_secs(seconds);
+            let lease = claim_specific(&backend, &worker, &job_id, configured).await;
+            let expected = chrono::Duration::seconds(seconds as i64);
 
-        assert_eq!(
-            lease.lease_duration, configured,
-            "the claim carries the configured lease duration back to the worker"
-        );
-        let (claimed_expiry, _) = export_lease_row(&backend, &job_id).await;
-        assert!(
-            claimed_expiry - Utc::now() > chrono::Duration::seconds(120),
-            "the claim itself already honours the configured duration"
-        );
+            assert_eq!(lease.lease_duration, configured);
+            let (claimed_expiry, claimed_heartbeat) = export_lease_row(&backend, &job_id).await;
+            let claim_precision_loss = (lease.lease_expiry - claimed_expiry)
+                .num_nanoseconds()
+                .unwrap()
+                .abs();
+            assert!(
+                claim_precision_loss < 1_000,
+                "PostgreSQL may discard sub-microsecond precision, lost {claim_precision_loss}ns"
+            );
+            assert_eq!(claimed_expiry - claimed_heartbeat, expected);
 
-        let first = backend.heartbeat(&lease).await.unwrap();
-        assert!(
-            first >= claimed_expiry,
-            "a renewal never moves the expiry backwards: {first} vs {claimed_expiry}"
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        let second = backend.heartbeat(&lease).await.unwrap();
-        assert!(
-            second > first,
-            "each renewal pushes the expiry further out: {second} vs {first}"
-        );
-        let (persisted, _) = export_lease_row(&backend, &job_id).await;
-        assert!(
-            persisted - Utc::now() > chrono::Duration::seconds(120),
-            "after two renewals the lease is still the configured 180s, not 60s"
-        );
+            for renewal in 1..=2 {
+                let returned = backend.heartbeat(&lease).await.unwrap();
+                let (persisted_expiry, heartbeat_at) = export_lease_row(&backend, &job_id).await;
+                let precision_loss = (returned - persisted_expiry)
+                    .num_nanoseconds()
+                    .unwrap()
+                    .abs();
+                assert!(
+                    precision_loss < 1_000,
+                    "renewal {renewal} for {seconds}s lost {precision_loss}ns to PostgreSQL precision"
+                );
+                assert_eq!(
+                    persisted_expiry - heartbeat_at,
+                    expected,
+                    "renewal {renewal} must preserve the {seconds}s claim duration"
+                );
+            }
 
-        backend
-            .finish_export_job(&tenant, &job_id, &worker, lease.fencing_token)
-            .await
-            .unwrap();
+            backend
+                .finish_export_job(&tenant, &job_id, &worker, lease.fencing_token)
+                .await
+                .unwrap();
+        }
     }
 
     /// Renewing by the lease's own duration must not weaken the fence: a
@@ -12690,27 +13271,55 @@ mod postgres_integration {
             .unwrap();
         let worker_a = WorkerId::new(format!("pg-hb-stolen-a-{}", uuid::Uuid::new_v4()));
         let lease_a =
-            claim_specific(&backend, &worker_a, &job_id, StdDuration::from_millis(1)).await;
+            claim_specific(&backend, &worker_a, &job_id, StdDuration::from_secs(30)).await;
 
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        // Expire only the row still owned by worker A. This avoids a timing
+        // dependency while proving the update itself is fenced.
+        let past = Utc::now() - chrono::Duration::seconds(1);
+        let stale_token = lease_a.fencing_token as i64;
+        let client = backend.get_client().await.unwrap();
+        let affected = client
+            .execute(
+                "UPDATE bulk_export_jobs SET lease_expiry = $1
+                 WHERE id = $2 AND worker_id = $3 AND fencing_token = $4",
+                &[&past, &job_id.as_str(), &worker_a.as_str(), &stale_token],
+            )
+            .await
+            .unwrap();
+        assert_eq!(affected, 1, "the test must expire exactly worker A's row");
+        drop(client);
+
         let worker_b = WorkerId::new(format!("pg-hb-stolen-b-{}", uuid::Uuid::new_v4()));
         let lease_b =
-            claim_specific(&backend, &worker_b, &job_id, StdDuration::from_secs(60)).await;
+            claim_specific(&backend, &worker_b, &job_id, StdDuration::from_secs(180)).await;
         assert!(lease_b.fencing_token > lease_a.fencing_token);
-        let (expiry_after_steal, _) = export_lease_row(&backend, &job_id).await;
+        assert_eq!(lease_b.lease_duration, StdDuration::from_secs(180));
+        let row_after_steal = export_lease_row(&backend, &job_id).await;
 
         assert!(matches!(
             backend.heartbeat(&lease_a).await,
             Err(LeaseError::LeaseLost { job_id: lost }) if lost == job_id
         ));
-        let (expiry_now, _) = export_lease_row(&backend, &job_id).await;
         assert_eq!(
-            expiry_now, expiry_after_steal,
-            "the fenced-out heartbeat left the new owner's lease untouched"
+            export_lease_row(&backend, &job_id).await,
+            row_after_steal,
+            "the stale heartbeat must change neither lease timestamp"
         );
 
-        // The new owner's own heartbeat still works.
-        backend.heartbeat(&lease_b).await.unwrap();
+        let returned = backend.heartbeat(&lease_b).await.unwrap();
+        let (persisted_expiry, heartbeat_at) = export_lease_row(&backend, &job_id).await;
+        assert!(
+            (returned - persisted_expiry)
+                .num_nanoseconds()
+                .unwrap()
+                .abs()
+                < 1_000
+        );
+        assert_eq!(
+            persisted_expiry - heartbeat_at,
+            chrono::Duration::seconds(180),
+            "the new owner's duration controls its renewal"
+        );
         backend
             .finish_export_job(&tenant, &job_id, &worker_b, lease_b.fencing_token)
             .await
@@ -17189,6 +17798,20 @@ mod postgres_integration {
 
     fn unique_base(label: &str) -> String {
         format!("{}_{}", label, uuid::Uuid::new_v4().simple())
+    }
+
+    /// #1312: `family=Neal` / `identifier=ne123` name the right resource on
+    /// every conditional interaction, and never the decoy the old
+    /// comparator-stripping parse would have found.
+    #[tokio::test]
+    async fn postgres_integration_conditional_criteria_with_prefix_like_values() {
+        let backend = create_backend().await;
+        super::conditional_criteria_suite::prefix_like_criteria_name_the_right_resource(
+            &backend,
+            &unique_base("cond_criteria_1312"),
+            true,
+        )
+        .await;
     }
 
     #[tokio::test]

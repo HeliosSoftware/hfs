@@ -67,6 +67,15 @@ fn reject_contained_missing(query: &SearchQuery) -> StorageResult<()> {
     Ok(())
 }
 
+/// A `_cursor` that decoded but carries a sort value of the wrong type for its
+/// sort key. Cursors are unkeyed base64 JSON, so any client can craft one; this
+/// is a bad request (400), not a server fault (#1120).
+fn invalid_cursor(cursor: &PageCursor) -> StorageError {
+    StorageError::Search(SearchError::InvalidCursor {
+        cursor: cursor.encode(),
+    })
+}
+
 /// Binds the cursor's boundary sort value as `?3`, typed per the sort key kind.
 /// Timestamps are stored as RFC3339 text, so they bind (and compare) as text.
 fn bind_cursor_value(
@@ -81,20 +90,14 @@ fn bind_cursor_value(
                 Some(CursorValue::Decimal(f)) => *f,
                 Some(CursorValue::Number(i)) => *i as f64,
                 Some(CursorValue::String(s)) => s.parse().unwrap_or(0.0),
-                _ => {
-                    return Err(internal_error(
-                        "Invalid cursor: expected number".to_string(),
-                    ));
-                }
+                _ => return Err(invalid_cursor(cursor)),
             };
             params.push(Box::new(n));
         }
         SortValueKind::Timestamp | SortValueKind::Text => match value {
             Some(CursorValue::String(s)) => params.push(Box::new(s.clone())),
             Some(CursorValue::Null) | None => params.push(Box::new(Option::<String>::None)),
-            _ => {
-                return Err(internal_error("Invalid cursor: expected text".to_string()));
-            }
+            _ => return Err(invalid_cursor(cursor)),
         },
     }
     Ok(())
@@ -1287,6 +1290,30 @@ mod tests {
     use crate::tenant::{TenantId, TenantPermissions};
     use crate::types::SearchParameter;
     use serde_json::json;
+
+    #[test]
+    fn a_type_mismatched_cursor_sort_value_is_a_client_error() {
+        // Crafted: a boolean where the Timestamp sort key expects an RFC3339
+        // string. Must surface as a 400 InvalidCursor, not a 500 (#1120).
+        let cursor = PageCursor::new(vec![CursorValue::Boolean(true)], "p1");
+        let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        let err = bind_cursor_value(&mut params, SortValueKind::Timestamp, &cursor)
+            .expect_err("a boolean is not a timestamp");
+        match err {
+            StorageError::Search(SearchError::InvalidCursor { cursor: c }) => {
+                assert_eq!(c, cursor.encode())
+            }
+            other => panic!("expected InvalidCursor, got {other:?}"),
+        }
+
+        // A well-typed cursor still binds.
+        let ok = PageCursor::new(
+            vec![CursorValue::String("2024-01-01T00:00:00Z".to_string())],
+            "p1",
+        );
+        let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        assert!(bind_cursor_value(&mut params, SortValueKind::Timestamp, &ok).is_ok());
+    }
 
     fn create_test_backend() -> SqliteBackend {
         // Point at the workspace's data directory so the search-parameter

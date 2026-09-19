@@ -1,8 +1,9 @@
 //! Number parameter SQL handler.
 
-use crate::types::{SearchPrefix, SearchValue};
+use crate::types::SearchValue;
 
-use super::super::query_builder::{SqlFragment, SqlParam};
+use super::super::query_builder::SqlFragment;
+use super::quantity::QuantityHandler;
 
 /// Handles number parameter SQL generation.
 pub struct NumberHandler;
@@ -12,6 +13,22 @@ impl NumberHandler {
     ///
     /// Supports all comparison prefixes: eq, ne, gt, lt, ge, le, sa, eb, ap.
     pub fn build_sql(value: &SearchValue, param_offset: usize) -> SqlFragment {
+        Self::build_sql_for("value_number", value, param_offset)
+    }
+
+    /// [`Self::build_sql`] against an explicit column expression, for the
+    /// chain builder's number terminal (`si2.value_number`, #1306).
+    ///
+    /// The per-prefix table is
+    /// [`QuantityHandler::build_numeric_condition`], shared with quantity
+    /// search: `eq`/`ne` match the implicit-precision range `[lo, hi)` derived
+    /// from the search text as written ("100" → [99.5, 100.5)), the
+    /// comparators use the exact value, and `ap` is +/- 10% of the magnitude.
+    pub(crate) fn build_sql_for(
+        column: &str,
+        value: &SearchValue,
+        param_offset: usize,
+    ) -> SqlFragment {
         let param_num = param_offset + 1;
 
         // Parse the number value
@@ -23,80 +40,21 @@ impl NumberHandler {
             }
         };
 
-        match value.prefix {
-            SearchPrefix::Eq | SearchPrefix::Ne => {
-                // eq/ne match the implicit-precision range [lo, hi) derived
-                // from the search text as written (FHIR spec).
-                let (lo, hi) = crate::search::implicit_range(num_value, &value.value);
-                if matches!(value.prefix, SearchPrefix::Eq) {
-                    Self::build_equals(lo, hi, param_num)
-                } else {
-                    Self::build_not_equals(lo, hi, param_num)
-                }
-            }
-            // gt/lt/ge/le/sa/eb compare against the exact search value: per
-            // the FHIR spec, the implicit precision is ignored for these
-            // prefixes.
-            SearchPrefix::Gt | SearchPrefix::Sa => Self::cmp(">", num_value, param_num),
-            SearchPrefix::Lt | SearchPrefix::Eb => Self::cmp("<", num_value, param_num),
-            SearchPrefix::Ge => Self::cmp(">=", num_value, param_num),
-            SearchPrefix::Le => Self::cmp("<=", num_value, param_num),
-            SearchPrefix::Ap => Self::build_approximately(num_value, param_num),
-        }
-    }
-
-    /// Builds a single-boundary numeric comparison `value_number {op} ?`.
-    fn cmp(op: &str, bound: f64, param_num: usize) -> SqlFragment {
-        SqlFragment::with_params(
-            format!("value_number {} ?{}", op, param_num),
-            vec![SqlParam::float(bound)],
-        )
-    }
-
-    /// Equality - matches the implicit-precision range `[lo, hi)` derived
-    /// from the search text as written (e.g. "100" → [99.5, 100.5), "100.0"
-    /// → [99.95, 100.05)).
-    fn build_equals(lo: f64, hi: f64, param_num: usize) -> SqlFragment {
-        SqlFragment::with_params(
-            format!(
-                "value_number >= ?{} AND value_number < ?{}",
-                param_num,
-                param_num + 1
-            ),
-            vec![SqlParam::float(lo), SqlParam::float(hi)],
-        )
-    }
-
-    /// Not equals - outside the implicit-precision range `[lo, hi)` derived
-    /// from the search text as written.
-    fn build_not_equals(lo: f64, hi: f64, param_num: usize) -> SqlFragment {
-        SqlFragment::with_params(
-            format!(
-                "(value_number < ?{} OR value_number >= ?{})",
-                param_num,
-                param_num + 1
-            ),
-            vec![SqlParam::float(lo), SqlParam::float(hi)],
-        )
-    }
-
-    /// Approximately equals - +/- 10%.
-    fn build_approximately(value: f64, param_num: usize) -> SqlFragment {
-        let margin = (value.abs() * 0.1).max(0.0001); // At least 0.0001 for very small numbers
-
-        SqlFragment::with_params(
-            format!("value_number BETWEEN ?{} AND ?{}", param_num, param_num + 1),
-            vec![
-                SqlParam::float(value - margin),
-                SqlParam::float(value + margin),
-            ],
+        QuantityHandler::build_numeric_condition(
+            column,
+            num_value,
+            &value.value,
+            value.prefix,
+            param_num,
         )
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::super::super::query_builder::SqlParam;
     use super::*;
+    use crate::types::SearchPrefix;
 
     #[test]
     fn test_number_eq() {
