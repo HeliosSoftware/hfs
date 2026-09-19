@@ -175,9 +175,14 @@ fn numeric_predicate(
 /// Returns the `[start, end)` timestamp range for a date search value at its
 /// inherent precision (year/month/day). Full-precision instants return a
 /// degenerate range (`start == end`).
-fn date_precision_range(value: &str) -> (DateTime<Utc>, DateTime<Utc>) {
+///
+/// Returns `None` when the value is not a date at all (see
+/// [`PostgresQueryBuilder::parse_date_value`]). Every caller must turn that into
+/// [`match_nothing`] rather than skipping the value: a dropped constraint
+/// over-matches.
+pub(crate) fn date_precision_range(value: &str) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
     use chrono::Datelike;
-    let start = PostgresQueryBuilder::parse_date_value(value);
+    let start = PostgresQueryBuilder::parse_date_value(value)?;
     let end = if value.contains('T') {
         start
     } else if value.len() == 4 {
@@ -195,7 +200,18 @@ fn date_precision_range(value: &str) -> (DateTime<Utc>, DateTime<Utc>) {
     } else {
         start
     };
-    (start, end)
+    Some((start, end))
+}
+
+/// The condition emitted for a search value that cannot be interpreted: it
+/// matches no row and binds no parameter, so it costs the surrounding builder no
+/// `$N` placeholder and the numbering stays gap-free.
+///
+/// Used under *every* prefix, `ne` included. `ne` normally widens a result set,
+/// but "not equal to something unparseable" is not a question the client asked;
+/// invalid input must never return more than valid input could.
+pub(crate) fn match_nothing() -> SqlFragment {
+    SqlFragment::new("FALSE")
 }
 
 /// How a sort key's value is typed for cursor (keyset) binding and comparison.
@@ -810,7 +826,12 @@ impl PostgresQueryBuilder {
         let mut conditions = Vec::new();
         let mut next = offset;
         for value in values {
-            let (start, end) = date_precision_range(&value.value);
+            // Not a date: fail closed. `continue` would drop the constraint and
+            // return every resource of the type (#1289).
+            let Some((start, end)) = date_precision_range(&value.value) else {
+                conditions.push(match_nothing());
+                continue;
+            };
             let degenerate = start == end;
             let (sql, params): (String, Vec<SqlParam>) = match value.prefix {
                 SearchPrefix::Eq if !degenerate => {
@@ -1679,7 +1700,13 @@ impl PostgresQueryBuilder {
             }
             SearchParamType::Date => {
                 let op = Self::prefix_to_operator(&value.prefix);
-                let ts = Self::parse_date_value(&value.value);
+                // Not a date: a bare `FALSE` predicate with no params, rather
+                // than `None`. Composite callers treat `None` as match-nothing,
+                // but `build_contained` skips it, which would drop the
+                // constraint and over-match (#1289).
+                let Some(ts) = Self::parse_date_value(&value.value) else {
+                    return Some((match_nothing().sql, Vec::new()));
+                };
                 Some((
                     format!("value_date {} ${}", op, offset + 1),
                     vec![SqlParam::Timestamp(ts)],
@@ -1694,7 +1721,12 @@ impl PostgresQueryBuilder {
         let mut next = offset;
 
         for value in &param.values {
-            let (start, end) = date_precision_range(&value.value);
+            // Not a date: fail closed. `continue` would drop the constraint and
+            // return every resource of the type (#1289).
+            let Some((start, end)) = date_precision_range(&value.value) else {
+                conditions.push(match_nothing());
+                continue;
+            };
             // Comparators match against the precision-range boundaries; a
             // full-precision instant (degenerate range) falls back to scalar.
             let degenerate = start == end;
@@ -2319,22 +2351,31 @@ impl PostgresQueryBuilder {
     /// Parses a FHIR date search value into a `DateTime<Utc>`.
     ///
     /// Handles partial dates (year, year-month, date) and full date-times.
-    fn parse_date_value(value: &str) -> DateTime<Utc> {
+    ///
+    /// Returns `None` when the value is not a date (`not-a-date`, `2024-13-45`).
+    /// This previously fell back to `Utc::now()`, which turned a parse failure
+    /// into a plausible-looking bound: `lt`/`le` then matched essentially every
+    /// indexed row, `gt`/`ge`/`eq` matched nothing, and the client got an
+    /// ordinary `200` either way (#1289). It is also what hid #1288 — a
+    /// mishandled negative offset became "compare against now" instead of a
+    /// visible failure. The index writer dropped the identical fallback for the
+    /// same reason; see `parse_index_date` in `writer.rs` (#494).
+    pub(crate) fn parse_date_value(value: &str) -> Option<DateTime<Utc>> {
         // Normalized by the same function the index writer uses, so a search
         // value and the stored value it should match can never be zoned
         // differently. This used to carry its own zone test, which recognized
         // only `+`, `Z` and `-00:00`: every other negative offset
         // (`2013-04-05T09:20:00-04:00`) was taken for zone-less, had `+00:00`
-        // appended, failed to parse, and fell through to `Utc::now()` below —
-        // so the search silently compared against the current time and
-        // matched nothing. The writer's copy of that bug was fixed; this one
-        // was not.
+        // appended, failed to parse, and fell through to the `Utc::now()`
+        // fallback this function then had — so the search silently compared
+        // against the current time and matched nothing. The writer's copy of
+        // that bug was fixed; this one was not.
         let normalized = super::writer::normalize_date_for_pg(value);
 
         DateTime::parse_from_rfc3339(&normalized)
             .map(|dt| dt.with_timezone(&Utc))
             .or_else(|_| normalized.parse::<DateTime<Utc>>())
-            .unwrap_or_else(|_| Utc::now())
+            .ok()
     }
 }
 
@@ -3092,11 +3133,197 @@ mod tests {
         ];
         for (input, expected) in cases {
             assert_eq!(
-                PostgresQueryBuilder::parse_date_value(input).to_rfc3339(),
-                expected,
+                PostgresQueryBuilder::parse_date_value(input).map(|ts| ts.to_rfc3339()),
+                Some(expected.to_string()),
                 "input {input}"
             );
         }
+    }
+
+    /// Every prefix a date search value can carry. An unparseable value must
+    /// behave identically under all of them.
+    const DATE_PREFIXES: [SearchPrefix; 9] = [
+        SearchPrefix::Eq,
+        SearchPrefix::Ne,
+        SearchPrefix::Gt,
+        SearchPrefix::Lt,
+        SearchPrefix::Ge,
+        SearchPrefix::Le,
+        SearchPrefix::Sa,
+        SearchPrefix::Eb,
+        SearchPrefix::Ap,
+    ];
+
+    /// Values that reach the builder but are not dates: free text, an
+    /// impossible calendar date, an impossible day, and a mangled zone.
+    const NOT_DATES: [&str; 4] = [
+        "not-a-date",
+        "2024-13-45",
+        "2024-02-30T10:00:00Z",
+        "2013-04-05T09:20:00-99",
+    ];
+
+    /// Fails if any bound param is a timestamp. An unparseable value has no
+    /// legitimate timestamp to bind, so the type alone catches the old
+    /// `Utc::now()` fallback; a near-now instant is called out in the message so
+    /// a regression names its own cause.
+    fn assert_binds_no_timestamp(frag: &SqlFragment, context: &str) {
+        let now = Utc::now();
+        for p in &frag.params {
+            if let SqlParam::Timestamp(ts) = p {
+                let near_now = (now - *ts).num_seconds().abs() < 3600;
+                panic!(
+                    "{context}: bound timestamp {ts} (near now: {near_now}) in {}",
+                    frag.sql
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn parse_date_value_rejects_what_is_not_a_date() {
+        // #1289: these used to come back as `Utc::now()`.
+        for input in NOT_DATES {
+            assert_eq!(
+                PostgresQueryBuilder::parse_date_value(input),
+                None,
+                "input {input}"
+            );
+            assert_eq!(date_precision_range(input), None, "input {input}");
+        }
+    }
+
+    #[test]
+    fn unparseable_date_matches_nothing_under_every_prefix() {
+        // #1289: `date=ltnot-a-date` bound the current time and so matched
+        // essentially every indexed row; `gt`/`ge`/`eq` matched nothing. All of
+        // them — `ne` included — must now match nothing and bind nothing.
+        for prefix in DATE_PREFIXES {
+            for input in NOT_DATES {
+                let context = format!("{prefix:?} {input}");
+                let query =
+                    SearchQuery::new("Procedure").with_parameter(date_param("date", prefix, input));
+                let frag = PostgresQueryBuilder::build_search_query(&query, 2)
+                    .expect("an invalid date must still constrain the query");
+
+                assert_eq!(frag.sql, "FALSE", "{context}");
+                assert!(frag.params.is_empty(), "{context}: {:?}", frag.params);
+                assert_binds_no_timestamp(&frag, &context);
+            }
+        }
+    }
+
+    #[test]
+    fn unparseable_last_updated_matches_nothing_under_every_prefix() {
+        for prefix in DATE_PREFIXES {
+            for input in NOT_DATES {
+                let context = format!("{prefix:?} {input}");
+                let query = SearchQuery::new("Patient").with_parameter(special_param(
+                    "_lastUpdated",
+                    vec![SearchValue::new(prefix, input)],
+                ));
+                let frag = PostgresQueryBuilder::build_search_query(&query, 2)
+                    .expect("an invalid _lastUpdated must still constrain the query");
+
+                assert_eq!(frag.sql, "FALSE", "{context}");
+                assert!(frag.params.is_empty(), "{context}: {:?}", frag.params);
+                assert_binds_no_timestamp(&frag, &context);
+            }
+        }
+    }
+
+    #[test]
+    fn unparseable_date_beside_a_valid_one_keeps_placeholders_gap_free() {
+        // Repeated values AND together, so one bad value empties the result. It
+        // must not consume a placeholder number it never binds: the valid value
+        // after it still starts at `$3`.
+        let mut param = date_param("date", SearchPrefix::Lt, "not-a-date");
+        param
+            .values
+            .push(SearchValue::new(SearchPrefix::Eq, "2024-01-15"));
+        let query = SearchQuery::new("Procedure").with_parameter(param);
+        let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("condition");
+
+        assert!(frag.sql.starts_with("(FALSE) AND ("), "{}", frag.sql);
+        assert!(
+            frag.sql.contains("value_date >= $3 AND value_date < $4"),
+            "{}",
+            frag.sql
+        );
+        assert!(!frag.sql.contains("$5"), "{}", frag.sql);
+        // Only the valid value's range is bound.
+        match frag.params.as_slice() {
+            [SqlParam::Timestamp(start), SqlParam::Timestamp(end)] => {
+                assert_eq!(start.to_rfc3339(), "2024-01-15T00:00:00+00:00");
+                assert_eq!(end.to_rfc3339(), "2024-01-16T00:00:00+00:00");
+            }
+            other => panic!("must bind exactly the valid day's range: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unparseable_composite_date_component_matches_nothing() {
+        // The date component becomes a bare `FALSE` inside the conjunction, so
+        // the token component still binds its code at `$3` and the row
+        // predicate can never hold.
+        for prefix in ["", "eq", "ne", "gt", "lt", "ge", "le", "sa", "eb", "ap"] {
+            for input in NOT_DATES {
+                let context = format!("{prefix}{input}");
+                let param = SearchParameter {
+                    name: "code-value-date".to_string(),
+                    param_type: SearchParamType::Composite,
+                    modifier: None,
+                    values: vec![SearchValue::new(
+                        SearchPrefix::Eq,
+                        format!("8867-4${prefix}{input}"),
+                    )],
+                    chain: vec![],
+                    components: vec![
+                        CompositeSearchComponent {
+                            param_type: SearchParamType::Token,
+                            param_name: "code".to_string(),
+                        },
+                        CompositeSearchComponent {
+                            param_type: SearchParamType::Date,
+                            param_name: "value".to_string(),
+                        },
+                    ],
+                };
+                let query = SearchQuery::new("Observation").with_parameter(param);
+                let frag = PostgresQueryBuilder::build_search_query(&query, 2)
+                    .expect("an invalid composite date must still constrain the query");
+
+                assert!(
+                    frag.sql.contains("(value_token_code = $3) AND (FALSE)"),
+                    "{context}: {}",
+                    frag.sql
+                );
+                assert!(!frag.sql.contains("value_date"), "{context}: {}", frag.sql);
+                assert!(!frag.sql.contains("$4"), "{context}: {}", frag.sql);
+                assert_eq!(frag.params.len(), 1, "{context}: {:?}", frag.params);
+                assert_binds_no_timestamp(&frag, &context);
+            }
+        }
+    }
+
+    #[test]
+    fn unparseable_contained_date_is_not_dropped() {
+        // `build_contained` skips a component that yields `None`, which would
+        // drop the parameter and match every contained resource of the type.
+        let query = SearchQuery::new("Procedure").with_parameter(date_param(
+            "date",
+            SearchPrefix::Lt,
+            "not-a-date",
+        ));
+        let frag = PostgresQueryBuilder::build_contained(&query)
+            .expect("an invalid date must still constrain the contained match");
+
+        assert!(
+            frag.sql.contains("(param_name = 'date' AND (FALSE))"),
+            "{}",
+            frag.sql
+        );
+        assert!(frag.params.is_empty(), "{:?}", frag.params);
     }
 
     #[test]
