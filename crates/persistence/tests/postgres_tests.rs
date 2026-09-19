@@ -11739,6 +11739,175 @@ mod postgres_integration {
         }
     }
 
+    /// Seeds the #1307 fixture through the real write path. Every terminal
+    /// value that begins with a comparator pair (`ne…`, `eq…`) has a decoy
+    /// whose value is what is left once the pair is wrongly stripped, so a
+    /// misparse shows up as the decoy being returned.
+    async fn seed_chain_prefix_fixture(backend: &PostgresBackend, tenant: &TenantContext) {
+        let patient = |id: &str, birth: &str, family: &str| {
+            json!({"resourceType": "Patient", "id": id, "birthDate": birth,
+                   "name": [{"family": family}]})
+        };
+        let sequence = |id: &str, start: i64| {
+            json!({"resourceType": "MolecularSequence", "id": id, "coordinateSystem": 0,
+                   "referenceSeq": {"windowStart": start}})
+        };
+        let observation = |id: &str, code: &str, value: f64| {
+            json!({"resourceType": "Observation", "id": id, "status": "final",
+                   "code": {"coding": [{"system": "http://example.org/c", "code": code}]},
+                   "valueQuantity": {"value": value, "unit": "mg"}})
+        };
+        let mut o_nelson = observation("o-nelson", "ne123", 5.4);
+        o_nelson["subject"] = json!({"reference": "Patient/nelson-1"});
+        o_nelson["device"] = json!({"reference": "Device/dev-news"});
+        o_nelson["derivedFrom"] = json!([{"reference": "MolecularSequence/ms-10"}]);
+        let mut o_wilson = observation("o-wilson", "123", 0.0);
+        o_wilson["subject"] = json!({"reference": "Patient/wilson-1"});
+        o_wilson["device"] = json!({"reference": "Device/dev-ws"});
+        o_wilson["derivedFrom"] = json!([{"reference": "MolecularSequence/ms-0"}]);
+        let mut o_equus = observation("o-equus", "eq77", 7.0);
+        o_equus["subject"] = json!({"reference": "Patient/equus-1"});
+
+        let resources = [
+            ("Patient", patient("nelson-1", "1950-04-12", "Nelson")),
+            ("Patient", patient("wilson-1", "1960-01-01", "Wilson")),
+            ("Patient", patient("equus-1", "1970-01-01", "Equus")),
+            (
+                "Device",
+                json!({"resourceType": "Device", "id": "dev-news", "url": "news:example/1"}),
+            ),
+            (
+                "Device",
+                json!({"resourceType": "Device", "id": "dev-ws", "url": "ws:example/1"}),
+            ),
+            ("MolecularSequence", sequence("ms-10", 10)),
+            ("MolecularSequence", sequence("ms-0", 0)),
+            ("Observation", o_nelson),
+            ("Observation", o_wilson),
+            ("Observation", o_equus),
+            ("Observation", observation("o-77", "77", 9.0)),
+        ];
+        for (resource_type, body) in resources {
+            backend
+                .create(tenant, resource_type, body, FhirVersion::default())
+                .await
+                .unwrap();
+        }
+        for obs in ["o-nelson", "o-wilson", "o-equus", "o-77"] {
+            backend
+                .create(
+                    tenant,
+                    "DiagnosticReport",
+                    json!({
+                        "resourceType": "DiagnosticReport",
+                        "id": obs.replacen("o-", "dr-", 1),
+                        "status": "final",
+                        "code": {"text": "panel"},
+                        "result": [{"reference": format!("Observation/{obs}")}],
+                    }),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+    }
+
+    /// #1307: through the `ChainedSearchProvider` trait API a comparator
+    /// prefix is recognised only on date / number / quantity terminals —
+    /// including an explicit `eq` — and never on string / token / reference /
+    /// uri terminals, whatever the value starts with.
+    #[tokio::test]
+    async fn postgres_integration_resolve_chain_prefix_only_on_ordered_terminals() {
+        use helios_persistence::core::ChainedSearchProvider;
+
+        const WINDOW_START: &str = "derived-from:MolecularSequence.window-start";
+        const VALUE_QUANTITY: &str = "result.value-quantity";
+        const FAMILY: &str = "subject:Patient.family";
+        const BIRTHDATE: &str = "subject:Patient.birthdate";
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("chain-prefix");
+        seed_chain_prefix_fixture(&backend, &tenant).await;
+
+        let cases: &[(&str, &str, &str, &[&str])] = &[
+            // Positive controls: unprefixed values prove each terminal is
+            // indexed, so the cases below cannot pass or fail vacuously.
+            ("Observation", FAMILY, "Wilson", &["o-wilson"]),
+            ("DiagnosticReport", "result.code", "123", &["dr-wilson"]),
+            (
+                "DiagnosticReport",
+                "result.subject",
+                "wilson-1",
+                &["dr-wilson"],
+            ),
+            (
+                "Observation",
+                "device:Device.url",
+                "ws:example/1",
+                &["o-wilson"],
+            ),
+            ("DiagnosticReport", VALUE_QUANTITY, "5.4", &["dr-nelson"]),
+            ("Observation", WINDOW_START, "10", &["o-nelson"]),
+            ("Observation", BIRTHDATE, "1950-04-12", &["o-nelson"]),
+            // String terminal: `ne` + "lson" would also match Wilson.
+            ("Observation", FAMILY, "nelson", &["o-nelson"]),
+            ("Observation", FAMILY, "Nelson", &["o-nelson"]),
+            ("Observation", FAMILY, "Equus", &["o-equus"]),
+            // Token terminal: `ne` + "123" / `eq` + "77" are the decoys' codes.
+            ("DiagnosticReport", "result.code", "ne123", &["dr-nelson"]),
+            ("DiagnosticReport", "result.code", "eq77", &["dr-equus"]),
+            // Reference terminal: `ne` + "lson-1" would also match wilson-1.
+            (
+                "DiagnosticReport",
+                "result.subject",
+                "nelson-1",
+                &["dr-nelson"],
+            ),
+            // Uri terminal: `ne` + "ws:example/1" is the decoy's url.
+            (
+                "Observation",
+                "device:Device.url",
+                "news:example/1",
+                &["o-nelson"],
+            ),
+            // Quantity terminal: explicit `eq` is a prefix, as are the rest.
+            ("DiagnosticReport", VALUE_QUANTITY, "eq5.4", &["dr-nelson"]),
+            (
+                "DiagnosticReport",
+                VALUE_QUANTITY,
+                "ne5.4",
+                &["dr-77", "dr-equus", "dr-wilson"],
+            ),
+            (
+                "DiagnosticReport",
+                VALUE_QUANTITY,
+                "gt6",
+                &["dr-77", "dr-equus"],
+            ),
+            // Number terminal, likewise.
+            ("Observation", WINDOW_START, "eq10", &["o-nelson"]),
+            ("Observation", WINDOW_START, "ne10", &["o-wilson"]),
+            ("Observation", WINDOW_START, "gt5", &["o-nelson"]),
+            // Date terminal with an explicit `eq` (#1290 regression guard).
+            ("Observation", BIRTHDATE, "eq1950-04-12", &["o-nelson"]),
+        ];
+
+        let mut failures = Vec::new();
+        for (base, chain, value, expected) in cases {
+            let ids = backend
+                .resolve_chain(&tenant, base, chain, value)
+                .await
+                .unwrap_or_else(|e| panic!("{base}?{chain}={value}: {e}"));
+            let ids = sorted_ids(ids);
+            if ids != expect_ids(expected) {
+                failures.push(format!(
+                    "{base}?{chain}={value}: got {ids:?}, want {expected:?}"
+                ));
+            }
+        }
+        assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+    }
+
     // ========================================================================
     // Bulk Export — Phase 2 multi-instance job state on Postgres.
     // ========================================================================
