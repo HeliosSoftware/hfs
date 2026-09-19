@@ -282,3 +282,12 @@ async fn test_date_search_year_precision() {
         assert!(birth_date.starts_with("1990"));
     }
 }
+
+/// The shared sub-day precision and validation table (#1293, #1295, #1296,
+/// #1297); PostgreSQL, MongoDB and Elasticsearch run the same one.
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn test_date_precision_and_validation_suite() {
+    let backend = super::make_sqlite_backend();
+    super::date_precision_suite::sub_day_precision_and_validation(&backend, "date-precision").await;
+}

@@ -714,9 +714,13 @@ impl QueryBuilder {
     ) -> Option<SqlFragment> {
         let mut conditions = Vec::new();
 
-        for (i, value) in values.iter().enumerate() {
-            let cond = DateHandler::build_sql(value, param_offset + i);
+        // Advanced by the binds actually made: the match-nothing fragment for
+        // a value that is not a date binds none.
+        let mut offset = param_offset;
+        for value in values {
+            let cond = DateHandler::build_sql(value, offset);
             if !cond.is_empty() {
+                offset += cond.params.len();
                 conditions.push(cond);
             }
         }
