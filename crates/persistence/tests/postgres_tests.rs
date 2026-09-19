@@ -68,6 +68,11 @@ mod date_boundary_suite;
 #[path = "search/date_precision_suite.rs"]
 mod date_precision_suite;
 
+/// The backend-agnostic suite for stored dateTimes with minutes but no
+/// seconds (#1315). Same `#[path]` arrangement.
+#[path = "search/date_minute_index_suite.rs"]
+mod date_minute_index_suite;
+
 #[path = "common/container_cleanup.rs"]
 mod container_cleanup;
 
@@ -17212,6 +17217,19 @@ mod postgres_integration {
         super::date_precision_suite::sub_day_precision_and_validation(
             &backend,
             &unique_base("date_precision"),
+        )
+        .await;
+    }
+
+    /// #1315: a stored `…T09:20` is not RFC 3339, so `parse_index_date`
+    /// returned `None`, the `search_index` row was skipped, and the resource
+    /// could not be found by that date parameter at all.
+    #[tokio::test]
+    async fn postgres_integration_minute_precision_stored_dates_are_indexed() {
+        let backend = create_backend().await;
+        super::date_minute_index_suite::minute_precision_stored_values_are_indexed(
+            &backend,
+            &unique_base("date_minute_index"),
         )
         .await;
     }

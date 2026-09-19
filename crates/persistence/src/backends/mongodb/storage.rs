@@ -93,7 +93,35 @@ pub(super) fn chrono_to_bson(dt: DateTime<Utc>) -> BsonDateTime {
     BsonDateTime::from_millis(dt.timestamp_millis())
 }
 
+/// The instant a stored date is indexed at, or `None` when it cannot be read
+/// and the caller should skip the index entry.
+///
+/// The value is read with the search side's own `FhirDateValue` first, so
+/// whatever that grammar accepts is indexed at exactly the first instant of the
+/// range a search for the same text covers. That is what indexes a stored
+/// `…T09:20` — minutes without seconds, which RFC 3339 does not allow and which
+/// used to be skipped here although `date=…T09:20` is a valid search (#1315) —
+/// and what puts a `:60` leap second on the next second, where the search side
+/// looks for it.
+///
+/// Only the text as stored counts: the search-side repairs (trimming, and a
+/// space read as a form-decoded `+`) do not apply to a resource, where a space
+/// is simply not part of a date. Anything the strict grammar does not take
+/// verbatim falls through to the lenient reading below, which is unchanged.
 fn normalize_date_for_mongo(value: &str) -> Option<DateTime<Utc>> {
+    if let Ok(parsed) = crate::search::FhirDateValue::parse(value) {
+        if parsed.canonical() == value {
+            return Some(parsed.start);
+        }
+    }
+    normalize_date_for_mongo_lenient(value)
+}
+
+/// The reading [`normalize_date_for_mongo`] falls back to: complete the value
+/// and take whatever chrono's RFC 3339 parser makes of it. Wider than the FHIR
+/// grammar on purpose — it is what keeps an out-of-grammar value (`+14:30`, an
+/// instant past the year 9999) indexed rather than dropped.
+fn normalize_date_for_mongo_lenient(value: &str) -> Option<DateTime<Utc>> {
     let normalized = if value.contains('T') {
         if value.contains('Z') || value.contains('+') || value.matches('-').count() > 2 {
             value.to_string()
@@ -4798,15 +4826,14 @@ mod index_date_tests {
     use super::*;
 
     /// A search value and the stored value it should match must never be zoned
-    /// differently. Search values are read by the shared `FhirDateValue`;
-    /// stored ones by [`normalize_date_for_mongo`], which stays lenient by
-    /// design. For every form a resource can carry, the instant indexed must
-    /// be the start of the range searched (both are then cut to the
-    /// millisecond a BSON date holds).
+    /// differently. Both are read by the shared `FhirDateValue` (the writer
+    /// since #1315): for every value the search grammar accepts, the instant
+    /// indexed must be the start of the range searched (both are then cut to
+    /// the millisecond a BSON date holds).
     ///
-    /// Not in the table, because a resource cannot validly carry them: `hh:mm`
-    /// without seconds (valid in search only; not indexed) and a `:60` leap
-    /// second (the search side reads it as the next second).
+    /// That includes what a resource cannot validly carry but real data does —
+    /// `hh:mm` without seconds — and a `:60` leap second, which the search
+    /// side reads as the next second.
     #[test]
     fn search_and_index_agree_on_every_valid_value() {
         for value in [
@@ -4824,6 +4851,31 @@ mod index_date_tests {
             "2013-04-05T09:20:00.5Z",
             "2013-04-05T23:30:00.123-04:00",
             "2021-11-10T16:48:57.246958-08:00",
+            // Minutes without seconds (#1315).
+            "2013-04-05T09:20",
+            "2013-04-05T09:20Z",
+            "2013-04-05T09:20-04:00",
+            "2013-04-05T18:50+05:30",
+            "2013-04-05T09:20-00:00",
+            "2013-04-05T23:59-14:00",
+            // A leap second is the first instant of the next second.
+            "2016-12-31T23:59:60Z",
+            "2013-04-05T09:20:60",
+            "2016-12-31T18:59:60-05:00",
+            "2016-12-31T23:59:60.5Z",
+            // Nine fraction digits, and digits past the ninth.
+            "2013-04-05T09:20:00.123456789Z",
+            "2013-04-05T09:20:00.1234567891Z",
+            "2013-04-05T09:20:00.12345678912345-04:00",
+            // The edges of the supported years.
+            "0001",
+            "0001-01-01T00:00:00Z",
+            "0001-01-01T14:00:00+14:00",
+            "9999",
+            "9999-12-31",
+            "9999-12-31T23:59",
+            "9999-12-31T23:59:59Z",
+            "9999-12-31T09:59:59-14:00",
         ] {
             let searched = crate::search::FhirDateValue::parse(value)
                 .unwrap_or_else(|e| panic!("{value} is a valid search value: {e}"));
@@ -4838,6 +4890,97 @@ mod index_date_tests {
                 Some(chrono_to_bson(start)),
                 "{value} at BSON resolution"
             );
+        }
+    }
+
+    /// #1315 itself: minutes without seconds are not RFC 3339, so the lenient
+    /// reading — all there was — dropped the value and the index document was
+    /// skipped.
+    #[test]
+    fn minute_precision_values_are_indexed() {
+        for (value, expected) in [
+            ("2013-04-05T09:20", "2013-04-05T09:20:00+00:00"),
+            ("2013-04-05T09:20Z", "2013-04-05T09:20:00+00:00"),
+            ("2013-04-05T09:20-04:00", "2013-04-05T13:20:00+00:00"),
+            ("2013-04-05T18:50+05:30", "2013-04-05T13:20:00+00:00"),
+        ] {
+            assert_eq!(
+                normalize_date_for_mongo_lenient(value),
+                None,
+                "{value} before"
+            );
+            assert_eq!(
+                normalize_date_for_mongo(value).map(|t| t.to_rfc3339()),
+                Some(expected.to_string()),
+                "{value}"
+            );
+        }
+    }
+
+    /// The only value both readings accept and disagree on. Chrono keeps a
+    /// leap second as `:59` plus a second of nanoseconds, which a BSON date
+    /// holds as `:59.999`-and-a-bit at best; the search side looks for it *at*
+    /// the next second.
+    #[test]
+    fn leap_second_is_indexed_where_the_search_side_looks_for_it() {
+        let lenient =
+            normalize_date_for_mongo_lenient("2016-12-31T23:59:60Z").expect("chrono reads it");
+        assert_eq!(lenient.timestamp(), 1_483_228_799, "lenient: still :59");
+        let indexed = normalize_date_for_mongo("2016-12-31T23:59:60Z").expect("indexed");
+        assert_eq!(indexed.to_rfc3339(), "2017-01-01T00:00:00+00:00");
+    }
+
+    /// The search side trims a value and reads a space in the zone-sign
+    /// position as a form-decoded `+` (#1296). Neither applies to a stored
+    /// value: there a space is not part of a date, and the value is skipped as
+    /// it always was rather than indexed at a zone nobody wrote.
+    #[test]
+    fn search_side_repairs_do_not_apply_to_stored_values() {
+        for value in [
+            "2013-04-05T18:50:00 05:30",
+            "2013-04-05T18:50 05:30",
+            " 2013-04-05T09:20",
+            "2013-04-05T09:20 ",
+            " 2013-04-05 ",
+        ] {
+            assert!(
+                crate::search::FhirDateValue::parse(value).is_ok(),
+                "{value:?} is accepted as a search value"
+            );
+            assert_eq!(normalize_date_for_mongo(value), None, "{value:?}");
+        }
+    }
+
+    /// What the strict grammar rejects still goes through the lenient reading,
+    /// exactly as before: the strict pass only ever adds index documents.
+    #[test]
+    fn values_outside_the_grammar_keep_the_lenient_reading() {
+        for value in [
+            // Offset beyond ±14:00.
+            "2013-04-05T09:20:00+14:30",
+            // Valid text whose UTC instant is past the year 9999.
+            "9999-12-31T23:59:59-01:00",
+            // Its range would have no width left inside the supported years.
+            "9999-12-31T23:59:59.999999999Z",
+        ] {
+            assert!(
+                crate::search::FhirDateValue::parse(value).is_err(),
+                "{value} is outside the search grammar"
+            );
+            assert!(normalize_date_for_mongo_lenient(value).is_some(), "{value}");
+            assert_eq!(
+                normalize_date_for_mongo(value),
+                normalize_date_for_mongo_lenient(value),
+                "{value}"
+            );
+        }
+    }
+
+    /// Never a timestamp for something that is not a date.
+    #[test]
+    fn unparseable_values_are_dropped_not_substituted() {
+        for value in ["", "not-a-date", "2024-13-45T99:99:99", "T00:00:00"] {
+            assert_eq!(normalize_date_for_mongo(value), None, "{value:?}");
         }
     }
 }
