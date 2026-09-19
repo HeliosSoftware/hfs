@@ -16,7 +16,7 @@ use crate::core::bulk_export::{
 use crate::core::bulk_export_output::{ExportPartKey, FinalizedPart};
 use crate::core::bulk_export_worker::{
     ExportClaimStrategy, ExportJobLease, ExportWorkerStorage, LeaseError, WorkerId, WorkerJobView,
-    abandoned_export_message,
+    abandoned_export_message, export_lease_expiry,
 };
 use crate::error::{
     BackendError, BulkExportError, QueryErrorExt, StorageError, StorageResult,
@@ -709,9 +709,7 @@ impl ExportClaimStrategy for SqliteBackend {
         let mut conn = self.get_connection()?;
         let now = Utc::now();
         let now_str = now.to_rfc3339();
-        let lease_expiry = now
-            + chrono::Duration::from_std(lease_duration)
-                .unwrap_or_else(|_| chrono::Duration::seconds(60));
+        let lease_expiry = export_lease_expiry(now, lease_duration);
         let lease_expiry_str = lease_expiry.to_rfc3339();
 
         // Lock-free eligibility probe, in autocommit. The claim itself needs an
@@ -906,7 +904,7 @@ impl ExportClaimStrategy for SqliteBackend {
         // `HFS_BULK_EXPORT_LEASE_DURATION` for slow batches would otherwise see
         // every heartbeat shrink the lease back to 60s, and the job be
         // reclaimed mid-run (#1152).
-        let new_expiry = lease.renewed_expiry();
+        let new_expiry = export_lease_expiry(now, lease.lease_duration);
         let affected = conn
             .execute(
                 "UPDATE bulk_export_jobs
@@ -2131,18 +2129,20 @@ mod tests {
             .unwrap();
     }
 
-    /// Reads back the `lease_expiry` a heartbeat actually persisted; the
-    /// worker traits only expose the value the call returned.
-    fn persisted_lease_expiry(backend: &SqliteBackend, job_id: &ExportJobId) -> DateTime<Utc> {
+    /// Reads back the lease timestamps that a claim or heartbeat persisted.
+    fn persisted_lease_row(
+        backend: &SqliteBackend,
+        job_id: &ExportJobId,
+    ) -> (DateTime<Utc>, DateTime<Utc>) {
         let conn = backend.get_connection().unwrap();
-        let raw: String = conn
+        let (expiry, heartbeat): (String, String) = conn
             .query_row(
-                "SELECT lease_expiry FROM bulk_export_jobs WHERE id = ?1",
+                "SELECT lease_expiry, heartbeat_at FROM bulk_export_jobs WHERE id = ?1",
                 params![job_id.as_str()],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
-        parse_dt(&raw).unwrap()
+        (parse_dt(&expiry).unwrap(), parse_dt(&heartbeat).unwrap())
     }
 
     /// Claims the single job of a fresh backend under `lease_duration`.
@@ -2158,108 +2158,41 @@ mod tests {
             .expect("a job should be claimable")
     }
 
-    /// A heartbeat under a short configured lease renews by that duration, not
-    /// by a hardcoded 60s: the renewal must not silently *extend* a lease the
-    /// deployment deliberately kept short (#1152).
+    /// Claims and repeated heartbeats preserve short, default, and long lease
+    /// durations in both stored timestamps (#1152).
     #[tokio::test]
-    async fn test_heartbeat_renews_by_a_short_configured_duration() {
-        let backend = create_test_backend();
-        let tenant = create_test_tenant();
+    async fn test_claim_duration_controls_repeated_heartbeats() {
+        for seconds in [30, 60, 180] {
+            let backend = create_test_backend();
+            let tenant = create_test_tenant();
+            let job_id = backend
+                .start_export(&tenant, test_input(ExportRequest::system()))
+                .await
+                .unwrap();
+            let configured = StdDuration::from_secs(seconds);
+            let worker = WorkerId::new(format!("worker-{seconds}"));
+            let lease = claim_one(&backend, &worker, configured).await;
+            let expected = chrono::Duration::seconds(seconds as i64);
 
-        let job_id = backend
-            .start_export(&tenant, test_input(ExportRequest::system()))
-            .await
-            .unwrap();
+            assert_eq!(lease.lease_duration, configured);
+            let (claimed_expiry, claimed_heartbeat) = persisted_lease_row(&backend, &job_id);
+            assert_eq!(lease.lease_expiry, claimed_expiry);
+            assert_eq!(claimed_expiry - claimed_heartbeat, expected);
 
-        let worker = WorkerId::new("worker-short");
-        let lease = claim_one(&backend, &worker, StdDuration::from_secs(2)).await;
-
-        let before = Utc::now();
-        let returned = backend.heartbeat(&lease).await.unwrap();
-        let persisted = persisted_lease_expiry(&backend, &job_id);
-        assert_eq!(
-            returned, persisted,
-            "heartbeat must persist what it returns"
-        );
-
-        let extension = (persisted - before).num_milliseconds();
-        assert!(
-            (1_000..=5_000).contains(&extension),
-            "a 2s lease should renew by ~2s, got {extension}ms"
-        );
-    }
-
-    /// The same heartbeat under a long configured lease renews by *that*
-    /// duration. This is the #1152 regression: the old code pinned every
-    /// renewal at 60s, so a deployment that raised
-    /// `HFS_BULK_EXPORT_LEASE_DURATION` for slow batches had each heartbeat
-    /// shrink the lease back under the batch it was protecting.
-    #[tokio::test]
-    async fn test_heartbeat_renews_by_a_long_configured_duration() {
-        let backend = create_test_backend();
-        let tenant = create_test_tenant();
-
-        let job_id = backend
-            .start_export(&tenant, test_input(ExportRequest::system()))
-            .await
-            .unwrap();
-
-        let worker = WorkerId::new("worker-long");
-        let lease = claim_one(&backend, &worker, StdDuration::from_secs(300)).await;
-
-        let before = Utc::now();
-        let returned = backend.heartbeat(&lease).await.unwrap();
-        let persisted = persisted_lease_expiry(&backend, &job_id);
-        assert_eq!(
-            returned, persisted,
-            "heartbeat must persist what it returns"
-        );
-
-        let extension = (persisted - before).num_seconds();
-        assert!(
-            (290..=300).contains(&extension),
-            "a 300s lease should renew by ~300s, got {extension}s"
-        );
-        assert!(
-            extension > 60,
-            "the renewal must not collapse back to the old 60s constant"
-        );
-    }
-
-    /// Round-trip: the duration a claim was made under rides on the lease and
-    /// is what a later heartbeat extends by.
-    #[tokio::test]
-    async fn test_claim_carries_the_lease_duration_into_the_heartbeat() {
-        let backend = create_test_backend();
-        let tenant = create_test_tenant();
-
-        let job_id = backend
-            .start_export(&tenant, test_input(ExportRequest::system()))
-            .await
-            .unwrap();
-
-        let configured = StdDuration::from_secs(180);
-        let worker = WorkerId::new("worker-roundtrip");
-        let lease = claim_one(&backend, &worker, configured).await;
-        assert_eq!(
-            lease.lease_duration, configured,
-            "the claim must report the duration it was made under"
-        );
-
-        // The claim itself already honours the duration.
-        let claimed_extension = (lease.lease_expiry - Utc::now()).num_seconds();
-        assert!(
-            (170..=180).contains(&claimed_extension),
-            "claim should expire in ~180s, got {claimed_extension}s"
-        );
-
-        let before = Utc::now();
-        backend.heartbeat(&lease).await.unwrap();
-        let renewed_extension = (persisted_lease_expiry(&backend, &job_id) - before).num_seconds();
-        assert!(
-            (170..=180).contains(&renewed_extension),
-            "heartbeat should extend by the same ~180s, got {renewed_extension}s"
-        );
+            for renewal in 1..=2 {
+                let returned = backend.heartbeat(&lease).await.unwrap();
+                let (persisted_expiry, heartbeat_at) = persisted_lease_row(&backend, &job_id);
+                assert_eq!(
+                    returned, persisted_expiry,
+                    "renewal {renewal} for {seconds}s must return its stored expiry"
+                );
+                assert_eq!(
+                    persisted_expiry - heartbeat_at,
+                    expected,
+                    "renewal {renewal} must preserve the {seconds}s claim duration"
+                );
+            }
+        }
     }
 
     /// Renewing by the configured duration must not weaken fencing: a
@@ -2269,26 +2202,57 @@ mod tests {
         let backend = create_test_backend();
         let tenant = create_test_tenant();
 
-        backend
+        let job_id = backend
             .start_export(&tenant, test_input(ExportRequest::system()))
             .await
             .unwrap();
 
         let worker_a = WorkerId::new("worker-a");
-        let lease_a = claim_one(&backend, &worker_a, StdDuration::from_millis(1)).await;
+        let lease_a = claim_one(&backend, &worker_a, StdDuration::from_secs(30)).await;
 
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        // Expire only the row still owned by worker A. This avoids a timing
+        // dependency while proving the update itself is fenced.
+        let past = Utc::now() - chrono::Duration::seconds(1);
+        let affected = backend
+            .get_connection()
+            .unwrap()
+            .execute(
+                "UPDATE bulk_export_jobs SET lease_expiry = ?1
+                 WHERE id = ?2 AND worker_id = ?3 AND fencing_token = ?4",
+                params![
+                    past.to_rfc3339(),
+                    job_id.as_str(),
+                    worker_a.as_str(),
+                    lease_a.fencing_token as i64
+                ],
+            )
+            .unwrap();
+        assert_eq!(affected, 1, "the test must expire exactly worker A's row");
+
         let worker_b = WorkerId::new("worker-b");
-        let lease_b = claim_one(&backend, &worker_b, StdDuration::from_secs(300)).await;
+        let lease_b = claim_one(&backend, &worker_b, StdDuration::from_secs(180)).await;
         assert!(lease_b.fencing_token > lease_a.fencing_token);
+        assert_eq!(lease_b.lease_duration, StdDuration::from_secs(180));
+        let row_after_steal = persisted_lease_row(&backend, &job_id);
 
         assert!(matches!(
             backend.heartbeat(&lease_a).await,
-            Err(LeaseError::LeaseLost { .. })
+            Err(LeaseError::LeaseLost { job_id: lost }) if lost == job_id
         ));
+        assert_eq!(
+            persisted_lease_row(&backend, &job_id),
+            row_after_steal,
+            "the stale heartbeat must change neither lease timestamp"
+        );
 
-        // The thief's own heartbeat still works, and still uses its duration.
-        backend.heartbeat(&lease_b).await.unwrap();
+        let returned = backend.heartbeat(&lease_b).await.unwrap();
+        let (persisted_expiry, heartbeat_at) = persisted_lease_row(&backend, &job_id);
+        assert_eq!(returned, persisted_expiry);
+        assert_eq!(
+            persisted_expiry - heartbeat_at,
+            chrono::Duration::seconds(180),
+            "the new owner's duration controls its renewal"
+        );
     }
 
     /// Counts a job's rows in the two tables a re-claim wipes; no trait
