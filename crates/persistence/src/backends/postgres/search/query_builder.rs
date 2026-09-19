@@ -2338,21 +2338,16 @@ impl PostgresQueryBuilder {
     ///
     /// Handles partial dates (year, year-month, date) and full date-times.
     fn parse_date_value(value: &str) -> DateTime<Utc> {
-        let normalized = if value.contains('T') {
-            if value.contains('+') || value.contains('Z') || value.ends_with("-00:00") {
-                value.to_string()
-            } else {
-                format!("{}+00:00", value)
-            }
-        } else if value.len() == 10 {
-            format!("{}T00:00:00+00:00", value)
-        } else if value.len() == 7 {
-            format!("{}-01T00:00:00+00:00", value)
-        } else if value.len() == 4 {
-            format!("{}-01-01T00:00:00+00:00", value)
-        } else {
-            value.to_string()
-        };
+        // Normalized by the same function the index writer uses, so a search
+        // value and the stored value it should match can never be zoned
+        // differently. This used to carry its own zone test, which recognized
+        // only `+`, `Z` and `-00:00`: every other negative offset
+        // (`2013-04-05T09:20:00-04:00`) was taken for zone-less, had `+00:00`
+        // appended, failed to parse, and fell through to `Utc::now()` below —
+        // so the search silently compared against the current time and
+        // matched nothing. The writer's copy of that bug was fixed; this one
+        // was not.
+        let normalized = super::writer::normalize_date_for_pg(value);
 
         DateTime::parse_from_rfc3339(&normalized)
             .map(|dt| dt.with_timezone(&Utc))
@@ -3093,6 +3088,59 @@ mod tests {
                 assert_eq!(ts.to_rfc3339(), "2026-09-02T00:00:00+00:00");
             }
             other => panic!("must bind the period end as a timestamp: {other:?}"),
+        }
+    }
+
+    /// A search value carrying a non-UTC offset must bind the instant it
+    /// names. The query-side zone test recognized only `+`, `Z` and `-00:00`,
+    /// so any other negative offset was mangled into invalid RFC3339 and the
+    /// parse fell back to `Utc::now()`: `date=2013-04-05T09:20:00-04:00`
+    /// compared against the current time and matched nothing. Found by the
+    /// Inferno US Quality Core suite, where it hid as six *skipped* (not
+    /// failed) date-search tests on the postgres leg only.
+    #[test]
+    fn date_with_negative_offset_binds_the_named_instant() {
+        let query = SearchQuery::new("Procedure").with_parameter(date_param(
+            "date",
+            SearchPrefix::Eq,
+            "2013-04-05T09:20:00-04:00",
+        ));
+        let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("condition");
+
+        assert!(frag.sql.contains("value_date = $3"), "{}", frag.sql);
+        assert_eq!(frag.params.len(), 1);
+        match &frag.params[0] {
+            SqlParam::Timestamp(ts) => {
+                assert_eq!(ts.to_rfc3339(), "2013-04-05T13:20:00+00:00");
+            }
+            other => panic!("must bind a timestamp: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_date_value_honors_every_zone_form() {
+        let cases = [
+            ("2013-04-05T09:20:00-04:00", "2013-04-05T13:20:00+00:00"),
+            ("2013-04-05T09:20:00+05:30", "2013-04-05T03:50:00+00:00"),
+            ("2013-04-05T09:20:00Z", "2013-04-05T09:20:00+00:00"),
+            ("2013-04-05T09:20:00-00:00", "2013-04-05T09:20:00+00:00"),
+            // Sub-second precision with a negative offset, as Inferno sends.
+            (
+                "2021-11-10T16:48:57.246958-08:00",
+                "2021-11-11T00:48:57.246958+00:00",
+            ),
+            // Zone-less and partial values are read as UTC.
+            ("2013-04-05T09:20:00", "2013-04-05T09:20:00+00:00"),
+            ("2013-04-05", "2013-04-05T00:00:00+00:00"),
+            ("2013-04", "2013-04-01T00:00:00+00:00"),
+            ("2013", "2013-01-01T00:00:00+00:00"),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(
+                PostgresQueryBuilder::parse_date_value(input).to_rfc3339(),
+                expected,
+                "input {input}"
+            );
         }
     }
 
