@@ -1378,6 +1378,33 @@ mod date_search {
         // Patients born before 1985: patient-1 (1980), patient-3 (1975)
         assert!(entries.len() >= 2);
     }
+
+    /// #1289: a value that is not a date never reaches a storage backend. On
+    /// PostgreSQL it used to be replaced by the current time, so the `lt` form
+    /// here returned nearly every Patient with a plain 200.
+    #[tokio::test]
+    async fn test_invalid_date_value_is_a_400_not_a_search() {
+        let (server, backend) = create_test_server().await;
+        seed_search_test_data(&backend).await;
+
+        for query in [
+            "/Patient?birthdate=not-a-date",
+            "/Patient?birthdate=ltnot-a-date",
+            "/Patient?birthdate=gt2024-13-45",
+            "/Patient?birthdate=ne2024-13-45",
+            "/Patient?_lastUpdated=ltnot-a-date",
+        ] {
+            let response = server
+                .get(query)
+                .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+                .await;
+
+            response.assert_status(StatusCode::BAD_REQUEST);
+            let body: Value = response.json();
+            assert_eq!(body["resourceType"], "OperationOutcome", "query={query}");
+            assert_eq!(body["issue"][0]["code"], "invalid", "query={query}");
+        }
+    }
 }
 
 // =============================================================================
