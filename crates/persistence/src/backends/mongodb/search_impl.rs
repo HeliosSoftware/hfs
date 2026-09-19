@@ -321,16 +321,6 @@ fn build_contained_stored(
     )
 }
 
-fn parse_simple_search_params(params: &str) -> Vec<(String, String)> {
-    params
-        .split('&')
-        .filter_map(|pair| {
-            let (name, value) = pair.split_once('=')?;
-            Some((name.to_string(), value.to_string()))
-        })
-        .collect()
-}
-
 /// The `search_index` field a parameter type's value lives in. `None` for
 /// `Composite`/`Special`, which have no single value field of their own
 /// (composite rows carry each sub-parameter's own field; special params like
@@ -2746,51 +2736,41 @@ impl MongoBackend {
         resource_type: &str,
         search_params_str: &str,
     ) -> StorageResult<Vec<StoredResource>> {
-        let parsed_params = parse_simple_search_params(search_params_str);
-
-        if parsed_params.is_empty() {
+        let Some(query) = self.conditional_query(tenant, resource_type, search_params_str)? else {
             return Ok(Vec::new());
-        }
-
-        let search_params = self.build_search_parameters(tenant, resource_type, &parsed_params);
-
-        let query = SearchQuery {
-            resource_type: resource_type.to_string(),
-            parameters: search_params,
-            count: Some(1000),
-            ..Default::default()
         };
 
         let result = <Self as SearchProvider>::search(self, tenant, &query).await?;
         Ok(result.resources.items)
     }
 
+    /// Builds the search a conditional interaction's criteria describe, or
+    /// `None` when they select nothing. The parsing is
+    /// [`crate::search::build_conditional_query`], shared by every backend so
+    /// criteria mean what they mean as a direct search (#1312).
+    fn conditional_query(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        criteria: &str,
+    ) -> StorageResult<Option<SearchQuery>> {
+        let registry_arc = self.tenant_registry(tenant.tenant_id().as_str());
+        let registry = registry_arc.read();
+        crate::search::build_conditional_query(&registry, resource_type, criteria)
+    }
+
+    /// Types already-split criteria pairs, for the in-transaction
+    /// `ifNoneExist` resolver, which drives the `search_index` collection
+    /// parameter by parameter instead of running a [`SearchQuery`].
     pub(super) fn build_search_parameters(
         &self,
         tenant: &TenantContext,
         resource_type: &str,
         params: &[(String, String)],
-    ) -> Vec<SearchParameter> {
+    ) -> StorageResult<Vec<SearchParameter>> {
         let registry_arc = self.tenant_registry(tenant.tenant_id().as_str());
         let registry = registry_arc.read();
-
-        params
-            .iter()
-            .map(|(name, value)| {
-                let values = vec![SearchValue::parse(value)];
-                let param_type =
-                    crate::search::resolve_param_type(&registry, resource_type, name, &values);
-
-                SearchParameter {
-                    name: name.clone(),
-                    param_type,
-                    modifier: None,
-                    values,
-                    chain: vec![],
-                    components: vec![],
-                }
-            })
-            .collect()
+        crate::search::build_conditional_parameters(&registry, resource_type, params)
     }
 
     fn merge_unique(target: &mut Vec<StoredResource>, additions: Vec<StoredResource>) {

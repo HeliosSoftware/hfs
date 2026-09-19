@@ -55,8 +55,7 @@ use crate::core::{
 use crate::error::{BackendError, ResourceError, StorageError, StorageResult, TransactionError};
 use crate::tenant::TenantContext;
 use crate::types::{
-    IncludeDirective, Pagination, ReverseChainedParameter, SearchParamType, SearchParameter,
-    SearchQuery, SearchValue, StoredResource,
+    IncludeDirective, Pagination, ReverseChainedParameter, SearchQuery, StoredResource,
 };
 
 use super::config::{CompositeConfig, SyncMode};
@@ -193,47 +192,23 @@ impl CompositeStorage {
             .is_some()
     }
 
-    fn parse_simple_search_params(params: &str) -> Vec<(String, String)> {
-        params
-            .split('&')
-            .filter_map(|pair| {
-                let parts: Vec<&str> = pair.splitn(2, '=').collect();
-                if parts.len() == 2 {
-                    Some((parts[0].to_string(), parts[1].to_string()))
-                } else {
-                    None
-                }
-            })
-            .collect()
-    }
-
-    fn infer_conditional_param_type(name: &str) -> SearchParamType {
-        crate::search::fallback_param_type(name)
-    }
-
     async fn find_conditional_matches(
         &self,
         tenant: &TenantContext,
         resource_type: &str,
         search_params: &str,
     ) -> StorageResult<Vec<StoredResource>> {
-        let parsed_params = Self::parse_simple_search_params(search_params);
-        if parsed_params.is_empty() {
+        // The one criteria builder every backend shares, so criteria mean what
+        // they mean as a direct search (#1312). The guard is dropped before
+        // the first await.
+        let query = {
+            let registry_arc = self.search_param_registry(tenant);
+            let registry = registry_arc.read();
+            crate::search::build_conditional_query(&registry, resource_type, search_params)?
+        };
+        let Some(query) = query else {
             return Ok(Vec::new());
-        }
-
-        let mut query = SearchQuery::new(resource_type);
-        query.count = Some(1000);
-        for (name, value) in parsed_params {
-            query = query.with_parameter(SearchParameter {
-                name: name.clone(),
-                param_type: Self::infer_conditional_param_type(&name),
-                modifier: None,
-                values: vec![SearchValue::parse(&value)],
-                chain: vec![],
-                components: vec![],
-            });
-        }
+        };
 
         // The criteria resolve against the search index, which on a
         // composite is the secondary: without this, an `If-None-Exist`

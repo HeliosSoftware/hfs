@@ -415,23 +415,6 @@ fn parse_history_row(
     })
 }
 
-fn parse_simple_bundle_search_params(params: &str) -> Vec<(String, String)> {
-    params
-        .split('&')
-        .filter_map(|pair| {
-            let mut iter = pair.splitn(2, '=');
-            let key = iter.next()?.trim();
-            let value = iter.next()?.trim();
-
-            if key.is_empty() || value.is_empty() {
-                return None;
-            }
-
-            Some((key.to_string(), value.to_string()))
-        })
-        .collect()
-}
-
 pub(super) fn document_to_stored_resource(
     doc: &Document,
     tenant: &TenantContext,
@@ -3791,7 +3774,7 @@ impl MongoBackend {
         resource_type: &str,
         search_params: &str,
     ) -> StorageResult<Vec<StoredResource>> {
-        let parsed_params = parse_simple_bundle_search_params(search_params);
+        let parsed_params = crate::search::parse_conditional_criteria(search_params);
         if parsed_params.is_empty() {
             return Ok(Vec::new());
         }
@@ -3802,7 +3785,12 @@ impl MongoBackend {
                 .await;
         }
 
-        let typed_params = self.build_search_parameters(tenant, resource_type, &parsed_params);
+        let typed_params = self.build_search_parameters(tenant, resource_type, &parsed_params)?;
+        // Result-shaping names (`_format`, …) are not criteria; with nothing
+        // left, an empty filter would match the whole type.
+        if typed_params.is_empty() {
+            return Ok(Vec::new());
+        }
         let index_params: Vec<_> = typed_params
             .iter()
             .filter(|p| !matches!(p.name.as_str(), "_id" | "_lastUpdated"))

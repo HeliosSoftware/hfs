@@ -63,6 +63,11 @@ mod meta_params_suite;
 #[path = "search/date_boundary_suite.rs"]
 mod date_boundary_suite;
 
+/// The backend-agnostic conditional-criteria suite (#1312): criteria whose
+/// values begin with comparator letters. Same `#[path]` arrangement.
+#[path = "search/conditional_criteria_suite.rs"]
+mod conditional_criteria_suite;
+
 #[path = "common/container_cleanup.rs"]
 mod container_cleanup;
 
@@ -17177,6 +17182,20 @@ mod postgres_integration {
 
     fn unique_base(label: &str) -> String {
         format!("{}_{}", label, uuid::Uuid::new_v4().simple())
+    }
+
+    /// #1312: `family=Neal` / `identifier=ne123` name the right resource on
+    /// every conditional interaction, and never the decoy the old
+    /// comparator-stripping parse would have found.
+    #[tokio::test]
+    async fn postgres_integration_conditional_criteria_with_prefix_like_values() {
+        let backend = create_backend().await;
+        super::conditional_criteria_suite::prefix_like_criteria_name_the_right_resource(
+            &backend,
+            &unique_base("cond_criteria_1312"),
+            true,
+        )
+        .await;
     }
 
     #[tokio::test]
