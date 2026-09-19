@@ -312,6 +312,32 @@ fn get_bundle_total(body: &Value) -> Option<i64> {
     body["total"].as_i64()
 }
 
+/// Returns the bundle's `self` link URL.
+fn self_link(body: &Value) -> String {
+    body["link"]
+        .as_array()
+        .and_then(|links| links.iter().find(|l| l["relation"] == "self"))
+        .and_then(|l| l["url"].as_str())
+        .expect("searchset must carry a self link")
+        .to_string()
+}
+
+/// Returns the `search.mode = outcome` entries of a searchset bundle.
+fn outcome_entries(body: &Value) -> Vec<&Value> {
+    get_bundle_entries(body)
+        .into_iter()
+        .filter(|e| e["search"]["mode"] == "outcome")
+        .collect()
+}
+
+/// Returns the `search.mode = match` entries of a searchset bundle.
+fn match_entries(body: &Value) -> Vec<&Value> {
+    get_bundle_entries(body)
+        .into_iter()
+        .filter(|e| e["search"]["mode"] == "match")
+        .collect()
+}
+
 // =============================================================================
 // Basic Search Tests
 // =============================================================================
@@ -404,24 +430,6 @@ mod basic_search {
             )
             .await;
         ok.assert_status_ok();
-    }
-
-    /// Returns the bundle's `self` link URL.
-    fn self_link(body: &Value) -> String {
-        body["link"]
-            .as_array()
-            .and_then(|links| links.iter().find(|l| l["relation"] == "self"))
-            .and_then(|l| l["url"].as_str())
-            .expect("searchset must carry a self link")
-            .to_string()
-    }
-
-    /// Returns the `search.mode = outcome` entries of a searchset bundle.
-    fn outcome_entries(body: &Value) -> Vec<&Value> {
-        get_bundle_entries(body)
-            .into_iter()
-            .filter(|e| e["search"]["mode"] == "outcome")
-            .collect()
     }
 
     #[tokio::test]
@@ -1719,6 +1727,182 @@ mod compartment_search {
             );
         }
     }
+
+    #[tokio::test]
+    async fn test_compartment_unknown_param_lenient_ignored_strict_rejected() {
+        // Compartment search used to hand an unrecognized parameter straight to
+        // the backend: no 400 under strict handling, and under lenient handling
+        // a silent empty result set whose self link still claimed the filter.
+        let (server, backend) = create_test_server().await;
+        seed_search_test_data(&backend).await;
+
+        let lenient = server
+            .get("/Patient/patient-1/Observation?nonsense-param=foo")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+        lenient.assert_status_ok();
+
+        let strict = server
+            .get("/Patient/patient-1/Observation?nonsense-param=foo")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .add_header(
+                HeaderName::from_static("prefer"),
+                HeaderValue::from_static("handling=strict"),
+            )
+            .await;
+        assert_eq!(
+            strict.status_code(),
+            StatusCode::BAD_REQUEST,
+            "unknown compartment parameter must be rejected under Prefer: handling=strict"
+        );
+
+        // A parameter the target type does know is accepted even under strict.
+        let ok = server
+            .get("/Patient/patient-1/Observation?code=8867-4")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .add_header(
+                HeaderName::from_static("prefer"),
+                HeaderValue::from_static("handling=strict"),
+            )
+            .await;
+        ok.assert_status_ok();
+    }
+
+    #[tokio::test]
+    async fn test_compartment_unknown_underscore_param_rejected_under_strict() {
+        // `_`-prefixed names are not a bypass here either (#524 for the
+        // type-level path).
+        let (server, backend) = create_test_server().await;
+        seed_search_test_data(&backend).await;
+
+        for param in ["_typo=foo", "_whatever=foo"] {
+            let strict = server
+                .get(&format!("/Patient/patient-1/Observation?{param}"))
+                .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+                .add_header(
+                    HeaderName::from_static("prefer"),
+                    HeaderValue::from_static("handling=strict"),
+                )
+                .await;
+            assert_eq!(
+                strict.status_code(),
+                StatusCode::BAD_REQUEST,
+                "{param} must be rejected under Prefer: handling=strict"
+            );
+        }
+
+        // Global parameters the server does honour still pass.
+        for param in ["_id=obs-1", "_lastUpdated=gt2000-01-01"] {
+            let ok = server
+                .get(&format!("/Patient/patient-1/Observation?{param}"))
+                .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+                .add_header(
+                    HeaderName::from_static("prefer"),
+                    HeaderValue::from_static("handling=strict"),
+                )
+                .await;
+            ok.assert_status_ok();
+        }
+    }
+
+    #[tokio::test]
+    async fn test_compartment_ignored_param_dropped_from_self_link_and_reported() {
+        // Under lenient handling an unsupported parameter may be ignored only if
+        // the server says so: it must not appear in the self link, it must be
+        // reported as an OperationOutcome entry, and "ignored" must be literal —
+        // the compartment result set is the same as without it.
+        let (server, backend) = create_test_server().await;
+        seed_search_test_data(&backend).await;
+
+        let unfiltered: Value = server
+            .get("/Patient/patient-1/Observation")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await
+            .json();
+        let total = match_entries(&unfiltered).len();
+        assert!(total > 0, "fixture should seed patient-1 observations");
+
+        for query in ["_typo=foo", "nonsense-param=foo"] {
+            let response = server
+                .get(&format!("/Patient/patient-1/Observation?{query}"))
+                .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+                .await;
+            response.assert_status_ok();
+            let body: Value = response.json();
+
+            let link = self_link(&body);
+            assert!(
+                !link.contains("typo") && !link.contains("nonsense-param"),
+                "self link must not echo the ignored parameter ({query}): {link}"
+            );
+
+            let outcomes = outcome_entries(&body);
+            assert_eq!(
+                outcomes.len(),
+                1,
+                "ignored parameter must be reported ({query})"
+            );
+            let issue = &outcomes[0]["resource"]["issue"][0];
+            assert_eq!(issue["severity"], "warning");
+            assert_eq!(issue["code"], "not-supported");
+            let text = issue["details"]["text"].as_str().unwrap_or_default();
+            assert!(
+                text.contains(query.split('=').next().unwrap()),
+                "outcome must name the ignored parameter: {text}"
+            );
+
+            assert_eq!(
+                match_entries(&body).len(),
+                total,
+                "ignored parameter must not filter the compartment ({query})"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_compartment_all_types_unknown_param() {
+        // `GET [compartment]/[id]/*` applies the same rule, but a parameter only
+        // counts as unknown when NO member type knows it.
+        let (server, backend) = create_test_server().await;
+        seed_search_test_data(&backend).await;
+
+        let strict = server
+            .get("/Patient/patient-1/*?nonsense-param=foo")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .add_header(
+                HeaderName::from_static("prefer"),
+                HeaderValue::from_static("handling=strict"),
+            )
+            .await;
+        assert_eq!(strict.status_code(), StatusCode::BAD_REQUEST);
+
+        // `code` is not a Patient parameter, but it is an Observation one, and
+        // the member types that cannot satisfy it are simply skipped. Rejecting
+        // it here would break `*` for a parameter the single-type search accepts.
+        let known_to_one_member = server
+            .get("/Patient/patient-1/*?code=8867-4")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .add_header(
+                HeaderName::from_static("prefer"),
+                HeaderValue::from_static("handling=strict"),
+            )
+            .await;
+        known_to_one_member.assert_status_ok();
+
+        // Lenient: ignored, reported, and absent from the self link.
+        let response = server
+            .get("/Patient/patient-1/*?nonsense-param=foo")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+        response.assert_status_ok();
+        let body: Value = response.json();
+        assert!(
+            !self_link(&body).contains("nonsense-param"),
+            "self link must not echo the ignored parameter: {}",
+            self_link(&body)
+        );
+        assert_eq!(outcome_entries(&body).len(), 1);
+    }
 }
 
 // =============================================================================
@@ -2093,6 +2277,186 @@ mod chaining {
         } else {
             assert_eq!(status, StatusCode::BAD_REQUEST);
         }
+    }
+
+    /// Two patients with two Procedures each, plus an Encounter and an
+    /// Observation per patient for the multi-hop case (#1292).
+    async fn seed_dated_chain_data(backend: &SqliteBackend) {
+        let tenant = test_tenant();
+        let resources = [
+            json!({"resourceType": "Patient", "id": "p80", "birthDate": "1980-05-06",
+                   "name": [{"family": "Lee"}]}),
+            json!({"resourceType": "Patient", "id": "p90", "birthDate": "1990-01-01",
+                   "name": [{"family": "Gert"}]}),
+            json!({"resourceType": "Procedure", "id": "pr1", "status": "completed",
+                   "subject": {"reference": "Patient/p80"},
+                   "performedDateTime": "2013-04-05T09:20:00-04:00"}),
+            json!({"resourceType": "Procedure", "id": "pr2", "status": "completed",
+                   "subject": {"reference": "Patient/p80"},
+                   "performedDateTime": "2013-04-05"}),
+            json!({"resourceType": "Procedure", "id": "pr3", "status": "completed",
+                   "subject": {"reference": "Patient/p90"},
+                   "performedDateTime": "2020-06-01T10:00:00+05:30"}),
+            json!({"resourceType": "Procedure", "id": "pr4", "status": "completed",
+                   "subject": {"reference": "Patient/p90"},
+                   "performedDateTime": "2021-02-03"}),
+            json!({"resourceType": "Encounter", "id": "e80", "status": "finished",
+                   "class": {"code": "AMB"},
+                   "subject": {"reference": "Patient/p80"}}),
+            json!({"resourceType": "Encounter", "id": "e90", "status": "finished",
+                   "class": {"code": "AMB"},
+                   "subject": {"reference": "Patient/p90"}}),
+            json!({"resourceType": "Observation", "id": "ob80", "status": "final",
+                   "code": {"text": "hr"},
+                   "subject": {"reference": "Patient/p80"},
+                   "encounter": {"reference": "Encounter/e80"},
+                   "valueQuantity": {"value": 60, "unit": "bpm"}}),
+            json!({"resourceType": "Observation", "id": "ob90", "status": "final",
+                   "code": {"text": "hr"},
+                   "subject": {"reference": "Patient/p90"},
+                   "encounter": {"reference": "Encounter/e90"},
+                   "valueQuantity": {"value": 90, "unit": "bpm"}}),
+        ];
+        for resource in resources {
+            let resource_type = resource["resourceType"].as_str().unwrap().to_string();
+            backend
+                .create(&tenant, &resource_type, resource, FhirVersion::R4)
+                .await
+                .unwrap();
+        }
+    }
+
+    /// Sorted ids of a search that must succeed.
+    async fn ids(server: &TestServer, url: &str) -> Vec<String> {
+        let response = server
+            .get(url)
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+        response.assert_status_ok();
+        let body: Value = response.json();
+        let mut ids: Vec<String> = get_bundle_entries(&body)
+            .iter()
+            .map(|e| e["resource"]["id"].as_str().unwrap().to_string())
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    /// #1292: the terminal parameter of a forward chain is parsed like the
+    /// same parameter in a direct search — comparator prefix and OR list.
+    #[tokio::test]
+    async fn test_chained_terminal_value_prefix_and_or_list() {
+        let (server, backend) = create_test_server().await;
+        seed_dated_chain_data(&backend).await;
+        let all = ["pr1", "pr2", "pr3", "pr4"];
+
+        assert_eq!(
+            ids(&server, "/Procedure?subject:Patient.birthdate=1980-05-06").await,
+            ["pr1", "pr2"]
+        );
+        assert_eq!(
+            ids(&server, "/Procedure?subject:Patient.birthdate=ge1980-01-01").await,
+            all
+        );
+        assert_eq!(
+            ids(&server, "/Procedure?subject:Patient.birthdate=eq1980-05-06").await,
+            ["pr1", "pr2"]
+        );
+        assert_eq!(
+            ids(&server, "/Procedure?subject:Patient.birthdate=lt1985-01-01").await,
+            ["pr1", "pr2"]
+        );
+        // Untyped chain, same answer.
+        assert_eq!(
+            ids(&server, "/Procedure?subject.birthdate=ge1985-01-01").await,
+            ["pr3", "pr4"]
+        );
+        // Every value of the OR list counts, not just the first.
+        assert_eq!(
+            ids(
+                &server,
+                "/Procedure?subject:Patient.birthdate=1980-05-06,1990-01-01"
+            )
+            .await,
+            all
+        );
+        // It agrees with the equivalent direct search.
+        assert_eq!(
+            ids(&server, "/Patient?birthdate=ge1985-01-01").await,
+            ["p90"]
+        );
+        // Multi-hop.
+        assert_eq!(
+            ids(
+                &server,
+                "/Observation?encounter.subject.birthdate=ge1985-01-01"
+            )
+            .await,
+            ["ob90"]
+        );
+        // Quantity terminal.
+        assert_eq!(
+            ids(
+                &server,
+                "/Encounter?_has:Observation:encounter:value-quantity=gt70"
+            )
+            .await,
+            ["e90"]
+        );
+        // Chained _lastUpdated.
+        assert_eq!(
+            ids(
+                &server,
+                "/Procedure?subject:Patient._lastUpdated=ge2000-01-01"
+            )
+            .await,
+            all
+        );
+        assert!(
+            ids(
+                &server,
+                "/Procedure?subject:Patient._lastUpdated=lt2000-01-01"
+            )
+            .await
+            .is_empty()
+        );
+        // A string terminal that starts with comparator letters is untouched.
+        assert_eq!(
+            ids(&server, "/Procedure?subject:Patient.family=Lee").await,
+            ["pr1", "pr2"]
+        );
+        assert_eq!(
+            ids(&server, "/Procedure?subject:Patient.family=gert").await,
+            ["pr3", "pr4"]
+        );
+    }
+
+    /// #1292: same for the terminal parameter of `_has`.
+    #[tokio::test]
+    async fn test_has_terminal_value_prefix_and_or_list() {
+        let (server, backend) = create_test_server().await;
+        seed_dated_chain_data(&backend).await;
+
+        assert_eq!(
+            ids(&server, "/Patient?_has:Procedure:subject:date=ge2013-01-01").await,
+            ["p80", "p90"]
+        );
+        assert_eq!(
+            ids(&server, "/Patient?_has:Procedure:subject:date=ge2020-01-01").await,
+            ["p90"]
+        );
+        assert_eq!(
+            ids(&server, "/Patient?_has:Procedure:subject:date=lt2014").await,
+            ["p80"]
+        );
+        assert_eq!(
+            ids(
+                &server,
+                "/Patient?_has:Procedure:subject:date=2013-04-05T09:20:00-04:00,2020"
+            )
+            .await,
+            ["p80", "p90"]
+        );
     }
 
     #[tokio::test]

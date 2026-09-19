@@ -1198,7 +1198,7 @@ where
                             count,
                         })
                     }
-                    Err(e) => entry_storage_failure(e),
+                    Err(e) => conditional_create_entry_failure(e),
                 };
             }
 
@@ -2151,6 +2151,29 @@ fn entry_failure(err: RestError) -> BundleEntryResult {
 /// an error more specifically than the message is permitted to describe it.
 fn entry_storage_failure(err: StorageError) -> BundleEntryResult {
     entry_failure(RestError::from(err))
+}
+
+/// A conditional create (`If-None-Exist`) that fails because the active storage
+/// backend cannot resolve the match criteria — it has neither a search backend
+/// nor a conditional store (e.g. `s3`, or `mongodb` with no search backend). The
+/// raw `UnsupportedCapability` surfaces through the generic mapping as
+/// "Feature 'search' is not implemented" (or 'conditional_create'), which blames
+/// a capability the client never invoked; this names the operation it did ask
+/// for. Still a 501 `not-supported`, per entry. Whether these backends should
+/// gain identifier-scoped conditional create is a separate product decision
+/// (#1225).
+fn conditional_create_entry_failure(err: StorageError) -> BundleEntryResult {
+    if matches!(
+        &err,
+        StorageError::Backend(
+            helios_persistence::error::BackendError::UnsupportedCapability { .. }
+        )
+    ) {
+        return entry_failure(RestError::NotImplemented {
+            feature: "conditional create (If-None-Exist) on this storage backend".to_string(),
+        });
+    }
+    entry_storage_failure(err)
 }
 
 /// Returns HTTP status text for a status code.
@@ -4506,6 +4529,9 @@ mod tests {
 
     /// A backend whose `ConditionalStorage` is a stub (S3) answers 501 per
     /// entry, through the same error funnel every other storage error takes.
+    /// The conditional-*create* entry additionally names the operation the
+    /// client asked for rather than the missing `search`/`conditional_create`
+    /// capability (#1225).
     #[tokio::test]
     async fn unsupported_conditional_storage_is_reported_as_501_per_entry() {
         let state = state_with(DelayStorage::conditional(ConditionalReply::Unsupported));
@@ -4532,6 +4558,21 @@ mod tests {
                 "entry {index}: {entry}"
             );
         }
+
+        // The If-None-Exist create must not blame `conditional_create`/`search`,
+        // a capability the client never invoked — it names the operation it did.
+        let create_text =
+            response["entry"][2]["response"]["outcome"]["issue"][0]["details"]["text"]
+                .as_str()
+                .expect("the create entry carries an OperationOutcome text");
+        assert!(
+            create_text.contains("conditional create (If-None-Exist)"),
+            "expected the honest conditional-create wording, got: {create_text}"
+        );
+        assert!(
+            !create_text.contains("'search'") && !create_text.contains("'conditional_create'"),
+            "must not surface the raw missing capability: {create_text}"
+        );
     }
 
     /// Conditional entries are read-then-write in the backend, so a bundle

@@ -1,5 +1,6 @@
 //! Bulk-submit job store that indexes into search while a manifest ingests
-//! (#1127, opt-in via `HFS_BULK_SUBMIT_INDEX_DURING_INGEST`).
+//! (#1127, selected by `HFS_BULK_SUBMIT_DEFER_INDEXING=false` on a deployment
+//! whose search is offloaded to a secondary — #1242).
 //!
 //! [`IndexingSubmitJobs`] wraps another job store — normally the composite's
 //! [`CompositeSubmitJobs`](super::CompositeSubmitJobs), so resource operations

@@ -1,7 +1,10 @@
 //! Local-filesystem [`ExportOutputStore`] for single-instance bulk export.
 //!
 //! Writes NDJSON output parts under `{root}/{tenant}/{job_id}/` and serves
-//! download URLs through HFS itself (`requires_access_token = true`).
+//! download URLs through HFS itself. Whether those URLs need the kickoff access
+//! token is set at construction (`true` when auth is enabled, `false` when it is
+//! not) rather than assumed, so the manifest's `requiresAccessToken` matches
+//! what the file endpoint actually enforces (#1269).
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -25,18 +28,33 @@ pub struct LocalFsOutputStore {
     root: PathBuf,
     /// Base URL used to construct HFS-served download URLs.
     base_url: String,
+    /// Whether the HFS-served download URLs require the kickoff access token —
+    /// advertised to clients as the manifest's `requiresAccessToken` (#1269).
+    requires_access_token: bool,
 }
 
 impl LocalFsOutputStore {
     /// Creates a new local-filesystem output store.
     ///
     /// `root` is the directory under which `{tenant}/{job_id}/...` is created;
-    /// `base_url` is the HFS base URL used for download links.
+    /// `base_url` is the HFS base URL used for download links. The download URLs
+    /// require an access token by default; call
+    /// [`with_access_token_required`](Self::with_access_token_required) to set it
+    /// from the deployment's auth state.
     pub fn new(root: impl Into<PathBuf>, base_url: impl Into<String>) -> Self {
         Self {
             root: root.into(),
             base_url: base_url.into(),
+            requires_access_token: true,
         }
+    }
+
+    /// Sets whether the served download URLs require the kickoff access token.
+    /// Pass the deployment's auth-enabled state: with auth off the file endpoint
+    /// serves without a token, so the manifest must not claim one is needed.
+    pub fn with_access_token_required(mut self, required: bool) -> Self {
+        self.requires_access_token = required;
+        self
     }
 
     /// The directory holding all parts for a single job.
@@ -134,7 +152,7 @@ impl ExportOutputStore for LocalFsOutputStore {
                 "{}/export-file/{}/{}-{}",
                 base, key.job_id, key.resource_type, key.part_index
             ),
-            requires_access_token: true,
+            requires_access_token: self.requires_access_token,
         })
     }
 
@@ -229,6 +247,30 @@ mod tests {
         // Idempotent: deleting again is fine.
         store.delete_job_outputs(&tenant, &job).await.unwrap();
         assert!(store.open_reader(&key).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn download_url_reflects_the_configured_token_requirement() {
+        let job = ExportJobId::new();
+        let key = test_key(&job);
+
+        // Default (auth enabled): the served URL needs the kickoff token.
+        let store = LocalFsOutputStore::new("/unused", "http://localhost:8080");
+        let url = store
+            .download_url(&key, Duration::from_secs(60))
+            .await
+            .unwrap();
+        assert!(url.requires_access_token);
+
+        // Auth disabled: the file endpoint serves without a token, so the
+        // manifest must not claim one is required (#1269).
+        let store = LocalFsOutputStore::new("/unused", "http://localhost:8080")
+            .with_access_token_required(false);
+        let url = store
+            .download_url(&key, Duration::from_secs(60))
+            .await
+            .unwrap();
+        assert!(!url.requires_access_token);
     }
 
     #[tokio::test]

@@ -424,6 +424,54 @@ jobs:
           aws s3 rm "s3://$BUCKET/$PREFIX" --recursive
           echo "Prefix emptied"
 
+      - name: Re-check Elasticsearch before starting HFS
+        # "Start Elasticsearch" only proves ES answered when it was created.
+        # On the s3-elasticsearch legs, "Configure AWS credentials", "Install
+        # AWS CLI" and "Empty S3 prefix" open a gap of up to ~40s after that,
+        # and the matrix runs as many as eight ES containers at once on one
+        # self-hosted runner. A container that dies in that window stays
+        # invisible until HFS is already up: the composite bootstrap seeds
+        # every SearchParameter through the search backend, burns three retries
+        # each against a dead one, and the readiness loop below times out
+        # reporting "HFS failed to start" — the wrong component (run
+        # 35252379003, job 105316685765).
+        #
+        # Nothing has been written yet at this point, so restarting ES loses no
+        # data and is worth a try before failing the leg.
+        if: matrix.backend == 'sqlite-elasticsearch' || matrix.backend == 's3-elasticsearch'
+        run: |
+          if curl -sf "http://$DOCKER_HOST_IP:$ES_PORT/_cluster/health" > /dev/null 2>&1; then
+            echo "Elasticsearch still answering on port $ES_PORT"
+            exit 0
+          fi
+
+          echo "::warning::Elasticsearch stopped answering on port $ES_PORT after 'Start Elasticsearch' — restarting $ES_CONTAINER"
+          docker ps -a --filter "name=$ES_CONTAINER" --format '{{.Names}}\t{{.Status}}' || true
+          # Memory pressure on the runner is the usual verdict; print it rather
+          # than leave it to be guessed from the absence of a reply.
+          docker inspect -f 'OOMKilled={{.State.OOMKilled}} ExitCode={{.State.ExitCode}} Status={{.State.Status}}' "$ES_CONTAINER" || true
+          echo "=== last 30 log lines of $ES_CONTAINER ==="
+          docker logs --tail 30 "$ES_CONTAINER" 2>&1 || true
+          echo "=== end of log ==="
+
+          docker restart "$ES_CONTAINER" || true
+          for i in $(seq 1 30); do
+            # The container was published with `-p 0:9200`, so the host port is
+            # allocated at start time and a restart can move it. Re-read it
+            # instead of trusting the ES_PORT from before.
+            NEW_PORT=$(docker port "$ES_CONTAINER" 9200 2>/dev/null | head -1 | sed 's/.*://')
+            if [ -n "$NEW_PORT" ] && curl -sf "http://$DOCKER_HOST_IP:$NEW_PORT/_cluster/health" > /dev/null 2>&1; then
+              echo "Elasticsearch is answering again on port $NEW_PORT"
+              echo "ES_PORT=$NEW_PORT" >> $GITHUB_ENV
+              exit 0
+            fi
+            echo "Attempt $i/30: Elasticsearch still not answering..."
+            sleep 2
+          done
+
+          echo "::error::Elasticsearch did not come back after a restart. HFS would spend its whole readiness budget retrying bootstrap writes against a dead search backend, so the leg is failed here, where the cause is still visible."
+          exit 1
+
       - name: Start HFS server
         run: |
           HFS_LOG="/tmp/hfs-${{ matrix.suite_id }}-${{ matrix.backend }}.log"
@@ -499,6 +547,19 @@ jobs:
             sleep 2
           done
           echo "HFS failed to start (process still running but not responding)"
+          # On the Elasticsearch legs this is usually not HFS's fault: its
+          # readiness depends on the search backend, so name that backend's
+          # state here instead of leaving the HFS log to be read for it.
+          if [ -n "$ES_CONTAINER" ]; then
+            if curl -sf "http://$DOCKER_HOST_IP:$ES_PORT/_cluster/health" > /dev/null 2>&1; then
+              echo "Elasticsearch on port $ES_PORT is answering, so this is not a search-backend outage."
+            else
+              echo "::error::Elasticsearch on port $ES_PORT is NOT answering — HFS was retrying its bootstrap writes against a dead search backend."
+              docker ps -a --filter "name=$ES_CONTAINER" --format '{{.Names}}\t{{.Status}}' || true
+              docker inspect -f 'OOMKilled={{.State.OOMKilled}} ExitCode={{.State.ExitCode}} Status={{.State.Status}}' "$ES_CONTAINER" || true
+              docker logs --tail 30 "$ES_CONTAINER" 2>&1 || true
+            fi
+          fi
           echo "=== Last 50 lines of HFS log ==="
           tail -50 "$HFS_LOG"
           echo "=== end of log ==="
@@ -524,13 +585,56 @@ jobs:
             || echo "::warning::Elasticsearch refresh request did not return success — proceeding anyway"
 
       - name: Sanity-check shared Inferno stack
+        env:
+          INFERNO_PROJECT: ${{ needs.inferno-stack-up.outputs.project }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          FALLBACK_PROJECT: inferno-${{ github.run_id }}-${{ github.run_attempt }}
         run: |
           INFERNO_HOST="${DOCKER_HOST_IP:-localhost}"
           echo "INFERNO_HOST=$INFERNO_HOST" >> $GITHUB_ENV
-          if ! curl -sf "http://$INFERNO_HOST:$INFERNO_PORT/api/test_suites" > /dev/null; then
-            echo "Shared Inferno stack not reachable at http://$INFERNO_HOST:$INFERNO_PORT"
+
+          # Retry briefly. The shared stack is already proven healthy by
+          # inferno-stack-up, so this only covers a transient blip (nginx busy
+          # serving the previous matrix job's results, a momentary connection
+          # reset). A stack that is genuinely gone will not come back, so the
+          # window stays short: 10 x 3s, against stack-up's 60 x 2s.
+          for attempt in $(seq 1 10); do
+            if curl -sf "http://$INFERNO_HOST:$INFERNO_PORT/api/test_suites" > /dev/null; then
+              echo "Shared Inferno stack reachable at http://$INFERNO_HOST:$INFERNO_PORT"
+              exit 0
+            fi
+            echo "Attempt $attempt/10: Inferno not reachable yet..."
+            sleep 3
+          done
+
+          echo "Shared Inferno stack not reachable at http://$INFERNO_HOST:$INFERNO_PORT"
+
+          PROJECT="${INFERNO_PROJECT:-$FALLBACK_PROJECT}"
+          echo "Compose project for this run's stack: $PROJECT"
+          # Not `docker compose ps`: the test-kit checkout (and its compose
+          # file) only exists in the inferno-stack-up job, so query the daemon
+          # by compose label the same way inferno-stack-down does.
+          DOCKER_ERR=$(mktemp)
+          if ! CONTAINERS=$(docker ps -a --filter "label=com.docker.compose.project=$PROJECT" --format '{{.Names}}\t{{.Status}}' 2>"$DOCKER_ERR"); then
+            echo "Could not query the Docker daemon about compose project '$PROJECT':"
+            cat "$DOCKER_ERR"
+            echo "::error::The Inferno stack did not answer at http://$INFERNO_HOST:$INFERNO_PORT after 30s, and the Docker daemon could not be queried to say why."
             exit 1
           fi
+
+          if [ -z "$CONTAINERS" ]; then
+            echo "No containers exist for compose project '$PROJECT' — the stack for this run was torn down."
+            if [ "$RUN_ATTEMPT" != "1" ]; then
+              echo "::error::Run attempt $RUN_ATTEMPT re-ran this job alone, but 'Stop Shared Inferno Stack' already tore down the stack at the end of the previous attempt. 'Re-run failed jobs' does not re-run 'Start Shared Inferno Stack', and this job inherits that job's replayed outputs (port $INFERNO_PORT, project $PROJECT) pointing at containers that no longer exist. Use 'Re-run all jobs' instead."
+            else
+              echo "::error::The shared Inferno stack is gone even though this is run attempt 1 — check whether 'Stop Shared Inferno Stack' or another workflow removed compose project '$PROJECT' while the matrix was still running."
+            fi
+          else
+            echo "Containers still present for compose project '$PROJECT':"
+            printf '%s\n' "$CONTAINERS"
+            echo "::error::The Inferno stack's containers exist but the API did not answer at http://$INFERNO_HOST:$INFERNO_PORT after 30s — inspect the container status above."
+          fi
+          exit 1
 
       - name: Create results directory
         run: mkdir -p inferno-results
