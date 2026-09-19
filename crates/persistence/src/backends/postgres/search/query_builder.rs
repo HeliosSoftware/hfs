@@ -172,6 +172,75 @@ fn numeric_predicate(
     }
 }
 
+/// Parses the number part of a `number` or `quantity` search value (prefix
+/// already split off), or returns `None` when it is not a finite decimal.
+///
+/// Accepted: an optional sign, then digits with an optional fraction, then an
+/// optional exponent — `5`, `-5.4`, `+5.4`, `007`, `1e3`, `1.5E-2`. That is
+/// the FHIR `decimal` grammar
+/// (`-?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?`) read as widely as is
+/// still unambiguous: a leading `+`, leading zeros and a bare leading or
+/// trailing point (`.5`, `5.`) are tolerated, because a false rejection turns a
+/// working search into an empty one.
+///
+/// Rejected: everything else `f64::from_str` would take — `inf`, `infinity`,
+/// `nan` in any case — plus a literal that overflows to infinity (`1e999`),
+/// surrounding whitespace and the empty string. The non-finite values are not
+/// just invalid, they widen: `value_number < 'Infinity'` is true of every row,
+/// and Postgres orders `NaN` above every number, so `lt`/`le`/`ne` with `nan`
+/// would match everything.
+pub(crate) fn parse_search_number(raw: &str) -> Option<f64> {
+    let digits = |s: &str| s.bytes().all(|b| b.is_ascii_digit());
+    let unsigned = raw.strip_prefix(['+', '-']).unwrap_or(raw);
+    let (mantissa, exponent) = match unsigned.split_once(['e', 'E']) {
+        Some((mantissa, exponent)) => (mantissa, Some(exponent)),
+        None => (unsigned, None),
+    };
+    if let Some(exponent) = exponent {
+        let exponent = exponent.strip_prefix(['+', '-']).unwrap_or(exponent);
+        if exponent.is_empty() || !digits(exponent) {
+            return None;
+        }
+    }
+    let (whole, fraction) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    if (whole.is_empty() && fraction.is_empty()) || !digits(whole) || !digits(fraction) {
+        return None;
+    }
+    raw.parse::<f64>().ok().filter(|n| n.is_finite())
+}
+
+/// Splits a `quantity` search value — `number`, `number|code` or
+/// `number|system|code`, prefix already split off — into its number part,
+/// system and code. An empty system or code is `None`.
+///
+/// Only an *unescaped* `|` separates; `\|` is a literal pipe inside a part and
+/// is unescaped here (the REST layer leaves `\|` intact for this purpose — see
+/// `split_unescaped_commas`). Anything after the second separator belongs to
+/// the code.
+fn split_quantity_value(raw: &str) -> (String, Option<String>, Option<String>) {
+    let mut parts: Vec<String> = vec![String::new()];
+    let mut chars = raw.chars().peekable();
+    while let Some(c) = chars.next() {
+        let last = parts.len() - 1;
+        match c {
+            '\\' if chars.peek() == Some(&'|') => {
+                chars.next();
+                parts[last].push('|');
+            }
+            '|' if parts.len() < 3 => parts.push(String::new()),
+            _ => parts[last].push(c),
+        }
+    }
+    let mut parts = parts.into_iter();
+    let number = parts.next().unwrap_or_default();
+    let non_empty = |s: String| (!s.is_empty()).then_some(s);
+    match (parts.next(), parts.next()) {
+        (Some(system), Some(code)) => (number, non_empty(system), non_empty(code)),
+        (Some(code), None) => (number, None, non_empty(code)),
+        _ => (number, None, None),
+    }
+}
+
 /// Builds the comparison of one `number` search value (prefix already split
 /// off) against the numeric column `col`, advancing `next` by exactly the
 /// number of binds returned.
@@ -180,16 +249,17 @@ fn numeric_predicate(
 /// (`chain_builder.rs`, #1306) both call this, so they share
 /// [`numeric_predicate`]'s per-prefix table and its implicit-precision range.
 ///
-/// Returns `None`, leaving `next` untouched, when `raw` is not a number. What
-/// that means is the caller's decision; the chain builder turns it into
-/// [`match_nothing`].
+/// Returns `None`, leaving `next` untouched, when `raw` is not a number (see
+/// [`parse_search_number`]). Every caller must turn that into
+/// [`match_nothing`] rather than skipping the value: a dropped constraint
+/// over-matches (#1319).
 pub(crate) fn number_predicate(
     col: &str,
     prefix: SearchPrefix,
     raw: &str,
     next: &mut usize,
 ) -> Option<(String, Vec<SqlParam>)> {
-    let num: f64 = raw.parse().ok()?;
+    let num = parse_search_number(raw)?;
     let (lo, hi) = crate::search::implicit_range(num, raw);
     Some(numeric_predicate(col, prefix, num, lo, hi, next))
 }
@@ -204,8 +274,10 @@ pub(crate) fn number_predicate(
 /// chain builder's terminals (`chain_builder.rs`, #1306). Both call this, so a
 /// chained quantity means what the unchained one does, units included.
 ///
-/// Returns `None`, leaving `next` untouched, when the number part does not
-/// parse. The returned predicate is parenthesized.
+/// Returns `None`, leaving `next` untouched, when the number part is not a
+/// number (see [`parse_search_number`]); as with [`number_predicate`], every
+/// caller must turn that into [`match_nothing`]. The returned predicate is
+/// parenthesized.
 pub(crate) fn quantity_predicate(
     table: &str,
     prefix: SearchPrefix,
@@ -220,17 +292,9 @@ pub(crate) fn quantity_predicate(
     }
 
     // Parse quantity: number|system|code (or number|code, or number).
-    let parts: Vec<&str> = raw_value.splitn(3, '|').collect();
-    let num_str = *parts.first()?;
-    let num: f64 = num_str.parse().ok()?;
-    let (system, code) = match parts.len() {
-        3 => (
-            (!parts[1].is_empty()).then_some(parts[1]),
-            (!parts[2].is_empty()).then_some(parts[2]),
-        ),
-        2 => (None, (!parts[1].is_empty()).then_some(parts[1])),
-        _ => (None, None),
-    };
+    let (num_str, system, code) = split_quantity_value(raw_value);
+    let (num_str, system, code) = (num_str.as_str(), system.as_deref(), code.as_deref());
+    let num = parse_search_number(num_str)?;
 
     // Raw branch: value comparison (exact for comparators, implicit-precision
     // range for eq/ne) + the stored unit/system.
@@ -1855,7 +1919,11 @@ impl PostgresQueryBuilder {
                 vec![SqlParam::text(&format!("{}%", value.value))],
             )),
             SearchParamType::Number => {
-                let num = value.value.parse::<f64>().ok()?;
+                // Not a number: a bare `FALSE` predicate with no params, for
+                // the reason given on the Date arm below (#1319).
+                let Some(num) = parse_search_number(&value.value) else {
+                    return Some((match_nothing().sql, Vec::new()));
+                };
                 let op = Self::prefix_to_operator(&value.prefix);
                 Some((
                     format!("{} {} ${}", number, op, offset + 1),
@@ -1864,7 +1932,10 @@ impl PostgresQueryBuilder {
             }
             SearchParamType::Quantity => {
                 let parts: Vec<&str> = value.value.splitn(3, '|').collect();
-                let num = parts.first().and_then(|s| s.parse::<f64>().ok())?;
+                // As for Number: `FALSE`, never `None` (#1319).
+                let Some(num) = parts.first().and_then(|s| parse_search_number(s)) else {
+                    return Some((match_nothing().sql, Vec::new()));
+                };
                 let op = Self::prefix_to_operator(&value.prefix);
                 if parts.len() >= 3 {
                     Some((
@@ -1938,9 +2009,13 @@ impl PostgresQueryBuilder {
         let mut next = offset;
 
         for value in &param.values {
+            // Not a number: fail closed with a bare `FALSE`, as the date
+            // builder does. Skipping the value would drop the constraint and
+            // return every resource of the type (#1319).
             let Some((sql, params)) =
                 number_predicate("value_number", value.prefix, &value.value, &mut next)
             else {
+                conditions.push(match_nothing());
                 continue;
             };
             conditions.push(SqlFragment::with_params(
@@ -1969,9 +2044,11 @@ impl PostgresQueryBuilder {
         let mut next = offset;
 
         for value in &param.values {
+            // Number part is not a number: fail closed, never skip (#1319).
             let Some((predicate, params)) =
                 quantity_predicate("", value.prefix, &value.value, &mut next)
             else {
+                conditions.push(match_nothing());
                 continue;
             };
 
@@ -3329,6 +3406,284 @@ mod tests {
         assert!(frag.params.is_empty(), "{:?}", frag.params);
     }
 
+    /// Values that reach the number and quantity builders but are not numbers:
+    /// free text, a dangling exponent, a bare prefix remainder, a number with a
+    /// tail — and the words `f64::from_str` takes for non-finite values.
+    const NOT_NUMBERS: [&str; 14] = [
+        "abc",
+        "",
+        " ",
+        "1e",
+        "1e+",
+        "e5",
+        ".",
+        "-",
+        "0.2abc",
+        "1,5",
+        "0x10",
+        "inf",
+        "-Infinity",
+        "NaN",
+    ];
+
+    #[test]
+    fn parse_search_number_follows_the_fhir_decimal_grammar() {
+        // FHIR `decimal`: -?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?
+        for (input, expected) in [
+            ("0", 0.0),
+            ("5", 5.0),
+            ("5.4", 5.4),
+            ("-5.4", -5.4),
+            ("100.00", 100.0),
+            ("1e3", 1000.0),
+            ("1E3", 1000.0),
+            ("1e+3", 1000.0),
+            ("1.5E-2", 0.015),
+            ("-1.5e-2", -0.015),
+            // Tolerated beyond the grammar: `+`, leading zeros, a bare point.
+            ("+5.4", 5.4),
+            ("007", 7.0),
+            (".5", 0.5),
+            ("5.", 5.0),
+            ("-.5", -0.5),
+        ] {
+            assert_eq!(
+                parse_search_number(input),
+                Some(expected),
+                "input {input:?}"
+            );
+        }
+        for input in NOT_NUMBERS {
+            assert_eq!(parse_search_number(input), None, "input {input:?}");
+        }
+        // Parses as a float but overflows to infinity; whitespace; doubled
+        // signs; a second point; digit separators.
+        for input in [
+            "1e999", "-1e999", " 5", "5 ", "--5", "+-5", "1.2.3", "1e5.5", "1_000", "infinity",
+            "nan", "+inf",
+        ] {
+            assert_eq!(parse_search_number(input), None, "input {input:?}");
+        }
+    }
+
+    #[test]
+    fn split_quantity_value_honors_escaped_pipes() {
+        let split = |raw: &str| {
+            let (n, s, c) = split_quantity_value(raw);
+            (n, s.unwrap_or_default(), c.unwrap_or_default())
+        };
+        let own = |n: &str, s: &str, c: &str| (n.to_string(), s.to_string(), c.to_string());
+
+        assert_eq!(split("5.4"), own("5.4", "", ""));
+        assert_eq!(split("5.4|mg"), own("5.4", "", "mg"));
+        assert_eq!(split("5.4||mg"), own("5.4", "", "mg"));
+        assert_eq!(
+            split("5.4|http://unitsofmeasure.org|mg"),
+            own("5.4", "http://unitsofmeasure.org", "mg")
+        );
+        assert_eq!(split("5.4|http://x|"), own("5.4", "http://x", ""));
+        assert_eq!(split("|http://x|mg"), own("", "http://x", "mg"));
+        // `\|` is a literal pipe, in either position.
+        assert_eq!(split("5.4|http://x|a\\|b"), own("5.4", "http://x", "a|b"));
+        assert_eq!(split("5.4|a\\|b"), own("5.4", "", "a|b"));
+        assert_eq!(split("5.4|s\\|t|mg"), own("5.4", "s|t", "mg"));
+        // Anything after the second separator stays in the code; other
+        // backslashes are left alone.
+        assert_eq!(split("5.4|s|a|b"), own("5.4", "s", "a|b"));
+        assert_eq!(split("5.4||a\\b"), own("5.4", "", "a\\b"));
+    }
+
+    #[test]
+    fn unparseable_number_matches_nothing_under_every_prefix() {
+        // #1319: the value used to be skipped, so `probability=abc` was an
+        // unconstrained search. Every prefix — `ne` included — must now match
+        // nothing and bind nothing.
+        for prefix in DATE_PREFIXES {
+            for input in NOT_NUMBERS {
+                let context = format!("{prefix:?} {input:?}");
+                let query =
+                    SearchQuery::new("RiskAssessment").with_parameter(number_param(prefix, input));
+                let frag = PostgresQueryBuilder::build_search_query(&query, 2)
+                    .expect("an invalid number must still constrain the query");
+
+                assert_eq!(frag.sql, "FALSE", "{context}");
+                assert!(frag.params.is_empty(), "{context}: {:?}", frag.params);
+            }
+        }
+    }
+
+    #[test]
+    fn unparseable_quantity_matches_nothing_under_every_prefix() {
+        for prefix in DATE_PREFIXES {
+            for input in NOT_NUMBERS {
+                for suffix in ["", "|mg", "||mg", "|http://unitsofmeasure.org|mg"] {
+                    let value = format!("{input}{suffix}");
+                    let context = format!("{prefix:?} {value:?}");
+                    let query = SearchQuery::new("Observation")
+                        .with_parameter(quantity_param(prefix, &value));
+                    let frag = PostgresQueryBuilder::build_search_query(&query, 2)
+                        .expect("an invalid quantity must still constrain the query");
+
+                    assert_eq!(frag.sql, "FALSE", "{context}");
+                    assert!(frag.params.is_empty(), "{context}: {:?}", frag.params);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn valid_quantity_forms_still_build() {
+        // The number part decides validity; system and code are free text.
+        for (value, binds) in [
+            ("5.4", 2),
+            ("-5.4", 2),
+            ("+5.4", 2),
+            ("1e3", 2),
+            ("1.5E-2", 2),
+            // Non-convertible unit: raw branch only (value range + unit).
+            ("5.4|a\\|b", 3),
+            ("5.4|http://unitsofmeasure.org|a\\|b", 4),
+        ] {
+            let query = SearchQuery::new("Observation")
+                .with_parameter(quantity_param(SearchPrefix::Eq, value));
+            let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("condition");
+            assert!(frag.sql.contains("value_quantity_value >= $3"), "{value}");
+            assert_eq!(frag.params.len(), binds, "{value}: {:?}", frag.params);
+        }
+
+        // The escaped pipe reaches the bind unescaped.
+        let query = SearchQuery::new("Observation")
+            .with_parameter(quantity_param(SearchPrefix::Eq, "5.4||a\\|b"));
+        let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("condition");
+        assert!(
+            matches!(frag.params.get(2), Some(SqlParam::Text(unit)) if unit == "a|b"),
+            "{:?}",
+            frag.params
+        );
+    }
+
+    #[test]
+    fn unparseable_number_beside_a_valid_one_keeps_placeholders_gap_free() {
+        // Repeated values AND together, so one bad value empties the result. It
+        // must not consume a placeholder number it never binds: the valid value
+        // after it still starts at `$3`.
+        let mut param = number_param(SearchPrefix::Lt, "abc");
+        param.values.push(SearchValue::new(SearchPrefix::Gt, "0.5"));
+        let query = SearchQuery::new("RiskAssessment").with_parameter(param);
+        let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("condition");
+
+        assert!(frag.sql.starts_with("(FALSE) AND ("), "{}", frag.sql);
+        assert!(frag.sql.contains("value_number > $3"), "{}", frag.sql);
+        assert!(!frag.sql.contains("$4"), "{}", frag.sql);
+        assert!(
+            matches!(frag.params.as_slice(), [SqlParam::Float(f)] if *f == 0.5),
+            "{:?}",
+            frag.params
+        );
+
+        let mut param = quantity_param(SearchPrefix::Ne, "abc||mg");
+        param.values.push(SearchValue::new(SearchPrefix::Gt, "6"));
+        let query = SearchQuery::new("Observation").with_parameter(param);
+        let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("condition");
+
+        assert!(frag.sql.starts_with("(FALSE) AND ("), "{}", frag.sql);
+        assert!(
+            frag.sql.contains("value_quantity_value > $3"),
+            "{}",
+            frag.sql
+        );
+        assert!(!frag.sql.contains("$4"), "{}", frag.sql);
+        assert_eq!(frag.params.len(), 1, "{:?}", frag.params);
+    }
+
+    #[test]
+    fn unparseable_composite_numeric_component_matches_nothing() {
+        // As for the Date component: a bare `FALSE` inside the conjunction, so
+        // the token component still binds its code at `$3` and the row
+        // predicate can never hold.
+        for component_type in [SearchParamType::Number, SearchParamType::Quantity] {
+            for prefix in ["", "eq", "ne", "gt", "lt", "ge", "le", "sa", "eb", "ap"] {
+                for input in NOT_NUMBERS {
+                    let context = format!("{component_type:?} {prefix}{input}");
+                    let param = SearchParameter {
+                        name: "code-value-quantity".to_string(),
+                        param_type: SearchParamType::Composite,
+                        modifier: None,
+                        values: vec![SearchValue::new(
+                            SearchPrefix::Eq,
+                            format!("8480-6${prefix}{input}"),
+                        )],
+                        chain: vec![],
+                        components: vec![
+                            CompositeSearchComponent {
+                                param_type: SearchParamType::Token,
+                                param_name: "code".to_string(),
+                            },
+                            CompositeSearchComponent {
+                                param_type: component_type,
+                                param_name: "value-quantity".to_string(),
+                            },
+                        ],
+                    };
+                    let query = SearchQuery::new("Observation").with_parameter(param);
+                    let frag = PostgresQueryBuilder::build_search_query(&query, 2)
+                        .expect("an invalid composite number must still constrain the query");
+
+                    assert!(
+                        frag.sql.contains("(value_token_code = $3) AND (FALSE)"),
+                        "{context}: {}",
+                        frag.sql
+                    );
+                    assert!(
+                        !frag.sql.contains("value_quantity"),
+                        "{context}: {}",
+                        frag.sql
+                    );
+                    assert!(
+                        !frag.sql.contains("value_number"),
+                        "{context}: {}",
+                        frag.sql
+                    );
+                    assert!(!frag.sql.contains("$4"), "{context}: {}", frag.sql);
+                    assert_eq!(frag.params.len(), 1, "{context}: {:?}", frag.params);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unparseable_contained_number_is_not_dropped() {
+        // `build_contained` skips a component that yields `None`, which would
+        // drop the parameter — and lower the `HAVING COUNT` with it — so a
+        // contained resource matching only the *other* parameter came back.
+        for (numeric, name) in [
+            (number_param(SearchPrefix::Ne, "abc"), "value-number"),
+            (
+                quantity_param(SearchPrefix::Lt, "inf||mg"),
+                "value-quantity",
+            ),
+        ] {
+            let query = SearchQuery::new("Observation")
+                .with_parameter(token_param("code", None, "8480-6"))
+                .with_parameter(numeric);
+            let frag = PostgresQueryBuilder::build_contained(&query)
+                .expect("an invalid number must still constrain the contained match");
+
+            assert!(
+                frag.sql
+                    .contains(&format!("(param_name = '{name}' AND (FALSE))")),
+                "{}",
+                frag.sql
+            );
+            assert!(
+                frag.sql.contains("HAVING COUNT(DISTINCT param_name) >= 2"),
+                "{}",
+                frag.sql
+            );
+            assert_eq!(frag.params.len(), 1, "{:?}", frag.params);
+        }
+    }
+
     #[test]
     fn text_or_list_placeholders_are_gap_free() {
         // Two terms OR together, and a blank one must not consume a placeholder
@@ -3511,12 +3866,13 @@ mod tests {
 
     #[test]
     fn composite_unparseable_component_binds_no_params() {
-        // `8867-4$abc` — the quantity component fails to parse. The value must
-        // collapse to `1 = 0` and contribute ZERO bound params. Previously the token
-        // component's params were already pushed before the quantity component
+        // `8867-4$abc` — the quantity component fails to parse. Originally the
+        // token component's params were pushed before the quantity component
         // bailed, leaving them bound with no placeholder to reference them, which
         // Postgres rejects outright ("bind message supplies N parameters...") — a
-        // 500 on a malformed query rather than an empty result.
+        // 500 on a malformed query rather than an empty result. The component now
+        // comes back as a bare `FALSE` (#1319), so the token's bind stays, with
+        // its placeholder; what must hold is that binds and placeholders agree.
         let param = SearchParameter {
             name: "code-value-quantity".to_string(),
             param_type: SearchParamType::Composite,
@@ -3540,11 +3896,12 @@ mod tests {
 
         assert_eq!(
             frag.params.len(),
-            0,
-            "a bailed-out composite value must leave no orphaned bind params: {}",
+            1,
+            "an unparseable composite value must leave no orphaned bind params: {}",
             frag.sql
         );
-        assert!(frag.sql.contains("1 = 0"));
+        assert!(frag.sql.contains("$3") && !frag.sql.contains("$4"));
+        assert!(frag.sql.contains("AND (FALSE)"));
     }
 
     #[test]
