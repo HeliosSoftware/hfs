@@ -15,6 +15,17 @@ impl QuantityHandler {
     /// - `value|unit` - matches specific unit (code)
     /// - `value|system|code` - matches specific system and code
     pub fn build_sql(value: &SearchValue, param_offset: usize) -> SqlFragment {
+        Self::build_sql_for("", value, param_offset)
+    }
+
+    /// [`Self::build_sql`] with every column qualified by `table` (`"si2."`),
+    /// for the chain builder's quantity terminal (#1306). `build_sql` passes
+    /// the empty string.
+    pub(crate) fn build_sql_for(
+        table: &str,
+        value: &SearchValue,
+        param_offset: usize,
+    ) -> SqlFragment {
         let param_num = param_offset + 1;
 
         // Parse the quantity value: [prefix]number|system|code or [prefix]number|code or [prefix]number
@@ -62,7 +73,7 @@ impl QuantityHandler {
         // Raw match: numeric comparison plus the stored unit/system verbatim.
         let raw = {
             let num = Self::build_numeric_condition(
-                "value_quantity_value",
+                &format!("{table}value_quantity_value"),
                 num_value,
                 num_str,
                 value.prefix,
@@ -73,12 +84,12 @@ impl QuantityHandler {
             let mut next_param = param_num + params.len();
 
             if let Some(sys) = system {
-                conditions.push(format!("value_quantity_system = ?{}", next_param));
+                conditions.push(format!("{table}value_quantity_system = ?{}", next_param));
                 params.push(SqlParam::string(sys));
                 next_param += 1;
             }
             if let Some(c) = code {
-                conditions.push(format!("value_quantity_unit = ?{}", next_param));
+                conditions.push(format!("{table}value_quantity_unit = ?{}", next_param));
                 params.push(SqlParam::string(c));
             }
             SqlFragment::with_params(conditions.join(" AND "), params)
@@ -91,7 +102,7 @@ impl QuantityHandler {
         if let Some(c) = code {
             let start = param_num + raw.params.len();
             if let Some((canon_sql, canon_params)) =
-                Self::build_canonical_condition(c, num_value, num_str, value.prefix, start)
+                Self::build_canonical_condition(table, c, num_value, num_str, value.prefix, start)
             {
                 let mut params = raw.params;
                 params.extend(canon_params);
@@ -114,6 +125,7 @@ impl QuantityHandler {
     /// says those prefixes ignore implicit precision. Returns `None` if the
     /// unit cannot be canonicalized.
     fn build_canonical_condition(
+        table: &str,
         code: &str,
         value: f64,
         num_str: &str,
@@ -121,7 +133,7 @@ impl QuantityHandler {
         param_num: usize,
     ) -> Option<(String, Vec<SqlParam>)> {
         use helios_fhirpath::ucum::canonicalize_quantity as canon;
-        let col = "value_quantity_canonical_value";
+        let col = format!("{table}value_quantity_canonical_value");
 
         let (sql, mut params, unit) = match prefix {
             SearchPrefix::Eq | SearchPrefix::Ne => {
@@ -187,7 +199,7 @@ impl QuantityHandler {
         let unit_param = param_num + params.len();
         params.push(SqlParam::string(&unit));
         Some((
-            format!("{sql} AND value_quantity_canonical_unit = ?{unit_param}"),
+            format!("{sql} AND {table}value_quantity_canonical_unit = ?{unit_param}"),
             params,
         ))
     }
@@ -195,7 +207,11 @@ impl QuantityHandler {
     /// Builds the numeric comparison part of the condition against `column`.
     /// `num_str` is the search value's textual form (used only by `eq`/`ne`
     /// to derive the implicit-precision range).
-    fn build_numeric_condition(
+    ///
+    /// This is the one numeric per-prefix table on SQLite: number search
+    /// ([`super::number::NumberHandler`]) and, through the two handlers, the
+    /// chain builder's numeric terminals use it too.
+    pub(crate) fn build_numeric_condition(
         column: &str,
         value: f64,
         num_str: &str,
