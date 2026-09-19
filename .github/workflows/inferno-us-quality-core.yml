@@ -657,7 +657,20 @@ jobs:
             docker inspect "$ID" \
               --format '{{.Name}} Status={{.State.Status}} ExitCode={{.State.ExitCode}} OOMKilled={{.State.OOMKilled}} Restarts={{.RestartCount}} FinishedAt={{.State.FinishedAt}}' 2>&1 || true
           done
-          docker stats --no-stream --format 'table {{.Name}}\t{{.MemUsage}}\t{{.MemPerc}}' 2>&1 | grep -E "NAME|$PROJECT" || true
+          echo "::endgroup::"
+          # Host-wide, not just this project: the validator has no mem_limit,
+          # so OOMKilled=true on it means the *host* ran out, and the culprit
+          # is as likely a neighbour (another workflow's stack, a leaked
+          # container) as this stack.
+          echo "::group::Docker host memory + all containers"
+          docker run --rm busybox sh -c \
+            'grep -E "MemTotal|MemFree|MemAvailable|SwapTotal|SwapFree" /proc/meminfo' 2>&1 || true
+          docker stats --no-stream --format 'table {{.Name}}\t{{.MemUsage}}\t{{.MemPerc}}' 2>&1 || true
+          docker ps -a --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}' 2>&1 || true
+          echo "::endgroup::"
+          echo "::group::Host OOM-killer (kernel ring buffer)"
+          docker run --rm --privileged busybox dmesg 2>/dev/null \
+            | grep -iE "out of memory|killed process|oom-kill" | tail -15 || true
           echo "::endgroup::"
           for SVC in hl7_validator_service inferno worker; do
             echo "::group::$SVC logs (last 150 lines)"
